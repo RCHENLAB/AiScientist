@@ -1,0 +1,78 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+# scGPT per-cell annotation image for AiScientist (Route C: short-lived gpu:1 batch job).
+# Route B: VENDOR the user's validated scGPT_refactor and run it unchanged — we do NOT
+# reimplement inference. See deploy/scgpt/README.md.
+#
+# Build ON HPC3 (macOS cannot build .sif). The build context must contain the user's
+# harness at ./scGPT_refactor/ (copied from scGPT_mwe/scGPT_refactor). The reference MODEL
+# WEIGHTS are NOT baked in — they are bind-mounted read-only at run time (--model), so this
+# image stays small and reusable across models.
+#
+# Entry contract (matches src/bioagent/gateway/scgpt_job.py + settings.scgpt_entrypoint):
+#   python /opt/scgpt/run_infer.py --input <query.h5ad> --model <model_dir> --out <out_dir>
+# -> writes <out>/predictions.csv  (per-cell: barcode, predictions, confidence)
+#
+# ⚠️ Confirm before building (see README §Prerequisites):
+#   1. The base-image CUDA (12.1) must be supported by the HPC3 GPU driver (`nvidia-smi`).
+#   2. torch is 2.3.0 to match the reference env (Prompt.mkd). Do NOT reinstall torch.
+#      scgpt pulls torchtext/flash-attn-adjacent deps; if pip resolves a conflicting torch,
+#      pin scgpt/torchtext to a combo known-good with YOUR scGPT_refactor.
+
+%files
+    # The user's harness: step1_preprocess.py, step2_inference.py, utils/. Place it in the
+    # build context (next to this .def) before building.
+    scGPT_refactor /opt/scgpt/scGPT_refactor
+    # The wrapper that arranges paths and runs step1+step2 unchanged.
+    run_infer.py /opt/scgpt/run_infer.py
+
+%post
+    set -eux
+    # Match the reference environment (Prompt.mkd: scgpt + scanpy/anndata/seaborn/leidenalg
+    # + wandb on torch 2.3.0). torch + CUDA come from the base image — keep that build.
+    # scikit-misc is needed for step1's seurat_v3 HVG flavor.
+    pip install --no-cache-dir \
+        scgpt \
+        scanpy \
+        anndata \
+        wandb \
+        seaborn \
+        leidenalg \
+        scikit-misc \
+        ipython
+    # Fail the build early if the harness / wrapper did not get copied in.
+    test -f /opt/scgpt/scGPT_refactor/step1_preprocess.py
+    test -f /opt/scgpt/scGPT_refactor/step2_inference.py
+    test -f /opt/scgpt/run_infer.py
+    # %files preserves source perms; the vendored harness arrived mode 600/700 (and
+    # root-owned), which a non-root container user cannot read. Make it world-readable
+    # (files +r, dirs +x so they're traversable).
+    chmod -R a+rX /opt/scgpt
+    python -c "import scgpt, torch; print('scgpt', scgpt.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+%environment
+    # W&B offline (no login, no mid-run network) — the reference forces this; weights are pre-staged
+    # so we don't rely on egress (HPC3 compute nodes DO have egress, verified 2026-07-08).
+    export WANDB_MODE=offline
+    export WANDB_SILENT=true
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export NUMBA_CACHE_DIR=/tmp/numba
+    export MPLBACKEND=Agg
+
+%runscript
+    exec python /opt/scgpt/run_infer.py "$@"
+
+%labels
+    org.bioagent.component scgpt-annotation
+    org.bioagent.entrypoint /opt/scgpt/run_infer.py
+    org.bioagent.route vendor-refactor
+
+%help
+    scGPT reference-based per-cell annotation, contained for HPC3 (vendored refactor).
+    Run via AiScientist (gateway/scgpt_job.py) or directly:
+      singularity exec --nv \
+        -B <query_dir>:<query_dir>:ro -B <model_dir>:<model_dir>:ro -B <out_dir>:<out_dir> \
+        scgpt.sif python /opt/scgpt/run_infer.py \
+        --input <query.h5ad> --model <model_dir> --out <out_dir>

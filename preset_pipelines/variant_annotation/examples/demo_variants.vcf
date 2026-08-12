@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##reference=GRCh38
+##source=AiScientist variant_annotation demo — well-known ClinVar variants; GRCh38 coords from Ensembl
+##INFO=<ID=GENE,Number=1,Type=String,Description="Gene symbol (demo aid; ignored by VEP)">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
+1	11796321	rs1801133	G	A	.	.	GENE=MTHFR
+1	169549811	rs6025	C	T	.	.	GENE=F5
+3	12351626	rs1801282	C	G	.	.	GENE=PPARG
+6	26092913	rs1800562	G	A	.	.	GENE=HFE
+11	5227002	rs334	T	A	.	.	GENE=HBB
+12	102840493	rs5030858	G	A	.	.	GENE=PAH
+14	94378610	rs28929474	C	T	.	.	GENE=SERPINA1
+17	7676154	rs1042522	G	C	.	.	GENE=TP53

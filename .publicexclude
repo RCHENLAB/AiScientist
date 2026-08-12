@@ -1,0 +1,27 @@
+# Paths that must NEVER be published to the public mirror (RCHENLAB/AiScientist).
+#
+# They stay in THIS private repository because the team needs them; they are stripped when the
+# public snapshot is built. Anyone regenerating that snapshot must honour this file — the first
+# public push did not, and shipped all of the below.
+#
+#   build the public snapshot with:
+#     git archive <sha> | tar -x -C <dir>
+#     (cd <dir> && grep -v '^#' /path/to/.publicexclude | grep . | xargs -I{} rm -rf -- {})
+#
+# --- internal proposals / documents ------------------------------------------------------------
+# Someone else's proposal document, with their name on it. Never ours to publish.
+VisionAnalysisAgentProposal - Jin Li copy.pdf
+#
+# --- reporting decks ---------------------------------------------------------------------------
+# 43-slide capability decks: they carry the roadmap and a "built but gated off" status table,
+# i.e. the progress of unreleased features. The same capability material lives in README.md and
+# docs/ in a form meant to be read by outsiders.
+reports/AiScientist-Capability-Overview-en.pptx
+reports/AiScientist-能力全览-zh.pptx
+#
+# --- literature corpus acquisition -------------------------------------------------------------
+# A step-by-step record of pulling ~1,700 papers through institutional subscriptions: which
+# databases, which titles were licensed, per-PMID outcomes, ILL lists, and how to retry past a
+# provider error. Publishing that invites a publisher terms-of-service problem, and it also
+# contains a colleague's local filesystem path.
+RETIGENE_PAPER_RECOVERY_HANDOFF.md

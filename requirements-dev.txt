@@ -1,0 +1,15 @@
+pytest>=9.0
+ruff>=0.6
+# Offline auth unit tests (tests/test_auth_accounts.py) import bioagent.gateway.auth,
+# which pulls in bcrypt (password hashing) + itsdangerous (signed cookies). These two
+# are pure-Python/offline — the heavier auth extras (sqlalchemy/psycopg/alembic/httpx)
+# stay out of CI and gate the app-level tests via pytest.importorskip.
+bcrypt>=4.1
+itsdangerous>=2.1
+# scrna_pack._select_resolution imports sklearn.metrics.adjusted_rand_score UNCONDITIONALLY, so
+# tests/test_resolution_selection.py (which exercises the bootstrap-stability rule against a FAKE
+# scanpy — no real clustering) cannot run without it. At runtime it arrives transitively via
+# scanpy in the analysis extra; CI installs neither, which is why those 6 tests had been failing
+# since before this line existed. Adding the one real dependency restores the coverage instead of
+# skipping a decision rule that picks the clustering resolution.
+scikit-learn>=1.3

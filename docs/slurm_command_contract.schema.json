@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bioagent.local/schemas/slurm_command_contract.schema.json",
+  "title": "AiScientist Slurm Command Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "conversation_intent",
+    "action",
+    "target",
+    "job_spec",
+    "safety_policy",
+    "approvals_required",
+    "fallback_policy",
+    "compiled_preview"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "bioagent.slurm_command.v1"
+    },
+    "conversation_intent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "render_slurm_script",
+        "check_queue_status",
+        "request_submit_approval",
+        "request_cancel_approval"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cluster",
+        "login_host",
+        "execution_mode"
+      ],
+      "properties": {
+        "cluster": {
+          "const": "uci_hpc3"
+        },
+        "login_host": {
+          "const": "hpc3.rcic.uci.edu"
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": [
+            "slurm_batch",
+            "slurm_queue_monitor"
+          ]
+        }
+      }
+    },
+    "job_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_name",
+        "account",
+        "partition",
+        "cpus_per_task",
+        "memory_gb",
+        "time_limit",
+        "gres",
+        "command"
+      ],
+      "properties": {
+        "job_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+        },
+        "account": {
+          "type": "string",
+          "minLength": 1
+        },
+        "partition": {
+          "type": "string",
+          "enum": [
+            "gpu",
+            "free-gpu",
+            "standard",
+            "free"
+          ]
+        },
+        "cpus_per_task": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "memory_gb": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "time_limit": {
+          "type": "string",
+          "pattern": "^[0-9]{2}:[0-9]{2}:[0-9]{2}$"
+        },
+        "gres": {
+          "type": "string",
+          "pattern": "^gpu(:[A-Za-z0-9_-]+)?:[0-9]+$"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "safety_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_data_to_cloud",
+        "browser_holds_ssh_key",
+        "requires_human_review_before_submit",
+        "allowed_backend_actions",
+        "blocked_backend_actions"
+      ],
+      "properties": {
+        "raw_data_to_cloud": {
+          "const": false
+        },
+        "browser_holds_ssh_key": {
+          "const": false
+        },
+        "requires_human_review_before_submit": {
+          "const": true
+        },
+        "allowed_backend_actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "render_script",
+              "validate_policy",
+              "queue_status_after_submit",
+              "request_submit_after_review",
+              "request_cancel_after_review"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "blocked_backend_actions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "direct_shell",
+              "unreviewed_sbatch",
+              "unreviewed_scancel",
+              "raw_data_upload",
+              "browser_private_key_access"
+            ]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "approvals_required": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "dataset_path_reviewed",
+          "slurm_account_charge_accepted",
+          "no_raw_data_leaves_uci",
+          "queue_fallback_policy_accepted",
+          "submit_script_reviewed",
+          "cancel_impact_reviewed"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "fallback_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wait_notice_minutes",
+        "human_review_minutes",
+        "max_queue_wait_minutes",
+        "lab_server_heavy_fallback_allowed"
+      ],
+      "properties": {
+        "wait_notice_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "human_review_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_queue_wait_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "lab_server_heavy_fallback_allowed": {
+          "const": false
+        }
+      }
+    },
+    "compiled_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sbatch_script"
+      ],
+      "properties": {
+        "sbatch_script": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

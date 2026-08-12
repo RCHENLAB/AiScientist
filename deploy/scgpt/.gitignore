@@ -1,0 +1,3 @@
+# Build artifacts — never commit these.
+scGPT_refactor/   # the user's harness, copied into the build context at build time
+*.sif             # the built Singularity image (lives on dfs3b, not in git)

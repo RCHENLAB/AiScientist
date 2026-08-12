@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static-analysis:
+    name: Static analysis (compile + ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: python -m pip install --upgrade pip ruff
+
+      - name: Byte-compile all sources (syntax/compile check)
+        run: python -m compileall -q src tests
+
+      # Lint is advisory, not a merge gate: the real gates are the byte-compile above
+      # (catches syntax errors) and the test suite. ruff still runs so style issues stay
+      # visible in the logs, but a lint nit never blocks a green build. Keep the tree clean
+      # locally with `ruff check --fix`.
+      - name: Static code review (ruff, non-blocking)
+        continue-on-error: true
+        run: ruff check src tests
+
+  test:
+    name: Offline tests and smoke harnesses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: python -m pytest

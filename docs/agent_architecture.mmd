@@ -1,0 +1,48 @@
+flowchart LR
+    R["Researcher / Lab UI"] --> I["AiScientist Intake and Orchestrator"]
+    I --> C["CoordinatorAgent"]
+    C --> D["DataAgent"]
+    D --> KKA["KosmosAdapter / KosmosKernelAdapter"]
+    KKA --> KSP["Kosmos Safety Policy"]
+    KKA -.-> KRT["KosmosRuntimeClient / KosmosCliRuntime"]
+    D --> LA["LocalAnalysisAgent"]
+    LA --> QC["SingleCellQCExecutionAgent"]
+    LA --> DE["DifferentialExpressionExecutionAgent"]
+    C --> LIT["LiteratureAgent"]
+    LIT --> LG["LiteratureGroundingAgent"]
+    LG --> G["DataBoundaryGuard"]
+    C --> GC["GeneratedCodeExecutionAgent"]
+    C --> HPC["HPCAgent"]
+    HPC -.-> SLURM["Real Slurm Submit / Queue Monitor"]
+    C --> AUTO["CheckpointedAutonomousLoop"]
+    AUTO --> RB["Research Brief and Staged Rounds"]
+    QC --> V["ValidationAgent"]
+    DE --> V
+    LG --> V
+    GC --> V
+    HPC --> V
+    V --> EV["ResearchEvaluationAgent"]
+    EV --> REP["ReporterAgent"]
+    REP --> ART["Reports, Artifacts, Checkpoints"]
+    ART --> PAR["ParityEvaluationAgent"]
+    PAR --> KB["KosmosBridgeAgent"]
+    KB -.-> KRT
+    I -.-> QWEN["Local Qwen / vLLM Runtime"]
+    ART -.-> UI["Frontend Dashboard"]
+
+    subgraph LEG["Color Legend"]
+        LD["Green: implemented with sample/test evidence"]
+        LP["Yellow: adapter/policy exists, live runtime not connected"]
+        LB["Blue: safety boundary / permission control"]
+        LT["Gray: planned, not implemented yet"]
+    end
+
+    classDef done fill:#DFF5E1,stroke:#258A43,stroke-width:2px,color:#123D1F;
+    classDef partial fill:#FFF1C7,stroke:#B7791F,stroke-width:2px,color:#4A3210;
+    classDef guard fill:#DDEBFF,stroke:#2F6FDB,stroke-width:2px,color:#102A56;
+    classDef todo fill:#ECEFF3,stroke:#7A8594,stroke-width:2px,color:#26313F;
+
+    class R,I,C,D,LA,QC,DE,LIT,LG,GC,HPC,AUTO,RB,EV,REP,ART,PAR,LD done;
+    class KKA,KB,LP partial;
+    class KSP,G,V,LB guard;
+    class KRT,SLURM,QWEN,UI,LT todo;

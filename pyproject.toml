@@ -1,0 +1,73 @@
+[project]
+name = "bioagent-prototype"
+version = "0.2.0"
+description = "AiScientist — a privacy-first, DAG-planned multi-agent bioinformatics research console (UCI HPC3 + vLLM) for single-cell / ocular biology workflows."
+requires-python = ">=3.10"
+dependencies = [
+  "h5py>=3.0",
+]
+
+[project.optional-dependencies]
+gateway = [
+  "paramiko>=3.4",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.29",
+  "python-multipart>=0.0.9",
+]
+# User accounts / login / admin (eye-server). SQLAlchemy 2.0 models + Alembic
+# migrations; bcrypt for password hashing; itsdangerous for signed session cookies;
+# psycopg (v3) is the PostgreSQL driver in prod. Local dev/CI uses SQLite (stdlib),
+# so psycopg/alembic are only needed on the server. NO external API — fully local.
+auth = [
+  "sqlalchemy>=2.0",
+  "bcrypt>=4.1",
+  "itsdangerous>=2.1",
+  "psycopg[binary]>=3.1",
+  "alembic>=1.13",
+]
+# Real Biomni runtime (eye-server only). The core + CI stay light; the
+# RealBiomniRuntime imports biomni lazily, so this is needed only to execute.
+biomni = [
+  "biomni",
+]
+# Deep literature agent (PaperQA2 — the open-source engine behind Edison Literature).
+# Eye-server only; imported lazily by tools/paperqa_search.py, so the core/CI stay light
+# and a host without it just gets status="dependency_missing". The [local] extra pulls in
+# sentence-transformers for a LOCAL embedding model, so chunk text never leaves UCI; the
+# LLM is pointed at the session's local Qwen vLLM endpoint (no cloud model).
+literature = [
+  "paper-qa[local]>=5",
+]
+# Single-cell analysis stack for the run_code (CodeAct) sandbox + the analysis line
+# (real scanpy QC/cluster/DE + gseapy enrichment + matplotlib figures). Eye-server
+# only; the lightweight core/CI never import these. The CodeSandbox runs the app
+# venv's python, so installing this extra into the app venv lets generated analysis
+# code `import scanpy/gseapy`. System tools (apt, not pip): `pandoc texlive-xetex`
+# for PDF rendering, `graphviz` for deterministic schematic figures (the `dot` binary).
+# Optional prettier SVG schematics: install d2 (curl -fsSL https://d2lang.com/install.sh | sh -s --).
+analysis = [
+  "scanpy>=1.10",
+  "anndata>=0.10",
+  "gseapy>=1.1",
+  "matplotlib>=3.8",
+  "leidenalg>=0.10",
+  "pandas>=2.0",
+]
+
+[project.scripts]
+bioagent-console = "bioagent.gateway.app:main"
+bioagent-admin = "bioagent.gateway.admin_cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["runs", ".adaptive_kg", ".venv"]
+
+[tool.ruff.lint]
+# Conservative gate: pyflakes (real bugs: unused/undefined names) + pycodestyle
+# error subset + syntax errors. Style nits are not enforced as a merge blocker.
+select = ["E4", "E7", "E9", "F"]

@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AiScientist · HPC3 Qwen3 Console</title>
+  <!-- Material Symbols icon font is bundled LOCALLY (assets/material-symbols/) — no Google CDN, so
+       the console renders its icons offline / under a strict CSP. Preloaded for a fast first paint. -->
+  <link rel="preload" href="/static/assets/material-symbols/material-symbols-rounded.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- ===== LOGIN (shown when not authenticated) ===== -->
+  <div id="loginOverlay" class="login-overlay hidden">
+    <div class="login-card">
+      <div class="login-brand"><span class="logo">🧬</span><h1>AiScientist</h1></div>
+      <p class="login-sub">UCI RUIC20 lab · single-cell research console</p>
+
+      <!-- Sign-in -->
+      <form id="loginForm" class="form">
+        <label>Username<input id="loginUser" type="text" autocomplete="username" autofocus /></label>
+        <label>Password<input id="loginPass" type="password" autocomplete="current-password" /></label>
+        <button id="loginBtn" type="submit" class="primary full">Sign in</button>
+        <p id="loginError" class="login-error hidden"></p>
+      </form>
+      <p class="login-foot" id="loginFoot">No account? <a href="#" id="showRegister" class="login-link">Create one with your UCI email</a>. Forgot your password? An admin can reset it.</p>
+
+      <!-- Self-registration: step 1 (details) -->
+      <form id="registerForm" class="form hidden">
+        <label>Username<input id="regUser" type="text" autocomplete="username" /></label>
+        <label>UCI email<input id="regEmail" type="email" placeholder="you@uci.edu" autocomplete="email" /></label>
+        <label>Password (≥6)<input id="regPass" type="password" autocomplete="new-password" /></label>
+        <button id="regBtn" type="submit" class="primary full">Send verification code</button>
+        <p id="registerError" class="login-error hidden"></p>
+        <p class="login-foot"><a href="#" id="showLoginFromRegister" class="login-link">← Back to sign in</a></p>
+      </form>
+
+      <!-- Self-registration: step 2 (verify emailed code) -->
+      <form id="verifyForm" class="form hidden">
+        <p class="login-sub" id="verifySub">Enter the 6-digit code we emailed you.</p>
+        <label>Verification code<input id="verifyCode" type="text" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code" /></label>
+        <button id="verifyBtn" type="submit" class="primary full">Verify &amp; sign in</button>
+        <p id="verifyError" class="login-error hidden"></p>
+        <p id="devCodeHint" class="login-dev hidden"></p>
+        <p class="login-foot"><a href="#" id="resendCode" class="login-link">Resend code</a> · <a href="#" id="showLoginFromVerify" class="login-link">Start over</a></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===== APP SHELL (shown when authenticated) ===== -->
+  <div id="appShell" class="app-shell hidden">
+    <header class="topbar">
+      <div class="brand">
+        <button id="toggleLeft" class="icon-toggle active" title="Toggle sidebar" aria-label="Toggle sidebar">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><rect x="1.5" y="2.5" width="15" height="13" rx="3" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="2.5" width="5.5" height="13" rx="3" fill="currentColor" opacity="0.5"/></svg>
+        </button>
+        <span class="logo">🧬</span>
+        <div>
+          <h1>AiScientist Console</h1>
+          <p class="subtitle">SSH → UCI HPC3 · GPU · vLLM / Qwen3</p>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="conn-indicator">
+          <span id="connDot" class="dot muted"></span>
+          <span id="connLabel">Disconnected</span>
+        </div>
+        <span id="userChip" class="user-chip" title="Signed in"></span>
+        <button id="toggleRight" class="icon-toggle active" title="Toggle results panel" aria-label="Toggle results panel">
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><rect x="1.5" y="2.5" width="15" height="13" rx="3" stroke="currentColor" stroke-width="1.4"/><rect x="11" y="2.5" width="5.5" height="13" rx="3" fill="currentColor" opacity="0.5"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="shell-body">
+      <!-- operon-style activity bar: switches the main view (JS state, not URL routing) -->
+      <nav id="navRail" class="nav-rail" aria-label="Sections">
+        <button class="nav-item active" data-view="research"><span class="nav-ico material-symbols-outlined">science</span><span class="nav-label">Research</span></button>
+        <button class="nav-item" data-view="datasets"><span class="nav-ico material-symbols-outlined">folder</span><span class="nav-label">Datasets</span></button>
+        <button class="nav-item" data-view="runs"><span class="nav-ico material-symbols-outlined">bar_chart</span><span class="nav-label">Runs</span></button>
+        <button class="nav-item" data-view="system"><span class="nav-ico material-symbols-outlined">extension</span><span class="nav-label">System</span></button>
+        <button class="nav-item admin-only hidden" data-view="admin"><span class="nav-ico material-symbols-outlined">settings</span><span class="nav-label">Admin</span></button>
+        <button class="nav-item" data-view="account"><span class="nav-ico material-symbols-outlined">person</span><span class="nav-label">Account</span></button>
+      </nav>
+
+      <div class="views">
+        <!-- ===== RESEARCH view (the existing 3-panel console) ===== -->
+        <section id="view-research" class="view active">
+          <main class="layout" id="layout">
+            <aside class="panel side-panel left-panel" id="leftPanel">
+              <div id="loginSection">
+                <div id="reattachHint" class="reattach-hint hidden">
+                  <button id="reattachDismiss" type="button" class="reattach-dismiss" title="Dismiss">×</button>
+                  <div id="reattachHintBody"></div>
+                </div>
+                <h2>Connect to HPC3</h2>
+                <form id="connectForm" class="form">
+                  <label>HPC host
+                    <input id="hostInput" type="text" value="hpc3.rcic.uci.edu" autocomplete="off" />
+                  </label>
+                  <label>UCInetID
+                    <input id="userInput" type="text" placeholder="your UCInetID" autocomplete="username" />
+                  </label>
+                  <label>Auth method
+                    <select id="authMethod">
+                      <option value="password_duo">Password + Duo</option>
+                      <option value="ssh_key">Saved SSH key</option>
+                    </select>
+                  </label>
+
+                  <!-- Password + Duo -->
+                  <label id="passwordRow">Password
+                    <input id="passwordInput" type="password" placeholder="UCInetID password" autocomplete="current-password" />
+                  </label>
+                  <label id="duoMethodRow">Duo approval
+                    <select id="duoMethod">
+                      <option value="push" selected>Push — approve on your phone</option>
+                      <option value="phone">Phone call</option>
+                      <option value="passcode">Passcode — I'll enter a code</option>
+                    </select>
+                  </label>
+                  <label class="check" id="createKeyRow"><input id="createKeyCheck" type="checkbox" checked /> Remember me — set up a reusable SSH key on HPC3 (skip password &amp; Duo next time)</label>
+                  <label id="newKeyPassRow">Protect the new key with a passphrase <span class="hint-inline">optional</span>
+                    <input id="newKeyPassInput" type="password" placeholder="leave blank for no passphrase" autocomplete="new-password" />
+                  </label>
+
+                  <!-- Saved SSH key -->
+                  <label id="credRow" class="hidden">Saved SSH key
+                    <select id="credSelect"></select>
+                  </label>
+                  <label id="keyPassRow" class="hidden">Key passphrase <span class="hint-inline">if the key is encrypted</span>
+                    <input id="keyPassInput" type="password" placeholder="key passphrase" autocomplete="current-password" />
+                  </label>
+
+                  <label class="check"><input id="campusCheck" type="checkbox" /> I'm on UCI campus network / VPN</label>
+                  <label class="check"><input id="mockCheck" type="checkbox" /> Mock mode (demo, no real cluster)</label>
+                  <button id="connectBtn" type="submit" class="primary full">Connect</button>
+                </form>
+              </div>
+
+              <div id="provisionSection" class="hidden">
+                <h2>Provisioning</h2>
+                <ul id="pipeline" class="pipeline">
+                  <li data-stage="ssh"><span class="step-dot"></span> SSH login</li>
+                  <li data-stage="ollama"><span class="step-dot"></span> vLLM detect / image</li>
+                  <li data-stage="gpu"><span class="step-dot"></span> GPU allocation (Slurm)</li>
+                  <li data-stage="serve"><span class="step-dot"></span> vLLM serve + tunnel</li>
+                  <li data-stage="model"><span class="step-dot"></span> Model ready</li>
+                  <li data-stage="ready"><span class="step-dot"></span> Live</li>
+                </ul>
+              </div>
+
+              <!-- Once connected, the GPU/model/compute controls fold away (collapsed by
+                   default) so the left panel is just Chats — click to reveal them. -->
+              <details id="connectedSection" class="compute-details hidden">
+                <summary>Connection &amp; compute</summary>
+                <div class="conn-card">
+                  <div class="conn-card-top">
+                    <span class="conn-card-dot"></span>
+                    <div class="conn-card-id">
+                      <strong id="connUser">connected</strong>
+                      <span id="connSub"></span>
+                    </div>
+                  </div>
+                  <div class="conn-gpu" id="connGpu">GPU —</div>
+                </div>
+                <label class="model-row">Model
+                  <div class="model-row-controls">
+                    <select id="modelSelect"></select>
+                    <button id="pullModelBtn" type="button" class="icon-btn" title="Pull another model">+</button>
+                  </div>
+                </label>
+                <button id="storageBtn" type="button" class="ghost full">Manage HPC3 storage</button>
+                <button id="disconnectBtn" type="button" class="ghost full">Disconnect</button>
+                <button id="stopGpuBtn" type="button" class="danger-btn">Stop my GPU job (frees my SU)</button>
+              </details>
+
+              <div id="duoPanel" class="duo-panel hidden">
+                <h2>Step 2 · Duo</h2>
+                <pre id="duoPrompt" class="duo-prompt"></pre>
+                <label>Passcode or option
+                  <input id="duoInput" type="text" inputmode="numeric" placeholder="6-digit passcode, or 1 for push" autocomplete="one-time-code" />
+                </label>
+                <div class="btn-row">
+                  <button id="duoSubmitBtn" type="button" class="primary">Submit</button>
+                  <button id="duoPushBtn" type="button" class="ghost">Push (1)</button>
+                </div>
+              </div>
+
+              <div class="sessions">
+                <div class="sessions-head">
+                  <h2>Chats</h2>
+                  <button id="newSessionBtn" type="button" class="icon-btn" title="New chat">+</button>
+                </div>
+                <div id="sessionList" class="session-list"></div>
+              </div>
+
+              <button id="leftLogoutBtn" type="button" class="ghost full left-logout hidden">
+                <span class="material-symbols-outlined msym">logout</span> Sign out
+              </button>
+            </aside>
+
+            <section class="panel chat-panel">
+              <div class="chat-head">
+                <h2 id="chatTitle">New chat</h2>
+                <small id="chatModel"></small>
+              </div>
+              <!-- Lightweight GPU cold-start status (shown only while provisioning; a
+                   liveness cue so the user knows it isn't stuck). Auto-closes when live. -->
+              <div id="bootStatus" class="boot-status hidden"></div>
+              <div id="chatStream" class="chat-stream">
+                <div class="empty-hint">Connect to a GPU-backed Qwen3 on HPC3, then ask a research question.</div>
+              </div>
+              <div class="chat-controls">
+                <!-- Axis B: WHICH ENGINE answers. Explicit and user-visible on purpose — a
+                     classifier that silently sent a real study down the fast path would return a
+                     fluent answer with no analysis behind it. Research stays the default. -->
+                <select id="routeSelect" class="workflow-select" title="Chat = a fast, streaming answer that starts typing immediately and can look things up (literature, HPO). No plan, no analysis, no report. Research = the full lab: the PI plans, tools run on HPC3, and you get a report + downloadable results.">
+                  <option value="research" selected>🔬 Research (full pipeline)</option>
+                  <option value="chat">💬 Chat (fast answer)</option>
+                </select>
+                <select id="modeSelect" class="workflow-select" title="How to run the research. Auto = the PI decides (a single scientist or a Virtual-Lab team). Single agent = one scientist. Virtual Lab = a team of expert agents that deliberate (Virtual-Lab style). The PI picks the analysis preset pipeline automatically — you don't.">
+                  <option value="auto" selected>✨ Auto (PI decides)</option>
+                  <option value="single">🧑‍🔬 Single agent</option>
+                  <option value="team">👥 Virtual Lab (multi-agent)</option>
+                </select>
+                <label class="pipeline-toggle" title="The PI proposes a plan first; you refine it in chat (no manual editing) before any tool runs"><input id="planMode" type="checkbox" checked /> Plan first (PI proposes; refine in chat)</label>
+                <label class="pipeline-toggle" title="Bypass mode: run the whole research loop end-to-end with NO human gates — no plan review and no decision-point pauses (the agent decides at every fork). Stop and mid-run notes still work. Off = Manual (review gates on)."><input id="autonomousMode" type="checkbox" /> Bypass (run autonomously, no HITL)</label>
+                <div id="datasetChips" class="dataset-chips" title="The data file(s) the next run will use — attach several (a VCF + a BED panel + a 2nd VCF); ★ marks the primary"></div>
+                <div id="caseNoteChips" class="dataset-chips" title="The patient's clinical description the next run will map to HPO terms"></div>
+                <input id="datasetInput" type="hidden" />
+                <input id="datasetFile" type="file" class="hidden" multiple accept=".h5ad,.h5,.loom,.csv,.tsv,.txt,.vcf,.vcf.gz,.bed,.bed.gz,.json" />
+                <input id="datasetDir" type="file" class="hidden" webkitdirectory directory multiple />
+                <input id="caseNoteFile" type="file" class="hidden" accept=".txt,.md,.text" />
+                <div class="data-menu-wrap">
+                  <button id="dataMenuBtn" type="button" class="ghost small data-menu-btn" title="Add or choose data file(s) — a run can bind several">
+                    <span class="material-symbols-outlined msym">add</span> Data
+                    <span class="material-symbols-outlined msym data-caret">expand_more</span>
+                  </button>
+                  <div id="dataMenu" class="data-menu hidden">
+                    <button type="button" class="data-menu-item" data-act="file" title="Attach one or more data files — each joins the run's bind-set"><span class="material-symbols-outlined msym">upload_file</span> Upload file(s)</button>
+                    <button type="button" class="data-menu-item" data-act="folder"><span class="material-symbols-outlined msym">drive_folder_upload</span> Upload a folder</button>
+                    <div class="data-menu-sep"></div>
+                    <button type="button" class="data-menu-item" data-act="note" title="Attach the patient's clinical description (.txt/.md) — it is mapped to HPO terms for the phenotype step, and does NOT replace the dataset"><span class="material-symbols-outlined msym">clinical_notes</span> Attach a case note</button>
+                    <div class="data-menu-sep"></div>
+                    <div class="data-menu-label">Recent uploads (click to add/remove)</div>
+                    <div id="dataMenuRecent" class="data-menu-recent"></div>
+                  </div>
+                </div>
+                <div id="uploadStatus" class="upload-status hidden"></div>
+                <button id="uploadCancel" type="button" class="ghost small hidden">Cancel upload</button>
+                <!-- Chat context occupancy. Hidden until the backend reports one (older runs and
+                     the Research route send no context events, and an empty box is worse than
+                     no box). Updated once per fast-chat turn. -->
+                <div id="ctxMeter" class="ctx-meter hidden"></div>
+              </div>
+              <details id="advancedPanel" class="advanced-panel">
+                <summary title="Optional: force a specific preset pipeline instead of letting the PI choose">Advanced — force a preset pipeline (the PI chooses by default)</summary>
+                <div class="preset-row">
+                  <input id="presetSearch" type="text" class="preset-search" autocomplete="off" placeholder="Search preset pipelines to require… (empty = PI decides)" title="Filter the preset-pipeline list; tick one or more to REQUIRE them for this conversation. The PI still auto-adds a best-fit pipeline on top. (These are full end-to-end pipelines, not composable tools.)" />
+                  <div id="presetList" class="preset-list" role="group" aria-label="Required preset pipelines"></div>
+                </div>
+                <div class="preset-hint">Optional. Tick preset pipelines to <b>require</b> them in this conversation (mandatory) — the PI still auto-adds the best-fit one on top. Leave empty to let the PI choose.</div>
+                <div class="preset-subhead">Require atomic skills (composable capabilities)</div>
+                <div id="skillList" class="preset-list" role="group" aria-label="Required atomic skills"></div>
+                <div class="preset-hint">Optional. Tick atomic <b>skills</b> the run must apply (e.g. E-distance ranking) — they compose, so pick several. Leave empty and the agent fetches skills on demand.</div>
+              </details>
+              <form id="chatForm" class="chat-input">
+                <textarea id="chatInput" rows="2" placeholder="Ask AiScientist to plan or interpret an ocular bioinformatics analysis..."></textarea>
+                <button id="chatSend" type="submit" class="primary">Send</button>
+                <button id="chatStop" type="button" class="danger-btn hidden" title="Stop the running analysis">■ Stop</button>
+              </form>
+            </section>
+
+            <aside class="panel side-panel right-panel" id="rightPanel">
+              <h2 class="results-title">Results</h2>
+              <div id="downloads" class="downloads">
+                <div class="downloads-empty">Run a pipeline to get a results bundle (.zip) and browse the report, figures, and tables here.</div>
+              </div>
+            </aside>
+          </main>
+        </section>
+
+        <!-- ===== DATASETS view ===== -->
+        <section id="view-datasets" class="view">
+          <div class="page">
+            <div class="page-head"><h2>My datasets</h2><button id="datasetsRefresh" class="ghost small">Refresh</button></div>
+            <div id="uploadsPanel" class="uploads-panel hidden"></div>
+            <p class="page-sub">Files you've uploaded to the server. Click "Use" to load one into a Research run.</p>
+            <div id="datasetsList" class="card-list"><div class="empty-hint">Loading…</div></div>
+          </div>
+        </section>
+
+        <!-- ===== RUNS view ===== -->
+        <section id="view-runs" class="view">
+          <div class="page">
+            <div class="page-head"><h2>My runs</h2><button id="runsRefresh" class="ghost small">Refresh</button></div>
+            <p class="page-sub">Past research-lab runs. Download a run's results bundle (.zip) — it contains the report, figures, tables, and the technical event log.</p>
+            <div id="runsList" class="card-list"><div class="empty-hint">Loading…</div></div>
+          </div>
+        </section>
+
+        <!-- ===== ADMIN view (role=admin only) ===== -->
+        <section id="view-admin" class="view">
+          <div class="page">
+            <div class="page-head"><h2>User management</h2><button id="adminRefresh" class="ghost small">Refresh</button></div>
+            <p class="page-sub">Create accounts, disable/enable them, reset a forgotten password, or delete an account. Admin only.</p>
+            <form id="createUserForm" class="create-user">
+              <input id="cuUser" type="text" placeholder="username" autocomplete="off" />
+              <input id="cuPass" type="password" placeholder="initial password (≥6)" autocomplete="new-password" />
+              <select id="cuRole"><option value="user">user</option><option value="admin">admin</option></select>
+              <input id="cuEmail" type="text" placeholder="email (optional)" autocomplete="off" />
+              <button type="submit" class="primary small">Create</button>
+            </form>
+            <div class="admin-search">
+              <span class="material-symbols-outlined msym">search</span>
+              <input id="userSearch" type="text" placeholder="Search by id or email…" autocomplete="off" />
+              <button id="userSearchClear" type="button" class="ghost small">Clear</button>
+            </div>
+            <table class="user-table">
+              <thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr></thead>
+              <tbody id="userTableBody"><tr><td colspan="7" class="empty-hint">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- ===== ACCOUNT view ===== -->
+        <section id="view-account" class="view">
+          <div class="page">
+            <div class="page-head"><h2>My account</h2></div>
+            <div id="accountInfo" class="account-info"></div>
+            <h3>Change my password</h3>
+            <form id="changePwForm" class="form narrow">
+              <label>Current password<input id="cpOld" type="password" autocomplete="current-password" /></label>
+              <label>New password (≥6)<input id="cpNew" type="password" autocomplete="new-password" /></label>
+              <button type="submit" class="primary">Update password</button>
+            </form>
+            <button id="logoutBtn" type="button" class="ghost">Sign out</button>
+          </div>
+        </section>
+
+        <!-- ===== SYSTEM view (live: agents / tools / capabilities / roadmap) ===== -->
+        <section id="view-system" class="view">
+          <div class="page">
+            <div class="page-head"><h2>System</h2><button id="systemRefresh" class="ghost small">Refresh</button></div>
+            <p class="page-sub">What this AiScientist defines and what this server can actually run — generated live from the code.</p>
+            <h3 class="sys-graph-h">Workflow graph <span class="muted">(live — reflects the current code)</span></h3>
+            <div class="sys-graph-wrap">
+              <div id="systemGraph" class="sys-graph"><div class="empty-hint">Loading…</div></div>
+              <div id="systemGraphInfo" class="sys-graph-info"><div class="empty-hint">Click a node to see its details.</div></div>
+            </div>
+            <div id="systemBody"><div class="empty-hint">Loading…</div></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div id="storageModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>HPC3 storage</h2>
+        <button id="storageClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <div id="storageBase" class="storage-base"></div>
+      <div class="storage-used">Total used: <strong id="storageUsed">—</strong></div>
+      <pre id="storageQuota" class="storage-quota"></pre>
+      <div id="storageItems" class="storage-items"><div class="storage-loading">Loading…</div></div>
+      <p class="storage-note">Deletes run <code>rm -rf</code> on HPC3, scoped to your own directory only. This cannot be undone.</p>
+    </div>
+  </div>
+
+  <div id="filePreviewModal" class="modal hidden">
+    <div class="modal-card preview-card">
+      <div class="modal-head">
+        <h2 id="filePreviewTitle">Preview</h2>
+        <div class="preview-actions">
+          <a id="filePreviewDownload" class="ghost small" download>⬇ Download</a>
+          <button id="filePreviewClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+      </div>
+      <div id="filePreviewBody" class="preview-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/cytoscape.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

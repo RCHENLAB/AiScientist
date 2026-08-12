@@ -1,0 +1,1189 @@
+:root {
+  /* Warm "tea" palette — soft beige canvas, warm-white surfaces, a warm-black ink.
+     The blue accent stays as one crisp cool pop against the warm ground. */
+  --bg: #ece3d4;
+  --surface: #fbf7f0;
+  --surface-sunken: #f2ebdc;
+  --surface-hover: #ece3d2;
+  --text: #322e27;
+  --text-secondary: #6d665a;
+  --text-tertiary: #9c9382;
+  --border: #e5ddcc;
+  --border-strong: #d7ccb5;
+  --accent: #0071e3;
+  --accent-hover: #0077ed;
+  --green: #34a853;
+  --amber: #e8930c;
+  --red: #e0463b;
+  --shadow-sm: 0 1px 2px rgba(70, 56, 36, 0.05), 0 1px 3px rgba(70, 56, 36, 0.07);
+  --shadow-md: 0 4px 16px rgba(70, 56, 36, 0.09), 0 1px 4px rgba(70, 56, 36, 0.05);
+  --radius: 18px;
+  --radius-sm: 12px;
+  /* Liquid-glass material: translucent frosted panels that refract the ambient page background,
+     with a soft 1px top highlight (the signature Apple "Liquid Glass" edge). */
+  --glass-bg: rgba(251, 247, 240, 0.58);
+  --glass-bg-strong: rgba(251, 247, 240, 0.74);
+  --glass-border: rgba(255, 255, 255, 0.55);
+  --glass-blur: saturate(180%) blur(24px);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);   /* the ambient mesh is layered on in the "material" section below */
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.01em;
+}
+
+/* ---- top bar ---- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 28px;
+  background: rgba(251, 247, 240, 0.66);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: var(--glass-highlight);
+  position: sticky; top: 0; z-index: 10;
+}
+.brand { display: flex; align-items: center; gap: 14px; }
+.logo { font-size: 28px; }
+.brand h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.02em; }
+.subtitle { margin: 2px 0 0; font-size: 12.5px; color: var(--text-tertiary); }
+.conn-indicator { display: flex; align-items: center; gap: 9px; font-size: 13.5px; color: var(--text-secondary); font-weight: 500; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-tertiary); }
+.dot.muted { background: var(--text-tertiary); }
+.dot.connecting { background: var(--amber); animation: pulse 1.2s infinite; }
+.dot.ready { background: var(--green); box-shadow: 0 0 0 4px rgba(52, 199, 89, 0.16); }
+.dot.error { background: var(--red); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* ---- layout ---- */
+.layout {
+  flex: 1; display: grid; grid-template-columns: 340px minmax(0, 1fr) 400px;
+  gap: 20px; padding: 22px; min-height: 0;
+  transition: grid-template-columns 0.36s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.layout.collapse-left { grid-template-columns: 0px minmax(0, 1fr) 400px; }
+.layout.collapse-right { grid-template-columns: 340px minmax(0, 1fr) 0px; }
+.layout.collapse-left.collapse-right { grid-template-columns: 0px minmax(0, 1fr) 0px; }
+.side-panel { transition: opacity 0.24s ease, transform 0.3s ease, padding 0.36s; }
+.layout.collapse-left .left-panel { opacity: 0; transform: translateX(-12px); padding-left: 0; padding-right: 0; pointer-events: none; }
+.layout.collapse-right .right-panel { opacity: 0; transform: translateX(12px); padding-left: 0; padding-right: 0; pointer-events: none; }
+
+/* topbar toggles */
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+.icon-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 30px; padding: 0; border-radius: 9px;
+  background: transparent; color: var(--text-tertiary); border: none; cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.icon-toggle:hover { background: rgba(0, 0, 0, 0.05); color: var(--text-secondary); }
+.icon-toggle.active { color: var(--accent); background: rgba(0, 113, 227, 0.1); }
+.brand .icon-toggle { margin-right: 4px; }
+.panel {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md), var(--glass-highlight);
+  padding: 22px;
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+}
+.panel h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-tertiary); font-weight: 600; margin: 0 0 14px;
+}
+.connect-panel { overflow-y: auto; }
+.left-panel { overflow-y: auto; overflow-x: hidden; }
+
+/* ---- forms ---- */
+.form { display: flex; flex-direction: column; gap: 13px; margin-bottom: 24px; }
+.form label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-secondary); font-weight: 500; }
+/* The connect form is the tallest thing in the left panel (host + UCInetID + auth + password +
+   Duo + Remember-me + passphrase + campus + mock + Connect). On a laptop-height viewport its
+   primary action (Connect) was pushed below the fold. Tighten just THIS form's vertical rhythm so
+   the whole form fits; the panel still scrolls on very short viewports. */
+#connectForm { gap: 8px; margin-bottom: 14px; }
+#connectForm label { gap: 4px; }
+#connectForm input, #connectForm select { padding: 8px 12px; }
+.form input, .form select, textarea, .duo-panel input {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  border-radius: 10px; padding: 10px 12px; font-size: 14px; font-family: inherit;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+}
+.form input::placeholder, textarea::placeholder { color: var(--text-tertiary); }
+.form input:focus, .form select:focus, textarea:focus, .duo-panel input:focus {
+  outline: none; background: var(--surface);
+  border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16);
+}
+.form .check { flex-direction: row; align-items: center; gap: 9px; color: var(--text); font-size: 12.5px; cursor: pointer; }
+.form .check input, .pipeline-toggle input { accent-color: var(--accent); width: 15px; height: 15px; }
+.hidden { display: none !important; }
+
+/* ---- buttons ---- */
+.btn-row { display: flex; gap: 10px; margin-top: 6px; }
+button {
+  border: none; background: var(--surface-sunken); color: var(--text);
+  border-radius: 980px; padding: 10px 18px; font-size: 14px; font-weight: 500;
+  cursor: pointer; font-family: inherit; transition: background 0.15s, opacity 0.15s, transform 0.05s;
+}
+button:hover:not(:disabled) { background: var(--surface-hover); }
+button:active:not(:disabled) { transform: scale(0.98); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+/* Softer than a flat saturated fill: a gentle top-lit gradient + a soft shadow + a 1px inner
+   highlight, so the primary CTA reads as a tactile "glass" pill instead of a glaring block. */
+button.primary {
+  background: linear-gradient(180deg, #2a8bf2 0%, var(--accent) 100%);
+  color: #fff;
+  box-shadow: 0 1px 2px rgba(0, 74, 153, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+button.primary:hover:not(:disabled) { background: linear-gradient(180deg, #3a97f6 0%, var(--accent-hover) 100%); }
+button.ghost { background: transparent; color: var(--accent); }
+button.ghost:hover:not(:disabled) { background: rgba(0, 113, 227, 0.08); }
+button.small { padding: 6px 12px; font-size: 12px; }
+.danger-btn {
+  width: 100%; margin-top: 10px; background: transparent; color: var(--red);
+  border: 1px solid rgba(255, 59, 48, 0.35); border-radius: 980px;
+}
+.danger-btn:hover:not(:disabled) { background: rgba(255, 59, 48, 0.08); }
+
+/* ---- Duo step ---- */
+.duo-panel {
+  background: #fff7ec; border: 1px solid #ffe2b8;
+  border-radius: var(--radius-sm); padding: 18px; margin-bottom: 24px;
+}
+.duo-panel h2 { color: #b25e00; margin-top: 0; }
+.duo-prompt {
+  white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; background: #fff; border: 1px solid #ffe2b8; padding: 10px; border-radius: 10px;
+  margin: 0 0 12px; max-height: 180px; overflow: auto; color: #7a4a00; line-height: 1.5;
+}
+.duo-panel label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-secondary); margin-bottom: 10px; }
+.duo-panel input { background: #fff; border: 1px solid #ffe2b8; letter-spacing: 2px; font-size: 15px; }
+.duo-hint { font-size: 11.5px; color: var(--text-tertiary); margin: 10px 0 0; }
+
+/* ---- pipeline ---- */
+.pipeline { list-style: none; padding: 0; margin: 0 0 24px; display: flex; flex-direction: column; gap: 13px; }
+.pipeline li { display: flex; align-items: center; gap: 12px; font-size: 13.5px; color: var(--text-tertiary); transition: color 0.2s; }
+.step-dot { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--border-strong); flex: none; transition: all 0.2s; }
+.pipeline li.active { color: var(--text); font-weight: 500; }
+.pipeline li.active .step-dot { border-color: var(--amber); background: var(--amber); box-shadow: 0 0 0 4px rgba(255, 159, 10, 0.16); }
+.pipeline li.done { color: var(--text); }
+.pipeline li.done .step-dot { border-color: var(--green); background: var(--green); }
+.pipeline li.failed .step-dot { border-color: var(--red); background: var(--red); }
+
+/* ---- GPU card ---- */
+.gpu-card { background: var(--surface-sunken); border-radius: var(--radius-sm); padding: 16px; }
+.gpu-card.empty { color: var(--text-tertiary); }
+.gpu-name { font-size: 13.5px; font-weight: 600; }
+.gpu-meta { font-size: 11.5px; color: var(--text-tertiary); margin: 4px 0 12px; }
+.meter { height: 7px; background: #e3e3e6; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+.meter-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 4px; transition: width 0.5s ease; }
+.meter-fill.mem { background: var(--green); }
+.meter-label { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-secondary); margin-top: 5px; }
+
+/* ---- chat ---- */
+/* overflow:visible so the composer's "+ Data" dropdown can float ABOVE the panel instead of being
+   clipped. The base .panel sets overflow:hidden (rounded-corner clipping) which cut the absolutely
+   positioned data menu off — and the glass backdrop-filter made this panel a containing block, so it
+   clipped even harder in a cramped layout. The chat log (#chatStream) keeps its own overflow-y:auto,
+   so message scrolling is unaffected. */
+.chat-panel { min-width: 0; overflow: visible; }
+.chat-panel h2 small { color: var(--accent); text-transform: none; letter-spacing: 0; margin-left: 8px; font-weight: 500; font-size: 12px; }
+.chat-stream { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-right: 8px; }
+.empty-hint { color: var(--text-tertiary); font-size: 14px; margin: auto; text-align: center; max-width: 320px; line-height: 1.5; }
+.msg { max-width: 88%; padding: 12px 16px; border-radius: 20px; font-size: 14.5px; line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; }
+.msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 6px; }
+.msg.assistant { align-self: flex-start; background: var(--surface-sunken); color: var(--text); border-bottom-left-radius: 6px; }
+.msg.assistant strong { font-weight: 600; }
+.msg.assistant h2, .msg.assistant h3 { color: var(--text); font-size: 15px; font-weight: 600; margin: 14px 0 6px; letter-spacing: -0.01em; }
+.msg.assistant code { background: rgba(0, 0, 0, 0.06); padding: 1px 6px; border-radius: 5px; font-size: 12.5px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+.artifacts-block { align-self: flex-start; max-width: 88%; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; box-shadow: var(--shadow-sm); }
+.artifacts-block .artifacts-title { font-size: 12.5px; color: var(--text-secondary); font-weight: 600; margin-bottom: 8px; }
+.artifacts-block a { display: flex; align-items: baseline; gap: 6px; color: var(--accent); text-decoration: none; font-size: 13.5px; padding: 4px 0; font-weight: 500; }
+.artifacts-block a:hover { text-decoration: underline; }
+.artifacts-block a span { color: var(--text-tertiary); font-size: 11.5px; font-weight: 400; }
+.artifact-bundle {
+  display: inline-flex !important; align-items: center; margin: 2px 0 8px; padding: 8px 14px;
+  background: var(--accent); color: #fff !important; border-radius: 980px; font-size: 13px; font-weight: 600;
+}
+.artifact-bundle:hover { background: var(--accent-hover); text-decoration: none !important; }
+
+.chat-controls { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+/* Chat context occupancy ("18K / 24K"), pushed to the right edge just above the composer. A
+   quiet status chip, not a control — it must never compete with Send for attention, so it stays
+   tertiary until the conversation actually approaches its budget. */
+.ctx-meter {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 7px;
+  font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--text-tertiary);
+  padding: 3px 10px; border: 1px solid var(--border); border-radius: 980px;
+  background: var(--surface-sunken); white-space: nowrap; cursor: default;
+}
+.ctx-meter .ctx-bar { width: 42px; height: 4px; border-radius: 980px; background: var(--border-strong); overflow: hidden; }
+.ctx-meter .ctx-fill { display: block; height: 100%; background: var(--text-tertiary); border-radius: 980px; }
+.ctx-meter.warn { color: var(--amber); border-color: var(--amber); }
+.ctx-meter.warn .ctx-fill { background: var(--amber); }
+/* Compacted = older turns were folded into a summary. Worth showing (memory is now lossy) but
+   not an error — the chat still remembers, just in condensed form. */
+.ctx-meter.compacted { color: var(--accent); border-color: var(--accent); }
+.ctx-meter.compacted .ctx-fill { background: var(--accent); }
+.pipeline-toggle { display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--text-tertiary); line-height: 1.4; }
+.dataset-input {
+  flex: 1; min-width: 160px; background: var(--surface-sunken); border: 1px solid var(--border); color: var(--text);
+  border-radius: 980px; padding: 7px 14px; font-size: 12px; font-family: inherit;
+}
+.dataset-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+
+/* Material Symbols (fonts.google.com/icons) — one icon set app-wide, bundled LOCALLY (no CDN, so
+   it works offline / under strict CSP). Rounded variant for the Apple/Claude feel. The FULL variable
+   font ships in assets/material-symbols/ so any icon name works — see that dir's README (the "素材库").
+   `.msym` is the inline size used in buttons/rows/labels; `.nav-ico` overrides the size in the rail. */
+@font-face {
+  font-family: "Material Symbols Rounded";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: block;   /* block briefly, then swap — avoids a flash of raw ligature text */
+  src: url("/static/assets/material-symbols/material-symbols-rounded.woff2") format("woff2");
+}
+.material-symbols-outlined, .material-symbols-rounded {
+  font-family: "Material Symbols Rounded";
+  font-weight: normal; font-style: normal; line-height: 1;
+  letter-spacing: normal; text-transform: none; white-space: nowrap;
+  direction: ltr; -webkit-font-feature-settings: "liga"; font-feature-settings: "liga";
+  -webkit-font-smoothing: antialiased; user-select: none;
+  font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+}
+.msym { font-size: 18px; vertical-align: middle; }
+
+/* Dataset chips — replaces the free-text "server path" field. Each uploaded file/folder
+   is a selectable chip; the active one is the next run's input. */
+.dataset-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 1; min-width: 160px; }
+.dataset-empty { color: var(--text-tertiary); font-size: 12px; }
+.dataset-chip {
+  display: inline-flex; align-items: center; gap: 5px; background: var(--surface-sunken);
+  border: 1px solid transparent; color: var(--text); border-radius: 980px;
+  padding: 5px 12px; font-size: 12px; font-family: inherit; cursor: pointer; max-width: 220px;
+}
+.dataset-chip { cursor: default; }
+.dataset-chip .msym { font-size: 16px; color: var(--text-tertiary); }
+.dataset-chip.active { border-color: var(--accent); background: rgba(0, 113, 227, 0.08); color: var(--accent); font-weight: 500; }
+.dataset-chip.active .msym { color: var(--accent); }
+.dataset-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dataset-chip-x {
+  display: inline-flex; align-items: center; justify-content: center; margin-left: 2px;
+  width: 16px; height: 16px; padding: 0; border-radius: 50%; font-size: 13px; line-height: 1;
+  background: transparent; color: var(--accent); cursor: pointer;
+}
+.dataset-chip-x:hover { background: rgba(0, 113, 227, 0.14); }
+
+/* "＋ Data" button + popover (upload a file / folder, or pick a recent upload) */
+.data-menu-wrap { position: relative; z-index: 30; }
+.data-menu-btn { display: inline-flex; align-items: center; gap: 3px; }
+.data-menu-btn .msym { font-size: 17px; }
+.data-menu-btn .data-caret { font-size: 16px; opacity: 0.7; }
+.data-menu {
+  position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 100; width: 244px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow-md); padding: 6px; display: flex; flex-direction: column; gap: 2px;
+}
+.data-menu-item {
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  background: transparent; border-radius: 8px; padding: 9px 10px; font-size: 13px;
+  color: var(--text); cursor: pointer;
+}
+.data-menu-item:hover { background: var(--surface-sunken); }
+.data-menu-item .msym { font-size: 19px; color: var(--accent); }
+.data-menu-sep { height: 1px; background: var(--border); margin: 5px 4px; }
+.data-menu-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); font-weight: 600; padding: 2px 10px 4px; }
+.data-menu-recent { display: flex; flex-direction: column; gap: 2px; max-height: 190px; overflow-y: auto; }
+.data-menu-empty { font-size: 12px; color: var(--text-tertiary); padding: 6px 10px 8px; }
+.data-menu-recent-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: transparent; border-radius: 8px; padding: 7px 10px; font-size: 12.5px;
+  color: var(--text); cursor: pointer;
+}
+.data-menu-recent-item:hover { background: var(--surface-sunken); }
+.data-menu-recent-item .msym { font-size: 17px; color: var(--text-tertiary); flex: none; }
+.data-menu-recent-item.active { color: var(--accent); font-weight: 500; }
+.data-menu-recent-item.active .msym { color: var(--accent); }
+.dmr-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmr-check { font-size: 16px !important; color: var(--accent) !important; }
+.upload-status { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
+
+/* Datasets-tab live upload tracker — a glass card per in-flight / failed upload with a progress bar. */
+.uploads-panel { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.upload-card {
+  background: var(--glass-bg); backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border); border-radius: var(--radius-sm);
+  padding: 11px 13px; box-shadow: var(--shadow-sm), var(--glass-highlight);
+}
+.upload-card.error { border-color: rgba(224, 70, 59, 0.40); }
+.upload-card.done, .upload-card.cancelled { opacity: 0.7; }
+.upload-row { display: flex; align-items: center; gap: 9px; font-size: 13px; }
+.upload-row > .msym { font-size: 19px; color: var(--accent); flex: none; }
+.upload-card.error .upload-row > .msym { color: var(--red); }
+.upload-card.done .upload-row > .msym { color: var(--green); }
+.upload-card.cancelled .upload-row > .msym { color: var(--text-tertiary); }
+.upload-card [data-cancel], #uploadCancel { color: var(--red); }
+#uploadCancel { align-self: flex-start; }
+.upload-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.upload-stat { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; flex: none; }
+.upload-card.error .upload-stat { color: var(--red); }
+.upload-card .meter { margin-top: 9px; }
+.workflow-select {
+  background: var(--surface-sunken); border: 1px solid var(--border); color: var(--text);
+  border-radius: 980px; padding: 7px 14px; font-size: 12.5px; font-family: inherit; cursor: pointer; font-weight: 500;
+}
+.workflow-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+/* The plan/clarify render AS a chat message (plan.md style) that stands out from a
+   normal assistant bubble with a blue tint + accent border, and carries inline actions. */
+.plan-card { border: 1px solid rgba(0, 113, 227, 0.3); background: rgba(0, 113, 227, 0.06); max-width: 92%; }
+.plan-card .plan-actions-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 13px; }
+.plan-actions-hint { font-size: 12px; color: var(--text-secondary); }
+.plan-actions-status { font-size: 12.5px; font-weight: 600; color: var(--accent); }
+.plan-card .clarify-q { margin-top: 10px; }
+/* Clarify: option chips + a custom answer via the composer. */
+.plan-clarify { display: flex; flex-direction: column; gap: 12px; }
+.clarify-q { display: flex; flex-direction: column; gap: 7px; }
+.clarify-question { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.clarify-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.clarify-chip {
+  font: inherit; font-size: 12.5px; cursor: pointer;
+  padding: 6px 13px; border-radius: 999px;
+  background: #fff; border: 1px solid rgba(0, 113, 227, 0.35); color: var(--accent);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.clarify-chip:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+.preset-panel {
+  margin-top: 10px; padding: 12px 14px; border-radius: 12px;
+  background: var(--surface-sunken); border: 1px solid var(--border);
+}
+.preset-hint { font-size: 12.5px; color: var(--text-secondary); margin-bottom: 8px; }
+.preset-subhead { margin: 12px 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); }
+/* Axis A — the "Advanced" disclosure that hides the skill override (the PI chooses by default). */
+.advanced-panel { margin-top: 10px; }
+.advanced-panel > summary {
+  cursor: pointer; font-size: 12.5px; color: var(--text-secondary);
+  list-style: none; user-select: none; padding: 2px 0; width: fit-content;
+}
+.advanced-panel > summary::-webkit-details-marker { display: none; }
+.advanced-panel > summary::before { content: "▸ "; color: var(--text-tertiary); }
+.advanced-panel[open] > summary::before { content: "▾ "; }
+.advanced-panel > summary:hover { color: var(--text-primary); }
+.preset-row { display: flex; flex-direction: column; align-items: stretch; gap: 8px; margin-top: 10px; }
+/* Multi-select skill picker: a search box over a scrollable checklist (Advanced panel). */
+.preset-search {
+  width: 100%; box-sizing: border-box; background: var(--surface);
+  border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 11px;
+  font-size: 13px; font-family: inherit;
+}
+.preset-search:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.preset-list {
+  display: flex; flex-direction: column; gap: 2px; max-height: 176px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 8px; padding: 4px; background: var(--surface-sunken);
+}
+.preset-item {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px;
+  font-size: 13px; cursor: pointer; user-select: none;
+}
+.preset-item:hover, .preset-item.checked { background: var(--surface); }
+.preset-item input { margin: 0; accent-color: var(--accent); }
+.preset-item-label { flex: 1; color: var(--text-primary); }
+.preset-empty { padding: 8px; font-size: 12.5px; color: var(--text-tertiary); }
+.preset-prompt {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 110px;
+  background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px;
+  padding: 9px 11px; font-size: 13px; line-height: 1.55; font-family: inherit;
+}
+.preset-prompt:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.chat-input { display: flex; gap: 10px; margin-top: 10px; }
+.chat-input textarea { flex: 1; resize: none; border-radius: 14px; }
+.chat-input button { align-self: stretch; }
+/* The Send/Stop action is a fixed-width pill — never let the shared full-width
+   `.danger-btn` rule stretch Stop across the row and crush the input box. */
+.chat-input #chatSend, .chat-input #chatStop { flex: none; width: auto; min-width: 92px; margin-top: 0; }
+
+/* downloads (right panel) */
+.downloads { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; overflow: hidden; }
+.downloads-empty { color: var(--text-tertiary); font-size: 12.5px; line-height: 1.5; }
+
+/* Results panel: small zip button + Files/Preview tabs */
+.results-bar { display: flex; align-items: center; gap: 8px; }
+.dl-zip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 980px;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 500; text-decoration: none;
+}
+.dl-zip .msym { font-size: 16px; }
+.dl-zip:hover { background: var(--accent-hover); text-decoration: none !important; }
+.dl-regen {
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 980px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text-secondary);
+  font: inherit; font-size: 12px; font-weight: 500; cursor: pointer;
+}
+.dl-regen .msym { font-size: 16px; }
+.dl-regen:hover { background: var(--surface-sunken); color: var(--text); }
+.results-tabs { display: flex; gap: 4px; margin-left: auto; }
+.rtab-btn {
+  display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; border: 0;
+  border-radius: 8px; background: transparent; color: var(--text-secondary);
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.rtab-btn .msym { font-size: 16px; }
+.rtab-btn.active { background: var(--surface-sunken); color: var(--text); font-weight: 600; }
+.rtab-pane { display: none; flex: 1; min-height: 0; overflow-y: auto; }
+.rtab-pane.active { display: block; }
+.file-tree { display: flex; flex-direction: column; gap: 6px; }
+.preview-empty { color: var(--text-tertiary); font-size: 12.5px; padding: 10px 4px; line-height: 1.5; }
+.preview-file-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px 2px 8px; border-bottom: 1px solid var(--border); margin-bottom: 8px;
+}
+.preview-file-name { font-weight: 600; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preview-code {
+  margin: 0; padding: 10px 12px; background: var(--surface-sunken); border: 1px solid var(--border);
+  border-radius: 8px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px; line-height: 1.5; white-space: pre; color: var(--text);
+}
+
+/* Left: collapsed compute controls + sign-out */
+/* NOTE: this is a flex item in the column-flex left panel. `overflow:hidden` would make
+   its flex min-size collapse to 0 and the panel would squash the expanded controls to a
+   sliver — so DON'T clip here, and DON'T let it shrink. Round the summary corners instead
+   of clipping the box. */
+.compute-details { margin-bottom: 14px; border: 1px solid var(--border); border-radius: 10px; flex: none; }
+.compute-details > summary {
+  cursor: pointer; user-select: none; list-style: none; padding: 9px 12px;
+  font-size: 12.5px; font-weight: 600; color: var(--text-secondary); background: var(--surface-sunken);
+  border-radius: 9px;
+}
+.compute-details > summary::-webkit-details-marker { display: none; }
+.compute-details[open] > summary { border-bottom: 1px solid var(--border); border-radius: 9px 9px 0 0; }
+.compute-details > *:not(summary) { margin-left: 12px; margin-right: 12px; }
+.compute-details .conn-card { margin-top: 12px; margin-bottom: 10px; padding: 11px 13px; }
+.compute-details .conn-gpu { margin-top: 8px; }
+.compute-details .model-row { margin-bottom: 10px; }
+/* Keep the compute-panel actions compact — they inherit the big default button
+   size otherwise and overflow this narrow rail. */
+/* width:auto (not 100%) so the 12px side margins from `> *:not(summary)` inset these
+   buttons instead of stacking ON TOP of a full width — a 100% width + 24px margin
+   overflowed the panel and pushed the Stop pill past the border. Block fills the inset row. */
+.compute-details button.full,
+.compute-details .danger-btn { display: block; width: auto; padding: 7px 12px; font-size: 12.5px; margin-top: 6px; }
+.compute-details > *:last-child { margin-bottom: 12px; }
+.left-logout { display: inline-flex; align-items: center; justify-content: center; gap: 6px; margin-top: 14px; }
+.left-logout .msym { font-size: 18px; }
+
+/* Cold-start status card in the chat area (lightweight liveness cue) */
+.boot-status { margin: 10px 14px 0; padding: 10px 12px; border-radius: 10px; background: var(--surface-sunken); border: 1px solid var(--border); }
+.boot-status.success { background: rgba(52, 199, 89, 0.10); border-color: rgba(52, 199, 89, 0.35); }
+.boot-status.error { background: rgba(255, 59, 48, 0.08); border-color: rgba(255, 59, 48, 0.35); }
+.boot-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); font-weight: 500; }
+.boot-row .msym { font-size: 18px; }
+.boot-status.success .boot-row .msym { color: var(--green); }
+.boot-status.error .boot-row .msym { color: var(--red); }
+.boot-sub { margin-top: 4px; font-size: 11.5px; color: var(--text-tertiary); line-height: 1.4; }
+.boot-spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); animation: boot-spin 0.7s linear infinite; flex: none; }
+@keyframes boot-spin { to { transform: rotate(360deg); } }
+.dl-item {
+  display: flex; align-items: center; gap: 8px; padding: 8px 11px; border-radius: 10px;
+  background: var(--surface-sunken); color: var(--text); text-decoration: none; font-size: 13px;
+}
+.dl-item:hover { background: var(--surface-hover); }
+.dl-name { color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- log ---- */
+.right-panel { overflow: hidden; }
+.log-panel { min-width: 0; }
+.log-head { display: flex; justify-content: space-between; align-items: center; }
+.log-stream { flex: 1; overflow-y: auto; font-size: 12px; display: flex; flex-direction: column; gap: 6px; }
+.log-entry {
+  padding: 9px 12px; border-radius: 10px; background: var(--surface-sunken);
+  border-left: 3px solid var(--border-strong);
+}
+.log-entry .meta { color: var(--text-tertiary); font-size: 10.5px; margin-bottom: 3px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.log-entry > div:last-child { color: var(--text); line-height: 1.45; }
+.log-entry.info { border-left-color: var(--accent); }
+.log-entry.step { border-left-color: var(--text-tertiary); }
+.log-entry.stream { border-left-color: var(--border-strong); opacity: 0.8; }
+.log-entry.success { border-left-color: var(--green); }
+.log-entry.warning { border-left-color: var(--amber); background: #fff7ec; }
+.log-entry.error { border-left-color: var(--red); background: #fff0ef; }
+.log-entry .detail-toggle { color: var(--accent); cursor: pointer; font-size: 11.5px; margin-top: 5px; display: inline-block; font-weight: 500; }
+.log-entry pre {
+  white-space: pre-wrap; word-break: break-word; background: #fff; border: 1px solid var(--border);
+  padding: 10px; border-radius: 8px; margin: 7px 0 0; max-height: 260px; overflow: auto;
+  color: #b3261e; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+}
+
+/* ---- storage modal ---- */
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.28); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; z-index: 50; }
+.modal-card { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow-md); width: min(560px, 92vw); max-height: 82vh; overflow-y: auto; padding: 22px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.modal-head h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.storage-base { font-size: 12px; color: var(--text-tertiary); font-family: ui-monospace, "SF Mono", Menlo, monospace; margin-bottom: 8px; word-break: break-all; }
+.storage-used { font-size: 13.5px; color: var(--text-secondary); margin-bottom: 10px; }
+.storage-used strong { color: var(--text); }
+.storage-quota { background: var(--surface-sunken); border-radius: 10px; padding: 10px; font-size: 11.5px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; margin: 0 0 14px; max-height: 120px; overflow: auto; }
+.storage-items { display: flex; flex-direction: column; gap: 6px; }
+.storage-loading, .storage-empty { color: var(--text-tertiary); font-size: 13px; padding: 8px 0; }
+.storage-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; background: var(--surface-sunken); }
+.storage-item .si-name { flex: 1; font-size: 13px; word-break: break-all; }
+.storage-item .si-size { font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.storage-item .si-del { padding: 5px 12px; border-radius: 980px; font-size: 12px; background: transparent; color: var(--red); border: 1px solid rgba(255, 59, 48, 0.35); }
+.storage-item .si-del:hover { background: rgba(255, 59, 48, 0.1); }
+.ghost.small.danger { color: var(--red); border-color: rgba(255, 59, 48, 0.35); }
+.ghost.small.danger:hover { background: rgba(255, 59, 48, 0.1); }
+.storage-note { font-size: 11.5px; color: var(--text-tertiary); margin: 14px 0 0; line-height: 1.5; }
+.storage-note code { background: var(--surface-sunken); padding: 1px 5px; border-radius: 4px; }
+
+/* ---- toast ---- */
+.toast {
+  position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%) translateY(20px);
+  background: rgba(30, 30, 32, 0.92); backdrop-filter: blur(20px); color: #fff;
+  padding: 12px 20px; border-radius: 14px; font-size: 13.5px; font-weight: 500;
+  opacity: 0; pointer-events: none; transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+  box-shadow: var(--shadow-md);
+}
+.toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* Scrollbars: a faint, warm, overlay-style thumb that stays out of the way — nearly
+   invisible at rest, gently appearing when you hover the scrolling area, deepening on the
+   thumb itself. (Firefox: thin + a translucent thumb via scrollbar-color.) */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 92, 48, 0.10);
+  border-radius: 8px; border: 3px solid transparent; background-clip: content-box;
+  transition: background 0.2s ease;
+}
+:hover::-webkit-scrollbar-thumb { background: rgba(120, 92, 48, 0.22); }
+::-webkit-scrollbar-thumb:hover { background: rgba(120, 92, 48, 0.42); }
+::-webkit-scrollbar-corner { background: transparent; }
+* { scrollbar-width: thin; scrollbar-color: rgba(120, 92, 48, 0.22) transparent; }
+
+/* full-width buttons + inline hints */
+button.full { width: 100%; margin-top: 6px; }
+.hint-inline { color: var(--text-tertiary); font-weight: 400; font-size: 11px; margin-left: 6px; }
+
+/* compact connected card */
+.conn-card { background: var(--surface-sunken); border-radius: var(--radius-sm); padding: 14px 16px; margin-bottom: 14px; }
+.conn-card-top { display: flex; align-items: center; gap: 10px; }
+.conn-card-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(52, 199, 89, 0.16); flex: none; }
+.conn-card-id { display: flex; flex-direction: column; line-height: 1.3; min-width: 0; }
+.conn-card-id strong { font-size: 14px; font-weight: 600; }
+.conn-card-id span { font-size: 12px; color: var(--text-tertiary); }
+.conn-gpu { display: flex; align-items: flex-start; gap: 7px; font-size: 12px; line-height: 1.45; color: var(--text-secondary); margin-top: 11px; }
+.conn-gpu-txt { min-width: 0; overflow-wrap: break-word; }   /* wrap at spaces / " · " only */
+.conn-gpu .nowrap { white-space: nowrap; }                    /* keep node id + mem figure intact */
+.gpu-pill { width: 7px; height: 7px; border-radius: 50%; flex: none; margin-top: 5px; }  /* sit on the first line when text wraps */
+.gpu-pill.ok { background: var(--green); }
+.gpu-pill.bad { background: var(--red); }
+
+/* model selector (connected card) */
+.model-row { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--text-secondary); font-weight: 500; margin-bottom: 12px; }
+.model-row-controls { display: flex; gap: 8px; align-items: stretch; min-width: 0; }
+.model-row select {
+  flex: 1; min-width: 0;   /* let flex shrink the select below its longest-option width (no overflow that pushes the + out) */
+  background: var(--surface-sunken); border: 1px solid var(--border); color: var(--text);
+  border-radius: 10px; padding: 9px 11px; font-size: 13.5px; font-family: inherit; cursor: pointer;
+  text-overflow: ellipsis;
+}
+.model-row select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.model-row .icon-btn { flex: none; }
+
+/* sessions sidebar (ChatGPT-style) */
+.sessions { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 18px; }
+.sessions-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.sessions-head h2 { margin: 0; }
+.icon-btn {
+  width: 28px; height: 28px; padding: 0; border-radius: 8px; font-size: 18px; line-height: 1;
+  background: var(--surface-sunken); color: var(--text-secondary); display: inline-flex;
+  align-items: center; justify-content: center;
+}
+.icon-btn:hover { background: var(--surface-hover); color: var(--accent); }
+.session-list { display: flex; flex-direction: column; gap: 3px; }
+.session-empty { color: var(--text-tertiary); font-size: 12.5px; padding: 6px 2px; }
+.session-item {
+  display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-radius: 10px;
+  cursor: pointer; transition: background 0.12s;
+}
+.session-item:hover { background: var(--surface-sunken); }
+.session-item.active { background: rgba(0, 113, 227, 0.1); }
+.session-item.active .session-title { color: var(--accent); font-weight: 500; }
+.session-title { flex: 1; font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-del {
+  width: 22px; height: 22px; padding: 0; border-radius: 6px; font-size: 12px; flex: none;
+  background: transparent; color: var(--text-tertiary); opacity: 0; transition: opacity 0.12s, background 0.12s;
+}
+.session-item:hover .session-del { opacity: 1; }
+.session-del:hover { background: rgba(255, 59, 48, 0.12); color: var(--red); }
+
+/* chat header */
+.chat-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+.chat-head h2 {
+  margin: 0; font-size: 16px; font-weight: 600; text-transform: none; letter-spacing: -0.01em; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-head small { color: var(--accent); font-size: 12px; font-weight: 500; flex: none; }
+
+@media (max-width: 1100px) {
+  .layout, .layout.collapse-left, .layout.collapse-right { grid-template-columns: 1fr; grid-auto-rows: minmax(280px, auto); overflow-y: auto; }
+}
+
+/* streamed model thinking (Qwen3) — a subtle collapsible box above the answer */
+.msg.assistant .think {
+  background: var(--surface-sunken); border: 1px solid var(--border); border-radius: 12px;
+  padding: 8px 13px; margin-bottom: 8px; font-size: 14px; color: var(--text-secondary);
+  transition: border-color 0.2s var(--ease-spring), background 0.2s var(--ease-spring);
+}
+.msg.assistant .think:hover { border-color: var(--border-strong); }
+/* Shared details-summary layout: leading icon + flexible label + a chevron that rotates on open.
+   Replaces the emoji glyphs and the (hidden) native marker with one consistent Material Symbol row. */
+.msg.assistant .think summary,
+.msg.assistant .run-recap > summary,
+.msg.assistant .lab-progress .step-code > summary {
+  cursor: pointer; user-select: none; list-style: none; outline: none;
+  display: flex; align-items: center; gap: 7px;
+}
+.msg.assistant .think summary::-webkit-details-marker,
+.msg.assistant .run-recap > summary::-webkit-details-marker,
+.msg.assistant .lab-progress .step-code > summary::-webkit-details-marker { display: none; }
+.msg.assistant summary .msym { color: var(--text-tertiary); font-size: 17px; flex: none; }
+.msg.assistant summary .sum-label { flex: 1; min-width: 0; }
+.msg.assistant summary .chev {
+  margin-left: auto; font-size: 18px; color: var(--text-tertiary);
+  transition: transform 0.24s var(--ease-spring);
+}
+.msg.assistant details[open] > summary .chev { transform: rotate(180deg); }
+/* Smooth reveal on open. Native <details> can't transition its own height, so we fade+slide the
+   revealed body in; the rotating chevron carries the collapse affordance the other direction. */
+.msg.assistant .think[open] > .think-body,
+.msg.assistant .run-recap[open] > .lab-progress,
+.msg.assistant .step-code[open] > .step-code-body {
+  animation: detailsReveal 0.24s var(--ease-spring);
+}
+@keyframes detailsReveal {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+.msg.assistant .think .think-body {
+  white-space: pre-wrap; margin-top: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  line-height: 1.6; max-height: 300px; overflow-y: auto;
+}
+/* Claude-style "generating" caret at the end of the live answer while it streams. */
+.msg.assistant.streaming .msg-body:not(:empty)::after {
+  content: ""; display: inline-block; width: 7px; height: 1.02em;
+  margin-left: 2px; vertical-align: text-bottom; border-radius: 2px;
+  background: var(--accent); animation: caretBlink 1.2s ease-in-out infinite;
+}
+/* soft fade rather than a hard on/off blink — never fully off, so it breathes instead of flickering */
+@keyframes caretBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+/* markdown fenced code blocks + bullet lists inside an answer body */
+.msg-body pre.md-code {
+  margin: 8px 0; padding: 10px 12px; background: var(--surface-sunken);
+  border: 1px solid var(--border); border-radius: 8px; overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  line-height: 1.5; white-space: pre;
+}
+.msg-body pre.md-code code { background: none; padding: 0; font: inherit; color: var(--text); }
+.msg-body ul { margin: 6px 0; padding-left: 20px; }
+.msg-body li { margin: 2px 0; }
+/* markdown pipe tables inside an answer body — wide ones scroll horizontally instead of overflowing */
+.msg-body table.md-table {
+  border-collapse: collapse; margin: 10px 0; font-size: 12.5px; line-height: 1.45;
+  display: block; width: max-content; max-width: 100%; overflow-x: auto;
+}
+.msg-body table.md-table th, .msg-body table.md-table td {
+  border: 1px solid var(--border); padding: 6px 10px; text-align: left; vertical-align: top;
+}
+.msg-body table.md-table th { background: var(--surface-sunken); font-weight: 600; color: var(--text); }
+.msg-body table.md-table td { color: var(--text-secondary); }
+
+/* Inline mermaid diagrams (```mermaid fences, rendered client-side — see renderMermaidIn).
+   Three states, and the block is styled so ALL of them are presentable:
+     .md-mermaid           — the escaped source, before/without rendering (also the state a
+                             stripped-down client or a failed asset load lands in)
+     .md-mermaid-ok        — replaced by mermaid's SVG
+     .md-mermaid-fallback  — parse failed or the bundle didn't load: the source stays visible,
+                             flagged, so the user still gets the information the model wrote.
+   The source states keep the .md-code look on purpose: an unrendered diagram should read as a
+   code block, not as broken layout. */
+.msg-body pre.md-mermaid {
+  margin: 8px 0; padding: 10px 12px; background: var(--surface-sunken);
+  border: 1px solid var(--border); border-radius: 8px; overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  line-height: 1.5; white-space: pre;
+}
+/* Rendered: drop the code-block chrome and let the diagram breathe. Centred, scrolls
+   horizontally when wide rather than forcing the chat column to. */
+.msg-body pre.md-mermaid.md-mermaid-ok {
+  background: none; border: none; padding: 4px 0; text-align: center;
+  white-space: normal; overflow-x: auto;
+  /* mermaid is initialized with fontFamily:"inherit", so without this the diagram's labels would
+     inherit the monospace of the <pre> the placeholder still is, and read as code. */
+  font: inherit;
+}
+.msg-body pre.md-mermaid.md-mermaid-ok svg { max-width: 100%; height: auto; }
+.msg-body pre.md-mermaid.md-mermaid-fallback {
+  border-color: var(--warning, #b7791f); border-left-width: 3px;
+}
+.msg-body pre.md-mermaid.md-mermaid-fallback::before {
+  content: "diagram source (could not be rendered)";
+  display: block; margin-bottom: 6px; font-size: 11px; letter-spacing: .02em;
+  color: var(--text-secondary); font-family: inherit; text-transform: uppercase;
+}
+
+/* Research-only composer controls, disabled while the fast chat path is selected. Dimmed rather
+   than hidden so the user can still see what Research mode would offer. */
+.chat-controls .dimmed, .chat-controls select.dimmed { opacity: .45; }
+.chat-controls select:disabled, .chat-controls input:disabled { cursor: not-allowed; }
+/* Persisted run recap kept with a finished answer (default-collapsed): thinking + steps/code. */
+.msg.assistant .think.recap { display: block; }
+.msg.assistant .run-recap { margin-bottom: 8px; }
+.msg.assistant .run-recap > summary {
+  cursor: pointer; user-select: none; list-style: none; outline: none;
+  font-size: 12px; font-weight: 500; color: var(--text-secondary); padding: 3px 0;
+}
+.msg.assistant .run-recap > summary::-webkit-details-marker { display: none; }
+.msg.assistant .run-recap .lab-progress.done { margin: 6px 0 0; }
+
+/* --- live key-progress feed (lab runs) --- */
+.msg.assistant .lab-progress {
+  display: flex; flex-direction: column; gap: 3px;
+  margin-bottom: 8px; padding: 8px 10px;
+  background: var(--surface); border: 1px solid var(--border, #e5e5ea);
+  border-radius: 10px; font-size: 13px; line-height: 1.4;
+}
+.msg.assistant .lab-progress.done { opacity: 0.7; }
+.msg.assistant .lab-progress .progress-line {
+  color: var(--text); animation: progress-in 0.2s ease;
+}
+.msg.assistant .lab-progress .progress-line:last-child:not(.sub) { font-weight: 500; }
+.msg.assistant .lab-progress.done .progress-line:last-child { font-weight: 400; }
+.msg.assistant .lab-progress .progress-line.sub {
+  color: var(--text-secondary); font-size: 12px; padding-left: 14px;
+}
+.msg.assistant .lab-progress .progress-line.success { color: var(--green); }
+.msg.assistant .lab-progress .progress-line.warning { color: var(--amber); }
+/* An inline Material Symbol that replaces a backend emoji marker inside a progress/answer line.
+   Sized in em so it tracks the line's text, sits on the baseline, and inherits the line's semantic
+   color (success rows -> green check, warning rows -> amber warning, everything else -> body color). */
+.feed-ico { font-size: 1.05em; vertical-align: -0.16em; margin-right: 4px; color: inherit; }
+/* The final successful run_code of a step, rendered as a collapsed code block inside the
+   feed (replaces the "run_code: ok" spam). */
+.msg.assistant .lab-progress .step-code { margin: 2px 0; }
+.msg.assistant .lab-progress .step-code > summary {
+  cursor: pointer; user-select: none; list-style: none; font-size: 12px;
+  color: var(--text-secondary); padding: 2px 0;
+}
+.msg.assistant .lab-progress .step-code > summary::-webkit-details-marker { display: none; }
+.msg.assistant .lab-progress .step-code .step-code-body {
+  margin: 4px 0 2px; padding: 10px 12px; background: var(--surface-sunken, var(--surface-sunken));
+  border: 1px solid var(--border, #e5e5ea); border-radius: 8px; overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+  line-height: 1.45; white-space: pre; color: var(--text);
+}
+@keyframes progress-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+
+/* Live "Working…" liveness line — a pulsing dot + latest activity + elapsed timer.
+   Kept ticking by a 1s heartbeat so a silent HPC3 compute step never looks frozen. */
+.msg.assistant .stream-working {
+  display: none; align-items: center; gap: 8px;
+  margin: 2px 0 8px; font-size: 13px; color: var(--text-secondary);
+}
+.msg.assistant .stream-working .working-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: none;
+  background: var(--accent); animation: working-pulse 1.2s ease-in-out infinite;
+}
+.msg.assistant .stream-working .working-text { font-variant-numeric: tabular-nums; }
+@keyframes working-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+}
+
+/* --- artifacts file grid + preview modal --- */
+.file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 8px; margin-top: 10px; }
+.file-grid-title { grid-column: 1 / -1; color: var(--text-tertiary); font-size: 12px; margin: 6px 0 2px; }
+.file-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px; background: var(--surface); border: 1px solid var(--border, #e5e5e8); border-radius: 8px; cursor: pointer; overflow: hidden; }
+.file-cell:hover { background: var(--surface-hover); }
+.file-cell img { width: 100%; height: 56px; object-fit: cover; border-radius: 4px; background: var(--surface-sunken); }
+.file-cell .file-icon { font-size: 30px; height: 56px; display: flex; align-items: center; }
+.file-cell-name { font-size: 10.5px; line-height: 1.2; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+
+/* --- file area: thumbnails on top, folder-grouped directory list below --- */
+.file-area { margin-top: 10px; }
+.artifacts-hint { color: var(--text-tertiary); font-size: 12px; margin-top: 6px; line-height: 1.4; }
+.file-folder { margin-top: 8px; border: 1px solid var(--border, #e5e5ea); border-radius: 8px; overflow: hidden; }
+.file-folder > summary { cursor: pointer; user-select: none; list-style: none; padding: 7px 10px; font-size: 12.5px; font-weight: 600; color: var(--text-secondary); background: var(--surface-sunken); }
+.file-folder > summary::-webkit-details-marker { display: none; }
+.file-folder-count { color: var(--text-tertiary); font-weight: 400; font-size: 11.5px; margin-left: 4px; }
+.file-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 10px; background: var(--surface); border: 0; border-top: 1px solid var(--border, #eee); cursor: pointer; text-align: left; font-size: 12.5px; }
+.file-row:hover { background: var(--surface-hover); }
+.file-row-icon { flex: 0 0 auto; }
+.file-row-name { flex: 1 1 auto; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-row-size { flex: 0 0 auto; color: var(--text-tertiary); font-size: 11px; }
+.preview-card { width: min(900px, 94vw); max-height: 88vh; }
+.preview-actions { display: flex; align-items: center; gap: 10px; }
+.preview-body { max-height: 74vh; overflow: auto; display: flex; justify-content: center; }
+.preview-img { max-width: 100%; height: auto; }
+.preview-frame { width: 100%; height: 70vh; border: 0; }
+.preview-text { width: 100%; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.5; text-align: left; background: #f7f7f8; padding: 12px; border-radius: 6px; }
+
+/* ===== Phase 1: login + operon-style shell + 5 views ===== */
+
+/* login overlay */
+.login-overlay {
+  position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(1200px 600px at 50% -10%, #eaf2ff 0%, var(--bg) 60%);
+}
+.login-card {
+  width: 380px; max-width: 92vw;
+  background: var(--glass-bg-strong);
+  backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius); box-shadow: var(--shadow-md), var(--glass-highlight); padding: 32px 30px;
+}
+.login-brand { display: flex; align-items: center; gap: 12px; }
+.login-brand h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.login-sub { margin: 6px 0 22px; color: var(--text-tertiary); font-size: 13px; }
+.login-error { color: var(--red); font-size: 13px; margin: 4px 0 0; }
+.login-foot { margin: 18px 0 0; font-size: 12px; color: var(--text-tertiary); line-height: 1.5; }
+.login-link { color: var(--accent); text-decoration: none; }
+.login-link:hover { text-decoration: underline; }
+.login-dev { margin: 8px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.4;
+  background: rgba(255, 149, 0, 0.10); border: 1px solid rgba(255, 149, 0, 0.35);
+  border-radius: 8px; color: var(--text); }
+
+/* --- reattach hint: shown on the connect screen after a gateway restart --- */
+.reattach-hint { position: relative; margin: 0 0 16px; padding: 11px 30px 11px 12px; background: rgba(52, 199, 89, 0.10); border: 1px solid rgba(52, 199, 89, 0.35); border-radius: 10px; font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.reattach-hint code { background: rgba(0, 0, 0, 0.06); padding: 1px 5px; border-radius: 5px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; }
+.reattach-dismiss { position: absolute; top: 6px; right: 8px; background: transparent; border: 0; color: var(--text-tertiary); font-size: 17px; line-height: 1; cursor: pointer; padding: 2px 4px; }
+.reattach-dismiss:hover { color: var(--text-secondary); }
+
+/* app shell: topbar + (nav rail | views) */
+.app-shell { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.shell-body { flex: 1; display: flex; min-height: 0; }
+.user-chip {
+  font-size: 12.5px; font-weight: 600; color: var(--text-secondary);
+  background: var(--surface-sunken); border: 1px solid var(--border); border-radius: 980px; padding: 5px 12px;
+}
+
+/* operon-style activity bar */
+.nav-rail {
+  flex: 0 0 92px; display: flex; flex-direction: column; gap: 4px; padding: 14px 8px;
+  background: rgba(251, 247, 240, 0.42);
+  backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur);
+  border-right: 1px solid var(--glass-border);
+}
+.nav-item {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 11px 4px;
+  border: none; background: none; border-radius: var(--radius-sm); cursor: pointer; color: var(--text-tertiary);
+  font: inherit; transition: background 0.15s, color 0.15s;
+}
+.nav-item:hover { background: var(--surface-sunken); color: var(--text-secondary); }
+.nav-item.active { background: rgba(0, 113, 227, 0.10); color: var(--accent); }
+.nav-ico { font-size: 20px; line-height: 1; }
+.nav-label { font-size: 11px; font-weight: 600; }
+
+/* views */
+.views { flex: 1; display: flex; min-height: 0; }
+.view { display: none; flex: 1; min-height: 0; }
+.view.active { display: flex; flex-direction: column; min-height: 0; }
+.view#view-research.active .layout { flex: 1; }
+
+/* page-style views (datasets/runs/admin/account) */
+.page { flex: 1; overflow-y: auto; padding: 26px 32px; max-width: 1100px; width: 100%; margin: 0 auto; }
+.page-head { display: flex; align-items: center; justify-content: space-between; }
+.page-head h2 { margin: 0; font-size: 20px; font-weight: 600; }
+.page-sub { color: var(--text-tertiary); font-size: 13px; margin: 6px 0 18px; }
+.page h3 { font-size: 15px; font-weight: 600; margin: 26px 0 10px; }
+.muted { color: var(--text-tertiary); }
+.ok { color: var(--green); font-weight: 600; }
+.bad { color: var(--red); font-weight: 600; }
+
+/* card lists (datasets, runs) */
+.card-list { display: flex; flex-direction: column; gap: 10px; }
+.card {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px;
+}
+.card-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.card-main strong { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-main .muted { font-size: 12px; }
+
+/* run artifacts panel */
+.run-artifacts { margin-top: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px; }
+.run-art-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+
+/* admin search bar (find a user by id or email) */
+.admin-search { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+.admin-search .msym { color: var(--text-tertiary); font-size: 20px; }
+.admin-search input {
+  flex: 1; max-width: 340px; background: var(--surface-sunken); border: 1px solid var(--border);
+  border-radius: 980px; padding: 7px 14px; font: inherit; font-size: 13px; color: var(--text);
+}
+.admin-search input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+
+/* admin table + create-user form */
+.create-user { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.create-user input, .create-user select {
+  background: var(--surface-sunken); border: 1px solid var(--border); border-radius: 980px;
+  padding: 7px 13px; font: inherit; font-size: 13px; color: var(--text);
+}
+.create-user input:focus, .create-user select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(0, 113, 227, 0.16); }
+.user-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.user-table th, .user-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.user-table th { color: var(--text-tertiary); font-weight: 600; font-size: 12px; }
+.row-actions { display: flex; gap: 6px; }
+
+/* account view */
+.account-info { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px 18px; }
+.account-info p { margin: 4px 0; font-size: 14px; }
+.form.narrow { max-width: 360px; }
+
+/* ===== System page (agents / tools / capabilities / roadmap) ===== */
+.cap-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.cap { font-size: 12px; font-weight: 600; border-radius: 980px; padding: 4px 11px; border: 1px solid var(--border); }
+.cap.on { color: #1a7f37; background: rgba(52,199,89,0.12); border-color: rgba(52,199,89,0.35); }
+.cap.off { color: var(--text-tertiary); background: var(--surface-sunken); }
+.sys-cat { margin-bottom: 14px; }
+.sys-cat h4 { margin: 12px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-tertiary); }
+.sys-desc { font-size: 12.5px; color: var(--text-secondary); line-height: 1.45; }
+.tag-priv { font-size: 10.5px; font-weight: 600; color: #b25e00; background: rgba(255,159,10,0.14); border-radius: 980px; padding: 1px 7px; vertical-align: middle; }
+.roadmap { display: flex; flex-direction: column; gap: 7px; }
+.road-row { display: flex; align-items: center; gap: 10px; font-size: 13.5px; }
+.road-badge { font-size: 11px; font-weight: 700; border-radius: 980px; padding: 3px 10px; min-width: 72px; text-align: center; }
+.road-badge.done { color: #1a7f37; background: rgba(52,199,89,0.14); }
+.road-badge.in_progress { color: #8a5a00; background: rgba(255,159,10,0.16); }
+.road-badge.planned { color: var(--text-tertiary); background: var(--surface-sunken); }
+
+/* workflow presets */
+.card.flow { align-items: flex-start; }
+.flow-kind { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--accent); background: rgba(0,113,227,0.10); border-radius: 980px; padding: 1px 8px; vertical-align: middle; }
+.flow-stages { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.flow-stage { font-size: 11.5px; font-weight: 600; color: var(--text-secondary);
+  background: var(--surface-sunken); border: 1px solid var(--border); border-radius: 8px; padding: 3px 9px; }
+.flow-arrow { color: var(--text-tertiary); font-size: 12px; }
+
+/* --- System: live workflow graph (read-only) --- */
+.sys-graph-h { margin: 18px 0 8px; font-size: 14px; font-weight: 600; }
+.sys-graph-h .muted { font-weight: 400; font-size: 12px; }
+.sys-graph-wrap { display: flex; gap: 12px; margin-bottom: 22px; }
+.sys-graph {
+  flex: 1 1 auto; min-width: 0; height: 440px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); box-shadow: var(--shadow-sm);
+  display: flex; align-items: center; justify-content: center;
+}
+.sys-graph-info {
+  flex: 0 0 280px; width: 280px; height: 440px; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); box-shadow: var(--shadow-sm);
+  padding: 14px; font-size: 13px; line-height: 1.5;
+}
+.sys-graph-info > div { margin-bottom: 6px; }
+.gi-title { font-weight: 600; font-size: 14px; margin-bottom: 10px; }
+.gi-type { font-size: 10.5px; color: var(--text-tertiary); border: 1px solid var(--border-strong); border-radius: 980px; padding: 1px 8px; margin-left: 4px; font-weight: 500; }
+.gi-k { display: inline-block; min-width: 62px; color: var(--text-tertiary); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.02em; }
+.gi-desc { margin-top: 10px; color: var(--text-secondary); }
+@media (max-width: 720px) { .sys-graph-wrap { flex-direction: column; } .sys-graph-info { flex-basis: auto; width: auto; height: auto; max-height: 240px; } }
+
+/* ===== micro-interactions: subtle Apple-style hover lift / press ===== */
+:root { --ease-spring: cubic-bezier(0.2, 0.8, 0.2, 1); }
+
+/* shared smooth transition for the interactive surfaces */
+button, .clarify-chip, .artifact-bundle, .workflow-select, .nav-item,
+.card, .conn-card, .gpu-card, .dl-item, .session-item, .artifacts-block {
+  transition: background 0.18s var(--ease-spring), color 0.18s var(--ease-spring),
+              transform 0.18s var(--ease-spring), box-shadow 0.18s var(--ease-spring),
+              border-color 0.18s var(--ease-spring), opacity 0.18s var(--ease-spring);
+}
+
+/* buttons grow a hair on hover and press in on click */
+button:not(:disabled):hover { transform: translateY(-1px) scale(1.03); }
+button:not(:disabled):active { transform: scale(0.97); }
+button.primary:not(:disabled):hover { box-shadow: 0 4px 14px rgba(0, 113, 227, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.22); }
+/* full-width buttons lift but do NOT scale (scaling would overflow their container) */
+button.full:not(:disabled):hover, .danger-btn:not(:disabled):hover,
+.chat-input button:not(:disabled):hover { transform: translateY(-1px) scale(1); }
+.clarify-chip:hover { transform: translateY(-1px) scale(1.04); }
+/* the selected nav item stays put — only idle items react */
+.nav-item.active, .nav-item.active:hover { transform: none; }
+
+/* cards / list rows / tooltips lift and deepen their shadow on hover */
+.card:hover, .conn-card:hover, .gpu-card:hover, .artifacts-block:hover {
+  transform: translateY(-2px); box-shadow: var(--shadow-md);
+}
+.dl-item:hover, .session-item:hover { transform: translateY(-1px); }
+
+/* file thumbnails: card lifts, image zooms gently inside it */
+.file-cell { transition: transform 0.2s var(--ease-spring), background 0.18s var(--ease-spring), box-shadow 0.2s var(--ease-spring); }
+.file-cell:hover { transform: translateY(-2px) scale(1.02); box-shadow: var(--shadow-sm); }
+.file-cell img { transition: transform 0.25s var(--ease-spring); }
+.file-cell:hover img { transform: scale(1.05); }
+
+/* the active pipeline step gently breathes so the eye lands on it */
+.pipeline li.active .step-dot { animation: stepBreathe 1.8s ease-in-out infinite; }
+@keyframes stepBreathe {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(255, 159, 10, 0.16); }
+  50%      { box-shadow: 0 0 0 7px rgba(255, 159, 10, 0.07); }
+}
+
+/* ===== entrance motion: views, messages, panels glide in instead of snapping =====
+   View switches and newly-rendered content used to appear instantly (felt abrupt). A
+   short fade-up on each gives the UI a continuous, considered feel. Fill-mode is left
+   at default on the big containers so no lingering transform traps position:fixed
+   descendants (toast / modal) after the animation ends. */
+@keyframes viewIn   { from { opacity: 0; transform: translateY(8px); }            to { opacity: 1; transform: translateY(0); } }
+@keyframes msgIn    { from { opacity: 0; transform: translateY(7px) scale(0.99); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes panelIn  { from { opacity: 0; transform: translateY(-6px); }           to { opacity: 1; transform: translateY(0); } }
+
+.view.active { animation: viewIn 0.34s var(--ease-spring); }
+.msg         { animation: msgIn 0.3s var(--ease-spring); }
+.preset-panel:not(.hidden), .duo-panel:not(.hidden) {
+  animation: panelIn 0.28s var(--ease-spring);
+}
+
+/* hover lift made a touch more legible (the previous 1.03 read as "nothing happened") */
+button:not(:disabled):hover { transform: translateY(-1px) scale(1.045); }
+.card:hover, .conn-card:hover, .gpu-card:hover, .artifacts-block:hover {
+  transform: translateY(-3px); box-shadow: var(--shadow-md);
+}
+/* idle nav items nudge toward their label on hover so the sidebar feels responsive */
+.nav-item:not(.active):hover { transform: translateX(2px); }
+
+/* ===== aesthetic polish: ambient warmth + brand mark + accent material =====
+   Additive layer (does not touch the rules above): a whisper of warm tea-light behind the
+   canvas, a branded logo chip, softer panel float, and top-lit accent surfaces. */
+body {
+  /* soft ambient mesh — a warm glow + a cool + a green whisper — so the frosted-glass panels
+     have something to refract (a flat canvas makes backdrop-blur invisible). */
+  background:
+    radial-gradient(1100px 720px at 8% -10%, rgba(255, 206, 156, 0.42), transparent 58%),
+    radial-gradient(950px 680px at 110% 4%, rgba(0, 113, 227, 0.10), transparent 55%),
+    radial-gradient(1000px 820px at 50% 122%, rgba(110, 190, 150, 0.12), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+}
+/* Header floats: keep the hairline, add a soft warm downward shadow. */
+.topbar { box-shadow: 0 1px 0 rgba(70, 56, 36, 0.05), 0 10px 24px -20px rgba(70, 56, 36, 0.45); }
+/* Brand mark: the 🧬 sits in a warm tinted rounded chip instead of floating bare. */
+.topbar .brand .logo {
+  font-size: 20px; width: 38px; height: 38px; display: inline-flex;
+  align-items: center; justify-content: center; border-radius: 11px;
+  background: linear-gradient(160deg, #f6efe1, #ece0c8);
+  box-shadow: inset 0 0 0 1px rgba(120, 92, 48, 0.16), 0 2px 6px rgba(120, 92, 48, 0.12);
+}
+/* Frosted-glass panels: a bright 1px glass rim + soft top highlight (the Apple "Liquid Glass" edge)
+   over the warm far shadow that lets them float. The translucent fill + backdrop-blur are set on the
+   base .panel rule above. */
+.panel {
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 1px 2px rgba(70, 56, 36, 0.05), 0 14px 34px -16px rgba(70, 56, 36, 0.16), var(--glass-highlight);
+}
+/* Accent surfaces: a gentle top-lit gradient + a SOFT neutral shadow + inner highlight, so the CTA
+   reads as a tactile pill rather than a glaring saturated block (was a bright colored glow). */
+button.primary {
+  background-image: linear-gradient(180deg, #2f8cf0 0%, #0a72dd 100%);
+  box-shadow: 0 1px 2px rgba(0, 66, 132, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+.msg.user {
+  background-image: linear-gradient(180deg, #2f8cf0 0%, #0a72dd 100%);
+  box-shadow: 0 4px 12px -6px rgba(0, 90, 180, 0.35);
+}
+.dl-zip { background-image: linear-gradient(180deg, #1a86ff, #0071e3); }
+/* Nav + chat selection read as a soft raised pill / accent bar, not a flat wash. */
+.nav-item.active {
+  background: linear-gradient(180deg, rgba(0, 113, 227, 0.16), rgba(0, 113, 227, 0.075));
+  box-shadow: inset 0 0 0 1px rgba(0, 113, 227, 0.14);
+}
+.session-item { position: relative; }
+.session-item.active::before {
+  content: ""; position: absolute; left: 0; top: 7px; bottom: 7px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--accent);
+}
+
+/* ===== refined composer controls — premium checkboxes, active toggles, custom select ===== */
+/* Custom checkbox: a rounded box that fills with the accent gradient + a crisp vector tick when
+   checked — replaces the cheap native checkbox in the connect form, the run toggles, and the picker. */
+.form .check input[type="checkbox"],
+.pipeline-toggle input[type="checkbox"],
+.preset-item input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  width: 18px; height: 18px; flex: none; margin: 0; padding: 0;
+  border: 1.5px solid var(--border-strong); border-radius: 6px;
+  background: var(--surface);
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+  transition: background 0.16s var(--ease-spring), border-color 0.16s, box-shadow 0.16s;
+}
+.form .check input[type="checkbox"]:hover,
+.pipeline-toggle input[type="checkbox"]:hover,
+.preset-item input[type="checkbox"]:hover { border-color: var(--accent); }
+.form .check input[type="checkbox"]:checked,
+.pipeline-toggle input[type="checkbox"]:checked,
+.preset-item input[type="checkbox"]:checked {
+  background: linear-gradient(180deg, #2f8cf0, #0a72dd); border-color: #0a72dd;
+  box-shadow: 0 1px 3px rgba(0, 90, 180, 0.28);
+}
+.form .check input[type="checkbox"]::after,
+.pipeline-toggle input[type="checkbox"]::after,
+.preset-item input[type="checkbox"]::after {
+  content: ""; width: 5px; height: 9px; margin-top: -2px;
+  border: solid #fff; border-width: 0 2px 2px 0;
+  transform: rotate(45deg) scale(0);
+  transition: transform 0.16s var(--ease-spring);
+}
+.form .check input[type="checkbox"]:checked::after,
+.pipeline-toggle input[type="checkbox"]:checked::after,
+.preset-item input[type="checkbox"]:checked::after { transform: rotate(45deg) scale(1); }
+
+/* Run toggles: the label shifts to accent when its checkbox is on, so state reads at a glance. */
+.pipeline-toggle { gap: 8px; transition: color 0.16s var(--ease-spring); }
+.pipeline-toggle:has(input:checked) { color: var(--accent); font-weight: 500; }
+
+/* Mode select: a glass pill with a custom chevron (drops the cheap native select arrow). */
+.workflow-select {
+  appearance: none; -webkit-appearance: none;
+  background-color: var(--glass-bg-strong);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='15' height='15' fill='none' stroke='%236d665a' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M4 6l3.5 3.5L11 6'/></svg>");
+  background-repeat: no-repeat; background-position: right 11px center;
+  padding: 7px 32px 7px 14px;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-sm), var(--glass-highlight);
+}
+.workflow-select:hover { border-color: var(--border-strong); }
+
+/* Primary buttons: a soft glossy top sheen so the accent reads as a tactile "liquid" pill. */
+button.primary { position: relative; overflow: hidden; font-weight: 600; }
+button.primary::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 48%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0));
+  pointer-events: none;
+}
+
+/* accessibility: honour reduced-motion — drop the transforms and loops */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  button:hover, .card:hover, .conn-card:hover, .gpu-card:hover, .artifacts-block:hover,
+  .dl-item:hover, .session-item:hover, .file-cell:hover, .file-cell:hover img,
+  .clarify-chip:hover, .nav-item:not(.active):hover { transform: none !important; }
+}

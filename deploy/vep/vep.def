@@ -1,0 +1,66 @@
+Bootstrap: docker
+From: ensemblorg/ensembl-vep:release_112.0
+
+# OFFLINE VCF variant-annotation image for AiScientist (variant_cli on HPC3).
+#
+# This is the container SlurmAnalysisExecutor runs the offline variant line inside
+# (src/bioagent/tools/variant_cli.py -> vcf_offline.run_offline_annotation) on an HPC3 CPU node,
+# so a WGS-size VCF is annotated where `#SBATCH --mem` is a REAL cgroup cap and there is NO network
+# dependency at run time. It carries ONLY the tools:
+#
+#   * Ensembl VEP (from the official ensemblorg/ensembl-vep base, PINNED to release_112.0), plus
+#   * bcftools (PASS-filter / region-subset streaming), and
+#   * python3 (to run `python -m bioagent.tools.variant_cli`).
+#
+# The VEP CACHE and the ClinVar VCF are NOT baked in — they are ~20GB each and are staged on dfs3b by
+# deploy/vep/build_and_stage.sh, then bind-mounted READ-ONLY at run time (offline). The bioagent tools
+# are likewise bind-mounted from dfs3b (pysrc) + put on PYTHONPATH by the executor, so a tool edit
+# needs only a code sync, never an image rebuild. Keeping the image deps-only also keeps `--remote`
+# builds working (no local %files to ship to the Sylabs cloud builder).
+#
+# IMPORTANT: the release in the image tag (release_112.0) MUST match the cache release the stage
+# script downloads (release-112 -> `homo_sapiens/112_GRCh38`). Bump both together.
+#
+# Build ON HPC3 or any Linux+singularity host (macOS cannot build .sif). See
+# deploy/vep/build_and_stage.sh and deploy/vep/README.md.
+
+%post
+    set -eux
+    # The base is Ubuntu; add bcftools for the pre-filter and python3 for the CLI entrypoint.
+    apt-get update
+    apt-get install -y --no-install-recommends bcftools python3
+    rm -rf /var/lib/apt/lists/*
+    # The executor entrypoint says `python3`, but symlink `python` too so either works.
+    if [ ! -e /usr/local/bin/python ]; then ln -s "$(command -v python3)" /usr/local/bin/python; fi
+    # Sanity — fail the build if any of the three tools is missing.
+    /opt/vep/src/ensembl-vep/vep --help >/dev/null
+    bcftools --version | head -1
+    python3 --version
+
+%environment
+    # VEP lives here in the base image; make sure it + its Perl libs are on PATH under `singularity
+    # exec` (the base sets these for its ENTRYPOINT, which exec bypasses).
+    export PATH=/opt/vep/src/ensembl-vep:$PATH
+    export PERL5LIB=/opt/vep/src/ensembl-vep:${PERL5LIB:-}
+
+%runscript
+    exec "$@"
+
+%labels
+    org.bioagent.component variant-offline-vep
+    org.bioagent.route cpu-slurm-variant
+    org.bioagent.vep_release 112
+
+%help
+    Offline Ensembl VEP + bcftools image for AiScientist's variant line on HPC3. The cache + ClinVar are
+    bind-mounted from dfs3b (NOT baked); the bioagent tools are bound from dfs3b + put on PYTHONPATH.
+
+      singularity exec --containall --net --network none \
+        -B <vcf>:<vcf>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
+        -B <cache>:<cache>:ro -B <clinvar.vcf.gz>:<clinvar.vcf.gz>:ro \
+        --env PYTHONPATH=<pysrc> \
+        vep.sif python3 -m bioagent.tools.variant_cli \
+          --tool annotate_variants --workspace <run_ws> --dataset <vcf> --args <args.json>
+
+    where <args.json> carries {cache_dir, clinvar_vcf, assembly, fork, pass_only, ...} injected by the
+    gateway (SlurmAnalysisExecutor.inject_args).

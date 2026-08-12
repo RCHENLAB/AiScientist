@@ -1,0 +1,89 @@
+Bootstrap: docker
+From: eclipse-temurin:17-jre-jammy
+
+# PHENOTYPE -> DISEASE differential-diagnosis image for BioAgent (phenotype_cli on HPC3).
+#
+# This is the container SlurmAnalysisExecutor runs the phenotype line inside
+# (src/bioagent/tools/phenotype_cli.py -> phenotype_dx.run_lirical) on an HPC3 CPU node. It fuses the
+# patient's HPO terms with the VCF variant findings into a per-disease POST-TEST PROBABILITY
+# (LIRICAL's likelihood-ratio model over the curated HPO/OMIM annotations) -- the confidence Rui Chen
+# asked for. The variant line (vep.sif) runs FIRST and produces the gene/variant shortlist; this line
+# is downstream of it.
+#
+# It carries ONLY the tool + its runtime:
+#   * a JRE 17 (from the official eclipse-temurin base -- LIRICAL v2 needs Java 17; HPC3 also has
+#     java/17 natively, but pinning it in the image keeps the run reproducible across module changes),
+#   * the LIRICAL v2 CLI (a fat distribution baked in at /opt/lirical -- LIRICAL *is* the tool here, so
+#     it is baked like VEP is in vep.sif; a version bump is a rebuild, which is rare), and
+#   * python3 (to run `python3 -m bioagent.tools.phenotype_cli`).
+#
+# The LIRICAL DATA (hp.json / phenotype.hpoa / Jannovar transcript DBs, ~1-2GB) and the EXOMISER
+# variant database (~20GB, needed ONLY for genotype-aware scoring) are NOT baked -- they are staged on
+# dfs3b by deploy/lirical/build_and_stage.sh and bind-mounted READ-ONLY at run time. The bioagent tools
+# are likewise bind-mounted from dfs3b (pysrc) + put on PYTHONPATH by the executor, so a tool edit
+# needs only a code sync, never an image rebuild. Keeping the DATA out of the image also keeps
+# `--remote` builds working (no huge %files shipped to the Sylabs cloud builder).
+#
+# IMPORTANT: LIRICAL_VERSION here MUST match the version deploy/lirical/build_and_stage.sh assumes for
+# the phenotype data layout, and the Exomiser data version must be one LIRICAL v2 supports (>= 2302 --
+# the lab's existing 1805_hg19 / exomiser-cli-10.1.0 data is the OLD Exomiser 10.x schema and is NOT
+# compatible with LIRICAL v2; see deploy/lirical/README.md).
+#
+# Build ON HPC3 or any Linux+singularity host (macOS cannot build .sif). See
+# deploy/lirical/build_and_stage.sh and deploy/lirical/README.md.
+
+%post
+    set -eux
+    LIRICAL_VERSION=2.4.1
+    # The base is Ubuntu (jammy); add python3 for the CLI entrypoint + unzip/curl for the LIRICAL dist.
+    apt-get update
+    apt-get install -y --no-install-recommends python3 curl unzip ca-certificates
+    rm -rf /var/lib/apt/lists/*
+    # The executor entrypoint says `python3`, but symlink `python` too so either works.
+    if [ ! -e /usr/local/bin/python ]; then ln -s "$(command -v python3)" /usr/local/bin/python; fi
+
+    # Bake the pinned LIRICAL v2 CLI distribution (fat jar + lib/) into /opt/lirical. The release asset
+    # is a zip that unpacks to lirical-cli-<ver>/ with lirical-cli-<ver>.jar + lib/. A thin /usr/local/
+    # bin/lirical wrapper makes `lirical <subcommand> ...` work regardless of the jar's exact path.
+    mkdir -p /opt/lirical
+    cd /opt/lirical
+    curl -fSL --retry 3 -o lirical.zip \
+      "https://github.com/TheJacksonLaboratory/LIRICAL/releases/download/v${LIRICAL_VERSION}/lirical-cli-${LIRICAL_VERSION}-distribution.zip"
+    unzip -q lirical.zip
+    rm -f lirical.zip
+    JAR="$(find /opt/lirical -name 'lirical-cli-*.jar' | head -1)"
+    test -n "${JAR}"
+    printf '#!/bin/sh\nexec java -jar %s "$@"\n' "${JAR}" > /usr/local/bin/lirical
+    chmod +x /usr/local/bin/lirical
+
+    # Sanity -- fail the build if java / lirical / python3 are not runnable.
+    java -version
+    lirical --help >/dev/null 2>&1 || lirical --help 2>&1 | head -5
+    python3 --version
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+%runscript
+    exec "$@"
+
+%labels
+    org.bioagent.component phenotype-lirical
+    org.bioagent.route cpu-slurm-phenotype
+    org.bioagent.lirical_version 2.4.1
+
+%help
+    LIRICAL v2 (phenotype -> disease differential) image for BioAgent's phenotype line on HPC3. The
+    LIRICAL data + the Exomiser variant DB are bind-mounted from dfs3b (NOT baked); the bioagent tools
+    are bound from dfs3b + put on PYTHONPATH.
+
+      singularity exec --containall \
+        -B <run_ws>:<run_ws> -B <vcf>:<vcf>:ro -B <pysrc>:<pysrc>:ro \
+        -B <lirical_data>:<lirical_data>:ro -B <exomiser_dir>:<exomiser_dir>:ro \
+        --env PYTHONPATH=<pysrc> \
+        lirical.sif python3 -m bioagent.tools.phenotype_cli \
+          --tool run_lirical --workspace <run_ws> --dataset <vcf> --args <args.json>
+
+    where <args.json> carries {data_dir, exomiser_hg19/hg38, assembly, hpo_terms, sample_id, ...}
+    injected by the gateway (SlurmAnalysisExecutor.inject_args) + the run's HPO terms.

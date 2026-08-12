@@ -1,0 +1,42 @@
+Bootstrap: docker
+From: pandoc/extra:latest
+
+# Report-render image for AiScientist (Phase 5 of the HPC3 offload). SlurmReportRenderer
+# (src/bioagent/gateway/slurm_report.py) runs `pandoc ... --pdf-engine=xelatex` inside this image
+# as a CPU Slurm job, so a multi-GB TeXLive + minutes of render never touch the eyeserver.
+#
+# DEPS-ONLY: pandoc is a self-contained binary and NO bioagent code runs here — so `--remote`
+# (Sylabs) builds work, and a report-format change (tools/report.py) never needs an image rebuild.
+#
+# Base `pandoc/extra` already bundles pandoc + a TeXLive with XeLaTeX + common LaTeX packages +
+# fonts + Lua-filter support. We only ensure the few packages tools/report.py's preamble uses.
+#
+# Build on HPC3 (no fakeroot) with `--remote`; see deploy/report/build_and_stage.sh.
+
+%post
+    set -eux
+    # etoolbox / pdflscape / geometry / booktabs back the report preamble + the wide-table filter.
+    # Most ship with pandoc/extra; install any missing (no-op if already present).
+    tlmgr install etoolbox pdflscape geometry booktabs 2>/dev/null || true
+    pandoc --version | head -1
+    (xelatex --version | head -1) || echo "note: verify xelatex at run time"
+
+%environment
+    # Give TeX writable caches under /tmp (the job runs --containall, so $HOME is hidden and the
+    # font/format cache must live somewhere writable). The renderer also sets these per run.
+    export HOME=/tmp
+    export TEXMFVAR=/tmp/texmf-var
+
+%runscript
+    exec pandoc "$@"
+
+%labels
+    org.bioagent.component report-render
+    org.bioagent.route cpu-slurm-report
+
+%help
+    pandoc + XeLaTeX report-render image for AiScientist on HPC3 (deps-only; tools bound at run time
+    is N/A here — pandoc needs no bioagent code). Per report the gateway runs:
+      singularity exec --containall --writable-tmpfs --net --network none -B <bundle>:<bundle> \
+        report.sif pandoc <bundle>/report/report.md -o <bundle>/report/report.pdf \
+          --pdf-engine=xelatex --toc --resource-path <bundle> ...

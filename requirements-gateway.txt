@@ -1,0 +1,5 @@
+# Dependencies for the live HPC3 SSH + Ollama gateway (src/bioagent/gateway).
+# Kept separate from requirements.txt so the offline CI / core stays dependency-light.
+paramiko>=3.4
+fastapi>=0.110
+uvicorn[standard]>=0.29

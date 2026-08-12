@@ -1,0 +1,120 @@
+# Kubernetes manifests for AiScientist — EXAMPLE to adapt to the eyeserver cluster.
+# Replace every <placeholder>. The cluster already routes multiple subdomains on the shared
+# 443 via its ingress controller; this adds <PUBLIC_HOSTNAME> as one more rule.
+#
+# ▲▲▲ CRITICAL — this app is a STATEFUL SINGLETON ▲▲▲
+#   It holds a per-session SSH tunnel to HPC3 + in-memory connection state in ONE process.
+#   - replicas MUST be 1 (a 2nd pod can't see the 1st pod's tunnels → broken sessions).
+#   - strategy MUST be Recreate (never run two pods at once), NOT RollingUpdate.
+#   - the pod needs EGRESS to hpc3.rcic.uci.edu:22 (SSH) + DNS — open it in any NetworkPolicy.
+#   - run artifacts need a PersistentVolume; accounts need PostgreSQL (managed or in-cluster).
+#   A restart drops live sessions (users reconnect) — inherent to the SSH-tunnel design.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bioagent-secrets
+  namespace: <namespace>
+type: Opaque
+stringData:
+  # Signs session cookies — MUST be strong & unique (NOT a default). Generate with:
+  #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+  BIOAGENT_SECRET_KEY: "<strong-random-secret>"
+  BIOAGENT_PUBLIC_HTTPS: "1"                 # marks session cookies Secure (HTTPS-only)
+  # PostgreSQL is REQUIRED (NOT SQLite) — UCI-wide / multi-project use needs real concurrency.
+  # Point this at a dedicated PG (in-cluster StatefulSet with its own PVC, or managed):
+  BIOAGENT_DATABASE_URL: "postgresql+psycopg://bioagent:<db-password>@<pg-service>:5432/bioagent"
+  # First admin — seed from a BCRYPT HASH, never a plaintext/default password:
+  #   bioagent-admin hash       # prompts, prints a bcrypt hash to paste here
+  BIOAGENT_ADMIN_USER: "<admin-username>"
+  BIOAGENT_ADMIN_PASSWORD_HASH: "<bcrypt-hash>"
+  # HPC3 / vLLM connection settings as already configured (host, account, image, etc.)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bioagent-runs
+  namespace: <namespace>
+spec:
+  accessModes: ["ReadWriteOnce"]            # single replica → RWO is fine
+  storageClassName: <storage-class>
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiscientist
+  namespace: <namespace>
+spec:
+  replicas: 1                               # ← keep 1 (stateful singleton; do not scale)
+  strategy:
+    type: Recreate                          # ← never two pods at once
+  selector:
+    matchLabels: { app: aiscientist }
+  template:
+    metadata:
+      labels: { app: aiscientist }
+    spec:
+      containers:
+        - name: app
+          image: <registry>/aiscientist:<tag>
+          ports: [{ containerPort: 8800 }]
+          envFrom:
+            - secretRef: { name: bioagent-secrets }
+          volumeMounts:
+            - { name: runs, mountPath: /data/runs }
+          readinessProbe:
+            httpGet: { path: /, port: 8800 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 8800 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits:   { cpu: "4", memory: 8Gi }   # scanpy runs in-pod; give it room
+      volumes:
+        - name: runs
+          persistentVolumeClaim: { claimName: bioagent-runs }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiscientist
+  namespace: <namespace>
+spec:
+  selector: { app: aiscientist }
+  ports:
+    - { name: http, port: 80, targetPort: 8800 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aiscientist
+  namespace: <namespace>
+  annotations:
+    # Translated from the standalone nginx conf — needed because runs stream for minutes,
+    # the first connect waits ~10 min for vLLM to load, datasets are large, and the UI uses
+    # WebSockets (nginx-ingress upgrades WS automatically; these tune the rest).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8g"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx                   # ← match your cluster's ingress class
+  tls:
+    - hosts: [<PUBLIC_HOSTNAME>]
+      secretName: <tls-secret>              # ← per-host cert Secret, or your cluster wildcard
+  rules:
+    - host: <PUBLIC_HOSTNAME>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aiscientist
+                port: { number: 80 }

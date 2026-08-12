@@ -1,0 +1,48 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+.env
+.deploy.env
+runs/
+.playwright-mcp/
+.adaptive_kg/
+# Real secrets stay out (handled above by .env), but *example* env templates are
+# deployment docs and MUST be tracked — re-include them despite a global
+# `*.env.*` ignore so handover/maintainers get them.
+!configs/*.env.example
+!configs/*.example.env
+
+# Raw datasets (never commit; provided per-run)
+*.h5ad
+
+# Local databases (dev SQLite created by running the gateway; prod uses PostgreSQL)
+*.db
+*.sqlite
+*.sqlite3
+
+# Local dev SQLite DB — never commit (prod uses Postgres)
+bioagent.db
+*.db
+
+# Claude Code local (machine-specific) settings — never commit; keep filemanager.md (shared)
+.claude/settings.local.json
+# Claude Code isolated worktrees (agent worktree mode) — local scratch, not part of the tree
+.claude/worktrees/
+
+# Local frontend preview helpers (dev only — gateway serves these in prod)
+.claude/launch.json
+frontend/console/serve.py
+
+# macOS
+.DS_Store
+
+# Offline enrichment gene-set libraries (downloaded via scripts/fetch_genesets.py; too big for git)
+src/bioagent/tools/genesets/*.gmt
+output/
+
+# Test/demo sample data (VCFs, case notes, run scripts) — not shipped, not deployed.
+# Kept out of git AND out of sync_deploy (see its EXCLUDE_PATTERNS).
+/sample_data/

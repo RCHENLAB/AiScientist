@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AiScientist Chat Workspace</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="login-shell" id="loginScreen">
+      <section class="login-card" aria-labelledby="loginTitle">
+        <div class="brand-row">
+          <div class="brand-mark">BA</div>
+          <div>
+            <p class="eyebrow">AiScientist</p>
+            <h1 id="loginTitle">Log in to AiScientist HPC3</h1>
+          </div>
+        </div>
+
+        <p class="login-intro">
+          Sign in with your UCI/RCIC account to request GPU-backed AiScientist runtime
+          on HPC3. The browser sends this login to the AiScientist backend gateway,
+          which will connect to the cluster-side LLM and agent services.
+        </p>
+
+        <form class="login-form" id="loginForm">
+          <label>
+            UCInetID
+            <input id="loginUcinetidInput" type="text" autocomplete="username" placeholder="panteater" />
+          </label>
+          <label>
+            Password
+            <input id="loginPasswordInput" type="password" autocomplete="current-password" placeholder="UCI password" />
+          </label>
+          <label class="check-row">
+            <input id="loginCampusNetworkCheck" type="checkbox" />
+            I am on the UCI campus network or connected to UCI VPN.
+          </label>
+          <label class="check-row">
+            <input id="loginDuoCheck" type="checkbox" />
+            Duo is enabled and I can approve the prompt if requested.
+          </label>
+        </form>
+
+        <section class="connection-request hidden" id="loginConnectionRequest">
+          <p class="eyebrow">Gateway status</p>
+          <div class="command-box" id="loginSshCommandBox"></div>
+          <ol id="loginConnectionSteps"></ol>
+        </section>
+
+        <div class="login-actions">
+          <button class="primary-action full-width" id="loginRequestBtn" type="button">Log in to HPC3</button>
+        </div>
+
+        <p class="login-links">
+          RCIC docs:
+          <a href="https://rcic.uci.edu/account/login.html" target="_blank" rel="noreferrer">Login</a>
+          ·
+          <a href="https://rcic.uci.edu/guides/beginner.html" target="_blank" rel="noreferrer">Beginner guide</a>
+          ·
+          <a href="https://rcic.uci.edu/slurm/jobs.html" target="_blank" rel="noreferrer">Slurm jobs</a>
+        </p>
+      </section>
+    </main>
+
+    <main class="app-shell hidden" id="workspaceScreen">
+      <aside class="session-sidebar" aria-label="AiScientist sessions">
+        <div class="brand-row">
+          <div class="brand-mark">BA</div>
+          <div>
+            <p class="eyebrow">AiScientist</p>
+            <h1>Chat Workspace</h1>
+          </div>
+        </div>
+
+        <button class="primary-action full-width" id="newSessionBtn" type="button">New session</button>
+
+        <section class="session-section">
+          <div class="section-label">Research sessions</div>
+          <div class="session-list" id="sessionList"></div>
+        </section>
+
+        <section class="sidebar-note">
+          <strong>Local-first</strong>
+          <span>Data stays on UCI/lab infrastructure. HPC actions require explicit authorization.</span>
+        </section>
+      </aside>
+
+      <section class="chat-column" aria-label="AiScientist chat">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="sessionMode">Offline mode</p>
+            <h2 id="sessionTitle">New AiScientist session</h2>
+          </div>
+          <div class="status-cluster">
+          <span class="status-pill" id="runStatus">Idle</span>
+            <button class="ghost-action" id="connectHpcBtn" type="button">Reconnect HPC3</button>
+          </div>
+        </header>
+
+        <div class="chat-stream" id="chatStream" aria-live="polite"></div>
+
+        <section class="examples" aria-label="Example prompts">
+          <button type="button" data-example="Run retina single-cell RNA-seq QC and differential expression planning.">Retina scRNA-seq QC</button>
+          <button type="button" data-example="Plan spatial transcriptomics pathway interpretation for RPE disease tissue.">Spatial transcriptomics</button>
+          <button type="button" data-example="Use UCI HPC3 GPU resources for this ocular biology analysis and prepare the reviewed Slurm workflow.">HPC-reviewed workflow</button>
+        </section>
+
+        <form class="composer" id="messageForm">
+          <label class="workflow-picker">
+            Workflow
+            <select id="workflowSelect">
+              <option value="auto">Auto route</option>
+              <option value="single_cell_qc_execution_agent">Single-cell QC</option>
+              <option value="differential_expression_execution_agent">Differential expression</option>
+              <option value="literature_grounding_agent">Literature grounding</option>
+              <option value="hpc_agent">HPC / Slurm review</option>
+            </select>
+          </label>
+          <label class="message-box">
+            Message
+            <textarea id="messageInput" rows="4" placeholder="Ask AiScientist to analyze retinal single-cell QC, plan DE, or prepare an HPC-reviewed workflow..."></textarea>
+          </label>
+          <button class="primary-action" id="sendBtn" type="submit">Send</button>
+        </form>
+      </section>
+
+      <aside class="artifact-panel" aria-label="Artifacts and report">
+        <section class="panel-block">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Workflow state</p>
+              <h3 id="workflowState">Waiting for request</h3>
+            </div>
+            <span class="status-pill muted" id="hpcState">HPC disconnected</span>
+          </div>
+          <div class="progress-list" id="progressList"></div>
+        </section>
+
+        <section class="panel-block">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Final report</p>
+              <h3 id="reportTitle">No report yet</h3>
+            </div>
+            <a class="download-link disabled" id="downloadReport" href="#" aria-disabled="true">Download</a>
+          </div>
+          <pre class="report-preview" id="reportPreview">The final report will appear here after AiScientist completes a workflow.</pre>
+        </section>
+
+        <section class="panel-block">
+          <p class="eyebrow">Artifacts</p>
+          <div class="artifact-list" id="artifactList"></div>
+        </section>
+      </aside>
+    </main>
+
+    <div class="modal-backdrop hidden" id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+      <section class="auth-dialog">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">UCI HPC3 authorization</p>
+            <h3 id="authTitle">Connect SSH gateway</h3>
+          </div>
+          <button class="icon-button" id="closeAuthBtn" type="button" aria-label="Close authorization dialog">x</button>
+        </div>
+        <div class="auth-copy">
+          <p>
+            Request an HPC3 connection for this AiScientist session. AiScientist will not collect
+            your password, Duo code, or SSH private key.
+          </p>
+          <dl>
+            <div>
+              <dt>Host</dt>
+              <dd>hpc3.rcic.uci.edu</dd>
+            </div>
+            <div>
+              <dt>Requirement</dt>
+              <dd>UCI campus network/VPN and your UCInetID account</dd>
+            </div>
+            <div>
+              <dt>RCIC docs</dt>
+              <dd>
+                <a href="https://rcic.uci.edu/account/login.html" target="_blank" rel="noreferrer">Login</a>
+                ·
+                <a href="https://rcic.uci.edu/slurm/jobs.html" target="_blank" rel="noreferrer">Slurm jobs</a>
+              </dd>
+            </div>
+          </dl>
+        </div>
+        <form class="auth-form" id="authForm">
+          <label>
+            UCInetID
+            <input id="ucinetidInput" type="text" autocomplete="username" placeholder="panteater" />
+          </label>
+          <label>
+            Authentication method
+            <select id="authMethodSelect">
+              <option value="password_duo">Password + Duo</option>
+              <option value="ssh_key">Passphrase-protected SSH key</option>
+            </select>
+          </label>
+          <label class="check-row">
+            <input id="campusNetworkCheck" type="checkbox" />
+            I am on the UCI campus network or connected to UCI VPN.
+          </label>
+          <label class="check-row" id="duoCheckRow">
+            <input id="duoCheck" type="checkbox" />
+            Duo is enabled and I can approve the Duo prompt.
+          </label>
+          <label class="check-row hidden" id="keyPolicyCheckRow">
+            <input id="keyPolicyCheck" type="checkbox" />
+            My SSH key has a non-empty passphrase and belongs only to me.
+          </label>
+        </form>
+        <section class="connection-request hidden" id="connectionRequest">
+          <p class="eyebrow">Connection request</p>
+          <div class="command-box" id="sshCommandBox"></div>
+          <ol id="connectionSteps"></ol>
+        </section>
+        <div class="modal-actions">
+          <button class="ghost-action" id="startAuthBtn" type="button">Request HPC3 connection</button>
+          <button class="ghost-action" id="copySshBtn" type="button" disabled>Copy SSH command</button>
+          <button class="primary-action" id="completeAuthBtn" type="button" disabled>I completed SSH/Duo</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

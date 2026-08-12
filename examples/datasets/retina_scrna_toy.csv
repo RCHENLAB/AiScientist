@@ -1,0 +1,9 @@
+cell_id,condition,cell_type,MT-ND1,RHO,OPN1MW,PECAM1,GFAP
+c001,control,rod,4,120,5,0,1
+c002,control,rod,3,110,6,0,2
+c003,control,cone,2,20,95,0,1
+c004,control,endothelial,5,2,0,85,3
+c005,disease,rod,8,70,8,0,4
+c006,disease,rod,9,65,7,1,5
+c007,disease,cone,6,18,60,0,6
+c008,disease,glia,12,4,2,5,90

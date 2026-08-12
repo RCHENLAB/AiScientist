@@ -1,0 +1,99 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+# CPU analysis image for AiScientist CodeAct (run_code on HPC3).
+#
+# This is the container SlurmCodeExecutor (src/bioagent/gateway/slurm_sandbox.py) runs each
+# `run_code` snippet inside, so a snippet can `import scanpy/pandas/gseapy` on an HPC3 CPU node
+# where `#SBATCH --mem` is a REAL, cgroup-enforced cap. It mirrors the app's `analysis` extra
+# (pyproject.toml) so snippets behave the same as in the local CodeSandbox.
+#
+# CPU-only: NO torch, NO CUDA, NO GPU — those belong in scgpt.sif. Keep this image small.
+# The dataset + run dirs are bind-mounted at run time (dataset read-only); no DATA is baked in.
+# It DOES bake the core bioinformatics CLI toolkit (bcftools/samtools/tabix+bgzip/bedtools) + the
+# Python VCF/BAM libs (pysam/cyvcf2): those are compiled binaries a run_code snippet cannot
+# self-install at run time (read-only .sif, non-root, no conda), so baking them stops a snippet from
+# hard-stalling on a missing standard tool. Version-pinned annotation (VEP + predictors) stays in vep.sif.
+#
+# Build ON HPC3 or any Linux+singularity host (macOS cannot build .sif). See
+# deploy/analysis/build_and_stage.sh and deploy/analysis/README.md.
+#
+# Phase 4 of the HPC3 offload ALSO runs the scanpy analysis line here via
+# `python -m bioagent.tools.scrna_cli` (gateway/slurm_analysis.py::SlurmAnalysisExecutor). The
+# bioagent tools are NOT baked in — they are bind-mounted from dfs3b at run time and put on
+# PYTHONPATH by the executor, so editing a tool needs only a code sync, never an image rebuild.
+# This image therefore carries ONLY the heavy deps below — which also keeps `--remote` builds
+# working (a %files copy of local source can't reach the Sylabs cloud builder).
+
+%post
+    set -eux
+    # build-essential: build tools only if a wheel is missing (most of the stack ships manylinux wheels).
+    # Core bioinformatics CLI toolkit (bcftools/samtools/htslib-tabix/bedtools): these are COMPILED
+    # binaries that a run_code snippet CANNOT self-install at run time (the .sif root fs is read-only,
+    # the snippet is not root, and there is no conda) — so a snippet that reaches for `bcftools`/
+    # `samtools` would hard-stall. Baking them here removes that whole "stuck on a missing standard
+    # tool" class deterministically (no per-run network, no re-install). The `tabix` package provides
+    # both `tabix` and `bgzip`. NOTE: a binary being present is necessary but NOT sufficient for ops
+    # that also need reference data (e.g. `bcftools norm -f REF` needs the genome FASTA bind-mounted) —
+    # those still require the data bind + path. Debian's bcftools/samtools are fine for QC / stats /
+    # query / format conversion; version-pinned annotation stays in vep.sif.
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential bcftools samtools tabix bedtools \
+        && rm -rf /var/lib/apt/lists/*
+    # Match pyproject.toml [analysis] + the deps the run_code snippets actually reach for:
+    #  - scikit-misc: scanpy's seurat_v3 HVG flavor
+    #  - igraph: leidenalg's backend
+    #  - psutil: snippets self-check memory (a real run_code snippet tried `import psutil`)
+    #  - pysam / cyvcf2: the Python VCF/BAM libraries a variant snippet reaches for (both ship
+    #    manylinux wheels bundling htslib, so no build step); baked so they are instant, not re-pip'd
+    #    into the ephemeral tmpfs on every run_code call.
+    pip install --no-cache-dir \
+        "scanpy>=1.10" \
+        "anndata>=0.10" \
+        "gseapy>=1.1" \
+        "matplotlib>=3.8" \
+        "leidenalg>=0.10" \
+        "igraph>=0.11" \
+        "scikit-misc>=0.3" \
+        "pandas>=2.0" \
+        "scipy>=1.11" \
+        "numpy>=1.26" \
+        "psutil>=5.9" \
+        "h5py>=3.9" \
+        "pysam>=0.22" \
+        "cyvcf2>=0.30"
+    python -c "import scanpy, anndata, gseapy, leidenalg, pandas, numpy, scipy, psutil, h5py, pysam, cyvcf2; \
+print('analysis stack OK — scanpy', scanpy.__version__, 'pandas', pandas.__version__, 'pysam', pysam.__version__)"
+    # Fail the build if a baked CLI binary is missing, so a broken image never ships silently.
+    for t in bcftools samtools tabix bgzip bedtools; do command -v "$t" >/dev/null || { echo "MISSING: $t"; exit 1; }; done
+    bcftools --version | head -1
+
+%environment
+    # Headless plotting + writable caches (compute nodes have no display, and $HOME may be
+    # read-only inside --containall). The executor also sets MPLBACKEND=Agg per run.
+    export MPLBACKEND=Agg
+    export NUMBA_CACHE_DIR=/tmp/numba
+    export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-8}
+    # bioagent tools are bind-mounted from dfs3b + put on PYTHONPATH by the executor at run time
+    # (NOT baked here), so a tool edit needs only a code sync — never an image rebuild.
+
+%runscript
+    exec python "$@"
+
+%labels
+    org.bioagent.component codeact-analysis
+    org.bioagent.route cpu-slurm-runcode+analysis
+
+%help
+    CPU scanpy/pandas/gseapy analysis image for AiScientist on HPC3. Two uses:
+      1) CodeAct run_code snippets (gateway/slurm_sandbox.py):
+           singularity exec --containall --writable-tmpfs --net --network none \
+             -B <dataset>:<dataset>:ro -B <work>:<work> -B <artifacts>:<artifacts> \
+             analysis.sif python <snippet>.py
+      2) The scanpy analysis line (gateway/slurm_analysis.py), tools BOUND from dfs3b (not baked):
+           singularity exec --containall --net --network none \
+             -B <dataset>:<dataset>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
+             --env PYTHONPATH=<pysrc> \
+             analysis.sif python -m bioagent.tools.scrna_cli \
+               --tool run_scanpy_qc --workspace <run_ws> --dataset <dataset> --args <args.json>
+         (<pysrc> = <lab_storage>/<user>/pysrc, synced by the gateway; contains bioagent/)

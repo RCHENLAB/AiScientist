@@ -1,0 +1,47 @@
+{
+  "benchmark_id": "retina_autonomous_loop_seed_v1",
+  "title": "Retina glial activation and vascular marker shift after disease perturbation",
+  "domain": "biology",
+  "purpose": "Evaluate an autonomous research loop on hypothesis generation, experiment planning, and critical evaluation rather than local deterministic CSV execution.",
+  "background": [
+    "A pilot retina single-cell experiment suggests increased glial activation signal in disease-like samples.",
+    "A lightweight marker screen from a tiny toy dataset ranks GFAP higher in disease and PECAM1 lower in disease.",
+    "The toy screen is intentionally underpowered and should be treated as a seed observation, not a validated result."
+  ],
+  "seed_observations": {
+    "sample_context": "toy retina scRNA-seq marker summary",
+    "candidate_markers": [
+      {"gene": "GFAP", "direction": "higher in disease", "interpretation_seed": "glial activation or stress response"},
+      {"gene": "PECAM1", "direction": "lower in disease", "interpretation_seed": "vascular/endothelial compartment shift or dropout"},
+      {"gene": "MT-ND1", "direction": "higher in disease", "interpretation_seed": "mitochondrial stress or QC confound"}
+    ],
+    "known_limitations": [
+      "only 8 toy cells",
+      "no validated cell-type annotation",
+      "no statistical test or multiple-testing correction",
+      "no batch, donor, or technical covariate metadata"
+    ]
+  },
+  "requested_autonomous_loop_output": [
+    "Generate 3 testable biological or technical hypotheses.",
+    "For each hypothesis, propose one validation experiment or analysis.",
+    "Name the most relevant research tools or databases to consult.",
+    "Define success criteria and falsification criteria.",
+    "Critique likely confounders and avoid claiming validated biology."
+  ],
+  "expected_skill_fit": [
+    "scientific-brainstorming",
+    "scientific-critical-thinking",
+    "literature-review",
+    "gene-database",
+    "gget or PubMed-style search",
+    "single-cell analysis planning"
+  ],
+  "engineering_success_criteria": [
+    "The agent returns structured hypotheses rather than raw QC metrics.",
+    "The agent proposes a multi-step research plan.",
+    "The agent identifies limitations and confounders.",
+    "The agent names tools/databases that could support the next research loop.",
+    "The agent does not pretend the toy marker screen is validated biology."
+  ]
+}

@@ -1,0 +1,3 @@
+# run artifacts (logs/JSON may carry account ids or study text) — never commit
+*
+!.gitignore

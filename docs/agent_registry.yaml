@@ -1,0 +1,390 @@
+version: 1
+updated: "2026-06-08"
+purpose: >
+  Source-of-truth registry for AiScientist development management. Multica can
+  track work items, while this file tracks each internal agent/component status,
+  implementation boundary, evidence, and next engineering step.
+
+status_legend:
+  implemented:
+    color: green
+    meaning: Implemented with local tests or sample artifacts.
+  partial:
+    color: yellow
+    meaning: Adapter, policy, or interface exists, but the real runtime is not connected.
+  guardrail:
+    color: blue
+    meaning: Safety boundary or permission-control component.
+  planned:
+    color: gray
+    meaning: Planned but not implemented yet.
+
+agents:
+  - id: coordinator_agent
+    display_name: CoordinatorAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Interpret the researcher request and create the staged local-first workflow plan.
+    entrypoint: CoordinatorAgent.run
+    inputs:
+      - research question
+      - workflow state
+    outputs:
+      - staged plan
+      - coordinator message
+    evidence:
+      - tests/test_workflow.py
+      - runs/literature-tool-check-2/artifacts/final_report.md
+    next_steps:
+      - Surface plan steps in the future frontend timeline.
+
+  - id: data_agent
+    display_name: DataAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Select reusable tools and build the Kosmos-style kernel/data-boundary plan.
+    entrypoint: DataAgent.run
+    inputs:
+      - research question
+      - optional dataset path
+      - KosmosAdapter
+    outputs:
+      - tool_plans
+      - kosmos_kernel_plan
+    evidence:
+      - runs/kosmos-kernel-smoke/kosmos_kernel_smoke.md
+      - runs/literature-tool-check-2/artifacts/agent_decision_trace.json
+    next_steps:
+      - Split tool selection from runtime execution before adding a real KosmosRuntimeClient.
+
+  - id: local_analysis_agent
+    display_name: LocalAnalysisAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Run local dataset smoke analysis and write dataset manifests, summaries, and QC preflight artifacts.
+    entrypoint: LocalAnalysisAgent.run
+    inputs:
+      - local CSV or H5AD dataset path
+    outputs:
+      - dataset_manifest.json
+      - dataset_results.json
+      - qc_metrics.json
+      - qc_preflight_summary.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/dataset_summary.md
+      - runs/literature-tool-check-2/artifacts/qc_preflight_summary.md
+    next_steps:
+      - Replace smoke-level dataset analysis with production Scanpy loaders and visual QC plots.
+
+  - id: single_cell_qc_execution_agent
+    display_name: SingleCellQCExecutionAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Build deterministic single-cell QC execution artifacts from local derived dataset summaries.
+    entrypoint: SingleCellQCExecutionAgent.run
+    inputs:
+      - dataset_result
+      - dataset manifest
+    outputs:
+      - single_cell_qc_execution.json
+      - single_cell_qc_execution_summary.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/single_cell_qc_execution_summary.md
+      - tests/test_workflow.py
+    next_steps:
+      - Add production QC thresholds, plots, and optional Scanpy-backed execution.
+
+  - id: differential_expression_execution_agent
+    display_name: DifferentialExpressionExecutionAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Run deterministic marker/effect screening when condition metadata is available and block unsupported DE claims otherwise.
+    entrypoint: DifferentialExpressionExecutionAgent.run
+    inputs:
+      - dataset_result
+      - condition metadata
+    outputs:
+      - de_marker_execution.json
+      - de_marker_execution_summary.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/de_marker_execution_summary.md
+      - runs/autonomous-research-pbmc3k-tools/autonomous_research_report.md
+    next_steps:
+      - Add full DE statistics, contrast definitions, and pathway hooks.
+
+  - id: literature_grounding_agent
+    display_name: LiteratureGroundingAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Query public literature with sanitized terms while preventing raw dataset or private metadata leakage.
+    entrypoint: LiteratureGroundingAgent.run
+    inputs:
+      - public sanitized query
+      - derived workflow context
+    outputs:
+      - literature_grounding.json
+      - literature_grounding.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/literature_grounding.md
+      - tests/test_workflow.py
+    next_steps:
+      - Add multi-database retrieval and stronger relevance scoring.
+
+  - id: generated_code_execution_agent
+    display_name: GeneratedCodeExecutionAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Execute generated summary code only against derived JSON artifacts with network disabled and raw dataset reads blocked.
+    entrypoint: GeneratedCodeExecutionAgent.run
+    inputs:
+      - derived JSON artifacts
+    outputs:
+      - generated_code_execution.json
+      - generated_code_execution.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/generated_code_execution.md
+      - tests/test_workflow.py
+    next_steps:
+      - Move execution into a container sandbox before allowing user-authored analysis snippets.
+
+  - id: hpc_agent
+    display_name: HPCAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Render dry-run Slurm scripts and queue waiting/local-fallback policy artifacts.
+    entrypoint: HPCAgent.run
+    inputs:
+      - selected tool plan
+      - Slurm job spec
+    outputs:
+      - slurm_job.sh
+      - hpc_queue_fallback_plan.md
+      - hpc_queue_fallback_plan.json
+    evidence:
+      - runs/hpc-fallback-check/artifacts/hpc_queue_fallback_plan.md
+      - tests/test_workflow.py
+    next_steps:
+      - Add reviewed real sbatch/squeue integration and queue-state UI.
+
+  - id: validation_agent
+    display_name: ValidationAgent
+    status: guardrail
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Validate privacy, provenance, Slurm boundaries, literature boundaries, and generated-code isolation.
+    entrypoint: ValidationAgent.run
+    inputs:
+      - workflow decisions
+      - artifact list
+    outputs:
+      - validation decision
+      - safety messages
+    evidence:
+      - tests/test_workflow.py
+      - runs/literature-tool-check-2/artifacts/final_report.md
+    next_steps:
+      - Convert validation checks into structured frontend-visible risk flags.
+
+  - id: research_evaluation_agent
+    display_name: ResearchEvaluationAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Evaluate whether outputs are claim-safe, evidence-backed, and ready for next research step.
+    entrypoint: ResearchEvaluationAgent.run
+    inputs:
+      - QC execution result
+      - DE or marker-screen result
+      - validation decision
+    outputs:
+      - research_evaluation.json
+      - research_evaluation_summary.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/research_evaluation_summary.md
+      - runs/autonomous-research-pbmc3k-tools/evaluator_report.md
+    next_steps:
+      - Add evaluator rubric versioning and reviewer override records.
+
+  - id: reporter_agent
+    display_name: ReporterAgent
+    status: implemented
+    source: src/bioagent/agents/pipeline.py
+    owner: unassigned
+    responsibility: Render the final human-readable report and artifact references.
+    entrypoint: ReporterAgent.run
+    inputs:
+      - workflow state
+      - artifacts
+      - decisions
+    outputs:
+      - final_report.md
+    evidence:
+      - runs/literature-tool-check-2/artifacts/final_report.md
+      - runs/hpc-fallback-check/artifacts/final_report.md
+    next_steps:
+      - Emit a frontend-friendly report index with stable sections and severity levels.
+
+  - id: checkpointed_autonomous_loop
+    display_name: CheckpointedAutonomousLoop
+    status: implemented
+    source: src/bioagent/eval/autonomous_loop.py
+    owner: unassigned
+    responsibility: Run staged autonomous research rounds with checkpoints, token tracking, progress metrics, and finalize-only recovery.
+    entrypoint: python -m bioagent.autonomous_loop
+    inputs:
+      - dataset path
+      - run mode
+      - token and round budgets
+    outputs:
+      - autonomous_research_report.md
+      - checkpoint_XX.md
+      - token_usage.json
+      - progress_metrics.csv
+      - artifact_index.json
+    evidence:
+      - runs/autonomous-research-pbmc3k-tools/autonomous_research_report.md
+      - runs/autonomous-research-pbmc3k-tools/progress_metrics.csv
+    next_steps:
+      - Add frontend resume controls and 15-minute delivery status cards.
+
+  - id: kosmos_adapter
+    display_name: KosmosAdapter / KosmosKernelAdapter
+    status: partial
+    source: src/bioagent/integrations/
+    owner: unassigned
+    responsibility: Model Kosmos-style tools, permissions, and data-boundary decisions without calling unsafe external runtime by default.
+    entrypoint: KosmosKernelAdapter.build_kernel_plan
+    inputs:
+      - research question
+      - optional dataset path
+      - KosmosSafetyPolicy
+    outputs:
+      - kosmos_kernel_plan
+      - allowed and blocked tool decisions
+    evidence:
+      - runs/kosmos-kernel-smoke/kosmos_kernel_smoke.md
+      - docs/archive/kosmos_kernel_guardrails.md
+    next_steps:
+      - Implement optional KosmosRuntimeClient or KosmosCliRuntime behind the current safety boundary.
+
+  - id: kosmos_bridge_agent
+    display_name: KosmosBridgeAgent
+    status: partial
+    source: src/bioagent/eval/parity.py
+    owner: unassigned
+    responsibility: Build concise Kosmos-compatible research briefs from local AiScientist artifacts for parity/gap evaluation.
+    entrypoint: KosmosBridgeAgent.build_research_brief
+    inputs:
+      - local artifacts
+      - scenario definition
+    outputs:
+      - research_brief.json
+      - kosmos_prompt.txt
+    evidence:
+      - runs/parity-integrated-bridge/kosmos_bridge/research_brief.json
+      - runs/parity-integrated-bridge/parity_report.md
+    next_steps:
+      - Connect to a reviewed runtime backend instead of baseline-only comparison.
+
+  - id: biomni_execution_agent
+    display_name: BiomniExecutionAgent / BiomniAdapter
+    status: partial
+    source: src/bioagent/integrations/biomni_adapter.py
+    owner: unassigned
+    responsibility: Model Biomni-style biomedical backend capabilities, local-first policy, and privacy decisions before any live Biomni runtime call.
+    entrypoint: BiomniAdapter.build_execution_plan
+    inputs:
+      - research question
+      - optional dataset path
+      - BiomniSafetyPolicy
+    outputs:
+      - biomni_execution_plan.json
+      - biomni_execution_plan.md
+    evidence:
+      - tests/test_workflow.py
+      - docs/archive/reference_architecture.md
+    next_steps:
+      - Add a reviewed local Biomni runtime client that can call a separately cloned Biomni environment with local model configuration.
+
+  - id: parity_evaluation_agent
+    display_name: ParityEvaluationAgent
+    status: implemented
+    source: src/bioagent/eval/parity.py
+    owner: unassigned
+    responsibility: Score AiScientist and Kosmos reference outputs by parity dimensions and render gap reports.
+    entrypoint: ParityEvaluationAgent.render_report
+    inputs:
+      - AiScientist run summary
+      - Kosmos run summary
+    outputs:
+      - parity_report.md
+      - parity_report.json
+    evidence:
+      - runs/parity-integrated-bridge/parity_report.md
+      - runs/parity-local-data/parity_report.md
+    next_steps:
+      - Add trend tracking across PRs and benchmark runs.
+
+  - id: local_qwen_runtime
+    display_name: Local Qwen / vLLM Runtime
+    status: planned
+    source: src/bioagent/providers/openai_compatible.py
+    owner: unassigned
+    responsibility: Route coordinator/evaluator LLM calls to a lab-server local endpoint for private deployment.
+    entrypoint: planned
+    inputs:
+      - OpenAI-compatible base URL
+      - model name
+    outputs:
+      - LLM responses with token usage
+    evidence:
+      - README.md
+      - HANDOFF.md
+    next_steps:
+      - Validate against a real lab-server vLLM or SGLang endpoint.
+
+  - id: real_slurm_submit
+    display_name: Real Slurm Submit / Queue Monitor
+    status: planned
+    source: src/bioagent/hpc/slurm.py
+    owner: unassigned
+    responsibility: Submit reviewed jobs to UCI HPC and monitor queue state while keeping fallback labels explicit.
+    entrypoint: planned
+    inputs:
+      - reviewed Slurm script
+      - human approval
+    outputs:
+      - job id
+      - queue status
+      - resume checkpoint
+    evidence:
+      - runs/hpc-fallback-check/artifacts/hpc_queue_fallback_plan.md
+    next_steps:
+      - Add sbatch/squeue adapter behind human-review gate.
+
+  - id: frontend_dashboard
+    display_name: Frontend Dashboard
+    status: planned
+    source: ui/
+    owner: unassigned
+    responsibility: Visualize agent state, artifact status, queue/fallback mode, checkpoints, and risk gates.
+    entrypoint: planned
+    inputs:
+      - agent registry
+      - artifact index
+      - run reports
+    outputs:
+      - local web dashboard
+    evidence:
+      - docs/archive/agent_dashboard.md
+      - docs/agent_architecture.mmd
+    next_steps:
+      - Start with a static dashboard that reads registry and sample run artifacts.

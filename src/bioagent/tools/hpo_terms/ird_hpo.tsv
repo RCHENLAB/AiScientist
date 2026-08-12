@@ -1,0 +1,37 @@
+# Curated IRD (inherited retinal disease) phenotype terms → HPO, for upstream-agent phenotype
+# inference (NO human-in-the-loop). The orchestrator maps a study's described symptoms / disease
+# names to these HPO terms and passes them to Exomiser; if nothing matches, the default root term
+# HP:0000556 (Retinal dystrophy) is used so a run never blocks on phenotype.
+#
+# This table is the ALIAS layer over the full HPO index (hpo_lexicon.tsv.gz): it exists for clinical
+# shorthand the ontology has no name for — DISEASE names used as phenotype shorthand ("Stargardt") and
+# field abbreviations ("LCA", "BBS"). An exact ontology name always wins over a row here (see
+# mapper.map_phrase), so rows do NOT need to restate terms HPO already names.
+#
+# All HPO IDs verified against the HPO API (ontology.jax.org) 2026-07-12; rows added 2026-07-15 were
+# verified against the bundled HPO 2026-06-23 lexicon. Expand as needed — keep keywords specific
+# (matching is word-boundary anchored, so short aliases like "ird" cannot fire inside another word).
+# Format:  HPO_ID <TAB> name <TAB> keyword|keyword|...
+#
+# NOTE a disease-name alias maps to the phenotype the diagnosis directly asserts, and no further: "BBS"
+# yields Retinal dystrophy, not the syndrome's obesity/polydactyly/renal features. Those are real BBS
+# features but are NOT stated by the text, and inventing findings a clinician did not write is how a
+# phenotype-driven differential quietly becomes fiction. LIRICAL's own HPO/OMIM annotations supply what
+# the disease implies; our job is only to encode what was said.
+HP:0000556	Retinal dystrophy	retinal dystrophy|inherited retinal|inherited retinal disease|ird|retinal disease|leber congenital amaurosis|lca|usher syndrome|bardet-biedl|bardet biedl|bbs
+HP:0001135	Chorioretinal dystrophy	choroidal dystrophy|chorioretinal dystrophy|choroidal degeneration
+HP:0007963	Pattern dystrophy of the retina	pattern dystrophy
+HP:0000510	Rod-cone dystrophy	rod-cone|rod cone|retinitis pigmentosa|rod-cone dystrophy|rp
+HP:0000548	Cone/cone-rod dystrophy	cone dystrophy|cone-rod|cone rod|cord
+HP:0007754	Macular dystrophy	macular dystrophy|macular degeneration|stargardt|best disease|vitelliform|maculopathy
+HP:0011516	Achromatopsia	achromatopsia|color blindness|colour blindness|total color blindness
+HP:0000662	Nyctalopia	night blindness|nyctalopia
+HP:0007675	Progressive night blindness	progressive night blindness|worsening night vision
+HP:0000546	Retinal degeneration	retinal degeneration|degeneration of the retina
+HP:0000613	Photophobia	photophobia|light sensitivity|sensitivity to light
+HP:0001133	Constriction of peripheral visual field	tunnel vision|peripheral vision loss|peripheral field loss|constricted visual field|constriction of the visual field
+HP:0001123	Visual field defect	visual field defect|field defect|scotoma
+HP:0000505	Visual impairment	visual impairment|vision loss|loss of vision|reduced vision|reduced visual acuity|low vision|blindness
+HP:0000512	Abnormal electroretinogram	electroretinogram|abnormal erg|reduced erg|nonrecordable erg
+HP:0000648	Optic atrophy	optic atrophy|optic nerve atrophy
+HP:0000501	Glaucoma	glaucoma|raised intraocular pressure

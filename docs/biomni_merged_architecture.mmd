@@ -1,0 +1,84 @@
+flowchart LR
+    R["Researcher / Lab UI"] --> I["AiScientist Intake and Orchestrator"]
+    I --> C["CoordinatorAgent / PI Role"]
+
+    subgraph BIOAGENT["AiScientist Lab-Local Orchestration and Safety Layer"]
+        C --> TM["Team Meeting Loop"]
+        C --> IM["Individual Specialist Loop"]
+        TM --> DS["Domain Specialists"]
+        IM --> DS
+        DS --> CB["Computational Biologist"]
+        DS --> ML["Machine Learning Specialist"]
+        DS --> IMM["Immunologist / Domain Expert"]
+        C --> DA["DataAgent"]
+        C --> LA["LocalAnalysisAgent"]
+        LA --> QC["SingleCellQCExecutionAgent"]
+        LA --> DE["DifferentialExpressionExecutionAgent"]
+        C --> LIT["LiteratureGroundingAgent"]
+        LIT --> DBG["DataBoundaryGuard"]
+        C --> HPC["HPCAgent"]
+        QC --> V["ValidationAgent / Scientific Critic"]
+        DE --> V
+        LIT --> V
+        HPC --> V
+        V --> EV["ResearchEvaluationAgent"]
+        EV --> REP["ReporterAgent"]
+        REP --> ART["Reports, Artifacts, Checkpoints"]
+    end
+
+    subgraph KOSMOS["Kosmos Reference Boundary"]
+        KKA["KosmosAdapter / Research-Loop Kernel"]
+        KSP["Kosmos Safety Policy"]
+        KRT["KosmosRuntimeClient / Future Optional Runtime"]
+        KRL["Autonomous Research Loop Reference"]
+        KVAL["Hypothesis / Experiment / Critique Pattern"]
+        KKA --> KSP
+        KKA -.-> KRT
+        KKA --> KRL
+        KRL --> KVAL
+    end
+
+    subgraph BIOMNI["Biomni Execution Backend Boundary"]
+        BA["BiomniAdapter"]
+        BLP["Biomni Local-First Policy"]
+        BT["Biomni Tool and Database Capabilities"]
+        BGEN["Genomics / Variants"]
+        BOMICS["Single-cell / Omics"]
+        BPROT["Protein / Structure / Docking"]
+        BPATH["Pathway / Literature / Public DBs"]
+        BA --> BLP
+        BA --> BT
+        BT --> BGEN
+        BT --> BOMICS
+        BT --> BPROT
+        BT --> BPATH
+    end
+
+    DA --> KKA
+    CB --> BA
+    ML --> BA
+    IMM --> BA
+    BA --> V
+    KKA --> V
+    HPC -.-> SLURM["Reviewed Slurm Submit / Queue Monitor"]
+    ART --> UI["Frontend Dashboard / Figma Target"]
+
+    subgraph LEG["Status Legend"]
+        L1["Green: implemented in AiScientist"]
+        L2["Yellow: planned/adapter boundary"]
+        L3["Blue: privacy and safety guardrail"]
+        L4["Gray: external/future runtime"]
+        L5["Dashed box: external reference/integration boundary"]
+    end
+
+    classDef done fill:#DFF5E1,stroke:#258A43,stroke-width:2px,color:#123D1F;
+    classDef partial fill:#FFF1C7,stroke:#B7791F,stroke-width:2px,color:#4A3210;
+    classDef guard fill:#DDEBFF,stroke:#2F6FDB,stroke-width:2px,color:#102A56;
+    classDef external fill:#ECEFF3,stroke:#7A8594,stroke-width:2px,color:#26313F;
+    classDef boundary fill:#FFFFFF,stroke:#6B7280,stroke-width:2px,stroke-dasharray:8 6,color:#111827;
+
+    class R,I,C,TM,IM,DS,CB,ML,IMM,DA,LA,QC,DE,LIT,HPC,EV,REP,ART,UI,L1 done;
+    class BA,KKA,BT,BGEN,BOMICS,BPROT,BPATH,KRL,KVAL,L2 partial;
+    class KSP,BLP,DBG,V,L3 guard;
+    class KRT,SLURM,L4 external;
+    class BIOAGENT,KOSMOS,BIOMNI,LEG,L5 boundary;

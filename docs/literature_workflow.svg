@@ -1,0 +1,244 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1380" viewBox="0 0 1800 1380">
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .title { font: 700 38px Arial, Helvetica, sans-serif; fill: #16324f; }
+      .subtitle { font: 400 18px Arial, Helvetica, sans-serif; fill: #58677a; }
+      .section-title { font: 700 24px Arial, Helvetica, sans-serif; fill: #12314f; }
+      .box-title { font: 700 18px Arial, Helvetica, sans-serif; fill: #142033; }
+      .box-text { font: 400 15px Arial, Helvetica, sans-serif; fill: #304054; }
+      .small { font: 400 13px Arial, Helvetica, sans-serif; fill: #5e6d7f; }
+      .panel { fill: #ffffff; stroke: #cfd8e3; stroke-width: 2; rx: 18; }
+      .box { fill: #ffffff; stroke: #8fb3d9; stroke-width: 2; rx: 12; }
+      .search { fill: #eef7ff; stroke: #5f9ed8; }
+      .plan { fill: #f2f7f1; stroke: #72ad74; }
+      .refs { fill: #fff6e7; stroke: #d89a41; }
+      .report { fill: #f5efff; stroke: #9a7ad6; }
+      .guard { fill: #fff0f0; stroke: #d46d6d; }
+      .arrow { stroke: #50677f; stroke-width: 2.4; fill: none; marker-end: url(#arrowhead); }
+      .thin-arrow { stroke: #6c7d90; stroke-width: 1.8; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke-dasharray: 8 7; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#50677f"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1380"/>
+  <text class="title" x="70" y="70">BioAgent Literature Line Workflow</text>
+  <text class="subtitle" x="70" y="103">How a user literature request becomes Europe PMC citations and final report References.</text>
+
+  <!-- Main workflow -->
+  <rect class="panel" x="60" y="135" width="1680" height="295"/>
+  <text class="section-title" x="90" y="178">Main workflow</text>
+
+  <rect class="box plan" x="90" y="215" width="225" height="120"/>
+  <text class="box-title" x="115" y="248">User prompt</text>
+  <text class="box-text" x="115" y="278">Question asks for</text>
+  <text class="box-text" x="115" y="300">literature, references,</text>
+  <text class="box-text" x="115" y="322">citations, or biology context.</text>
+
+  <rect class="box plan" x="380" y="215" width="245" height="120"/>
+  <text class="box-title" x="405" y="248">PI plan guard</text>
+  <text class="box-text" x="405" y="278">Ensures one canonical</text>
+  <text class="box-text" x="405" y="300">literature_search step</text>
+  <text class="box-text" x="405" y="322">when requested.</text>
+
+  <rect class="box search" x="690" y="215" width="245" height="120"/>
+  <text class="box-title" x="715" y="248">Scientist hard route</text>
+  <text class="box-text" x="715" y="278">Literature step bypasses</text>
+  <text class="box-text" x="715" y="300">LLM tool choice and calls</text>
+  <text class="box-text" x="715" y="322">literature_search directly.</text>
+
+  <rect class="box search" x="1000" y="215" width="235" height="120"/>
+  <text class="box-title" x="1025" y="248">Europe PMC search</text>
+  <text class="box-text" x="1025" y="278">Keyword API returns real</text>
+  <text class="box-text" x="1025" y="300">paper metadata with</text>
+  <text class="box-text" x="1025" y="322">DOI / PMID / URL.</text>
+
+  <rect class="box refs" x="1300" y="215" width="240" height="120"/>
+  <text class="box-title" x="1325" y="248">Accepted citations</text>
+  <text class="box-text" x="1325" y="278">Critic-accepted results</text>
+  <text class="box-text" x="1325" y="300">are reused in final</text>
+  <text class="box-text" x="1325" y="322">References.</text>
+
+  <rect class="box report" x="1575" y="215" width="135" height="120"/>
+  <text class="box-title" x="1595" y="248">Report</text>
+  <text class="box-text" x="1595" y="278">DOCX / PDF</text>
+  <text class="box-text" x="1595" y="300">with real</text>
+  <text class="box-text" x="1595" y="322">References.</text>
+
+  <path class="arrow" d="M315 275 H380"/>
+  <path class="arrow" d="M625 275 H690"/>
+  <path class="arrow" d="M935 275 H1000"/>
+  <path class="arrow" d="M1235 275 H1300"/>
+  <path class="arrow" d="M1540 275 H1575"/>
+
+  <text class="small" x="90" y="382">Key rule: the final report does not run a hidden fallback search. References must come from an accepted literature_search step.</text>
+
+  <!-- Search subflow -->
+  <rect class="panel" x="60" y="470" width="820" height="390"/>
+  <text class="section-title" x="90" y="512">Subflow A: literature_search / Europe PMC</text>
+
+  <rect class="box search" x="90" y="550" width="220" height="95"/>
+  <text class="box-title" x="115" y="582">Raw step text</text>
+  <text class="box-text" x="115" y="612">Example: Search DDX41</text>
+  <text class="box-text" x="115" y="634">retina Return citations.</text>
+
+  <rect class="box search" x="360" y="550" width="220" height="95"/>
+  <text class="box-title" x="385" y="582">focus_literature_query</text>
+  <text class="box-text" x="385" y="612">Drop UI/file terms and</text>
+  <text class="box-text" x="385" y="634">keep public keywords.</text>
+
+  <rect class="box search" x="630" y="550" width="210" height="95"/>
+  <text class="box-title" x="655" y="582">Query Europe PMC</text>
+  <text class="box-text" x="655" y="612">GET /webservices/</text>
+  <text class="box-text" x="655" y="634">rest/search</text>
+
+  <path class="arrow" d="M310 598 H360"/>
+  <path class="arrow" d="M580 598 H630"/>
+
+  <rect class="box search" x="90" y="710" width="220" height="95"/>
+  <text class="box-title" x="115" y="742">Normalize metadata</text>
+  <text class="box-text" x="115" y="772">title, authors, year,</text>
+  <text class="box-text" x="115" y="794">journal, doi, pmid, url.</text>
+
+  <rect class="box guard" x="360" y="710" width="220" height="95"/>
+  <text class="box-title" x="385" y="742">Filter weak hits</text>
+  <text class="box-text" x="385" y="772">Remove abstract books,</text>
+  <text class="box-text" x="385" y="794">posters, supplements.</text>
+
+  <rect class="box search" x="630" y="710" width="210" height="95"/>
+  <text class="box-title" x="655" y="742">Rank and return</text>
+  <text class="box-text" x="655" y="772">Prefer DOI/PMID and</text>
+  <text class="box-text" x="655" y="794">query-matching titles.</text>
+
+  <path class="arrow" d="M735 645 V675 H200 V710"/>
+  <path class="arrow" d="M310 758 H360"/>
+  <path class="arrow" d="M580 758 H630"/>
+
+  <!-- Reference subflow -->
+  <rect class="panel" x="920" y="470" width="820" height="390"/>
+  <text class="section-title" x="950" y="512">Subflow B: References insertion</text>
+
+  <rect class="box refs" x="950" y="550" width="220" height="95"/>
+  <text class="box-title" x="975" y="582">Accepted rounds only</text>
+  <text class="box-text" x="975" y="612">Ignore rejected or failed</text>
+  <text class="box-text" x="975" y="634">literature_search calls.</text>
+
+  <rect class="box refs" x="1220" y="550" width="220" height="95"/>
+  <text class="box-title" x="1245" y="582">Select DOI/PMID</text>
+  <text class="box-text" x="1245" y="612">Keep citations mentioned</text>
+  <text class="box-text" x="1245" y="634">in final_answer.</text>
+
+  <rect class="box refs" x="1490" y="550" width="210" height="95"/>
+  <text class="box-title" x="1515" y="582">Normalize citations</text>
+  <text class="box-text" x="1515" y="612">Fill URL or citation text</text>
+  <text class="box-text" x="1515" y="634">when missing.</text>
+
+  <path class="arrow" d="M1170 598 H1220"/>
+  <path class="arrow" d="M1440 598 H1490"/>
+
+  <rect class="box refs" x="950" y="710" width="220" height="95"/>
+  <text class="box-title" x="975" y="742">Format section</text>
+  <text class="box-text" x="975" y="772">Build numbered</text>
+  <text class="box-text" x="975" y="794">## References.</text>
+
+  <rect class="box refs" x="1220" y="710" width="220" height="95"/>
+  <text class="box-title" x="1245" y="742">Insert into report</text>
+  <text class="box-text" x="1245" y="772">Replace placeholder or</text>
+  <text class="box-text" x="1245" y="794">existing References body.</text>
+
+  <rect class="box guard" x="1490" y="710" width="210" height="95"/>
+  <text class="box-title" x="1515" y="742">Empty case</text>
+  <text class="box-text" x="1515" y="772">Write honest note; no</text>
+  <text class="box-text" x="1515" y="794">fabricated references.</text>
+
+  <path class="arrow" d="M1595 645 V675 H1060 V710"/>
+  <path class="arrow" d="M1170 758 H1220"/>
+  <path class="thin-arrow dash" d="M1440 758 H1490"/>
+
+  <!-- Planning subflow -->
+  <rect class="panel" x="60" y="900" width="820" height="370"/>
+  <text class="section-title" x="90" y="942">Subflow C: PI plan guard</text>
+
+  <rect class="box plan" x="90" y="980" width="220" height="90"/>
+  <text class="box-title" x="115" y="1012">Detect request</text>
+  <text class="box-text" x="115" y="1040">Look for literature,</text>
+  <text class="box-text" x="115" y="1062">references, citations.</text>
+
+  <rect class="box plan" x="360" y="980" width="220" height="90"/>
+  <text class="box-title" x="385" y="1012">Tool available?</text>
+  <text class="box-text" x="385" y="1040">Only modify plan if</text>
+  <text class="box-text" x="385" y="1062">literature_search exists.</text>
+
+  <rect class="box plan" x="630" y="980" width="210" height="90"/>
+  <text class="box-title" x="655" y="1012">Canonical step</text>
+  <text class="box-text" x="655" y="1040">Literature search for</text>
+  <text class="box-text" x="655" y="1062">focused query.</text>
+
+  <path class="arrow" d="M310 1025 H360"/>
+  <path class="arrow" d="M580 1025 H630"/>
+
+  <rect class="box plan" x="90" y="1130" width="220" height="90"/>
+  <text class="box-title" x="115" y="1162">Already has step</text>
+  <text class="box-text" x="115" y="1190">Collapse duplicates into</text>
+  <text class="box-text" x="115" y="1212">one literature step.</text>
+
+  <rect class="box plan" x="360" y="1130" width="220" height="90"/>
+  <text class="box-title" x="385" y="1162">Agenda has room</text>
+  <text class="box-text" x="385" y="1190">Append literature step</text>
+  <text class="box-text" x="385" y="1212">near the end.</text>
+
+  <rect class="box plan" x="630" y="1130" width="210" height="90"/>
+  <text class="box-title" x="655" y="1162">Agenda is full</text>
+  <text class="box-text" x="655" y="1190">Replace lower-priority</text>
+  <text class="box-text" x="655" y="1212">pathway/annotation step.</text>
+
+  <path class="thin-arrow dash" d="M735 1070 V1100 H200 V1130"/>
+  <path class="thin-arrow dash" d="M735 1070 V1100 H470 V1130"/>
+  <path class="thin-arrow dash" d="M735 1070 V1130"/>
+
+  <!-- Report polish subflow -->
+  <rect class="panel" x="920" y="900" width="820" height="370"/>
+  <text class="section-title" x="950" y="942">Subflow D: Report polish guardrails</text>
+
+  <rect class="box report" x="950" y="980" width="220" height="90"/>
+  <text class="box-title" x="975" y="1012">Report writer</text>
+  <text class="box-text" x="975" y="1040">Leaves reserved</text>
+  <text class="box-text" x="975" y="1062">## References slot.</text>
+
+  <rect class="box report" x="1220" y="980" width="220" height="90"/>
+  <text class="box-title" x="1245" y="1012">Self-review</text>
+  <text class="box-text" x="1245" y="1040">Clean placeholders and</text>
+  <text class="box-text" x="1245" y="1062">bad figure refs.</text>
+
+  <rect class="box guard" x="1490" y="980" width="210" height="90"/>
+  <text class="box-title" x="1515" y="1012">Deterministic cleanup</text>
+  <text class="box-text" x="1515" y="1040">Remove body Title /</text>
+  <text class="box-text" x="1515" y="1062">Authors / DOI blocks.</text>
+
+  <path class="arrow" d="M1170 1025 H1220"/>
+  <path class="arrow" d="M1440 1025 H1490"/>
+
+  <rect class="box guard" x="950" y="1130" width="220" height="90"/>
+  <text class="box-title" x="975" y="1162">Literature section</text>
+  <text class="box-text" x="975" y="1190">Remove fake see-Figure</text>
+  <text class="box-text" x="975" y="1212">callouts only there.</text>
+
+  <rect class="box refs" x="1220" y="1130" width="220" height="90"/>
+  <text class="box-title" x="1245" y="1162">Last writer wins</text>
+  <text class="box-text" x="1245" y="1190">References are inserted</text>
+  <text class="box-text" x="1245" y="1212">after review/cleanup.</text>
+
+  <rect class="box report" x="1490" y="1130" width="210" height="90"/>
+  <text class="box-title" x="1515" y="1162">Render outputs</text>
+  <text class="box-text" x="1515" y="1190">Generate report.docx</text>
+  <text class="box-text" x="1515" y="1212">and report.pdf.</text>
+
+  <path class="thin-arrow dash" d="M1595 1070 V1100 H1060 V1130"/>
+  <path class="arrow" d="M1170 1175 H1220"/>
+  <path class="arrow" d="M1440 1175 H1490"/>
+
+  <text class="small" x="70" y="1332">Files to inspect: registry.py, research_lab.py, literature_search.py, gateway/app.py, literature_references.py.</text>
+</svg>

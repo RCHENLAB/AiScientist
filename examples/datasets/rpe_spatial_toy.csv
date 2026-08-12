@@ -1,0 +1,9 @@
+spot_id,region,condition,RPE65,BEST1,VEGFA,C3,CFH
+s001,macula,control,95,80,20,12,40
+s002,macula,control,92,78,22,10,42
+s003,periphery,control,75,70,18,11,38
+s004,periphery,control,78,72,19,12,39
+s005,macula,disease,60,55,65,45,25
+s006,macula,disease,58,50,70,48,23
+s007,periphery,disease,62,54,60,40,27
+s008,periphery,disease,64,56,62,42,26

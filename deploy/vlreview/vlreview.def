@@ -1,0 +1,80 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+# Qwen2.5-VL render-review image for AiScientist (Route C: short-lived gpu:1 batch job).
+#
+# WHY a vision model at all: Qwen3.6 (the main LLM) is TEXT-ONLY, so it can audit the
+# NUMBERS behind a chart but is blind to render-level defects — text-over-text overlap,
+# a caption printed on top of the figure, clipped/truncated cells, a table that overran
+# its box. Those only exist in the FINAL rendered pdf/docx, and only "looking" finds them.
+# So we pair the text LLM with a SEPARATE small VL model, run exactly like scGPT (Route C):
+#   - NOT co-located on Qwen's vLLM GPU (that server claims most VRAM), and
+#   - NOT a second *persistent* GPU (which would hold a scarce card for the whole session).
+# It loads once, reviews the rendered pages, writes review.json, and exits — releasing the
+# GPU. Same shape as deploy/scgpt/scgpt.def and gateway/scgpt_job.py.
+#
+# Build ON HPC3 (macOS cannot build .sif). The reference MODEL WEIGHTS are NOT baked in —
+# they are bind-mounted read-only at run time (--model), so this image stays small and
+# reusable across VL model swaps (7B <-> 32B). Stage the weights once on shared DFS.
+#
+# Entry contract (matches src/bioagent/gateway/vlreview_job.py + settings.vlreview_entrypoint):
+#   python /opt/vlreview/run_review.py --pdf <report.pdf> --model <model_dir> --out <out_dir>
+# -> writes <out>/review.json  (per-page defects + escalating fix directives)
+#
+# GPU sizing: Qwen2.5-VL-7B in bf16 is ~16GB — fits a 24GB A30 / RTX6000 with room to
+# spare. Do NOT request an A100 for this; pin a cheap card with a typed gres in settings
+# (BIOAGENT_VLREVIEW_GRES="gpu:A30:1"). V100 (16GB, no flash-attn) is too tight — exclude it.
+
+%files
+    # The in-container CLI: rasterize pdf -> deterministic bbox-overlap pre-check ->
+    # Qwen2.5-VL page review -> review.json. Place it next to this .def before building.
+    run_review.py /opt/vlreview/run_review.py
+
+%post
+    set -eux
+    # transformers + qwen-vl-utils give us Qwen2.5-VL offline inference; PyMuPDF (fitz)
+    # rasterizes the rendered pdf to page PNGs AND yields per-word bounding boxes for the
+    # zero-GPU overlap pre-check. torch + CUDA come from the base image — do NOT reinstall.
+    #
+    # PIN transformers < 5: the base image ships torch 2.3.0, but transformers >= 5 requires
+    # torch >= 2.4 and, if it doesn't find it, SILENTLY DISABLES PyTorch — Qwen2.5-VL then can't
+    # load and run_review.py degrades to the geometry-only bbox check. (4.49 is where Qwen2.5-VL
+    # landed; <5 keeps torch-2.3 compatibility. Bump the base image's torch if you want 5.x.)
+    pip install --no-cache-dir \
+        "transformers>=4.49,<5" \
+        accelerate \
+        qwen-vl-utils \
+        pymupdf \
+        pillow
+    # Fail the build early if the CLI did not get copied in.
+    test -f /opt/vlreview/run_review.py
+    # %files preserves source perms; make world-readable so a non-root container user reads it.
+    chmod -R a+rX /opt/vlreview
+    # Verify torch is not just importable but ACTUALLY USABLE by transformers (the failure above
+    # slips past a bare `import torch`), and that the VL class resolves — fail the build if not.
+    python -c "import fitz, torch, transformers; from transformers.utils import is_torch_available; assert is_torch_available(), 'transformers disabled torch (version mismatch) — pin transformers'; from transformers import Qwen2_5_VLForConditionalGeneration; print('OK transformers', transformers.__version__, 'torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+%environment
+    # Weights are pre-staged — force every HF/model lookup to the bind-mounted dir so nothing hits
+    # the network mid-job (HPC3 compute nodes DO have egress, verified 2026-07-08, but we don't rely on it).
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export TOKENIZERS_PARALLELISM=false
+    export NUMBA_CACHE_DIR=/tmp/numba
+    export MPLBACKEND=Agg
+
+%runscript
+    exec python /opt/vlreview/run_review.py "$@"
+
+%labels
+    org.bioagent.component vlreview-render-audit
+    org.bioagent.entrypoint /opt/vlreview/run_review.py
+    org.bioagent.route short-lived-gpu-batch
+
+%help
+    Qwen2.5-VL render-level review of a rendered report, contained for HPC3.
+    Run via AiScientist (gateway/vlreview_job.py) or directly:
+      singularity exec --nv \
+        -B <report_dir>:<report_dir>:ro -B <model_dir>:<model_dir>:ro -B <out_dir>:<out_dir> \
+        vlreview.sif python /opt/vlreview/run_review.py \
+        --pdf <report_dir>/report.pdf --model <model_dir> --out <out_dir>

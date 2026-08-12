@@ -1,0 +1,62 @@
+Bootstrap: docker
+From: python:3.12-slim-bookworm
+
+# PaperQA2 deep-literature image for BioAgent — offloaded HPC3 CPU job, like the VEP/LIRICAL lines.
+# Mirrors deploy/scgpt/scgpt.def. See deploy/paperqa/HOW_PAPERQA_WORKS.md + RUNBOOK.md.
+#
+# CPU-ONLY: PaperQA's retrieval + the local sentence-transformers embedding run on CPU. The ANSWER
+# LLM is the session's Qwen, reached over the network (--args.llm_base_url) — NOT in this image, so
+# no CUDA/torch-GPU is needed here.
+#
+# Build ON HPC3 (macOS cannot build .sif) — see deploy/paperqa/build_and_stage.sh.
+#
+# NOT baked in (bind-mounted read-only at run time, exactly like the vep/lirical/scgpt lines):
+#   * the bioagent SOURCE  -> SlurmAnalysisExecutor source_dir + PYTHONPATH (edit a tool = code sync,
+#     no image rebuild);
+#   * the PubMedBERT EMBEDDING model -> HF_HOME on /dfs3b;
+#   * the pre-built corpus INDEX + PDFs -> BIOAGENT_PAPERQA_INDEX_DIR / _PAPERS on /dfs3b.
+# So this image stays small and corpus-independent.
+#
+# Entry contract (matches src/bioagent/tools/paperqa_cli.py):
+#   python3 -m bioagent.tools.paperqa_cli --tool deep_literature --workspace <ws> --args <json>
+#   -> prints one line:  BIOAGENT_RESULT_JSON {"status": "ok", ...}
+#
+# Dependency pin matches deploy/paperqa/RUNBOOK.md A2: the exact paper-qa the indexer was verified
+# against, WITH the pymupdf reader (pypdf crashes the build on some malformed PDFs). If 2026.3.18 is
+# unavailable, use "paper-qa[local,pymupdf]>=5,<2027" and re-verify the imports below still resolve.
+
+%post
+    set -eux
+    pip install --no-cache-dir "paper-qa[local,pymupdf]==2026.3.18"
+    # Fail the build early if the pieces the tool needs are missing, and confirm pymupdf is the
+    # active PDF reader (must print paperqa_pymupdf.reader, NOT paperqa_pypdf).
+    python3 -c "import paperqa, sentence_transformers, torch; print('paper-qa', paperqa.__version__, 'torch', torch.__version__)"
+    python3 -c "from paperqa.settings import get_default_pdf_parser; print(get_default_pdf_parser().__module__)"
+
+%environment
+    # Run-time config (HF_HOME, the index dir, the Qwen base URL) is injected per-run by the
+    # executor / --args. The embedding is loaded from an ABSOLUTE snapshot path on /dfs3b, so these
+    # offline flags never trigger a hub lookup — they just keep transformers from a network HEAD call.
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export TOKENIZERS_PARALLELISM=false
+
+%runscript
+    exec python3 -m bioagent.tools.paperqa_cli "$@"
+
+%labels
+    org.bioagent.component paperqa-literature
+    org.bioagent.entrypoint bioagent.tools.paperqa_cli
+    org.bioagent.route offload-cpu
+
+%help
+    PaperQA2 deep-literature RAG, contained for HPC3 (offloaded CPU job).
+    Run via BioAgent (gateway offload) or directly (bind the bioagent src + the retigene data,
+    point HF_HOME at the embedding cache; the Qwen endpoint arrives in --args.llm_base_url):
+      singularity exec \
+        -B <repo>/src:/opt/bioagent-src:ro \
+        -B /dfs3b/ruic20_lab/<user>/retigene:/dfs3b/ruic20_lab/<user>/retigene:ro \
+        --env PYTHONPATH=/opt/bioagent-src \
+        --env HF_HOME=/dfs3b/ruic20_lab/<user>/retigene/hf_cache \
+        paperqa.sif python3 -m bioagent.tools.paperqa_cli \
+        --tool deep_literature --workspace /tmp --args /tmp/pq_args.json
