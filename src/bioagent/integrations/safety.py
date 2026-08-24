@@ -56,12 +56,23 @@ class DataBoundaryReport:
 class DataBoundaryGuard:
     """Detect prompt/data boundary violations before calling any external service or LLM."""
 
+    # Users now supply their OWN provider keys, so the shapes worth catching are no longer just
+    # OpenAI's. Each entry is anchored on a vendor-specific prefix rather than "a long random
+    # string", because the latter matches gene ids, checksums, and base64 artifact digests — all
+    # of which legitimately appear in these prompts.
     SECRET_PATTERNS = (
-        re.compile(r"sk-[A-Za-z0-9_-]{12,}"),
-        re.compile(r"sk-or-[A-Za-z0-9_-]{12,}"),
-        re.compile(r"OPENROUTER_API_KEY\s*="),
-        re.compile(r"ANTHROPIC_API_KEY\s*="),
-        re.compile(r"OPENAI_API_KEY\s*="),
+        re.compile(r"sk-[A-Za-z0-9_-]{12,}"),           # OpenAI, DeepSeek, Moonshot, most clones
+        re.compile(r"sk-or-[A-Za-z0-9_-]{12,}"),        # OpenRouter
+        re.compile(r"sk-ant-[A-Za-z0-9_-]{12,}"),       # Anthropic
+        re.compile(r"AIza[A-Za-z0-9_-]{20,}"),          # Google AI Studio / Gemini
+        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),            # AWS access key id
+        re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),      # GitHub tokens
+        re.compile(r"hf_[A-Za-z0-9]{20,}"),             # Hugging Face
+        re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),  # Slack
+        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        re.compile(r"(?:OPENROUTER|ANTHROPIC|OPENAI|DEEPSEEK|MOONSHOT|DASHSCOPE|GEMINI|GOOGLE)"
+                   r"_API_KEY\s*="),
+        re.compile(r"(?:BIOAGENT|AISCIENTIST)_(?:LAB_)?LLM_API_KEY\s*="),
     )
 
     # A "data matrix" = at least this many CONSECUTIVE rows, each with the SAME column count

@@ -124,6 +124,13 @@ class RunState:
         self.plan_event = threading.Event()
         self.plan_value: Any = None          # approved/edited agenda or decision; None = cancelled
         self.pending_plan: Any = None        # buffered for a late WS subscriber
+        # HITL confirmation for an out-of-bounds agent action (a destructive shell command, a
+        # download from an unrecognised host, a shared package install). A SEPARATE channel from
+        # plan review rather than a reuse of it: the two can be outstanding at different moments
+        # in a run, and sharing one event would let an answer to one satisfy the other.
+        self.confirm_event = threading.Event()
+        self.confirm_value: bool | None = None
+        self.pending_confirm: Any = None     # buffered for a late WS subscriber
         # Which ENGINE this run is: "research" (the lab) or "chat" (the answer-first fast path).
         # Endpoints that only make sense against the lab (mid-run steering via /api/chat/inject)
         # check this — a note queued during a chat turn has nothing to consume it and would
@@ -150,6 +157,10 @@ class Connection:
         self.status = "connecting"
         self.executor: RemoteExecutor | None = None
         self.alloc: gpu.GPUAllocation | None = None
+        # The session's held CPU node for the agent's shell (see gateway/worker.py). Allocated
+        # LAZILY on the first command that needs a compute node, so a session that only inspects
+        # files never costs one, and released on disconnect.
+        self.worker_alloc: Any = None
         self.gpu_lock = threading.Lock()   # serializes GPU/vLLM work (mid-run heal vs the provisioning thread)
         self.hpc_pysrc: str | None = None  # dfs3b dir the live bioagent source is synced to (bind for analysis jobs)
         # <shared_root> exists and this user's dirs under it are ready (see _prepare_shared_storage).
@@ -159,6 +170,11 @@ class Connection:
         self.llm_info: dict[str, Any] = {"installed": False, "version": None}
         self.available_models: list[str] = []
         self.selected_model: str = settings.serving_model()
+        # Which LLM answers for this session: {} / {"credential_id": None} => the cluster's own
+        # vLLM on the GPU node; {"credential_id": "<id>"} => one of this owner's saved API
+        # credentials. Only the ID lives here — never the key — so no status payload, log line,
+        # or crash dump can carry a secret, and a rotation needs nothing updated here.
+        self.llm_choice: dict[str, Any] = {}
         self.gpu_health: dict[str, Any] | None = None
         self.log: list[dict[str, Any]] = []
         self.subscribers: set[asyncio.Queue] = set()
@@ -469,7 +485,31 @@ class Connection:
                             "conversation_id": self.active_run.conversation_id}
                            if self.active_run is not None else None),
             "new_credential": self.new_credential,
+            # Which LLM answers, and — because a user's own API endpoint means prompts leave
+            # UCI — whether that is off-host. The UI keeps a banner up whenever it is, so the
+            # egress is visible for the whole session instead of only in the line that set it.
+            "llm_endpoint": self._llm_endpoint_summary(),
         }
+
+    def _llm_endpoint_summary(self) -> dict[str, Any]:
+        """Masked description of this session's LLM endpoint. Reads the credential store rather
+        than caching, so an edited model/label shows up without a reconnect. Never carries a key."""
+        cred_id = (self.llm_choice or {}).get("credential_id")
+        if not cred_id:
+            return {"kind": "cluster", "label": "vLLM (UCI GPU node)", "remote": False}
+        try:
+            from . import llm_credentials
+            cred = llm_credentials.get_public(self.owner, cred_id)
+        except Exception:  # noqa: BLE001 - a status payload must never break the session
+            cred = None
+        if cred is None:
+            # The credential was deleted mid-session. Say so instead of silently reverting:
+            # the next run falls back to the cluster, and the user should know why.
+            return {"kind": "missing", "label": "Saved API endpoint (deleted)", "remote": False}
+        return {"kind": "credential", "credential_id": cred_id, "label": cred["label"],
+                "provider": cred["provider"], "model": cred["model"], "lab_model": cred["lab_model"],
+                "base_url": cred["base_url"], "key_hint": cred["key_hint"],
+                "remote": _endpoint_is_off_host(cred["base_url"])}
 
     def broadcast_status(self) -> None:
         self.push({"type": "status", "connection": self.summary()})
@@ -495,6 +535,11 @@ class ConnectRequest(BaseModel):
     create_key: bool = True          # after a password+Duo login, mint+deploy a reusable key
     campus_network_confirmed: bool = False
     mock: bool = False
+    # Which LLM answers for this session. Chosen HERE rather than only after connecting because
+    # it decides whether the connect allocates a GPU at all: with your own API endpoint there is
+    # nothing to hold a card for, and the session is ready in seconds instead of minutes.
+    llm_credential_id: str | None = None
+    accept_egress: bool = False     # one-time consent when that endpoint is off-host
 
 
 
@@ -722,14 +767,42 @@ def _provision_gpu_blocking(conn: Connection) -> None:
 
 
 def _provision_blocking(conn: Connection, req: ConnectRequest) -> None:
-    """The ONE connection path: SSH login, then GPU + vLLM, in a single shot.
+    """The connection path: SSH login, then an LLM — either the cluster's GPU or the user's API.
 
-    Status walks connecting → provisioning → ready and nothing else; there is no
-    intermediate state in which the session is handed back with SSH up but no model, so
-    every caller downstream can assume ``status == "ready"`` means the whole stack is live.
+    Status walks connecting → provisioning → ready and nothing else; there is no intermediate
+    state in which the session is handed back with SSH up but no model, so every caller
+    downstream can assume ``status == "ready"`` means the whole stack is live.
+
+    **A user who brings their own API key gets no GPU.** The HPC3 account is still what runs the
+    Slurm analysis jobs, but nothing needs an accelerator held for the whole session, so connect
+    skips the GPU queue entirely and the session is usable in seconds instead of minutes. Work
+    that genuinely needs a card (scGPT, local inference) queues as its own job when it is asked
+    for — Yijun's call, and it also removes the cold-start wait that dominates this path today.
     """
     _ssh_connect_blocking(conn, req)
-    _provision_gpu_blocking(conn)
+    if _session_credential(conn) is not None:
+        _provision_api_session(conn)
+    else:
+        _provision_gpu_blocking(conn)
+
+
+def _provision_api_session(conn: Connection) -> None:
+    """Finish a connect that reasons on the user's own API endpoint: no GPU, no vLLM, no tunnel."""
+    emit = conn.emit_fn()
+    cred = _session_credential(conn) or {}
+    conn.status = "provisioning"
+    conn.broadcast_status()
+
+    conn.llm_info = {"installed": True, "engine": "api", "version": None,
+                     "models": [cred.get("model", "")]}
+    conn.available_models = [m for m in (cred.get("model"), cred.get("lab_model")) if m]
+    conn.selected_model = cred.get("model") or ""
+    conn.status = "ready"
+    emit("success", "ready",
+         f"Ready on your API endpoint “{cred.get('label') or 'API'}” ({conn.selected_model}). "
+         "No GPU was allocated — jobs that need one (scGPT, local inference) will queue on Slurm "
+         "when you ask for them.")
+    conn.broadcast_status()
 
 
 def _serve_log_tail(conn: Connection, lines: int = 50) -> str:
@@ -976,8 +1049,32 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
     # app user is the workspace owner so datasets/runs bind to the right account.
     app_user = _optional_user(request)
     owner_name = app_user.username if app_user else req.ucinetid
+    # The LLM choice is resolved BEFORE the connection is registered, because it decides whether
+    # this connect allocates a GPU at all — and because a refused consent must not leave a
+    # half-built session behind.
+    cred_id = (req.llm_credential_id or "").strip()
+    if cred_id:
+        from . import llm_credentials
+        cred = llm_credentials.get_credential(safe_name(owner_name), cred_id)
+        if cred is None:
+            return JSONResponse({"error": "Credential not found."}, status_code=404)
+        if not cred.get("model"):
+            return JSONResponse({"error": "Set a model on this API endpoint before using it."},
+                                status_code=400)
+        if _endpoint_is_off_host(cred.get("base_url")) and not cred.get("egress_consent_at"):
+            if not req.accept_egress:
+                return JSONResponse({
+                    "error": "This endpoint is outside UCI. Confirm before routing prompts to it.",
+                    "needs_consent": True,
+                    "endpoint": {"label": cred.get("label"), "base_url": cred.get("base_url"),
+                                 "model": cred.get("model"), "lab_model": cred.get("lab_model")},
+                }, status_code=409)
+            llm_credentials.record_egress_consent(safe_name(owner_name), cred_id)
+
     conn = Connection(settings, mock=req.mock, loop=loop, username=owner_name)
     conn.app_user_id = app_user.id if app_user else None
+    if cred_id:
+        conn.llm_choice = {"credential_id": cred_id}
     CONNECTIONS[conn.id] = conn
 
     # One shot: SSH login + GPU allocation + vLLM serve, then the health monitor. The session
@@ -1026,6 +1123,191 @@ async def delete_ssh_credential(cred_id: str, request: Request, user: str = "") 
         return JSONResponse({"error": "Credential not found."}, status_code=404)
     return JSONResponse({"status": "ok"})
 
+
+# --- bring-your-own LLM API key ----------------------------------------------
+#
+# The HPC3 account stays required — it is what runs the Slurm analysis jobs. These routes
+# cover the separate question of which LLM answers and on whose bill. Owner scoping reuses
+# ``_cred_owner`` so an API key is confined exactly like an SSH key.
+#
+# Two invariants hold across every route below:
+#   1. No response ever carries an API key. Routes return ``llm_credentials`` PUBLIC metadata
+#      only, which masks the key to a hint.
+#   2. A stored credential has been proven to work at least once, because create and rotate
+#      both pass a ``verify`` callable into the store, which runs it BEFORE writing anything.
+
+
+class LLMCredentialRequest(BaseModel):
+    provider: str = "custom"
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
+    label: str | None = None
+    lab_model: str | None = None   # optional stronger model for the PI/Critic roles
+    user: str = ""                 # owner fallback when accounts are disabled
+
+
+class LLMCredentialUpdate(BaseModel):
+    """A rotation, a metadata edit, or both. ``api_key`` empty => metadata only, so the UI can
+    let a user retitle an endpoint or switch its model without re-typing the key."""
+
+    api_key: str = ""
+    label: str | None = None
+    model: str | None = None
+    lab_model: str | None = None
+    base_url: str | None = None
+    user: str = ""
+
+
+def _verify_or_raise(base_url: str, api_key: str, model: str | None) -> None:
+    """The ``verify`` callable handed to the credential store. Raises :class:`GatewayError`
+    carrying the provider's actual cause, so the UI can say *which* of the four problems it
+    is — a bad key, an empty account, a wrong model id, or an unreachable endpoint."""
+    from . import llm_providers
+    result = llm_providers.verify(base_url, api_key, model)
+    if not result.ok:
+        raise GatewayError(result.message, stage=f"llm_verify_{result.cause}")
+
+
+def _llm_error(exc: GatewayError, status: int = 400) -> JSONResponse:
+    """Report a credential failure with the CAUSE surfaced as its own field.
+
+    "Your key doesn't work" has four different fixes and the user can only apply one of them
+    if we say which, so ``cause`` (auth | credit | model | endpoint | network) is lifted out of
+    the stage tag rather than left for the UI to parse out of prose.
+    """
+    stage = exc.stage or ""
+    prefix = "llm_verify_"
+    cause = stage[len(prefix):] if stage.startswith(prefix) else "error"
+    return JSONResponse({"error": exc.message, "cause": cause, "detail": error_detail(exc)},
+                        status_code=status)
+
+
+@app.get("/api/llm-providers")
+async def list_llm_providers() -> JSONResponse:
+    """Endpoint presets for the credential dialog. Static data — model ids are NOT included
+    because providers retire them faster than we redeploy; the UI reads live ids from
+    ``/api/llm-credentials/{id}/models`` once a key exists."""
+    from . import llm_providers
+    return JSONResponse({"providers": llm_providers.public_presets()})
+
+
+@app.get("/api/llm-credentials")
+async def list_llm_credentials(request: Request, user: str = "") -> JSONResponse:
+    from . import llm_credentials
+    return JSONResponse({
+        "credentials": llm_credentials.list_credentials(_cred_owner(request, user)),
+        "encryption": llm_credentials.encryption_enabled(),
+    })
+
+
+@app.post("/api/llm-credentials")
+async def create_llm_credential(req: LLMCredentialRequest, request: Request) -> JSONResponse:
+    from . import llm_credentials, llm_providers
+
+    # No logged-in account and no UCInetID means there is nowhere to file this: it would land in
+    # the anonymous "guest" bucket, where the session — which resolves its owner from the UCInetID
+    # it logged in with — never looks. Refusing is the honest outcome, because a key that verifies,
+    # saves, and then cannot be found is a silent failure, and this is the route that creates it.
+    if _optional_user(request) is None and not req.user.strip():
+        return JSONResponse(
+            {"error": "Provide the UCInetID this key belongs to — keys are stored per user.",
+             "cause": "owner"}, status_code=400)
+
+    preset = llm_providers.get_provider(req.provider)
+    base_url = llm_providers.normalize_base_url(req.base_url or (preset.base_url if preset else ""))
+    try:
+        cred = await asyncio.to_thread(
+            llm_credentials.create, _cred_owner(request, req.user),
+            provider=req.provider, base_url=base_url, model=req.model.strip(),
+            api_key=req.api_key, label=req.label, lab_model=(req.lab_model or None),
+            verify=_verify_or_raise,
+        )
+    except GatewayError as exc:
+        return _llm_error(exc)
+    return JSONResponse({"credential": cred})
+
+
+@app.put("/api/llm-credentials/{cred_id}")
+async def update_llm_credential(cred_id: str, req: LLMCredentialUpdate,
+                                request: Request) -> JSONResponse:
+    """Rotate the key and/or edit the metadata of an EXISTING credential.
+
+    The credential id is stable across a rotation, so the session's endpoint choice, a
+    conversation's saved preference, and any in-flight run all keep pointing at the right
+    thing — nothing downstream has to be updated when a user replaces a leaked or expired key.
+
+    Order matters: metadata is applied first so a rotation is verified against the endpoint the
+    user is moving TO, not the one they are leaving. If verification then fails, the key file is
+    untouched and the previous key keeps working.
+    """
+    from . import llm_credentials, llm_providers
+
+    owner = _cred_owner(request, req.user)
+    if llm_credentials.get_credential(owner, cred_id) is None:
+        return JSONResponse({"error": "Credential not found."}, status_code=404)
+
+    base_url = (llm_providers.normalize_base_url(req.base_url)
+                if req.base_url is not None else None)
+    try:
+        cred = llm_credentials.update(owner, cred_id, label=req.label, model=req.model,
+                                      lab_model=req.lab_model, base_url=base_url)
+        if req.api_key.strip():
+            cred = await asyncio.to_thread(llm_credentials.rotate_key, owner, cred_id,
+                                           req.api_key, verify=_verify_or_raise)
+    except GatewayError as exc:
+        return _llm_error(exc)
+    return JSONResponse({"credential": cred})
+
+
+@app.post("/api/llm-credentials/{cred_id}/verify")
+async def verify_llm_credential(cred_id: str, request: Request, user: str = "") -> JSONResponse:
+    """Re-test a saved credential against its endpoint. Used by the UI to show which keys still
+    work (a key can stop working with no local change at all — revoked, or out of credit)."""
+    from . import llm_credentials, llm_providers
+
+    owner = _cred_owner(request, user)
+    row = llm_credentials.get_credential(owner, cred_id)
+    if row is None:
+        return JSONResponse({"error": "Credential not found."}, status_code=404)
+    try:
+        secret = llm_credentials.resolve_secret(owner, cred_id)
+    except GatewayError as exc:
+        return _llm_error(exc)
+    if not secret:
+        return JSONResponse({"error": "This credential's key file is missing."}, status_code=400)
+
+    result = await asyncio.to_thread(llm_providers.verify, row.get("base_url", ""), secret,
+                                     row.get("model"))
+    cred = llm_credentials.mark_verified(owner, cred_id, model=result.verified_model,
+                                         error=None if result.ok else result.message)
+    return JSONResponse({"credential": cred, "result": result.as_dict()})
+
+
+@app.get("/api/llm-credentials/{cred_id}/models")
+async def list_llm_credential_models(cred_id: str, request: Request, user: str = "") -> JSONResponse:
+    """Live model ids from the saved credential's endpoint, so the model picker offers what the
+    endpoint actually serves instead of a hard-coded list that goes stale."""
+    from . import llm_credentials, llm_providers
+
+    owner = _cred_owner(request, user)
+    row = llm_credentials.get_credential(owner, cred_id)
+    if row is None:
+        return JSONResponse({"error": "Credential not found."}, status_code=404)
+    try:
+        secret = llm_credentials.resolve_secret(owner, cred_id)
+    except GatewayError as exc:
+        return _llm_error(exc)
+    models = await asyncio.to_thread(llm_providers.list_models, row.get("base_url", ""), secret or "")
+    return JSONResponse({"models": models})
+
+
+@app.delete("/api/llm-credentials/{cred_id}")
+async def delete_llm_credential(cred_id: str, request: Request, user: str = "") -> JSONResponse:
+    from . import llm_credentials
+    if not llm_credentials.delete_credential(_cred_owner(request, user), cred_id):
+        return JSONResponse({"error": "Credential not found."}, status_code=404)
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/api/connections/{connection_id}")
@@ -1286,6 +1568,14 @@ async def disconnect(payload: dict) -> JSONResponse:
     conn.status = "disconnected"
     if conn.monitor_task:
         conn.monitor_task.cancel()
+    # Release the agent's CPU worker BEFORE closing the SSH session — scancel needs the executor.
+    # Unlike the GPU job (deliberately left running so a reconnect reuses it), the worker is
+    # cheap to re-acquire and idles on a free-partition node nobody else can use meanwhile.
+    if conn.worker_alloc is not None and conn.executor is not None and not conn.mock:
+        from . import worker as worker_mod
+        await asyncio.to_thread(worker_mod.release_worker, conn.executor, conn.worker_alloc,
+                                conn.emit_fn())
+        conn.worker_alloc = None
     if conn.executor:
         await asyncio.to_thread(conn.executor.close)
     conn.emit("info", "disconnect", "Session closed. The GPU job keeps running until its time limit or scancel.")
@@ -1304,34 +1594,71 @@ async def auth_duo(payload: dict) -> JSONResponse:
     return JSONResponse({"status": "submitted"})
 
 
-def _release_my_gpu(conn: Connection) -> tuple[list[str], str | None]:
-    """scancel THIS user's serve job(s) over the already-authenticated SSH connection.
+# Every Slurm job name this product submits, so "release my session" can find ALL of them with
+# ONE `squeue --me` instead of only the model server. Names carry the username where a job is a
+# per-user singleton; the analysis jobs do not, but `--me` already scopes to the caller.
+_SESSION_JOB_KINDS: "tuple[tuple[str, str], ...]" = (
+    ("gpu", "bioagent-vllm-"),        # the served model
+    ("gpu", "bioagent-scgpt-"),       # scGPT annotation batch (also a GPU)
+    ("worker", "aiscientist-worker-"),  # the CPU shell/worker node
+    ("analysis", "bioagent_analysis_"),
+    ("analysis", "bioagent_paperqa_"),
+    ("analysis", "bioagent_variant_"),
+    ("analysis", "bioagent_phenotype_"),
+)
+# Deliberately absent: aiscientist-tempgc-*. It sweeps the shared Temp tree and exits in about a
+# second; killing it mid-sweep buys nothing and can leave the cleanup half-done.
 
-    Live job ids are discovered with ``squeue --me --name=<jobname>`` rather than the
-    cached ``conn.alloc`` (which can be stale, or gone after a reload) — so the user can
-    always free their own A100 from the same session WITHOUT re-doing Duo. ``--me`` scopes
-    strictly to the caller's own jobs, so this can never touch another lab member's job.
-    Returns ``(cancelled_ids, error)``."""
+
+def _classify_session_job(name: str) -> str | None:
+    """Which part of this session a Slurm job belongs to, or None when it is not ours.
+
+    Prefix matching, never ``scancel --me``: a researcher's OWN unrelated jobs share the account
+    and must survive a click on "free my session"."""
+    n = (name or "").strip()
+    for kind, prefix in _SESSION_JOB_KINDS:
+        if n.startswith(prefix):
+            return kind
+    return None
+
+
+def _release_session_jobs(conn: Connection) -> tuple[list[tuple[str, str, str]], str | None]:
+    """scancel EVERY Slurm job this session holds, and confirm each one actually died.
+
+    Was ``_release_my_gpu``, which queried only ``--name=<model job>``. Two ways that stranded
+    resources, both seen live: (1) when the model job had already gone (wall-clock timeout,
+    preemption), the endpoint returned "nothing to release" BEFORE the worker-release code below
+    it, so the 4-CPU worker sat on a free-partition node nobody else could use for the rest of its
+    8-hour limit; (2) analysis jobs (run_code, PaperQA, variant, phenotype, scGPT) were never in
+    scope at all, so a multi-minute literature job outlived the session that asked for it.
+
+    Returns ``([(job_id, name, kind), ...], error)`` — the jobs CONFIRMED cancelled.
+    """
     ex = conn.executor
-    username = getattr(ex, "username", "")
-    ids: list[str] = []
+    found: dict[str, tuple[str, str]] = {}     # job_id -> (name, kind)
     try:
-        res = ex.exec(
-            f"squeue --me --name={gpu.job_name(username)} --states=R,PD,CF,CG "
-            "--noheader --format='%i'"
-        )
-        ids = [ln.strip() for ln in (res.out or "").splitlines() if ln.strip()]
-    except Exception as exc:  # noqa: BLE001 - fall back to the cached id below
-        if not (conn.alloc and conn.alloc.job_id):
+        res = ex.exec("squeue --me --states=R,PD,CF,CG --noheader --format='%i|%j'")
+        for line in (res.out or "").splitlines():
+            jid, _, jname = line.strip().partition("|")
+            kind = _classify_session_job(jname)
+            if jid.strip() and kind:
+                found[jid.strip()] = (jname.strip(), kind)
+    except Exception as exc:  # noqa: BLE001 - fall back to the cached ids below
+        if not ((conn.alloc and conn.alloc.job_id) or conn.worker_alloc):
             return [], f"could not query your jobs (squeue): {exc}"
-    # Belt-and-suspenders: include the cached allocation id if squeue missed it (also
-    # this user's own job, so still ownership-safe).
-    if conn.alloc and conn.alloc.job_id and conn.alloc.job_id not in ids:
-        ids.append(conn.alloc.job_id)
-    if not ids:
-        return [], None  # nothing running for this user — already free
+    # Belt-and-suspenders: the ids this session cached, in case squeue missed them (a job in an
+    # odd state, a truncated reply). Both are this user's own jobs, so ownership stays safe.
+    if conn.alloc and conn.alloc.job_id and conn.alloc.job_id not in found:
+        found[conn.alloc.job_id] = ("bioagent-vllm (cached)", "gpu")
+    wjob = getattr(conn.worker_alloc, "job_id", "")
+    if wjob and wjob not in found:
+        found[wjob] = ("aiscientist-worker (cached)", "worker")
+    if not found:
+        return [], None                        # nothing of ours is running — already free
+
+    ids = sorted(found)
     try:
-        res = ex.exec("scancel " + " ".join(ids))  # ids came from `--me`; never another user's
+        res = ex.exec("scancel " + " ".join(ids))   # every id came from `--me` or our own cache
     except Exception as exc:  # noqa: BLE001
         return [], f"scancel failed: {exc}"
     # exec() does NOT raise on a non-zero exit, so surface a real scancel error (e.g. exit 210
@@ -1339,16 +1666,13 @@ def _release_my_gpu(conn: Connection) -> tuple[list[str], str | None]:
     if not res.ok and (res.stderr or "").strip():
         return [], f"scancel failed: {res.stderr.strip()[:200]}"
     # CONFIRM the kill. `scancel` exits 0 even for a job id that does not exist (verified on HPC3),
-    # so its exit status alone can never tell us the job actually died — only re-querying can. Slurm
-    # needs a moment to move a job R -> CG -> gone, so poll briefly rather than checking once.
-    still: set[str] = set()
+    # so its exit status alone can never tell us the jobs actually died — only re-querying can.
+    # Slurm needs a moment to move a job R -> CG -> gone, so poll rather than checking once.
+    still: set[str] = set(ids)
     for _ in range(8):
         time.sleep(1.0)
         try:
-            chk = ex.exec(
-                f"squeue --me --name={gpu.job_name(username)} --states=R,PD,CF,CG "
-                "--noheader --format='%i'"
-            )
+            chk = ex.exec("squeue --me --states=R,PD,CF,CG --noheader --format='%i'")
             still = {ln.strip() for ln in (chk.out or "").splitlines() if ln.strip()} & set(ids)
         except Exception:  # noqa: BLE001 - a failed check is not proof the job survived; retry
             still = set()
@@ -1357,7 +1681,7 @@ def _release_my_gpu(conn: Connection) -> tuple[list[str], str | None]:
     if still:
         return [], ("scancel ran but job(s) " + ", ".join(sorted(still))
                     + " are still on HPC3 — verify with `squeue --me`")
-    return ids, None
+    return [(jid, found[jid][0], found[jid][1]) for jid in ids], None
 
 
 @app.post("/api/stop-gpu")
@@ -1368,27 +1692,57 @@ async def stop_gpu(payload: dict) -> JSONResponse:
     if not conn.executor:
         return JSONResponse({"error": "No live HPC3 connection to run scancel on. "
                                       "Reconnect, or run `scancel --me` on HPC3."}, status_code=409)
+    # A research run still executing would keep calling the endpoint we are about to kill and die
+    # slowly, one timed-out call at a time. Stop it first — same path as the Stop button, including
+    # waking a run parked at a plan/decision card.
+    if conn.chat_running and conn.active_run is not None:
+        run = conn.active_run
+        run.chat_stop.set()
+        if run.pending_plan is not None:
+            run.plan_value = {"action": "cancel"}
+            run.pending_plan = None
+            run.plan_event.set()
+            conn.push({"type": "plan_done"})
+        conn.emit("info", "gpu_alloc", "Stopping the in-flight run before releasing the GPU.")
+    prev_status = conn.status
     # Stop the health monitor FIRST so a poll already in flight can't emit a spurious
     # dead-port / vanished-job error after we cancel; flip status so the loop exits.
     conn.status = "disconnected"
     if conn.monitor_task:
         conn.monitor_task.cancel()
-    ids, err = await asyncio.to_thread(_release_my_gpu, conn)
+    cancelled, err = await asyncio.to_thread(_release_session_jobs, conn)
     if err:
-        conn.emit("error", "gpu_alloc", f"GPU release failed: {err}")
+        conn.emit("error", "gpu_alloc", f"Release failed: {err}")
         return JSONResponse({"error": err}, status_code=500)
-    if not ids:
-        conn.emit("info", "gpu_alloc", "No running GPU job found for you — nothing to release.")
+    # The cached handles are stale either way now — the jobs behind them are confirmed gone, or
+    # were already gone before the click. Clearing them unconditionally is what stops the next
+    # reconnect from adopting a dead allocation. (The old code cleared worker_alloc only when a
+    # GPU job had been found, which is how an orphaned worker survived a "free my GPU".)
+    conn.worker_alloc = None
+    conn.alloc = None
+    by_kind: dict[str, list[str]] = {}
+    for jid, _name, kind in cancelled:
+        by_kind.setdefault(kind, []).append(jid)
+    if not cancelled:
+        conn.status = prev_status if prev_status != "ready" else "disconnected"
+        conn.emit("info", "gpu_alloc",
+                  "Nothing left to release — no GPU, worker or analysis job of yours is running.")
         conn.broadcast_status()
-        return JSONResponse({"status": "no_job", "message": "No running GPU job found for you."})
+        return JSONResponse({"status": "no_job",
+                             "message": "No running jobs found for this session."})
+    parts = [f"{kind} {', '.join(v)}" for kind, v in sorted(by_kind.items())]
     conn.emit(
         "warning",
         "gpu_alloc",
-        f"Released your GPU job(s) {', '.join(ids)} via scancel — A100 freed, SU charge stopped. "
+        "Released this session's HPC3 jobs via scancel — " + "; ".join(parts)
+        + ". GPU freed and the SU charge stopped; the worker node is back in the free pool. "
         "No other lab member's jobs are affected.",
     )
     conn.broadcast_status()
-    return JSONResponse({"status": "gpu_stopped", "job_id": ids[0], "job_ids": ids})
+    ids = [jid for jid, _n, _k in cancelled]
+    return JSONResponse({"status": "gpu_stopped", "job_id": ids[0], "job_ids": ids,
+                         "cancelled": [{"job_id": j, "name": n, "kind": k}
+                                       for j, n, k in cancelled]})
 
 
 def _hpc_user(conn: Connection) -> str:
@@ -1500,7 +1854,31 @@ def _ensure_local_dataset(conn: Connection, path: str, cache_dir: Path) -> Path:
     if conn.executor is not None and _is_remote_dataset(conn, path):
         cache_dir.mkdir(parents=True, exist_ok=True)
         local = cache_dir / path.rsplit("/", 1)[-1]
+        # Verify the source EXISTS before staging, and that something arrived after. A dataset that
+        # had been swept from Temp/ was staged as a 0-byte file with no error, and the run went on
+        # to profile an empty .h5ad — the failure surfaced downstream as an unexplained dead run.
+        # (Temp/<user>/ is disposable by design; a path into it can legitimately vanish.)
+        # (Mock mode has no remote filesystem at all — its get_file fetches nothing by design — so
+        # the existence checks would only ever fail there. Real sessions get both checks.)
+        if getattr(conn, "mock", False):
+            conn.executor.get_file(path, str(local))
+            return local
+        chk = conn.executor.exec(f"test -s {shlex.quote(path)} && echo OK")
+        if (chk.out or "").strip() != "OK":
+            raise FileNotFoundError(
+                f"dataset not found on HPC3 (or empty): {path}. If it lived under Temp/, it may "
+                "have been swept — re-upload it or point at a copy under uploads/.")
         conn.executor.get_file(path, str(local))
+        try:
+            size = local.stat().st_size
+        except OSError:
+            size = 0
+        if size <= 0:
+            try:
+                local.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(f"staging {path} from HPC3 produced an empty file — transfer failed")
         return local
     return Path(path)
 
@@ -1729,6 +2107,129 @@ def _sync_bioagent_source_to_hpc(conn: Connection) -> str:
     return pysrc
 
 
+def _hitl_confirm(conn: "Connection", run: "RunState | None"):
+    """A ``confirm(ConfirmRequest) -> bool`` that asks the person watching the run.
+
+    Yijun's instruction for the agent's shell: give it real capability, keep it inside RCIC, and
+    **raise a prompt at the edge** rather than failing opaquely or proceeding quietly. This is
+    that prompt — the same shape as plan review (push a card, block the worker thread, wait for
+    a POST), on its own channel so the two never answer each other.
+
+    A cancelled run, a closed browser, or a timeout all resolve to **no**. Declining is a normal
+    outcome the model can plan around; silently proceeding because nobody answered is not.
+    """
+    if run is None:
+        return None
+
+    def confirm(req) -> bool:
+        payload = {"type": "confirm_request", "run_id": run.run_id,
+                   "conversation_id": run.conversation_id, **req.as_dict()}
+        run.confirm_value = None
+        run.confirm_event.clear()
+        run.pending_confirm = payload
+        conn.push(payload)
+        # Bounded wait: an unattended run must not hold a worker allocation forever waiting for a
+        # click that is never coming.
+        timeout = float(os.environ.get("BIOAGENT_CONFIRM_TIMEOUT_S", "600") or 600)
+        answered = run.confirm_event.wait(timeout)
+        run.pending_confirm = None
+        conn.push({"type": "confirm_done", "run_id": run.run_id})
+        if not answered:
+            conn.emit("warning", "hpc_shell",
+                      f"No answer within {int(timeout)}s — declined: {req.summary}")
+            return False
+        return bool(run.confirm_value)
+
+    return confirm
+
+
+def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
+    """The agent's HPC3 filesystem/shell tools for this run, or None to leave them out.
+
+    None (rather than tools that fail when called) whenever there is no live cluster session, so
+    the model is never offered a tool that cannot work. The CPU worker is NOT allocated here — it
+    is requested lazily on the first command that actually needs a compute node, so a run that
+    only inspects files never costs an allocation.
+    """
+    if conn.executor is None or conn.mock:
+        return None
+    from ..tools.hpc_shell import HpcShell, HpcWorkspace
+
+    st = conn.settings
+    # The HPC3 UCInetID, NOT the console account name. Every directory this session actually owns
+    # on dfs3b is created under `_hpc_user` (see `_shared_dir`), so building the sandbox roots from
+    # `conn.owner` produced an allow-list for directories that do not exist: a console account
+    # "Ziyaoma" got Temp/Ziyaoma while its files were written to Temp/ziyaom2, and every
+    # stat/list/find of the run's own work dir came back "outside the areas this session may read".
+    # The model then spent its step guessing at paths instead of reading them.
+    user = _hpc_user(conn)
+    shared = st.shared_root.rstrip("/")
+    home = f"/data/homezvol0/{user}"
+    # Read wider than write, deliberately: the agent may consult the lab's shared reference data
+    # and containers, but may only ever modify its own user's directories. The lab account is
+    # shared, so "my account" is not the same as "my data".
+    read_roots = (home, f"{shared}/Temp/{user}", f"{shared}/uploads/{user}",
+                  f"{shared}/pysrc/{user}", f"{shared}/containers", f"{shared}/reference",
+                  f"{shared}/pkgs")
+    write_roots = (home, f"{shared}/Temp/{user}", f"{shared}/uploads/{user}")
+
+    cache = None
+    if st.run_code_on_hpc or st.analysis_on_hpc:
+        from .package_cache import SharedPackageCache, ensure_sitecustomize
+        pkg_root = f"{shared}/pkgs"
+        cache = SharedPackageCache(root=pkg_root, image=st.analysis_image)
+        # Must exist BEFORE any sandbox launch: the in-container preamble points PYTHONPATH at
+        # this directory, and without the file there the cache silently does nothing — measured
+        # exactly that way (package installed, import still failed). One cheap idempotent
+        # login-node command; never worth failing a run over.
+        try:
+            ensure_sitecustomize(conn.executor, pkg_root)
+        except Exception as exc:  # noqa: BLE001
+            conn.emit("warning", "hpc_shell",
+                      f"Shared package cache not initialised ({exc}); installs will not be importable.")
+
+    return HpcShell(
+        remote=conn.executor,
+        workspace=HpcWorkspace(read_roots=read_roots, write_roots=write_roots),
+        home=home,
+        worker_provider=(lambda: _ensure_session_worker(conn)) if st.worker_enabled else None,
+        run_on_worker=_run_on_session_worker if st.worker_enabled else None,
+        confirm=_hitl_confirm(conn, run),
+        emit=conn.emit,
+        command_timeout_s=st.worker_command_timeout_s,
+        package_cache=cache,
+    )
+
+
+def _ensure_session_worker(conn: "Connection"):
+    """This session's held CPU node, acquired on first use and reacquired if Slurm reclaimed it.
+
+    Lazy because most runs never need it: the typed metadata tools answer from the login node,
+    and only byte-moving work requires a node. Serialized on the GPU lock so two concurrent tool
+    calls cannot each submit a holder job.
+    """
+    from . import worker as worker_mod
+
+    with conn.gpu_lock:
+        alloc = getattr(conn, "worker_alloc", None)
+        if alloc is not None and worker_mod.worker_is_alive(conn.executor, alloc):
+            return alloc
+        if alloc is not None:
+            conn.emit("info", "worker", "The worker node's allocation ended; requesting another.")
+        alloc = worker_mod.ensure_worker(conn.executor, conn.settings, conn.emit_fn())
+        conn.worker_alloc = alloc
+        return alloc
+
+
+def _run_on_session_worker(alloc, command: str, timeout_s: int):
+    """Bridge for :class:`HpcShell` — it holds the allocation, the gateway holds the executor."""
+    from . import worker as worker_mod
+    for c in CONNECTIONS.values():
+        if getattr(c, "worker_alloc", None) is alloc and c.executor is not None:
+            return worker_mod.run_on_worker(c.executor, alloc, command, timeout_s=timeout_s)
+    raise GatewayError("The session that owns this worker node is gone.", stage="worker_exec")
+
+
 def _build_literature_executor(conn: "Connection") -> Any:
     """Offload deep_literature (PaperQA) to HPC3 (paperqa.sif), or None to keep it disabled.
 
@@ -1954,6 +2455,78 @@ async def select_model(payload: dict) -> JSONResponse:
     )
 
 
+class LLMEndpointRequest(BaseModel):
+    connection_id: str
+    # None / "" => the cluster's own vLLM; otherwise one of this owner's saved credential ids.
+    credential_id: str | None = None
+    # Explicit acknowledgement that using an OFF-HOST endpoint sends the reasoning payload
+    # (dataset profile, accepted findings, artifact digests) to that third party. Required once
+    # per credential; the route answers 409 with the details until it is given.
+    accept_egress: bool = False
+
+
+@app.post("/api/llm-endpoint")
+async def select_llm_endpoint(req: LLMEndpointRequest) -> JSONResponse:
+    """Choose which LLM answers for this session: the cluster's vLLM, or the user's own API key.
+
+    Unlike ``/api/model`` this is NOT constrained by what vLLM loaded at serve-launch — an API
+    endpoint serves whatever the provider offers, so switching costs nothing and needs no
+    reconnect. It takes effect on the NEXT run: a run already executing keeps the endpoint and
+    key it started with (see :func:`_lab_llm`), so switching never corrupts work in flight.
+    """
+    conn = CONNECTIONS.get(req.connection_id)
+    if not conn:
+        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+
+    cred_id = (req.credential_id or "").strip()
+    if not cred_id:
+        conn.llm_choice = {}
+        conn.emit("info", "llm_model", "LLM switched to the cluster's vLLM on the GPU node.")
+        conn.broadcast_status()
+        return JSONResponse({"status": "ok", "endpoint": "cluster"})
+
+    from . import llm_credentials
+    cred = llm_credentials.get_credential(conn.owner, cred_id)
+    if cred is None:
+        return JSONResponse({"error": "Credential not found."}, status_code=404)
+    if not cred.get("model"):
+        return JSONResponse({"error": "Set a model on this credential before using it."},
+                            status_code=400)
+
+    # Informed consent is the REAL control on this feature — no scanner can judge whether a gene
+    # list or a phenotype description identifies a patient, so the person who knows the data has
+    # to make the call. Asked once per credential, and only for endpoints that actually leave the
+    # host (a self-hosted vLLM on loopback needs no consent because nothing goes anywhere).
+    remote = _endpoint_is_off_host(cred.get("base_url"))
+    if remote and not cred.get("egress_consent_at"):
+        if not req.accept_egress:
+            return JSONResponse({
+                "error": "This endpoint is outside UCI. Confirm before routing prompts to it.",
+                "needs_consent": True,
+                "endpoint": {"label": cred.get("label"), "base_url": cred.get("base_url"),
+                             "model": cred.get("model"), "lab_model": cred.get("lab_model")},
+                "sends": ["the research question and your mid-run notes",
+                          "the dataset profile (shape, columns, QC summary — not the matrix)",
+                          "accepted findings and artifact digests",
+                          "planning, critique and write-up prompts"],
+                "stays": ["your uploaded data files and the analysis itself, which run on HPC3",
+                          "raw expression tables and variant records"],
+            }, status_code=409)
+        llm_credentials.record_egress_consent(conn.owner, cred_id)
+
+    conn.llm_choice = {"credential_id": cred_id}
+    label = cred.get("label") or cred.get("provider") or "API"
+    # Named out loud in the session log because it is a DATA-EGRESS change, not a preference:
+    # from here on the prompts leave the cluster for a third party on the user's own account.
+    conn.emit("info", "llm_model",
+              f"LLM switched to your API endpoint “{label}” (model {cred['model']}"
+              + (f", {cred['lab_model']} for PI/Critic" if cred.get("lab_model") else "")
+              + "). Prompts for this session now leave UCI for that provider.")
+    conn.broadcast_status()
+    return JSONResponse({"status": "ok", "endpoint": "credential",
+                         "credential": llm_credentials.get_public(conn.owner, cred_id)})
+
+
 class StopRequest(BaseModel):
     connection_id: str
     conversation_id: str | None = None  # stop only THIS chat's run (not whatever run is live on the
@@ -1986,6 +2559,14 @@ async def chat_stop(req: StopRequest) -> JSONResponse:
               f"({getattr(ar, 'run_id', None)!r}/{getattr(ar, 'conversation_id', None)!r}).")
         return JSONResponse({"status": "idle"})
     target.chat_stop.set()
+    # A run blocked at a plan-review or decision-point card is waiting on plan_event, NOT watching
+    # chat_stop — so a Stop clicked while the card is up silently held until the 10-minute review
+    # timeout. Resolve the pending wait as a cancel, exactly as /api/lab/plan would.
+    if target.pending_plan is not None:
+        target.plan_value = {"action": "cancel"}
+        target.pending_plan = None
+        target.plan_event.set()
+        conn.push({"type": "plan_done"})
     conn.emit("info", "chat", "Stop requested — ending the current run.")
     return JSONResponse({"status": "stopping"})
 
@@ -2105,14 +2686,6 @@ class LabRequest(BaseModel):
     history: list[dict[str, str]] | None = None
 
 
-
-
-class RegenerateReportRequest(BaseModel):
-    connection_id: str
-    conversation_id: str | None = None  # the chat this regenerate belongs to (scopes the WS stream)
-    run_id: str | None = None        # which run's report to rebuild; default = last run on this conn
-    instruction: str | None = None   # optional edit directive; None/"" = re-render the existing .md as-is
-    basename: str = "report"         # "report" (manuscript) | "technical_report"
 
 
 class ContinueRunRequest(BaseModel):
@@ -2471,16 +3044,15 @@ FOLLOWUP_CONFIDENCE = 0.6   # below this the router asks instead of auto-routing
 _FOLLOWUP_ROUTER_SYS = (
     "You route a follow-up message in a single-cell bioinformatics console. The user ALREADY "
     "completed a research run (its report + figures are saved) and just sent another message. "
-    "Classify what they want, choosing exactly one intent:\n"
-    "- \"edit_report\": change the EXISTING report's wording, structure, or references WITHOUT "
-    "re-running any analysis (e.g. 'make the discussion shorter', 'fix the title', 're-render the "
-    "PDF', 'tone down the claims').\n"
+    "Classify what they want, choosing exactly one intent. There is no "
+    "report-editing path: a request to reword or re-render the existing report without new "
+    "analysis is a \"new_study\", because the report is only ever written from a run.\n"
     "- \"rerun_step\": re-run ONE analysis step of the SAME study and let the report follow, reusing "
     "the other steps and their figures (e.g. 're-cluster at resolution 1.0', 'search the literature "
     "again', 'redo the differential expression', 'add pathway enrichment'). Pick the single most "
     "relevant step, copied VERBATIM from the prior agenda.\n"
     "- \"new_study\": a genuinely different question, dataset, or analysis that should start fresh.\n"
-    "Return ONLY a JSON object: {\"intent\": \"edit_report|rerun_step|new_study\", "
+    "Return ONLY a JSON object: {\"intent\": \"rerun_step|new_study\", "
     "\"step\": \"<verbatim agenda step when intent=rerun_step, else null>\", "
     "\"confidence\": <0.0-1.0>, \"reason\": \"<one short clause>\"}."
 )
@@ -2535,7 +3107,7 @@ def _parse_followup_intent(raw: Any, agenda: list[str]) -> dict | None:
     if obj is None:
         return None
     intent = str(obj.get("intent") or "").strip().lower()
-    if intent not in ("edit_report", "rerun_step", "new_study"):
+    if intent not in ("rerun_step", "new_study"):
         return None
     try:
         conf = max(0.0, min(1.0, float(obj.get("confidence"))))
@@ -2600,7 +3172,7 @@ def _followup_target(conn: Connection, req: LabRequest) -> tuple[str, Path, dict
     NB: plan-mode does NOT disqualify. "Plan first" is checked by DEFAULT, so treating it as a
     new-study signal made EVERY follow-up (e.g. "continue and generate the report") fall through to
     a fresh full re-run. The classifier decides the intent instead; a new_study result still runs
-    fresh and honors req.plan_mode, while edit_report / rerun_step don't re-plan at all.
+    fresh and honors req.plan_mode, while rerun_step does not re-plan at all.
 
     The "prior run" is scoped to THIS conversation: a follow-up amends the run its OWN chat produced,
     and a fresh window/thread (or a message in a conversation that has never run) is a NEW study —
@@ -2637,8 +3209,7 @@ async def _ask_followup_clarify(conn: Connection) -> str | None:
     reusing the exact PI-clarify round-trip (answered via /api/lab/plan). Returns the chosen
     intent string, or None on timeout/cancel."""
     q = {"question": "What would you like me to do with this message?",
-         "options": ["Revise the last report (no re-run)", "Re-run a step and update the report",
-                     "Start a brand-new analysis"]}
+         "options": ["Re-run a step and update the report", "Start a brand-new analysis"]}
     conn.plan_value = None
     conn.plan_event.clear()
     conn.pending_plan = {"kind": "clarify", "payload": [q]}
@@ -2650,14 +3221,97 @@ async def _ask_followup_clarify(conn: Connection) -> str | None:
         return None
     fb = str((conn.plan_value or {}).get("feedback", "")).lower()
     conn.plan_value = None
-    # Order matters: match the report-edit intent first so "no re-run" isn't read as a re-run.
-    if "revise" in fb or "edit" in fb or "no re-run" in fb or "as-is" in fb:
-        return "edit_report"
     if "re-run" in fb or "rerun" in fb or "redo" in fb or "step" in fb:
         return "rerun_step"
     if "new" in fb or "fresh" in fb or "brand" in fb:
         return "new_study"
     return None
+
+
+# Does this message ask for an ANALYSIS, or is it a conversational turn?
+#
+# The composer's research/chat dial stays the user's explicit choice — that decision is not
+# revisited here (a classifier silently downgrading a study to chat would answer it with fluent
+# prose and nothing behind it, and nothing downstream flags that). This asks a narrower question,
+# and only on the path that would mint a BRAND-NEW run: is there a research request in this
+# message at all? Observed live: a plan review timed out, which clears last_run_id by design, so
+# the follow-up router had nothing to attach to and the user's next two messages — a plan
+# revision, then the single word "why" — each staged the dataset from HPC3 and convened a design
+# meeting whose experts fire multi-minute Slurm jobs.
+#
+# The session's own warm model decides, exactly as the follow-up router does; the cost asymmetry
+# sets which way the uncertainty falls. Blocking a real study is the expensive error (the user is
+# stuck), so ONLY a confident "conversational" verdict stops the run — low confidence, a parse
+# failure, a call failure and a cold session all fall through to _CONVERSATIONAL_TURN, and
+# anything that list does not recognise runs.
+_NEW_STUDY_ROUTER_SYS = (
+    "You screen one message in a single-cell bioinformatics console before it starts an analysis "
+    "run (which stages a dataset on a cluster and spends 20+ minutes of compute). There is NO "
+    "previous run in this chat to refer to. Decide what the message IS:\n"
+    '- "study": it asks for analysis, or names data, a method, a tool, a gene, a cell type, a '
+    "comparison — anything a bioinformatician could act on. A terse request ('run QC', 'cluster "
+    "it') is a study. A scientific QUESTION about the data is a study.\n"
+    '- "conversational": it is a reply, an acknowledgement, a filler or a bare interjection with '
+    "no request in it ('why', 'ok', 'thanks', 'hmm', 'continue', '为什么', '继续'). Only choose "
+    "this when the message carries NO request at all.\n"
+    "When you are unsure, answer \"study\" — a wrongly blocked request strands the user, while a "
+    "wrongly started run merely costs compute.\n"
+    'Return ONLY JSON: {"intent": "study|conversational", "confidence": <0.0-1.0>, '
+    '"reason": "<one short clause>"}.'
+)
+# Deterministic floor for when the model cannot be asked (cold session) or its answer cannot be
+# used. A closed list, never a length rule: "run QC" is two words and real work.
+_CONVERSATIONAL_TURN = re.compile(
+    r"^(?:why|what|how|huh|ok|okay|k|thanks|thank you|thx|yes|yeah|no|nope|sure|hmm+|"
+    r"continue|go on|and then|next|really|and|so"
+    r"|为什么|为啥|怎么|然后呢|然后|继续|好的|好|嗯+|是吗|真的吗)"
+    r"[\s?!.,。？！]*$",
+    re.IGNORECASE)
+
+
+def _is_conversational_turn(question: str) -> bool:
+    """The deterministic floor: True for a message that cannot be read as a request on any reading."""
+    q = (question or "").strip()
+    return not q or bool(_CONVERSATIONAL_TURN.match(q))
+
+
+def _classify_new_study(complete_fn: Any, question: str) -> dict | None:
+    """Ask the warm session model whether ``question`` contains a research request at all."""
+    try:
+        raw = complete_fn([{"role": "system", "content": _NEW_STUDY_ROUTER_SYS},
+                           {"role": "user", "content": f"The message:\n{question}\n\nReturn the JSON."}])
+    except Exception as exc:  # noqa: BLE001 - a screening failure must never block a real study
+        print(f"[dispatch] new-study classify failed: {exc}")
+        return None
+    obj = _extract_json_object(raw if isinstance(raw, str) else str(raw))
+    if not obj or str(obj.get("intent", "")).lower() not in ("study", "conversational"):
+        return None
+    try:
+        conf = float(obj.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {"intent": str(obj["intent"]).lower(), "confidence": conf,
+            "reason": str(obj.get("reason", ""))[:120]}
+
+
+def _starts_no_study(conn: Connection, req: LabRequest) -> bool:
+    """True when this message should NOT mint a new run. Model first, floor second."""
+    q = (req.question or "").strip()
+    if not q:
+        return True
+    if conn.alloc is not None:          # warm model — cheap to ask, and it reads intent, not keywords
+        try:
+            complete_fn, *_ = _lab_llm(conn)
+            verdict = _classify_new_study(complete_fn, q)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[dispatch] new-study screen unavailable: {exc}")
+            verdict = None
+        if verdict and verdict["intent"] == "conversational" \
+                and verdict["confidence"] >= FOLLOWUP_CONFIDENCE:
+            return True
+        if verdict and verdict["intent"] == "study":
+            return False                # the model saw a request — believe it, never second-guess
+    return _is_conversational_turn(q)   # cold, unparseable, or unsure → deterministic floor
 
 
 async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
@@ -2679,6 +3333,17 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
         return
     target = _followup_target(conn, req)
     if target is None:
+        # Nothing to attach a follow-up to, so this message would mint a FRESH study. Refuse to do
+        # that for a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
+        if await asyncio.to_thread(_starts_no_study, conn, req):
+            conn.push({"type": "lab_progress",
+                       "text": "💬 That reads as a reply, not a study — nothing was started. "
+                               "There's no previous run in this chat to answer about (a cancelled "
+                               "or timed-out plan leaves none), so send the question you want "
+                               "analysed, or switch the composer to Chat to just talk.",
+                       "level": "info"})
+            conn.push({"type": "chat_stopped"})
+            return
         await _run_lab(conn, req)
         return
     run_id, art, state = target
@@ -2697,17 +3362,11 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
             await _run_lab(conn, req)
             return
         intent = {"intent": choice, "confidence": 1.0, "reason": "user choice",
-                  "step_index": None if choice == "edit_report" else _default_rerun_index(state)}
+                  "step_index": _default_rerun_index(state)}
 
     kind = intent["intent"]
     if kind == "new_study":
         await _run_lab(conn, req)
-        return
-    if kind == "edit_report":
-        conn.push({"type": "lab_progress",
-                   "text": "🧭 Read as “revise the last report” — no re-run; the existing figures are kept.",
-                   "level": "info"})
-        await _regenerate_report(conn, run_id, art, "report", req.question)
         return
     # rerun_step: re-run the chosen step in place; the checkpoint guard degrades to an edit
     # (A1) when the upstream analysis checkpoints have expired, so figures are never lost.
@@ -2718,10 +3377,14 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
         resume, resume_decisions, cont_req, idx = _prepare_continue(
             req.connection_id, conn, run_id, art, state, step_index, modify_note=req.question)
     except ValueError:
+        # The analysis checkpoints are gone (they are deleted as soon as the report is written),
+        # so the step cannot be re-run in place. Report editing no longer exists as a path, so say
+        # what is actually happening and start the study again rather than silently doing less.
         conn.push({"type": "lab_progress",
-                   "text": "🧭 Analysis checkpoints have expired — updating the existing report instead (figures kept).",
+                   "text": "🧭 This run's analysis checkpoints are gone, so a single step cannot be "
+                           "re-run — starting a fresh analysis instead.",
                    "level": "info"})
-        await _regenerate_report(conn, run_id, art, "report", req.question)
+        await _run_lab(conn, req)
         return
     conn.push({"type": "lab_progress",
                "text": f"🧭 Read as “re-run step {idx + 1} and update the report” — the other results and figures are kept.",
@@ -2966,32 +3629,6 @@ def _default_run_id(conn: Connection, explicit: str | None, conversation_id: str
     return (conn.last_run_id or "").strip()
 
 
-@app.post("/api/report/regenerate")
-async def report_regenerate(req: RegenerateReportRequest) -> JSONResponse:
-    """Rebuild a PRIOR run's report from its persisted bundle — WITHOUT re-running the PI or the
-    analysis. Re-renders the existing ``report.md`` (optionally after one LLM edit pass driven by
-    ``instruction``) to PDF/DOCX, in place. This is the "重新生成 PDF / 接着上次结果改报告" path: a
-    follow-up no longer triggers a full fresh pipeline. Loads the bundle by (owner, run_id) off
-    disk, so it works after a page refresh (the client remembers run_id) and even after a reconnect."""
-    conn = CONNECTIONS.get(req.connection_id)
-    if not conn:
-        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
-    if conn.chat_running:
-        return JSONResponse({"error": "A run is already in progress."}, status_code=409)
-    run_id = _default_run_id(conn, req.run_id, req.conversation_id)
-    if not run_id:
-        return JSONResponse({"error": "No previous report to regenerate."}, status_code=409)
-    basename = req.basename if req.basename in ("report", "technical_report") else "report"
-    art = conn.workspace / safe_name(run_id) / "artifacts"
-    if not (art / "report" / f"{basename}.md").exists():
-        return JSONResponse(
-            {"error": f"No {basename}.md found for run {run_id} — nothing to regenerate."},
-            status_code=404)
-    conn.begin_run(req.conversation_id, run_id=run_id)
-    asyncio.create_task(_regenerate_report(conn, run_id, art, basename, req.instruction))
-    return JSONResponse({"status": "running", "run_id": run_id})
-
-
 @app.post("/api/lab/continue")
 async def lab_continue(req: ContinueRunRequest) -> JSONResponse:
     """A2 continuation: re-run ONE changed analysis step (and everything downstream of it) from a
@@ -3105,6 +3742,33 @@ async def lab_plan_review(req: PlanReviewRequest) -> JSONResponse:
     return JSONResponse({"status": "ok", "action": action})
 
 
+class ConfirmRequestBody(BaseModel):
+    connection_id: str
+    approved: bool = False
+    run_id: str | None = None
+    conversation_id: str | None = None
+
+
+@app.post("/api/confirm")
+async def confirm_agent_action(req: ConfirmRequestBody) -> JSONResponse:
+    """Answer the agent's HITL prompt for an out-of-bounds action.
+
+    Resolved to the OWNING run, exactly like plan review: on a shared SSH session an approval
+    clicked in one window must never satisfy a different window's prompt — that is the whole
+    reason these events live on ``RunState`` rather than the connection.
+    """
+    conn = CONNECTIONS.get(req.connection_id)
+    if not conn:
+        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    target = conn.resolve_run(req.run_id, req.conversation_id)
+    if target is None:
+        return JSONResponse({"status": "stale", "approved": False})
+    target.confirm_value = bool(req.approved)
+    target.pending_confirm = None
+    target.confirm_event.set()
+    return JSONResponse({"status": "ok", "approved": bool(req.approved)})
+
+
 class LabLLM(NamedTuple):
     """What :func:`_lab_llm` binds for one session.
 
@@ -3124,21 +3788,99 @@ class LabLLM(NamedTuple):
     lab_label: str
 
 
-def _lab_llm(conn: Connection) -> "LabLLM":
-    """Bind the lab's PI/Critic completion + Scientist tool-chat to this session's
-    vLLM tunnel — or, when BIOAGENT_LLM_BASE_URL is set, to any OpenAI-compatible
-    endpoint (e.g. OpenRouter) for off-cluster testing without HPC3.
+def _guard_lab_payload(messages: list[dict[str, Any]]) -> None:
+    """Data-boundary check on the PI/Critic payload before it leaves the cluster.
 
-    Also reports whether that endpoint is OFF-HOST, so the caller can stamp
+    The Scientist brief has always been guarded; this closes the same check on the reasoning
+    roles, which carry the dataset profile, accepted findings and artifact digests. That payload
+    used to reach a remote endpoint unguarded — tolerable while a remote endpoint was an operator
+    override, untenable now that a user's own API key makes it the ordinary path.
+
+    **This is a backstop, not the control.** No string scanner can decide whether a gene list or
+    a phenotype description is identifying; the actual control is the informed consent recorded
+    on the credential (see ``/api/llm-endpoint``). What this catches is the accident:
+
+    * a secret interpolated into a prompt — a HARD block at any endpoint, because an API key
+      cannot be un-sent and the cost of a false positive is one retry;
+    * a raw data matrix that reached the reasoning payload, which should carry only derived
+      fields — so its presence is a bug worth failing on rather than shipping off-site.
+
+    Raises :class:`GatewayError` so the run stops with a stated cause instead of quietly sending.
+    """
+    from ..integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
+
+    text = "\n".join(str(m.get("content") or "") for m in messages)
+    guard = DataBoundaryGuard()
+    report = guard.inspect_prompt(text, None, DataBoundaryPolicy(allow_raw_data_to_llm=False))
+    try:
+        guard.assert_safe_for_prompt(report)
+    except ValueError as exc:
+        raise GatewayError(
+            f"The reasoning prompt was withheld from the remote model: {exc}. "
+            "Switch this session back to the cluster GPU to run it locally.",
+            stage="lab_role_egress") from exc
+
+
+def _session_credential(conn: Connection) -> dict | None:
+    """The saved API credential this session chose, or None to use the cluster's own vLLM.
+
+    Resolved from the store per run rather than cached on the ``Connection``, so an endpoint or
+    model the user edited since connect takes effect on the next run without reconnecting.
+    Returns the public row — the secret is read separately, exactly once, in :func:`_lab_llm`.
+    """
+    cred_id = (getattr(conn, "llm_choice", None) or {}).get("credential_id")
+    if not cred_id:
+        return None
+    from . import llm_credentials
+    return llm_credentials.get_credential(conn.owner, cred_id)
+
+
+def _lab_llm(conn: Connection) -> "LabLLM":
+    """Bind the lab's PI/Critic completion + Scientist tool-chat to an LLM endpoint.
+
+    Three sources, in priority order:
+
+    1. **The user's own saved API credential** (``conn.llm_choice``) — the product path for
+       bring-your-own-key. The HPC3 account still runs the Slurm analysis jobs; this only
+       decides which model reasons, and on whose bill.
+    2. ``BIOAGENT_LLM_BASE_URL`` — the process-wide env path, kept for local development and
+       the offline test suite. It was never the product path (see README) and is now the
+       fallback rather than the only option.
+    3. This session's **vLLM tunnel** to the GPU node — the cluster default.
+
+    The secret is resolved ONCE here, at run start, and captured by the closures below. That is
+    what makes a mid-run key rotation safe: a run that is already executing keeps using the key
+    it started with, and the next run picks up the new one. Nothing stores the key on the
+    ``Connection``, so no status payload can serialize it.
+
+    Also reports whether the endpoint is OFF-HOST, so the caller can stamp
     ``HarnessContext.llm_is_remote``. Only this function knows where the calls actually go: a
     session can hold an open vLLM tunnel while completions are routed to a remote API, so the
-    tunnel's existence is not evidence the prompt stays local."""
-    base_url = os.environ.get("BIOAGENT_LLM_BASE_URL") or None
-    api_key = os.environ.get("BIOAGENT_LLM_API_KEY") or None
-    if base_url:
+    tunnel's existence is not evidence the prompt stays local.
+    """
+    cred = _session_credential(conn)
+    if cred is not None:
+        from . import llm_credentials
+        base_url = cred.get("base_url") or None
+        api_key = llm_credentials.resolve_secret(conn.owner, cred["id"])
+        if not api_key:
+            # Fail loudly rather than sending an unauthenticated request and reporting the
+            # provider's 401 — the cause is local (the key file is gone) and the fix is to
+            # re-enter the key, which a bare "unauthorized" would not tell the user.
+            raise GatewayError(
+                f"The API key for “{cred.get('label') or 'this endpoint'}” could not be read. "
+                "Re-enter it under API endpoints, or switch this session back to the cluster GPU.",
+                stage="llm_credential")
+        model = cred.get("model") or ""
+        label = cred.get("label") or cred.get("provider") or "API"
+    elif os.environ.get("BIOAGENT_LLM_BASE_URL"):
+        base_url = os.environ.get("BIOAGENT_LLM_BASE_URL")
+        api_key = os.environ.get("BIOAGENT_LLM_API_KEY") or None
         model = os.environ.get("BIOAGENT_LLM_MODEL") or "qwen/qwen3.6-35b-a3b"
         label = "OpenRouter"
     else:
+        base_url = None
+        api_key = os.environ.get("BIOAGENT_LLM_API_KEY") or None
         model = conn.selected_model
         label = "vLLM"
 
@@ -3160,26 +3902,39 @@ def _lab_llm(conn: Connection) -> "LabLLM":
             return call(_port())       # retry ONCE on the recovered tunnel
 
     # ROLE SPLIT: the reasoning roles (PI / Critic / plan review / exploration / cycle re-planning /
-    # synthesis) may run on a DIFFERENT, stronger endpoint than the Scientist's tool-calling. They
+    # synthesis) may run on a DIFFERENT, stronger model than the Scientist's tool-calling. They
     # are the low-volume, long-horizon half, and the half a small model is weakest at; the Scientist
     # is high-volume, fenced by deterministic guards, bound to vLLM's tool-parser contract, and sits
-    # next to the data. Unset BIOAGENT_LAB_LLM_BASE_URL => both roles share one endpoint, exactly as
-    # before. Setting it is a DATA-EGRESS decision: the PI/Critic payload carries the dataset
-    # profile, accepted findings and artifact digests. See _lab_role_egress_note below.
-    lab_base_url = os.environ.get("BIOAGENT_LAB_LLM_BASE_URL") or None
-    if lab_base_url:
+    # next to the data. So a user pays for a strong model only on the calls that need one.
+    #
+    # With a saved credential the split is a MODEL choice on one endpoint (``lab_model``); the env
+    # path additionally allows a whole separate endpoint. Either way it is a DATA-EGRESS decision:
+    # the PI/Critic payload carries the dataset profile, accepted findings and artifact digests.
+    # See _lab_role_egress_note below.
+    if cred is not None:
+        lab_base_url, lab_key = base_url, api_key
+        lab_model = cred.get("lab_model") or model
+        lab_label = f"{lab_model} @ {label}"
+    elif os.environ.get("BIOAGENT_LAB_LLM_BASE_URL"):
+        lab_base_url = os.environ.get("BIOAGENT_LAB_LLM_BASE_URL")
         lab_model = os.environ.get("BIOAGENT_LAB_LLM_MODEL") or model
         lab_key = os.environ.get("BIOAGENT_LAB_LLM_API_KEY") or api_key
         lab_label = f"{lab_model} @ lab-role endpoint"
     else:
         lab_base_url, lab_model, lab_key, lab_label = base_url, model, api_key, label
 
+    lab_remote = _endpoint_is_off_host(lab_base_url)
+
     def complete_fn(messages):
-        # A dedicated lab endpoint is remote by construction — nothing to heal, so no recovery wrap.
-        if lab_base_url is not base_url:
+        # A remote endpoint has no tunnel to heal, so it skips the recovery wrap. Keyed on
+        # lab_base_url being set rather than on it differing from base_url: with a saved
+        # credential both roles share one remote endpoint and neither is recoverable.
+        if lab_remote:
+            _guard_lab_payload(messages)
+        if lab_base_url:
             return vllm_client.complete(0, lab_model, messages,
                                         base_url=lab_base_url, api_key=lab_key)
-        return _with_recovery(lambda p: vllm_client.complete(p, model, messages, base_url=base_url, api_key=api_key))
+        return _with_recovery(lambda p: vllm_client.complete(p, lab_model, messages, api_key=api_key))
 
     def scientist_chat(messages, tools):
         return _with_recovery(lambda p: vllm_client.chat_tools(p, model, messages, tools, base_url=base_url, api_key=api_key))
@@ -3315,20 +4070,126 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                      + (f" (composes tools: {', '.join(tools)})" if tools else ""))
         else:
             progress("📚 No matching preset pipeline — planned from scratch.")
+    elif t == "tool_nudge":
+        progress(f"↩︎ The scientist ended the step without calling {', '.join('`'+x+'`' for x in (ev.get('tools') or []))} "
+                 f"— nudged once to run it before the Critic sees the step.")
+    elif t == "mode_selected":
+        # Team vs single decides whether a multi-minute design meeting runs before the plan.
+        # Never rendered before, so a 7-minute wait and a 1-minute wait on the same question
+        # looked like random slowness. Say which and why.
+        why = {"dataset_design": "the dataset has an experimental contrast (comparative study)",
+               "question": "the PI's read of the question"}.get(str(ev.get("reason")), "")
+        if ev.get("mode") == "team":
+            progress(f"👥 Team mode — the PI will form an expert team and hold a design meeting "
+                     f"before drafting the plan (adds a few minutes){' — ' + why if why else ''}.")
+        else:
+            progress(f"👤 Single-scientist mode — planning directly{' — ' + why if why else ''}.")
     elif t == "skills_required":
         # The user REQUIRED specific atomic skills (the console's skill multi-select) — the plan
         # must apply each.
         names = ", ".join(str(s.get("name")) for s in (ev.get("skills") or []))
         if names:
             progress(f"🧩 Required skills (must apply): {names}")
+    elif t == "tool_warnings":
+        for w in list(ev.get("warnings") or [])[:4]:
+            progress(f"⚠️ {str(w)[:300]}", level="warning")
+    elif t == "plan_question":
+        progress(f"❓ Your question — answering it; the plan is unchanged: "
+                 f"{str(ev.get('text', ''))[:200]}")
+    elif t == "plan_answer":
+        # Rendered as a chat answer, not a feed line: it is a reply to the person, and burying it
+        # in the technical feed would make asking feel like nothing happened.
+        out.append({"type": "chat_token", "token": "\n" + str(ev.get("answer", "")).strip() + "\n"})
+        progress("📋 Plan unchanged — approve it, ask something else, or say what to change.")
+    elif t == "plan_review_rejected":
+        progress(f"🔬 Plan review overruled — {str(ev.get('reason', ''))[:200]}", level="warning")
+    elif t == "plan_self_sourced":
+        # What the PI decided on its OWN knowledge rather than from the protocol. Shown with the
+        # plan, because the moment to question a choice the protocol never made is before the run.
+        progress(f"🧠 Decided by the planner, not the protocol: {str(ev.get('text', ''))[:600]}",
+                 level="warning")
+    elif t == "plan_review":
+        # The PI/Critic read the draft plan back and changed it. Previously invisible even when it
+        # fired: the plan the user approved silently differed from the one the PI drafted.
+        for issue in list(ev.get("issues") or [])[:6]:
+            progress(f"🔬 Plan review: {str(issue)[:300]}", level="warning")
+        after = list(ev.get("after") or [])
+        if after:
+            progress(f"🔬 Plan revised by the Critic ({len(list(ev.get('before') or []))} → "
+                     f"{len(after)} steps): {str(ev.get('reason', ''))[:200]}")
     elif t == "steps_pruned":
         dropped = list(ev.get("dropped") or [])
         if ev.get("reason") == "no_experimental_contrast":
             progress(f"✂️ Dropped {len(dropped)} pathway-enrichment step(s): the dataset is already "
                      f"annotated with no experimental contrast, so enrichment on identity markers "
                      f"would be circular.")
+        elif ev.get("reason") == "report_busywork":
+            progress(f"✂️ Dropped {len(dropped)} step(s) that only export/package/render outputs — "
+                     f"every table and figure is already written to artifacts/ and the report is "
+                     f"assembled automatically: " + "; ".join(str(s)[:100] for s in dropped[:3]))
+        elif ev.get("reason") == "enrichment_without_de":
+            progress(f"✂️ Dropped {len(dropped)} enrichment step(s): nothing in the plan produces a "
+                     f"DE table for them to read, and the dataset profile shows no condition column "
+                     f"to contrast.", level="warning")
+        elif ev.get("reason") == "reads_back_earlier_output":
+            # Naming the step matters here: it looked like real analysis in the approved plan, and
+            # a reader who does not see WHICH step went will think an analysis was skipped.
+            progress(f"✂️ Dropped {len(dropped)} step(s) that only re-read output an earlier step "
+                     f"already produced — no new analysis: "
+                     + "; ".join(str(s)[:120] for s in dropped[:3]), level="warning")
         elif dropped:
             progress(f"✂️ Dropped {len(dropped)} step(s) the data cannot support.")
+    elif t == "plan_dependency_fixed":
+        progress(f"🔗 Plan repaired — enrichment was scheduled with no step producing a DE table; "
+                 f"inserted a contrast step before step {ev.get('before_step')}: "
+                 f"{str(ev.get('inserted') or '')[:160]}", level="warning")
+    elif t == "plan_unknown_tools":
+        tools = ", ".join(f"`{x}`" for x in list(ev.get("tools") or []))
+        progress(f"🧪 {tools}: not in the tool catalog — the step will be IMPROVISED with "
+                 f"`run_code` (allowed). Before approving, check it is not re-making something an "
+                 f"existing tool or the automatic report already produces.", level="warning")
+    elif t == "team_meeting_start":
+        members = ", ".join(str(m) for m in (ev.get("members") or []))
+        progress(f"👥 Design meeting — the PI formed a team ({members}); experts may read the "
+                 f"dataset profile and search literature before the plan is drafted. This phase "
+                 f"can take a few minutes.")
+    elif t == "expert_contribution":
+        # One line per expert turn: the 5 minutes between "Loaded preset" and the plan card used
+        # to render NOTHING — the whole meeting (rounds of tool-using expert turns) was invisible,
+        # and a user watching "Working…" had no way to tell planning from a hang.
+        progress(f"💬 [{ev.get('kind')}·round {ev.get('round')}] {ev.get('member')}: "
+                 f"{str(ev.get('text') or '').strip()[:180]}")
+    elif t == "planning":
+        progress("📝 The PI is drafting the plan…")
+    elif t == "team_meeting_cancelled":
+        progress("🛑 Stop landed during the design meeting — skipping the remaining rounds.")
+    elif t == "tool_params_nondefault":
+        # A parameter this call does NOT take from the tool's declared default. Raised while the
+        # run is still going, because that is the only moment a researcher can cheaply say "no,
+        # not 10% — use 20". Column SELECTIONS are skipped here: they restate the plan and would
+        # fire every run. They stay in the record and in the technical report.
+        tool = str(ev.get("tool") or "")
+        for p in list(ev.get("params") or []):
+            if p.get("kind") == "selection":
+                continue
+            head = ("🔓 Guard bypassed" if p.get("kind") == "switch" else "🎚 Non-default setting")
+            progress(f"{head} — {tool}.{p.get('param')} = {p.get('value')} "
+                     f"(declared default {p.get('default')}): {str(p.get('meaning') or '')[:200]}",
+                     level="warning")
+    elif t == "evidence_missing":
+        # A tool named an artifact it did not write. The step still ran, so nothing else objects —
+        # this line is the only place a human learns the citation is dangling.
+        paths = list(ev.get("paths") or [])
+        progress(f"🔍 {len(paths)} claimed artifact(s) are NOT on disk — treated as unsupported: "
+                 + ", ".join(str(p) for p in paths[:4])
+                 + (f" (+{len(paths) - 4} more)" if len(paths) > 4 else ""), level="warning")
+    elif t == "plan_patched":
+        # Show the edit as a BEFORE/AFTER. The failure this replaces was invisible: the plan came
+        # back different and nothing told the researcher which steps had moved, so asking for a
+        # clustering resolution could silently cost them the differential-expression step.
+        progress(f"✏️ Revised step {ev.get('step')} only — the rest of the plan is unchanged.\n"
+                 f"   − {str(ev.get('before') or '')[:220]}\n"
+                 f"   + {str(ev.get('after') or '')[:220]}")
     elif t == "context_pressure":
         pct = int(float(ev.get("ratio") or 0) * 100)
         progress(f"🧮 Context check — {ev.get('reason')} ({ev.get('tokens')} of "
@@ -3426,7 +4287,8 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     elif t == "decision_made":
         progress(f"✅ Your choice: {str(ev.get('choice', ''))[:80]}", "success")
     elif t == "plan_cancelled":
-        progress("✋ Plan cancelled — nothing was executed.", "warning")
+        progress("✋ Plan cancelled or timed out — nothing ran, so no report was written.",
+                 "warning")
     elif t == "lab_done":
         progress(
             f"🏁 Analysis done — {ev.get('accepted_steps')}/{ev.get('agenda')} "
@@ -3455,15 +4317,30 @@ def _build_report_render_fn(conn: "Connection"):
     return None
 
 
-def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: dict[str, Any]) -> None:
+def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: dict[str, Any],
+                     execution: dict[str, Any] | None = None,
+                     protocols: "list[dict[str, str]] | None" = None,
+                     self_sourced: str = "") -> None:
     """Persist everything an A2 resume needs — the agenda + accepted rounds (via ``result.to_dict``)
     plus the resolved skill ``guidance`` and the dataset pointers — to
     ``artifacts/process/run_state.json``. A future ``/api/lab/continue`` loads this to re-enter the
     loop from a chosen step without re-planning (see ``ResumeState.from_run_state``). Best-effort:
-    resumability metadata must never fail the run."""
+    resumability metadata must never fail the run.
+
+    ``execution`` stamps HOW the run was executed (resolved mode, team, planner, switches). Of 26
+    production bundles inspected on 2026-08-11, none recorded it, so telling a Virtual-Lab run from
+    a single-scientist one meant guessing from the specialist names — and that guess cannot
+    distinguish "ran single" from "ran team but the roster fell back to the fixed one"."""
     try:
         state = result.to_dict()
         state["guidance"] = guidance
+        # The protocol's IDENTITY, alongside its text. `guidance` is the prompt body, which
+        # answers "what was it told" but not "which protocol was this" — and the protocol
+        # files get edited, so the text alone cannot be traced back to a version later.
+        state["protocols"] = protocols or []
+        state["self_sourced"] = self_sourced or ""
+        if execution:
+            state["execution"] = execution
         state["dataset_path"] = str(decisions.get("dataset_path") or "") or None
         if decisions.get("hpc_primary"):
             state["hpc_primary"] = decisions["hpc_primary"]
@@ -3486,6 +4363,39 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
         p.write_text(json.dumps(state, default=str, indent=2), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001 - best-effort resumability metadata
         print(f"[lab] run_state persist failed: {exc}")
+
+
+def _drop_process_files(run_dir: Path) -> int:
+    """Delete a finished run's PROCESS files, keeping ``artifacts/``. Returns bytes freed.
+
+    A run's workspace holds two kinds of thing: the deliverable (``artifacts/`` — report, figures,
+    tables, and the small ``process/`` JSON a reader or a post-mortem needs) and the machinery that
+    produced it (``work/`` checkpoints at hundreds of MB each, ``staged/`` holding a whole copy of
+    the input matrix). The machinery used to survive for a 7-day TTL so a step could be re-run in
+    place; with report regeneration gone that trade no longer pays, and the console's run store had
+    grown to 7.4 GB. Deleting at publish time keeps the deliverable permanently and the bulk for
+    minutes.
+
+    Path-guarded and best-effort: anything unexpected leaves the directory alone rather than
+    risking the bundle.
+    """
+    freed = 0
+    try:
+        base = run_dir.resolve()
+    except OSError:
+        return 0
+    for name in ("work", "staged"):
+        target = base / name
+        if not target.is_dir() or target.is_symlink():
+            continue
+        try:
+            if not str(target.resolve()).startswith(str(base)):
+                continue                       # never follow a link out of the run directory
+            freed += sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+            shutil.rmtree(target)
+        except OSError:
+            continue
+    return freed
 
 
 def _trim_work_keep_checkpoints(work_dir: Path) -> None:
@@ -3822,8 +4732,20 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     container_module=st.container_module, container_bin=st.container_bin,
                     local_fallback=sandbox, job_store=job_store, owner=owner,
                     should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight run_code job
+                    # The lab-SHARED package cache: a snippet can import anything a member has
+                    # installed via install_package, so the image no longer has to be rebuilt for
+                    # every missing library and nobody downloads the same package twice.
+                    package_cache_root=f"{st.shared_root.rstrip('/')}/pkgs",
                 )
                 emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
+                # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
+                # than letting it die on ModuleNotFoundError mid-step. Transparent when nothing is
+                # missing; skipped entirely when the shell/cache aren't available.
+                _shell = _build_hpc_shell(conn, run)
+                if _shell is not None and getattr(_shell, "package_cache", None) is not None:
+                    from .code_preflight import PreflightingExecutor
+                    code_executor = PreflightingExecutor(
+                        inner=code_executor, shell=_shell, cache=_shell.package_cache, emit=emit)
         # scGPT per-cell annotation runs as a GPU batch job on HPC3 (Route C). Wire its
         # runner only for a LIVE session (a real SSH executor) — in mock/offline mode the
         # tool stays present but reports not-enabled (the mock host has no batch lifecycle).
@@ -3872,6 +4794,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     remote=conn.executor, container_image=st.analysis_image,
                     remote_workspace=remote_ws, remote_dataset=remote_ds,
                     local_workspace=conn.workspace / run_id, source_dir=pysrc,
+                    # Shared dfs3b dir with pure-Python deps the analysis image lacks (pydeseq2).
+                    # Unset -> run_pseudobulk_de degrades loudly to its Welch fallback.
+                    deps_dir=os.environ.get("BIOAGENT_HPC_PYDEPS") or None,
                     mem_gb=st.run_code_mem_gb, cpus=st.run_code_cpus, partition=st.cpu_partition,
                     account=st.cpu_account or "", time_limit=st.run_code_time_limit,
                     container_module=st.container_module, container_bin=st.container_bin,
@@ -4280,7 +5205,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                             analysis_executor=analysis_executor,
                                             variant_executor=variant_executor,
                                             phenotype_executor=phenotype_executor,
-                                            literature_executor=_build_literature_executor(conn)),
+                                            literature_executor=_build_literature_executor(conn),
+                                            hpc_shell=_build_hpc_shell(conn, run)),
             chat_fn=scientist_chat,
             count_tokens_fn=count_tokens,   # exact server-side window sensing (vLLM /tokenize)
         )
@@ -4358,6 +5284,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                               in ("1", "true", "yes"))
         induced_dir = (os.environ.get("BIOAGENT_INDUCED_SKILLS_DIR")
                        or str(conn.workspace / "_induced_skills")) if skill_induction else None
+        # PI↔Critic review of the whole draft plan before any step runs. ON unless explicitly
+        # disabled: this had a config flag and a full implementation but no caller, so every
+        # production run went from a single-shot draft straight to execution with nothing ever
+        # reading the plan back. Set BIOAGENT_PLAN_REVIEW=0 to go back to that.
+        plan_review = (os.environ.get("BIOAGENT_PLAN_REVIEW", "1").strip().lower()
+                       not in ("0", "false", "no", "off"))
         # Merge of main's planner budgets (max_steps/max_rounds) and the DAG line's planner config.
         lab_obj = ResearchLab(ctx, LabConfig(preset_prompt=preset_prompt, pinned_skills=pinned_skills,
                                              required_skills=required_skills,
@@ -4371,6 +5303,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                              max_cycles=max_cycles,
                                              skill_induction=skill_induction,
                                              induced_skills_dir=induced_dir,
+                                             plan_review=plan_review,
                                              context_management=context_management),
                               complete_fn=complete_fn, scientist=scientist)
         if _llm.lab_role_remote:
@@ -4419,7 +5352,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 emit("step", "lab", f"Incorporating your mid-run note: {str(ev.get('text', ''))[:80]}")
             elif t == "plan_cancelled":
                 run_flags["plan_cancelled"] = True
-                emit("warning", "lab", "Plan cancelled by user — nothing was executed.")
+                emit("warning", "lab", "Plan cancelled or timed out — nothing was executed.")
             elif t == "lab_done":
                 emit("success", "lab",
                      f"Lab done: converged={ev['converged']} accepted={ev['accepted_steps']}/{ev['agenda']}")
@@ -4444,9 +5377,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             else:
                 conn.push({"type": "plan_prompt", "agenda": list(payload)})
                 emit("step", "lab", "Plan ready — Run it, or tell the PI what to change in chat.")
-            if not conn.plan_event.wait(timeout=600):
+            if not conn.plan_event.wait(timeout=_plan_review_timeout()):
                 conn.pending_plan = None
-                emit("warning", "lab", "Plan review timed out (10 min) — cancelling.")
+                mins = max(1, _plan_review_timeout() // 60)
+                emit("warning", "lab",
+                     f"Plan review timed out ({mins} min with no answer) — cancelling.")
                 return {"action": "cancel"}
             conn.pending_plan = None
             return conn.plan_value or {"action": "cancel"}
@@ -4491,13 +5426,27 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 return True
             return False
 
+        def checkpoint_run(partial: Any) -> None:
+            """Persist the run state after EVERY round, not only when the run finishes.
+
+            ``_write_run_state`` used to be called once, after ``lab_obj.run`` returned. A gateway
+            restart (prod is a single stateful replica, so one restart hits every live run) or a
+            crash mid-analysis therefore threw away hours of completed steps: the
+            ``work/adata_*.h5ad`` checkpoints were still on disk, but with no run_state.json nothing
+            could re-enter the loop to use them. Now an interrupted run is continuable from its last
+            completed step via the SAME /api/lab/continue path a user-requested re-run uses.
+            ``lab_obj.guidance`` is read live because the PI resolves it during run()."""
+            _write_run_state(art, partial, lab_obj.guidance, decisions,
+                             lab_obj.execution_profile)
+
         result = await asyncio.to_thread(
             lab_obj.run, req.question, on_event,
             plan_review if want_plan_review else None,
             should_cancel=run.chat_stop.is_set, pull_injections=conn.pull_injections,
             resume=resume,
             decision_review=(decision_review if want_decisions else None),
-            should_compact=take_compact_request)
+            should_compact=take_compact_request,
+            checkpoint=checkpoint_run)
 
         # A plan cancelled or timed-out during review — or a run that executed and accepted NOTHING —
         # has no results to write up. Rendering a report from it produced a placeholder, DATALESS
@@ -4509,7 +5458,6 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if _run_produced_nothing(result, run_flags["plan_cancelled"]):
             reason = (result.final_answer or "").strip() or \
                 "Plan cancelled or timed out during review — no analysis steps were executed."
-            say_key("🛑 计划已取消或超时,未执行任何分析步骤 —— 不生成报告。", "warning")
             emit("warning", "lab", "Run ended before any step was accepted — skipping report render.")
             conn.push({"type": "chat_token", "token": reason})
             conn.push({"type": "chat_stopped"})
@@ -4523,18 +5471,37 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 plan_md = art / "report" / "plan.md"
                 plan_md.parent.mkdir(parents=True, exist_ok=True)
                 body = "\n".join(f"{i}. {s}" for i, s in enumerate(result.agenda, 1))
+                # WHICH protocol steered this plan, and WHAT the PI decided on its own. Both were
+                # known at plan time and neither was ever written down: the protocol's identity
+                # lived only in an ephemeral chat line, and nothing recorded which choices the
+                # protocol did not actually specify. A plan.md that answers neither cannot be
+                # audited months later, which is the only time anyone reads it.
+                protos = lab_obj.protocols
+                proto_line = (
+                    "**Protocol:** " + ", ".join(f"{p['label']} (`{p['key']}`)" for p in protos)
+                    if protos else
+                    "**Protocol:** none matched — this plan was drafted from scratch."
+                )
+                disclosure = (f"\n## Decided by the planner, not the protocol\n\n"
+                              f"{lab_obj.self_sourced}\n" if lab_obj.self_sourced else "")
                 plan_md.write_text(
-                    f"# Research plan\n\n**Question:** {req.question}\n\n{body}\n",
+                    f"# Research plan\n\n**Question:** {req.question}\n\n{proto_line}\n\n"
+                    f"{body}\n{disclosure}",
                     encoding="utf-8")
             except OSError:
                 pass
 
         # Categorized bundle: process/ (the Virtual-Lab meeting record), figures/,
         # tables/ (written by the analysis tools), report/ (final deliverables), data/.
-        write_process_artifacts(result.to_dict(), art / "process")
+        # Stamp HOW the run executed into the bundle itself, so a result read months later states
+        # whether it was a Virtual-Lab team or one scientist instead of leaving it to be inferred.
+        write_process_artifacts({**result.to_dict(), "execution": lab_obj.execution_profile},
+                                art / "process")
         # Persist the resumable run state (agenda + rounds + guidance + dataset) so a follow-up can
         # re-run a single changed step from this run without re-planning (A2 continuation).
-        _write_run_state(art, result, lab_obj.guidance, decisions)
+        _write_run_state(art, result, lab_obj.guidance, decisions,
+                         lab_obj.execution_profile,
+                         protocols=lab_obj.protocols, self_sourced=lab_obj.self_sourced)
         # Mark this run continuable AS SOON AS its state is durably written — BEFORE the report
         # render. Then a follow-up ("continue and generate the report") can route to the bundle even
         # if the render step later hiccups; a run whose analysis finished must never be un-continuable
@@ -4669,7 +5636,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # report/technical_report.{pdf,docx}. Best-effort; never blocks the manuscript.
         try:
             tech_md = await asyncio.to_thread(
-                _build_technical_report, result, art, complete_fn, req.question, lit_note, visual_diag)
+                _build_technical_report, result, art, complete_fn, req.question, lit_note, visual_diag,
+                _llm_provenance_note(_llm))
             tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
             tech_rep = await asyncio.to_thread(
                 build_pdf_report, tech_md, art / "report",
@@ -4689,14 +5657,20 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
         conn.push({"type": "chat_done"})
 
-        # Bundle cleanup — best-effort. Trim scratch but KEEP the analysis checkpoints
-        # (work/adata_*.h5ad): an A2 resume ("re-run clustering, keep QC") reads the kept step's
-        # checkpoint as its input, so deleting them would force a full re-run. Delete everything
-        # else under work/ to reclaim space. Then move any off-script files the model wrote (a
-        # self-made qc_report.docx / self-zipped bundle) into extra/ — kept, not deleted. A failure
-        # in either MUST NOT lose the bundle (analysis is done + checkpointed), so it's guarded.
+        # Bundle cleanup — best-effort. Once the report exists, the PROCESS files have done their
+        # job: the whole run workspace except `artifacts/` is deleted here rather than left for a
+        # TTL sweeper (Yijun, 2026-08-21). That is `work/` (the densified adata_*.h5ad checkpoints,
+        # hundreds of MB each) and `staged/` (a full copy of the input matrix pulled back from
+        # HPC3). What survives is `artifacts/` — the report, figures, tables, data and the small
+        # process/ JSON the run is reconstructed from. Then move any off-script files the model
+        # wrote (a self-made qc_report.docx / self-zipped bundle) into extra/ — kept, not deleted.
+        # A failure MUST NOT lose the bundle (the analysis is done), so it is guarded.
         try:
-            _trim_work_keep_checkpoints(conn.workspace / run_id / "work")
+            freed = _drop_process_files(conn.workspace / run_id)
+            if freed:
+                emit("info", "lab",
+                     f"Report written — released {freed / (1 << 20):.0f} MB of process files "
+                     "(checkpoints + the staged input copy); artifacts kept.")
             strays = _quarantine_strays(art)
             if strays:
                 emit("info", "lab",
@@ -4771,6 +5745,23 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         conn.end_run(run)
 
 
+def _plan_review_timeout() -> int:
+    """Seconds the run waits for the user to approve/revise a drafted plan.
+
+    The old 10-minute wait was sized for "glance at it and click Run". A researcher actually
+    READS a 10-step plan — checks the tools, the thresholds, whether the design supports the
+    statistics — and 10 minutes of silence then destroyed the draft AND their half-written
+    revision (a timeout returns "cancel", and a cancelled plan deliberately clears last_run_id
+    so the next message starts a fresh study). An hour costs nothing extra: the session's GPU is
+    already allocated and idles between messages either way.
+    """
+    try:
+        val = int(str(os.environ.get("BIOAGENT_PLAN_REVIEW_TIMEOUT", "")).strip() or 3600)
+    except (TypeError, ValueError):
+        return 3600
+    return val if val > 0 else 3600
+
+
 def _run_produced_nothing(result: Any, plan_cancelled: bool) -> bool:
     """True when a run has NO results to write up — the plan was cancelled/timed-out during review, or
     the loop executed and accepted NOTHING (no rounds). Rendering a report from either produced a
@@ -4814,109 +5805,6 @@ def _split_front_matter(md: str) -> tuple[str, str]:
     if close == -1:
         return md.rstrip(), ""
     return md[:close], md[close + 1:].lstrip("\n")
-
-
-def _edit_report_body(body: str, instruction: str, art: Path, complete_fn) -> str:
-    """One LLM pass that applies ``instruction`` to the report body. Mirrors ``_review_report``'s
-    safeguards: constrains figure refs to the run's actual figures and keeps the original body if
-    the edit fails or comes back degenerate (so a follow-up never destroys the existing report)."""
-    figs = sorted((art / "figures").glob("*.png")) if (art / "figures").exists() else []
-    fig_list = "\n".join(f"- figures/{f.name}" for f in figs) or "(none)"
-    try:
-        edited = complete_fn([
-            {"role": "system", "content": _REPORT_EDIT_SYSTEM},
-            {"role": "user", "content": (
-                f"Requested change:\n{instruction}\n\n"
-                f"Valid figure paths (any ![](...) must be one of these):\n{fig_list}\n\n"
-                f"Current report to edit:\n\n{body}"
-            )},
-        ])
-    except Exception as exc:  # noqa: BLE001 - never lose the report over an edit hiccup
-        print(f"[regen] report edit failed ({exc}); keeping the existing report.")
-        return body
-    edited = (edited or "").strip()
-    if len(edited) < min(200, len(body) // 2):   # degenerate edit → keep the original
-        return body
-    return edited
-
-
-async def _regenerate_report(conn: Connection, run_id: str, art: Path, basename: str,
-                             instruction: str | None) -> None:
-    """Re-render a prior run's report from its bundle (optionally after one instruction-driven edit),
-    streaming progress into the chat like a normal run — but with NO PI and NO analysis. Overwrites
-    ``report.{md,pdf,docx}`` in place and republishes the run's files so the UI refreshes."""
-    # Bind the run scope (the caller opened it via begin_run; a direct call gets a fresh one) so this
-    # regenerate's stream is tagged with run_id + conversation_id and its Stop targets only this run.
-    run = conn.active_run or conn.begin_run(None, run_id=run_id)
-    conn.bind_run_id(run, run_id)
-    run.chat_stop.clear()
-    conn.chat_running = True
-    conn.push({"type": "chat_start"})
-    emit = conn.emit_fn()
-
-    def say_key(text: str, level: str = "info") -> None:
-        conn.push({"type": "lab_progress", "text": text, "level": level})
-
-    try:
-        from ..tools.report import build_pdf_report
-
-        md_path = art / "report" / f"{basename}.md"
-        md = md_path.read_text(encoding="utf-8")
-        front, body = _split_front_matter(md)
-        instr = (instruction or "").strip()
-        if instr:
-            say_key(f"✏️ 按你的指示修改报告(不重跑分析):{instr[:80]}")
-            complete_fn, *_ = _lab_llm(conn)
-            body = await asyncio.to_thread(_edit_report_body, body, instr, art, complete_fn)
-        else:
-            say_key("📄 用已有分析结果重新渲染报告(不重跑分析)…")
-        new_md = f"{front}\n\n{body}" if front else body
-
-        render_fn = _build_report_render_fn(conn)
-        if render_fn is not None:
-            emit("info", "lab", "Report rendering runs on HPC3 (CPU Slurm, pandoc/xelatex).")
-        say_key("📄 Rendering the report (PDF / DOCX)…")
-        # title=None: new_md already carries the original YAML title block, so build_pdf_report
-        # writes it back verbatim (basename.md) and renders from it.
-        rep = await asyncio.to_thread(
-            build_pdf_report, new_md, art / "report", title=None, basename=basename,
-            assets_root=art, render_fn=render_fn)
-
-        made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
-        if made:
-            fmts = " + ".join(f"{basename}.{f.split('_')[0]}" for f in made)
-            emit("success", "lab", f"Regenerated {fmts} (pandoc).")
-        else:
-            full_err = str(rep.get("error", "") or "").strip()
-            if full_err:
-                try:
-                    (art / "process").mkdir(parents=True, exist_ok=True)
-                    (art / "process" / f"{basename}_render_error.log").write_text(full_err, encoding="utf-8")
-                except OSError:
-                    pass
-            emit("warning", "lab",
-                 f"Report render failed (full log: process/{basename}_render_error.log): {full_err[:160]}")
-
-        # Republish the run's files so the Downloads panel + file browser refresh with the new render.
-        items = [
-            {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
-             "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
-            for p in sorted(art.rglob("*")) if p.is_file()
-        ]
-        conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
-        _remember_run(conn, run)
-        conn.push({"type": "run_complete", "run_id": run_id})
-        note = "报告已按指示更新并重新生成" if instr else "报告已用已有结果重新生成"
-        conn.push({"type": "chat_token", "token": f"✅ {note}(run {run_id})。"})
-        conn.push({"type": "chat_done"})
-    except Exception as exc:  # noqa: BLE001 - a regenerate failure is reported, never fatal
-        print(f"[regen] failed: {type(exc).__name__}: {exc}")
-        traceback.print_exc()
-        conn.emit("error", "lab", f"Report regenerate failed: {exc}", detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": str(exc)})
-    finally:
-        conn.chat_running = False
-        conn.end_run(run)
 
 
 def _finish_run_record(conn: Connection, run_id: str | None, status: str,
@@ -5039,7 +5927,13 @@ def _report_writer_system(kind: str = "single_cell") -> str:
         "(do NOT prefix them with your own '1.'/'2.' numbers):\n"
         "  # <a concise, informative title summarizing the main finding>\n"
         "  ## Abstract  (ONE paragraph: background, methods, key quantitative results, conclusion)\n"
-        "  ## Introduction  (biological background and the study objective / question)\n"
+        "  ## Study question  (2-4 sentences: what was being asked of THIS dataset and why "
+        "that question is answerable from it. NOT textbook background — the reader is the "
+        "person whose data this is and does not need the gene or the tissue explained.)\n"
+        "  (Two further sections — '## The dataset' and '## What was run' — are inserted "
+        "automatically from the execution record and must NOT be written by you. Do not "
+        "restate the dataset shape, the design, or the tool list; write Results as though "
+        "the reader has just read them.)\n"
         "  ## Results  (core findings as flowing scientific prose; organize into labelled subsections "
         f"{_manuscript_results_hint(kind)}; lead each subsection with its take-home message; reference "
         "figures to carry the data and keep any inline table small — see the table rule below)\n"
@@ -5089,6 +5983,33 @@ def _report_writer_system(kind: str = "single_cell") -> str:
         "p-value in scientific notation with 2 significant figures (e.g. 1.6e-18); round scores to "
         "integers; NEVER paste 10+ digit numbers or full-precision floats. Drop redundant tables whose "
         "data is already shown in a referenced figure.\n"
+        "- NUMBER FORMAT (prose and tables): scientific notation is ONLY for p-values / adjusted p-values "
+        "and for magnitudes below 0.001 or above 100,000. Percentages, proportions, fold-changes, NES, "
+        "SEMs and counts are written as ordinary decimals — '65.2%', '12.6% vs 5.9%', 'NES -4.2', "
+        "'SEM 0.013' — never '6.5e+01%' or '-4.2e+00'.\n"
+        "- REPLICATION WORDING: describe the study's replication EXACTLY as the '## The dataset' section "
+        "states it (e.g. 'one library, two condition labels, no biological replicates'). Do NOT restate it "
+        "as 'two donors', 'one animal per arm', 'a single mutant retina', or any other count the dataset "
+        "section does not give.\n"
+        "- DESCRIPTIVE DE: when a differential-expression result carries inference='exploratory_ranking' "
+        "or 'pseudoreplicated', it is a RANKING, not a test. Report it by effect size and rank ('the "
+        "genes with the largest positive log2 fold-changes in Rod were …'), do NOT report 'N genes "
+        "significantly up-regulated', do NOT call anything 'significant', and caption volcano plots as "
+        "'genes past the descriptive threshold' rather than 'significant'. If the profile or a tool "
+        "warning notes a DEPTH IMBALANCE or DIRECTION BIAS between the arms, say so in Results AND "
+        "Discussion, and present any same-direction shift across cell types (translation / ribosomal "
+        "genes especially) as depth-confounded, not as biology.\n"
+        "- ENRICHMENT P-VALUES ARE CONDITIONAL: when the DE that produced the gene lists carries "
+        "inference='exploratory_ranking' (or any pseudoreplication warning), enrichment adjusted "
+        "p-values (ORA/GSEA) are overlap statistics COMPUTED ON a descriptive, possibly "
+        "depth-confounded ranking — they inherit its limits. Report the terms and gene overlaps as "
+        "the finding; keep the p-values in parentheses as descriptive strength-of-overlap, never "
+        "as the lead claim of a Results sentence, and never as evidence that the underlying "
+        "expression change is real.\n"
+        "- CAPTION TRUTH: a caption may state only what the tool result says the figure shows (its "
+        "stated axes / groups). If the axes are not stated, describe the figure generically ('QC "
+        "scatter of per-cell metrics') — NEVER invent axis names, colour meanings, legends, or "
+        "'coloured by …' details. Two different figure files never share one caption.\n"
         "- FIGURE CAPTIONS (required): every embedded figure MUST carry a numbered, descriptive caption "
         "via EXACTLY this form: ![Figure N. <what the panel shows, and what the axes / colours / legend "
         "represent>](figures/NAME.png) with a path from the provided figure list. Number figures "
@@ -5376,6 +6297,180 @@ def _manuscript_run_status_block(result: Any) -> str:
     return "\n".join(lines)
 
 
+def _dataset_section(art: Path, result: Any = None) -> str:
+    """"The dataset" — what came in, written from the preflight profile, not from prose.
+
+    A researcher opening a report needs to see the object the conclusions rest on: how many cells,
+    what the arms are, HOW MANY SAMPLES back each arm, which labels the file already carried, and
+    what had already been done to it before the lab touched it. None of that survived into the
+    manuscript: the profile was computed at run start, handed to the planner, and then discarded,
+    so a reader could not tell a two-donor pilot from a twenty-donor cohort. Built deterministically
+    so it cannot be summarised away or invented."""
+    try:
+        dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(dr, dict):
+        return ""
+    from ..tools.scrna_pack import _looks_like_celltype_column, _looks_like_condition_column
+
+    cats = dr.get("obs_categoricals") or {}
+    lines = ["## The dataset", ""]
+    shape = []
+    if dr.get("cells"):
+        shape.append(f"{int(dr['cells']):,} cells")
+    if dr.get("genes"):
+        shape.append(f"{int(dr['genes']):,} genes")
+    lines.append(f"**Input.** `{Path(str(dr.get('dataset_path') or 'dataset')).name}` — "
+                 + (" x ".join(shape) if shape else str(dr.get("dataset_kind") or "unknown"))
+                 + (f" ({dr['dataset_kind']})." if dr.get("dataset_kind") else "."))
+
+    # The experimental design, and the number every conclusion about a condition depends on.
+    design, labels, qc_cols = [], [], []
+    for col, info in cats.items():
+        if not isinstance(info, dict) or not isinstance(info.get("n"), int):
+            continue
+        vals = info.get("values") or []
+        # Show every level of a real design/label column — 11 cell types listed as 8 plus a
+        # silent truncation is how a reader loses the three the analysis skipped.
+        extra = f", +{len(vals) - 12} more" if len(vals) > 12 else ""
+        shown = (" [" + ", ".join(map(str, vals[:12])) + extra + "]") if vals else ""
+        entry = f"`{col}` — {info['n']} level{'s' if info['n'] != 1 else ''}{shown}"
+        if _looks_like_celltype_column(col):
+            labels.append(entry)
+        elif _looks_like_condition_column(col):
+            design.append(entry)
+        else:
+            qc_cols.append(entry)
+    # NOTE the blank line between each bold label and its list: pandoc/CommonMark treats a list
+    # that follows a paragraph WITHOUT a blank line as part of that paragraph, so the rendered PDF
+    # showed "- orig.ident — 1 level - sampleid — 2 levels …" run together on one line.
+    if design:
+        lines += ["", "**Experimental design.**", ""] + [f"- {d}" for d in design]
+        singles = [c for c, i in cats.items()
+                   if isinstance(i, dict) and i.get("n") == 1 and _looks_like_condition_column(c)]
+        if singles:
+            lines.append(f"- Replication: {', '.join('`' + c + '`' for c in singles)} takes a "
+                         "SINGLE value across every cell, so this object holds one library and "
+                         "carries no biological replication. Comparisons between the arms are "
+                         "descriptive; no valid p-value for the condition can be computed from it.")
+    if labels:
+        lines += ["", "**Cell-type labels already present in the file** (reused, not recomputed):",
+                  ""] + [f"- {d}" for d in labels]
+    if qc_cols:
+        lines += ["", "**Other metadata.** " + "; ".join(qc_cols) + "."]
+
+    # Per-arm design table + depth check — the numbers a reader needs before any comparison.
+    dba = dr.get("design_by_arm") if isinstance(dr.get("design_by_arm"), dict) else None
+    if dba and (dba.get("cells_by_arm") or {}):
+        arms = list((dba.get("cells_by_arm") or {}).keys())
+        lines += ["", f"**Cells per arm** (`{dba.get('condition_column')}`).", ""]
+        lines.append("| | " + " | ".join(arms) + " |")
+        lines.append("|---|" + "|".join("---:" for _ in arms) + "|")
+        lines.append("| cells | " + " | ".join(f"{dba['cells_by_arm'][a]:,}" for a in arms) + " |")
+        for col, per in (dba.get("qc_median_by_arm") or {}).items():
+            lines.append(f"| median {col} | " + " | ".join(str(per.get(a, "")) for a in arms) + " |")
+        lab = dba.get("cells_by_label_and_arm") or {}
+        if lab:
+            lines += ["", f"**Cells per `{dba.get('label_column')}` per arm.**", ""]
+            lines.append("| label | " + " | ".join(arms) + " | testable (≥30 in each arm) |")
+            lines.append("|---|" + "|".join("---:" for _ in arms) + "|:---:|")
+            for l, per in lab.items():
+                ok = all(per.get(a, 0) >= 30 for a in arms)
+                lines.append(f"| {l} | " + " | ".join(f"{per.get(a, 0):,}" for a in arms)
+                             + f" | {'yes' if ok else 'no'} |")
+        if dba.get("depth_imbalance"):
+            lines += ["", f"**Depth check.** {dba['depth_imbalance']}"]
+        if dba.get("snrna_hint"):
+            lines += ["", f"**Protocol check.** {dba['snrna_hint']}"]
+
+    # What the QC step actually did to it, from the step's own return value.
+    for rnd in (getattr(result, "rounds", None) or []):
+        sr = rnd.get("scientist_result") if isinstance(rnd, dict) else None
+        for st in ((sr or {}).get("steps") or []):
+            if st.get("tool") != "run_scanpy_qc" or not isinstance(st.get("result"), dict):
+                continue
+            r = st["result"]
+            if r.get("status") != "ok":
+                continue
+            before, after = r.get("cells_before"), r.get("cells_after")
+            if before is None:
+                continue
+            removed = int(before) - int(after or 0)
+            note = (f"**After quality control.** {int(after or 0):,} of {int(before):,} cells kept "
+                    f"({removed:,} removed) and {int(r.get('genes_after') or 0):,} genes retained.")
+            if removed == 0:
+                note += (" No cell fell below the thresholds — consistent with data that had "
+                         "already been quality-controlled before it reached this pipeline.")
+            if r.get("mt_filter_effective") is False:
+                note += (" NOTE: no mitochondrial genes matched, so that filter removed nothing "
+                         "regardless of its threshold.")
+            lines += ["", note]
+            break
+    return "\n".join(lines) + "\n"
+
+
+def _pipeline_section(result: Any = None) -> str:
+    """"What was run" — every tool that executed, what it does, and the settings it used.
+
+    The report a researcher reads named no tool at all; the tool names lived only in the technical
+    report. They do not read the code, and they should not have to: the point of this section is
+    that "we ran a Wilcoxon test over cells" and "we aggregated to donors and tested across them"
+    are different studies, and which one happened has to be legible without opening a file.
+    Deterministic — the tools are read off the execution log, the descriptions off the tool
+    library, and the parameter meanings off the declared-parameter table."""
+    from ..agents.research_harness import nondefault_params
+    from ..tools.scrna_pack import PARAMS, TOOL_SUMMARY
+
+    seen: list[tuple[str, dict]] = []
+    for rnd in (getattr(result, "rounds", None) or []):
+        # LabResult.rounds are LabRound dataclasses in production; the tests (and run_state.json
+        # replays) hand dicts. Reading only the dict shape made this section EMPTY in every real
+        # report — the run-that-verified-it produced "## The dataset" and no "## What was run".
+        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
+              else getattr(rnd, "scientist_result", None))
+        for st in ((sr or {}).get("steps") or []):
+            tool = str(st.get("tool") or "")
+            # `ok` means the executor did not RAISE — a tool that returned {"status": "error"}
+            # still carries ok=True. Reading the settings off such a call describes a run that
+            # did not happen: the DDX41 bundle's first run_de was refused by the guard with
+            # force=false, and reporting that call would tell a reader the guard was respected
+            # when the analysis they are holding came from a later force=true call.
+            res = st.get("result")
+            failed = isinstance(res, dict) and res.get("status") not in (None, "ok")
+            if not st.get("ok") or failed or tool not in TOOL_SUMMARY:
+                continue
+            if any(t == tool for t, _ in seen):
+                continue
+            seen.append((tool, st.get("args") or {}))
+    if not seen:
+        return ""
+    out = ["## What was run", "",
+           "Each analysis below was performed by the named tool. Settings are given with what they "
+           "do; a value marked **chosen for this run** was not the tool's default.", ""]
+    for i, (tool, args) in enumerate(seen, 1):
+        out.append(f"**{i}. `{tool}`** — {TOOL_SUMMARY[tool]}")
+        decl = PARAMS.get(tool, {})
+        used = {k: v for k, v in args.items() if k in decl}
+        nd = {d["param"] for d in nondefault_params(
+            {"properties": {k: {"default": v[0], "description": v[1]} for k, v in decl.items()}},
+            args)}
+        shown = list(used) or [k for k in decl][:4]
+        if shown:
+            out.append("")
+            for k in shown:
+                val = used.get(k, decl[k][0])
+                mark = " — **chosen for this run**" if k in nd else ""
+                # A plain list item. The first version indented these four spaces, which in
+                # markdown is a CODE BLOCK: pandoc set every parameter line in monospace and
+                # LaTeX code blocks do not wrap, so the plain-English meanings ran off the right
+                # edge of the page — the one section written for people who do not read code
+                # rendered as the most code-like thing in the report.
+                out.append(f"- `{k}` = `{val}` — {decl[k][1]}{mark}")
+        out.append("")
+    return "\n".join(out)
+
+
 def _build_report(synthesis: str, art: Path, complete_fn, question: str, result: Any = None) -> str:
     """Write a Ddx41-style report: hand the model the figure inventory + previews of the
     smallest (usually summary) result tables, let it write a structured report with inline
@@ -5431,7 +6526,34 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
     if not (body and body.strip()):
         return _assemble_report_md(synthesis, art)
 
-    return _append_output_index(_ensure_references(body.strip()), figs, tables)
+    # The two record-derived sections go in AFTER the writer, placed straight after the abstract:
+    # a reader meets the data and the analysis before any claim about them. Inserted rather than
+    # requested, so neither can be paraphrased into vagueness, dropped for length, or invented.
+    body = _insert_record_sections(body.strip(), _dataset_section(art, result),
+                                   _pipeline_section(result))
+    return _append_output_index(_ensure_references(body), figs, tables)
+
+
+def _insert_record_sections(body: str, *sections: str) -> str:
+    """Place the deterministic sections after the Abstract (or after the title if there is none).
+
+    Anchored on the first heading that FOLLOWS the abstract rather than appended at the end: a
+    reader who stops after two screens should already have seen what the data was and what ran on
+    it, and those are also the two things a reviewer checks first."""
+    blocks = [b.strip() for b in sections if b and b.strip()]
+    if not blocks:
+        return body
+    payload = "\n\n".join(blocks)
+    heads = list(re.finditer(r"(?m)^##\s+\S.*$", body))
+    # after the Abstract heading's section -> the next H2; else after the title; else prepend.
+    anchor = None
+    for i, h in enumerate(heads):
+        if re.match(r"(?i)^##\s+abstract\b", h.group(0)):
+            anchor = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+            break
+    if anchor is None:
+        anchor = heads[0].start() if heads else 0
+    return (body[:anchor].rstrip() + "\n\n" + payload + "\n\n" + body[anchor:].lstrip()).strip()
 
 
 _REFERENCES_PLACEHOLDER = "*Citations to be inserted by the literature module (PaperQA).*"
@@ -5635,8 +6757,62 @@ def _summarize_pipeline_degradations(result: Any) -> str:
     )
 
 
+def _llm_provenance_note(llm: "LabLLM") -> str:
+    """One deterministic line stating WHERE this run's prompts actually went.
+
+    Belongs in the technical report because "which model wrote this, and did the prompts leave
+    UCI" is a methods fact a reader needs and cannot recover from the artifacts. Deterministic
+    (not LLM-written) for the same reason the variant facts block is: a provenance claim that a
+    model could paraphrase is worthless.
+    """
+    if not (llm.scientist_remote or llm.lab_role_remote):
+        return (f"All model calls ran on the cluster's own vLLM ({llm.model}) over the session "
+                "SSH tunnel. No prompt left UCI.")
+    parts = [f"Scientist (tool-calling): {llm.model} — "
+             + ("OFF-SITE" if llm.scientist_remote else "local vLLM, on-cluster"),
+             f"PI/Critic (planning, critique, write-up): {llm.lab_label} — "
+             + ("OFF-SITE" if llm.lab_role_remote else "local vLLM, on-cluster")]
+    tail = ("Prompts routed off-site carried the research question, the dataset PROFILE, accepted "
+            "findings and artifact digests. Raw expression tables and variant records were not "
+            "sent; the analysis itself ran on HPC3.")
+    return "\n".join(f"- {p}" for p in parts) + f"\n\n{tail}"
+
+
+def _nondefault_params_block(result: Any) -> str:
+    """Every setting the run used that was NOT the tool's declared default, as a table.
+
+    A Methods section renders "filtered at 10% mitochondrial reads" identically whether 10 came
+    from the protocol or the model typed it once, and a reader has no way to tell — which is how a
+    production run reported an invented threshold as though it were the pipeline's. Built
+    deterministically from the step log (each step carries ``nondefault_params``) and prepended to
+    the technical report rather than only described to the writer, so no model can drop it."""
+    rows: list[tuple[str, str, str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rnd in (getattr(result, "rounds", None) or []):
+        sr = rnd.get("scientist_result") if isinstance(rnd, dict) else None
+        for step in ((sr or {}).get("steps") or []):
+            tool = str(step.get("tool") or "")
+            for p in (step.get("nondefault_params") or []):
+                key = (tool, str(p.get("param")), str(p.get("value")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append((tool, str(p.get("param")), str(p.get("value")),
+                             str(p.get("default")), str(p.get("kind") or "")))
+    if not rows:
+        return ""
+    head = ("| tool | parameter | used | declared default | kind |\n"
+            "| --- | --- | --- | --- | --- |\n")
+    body = "".join(f"| `{t}` | `{p}` | **{v}** | {d} | {k} |\n" for t, p, v, d, k in rows)
+    return ("## Parameters that were NOT the declared default\n\n"
+            "Each row is a value this run chose instead of the tool's declared default. A value "
+            "here was a decision — it is not what the protocol specifies, and any conclusion that "
+            "depends on it should say so.\n\n" + head + body)
+
+
 def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
-                            lit_note: str | None = None, render_diag: str | None = None) -> str:
+                            lit_note: str | None = None, render_diag: str | None = None,
+                            llm_note: str | None = None) -> str:
     """Write the internal technical report from the FULL run log (every step, every failure)
     plus the figure/table inventory. Best-effort: returns a deterministic skeleton if the
     LLM step fails, so the run never breaks over the second report.
@@ -5664,11 +6840,16 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     # Render-level layout defects the visual review could not fully fix (empty when clean/off) —
     # the same tech-report-only Diagnostics channel; the manuscript stays clean regardless.
     render_block = (render_diag or "").strip() or "(rendered layout passed visual review — no defects)"
+    # WHERE the prompts went. Always present, not only when something degraded: with users
+    # supplying their own API keys, "which endpoint answered" is a methods fact, and a report
+    # that is silent about it reads as though everything stayed on-cluster.
+    llm_block = (llm_note or "").strip() or "(model endpoint not recorded)"
     # Task-kind routing + authoritative counts: a variant run gets variant Methods (not scanpy) and a
     # facts block, so the tech report cannot invent numbers (the '165 high-priority' / '6 citations' bug).
     kind = _report_task_kind(art, result)
     facts = _variant_facts_block(art, result)
     facts_block = f"{facts}\n\n" if facts else ""
+    params_block = _nondefault_params_block(result)
 
     try:
         body = complete_fn([
@@ -5682,6 +6863,12 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                 f"Pipeline step degradations (report EACH of these in 'Diagnostics & failures' — "
                 f"name the step, what degraded, and the downstream impact on the results):\n{degr_block}\n\n"
                 f"Literature retrieval status (report this in 'Diagnostics & failures'):\n{lit_block}\n\n"
+                f"Model endpoint provenance (reproduce this VERBATIM in the Methods section under a "
+                f"'Model endpoints' heading — do not paraphrase, soften, or omit it):\n{llm_block}\n\n"
+                f"Settings that were NOT the tool's declared default (a table of these is prepended "
+                f"to this report automatically — where the Methods states one of these values, say "
+                f"explicitly that it was chosen for this run rather than inherited from the tool):\n"
+                f"{params_block or '(every setting was the declared default)'}\n\n"
                 f"Render-level review findings (include verbatim in 'Diagnostics & failures' if it "
                 f"lists any defects):\n{render_block}\n\n"
                 f"Figures available (reference inline by the exact path shown):\n{fig_list}\n\n"
@@ -5696,11 +6883,23 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
         diag_parts = [p for p in (degradations, (lit_note.strip() if lit_note else ""),
                                   (render_diag.strip() if render_diag else "")) if p]
         diag = "\n\n## Diagnostics & failures\n\n" + "\n\n".join(diag_parts) + "\n" if diag_parts else ""
+        # Provenance survives the writer failing — it is deterministic text, so the skeleton can
+        # carry it verbatim. This is the path where it matters most: no model was available to
+        # describe the run, and the endpoint fact would otherwise be lost entirely.
+        prov = f"\n## Model endpoints\n\n{llm_block}\n" if llm_note else ""
         body = (f"# Technical Report\n\n## Run summary\n\n{agenda}\n\n"
-                f"## Pipeline execution log\n\n{log}\n{diag}")
+                f"## Pipeline execution log\n\n{log}\n{prov}{diag}")
     if not (body and body.strip()):
         body = f"# Technical Report\n\n## Pipeline execution log\n\n{log}\n"
-    return _append_output_index(body.strip(), figs, tables)
+    body = body.strip()
+    # Deterministic, and placed FIRST after the title: the settings a run did not inherit from its
+    # tools are the fastest way to tell a reproducible result from an improvised one, and this
+    # block must not depend on a writer model choosing to mention it.
+    if params_block:
+        title, sep, rest = body.partition("\n")
+        body = (f"{title}\n\n{params_block}\n{rest}" if sep and title.startswith("#")
+                else f"{params_block}\n\n{body}")
+    return _append_output_index(body, figs, tables)
 
 
 def _report_review_system(kind: str = "single_cell") -> str:
@@ -5708,9 +6907,16 @@ def _report_review_system(kind: str = "single_cell") -> str:
   return (
     f"You are a meticulous scientific editor reviewing a {study} MANUSCRIPT draft "
     "BEFORE it is rendered to PDF/DOCX. Return the corrected FULL Markdown, fixing:\n"
-    "- Manuscript structure: it should read like a journal article with Title, Abstract, "
-    "Introduction, Results, Discussion, Limitations, Conclusion, Methods, and References sections "
-    "(References LAST). If a core section is missing or mislabelled, add/rename it. A Conclusion "
+    "- Manuscript structure: Title, Abstract, Study question, Results, Discussion, Limitations, "
+    "Conclusion, Methods, and References (References LAST). If a core section is missing or "
+    "mislabelled, add/rename it. There is deliberately NO Introduction: the reader is the "
+    "researcher whose data this is and does not need the gene, tissue or method explained to "
+    "them — do not add one, and do not expand 'Study question' into textbook background. "
+    "TWO SECTIONS ARE INSERTED AFTER YOU AND MUST BE LEFT EXACTLY AS THEY ARE: '## The dataset' "
+    "and '## What was run' are generated from the execution record, not written by a model. Do "
+    "not edit, reword, condense, reorder or delete a single line of either, and do not merge "
+    "them into Methods — they are the only place a reader learns what the input actually was and "
+    "which tool produced each result. A Conclusion "
     "(3–4 sentences) is REQUIRED — add one if absent. The '## References' section has ALREADY been "
     "populated by the literature module (real DOI/PMID citations, or an honest 'none retrieved' "
     "line) — PRESERVE it VERBATIM: do not add, remove, reorder, reword, or fabricate any citation, "
@@ -5729,9 +6935,12 @@ def _report_review_system(kind: str = "single_cell") -> str:
     "'Figure N. <what it shows; axes/colours/legend>'. If a figure has an empty or one-word caption, "
     "write a proper one from the surrounding text; do NOT invent data not implied by the draft.\n"
     "- Data tables: result tables must be real Markdown tables, never bare filenames. Keep each "
-    "table to AT MOST 5 rows and the most informative columns; rewrite any p-value or full-precision "
-    "float into scientific notation with 2 significant figures (e.g. 1.6e-18) and round scores to "
-    "integers; NEVER leave a 10+ digit number in a table. If a table merely duplicates data already "
+    "table to AT MOST 5 rows and the most informative columns; rewrite any p-value / adjusted p-value "
+    "(and ONLY those, or a magnitude below 0.001 / above 100,000) into scientific notation with 2 "
+    "significant figures (e.g. 1.6e-18) and round scores to integers; NEVER leave a 10+ digit number "
+    "in a table. Percentages, proportions, fold-changes, NES and SEMs stay ordinary decimals — if the "
+    "draft has '6.5e+01%' or 'NES -4.2e+00', rewrite them as '65.2%' and 'NES -4.2'. If a table "
+    "merely duplicates data already "
     "shown in a referenced figure, drop the table and keep the figure.\n"
     "- Citations: KEEP real citations that carry a DOI or PMID (from the literature_search tool); "
     "DELETE any fabricated citation — one with no DOI/PMID, or not traceable to the findings — and "
@@ -6164,15 +7373,23 @@ def _postrender_visual_check(rep: dict[str, Any], report_md: str, report_title: 
         from ..tools.visual_review import render_with_visual_review, format_diagnostics
         from .vlreview_runner import build_vlreview_review_fn
 
-        run_id = conn.workspace.name if getattr(conn, "workspace", None) else "run"
+        # The RUN id (…/<owner>/<run_id>/artifacts → art.parent.name). conn.workspace is the
+        # OWNER dir, so every run's review pages were written over the same
+        # vlreview/<owner>/pass1 on dfs3b — three runs' job logs sat in one out dir.
+        run_id = art.parent.name if art is not None else "run"
 
         def render_fn(overrides: dict[str, Any]) -> dict:
             return build_pdf_report(report_md, art / "report", title=report_title,
                                     basename="report", assets_root=art, format_overrides=overrides)
 
+        # The live source on dfs3b (synced at connect) so the job runs the CURRENT reviewer.
+        try:
+            _pysrc = _sync_bioagent_source_to_hpc(conn)
+        except Exception:  # noqa: BLE001 - fall back to the reviewer baked into the image
+            _pysrc = None
         review_fn = build_vlreview_review_fn(
             conn.executor, st, cluster_user_dir=_temp_base(conn), run_id=run_id,
-            local_review_dir=art / "process", emit=conn.emit,
+            local_review_dir=art / "process", emit=conn.emit, source_dir=_pysrc,
         )
         outcome = render_with_visual_review(
             render_fn, review_fn, max_iters=st.vlreview_max_iters,

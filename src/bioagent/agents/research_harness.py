@@ -91,6 +91,42 @@ class HarnessTool:
         }
 
 
+def nondefault_params(parameters: dict[str, Any], args: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every argument in ``args`` whose value differs from the parameter schema's declared default.
+
+    The point is PROVENANCE, not validation. A threshold the model typed on the spot and a
+    threshold the protocol mandates are the same sentence once they reach a Methods section, and
+    only one of them was a decision somebody made — a production run filtered at ``max_pct_mt=10``
+    against a declared default of 20 and the manuscript reported it as simply "the threshold used".
+
+    Schema-generic and side-effect free: a tool whose schema declares no ``default`` contributes
+    nothing, so this is safe to call across the whole catalog. Each entry is tagged ``kind``:
+
+    * ``threshold`` — a number the model chose; the case this exists for.
+    * ``switch`` — a boolean, usually a guard bypass (``force``), so louder still.
+    * ``selection`` — a column name (``groupby``/``reference``/``stratify_by``). Part of the study
+      design, already stated in the plan, and it would fire on every ordinary run — recorded, but
+      not raised in the live feed.
+    """
+    props = (parameters or {}).get("properties") or {}
+    out: list[dict[str, Any]] = []
+    for name, value in (args or {}).items():
+        spec = props.get(name)
+        if not isinstance(spec, dict) or "default" not in spec:
+            continue
+        default = spec["default"]
+        numeric = (isinstance(value, (int, float)) and not isinstance(value, bool)
+                   and isinstance(default, (int, float)) and not isinstance(default, bool))
+        if value == default or (numeric and float(value) == float(default)):
+            continue
+        kind = ("switch" if isinstance(default, bool)
+                else "threshold" if isinstance(default, (int, float))
+                else "selection")
+        out.append({"param": name, "value": value, "default": default, "kind": kind,
+                    "meaning": str(spec.get("description") or "")})
+    return out
+
+
 @dataclass
 class HarnessContext:
     """Everything the tools need, threaded through one harness run.
@@ -164,6 +200,11 @@ class HarnessResult:
     final_answer: str | None
     steps: list[dict[str, Any]]       # each: {tool, args, ok, summary|error}
     errors: list[dict[str, Any]]      # each: {tool, error}
+    # True when ``final_answer`` is the deterministic tool digest, not the model's own words.
+    # Callers that need a WRITTEN answer (a meeting expert owes the room an opinion, not a tool
+    # log) must check this and fall back to a plain completion; callers that only need the step
+    # closed (the Critic, the report writer) can use the digest as-is.
+    answer_synthesized: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -395,6 +436,16 @@ class ResearchHarness:
                         continue
 
                     emit({"type": "tool_start", "tool": name, "args": args})
+                    # Provenance for every number this call does NOT take from the tool's declared
+                    # default. Once a threshold is in a Methods sentence, "the protocol says 20%"
+                    # and "the model typed 10% this once" read identically — and only one of them
+                    # was a decision. Announced HERE, before the tool runs, so a researcher
+                    # watching the run sees the choice while it is still cheap to object to; the
+                    # same records are collected into the technical report at the end.
+                    deviations = nondefault_params(self._by_name[name].parameters, args)
+                    if deviations:
+                        emit({"type": "tool_params_nondefault", "tool": name,
+                              "params": deviations})
                     if checkpoint:
                         checkpoint.log("tool_start", tool=name)
                     try:
@@ -435,7 +486,12 @@ class ResearchHarness:
                     # produced (artifact paths, counts, status) to judge/ground a step,
                     # instead of a hand-maintained field projection. ``summary`` stays for
                     # the live event stream.
-                    steps.append({"tool": name, "args": args, "ok": True, "summary": summary, "result": output})
+                    steps.append({"tool": name, "args": args, "ok": True, "summary": summary,
+                                  "result": output,
+                                  # Carried on the step, not just emitted, so the technical report
+                                  # can list every non-default setting the run actually used
+                                  # instead of re-deriving it from prose.
+                                  **({"nondefault_params": deviations} if deviations else {})})
                     # Carry ``args`` on success so the UI can surface a step's FINAL successful
                     # code (run_code) as a formatted block, without pasting the raw snippet into
                     # the always-visible progress feed.
@@ -463,7 +519,40 @@ class ResearchHarness:
                 checkpoint.stop()
 
         status = "ok" if final_answer is not None else "incomplete"
-        return HarnessResult(status, stop_reason or "max_steps", final_answer, steps, errors)
+        # NEVER end a step with an empty answer: a step that ran out of turn budget mid-workflow
+        # (max_steps / done_early) used to return final_answer="" — the Critic then bounced a step
+        # whose ARTIFACTS were fine, and the report writer had nothing to quote. Synthesize a
+        # deterministic account from what the tools actually returned instead. Measured across 9
+        # models on the same 7-step plan: 50-83% of steps hit the budget and every one of those
+        # returned empty text, while their tables/figures were already on disk.
+        synthesized = False
+        if not (final_answer or "").strip() and steps:
+            final_answer = self._digest_answer(steps, stop_reason or "max_steps")
+            synthesized = True
+        return HarnessResult(status, stop_reason or "max_steps", final_answer, steps, errors,
+                             answer_synthesized=synthesized)
+
+    @staticmethod
+    def _digest_answer(steps: "list[dict[str, Any]]", stop_reason: str) -> str:
+        """Deterministic closing summary for a step the model did not wrap up itself."""
+        lines = [f"(auto-summary: the step ended on {stop_reason} before the model wrote a "
+                 "closing answer; this is a deterministic account of what its tool calls returned)"]
+        for st in steps:
+            if st.get("tool") == "finish":
+                continue
+            ok = st.get("ok")
+            res = st.get("result")
+            digest = result_digest(res) if isinstance(res, dict) else {}
+            frag = json.dumps(digest, default=str)[:400] if digest else str(st.get("summary", ""))[:200]
+            lines.append(f"- {st.get('tool')}: {'ok' if ok else 'ERROR'} {frag}")
+        pointers: list[str] = []
+        for st in steps:
+            for p in evidence_pointers(st.get("result")):
+                if p not in pointers:
+                    pointers.append(p)
+        if pointers:
+            lines.append("artifacts written: " + "; ".join(pointers[:12]))
+        return "\n".join(lines)
 
     # -- internals ------------------------------------------------------------
 

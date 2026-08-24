@@ -60,7 +60,18 @@ _SUPERSEDED_WHEN_SCANPY = ("run_qc", "run_de_markers")
 # The real scanpy analysis-line tools that can be offloaded to HPC3 as Slurm jobs (Phase 4).
 # The smoke fallbacks (_SUPERSEDED_WHEN_SCANPY) are NOT routed — the in-container CLI only knows
 # these four.
-_HPC_ANALYSIS_TOOLS = ("run_scanpy_qc", "run_clustering", "run_de", "run_enrichment")
+# EVERY tool that reads or writes the run's ``work/`` checkpoints must run where those checkpoints
+# live. This list held only four; ``run_composition`` / ``run_pseudobulk_de`` / ``run_gsea_prerank``
+# / ``run_doublet_detection`` / ``run_marker_annotation`` / ``run_integration`` therefore executed
+# IN-PROCESS on the eyeserver, whose local work/ is empty when QC ran as a Slurm job — so
+# `run_composition` failed three rounds running with "no analysis checkpoint found" while a 647 MB
+# adata_qc.h5ad sat on dfs3b. That made the condition-comparison protocol's FIRST analysis (and its
+# replicated pseudobulk path) structurally un-runnable in production. scrna_cli already dispatches
+# all of these; only this allowlist was short.
+_HPC_ANALYSIS_TOOLS = ("run_scanpy_qc", "run_clustering", "run_de", "run_enrichment",
+                       "run_gsea_prerank", "run_composition", "run_pseudobulk_de",
+                       "run_depth_matched_de",
+                       "run_doublet_detection", "run_marker_annotation", "run_integration")
 
 # The variant-line tool that can be offloaded to HPC3 as an OFFLINE VEP Slurm job (variant_cli).
 _HPC_VARIANT_TOOLS = ("annotate_variants",)
@@ -119,7 +130,8 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
                             analysis_executor: Any = None,
                             variant_executor: Any = None,
                             phenotype_executor: Any = None,
-                            literature_executor: Any = None) -> list["HarnessTool"]:
+                            literature_executor: Any = None,
+                            hpc_shell: Any = None) -> list["HarnessTool"]:
     """Assemble the full ordered Scientist catalog from the registry. When scanpy is
     available, the lightweight smoke QC/DE tools are dropped in favour of the real
     scanpy analysis line (they remain only as a no-scanpy fallback).
@@ -156,6 +168,13 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
         catalog = [_route_literature(t, literature_executor) for t in catalog]
     catalog = _bind_diagnose_disease(catalog)
     catalog.append(make_scgpt_annotate_tool(scgpt_runner))   # foundation-model annotation (GPU)
+    # The HPC3 filesystem/shell line — appended LAST so it never displaces a typed tool in the
+    # model's reading of the roster. These exist because the Scientist previously had NO way to
+    # look at the cluster's filesystem: the only escape hatch was run_code, a Slurm batch job, so
+    # `ls` cost minutes of queue and the model tended to guess at paths instead. Empty (not
+    # broken tools) when no HPC session is bound, so a local run's roster stays honest.
+    from ..tools.hpc_shell import hpc_shell_catalog
+    catalog.extend(hpc_shell_catalog(hpc_shell))
     return catalog
 
 

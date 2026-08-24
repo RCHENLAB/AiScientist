@@ -164,7 +164,10 @@ def test_max_steps_stops_with_incomplete_status() -> None:
 
     assert result.stop_reason == "max_steps"
     assert result.status == "incomplete"
-    assert result.final_answer is None
+    # Since the run-97dfc89dc5aa fix a budget-exhausted step never returns an EMPTY answer:
+    # it carries a deterministic digest of what the tools returned, so the Critic and the
+    # report writer have material even when the model did not wrap up.
+    assert result.final_answer and "auto-summary" in result.final_answer
 
 
 def test_repeated_tool_errors_bail_the_step_early() -> None:

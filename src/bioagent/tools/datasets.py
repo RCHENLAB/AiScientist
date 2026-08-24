@@ -317,6 +317,12 @@ def run_h5ad_preflight(dataset_path: Path, output_dir: Path) -> dict[str, Any]:
     }
 
 
+# How many rows of a PLAIN obs column to read when counting its distinct values. Bounded because
+# an obs column can be millions of rows and this runs in the run-start preflight; large enough that
+# a real design column (sample / donor / condition) shows all its levels well inside it.
+_PLAIN_COL_SCAN = 50_000
+
+
 def _obs_categoricals(obs: Any, *, max_cols: int = 30, list_max: int = 30) -> dict[str, Any]:
     """Category values for the CATEGORICAL obs columns (anndata stores these as a subgroup with
     a ``categories`` child). Surfaces the dataset's experimental design — a condition/group
@@ -324,7 +330,15 @@ def _obs_categoricals(obs: Any, *, max_cols: int = 30, list_max: int = 30) -> di
     planner, so it can plan a group comparison / reuse labels instead of a generic atlas.
 
     Low-cardinality columns get their values listed; a high-cardinality column (e.g. a fine
-    ``celltype`` with 100+ levels) records only its count, so the prompt stays compact. Never
+    ``celltype`` with 100+ levels) records only its count, so the prompt stays compact.
+
+    A PLAIN (non-Categorical) column is counted too, not skipped. Whether a column arrived as a
+    pandas Categorical is a serialization detail of whoever wrote the file, and treating it as the
+    test for "does this describe the design" put a decisive column in the wrong bucket: a dataset
+    whose ``orig.ident`` was a plain string array holding ONE value ('0', i.e. a single library and
+    therefore zero biological replication) was omitted here, so the planner's profile filed it
+    under "numeric / high-cardinality" — advertising many donors where there was one. The plan that
+    came back proposed aggregating counts "per donor", which the data could not support. Never
     raises — a malformed column is skipped."""
     out: dict[str, Any] = {}
     try:
@@ -336,15 +350,175 @@ def _obs_categoricals(obs: Any, *, max_cols: int = 30, list_max: int = 30) -> di
             continue
         try:
             node = obs[key]
-            if not (hasattr(node, "keys") and "categories" in node):
-                continue                         # plain (numeric/string) column — not categorical
-            raw = node["categories"][:]
-            values = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for v in raw]
-            n = len(values)
-            out[key] = {"n": n, "values": values[:list_max] if n <= list_max else []}
+            if hasattr(node, "keys") and "categories" in node:
+                raw = node["categories"][:]
+                values = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+                          for v in raw]
+                n = len(values)
+                out[key] = {"n": n, "values": values[:list_max] if n <= list_max else []}
+                continue
+            # Plain column. Read a bounded head rather than the whole thing (an obs column can be
+            # millions of rows) and only record it when it is genuinely low-cardinality — a float
+            # measurement or a per-cell barcode has nothing to say about the design.
+            head = node[:_PLAIN_COL_SCAN]
+            if getattr(head, "dtype", None) is not None and head.dtype.kind == "f":
+                continue                          # continuous measurement, not a design column
+            seen: list[str] = []
+            for v in head:
+                s = v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+                if s not in seen:
+                    seen.append(s)
+                    if len(seen) > list_max:
+                        break
+            if not seen or len(seen) > list_max:
+                continue
+            entry: dict[str, Any] = {"n": len(seen), "values": sorted(seen)}
+            if getattr(node, "shape", (0,))[0] > _PLAIN_COL_SCAN:
+                entry["scanned"] = _PLAIN_COL_SCAN   # count is from a head sample, not the column
+            out[key] = entry
         except Exception:  # noqa: BLE001 - skip an unreadable column, keep the rest
             continue
     return out
+
+
+# Numeric per-cell QC columns most pipelines leave in obs (Seurat / scanpy names). Only these are
+# summarised per arm — a float column that is not one of these is a measurement, not a QC metric.
+_QC_NUMERIC_COLS = ("nCount_RNA", "nFeature_RNA", "percent.mt", "pct_counts_mt", "total_counts",
+                    "n_genes_by_counts", "n_genes", "n_counts", "nuclear_fraction", "pANN")
+_ARM_TABLE_MAX_CELLS = 400_000
+
+
+def _obs_column_values(obs: Any, key: str, n: int) -> "list[str] | None":
+    """The first ``n`` values of an obs column as strings — categorical (codes → categories) or
+    plain — or None when unreadable."""
+    try:
+        node = obs[key]
+        if hasattr(node, "keys") and "categories" in node:
+            cats = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+                    for v in node["categories"][:]]
+            codes = node["codes"][:n]
+            return [cats[int(c)] if 0 <= int(c) < len(cats) else "NA" for c in codes]
+        raw = node[:n]
+        return [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for v in raw]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _design_by_arm(obs: Any, cats: dict[str, Any], n_cells: int) -> "dict[str, Any] | None":
+    """Per-ARM cell counts by label column, plus per-arm medians of the QC columns the file
+    already carries — the table a reviewer needs before reading any comparison.
+
+    Built because a production report narrated "translation machinery up in every cell type" as
+    DDX41 biology while nothing in the run had asked whether the two arms were sequenced to the
+    same depth or quality; a direction-biased shift in every stratum with ribosomal genes on top
+    is the classic signature of exactly that, and the numbers to check it (nCount / nFeature /
+    percent.mt per arm) sat in obs the whole time. Deterministic, bounded, never raises. Returns
+    None when the profile shows no 2-3-level condition column."""
+    import statistics
+    def _numeric_values(info: dict) -> bool:
+        vals = info.get("values") or []
+        if not vals:
+            return False
+        try:
+            [float(v) for v in vals]
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    # A condition column holds a few NAMED levels. An integer QC column that happens to take
+    # only two or three distinct values (a tiny synthetic object's nFeature) is not a design.
+    cond = next((c for c, i in cats.items()
+                 if isinstance(i, dict) and isinstance(i.get("n"), int) and 2 <= i["n"] <= 3
+                 and not _looks_like_label_col(c) and not _looks_like_qc_col(c)
+                 and c not in _QC_NUMERIC_COLS and not _numeric_values(i)), None)
+    if not cond or not n_cells:
+        return None
+    n = min(int(n_cells), _ARM_TABLE_MAX_CELLS)
+    arm = _obs_column_values(obs, cond, n)
+    if not arm:
+        return None
+    out: dict[str, Any] = {"condition_column": cond,
+                           "cells_scanned": n, "cells_total": int(n_cells)}
+    arms = sorted(set(arm))
+    out["cells_by_arm"] = {a: sum(1 for x in arm if x == a) for a in arms}
+    # counts per label column per arm (the coarsest label column, <= 30 levels)
+    label_col = next((c for c, i in cats.items()
+                      if _looks_like_label_col(c) and not _looks_like_qc_col(c)
+                      and isinstance(i, dict) and isinstance(i.get("n"), int)
+                      and 2 <= i["n"] <= 30), None)
+    if label_col:
+        lab = _obs_column_values(obs, label_col, n)
+        if lab:
+            tab: dict[str, dict[str, int]] = {}
+            for a, l in zip(arm, lab):
+                tab.setdefault(l, {}).setdefault(a, 0)
+                tab[l][a] += 1
+            out["label_column"] = label_col
+            out["cells_by_label_and_arm"] = {l: {a: tab[l].get(a, 0) for a in arms}
+                                             for l in sorted(tab)}
+    # per-arm medians of whatever QC columns exist
+    qc: dict[str, dict[str, float]] = {}
+    for col in _QC_NUMERIC_COLS:
+        try:
+            if col not in obs.keys():
+                continue
+            vals = obs[col][:n]
+            if getattr(vals, "dtype", None) is None or vals.dtype.kind not in "fiu":
+                continue
+            per: dict[str, float] = {}
+            for a in arms:
+                sel = [float(v) for v, x in zip(vals, arm) if x == a]
+                if sel:
+                    per[a] = round(statistics.median(sel), 3)
+            if per:
+                qc[col] = per
+        except Exception:  # noqa: BLE001
+            continue
+    if qc:
+        out["qc_median_by_arm"] = qc
+        # A flag the PI and the writer can act on without re-deriving it: depth differing by
+        # >1.5x between arms means a pooled/global shift must be read as technical first.
+        depth_col = next((c for c in ("nCount_RNA", "total_counts", "n_counts") if c in qc), None)
+        if depth_col and len(qc[depth_col]) >= 2:
+            vals = sorted(qc[depth_col].values())
+            if vals[0] > 0 and vals[-1] / vals[0] > 1.5:
+                out["depth_imbalance"] = (
+                    f"median {depth_col} differs {vals[-1] / vals[0]:.1f}x between arms "
+                    f"({qc[depth_col]}); a global, same-direction expression shift across cell "
+                    "types is consistent with this depth difference and must not be read as "
+                    "biology without a per-cell-type depth-matched check.")
+        # snRNA hint: a `nuclear_fraction` column is the fingerprint of a single-NUCLEUS protocol
+        # (or of a nuclei-fraction QC pass). Nuclei carry almost no mitochondria, so the standard
+        # 10% mitochondrial threshold is far too lax for them (1-5% is the working range) — and a
+        # low percent.mt median corroborates it. The chain (column exists -> likely snRNA -> mt
+        # threshold guidance) sat un-connected across the prompt in run 97dfc89dc5aa; compute it
+        # here so no model has to make the connection itself.
+        try:
+            has_nf = any("nuclear_fraction" in str(c).lower() for c in obs.keys())
+        except Exception:  # noqa: BLE001 - the hint is an extra, never a blocker
+            has_nf = False
+        if has_nf:
+            mt = (qc.get("percent.mt") or qc.get("pct_counts_mt") or {})
+            mt_med = max(mt.values()) if mt else None
+            out["snrna_hint"] = (
+                "a `nuclear_fraction` column is present"
+                + (f" and median mitochondrial content is low ({mt_med:.1f}%)" if mt_med is not None else "")
+                + " — this is likely single-NUCLEUS (snRNA-seq) data. For nuclei the mitochondrial "
+                "QC threshold should be 1-5%, not the 10% single-cell default; state the protocol "
+                "assumption explicitly in the report.")
+    return out
+
+
+def _looks_like_label_col(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in ("celltype", "cell_type", "majorclass", "cluster", "leiden",
+                                "louvain", "annotation", "label", "subclass", "class"))
+
+
+def _looks_like_qc_col(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in ("classification", "doublet", "singlet", "qc", "filter", "pass",
+                                "phase", "batch_key")) or n.startswith("df.")
 
 
 def inspect_h5ad(handle: Any) -> dict[str, Any]:
@@ -362,6 +536,17 @@ def inspect_h5ad(handle: Any) -> dict[str, Any]:
         cats = _obs_categoricals(obs)
         if cats:
             result["obs_categoricals"] = cats
+            try:
+                n_obs = result.get("cells")
+                if not n_obs:
+                    idx_key = obs.attrs.get("_index", "_index") if hasattr(obs, "attrs") else "_index"
+                    idx_key = idx_key.decode() if isinstance(idx_key, bytes) else str(idx_key)
+                    n_obs = int(obs[idx_key].shape[0]) if idx_key in obs else 0
+                design = _design_by_arm(obs, cats, n_obs)
+            except Exception:  # noqa: BLE001 - the arm table is an extra, never a blocker
+                design = None
+            if design:
+                result["design_by_arm"] = design
 
     if x is None:
         result["x_encoding"] = "missing"

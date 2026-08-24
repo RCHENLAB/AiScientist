@@ -271,3 +271,53 @@ def test_exploration_and_cycles_compose_within_and_across_cycles():
     assert result.agenda == CYCLE1 + [new_step] + CYCLE2
     assert result.hypotheses[0]["statement"] == statement
     assert result.accepted_steps == 5
+
+
+def test_a_team_campaign_reaches_its_interpretation_meeting(tmp_path):
+    """Regression: `_run_campaign` holds its rounds in `all_rounds`, and a blanket edit that added
+    `rounds_ctx=rounds` to the three interpretation-meeting call sites left this one raising
+    NameError. Nothing caught it — max_cycles defaults to 1, so this function never runs in the
+    default config, and no test combined team mode with a campaign."""
+    import json
+
+    from bioagent.agents.research_harness import HarnessContext, HarnessResult
+    from bioagent.agents.research_lab import LabConfig, ResearchLab
+
+    def fn(messages):
+        system = messages[0]["content"]
+        if "expert team member" in system:
+            return "my take"
+        if "Critic" in system and "meeting" in system.lower():
+            return json.dumps({"score": 0.9, "critique": "ok"})
+        if "Critic" in system:
+            return json.dumps({"verdict": "accept", "score": 0.9, "critique": "ok"})
+        if "final research report" in system:
+            return "REPORT"
+        if "assembling a small expert team" in system:
+            return json.dumps([{"title": "Retina expert", "expertise": "retina"},
+                               {"title": "Statistician", "expertise": "stats"}])
+        return json.dumps({"agenda": ["QC the cells"]})
+
+    class _Sci:
+        catalog: list = []
+
+        def add_tools(self, *_a, **_k):
+            return None
+
+        def run(self, *_a, **_k):
+            return HarnessResult(
+                status="ok", stop_reason=None, final_answer="did it",
+                steps=[{"tool": "run_scanpy_qc", "ok": True,
+                        "result": {"status": "ok", "figures": ["figures/a.png"]}}],
+                errors=[])
+
+    lab = ResearchLab(
+        HarnessContext(decisions={}, workspace=tmp_path),
+        LabConfig(mode="team", max_cycles=2, max_steps=2, auto_select_skill=False,
+                  meeting_rounds=1, meeting_tools=False),
+        complete_fn=fn, scientist=_Sci())
+
+    result = lab.run("compare KO vs WT")          # must not raise
+
+    assert result.final_answer == "REPORT"
+    assert result.accepted_steps >= 1

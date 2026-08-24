@@ -28,6 +28,70 @@ from .errors import GatewayError, VLLMNetworkError, error_detail
 from .settings import HPCSettings
 
 
+# --- Served-model dialect knobs (env-gated; empty = today's Qwen behaviour, byte-for-byte) ----------
+# The Qwen3 chat template thinks by default and is switched OFF with
+# ``chat_template_kwargs={"enable_thinking": False}`` (the only kwarg this module ever sent).
+# Other served models invert that: vLLM's ``--tokenizer-mode deepseek_v4`` runs DeepSeek-V4 in
+# "chat" (no-reasoning) mode unless the request carries ``{"enable_thinking": true}``, and picks
+# the effort from ``reasoning_effort``. So a role that WANTS thinking must be able to say so
+# explicitly, and the Scientist's bounded tool turns must be able to carry a larger budget when
+# the served model reasons before it calls a tool. Both are deployment facts about the served
+# model, hence env vars next to BIOAGENT_VLLM_MODEL, not code constants.
+def _think_on_kwargs() -> dict | None:
+    """``chat_template_kwargs`` to send on think=True calls (PI / Critic / writer), from
+    ``BIOAGENT_VLLM_THINK_ON_KWARGS`` (JSON object). None = send nothing (Qwen default: thinks)."""
+    import os
+    raw = os.environ.get("BIOAGENT_VLLM_THINK_ON_KWARGS", "").strip()
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) and val else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _scientist_kwargs() -> dict | None:
+    """``chat_template_kwargs`` for the Scientist's tool turns (``chat_tools``), from
+    ``BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS`` (JSON object). None = send nothing (today)."""
+    import os
+    raw = os.environ.get("BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS", "").strip()
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) and val else None
+    except json.JSONDecodeError:
+        return None
+
+
+def scientist_max_tokens(default: int = 2048) -> int:
+    """Output reservation for one Scientist tool turn: ``BIOAGENT_SCIENTIST_MAX_TOKENS`` or the
+    historical 2048 (enough for a tool call; too small for a model that reasons first)."""
+    import os
+    try:
+        return int(os.environ.get("BIOAGENT_SCIENTIST_MAX_TOKENS", "") or default)
+    except ValueError:
+        return default
+
+
+def _lab_remote_reasoning() -> dict | None:
+    """Optional ``reasoning`` payload for REMOTE (base_url) completions — OpenRouter-style
+    ``{"effort": "low"}`` — from ``BIOAGENT_LAB_LLM_REASONING`` (JSON object). A reasoning model
+    left at its provider-default effort can think for many minutes per PI/Critic/writer call
+    (measured: one DSV4-Flash plan call = 858 s at default vs ~60 s at effort=low, with BETTER
+    judged output), so deployments that route lab roles to such a model should set this."""
+    import os
+    raw = os.environ.get("BIOAGENT_LAB_LLM_REASONING", "").strip()
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) and val else None
+    except json.JSONDecodeError:
+        return None
+
+
 def _base(local_port: int) -> str:
     return f"http://127.0.0.1:{local_port}/v1"
 
@@ -307,11 +371,17 @@ def complete(
     payload: dict = {"model": model, "messages": messages, "stream": False}
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if base_url and _lab_remote_reasoning():
+        payload["reasoning"] = _lab_remote_reasoning()
     if not think:
         # Only injected on the opt-out path so the default (orchestrator) call is byte-for-byte
         # unchanged. The phenotype mapper uses the session tunnel, never base_url, so this vLLM-only
         # chat-template kwarg never reaches an OpenRouter endpoint that wouldn't understand it.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif not base_url and _think_on_kwargs():
+        # Served models whose template does NOT think by default (DeepSeek-V4 under vLLM's
+        # deepseek_v4 tokenizer mode) need the opt-IN spelled out; configured per deployment.
+        payload["chat_template_kwargs"] = _think_on_kwargs()
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
     try:
@@ -335,7 +405,7 @@ def chat_tools(
     fmt: dict | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
-    max_tokens: int | None = 2048,
+    max_tokens: int | None = None,
 ) -> dict:
     """One **non-streaming** ``/v1/chat/completions`` call WITH tool schemas.
 
@@ -362,8 +432,12 @@ def chat_tools(
         "tool_choice": "auto",
         "stream": False,
     }
+    if max_tokens is None:
+        max_tokens = scientist_max_tokens()      # 2048 unless BIOAGENT_SCIENTIST_MAX_TOKENS
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
+    if not base_url and _scientist_kwargs():
+        payload["chat_template_kwargs"] = _scientist_kwargs()
     if fmt is not None:
         payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "tool_selection", "schema": fmt}}
     data = json.dumps(payload).encode("utf-8")

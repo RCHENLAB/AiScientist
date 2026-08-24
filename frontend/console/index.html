@@ -132,6 +132,18 @@
                     <input id="keyPassInput" type="password" placeholder="key passphrase" autocomplete="current-password" />
                   </label>
 
+                  <!-- Which LLM answers, chosen BEFORE connecting. This has to be on the login
+                       form and not only in the post-connect panel: bringing your own API endpoint
+                       is what lets a session skip the GPU queue entirely, and a control you can
+                       only reach AFTER connecting has already missed the moment it exists for. -->
+                  <label class="model-row">LLM endpoint
+                    <div class="model-row-controls">
+                      <select id="connectLlmSelect"></select>
+                      <button id="connectManageKeysBtn" type="button" class="icon-btn" title="Manage your API keys">🔑</button>
+                    </div>
+                  </label>
+                  <p id="connectLlmHint" class="hint-inline">Cluster GPU waits for a free card. Your own API key is ready in seconds — your HPC3 account still runs the analysis jobs either way.</p>
+
                   <label class="check"><input id="campusCheck" type="checkbox" /> I'm on UCI campus network / VPN</label>
                   <label class="check"><input id="mockCheck" type="checkbox" /> Mock mode (demo, no real cluster)</label>
                   <button id="connectBtn" type="submit" class="primary full">Connect</button>
@@ -170,6 +182,16 @@
                     <button id="pullModelBtn" type="button" class="icon-btn" title="Pull another model">+</button>
                   </div>
                 </label>
+                <!-- WHICH LLM answers: the cluster's own vLLM, or one of your saved API keys.
+                     Separate from the Model row above, which only picks among what vLLM already
+                     loaded — an API endpoint serves whatever the provider offers. -->
+                <label class="model-row">LLM endpoint
+                  <div class="model-row-controls">
+                    <select id="llmEndpointSelect"></select>
+                    <button id="manageKeysBtn" type="button" class="icon-btn" title="Manage API keys">🔑</button>
+                  </div>
+                </label>
+                <div id="llmEgressBanner" class="llm-egress hidden"></div>
                 <button id="storageBtn" type="button" class="ghost full">Manage HPC3 storage</button>
                 <button id="disconnectBtn" type="button" class="ghost full">Disconnect</button>
                 <button id="stopGpuBtn" type="button" class="danger-btn">Stop my GPU job (frees my SU)</button>
@@ -367,6 +389,77 @@
       <pre id="storageQuota" class="storage-quota"></pre>
       <div id="storageItems" class="storage-items"><div class="storage-loading">Loading…</div></div>
       <p class="storage-note">Deletes run <code>rm -rf</code> on HPC3, scoped to your own directory only. This cannot be undone.</p>
+    </div>
+  </div>
+
+  <!-- Bring-your-own API key. The HPC3 account is still required (it runs the analysis jobs);
+       this only chooses which LLM reasons, and on whose bill. A credential's id is stable, so
+       replacing an expired key here keeps every session and saved preference pointing at it. -->
+  <div id="apiKeysModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>API endpoints</h2>
+        <button id="apiKeysClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="storage-note">
+        Use your own LLM account instead of the cluster GPU. Keys are stored per user on this
+        server and are never shown again after you save them — only the last few characters.
+        Your HPC3 login is still what runs the analysis.
+      </p>
+      <div id="apiKeyList" class="storage-items"><div class="storage-loading">Loading…</div></div>
+
+      <form id="apiKeyForm" class="form api-key-form">
+        <h3 id="apiKeyFormTitle">Add an endpoint</h3>
+        <label>Provider
+          <select id="apiKeyProvider"></select>
+        </label>
+        <p id="apiKeyProviderNote" class="hint-inline"></p>
+        <label>Base URL
+          <input id="apiKeyBaseUrl" type="text" placeholder="https://api.example.com/v1" autocomplete="off" />
+        </label>
+        <label>API key <span class="hint-inline" id="apiKeyHintLabel">required</span>
+          <input id="apiKeyValue" type="password" placeholder="paste your key" autocomplete="off" />
+        </label>
+        <label>Model
+          <div class="model-row-controls">
+            <input id="apiKeyModel" type="text" list="apiKeyModelList" placeholder="e.g. deepseek-chat" autocomplete="off" />
+            <button id="apiKeyFetchModels" type="button" class="icon-btn" title="List models this endpoint serves">↻</button>
+          </div>
+          <datalist id="apiKeyModelList"></datalist>
+        </label>
+        <label>Model for PI &amp; Critic <span class="hint-inline">optional — a stronger model for planning and critique only</span>
+          <input id="apiKeyLabModel" type="text" list="apiKeyModelList" placeholder="leave blank to use the same model" autocomplete="off" />
+        </label>
+        <label>Label <span class="hint-inline">optional</span>
+          <input id="apiKeyLabel" type="text" placeholder="My DeepSeek" autocomplete="off" />
+        </label>
+        <p id="apiKeyError" class="login-error hidden"></p>
+        <div class="btn-row">
+          <button id="apiKeySave" type="submit" class="primary">Verify &amp; save</button>
+          <button id="apiKeyCancel" type="button" class="ghost hidden">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Shown once per credential, before any prompt is routed off-site. Consent is the real
+       control on this feature: no scanner can decide whether a gene list or a phenotype
+       description identifies a patient, so the person who knows the data decides. -->
+  <div id="egressModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>This endpoint is outside UCI</h2>
+        <button id="egressClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <div id="egressTarget" class="storage-base"></div>
+      <p class="storage-note">Using it sends the following to that provider, on your own account:</p>
+      <ul id="egressSends" class="egress-list"></ul>
+      <p class="storage-note">These stay at UCI:</p>
+      <ul id="egressStays" class="egress-list"></ul>
+      <div class="btn-row">
+        <button id="egressAccept" type="button" class="primary">I understand — use this endpoint</button>
+        <button id="egressCancel" type="button" class="ghost">Keep using the cluster GPU</button>
+      </div>
     </div>
   </div>
 

@@ -720,14 +720,14 @@ def test_quarantine_strays_moves_offscript_files_only(tmp_path):
     assert gw_app._quarantine_strays(art) == []
 
 
-def test_release_my_gpu_uses_squeue_not_stale_alloc(monkeypatch):
+def test_release_session_jobs_uses_squeue_not_stale_alloc(monkeypatch):
     """The release path finds live jobs via `squeue --me` over the SAME executor, so it
     works without a cached alloc and never needs a second (Duo) authentication."""
     from types import SimpleNamespace
     calls = []
 
     class FakeExec:
-        """Stateful, because `_release_my_gpu` queries squeue TWICE with different meaning: once to
+        """Stateful, because `_release_session_jobs` queries squeue TWICE with different meaning: once to
         discover live jobs, then again AFTER scancel to confirm the kill (scancel exits 0 even for a
         job that never existed, so only a re-query proves it died). A fake that returns the same id
         every time is claiming the job survived its own scancel."""
@@ -740,19 +740,88 @@ def test_release_my_gpu_uses_squeue_not_stale_alloc(monkeypatch):
         def exec(self, cmd, *a, **k):
             calls.append(cmd)
             if cmd.startswith("squeue"):
-                return SimpleNamespace(out="" if self.cancelled else "123456\n", ok=True)
+                # discovery asks for "%i|%j"; the confirm re-query asks for "%i" alone
+                if self.cancelled:
+                    return SimpleNamespace(out="", ok=True)
+                out = "123456|bioagent-vllm-testuser\n" if "%j" in cmd else "123456\n"
+                return SimpleNamespace(out=out, ok=True)
             if cmd.startswith("scancel"):
                 self.cancelled = True
             return SimpleNamespace(out="", ok=True)
 
-    conn = SimpleNamespace(executor=FakeExec(), alloc=None)  # no cached allocation
+    conn = SimpleNamespace(executor=FakeExec(), alloc=None, worker_alloc=None)
     # The confirm loop sleeps between polls; the fake reports the job gone on the first one, so this
     # only skips the 1s the real Slurm state transition needs.
     monkeypatch.setattr(gw_app.time, "sleep", lambda _s: None)
-    ids, err = gw_app._release_my_gpu(conn)
-    assert err is None and ids == ["123456"]
+    cancelled, err = gw_app._release_session_jobs(conn)
+    assert err is None and [c[0] for c in cancelled] == ["123456"]
     assert any(c.startswith("squeue --me") for c in calls)
     assert any(c == "scancel 123456" for c in calls)
+
+
+def test_free_my_session_takes_the_worker_and_the_analysis_jobs_too(monkeypatch):
+    """The click means "let go of everything this session holds", not "kill the model server".
+
+    Both halves were seen live on 2026-08-20: the model job hit its 2 h wall clock and vanished,
+    the endpoint reported "nothing to release" and returned BEFORE the worker-release code, and a
+    4-CPU worker held a free-partition node for three more hours. Analysis jobs (PaperQA here)
+    were never in scope at all.
+    """
+    from types import SimpleNamespace
+    seen = []
+
+    class FakeExec:
+        username = "testuser"
+
+        def __init__(self):
+            self.cancelled = False
+
+        def exec(self, cmd, *a, **k):
+            seen.append(cmd)
+            if cmd.startswith("squeue"):
+                if self.cancelled:
+                    return SimpleNamespace(out="", ok=True)
+                if "%j" in cmd:
+                    return SimpleNamespace(out=(
+                        "111|aiscientist-worker-testuser\n"
+                        "222|bioagent_paperqa_deep_literature_3\n"
+                        "333|aiscientist-tempgc-testuser\n"      # not ours to kill
+                        "444|my-own-alignment-run\n"             # the researcher's own job
+                    ), ok=True)
+                return SimpleNamespace(out="", ok=True)
+            if cmd.startswith("scancel"):
+                self.cancelled = True
+            return SimpleNamespace(out="", ok=True)
+
+    conn = SimpleNamespace(executor=FakeExec(), alloc=None, worker_alloc=None)
+    monkeypatch.setattr(gw_app.time, "sleep", lambda _s: None)
+    cancelled, err = gw_app._release_session_jobs(conn)
+
+    assert err is None
+    assert sorted(c[0] for c in cancelled) == ["111", "222"]     # worker + analysis, no GPU needed
+    assert {c[2] for c in cancelled} == {"worker", "analysis"}
+    scancel = next(c for c in seen if c.startswith("scancel"))
+    assert "333" not in scancel, "the Temp sweeper exits in a second; killing it half-done buys nothing"
+    assert "444" not in scancel, "a researcher's own unrelated job must survive this click"
+
+
+def test_a_cached_worker_id_is_released_even_when_squeue_misses_it(monkeypatch):
+    from types import SimpleNamespace
+    seen = []
+
+    class FakeExec:
+        username = "testuser"
+
+        def exec(self, cmd, *a, **k):
+            seen.append(cmd)
+            return SimpleNamespace(out="", ok=True)     # squeue sees nothing at all
+
+    conn = SimpleNamespace(executor=FakeExec(), alloc=None,
+                           worker_alloc=SimpleNamespace(job_id="999", node="hpc3-15-27"))
+    monkeypatch.setattr(gw_app.time, "sleep", lambda _s: None)
+    cancelled, err = gw_app._release_session_jobs(conn)
+    assert err is None and [c[0] for c in cancelled] == ["999"]
+    assert any(c == "scancel 999" for c in seen)
 
 
 # --- delete boundary: a user can ONLY delete inside their own folder ---------

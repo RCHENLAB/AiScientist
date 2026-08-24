@@ -468,12 +468,52 @@ def update_conversation(cid: int, req: ConversationPatch, request: Request) -> d
 
 @router.delete("/conversations/{cid}")
 def delete_conversation(cid: int, request: Request) -> dict:
+    """Delete a chat AND everything it produced: its messages, its run records, and those runs'
+    files on disk.
+
+    The browser already asked the server to delete each run's artifacts before calling this, but it
+    derived the run list from the chat's own MESSAGE METADATA — so a chat whose messages failed to
+    load, or a run whose reference never made it into a message, left its bundle on disk forever
+    with no owner and no way to reach it from the UI. The authoritative list is ``Run.conversation_id``,
+    which only the server has. Deleting a chat now means the disk is clean too.
+    """
     user = require_user(request)
+    removed_dirs = 0
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
+        runs = list(s.scalars(
+            select(Run).where(Run.user_id == user.id, Run.conversation_id == str(cid))).all())
+        run_ids = [r.run_id for r in runs]
+        for run in runs:
+            s.delete(run)
         s.delete(conv)   # cascade removes the conversation's messages
         s.commit()
-        return {"status": "ok"}
+    for run_id in run_ids:
+        if _delete_run_dir(user.username, run_id):
+            removed_dirs += 1
+    return {"status": "ok", "runs_deleted": len(run_ids), "dirs_removed": removed_dirs}
+
+
+def _delete_run_dir(owner: str, run_id: str) -> bool:
+    """Remove ``<results>/<owner>/<run_id>/`` — the report bundle a download would have zipped.
+
+    Guarded twice: the components must be plain identifiers (no traversal), and the resolved path
+    must stay under the results root.
+    """
+    import shutil
+    from .app import CONSOLE_RUNS_DIR       # deferred: auth_routes is imported BY app
+
+    if not all(part and part.replace("-", "").replace("_", "").isalnum() for part in (owner, run_id)):
+        return False
+    try:
+        root = CONSOLE_RUNS_DIR.resolve()
+        target = (root / owner / run_id).resolve()
+        if not str(target).startswith(str(root)) or not target.is_dir():
+            return False
+        shutil.rmtree(target)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 @router.post("/conversations/{cid}/messages")

@@ -14,6 +14,15 @@ gateway = [
   "uvicorn[standard]>=0.29",
   "python-multipart>=0.0.9",
 ]
+# LangGraph execution shell (agents/lab_graph.py, LabConfig.planner="langgraph").
+# DELIBERATELY NOT part of `gateway`: installing it pulls ~19 transitive packages
+# (langchain-core, langsmith, orjson, ormsgpack, zstandard, websockets, …) into the
+# production gateway, and the default "linear"/"dag" planners must keep working on a host
+# that has never seen it. `lab_graph` is imported lazily and its tests importorskip, so a
+# deploy without this extra behaves exactly as before.
+langgraph = [
+  "langgraph>=1.2",
+]
 # User accounts / login / admin (eye-server). SQLAlchemy 2.0 models + Alembic
 # migrations; bcrypt for password hashing; itsdangerous for signed session cookies;
 # psycopg (v3) is the PostgreSQL driver in prod. Local dev/CI uses SQLite (stdlib),
@@ -47,6 +56,7 @@ literature = [
 # Optional prettier SVG schematics: install d2 (curl -fsSL https://d2lang.com/install.sh | sh -s --).
 analysis = [
   "scanpy>=1.10",
+  "pydeseq2>=0.4",           # pseudobulk DE: DESeq2's NB Wald test (run_pseudobulk_de)
   "anndata>=0.10",
   "gseapy>=1.1",
   "matplotlib>=3.8",

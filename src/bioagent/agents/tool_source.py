@@ -25,6 +25,7 @@ instead.
 from __future__ import annotations
 
 import inspect
+import json
 import textwrap
 from typing import Any, Callable
 
@@ -124,7 +125,7 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
             "declared_parameters": tool.parameters,
         }
         if not symbol:
-            out["defaults"] = _declared_defaults(src)
+            out["defaults"] = _merge_defaults(tool.parameters, src)
             out["review_prompt"] = (
                 "Check the code against THIS dataset, not in the abstract. Most defaults here are "
                 "conventional and correct — the common and expected answer is 'no problem', and "
@@ -165,6 +166,34 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
 
 
 # --- default extraction -------------------------------------------------------
+
+
+def _merge_defaults(parameters: dict[str, Any], src: str) -> list[dict[str, Any]]:
+    """Every default this tool applies, DECLARED ones first.
+
+    Two sources, because tools are in two states. A tool that declares its parameters in the schema
+    (``default`` + ``description`` per property) is the authority: the value is exact rather than a
+    scraped source token, and it carries the plain-English meaning the reviewer actually needs —
+    "20 percent mitochondrial reads" is reviewable, ``args.get("max_pct_mt", 20.0)`` is a grep hit.
+    A tool that has not adopted that yet still gets the source scrape below, which is where this
+    started and what it can fall back to. Declared entries win on name collision."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    lines = src.splitlines()
+    for name, spec in ((parameters or {}).get("properties") or {}).items():
+        if not isinstance(spec, dict) or "default" not in spec:
+            continue
+        seen.add(name)
+        # Point at where the body reads it, so the reviewer can see the use, not just the value.
+        line_no = next((i for i, ln in enumerate(lines, start=1) if f'"{name}"' in ln), 1)
+        out.append({"param": name, "default": json.dumps(spec["default"]),
+                    "value": spec["default"], "line": line_no,
+                    "meaning": str(spec.get("description") or ""), "declared": True})
+    for entry in _declared_defaults(src):
+        if entry["param"] not in seen:
+            out.append({**entry, "declared": False})
+    return out
+
 
 _DEFAULT_CALLS = ("args.get(", "kwargs.get(")
 

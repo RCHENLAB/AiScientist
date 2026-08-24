@@ -22,6 +22,7 @@ bundler (still on the eyeserver) can assemble them.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,11 @@ class SlurmAnalysisExecutor:
     # and put on PYTHONPATH so the job imports the live tools WITHOUT baking them into the image —
     # so editing a tool only needs a code sync, never an image rebuild. None → rely on the image.
     source_dir: str | None = None
+    # dfs3b dir holding EXTRA pure-Python deps the image lacks (e.g. pydeseq2), installed with
+    # `pip install --no-deps --target` so nothing in it shadows the image's numpy/scipy stack.
+    # Appended to PYTHONPATH after `source_dir` and bind-mounted read-only. None -> the tools'
+    # own loud fallbacks cover the gap.
+    deps_dir: str | None = None
     scratch_dir: str = "$HOME/.bioagent/analysis"
     entrypoint: str = "python -m bioagent.tools.scrna_cli"
     job_prefix: str = "bioagent_analysis"   # squeue job-name prefix (variant line overrides it)
@@ -75,7 +81,14 @@ class SlurmAnalysisExecutor:
     # Set a positive value to pin an explicit wait (e.g. tests).
     run_timeout_s: int = 0
     local_fallback: Callable[[str, dict, Any], dict] | None = None
-    fallback_on_error: bool = True
+    # After a FAILED Slurm job, run the tool in-process on the gateway host? Default OFF: the
+    # eyeserver is a thin I/O layer with nowhere near the memory for scanpy on a real object, and
+    # a silent fallback there both starves the host and hides the Slurm failure the model should
+    # be reacting to. The error now carries the Slurm reason so the model can retry ON HPC3. Set
+    # BIOAGENT_HPC_LOCAL_FALLBACK=1 to restore the old behaviour (dev boxes without HPC3). The
+    # "no live HPC connection" branch (mock / offline dev) is a separate path and unchanged.
+    fallback_on_error: bool = field(default_factory=lambda: os.environ.get(
+        "BIOAGENT_HPC_LOCAL_FALLBACK", "").strip().lower() in ("1", "true", "yes"))
     # Optional hook fired with the VERBATIM fallback reason (e.g. the Slurm-job error tail) the moment
     # a job degrades to the in-process fallback — so the gateway can log WHY, not just that it happened.
     on_fallback: Callable[[str], None] | None = None
@@ -125,7 +138,15 @@ class SlurmAnalysisExecutor:
         except SlurmJobError as exc:
             if self.fallback_on_error:
                 return self._fallback(tool, args, ctx, f"Slurm job failed: {exc}")
-            return {"status": "error", "error": f"Slurm analysis job failed: {exc}"}
+            if callable(self.on_fallback):
+                try:
+                    self.on_fallback(f"Slurm job failed (no local fallback): {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+            return {"status": "error", "execution_mode": "hpc_slurm",
+                    "error": (f"HPC3 analysis job failed: {exc}. Not run on the gateway host "
+                              "(local fallback is disabled). Fix the cause and call the tool again "
+                              "— it will be resubmitted to HPC3.")}
         if self.memoize_result and isinstance(out, dict) and out.get("status") == "ok":
             self._memo_store(tool, args, out)   # only a SUCCESSFUL run is cached (a failure still retries)
         return out
@@ -232,8 +253,15 @@ class SlurmAnalysisExecutor:
 
         # Stage the args as a JSON file (quoted heredoc → no shell expansion of the payload).
         payload = json.dumps(args)
+        # Create the WORKSPACE too, not only scratch. Singularity refuses to bind-mount a source
+        # that does not exist ("mount source … doesn't exist" → FATAL, exit 127), and the paperqa
+        # executor's workspace (`Temp/<user>/paperqa`) was never created by anything: every
+        # deep_literature job on HPC3 — 28 of 28 across two users since the feature shipped — died
+        # in one second, and each literature step silently fell back to Europe PMC keyword search.
+        # The scrna path happened to survive because the gateway mkdir'd its workspace elsewhere.
+        ws_mk = f"mkdir -p {shlex.quote(self.remote_workspace)} && " if self.remote_workspace else ""
         write = self.remote.exec(
-            f"mkdir -p {scratch} && cat > {args_f} <<'{_ARGS_EOF}'\n{payload}\n{_ARGS_EOF}")
+            f"{ws_mk}mkdir -p {scratch} && cat > {args_f} <<'{_ARGS_EOF}'\n{payload}\n{_ARGS_EOF}")
         if not write.ok:
             raise SlurmJobError("failed to stage analysis args on the cluster", detail=write.stderr)
 
@@ -241,13 +269,23 @@ class SlurmAnalysisExecutor:
         ds = self.remote_dataset or ""
         # Bind the live source read-only + put it on PYTHONPATH so `bioagent.tools.scrna_cli` is the
         # CURRENT code — no image rebuild on tool edits.
-        pysrc_env = f"export PYTHONPATH={shlex.quote(self.source_dir)}:${{PYTHONPATH:-}}; " if self.source_dir else ""
+        pypath = ":".join(p for p in (self.source_dir, self.deps_dir) if p)
+        pysrc_env = f"export PYTHONPATH={shlex.quote(pypath)}:${{PYTHONPATH:-}}; " if pypath else ""
         inner_payload = (
             f"{pysrc_env}export MPLBACKEND=Agg; "
             f"{self.entrypoint} --tool {shlex.quote(tool)} --workspace {shlex.quote(ws)} "
             f"--dataset {shlex.quote(ds)} --args {shlex.quote(args_f)} > {res_f} 2> {log_f}"
         )
-        binds_ro = tuple(p for p in (ds, self.source_dir, *self.extra_ro_binds) if p)
+        # Bind the dataset's PARENT DIRECTORY, never the bare file: a file bind FATALs with
+        # "destination ... doesn't exist in container" when that path is absent from the image
+        # (scgpt_job binds dirname() for the same reason). And when the dataset already lives
+        # under the rw-bound workspace, skip the extra bind entirely - the workspace bind
+        # already exposes it, and a duplicate ro/rw bind of the same tree can conflict.
+        ds_dir = str(Path(ds).parent) if ds else ""
+        if ds_dir and ws and (ds_dir.rstrip("/") + "/").startswith(ws.rstrip("/") + "/"):
+            ds_dir = ""
+        binds_ro = tuple(p for p in (ds_dir, self.source_dir, self.deps_dir,
+                                     *self.extra_ro_binds) if p)
         binds_rw = tuple(p for p in (ws, scratch, *self.extra_rw_binds) if p)
         inner = singularity_exec(
             self.container_image, inner_payload,

@@ -48,12 +48,44 @@ def write_process_artifacts(result: dict[str, Any], process_dir: Path) -> list[P
     return written
 
 
+def _render_execution(execution: "dict[str, Any] | None") -> list[str]:
+    """HOW the run was executed, at the top of the transcript where a reader lands first.
+
+    Every result must say this on its own. Before it was stamped, telling a Virtual-Lab run from a
+    single-scientist one meant inferring it from the specialist NAMES in the rounds — and that
+    inference cannot separate "ran single" from "ran as a team whose roster failed to parse and
+    fell back to the fixed one". ``mode`` here is the RESOLVED value: "auto" is what the user
+    picks, and it says nothing about what actually ran."""
+    if not isinstance(execution, dict) or not execution:
+        return []
+    mode = str(execution.get("mode") or "?")
+    requested = str(execution.get("mode_requested") or "")
+    label = {"team": "👥 Virtual Lab (multi-agent team)",
+             "single": "🧑‍🔬 Single scientist"}.get(mode, mode)
+    line = f"**Execution mode:** {label}"
+    if requested and requested != mode:
+        line += f" — resolved from the requested `{requested}`"
+    out = [line]
+    team = execution.get("team") or []
+    if team:
+        formed = "PI-formed for this question" if execution.get("team_is_pi_formed") else "fixed roster"
+        out.append(f"**Team ({formed}):** " + ", ".join(str(t) for t in team))
+    flags = [k for k in ("multi_agent", "agent_memory", "hypothesis_driven", "step_meetings")
+             if execution.get(k)]
+    out.append(
+        f"**Execution:** planner `{execution.get('planner')}`, "
+        f"concurrency {execution.get('max_concurrency')}, cycles {execution.get('max_cycles')}"
+        + (f", on: {', '.join(flags)}" if flags else ""))
+    return [*out, ""]
+
+
 def _render_transcript(result: dict[str, Any]) -> str:
     """A human-readable meeting record: agenda → each round (Scientist + Critic) →
     final synthesis. Mirrors the Virtual-Lab 'team meeting' transcript."""
     lines: list[str] = ["# Research transcript", ""]
     if result.get("question"):
         lines += [f"**Research question:** {result['question']}", ""]
+    lines += _render_execution(result.get("execution"))
 
     agenda = result.get("agenda", []) or []
     if agenda:

@@ -413,7 +413,8 @@ async function loadSessions() {
     try {
       const data = await api("GET", "/api/conversations");
       state.sessions = (data.conversations || []).map((c) => ({
-        id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false, createdAt: c.created_at,
+        id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false,
+        createdAt: c.created_at, updatedAt: c.updated_at,
       }));
       if (!state.sessions.length) { await newSession(); }
       else { state.activeId = state.sessions[0].id; await ensureMessages(activeSession()); }
@@ -443,7 +444,8 @@ async function newSession() {
   if (authed()) {
     try {
       const c = (await api("POST", "/api/conversations", {})).conversation;
-      state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true, createdAt: c.created_at });
+      state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
+      createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
       state.activeId = String(c.id);
       hideContextMeter();
       renderSessionList();
@@ -722,13 +724,38 @@ async function deleteSession(id) {
   renderChat();
 }
 
+// A chat's age, in the sidebar. Shown relative because that is how someone looks for a chat
+// ("the one from yesterday"); the exact stamp is the tooltip.
+function absTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleString();
+}
+
+function relTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const mins = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
 function renderSessionList() {
   const list = $("sessionList");
   if (!state.sessions.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
   list.innerHTML = state.sessions
     .map((s) => `
       <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}">
-        <span class="session-title">${escapeHtml(s.title || "New chat")}</span>
+        <span class="session-text">
+          <span class="session-title">${escapeHtml(s.title || "New chat")}</span>
+          <span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span>
+        </span>
         <button class="session-del" data-del="${s.id}" title="Delete chat" aria-label="Delete chat">✕</button>
       </div>`)
     .join("");
@@ -1091,10 +1118,9 @@ function renderDownloads(items, bundleUrl) {
   // These two are conversational entry points, NOT mechanical actions: they focus the composer and
   // hint what to say. The PI's follow-up router (_dispatch_lab) then decides edit-report vs re-run-step
   // — inferring WHICH step from your words — and executes. No manual step-picking in the UI.
-  const regen = `<button type="button" class="dl-regen" data-regen title="Ask the PI to revise the report (no re-run). Click, then tell it what to change in the chat — e.g. 'make the discussion concise'. Just say 'regenerate' to rebuild as-is.">${icon("autorenew")}<span>Regenerate report</span></button>`;
   const rerun = `<button type="button" class="dl-regen" data-rerun title="Ask the PI to re-run an analysis step. Click, then say what to change in the chat — e.g. 'redo clustering at resolution 1.0'; the PI picks the right step, re-runs it (and everything after), and updates the report.">${icon("replay")}<span>Re-run a step</span></button>`;
   d.innerHTML =
-    `<div class="results-bar">${zip}${regen}${rerun}<div class="results-tabs">` +
+    `<div class="results-bar">${zip}${rerun}<div class="results-tabs">` +
       `<button type="button" class="rtab-btn active" data-rtab="files">${icon("folder_open")}<span>Files</span></button>` +
       `<button type="button" class="rtab-btn" data-rtab="preview">${icon("visibility")}<span>Preview</span></button>` +
     `</div></div>` +
@@ -1104,29 +1130,23 @@ function renderDownloads(items, bundleUrl) {
   const m = (bundleUrl || (items && items[0] && items[0].url) || "").match(/\/api\/(?:bundle|file|artifacts)\/([^/]+)\/([^/]+)/);
   if (m) {
     loadResults(m[1], m[2]);
-    // This run's id — the target of "Regenerate report". Persisted so a refresh keeps regenerate working.
+    // This run's id — the target of "Re-run a step". Persisted so a refresh keeps it working.
     state.lastRunId = m[2];
     try { localStorage.setItem(LASTRUN_KEY, m[2]); } catch {}
   }
 }
 
-// The results-panel "Regenerate report" / "Re-run a step" buttons are conversational entry points,
-// not mechanical actions. Clicking one focuses the composer and hints what to say; the message the
-// user then sends is routed by the PI's follow-up router (gateway `_dispatch_lab`): it classifies
-// edit-report vs re-run-step — inferring WHICH step from the wording — and executes, updating the
-// report. So the user never hand-picks a step number; they just tell the PI what they want.
+// The results-panel "Re-run a step" button is a conversational entry point, not a mechanical
+// action. Clicking it focuses the composer and hints what to say; the message the user then sends
+// is routed by the PI's follow-up router (gateway `_dispatch_lab`), which infers WHICH step from
+// the wording, re-runs it and updates the report. So the user never hand-picks a step number.
 function primeComposer(kind) {
   if (!state.connectionId) { toast("Connect to a session first"); return; }
   if (state.running) { toast("A task is running — let it finish first"); return; }
   const input = $("chatInput");
   if (!input) return;
-  if (kind === "rerun") {
-    input.placeholder = "Tell the PI what to change — e.g. “redo clustering at resolution 1.0”. It'll re-run the right step and update the report.";
-    toast("Say what to change — the PI re-runs the right step.");
-  } else {
-    input.placeholder = "Tell the PI how to revise the report — e.g. “make the discussion concise”. Say “regenerate” to rebuild as-is.";
-    toast("Say how to revise the report — the PI regenerates it.");
-  }
+  input.placeholder = "Tell the PI what to change — e.g. “redo clustering at resolution 1.0”. It'll re-run the right step and update the report.";
+  toast("Say what to change — the PI re-runs the right step.");
   input.focus();
   const stream = $("chatStream");
   if (stream) stream.scrollTop = stream.scrollHeight;
@@ -1398,6 +1418,11 @@ function applyStatus(summary) {
   }
   if (isReady) {
     renderModelOptions(summary);
+    // Which LLM answers, and — when that is off-site — a banner that stays up for as long as it
+    // is selected. Loaded once per session; after that the status stream keeps the picker honest.
+    if (!apiKeys.creds.length && !state._apiKeysLoaded) { state._apiKeysLoaded = true; loadApiCredentials(); }
+    renderEndpointSelect(summary);
+    renderEgressBanner(summary);
     // A reusable SSH key was just minted+deployed — tell the user and refresh the picker.
     const nc = summary.new_credential;
     if (nc && nc.id && state._credToastedId !== nc.id) {
@@ -1504,6 +1529,364 @@ async function selectModel(model) {
     if (d.status === "pulling") toast(`Pulling ${model} … watch the log for progress.`);
     else toast(`Model: ${model}`);
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Model switch failed: " + err.message); }
+}
+
+// ---- bring-your-own LLM API key -------------------------------------------
+//
+// Two axes that look similar but are not: the Model row picks among what vLLM already loaded
+// into VRAM at serve-launch, while this picks WHICH ENDPOINT answers at all. Switching endpoint
+// costs nothing and needs no reconnect — an API serves whatever the provider offers.
+
+const apiKeys = { creds: [], providers: [], editing: null, pendingSelect: null,
+                  activeId: "", connectChoice: "" };
+
+// The "add one" affordance belongs INSIDE the picker, not only beside it. A first-time user opens
+// the endpoint dropdown looking for their own endpoint, finds a single "Cluster GPU" entry, and
+// concludes there is no such thing here — the 🔑 next to the box never says that it is where an
+// endpoint comes from. This option makes the dropdown answer its own question.
+const ADD_KEY_OPTION = "__add_key__";
+const ADD_KEY_HTML = `<option value="${ADD_KEY_OPTION}">＋ Add your own API key…</option>`;
+
+async function loadApiCredentials() {
+  const q = state.connectionId ? "" : `?user=${encodeURIComponent($("userInput").value.trim())}`;
+  try {
+    const d = await (await fetch("/api/llm-credentials" + q)).json();
+    apiKeys.creds = d.credentials || [];
+  } catch { apiKeys.creds = []; }
+  renderEndpointSelect();
+  renderConnectEndpointSelect();
+  renderApiKeyList();
+}
+
+function renderEndpointSelect(summary) {
+  const sel = $("llmEndpointSelect");
+  if (!sel) return;
+  const current = summary && summary.llm_endpoint;
+  const activeId = current && current.kind === "credential" ? current.credential_id : "";
+  const opts = ['<option value="">Cluster GPU (vLLM at UCI)</option>'];
+  for (const c of apiKeys.creds) {
+    const bad = c.last_error ? " ⚠" : "";
+    opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(c.model || "no model")}${bad}</option>`);
+  }
+  opts.push(ADD_KEY_HTML);
+  sel.innerHTML = opts.join("");
+  apiKeys.activeId = activeId;   // what to snap back to when "＋ Add" is picked
+  if (activeId) sel.value = activeId;
+  else if (current && current.kind === "credential") {
+    // The status names a credential we don't have in the list (another window added it, or the
+    // list predates it). Reload rather than silently showing "Cluster GPU", which would misreport
+    // where prompts are going.
+    loadApiCredentials();
+  }
+}
+
+// A persistent banner, not a one-off toast: the session keeps sending prompts off-site for as
+// long as this endpoint is selected, so the notice has to persist too.
+function renderEgressBanner(summary) {
+  const el = $("llmEgressBanner");
+  if (!el) return;
+  const ep = summary && summary.llm_endpoint;
+  if (!ep || !ep.remote) { el.classList.add("hidden"); el.textContent = ""; return; }
+  const roles = ep.lab_model && ep.lab_model !== ep.model
+    ? `${escapeHtml(ep.model)} · ${escapeHtml(ep.lab_model)} for PI/Critic`
+    : escapeHtml(ep.model || "");
+  el.innerHTML = `🌐 Prompts leave UCI for <strong>${escapeHtml(ep.label)}</strong> (${roles}).`
+    + ` Your data files and the analysis stay on HPC3.`;
+  el.classList.remove("hidden");
+}
+
+async function selectLlmEndpoint(credId, { accept = false } = {}) {
+  if (!state.connectionId) return;
+  try {
+    const res = await fetch("/api/llm-endpoint", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, credential_id: credId || null,
+                             accept_egress: accept }),
+    });
+    const d = await res.json();
+    if (res.status === 409 && d.needs_consent) { openEgressDialog(credId, d); return; }
+    if (!res.ok) { toast(d.error || "Could not switch endpoint"); renderEndpointSelect(); return; }
+    toast(credId ? `LLM: ${d.credential ? d.credential.label : "your API endpoint"}` : "LLM: cluster GPU");
+  } catch (err) {
+    toast(isUnreachable(err) ? "Can't reach the local server." : "Endpoint switch failed: " + err.message);
+  }
+}
+
+function openEgressDialog(credId, info) {
+  apiKeys.pendingSelect = credId;
+  const ep = info.endpoint || {};
+  $("egressTarget").innerHTML = `<strong>${escapeHtml(ep.label || "endpoint")}</strong><br>`
+    + `<code>${escapeHtml(ep.base_url || "")}</code>`;
+  const li = (items) => (items || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("");
+  $("egressSends").innerHTML = li(info.sends);
+  $("egressStays").innerHTML = li(info.stays);
+  $("egressModal").classList.remove("hidden");
+}
+
+function closeEgressDialog(accepted) {
+  $("egressModal").classList.add("hidden");
+  // Promise mode: the connect flow awaits a decision rather than firing a follow-up request,
+  // because it has to retry the SAME connect with consent attached.
+  if (apiKeys.pendingResolve) {
+    const resolve = apiKeys.pendingResolve;
+    apiKeys.pendingResolve = null;
+    apiKeys.pendingSelect = null;
+    resolve(Boolean(accepted));
+    return;
+  }
+  const credId = apiKeys.pendingSelect;
+  apiKeys.pendingSelect = null;
+  if (accepted && credId) selectLlmEndpoint(credId, { accept: true });
+  else renderEndpointSelect();          // snap the dropdown back to what is actually in use
+}
+
+// Show the same consent card and RESOLVE with the answer. Used by connect(), which must know the
+// decision before it can retry; the post-connect path stays callback-driven.
+function confirmEgress(info) {
+  return new Promise((resolve) => {
+    apiKeys.pendingResolve = resolve;
+    openEgressDialog(null, info);
+  });
+}
+
+// The endpoint picker on the LOGIN form. Populated before any session exists, which is the whole
+// point — choosing here is what lets connect skip the GPU.
+function renderConnectEndpointSelect() {
+  const sel = $("connectLlmSelect");
+  if (!sel) return;
+  const keep = sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.connectChoice;
+  const opts = ['<option value="">Cluster GPU (vLLM at UCI)</option>'];
+  for (const c of apiKeys.creds) {
+    opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(c.model || "no model")}</option>`);
+  }
+  opts.push(ADD_KEY_HTML);
+  sel.innerHTML = opts.join("");
+  if (keep && apiKeys.creds.some((c) => c.id === keep)) sel.value = keep;
+  apiKeys.connectChoice = sel.value;
+  renderConnectLlmHint();
+}
+
+// The line under the login picker is the only place that can tell a first-time user that an
+// endpoint of their own is even possible, so it says what to do when they have no key yet — and
+// stops nagging once they have one.
+function renderConnectLlmHint() {
+  const el = $("connectLlmHint");
+  if (!el) return;
+  const sel = $("connectLlmSelect");
+  const chosen = sel && sel.value && sel.value !== ADD_KEY_OPTION;
+  if (chosen) {
+    el.textContent = "This session reasons on your own endpoint — no GPU queue. Your HPC3 account still runs the analysis jobs.";
+  } else if (apiKeys.creds.length) {
+    el.textContent = "Cluster GPU waits for a free card. Pick one of your own endpoints above to start in seconds — your HPC3 account still runs the analysis jobs either way.";
+  } else {
+    el.textContent = "Cluster GPU waits for a free card. No API key saved yet — add one here with 🔑 and a session starts in seconds; your HPC3 account still runs the analysis jobs either way.";
+  }
+}
+
+// The login picker's value as a credential id: never the "＋ Add" sentinel, which is a menu item
+// and would otherwise be sent to /api/connect as a credential that does not exist.
+function connectEndpointChoice() {
+  const sel = $("connectLlmSelect");
+  const v = sel && sel.value;
+  return v && v !== ADD_KEY_OPTION ? v : null;
+}
+
+// ---- credential manager ---------------------------------------------------
+
+function renderApiKeyList() {
+  const box = $("apiKeyList");
+  if (!box) return;
+  // Keys are stored per owner, and with accounts off the owner IS the UCInetID typed on the login
+  // form. Opening this dialog before typing it would list (and save into) the anonymous "guest"
+  // bucket, which the session then never looks in — so say what is missing instead of showing an
+  // empty list that looks like "no keys".
+  if (!state.user && !$("userInput").value.trim()) {
+    box.innerHTML = '<div class="storage-loading">Type your UCInetID on the login form first — saved keys belong to that account.</div>';
+    return;
+  }
+  if (!apiKeys.creds.length) {
+    box.innerHTML = '<div class="storage-loading">No endpoints yet. Add one below to use your own LLM account.</div>';
+    return;
+  }
+  box.innerHTML = apiKeys.creds.map((c) => {
+    const state_ = c.last_error
+      ? `<span class="api-key-bad">⚠ ${escapeHtml(c.last_error)}</span>`
+      : c.verified_at ? '<span class="api-key-ok">✓ verified</span>' : "<span>not tested</span>";
+    const roles = c.lab_model && c.lab_model !== c.model
+      ? `${escapeHtml(c.model)} · PI/Critic on ${escapeHtml(c.lab_model)}` : escapeHtml(c.model || "no model");
+    return `<div class="api-key-row" data-id="${escapeHtml(c.id)}">
+      <div class="api-key-main">
+        <strong>${escapeHtml(c.label)}</strong>
+        <small>${roles}</small>
+        <small><code>${escapeHtml(c.base_url || "")}</code> · key ${escapeHtml(c.key_hint || "")}${c.encrypted ? " 🔒" : ""}</small>
+        <small>${state_}</small>
+      </div>
+      <div class="api-key-actions">
+        <button type="button" class="ghost small" data-act="test">Test</button>
+        <button type="button" class="ghost small" data-act="edit">Edit / rotate key</button>
+        <button type="button" class="ghost small" data-act="del">Delete</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderProviderOptions() {
+  const sel = $("apiKeyProvider");
+  if (!sel || !apiKeys.providers.length) return;
+  sel.innerHTML = apiKeys.providers.map((p) =>
+    `<option value="${escapeHtml(p.key)}">${escapeHtml(p.label)}</option>`).join("");
+  applyProviderPreset();
+}
+
+function applyProviderPreset() {
+  const p = apiKeys.providers.find((x) => x.key === $("apiKeyProvider").value);
+  if (!p) return;
+  $("apiKeyProviderNote").textContent = p.note || "";
+  // Only prefill an EMPTY base URL: a user editing a saved endpoint, or one who typed a custom
+  // host, must not have it overwritten by flipping the dropdown to read a note.
+  if (p.base_url && !$("apiKeyBaseUrl").value.trim()) $("apiKeyBaseUrl").value = p.base_url;
+}
+
+function resetApiKeyForm() {
+  apiKeys.editing = null;
+  $("apiKeyFormTitle").textContent = "Add an endpoint";
+  $("apiKeyHintLabel").textContent = "required";
+  $("apiKeySave").textContent = "Verify & save";
+  $("apiKeyCancel").classList.add("hidden");
+  for (const id of ["apiKeyBaseUrl", "apiKeyValue", "apiKeyModel", "apiKeyLabModel", "apiKeyLabel"]) $(id).value = "";
+  $("apiKeyModelList").innerHTML = "";
+  $("apiKeyError").classList.add("hidden");
+  applyProviderPreset();
+}
+
+function editApiKey(cred) {
+  apiKeys.editing = cred.id;
+  $("apiKeyFormTitle").textContent = `Edit “${cred.label}”`;
+  // The stored key is never sent back to the browser, so an empty field here means "keep the
+  // current key" rather than "no key" — which is also exactly what a rotation needs.
+  $("apiKeyHintLabel").textContent = `leave blank to keep ${cred.key_hint || "the saved key"}`;
+  $("apiKeySave").textContent = "Save changes";
+  $("apiKeyCancel").classList.remove("hidden");
+  $("apiKeyProvider").value = cred.provider || "custom";
+  $("apiKeyBaseUrl").value = cred.base_url || "";
+  $("apiKeyValue").value = "";
+  $("apiKeyModel").value = cred.model || "";
+  $("apiKeyLabModel").value = cred.lab_model || "";
+  $("apiKeyLabel").value = cred.label || "";
+  $("apiKeyError").classList.add("hidden");
+  $("apiKeyProviderNote").textContent = "";
+}
+
+function apiKeyError(msg, cause) {
+  // The four causes have four different fixes, so name the fix rather than repeating the error.
+  const fix = {
+    auth: "Check the key was copied whole, and that it belongs to this provider.",
+    credit: "The key works but the account is out of credit or rate-limited.",
+    model: "That model id isn't served here — press ↻ to list what is.",
+    endpoint: "Check the base URL. It should end in /v1 for most providers.",
+    network: "The server could not reach that host.",
+  }[cause];
+  const el = $("apiKeyError");
+  el.textContent = fix ? `${msg} — ${fix}` : msg;
+  el.classList.remove("hidden");
+}
+
+async function submitApiKey(ev) {
+  ev.preventDefault();
+  const body = {
+    provider: $("apiKeyProvider").value,
+    base_url: $("apiKeyBaseUrl").value.trim(),
+    model: $("apiKeyModel").value.trim(),
+    api_key: $("apiKeyValue").value.trim(),
+    lab_model: $("apiKeyLabModel").value.trim(),
+    label: $("apiKeyLabel").value.trim() || null,
+    user: $("userInput").value.trim(),
+  };
+  const editing = apiKeys.editing;
+  if (!editing && !body.api_key) { apiKeyError("Paste an API key to save this endpoint."); return; }
+  // Without an owner the server files this under "guest" and the session — which looks it up by
+  // UCInetID — never finds it again. A key that verifies and then silently isn't there is worse
+  // than a refused save, so refuse.
+  if (!state.user && !body.user) {
+    apiKeyError("Type your UCInetID on the login form first — saved keys belong to that account.");
+    return;
+  }
+
+  $("apiKeySave").disabled = true;
+  $("apiKeySave").textContent = "Verifying…";
+  try {
+    const res = await fetch(editing ? `/api/llm-credentials/${editing}` : "/api/llm-credentials", {
+      method: editing ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const d = await res.json();
+    if (!res.ok) { apiKeyError(d.error || "Could not save", d.cause); return; }
+    $("apiKeyValue").value = "";
+    resetApiKeyForm();
+    await loadApiCredentials();
+    // A key added from the login form was added FOR this login: select it, so the user closes the
+    // dialog onto the choice they just made rather than back on "Cluster GPU".
+    const created = !editing && d.credential;
+    if (created && $("connectLlmSelect") && !state.connectionId) {
+      apiKeys.connectChoice = created.id;
+      $("connectLlmSelect").value = created.id;
+      renderConnectLlmHint();
+    }
+    toast(editing ? "Endpoint updated" : "Endpoint saved");
+  } catch (err) {
+    apiKeyError(isUnreachable(err) ? "Can't reach the local server." : err.message);
+  } finally {
+    $("apiKeySave").disabled = false;
+    if (!apiKeys.editing) $("apiKeySave").textContent = "Verify & save";
+  }
+}
+
+async function fetchEndpointModels() {
+  // Only meaningful for a SAVED credential: listing models needs a key, and the key we would
+  // use lives on the server.
+  if (!apiKeys.editing) { apiKeyError("Save this endpoint first, then ↻ lists the models it serves."); return; }
+  const q = `?user=${encodeURIComponent($("userInput").value.trim())}`;
+  try {
+    const d = await (await fetch(`/api/llm-credentials/${apiKeys.editing}/models${q}`)).json();
+    const models = d.models || [];
+    $("apiKeyModelList").innerHTML = models.map((m) => `<option value="${escapeHtml(m)}"></option>`).join("");
+    toast(models.length ? `${models.length} models available` : "This endpoint does not list models — type the id.");
+  } catch { toast("Could not list models"); }
+}
+
+async function apiKeyRowAction(ev) {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = btn.closest(".api-key-row").dataset.id;
+  const cred = apiKeys.creds.find((c) => c.id === id);
+  if (!cred) return;
+  const q = `?user=${encodeURIComponent($("userInput").value.trim())}`;
+
+  if (btn.dataset.act === "edit") { editApiKey(cred); return; }
+  if (btn.dataset.act === "del") {
+    if (!confirm(`Delete “${cred.label}”? The stored key is removed from this server.`)) return;
+    await fetch(`/api/llm-credentials/${id}${q}`, { method: "DELETE" });
+    await loadApiCredentials();
+    toast("Endpoint deleted");
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "Testing…";
+  try {
+    const d = await (await fetch(`/api/llm-credentials/${id}/verify${q}`, { method: "POST" })).json();
+    toast(d.result && d.result.ok ? `${cred.label}: working` : `${cred.label}: ${(d.result || {}).message || "failed"}`);
+    await loadApiCredentials();
+  } finally { btn.disabled = false; btn.textContent = "Test"; }
+}
+
+async function openApiKeys() {
+  $("apiKeysModal").classList.remove("hidden");
+  if (!apiKeys.providers.length) {
+    try { apiKeys.providers = (await (await fetch("/api/llm-providers")).json()).providers || []; } catch {}
+    renderProviderOptions();
+  }
+  resetApiKeyForm();
+  await loadApiCredentials();
 }
 
 function renderGpu(summary) {
@@ -1670,6 +2053,10 @@ async function connect(e) {
     host: $("hostInput").value.trim(),
     campus_network_confirmed: $("campusCheck").checked,
     mock: $("mockCheck").checked,
+    // Chosen on THIS form, so the server knows before it provisions: with your own endpoint it
+    // skips the GPU allocation entirely instead of queueing for a card nothing will use.
+    llm_credential_id: connectEndpointChoice(),
+    accept_egress: false,
   };
   if (!body.mock && !body.ucinetid) { toast("Enter your UCInetID."); return; }
   if (useKey && !body.credential_id && !body.mock) { toast("No saved SSH key — log in with password + Duo once first."); return; }
@@ -1678,8 +2065,19 @@ async function connect(e) {
   const ls = $("logStream"); if (ls) ls.innerHTML = "";
   $("connectBtn").disabled = true;
   try {
-    const res = await fetch("/api/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-    const data = await res.json();
+    let res = await fetch("/api/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    let data = await res.json();
+    // 409 + needs_consent: the chosen endpoint is outside UCI and this user has not yet
+    // acknowledged what leaves. Ask, then retry the SAME connect — the server records the consent
+    // on the credential, so it is asked once per endpoint, not once per session.
+    if (res.status === 409 && data.needs_consent) {
+      $("connectBtn").disabled = false;
+      if (!(await confirmEgress(data))) return;
+      body.accept_egress = true;
+      $("connectBtn").disabled = true;
+      res = await fetch("/api/connect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      data = await res.json();
+    }
     if (!res.ok) { toast(data.error || "Connect failed"); $("connectBtn").disabled = false; return; }
     state.connectionId = data.connection_id;
     try { localStorage.setItem(CONN_KEY, data.connection_id); } catch {}
@@ -1799,8 +2197,14 @@ function updateComposerButton() {
   const send = $("chatSend"), stop = $("chatStop"), input = $("chatInput");
   if (!send || !stop || !input) return;
   const hasText = input.value.trim().length > 0;
-  const busy = state.planPending || state.running;
+  const ownsRun = !state.runSessionId || state.runSessionId === state.activeId;
+  const busy = (state.planPending || state.running) && ownsRun;
   const showSend = !busy || hasText;             // idle → Send; busy → Send only once typing
+  if (!ownsRun && (state.planPending || state.running)) {
+    input.placeholder = "Another chat's run is in progress — switch to it to refine or stop it.";
+  } else if (!state.planPending && !state.running && input.placeholder.startsWith("Another chat")) {
+    input.placeholder = "Ask a research question…";
+  }
   send.classList.toggle("hidden", !showSend);
   stop.classList.toggle("hidden", showSend);
 }
@@ -1839,14 +2243,26 @@ async function sendChat(e) {
   const input = $("chatInput");
   const text = input.value.trim();
   if (!text) return;
+  // The plan-review / mid-run channels belong to the chat that OWNS the in-flight run. A message
+  // typed in a DIFFERENT chat is a new question, never feedback on someone else's plan: a tester
+  // opened a fresh chat with "+", typed "Analyze this dataset", and it was sent to the PI as a
+  // change request for the previous chat's plan (planPending is global; the ownership test below
+  // is what was missing).
+  const ownsRun = !state.runSessionId || state.runSessionId === state.activeId;
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the
   // plan" channel — the message is natural-language feedback that re-plans (it does NOT
   // start a new run).
-  if (state.planPending) {
+  if (state.planPending && ownsRun) {
     appendUserMessage(text);
     input.value = "";
     updateComposerButton();
     submitPlan("revise", text);
+    return;
+  }
+  if ((state.planPending || state.running) && !ownsRun) {
+    // Another chat's run is live on this shared HPC session (one run at a time). Say so instead
+    // of silently steering it — and instead of silently launching a second run.
+    toast("Another chat's run is in progress — finish or stop it there before starting a new one.");
     return;
   }
   // A run is already executing (post-plan): the message is mid-run steering — queue it for
@@ -1895,7 +2311,21 @@ async function sendChat(e) {
     // gets today's research behaviour, because the server defaults it.
     const route = activeRoute();
     const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: state.activeId, question: text, dataset_path, datasets, case_note: (state.caseNote && state.caseNote.text) || null, plan_mode, autonomous, planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
-    if (!res.ok) { const d = await res.json(); toast(d.error || "Run failed"); }
+    if (!res.ok) {
+      const d = await res.json();
+      if (res.status === 404 && /unknown connection/i.test(d.error || "")) {
+        // The server no longer knows this connection: it restarted under us. A bare "Unknown
+        // connection id" toast read as "the question did nothing" — say what happened and what to
+        // do, and drop the dead connection so the connect button comes back.
+        toast("The server restarted and this session ended — reconnect to HPC3 to continue (your GPU job may still be running and will reattach).");
+        state.connectionId = null;
+        setRunning(false);
+        try { showReattachHint(); } catch { /* banner is best-effort */ }
+        try { renderConnectState && renderConnectState(); } catch { /* optional */ }
+        return;
+      }
+      toast(d.error || "Run failed");
+    }
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Run failed: " + err.message); }
 }
 
@@ -1925,7 +2355,14 @@ function planCardShell() {
 function showPlanPanel(agenda) {
   const el = planCardShell();
   state.planAgenda = agenda || [];
-  const md = "## 📋 Proposed plan\n\n" + state.planAgenda.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  // Steps arrive as `**Short title** — detailed prose`. Render each as its own heading + body so
+  // the plan scans as a pipeline (titles) with detail on demand (prose), instead of one dense
+  // numbered wall. Steps without a title (older runs, fallback plans) keep the plain list row.
+  const stepMd = state.planAgenda.map((s, i) => {
+    const m = /^\*\*(.+?)\*\*\s*[—–:-]+\s*([\s\S]*)$/.exec(s);
+    return m ? `### ${i + 1} · ${m[1]}\n\n${m[2]}` : `### ${i + 1}\n\n${s}`;
+  }).join("\n\n");
+  const md = "## 📋 Proposed plan\n\n" + stepMd;
   el.innerHTML = renderMarkdown(md) +
     `<div class="plan-actions-row">
        <button class="primary small" data-plan="approve">▶ Run this plan</button>
@@ -2907,6 +3344,37 @@ function init() {
   $("storageModal").addEventListener("click", (e) => { if (e.target.id === "storageModal") $("storageModal").classList.add("hidden"); });
   $("storageItems").addEventListener("click", (e) => { const b = e.target.closest("[data-path]"); if (b) deleteStorageItem(b.dataset.path); });
   $("modelSelect").addEventListener("change", (e) => selectModel(e.target.value));
+
+  // --- LLM endpoint + API-key manager ---
+  // "＋ Add your own API key…" is a menu ITEM, not an endpoint: it opens the manager and snaps the
+  // picker back to whatever is actually in use, so the dropdown never shows a selection that isn't.
+  $("llmEndpointSelect").addEventListener("change", (e) => {
+    if (e.target.value === ADD_KEY_OPTION) { e.target.value = apiKeys.activeId || ""; openApiKeys(); return; }
+    selectLlmEndpoint(e.target.value);
+  });
+  $("manageKeysBtn").addEventListener("click", openApiKeys);
+  // The same manager, reachable from the LOGIN form. Without this the only way to register a key
+  // was the post-connect panel — i.e. after the GPU wait the key exists to avoid.
+  $("connectManageKeysBtn").addEventListener("click", openApiKeys);
+  $("connectLlmSelect").addEventListener("change", (e) => {
+    if (e.target.value === ADD_KEY_OPTION) { e.target.value = apiKeys.connectChoice || ""; openApiKeys(); return; }
+    apiKeys.connectChoice = e.target.value;
+    renderConnectLlmHint();
+  });
+  $("apiKeysClose").addEventListener("click", () => $("apiKeysModal").classList.add("hidden"));
+  $("apiKeysModal").addEventListener("click", (e) => { if (e.target.id === "apiKeysModal") $("apiKeysModal").classList.add("hidden"); });
+  $("apiKeyList").addEventListener("click", apiKeyRowAction);
+  $("apiKeyForm").addEventListener("submit", submitApiKey);
+  $("apiKeyCancel").addEventListener("click", resetApiKeyForm);
+  $("apiKeyProvider").addEventListener("change", applyProviderPreset);
+  $("apiKeyFetchModels").addEventListener("click", fetchEndpointModels);
+  // The consent dialog has no silent dismissal: closing it counts as declining, so a click on
+  // the backdrop or ✕ snaps the picker back to the endpoint actually in use rather than leaving
+  // the dropdown showing a selection that never took effect.
+  $("egressAccept").addEventListener("click", () => closeEgressDialog(true));
+  $("egressCancel").addEventListener("click", () => closeEgressDialog(false));
+  $("egressClose").addEventListener("click", () => closeEgressDialog(false));
+  $("egressModal").addEventListener("click", (e) => { if (e.target.id === "egressModal") closeEgressDialog(false); });
   $("pullModelBtn").addEventListener("click", () => {
     const tag = prompt("Pull a model tag from Ollama (e.g. qwen3:32b, llama3.1:8b):");
     if (tag && tag.trim()) selectModel(tag.trim());
@@ -2917,7 +3385,11 @@ function init() {
   $("authMethod").addEventListener("change", syncAuthMethod);
   $("createKeyCheck").addEventListener("change", syncNewKeyPass);
   // Re-load saved keys for whatever UCInetID is typed (keys are per-user).
-  $("userInput").addEventListener("change", () => { if ($("authMethod").value === "ssh_key") loadCredentials(); });
+  $("userInput").addEventListener("change", () => {
+    if ($("authMethod").value === "ssh_key") loadCredentials();
+    loadApiCredentials();   // credentials are per-owner, so the picker follows the UCInetID
+  });
+  loadApiCredentials();     // populate the login picker on first paint, before any session exists
   $("chatForm").addEventListener("submit", sendChat);
   $("chatStop").addEventListener("click", stopRun);
   $("datasetFile").addEventListener("change", (e) => { for (const f of e.target.files || []) uploadDataset(f); e.target.value = ""; });   // multi-attach: each file joins the bind-set
@@ -2941,7 +3413,6 @@ function init() {
   });
   document.addEventListener("click", (e) => { if (!e.target.closest(".data-menu-wrap")) toggleDataMenu(false); });
   $("downloads").addEventListener("click", (e) => {
-    if (e.target.closest("[data-regen]")) { primeComposer("regen"); return; }
     if (e.target.closest("[data-rerun]")) { primeComposer("rerun"); return; }
     const tab = e.target.closest("[data-rtab]");
     if (tab) { switchResultsTab(tab.dataset.rtab); return; }

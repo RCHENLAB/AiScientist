@@ -1,5 +1,836 @@
 # BioAgent Prototype Handoff
 
+## 2026-08-20 (late) — the eight defects in the live all-Qwen plan, fixed at the framework level (main 764f214, deployed)
+
+Yijun reviewed the plan the production PI wrote in the real console and found eight problems.
+Each is fixed where it can recur.
+
+**A new tool, `run_depth_matched_de`** (findings 1 and 6). The plan told the executor to
+"correlate per-gene logFC against the between-arm median nCount_RNA" — not computable, a per-gene
+vector against one scalar. Three models wrote three wrong versions across two runs and it failed
+every time, leaving the report's central question (artefact or biology?) unanswered. The tool
+quantile-matches the deeper arm onto the shallower arm's per-cell UMI distribution within each
+cell type (capped at each cell's own counts), re-runs the SAME Wilcoxon contrast, and Spearman-
+correlates the original ranking against the matched one PER DIRECTION.
+
+**Validated against a known answer** (`experiments/depth_matched_validation/`), because no unit
+test can show a method is scientifically right. Two synthetic cell types: one with a 2x depth
+imbalance AND real biology, one with the same imbalance and NOTHING different. All four verdicts
+correct — DepthOnly up/down both INVERTED (rho -0.16 / -0.05), RealBio up PRESERVED (rho 0.82),
+RealBio down (no real biology there) correctly weak. Gene level: 30/30 of the genuinely changed
+genes kept their rank, 3/30 of the background did. The first run of this validation FAILED its own
+control and changed the tool: "depth-robust" had meant "kept its sign", which passes a gene whose
+effect collapses from 3.0 to 0.02; it now means the gene stays in the matched ranking's own top-N.
+
+**A deterministic guard in `run_enrichment`** (finding 3). The plan declared its p-values
+non-inferential in the DE step, then passed padj=0.05 to enrichment — where that parameter is the
+cutoff a gene must clear to ENTER the test, laundering a pseudoreplicated p-value into
+"significantly shifted genes". `run_de` now persists its own `inference` label as a sidecar beside
+the tables (it existed, but only in a dict `run_enrichment` never sees), and enrichment IGNORES
+padj — not widens it — when the DE was `exploratory_ranking` or `pseudoreplicated`, selecting by
+|log2FC| and saying so in its output.
+
+**Four rules for the plan-review Critic** (findings 2, 4, 5, 7, 8), which reviewed this plan and
+passed it because three of them were not on its checklist: (6) is every specified operation
+COMPUTABLE; (7) is every promised output PRODUCED by some step — a figures step promised a
+composition chart with no composition step anywhere; (8) does a step's description match what its
+named tool DOES — it claimed GSEA ranks on log2FC when `run_gsea_prerank` ranks on the Wilcoxon z;
+(9) a literature step ASKS rather than asserts — the plan called DDX41 "a DEAD-box helicase (BRR2)
+in the U4/U6 snRNP", a different protein of a different family, and that premise would have
+steered every query. Rule (1) now also names the two cases it should have caught: re-deriving obs
+columns the dataset profile already states, and re-drawing figures the tools already write.
+
+Finding 4's knowledge gap is not fixable here — a 35B model does not reliably know DDX41's
+molecular identity. Rule (9) stops it from ASSERTING one.
+
+Deploy note: the analysis container imports the source staged on dfs3b, which
+`_ensure_hpc_pysrc` re-pushes per session — so the new tool reaches HPC3 on the next connect with
+no image rebuild. 1,513 tests pass.
+
+## 2026-08-20 (evening) — five defects from Yijun's live frontend test, fixed and deployed (main 973850d)
+
+Yijun drove the real console end to end. Every finding below came from that hour, not from a test.
+
+**1. A meeting expert recited its tool log instead of speaking.** Yesterday's cd4a9f1 made
+`ResearchHarness` synthesize a deterministic digest rather than return an empty `final_answer` —
+right for the Critic and the writer, but `_expert_turns_with_tools` read
+`(res.final_answer or "").strip() or self._complete(messages)`, so a now-always-non-empty answer
+silently disabled the fall-back and the design meeting printed "(auto-summary: the step ended on
+max_steps …)" where an opinion belonged. `HarnessResult.answer_synthesized` now marks it; the
+meeting hands the lookups back to the persona as notes and lets it speak. (d98d0cf)
+
+**2. Plan review timed out in 10 minutes.** Sized for "glance and click Run"; a researcher READS a
+10-step plan. The timeout returns `{"action": "cancel"}`, and a cancelled plan deliberately clears
+`last_run_id`, so the draft AND the half-written revision were destroyed.
+`BIOAGENT_PLAN_REVIEW_TIMEOUT`, default 3600. The two-language duplicate cancellation notice is now
+one English line that no longer claims "by user". (d2912c2)
+
+**3. The word "why" started a full study.** With no prior run to attach to, `_followup_target`
+returns None and everything fell through to `_run_lab`: staging the matrix from HPC3, loading the
+preset pipeline, convening a design meeting. Dispatch now screens the message with the session's
+own warm model (the pattern `_followup_router` already used) on the new-run path only; the
+composer's research/chat dial is NOT revisited. Only a confident "conversational" verdict stops a
+run — low confidence, an unparseable reply, a failed call and a cold session all fall through to a
+closed word list, and anything it does not recognise runs. (c7f23cf → acc3001; the first cut was a
+regex, which Yijun rightly rejected as the wrong mechanism for an intent judgement.)
+
+**4. "Free my GPU" left the worker behind.** `_release_my_gpu` queried `--name=<model job>` only.
+When the model job had already died (55436595 hit its 2 h wall clock at 18:03), the handler
+returned "no running GPU job found" at an early return placed ABOVE the worker-release block —
+`aiscientist-worker-<ucinetid>` held a 4-CPU free-partition node from 16:10 to 19:26 with no model
+behind it. Analysis jobs (run_code / PaperQA / variant / phenotype / scGPT) were never in scope at
+all. `_release_session_jobs` now takes ONE `squeue --me` listing `%i|%j`, classifies by our own job
+prefixes, adds the cached alloc + worker ids, scancels the set and polls until each is confirmed
+gone. Prefix matching, never `scancel --me` — a researcher's own jobs share the account.
+`aiscientist-tempgc-*` is left alone (it exits in a second). (791db1e)
+
+**Also measured, not yet fixed.** `deep_literature` costs 2.5–5 min per call and the queue wait is
+1–7 s — the time is 40 evidence chunks × one summary LLM call each (`evidence_k=40`, concurrency
+12) plus a ~500-word answer, all against the SAME vLLM the agent uses. One design meeting fired six
+of these (18:36–18:45), which is most of the 20-minute plan latency. `inject_args` sit at the
+BOTTOM of the precedence chain (`{**inject_args, **caller, **force_args}`), so a meeting-only
+narrow profile (evidence_k 10 / search_count 15 / max_sources 5) is a ~10-line change that leaves
+the real literature step at full depth.
+
+**Still open.** A timeout should PARK the draft (question + agenda + feedback_log, scoped by
+run/conversation — not by connection, see the isolation bug) so the next message re-enters
+`_pi_plan`'s revise branch instead of opening a new study. No idle reaper for the worker: it is
+released only by `/api/disconnect` and this endpoint, with `--time=08:00:00` as the backstop.
+Slurm job names are split between `bioagent-*` and `aiscientist-*`, and squeue truncates NAME to 8
+chars so all the `aiscientist-*` jobs read as "aiscient"; renaming needs dual-prefix matching in
+the finder or it orphans running workers.
+
+## 2026-08-20 — deployed; two live findings from the post-deploy all-Qwen runs
+
+Merged the 45-commit branch to main (91c1547) and deployed (tar-archive path — rsync now dies
+reproducibly at the same file, worth a look). Prod stays all-Qwen, no OpenRouter/DSV4 config (BYO
+only); GPU policy live (sessions → A100 on `gpu`; run allocated hpc3-gpu-l54-04). Post-deploy
+plan-only smoke: 10/10 titled steps, no echo pseudo-step, and Qwen now PLANS the depth-matched
+step by itself (profile hint working).
+**Live finding #1:** the first full all-Qwen run died 3× on one step with SyntaxError/IndentationError
+— the model's long run_code snippets (150+ lines) were TRUNCATED mid-argument by the Scientist
+turn's 2048-token output reservation. That cap has bitten silently for weeks (every "invalid
+syntax at line ~150" revise). Fix: `BIOAGENT_SCIENTIST_MAX_TOKENS=8192` now in prod .env (knob
+shipped this morning). Rerun in progress.
+
+## 2026-08-19 — GPU placement policy (Yijun): Qwen sessions on A100 (`gpu`, billed); RTX6000/gpu32 reserved for the big-PI model
+
+Standing decision: user Qwen sessions allocate from the regular `gpu` partition on A100
+(`ruic20_lab_gpu`, billed) — no longer from free-gpu32. The gpu32 RTX PRO 6000 nodes (free pool,
+4 concurrent GPUs for the whole account) are reserved for serving the big PI/writer model only.
+Ops: prod `.env` → `BIOAGENT_GPU_CANDIDATES="gpu,gpu:A100:1,ruic20_lab_gpu"`. Also in
+`deploy/dsv4/README.md`.
+
+## 2026-08-19 — DSV4-Flash on our own RTX PRO 6000: blocked at the kernel level (measured, 5 attempts); full pipeline runs with DSV4 via OpenRouter lab-role split
+
+**Local serving verdict:** DeepSeek-V4-Flash CANNOT currently serve on the gpu32 RTX PRO 6000
+(sm_120) nodes. Root cause chain, each proven by a Slurm run: (1) NCCL init hangs in the container
+→ fixed (`NCCL_SOCKET_IFNAME=lo`, `NCCL_IB_DISABLE=1`, P2P off); (2) the mHC hyper-connection
+kernel calls DeepGEMM's TF32 GEMM which asserts "Unsupported architecture" on sm_120 → fixed with a
+bind-mounted fallback patch (`containers/vllm-0.27.1-patches/tilelang.py`, mirrors upstream's own
+non-DeepGEMM path); (3) the FP8 dense/attention layers use DeepSeek's UE8M0 scale format, which
+ONLY DeepGEMM understands — and DeepGEMM's SF transform asserts "Unknown SF transformation" on
+sm_120 (Cutlass c3x has no sm_120 dispatch; Triton's kernel KeyErrors on `float8_e8m0fnu`).
+Verified on vLLM 0.27.1 AND the 2026-08-19 nightly, with BOTH NVFP4 checkpoints (MJPansa 0731,
+nvidia official — both keep UE8M0 FP8 non-MoE layers). Blocked until DeepGEMM grows sm_120 SF
+support or a standard-scale (AWQ/GPTQ) requant appears. Artifacts kept: `vllm-0.27.1.sif`,
+`vllm-nightly.sif`, both weight sets in `hf/hub` (127+126 GB), serve sbatch + logs in
+`~<ucinetid>/vllm27-build/` on HPC3. Also learned: free-gpu32 caps the WHOLE ruic20_lab account at
+4 concurrent GPUs (QoS MaxTRESPerAccount), shared with every user session.
+
+**Plan B ran the full pipeline anyway:** local gateway with `BIOAGENT_LAB_LLM_BASE_URL` →
+OpenRouter `deepseek/deepseek-v4-flash-0731` for PI/Critic/writer, session Qwen3.6 (1×RTX6000)
+for the Scientist — the exact two-model split recommended by the A/B. First DSV4-authored plan in
+the real product: 9 titled steps INCLUDING a dedicated "Depth-matched sensitivity check" citing
+the 1.6× nCount imbalance (3,078 vs 1,916) — the step Qwen never planned. Plan-card latency 858 s
+(DSV4 default reasoning effort; needs `reasoning_effort` capping when productised). vllm_client
+gained env-gated dialect knobs for a future V4/other served model: `BIOAGENT_VLLM_THINK_ON_KWARGS`
+(opt-IN thinking for PI/writer on templates that default to no-think), `BIOAGENT_SCIENTIST_MAX_TOKENS`
+(the tool-turn 2048 default is too small for reasoning models), `BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS`;
+defaults byte-identical to today (tests: tests/test_vllm_client_dialect.py).
+
+## 2026-08-19 — A/B round 2: the three node candidates, and a correction about thinking in prod
+
+**Correction.** The round-1 write-up said prod runs every role with thinking OFF. Wrong: the PI / Critic /
+writer go through `vllm_client.complete()` (default `think=True`, served with `--reasoning-parser qwen3`)
+— thinking is ON there; only the Scientist tool loop (`chat_tools`, `think=False`) and a few bounded
+helpers (summariser, phenotype mapper, dataset describer) run without it. So in the experiment read
+`qwen36-35b-think` as prod for plan/write and `qwen36-35b` as prod for execution. Re-read: prod plan
+2/3 depth-aware (judges 7.2) vs 100 % / 8.5–9.5 for every bigger model; prod writer with the pre-fix
+prompt raises the artefact 0/4 (= run 8847's report), with 06e4937 rules 3/4, quality 5.5.
+**Round 2 (Yijun refilled OpenRouter; "少跑几组"):** MiniMax-M2.7 (229B-A10B), MiniMax-M3 (428B-A23B,
+multimodal), DeepSeek-V4-Flash-0731 (304B, MIT), full A/B/C. Plan: all 100 % depth-aware, soundness
+8.5 / 9.25 / 9.5. Execute: same post-tool churn as everyone (50–79 % max_steps); M2.7 copes best (7/14
+finished with an answer, grounded 4.5), flash worst (3/14). Code ran clean: M3 95 %, flash 90 %, M2.7
+86 %, Qwen 79–82 %. Write (current rules): flash **8.0 at effort=low** (at provider-default effort it
+spent the whole 24k output budget thinking and returned EMPTY 4/4 — the budget trap), M3 7.5, M2.7 4.5
+(verbose, over-claims); Sonnet 8.5 for reference. Fit on 4×96 GB: M2.7 FP8 ≈ 230 GB easy; flash FP8 ≈
+300 GB tight + needs a newer vLLM (V4 + DSpark); M3 only at 4-bit.
+**Recommendation:** DeepSeek-V4-Flash-0731 for PI + writer (capped effort, ≥32k output), MiniMax-M2.7
+for the Scientist loop; single-model fallback = flash + the loop fix. Loop fix (every model needs it):
+after the named tool succeeds ≤2 more calls then forced `finish`; never an empty answer at max_steps.
+Spend both rounds ≈ $10. Full tables: `experiments/plan_vs_exec_ab/results/SUMMARY.md`.
+
+## 2026-08-19 — Is it the plan, the execution, or the writing? Same scaffolding, six models (measured)
+
+Yijun: "判断一下是模型写的plan不好还是模型执行的不好,都测一下,允许用 openrouter". Built
+`experiments/plan_vs_exec_ab/` — the real `ResearchLab` code paths (`_pi_plan`; `_scientist`+
+`_critic` on ONE fixed plan, the production PI's 7 steps for run 8847d521ba32, with the real tools
+running locally on the real dataset, seeded step by step with production's own recorded calls;
+`_synthesize`→gateway `_build_report`→`_review_report` on run 8847's accepted findings) with ONLY
+the model swapped: prod Qwen3.6-35B no-think / same weights with thinking / Qwen3.5-122B /
+DeepSeek-V4-pro / Sonnet 5 / GPT-5.4, via OpenRouter; deterministic rubrics + two blind judges.
+Full write-up: `experiments/plan_vs_exec_ab/results/SUMMARY.md` (+ raw jsonl, sample reports).
+
+**Plan — model.** Identical prompt/profile/guidance, and the profile SAYS "⚠ DEPTH IMBALANCE
+1.6×": Qwen3.6 plans a depth check 0/3 (judges 0/6), Qwen3.5-122B 1/3, Qwen3.6-think 2/3,
+DeepSeek / Sonnet / GPT-5.4 3/3 (Sonnet writes a "Depth-imbalance check" step, GPT a
+"Depth-bias diagnostics" step). Judge soundness 6.0 → 7.2 → 8.5 → 9.3–9.5. Basics (stratified DE,
+composition, enrichment after DE, replication caveat, no hallucinated tools) are right for all.
+**Execution — scaffolding (+model).** All open-weight arms call the named tool with the right
+arguments (86–93 %, arg match 1.0). Then 3.5–4.3 MORE calls re-reading what the tool just wrote,
+until the 8-call budget: 64 % (Qwen) / 57 % (think) / 83 % (Qwen3.5-122B) / 50 % (DeepSeek, n=6)
+of steps hit max_steps, and those end with an EMPTY answer (answer present 4/14, 5/14, 2/12, 3/6);
+the Critic accepts 71–93 % anyway. Same pathology across four models of very different size ⇒ the
+loop's contract. Frontier arms NOT measured (budget).
+**Writing — model, partly recoverable.** Same facts/figures/tables: prod Qwen (pre-fix prompt) raises
+the "technical artefact" possibility 0/4, overclaims significance 4/4, invents detail 4/4; the
+06e4937 rules cut invention to 1/4 but NOT "significant" (4/4); Qwen WITH thinking + rules:
+artefact 3/4, overclaims 1/4, quality 5.5 vs 4.25. Sonnet (deterministic only): depth mentioned
+4–9× per report, technical caveat 2/2; DeepSeek 1/2. The depth facts were in every writer's
+previews (`qc_descriptive_summary.csv`); the difference is connecting them.
+
+**What to do:** (1) thinking ON for PI + writer (same GPU/weights; it is off only because of the
+old "trace eats max_tokens" budget bug — give those roles 16k output); (2) fix the loop: after
+the named tool succeeds allow ≤2 more calls then force `finish`; never return an empty answer at
+max_steps (synthesise from the tool digest); (3) if buying a stronger model, buy it for PI+writer
+only via the existing `BIOAGENT_LAB_LLM_*` role split (DeepSeek-V4 is open-weight and plans at 8.5).
+**Budget/caveats:** the OpenRouter key ($20 cap, account $50) ran out mid-Stage-B — Sonnet/GPT
+execution trials, 8 DeepSeek, 2 Qwen3.5, GPT reports and the later judgements did not run
+(≈$15–20 to finish). Wall-clock is unreliable: the laptop idle-slept in 17-min cycles for ~5 h
+(DarkWake log) — what looked like provider stalls; `caffeinate` fixed it; tokens/calls unaffected.
+
+## 2026-08-19 — the report's CONTENT: a depth artifact narrated as biology, and what now catches it
+
+Read run 2's report as a reviewer. Six substantive problems; the big one: every cell type came
+back up >> down (MG 5,028/508, Rod 3,279/107) with translation/ribosomal genes on top, and the
+Discussion narrated "DDX41-driven translational up-regulation". Computed from obs: **DDX41 arm
+median depth 3,078 vs WT 1,916 (1.6x), nFeature 1,777 vs 1,194** — the classic depth artifact.
+Nothing in the pipeline had ever compared the arms' QC metrics.
+
+Fixed, all deterministic + prompt-level: (1) the dataset profile now carries `design_by_arm`
+(cells per arm, cells per label per arm, per-arm medians of nCount/nFeature/percent.mt/…, and a
+`depth_imbalance` flag at >1.5x) — shown to the PI in `_dataset_context` and rendered as tables
+in `## The dataset`; (2) `run_de` names a same-direction skew across strata as technical
+(`direction_bias` + hoisted warning); (3) the writer/reviewer number rule was over-broad ("rewrite
+any full-precision float into scientific notation") → the model obeyed and wrote '6.5e+01%' —
+sci notation is now p-values / <1e-3 / >1e5 only; (4) writer rules: replication wording copied
+from the dataset section (no "two donors"), exploratory DE reported by effect size not "N
+significant", captions only from tool-stated axes (two files never share a caption).
+Still open (writer quality): 20 figures incl. 10 per-type bar plots; a filename fragment in
+Methods; the model's own "top 100" constant in the run_code synthesis.
+
+**Model vs scaffolding, on this report:** the sci-notation, the missing per-arm QC, the empty
+"What was run", the code-block rendering — scaffolding (mine/ours). "two donors" vs "one
+library", the fabricated caption details, "significant" after being told there is no valid
+p-value, and not SUSPECTING a global same-direction shift — model (Qwen3.6-35B) reasoning slips a
+senior analyst would not make. Each of those is now constrained by a rule or a computed fact,
+which is the pattern all week: this model follows what it is shown and told; it does not go
+looking for what it was not shown.
+
+## 2026-08-19 — the rendered report: two markdown bugs of mine + a blind VL reviewer (fixed)
+
+Yijun opened run 1's PDF: "What was run" rendered as CODE and ran off the right margin; "The
+dataset" lists collapsed into run-on paragraphs. Both mine: 4-space-indented list items ARE a
+markdown code block (LaTeX code does not wrap); a list right after a bold paragraph label needs a
+blank line. Fixed in `_pipeline_section` / `_dataset_section`.
+VL review (Qwen2.5-VL-7B on HPC3) was ON and ran on all three runs — and called those pages
+clean. Two deterministic detectors added to the reviewer: `text_clipped` (word bbox past the
+page box) and `unrendered_markup` (`**`, many backticks, raw image links in page text). Verified
+on the very PDF the old reviewer passed: p2/p3 clipped (high) + markup (medium). The reviewer now
+ships INSIDE the package (`bioagent.tools.vlreview_run`, byte-identical to deploy/vlreview/) and
+the job runs it from pysrc — a detector change reaches prod on code sync, no sif rebuild.
+Also: the VL job's `run_id` was the OWNER dir name, so every run overwrote `vlreview/<owner>/pass1`.
+
+## 2026-08-19 — E2E run 3 (7/7, converged) + timing breakdown + no-fallback (a6e954c)
+
+- **Ziyao's literature fix verified on deployed code**: arRP question → 18 relevant papers, 25
+  evidence contexts, cited answer; writes land in `Temp/<user>/paperqa/`, shared corpus untouched.
+- **ORA/GSEA/synthesis first-try** after the `resolve_evidence` fix; the DE step's "recon then
+  final text without run_de" is now caught by a one-shot nudge (3dc6591).
+- **No in-process fallback after a failed Slurm job** (default; `BIOAGENT_HPC_LOCAL_FALLBACK=1`
+  restores). Census of every retained run: the in-process executions were the allowlist bug B,
+  the post-failure fallback never fired — but it was armed. Eyeserver now does profile + report
+  glue only.
+- **79 min = ~27 min necessary + 10 min decision card waiting for a human + 24 min the model's
+  own `select_resolution=True, n_bootstrap=10` re-clustering of a LABELLED dataset + 17 min of
+  post-run team interpretation meetings (2 rounds × 3 experts × tools + 4 deep_literature jobs).**
+  Proposed (awaiting Yijun): auto-resolve the labels-vs-recluster card to "labels" on annotated
+  data (or 2-min timeout); post-run meeting → 1 round, no deep_literature from experts.
+
+## 2026-08-19 — E2E run 2 post-mortem: three more scaffolding defects (found by replaying the run's own JSON)
+
+- **Literature step searched for the pasted step brief** ("DDX41 ONLY splicing retinal" → 0
+  hits): `run_gsea_prerank` returns dict-shaped terms `{term, nes, fdr…}`; the findings DIGEST
+  joined them as strings → TypeError — computed OUTSIDE its caller's try → the caller's own
+  except substituted `[step]` as the query. Same class as the empty "What was run" (a consumer
+  assumed a shape). `_term_label` normalises both shapes; digest/fallback now inside the try;
+  neither fallback can ever be the raw brief; all-caps instruction words (ONLY/NOT/MUST…)
+  excluded from the entity regex.
+- **ORA step scored 0.0 with its tables on disk**: `resolve_evidence` checked ABSOLUTE paths on
+  the gateway host — the HPC3 shell tools return dfs3b paths, which never exist there, so every
+  step that used `list_dir`/`read_text` was told ALL its evidence was missing. Remote artifacts
+  now map to their local mirror by the `artifacts/`-suffix; other remote paths are unverifiable
+  here, not "missing".
+- `run_de`/`run_pseudobulk_de` results carry `table_columns` — a run_code step indexed the DE
+  table by `sampleid` (KeyError; the table is keyed by `group`).
+Method: `scripts/e2e_prod_drive.py` + replaying `process/run_state.json` through the helpers.
+
+## 2026-08-18 (final) — for Ziyao: nothing to move; one permission fix; router now dataset-first
+
+**Ziyao / retigene — checked every dfs3b path in prod `.env`: NONE points at a personal dir.**
+PaperQA is fully on the shared root and that copy is complete (1,739 papers, 1,737 indexed,
+manifest, 3 GB `paperqa.sif`, `hf_cache`) — identical to her personal copy. **No env change.**
+
+| under `/dfs3b/ruic20_lab/ziyaom2/` | what | recommendation |
+|---|---|---|
+| `retigene/` (4.8 G) | older dev copy (`index_pubmedbert_OLD`, `pqa_test*.py`) | **delete** — prod never reads it; dfs3b is ~97 % full |
+| `BioAgentPrototype/` (3.2 G) | her clone + `retigene_embed-*.log` | hers, leave |
+| `analysis/ phenotype/ variant/ reports/` (~64 M, ≤ 7/26) | pre-shared-root run outputs | legacy deliverables, never auto-swept; delete by hand if wanted |
+| `pysrc/ .bioagent/ vlreview/` | old process files | superseded by `AiScientist/Temp/ziyaom2/`; delete |
+
+The one thing that IS hers to do (permissions, not location): the shared corpus carries her
+tantivy locks in `index_pubmedbert/answers/`, which blocked every other user's PaperQA write. The
+query path is now read-only + writes to `Temp/<user>/paperqa/`, so it works regardless; for
+hygiene: `rm -rf …/retigene/index_pubmedbert/answers && chmod -R g+rwX …/retigene`. And on her
+line proper: pin compatible lmi/aviary in the next `paperqa.sif` build (runtime-patched for now).
+
+**Router**: team/single was an LLM coin-flip on the question alone. `_dataset_mode_rule` now
+decides first — contrast column present → team; labels only → single; neither → PI decides —
+and the choice is rendered with its reason. **`scripts/e2e_prod_drive.py`** promoted from the
+scratchpad: the tool that found this week's prod defects.
+
+## 2026-08-18 (late) — headless E2E ×2 on prod; deep_literature had NEVER worked (4254a9a)
+
+Method: drive prod through the browser's own HTTP+WS API with my HPC3 account, real GPU, real
+data; then read the run's process files. Two full runs. Everything below was found THIS way, and
+nothing below was visible from unit tests (all green throughout).
+
+Run 1 (3a687047e056, 79 min, 5/10 accepted) exposed: A) a DE step ending "…biological
+interpretation" routed to the literature fast path (run_de never ran); B) `_HPC_ANALYSIS_TOOLS`
+held 4 names — run_composition/pseudobulk/gsea/doublet ran IN-PROCESS on the eyeserver where the
+HPC3 checkpoints don't exist (composition failed 3 rounds); C) step brief pasted as the literature
+query → 0 hits; D) `## What was run` EMPTY in every real report (LabRound vs dict).
+Run 2 (1cc6d9285ac4, 29 min, **6/6 accepted, converged**) after fixes: A ✓ run_de first try;
+B ✓ composition hpc_slurm ok, both arms (MG 12.6% vs 5.9%, AC 6.3% vs 2.9%); D ✓ section renders
+with declared params + "chosen for this run" marks.
+
+deep_literature (Ziyao's PaperQA): 28/28 prod jobs since 8/15 died in 1s (workspace never
+mkdir'd → Singularity bind FATAL). Fixed → then lmi/aviary TypeError on the fake agent's final
+step (patched) → then PermissionDenied writing the answers index into the ziyaom2-owned shared
+corpus (per-user Temp/ shim + read-only corpus). Positive control ABCA4: 13 papers / 36 contexts /
+cited answer. So every literature step and every meeting expert had been silently falling back to
+Europe PMC keyword search — the "critic looks weak" observation was the good tool never running.
+
+Also: staging a swept Temp/ dataset wrote a 0-byte file silently → now fails loudly; deploy
+must wait for prod quiet (I restarted the service under Ziyao's test earlier — my fault).
+GPU-stop audit: stops the run first, releases the worker, no teardown on no_job.
+
+Open: team/single router is an LLM coin-flip on the question alone (7 min vs 1 min plans) —
+propose deterministic rule; ⑥ step count; paperqa.sif version pin (Ziyao).
+
+## 2026-08-18 (night) — Ziyao's report fixes + PI-authored steps + GPU-stop audit (c59195b)
+
+From `plan_mode_report_1.html` (Ziyao's run of the 8-checkpoint sheet on 107825c):
+
+- **Literature-step label residue** ("for has donors", "for help", punched-out Chinese) — the
+  scaffolding no longer WRITES steps from string templates. `_author_step`: the PI writes any
+  step a deterministic guard decides must exist (literature; the DE producer below), from the full
+  question + profile. Templates are the offline fallback only. A PI-written literature step already
+  in the plan is kept as written. **Nothing on the plan card is a template sentence any more.**
+- **New chat hijacked the old chat's plan review** (A7): composer routes to revise/inject only when
+  the active chat OWNS the run (`state.runSessionId`); otherwise a clear "in progress elsewhere".
+- **Enrichment planned with no DE producer** (A7, Critic passed it): deterministic dependency
+  check → PI writes a contrast step (`plan_dependency_fixed` 🔗), or the orphan enrichment is
+  dropped when the profile has no condition column.
+- **Server restart surfaced as bare "Unknown connection id"**: now names the restart, drops the
+  dead connection, shows the reattach banner without a refresh.
+- **GPU-stop audit** (`/api/stop-gpu`): scoping/confirmation/no_job honesty already held; closed
+  three gaps — stops the in-flight run first, releases the CPU worker node, no teardown on no_job.
+
+Not done: ⑤ zh-vs-en latency (needs a probe against a served model), ⑥ step count.
+
+## 2026-08-18 (later) — plan-mode UX + Stop coverage (a2037fd, NOT yet deployed)
+
+From Yijun's live team-mode test. Deploy FROZEN while Ziyao tests; verify via direct HPC3 jobs.
+
+- **Stop while the plan card is pending did nothing for 10 min**: the worker blocks in
+  `plan_event.wait(600)`, which never looks at `chat_stop`. `/api/lab/stop` now resolves a pending
+  plan/decision card as a cancel. (Not the July WS-drift bug recurring — separate gap.)
+- **Stop during the whole pre-plan stretch was ignored** (routing, team forming, multi-round
+  design meeting, PI drafting): `should_cancel` checks added at every phase boundary + between
+  meeting rounds.
+- **The 5-minute silence**: `team_meeting_start` / `expert_contribution` had no renderers — the
+  meeting's tool-using expert turns were invisible. Rendered now, plus a "PI is drafting" heartbeat.
+- **Plan readability**: every step opens `**short title** — prose`; the plan card renders
+  `### N · title` blocks instead of one dense numbered wall.
+- **Invented tool names** (`run_wilcoxon_DE`, `run_cell_bootstrapping`, `run_summary_visualization`
+  in a real plan): ANNOTATED on the plan card, never pruned — per Yijun, improvising a missing tool
+  via run_code (even installing packages) is allowed; the sin is duplicating automatic outputs,
+  which the plan-review Critic now checks for explicitly.
+
+## 2026-08-18 — DE line: academic defaults, measured (deployed 8ca0b00)
+
+Profiled the REAL DDX41 object instead of reading code. Found and fixed, all live on prod + HPC3:
+
+- **`run_de` tested 22,387 genes/stratum; only ~33% were detected** (21% in Rod). New
+  `min_pct=0.1` (Seurat's min.pct) drops undetected genes BEFORE the test and re-adjusts BH over
+  the tested set. |log2FC|>10 divide-by-zero artifacts: ~2,700/stratum → 0-1 on the whole object.
+  Significant genes ROSE 9,483 → 11,565 — the inflated denominator had been suppressing signal.
+- **One definition of "significant"** everywhere: padj<0.05 AND |lfc|>=0.25 (was padj-only in
+  run_de vs both gates in run_enrichment: 9,483 vs 8,800 in the same report). Result carries
+  `significance` and disowns the cross-stratum total (`n_significant_total_note`).
+- **`run_pseudobulk_de` now runs DESeq2** (NB Wald, pydeseq2) after an edgeR-filterByExpr-style
+  `min_count=10` filter; Welch t on log2 CPM only as a LOUD fallback (`warnings` names the power
+  cost). Universe file = tested set, not var_names. pydeseq2: prod venv 0.5.4;
+  HPC3 `pydeps/` 0.5.4 (+ formulaic chain; installed with the SIF'S OWN pip, `--no-deps` per
+  package — 0.4.12 broke on the sif's numpy 2.4), wired via `BIOAGENT_HPC_PYDEPS` →
+  `SlurmAnalysisExecutor.deps_dir` → container PYTHONPATH. VERIFIED end-to-end inside analysis.sif
+  on a compute node: real DDX41 run_de reproduces local numbers exactly, and run_pseudobulk_de
+  reports "DESeq2 Wald (negative binomial, pydeseq2)" with 0 significant on null data.
+- **`tie_correct=True`** declared + passed to the Wilcoxon (~90%-zeros matrices are all ties);
+  `min_cells=30` now labeled an engineering guard.
+- Plan-mode classifier: pure interrogatives (why/how/为什么…) can no longer be misread as change
+  requests ("why do you use wilcoxon here?" was triggering a re-plan). Test sheet for Ziyao:
+  `plan-mode-test-prompts.md` (3 sessions / 8 checkpoints).
+
+## 2026-08-17 — a plan nobody could audit, and the guard that would have stopped it (`2f307ea`)
+
+Post-mortem of production run `Ziyaoma/f5111e1a2382`. A retina `.h5ad` that already carried an
+11-level `majorclass` annotation, scVI/UMAP embeddings, completed QC and removed doublets was
+re-clustered from scratch, pooled across all 15,307 cells for a Wilcoxon test on `sampleid`, and
+written up as 100 "highly significant" markers. The two arms do not share a cell-type mix (Cone
+1.8% vs 5.5%, MG 12.6% vs 5.9%), so a composition shift is indistinguishable from a change in
+expression — the ranking is uninterpretable before the p-values are even discussed.
+
+Eight defects, and the attribution is not where it looks: **~15% skill, ~35% model, ~50%
+scaffolding**. The skill named `majorclass` for reuse and named `orig.ident` as the sample column;
+it was written correctly. It failed because two facts it depends on reached the planner wrong, and
+because nothing ever checked whether it had been followed:
+
+* `_plan_review` — the PI/Critic pass over the whole draft plan — had a flag, a full implementation
+  and **no caller**: `app.py` never set `step_meetings`, so it was reachable only from tests. Its
+  checklist item (2) describes this exact failure verbatim.
+* The dataset profiler counted only pandas Categorical columns, so `orig.ident` — holding ONE value,
+  i.e. zero biological replication — was omitted, and the profile filed it under
+  "high-cardinality". The plan proposed aggregating per donor because the profile said donors
+  existed.
+* The annotation hint offered the labels for `groupby` only, the slot a condition contrast already
+  needs, so when the question named a condition column the advice became unsatisfiable and the
+  labels were dropped entirely. `stratify_by` went unmentioned.
+* `run_de`'s condition-column guard existed in an earlier build and was dropped in a rewrite.
+
+Fixed on this branch: the guard restored (refusing only the unambiguous shape, and stating how much
+replication the object actually has); `plan_review` split out, defaulted on and wired in; the
+profiler counting plain columns plus a REPLICATION paragraph in the profile; `scrna_pack.PARAMS` as
+the one table the tool bodies, the model-facing schema and each SKILL.md's `## Parameters` section
+all read; non-default settings warned live and tabled at the top of the technical report; the PI
+prompt now requiring the tool name and a closing `SELF-SOURCED:` disclosure; the steering protocol
+persisted into `plan.md` and `run_state.json`. Also the two HPC sandbox bugs behind that run's
+failed-call storm (allow-list built from the console name instead of the UCInetID; `2>/dev/null`
+parsed as an out-of-workspace write, costing 600s blocked on a confirmation).
+
+Full bilingual write-up: `handoff/yijun/ddx41-postmortem.html`.
+
+**Measured (12 trials each, served Qwen3.6-35B-A3B-AWQ, same profile + question):** the DAG is
+NOT the instability — 12/12 structurings parsed into 2 graphs differing by one edge, and the pass
+cannot change step text, so every defect predated it. Before vs after the fixes: per-donor
+pseudobulk 9/12 -> 0/12, label reuse 2/12 -> 9/12, stratification 6/12 -> 10/12, tool naming and
+`SELF-SOURCED:` disclosure 0/12 -> 12/12. NOTE a regression I shipped and then fixed: the first
+plan review cut plans from 4.6 steps to 1.9 by reading a narrow question literally; corrected
+Critic + a "may halve, may not gut" floor restored it to 4.3 (`36513a1`, deployed).
+
+**Live now:** `BIOAGENT_WORKER_NODE=1` is in the prod `.env` (backup `.env.bak-20260817-worker`),
+service restarted 2026-08-17 14:12 PDT, verified in the process environ and via
+`HPCSettings.worker_enabled=True`. Without it `run_shell` and the dependency preflight before every
+`run_code` were dead in production. It is configuration, not code, so it is the ONLY part of this
+work that is live.
+
+**Open:** `2f307ea` / `5ba361b` are not deployed — until they ship, none of the code fixes above
+are in production; the per-step Critic still
+judges "was evidence produced" rather than "did the step's own method produce it", which is how a
+step that substituted `run_de` for pseudobulk scored 0.95.
+
+## 2026-08-17 — the BYO-key control was reachable but not findable (`6f7fa70`)
+
+`b87d7e6` put the LLM endpoint picker on the login form, and it worked. It still read as "the
+feature isn't here", because the dropdown's only entry was **Cluster GPU (vLLM at UCI)** — nothing
+in it said an endpoint of your own was possible, and the 🔑 beside it never claimed to be where one
+comes from. A control that exists and a control a first-time user can find are different things.
+
+Both pickers now carry **"＋ Add your own API key…"** as a menu item: it opens the manager and snaps
+the selection back to what is actually in use, so the box never shows a selection that isn't real
+(`connect()` reads `connectEndpointChoice()`, which can never return the sentinel). The hint under
+the login picker says what to do while there is no key and stops once there is one, and a key added
+from the login form is selected on save.
+
+Behind it was a real silent failure, now closed: **with accounts off the credential owner IS the
+UCInetID typed on the login form**, so saving a key before typing it filed a *verified* key under
+the anonymous `guest` bucket, which the session never reads — the key saved, then vanished.
+`POST /api/llm-credentials` refuses when there is neither a logged-in account nor a UCInetID
+(`cause: "owner"`), with a client-side guard and an explanatory manager state to match. **Prod is
+unaffected** — accounts are on there, so `_cred_owner` resolves to the account name and the
+`?user=` param is ignored; this was the dev/accounts-off path only.
+
+Verified live against a stub OpenAI endpoint on a gateway with accounts ON (prod's shape): open
+picker → "＋ Add your own API key…" → save → the new endpoint is the selected one.
+**Merged to `main` but NOT yet deployed** — `deploy/sync_deploy.sh` still has to be run.
+
+## 2026-08-10 — DEG verified on the lab's REAL data (Ddx41), and what it revealed
+
+`/dfs3b/ruic20_lab/<ucinetid>/share/Ddx41/Ddx41_rawcounts.h5ad` — 21,006 cells × 33,696 genes, mouse
+retina, `sampleid=[DDX41, WT]`, cell types in **`subclass`** (NOT the `majorclass` the skill
+template's CONFIG defaults assume). Run inside `analysis.sif` on HPC3 (scanpy 1.11.5), job 55178903.
+
+The whole chain worked end to end on real data:
+
+| step | result |
+|---|---|
+| `run_scanpy_qc` | ok — 21,006 cells kept, 33,696 → 22,865 genes, 2,000 HVG |
+| `run_de` contrast | ok — `"sampleid: DDX41 vs WT (reference=WT), stratified by subclass"` |
+| cell types tested | **7**; 5 skipped and REPORTED (Endothelial_pericyte, HC, Microglia, RGC, RPE — too few cells in an arm) |
+| both directions | every tested type has up AND down significant genes |
+| figures | 7 volcanoes, every returned path resolves |
+| hand-off | `run_enrichment` found `de_subclass_all.csv` unaided; 14 groups (7 × up/down) |
+| background | `tested_universe`, 22,865 — not the 20,000 constant |
+
+**The down-regulated half is where the biology was.** In amacrine cells the DDX41 mutant shows
+oxidative phosphorylation / TCA / respiratory electron transport **up**, and Neuronal System,
+synaptic protein-protein interactions, NMDA receptor activation and transmission across chemical
+synapses **down**. Under the old code that entire down half was invisible — rows are score-ordered,
+so "take the first N significant" kept only the up side. This is the clearest evidence that fix ④
+was not cosmetic.
+
+**A speculation of mine that the data refuted.** I expected mouse symbols (`0610005C13Rik`; only
+55 of the first 2,000 are uppercase) to miss the human Reactome/Hallmark libraries. They did not —
+gseapy matches case-insensitively, and the terms that came back are coherent. Do not "fix" a
+species mismatch here; there isn't one.
+
+**A real caveat about this dataset, though:** `orig.ident` has exactly ONE level (`'0'`), so there
+are **no biological replicates** — one sample per arm. Per `SKILL.md` v2 that means there is no
+valid p-value for the condition at all: `run_pseudobulk_de` would (correctly) refuse, and what
+`run_de` produces here is an **exploratory ranking**, not inferential differential expression. The
+tooling behaved correctly; the study design cannot support inference. Any write-up from this
+dataset must say so.
+
+## 2026-08-10 (later still) — production has been enriching against a fake GO library
+
+### The defect
+
+`/data/BioAgent/app/src/bioagent/tools/genesets/GO_Biological_Process_2023.gmt` on prod is **20
+bytes**:
+
+```
+term	desc	RHO	PDE6A
+```
+
+That is byte-for-byte the shape of the stub fixture in `tests/test_scrna_pack.py`, so it was
+almost certainly copied from there rather than downloaded. Dated Jul 5.
+
+`run_enrichment` resolved libraries with `p.exists()`, which a stub passes. So the file went to
+gseapy, did **not** appear in `missing_libraries`, and **every GO Biological Process enrichment in
+production has been tested against one made-up gene set**. The output reads as "no GO terms
+enriched" — a scientific finding about the data — instead of a broken library. Reactome (1,817
+sets) and Hallmark (49) are real, so enrichment was never dead; it was quietly missing its largest
+and most-used library.
+
+### Fixed in code (`c192cd3`)
+
+Count real term sets instead of trusting existence; report `gene_set_terms` per library so
+"nothing enriched against 1,817 sets" and "nothing enriched against 1" are distinguishable. A
+library is refused only when empty, or when it is one of the KNOWN standard Enrichr downloads and
+implausibly small — a user's own two-set custom `.gmt` stays legitimate. The stub-shaped test
+fixtures were renamed off the standard library name, since squatting on that name is what seeded
+the production file.
+
+Also fixed a crash it exposed: gseapy returns a DataFrame when something is enriched but a plain
+list when nothing is, and `.results.sort_values` sat outside the `try` — so the most ordinary
+outcome in the tool, "no enriched terms", took the whole tool down with an `AttributeError`.
+
+### STILL NEEDS AN OPS ACTION — Yijun
+
+The code now *reports* the broken library; it cannot fix it. **On prod**, re-download it:
+
+```bash
+/data/BioAgent/env/bin/python /data/BioAgent/app/scripts/fetch_genesets.py \
+  /data/BioAgent/app/src/bioagent/tools/genesets
+```
+
+Until that runs, GO BP enrichment returns nothing — but now it says so out loud instead of
+implying the biology was uninteresting.
+
+## 2026-08-10 (later) — LangGraph, in two steps; and the context window, finally proven
+
+### Step 1 — mid-run durability, zero new dependencies (commit `e5ed58e`)
+
+`run_state.json` was written ONCE, after `ResearchLab.run` returned. Prod is a single stateful
+replica, so one gateway restart hits every live run: a multi-hour analysis lost its whole
+orchestration state, and although `work/adata_*.h5ad` survived on disk, nothing could re-enter the
+loop to use them. `run()` now takes a `checkpoint` callback invoked after EVERY round, from both
+the linear loop and the DAG scheduler. The gateway passes `_write_run_state`, so recovery uses the
+SAME `/api/lab/continue` path a user-requested re-run uses — not a second mechanism.
+
+This is the durability a graph checkpointer provides, and it is the prerequisite for step 2 either
+way: the state has to be incrementally serializable before anything else can own it.
+
+### Step 2 — the LangGraph shell (`LabConfig.planner="langgraph"`)
+
+`src/bioagent/agents/lab_graph.py`. LangGraph owns nodes / edges / state / checkpointing; every
+node still calls `_run_one_node` unchanged, so the Scientist→Critic loop, the specialists, the
+decision points and the evidence grounding are the same code the tested scheduler runs.
+
+**The load-bearing problem, and the answer.** LangGraph executes every node whose dependencies are
+met CONCURRENTLY. Our analysis nodes cannot: scanpy has global state and they share one checkpoint
+chain. `_run_dag` enforced that at dispatch time with `_concurrency_safe` — a runtime check
+LangGraph has no equivalent of. So `serialize_conflicting_nodes()` expresses the constraint where
+the graph can see it: as EDGES. Conflicting nodes get an ordering edge; genuinely independent work
+(the literature branch) still runs in parallel; an edge that would close a cycle is skipped,
+because deadlocking to honour a performance constraint is worse than the plan's existing order.
+The function is pure, so the guarantee is unit-testable, and one test asserts it end-to-end by
+watching for temporal overlap during a real graph run.
+
+**Deliberately NOT at parity with `_run_dag`:** no Coordinator ordering among ready nodes (the
+graph decides), and no mid-run agenda growth from hypothesis-driven exploration (the graph is
+compiled up front). Both are first-increment omissions, not oversights.
+
+**Dependency posture:** new `langgraph` optional extra in `pyproject.toml`, deliberately NOT part
+of `gateway`. Installing it pulls ~19 transitive packages (langchain-core, langsmith, orjson,
+ormsgpack, zstandard, websockets, …) into the production gateway. `lab_graph` is imported lazily
+and its tests `importorskip`, so **a deploy without the extra behaves exactly as today**. Turning
+it on in prod is a deliberate, separate decision — it needs the extra installed and a restart.
+
+Suite: 1151 passed, 3 skipped.
+
+### The context window — the config was right, but nothing had proven it
+
+Probed the real cluster (a short `ctxprobe` serve job on free-gpu32, cancelled after reading the
+log):
+
+```
+Using max model len 262144
+GPU KV cache size: 3,034,420 tokens
+Maximum concurrency for 262,144 tokens per request: 11.58x
+```
+
+The gap worth knowing about: the last REAL prod serve job (55085529, 2026-08-06) ran at **131072**.
+Prod `.env` was changed to 262144 on 2026-08-08 20:49 and the service restarted 21:01 — after it —
+but no serve job had run between then and this probe, so nothing on record showed the new value in
+effect. It does now. (131072 bought 22.79x concurrency vs 11.58x; the KV pool is the same either
+way, and 11.58x is far more than a lab console needs.)
+
+Also observed, unrelated but worth noting: that real serve ran on `hpc3-gpu-l54-04` with
+`tensor_parallel_size=1`, and there is **no tensor-parallel support anywhere in the codebase** — so
+requesting >1 GPU today would allocate cards vLLM never uses. Left alone deliberately.
+
+### free-gpu32, measured 2026-08-10
+
+4 RTX6000 nodes (`hpc3-gpu-n54-00..03`) fully idle, 4×96 GB / 32 CPU / 257 GB each; `--test-only`
+on `gpu:RTX6000:4` schedules immediately. MaxTime **3 days** (our serve default asks for 2 hours),
+`AllowQos=low,guest` (submitting without `--qos` works), and — the one real risk —
+**`PreemptMode=CANCEL`**: a preempted serve job is killed outright, not requeued. The paid `gpu`
+partition is `PreemptMode=OFF`, MaxTime 14 days.
+
+## 2026-08-10 — the DEG line's tools did not connect to each other
+
+### What was wrong
+
+The DEG protocol is the pipeline lab staff use most, and three of its steps did not fit together.
+None of this was a model failure — the tools' contracts disagreed, and the model's most reasonable
+reaction to each mismatch made the result worse.
+
+1. **`run_de` could not express a condition contrast.** It called `rank_genes_groups` with no
+   `reference`, so it was one-vs-rest MARKERS only. The protocol nonetheless listed it as an option
+   for step 3 ("KO vs WT per cell type"). Picking it produced a table that looks like a DEG result
+   and answers a different question.
+2. **`run_de` hard-required `adata_clustered.h5ad`.** The protocol tells the planner to REUSE
+   existing cell-type labels and SKIP clustering — which made `run_de` return
+   `"run_clustering must run first"` on exactly the documented path. The natural next move for the
+   model is to run the clustering it was told not to run, after which the DE is per-new-cluster
+   one-vs-rest and the study has quietly become a marker analysis.
+3. **Nothing that produced a contrast wrote what `run_enrichment` reads.** Enrichment discovers DE
+   results as `tables/de_<key>_all.csv`. The `condition_by_celltype` run_code template wrote
+   `tables/DEG/DEG_<ct>.csv`; **`run_pseudobulk_de` — the tool SKILL.md v2 actually recommends —
+   wrote `pseudobulk_all.csv`**. Neither is discoverable. Enrichment then either errors or falls
+   back to `args.genes`, a single pooled list: per-cell-type stratification gone, and with no
+   `_universe.txt` the ORA background falls back to the 20000-gene constant, so every enrichment
+   p-value comes out optimistic.
+4. Two smaller ones: the contrast's **down-regulated half never reached enrichment** (rows are
+   score-ordered, so "take the first N significant" keeps only the up side), and `run_de` returned
+   a figure path hardcoded to `rank_genes_groups_leiden_de.png` — a nonexistent file for any other
+   `groupby`, i.e. an evidence pointer the Critic grounds on that does not resolve.
+
+### What changed
+
+- `run_de` takes `reference` (control level), `stratify_by` (cell-type column), `groups`,
+  `min_cells`, `padj`, `lfc`. Default `reference="rest"` keeps the marker behaviour byte-for-byte.
+  A contrast writes the full per-group table, a volcano per group, `significant_by_group` (up AND
+  down counts) and `skipped_groups` (cell types without enough cells in an arm — a finding, not an
+  implementation detail).
+- `run_de` reads `adata_clustered.h5ad` if present, else `adata_qc.h5ad`. Clustering is now only
+  required for genuinely unlabeled data.
+- **One canonical DE contract:** every producer writes `de_<key>_all.csv` +
+  `de_<key>_universe.txt` + `rank_<key>_<group>.rnk`. `run_pseudobulk_de` and the
+  `condition_by_celltype` template now write them too (pseudobulk also gained a `score` column =
+  the t-statistic, so its table is schema-identical to `run_de`'s and needs no special case).
+- `run_enrichment` splits each group into `(up)` / `(down)` when the table carries both directions
+  (`split_direction: false` opts out). A marker table has one direction and is untouched.
+- Protocol/skill text follows the code: `PROTOCOL.md` had also drifted a full version behind
+  `SKILL.md` (it never mentioned pseudobulk or the replication argument at all) — that is patched,
+  though it is still a hand-patch, not a regeneration.
+
+### Still open
+
+- **`PROTOCOL.md` is not actually generated from `SKILL.md`** despite saying it is. The drift
+  found here will recur.
+- Nothing tests the PLANNER's choice: these tests prove the tools connect, not that the PI picks
+  `reference`/`stratify_by`. That needs a planning-level eval.
+- `run_de` and `run_pseudobulk_de` with the same `group_key` write the same
+  `de_<key>_all.csv`; the later call wins. That favours pseudobulk (the better test) but it is an
+  overwrite, not a decision.
+## 2026-08-10 (later) — the agent's HPC3 shell, the CPU worker, and a lab-shared package cache
+
+Continuation of the BYO-key entry below. Design + full rationale:
+[`docs/byo_api_key_and_hpc_shell.md`](../../docs/byo_api_key_and_hpc_shell.md).
+
+### The insight that made the shell possible
+
+RCIC's rule is not "no wget" — it is that **login nodes are for logging in and submitting jobs**,
+which this repo already codifies for the Temp sweeper. So Yijun's answer to the GPU question
+("don't give them a GPU at connect, give them a CPU node") is also what makes a real shell legal:
+on a node you legitimately hold, `wget`/decompression/full-text `grep` are ordinary work. The
+boundary becomes **mechanical** — *where* a command runs — instead of a guessed-at list of
+forbidden command names.
+
+Metadata (`list_dir`/`stat_path`/`find_files`/`read_text`/`disk_usage`) on the login node, costing
+no allocation at all. Everything else (`run_shell`/`fetch_url`/`install_package`) on the held CPU
+worker via `srun --jobid --overlap`, allocated lazily on first use. There is deliberately no
+command allowlist to get wrong.
+
+Before this the Scientist had NO filesystem tools whatsoever — the only escape hatch was
+`run_code`, a Slurm batch job, so `ls` cost minutes of queue. That is a plausible source of the
+model guessing at paths instead of looking at them.
+
+### HITL
+
+Its own per-`RunState` channel (`confirm_event`), NOT a reuse of plan review — both can be
+outstanding at different moments and one shared event would let an answer to one satisfy the
+other. Refuses by default when nothing is wired to ask: a fence that opens when nobody can be
+asked is decorative in exactly the headless deployments where it matters. Notably NOT a trigger:
+writing to an absolute path inside your own workspace, because a prompt that fires on routine work
+trains people to approve without reading.
+
+### The shared package cache (Yijun's second request)
+
+Requirement: the sandbox installs what it is missing, and every install is **public** so nobody
+installs the same thing twice.
+
+The hard part is that **on HPC3 a shared directory is not a shared file** — user A's files cannot
+be modified by user B, which is exactly why `hpc_gc.SHARED_SUBDIRS` are all per-user. So the cache
+is immutable: each package gets its own directory, published by an atomic `mv -T`, and nothing
+ever writes to a published tree again. Cross-user ownership stops mattering because there is no
+second write. Concurrent installers stage separately and the failed rename is the arbiter — no
+lock file, because advisory locking on a parallel filesystem is not worth betting on.
+
+The security consideration worth flagging: a shared import path is a **code-execution channel
+between lab members**. Four fences — refuse to publish anything the image already provides, prune
+colliding dependencies before publish, append to `sys.path` via a generated `sitecustomize`
+(plain `PYTHONPATH` sorts BEFORE site-packages and would let a cached dep outrank the image's
+copy), and accept only plain PyPI requirements. That third one is proven by execution, not
+assertion: a test runs a real interpreter against a real cache tree containing a `json.py`, and
+then runs the SAME file through a plain `PYTHONPATH` to show it really does get hijacked.
+
+Found while testing: the in-container preamble used a bare `python`, which silently disables the
+cache on any image that ships only `python3` — fixed to try both.
+
+### State
+
+Built + 202 offline tests; full suite 1325 passed. **Nothing cluster-shaped is verified.** Needs
+checking on HPC3 before anyone relies on it:
+
+* `srun --jobid --overlap` — the mechanism the whole shell rests on; Slurm version/site config
+  decides whether a step can share the holder's allocation.
+* Whether the free `standard` partition allocates fast enough that lazy allocation feels instant.
+* **Whether `<shared_root>/pkgs` can be made group-writable at all** — the lab root is
+  `drwxr-s--- ruic20` and `newgrp`/`sg` were already found not to help. The cache assumes
+  `chmod 2775` works on a directory we own under `software/AiScientist`.
+* `pip install --target` inside `analysis.sif` with network on a compute node.
+
+All opt-in: `BIOAGENT_WORKER_NODE=1`. Without it the metadata tools still work and cost nothing.
+
+## 2026-08-10 — Users can bring their own LLM API key; the HPC3 shell is designed
+
+### What this changes
+
+The HPC3 account stays required — it runs the Slurm analysis jobs. What is now the user's choice
+is **which model reasons, and on whose bill**. Design decisions and the full rationale are in
+[`docs/byo_api_key_and_hpc_shell.md`](../../docs/byo_api_key_and_hpc_shell.md).
+
+The transport layer was already done (`vllm_client.*` all took `base_url`/`api_key`). What was
+missing was any notion of *whose* key: `_lab_llm()` read process-global `BIOAGENT_LLM_*`, one
+value for the whole server, which the README correctly calls "a test convenience, not the product
+path". That path is now the fallback; the product path is a per-user credential.
+
+### The storage question Yijun raised — how do you change a key later?
+
+**The credential id is stable and the key is a rotatable field inside it.** Every reference —
+the session's endpoint choice, a saved preference, a run in flight — points at the `id`, so
+rotating a leaked or expired key updates nothing else.
+
+**Rotation verifies before it commits**: `rotate_key()` takes a `verify` callable and runs it
+against the NEW key before writing a byte. If it fails, the stored credential is untouched and the
+old key still works. It is a parameter rather than a convention so a caller cannot skip it. This
+exists to prevent the state users fear — old key discarded, new key broken, no way back.
+
+The key is resolved **once at run start**, so rotating mid-run does not break a running analysis;
+the next run picks up the new key.
+
+**At-rest encryption is optional** (`BIOAGENT_LLM_KEY_ENCRYPTION=1`, off by default, per-row flag),
+as Yijun called it. It protects against file-level exposure, not a compromised gateway (which must
+decrypt to use the key), and costs a real failure mode: lose the master key, everyone re-enters
+theirs. Master key in its own 0600 file, **never `.env`** — prod's `.env` is world-readable.
+
+### Egress — consent is the control, not the scanner
+
+`LabLLM` already documented that the PI/Critic payload (dataset profile, accepted findings,
+artifact digests) does not pass the `DataBoundaryGuard`. That was fine while remote endpoints were
+an operator override; with user keys it becomes the ordinary path. Now: consent recorded **per
+credential** (trusting your own vLLM != trusting a commercial API; loopback needs none), a guard on
+every off-host reasoning call as an accident backstop, `SECRET_PATTERNS` widened past `sk-*`, a
+deterministic provenance note in the technical report's Methods, and a banner that stays up for as
+long as a remote endpoint is selected.
+
+Be clear about the limit: no scanner can decide whether a gene list or a phenotype description
+identifies a rare-disease patient. The person who knows the data decides.
+
+### Found in passing: `ssh_creds/` was not gitignored
+
+`BIOAGENT_STATE_DIR` defaults to `"."`, so running the console from a checkout drops real **private
+SSH keys** into the repo root as untracked files, one `git add -A` from being committed. Predates
+this work; found while adding the parallel `llm_creds/` store. Both are now in `.gitignore`.
+
+### State
+
+Built and tested (105 offline tests, full suite 1215 passed): the credential store, provider
+presets + four-cause verification, the routes, the `_lab_llm` rewiring with role split, the egress
+layer, and the UI. Driven end-to-end through the real console against a stub OpenAI-compatible
+endpoint — wrong key rejected as `auth`, right key saved, failed rotation left the old key
+working, id survived a successful rotation.
+
+**Not built**: the CPU-worker allocation that replaces the GPU at connect, the HPC3 shell/file
+toolset, and the HITL gate. Designed in the doc; they need live-cluster verification because
+`srun --overlap` behaviour and the free CPU queue are cluster-specific.
+
+**Not verified**: nothing has run against a real provider account or real HPC3.
 ## 2026-08-10 — why the deploy asked for a password, and six bugs in sync_deploy.sh
 
 ### It was never a credential problem
@@ -115,6 +946,7 @@ One command finishes it:
 ```
 ssh -t <admin-ssh-alias> 'sudo systemctl restart bioagent && sleep 2 && systemctl is-active bioagent'
 ```
+
 
 ## 2026-08-08 — HPC3 process files moved to a shared `AiScientist/Temp`, swept every 3 days
 
@@ -726,6 +1558,47 @@ toggle; (2) the ledger is still not persisted into run_state, so an A2 resume lo
 campaign cannot be resumed mid-flight; (3) induced skills are never reviewed, retired, or promoted
 into `skills/` — there is no curation path, so the library only grows; (4) none of this has run
 against a real dataset yet, only the offline harness and the single-turn probe.
+
+## 2026-07-31 — mmfatlas 503 fixed: the 5006 targetPort patch had to be reverted to 5005
+
+**https://mmfatlas.<PUBLIC_HOSTNAME> is serving again (HTTP 200, real CELLxGENE app, 8854-cell
+MERFISH dataset rendering).** One-line, reversible edit in **Texera's** namespace — same "help
+once, don't own it" scope as 2026-07-02. Rollback: patch `targetPort` back to `5006`.
+
+Jin reported the service down and, diagnosing from the host, saw no CELLxGENE Docker image and no
+process under the `mmfatlas` service account. **Both observations are correct but look in the wrong
+layer** — MMFatlas does not run on the host at all. It is a k8s Deployment in its **own `mmfatlas`
+namespace** (not `texera`, which is what our earlier notes said): `mmfatlas-cellxgene`, image
+`alirisheh876/eye-cellxgene`, pulled by **RKE2/containerd**. `sudo docker ps` / `docker images` can
+never show it — the only Docker daemon on that host runs the Texera buildx builder. Likewise no
+host process runs as `mmfatlas`: the app lives inside the container.
+
+**The actual fault was ours, and it was the 2026-07-02 fix aging out.** Back then the running
+container (up since 2026-04-08) was serving on **5006** while `mmfatlas-svc` targeted 5005, so I
+patched `targetPort` 5005→5006. On **2026-07-30 21:16 UTC that container was SIGKILLed (exit 137,
+consistent with its 2Gi limit; events had rotated so OOM is unconfirmed)** and restarted fresh —
+and a fresh `eye-cellxgene` starts on its **default 5005** (`[cellxgene] Launching! ...
+http://0.0.0.0:5005`, and `containerPort: 5005` in the manifest). So the service pointed at 5006,
+nothing listened there, endpoint refused → Envoy returned **503**. TLS, routing and the cert were
+never the problem: `mmfatlas-route` was `Accepted` + `ResolvedRefs`, the InCommon cert is valid
+through **2027-01-14**, and the 503 (not a cert error) was the tell.
+
+Verified before touching anything: pod `10.42.0.32:5005` → **200**, `:5006` → connection refused.
+Patched `mmfatlas-svc` targetPort 5006→**5005**, endpoint moved to `10.42.0.32:5005`, public URL
+went 503 → **200** on three consecutive probes. **5005 is now the durable value** — it matches
+Texera's own manifest/`containerPort`, so unlike the July patch it survives their redeploys and
+they have nothing to reconcile.
+
+**Left alone deliberately, for Jin/Texera to decide:**
+- **`/data/mmfatlas` (root:mmfatlas, 750) and the `mmfatlas` service account are unused.** The
+  Deployment declares **no `volumes` and no `volumeMounts`** — nothing is wired to the host. The
+  pod **re-downloads `Chen_MERFISH_wt2_5_cellxgene.h5ad` into ephemeral container storage on every
+  restart**, so annotations/gene-sets created in the UI die with the container. If the intent
+  behind that directory was persistent storage, it needs a hostPath/PVC in Texera's manifest.
+- **The 2Gi memory limit** is what most likely killed it; a bigger limit would stop the recurrence
+  (23 restarts on this pod).
+- **Plain `http://mmfatlas...` serves 200 instead of redirecting to HTTPS** (aiscientist 301s).
+  Texera's route config, not ours.
 
 ## 2026-07-31 — the plan can finally GROW: hypothesis-driven exploration
 
@@ -3700,6 +4573,10 @@ removed + stuck Certificate deleted); (2) a **port mismatch** — the app listen
 `mmfatlas-svc` targetPort 5005→5006 (LIVE edit; Texera must reconcile in their manifest or it
 reverts on redeploy). Their pod/app/data and `mmfatlas-route` were NOT touched. Texera handoff:
 `~/aiscientist-handoff/mmfatlas-texera-handoff.md`; its private key is in Jin's bundle.
+> **Superseded — do not apply the 5006 value from this entry.** That patch went stale and caused a
+> second outage on 2026-07-30 (the container was SIGKILLed and the fresh one came up on its default
+> 5005 while the Service still pointed at 5006). The durable value is **5005**; see the 2026-07-31
+> entry above and the runbook [`deploy/mmfatlas-service.md`](../../deploy/mmfatlas-service.md).
 
 ## 2026-07-01 (earlier) — Public-domain TLS certs issued & verified
 

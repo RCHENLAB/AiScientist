@@ -1,0 +1,586 @@
+{
+  "resolution": {
+    "redraft": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      }
+    ],
+    "patch": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Cluster the cells with Leiden at resolution 1.0 and produce a UMAP",
+          "Assign cell-type labels to each cluster from canonical retinal markers",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Summarise which changes are shared across cell classes and which are class-specific"
+        ]
+      }
+    ]
+  },
+  "reference_group": {
+    "redraft": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT, explicitly setting WT as the reference group, within each major cell class",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT within each major cell class, explicitly using WT as the reference group so that fold changes point the correct way",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT, explicitly setting WT as the reference group, within each major cell class",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression with WT as the explicit reference group against DDX41 within each major cell class",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT within each major cell class, using WT as the explicit reference group so that fold changes point the right way",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      }
+    ],
+    "patch": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT with WT explicitly set as the reference group within each major cell class, so the fold changes point the right way.",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT within each major cell class, explicitly setting WT as the reference group so the fold changes point the right way.",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT within each major cell class, explicitly setting WT as the reference group so fold changes point the correct way.",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT (with WT explicitly set as the reference group) within each major cell class",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: per-cell metrics, filter, normalize and log1p, report counts before/after",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run differential expression between DDX41 and WT (with WT as the reference group) within each major cell class",
+          "Run pathway enrichment on the up- and down-regulated genes per cell class",
+          "Search the literature for the pathways that came out enriched",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      }
+    ]
+  },
+  "add_threshold": {
+    "redraft": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: drop cells with >10% mitochondrial reads, filter, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter out cells with >10% mitochondrial reads, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter out cells with >10% mitochondrial reads, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: drop cells with >10% mitochondrial reads, filter, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter out cells with >10% mitochondrial reads, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      }
+    ],
+    "patch": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "1. QC the cells: drop cells with more than 10% mitochondrial reads, filter, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter (drop cells with >10% mitochondrial reads), normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "1. QC the cells: filter out cells with >10% mitochondrial reads, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: drop cells with more than 10 percent mitochondrial reads, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: drop cells with >10% mitochondrial reads, filter, normalize, log1p, and report counts",
+          "Reuse the existing majorclass labels; do not re-cluster",
+          "Run DDX41 vs WT differential expression within each major cell class",
+          "Run pathway enrichment on the changed genes per cell class",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cell-class-specific changes"
+        ]
+      }
+    ]
+  },
+  "skip_clustering": {
+    "redraft": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Assign cells to existing majorclass labels and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Assign cells to existing majorclass labels and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels for cell grouping and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "2. Assign cells to the existing majorclass labels and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Assign cells to the existing majorclass labels and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      }
+    ],
+    "patch": [
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Reuse the existing majorclass labels for grouping instead of clustering de novo and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "2. Reuse the existing majorclass labels for cell assignment rather than clustering de novo, and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Assign cells to the existing majorclass labels and produce a UMAP instead of clustering de novo.",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Assign existing majorclass labels to cells and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      },
+      {
+        "target_hit": true,
+        "intent_ok": true,
+        "collateral": 0,
+        "count_delta": 0,
+        "after": [
+          "QC the cells: filter, normalize and log1p, report counts",
+          "Reuse existing majorclass labels for cell annotation and produce a UMAP",
+          "Run DDX41 vs WT differential expression within each cluster",
+          "Run pathway enrichment on the changed genes per cluster",
+          "Search the literature for the enriched pathways",
+          "Summarise shared versus cluster-specific changes"
+        ]
+      }
+    ]
+  }
+}

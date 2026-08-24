@@ -33,7 +33,9 @@ from .scrna_pack import (
     _dirs,
     _import_scanpy,
     _missing,
+    _p,
     _rel,
+    _schema,
     _slug,
     _write_table,
 )
@@ -121,7 +123,7 @@ def run_doublet_detection(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     do_filter = bool(args.get("filter", True))
     batch_key = str(args.get("batch_key", "")).strip() or None
     threshold = args.get("threshold")
-    expected_rate = float(args.get("expected_doublet_rate", 0.06))
+    expected_rate = float(_p("run_doublet_detection", "expected_doublet_rate", args))
 
     adata = sc.read_h5ad(ckpt)
     counts = _counts_matrix(adata)
@@ -173,7 +175,7 @@ def run_doublet_detection(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
          "expected_doublet_rate"])
 
     warning = ""
-    if rate > 0.20:
+    if rate > float(_p("run_doublet_detection", "flag_rate_above", args)):
         warning = (f"{rate:.0%} of cells called doublets — implausibly high for most protocols. "
                    "Inspect the score histogram before trusting this; the threshold is the "
                    "likelier problem than the data.")
@@ -320,6 +322,44 @@ def run_integration(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
 # --- pseudobulk differential expression ---------------------------------------
 
 
+def _deseq2_contrast(counts_ab: Any, cond_labels: list, sample_names: list,
+                     gene_names: list, b_name: str, a_name: str):
+    """``(lfc, pval, padj, stat)`` from DESeq2's Wald test on a samples-x-genes count matrix, or
+    ``None`` when pydeseq2 is missing or errors — the caller then falls back to Welch's t and says
+    so. The reason is left on ``_deseq2_contrast.last_error`` so the warning can name it."""
+    import numpy as np
+    _deseq2_contrast.last_error = ""
+    try:
+        from pydeseq2.dds import DeseqDataSet
+        from pydeseq2.ds import DeseqStats
+    except Exception:
+        _deseq2_contrast.last_error = "pydeseq2 is not installed"
+        return None
+    try:
+        import pandas as pd
+        cdf = pd.DataFrame(np.rint(np.asarray(counts_ab, dtype=float)).astype(int),
+                           index=sample_names, columns=gene_names)
+        meta = pd.DataFrame({"condition": list(cond_labels)}, index=sample_names)
+        try:
+            dds = DeseqDataSet(counts=cdf, metadata=meta, design="~condition", quiet=True)
+        except TypeError:                                   # pydeseq2 < 0.5
+            dds = DeseqDataSet(counts=cdf, metadata=meta, design_factors=["condition"],
+                               quiet=True)
+        dds.deseq2()
+        st = DeseqStats(dds, contrast=["condition", b_name, a_name], quiet=True)
+        st.summary()
+        r = st.results_df.reindex(gene_names)
+        # DESeq2 leaves padj NaN for genes its independent filtering set aside; for counting and
+        # ranking purposes that is "not significant", not "missing".
+        return (np.nan_to_num(r["log2FoldChange"].to_numpy(float), nan=0.0),
+                np.nan_to_num(r["pvalue"].to_numpy(float), nan=1.0),
+                np.nan_to_num(r["padj"].to_numpy(float), nan=1.0),
+                np.nan_to_num(r["stat"].to_numpy(float), nan=0.0))
+    except Exception as exc:  # noqa: BLE001 - a degenerate matrix must degrade, not crash the tool
+        _deseq2_contrast.last_error = f"{type(exc).__name__}: {exc}"
+        return None
+
+
 def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Condition contrast done on SAMPLES, not cells.
 
@@ -329,8 +369,13 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     treating them as 5,000 produces p-values that are wrong by orders of magnitude. Nearly
     every gene comes out "significant".
 
-    This sums raw counts to one profile per sample (optionally per cell type), converts to
-    log2 CPM, and runs Welch's t-test across the condition with BH correction.
+    This sums raw counts to one profile per sample (optionally per cell type), drops genes too
+    lowly expressed to test (edgeR ``filterByExpr``'s rule of thumb), and tests the condition with
+    DESeq2's negative-binomial Wald test (via pydeseq2) — the framework the single-cell DE
+    literature (Squair et al. 2021) recommends, because its variance shrinkage is what makes an
+    n=2-3 design testable at all. When pydeseq2 is unavailable it falls back to Welch's t-test on
+    log2 CPM and SAYS SO in ``warnings``: the fallback still fixes pseudoreplication, but has
+    little power at small n.
 
     It REFUSES when a condition has fewer than ``min_samples_per_condition`` (default 2)
     samples. That refusal is the point: with one sample per side there is no replication and
@@ -352,8 +397,9 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     sample_key = str(args.get("sample_key", "")).strip()
     condition_key = str(args.get("condition_key", "")).strip()
     group_key = str(args.get("group_key", "")).strip()          # optional: per cell type
-    min_cells = int(args.get("min_cells_per_sample", 10))
-    min_samples = int(args.get("min_samples_per_condition", 2))
+    min_cells = int(_p("run_pseudobulk_de", "min_cells_per_sample", args))
+    min_samples = int(_p("run_pseudobulk_de", "min_samples_per_condition", args))
+    min_count = int(_p("run_pseudobulk_de", "min_count", args))
     if not sample_key or not condition_key:
         return {"status": "error", "step": "pseudobulk_de",
                 "error": ("sample_key and condition_key are both required: sample_key is the "
@@ -390,11 +436,31 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     for s, c in zip(samples, conditions):
         if sample_condition.setdefault(s, c) != c:
             return {"status": "error", "step": "pseudobulk_de",
-                    "error": (f"sample '{s}' carries more than one value of '{condition_key}'. "
-                              "A replicate must belong to exactly one arm — check the metadata.")}
+                    "error": (
+                        f"sample '{s}' carries more than one value of '{condition_key}' "
+                        f"({sorted(set(str(c2) for s2, c2 in zip(samples, conditions) if s2 == s))}). "
+                        "A replicate must belong to exactly one arm. "
+                        # The common case is NOT a mislabelled design, and telling a researcher to
+                        # "check the metadata" when the metadata is fine sends them looking for a
+                        # bug that is not there. A `sample_key` that takes ONE value across the
+                        # whole object means one library: the arms are not separated by anything,
+                        # so no pseudobulk test exists to run and the finding is the study's, not
+                        # the file's.
+                        + (f"Here '{sample_key}' takes a single value across all "
+                           f"{int(len(samples))} cells, so this object holds ONE library and has "
+                           "no biological replication at all — there is no valid p-value for "
+                           f"'{condition_key}' to compute. Report the comparison as DESCRIPTIVE "
+                           "(effect sizes and rankings only); `run_de` with `reference` + "
+                           "`stratify_by` gives that ranking per cell type. Nothing here needs "
+                           "fixing in the metadata."
+                           if len(set(samples)) == 1 else
+                           "Check that the sample column really identifies libraries/donors and "
+                           "not something that spans them."))}
 
     def _pseudobulk(mask: Any) -> tuple[list[str], Any, list[str]]:
-        """Sum counts per sample over `mask`; return (samples kept, log2 CPM matrix, dropped)."""
+        """Sum RAW counts per sample over `mask`; return (samples kept, samples x genes count
+        matrix, dropped). Counts, not CPM: DESeq2 models counts, and CPM is derived for reporting
+        and for the fallback test only."""
         keep, mats, dropped = [], [], []
         for s in sorted(set(samples[mask])):
             sel = mask & (samples == s)
@@ -402,10 +468,7 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
             if n < min_cells:
                 dropped.append(f"{s} ({n} cells < {min_cells})")
                 continue
-            summed = np.asarray(counts[sel].sum(axis=0)).ravel()
-            total = summed.sum()
-            cpm = summed / total * 1e6 if total > 0 else summed
-            mats.append(np.log2(cpm + 1.0))
+            mats.append(np.asarray(counts[sel].sum(axis=0)).ravel())
             keep.append(s)
         return keep, (np.vstack(mats) if mats else np.empty((0, len(genes)))), dropped
 
@@ -414,6 +477,8 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     all_rows: list[dict[str, Any]] = []
     per_group: dict[str, Any] = {}
     skipped: dict[str, str] = {}
+    tested_universe: set[str] = set()
+    fallback_warnings: list[str] = []
     for grp in (sorted(set(groups)) if group_key else [""]):
         mask = (groups == grp) if group_key else np.ones(adata.n_obs, dtype=bool)
         kept, mat, dropped = _pseudobulk(mask)
@@ -431,26 +496,72 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
             continue
 
         (a_name, a_idx), (b_name, b_idx) = sorted(arms.items())[:2]
-        A, B = mat[a_idx], mat[b_idx]
-        with np.errstate(invalid="ignore"):
-            tstat, pval = sstats.ttest_ind(B, A, axis=0, equal_var=False)   # B vs A
-        lfc = B.mean(axis=0) - A.mean(axis=0)
-        pval = np.nan_to_num(np.asarray(pval, dtype=float), nan=1.0)
-        padj = _bh_fdr(list(pval))
-        rows = [{"group": label, "gene": genes[i], "log2fc": round(float(lfc[i]), 4),
+        # Low-expression filter BEFORE the test (edgeR filterByExpr's rule of thumb): a gene must
+        # reach `min_count` summed counts in at least as many samples as the smaller arm. A gene
+        # nobody detected cannot be tested — it only inflates the BH denominator.
+        used = np.asarray([*a_idx, *b_idx], dtype=int)
+        min_arm = min(len(a_idx), len(b_idx))
+        gidx = np.where((mat[used] >= min_count).sum(axis=0) >= min_arm)[0]
+        if gidx.size == 0:
+            skipped[label] = (f"no gene reached min_count={min_count} summed counts in "
+                              f">={min_arm} samples — nothing is testable")
+            continue
+        sub_genes = [genes[i] for i in gidx]
+        n_low = int(len(genes) - gidx.size)
+        # log2 CPM on the FULL library (depth normalisation must see every read, including the
+        # filtered genes') — reported means, and the fallback test's working scale.
+        lib = mat.sum(axis=1, keepdims=True)
+        lib[lib == 0] = 1.0
+        logcpm = np.log2(mat / lib * 1e6 + 1.0)[:, gidx]
+        A, B = logcpm[a_idx], logcpm[b_idx]
+
+        des = _deseq2_contrast(mat[used][:, gidx],
+                               [sample_condition[kept[i]] for i in used],
+                               [kept[i] for i in used], sub_genes, b_name, a_name)
+        if des is not None:
+            lfc, pval, padj, tstat = des
+            test_used = "DESeq2 Wald (negative binomial, pydeseq2)"
+        else:
+            with np.errstate(invalid="ignore"):
+                tstat, pval = sstats.ttest_ind(B, A, axis=0, equal_var=False)   # B vs A
+            lfc = B.mean(axis=0) - A.mean(axis=0)
+            pval = np.nan_to_num(np.asarray(pval, dtype=float), nan=1.0)
+            padj = np.asarray(_bh_fdr(list(pval)), dtype=float)
+            tstat = np.nan_to_num(np.asarray(tstat, dtype=float), nan=0.0)
+            test_used = "Welch t on log2 CPM (FALLBACK)"
+            fallback_warnings.append(
+                f"{label}: DESeq2 unavailable ({_deseq2_contrast.last_error}) — fell back to "
+                "Welch's t-test on log2 CPM. The fallback still fixes pseudoreplication but has "
+                "little power at n<=3 per arm (no variance shrinkage); install pydeseq2 for the "
+                "recommended test.")
+        tested_universe.update(sub_genes)
+        rows = [{"group": label, "gene": sub_genes[i], "log2fc": round(float(lfc[i]), 4),
                  "pval": float(pval[i]), "pval_adj": round(float(padj[i]), 6),
+                 # `score` keeps this table schema-compatible with run_de's, so run_enrichment
+                 # and run_gsea_prerank consume a pseudobulk contrast without special-casing it.
+                 "score": round(float(tstat[i]), 4),
                  "mean_" + a_name: round(float(A[:, i].mean()), 4),
                  "mean_" + b_name: round(float(B[:, i].mean()), 4)}
-                for i in range(len(genes))]
+                for i in range(len(sub_genes))]
         rows.sort(key=lambda r: r["pval"])
         _write_table(tables / f"pseudobulk_{_slug(label)}.csv", rows[:2000],
-                     ["group", "gene", "log2fc", "pval", "pval_adj",
+                     ["group", "gene", "log2fc", "pval", "pval_adj", "score",
                       f"mean_{a_name}", f"mean_{b_name}"])
-        n_sig = sum(1 for r in rows if r["pval_adj"] < 0.05)
+        # The ranked list run_gsea_prerank consumes (every tested gene, signed by the t-statistic
+        # so a positive NES means "up in the condition arm"). Without it GSEA has no input for a
+        # pseudobulk contrast and the protocol's step 4 is half-runnable.
+        (tables / f"rank_{_slug(group_key or 'pseudobulk')}_{_slug(label)}.rnk").write_text(
+            "".join(f"{r['gene']}\t{r['score']:.6g}\n"
+                    for r in sorted(rows, key=lambda r: -r["score"])), encoding="utf-8")
+        n_sig = sum(1 for r in rows
+                    if r["pval_adj"] < float(_p("run_pseudobulk_de", "padj", args)))
         per_group[label] = {
             "contrast": f"{b_name} vs {a_name}",
+            "test": test_used,
             "n_samples": {a_name: len(a_idx), b_name: len(b_idx)},
             "samples_dropped": dropped,
+            "n_genes_tested": len(sub_genes),
+            "n_genes_low_expression_filtered": n_low,
             "n_significant": n_sig,
             # A preview only — the table on disk is the result.
             "top_genes": [r["gene"] for r in rows[:15]],
@@ -465,22 +576,44 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                          "needs biological replicates; with one sample per arm nothing "
                          "distinguishes the condition from the individual.")}
 
+    de_table = None
     if all_rows:
-        cols = ["group", "gene", "log2fc", "pval", "pval_adj"]
-        _write_table(tables / "pseudobulk_all.csv",
-                     [{k: r.get(k) for k in cols} for r in all_rows], cols)
+        cols = ["group", "gene", "log2fc", "pval", "pval_adj", "score"]
+        combined = [{k: r.get(k) for k in cols} for r in all_rows]
+        _write_table(tables / "pseudobulk_all.csv", combined, cols)
+        # ALSO write the canonical DE names. run_enrichment / run_gsea_prerank discover DE results
+        # as `de_<key>_all.csv` + `de_<key>_universe.txt`; a pseudobulk contrast that only wrote
+        # `pseudobulk_all.csv` was invisible to them, so the recommended (replicated) path silently
+        # lost its per-cell-type enrichment and its ORA background fell back to a 20000 constant.
+        de_key = _slug(group_key or "pseudobulk")
+        de_table = tables / f"de_{de_key}_all.csv"
+        _write_table(de_table, combined, cols)
+        (tables / f"de_{de_key}_universe.txt").write_text(
+            "\n".join(sorted(tested_universe)) + "\n", encoding="utf-8")
+        # Slug -> real label, so a later step reports "Club/Secretory", not "Club_Secretory".
+        _write_table(tables / f"rank_{de_key}_index.csv",
+                     [{"slug": _slug(g), "group": g} for g in per_group], ["slug", "group"])
     return {
         "status": "ok",
         "step": "pseudobulk_de",
         "unit_of_replication": sample_key,        # the whole point, stated in the result
         "condition_key": condition_key,
         "group_key": group_key,
-        "method": "pseudobulk sum of raw counts -> log2 CPM -> Welch t-test -> BH FDR",
+        "method": ("pseudobulk sum of raw counts -> low-expression filter (min_count) -> "
+                   + " / ".join(sorted({g["test"] for g in per_group.values()}))
+                   + " -> BH FDR"),
         "results_by_group": per_group,
         "skipped_groups": skipped,                # kept, never dropped: a refusal is a finding
         "min_cells_per_sample": min_cells,
         "min_samples_per_condition": min_samples,
-        "tables": [_rel(art, tables / "pseudobulk_all.csv")] if all_rows else [],
+        "min_count": min_count,
+        **({"warnings": fallback_warnings} if fallback_warnings else {}),
+        "tables": ([_rel(art, tables / "pseudobulk_all.csv"), _rel(art, de_table)]
+                   if all_rows else []),
+        # Call run_enrichment with NO `genes` argument — it picks this table up on its own and
+        # runs ORA per group and per direction.
+        "de_table": _rel(art, de_table) if de_table is not None else None,
+        "table_columns": ["group", "gene", "log2fc", "pval", "pval_adj", "score"],
         "raw_data_to_llm": False,
     }
 
@@ -504,11 +637,22 @@ def run_composition(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         return _missing(getattr(exc, "name", None) or "scanpy")
 
     work, art, figs, tables = _dirs(ctx)
+    # `adata_qc.h5ad` is a valid starting point, not a fallback. Clustering is required only when
+    # the grouping COMES from it; a dataset that arrives with its own cell-type labels is analysed
+    # straight off QC, which is precisely what the condition-comparison protocol tells the planner
+    # to do ("REUSE it — do NOT re-cluster"). `run_de` had this same defect and was fixed; this
+    # tool was missed, so composition — the analysis a labelled two-arm dataset needs FIRST, and
+    # the one whose absence let a 3x shift in Cone abundance pass as differential expression —
+    # refused to run on exactly the datasets it exists for, and demanded the re-clustering the
+    # protocol forbids.
     ckpt = _latest_checkpoint(work, ("adata_annotated.h5ad", "adata_de.h5ad",
-                                     "adata_clustered.h5ad"))
+                                     "adata_clustered.h5ad", "adata_qc.h5ad"))
     if ckpt is None:
         return {"status": "error", "step": "composition",
-                "error": "run_clustering must run first (no clustered/annotated checkpoint)"}
+                "error": ("no analysis checkpoint found — run run_scanpy_qc first (it writes "
+                          "adata_qc.h5ad). run_clustering is needed only when the cell-type "
+                          "grouping has to be derived; a dataset that already carries labels "
+                          "needs QC only.")}
 
     adata = sc.read_h5ad(ckpt)
     group_key = str(args.get("group_key", "")).strip() or (
@@ -560,14 +704,52 @@ def run_composition(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         result["note"] = "per-sample proportions only; pass condition_key to contrast arms."
         return result
 
-    cond = {s: c for s, c in zip(samples, _obs_series(adata, condition_key).values)}
+    conditions = _obs_series(adata, condition_key).values
+    # Proportions PER ARM, computed straight off the condition column and always reported — the
+    # question this tool exists to answer is "does this population shift between the arms", and
+    # that number must survive the study being untestable. Deriving it from the sample->condition
+    # map instead silently collapses when a study has one library: `orig.ident` held a single
+    # value, every cell mapped to one arm, and the tool returned the pooled composition of the
+    # whole object. The 3x depletion of Cone cells between DDX41 and WT — the shift that made the
+    # original run's pooled DE uninterpretable — was simply absent from the output.
+    arm_names = sorted(set(str(c) for c in conditions))
+    arm_rows: list[dict[str, Any]] = []
+    arm_pct: dict[str, dict[str, float]] = {}
+    for a in arm_names:
+        sel_a = conditions == a
+        n_a = int(sel_a.sum())
+        arm_pct[a] = {}
+        for g in labels:
+            k = int(((groups == g) & sel_a).sum())
+            arm_pct[a][g] = round(100 * k / n_a, 3) if n_a else 0.0
+            arm_rows.append({"condition": a, "group": g, "n_cells": k, "pct": arm_pct[a][g]})
+    _write_table(tables / "composition_by_condition.csv", arm_rows,
+                 ["condition", "group", "n_cells", "pct"])
+    result["condition_key"] = condition_key
+    result["pct_by_condition"] = arm_pct
+    result["tables"].append(_rel(art, tables / "composition_by_condition.csv"))
+    if len(arm_names) == 2:
+        a, b = arm_names
+        result["largest_shifts"] = sorted(
+            ({"group": g, f"pct_{a}": arm_pct[a][g], f"pct_{b}": arm_pct[b][g],
+              "fold": round((arm_pct[b][g] + 1e-9) / (arm_pct[a][g] + 1e-9), 2)} for g in labels),
+            key=lambda r: abs(math.log((r["fold"] or 1e-9))), reverse=True)[:6]
+
+    cond = {s: c for s, c in zip(samples, conditions)}
     arms: dict[str, list[str]] = {}
     for s in prop:
         arms.setdefault(cond[s], []).append(s)
     if len(arms) < 2 or any(len(v) < 2 for v in arms.values()):
-        result["note"] = (f"not tested: each arm needs >=2 samples, has "
-                          f"{ {k: len(v) for k, v in arms.items()} }. Proportions are reported; "
-                          "a difference between single samples is not evidence of an effect.")
+        one_library = len(set(samples)) == 1
+        result["note"] = (
+            (f"NOT TESTED — '{sample_key}' takes one value across the whole object, so this study "
+             f"has one library and no biological replication; no p-value for '{condition_key}' "
+             "exists. " if one_library else
+             f"not tested: each arm needs >=2 samples, has {{{', '.join(f'{k}: {len(v)}' for k, v in arms.items())}}}. ")
+            + "The per-arm proportions in `pct_by_condition` ARE the descriptive finding and "
+              "should be reported — a large shift there means a pooled differential-expression "
+              "result cannot be read as expression change. A difference between single samples is "
+              "not evidence of an effect, so state it as a description, not a test.")
         return result
 
     # CLR: proportions are constrained to sum to 1, so testing them raw makes every population
@@ -774,10 +956,13 @@ def scrna_advanced_catalog() -> list[Any]:
             "how a single-cell analysis invents a population. Filters predicted doublets by "
             "default (`filter: false` to annotate only) and returns the rate; a rate above ~20% "
             "usually means the threshold, not the biology.",
-            {"type": "object", "properties": {
-                "filter": {"type": "boolean"}, "batch_key": {"type": "string"},
-                "threshold": {"type": "number"},
-                "expected_doublet_rate": {"type": "number"}}},
+            _schema("run_doublet_detection",
+                    filter={"type": "boolean",
+                            "description": "remove the predicted doublets (default) or only annotate them"},
+                    batch_key={"type": "string",
+                               "description": "obs column to simulate doublets within, per batch"},
+                    threshold={"type": "number",
+                               "description": "explicit score cutoff; omit to let scrublet choose one"}),
             run_doublet_detection,
             reads_private_data=True, category="qc", requires=("scanpy",),
         ),
@@ -804,14 +989,20 @@ def scrna_advanced_catalog() -> list[Any]:
             "treated vs untreated). run_de tests over cells, and cells from one donor are not "
             "independent replicates of that donor's condition, so its p-values are "
             "pseudoreplicated and nearly every gene comes out significant. Sums raw counts per "
-            "`sample_key`, optionally within each `group_key` cell type, then log2 CPM + Welch "
-            "t-test + BH. REFUSES a group with fewer than 2 samples per arm and reports it in "
-            "`skipped_groups` rather than falling back to the cell-level test.",
-            {"type": "object", "properties": {
-                "sample_key": {"type": "string"}, "condition_key": {"type": "string"},
-                "group_key": {"type": "string"},
-                "min_cells_per_sample": {"type": "integer"},
-                "min_samples_per_condition": {"type": "integer"}}},
+            "`sample_key`, optionally within each `group_key` cell type, then filters untestably-low genes and runs DESeq2 "
+            "(negative-binomial Wald, via pydeseq2; Welch t on log2 CPM as a LOUD fallback) + "
+            "BH. REFUSES a group with fewer than 2 samples per arm and reports it in "
+            "`skipped_groups` rather than falling back to the cell-level test. Writes "
+            "`tables/de_<group_key>_all.csv` (+ the tested universe and per-group .rnk files), so "
+            "run_enrichment and run_gsea_prerank pick the result up with NO `genes` argument — do "
+            "not paste a gene list into them.",
+            _schema("run_pseudobulk_de",
+                    sample_key={"type": "string",
+                                "description": "obs column holding the sample / donor / library id"},
+                    condition_key={"type": "string",
+                                   "description": "obs column holding the experimental condition"},
+                    group_key={"type": "string",
+                               "description": "cell-type column to test within, one test per cell type"}),
             run_pseudobulk_de,
             reads_private_data=True, category="analysis", requires=("scanpy",),
         ),

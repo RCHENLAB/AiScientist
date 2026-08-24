@@ -163,32 +163,6 @@ def test_classify_new_study_runs_fresh(tmp_path, monkeypatch):
     assert cap["path"] == "run_lab" and cap["resume"] is None
 
 
-def test_classify_edit_report_regenerates(tmp_path, monkeypatch):
-    conn = _conn(tmp_path, last_run_id="run123")
-    _seed_bundle(conn)
-    cap: dict = {}
-    monkeypatch.setattr(gw_app, "_regenerate_report", _fake_regen(cap))
-    _patch_llm(monkeypatch, {"intent": "edit_report", "confidence": 0.9})
-    _dispatch(conn, "make the discussion shorter and fix the title")
-    assert cap["path"] == "regenerate"
-    assert cap["run_id"] == "run123" and cap["basename"] == "report"
-    assert cap["instruction"] == "make the discussion shorter and fix the title"
-
-
-def test_plan_mode_followup_still_routes_to_edit(tmp_path, monkeypatch):
-    # THE reported regression: "Plan first" is checked by default, so a follow-up like
-    # "continue to generate the report" used to fall through to a FRESH full re-run (a new 5-step
-    # plan). It must now route to the report path even with plan_mode=True.
-    conn = _conn(tmp_path, last_run_id="run123")
-    _seed_bundle(conn)
-    cap: dict = {}
-    monkeypatch.setattr(gw_app, "_regenerate_report", _fake_regen(cap))
-    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab({}))   # a fresh run here would be the bug
-    _patch_llm(monkeypatch, {"intent": "edit_report", "confidence": 0.9})
-    _dispatch(conn, "continue to generate the report", plan_mode=True)
-    assert cap["path"] == "regenerate" and cap["run_id"] == "run123"
-
-
 def test_classify_rerun_step_continues_in_place(tmp_path, monkeypatch):
     conn = _conn(tmp_path, last_run_id="run123")
     _seed_bundle(conn)
@@ -204,32 +178,32 @@ def test_classify_rerun_step_continues_in_place(tmp_path, monkeypatch):
     assert cap["resume"].modify_note == "please search the literature again with better terms"
 
 
-def test_rerun_degrades_to_edit_when_checkpoints_expired(tmp_path, monkeypatch):
-    # A mid-pipeline re-run needs the upstream checkpoints. If they've expired, don't silently
-    # produce nothing — degrade to an in-place report edit (A1) so the figures survive.
+def test_rerun_without_checkpoints_starts_a_fresh_study(tmp_path, monkeypatch):
+    # A mid-pipeline re-run needs the upstream checkpoints, and those are now deleted the moment
+    # the report is written. Report editing no longer exists as a fallback, so the honest outcome
+    # is to run the analysis again rather than quietly doing less.
     conn = _conn(tmp_path, last_run_id="run123")
     _seed_bundle(conn, with_checkpoint=False)
     cap: dict = {}
-    monkeypatch.setattr(gw_app, "_regenerate_report", _fake_regen(cap))
-    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab({}))
+    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab(cap))
     _patch_llm(monkeypatch, {"intent": "rerun_step",
                              "step": "Differential expression per cluster", "confidence": 0.9})
     _dispatch(conn, "redo the differential expression")
-    assert cap["path"] == "regenerate"                     # fell back to A1, figures preserved
+    assert cap["path"] == "run_lab"
 
 
 def test_low_confidence_asks_then_routes_to_choice(tmp_path, monkeypatch):
     conn = _conn(tmp_path, last_run_id="run123")
     _seed_bundle(conn)
     cap: dict = {}
-    monkeypatch.setattr(gw_app, "_regenerate_report", _fake_regen(cap))
-    _patch_llm(monkeypatch, {"intent": "edit_report", "confidence": 0.2})   # below threshold
-    # The clarify card is answered "edit report".
+    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab(cap))
+    _patch_llm(monkeypatch, {"intent": "rerun_step", "confidence": 0.2})   # below threshold
+    # The clarify card is answered "start a brand-new analysis".
     async def fake_ask(_conn):
-        return "edit_report"
+        return "new_study"
     monkeypatch.setattr(gw_app, "_ask_followup_clarify", fake_ask)
     _dispatch(conn, "hmm can you tweak it")
-    assert cap["path"] == "regenerate"
+    assert cap["path"] == "run_lab"
 
 
 def test_cold_model_asks_without_classifying(tmp_path, monkeypatch):

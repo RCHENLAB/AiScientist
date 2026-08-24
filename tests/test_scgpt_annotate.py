@@ -15,6 +15,7 @@ from bioagent.gateway.executor import ExecResult
 from bioagent.gateway.scgpt_runner import build_scgpt_runner
 from bioagent.gateway.settings import HPCSettings
 from bioagent.tools.scgpt_annotate import make_scgpt_annotate_tool
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 # --- the tool itself ---------------------------------------------------------
@@ -137,7 +138,7 @@ def test_runner_stages_infers_fetches_and_summarises(tmp_path):
     workspace.mkdir(parents=True)
 
     fake = FakeRunnerHost(plans=[["R:gpu-3-1", ""]], finals={"3000": "COMPLETED"})
-    runner = build_scgpt_runner(fake, HPCSettings(), cluster_user_dir="/dfs3b/ruic20_lab/u1")
+    runner = build_scgpt_runner(fake, HPCSettings(), cluster_user_dir=f"{LAB_STORAGE}/u1")
     # Speed up the lifecycle polling for the test via the engine defaults being overridable
     # is not needed here — the fake reports R then "" on the first two polls.
     ctx = HarnessContext(decisions={"dataset_path": str(dataset)}, workspace=workspace)
@@ -154,7 +155,7 @@ def test_runner_stages_infers_fetches_and_summarises(tmp_path):
 
 def test_runner_errors_when_dataset_missing(tmp_path):
     fake = FakeRunnerHost(plans=[["R:gpu-3-1", ""]])
-    runner = build_scgpt_runner(fake, HPCSettings(), cluster_user_dir="/dfs3b/ruic20_lab/u1")
+    runner = build_scgpt_runner(fake, HPCSettings(), cluster_user_dir=f"{LAB_STORAGE}/u1")
     ctx = HarnessContext(decisions={"dataset_path": str(tmp_path / "missing.h5ad")},
                          workspace=tmp_path)
     assert runner({}, ctx)["status"] == "error"

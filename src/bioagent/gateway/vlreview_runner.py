@@ -34,6 +34,7 @@ def build_vlreview_review_fn(
     run_id: str,
     local_review_dir: Path | None = None,
     emit: Callable[[str, str, str], None] | None = None,
+    source_dir: str | None = None,
 ) -> Callable[[str], dict]:
     """Return a ``review_fn(local_pdf_path) -> review dict`` that stages the PDF to shared DFS,
     runs the VL review GPU job, and returns the parsed ``review.json``. On any failure it returns
@@ -52,6 +53,7 @@ def build_vlreview_review_fn(
             executor.put_file(local_pdf_path, remote_pdf)
             result = run_vlreview(
                 executor, settings, pdf=remote_pdf, out_dir=out_dir, emit=emit,
+                source_dir=source_dir,
             )
         except Exception as exc:  # noqa: BLE001 - never block the deliverable on a review hiccup
             return {"clean": True, "defects": [], "fix_directives": [],

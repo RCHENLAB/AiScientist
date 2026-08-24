@@ -18,6 +18,7 @@ import pytest
 pytest.importorskip("paramiko")
 
 from bioagent.gateway.ssh_gateway import SSHExecutor  # noqa: E402
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 class _FakeRemoteFile:
@@ -165,13 +166,13 @@ def dtn(monkeypatch):
 
 def test_put_and_get_go_over_the_transfer_host_not_the_login_node(dtn):
     ex = _executor()
-    ex.put_file("/local/big.vcf.gz", "/dfs3b/ruic20_lab/u/uploads/big.vcf.gz")
-    ex.get_file("/dfs3b/ruic20_lab/u/out/result.csv", "/local/result.csv")
+    ex.put_file("/local/big.vcf.gz", f"{LAB_STORAGE}/u/uploads/big.vcf.gz")
+    ex.get_file(f"{LAB_STORAGE}/u/out/result.csv", "/local/result.csv")
 
     assert dtn.dialed == [("access-hpc3.rcic.uci.edu", 22)]
     transfer = dtn.clients[0]
-    assert transfer.puts == [("/local/big.vcf.gz", "/dfs3b/ruic20_lab/u/uploads/big.vcf.gz")]
-    assert transfer.gets == [("/dfs3b/ruic20_lab/u/out/result.csv", "/local/result.csv")]
+    assert transfer.puts == [("/local/big.vcf.gz", f"{LAB_STORAGE}/u/uploads/big.vcf.gz")]
+    assert transfer.gets == [(f"{LAB_STORAGE}/u/out/result.csv", "/local/result.csv")]
     # The login node carried NO bytes — that is the whole point of the rule.
     assert ex._client.puts == [] and ex._client.gets == [] and ex._client.sftps == []
 
@@ -195,7 +196,7 @@ def test_mkdir_stays_on_the_login_session(dtn):
     """The parent mkdir is control plane, not transfer — and the DTN's restricted shell
     would refuse to run it anyway."""
     ex = _executor()
-    ex.put_file("/local/big.h5ad", "/dfs3b/ruic20_lab/u/uploads/nested/big.h5ad")
+    ex.put_file("/local/big.h5ad", f"{LAB_STORAGE}/u/uploads/nested/big.h5ad")
     assert ex.execs == ["mkdir -p /dfs3b/ruic20_lab/u/uploads/nested"]
 
 

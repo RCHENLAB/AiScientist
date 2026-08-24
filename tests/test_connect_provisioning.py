@@ -84,7 +84,12 @@ def test_lab_endpoint_starts_a_run_on_a_ready_session(monkeypatch):
 
     async def call():
         resp = await gw_app.lab(req)
-        await asyncio.sleep(0)          # let the created _run_lab task run
+        # Poll rather than a single tick: dispatch screens the message on a worker thread
+        # (asyncio.to_thread) before it starts the run, so one event-loop turn is not enough.
+        for _ in range(200):
+            if started:
+                break
+            await asyncio.sleep(0.01)
         return resp
 
     try:

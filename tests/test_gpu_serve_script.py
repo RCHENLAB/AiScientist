@@ -9,6 +9,7 @@ import base64
 
 from bioagent.gateway import gpu
 from bioagent.gateway.settings import HPCSettings
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 def _script(**over) -> str:
@@ -31,9 +32,9 @@ def test_serve_script_keeps_dynamic_port_and_jobname():
 def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
     s = _script(
         llm_backend="vllm",
-        vllm_image="/dfs3b/ruic20_lab/software/bioagent/containers/vllm.sif",
+        vllm_image=f"{LAB_STORAGE}/software/bioagent/containers/vllm.sif",
         vllm_model="QuantTrio/Qwen3.6-35B-A3B-AWQ",
-        hf_home="/dfs3b/ruic20_lab/software/bioagent/hf",
+        hf_home=f"{LAB_STORAGE}/software/bioagent/hf",
     )
     # group-wrap: vLLM image/HF on DFS -> body is base64'd into `sg ruic20_hpc`
     assert "sg ruic20_hpc -c 'bash -s'" in s

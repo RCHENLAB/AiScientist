@@ -82,19 +82,41 @@ def _current(user):
     return next((s["step"] for s in p["plan"] if s["state"] == "current"), "")
 
 
-# --- off by default: the protocol adds no meetings and changes nothing -------
+# --- off by default: the PER-STEP meetings add nothing; the PLAN review still runs ----
 
-def test_step_meetings_off_by_default_holds_no_meetings():
+def test_step_meetings_off_by_default_holds_no_per_step_meetings():
     seen: list[str] = []
     complete = _router(["Run QC on the dataset", "Identify marker genes"], seen=seen)
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.converged is True and result.accepted_steps == 2
-    # no meeting prompt was ever issued — plan-time review, pre-flight gate, or post-step review
-    assert not any("DRAFT analysis plan" in s for s in seen)
+    # The two PER-STEP meetings stay opt-in: they cost two completions per step.
     assert not any("PRE-FLIGHT" in s for s in seen)
     assert not any("JUST completed" in s for s in seen)
+
+
+def test_the_plan_review_runs_by_default():
+    # Split out of step_meetings and defaulted ON. It was previously reachable only from tests —
+    # the gateway never set step_meetings — so every production run went from a one-shot draft
+    # straight to execution with nothing reading the plan back. It costs one completion (a second
+    # only when the Critic actually objects), against a whole run spent on an incoherent plan.
+    seen: list[str] = []
+    complete = _router(["Run QC on the dataset", "Identify marker genes"], seen=seen)
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+    lab.run("Characterize the dataset")
+    assert any("DRAFT analysis plan" in s for s in seen)
+
+
+def test_the_plan_review_can_still_be_switched_off():
+    seen: list[str] = []
+    complete = _router(["Run QC on the dataset", "Identify marker genes"], seen=seen)
+    lab = ResearchLab(_ctx(), LabConfig(plan_review=False), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+    result = lab.run("Characterize the dataset")
+    assert result.accepted_steps == 2
+    assert not any("DRAFT analysis plan" in s for s in seen)
 
 
 # --- deterministic floor: enrichment w/o contrast is skipped without an LLM --
@@ -302,3 +324,50 @@ def test_dag_structurer_deterministically_flags_label_decision():
 def _CLUSTERS(goal: str) -> bool:
     g = (goal or "").lower()
     return "clustering" in g or "leiden" in g
+
+
+# --- the review must not strip-mine a plan -----------------------------------
+#
+# Measured, not hypothesised: over 12 plans drafted by the served model against the DDX41
+# profile, the first version of this review cut a mean of 4.6 steps to 1.9. The question was
+# deliberately narrow ("call run_de with groupby=sampleid and report what it returns"), and the
+# Critic read it literally — calling the QC, composition and enrichment steps "orphans relative
+# to the research question". A prompt alone cannot be trusted to hold that line, so there is a
+# floor underneath it: a review may trim, it may not delete most of a study.
+
+def test_a_review_that_deletes_most_of_the_plan_is_rejected():
+    draft = ["Assess quality with `run_scanpy_qc`", "Compare composition with `run_composition`",
+             "Contrast the conditions with `run_de`", "Interpret with `run_enrichment`",
+             "Attach citations with `deep_literature`"]
+
+    def complete(messages):
+        system = messages[0]["content"]
+        if "Scientific Critic reviewing a DRAFT" in system:
+            return json.dumps({"issues": ["everything but the DE step is an orphan"],
+                               "revised_agenda": ["Contrast the conditions with `run_de`"]})
+        return json.dumps({"final_agenda": ["Contrast the conditions with `run_de`"],
+                           "reason": "narrow question"})
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+    events: list[dict] = []
+    assert lab._plan_review("Call run_de and report what it returns", draft, events.append) == draft
+    assert any(e.get("type") == "plan_review_rejected" for e in events), \
+        "dropping the revision silently would look like the Critic found nothing"
+
+
+def test_a_proportionate_trim_is_still_applied():
+    """The floor must not turn the review off — trimming one bad step is the whole point."""
+    draft = ["Assess quality with `run_scanpy_qc`", "Parse the generated DE tables and report them",
+             "Contrast the conditions with `run_de`", "Interpret with `run_enrichment`"]
+    kept = [s for s in draft if "Parse" not in s]
+
+    def complete(messages):
+        if "Scientific Critic reviewing a DRAFT" in messages[0]["content"]:
+            return json.dumps({"issues": ["step 2 only re-reads step 3's output"],
+                               "revised_agenda": kept})
+        return json.dumps({"final_agenda": kept, "reason": "dropped the read-back step"})
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+    assert lab._plan_review("Characterize the dataset", draft, lambda _e: None) == kept

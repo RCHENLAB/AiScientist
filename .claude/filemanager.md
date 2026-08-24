@@ -18,6 +18,192 @@ created by Claude then reworked by a human.
 
 ## Change log (newest first)
 
+### 2026-08-19 — `claude` — add `deploy/dsv4/` (README, serve sbatch, sm_120 mHC patch); `tests/test_vllm_client_dialect.py`
+- **Added:** `deploy/dsv4/` — DeepSeek-V4-Flash serving kit + the sm_120 blocked-verdict README;
+  `tests/test_vllm_client_dialect.py` — env-gated served-model dialect knobs in `vllm_client`
+  (`BIOAGENT_VLLM_THINK_ON_KWARGS`, `BIOAGENT_SCIENTIST_MAX_TOKENS`, `BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS`).
+  On HPC3 (not in git): `containers/vllm-0.27.1.sif`, `containers/vllm-nightly.sif`,
+  `containers/vllm-0.27.1-patches/tilelang.py`, two NVFP4 weight sets in `hf/hub`.
+
+
+### 2026-08-19 — `claude` — add `experiments/plan_vs_exec_ab/` (README.md, run_ab.py, results/)
+- **Added:** `experiments/plan_vs_exec_ab/run_ab.py` — "is it the plan or the execution?" A/B: the
+  real `ResearchLab._pi_plan` / `_scientist`+`_critic` / `_synthesize`→gateway `_build_report`→
+  `_review_report` code paths, on the real DDX41 dataset with real local tools, swapping ONLY the
+  model (prod Qwen3.6-35B no-think, Qwen3.6 think, Qwen3.5-122B, DeepSeek-V4-pro, Sonnet 5, GPT-5.4
+  via OpenRouter); deterministic rubrics + blind judges. `results/SUMMARY.md` + raw jsonl.
+  `src/bioagent/gateway/_app_prefix_9d72d43.py` is a transient, git-ignored copy of the pre-fix
+  gateway module the script materialises for the "prefix" writer variant (not committed).
+
+
+### 2026-08-19 — `claude` — add `tests/test_design_by_arm.py`
+- **Added:** `tests/test_design_by_arm.py` — the profile's per-arm design table (cells / labels /
+  QC medians per arm, depth-imbalance flag), run_de's direction-bias self-diagnosis, and the
+  report's rendered per-arm table.
+
+### 2026-08-19 — `claude` — add `src/bioagent/tools/vlreview_run.py`, `tests/test_vlreview_run.py`
+- **Added:** `src/bioagent/tools/vlreview_run.py` — byte-identical copy of `deploy/vlreview/run_review.py`
+  so the render-review Slurm job runs the LIVE reviewer from the synced pysrc (no sif rebuild);
+  the test pins the two identical. Reviewer gained two deterministic detectors (text_clipped by
+  page geometry, unrendered_markup by page text) after Qwen2.5-VL-7B passed a page with every
+  parameter line running off the right edge and literal `**`/backticks.
+
+### 2026-08-18 — `claude` — add `scripts/e2e_prod_drive.py`
+- **Added:** `scripts/e2e_prod_drive.py` — headless end-to-end drive of the DEPLOYED gateway via
+  the browser's own HTTP+WS API (connect → plan card → [question / one-step change / Stop] →
+  approve → run → verify). Two runs of it found nine prod defects that 1,500+ green unit tests
+  could not. Run after any change to planning, routing, offload or reporting.
+- Also on HPC3 (not in repo): `uploads/<ucinetid>/Ddx41_DEG.h5ad` — a durable copy of the test
+  dataset (the Temp/ copies get swept and one had, mid-test).
+
+### 2026-08-18 — `claude` — add `tests/test_de_academic_defaults.py`; pydeps dir on HPC3
+- **Added:** `tests/test_de_academic_defaults.py` (min_pct / dual-gate significance / DESeq2
+  pseudobulk + loud fallback), and (on HPC3, not in the repo)
+  `/dfs3b/ruic20_lab/software/AiScientist/pydeps/` — pure-Python deps the analysis image lacks
+  (pydeseq2 0.4.12, `pip install --no-deps --target`), wired via `BIOAGENT_HPC_PYDEPS`.
+- **Why:** measured on the real DDX41 object: run_de tested 22,387 genes of which only ~33% were
+  detected (3x BH inflation + ~2,700 divide-by-zero fold-changes per stratum), and pseudobulk used
+  a Welch t instead of the DESeq2 the field (and our own cited Squair 2021) expects.
+
+### 2026-08-18 — `claude` — add `handoff/yijun/plan-mode-test-prompts.md`
+- **Added:** `handoff/yijun/plan-mode-test-prompts.md`
+- **Why:** the hand-off test sheet for the plan-mode work (first-round plan output, revision
+  requests, and questions that must NOT redraft the plan). Written to be run by Ziyao against the
+  deployed build; the ⚠️ rows in section C are the classifier misfires fixed in the same change.
+
+- 2026-08-20 · claude · `experiments/depth_matched_validation/` (新增) —— `run_depth_matched_de` 的已知答案验证:合成两个细胞类型(纯深度 vs 真实生物学),记录 2026-08-20 在 analysis.sif 上的结果;单元测试证明不了科学正确性,这个能。
+- 2026-08-20 · claude · `tests/test_conversational_turn_guard.py` (新增) —— 派发前的"这条消息里有没有研究请求"筛查(模型主判、封闭词表兜底)的回归测试;真实前端里一个 "why" 启动了完整流程。
+- 2026-08-17 · `claude` · (worktree `single-cell-pipeline-review-c760de`)
+  **added** `handoff/yijun/ddx41-postmortem.html` — the bilingual (ZH/EN, one source, language
+  switch) post-mortem of production run `Ziyaoma/f5111e1a2382`: the eight defects and their
+  attribution, the pipeline that should have run against the one that did, the causal chain from
+  the dataset profiler through to the missing plan review, and an assessment of whether
+  Qwen3.6-35B-A3B can carry the planning role. Also published as a private Artifact. Committed.
+
+- 2026-08-17 · `claude` · (worktree `single-cell-pipeline-review-c760de`)
+  **added** `tests/test_pseudoreplication_guard.py`, `tests/test_declared_params.py`,
+  `tests/test_plan_provenance.py` — the three mechanisms recovered from reviewing production run
+  `Ziyaoma/f5111e1a2382`: the `run_de` condition-column guard (lost in a rewrite, and its absence
+  is how a retina .h5ad with an 11-level `majorclass` got pooled across DDX41/WT); the declared
+  parameter table (`scrna_pack.PARAMS`) that the tool bodies, the model-facing schema and each
+  preset's `## Parameters` section now all read, so the three copies cannot drift; and the plan
+  provenance layer (`SELF-SOURCED:` disclosure, non-default-parameter reporting, read-back-step
+  pruning). Committed.
+
+- 2026-08-11 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_tool_self_diagnosis.py` — tools report defects in their OWN output
+  (`warnings`), starting with `run_scanpy_qc`: zero matched mitochondrial genes means the
+  `max_pct_mt` filter was a no-op, which no count in the old result could reveal. The Critic gets
+  them hoisted to the top of its payload. Single-cell/DEG line only — variant line deprioritised
+  per Yijun. Committed.
+
+- 2026-08-11 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_evidence_resolution.py` — deterministic check that artifact paths a tool
+  CLAIMS actually exist on disk before the Critic grounds a verdict on them. `evidence_pointers` was
+  called in four places and nothing ever verified the files; `run_de`'s hardcoded
+  `rank_genes_groups_leiden_de.png` dangled in production for every non-leiden groupby. Committed.
+
+- 2026-08-11 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_meeting_asymmetry.py` — team meetings now deal each expert a DIFFERENT slice
+  of the accepted findings, let experts call a read-only tool whitelist (`_MEETING_TOOLS`), and make
+  the synthesis report AGREED **and** UNRESOLVED. Also **added** `tests/test_team_formation_context.py`
+  and `tests/test_execution_stamp.py` earlier the same day. Committed.
+
+- 2026-08-11 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_plan_patch.py` — a plan revision now PATCHES one step (model names it, code
+  applies it) instead of re-drafting the whole agenda, with a fallback to the redraft for anything
+  a single-step edit cannot express. Pins that untouched steps stay identical, that the edit is
+  emitted as a before/after diff, and that step-0 / garbage / no-op replies route to the redraft.
+  Measured motivation in `experiments/plan_revision_ab/`. Committed.
+
+- 2026-08-10 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_report_coverage.py` — pins that groups the analysis REFUSED (cell types with
+  too few cells in one arm) reach the report. `_collect_facts` only recursed into dicts while both
+  producers emit their skips as a list (`run_de`) or a flat dict (`run_pseudobulk_de`), so on the
+  real Ddx41 data 5 of 12 cell types went untested and the grounding block never said so. Committed.
+
+- 2026-08-10 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `src/bioagent/agents/lab_graph.py` + `tests/test_lab_graph.py` — the LangGraph execution
+  shell (`LabConfig.planner="langgraph"`), step 2 of the LangGraph direction. LangGraph owns
+  nodes/edges/state; `_run_one_node` (Scientist→Critic) is called unchanged from inside the graph
+  nodes. The load-bearing piece is `serialize_conflicting_nodes`, which turns the scheduler's
+  runtime `_concurrency_safe` check into graph EDGES, because LangGraph co-runs every ready node
+  and our analysis nodes share one checkpoint chain. Optional dependency: new `langgraph` extra in
+  `pyproject.toml`, deliberately NOT in `gateway`, lazily imported, tests `importorskip`. Committed.
+
+- 2026-08-10 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_midrun_checkpoint.py` — pins mid-run durability: `ResearchLab.run(checkpoint=…)`
+  persists the run state after EVERY round, and the last snapshot before a crash round-trips through
+  `ResumeState.from_run_state` (the same path `/api/lab/continue` uses). Step 1 of the LangGraph
+  direction, deliberately with ZERO new dependencies. Committed.
+
+- 2026-08-10 · `claude` · (worktree `vcf-normalization-variants-cef98c`, branch
+  `claude/langgraph-framework-evaluation-f50fa7`)
+  **added** `tests/test_deg_contrast.py` — the DEG line's condition-vs-reference contrast and the
+  `run_de` / `run_pseudobulk_de` → `run_enrichment` hand-off. Runs REAL scanpy/gseapy on a small
+  synthetic AnnData (auto-skipped without the analysis extra) because every defect it covers was an
+  INTERFACE defect — what one tool writes vs what the next tool looks for — which a mocked tool
+  cannot show. Committed.
+- 2026-08-10 · `claude` · (worktree `elastic-nightingale-acbc89`, branch `claude/api-agent-setup-488ed1`)
+  **added** `src/bioagent/gateway/llm_credentials.py` — per-user LLM API-key store, mirroring
+  `ssh_credentials.py` (`<STATE_DIR>/llm_creds/<owner>/index.json` + `<id>.key` at 0600). The
+  credential **id is stable and the key is a rotatable field**, so every reference to an endpoint
+  survives a key rotation. At-rest encryption is opt-in per deployment
+  (`BIOAGENT_LLM_KEY_ENCRYPTION=1`, master key in its own 0600 file, never in the world-readable
+  prod `.env`) and recorded **per row**, so it can be switched on later without a migration.
+  **added** `src/bioagent/gateway/llm_providers.py` — OpenAI-compatible endpoint presets
+  (OpenRouter / OpenAI / DeepSeek / DashScope / Moonshot / Gemini-compat / custom) + key
+  verification. Split from the store so neither half does the other's I/O. Model ids are NOT
+  hard-coded — providers retire them faster than we redeploy, so ids come from the live
+  `GET /models`. `verify()` distinguishes the four causes of "my key doesn't work" (bad key /
+  no credit / wrong model id / unreachable endpoint) because only one of them is fixed by
+  getting a new key.
+  **added** `tests/test_llm_credentials.py`, `tests/test_llm_providers.py`,
+  `tests/test_llm_credential_routes.py`, `tests/test_llm_endpoint_binding.py` — 79 offline tests,
+  no network. The load-bearing ones pin verify-before-commit (a failed rotation leaves the old key
+  working) and bind-time key snapshotting (rotating mid-run does not break a running analysis).
+  **added** `docs/byo_api_key_and_hpc_shell.md` — the locked decisions for both halves of this
+  line, including the parts NOT yet built (CPU worker allocation, HPC3 shell toolset, HITL
+  triggers) so the design survives even if the code lands later.
+  **edited** `.gitignore` — added `ssh_creds/` and `llm_creds/`. `BIOAGENT_STATE_DIR` defaults to
+  `"."`, so running the console from a checkout drops real PRIVATE SSH KEYS and API keys into the
+  repo root as untracked files. The `ssh_creds/` hole PREDATES this work; found while adding the
+  parallel store.
+  **added** `src/bioagent/gateway/worker.py` — the session's standing CPU allocation, held so the
+  agent's shell has somewhere RCIC-legal to run. `srun --jobid --overlap` per command (no queue
+  wait); reuses `acquire_allocation`/`JobStore` from `slurm_job.py`. Opt-in
+  (`BIOAGENT_WORKER_NODE=1`). Connect skips the GPU entirely when the user brings an API key.
+  **added** `src/bioagent/tools/hpc_shell.py` — list_dir/stat_path/find_files/read_text/disk_usage
+  on the LOGIN node (metadata-class, no allocation); run_shell/fetch_url/install_package on the
+  WORKER. No command allowlist: the general shell simply never runs on a login node, so RCIC
+  compliance is structural. Reads/writes confined (writes narrower than reads — the lab account is
+  shared), re-checked after `readlink -f`. Crossing a line raises HITL, refusing by default when
+  no approver is wired.
+  **added** `src/bioagent/gateway/package_cache.py` — the lab-SHARED install cache
+  (`<shared_root>/pkgs`), so a package one member installs is instantly there for everyone and is
+  never downloaded twice. Immutable + atomically published (`mv -T` is the concurrency arbiter, no
+  lock file) because on HPC3 one user cannot overwrite another's files — the same constraint that
+  forced `hpc_gc.SHARED_SUBDIRS` to be per-user. Cannot shadow the image: publishing an existing
+  module is refused, colliding deps are pruned, and `sys.path` is APPENDED via a generated
+  `sitecustomize` (plain PYTHONPATH sorts before site-packages and would hijack — proven by an
+  executed counterfactual test).
+  **added** `tests/test_worker_node.py`, `tests/test_hpc_shell.py`, `tests/test_hpc_shell_wiring.py`,
+  `tests/test_package_cache.py`.
+  **edited** `gateway/slurm_sandbox.py` (binds the cache read-only into run_code),
+  `agents/registry.py` (`hpc_shell` catalog), `gateway/settings.py` (worker_* knobs),
+  `gateway/app.py` (worker lifecycle, `/api/confirm`, `RunState.confirm_event`, API-only connect).
+  **added** `src/bioagent/agents/code_imports.py` + `src/bioagent/gateway/code_preflight.py` —
+  a snippet's third-party imports are read from its AST BEFORE it runs, and anything missing is
+  resolved in ONE confirmation. Replaces a path that was measured to be actively misleading: pip
+  inside the sandbox could report success while the very next import failed (`--containall` leaves
+  `~/.local` off `sys.path`), and nothing survived to the next step. The run_code tool description
+  that invited it was removed. `tests/test_code_preflight.py`.
+  The package cache was subsequently **measured on the real HPC3** (probe jobs, since cleaned up):
+  the `--target`+atomic-publish design works there, and the Singularity-overlay alternative does
+  NOT — no fakeroot, non-root cannot write image `site-packages`, and a writer blocks all readers.
+  `<shared_root>` turned out to be already `drwxrwsr-x ruic20_hpc`, so that flagged risk was
+  unreal. Details in the doc. Still unverified: `srun --jobid --overlap` and CPU queue latency.
+
 - 2026-08-08 · `claude` · (worktree `ziyaoma-pr-merge-status-544fde`)
   **renamed on HPC3 (not a repo path):** `/dfs3b/ruic20_lab/software/bioagent` →
   `.../software/AiScientist`, with `software/bioagent` left as a **symlink** so prod's `.env` and
@@ -51,6 +237,16 @@ created by Claude then reworked by a human.
   `_prepare_shared_storage` + `_submit_temp_sweep` + `_hpc_temp_gc_loop`, storage panel lists all
   three areas and its delete guard covers them), `gateway/scgpt_runner.py` (docstring),
   `tests/test_uploads_hpc.py` + `tests/test_bind_set.py` (new upload/pysrc paths).
+- 2026-08-06 · `claude` · (worktree `vcf-normalization-variants-cef98c`)
+  **added** `tests/test_ssh_transfer_host.py` — pins the control-plane / data-plane split in
+  `SSHExecutor`. RCIC's 2026-08-06 notice reserves the HPC3 login nodes for logins and Slurm
+  submission — no compute and no `rsync`/`SFTP`/`rclone`/`wget` — and we were pushing every
+  upload (GB-scale VCFs, h5ad) over the login session. `put_file`/`get_file` now open their own
+  connection to `BIOAGENT_HPC_TRANSFER_HOST` (`access-hpc3.rcic.uci.edu`) while `exec`, Slurm
+  and tunnels stay on the login node; the tests assert WHICH connection each byte rides, that
+  the parent `mkdir` stays on the control plane, and that an unusable transfer host degrades
+  with one warning instead of breaking a run. No new source file — the change itself lives in
+  `src/bioagent/gateway/{ssh_gateway,settings,app}.py`.
 
 - 2026-08-05 · `claude` · (worktree `adaptive-kg-status-40c9b8`)
   **added** `src/bioagent/tools/phenotype_evidence.py` + `tests/test_phenotype_evidence.py` — the
@@ -159,6 +355,27 @@ created by Claude then reworked by a human.
   chat-route wiring is content-only in `agents/quick_chat.py` (forced deep_literature grounding for
   literature questions) and `frontend/console/app.js` (plain `[N]` citations, no `#ref` anchors).
   Nothing removed. Conflict resolution for the merge touched tests only — see `7c6a075`.
+
+- 2026-07-28 · `claude` · (branch `main`) **added** `docs/decks/` —
+  `AiScientist_Technical_Spec_EN.pptx`, `AiScientist_技术规格说明_中文.pptx`, and the
+  `build_deck.js` generator that produces both from one source (a `t(en, zh)` helper keeps the two
+  language versions structurally identical, so a content edit lands in both). A 27-slide technical
+  specification deck requested by Yijun: job state design, context management (research vs fast-chat
+  paths), cross-server job submission, the existing workflows / business capability, package selection
+  and its rationale, positioning vs cloud science-agent platforms, and a six-slide deep dive on the
+  in-development genetic-variant-annotation line. Regenerate with
+  `node docs/decks/build_deck.js <en.pptx> <zh.pptx>` (needs `npm i pptxgenjs`). The `.pptx` files are
+  build OUTPUT — regenerate rather than hand-edit, or the generator and the deck drift apart.
+
+- 2026-07-31 · `claude` · (worktree `mmfatlas-service-setup-7ca4e1`, branch
+  `claude/mmfatlas-service-setup-7ca4e1`) **added** `deploy/mmfatlas-service.md` — operational
+  README for the MMFAtlas/CELLxGENE service, written after its second outage in a month
+  (503 for ~22.5 h; the 2026-07-02 `targetPort` 5006 patch went stale when the container was
+  SIGKILLed and restarted on its default 5005). Exists mainly to stop the recurring wrong-layer
+  debugging: MMFAtlas is a k8s Deployment in its **own `mmfatlas` namespace** pulled by
+  RKE2/containerd, so `docker ps` and the host `mmfatlas` service account will never show it.
+  Complements `deploy/public-domain-tls.md` (TLS/cert side). MMFAtlas is Texera's service, not
+  ours — the doc is a handoff to Jin, not a claim of ownership.
 
 - 2026-07-27 · `claude` · (worktree `agent-ae5db1eff54a6dd2e`, branch `refactor/drop-lazy-gpu`)
   **renamed** `tests/test_lazy_gpu.py` → `tests/test_connect_provisioning.py` — the lazy GPU path

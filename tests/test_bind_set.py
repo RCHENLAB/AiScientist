@@ -76,6 +76,11 @@ class _FakeExec:
     def __init__(self):
         self.gets: list[tuple[str, str]] = []
 
+    def exec(self, cmd: str, timeout: float = 60.0):
+        # _ensure_local_dataset now checks the source exists (`test -s … && echo OK`) before
+        # staging; a fake remote FS answers "present" for everything.
+        return types.SimpleNamespace(ok=True, out="OK", stderr="")
+
     def get_file(self, remote: str, local: str) -> None:
         self.gets.append((remote, local))
         with open(local, "wb") as fh:

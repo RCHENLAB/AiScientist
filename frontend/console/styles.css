@@ -549,6 +549,30 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .storage-note { font-size: 11.5px; color: var(--text-tertiary); margin: 14px 0 0; line-height: 1.5; }
 .storage-note code { background: var(--surface-sunken); padding: 1px 5px; border-radius: 4px; }
 
+/* ---- bring-your-own LLM API key ---- */
+
+/* Amber, not red: routing prompts to your own provider is a legitimate choice, not an error.
+   It stays visible for the whole session because the egress lasts as long as the selection. */
+.llm-egress {
+  margin: 8px 0 0; padding: 8px 10px; font-size: 11.5px; line-height: 1.45;
+  background: rgba(255, 149, 0, 0.10); border: 1px solid rgba(255, 149, 0, 0.35);
+  border-radius: 8px; color: var(--text);
+}
+
+.api-key-row {
+  display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px;
+  border-radius: 10px; background: var(--surface-sunken);
+}
+.api-key-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.api-key-main small { font-size: 11.5px; color: var(--text-tertiary); word-break: break-all; }
+.api-key-main code { background: transparent; padding: 0; }
+.api-key-actions { display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; }
+.api-key-ok { color: var(--green, #34c759); }
+.api-key-bad { color: var(--red); }
+.api-key-form { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.api-key-form h3 { font-size: 13px; margin: 0 0 10px; }
+.egress-list { margin: 6px 0 0; padding-left: 20px; font-size: 12.5px; line-height: 1.6; color: var(--text-secondary); }
+
 /* ---- toast ---- */
 .toast {
   position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%) translateY(20px);
@@ -623,7 +647,10 @@ button.full { width: 100%; margin-top: 6px; }
 .session-item:hover { background: var(--surface-sunken); }
 .session-item.active { background: rgba(0, 113, 227, 0.1); }
 .session-item.active .session-title { color: var(--accent); font-weight: 500; }
-.session-title { flex: 1; font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.session-title { font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* When the chat was last touched. Muted and small: it is for finding a chat, not for reading. */
+.session-time { font-size: 11px; color: var(--text-muted, #8a8f98); font-variant-numeric: tabular-nums; }
 .session-del {
   width: 22px; height: 22px; padding: 0; border-radius: 6px; font-size: 12px; flex: none;
   background: transparent; color: var(--text-tertiary); opacity: 0; transition: opacity 0.12s, background 0.12s;

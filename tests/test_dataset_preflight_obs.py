@@ -58,3 +58,47 @@ def test_obs_categoricals_never_raises_on_garbage():
             raise RuntimeError("boom")
 
     assert _obs_categoricals(_Bad()) == {}
+
+
+# --- plain (non-Categorical) columns ------------------------------------------
+#
+# Whether a column arrived as a pandas Categorical is a detail of whoever wrote the file, and it
+# used to decide whether the planner heard about the column at all. A production dataset stored
+# `orig.ident` as a plain string array holding ONE value — a single library, i.e. zero biological
+# replication — so it was skipped here, and the planner's profile filed it under "numeric /
+# high-cardinality": an advertisement for many donors where there was one. The plan that came back
+# proposed aggregating counts per donor, which the data could not support.
+
+
+def _make_h5ad_with_plain_columns(path):
+    with h5py.File(path, "w") as f:
+        obs = f.create_group("obs")
+        _write_categorical(obs, "sampleid", [b"DDX41", b"WT"], [0, 1, 0, 1])
+        obs.create_dataset("orig.ident", data=np.array([b"0", b"0", b"0", b"0"]))   # ONE library
+        obs.create_dataset("library", data=np.array([b"L1", b"L2", b"L1", b"L2"]))  # two, plain
+        obs.create_dataset("nCount_RNA", data=np.array([10.5, 9.1, 22.0, 7.7]))     # continuous
+        obs.create_dataset("barcode", data=np.array([f"bc{i}".encode() for i in range(4)]))
+
+
+def test_a_single_valued_plain_column_is_counted_not_dropped(tmp_path):
+    p = tmp_path / "plain.h5ad"
+    _make_h5ad_with_plain_columns(p)
+    with h5py.File(p, "r") as f:
+        cats = _obs_categoricals(f["obs"], list_max=3)
+
+    assert cats["orig.ident"] == {"n": 1, "values": ["0"]}, (
+        "one library must be visible as one library — this is the number that decides which "
+        "statistical test is legal for a condition contrast")
+    assert cats["library"] == {"n": 2, "values": ["L1", "L2"]}
+
+
+def test_continuous_and_per_cell_columns_stay_out(tmp_path):
+    """The counting must not turn every float measurement and every barcode into a design column;
+    a profile that lists all of them is one the planner stops reading."""
+    p = tmp_path / "plain.h5ad"
+    _make_h5ad_with_plain_columns(p)
+    with h5py.File(p, "r") as f:
+        cats = _obs_categoricals(f["obs"], list_max=3)
+
+    assert "nCount_RNA" not in cats                 # float measurement
+    assert "barcode" not in cats                    # 4 distinct values, over list_max=3

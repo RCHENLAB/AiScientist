@@ -1,5 +1,622 @@
-# BioAgent 原型交接文档
+# BioAgent Prototype 交接文档
 
+## 2026-08-20(深夜)—— 全 Qwen 实测计划里的八个缺陷,在框架层面修复(main 764f214,已部署)
+
+Yijun 在真实控制台里审阅了生产 PI 写出的计划,找出八个问题。每一个都修在它会复发的地方。
+
+**新工具 `run_depth_matched_de`(第 1、6 条)。** 计划让执行器"把每个基因的 logFC 与两臂中位
+nCount_RNA 求相关"——不可计算,每基因的向量对一个标量。三个模型在两次跑里写出三个错版本,次次失败,
+报告最核心的问题(是假象还是生物学?)始终没有答案。工具的做法:在每个细胞类型内,把更深的那一臂
+**按分位数匹配**到较浅一臂的每细胞 UMI 分布(以各细胞自身计数封顶,只能丢不能造),重跑**同一个**
+Wilcoxon 对比,再**按方向分别**对原始排名与匹配后排名求 Spearman。
+
+**用已知答案做了验证**(`experiments/depth_matched_validation/`)——单元测试证明不了一个方法科学上
+对不对。两个合成细胞类型:一个有 2× 深度差**且有真实生物学**,另一个同样的深度差但**毫无差异**。四个
+判定全对:DepthOnly 的 up/down 都判 **inverted**(rho −0.16 / −0.05),RealBio 的 up 判 **preserved**
+(rho 0.82),RealBio 的 down(那里本来就没有真实生物学)正确判为 weak。基因层面:真正被改变的基因
+**30/30 保住位置**,背景只剩 3/30。而且这次验证的第一轮**没通过自己的对照,反过来改了工具**:原来
+"depth-robust"只看符号是否不变,那会放过一个效应从 3.0 塌到 0.02 的基因;现在的判据是"仍留在匹配后
+排名自己的 top-N 里"。
+
+**`run_enrichment` 的确定性护栏(第 3 条)。** 计划在 DE 步声明 p 值不作推断,却在富集步传
+`padj=0.05`——而那个参数正是"基因要进入检验必须通过的门槛",等于把一个伪重复的 p 值洗成"显著变化的
+基因"。现在 `run_de` 把自己的 `inference` 标记**落盘**成表旁边的 sidecar(标记本来就有,只是活在
+`run_enrichment` 永远看不到的字典里),而富集在读到 `exploratory_ranking` / `pseudoreplicated` 时
+**彻底忽略 padj**(不是放宽),改按 |log2FC| 选入,并在输出里写明。
+
+**计划审查 Critic 的四条新规则(第 2、4、5、7、8 条)** —— 它审过这份计划并放行了,因为其中三条
+根本不在它的清单上:(6) 每个被指定的运算**是否可计算**;(7) 每个被承诺的产物**是否有步骤产出**——
+出图步骤承诺了细胞组成图,而全计划没有任何组成分析;(8) 步骤描述**是否与它点名的工具实际行为一致**
+——它说 GSEA 按 log2FC 排序,而 `run_gsea_prerank` 用的是 Wilcoxon z;(9) 文献步骤**只提问、不断言**
+——计划把 DDX41 说成"DEAD-box 解旋酶(BRR2)、位于 U4/U6 snRNP",那是另一个家族的另一个蛋白,这个
+前提会带偏每一次检索。规则 (1) 也补上了它本该抓到的两种情况:重新推导数据集画像里已有的列,以及重画
+工具自己已经产出的图。
+
+第 4 条的知识缺口在这里补不了——35B 对 DDX41 的分子身份没有可靠记忆。规则 (9) 只能阻止它**断言**一个。
+
+部署说明:分析容器 import 的是暂存在 dfs3b 上的源码,`_ensure_hpc_pysrc` 每个会话重新推送一次,所以
+新工具会在你下次连接时自动到达 HPC3,不需要重建镜像。测试 1513 通过。
+
+## 2026-08-20(晚)—— Yijun 真实前端实测暴露的五个缺陷,已修复并部署(main 973850d)
+
+以下每一条都来自这一个小时的真实操作,不是测试造出来的。
+
+**1. 设计会专家把工具日志当发言念出来。** 昨天的 cd4a9f1 让 `ResearchHarness` 在预算耗尽时返回确定性
+摘要而不是空 `final_answer`——对 Critic 和写手是对的,但 `_expert_turns_with_tools` 写的是
+`(res.final_answer or "").strip() or self._complete(messages)`,于是"永远非空"的答案**静默地废掉了
+退回普通发言的那条路**,设计会里出现了 "(auto-summary: the step ended on max_steps …)" 冒充专家意见。
+现在 `HarnessResult.answer_synthesized` 标记它,会议把查到的内容**当笔记还给专家**,让它用自己的话说。
+(d98d0cf)
+
+**2. 计划审阅只给 10 分钟。** 那是按"扫一眼点 Run"设计的;研究者是真的要**读**一份十步计划。超时返回
+`{"action": "cancel"}`,而取消分支会故意清掉 `last_run_id`,于是草案和写了一半的修订意见一起被销毁。
+现在是 `BIOAGENT_PLAN_REVIEW_TIMEOUT`,默认 3600 秒。中英双语重复的取消提示合并成一条英文,并且不再
+谎称"由用户取消"。(d2912c2)
+
+**3. 一个 "why" 启动了完整研究。** 没有前一次 run 可挂时 `_followup_target` 返回 None,一切落到
+`_run_lab`:从 HPC3 staging 矩阵、加载 preset、召开设计会。现在派发前**用会话自己的 warm 模型筛一遍**
+(旁边的 `_followup_router` 早就是这个模式),且只作用在"会新建 run"的那条路径上;输入框的
+research/chat 档位不被重新判断。只有**高置信度的"对话性"判定**才拦下——低置信、解析失败、调用失败、
+冷会话全部落到一张封闭词表,词表不认识的一律放行开跑。(c7f23cf → acc3001;第一版我用的正则,Yijun 指出
+判断意图不该用关键词表,是对的。)
+
+**4. "Free my GPU" 会把 worker 落下。** `_release_my_gpu` 只查 `--name=<模型作业>`。当模型作业已经先
+死了(55436595 在 18:03 撞上 2 小时墙钟),处理函数会在**早退分支**返回"没有运行中的 GPU 作业",而释放
+worker 的代码在那个早退**下面**——`aiscientist-worker-<ucinetid>` 就这样从 16:10 占着一个 4 CPU 的 free
+分区节点到 19:26,背后根本没有模型。分析作业(run_code / PaperQA / variant / phenotype / scGPT)更是
+从来不在范围内。现在 `_release_session_jobs` 用**一次** `squeue --me` 列出 `%i|%j`,按我们自己的作业名
+前缀分类,补上缓存的 alloc 和 worker id,一次 scancel,然后轮询确认每一个真的没了。按前缀匹配,**绝不
+用 `scancel --me`**——研究者自己的作业共用同一个账户,必须活下来。`aiscientist-tempgc-*` 不动(它一秒
+就退)。(791db1e)
+
+**另有实测结论,尚未修复。** `deep_literature` 每次 2.5–5 分钟,排队只占 1–7 秒——时间全在 **40 个证据
+片段各发一次 summary LLM 调用**(`evidence_k=40`,并发 12)加一段约 500 词的作答,而且打的是**和 agent
+同一台 vLLM**。一次设计会连发了六个(18:36–18:45),这就是那 20 分钟出计划的大头。`inject_args` 位于
+优先级链最底层(`{**inject_args, **caller, **force_args}`),所以"只给会议用的窄档"(evidence_k 10 /
+search_count 15 / max_sources 5)是十行左右的改动,正式文献步骤仍保持全深度。
+
+**仍然待办。** 超时应当把草案**寄存**下来(question + agenda + feedback_log,按 run/会话作用域——不能
+只挂在连接上,那块有跨窗口串扰的前科),让下一条消息重新进入 `_pi_plan` 的 revise 分支,而不是开一个新
+研究。worker 没有空闲回收:只有 `/api/disconnect` 和这个端点会释放它,兜底是 `--time=08:00:00`。Slurm
+作业名一半 `bioagent-*` 一半 `aiscientist-*`,而 squeue 把 NAME 截到 8 字符,所有 `aiscientist-*` 都
+显示成 "aiscient";改名必须在查找侧同时接受新旧前缀,否则会把正在跑的 worker 变成孤儿。
+
+## 2026-08-20 — 已部署;部署后全 Qwen 运行的两个现场发现
+
+45-commit 分支已合并 main(91c1547)并部署(走 tar 包——rsync 现在稳定死在同一文件,值得查)。
+prod 保持全 Qwen,无 OpenRouter/DSV4 配置(仅 BYO);GPU 策略生效(会话→`gpu` 分区 A100,实测分到
+hpc3-gpu-l54-04)。部署后 plan-only 冒烟:10/10 步带标题、无回显伪步、且 Qwen 靠画像提示**自己规划出
+深度匹配步**。
+**现场发现 #1:** 部署后首个全 Qwen 完整 run 在一个步骤上三连败,全是 SyntaxError/IndentationError——
+模型写的 150+ 行长代码在 Scientist 回合的 2048 token 输出预留处被**拦腰截断**。这个上限静默坑了我们
+数周(所有"第 ~150 行 invalid syntax"的 revise 都是它)。修复:prod .env 已加
+`BIOAGENT_SCIENTIST_MAX_TOKENS=8192`(开关正是今晨上的)。重跑进行中。
+
+## 2026-08-19 — GPU 摆放策略(Yijun 拍板):Qwen 会话回 A100(`gpu` 分区,计费);RTX6000/gpu32 只留给主 PI 大模型
+
+固定决定:用户的 Qwen 会话从普通 `gpu` 分区申 A100(`ruic20_lab_gpu`,计费),不再用 free-gpu32;
+gpu32 的 RTX PRO 6000 节点(免费池,全账户并发 4 张)只用来部署主 PI/写手大模型。
+运维:prod `.env` → `BIOAGENT_GPU_CANDIDATES="gpu,gpu:A100:1,ruic20_lab_gpu"`。同步记录在
+`deploy/dsv4/README.md`。
+
+## 2026-08-19 — DSV4-Flash 上自家 RTX PRO 6000:内核层面被堵死(实测 5 次);全流程改走 OpenRouter 角色分流照样跑通
+
+**本地 serving 结论:** DeepSeek-V4-Flash 目前**无法**在 gpu32 的 RTX PRO 6000(sm_120)上起服务。
+因果链(每一环都有 Slurm 运行佐证):(1)容器内 NCCL 初始化挂起 → 已解(`NCCL_SOCKET_IFNAME=lo`、
+IB/P2P 关);(2)mHC hyper-connection 内核调 DeepGEMM 的 TF32 GEMM,sm_120 上断言 "Unsupported
+architecture" → 已解(bind 挂载 fallback 补丁 `containers/vllm-0.27.1-patches/tilelang.py`,复用上游
+自己的非 DeepGEMM 路径);(3)FP8 稠密/attention 层用 DeepSeek 的 UE8M0 缩放格式,只有 DeepGEMM 认,
+而 DeepGEMM 的 SF 变换在 sm_120 上断言 "Unknown SF transformation"(Cutlass c3x 没有 sm_120 分发;
+Triton 内核对 `float8_e8m0fnu` 直接 KeyError)。vLLM 0.27.1 和 2026-08-19 nightly、两份 NVFP4 权重
+(MJPansa 0731、NVIDIA 官方——两者非 MoE 层都保留 UE8M0 FP8)全部验证。要等 DeepGEMM 支持 sm_120
+或出现标准缩放的 AWQ/GPTQ 重量化版。留存物:`vllm-0.27.1.sif`、`vllm-nightly.sif`、两套权重
+(127+126 GB),serve 脚本和日志在 HPC3 `~<ucinetid>/vllm27-build/`。另一个事实:free-gpu32 对整个
+ruic20_lab 账户限并发 4 张 GPU(QoS MaxTRESPerAccount),和所有人的会话卡共享。
+
+**Plan B 全流程照样跑:** 本地网关 `BIOAGENT_LAB_LLM_BASE_URL` → OpenRouter
+`deepseek/deepseek-v4-flash-0731` 服务 PI/Critic/写手,Scientist 用会话 Qwen3.6(1×RTX6000)——
+正是 A/B 推荐的双模型分工。DSV4 在真产品里写的第一份 plan:9 步全带标题,**含专门的"深度匹配敏感性
+检查"一步,明确引用 1.6× nCount 失衡(3,078 vs 1,916)**——Qwen 从来不会主动规划的那一步。plan 卡
+延迟 858 秒(DSV4 默认思考 effort;产品化时要加 `reasoning_effort` 上限)。`vllm_client` 新增三个
+环境开关备将来换served模型用:`BIOAGENT_VLLM_THINK_ON_KWARGS`(对默认不思考的模板给 PI/写手显式开启)、
+`BIOAGENT_SCIENTIST_MAX_TOKENS`(工具回合默认 2048 对推理模型太小)、
+`BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS`;默认行为与今天逐字节一致(tests/test_vllm_client_dialect.py)。
+
+## 2026-08-19 — A/B 第二轮:三个节点候选模型,以及一处关于 prod 思考开关的更正
+
+**更正。** 第一轮写的"prod 所有角色都没开思考"是错的:PI / Critic / 写手走 `vllm_client.complete()`
+(默认 `think=True`,服务端 `--reasoning-parser qwen3`)—— 那里思考是**开着的**;只有 Scientist 工具循环
+(`chat_tools`,`think=False`)和几个有界小调用(摘要、表型映射、数据集描述)没开。所以实验里 plan/写作
+请把 `qwen36-35b-think` 当 prod,执行请把 `qwen36-35b` 当 prod。重读:prod plan 深度感知 2/3(裁判 7.2)
+vs 所有更大模型 100 % / 8.5–9.5;prod 写手 + 修复前提示词 提出伪影 0/4(= run 8847 那份报告),
++ 06e4937 规则 3/4、质量 5.5。
+**第二轮(Yijun 充值后,"少跑几组"):** MiniMax-M2.7(229B-A10B)、MiniMax-M3(428B-A23B,多模态)、
+DeepSeek-V4-Flash-0731(304B,MIT),A/B/C 全跑。Plan:三家 100 % 深度感知,soundness 8.5 / 9.25 / 9.5。
+执行:和所有模型一样的工具后空转(50–79 % max_steps);M2.7 最好(7/14 有答案、grounded 4.5),flash 最差
+(3/14)。代码一次跑通:M3 95 %、flash 90 %、M2.7 86 %、Qwen 79–82 %。写作(现行规则):flash **effort=low
+时 8.0**(供应商默认 effort 下把 24k 输出预算全用来思考、返回**空** 4/4 —— 预算陷阱),M3 7.5,M2.7 4.5
+(啰嗦、过度宣称);Sonnet 8.5 作参照。4×96 GB 能否放下:M2.7 FP8 ≈ 230 GB 宽裕;flash FP8 ≈ 300 GB 紧
+且需新版 vLLM(V4 + DSpark);M3 只能 4-bit。
+**建议:** DeepSeek-V4-Flash-0731 做 PI + 写手(限制 effort、≥32k 输出),MiniMax-M2.7 做 Scientist 循环;
+单模型退路 = flash + 循环修复。循环修复(所有模型都需要):命名工具成功后最多再 2 次调用即强制 `finish`;
+max_steps 时绝不空答案。两轮共花 ≈ $10。完整表格:`experiments/plan_vs_exec_ab/results/SUMMARY.md`。
+
+## 2026-08-19 — 是 plan 差、执行差、还是写作差?同一套脚手架、六个模型(实测)
+
+Yijun:"判断一下是模型写的 plan 不好还是模型执行的不好,都测一下,允许用 openrouter"。做了
+`experiments/plan_vs_exec_ab/`:走**真实** `ResearchLab` 代码路径(`_pi_plan`;`_scientist`+`_critic`
+跑**同一份固定计划** = 生产 PI 给 run 8847d521ba32 写的 7 步,真实工具在本地对真实数据集运行,按步
+用生产自己录下的调用回放出前序状态;`_synthesize`→网关 `_build_report`→`_review_report` 写 run 8847
+的同一批 accepted 结果),**只换模型**:生产 Qwen3.6-35B 不思考 / 同权重开思考 / Qwen3.5-122B /
+DeepSeek-V4-pro / Sonnet 5 / GPT-5.4(OpenRouter);确定性评分 + 两个盲审裁判。
+完整报告:`experiments/plan_vs_exec_ab/results/SUMMARY.md`(+原始 jsonl、样例报告)。
+
+**Plan —— 模型问题。** 提示词/画像/指南完全一样,画像里**明写** "⚠ DEPTH IMBALANCE 1.6×":Qwen3.6
+规划深度检查 0/3(裁判 0/6),Qwen3.5-122B 1/3,Qwen3.6 开思考 2/3,DeepSeek / Sonnet / GPT-5.4 3/3
+(Sonnet 单写一步 "Depth-imbalance check",GPT 写 "Depth-bias diagnostics")。裁判 soundness
+6.0 → 7.2 → 8.5 → 9.3–9.5。基础项(分层 DE、组成、富集在 DE 后、复制性声明、无幻觉工具)各家都对。
+**执行 —— 脚手架问题(带模型成分)。** 所有开源权重臂都能按名调对工具、参数全对(86–93 %,参数匹配
+1.0)。问题在工具返回**之后**:再打 3.5–4.3 次调用去重读刚写出的表,直到 8 次预算耗尽:64 %(Qwen)/
+57 %(思考)/ 83 %(Qwen3.5-122B)/ 50 %(DeepSeek,n=6)的步撞到 max_steps,而撞到 max_steps 的步
+最终答案为**空**(有答案的仅 4/14、5/14、2/12、3/6);Critic 照样接受 71–93 %。四个体量悬殊的模型同一
+病症 ⇒ 是循环的契约。前沿模型臂**未测到**(预算)。
+**写作 —— 模型问题,部分可补。** 同样的事实/图/表:生产 Qwen(修复前提示词)提出"技术伪影"可能性
+0/4、过度宣称显著 4/4、编造细节 4/4;06e4937 的规则把编造压到 1/4,但 "significant" **压不下去**
+(4/4);Qwen **开思考** + 规则:伪影 3/4、过度宣称 1/4、质量 5.5 vs 4.25。Sonnet(仅确定性指标):
+每份报告提深度 4–9 次、技术性 caveat 2/2;DeepSeek 1/2。深度事实在每个写手的预览里都有
+(`qc_descriptive_summary.csv`),差别在于能不能把它们连起来。
+
+**该做什么:**(1)PI + 写手开思考(同 GPU 同权重;关掉只是因为老的"思考吃掉 max_tokens"预算 bug ——
+给这两个角色 16k 输出);(2)修循环:命名工具成功后最多再 2 次调用即强制 `finish`;max_steps 时绝不
+返回空答案(从工具摘要合成);(3)若买更强模型,只给 PI+写手,用现成的 `BIOAGENT_LAB_LLM_*` 角色分流
+(DeepSeek-V4 开源权重、plan 8.5 分)。
+**预算/注意:** OpenRouter key($20 上限,账户 $50)在 Stage B 中途耗尽 —— Sonnet/GPT 执行试验、8 个
+DeepSeek、2 个 Qwen3.5、GPT 报告及后半裁判没跑(补完约 $15–20)。时长数据不可信:笔记本前 ~5 小时
+每 17 分钟一次空闲休眠(DarkWake 日志),表现得像供应商卡死;`caffeinate` 解决;token/调用数不受影响。
+
+## 2026-08-19 — 报告内容层:一个测序深度伪影被讲成了生物学,以及现在怎么抓它
+
+以审稿人身份读了 run 2 的报告。6 个实质问题,最大的一个:每个细胞类型都是 up >> down(MG 5,028/508、
+Rod 3,279/107),顶端全是翻译/核糖体基因,Discussion 讲成 "DDX41 驱动的翻译上调"。从 obs 直接算:
+**DDX41 臂中位深度 3,078 vs WT 1,916(1.6 倍),nFeature 1,777 vs 1,194** —— 经典深度伪影。流程里
+从来没有一步比较过两臂的 QC 指标。
+
+已修,全是确定性 + 提示词层:(1)数据集画像新增 `design_by_arm`(每臂细胞数、每臂每标签细胞数、每臂
+nCount/nFeature/percent.mt 中位数、>1.5 倍时的 `depth_imbalance` 标记)—— 喂给 PI 的 `_dataset_context`,
+并在 `## The dataset` 渲染成表;(2)`run_de` 把跨层同向偏斜标为技术性(`direction_bias` + 提升的
+warning);(3)写手/审稿的数字规则过宽("任何全精度浮点改科学计数法")→ 模型照做写出 '6.5e+01%' ——
+现在只有 p 值 / <1e-3 / >1e5 用科学计数法;(4)写手规则:复制数据集节的复制性措辞(不许"two donors")、
+探索性 DE 按效应量报不说 "N significant"、图注只能用工具声明的坐标轴(两张图不共用一条图注)。
+未处理(写手质量):20 张图含 10 张逐类型条形图;Methods 里漏进文件名碎片;run_code 合成步模型自定
+的 "top 100"。
+
+**这份报告上模型 vs 脚手架:** 科学计数法、缺每臂 QC、空的 "What was run"、代码块渲染 —— 脚手架
+(我/我们)。"two donors" vs "一个文库"、编造的图注细节、被明确告知没有有效 p 值后仍写 "significant"、
+以及**没有怀疑**全细胞类型同向偏移 —— 模型(Qwen3.6-35B)的推理滑坡,资深分析员不会犯。每一条现在
+都被一条规则或一个算出来的事实约束住,这就是这一周的规律:这个模型照着给它看的、告诉它的做;它不会
+主动去找没给它看的东西。
+
+## 2026-08-19 — 渲染出的报告:我的两个 markdown bug + 一个瞎的 VL 审核(已修)
+
+Yijun 打开 run 1 的 PDF:"What was run" 渲染成了**代码**并冲出右边界;"The dataset" 的列表塌成
+一段。都是我的:4 空格缩进的列表项在 markdown 里就是代码块(LaTeX 代码不换行);粗体段落标签后面
+的列表要空一行。已在 `_pipeline_section` / `_dataset_section` 修。
+VL 审核(HPC3 上的 Qwen2.5-VL-7B)是开着的、三轮都跑了 —— 却把这些页判 clean。给审核器加了两个
+确定性检测:`text_clipped`(词框超出页面框)和 `unrendered_markup`(页面文字里的 `**`、大量反引号、
+裸图片链接)。在旧审核器放过的那份 PDF 上验证:p2/p3 clipped(high)+ markup(medium)。审核器现在
+随包发布(`bioagent.tools.vlreview_run`,与 deploy/vlreview/ 字节一致),job 从 pysrc 跑它 ——
+改检测器随代码同步生效,不用重建 sif。另:VL job 的 `run_id` 用成了 owner 目录名,每个 run 都覆盖
+`vlreview/<owner>/pass1`。
+
+## 2026-08-19 — E2E 第 3 轮(7/7,converged)+ 时间拆解 + 不回落(a6e954c)
+
+- **Ziyao 的文献修复在部署代码上验证通过**:arRP 问题 → 18 篇相关、25 条证据、带引用回答;写入落在
+  `Temp/<user>/paperqa/`,共享语料未动。
+- **ORA/GSEA/合成一次通过**(`resolve_evidence` 修复奏效);DE 步"侦察完就收工没调 run_de"现在由
+  一次性 nudge 兜住(3dc6591)。
+- **Slurm 任务失败后不再回落 eyeserver 进程内执行**(默认;`BIOAGENT_HPC_LOCAL_FALLBACK=1` 恢复)。
+  普查所有留存 run:进程内执行全是白名单 bug B,失败后回落一次没触发过 —— 但它一直上着膛。
+  eyeserver 现在只做画像 + 报告胶水。
+- **79 分钟 = 必要 ~27 + 决策卡等人 10 + 模型自选 `select_resolution=True, n_bootstrap=10` 重聚类
+  已标注数据 24 + 会后 team 解读会议 17(2 轮 × 3 专家 × 工具 + 4 个 deep_literature job)。**
+  建议(等 Yijun 拍板):已标注数据的"复用标签还是重聚类"卡自动选标签(或 2 分钟超时);会后会议
+  减到 1 轮、专家不调 deep_literature。
+
+## 2026-08-19 — E2E 第 2 轮复盘:又三个脚手架缺陷(用 run 自己的 JSON 回放发现)
+
+- **文献步拿整段步骤文案去搜**("DDX41 ONLY splicing retinal" → 0 结果):`run_gsea_prerank` 返回的
+  通路条目是 dict `{term, nes, fdr…}`,发现摘要把它们当字符串 join → TypeError —— 这段在调用方 try
+  之外 → 调用方自己的 except 用 `[step]` 兜底当 query。和空的 "What was run" 同一类(消费方假设了
+  形状)。`_term_label` 兼容两种形状;摘要/兜底移入 try;任何兜底都不再是原始文案;实体正则排除
+  全大写指令词(ONLY/NOT/MUST…)。
+- **ORA 步表格明明在盘上却得 0.0**:`resolve_evidence` 在网关主机上检查绝对路径 —— HPC3 shell 工具
+  返回的是 dfs3b 路径,网关上永远不存在,于是所有用过 `list_dir`/`read_text` 的步骤都被告知
+  "全部证据缺失"。远端 artifacts 现按 `artifacts/` 后缀映射到本地镜像;其它远端路径视为此处不可
+  验证,不算"缺失"。
+- `run_de`/`run_pseudobulk_de` 结果带 `table_columns` —— 有个 run_code 步骤按 `sampleid` 索引 DE 表
+  (KeyError;表按 `group` 键)。
+方法:`scripts/e2e_prod_drive.py` + 把 `process/run_state.json` 回放进各 helper。
+
+## 2026-08-18(收尾)— 给 Ziyao:不用搬;一处权限;路由改为数据集优先
+
+**Ziyao / retigene —— 逐条核过 prod `.env` 的 dfs3b 路径:没有一条指向个人目录。** PaperQA 全在
+共享根,那份拷贝完整(1,739 篇、1,737 已索引、manifest、3 GB `paperqa.sif`、`hf_cache`),与她个人
+目录那份逐项一致。**env 不用改。**
+
+| `/dfs3b/ruic20_lab/ziyaom2/` 下 | 是什么 | 建议 |
+|---|---|---|
+| `retigene/`(4.8 G) | 旧开发副本(`index_pubmedbert_OLD`、`pqa_test*.py`)| **可删** —— prod 不读;dfs3b 已 ~97 % 满 |
+| `BioAgentPrototype/`(3.2 G) | 她的克隆 + `retigene_embed-*.log` | 她的,不动 |
+| `analysis/ phenotype/ variant/ reports/`(~64 M,≤ 7/26)| 共享根建立前的运行产物 | 历史交付物,永不自动清;想删手动 |
+| `pysrc/ .bioagent/ vlreview/` | 旧过程文件 | 已被 `AiScientist/Temp/ziyaom2/` 取代;可删 |
+
+真正需要她做的一件事(是权限,不是位置):共享语料里 `index_pubmedbert/answers/` 带着她的 tantivy
+锁,挡住了别人的 PaperQA 写入。查询路径已改成只读 + 写到 `Temp/<user>/paperqa/`,现在不改也能跑;
+为了干净:`rm -rf …/retigene/index_pubmedbert/answers && chmod -R g+rwX …/retigene`。她这条线的
+正式修复:下次重建 `paperqa.sif` 时锁定兼容的 lmi/aviary(目前是运行时补丁)。
+
+**路由**:team/single 原来是只看问题的 LLM 抛硬币。`_dataset_mode_rule` 现在先判 —— 有对照列 →
+team;只有标签 → single;都没有 → PI 判 —— 并把选择和理由渲染出来。**`scripts/e2e_prod_drive.py`**
+从 scratchpad 收进仓库:这周所有 prod 缺陷的来源工具。
+
+## 2026-08-18(深夜)— 线上 headless 端到端 ×2;deep_literature 从未跑通过(4254a9a)
+
+方法:用我的 HPC3 账号、真 GPU、真数据,通过浏览器同一套 HTTP+WS API 驱动 prod,再读 run 的过程
+文件。跑了两轮完整 run。**下面所有问题都是这么发现的,单元测试全程全绿。**
+
+第 1 轮(3a687047e056,79 分钟,5/10 通过)暴露:A)DE 步末尾"…biological interpretation"被路由到
+文献快车道(run_de 从没跑);B)`_HPC_ANALYSIS_TOOLS` 只有 4 个名字 —— composition/pseudobulk/gsea/
+doublet 全在 eyeserver 本地进程跑,HPC3 上的 checkpoint 看不见(composition 三轮失败);C)整段步骤
+文案当文献 query → 0 结果;D)每份真实报告里 `## What was run` 都是空的(LabRound vs dict)。
+第 2 轮(1cc6d9285ac4,29 分钟,**6/6 通过,converged**)修复后:A ✓ run_de 一次过;B ✓ composition
+hpc_slurm ok、两臂都在(MG 12.6% vs 5.9%,AC 6.3% vs 2.9%);D ✓ 该节渲染出声明参数 + "本次选择"标记。
+
+deep_literature(Ziyao 的 PaperQA):自 8/15 起 prod 上 28/28 个 job 1 秒死亡(workspace 从未
+mkdir → Singularity 挂载 FATAL)。修后 → 假 agent 最后一步 lmi/aviary TypeError(已打补丁)→
+再往 ziyaom2 所有的共享语料里写 answers 索引 PermissionDenied(改为每用户 Temp/ + 语料只读)。
+阳性对照 ABCA4:13 篇/36 条证据/带引用回答。也就是说所有文献步和会议专家一直在静默退到 Europe PMC
+关键词搜索 —— "critic 太差"就是好工具从没运行过。
+
+另:staging 已被清扫的 Temp/ 数据集会静默写 0 字节文件 → 现在明确报错;部署要等 prod 安静(我之前
+在 Ziyao 测试中途重启过服务 —— 我的问题)。GPU 停止审计:先停 run、释放 worker、no_job 不拆会话。
+
+待办:team/single 路由是只看问题的 LLM 抛硬币(7 分钟 vs 1 分钟计划)—— 建议改确定性规则;
+⑥ 步骤数;paperqa.sif 版本锁定(Ziyao)。
+
+## 2026-08-18(夜)— Ziyao 报告修复 + PI 自写步骤 + GPU 停止审计(c59195b)
+
+来自 `plan_mode_report_1.html`(Ziyao 在 107825c 上跑 8 检查点清单):
+
+- **文献步标签残缺**("for has donors"、"for help"、被打洞的中文)—— 脚手架**不再用字符串模板写
+  步骤**。`_author_step`:确定性守卫只决定"必须有这一步"(文献步;下面的 DE 生产步),内容由 PI
+  拿完整问题 + 数据画像自己写;模板只在无模型时兜底。PI 已写的文献步原句保留。**计划卡上不再有
+  任何一句模板文案。**
+- **新会话吞旧计划**(A7):composer 只在当前会话拥有运行时才走 revise/inject,否则明确提示。
+- **有富集无 DE 步**(A7,Critic 放过):确定性依赖检查 → PI 补写一步 contrast(🔗
+  `plan_dependency_fixed`);画像无 condition 列时删孤儿富集。
+- **重启只弹 "Unknown connection id"**:改为说明重启、丢弃死连接、立即显示重挂横幅。
+- **GPU 停止审计**(`/api/stop-gpu`):`--me` 限定、二次确认、no_job 如实报告本来就对;补了三个洞
+  —— 先停运行中的 run、释放 CPU worker 节点、no_job 时不再拆会话。
+
+未做:⑤ 中英文耗时差异(需对模型端点做 probe)、⑥ 步骤数偏少。
+
+## 2026-08-18(晚)— plan mode 体验 + Stop 覆盖(a2037fd,**尚未部署**)
+
+来自 Yijun 的实测。Ziyao 在测线上,**部署冻结**;验证改走 HPC3 直提任务。
+
+- **计划卡待审时 Stop 失效 10 分钟**:线程阻塞在 `plan_event.wait(600)`,不看 `chat_stop`;
+  现在 `/api/lab/stop` 会把待审卡直接按 cancel 解决。(不是七月 WS 漂移 bug 复发,是另一个洞。)
+- **规划前全阶段忽略 Stop**(路由/组队/多轮设计会/PI 起草):每个阶段边界 + 会议轮间补上检查。
+- **5 分钟静默**:`team_meeting_start` / `expert_contribution` 没有渲染器,专家带工具调研全程隐形;
+  已渲染,另加「PI 正在起草」心跳。
+- **计划可读性**:每步 `**短标题** — 正文`,计划卡按 `### N · 标题` 分块渲染。
+- **幻觉工具名**(实测计划里的 `run_wilcoxon_DE` 等):只**标注**不删 —— 按 Yijun 规矩,run_code
+  现写(含装包)是允许的;要抓的是重复自动产物,这条已写进计划复核 Critic。
+
+## 2026-08-18 — DE 线:学术默认值,实测驱动(已部署 8ca0b00)
+
+在真实 DDX41 对象上实测(不是读代码),发现并修复,已全部上线 prod + HPC3:
+
+- **`run_de` 每层测 22,387 个基因,其中只有 ~33% 真正检出**(Rod 层 21%)。新增
+  `min_pct=0.1`(Seurat 的 min.pct):未检出基因在检验**前**剔除,BH 只在实际检验的集合上校正。
+  |log2FC|>10 的除零伪影:每层 ~2,700 个 → 全对象 0–1 个。显著基因数**反升** 9,483 → 11,565 ——
+  说明之前膨胀的分母一直在压真信号。
+- **"显著"全线统一为一个定义**:padj<0.05 且 |lfc|≥0.25(此前 run_de 只看 padj、run_enrichment
+  看双门槛,同一份报告 9,483 vs 8,800)。结果携带 `significance`,并声明跨层合计不控制 FDR。
+- **`run_pseudobulk_de` 改用 DESeq2**(负二项 Wald,pydeseq2),前置 edgeR filterByExpr 风格的
+  `min_count=10` 低表达过滤;Welch t 仅作**响亮降级**(`warnings` 写明把握度代价)。universe
+  文件 = 实际检验集。pydeseq2:prod venv 0.5.4;HPC3 `pydeps/` 0.5.4(+ formulaic 依赖链;用 **sif 自己的 pip** 逐包 `--no-deps` 安装 ——
+  0.4.12 与 sif 的 numpy 2.4 不兼容),经 `BIOAGENT_HPC_PYDEPS` → `deps_dir` → 容器 PYTHONPATH。
+  已在计算节点的 analysis.sif 内**端到端**验证:真实 DDX41 的 run_de 与本地逐数字一致;
+  run_pseudobulk_de 报 "DESeq2 Wald (negative binomial, pydeseq2)",空数据 0 显著(正确)。
+- **`tie_correct=True`** 声明为参数并传入 Wilcoxon(90% 零值矩阵全是 ties);`min_cells=30`
+  标注为工程护栏。
+- Plan mode 分类器:纯疑问词(why/how/为什么…)不再被误判成改计划("why do you use wilcoxon
+  here?" 之前会触发重画)。给 Ziyao 的测试清单:`plan-mode-test-prompts.md`(3 次会话 / 8 检查点)。
+
+## 2026-08-17 — 一份没人能审计的计划,以及那个本该拦住它的守卫 (`2f307ea`)
+
+生产运行 `Ziyaoma/f5111e1a2382` 的复盘。一份已经带有 11 类 `majorclass` 标注、scVI/UMAP 降维、
+做完 QC 且去过双细胞的视网膜 `.h5ad`,被重新聚类,把全部 15,307 个细胞混在一起对 `sampleid` 做了
+一次 Wilcoxon,并作为 100 个"高度显著"的 marker 写进了报告。两组的细胞构成差别很大(Cone 1.8%
+vs 5.5%,MG 12.6% vs 5.9%),组成变化与表达变化因此无法区分 —— 在讨论 p 值之前,这个排序本身
+就没有意义。
+
+八处缺陷,归因和直觉不同:**skill 约 15%,模型约 35%,脚手架约 50%**。skill 点名要求复用
+`majorclass`、点名 `orig.ident` 是样本列,写得是对的。它失效是因为它依赖的两条事实被喂错了,
+而且没有任何机制检查它有没有被执行:
+
+* `_plan_review`(PI↔Critic 对整份草案计划的复核)有开关、有完整实现,**没有调用方**:`app.py`
+  从未设置过 `step_meetings`,所以只有测试能碰到它。它检查清单的第 (2) 条逐字描述的正是这次的
+  塌点。
+* 数据集 profiler 只统计 pandas Categorical 列,于是只有一个取值(即零生物学重复)的
+  `orig.ident` 被跳过,profile 把它归入"高基数"。计划提出按 donor 聚合,是因为 profile 说有 donor。
+* 标注提示只把标签列指向 `groupby` —— 而条件对比本来就要占用这个槽 —— 所以当问题指定了条件列,
+  这条建议变得不可满足,标签被整条丢弃。`stratify_by` 全程无人提及。
+* `run_de` 的条件列守卫曾经存在,被一次重构删掉了。
+
+本分支已修:恢复守卫(只拦明确错误的形态,并报告这份数据到底有多少重复);把 `plan_review` 拆出
+独立开关、默认开启并接进 gateway;profiler 统计普通列,profile 新增 REPLICATION 段落;
+`scrna_pack.PARAMS` 成为工具函数体、模型可见 schema、各 SKILL.md `## Parameters` 表三者共同读取的
+唯一真相;非默认参数实时告警并确定性置于技术报告最前;PI 提示词现在要求点名工具并以
+`SELF-SOURCED:` 收尾声明自身判断;steering 协议落盘进 `plan.md` 和 `run_state.json`。另修复该次
+运行中大量报错背后的两个 HPC 沙箱 bug(白名单用控制台账号名而非 UCInetID;`2>/dev/null` 被判为
+越权写,导致卡住 600 秒等一个没人能回答的确认)。
+
+完整中英文报告:`handoff/yijun/ddx41-postmortem.html`。
+
+**实测(各 12 次,HPC3 上的 Qwen3.6-35B-A3B-AWQ,同一 profile 与提问):** DAG 不是不稳定的来源 ——
+12/12 结构化全部解析成功,只出 2 种图且只差一条边,且该步骤按契约不能改动步骤文本,所有缺陷都在它
+之前就存在。修复前后:per-donor pseudobulk 9/12→0/12,复用已有标签 2/12→9/12,按细胞类型分层
+6/12→10/12,工具署名与 `SELF-SOURCED:` 声明 0/12→12/12。**注意一处我自己引入又修掉的回归**:第一版
+计划复核把计划从 4.6 步砍到 1.9 步(照字面问题把 QC/组成/富集判成孤儿);修正 Critic 判据 + 加
+"可砍一半、不可掏空"的确定性下限后回到 4.3 步(`36513a1`,已部署)。
+
+**已上线:** `BIOAGENT_WORKER_NODE=1` 已写入 prod `.env`(备份 `.env.bak-20260817-worker`),
+服务于 2026-08-17 14:12 PDT 重启,已验证变量进入进程且 `HPCSettings.worker_enabled=True`。缺它则
+`run_shell` 和每次 `run_code` 前的依赖预检在生产上全废。它是配置不是代码,所以是这批工作里**唯一**
+已经对生产生效的部分。
+
+**待办:** `2f307ea` / `5ba361b` 尚未部署 —— 在部署之前上述代码修复对生产都不生效;
+per-step Critic 仍然只判"有没有产出证据"而不判
+"证据是不是这一步声称的方法产的" —— 这就是那个用 `run_de` 冒充 pseudobulk 的步骤拿到 0.95 的原因。
+
+## 2026-08-17 — 自带 key 的入口"能用"但"找不到"（`6f7fa70`）
+
+`b87d7e6` 已经把 LLM endpoint 选择器放到了登录表单上，功能是通的。但它读起来仍然像"没这个功能"：
+下拉框里唯一一项是 **Cluster GPU (vLLM at UCI)**，里面没有任何东西告诉用户"你可以用自己的端点"，
+旁边那个 🔑 也从没说过自己就是"端点从哪来"。**控件存在**和**新用户能找到控件**是两回事。
+
+两个选择器现在都带一项 **"＋ Add your own API key…"**：选它会打开密钥管理器，并把选中项**弹回**当前
+真正在用的端点，所以下拉框永远不会显示一个并不生效的选择（`connect()` 读的是
+`connectEndpointChoice()`，它不可能返回这个哨兵值）。选择器下面那行提示在没有 key 时说明该做什么、
+有了就不再唠叨；从登录表单里新存的 key 保存后会**自动选中**。
+
+它背后还压着一个真实的静默失败，这次一并关掉：**accounts 关闭时，凭据的 owner 就是登录表单里填的
+UCInetID**，所以在填 UCInetID 之前保存，会把一个**已验证**的 key 存进匿名 `guest` 桶——而会话永远不
+会去那里读，于是 key「存上了，然后消失了」。现在 `POST /api/llm-credentials` 在既没有登录账号、也没有
+UCInetID 时直接拒绝（`cause: "owner"`），前端同样拦一道，管理器也会说清缺的是什么。**生产不受影响**
+——那边 accounts 是开的，`_cred_owner` 解析到账号名、`?user=` 参数被忽略；这只是 dev / accounts 关闭
+这条路径的问题。
+
+已在**开启 accounts**（与生产同形）的网关上对着 stub OpenAI 端点实测：打开选择器 →
+"＋ Add your own API key…" → 保存 → 新端点就是选中项。**已合入 `main`，但还没部署** ——
+`deploy/sync_deploy.sh` 仍需执行。
+
+## 2026-08-10（晚些）— LangGraph 分两步走；以及上下文窗口终于被证明
+
+### 第一步 —— 跑到一半也能续，零新依赖（commit `e5ed58e`）
+
+`run_state.json` 原来只在 `ResearchLab.run` 返回之后写**一次**。生产是单副本 stateful，一次网关重启
+就打到所有在飞的 run：几小时的分析丢掉全部编排状态，`work/adata_*.h5ad` 还在磁盘上，但没有任何东西
+能重新进入循环去用它们。现在 `run()` 接受 `checkpoint` 回调，**每个 round 后**落盘一次，线性循环和
+DAG 调度器两条路径都接了。网关传进去的就是原来的 `_write_run_state`，所以恢复走的是**同一条**
+`/api/lab/continue`，不是第二套机制。
+
+这正是 graph checkpointer 提供的持久性；而且无论如何它都是第二步的前置——状态必须先能增量序列化。
+
+### 第二步 —— LangGraph 外壳（`LabConfig.planner="langgraph"`）
+
+`src/bioagent/agents/lab_graph.py`。LangGraph 管 节点/边/状态/checkpoint；每个节点仍然原样调用
+`_run_one_node`，所以 Scientist→Critic 环、专家分派、决策点、证据 grounding 全是原来那套代码。
+
+**真正的难点和解法。** LangGraph 会把所有依赖满足的节点**并发**执行。我们的分析节点不行：scanpy 有
+全局状态，而且它们共用一条 checkpoint 链。`_run_dag` 是在派发时用 `_concurrency_safe` 拦的——这是个
+运行时检查，LangGraph 没有对应物。所以 `serialize_conflicting_nodes()` 把这个约束搬到图看得见的地方：
+**变成边**。冲突节点之间加一条排序边；真正独立的工作（文献分支）照样并行；会成环的边直接跳过——为了
+遵守一个性能约束而把整个 run 死锁，比按计划原有顺序跑更糟。这个函数是纯函数，所以保证可以单测；还有
+一个测试是在真实图执行中监测时间重叠，端到端验证。
+
+**明确还没和 `_run_dag` 对齐的**：ready 节点之间没有 Coordinator 排序（交给图决定），也没有
+hypothesis-driven 的运行中扩展 agenda（图是提前编译的）。这两个是第一版的有意省略，不是疏漏。
+
+**依赖姿态**：`pyproject.toml` 新增 `langgraph` 可选 extra，**故意不放进 `gateway`**。装它会往生产网关
+里拉进约 19 个传递依赖（langchain-core、langsmith、orjson、ormsgpack、zstandard、websockets…）。
+`lab_graph` 是懒加载，测试用 `importorskip`，所以**不装这个 extra 的部署行为和今天完全一样**。要不要在
+生产打开是一个独立决定：需要装 extra + 重启。
+
+测试：1151 passed, 3 skipped。
+
+### 上下文窗口 —— 配置是对的，但此前没有任何证据
+
+上集群跑了个短探针（free-gpu32 上的 `ctxprobe` serve 作业，读完日志就 scancel）：
+
+```
+Using max model len 262144
+GPU KV cache size: 3,034,420 tokens
+Maximum concurrency for 262,144 tokens per request: 11.58x
+```
+
+值得知道的时间差：最后一次**真实**生产 serve 作业（55085529，2026-08-06）跑的是 **131072**。生产
+`.env` 在 2026-08-08 20:49 改成 262144，服务 21:01 重启（在其之后），但从那时到这次探针之间没有任何
+serve 作业跑过，所以没有一条记录能显示新值生效。现在有了。（131072 换来 22.79x 并发，262144 是
+11.58x；KV 池大小两者几乎相同，而 11.58x 对一个实验室 console 远远够用。）
+
+另外顺带发现：那次真实 serve 跑在 `hpc3-gpu-l54-04` 上，`tensor_parallel_size=1`，而**整个代码库没有
+任何 tensor-parallel 支持**——今天就算申请多张卡，vLLM 也用不上。按指示未动。
+
+### free-gpu32 实测 2026-08-10
+
+4 台 RTX6000 节点（`hpc3-gpu-n54-00..03`）完全空闲，各 4×96 GB / 32 CPU / 257 GB；`--test-only` 对
+`gpu:RTX6000:4` 立即可调度。时限 **3 天**（我们 serve 默认只要 2 小时），`AllowQos=low,guest`（不传
+`--qos` 也能过），以及唯一的真风险——**`PreemptMode=CANCEL`**：被抢占的 serve 作业是直接杀掉，不是
+重排队。付费 `gpu` 分区是 `PreemptMode=OFF`，时限 14 天。
+
+## 2026-08-10 — DEG 这条线的工具之间接不上
+
+### 问题
+
+DEG 是实验室用得最多的流程，而它的三个步骤彼此对不上。这些都**不是模型的问题**——是工具之间的契约
+互相矛盾，而模型面对每一处矛盾时最合理的反应，恰好都让结果变得更糟。
+
+1. **`run_de` 表达不了条件对比。** 它调 `rank_genes_groups` 时不传 `reference`，所以只能做
+   one-vs-rest 的 **marker**。但协议里第 3 步（"每个细胞类型内 KO vs WT"）把它列为可选项。选了它，
+   会得到一张长得像 DEG、实际回答的是另一个问题的表。
+2. **`run_de` 硬性要求 `adata_clustered.h5ad`。** 而协议明确要求"已有细胞类型标签就复用、跳过聚类"
+   ——于是在协议自己写明的那条路径上，`run_de` 必然返回 `"run_clustering must run first"`。模型最自然
+   的下一步就是去补跑那个被明令跳过的聚类，之后 DE 变成按新簇做 one-vs-rest，整个研究悄悄变成了
+   marker 分析。
+3. **没有任何产出对比结果的东西，写的是 `run_enrichment` 会读的文件名。** 富集按
+   `tables/de_<key>_all.csv` 发现 DE 结果。`condition_by_celltype` 模板写的是
+   `tables/DEG/DEG_<ct>.csv`；**而 `run_pseudobulk_de`——SKILL.md v2 实际推荐的那个工具——写的是
+   `pseudobulk_all.csv`**。两个都发现不了。富集于是要么报错，要么退回 `args.genes` 的单个池化列表：
+   按细胞类型分层全丢；又因为没有 `_universe.txt`，ORA 背景退回 20000 的常数，所有富集 p 值系统性偏乐观。
+4. 还有两个小的：对比的**下调那一半从来进不了富集**（行按 score 排序，"取前 N 个显著的"只会留下上调），
+   以及 `run_de` 返回的图路径被硬编码成 `rank_genes_groups_leiden_de.png`——只要 `groupby` 不是 leiden
+   就指向一个不存在的文件，而这正是 Critic 用来做证据核对的指针。
+
+### 改了什么
+
+- `run_de` 新增 `reference`（对照组）、`stratify_by`（细胞类型列）、`groups`、`min_cells`、`padj`、
+  `lfc`。默认 `reference="rest"` 与原 marker 行为逐字节一致。走对比时会写完整的分组表、每组一张火山图、
+  `significant_by_group`（上调**和**下调计数）以及 `skipped_groups`（某一臂细胞数不够的细胞类型——这是
+  结论的一部分，不是实现细节）。
+- `run_de` 优先读 `adata_clustered.h5ad`，没有就读 `adata_qc.h5ad`。聚类现在只对真正无标签的数据才必需。
+- **统一一个 DE 契约**：所有产出方都写 `de_<key>_all.csv` + `de_<key>_universe.txt` +
+  `rank_<key>_<group>.rnk`。`run_pseudobulk_de` 和 `condition_by_celltype` 模板现在也写（pseudobulk
+  另加了 `score` 列＝t 统计量，表结构与 `run_de` 完全一致，富集端无需特判）。
+- `run_enrichment` 在表里同时存在两个方向时，把每组拆成 `(up)` / `(down)` 分别做 ORA
+  （`split_direction: false` 可关）。marker 表只有一个方向，行为不变。
+- 协议/技能文档跟着代码改：`PROTOCOL.md` 还整整落后 `SKILL.md` 一个版本（完全没提 pseudobulk 和重复
+  单位的论证）——已补，但只是手工补，不是重新生成。
+
+### 仍未解决
+
+- **`PROTOCOL.md` 并不是真的从 `SKILL.md` 生成的**，尽管它自己这么写。这次发现的漂移还会再发生。
+- 没有任何测试覆盖**规划器的选择**：现有测试证明的是工具能接上，不是 PI 会去传
+  `reference`/`stratify_by`。那需要一个规划层面的 eval。
+- `run_de` 和 `run_pseudobulk_de` 用同一个 `group_key` 时会写同一个 `de_<key>_all.csv`，后调用的覆盖
+  先调用的。这在方向上偏向 pseudobulk（更正确的检验），但它是一次覆盖，不是一个决策。
+## 2026-08-10（续）— agent 的 HPC3 shell、CPU worker、以及实验室共享包缓存
+
+接着下面那条 BYO-key 的记录。设计与完整理由见
+[`docs/byo_api_key_and_hpc_shell.md`](../../docs/byo_api_key_and_hpc_shell.md)。
+
+### 让 shell 成为可能的那个洞察
+
+RCIC 的规矩不是「禁止 wget」，而是**login node 只配用来登录和投作业**——这条线本仓库在 Temp
+清理器那里已经写死了。所以 Yijun 对 GPU 那个问题的回答（「连接时不给 GPU，给一个 CPU 节点」）
+恰好也让真正的 shell 变得合规：在一个你合法持有的节点上，wget / 解压 / 全文 grep 都是正常操作。
+边界于是变成**机械的**——看命令**在哪里**跑——而不是靠猜一份禁用命令名单。
+
+元数据（list_dir/stat_path/find_files/read_text/disk_usage）走 login node，完全不占分配；
+其余（run_shell/fetch_url/install_package）走常驻 CPU worker，用 `srun --jobid --overlap`，
+首次用到时才申请节点。刻意不做命令白名单——没有白名单可以写错。
+
+在这之前 Scientist **一个文件系统工具都没有**，唯一的出口是 `run_code`（Slurm 批作业），
+所以 `ls` 一下要排队几分钟。这很可能就是模型宁可瞎猜路径也不去看的原因。
+
+### HITL
+
+用 `RunState` 上**独立的** `confirm_event`，没有复用 plan 审批——两者可能在不同时刻同时等待，
+共用一个 event 会让对其中一个的回答顺带满足另一个。**没有接审批人时默认拒绝**：一道在无人可问
+时自动打开的闸门，恰恰在最需要它的无人值守部署里形同虚设。刻意**不**触发的情况：写到自己工作区内
+的绝对路径——在日常操作上频繁弹窗只会训练人闭眼点同意。
+
+### 共享包缓存（你提的第二件事）
+
+需求：沙箱能自己装缺的包，且每次安装都是**公共的**，没人重复装。
+
+难点在于 **HPC3 上「共享目录」不等于「共享文件」**——A 建的文件 B 改不了，这正是
+`hpc_gc.SHARED_SUBDIRS` 全部按用户分的原因。所以缓存做成**不可变**：每个包一个独立目录，用原子
+`mv -T` 发布，已发布的树此后再没有任何写入。跨用户所有权因此根本不构成问题。并发安装各自 stage，
+rename 失败就是仲裁结果——不用锁文件，因为并行文件系统上的建议锁不值得拿正确性去赌。
+
+值得指出的安全考量：共享 import 路径是**实验室成员之间的代码执行通道**。四道防线——镜像已有的模块
+拒绝发布、发布前剪掉冲突依赖、通过生成的 `sitecustomize` **追加**到 `sys.path`（直接用
+`PYTHONPATH` 会排在 site-packages **之前**，缓存里的依赖会盖过镜像自带的）、只接受纯 PyPI
+requirement。第三条是**跑出来验证的**而不是断言的：测试用真解释器跑一棵真的缓存树（里面塞了个
+`json.py`），再把**同一个文件**用普通 `PYTHONPATH` 跑一遍，证明那样确实会被劫持。
+
+测试时发现的问题：容器内 preamble 用的是裸 `python`，在只提供 `python3` 的镜像上会静默失效——已修成两个都试。
+
+### 状态
+
+已构建 + 202 个离线测试；全套 1325 passed。**所有跟集群相关的东西都没验证过**，依赖它之前必须在
+HPC3 上确认：
+
+* `srun --jobid --overlap` —— 整个 shell 的支点；能否共享 holder 的分配取决于 Slurm 版本和站点配置。
+* 免费 `standard` 分区分配得够不够快，让「延迟申请」感觉是瞬时的。
+* **`<shared_root>/pkgs` 到底能不能设成 group-writable** —— lab root 是 `drwxr-s--- ruic20`，
+  而且我们已经知道 `newgrp`/`sg` 没用。缓存假设在 `software/AiScientist` 下我们自己拥有的目录上
+  `chmod 2775` 是有效的。
+* `analysis.sif` 里带网络的 `pip install --target` 在计算节点上能不能跑通。
+
+全部 opt-in：`BIOAGENT_WORKER_NODE=1`。不开的话元数据工具照样能用，且不占任何资源。
+
+## 2026-08-10 — 用户可以自带 LLM API key；HPC3 shell 已设计
+
+### 这改变了什么
+
+HPC3 账号仍然必需 —— 是它在跑 Slurm 分析作业。现在交给用户选的是**哪个模型做推理、算谁的账**。
+完整决策和理由见 [`docs/byo_api_key_and_hpc_shell.md`](../../docs/byo_api_key_and_hpc_shell.md)。
+
+传输层本来就通了（`vllm_client.*` 全都接受 `base_url`/`api_key`）。缺的是「这是谁的 key」这个概念：
+`_lab_llm()` 读的是进程级 `BIOAGENT_LLM_*`，整台服务器一个值 —— README 自己写着这是
+"a test convenience, not the product path"。现在那条路降级为 fallback，产品路径是按用户的凭证。
+
+### Yijun 提的存储问题 —— 以后怎么换 key？
+
+**凭证 id 是稳定的，key 只是里面一个可轮换的字段。** 所有引用它的地方 —— 会话的端点选择、保存的偏好、
+正在跑的 run —— 指向的都是 `id`，所以换掉泄漏或过期的 key 不需要更新任何其他东西。
+
+**先验证后提交**：`rotate_key()` 接一个 `verify` 回调，在写入任何一个字节之前先拿**新** key 去验证。
+失败则存储的凭证纹丝不动，旧 key 继续可用。做成参数而不是约定，是为了让调用方无法「忘记」。
+这条就是为了避免用户真正害怕的状态：旧 key 已经丢了、新 key 又不工作、退不回去。
+
+key 在 **run 启动时解析一次**，所以跑到一半换 key 不会打断正在进行的分析，下一个 run 自动用新的。
+
+**静态加密按你说的做成可选**（`BIOAGENT_LLM_KEY_ENCRYPTION=1`，默认关，按行记标志）。它防的是
+文件级泄漏，防不了被攻陷的 gateway（后者必须能解密才能用 key），代价却是一个真实的失效模式：
+主密钥丢了，所有人重输。主密钥放独立的 0600 文件，**绝不进 `.env`** —— prod 的 `.env` 是 world-readable。
+
+### 数据出境 —— 真正的控制是知情同意，不是扫描器
+
+`LabLLM` 自己的注释早就写了：PI/Critic 的 payload（dataset profile、accepted findings、artifact
+digests）不过 `DataBoundaryGuard`。远程端点还只是运维覆盖项时这没问题；用户自带 key 之后它变成默认
+路径。现在补上：同意**按凭证**记录（信任自己的 vLLM ≠ 信任商业 API；loopback 不需要），每次出境的推理
+调用都过守卫作为事故兜底，`SECRET_PATTERNS` 扩到 `sk-*` 以外，technical report 的 Methods 里有一条
+确定性的 provenance 记录，以及只要选着远程端点就一直挂着的横幅。
+
+要说清楚边界：没有任何字符串扫描能判断一个基因列表或表型描述是否能识别出某个罕见病患者。
+只有懂这份数据的人能决定。
+
+### 顺手发现：`ssh_creds/` 没进 .gitignore
+
+`BIOAGENT_STATE_DIR` 默认是 `"."`，所以在 checkout 里跑 console 会把真实的 **SSH 私钥**丢在仓库根目录
+当未跟踪文件，离被 `git add -A` 提交只差一步。这个洞在本次工作之前就存在，是加并行的 `llm_creds/`
+存储时发现的。两个现在都进了 `.gitignore`。
+
+### 状态
+
+已构建并测试（105 个离线测试，全套 1215 passed）：凭证存储、provider 预设 + 四种失败原因的验证、
+路由、`_lab_llm` 改接 + 角色分流、出境层、UI。已经通过真实 console 对着一个 stub OpenAI 兼容端点端到端
+跑过 —— 错 key 报 `auth`、对 key 保存成功、轮换失败后旧 key 仍在、轮换成功后 id 不变。
+
+**未构建**：连接时用 CPU worker 取代 GPU、HPC3 shell/文件工具集、HITL 闸门。文档里已设计，需要真集群
+验证，因为 `srun --overlap` 的行为和免费 CPU 队列都是集群相关的。
+
+**未验证**：所有东西都没跑过真实 provider 账号或真实 HPC3。
 ## 2026-08-10 — 部署为什么要密码，以及 sync_deploy.sh 的六个 bug
 
 ### 从头到尾就不是凭证问题
@@ -100,6 +717,7 @@ Cmnd_Alias AISCIENTIST_SVC = /usr/bin/systemctl restart bioagent.service, \
 ```
 ssh -t <admin-ssh-alias> 'sudo systemctl restart bioagent && sleep 2 && systemctl is-active bioagent'
 ```
+
 
 ## 2026-08-08 — HPC3 过程文件搬到公共 `AiScientist/Temp`，每 3 天清理
 
@@ -630,6 +1248,43 @@ harness 在 session 目录的 `scratchpad/capture_baseline.py`，下次做同类
 持久化进 run_state，A2 resume 会丢，campaign 也无法中途恢复；（3）诱导出的技能没有任何审查、退休或
 "晋升进 `skills/`"的流程，库只会单调增长；（4）**这些都还没有在真实数据上跑过**，只有离线 harness 和
 那个单回合探针。
+
+## 2026-07-31 —— mmfatlas 503 已修复:5006 的 targetPort 补丁必须改回 5005
+
+**https://mmfatlas.<PUBLIC_HOSTNAME> 已恢复(HTTP 200,真正的 CELLxGENE 应用,8854 个细胞的
+MERFISH 数据集正常渲染)。** 改动是 **Texera 命名空间**里的一行、可回滚的编辑 —— 与 2026-07-02
+一样,仍是"帮一次,不接管"的范围。回滚方式:把 `targetPort` 改回 `5006`。
+
+Jin 报告服务挂了,并且从宿主机排查时发现既没有 CELLxGENE 的 Docker 镜像,也没有跑在 `mmfatlas`
+服务账号下的进程。**这两个观察都没错,但排查的层次不对** —— MMFatlas 根本不跑在宿主机上。它是
+一个 k8s Deployment,而且在**自己的 `mmfatlas` 命名空间**里(不是我们早前笔记里写的 `texera`):
+`mmfatlas-cellxgene`,镜像 `alirisheh876/eye-cellxgene`,由 **RKE2/containerd** 拉取。
+`sudo docker ps` / `docker images` 永远看不到它 —— 那台机器上唯一的 Docker daemon 只跑着 Texera
+的 buildx builder。同理也不会有以 `mmfatlas` 身份运行的宿主机进程:应用在容器里面。
+
+**真正的故障是我们自己的,是 2026-07-02 那个修复"过期"了。** 当时正在运行的容器(2026-04-08
+起一直没重启)监听在 **5006**,而 `mmfatlas-svc` 指向 5005,所以我把 `targetPort` 从 5005 改成了
+5006。**2026-07-30 21:16 UTC 该容器被 SIGKILL(exit 137,与它 2Gi 的内存上限吻合;事件已轮转,
+OOM 无法确证)**后重启成了一个全新容器 —— 而全新的 `eye-cellxgene` 启动在它的**默认端口 5005**
+(`[cellxgene] Launching! ... http://0.0.0.0:5005`,manifest 里也是 `containerPort: 5005`)。
+于是 Service 指着 5006、那里没人监听、endpoint 拒绝连接 → Envoy 返回 **503**。TLS、路由和证书
+自始至终都没问题:`mmfatlas-route` 是 `Accepted` + `ResolvedRefs`,InCommon 证书有效期到
+**2027-01-14**,而返回的是 503 而不是证书错误,这本身就是线索。
+
+动手前先验证:Pod `10.42.0.32:5005` → **200**,`:5006` → 连接被拒。随后把 `mmfatlas-svc` 的
+targetPort 从 5006 改为 **5005**,endpoint 变为 `10.42.0.32:5005`,公网 URL 连续三次探测
+从 503 变成 **200**。**5005 现在是长期正确的值** —— 它与 Texera 自己的 manifest/`containerPort`
+一致,所以不像 7 月那个补丁,这次能在他们重新部署后存活,他们也不需要再做任何对齐。
+
+**有意没有动、留给 Jin/Texera 决定的三件事:**
+- **`/data/mmfatlas`(root:mmfatlas,750)和 `mmfatlas` 服务账号目前都没被使用。** 该 Deployment
+  **既没有 `volumes` 也没有 `volumeMounts`** —— 没有任何东西挂到宿主机。Pod **每次重启都会把
+  `Chen_MERFISH_wt2_5_cellxgene.h5ad` 重新下载到容器的临时存储里**,所以在 UI 里创建的标注和
+  gene set 会随容器一起消失。如果建那个目录的本意是持久化存储,需要在 Texera 的 manifest 里加
+  hostPath/PVC。
+- **2Gi 的内存上限**很可能就是它被杀的原因;调大能减少复发(这个 Pod 已经重启 23 次)。
+- **明文 `http://mmfatlas...` 直接返回 200,而不是跳转 HTTPS**(aiscientist 是 301)。这属于
+  Texera 的路由配置,不是我们的。
 
 ## 2026-07-31 —— 计划终于能"长出来"了：假设驱动的探索
 
@@ -2788,6 +3443,9 @@ cert-manager ACME(删掉 `cert-manager.io/cluster-issuer` 注解 + 卡了 10 天
 targetPort 5005→5006(**在线改**;Texera 得在自己 manifest 里同步,否则重部署会退回)。他们的
 pod/app/数据和 `mmfatlas-route` 一概没动。给 Texera 的交接文件:
 `~/aiscientist-handoff/mmfatlas-texera-handoff.md`;私钥已在给 Jin 的移交包里。
+> **已被取代 —— 不要照这条用 5006。** 那个补丁后来过期,并在 2026-07-30 引发了第二次故障(容器被
+> SIGKILL,新容器起在默认的 5005,而 Service 还指着 5006)。长期正确的值是 **5005**,见上面
+> 2026-07-31 那条以及运维手册 [`deploy/mmfatlas-service.md`](../../deploy/mmfatlas-service.md)。
 
 ## 2026-07-01(早些)—— 公网域名 TLS 证书已签发并校验
 

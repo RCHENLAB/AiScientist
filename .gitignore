@@ -46,3 +46,11 @@ output/
 # Test/demo sample data (VCFs, case notes, run scripts) — not shipped, not deployed.
 # Kept out of git AND out of sync_deploy (see its EXCLUDE_PATTERNS).
 /sample_data/
+
+# Per-user secret stores written by the gateway when BIOAGENT_STATE_DIR is unset (it defaults
+# to "."), so running the console from a checkout drops them here. ssh_creds/ holds real PRIVATE
+# SSH KEYS and llm_creds/ holds real API keys — a `git add -A` from the repo root would otherwise
+# stage them. Ignored regardless of depth; in prod both live under BIOAGENT_STATE_DIR instead.
+ssh_creds/
+llm_creds/
+src/bioagent/gateway/_app_prefix_9d72d43.py

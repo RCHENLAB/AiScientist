@@ -43,6 +43,7 @@ def _analysis_tools() -> dict[str, Any]:
         "run_de": scrna_pack.run_de,
         "run_enrichment": scrna_pack.run_enrichment,
         "run_gsea_prerank": scrna_pack.run_gsea_prerank,
+        "run_depth_matched_de": scrna_pack.run_depth_matched_de,
         "run_doublet_detection": scrna_advanced.run_doublet_detection,
         "run_integration": scrna_advanced.run_integration,
         "run_pseudobulk_de": scrna_advanced.run_pseudobulk_de,

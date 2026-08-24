@@ -183,7 +183,12 @@ say "deploying ${BRANCH}@${SHA}  ->  ${SVC_USER}@${DEPLOY_SSH}:${APP_DIR}"
 EXCLUDE_PATTERNS=(
   'output/' 'work/' 'report-hero.jpeg' 'report-loop.jpeg' 'report-loop3.jpeg' 'Weixin Image_20260705170510_101_39.png'
   'tmp/' '.idea/' 'img.png' '_handoff_tmp.md'
-  '.git/' '.env' '*.db' '*.sqlite*' '.venv/' 'venv/' 'env/'
+  # '.git' has NO trailing slash on purpose: in a git WORKTREE it is a FILE holding
+  # `gitdir: <path>`, and the pattern '.git/' matches only a directory — so the file rode
+  # along on every deploy and left the server with a `gitdir:` pointing at whichever laptop
+  # worktree last shipped. That is what makes `git -C $APP_DIR` fatal and why .deployed_sha
+  # (written below) is the marker to trust. Excluding both forms stops it recurring.
+  '.git' '.env' '*.db' '*.sqlite*' '.venv/' 'venv/' 'env/'
   '__pycache__/' '*.pyc' 'runs/' '.adaptive_kg/' 'node_modules/'
   # '.claude/worktrees/' holds full nested worktree checkouts (a per-feature copy of the whole repo);
   # without this they get rsynced into the prod app dir — bloating every deploy and, absent --delete,

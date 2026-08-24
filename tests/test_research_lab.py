@@ -402,7 +402,8 @@ def test_pi_plan_guard_collapses_duplicate_literature_steps():
         if "Principal Investigator of a bioinformatics lab" in sys:
             return json.dumps({"agenda": [
                 "literature_search",
-                "Literature search for Search DDX41 retina Return citations evidence",
+                "**Literature grounding** — Search the literature with `deep_literature` for DDX41 "
+                "in the retina and attach DOI-backed citations.",
             ]})
         raise AssertionError("only planning should run")
 
@@ -414,7 +415,10 @@ def test_pi_plan_guard_collapses_duplicate_literature_steps():
     )
 
     assert kind == "agenda"
-    assert agenda == ["Literature search for DDX41 retina"]
+    # Duplicates collapse to ONE literature step, and it is the PI's OWN sentence — the guard no
+    # longer overwrites the planner's wording with a string template.
+    assert agenda == ["**Literature grounding** — Search the literature with `deep_literature` for "
+                      "DDX41 in the retina and attach DOI-backed citations."]
 
 
 def test_literature_context_step_is_deterministically_routed_to_literature_search():

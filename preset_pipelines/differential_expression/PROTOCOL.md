@@ -17,7 +17,7 @@ that).
 |---|---|
 | **Input** | one scRNA-seq AnnData whose `obs` has a **2-group condition column** (+ ideally an existing cell-type / cluster label column) |
 | **Output** | per-cell-type DE tables (logFC + adjusted p), per-cell-type enrichment, a DEG-count summary table, volcano plots, shared up/down-regulated heatmaps, enrichment bar plots |
-| **Engine** | `scanpy` (`rank_genes_groups`) driven by `run_scanpy_qc` / `run_clustering` / `run_de` / `run_enrichment`, with the per-cell-type contrast run via `run_code` |
+| **Engine** | `scanpy` (`rank_genes_groups`) driven by `run_scanpy_qc` / `run_de` (`reference=` + `stratify_by=`) / `run_enrichment`; `run_clustering` only when the data has no labels |
 | **Not for** | assigning / predicting cell-type labels (use the `celltype_annotation` pipeline instead) |
 
 > **How to read the "parameters" in each step.** Two kinds of knob feed these tools, and this protocol
@@ -39,7 +39,7 @@ that).
 |---|------|--------------|----------------------------|--------|
 | 1 | **QC the cells** | `run_scanpy_qc` | filter thresholds, HVG *(agent-chosen per study)* | filtered + normalized AnnData, reported counts |
 | 2 | **Define the comparison** | *(planning, from DATASET PROFILE)* · `run_clustering` **only if no labels** | condition column, reference group, cell-type column | named contrast + stratification |
-| 3 | **Per-cell-type DE** | `run_de` / `run_code` (template `condition_by_celltype.py`) | condition-vs-**reference** contrast, per-cell-type groupby | per-cell-type DEG tables |
+| 3 | **Per-cell-type DE** | `run_de` with `reference=` + `stratify_by=` | condition-vs-**reference** contrast, cell-type column, `min_cells` | per-cell-type DEG tables + volcanoes |
 | 4 | **Pathway enrichment** | `run_enrichment` | up- & down-gene sets per cell type (SYMBOLS) | enrichment per cell type |
 | 5 | **Cross-cell-type synthesis** | *(report from Step-3 tables)* | — | shared vs cell-type-specific signatures |
 | 6 | **Figures / tables** | `run_code` (adapt template) | *(adapt template)* | DEG-count table, volcano, heatmaps, enrichment bars |
@@ -117,36 +117,49 @@ already existed.
 <details>
 <summary><b>Step 3 · Per-cell-type differential expression</b> — condition vs reference, within each cell type</summary>
 
+**First, pick the test from the DESIGN.** A condition contrast is a statement about the CONDITION, so the
+unit of replication is the **sample** (donor / animal / library), never the cell. With **≥2 samples per
+arm**, use **`run_pseudobulk_de`** (`sample_key`, `condition_key`, `group_key` = the cell-type column) — a
+Wilcoxon test over cells treats cells from one donor as independent observations of that donor's condition
+and its p-values are anti-conservative by orders of magnitude. With **1 sample per arm** there is no valid
+p-value for the condition at all: say so, and treat what follows as an exploratory ranking.
+
 **What.** For **EACH** cell type that has enough cells in **BOTH** groups, run condition-vs-reference DE.
-Because `run_de` is per-cluster **one-vs-rest**, this stratified condition-vs-control comparison is done by
-adapting the reference template `condition_by_celltype.py` via `run_code`: scanpy `rank_genes_groups` with
-an **explicit `reference`**, looped over cell types. **Skip / flag** any cell type with too few cells in
-either group — small groups give unstable DE, so say so and don't over-interpret.
+For the no-replicate / exploratory case `run_de` does this directly — pass `reference` (the control level)
+instead of accepting the one-vs-rest default, and `stratify_by` (the cell-type column) to run the contrast
+within each cell type. Either tool **skips and reports** cell types with too few cells in an arm
+(`skipped_groups`) rather than silently dropping them.
 
 **Why.** A whole-dataset DE would confound cell-type composition with the condition effect; stratifying by
-cell type isolates the per-lineage response.
+cell type isolates the per-lineage response. Leaving `reference` at its default gives *markers*
+(one-vs-rest) — a different question that looks superficially like a DEG table.
 
-**🔬 Agent-chosen:** the condition-vs-**reference** contrast and the per-cell-type groupby (carried from
-Step 2). The per-cell-type minimum-cell cutoff for skipping is a judgement call *(agent-chosen per study)*.
+**🔬 Agent-chosen:** the condition-vs-**reference** contrast and the cell-type column (both carried from
+Step 2). The per-cell-type minimum-cell cutoff (`min_cells`, default 30) is a judgement call
+*(agent-chosen per study)*.
 
-**⚙️ Fixed infra.** **Memory discipline** for the loop: load the AnnData **ONCE**, and inside the
-per-cell-type loop subset with a **view** (`adata[mask]`) — do **NOT** `adata[mask].copy()` every cell type,
-and do not hold all subsets at once. On the local sandbox an over-budget loop is **OOM-killed**
-(`returncode == -9`); prefer `BIOAGENT_RUN_CODE_ON_HPC=1` (see `skills/README.md`) for a real `--mem` cap on
-large datasets.
-
-**What runs** — the `run_code` tool call adapting the template:
+**What runs** — the `run_de` tool call:
 ```
-run_code( adapt template condition_by_celltype.py )
-  # for each value of <cell-type column>:
-  #   sc.tl.rank_genes_groups(adata[mask], groupby=<condition column>, reference=<control group>)
-  # load AnnData ONCE; subset with a VIEW adata[mask] (never .copy() per cell type)
-  # skip / flag any cell type with too few cells in EITHER group
+run_de(groupby=<condition column>, reference=<control group>, stratify_by=<cell-type column>,
+       min_cells=30)
+  # writes tables/de_<cell-type column>_all.csv (BOTH directions), one table + volcano per cell
+  # type, the tested universe, and .rnk files for run_gsea_prerank
 ```
+This reads `adata_qc.h5ad` when there is no clustering checkpoint, so a dataset that already carries
+labels needs **only** Step 1 — do not add a clustering step to satisfy it.
 
-**✅ Verify this step:** the comparison is condition-vs-**reference** (not one-vs-rest) · it is run
-**separately within each cell type** · cell types with too few cells in either group are listed as
-skipped/flagged, not silently dropped or over-interpreted · results carry **logFC + adjusted p-values**.
+**Fall back to `run_code`** (template `condition_by_celltype.py`) only for a design the tool cannot
+express — a paired/covariate-adjusted comparison, or a custom shared-signature rule. If you do,
+**keep the template's `de_<cell-type column>_all.csv` + `_universe.txt` writes**: Step 4 discovers DE
+results by those exact names. **⚙️ Memory discipline** for that loop: load the AnnData **ONCE** and subset
+with a **view** (`adata[mask]`), never `.copy()` per cell type. On the local sandbox an over-budget loop is
+**OOM-killed** (`returncode == -9`); prefer `BIOAGENT_RUN_CODE_ON_HPC=1` (see `skills/README.md`) for a real
+`--mem` cap on large datasets.
+
+**✅ Verify this step:** the result's `comparison` field names the condition, the **reference**, and the
+stratification column · `reference` is NOT `"rest"` · `significant_by_group` reports **both** up and down
+counts · `skipped_groups` (if any) is carried into the report as cell types the contrast did not cover ·
+results carry **logFC + adjusted p-values**.
 
 <sub>Source: SKILL.md "Ordered plan" §3 · `run_de` · template `skills/condition_by_celltype/reference.py`</sub>
 </details>
@@ -154,22 +167,26 @@ skipped/flagged, not silently dropped or over-interpreted · results carry **log
 <details>
 <summary><b>Step 4 · Pathway enrichment per cell type</b></summary>
 
-**What.** Run `run_enrichment` on the **up-** and **down-**regulated gene sets of each cell type. Send gene
-**SYMBOLS only**.
+**What.** Call `run_enrichment` with **no `genes` argument**. It finds Step 3's `de_<key>_all.csv` itself
+and runs ORA per cell type, splitting each into its **up-** and **down-**regulated halves.
 
 **Why.** Enrichment turns each cell type's changed-gene list into interpretable pathways — computed per
-cell type so the biology stays lineage-specific.
+cell type so the biology stays lineage-specific, and per direction so an up-regulated and a
+down-regulated programme cannot cancel each other into "nothing enriched".
 
-**🔬 Agent-chosen:** the up/down gene sets per cell type (derived from Step 3); the enrichment gene sets
-*(agent-chosen per study)*.
+**🔬 Agent-chosen:** the enrichment gene sets *(agent-chosen per study)*. The gene lists are **not**
+agent-chosen — they come from the Step-3 table.
 
 **What runs** — the `run_enrichment` tool call:
 ```
-run_enrichment(...)   # per cell type, on its up- and down-regulated SYMBOL lists
+run_enrichment()   # discovers tables/de_<key>_all.csv; ORA per cell type × direction
 ```
+**Do NOT paste a pooled gene list into `genes`** — that collapses every cell type into one `input` group
+and drops the tested-universe background, which inflates every p-value.
 
-**✅ Verify this step:** enrichment is run per cell type on the up- and down-regulated sets separately ·
-inputs are gene **symbols** · reported pathways trace back to the DE gene lists from Step 3.
+**✅ Verify this step:** the returned `groups` name each cell type with `(up)` / `(down)` (or the result
+says why not) · `background_source` is `tested_universe`, **not** `constant_fallback` · reported pathways
+trace back to the DE gene lists from Step 3.
 
 <sub>Source: `run_enrichment` · SKILL.md "Ordered plan" §4</sub>
 </details>
@@ -223,10 +240,11 @@ as **hypotheses to validate**, not established fact.
 
 ## Method provenance
 
-scanpy `rank_genes_groups` (per-cell-type condition-vs-reference), driven by `run_scanpy_qc` /
-`run_clustering` / `run_de` / `run_enrichment`, with the stratified contrast and figures run via `run_code`
-adapting `skills/condition_by_celltype/reference.py`. On large datasets the per-cell-type loop runs with a
-real `--mem` cap under `BIOAGENT_RUN_CODE_ON_HPC=1` (see `skills/README.md`).
+scanpy `rank_genes_groups` (per-cell-type condition-vs-reference), driven by `run_scanpy_qc` / `run_de`
+(`reference=` + `stratify_by=`) / `run_enrichment`; `run_clustering` only for unlabeled data. Designs the
+tool cannot express fall back to `run_code` adapting `skills/condition_by_celltype/reference.py`, and on
+large datasets that loop runs with a real `--mem` cap under `BIOAGENT_RUN_CODE_ON_HPC=1` (see
+`skills/README.md`).
 
 <sub>This protocol renders `preset_pipelines/differential_expression/SKILL.md` — regenerate to keep it in
 step with the skill.</sub>

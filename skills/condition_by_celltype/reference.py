@@ -1,14 +1,23 @@
 """Reference template — condition-vs-control differential expression, STRATIFIED BY CELL TYPE.
 
+PREFER THE TOOL. `run_de(groupby=<condition col>, reference=<control level>,
+stratify_by=<cell-type col>)` now performs exactly this comparison, writes the tables
+`run_enrichment` and `run_gsea_prerank` discover, and reports skipped cell types — with none of the
+adaptation risk of a hand-edited script. Use this template only for something the tool does NOT do
+(a paired/covariate design, a custom shared-signature rule, a non-standard figure).
+
 The pattern behind a KO-vs-WT (or disease-vs-control) report: for each cell type, compare the
 condition group against the reference group and collect the changed genes, then look for a shared
-cross-cell-type signature. The curated `run_de` tool does per-cluster one-vs-rest DE; this template
-covers the stratified condition-vs-reference comparison via scanpy `rank_genes_groups` with an
-explicit `reference`, looped over an existing cell-type label column.
+cross-cell-type signature.
 
-ADAPT the five CONFIG values to columns/levels that exist in adata.obs (the DATASET PROFILE in your
+ADAPT the CONFIG values to columns/levels that exist in adata.obs (the DATASET PROFILE in your
 planning brief lists them). Everything else is generic. Writes per-cell-type DE tables, a summary
 table, shared up/down gene lists, and a volcano per cell type; prints a JSON summary for the report.
+
+It ALSO writes the canonical hand-off files `tables/de_<CELLTYPE_KEY>_all.csv` and
+`tables/de_<CELLTYPE_KEY>_universe.txt`. Do not drop those: `run_enrichment` discovers DE results by
+that exact name, and without them it falls back to a single pooled gene list (losing the per-cell-
+type stratification) and to a constant 20000-gene ORA background (inflating every p-value).
 """
 import json
 import os
@@ -50,6 +59,7 @@ if not {CONDITION, REFERENCE} <= groups:
     raise SystemExit(f"{CONDITION!r}/{REFERENCE!r} not in {CONDITION_KEY} values {sorted(groups)}")
 
 summary_rows, up_by_ct, down_by_ct = [], {}, {}
+canonical_rows, universe = [], set()   # the run_enrichment / run_gsea_prerank hand-off
 
 for ct in [str(c) for c in adata.obs[CELLTYPE_KEY].cat.categories] if hasattr(
         adata.obs[CELLTYPE_KEY], "cat") else sorted(set(adata.obs[CELLTYPE_KEY].astype(str))):
@@ -71,6 +81,15 @@ for ct in [str(c) for c in adata.obs[CELLTYPE_KEY].cat.categories] if hasattr(
     up = sig[sig["logfoldchanges"] > 0]["names"].tolist()
     down = sig[sig["logfoldchanges"] < 0]["names"].tolist()
     up_by_ct[ct], down_by_ct[ct] = set(up), set(down)
+
+    # Canonical hand-off rows: the `group` column is the CELL TYPE (what enrichment stratifies by),
+    # and BOTH directions go in — a selection rule that keeps only the top of a score-ordered list
+    # would silently drop every down-regulated gene.
+    universe.update(res["names"].tolist())
+    for _, r in sig.iterrows():
+        canonical_rows.append({"group": ct, "gene": r["names"],
+                               "log2fc": float(r["logfoldchanges"]), "pval": float(r["pvals"]),
+                               "pval_adj": float(r["pvals_adj"]), "score": float(r["scores"])})
     summary_rows.append({"celltype": ct, "n_condition": n_cond, "n_reference": n_ref,
                          "n_DEG": len(sig), "n_up": len(up), "n_down": len(down), "skipped": ""})
 
@@ -87,6 +106,13 @@ for ct in [str(c) for c in adata.obs[CELLTYPE_KEY].cat.categories] if hasattr(
     plt.savefig(fdir / f"volcano_{ct}.png", dpi=150); plt.close()
 
 pd.DataFrame(summary_rows).to_csv(art / "tables" / "DEG_summary.csv", index=False)
+
+# The names run_enrichment / run_gsea_prerank look for. Keep them EXACTLY as written.
+pd.DataFrame(canonical_rows,
+             columns=["group", "gene", "log2fc", "pval", "pval_adj", "score"]).to_csv(
+    art / "tables" / f"de_{CELLTYPE_KEY}_all.csv", index=False)
+(art / "tables" / f"de_{CELLTYPE_KEY}_universe.txt").write_text(
+    "\n".join(sorted(universe)) + "\n", encoding="utf-8")
 
 # Shared signature: genes changed in the SAME direction in >= 2 cell types.
 def _shared(d):
@@ -106,5 +132,7 @@ print(json.dumps({
     "per_celltype": summary_rows,
     "n_shared_up": len(shared_up), "n_shared_down": len(shared_down),
     "shared_up_top": shared_up[:20], "shared_down_top": shared_down[:20],
-    "next": "run_enrichment on each cell type's up/down gene SYMBOLS",
+    "de_table": f"tables/de_{CELLTYPE_KEY}_all.csv",
+    "next": ("call run_enrichment with NO `genes` argument — it reads "
+             f"tables/de_{CELLTYPE_KEY}_all.csv and runs ORA per cell type, per direction"),
 }, indent=2))

@@ -16,10 +16,11 @@ from bioagent.gateway.scgpt_job import (
     scgpt_job_name,
 )
 from bioagent.gateway.slurm_job import AcquireConfig, RunConfig, SlurmJobError
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
-IN = "/dfs3b/ruic20_lab/runs/u1/query_aligned.h5ad"
-MODEL = "/dfs3b/ruic20_lab/software/bioagent/scgpt/reference_model"
-OUT = "/dfs3b/ruic20_lab/runs/u1/scgpt_out"
+IN = f"{LAB_STORAGE}/runs/u1/query_aligned.h5ad"
+MODEL = f"{LAB_STORAGE}/software/bioagent/scgpt/reference_model"
+OUT = f"{LAB_STORAGE}/runs/u1/scgpt_out"
 
 
 class FakeScgptHost:
@@ -100,7 +101,7 @@ def test_build_scgpt_script_is_a_contained_gpu_job():
     assert "--nv" in script
     # Contained: model + the dataset's directory are read-only; only out_dir is writable.
     assert f"-B {MODEL}:{MODEL}:ro" in script
-    assert "/dfs3b/ruic20_lab/runs/u1:/dfs3b/ruic20_lab/runs/u1:ro" in script
+    assert f"{LAB_STORAGE}/runs/u1:/dfs3b/ruic20_lab/runs/u1:ro" in script
     assert f"-B {OUT}:{OUT}" in script and f"{OUT}:{OUT}:ro" not in script
     assert "--containall" in script and "--network none" in script
     # Entry command got --input/--model/--out and runs the scGPT image.

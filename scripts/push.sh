@@ -65,7 +65,11 @@ for arg in "$@"; do
 done
 
 # --- build the ssh transport (port + optional key) ---------------------------
-SSH_CMD="ssh -p $REMOTE_PORT"
+# Keepalives: --checksum reads every file on BOTH ends, so a full push holds one SSH session
+# open far longer than an interactive command. On a link that stalls, that session dies and
+# rsync exits 12 ("unexpected end of file") after having already transferred part of the tree —
+# a half-deployed server. The keepalives detect the stall in 30s instead of hanging on it.
+SSH_CMD="ssh -p $REMOTE_PORT -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
 [ -n "$SSH_KEY" ] && SSH_CMD="$SSH_CMD -i $SSH_KEY"
 
 DEST="${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_APP}/"
@@ -86,7 +90,12 @@ RSYNC_FILTERS=(
   # ship exactly what git tracks (per-dir .gitignore merge):
   --filter=':- .gitignore'
   # explicit excludes (cheap insurance; most are already in .gitignore):
-  --exclude='.git/'
+  # No trailing slash: in a git WORKTREE, `.git` is a FILE holding `gitdir: <path>`, and
+  # `.git/` matches only a directory — so the file was copied to the server every push. That is
+  # how production ended up with a `.git` pointing at `…/.git/worktrees/<branch>` on a laptop:
+  # `git` there fails with "not a repository", and prod has had no way to report its own version
+  # since. Matching both forms keeps the server's version provenance out of rsync's hands.
+  --exclude='.git'
   --exclude='.venv/'
   --exclude='__pycache__/'
   --exclude='*.py[cod]'
@@ -105,6 +114,11 @@ RSYNC_OPTS=(
   --checksum      # "hash overwrite": compare by content, not mtime/size
   --human-readable
   --itemize-changes
+  # A dropped link mid-push leaves the server half-updated, which is worse than either end
+  # state. --partial keeps what arrived so a re-run resumes instead of restarting, and
+  # --timeout turns a silently wedged socket into an error the caller can retry.
+  --partial
+  --timeout=120
 )
 [ "$DO_DELETE" = "1" ] && RSYNC_OPTS+=( --delete )
 

@@ -65,10 +65,16 @@ class VlReviewResult:
         return {"job": self.job.as_dict(), "review_json": self.review_json, "review": self.review}
 
 
-def build_vlreview_command(settings: HPCSettings, *, pdf: str, model_dir: str, out_dir: str) -> str:
-    """The in-container review command, fed --pdf/--model/--out (all quoted)."""
+def build_vlreview_command(settings: HPCSettings, *, pdf: str, model_dir: str, out_dir: str,
+                           source_dir: str | None = None) -> str:
+    """The in-container review command, fed --pdf/--model/--out (all quoted). With ``source_dir``
+    (the synced bioagent source on dfs3b) the LIVE reviewer ``bioagent.tools.vlreview_run`` runs
+    instead of the copy baked into the image — a detector added in the repo reaches production on
+    the next code sync, no image rebuild (the analysis line's pattern)."""
+    entry = (f"env PYTHONPATH={shlex.quote(source_dir)} python -m bioagent.tools.vlreview_run"
+             if source_dir else settings.vlreview_entrypoint)
     return (
-        f"{settings.vlreview_entrypoint} "
+        f"{entry} "
         f"--pdf {shlex.quote(pdf)} "
         f"--model {shlex.quote(model_dir)} "
         f"--out {shlex.quote(out_dir)} "
@@ -83,19 +89,21 @@ def build_vlreview_script(
     pdf: str,
     model_dir: str,
     out_dir: str,
+    source_dir: str | None = None,
 ) -> str:
     """Build the ``gpu:1`` sbatch script: a ``singularity exec --nv`` of the vlreview image
     with the rendered report + VL weights bound **read-only** and only ``out_dir`` writable.
     ``gres`` comes from ``settings.vlreview_gres`` so this pins a cheap 24GB card, not an A100."""
     import os.path
 
-    inner = build_vlreview_command(settings, pdf=pdf, model_dir=model_dir, out_dir=out_dir)
+    inner = build_vlreview_command(settings, pdf=pdf, model_dir=model_dir, out_dir=out_dir,
+                                   source_dir=source_dir)
     contained = singularity_exec(
         settings.vlreview_image,
         inner,
-        # The rendered pdf's directory + the VL weights are read-only; the job can never
-        # modify the report it is auditing. Only out_dir (review.json + page PNGs) is writable.
-        binds_ro=(os.path.dirname(pdf) or "/", model_dir),
+        # The rendered pdf's directory + the VL weights (+ the live source) are read-only; the
+        # job can never modify the report it is auditing. Only out_dir is writable.
+        binds_ro=tuple(p for p in (os.path.dirname(pdf) or "/", model_dir, source_dir) if p),
         binds_rw=(out_dir,),
         nv=True,            # GPU passthrough
         network=False,      # weights are local; no network inside the container
@@ -129,6 +137,7 @@ def run_vlreview(
     acquire: AcquireConfig | None = None,
     run: RunConfig | None = None,
     emit: EmitFn | None = None,
+    source_dir: str | None = None,
 ) -> VlReviewResult:
     """Submit + supervise the render-review GPU batch job, then read ``review.json`` back and
     return it parsed. Raises :class:`SlurmJobError` if the job does not complete or writes no
@@ -136,7 +145,8 @@ def run_vlreview(
     ``out_dir`` must be writable."""
     name = job_name or vlreview_job_name(executor.username)
     model = model_dir or settings.vlreview_model_dir
-    script = build_vlreview_script(settings, job_name=name, pdf=pdf, model_dir=model, out_dir=out_dir)
+    script = build_vlreview_script(settings, job_name=name, pdf=pdf, model_dir=model, out_dir=out_dir,
+                                   source_dir=source_dir)
     spec = SlurmJobSpec(script=script, job_name=name)
     result = run_batch_job(executor, spec, acquire=acquire, run=run, emit=emit)
     if not result.completed:

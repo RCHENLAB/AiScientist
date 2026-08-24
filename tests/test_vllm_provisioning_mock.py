@@ -17,14 +17,15 @@ import base64
 from bioagent.gateway import gpu
 from bioagent.gateway.mock_host import MockExecutor
 from bioagent.gateway.settings import HPCSettings
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 def _vllm_settings() -> HPCSettings:
     return HPCSettings(
         llm_backend="vllm",
-        vllm_image="/dfs3b/ruic20_lab/software/bioagent/containers/vllm.sif",
+        vllm_image=f"{LAB_STORAGE}/software/bioagent/containers/vllm.sif",
         vllm_model="QuantTrio/Qwen3.6-35B-A3B-AWQ",
-        hf_home="/dfs3b/ruic20_lab/software/bioagent/hf",
+        hf_home=f"{LAB_STORAGE}/software/bioagent/hf",
     )
 
 

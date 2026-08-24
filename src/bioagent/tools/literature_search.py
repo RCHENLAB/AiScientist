@@ -19,6 +19,24 @@ _EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9-]*")
 _QUERY_MAX_WORDS = 18
+# All-caps tokens that are methods/formats, not biology (kept in sync with research_lab's list).
+_BRIEF_NOT_ENTITIES = {
+    "WT", "KO", "DE", "QC", "PCA", "UMAP", "GO", "RNA", "DNA", "PDF", "CSV", "OK", "AND", "OR",
+    "THE", "VCF", "VEP", "PASS", "GRCH37", "GRCH38", "HG19", "HG38", "BAM", "FASTQ", "H5AD", "TSV",
+    "JSON", "API", "REST", "HPC", "GPU", "CPU", "LLM", "AI", "ORA", "GSEA", "FDR", "BH", "HVG",
+    "MT", "SNP", "SNV", "INDEL", "CNV", "SV", "CADD", "REVEL", "SPLICEAI", "CLINVAR", "GNOMAD",
+    "OMIM", "HPO", "ACMG", "DOI", "PMID", "PUBMED", "SCVI", "SCGPT", "SEURAT", "SCANPY", "DESEQ2",
+    "EDGER", "LIMMA", "IRD", "WGS", "WES", "NES", "LOG2FC", "LFC",
+    # all-caps INSTRUCTION words the harness or a planner writes into a brief ("Do ONLY this
+    # task"); a real one of these reached Europe PMC as "DDX41 ONLY splicing retinal" -> 0 hits
+    "ONLY", "NOT", "DO", "MUST", "NEVER", "ALWAYS", "ALL", "ANY", "EACH", "EVERY", "TRUE",
+    "FALSE", "NONE", "NULL", "NOTE", "TBD", "IMPORTANT", "REQUIRED", "STRICTLY", "EXACT",
+    "EXACTLY", "FIRST", "LAST", "BEFORE", "AFTER", "WITH", "WITHOUT", "USE", "USING", "RUN",
+    "SEE", "ABOVE", "BELOW", "THIS", "THAT", "THESE", "THOSE", "FROM", "INTO", "ONTO", "PER",
+}
+_BRIEF_FUNCTION_WORDS = {"against", "known", "using", "within", "between", "across", "toward",
+                         "through", "under", "above", "below", "while", "where", "which",
+                         "their", "these", "those", "there", "other", "every", "about"}
 _QUERY_MAX_CHARS = 180
 #throw a series of garbage words
 _QUERY_STOPWORDS = {
@@ -105,6 +123,31 @@ def focus_literature_query(question: str) -> str:
         return q
 
     text = q
+    # A pasted STEP BRIEF ("**Reconciliation …** — Cross-reference the bootstrap-stabilized … using
+    # `literature_search` …") is not a query. Europe PMC ANDs every term, so the 10-word residue of a
+    # brief returns nothing (measured: 0 hits, the Critic then scored the step 0.2). When the text
+    # is brief-shaped — a bold title, backticked tool names, or very long — search on the ENTITIES
+    # it names (gene/protein symbols) plus at most two adjacent content words instead.
+    brief_shaped = text.startswith("**") or "`run_" in text or "`literature" in text
+    if brief_shaped:
+        stripped = re.sub(r"`[^`]*`|\*\*[^*]*\*\*", " ", text)
+        ents: list[str] = []
+        for m in re.finditer(r"\b(?:[A-Z][A-Za-z0-9-]*\d[A-Za-z0-9-]*|[A-Z]{2,}[A-Za-z0-9-]*"
+                             r"|[A-Z][a-z]{2,}\d+[a-z0-9]*)\b", stripped):
+            t = m.group(0).strip("-")
+            if len(t) >= 3 and t.upper() not in _BRIEF_NOT_ENTITIES and t not in ents:
+                ents.append(t)
+        if ents:
+            near: list[str] = []
+            toks = _WORD.findall(stripped)
+            pos = {i for i, w in enumerate(toks) if w.strip("-") in ents}
+            for i, w in enumerate(toks):
+                lw = w.lower().strip("-")
+                if (w.islower() and len(lw) >= 5 and lw not in _QUERY_STOPWORDS
+                        and lw not in _BRIEF_FUNCTION_WORDS
+                        and any(abs(i - e) <= 2 for e in pos) and lw not in near):
+                    near.append(lw)
+            return " ".join([*ents[:3], *near[:2]])
     about = re.search(r"(?i)\babout\s+(.+)", text)
     if about:
         text = about.group(1)

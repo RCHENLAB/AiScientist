@@ -18,6 +18,7 @@ from bioagent.agents.research_lab import LabResult, LabRound  # noqa: E402
 from bioagent.agents.research_lab import CriticVerdict  # noqa: E402
 from bioagent.gateway import app as gw_app  # noqa: E402
 from bioagent.tools.hpo_terms.mapper import make_hpo_mapping_tool  # noqa: E402
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 class _Ctx:
@@ -50,7 +51,7 @@ def test_an_over_long_note_is_truncated_not_rejected():
 def test_the_request_carries_a_note_without_touching_the_dataset_slot():
     """The whole point: the note rides alongside the dataset, it does not compete for the slot."""
     req = gw_app.LabRequest(connection_id="c", question="q",
-                            dataset_path="/dfs3b/ruic20_lab/u/uploads/case.vcf.gz",
+                            dataset_path=f"{LAB_STORAGE}/u/uploads/case.vcf.gz",
                             case_note="夜盲，视野缩窄")
     assert req.dataset_path.endswith("case.vcf.gz")      # the VCF still owns the dataset slot
     assert req.case_note == "夜盲，视野缩窄"

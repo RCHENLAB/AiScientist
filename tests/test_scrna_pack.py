@@ -15,6 +15,8 @@ from __future__ import annotations
 import builtins
 import types
 
+import pytest
+
 from bioagent.tools import scrna_pack
 
 
@@ -29,7 +31,9 @@ def test_catalog_shape_matches_harness_tools():
     cat = scrna_pack.scrna_catalog()
     names = [t.name for t in cat]
     assert names == ["run_scanpy_qc", "run_clustering", "run_de", "run_enrichment",
-                     "run_gsea_prerank",
+                     # the depth-matched check: a tool, because three models could not write it
+                     # as ad-hoc code (see tests/test_depth_matched_de.py)
+                     "run_depth_matched_de", "run_gsea_prerank",
                      # the steps the line was missing (tools/scrna_advanced)
                      "run_doublet_detection", "run_integration", "run_pseudobulk_de",
                      "run_composition", "run_marker_annotation"]
@@ -87,7 +91,7 @@ def _install_fake_gseapy(monkeypatch, cap):
     def _enrich(gene_list, gene_sets, background=None, outdir=None, verbose=False):
         cap.update(gene_sets=gene_sets, background=background, n_genes=len(gene_list))
         return types.SimpleNamespace(results=_Res([
-            {"Term": "regulation of synaptic signaling", "Gene_set": "GO_Biological_Process_2023",
+            {"Term": "regulation of synaptic signaling", "Gene_set": "TestPathways",
              "Adjusted P-value": 0.002, "Combined Score": 14.5, "Overlap": "4/60"}]))
 
     fake = types.ModuleType("gseapy")
@@ -100,7 +104,7 @@ def test_enrichment_runs_offline_against_local_gmt(tmp_path, monkeypatch):
     # A local GMT + a DE table -> gp.enrich is called with the LOCAL .gmt path (no network).
     gdir = tmp_path / "genesets"
     gdir.mkdir()
-    (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tGRIA4\tDLGAP1\n", encoding="utf-8")
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tGRIA4\tDLGAP1\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
@@ -111,12 +115,12 @@ def test_enrichment_runs_offline_against_local_gmt(tmp_path, monkeypatch):
     _install_fake_gseapy(monkeypatch, cap)
 
     out = scrna_pack.run_enrichment(
-        {"gene_sets": ["GO_Biological_Process_2023"], "background": 18000}, _ctx(tmp_path))
+        {"gene_sets": ["TestPathways"], "background": 18000}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
-    assert out["gene_sets"] == ["GO_Biological_Process_2023"]
+    assert out["gene_sets"] == ["TestPathways"]
     assert out["top_terms_by_group"]["0"] == ["regulation of synaptic signaling"]
-    assert cap["gene_sets"] == [str(gdir / "GO_Biological_Process_2023.gmt")]   # local file, not a URL
+    assert cap["gene_sets"] == [str(gdir / "TestPathways.gmt")]   # local file, not a URL
     assert cap["background"] == 18000
 
 
@@ -126,7 +130,7 @@ def test_enrichment_uses_annotated_de_table_and_runs_per_class(tmp_path, monkeyp
     # annotated DE table and run ORA PER CLASS.
     gdir = tmp_path / "genesets"
     gdir.mkdir()
-    (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
@@ -139,7 +143,7 @@ def test_enrichment_uses_annotated_de_table_and_runs_per_class(tmp_path, monkeyp
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, _ctx(tmp_path))
+    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
     assert set(out["groups"]) == {"Rod", "AC"}          # per-class, not a single pooled "input"
@@ -154,7 +158,7 @@ def test_enrichment_background_is_the_tested_universe_not_a_round_number(tmp_pat
     # every term whenever QC/HVG filtering left far fewer genes in the object.
     gdir = tmp_path / "genesets"
     gdir.mkdir()
-    (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
@@ -164,7 +168,7 @@ def test_enrichment_background_is_the_tested_universe_not_a_round_number(tmp_pat
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, _ctx(tmp_path))
+    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
     assert cap["background"] == ["RHO", "PDE6A", "GRIA4"]     # the real universe, not 20000
@@ -177,7 +181,7 @@ def test_enrichment_records_the_constant_fallback_when_no_universe_exists(tmp_pa
     # must be REPORTED as a fallback so a reader never mistakes it for the measured universe.
     gdir = tmp_path / "genesets"
     gdir.mkdir()
-    (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tRHO\n", encoding="utf-8")
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
@@ -186,7 +190,7 @@ def test_enrichment_records_the_constant_fallback_when_no_universe_exists(tmp_pa
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, _ctx(tmp_path))
+    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["background_source"] == "constant_fallback"
     assert out["background_size"] == 20000 and cap["background"] == 20000
@@ -198,7 +202,7 @@ def test_group_labels_with_a_slash_do_not_lose_their_table(tmp_path, monkeypatch
     # never appeared. The label stays verbatim inside the table; only the filename is slugged.
     gdir = tmp_path / "genesets"
     gdir.mkdir()
-    (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tSCGB1A1\n", encoding="utf-8")
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tSCGB1A1\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
@@ -207,7 +211,7 @@ def test_group_labels_with_a_slash_do_not_lose_their_table(tmp_path, monkeypatch
         encoding="utf-8")
     _install_fake_gseapy(monkeypatch, {})
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, _ctx(tmp_path))
+    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok" and out["groups"] == ["Club/Secretory"]
     written = tables / "enrichment_Club_Secretory.csv"
@@ -335,9 +339,9 @@ def test_enrichment_missing_gmt_is_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(tmp_path / "empty"))   # no .gmt files
     (tmp_path / "empty").mkdir()
     _install_fake_gseapy(monkeypatch, {})
-    out = scrna_pack.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, _ctx(tmp_path))
+    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
     assert out["status"] == "error"
-    assert out["missing_libraries"] == ["GO_Biological_Process_2023"]
+    assert out["missing_libraries"] == ["TestPathways"]
     assert "fetch_genesets" in out["error"]
 
 
@@ -348,7 +352,25 @@ def test_pipeline_order_is_enforced(tmp_path, monkeypatch):
     monkeypatch.setattr(scrna_pack, "_import_scanpy", lambda: types.SimpleNamespace())
     ctx = _ctx(tmp_path)
     assert scrna_pack.run_clustering({}, ctx)["error"].startswith("run_scanpy_qc must run first")
-    assert scrna_pack.run_de({}, ctx)["error"].startswith("run_clustering must run first")
+    # run_de's prerequisite is QC, NOT clustering: a dataset that already carries cell-type labels
+    # is analysed straight off adata_qc.h5ad, and the DEG protocol explicitly tells the planner to
+    # reuse those labels and skip clustering. Demanding adata_clustered.h5ad here turned that
+    # documented path into an error and pushed the model into re-clustering the data anyway.
+    assert "run_scanpy_qc" in scrna_pack.run_de({}, ctx)["error"]
+
+
+def test_de_runs_off_the_qc_checkpoint_when_there_is_no_clustering(tmp_path, monkeypatch):
+    """The labeled-dataset path: QC ran, clustering deliberately did not — run_de must proceed
+    past the checkpoint guard rather than reporting an ordering error."""
+    monkeypatch.setattr(scrna_pack, "_import_scanpy", lambda: types.SimpleNamespace())
+    ctx = _ctx(tmp_path)
+    (tmp_path / "work").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "work" / "adata_qc.h5ad").write_bytes(b"")   # presence is what the guard checks
+
+    # The stub scanpy has no read_h5ad, so getting PAST the guard raises AttributeError —
+    # which is precisely the evidence that the guard let it through.
+    with pytest.raises(AttributeError):
+        scrna_pack.run_de({}, ctx)
 
 
 def test_qc_without_dataset_errors_clearly(tmp_path, monkeypatch):

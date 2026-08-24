@@ -106,6 +106,10 @@ class SlurmCodeExecutor:
     # call ends at once (no local fallback — that would re-run the snippet and defeat Stop). Set to
     # conn.chat_stop.is_set. Without it, a Stop can't cancel a run_code job (the old bug).
     should_cancel: Callable[[], bool] | None = None
+    # Root of the lab-SHARED package cache (``<shared_root>/pkgs``). When set, each snippet can
+    # import packages any lab member has installed — the point being that nobody installs the
+    # same thing twice. Empty disables it entirely and the sandbox behaves exactly as before.
+    package_cache_root: str = ""
     _counter: int = field(default=0, repr=False)
     _scratch: str | None = field(default=None, repr=False)
 
@@ -114,6 +118,22 @@ class SlurmCodeExecutor:
         """The per-snippet memory cap in MB — read by ``build_run_code_context`` so the injected
         run_code guidance quotes the REAL HPC cap (not the local sandbox default)."""
         return int(self.mem_gb) * 1024
+
+    def _package_cache_preamble(self) -> tuple[str, tuple[str, ...]]:
+        """``(bash preamble, read-only binds)`` wiring the shared cache into this snippet.
+
+        Bound READ-ONLY on purpose: a snippet may import from the cache but must never write to
+        it. Publishing goes through ``install_package``, which stages, prunes image collisions,
+        and publishes atomically — none of which a snippet should be able to bypass.
+        """
+        if not self.package_cache_root:
+            return "", ()
+        from .package_cache import cache_preamble, image_tag_for
+
+        # One bind: the generated sitecustomize lives under the same root, so binding the root
+        # covers both it and every published package tree.
+        root = self.package_cache_root.rstrip("/")
+        return cache_preamble(root, image_tag_for(self.container_image)), (root,)
 
     def __call__(self, code: str) -> dict[str, object]:
         return self.run(code)
@@ -194,8 +214,16 @@ class SlurmCodeExecutor:
             )
             if val
         )
-        inner_payload = f"{exports}; python {snippet} > {out_f} 2> {err_f}; echo $? > {rc_f}"
-        binds_ro = tuple(p for p in (self.dataset_path,) if p)
+        # The lab-shared package cache. Resolved INSIDE the container (the key depends on the
+        # image's own Python version) and bound read-only, so a snippet can import a library some
+        # other member installed — without this image having to be rebuilt, and without the second
+        # user re-downloading it. Fails open: no cache, or an unreadable one, just means the
+        # image's own packages. See gateway/package_cache.py for why it appends to sys.path
+        # rather than going through PYTHONPATH.
+        preamble, cache_binds = self._package_cache_preamble()
+        inner_payload = (f"{preamble}{exports}; python {snippet} > {out_f} 2> {err_f}; "
+                         f"echo $? > {rc_f}")
+        binds_ro = tuple(p for p in (self.dataset_path, *cache_binds) if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
         inner = singularity_exec(
             self.container_image, inner_payload,

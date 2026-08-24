@@ -45,15 +45,28 @@ def test_the_defaults_nobody_chose_are_listed_explicitly():
     # structured field turns "read the code" from an instruction that can be skipped into a
     # list the model has to look at.
     tool, ctx = _tool()
-    defaults = {d["param"]: d["default"] for d in tool.executor({"tool": "run_de"}, ctx)["defaults"]}
-    assert defaults["n_genes"] == "50"          # the cap, stated
-    assert defaults["groupby"] == '"leiden"'
-    assert all(d["line"] > 0 for d in tool.executor({"tool": "run_de"}, ctx)["defaults"])
+    entries = tool.executor({"tool": "run_de"}, ctx)["defaults"]
+    defaults = {d["param"]: d["value"] for d in entries}
+    assert defaults["n_genes"] == 50            # the cap, stated
+    assert defaults["groupby"] == "leiden"
+    assert all(d["line"] > 0 for d in entries)
 
-    clustering = {d["param"]: d["default"]
+    clustering = {d["param"]: d["value"]
                   for d in tool.executor({"tool": "run_clustering"}, ctx)["defaults"]}
-    assert clustering["resolution"] == "1.0"    # the other frozen choice
-    assert clustering["stability_min"] == "0.90"
+    assert clustering["resolution"] == 1.0      # the other frozen choice
+    assert clustering["stability_min"] == 0.90
+
+
+def test_a_declared_default_carries_what_it_MEANS_not_just_its_value():
+    # A reviewer cannot judge `max_pct_mt = 20.0` from the number. The declared-parameter table
+    # (scrna_pack.PARAMS) attaches the sentence that makes it reviewable, and read_tool_source
+    # hands that to the model alongside the value rather than making it infer one from the name.
+    tool, ctx = _tool()
+    entries = {d["param"]: d for d in tool.executor({"tool": "run_scanpy_qc"}, ctx)["defaults"]}
+    mt = entries["max_pct_mt"]
+    assert mt["value"] == 10.0 and mt["declared"] is True
+    assert "mitochondrial" in mt["meaning"]
+    assert all(e["meaning"] for e in entries.values() if e["declared"])
 
 
 def test_the_review_prompt_asks_the_question_that_finds_this_class_of_bug():

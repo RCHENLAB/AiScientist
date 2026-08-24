@@ -171,14 +171,23 @@ def _build_settings(ctx: Any) -> Any:
     # Match scripts/build_paperqa_directory_index.py IndexSettings EXACTLY so PaperQA REUSES the
     # pre-built 211M index instead of creating a fresh empty one (mismatched settings make it
     # ignore the persistent index and retrieve 0 papers).
+    # QUERY-time use of a PREBUILT, shared index. `sync_with_paper_directory=True` (the old
+    # setting) makes PaperQA compare the papers/ dir against the index on every query and try to
+    # ADD any file it does not find — i.e. open the shared index for WRITING as whoever is
+    # asking. The index belongs to the lab member who built it; every other user's query then
+    # died with "Failed to open file for read: .managed.json … PermissionDenied" (tantivy's
+    # writer lock), and the answer came back "I cannot answer". Building/refreshing the index is
+    # a maintenance job (Ziyao's), not something a research run does. Opt back in with
+    # BIOAGENT_PAPERQA_SYNC_INDEX=1 for that maintenance run.
     index_cfg = IndexSettings(
         name=_DEFAULT_INDEX_NAME,
         paper_directory=papers,
         recurse_subdirectories=False,
-        sync_with_paper_directory=True,
+        sync_with_paper_directory=(os.environ.get("BIOAGENT_PAPERQA_SYNC_INDEX", "").strip()
+                                   in ("1", "true", "yes")),
     )
     if _DEFAULT_INDEX_DIR:
-        index_cfg.index_directory = _DEFAULT_INDEX_DIR
+        index_cfg.index_directory = _writable_index_root(_DEFAULT_INDEX_DIR, ctx)
     manifest = os.environ.get("BIOAGENT_PAPERQA_MANIFEST")
     if manifest:
         index_cfg.manifest_file = manifest
@@ -219,6 +228,85 @@ def _build_settings(ctx: Any) -> Any:
         ),
     )
 
+def _writable_index_root(shared_index_dir: str, ctx: Any) -> str:
+    """The index root PaperQA is handed at query time.
+
+    ``paperqa.ask`` does not only READ the corpus index: ``agent_query`` always writes the answer
+    into a second index, ``<index_directory>/answers/``, and calls ``save_index()``. Pointed at
+    the lab's shared corpus root, that write runs as whoever is asking — and the answers/ index
+    there belongs to the member who built the corpus, so every other user's query died in
+    tantivy's writer with "Failed to open file for read: .managed.json … PermissionDenied" and
+    the answer surfaced as "I cannot answer". Observed on every deep_literature job once the
+    workspace-mount and lmi/aviary faults ahead of it were fixed.
+
+    When the shared root is writable by this process, use it as before. Otherwise build a
+    per-run root under the workspace holding a SYMLINK to the corpus index (read-only use — the
+    query path never writes it once ``sync_with_paper_directory`` is off) and let PaperQA create
+    its answers/ index next to it, where it can. Falls back to the shared root if the shim cannot
+    be built, so the failure mode never gets worse than it was."""
+    shared = Path(shared_index_dir)
+    # Do NOT short-circuit on os.access(shared, W_OK): the shared root is group-writable, yet the
+    # answers/ index INSIDE it carries its builder's tantivy lock/meta files, and a second user's
+    # writer still fails there. A shared corpus root is never written at query time, full stop —
+    # when a workspace exists, the answers index goes there.
+    ws = getattr(ctx, "workspace", None)
+    if not ws:
+        return str(shared)
+    try:
+        root = Path(ws) / "pqa_index"
+        root.mkdir(parents=True, exist_ok=True)
+        link = root / _DEFAULT_INDEX_NAME
+        target = shared / _DEFAULT_INDEX_NAME
+        if not target.exists():
+            return str(shared)
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and os.readlink(link) != str(target):
+                link.unlink()
+                link.symlink_to(target)
+        else:
+            link.symlink_to(target)
+        return str(root)
+    except OSError:
+        return str(shared)
+
+
+def _patch_lmi_select_tool() -> None:
+    """Work around an lmi <-> aviary mismatch inside paperqa.sif (paper-qa 2026.3.18).
+
+    ``LiteLLMModel.select_tool`` builds an inner ``_acompletion(**kw)`` — keyword-only — and hands
+    it to aviary's ``ToolSelector``, which calls it as ``acompletion(model_name, **kw)``: one
+    positional argument, so ``TypeError: _acompletion() takes 0 positional arguments but 1 was
+    given``. The fake agent hits this on its LAST, purely formal step (the "complete" call, after
+    gather_evidence found 3 relevant papers and generate_answer already produced the answer), the
+    rollout is marked FAIL and the answer is thrown away as "I cannot answer". Observed on every
+    deep_literature job the moment the workspace-mount bug was fixed. This redefines select_tool
+    with a positional-tolerant closure; the primary model's own kwargs still win. No-op when the
+    installed lmi does not have the shape this targets. The proper fix is pinning compatible
+    lmi/aviary versions in paperqa.sif (Ziyao's image)."""
+    try:
+        import litellm
+        from lmi.cost_tracker import track_costs
+        from lmi.llms import LiteLLMModel
+        from aviary.core import ToolSelector
+    except Exception:  # noqa: BLE001 - not the environment this targets
+        return
+    if getattr(LiteLLMModel.select_tool, "_bioagent_patched", False):
+        return
+
+    async def select_tool(self, *selection_args, **selection_kwargs):
+        primary = self.llm_config.models[0]
+
+        async def _acompletion(*args, **kw):
+            kw.pop("model", None)                     # the primary's model always wins
+            return await litellm.acompletion(**primary.to_litellm_kwargs(), **kw)
+
+        selector = ToolSelector(model_name=self.name, acompletion=track_costs(_acompletion))
+        return await selector(*selection_args, **selection_kwargs)
+
+    select_tool._bioagent_patched = True   # type: ignore[attr-defined]
+    LiteLLMModel.select_tool = select_tool  # type: ignore[method-assign]
+
+
 #get answer from paperqa and package to a payload
 def _extract_answer(resp: Any) -> dict[str, Any]:
     """Pull the cited answer + contexts off a PaperQA response, tolerating API drift
@@ -253,6 +341,7 @@ def run_paperqa(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
     try:
         from paperqa import ask  # heavy; lazy import
+        _patch_lmi_select_tool()
     except ImportError:
         return _missing(
             "paper-qa",
@@ -274,7 +363,15 @@ def run_paperqa(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     try:
         resp = ask(question, settings=settings)
     except Exception as exc:  # noqa: BLE001 - a literature failure must never kill the run
-        return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "question": question}
+        # Carry the LAST frames of the traceback: "error: 0 context(s)" in the event log was the
+        # only trace of 28 consecutive failures, and it named neither the missing workspace mount
+        # nor the lmi/aviary mismatch that followed. Nobody reads a Slurm log they do not know
+        # exists; the failure has to explain itself in the tool result.
+        import traceback as _tb
+        frames = _tb.extract_tb(exc.__traceback__)[-4:]
+        where = " <- ".join(f"{f.name}@{f.filename.rsplit('/', 1)[-1]}:{f.lineno}" for f in frames)
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}",
+                "where": where, "question": question}
 
     result = _extract_answer(resp)
     result.update({"status": "ok", "question": question})

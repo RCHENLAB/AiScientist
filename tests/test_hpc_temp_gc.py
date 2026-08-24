@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from bioagent.gateway import hpc_gc  # noqa: E402
 from bioagent.gateway.executor import ExecResult  # noqa: E402
 from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 GC_SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "hpc3" / "aiscientist_temp_gc.sh"
 
@@ -65,15 +66,15 @@ class _FakeRemote:
 
 def test_shared_root_and_ttl_have_the_documented_defaults():
     st = HPCSettings()
-    assert st.shared_root == "/dfs3b/ruic20_lab/software/AiScientist"
+    assert st.shared_root == f"{SHARED_ROOT}"
     assert st.temp_ttl_days == 3
 
 
 def test_shared_root_and_ttl_come_from_env(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_HPC_SHARED_ROOT", "/dfs3b/ruic20_lab/elsewhere/AiScientist/")
+    monkeypatch.setenv("BIOAGENT_HPC_SHARED_ROOT", f"{LAB_STORAGE}/elsewhere/AiScientist/")
     monkeypatch.setenv("BIOAGENT_TEMP_TTL_DAYS", "7")
     st = HPCSettings.from_env()
-    assert st.shared_root == "/dfs3b/ruic20_lab/elsewhere/AiScientist"   # trailing slash normalized
+    assert st.shared_root == f"{LAB_STORAGE}/elsewhere/AiScientist"   # trailing slash normalized
     assert st.temp_ttl_days == 7
 
 
@@ -90,23 +91,23 @@ def test_process_files_go_to_shared_temp_never_a_personal_dir():
         settings=HPCSettings())
 
     temp = gw_app._temp_base(conn)
-    assert temp == "/dfs3b/ruic20_lab/software/AiScientist/Temp/tester"
+    assert temp == f"{SHARED_ROOT}/Temp/tester"
     # The legacy personal dir is still addressable (for browsing) but is not a prefix of Temp.
     assert not temp.startswith(gw_app._storage_base(conn) + "/")
 
     # Raw data and the synced source are deliberately OUTSIDE Temp — the sweeper must never
     # be able to walk into either.
     assert not gw_app._hpc_uploads_dir(conn).startswith(temp)
-    assert gw_app._shared_dir(conn, "pysrc") == "/dfs3b/ruic20_lab/software/AiScientist/pysrc/tester"
+    assert gw_app._shared_dir(conn, "pysrc") == f"{SHARED_ROOT}/pysrc/tester"
 
 
 def test_shared_paths_are_per_user():
-    mine = hpc_gc.shared_paths("/dfs3b/ruic20_lab/software/AiScientist", "tester")
-    theirs = hpc_gc.shared_paths("/dfs3b/ruic20_lab/software/AiScientist", "someoneelse")
-    assert mine["temp"] == "/dfs3b/ruic20_lab/software/AiScientist/Temp/tester"
+    mine = hpc_gc.shared_paths(f"{SHARED_ROOT}", "tester")
+    theirs = hpc_gc.shared_paths(f"{SHARED_ROOT}", "someoneelse")
+    assert mine["temp"] == f"{SHARED_ROOT}/Temp/tester"
     # EVERY subdir is per-user, `bin` included: members stage the sweeper concurrently and one
     # shared copy would mean each overwriting a file the others own.
-    assert mine["bin"] == "/dfs3b/ruic20_lab/software/AiScientist/bin/tester"
+    assert mine["bin"] == f"{SHARED_ROOT}/bin/tester"
     for kind in ("temp", "uploads", "pysrc", "bin"):
         assert not theirs[kind].startswith(mine[kind])
 
@@ -115,7 +116,7 @@ def test_shared_paths_are_per_user():
 
 def test_missing_shared_root_is_reported_with_the_exact_fix():
     remote = _FakeRemote(root_exists=False)
-    ok, message = hpc_gc.ensure_shared_dirs(remote, "/dfs3b/ruic20_lab/software/AiScientist", "tester")
+    ok, message = hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester")
     assert ok is False
     # /dfs3b/ruic20_lab is drwxr-s--- ruic20, so this one mkdir is a human prerequisite. The
     # message has to carry it, or every offloaded job later dies on an unexplained mkdir.
@@ -126,7 +127,7 @@ def test_missing_shared_root_is_reported_with_the_exact_fix():
 
 def test_bootstrap_creates_only_this_users_dirs_group_writable():
     remote = _FakeRemote()
-    ok, _ = hpc_gc.ensure_shared_dirs(remote, "/dfs3b/ruic20_lab/software/AiScientist", "tester")
+    ok, _ = hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester")
     assert ok is True
     mkdir = next(c for c in remote.commands if "mkdir -p" in c)
     for expected in ("/AiScientist/Temp/tester", "/AiScientist/uploads/tester",
@@ -138,7 +139,7 @@ def test_bootstrap_creates_only_this_users_dirs_group_writable():
 # --------------------------------------------------------------------------- sweep call
 
 def test_sweep_command_is_pinned_to_one_user_and_an_explicit_root_and_ttl():
-    cmd = hpc_gc.sweep_command("/root/bin/temp_gc.sh", "/dfs3b/ruic20_lab/software/AiScientist/", 3, "tester")
+    cmd = hpc_gc.sweep_command("/root/bin/temp_gc.sh", f"{SHARED_ROOT}/", 3, "tester")
     assert "--root /dfs3b/ruic20_lab/software/AiScientist " in cmd     # trailing slash stripped
     assert "--ttl-days 3" in cmd
     assert "--user tester" in cmd
@@ -155,12 +156,12 @@ def test_the_sweep_runs_on_a_compute_node_not_the_login_node():
     """RCIC's rule: login nodes are for logging in and SUBMITTING jobs. The sweep walks trees and
     calls rm -rf, so the only thing the login node may run is the sbatch."""
     remote = _FakeRemote()
-    out = hpc_gc.sweep_temp(remote, "/dfs3b/ruic20_lab/software/AiScientist", "tester", 3,
+    out = hpc_gc.sweep_temp(remote, f"{SHARED_ROOT}", "tester", 3,
                             partition="standard", account="ruic20_lab")
     assert out["status"] == "submitted" and out["job_id"] == "7654321"
     # the previous run's numbers, read back from its log
     assert out["removed"] == 4 and out["kept"] == 1
-    assert out["root"] == "/dfs3b/ruic20_lab/software/AiScientist/Temp/tester"
+    assert out["root"] == f"{SHARED_ROOT}/Temp/tester"
     assert remote.staged and remote.staged[0][1].endswith("/AiScientist/bin/tester/temp_gc.sh")
 
     submit = next(c for c in remote.commands if c.startswith("sbatch"))
@@ -202,16 +203,16 @@ def test_storage_delete_guard_covers_the_new_roots_but_not_another_member():
     def permitted(path: str) -> bool:
         return ".." not in path and any(path.startswith(a + "/") for a in allowed)
 
-    assert permitted("/dfs3b/ruic20_lab/software/AiScientist/Temp/tester/analysis/abc")
-    assert permitted("/dfs3b/ruic20_lab/software/AiScientist/uploads/tester/case.vcf.gz")
-    assert permitted("/dfs3b/ruic20_lab/tester/old_run")            # legacy personal dir, by hand
+    assert permitted(f"{SHARED_ROOT}/Temp/tester/analysis/abc")
+    assert permitted(f"{SHARED_ROOT}/uploads/tester/case.vcf.gz")
+    assert permitted(f"{LAB_STORAGE}/tester/old_run")            # legacy personal dir, by hand
     # Sharing one project root must NOT let a member reach anyone else's files.
-    assert not permitted("/dfs3b/ruic20_lab/software/AiScientist/Temp/someoneelse/analysis/abc")
-    assert not permitted("/dfs3b/ruic20_lab/someoneelse/data.h5ad")
-    assert not permitted("/dfs3b/ruic20_lab/software/AiScientist/Temp/tester/../../someoneelse")
+    assert not permitted(f"{SHARED_ROOT}/Temp/someoneelse/analysis/abc")
+    assert not permitted(f"{LAB_STORAGE}/someoneelse/data.h5ad")
+    assert not permitted(f"{SHARED_ROOT}/Temp/tester/../../someoneelse")
     # the shared root also holds 100+GB of containers/model weights — off limits to the panel
-    assert not permitted("/dfs3b/ruic20_lab/software/AiScientist/containers/vllm.sif")
-    assert not permitted("/dfs3b/ruic20_lab/software/reference")
+    assert not permitted(f"{SHARED_ROOT}/containers/vllm.sif")
+    assert not permitted(f"{REFERENCE_ROOT}")
 
 
 # --------------------------------------------------------------------------- the script itself

@@ -16,6 +16,7 @@ pytest.importorskip("fastapi")
 from bioagent.gateway import app as gw_app  # noqa: E402
 from bioagent.gateway.mock_host import MockExecutor  # noqa: E402
 from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 def _conn():
@@ -34,7 +35,7 @@ def test_uploads_on_hpc_gate():
 
 def test_is_remote_dataset():
     conn = _conn()
-    assert gw_app._is_remote_dataset(conn, "/dfs3b/ruic20_lab/tester/uploads/x.h5ad") is True
+    assert gw_app._is_remote_dataset(conn, f"{LAB_STORAGE}/tester/uploads/x.h5ad") is True
     assert gw_app._is_remote_dataset(conn, "/data/BioAgent/tester/uploads/x.h5ad") is False
     assert gw_app._is_remote_dataset(conn, "") is False
 
@@ -49,7 +50,7 @@ def test_stage_upload_to_hpc_moves_and_records(tmp_path):
 
     # Uploads live in the SHARED project root now, not the member's personal lab dir — and
     # deliberately outside Temp/, so the 3-day sweeper can never reach raw research data.
-    assert remote == "/dfs3b/ruic20_lab/software/AiScientist/uploads/tester/pbmc.h5ad"
+    assert remote == f"{SHARED_ROOT}/uploads/tester/pbmc.h5ad"
     assert (str(local), remote) in conn.executor.state.staged_files   # put_file was called
     assert not local.exists()                                         # local copy removed
     assert gw_app._is_remote_dataset(conn, remote) is True
@@ -59,7 +60,7 @@ def test_ensure_local_dataset_stages_remote_back(tmp_path):
     conn = _conn()
     conn.executor = MockExecutor(username="tester")
     cache = tmp_path / "staged"
-    remote = "/dfs3b/ruic20_lab/tester/uploads/pbmc.h5ad"
+    remote = f"{LAB_STORAGE}/tester/uploads/pbmc.h5ad"
 
     got = gw_app._ensure_local_dataset(conn, remote, cache)
     assert got == cache / "pbmc.h5ad"                    # staged into the run's cache dir
@@ -74,7 +75,7 @@ def test_sync_bioagent_source_to_hpc_tars_and_caches():
     conn.executor = MockExecutor(username="tester")
 
     pysrc = gw_app._sync_bioagent_source_to_hpc(conn)
-    assert pysrc == "/dfs3b/ruic20_lab/software/AiScientist/pysrc/tester"
+    assert pysrc == f"{SHARED_ROOT}/pysrc/tester"
     assert conn.hpc_pysrc == pysrc
     staged = conn.executor.state.staged_files
     assert any(remote == f"{pysrc}/bioagent-src.tgz" for _l, remote in staged)   # tarball pushed

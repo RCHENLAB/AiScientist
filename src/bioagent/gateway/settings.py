@@ -4,6 +4,25 @@ import os
 from dataclasses import dataclass
 
 
+# --- the three roots every HPC3 path hangs off ------------------------------------------------
+# These were 21 separate literals until 2026-08-23, which meant deploying this anywhere but our own
+# cluster was a 21-line edit, and each one was a place to get a path subtly wrong. They are now
+# derived from ONE value. Override it for another site:
+#
+#     AISCIENTIST_LAB_STORAGE=/your/lab/filesystem
+#
+# (BIOAGENT_LAB_STORAGE works too — core.config.apply_brand_env_aliases mirrors the two prefixes.)
+# Every field below is still an independent dataclass field with its own env override, so a site
+# that moves ONE asset out of the tree does not have to fork the root.
+LAB_STORAGE = (os.environ.get("AISCIENTIST_LAB_STORAGE")
+               or os.environ.get("BIOAGENT_LAB_STORAGE")
+               or "/dfs3b/ruic20_lab").rstrip("/")
+# Everything AiScientist owns: containers, model weights, envs, and each member's working files.
+SHARED_ROOT = f"{LAB_STORAGE}/software/AiScientist"
+# Reference data the whole lab shares and AiScientist only reads (VEP caches, SpliceAI, LIRICAL).
+REFERENCE_ROOT = f"{LAB_STORAGE}/software/reference"
+
+
 @dataclass
 class HPCSettings:
     """Cluster + vLLM serving settings, all overridable by environment variables.
@@ -71,7 +90,7 @@ class HPCSettings:
     # the *current user's own* serve job (named bioagent-vllm-<ucinetid> and
     # filtered with `squeue --me`). It never searches, reuses, or cancels another
     # lab member's jobs — one project must never be able to affect another.
-    lab_storage: str = "/dfs3b/ruic20_lab"   # research data lives here
+    lab_storage: str = LAB_STORAGE   # research data lives here
     lab_data_group: str = "ruic20_hpc"        # `newgrp ruic20_hpc` before touching lab_storage
 
     # --- SHARED project root: everything AiScientist owns on HPC3 ---------------
@@ -97,7 +116,7 @@ class HPCSettings:
     # The sweeper is hard-guarded to `<root>/Temp` and cannot walk into the assets. Nothing outside
     # <shared_root> is ever deleted automatically: a member's personal <lab_storage>/<ucinetid>/ dir
     # is read/browsed but left strictly alone.
-    shared_root: str = "/dfs3b/ruic20_lab/software/AiScientist"
+    shared_root: str = SHARED_ROOT
     # Age (days) after which a <shared_root>/Temp/<user>/<kind>/<run> dir whose whole subtree has
     # gone untouched is removed. 0 disables the sweep entirely.
     temp_ttl_days: int = 3
@@ -114,8 +133,8 @@ class HPCSettings:
     # and runs on the whole heterogeneous GPU pool (A30/L40S/A100/RTX6000) via
     # INT4 Marlin kernels — unlike FP8, which is native only on L40S (Ada).
     vllm_model: str = "QuantTrio/Qwen3.6-35B-A3B-AWQ"
-    vllm_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/vllm.sif"
-    hf_home: str = "/dfs3b/ruic20_lab/software/AiScientist/hf"  # HF cache on shared DFS, NOT $HOME
+    vllm_image: str = f"{SHARED_ROOT}/containers/vllm.sif"
+    hf_home: str = f"{SHARED_ROOT}/hf"  # HF cache on shared DFS, NOT $HOME
     # The model's NATIVE window (config.json max_position_embeddings = 262144) — no YaRN, no
     # rope scaling. The old 32768 default was justified by "A100-40G leaves ~16GB KV", and both
     # halves of that were wrong. MEASURED on HPC3 2026-08-02 by booting this exact image+model
@@ -147,14 +166,14 @@ class HPCSettings:
     # ONLY in the image — never in the gateway's Python env. The image bundles the
     # scGPT_refactor step-2 code; ``scgpt_entrypoint`` is the in-container command,
     # given --input/--model/--out by the engine.
-    scgpt_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/scgpt.sif"
+    scgpt_image: str = f"{SHARED_ROOT}/containers/scgpt.sif"
     # In-container CLI (deploy/scgpt/run_infer.py): runs the full reference flow
     # (step1 preprocess + step2 inference) given --input/--model/--out and writes
     # predictions.csv to --out.
     scgpt_entrypoint: str = "python /opt/scgpt/run_infer.py"
     # Reference model dir on shared DFS (best_model.pt, vocab.json, id2type.json,
     # dev_train_args.yml), bound read-only into the job. Staged by deploy/scgpt/build_and_stage.sh.
-    scgpt_model_dir: str = "/dfs3b/ruic20_lab/software/AiScientist/scgpt_model"
+    scgpt_model_dir: str = f"{SHARED_ROOT}/scgpt_model"
     # scGPT inference is a short annotation job that runs fine on ANY card — keep it on gpu:1 so it
     # is NOT pinned to the (scarcer) A100 the LLM reserves. Decoupled from the main `gres`.
     scgpt_gres: str = "gpu:1"
@@ -165,10 +184,10 @@ class HPCSettings:
     # rendered pdf as a short-lived gpu:1 batch job via vlreview_job.run_vlreview, fully
     # contained in this .sif. transformers/torch/VL-weights live ONLY in the image. Opt-in.
     vlreview_enabled: bool = False
-    vlreview_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/vlreview.sif"
+    vlreview_image: str = f"{SHARED_ROOT}/containers/vlreview.sif"
     vlreview_entrypoint: str = "python /opt/vlreview/run_review.py"
     # VL weights on shared DFS, bound read-only. Staged by deploy/vlreview/build_and_stage.sh.
-    vlreview_model_dir: str = "/dfs3b/ruic20_lab/software/AiScientist/vlreview_model"
+    vlreview_model_dir: str = f"{SHARED_ROOT}/vlreview_model"
     # Use the lab's paid GPU partition ("gpu") — the lab GPU account buys scheduling PRIORITY,
     # and the free/preemptible partitions (free-gpu/free-gpu32) queue too slowly, delaying the
     # report. Cost is bounded anyway: a cheap A30 for one short (~30 min) job. Set empty to fall
@@ -187,12 +206,33 @@ class HPCSettings:
     # batch job on HPC3, where `#SBATCH --mem` is a REAL, cgroup-enforced memory cap (the durable
     # fix for the OOM/-9 kills). Needs the dataset + run dirs on shared DFS and an analysis image.
     run_code_on_hpc: bool = False
-    analysis_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif"
+    analysis_image: str = f"{SHARED_ROOT}/containers/analysis.sif"
     cpu_partition: str = "standard"          # RCIC HPC3 free CPU partition (no GPU)
     cpu_account: str | None = "ruic20_lab"   # CPU jobs charge the lab's non-GPU account
     run_code_mem_gb: int = 64                # per-snippet memory cap on HPC3
     run_code_cpus: int = 8
     run_code_time_limit: str = "01:00:00"
+
+    # --- the session's standing CPU worker node --------------------------------
+    # A held CPU allocation the agent's shell runs ON, via `srun --jobid=<id> --overlap`. This
+    # is what makes "give the agent a real shell" and "obey RCIC policy" the same design instead
+    # of opposing ones: RCIC's rule is that login nodes are for logging in and SUBMITTING, so
+    # anything that moves bytes or burns CPU belongs on a node you hold. Metadata (ls/stat/du)
+    # stays on the login node, where it is cheap and allowed.
+    #
+    # Unlike the GPU serve job this costs nothing scarce (free `standard` partition) and holds no
+    # accelerator, so it is safe to keep for the whole session. Off by default: enabling it
+    # changes what connect does, and the shell tools that need it are themselves opt-in.
+    worker_enabled: bool = False
+    worker_cpus: int = 4
+    worker_mem_gb: int = 16
+    # Long enough to outlive a working session without pinning a node overnight. Slurm kills the
+    # allocation at this wall limit; the session re-acquires one on the next command.
+    worker_time_limit: str = "08:00:00"
+    worker_startup_timeout_s: int = 180      # a free-partition CPU node should come up fast
+    # Per-command wall cap for `srun --overlap` work. Distinct from the ALLOCATION's time limit:
+    # this bounds one agent command so a runaway `find /` cannot hold the session forever.
+    worker_command_timeout_s: int = 900
 
     # --- Uploads land on HPC3 dfs3b, not the eyeserver (opt-in) -----------------
     # Off: uploaded datasets are written to the eyeserver's per-user workspace. Set
@@ -217,7 +257,7 @@ class HPCSettings:
     # Singularity-contained CPU batch job on HPC3 (SlurmReportRenderer) using a deps-only
     # pandoc/texlive image — no texlive on the eyeserver. Falls back to local pandoc on failure.
     report_on_hpc: bool = False
-    report_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/report.sif"
+    report_image: str = f"{SHARED_ROOT}/containers/report.sif"
 
     # --- VCF variant annotation runs OFFLINE on HPC3 (opt-in) -------------------
     # Off: annotate_variants uses the public Ensembl VEP REST API on the eyeserver — fine for a small
@@ -230,16 +270,16 @@ class HPCSettings:
     # SlurmAnalysisExecutor + cpu_partition/cpu_account/run_code_mem_gb. Falls
     # back to the REST path in-process on failure (small VCFs still work when HPC is unavailable).
     variant_on_hpc: bool = False
-    vep_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/vep.sif"
+    vep_image: str = f"{SHARED_ROOT}/containers/vep.sif"
     # VEP cache + ClinVar VCF per assembly, staged on dfs3b by deploy/vep/build_and_stage.sh. The
     # cache is a bind-mounted local directory (offline); ClinVar is added via VEP --custom so the
     # offline path reproduces the REST tool's pathogenicity output.
     # Annotation DBs live in the lab's SHARED reference dir (Jin Li's convention: download each DB
     # once, mount read-only, reuse across projects) — NOT under a bioagent-private path.
-    vep_cache_dir_grch38: str = "/dfs3b/ruic20_lab/software/reference/vep_annotation/GRCh38"
-    vep_cache_dir_grch37: str = "/dfs3b/ruic20_lab/software/reference/vep_annotation/GRCh37"
-    vep_clinvar_grch38: str = "/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh38.vcf.gz"
-    vep_clinvar_grch37: str = "/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh37.vcf.gz"
+    vep_cache_dir_grch38: str = f"{REFERENCE_ROOT}/vep_annotation/GRCh38"
+    vep_cache_dir_grch37: str = f"{REFERENCE_ROOT}/vep_annotation/GRCh37"
+    vep_clinvar_grch38: str = f"{REFERENCE_ROOT}/vep_annotation/clinvar_GRCh38.vcf.gz"
+    vep_clinvar_grch37: str = f"{REFERENCE_ROOT}/vep_annotation/clinvar_GRCh37.vcf.gz"
     # Fallback assembly used ONLY when the build can't be read from the VCF header — the gateway
     # auto-detects GRCh37/GRCh38 from the header (chr1 contig length) and overrides this per run
     # (see app.py `_detect_vcf_assembly`). GRCh37 is the right fallback for an ophthalmology lab:
@@ -268,7 +308,7 @@ class HPCSettings:
     # the retina-exon BED and ATAC narrowPeak need bgzip+tabix (or a memory loader) first, so they
     # default empty — set BIOAGENT_IRD_RETINA_EXONS / _ATAC once prepped. See docs/ird_filter_spec.md.
     ird_annotate_enabled: bool = False
-    _IRD = "/dfs3b/ruic20_lab/chen/pipeline_restructure/pipeline_restructure"
+    _IRD = f"{LAB_STORAGE}/chen/pipeline_restructure/pipeline_restructure"
     ird_hgmd: str = f"{_IRD}/bin/annotate_filter/HGMD_v.12-20-2016.SNVs.INDELs.parsedforVCFannotationandindexingfixed.txt.gz"
     ird_dbscsnv: str = f"{_IRD}/bin/dbNSFP3.5a/dbscSNV1.1.{{chrom}}"   # per-chromosome tabix template
     ird_retina_exons: str = ""
@@ -279,7 +319,7 @@ class HPCSettings:
     # shared-reference locations the staging script writes — so enabling in prod is just
     # BIOAGENT_VEP_PLUGINS=1 (no need to re-specify every path).
     vep_plugins_enabled: bool = False       # master switch for CADD/AlphaMissense/REVEL + MANE
-    _VA = "/dfs3b/ruic20_lab/software/reference/vep_annotation"
+    _VA = f"{REFERENCE_ROOT}/vep_annotation"
     vep_plugins_dir: str = f"{_VA}/plugins/vep_plugins"                          # VEP --dir_plugins (.pm scripts)
     vep_cadd_snv: str = f"{_VA}/plugins/cadd/whole_genome_SNVs.tsv.gz"           # CADD (+ .tbi alongside)
     vep_cadd_indels: str = ""                                                    # optional CADD indels
@@ -303,8 +343,8 @@ class HPCSettings:
     # dir are on dfs3b and bind-mounted into vep.sif at run time (validated: the conda-forge python runs
     # under vep.sif's glibc). ~50 s/variant on CPU ⇒ it runs only on the reduced set, capped.
     spliceai_enabled: bool = False
-    spliceai_bin: str = "/dfs3b/ruic20_lab/software/AiScientist/envs/openspliceai/bin/openspliceai"
-    spliceai_models: str = "/dfs3b/ruic20_lab/software/reference/spliceai/OSAI-MANE-10000nt"
+    spliceai_bin: str = f"{SHARED_ROOT}/envs/openspliceai/bin/openspliceai"
+    spliceai_models: str = f"{REFERENCE_ROOT}/spliceai/OSAI-MANE-10000nt"
     spliceai_max_variants: int = 0          # 0 = NO cap (default); set >0 as an optional safety valve
     #                                         to skip SpliceAI if the post-filter set is still huge
     vep_fork: int = 8                       # VEP --fork width == cpus-per-task on the CPU node
@@ -321,8 +361,8 @@ class HPCSettings:
     # lab's existing 1805_hg19/exomiser-10.1.0 data is too old for LIRICAL v2); leave the exomiser_* paths
     # empty for phenotype-only, which needs no Exomiser DB. See deploy/lirical/README.md.
     phenotype_on_hpc: bool = False
-    lirical_image: str = "/dfs3b/ruic20_lab/software/AiScientist/containers/lirical.sif"
-    lirical_data_dir: str = "/dfs3b/ruic20_lab/software/reference/lirical/data"
+    lirical_image: str = f"{SHARED_ROOT}/containers/lirical.sif"
+    lirical_data_dir: str = f"{REFERENCE_ROOT}/lirical/data"
     lirical_exomiser_hg19: str = ""         # e.g. .../reference/lirical/exomiser/2302_hg19 (optional)
     lirical_exomiser_hg38: str = ""         # e.g. .../reference/lirical/exomiser/2302_hg38 (optional)
     # MEASURED on HPC3 2026-07-15, genotype-aware, on a REAL 1.13 GB WGS VCF (CASE_A, 4,928,515
@@ -464,6 +504,13 @@ class HPCSettings:
             run_code_mem_gb=_int("BIOAGENT_RUN_CODE_MEM_GB", cls.run_code_mem_gb),
             run_code_cpus=_int("BIOAGENT_RUN_CODE_CPUS", cls.run_code_cpus),
             run_code_time_limit=os.environ.get("BIOAGENT_RUN_CODE_TIME_LIMIT", cls.run_code_time_limit),
+            worker_enabled=(os.environ.get("BIOAGENT_WORKER_NODE", "").strip().lower()
+                            in ("1", "true", "yes", "on")),
+            worker_cpus=_int("BIOAGENT_WORKER_CPUS", cls.worker_cpus),
+            worker_mem_gb=_int("BIOAGENT_WORKER_MEM_GB", cls.worker_mem_gb),
+            worker_time_limit=os.environ.get("BIOAGENT_WORKER_TIME_LIMIT", cls.worker_time_limit),
+            worker_startup_timeout_s=_int("BIOAGENT_WORKER_STARTUP_TIMEOUT_S", cls.worker_startup_timeout_s),
+            worker_command_timeout_s=_int("BIOAGENT_WORKER_COMMAND_TIMEOUT_S", cls.worker_command_timeout_s),
             variant_on_hpc=(os.environ.get("BIOAGENT_VARIANT_ON_HPC", "").strip().lower()
                             in ("1", "true", "yes", "on")),
             vep_image=os.environ.get("BIOAGENT_VEP_IMAGE", cls.vep_image),
