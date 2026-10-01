@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time vLLM + Qwen3.6-AWQ deploy on HPC3, following RCIC's container rules
+# One-time vLLM + Qwen3.8-27B-INT4 deploy on HPC3, following RCIC's container rules
 # (rcic.uci.edu/software/user-installed.html): Singularity (NOT Apptainer), pulled
 # on an INTERACTIVE COMPUTE NODE (never a login node), with the cache OFF $HOME, into
 # the SHARED lab DFS area (not $HOME). The serve command printed at the end is
@@ -12,10 +12,10 @@
 set -uo pipefail
 
 BASE="${BIOAGENT_LAB_BASE:-/dfs3b/ruic20_lab/software/bioagent}"
-IMAGE="$BASE/containers/vllm.sif"
+IMAGE="${BIOAGENT_VLLM_IMAGE:-$BASE/containers/vllm-0.28.0.sif}"
 HF="$BASE/hf"
-MODEL="${BIOAGENT_VLLM_MODEL:-QuantTrio/Qwen3.6-35B-A3B-AWQ}"
-VLLM_IMG="${VLLM_DOCKER:-docker://vllm/vllm-openai:latest}"
+MODEL="${BIOAGENT_VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}"
+VLLM_IMG="${VLLM_DOCKER:-docker://vllm/vllm-openai:v0.28.0}"
 SING_MODULE="${BIOAGENT_CONTAINER_MODULE:-singularity/3.11.3}"
 
 log() { echo "[hpc3-vllm] $*"; }
@@ -57,7 +57,7 @@ fi
 #    CLI — no host pip/python needed, and `huggingface-cli` is deprecated in newer
 #    huggingface_hub (use `hf download`).
 export HF_HOME="$HF"
-log "downloading $MODEL into $HF (~24GB; resumable) ..."
+log "downloading $MODEL into $HF (~16GB; resumable) ..."
 singularity exec --env HF_HOME="$HF" "$IMAGE" hf download "$MODEL" \
   || { echo "weight download failed"; exit 1; }
 
@@ -71,7 +71,7 @@ cat <<EOF
   singularity exec --nv -B $HF:$HF --env HF_HOME=$HF --env HF_HUB_OFFLINE=1 \\
     $IMAGE \\
     vllm serve $MODEL --host 0.0.0.0 --port 8000 \\
-      --quantization awq_marlin --max-model-len 32768 --gpu-memory-utilization 0.92 \\
+      --max-model-len 262144 --gpu-memory-utilization 0.92 \\
       --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 &
   # then: curl -s 127.0.0.1:8000/v1/models
 EOF

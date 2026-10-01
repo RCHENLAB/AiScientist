@@ -92,6 +92,56 @@ def _lab_remote_reasoning() -> dict | None:
         return None
 
 
+# What a served model may accept as ``reasoning_effort``. Models disagree: Qwen3.8 takes ONLY
+# low / medium / xhigh (xhigh is its default) and answers "high" with HTTP 400, so an effort the
+# model rejects is retried without the field (see complete_ex) rather than failing the run.
+REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "none", "minimal"})
+
+
+def _reasoning_effort() -> str | None:
+    """Reasoning strength for LOCAL (tunnelled vLLM/SGLang) completions, from
+    ``BIOAGENT_VLLM_REASONING_EFFORT`` (``low``/``medium``/``high``).
+
+    ``_think_on_kwargs`` only turns the thinking trace ON or OFF via the chat template; it cannot
+    say HOW HARD to think. Models served with a reasoning parser (DeepSeek-V4 under vLLM's
+    ``deepseek_v4`` tokenizer mode) read the strength from the top-level ``reasoning_effort``
+    field instead, which this module never sent — so the local path had no effort control at all.
+    Unset = send nothing, i.e. today's behaviour byte-for-byte, because a server whose model has
+    no reasoning parser can reject an unknown field.
+    """
+    import os
+    raw = os.environ.get("BIOAGENT_VLLM_REASONING_EFFORT", "").strip().lower()
+    return raw if raw in REASONING_EFFORTS else None
+
+
+#: Output ceiling for one REMOTE lab-role completion, per role. Two tiers because the roles are
+#: not the same shape: planning / critique / scheduling / classification emit a short verdict or a
+#: JSON object, while the synthesis node writes the whole manuscript.
+_LAB_MAX_TOKENS_DEFAULTS = {"reason": 4096, "writer": 16384}
+
+
+def lab_max_tokens(role: str | None = None) -> int:
+    """Output cap for one lab-role call on a METERED endpoint, by role.
+
+    On the cluster's own GPU an output budget is a CONTEXT-FITTING number — ``max_model_len``
+    caps prompt+output together, so "let the reply use whatever the window leaves" is both correct
+    and free. Pointed at a per-token API that same number stops being a fitting constraint and
+    becomes a SPENDING limit, and the lab's computed ``max_model_len - prompt - margin`` (≈240k on
+    a 262144 window) is no limit at all. Worse, the injected ``complete_fn`` dropped it entirely,
+    so the request carried no ``max_tokens`` key and the endpoint was free to reason without
+    bound. This is the remote-only ceiling, per role, env-tunable:
+    ``BIOAGENT_LAB_MAX_TOKENS`` / ``BIOAGENT_LAB_MAX_TOKENS_WRITER``.
+    """
+    import os
+    key = "writer" if (role or "").strip().lower() == "writer" else "reason"
+    env = "BIOAGENT_LAB_MAX_TOKENS_WRITER" if key == "writer" else "BIOAGENT_LAB_MAX_TOKENS"
+    try:
+        val = int(os.environ.get(env, "") or _LAB_MAX_TOKENS_DEFAULTS[key])
+    except ValueError:
+        val = _LAB_MAX_TOKENS_DEFAULTS[key]
+    return max(256, val)
+
+
 def _base(local_port: int) -> str:
     return f"http://127.0.0.1:{local_port}/v1"
 
@@ -344,7 +394,7 @@ def chat_tools_stream(
         yield ("tool_calls", [calls[i] for i in sorted(calls)])
 
 
-def complete(
+def complete_ex(
     local_port: int,
     model: str,
     messages: list[dict],
@@ -353,8 +403,25 @@ def complete(
     base_url: str | None = None,
     api_key: str | None = None,
     think: bool = True,
-) -> str:
-    """One non-streaming ``/v1/chat/completions`` — return the assistant text.
+    reasoning_effort: str | None = None,
+    idle_timeout: float | None = None,
+) -> tuple[str, dict]:
+    """One ``/v1/chat/completions`` — the assistant text AND the provider's usage.
+
+    ``reasoning_effort`` overrides ``BIOAGENT_VLLM_REASONING_EFFORT`` for this call (the gateway sets
+    it PER ROLE: planning and the write-up think harder than a routing classifier).
+
+    ``idle_timeout`` (local path only) switches to STREAMING with no limit on total time: the call
+    fails only when the server sends NOTHING for that many seconds. A reasoning model streams its
+    thinking too, so an hour of thinking never trips it, while a dead node or dropped tunnel still
+    does. Without it the call is the historical non-streaming request with a total ``timeout`` —
+    which is what cut a Qwen3.8 plan off at 600 s mid-thought.
+
+    ``complete`` (below) is the text-only form every caller used before; this is the same request
+    with the ``usage`` block kept instead of discarded. The provider returns exactly what the call
+    cost — prompt/completion/total tokens, and on OpenRouter a ``cost`` in USD — and dropping it
+    was why a metered endpoint could only be measured from the monthly bill. The dict is whatever
+    the endpoint sent (``{}`` when it sent nothing), plus the ``model`` actually billed.
 
     For plain reasoning turns (no tools): the PI/Critic roles in the research lab,
     which just read context and emit text/JSON. Thinking traces (if the server runs
@@ -382,6 +449,21 @@ def complete(
         # Served models whose template does NOT think by default (DeepSeek-V4 under vLLM's
         # deepseek_v4 tokenizer mode) need the opt-IN spelled out; configured per deployment.
         payload["chat_template_kwargs"] = _think_on_kwargs()
+    effort = (reasoning_effort or "").strip().lower() or _reasoning_effort()
+    if think and not base_url and effort in REASONING_EFFORTS:
+        # HOW HARD to think on the local path. chat_template_kwargs only toggles the trace on/off;
+        # a model served with a reasoning parser reads the strength from this field.
+        payload["reasoning_effort"] = effort
+    if idle_timeout and not base_url:
+        try:
+            return _complete_streaming(url, payload, model, api_key, idle_timeout)
+        except GatewayError as exc:
+            if "reasoning_effort" not in payload or not _effort_rejected(exc):
+                raise
+            # The model does not take this effort level (e.g. "high" on Qwen3.8). Its own default
+            # is the right fallback — never fail a plan or a manuscript over a tuning knob.
+            payload = {k: v for k, v in payload.items() if k != "reasoning_effort"}
+            return _complete_streaming(url, payload, model, api_key, idle_timeout)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
     try:
@@ -393,7 +475,84 @@ def complete(
     except (urllib.error.URLError, OSError) as exc:
         raise VLLMNetworkError("Network error during vLLM completion.", stage="vllm_chat", detail=error_detail(exc)) from exc
     choices = (body or {}).get("choices") or [{}]
-    return (choices[0].get("message") or {}).get("content") or ""
+    content = (choices[0].get("message") or {}).get("content") or ""
+    usage = (body or {}).get("usage")
+    usage = dict(usage) if isinstance(usage, dict) else {}
+    usage.setdefault("model", (body or {}).get("model") or model)
+    # Surface WHY generation stopped. "length" means the reply was cut at max_tokens, and a cut
+    # reply is not a short reply: a truncated agenda is unparseable JSON, and the PI's plan then
+    # falls back to an agenda made of the user's own question with nothing saying so. Measured on
+    # claude-sonnet against the 4096 `reason` cap — six truncations in one day, one of which
+    # reached a reviewer as a two-step "plan" whose first step was the question.
+    usage.setdefault("finish_reason", (choices[0].get("finish_reason") or ""))
+    return content, usage
+
+
+def _effort_rejected(exc: GatewayError) -> bool:
+    text = f"{getattr(exc, 'message', '')} {getattr(exc, 'detail', '')}".lower()
+    return "reasoning effort" in text or "reasoning_effort" in text
+
+
+def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None,
+                        idle_timeout: float) -> tuple[str, dict]:
+    """``complete_ex`` over SSE: the socket timeout is per READ, so it bounds silence, not length."""
+    payload = dict(payload, stream=True, stream_options={"include_usage": True})
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers=_headers(api_key), method="POST")
+    parts: list[str] = []
+    usage: dict = {}
+    finish = ""
+    served_model = ""
+    try:
+        with urllib.request.urlopen(req, timeout=idle_timeout) as resp:  # noqa: S310 - local tunnel
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("error"):
+                    err = chunk["error"]
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    raise GatewayError(f"vLLM completion error: {str(msg)[:300]}", stage="vllm_chat", detail=err)
+                served_model = chunk.get("model") or served_model
+                if isinstance(chunk.get("usage"), dict):
+                    usage = dict(chunk["usage"])
+                for ch in chunk.get("choices") or []:
+                    delta = ch.get("delta") or {}
+                    if delta.get("content"):
+                        parts.append(delta["content"])
+                    if ch.get("finish_reason"):
+                        finish = ch["finish_reason"]
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise GatewayError(f"vLLM completion error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise VLLMNetworkError(f"vLLM sent nothing for {idle_timeout:.0f}s (or the connection dropped).",
+                               stage="vllm_chat", detail=error_detail(exc)) from exc
+    usage.setdefault("model", served_model or model)
+    usage.setdefault("finish_reason", finish)
+    return "".join(parts), usage
+
+
+def complete(
+    local_port: int,
+    model: str,
+    messages: list[dict],
+    timeout: float = 600.0,
+    max_tokens: int | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    think: bool = True,
+) -> str:
+    """``complete_ex`` without the usage — the historical ``-> str`` contract, unchanged."""
+    return complete_ex(local_port, model, messages, timeout=timeout, max_tokens=max_tokens,
+                       base_url=base_url, api_key=api_key, think=think)[0]
 
 
 def chat_tools(
@@ -406,13 +565,20 @@ def chat_tools(
     base_url: str | None = None,
     api_key: str | None = None,
     max_tokens: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict:
     """One **non-streaming** ``/v1/chat/completions`` call WITH tool schemas.
 
-    Returns ``{"content": str, "tool_calls": list}`` — the SAME shape as
-    ``ollama.chat_tools`` (the OpenAI ``tool_calls`` items carry ``function.name``
-    and ``function.arguments`` as a JSON *string*, which ``ResearchHarness._parse_call``
-    already accepts), so the agentic harness is backend-agnostic.
+    Returns ``{"content": str, "tool_calls": list, "finish_reason": str}`` — the SAME shape as
+    ``ollama.chat_tools`` plus why generation stopped (the OpenAI ``tool_calls`` items carry
+    ``function.name`` and ``function.arguments`` as a JSON *string*, which
+    ``ResearchHarness._parse_call`` already accepts), so the agentic harness is backend-agnostic.
+
+    ``reasoning_effort`` sets how hard a LOCAL model thinks before it acts, falling back to
+    ``BIOAGENT_VLLM_REASONING_EFFORT``. Without it Qwen3.8 thinks at its default, xhigh, and on
+    2026-09-30 a Scientist turn spent its whole 8192-token reservation reasoning: finish_reason
+    "length", no tool call, a wasted two-minute turn, step after step. A model that rejects the
+    level is asked again without the field, as ``complete_ex`` does.
 
     ``fmt`` (a JSON schema) maps to vLLM's structured-output ``response_format`` on
     the harness's constrained-decoding fallback path. ``base_url``/``api_key`` override
@@ -440,21 +606,35 @@ def chat_tools(
         payload["chat_template_kwargs"] = _scientist_kwargs()
     if fmt is not None:
         payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "tool_selection", "schema": fmt}}
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
+    effort = (reasoning_effort or "").strip().lower() or _reasoning_effort()
+    if not base_url and effort in REASONING_EFFORTS:
+        payload["reasoning_effort"] = effort
+
+    def _post(body_payload: dict) -> dict:
+        data = json.dumps(body_payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local tunnel
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise GatewayError(f"vLLM tool-chat error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise VLLMNetworkError("Network error during vLLM tool-chat.", stage="vllm_chat", detail=error_detail(exc)) from exc
+        if isinstance(body, dict) and body.get("error"):
+            raise GatewayError(f"vLLM tool-chat error: {body['error']}", stage="vllm_chat", detail=body)
+        return body
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local tunnel
-            body = json.loads(resp.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GatewayError(f"vLLM tool-chat error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise VLLMNetworkError("Network error during vLLM tool-chat.", stage="vllm_chat", detail=error_detail(exc)) from exc
-    if isinstance(body, dict) and body.get("error"):
-        raise GatewayError(f"vLLM tool-chat error: {body['error']}", stage="vllm_chat", detail=body)
+        body = _post(payload)
+    except GatewayError as exc:
+        if "reasoning_effort" not in payload or not _effort_rejected(exc):
+            raise
+        body = _post({k: v for k, v in payload.items() if k != "reasoning_effort"})
     choices = (body or {}).get("choices") or [{}]
     message = choices[0].get("message") or {}
-    return {"content": message.get("content") or "", "tool_calls": message.get("tool_calls") or []}
+    return {"content": message.get("content") or "", "tool_calls": message.get("tool_calls") or [],
+            "finish_reason": str(choices[0].get("finish_reason") or "")}
 
 
 def _tokenize_root(local_port: int, base_url: str | None) -> str | None:
@@ -514,3 +694,12 @@ def count_tokens(
         if got is not None:
             return got
     return _post(base_payload)
+
+
+# The tools ask the session's served model through ``tools.sdk.session_chat_fn`` instead of
+# importing this module (the tools must not import the gateway). Register the backend here, at
+# import time; the lambda looks ``complete`` up on every call, so tests that monkeypatch
+# ``vllm_client.complete`` still intercept the tools' calls.
+from ..tools import sdk as _tool_sdk  # noqa: E402
+
+_tool_sdk.register_llm_backend(lambda *a, **k: complete(*a, **k))

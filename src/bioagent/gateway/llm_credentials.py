@@ -211,6 +211,24 @@ def _key_path(owner: str, cred_id: str) -> Path:
     return _owner_dir(owner) / f"{cred_id}.key"
 
 
+def _key_file(owner: str, cred_id: str, row: dict) -> Path:
+    """Where this credential's key actually is — canonical location first, recorded path second.
+
+    A row stores the ``key_path`` it was written with, and that path does not survive the store
+    moving. Rows created while ``BIOAGENT_STATE_DIR`` was unset hold a path relative to the
+    then-current working directory (``llm_creds/<owner>/<id>.key``); pointing the state dir
+    somewhere else left every one of them naming a file that is no longer there, so the key sat
+    intact on disk while every use of it failed — "outside the owner's store" for an LLM key, a
+    missing file for an SSH one. The canonical path is derived from the CURRENT store, so it
+    follows the move; the recorded path stays as a fallback for any layout that predates it, and
+    is still confined to the owner's directory by the caller.
+    """
+    canonical = _key_path(owner, cred_id)
+    if canonical.is_file():
+        return canonical
+    return Path(row.get("key_path") or canonical)
+
+
 def create(owner: str, *, provider: str, base_url: str, model: str, api_key: str,
            label: str | None = None, lab_model: str | None = None,
            verify: Callable[[str, str, str | None], Any] | None = None) -> dict:
@@ -293,7 +311,8 @@ def rotate_key(owner: str, cred_id: str, api_key: str, *,
 
 
 def update(owner: str, cred_id: str, *, label: str | None = None, model: str | None = None,
-           lab_model: str | None = None, base_url: str | None = None) -> dict:
+           lab_model: str | None = None, base_url: str | None = None,
+           provider: str | None = None) -> dict:
     """Edit METADATA only — never the key. Changing ``model`` or ``base_url`` invalidates the
     stored verification (the key was proven against the old pair, not this one), so the row is
     marked unverified rather than carrying a stale green tick."""
@@ -305,6 +324,8 @@ def update(owner: str, cred_id: str, *, label: str | None = None, model: str | N
     endpoint_changed = False
     if label is not None:
         row["label"] = label
+    if provider is not None and provider != row.get("provider"):
+        row["provider"] = provider
     if model is not None and model != row.get("model"):
         row["model"] = model
         endpoint_changed = True
@@ -354,6 +375,25 @@ def record_egress_consent(owner: str, cred_id: str) -> dict | None:
     return _public(row)
 
 
+def storage_info(owner: str) -> dict:
+    """Where this owner's keys actually live, in plain terms, for the UI to show.
+
+    "Where is my key?" is a fair question and the honest answer is short: a 0600 file on THIS
+    server, under a directory named after the account, never in the browser and never back over
+    the wire. Users who cannot see that answer assume the worst (or paste the key somewhere
+    else "to be safe"), so the dialog states it rather than leaving it to the docs.
+    """
+    # Absolute, always. ``BIOAGENT_STATE_DIR`` is unset in production, so the store resolves
+    # relative to the service's working directory and this read "llm_creds/<user>" — which
+    # answers "where is my key?" with a path the reader cannot locate, and so does not answer it.
+    return {
+        "owner": _safe_owner(owner),
+        "dir": str(_owner_dir(owner).resolve()),
+        "mode": "0600",
+        "encrypted": encryption_enabled(),
+    }
+
+
 def list_credentials(owner: str) -> list[dict]:
     return [_public(r) for r in _load_index(owner)]
 
@@ -380,7 +420,7 @@ def resolve_secret(owner: str, cred_id: str) -> str | None:
     row = get_credential(owner, cred_id)
     if row is None:
         return None
-    path = Path(row.get("key_path") or _key_path(owner, cred_id))
+    path = _key_file(owner, cred_id, row)
     try:
         # Containment: a hand-edited index.json must not be able to point key_path at an
         # arbitrary file (/etc/shadow, another owner's key) and have us read it back out.
@@ -400,7 +440,7 @@ def delete_credential(owner: str, cred_id: str) -> bool:
         return False
     gone = _find(rows, cred_id)
     try:
-        kp = Path((gone or {}).get("key_path") or _key_path(owner, cred_id)).resolve()
+        kp = _key_file(owner, cred_id, gone or {}).resolve()
         if kp.is_relative_to(_owner_dir(owner).resolve()) and kp.is_file():
             kp.unlink()
     except OSError:

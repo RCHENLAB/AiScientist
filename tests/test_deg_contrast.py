@@ -28,7 +28,8 @@ import numpy as np  # noqa: E402
 import anndata as ad  # noqa: E402
 import scanpy as sc  # noqa: E402
 
-from bioagent.tools import scrna_pack  # noqa: E402
+from bioagent.tools.run_de import tool as run_de_tool  # noqa: E402
+from bioagent.tools.run_enrichment import tool as run_enrichment_tool
 
 
 N_GENES = 200
@@ -91,7 +92,7 @@ def test_contrast_runs_off_the_qc_checkpoint_without_clustering(ctx):
     """No adata_clustered.h5ad exists — the labeled-dataset path the DEG protocol prescribes."""
     assert not (Path(ctx.workspace) / "work" / "adata_clustered.h5ad").exists()
 
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
 
@@ -104,7 +105,7 @@ def test_contrast_runs_off_the_qc_checkpoint_without_clustering(ctx):
 
 
 def test_contrast_keeps_both_directions_in_the_combined_table(ctx):
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
 
@@ -127,7 +128,7 @@ def test_contrast_keeps_both_directions_in_the_combined_table(ctx):
 
 
 def test_contrast_writes_universe_and_rank_files_under_the_stratified_key(ctx):
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
     tables = Path(ctx.workspace) / "artifacts" / "tables"
@@ -142,7 +143,7 @@ def test_contrast_writes_universe_and_rank_files_under_the_stratified_key(ctx):
 
 
 def test_a_cell_type_without_enough_cells_is_reported_not_silently_dropped(ctx):
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype",
          "min_cells": 1000},          # nothing can clear this
         ctx)
@@ -152,9 +153,32 @@ def test_a_cell_type_without_enough_cells_is_reported_not_silently_dropped(ctx):
     assert out["de_rows_total"] == 0
 
 
+def test_contrast_names_its_arms_and_counts_every_stratum(ctx):
+    """What a write-up tabulates as "cells per arm", straight from the tool — and by name, so
+    n_condition / n_reference cannot be read the wrong way round (run 8847d521ba32 did)."""
+    tested = run_de_tool.run_de(
+        {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
+        ctx)
+    skipped = run_de_tool.run_de(
+        {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 1000},
+        ctx)
+
+    every = {"Alpha": {"KO": 60, "WT": 60}, "Beta": {"KO": 60, "WT": 60}}
+    assert tested["condition"] == "KO" and tested["cells_by_group_and_arm"] == every
+    # A stratum refused for too few cells is still counted, consistently with its skip record.
+    assert skipped["cells_by_group_and_arm"] == every
+    for s in skipped["skipped_groups"]:
+        per = skipped["cells_by_group_and_arm"][s["group"]]
+        assert (per["KO"], per["WT"]) == (s["n_condition"], s["n_reference"])
+    # Last. The shortened views keep the warnings wherever they sit and drop data from the end, so
+    # at the end this table goes before the per-stratum counts do; the count check reads it from
+    # the full result.
+    assert list(tested)[-1] == "cells_by_group_and_arm"
+
+
 def test_markers_path_is_unchanged(ctx):
     """One-vs-rest markers — the historical behaviour, keyed by groupby, capped at n_genes."""
-    out = scrna_pack.run_de({"groupby": "celltype", "n_genes": 20}, ctx)
+    out = run_de_tool.run_de({"groupby": "celltype", "n_genes": 20}, ctx)
 
     assert out["status"] == "ok"
     assert out["reference"] == "rest"
@@ -175,11 +199,11 @@ def test_markers_path_is_unchanged(ctx):
 def test_a_stratified_run_does_not_clobber_an_existing_marker_checkpoint(ctx):
     """Annotation skills read rank_genes_groups out of adata_de.h5ad; a stratified contrast has
     no global result to put there, so it must not overwrite one."""
-    scrna_pack.run_de({"groupby": "celltype", "n_genes": 10}, ctx)
+    run_de_tool.run_de({"groupby": "celltype", "n_genes": 10}, ctx)
     marker_ckpt = Path(ctx.workspace) / "work" / "adata_de.h5ad"
     before = marker_ckpt.read_bytes()
 
-    scrna_pack.run_de(
+    run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
 
@@ -191,20 +215,20 @@ def test_a_stratified_run_does_not_clobber_an_existing_marker_checkpoint(ctx):
 
 
 def test_unknown_reference_level_is_an_error_not_a_silent_one_vs_rest(ctx):
-    out = scrna_pack.run_de({"groupby": "condition", "reference": "control"}, ctx)
+    out = run_de_tool.run_de({"groupby": "condition", "reference": "control"}, ctx)
     assert out["status"] == "error"
     assert "not a level" in out["error"]
 
 
 def test_stratify_without_reference_is_refused(ctx):
     """Silently running one-vs-rest inside each cell type would look like a contrast and is not."""
-    out = scrna_pack.run_de({"groupby": "condition", "stratify_by": "celltype"}, ctx)
+    out = run_de_tool.run_de({"groupby": "condition", "stratify_by": "celltype"}, ctx)
     assert out["status"] == "error"
     assert "reference" in out["error"]
 
 
 def test_missing_qc_checkpoint_names_the_step_that_writes_it(tmp_path):
-    out = scrna_pack.run_de({}, SimpleNamespace(workspace=tmp_path, decisions={}))
+    out = run_de_tool.run_de({}, SimpleNamespace(workspace=tmp_path, decisions={}))
     assert out["status"] == "error"
     assert "run_scanpy_qc" in out["error"]
 
@@ -215,7 +239,7 @@ def test_missing_qc_checkpoint_names_the_step_that_writes_it(tmp_path):
 def test_enrichment_finds_the_contrast_table_and_splits_by_direction(ctx, tmp_path,
                                                                      monkeypatch):
     pytest.importorskip("gseapy")
-    scrna_pack.run_de(
+    run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
 
@@ -228,7 +252,7 @@ def test_enrichment_finds_the_contrast_table_and_splits_by_direction(ctx, tmp_pa
         encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestSets"], "top_n_terms": 5}, ctx)
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestSets"], "top_n_terms": 5}, ctx)
 
     assert out["status"] == "ok", out
     assert out["split_by_direction"] is True
@@ -247,7 +271,7 @@ def test_pseudobulk_writes_the_table_enrichment_discovers(tmp_path):
     ONLY as pseudobulk_all.csv, which run_enrichment does not look for — so the RECOMMENDED path
     silently lost per-cell-type enrichment and its ORA background."""
     pytest.importorskip("scipy")
-    from bioagent.tools import scrna_advanced
+    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     work = tmp_path / "work"
     _synthetic_qc_checkpoint(work, n_per_arm=40)
@@ -259,7 +283,7 @@ def test_pseudobulk_writes_the_table_enrichment_discovers(tmp_path):
     adata.write(work / "adata_qc.h5ad")
     ctx = SimpleNamespace(workspace=tmp_path, decisions={})
 
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "donor", "condition_key": "condition", "group_key": "celltype",
          "min_cells_per_sample": 5},
         ctx)
@@ -284,11 +308,11 @@ def test_enrichment_reports_no_significant_genes_instead_of_asking_for_a_gene_li
                                        encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     # A contrast that finds nothing: no cell type clears min_cells, so the combined table is empty.
-    scrna_pack.run_de(
+    run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 1000},
         ctx)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestSets"]}, ctx)
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestSets"]}, ctx)
 
     assert out["status"] == "error"
     assert "do not substitute a gene list" in out["error"]
@@ -304,11 +328,11 @@ def test_a_stub_gmt_is_refused_not_silently_enriched_against(ctx, monkeypatch, t
     gdir.mkdir()
     (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
-    scrna_pack.run_de(
+    run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, ctx)
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["GO_Biological_Process_2023"]}, ctx)
 
     assert out["status"] == "error"
     assert "GO_Biological_Process_2023" in out["unusable_libraries"]
@@ -325,11 +349,11 @@ def test_a_real_library_reports_its_term_count(ctx, monkeypatch, tmp_path):
     lines = [f"SET_{i}\tna\t" + "\t".join(UP_IN_KO) for i in range(20)]
     (gdir / "TestSets.gmt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
-    scrna_pack.run_de(
+    run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestSets"]}, ctx)
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestSets"]}, ctx)
 
     assert out["status"] == "ok"
     assert out["gene_set_terms"]["TestSets"] == 20

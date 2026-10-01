@@ -34,7 +34,9 @@ def test_perturbation_analysis_in_selector():
 def test_all_skill_scripts_compile():
     # Each skill is a folder skills/<name>/ with a SKILL.md + reference.py (+ any bundle); compile
     # every bundled .py so a syntax slip in a never-imported CodeAct template can't ship silently.
-    skills = Path(__file__).resolve().parents[1] / "skills"
+    from bioagent.agents.skills import _skills_dir
+
+    skills = _skills_dir()        # the repo-root skills/, or $BIOAGENT_SKILLS_DIR once skills live apart
     scripts = sorted(skills.glob("*/*.py"))
     assert scripts, "no skills/*/*.py found — wrong dir?"
     for s in scripts:

@@ -85,6 +85,12 @@ class HPCSettings:
     # partition still buys scheduling priority and is not preemptible — that, not capability, is
     # what the default is paying for. 7 RTX6000 nodes x 4 cards sit in free-gpu32.
     gpu_candidates: str = ""
+    # PRIORITY within the race: list order is preference order. With this > 0, a LOWER-priority
+    # candidate that starts first is held (not claimed) until every higher-priority candidate still
+    # pending has queued this many seconds — so e.g. the free RTX6000 wins whenever it frees up within
+    # the window, and the paid A100 only takes over when the free pool is genuinely busy. 0 = pure
+    # first-come-first-served (the original behaviour). See BIOAGENT_GPU_PREFER_SECONDS.
+    gpu_prefer_seconds: int = 0
 
     # STRICT per-user isolation. The console only ever finds, reuses, or stops
     # the *current user's own* serve job (named bioagent-vllm-<ucinetid> and
@@ -129,16 +135,27 @@ class HPCSettings:
     llm_backend: str = "vllm"
 
     # vLLM (runs inside a Singularity container on the GPU node; serves /v1).
-    # AWQ INT4 (~24GB) is the A100-optimal + smallest-disk Qwen3.6-35B-A3B build,
-    # and runs on the whole heterogeneous GPU pool (A30/L40S/A100/RTX6000) via
-    # INT4 Marlin kernels — unlike FP8, which is native only on L40S (Ada).
-    vllm_model: str = "QuantTrio/Qwen3.6-35B-A3B-AWQ"
-    vllm_image: str = f"{SHARED_ROOT}/containers/vllm.sif"
+    # Qwen3.8-27B (dense, hybrid attention, vision) as W4A16 INT4 (compressed-tensors, 16GB). It
+    # needs a newer vLLM than the June vllm.sif, hence vllm-0.28.0.sif; the format is auto-detected,
+    # so vllm_quantization is "". MEASURED 2026-09-25 on HPC3 (one card, 262144 ctx, same bench):
+    #                               1-stream tok/s   8-way tok/s   KV tokens    tool calls  ready
+    #   Qwen3.6-35B-A3B-AWQ  A100        146              898       2,467,482      5/5      280s
+    #   Qwen3.6-35B-A3B-AWQ  RTX6000     175              982       3,034,420      5/5      190s
+    #   Qwen3.8-27B-INT4     A100         70              459       1,625,594      5/5      410s
+    #   Qwen3.8-27B-INT4     RTX6000      75              516       2,017,303      5/5      390s
+    #   Qwen3.8-27B-NVFP4    A100         62              403         794,888      5/5      530s
+    #   Qwen3.8-27B-NVFP4    RTX6000      63              354         971,700      5/5      640s
+    # 27B dense vs 3B active: ~2.3x slower per token, the price of the 3.8 quality gain. NVFP4 is
+    # not faster even on Blackwell and halves the KV pool — INT4 is the build to use. To roll back:
+    # BIOAGENT_VLLM_MODEL=QuantTrio/Qwen3.6-35B-A3B-AWQ, BIOAGENT_VLLM_IMAGE=.../vllm.sif,
+    # BIOAGENT_VLLM_QUANTIZATION=awq_marlin (those weights and that image are kept).
+    vllm_model: str = "RedHatAI/Qwen3.8-27B-INT4"
+    vllm_image: str = f"{SHARED_ROOT}/containers/vllm-0.28.0.sif"
     hf_home: str = f"{SHARED_ROOT}/hf"  # HF cache on shared DFS, NOT $HOME
     # The model's NATIVE window (config.json max_position_embeddings = 262144) — no YaRN, no
     # rope scaling. The old 32768 default was justified by "A100-40G leaves ~16GB KV", and both
     # halves of that were wrong. MEASURED on HPC3 2026-08-02 by booting this exact image+model
-    # at --max-model-len 262144 (see the ctxprobe logs):
+    # at --max-model-len 262144 (see the ctxprobe logs; Qwen3.6 numbers — 3.8's are in the table above):
     #   A100 80GB  (partition gpu,       gpu:A100:1)  -> 47.8 GiB KV = 2,466,442 tokens, 9.41x
     #   RTX PRO 6000 Blackwell 96GB (free-gpu32)      -> 58.8 GiB KV = 3,035,461 tokens, 11.58x
     # HPC3's A100s are 80GB, not 40GB; and this Qwen3.6 is a HYBRID — `layer_types` is
@@ -148,10 +165,15 @@ class HPCSettings:
     # Lower this only to trade window for concurrency, never "to make it fit".
     vllm_max_model_len: int = 262144
     vllm_gpu_mem_util: float = 0.92
-    vllm_quantization: str = "awq_marlin"  # AWQ INT4 on Ampere(A100); "" = let vLLM auto-detect
+    vllm_quantization: str = ""            # "" = auto-detect (compressed-tensors); "awq_marlin" for the 3.6 AWQ
     vllm_tool_parser: str = "qwen3_coder"  # per the AWQ model card; needs vllm>=0.19
     vllm_reasoning_parser: str = "qwen3"   # parse Qwen3 thinking trace; "" to disable
     vllm_extra_args: str = ""              # escape hatch for extra `vllm serve` flags
+    # Which GPU types this model may run on, in the gres vocabulary of BIOAGENT_GPU_CANDIDATES
+    # (e.g. "RTX6000,A100"); "" = any card the race can give it. Decides whether switching a live
+    # session to this model can keep its current card (gpu.card_fits) and which race candidates
+    # a new job may use. Set per model from the cluster model list.
+    vllm_gpu_cards: str = ""
 
     # Container runtime for the GPU serve job + code sandbox. RCIC HPC3 provides
     # SINGULARITY (module `singularity/<ver>`), NOT Apptainer — they share a CLI, but
@@ -390,7 +412,9 @@ class HPCSettings:
     # one step without redoing the whole pipeline. Those densified matrices are large, so they auto-
     # expire after this many days (only the CHECKPOINTS — never artifacts/reports). 0 disables the
     # sweep (keep forever). After expiry, step-level "continue" needs the study re-run once; the
-    # report + regenerate still work (they read artifacts/, which never expire).
+    # report, figures and tables still work (they live in artifacts/, which never expires).
+    # Note this is now a BACKSTOP: `_drop_process_files` releases work/ as soon as the report is
+    # written, so checkpoints normally never live long enough for this TTL to see them.
     checkpoint_ttl_days: int = 7
 
     # vLLM serve job networking (the GPU node binds a DYNAMIC port; these are the
@@ -450,6 +474,7 @@ class HPCSettings:
             exclude=os.environ.get("BIOAGENT_SLURM_EXCLUDE") or None,
             constraint=os.environ.get("BIOAGENT_SLURM_CONSTRAINT") or None,
             gpu_candidates=os.environ.get("BIOAGENT_GPU_CANDIDATES", cls.gpu_candidates),
+            gpu_prefer_seconds=_int("BIOAGENT_GPU_PREFER_SECONDS", cls.gpu_prefer_seconds),
             # New names, with backward-compat fallback to the old BIOAGENT_OLLAMA_* so a
             # deployed .env keeps working until it's updated.
             serve_port=_int("BIOAGENT_VLLM_PORT", _int("BIOAGENT_OLLAMA_PORT", cls.serve_port)),
@@ -471,6 +496,7 @@ class HPCSettings:
             vllm_max_model_len=_int("BIOAGENT_VLLM_MAX_MODEL_LEN", cls.vllm_max_model_len),
             vllm_gpu_mem_util=_float("BIOAGENT_VLLM_GPU_MEM_UTIL", cls.vllm_gpu_mem_util),
             vllm_quantization=os.environ.get("BIOAGENT_VLLM_QUANTIZATION", cls.vllm_quantization),
+            vllm_gpu_cards=os.environ.get("BIOAGENT_VLLM_GPU_CARDS", cls.vllm_gpu_cards),
             vllm_tool_parser=os.environ.get("BIOAGENT_VLLM_TOOL_PARSER", cls.vllm_tool_parser),
             vllm_reasoning_parser=os.environ.get("BIOAGENT_VLLM_REASONING_PARSER", cls.vllm_reasoning_parser),
             vllm_extra_args=os.environ.get("BIOAGENT_VLLM_EXTRA_ARGS", cls.vllm_extra_args),

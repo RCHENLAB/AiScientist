@@ -12,10 +12,10 @@ import json
 import runpy
 from pathlib import Path
 
-from bioagent.agents.skills import SKILLS
-from bioagent.tools.variant_annotation import ANNOTATION_COLUMNS
+from bioagent.agents.skills import SKILLS, _skills_dir
+from bioagent.tools.annotate_variants.tool import ANNOTATION_COLUMNS
 
-_SKILL = Path(__file__).resolve().parents[1] / "skills" / "variant_output_tables" / "reference.py"
+_SKILL = _skills_dir() / "variant_output_tables" / "reference.py"
 
 
 def _write_tsv(path: Path, rows: list[dict]) -> None:

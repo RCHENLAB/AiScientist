@@ -21,7 +21,8 @@ from __future__ import annotations
 import datetime as _dt
 import json as _json
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String,
+                        Text, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -200,5 +201,52 @@ class Message(Base):
         return {
             "id": self.id, "role": self.role, "content": self.content, "kind": self.kind,
             "meta": meta, "seq": self.seq,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class LlmCall(Base):
+    """One LLM completion, with what the provider said it cost.
+
+    Every endpoint returns a ``usage`` block — prompt/completion/total tokens, and on OpenRouter a
+    ``cost`` in USD. ``vllm_client.complete`` read the response body for its ``content`` and threw
+    the rest away, so a run's spend existed NOWHERE: not in a log, not on the ``Run`` row, not in
+    this database. The only instrument was the monthly bill, and a bill cannot tell you WHICH call
+    was expensive — which is the only question worth asking when a run costs more than it should.
+
+    One row per call. Written best-effort: accounting must never be able to fail a run, so the
+    recorder swallows its own errors and a lost row is preferable to a broken analysis.
+    """
+
+    __tablename__ = "llm_calls"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    #: Which half of the lab this was — the cost profile differs by an order of magnitude.
+    role: Mapped[str] = mapped_column(String(24), default="reason")   # reason | writer | scientist
+    model: Mapped[str] = mapped_column(String(128), default="")
+    endpoint: Mapped[str] = mapped_column(String(128), default="")
+    #: True when the prompt left the cluster — i.e. when the call was BILLED to the user's key.
+    remote: Mapped[bool] = mapped_column(Boolean, default=False)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    #: Provider-reported USD, when the endpoint returns one. NULL when it does not — never
+    #: inferred from a hard-coded price table, because a stale table is worse than no number.
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: The ``max_tokens`` this call actually SENT (NULL = none sent, i.e. uncapped). Recorded so a
+    #: bill can be read against the ceiling that was in force, not the one currently configured.
+    max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def public(self) -> dict:
+        return {
+            "id": self.id, "run_id": self.run_id, "role": self.role, "model": self.model,
+            "endpoint": self.endpoint, "remote": self.remote,
+            "prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens, "cost_usd": self.cost_usd,
+            "max_tokens": self.max_tokens, "duration_ms": self.duration_ms,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

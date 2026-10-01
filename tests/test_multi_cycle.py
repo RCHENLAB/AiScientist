@@ -248,7 +248,9 @@ def test_exploration_and_cycles_compose_within_and_across_cycles():
         ecalls["n"] += 1
         if ecalls["n"] == 1:
             return {"surprise": "QC loss is concentrated in one animal",
-                    "hypotheses": [{"statement": statement, "prediction": "p", "test": "t"}],
+                    "hypotheses": [{"statement": statement, "prediction": "p", "test": "t",
+                                    "rival": "a technical artefact explains it",
+                                    "discriminator": "confined to one cell type -> real; uniform -> artefact"}],
                     "new_steps": [{"step": new_step, "hypothesis": statement}]}
         return {"surprise": "nothing", "hypotheses": [], "new_steps": []}
 

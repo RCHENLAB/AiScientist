@@ -350,3 +350,33 @@ def test_multiple_parallel_tool_calls_keep_their_indexes(monkeypatch):
     (kind, calls), = list(vllm_client.chat_tools_stream(1234, "m", [], []))
     assert kind == "tool_calls"
     assert [c["function"]["name"] for c in calls] == ["one", "two"]   # sorted by index
+
+
+# --- forced grounding: how a failed deep_literature result is shown to the model ------------
+
+
+def test_grounding_keeps_the_passages_when_paperqa_could_not_answer():
+    """deep_literature returns `failed` when it gathered passages but its answer step failed. Chat
+    must still ground on the passages; before, it told the user the corpus had nothing."""
+    from bioagent.agents.quick_chat import _format_grounding
+
+    text = _format_grounding({
+        "status": "failed", "n_contexts": 2, "agent_status": "truncated", "answer": "",
+        "error": "PaperQA gathered 2 passage(s) but produced no answer",
+        "contexts": [{"citation": "Allikmets R et al. 1997", "summary": "ABCA4 causes STGD1."},
+                     {"citation": "Cremers FPM et al. 2020", "summary": "ELOVL4, PROM1: STGD-like."}]})
+    assert "Allikmets" in text and "ELOVL4" in text
+    assert "has nothing" not in text
+
+
+def test_grounding_for_a_search_that_ran_out_of_time_does_not_claim_an_empty_corpus():
+    from bioagent.agents.quick_chat import _format_grounding
+
+    text = _format_grounding({"status": "failed", "n_contexts": 0, "agent_status": "truncated",
+                              "error": "PaperQA's time budget ran out"})
+    assert "did NOT finish" in text
+    assert "The corpus has nothing on this." not in text
+    # An honest empty retrieval still says so.
+    empty = _format_grounding({"status": "failed", "n_contexts": 0, "agent_status": "success",
+                               "error": "the indexed corpus returned 0 passages"})
+    assert "The corpus has nothing on this." in empty

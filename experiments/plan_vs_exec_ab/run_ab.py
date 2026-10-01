@@ -129,6 +129,33 @@ ARMS: dict[str, dict[str, Any]] = {
     # variable: what our local NVFP4 quantisation costs versus the provider's FP8 serving.
     "dsv4-local":        {"model": "deepseek-v4-flash", "reasoning": None, "max_tokens_scale": 3.0,
                           "base_url": os.environ.get("DSV4_LOCAL_URL", "http://127.0.0.1:30000/v1")},
+    # --- round 6 (2026-09-25): the model swap itself. Both served from OUR cards (one RTX PRO 6000
+    # each, same vLLM flags as prod's gateway/gpu.py, reached over SSH tunnels), so the only variable
+    # is the model + its quantisation. No reasoning field is sent to a local server, so the chat
+    # template's default applies — thinking ON, which is how prod's PI / writer call it.
+    "qwen36-awq-local":  {"model": "QuantTrio/Qwen3.6-35B-A3B-AWQ", "reasoning": None, "max_tokens_scale": 3.0,
+                          "base_url": os.environ.get("QWEN36_LOCAL_URL", "http://127.0.0.1:30036/v1")},
+    "qwen38-int4-local": {"model": "RedHatAI/Qwen3.8-27B-INT4", "reasoning": None, "max_tokens_scale": 3.0,
+                          "base_url": os.environ.get("QWEN38_LOCAL_URL", "http://127.0.0.1:30038/v1"),
+                          # 3.8 at its default effort thought past the 300 s cap on every plan call
+                          # (4 in flight, all retried) — give it room so the default is MEASURED.
+                          "hard_s": 1500.0},
+    # The same server at the effort prod would set via BIOAGENT_VLLM_REASONING_EFFORT, which
+    # vllm_client sends as the top-level ``reasoning_effort`` field.
+    "qwen38-int4-local-low":    {"model": "RedHatAI/Qwen3.8-27B-INT4", "reasoning": None, "max_tokens_scale": 3.0,
+                                 "base_url": os.environ.get("QWEN38_LOCAL_URL", "http://127.0.0.1:30038/v1"),
+                                 "local_effort": "low", "hard_s": 900.0},
+    # Round 6c: the SAME arm as -low, run with BIOAGENT_CLAIM_AUDIT=1 (checks asked one at a time before writing)
+    "qwen38-int4-local-low-audit": {"model": "RedHatAI/Qwen3.8-27B-INT4", "reasoning": None, "max_tokens_scale": 3.0,
+                                    "base_url": os.environ.get("QWEN38_LOCAL_URL", "http://127.0.0.1:30038/v1"),
+                                    "local_effort": "low", "hard_s": 900.0},
+    # Round 6d: the audit after review — authoritative design numbers in the block, no "ROBUST" label
+    "qwen38-int4-local-low-audit2": {"model": "RedHatAI/Qwen3.8-27B-INT4", "reasoning": None, "max_tokens_scale": 3.0,
+                                     "base_url": os.environ.get("QWEN38_LOCAL_URL", "http://127.0.0.1:30038/v1"),
+                                     "local_effort": "low", "hard_s": 900.0},
+    "qwen38-int4-local-medium": {"model": "RedHatAI/Qwen3.8-27B-INT4", "reasoning": None, "max_tokens_scale": 3.0,
+                                 "base_url": os.environ.get("QWEN38_LOCAL_URL", "http://127.0.0.1:30038/v1"),
+                                 "local_effort": "medium", "hard_s": 1200.0},
 }
 JUDGES = {
     "judge-opus5":   {"model": "anthropic/claude-opus-5", "reasoning": "low", "max_tokens_scale": 4.0},
@@ -304,6 +331,8 @@ def or_chat(arm: str, messages: list[dict[str, Any]], *, tools: list[dict[str, A
     r = spec.get("reasoning")
     if local_url:
         r = None
+        if spec.get("local_effort"):
+            payload["reasoning_effort"] = spec["local_effort"]
     if r == "none":
         payload["reasoning"] = {"effort": "none", "exclude": True}
     elif r:
@@ -322,8 +351,9 @@ def or_chat(arm: str, messages: list[dict[str, Any]], *, tools: list[dict[str, A
             "HTTP-Referer": "https://aiscientist.local/experiments", "X-Title": "plan_vs_exec_ab"})
         t0 = time.time()
         try:
-            out = _with_deadline(lambda: _stream_once(req, stall_s=stall_s, hard_s=(480.0 if r and r != "none" else 300.0)),
-                                 deadline_s=(520.0 if r and r != "none" else 330.0))
+            hard = float(spec.get("hard_s") or (480.0 if r and r != "none" else 300.0))
+            out = _with_deadline(lambda: _stream_once(req, stall_s=stall_s, hard_s=hard),
+                                 deadline_s=hard + 30.0)
             usage = out.pop("usage", {}) or {}
             prov = out.pop("provider", None)
             USAGE.add(arm, usage, time.time() - t0)
@@ -359,7 +389,7 @@ def or_chat(arm: str, messages: list[dict[str, Any]], *, tools: list[dict[str, A
 class LocalShell:
     """The HPC3 filesystem/shell tool-set (list_dir/read_text/run_shell/...) bound to the LOCAL
     trial workspace, so the roster the model sees is production's roster and the calls do real
-    (local) work.  Same method contract as ``bioagent.tools.hpc_shell.HpcShell``."""
+    (local) work.  Same method contract as ``bioagent.hpc.shell.HpcShell``."""
 
     def __init__(self, workspace: Path) -> None:
         self.ws = workspace
@@ -437,7 +467,7 @@ def make_lab(arm: str, workspace: Path, dataset_path: Path, dataset_result: dict
     from bioagent.agents.research_harness import HarnessConfig, HarnessContext, ResearchHarness
     from bioagent.agents.research_lab import LabConfig, ResearchLab
     from bioagent.agents.sandbox import CodeSandbox
-    from bioagent.tools.hpc_shell import hpc_shell_catalog
+    from bioagent.hpc.shell import hpc_shell_catalog
 
     (workspace / "work").mkdir(parents=True, exist_ok=True)
     (workspace / "artifacts" / "tables").mkdir(parents=True, exist_ok=True)
@@ -965,6 +995,8 @@ def stage_C(args, inp: Inputs) -> None:
     old = _load_prefix_gateway()
     art_src = Path(args.run_state).resolve().parents[1]           # <run>/artifacts
     variants = {"prefix": old, "current": gw}
+    if getattr(args, "variants", ""):
+        variants = {k: v for k, v in variants.items() if k in args.variants.split(",")}
     tasks = [(arm, var, rep) for arm in args.arms for var in variants for rep in range(args.reps)
              if f"{arm}#{var}#{rep}" not in done]
     print(f"[C] {len(tasks)} report(s); art = {art_src}")
@@ -989,6 +1021,11 @@ def stage_C(args, inp: Inputs) -> None:
         try:
             synthesis = lab._synthesize(QUESTION, result.rounds, _events_sink(events))
             rec["synthesis"] = synthesis
+            # the claim audit runs inside _synthesize (BIOAGENT_CLAIM_AUDIT); production stamps it on the
+            # LabResult in run(), which this stage bypasses, so carry it the same way here
+            if getattr(lab, "_claim_audit", None):
+                result.claim_audit = dict(lab._claim_audit)
+                rec["claim_audit"] = result.claim_audit
             complete_fn = lab._complete_fn
             draft = mod._build_report(synthesis, art, complete_fn, QUESTION, result)
             rec["draft"] = draft
@@ -1288,6 +1325,7 @@ def main() -> None:
     ap.add_argument("--max-steps", dest="max_steps", type=int, default=None,
                     help="B only: tool-call budget per step (default = production's 8)")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--variants", default="", help="C only: comma list of prompt variants (prefix,current)")
     ap.add_argument("--out", default=str(HERE / "results"))
     ap.add_argument("--run-state", dest="run_state", required=True, help="run 8847's artifacts/process/run_state.json")
     ap.add_argument("--dataset", required=True, help="local Ddx41_DEG.h5ad")

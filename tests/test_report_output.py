@@ -136,3 +136,66 @@ def test_step_failures_scans_steps_not_just_errors_list():
     ]}
     fails = _step_failures(sr)
     assert fails == [("run_code", "ValueError: bad")]
+
+
+# --- the reasoning layer has to reach the exported record ----------------------------------------
+# Run c135ae589d96 raised one hypothesis, added a step to test it, and closed it as `supported`.
+# technical_report.md mentioned hypotheses ZERO times and event_log.txt held 407 lines without one
+# of them; the only trace was a JSON blob nobody reads. You cannot review what the record omits.
+
+def _ns(hypotheses):
+    import types
+    return types.SimpleNamespace(hypotheses=hypotheses)
+
+
+_H1 = {
+    "id": "h1", "status": "supported",
+    "statement": "The shifts are driven by a 1.6x sequencing depth imbalance, not regulation.",
+    "prediction": "Pseudobulk aggregation will collapse the top log2FC values.",
+    "test": "Run run_pseudobulk_de and see whether the ranking survives aggregation.",
+    "origin_step": "**Descriptive differential expression** — rank genes with run_de",
+    "evidence": ["Depth-matched contrasts yielded rho < 0.5 for all eight comparisons."],
+    "tested_by": ["Run run_pseudobulk_de to aggregate expression by major class."],
+}
+
+
+def test_the_ledger_reaches_the_technical_report_with_its_provenance():
+    from bioagent.gateway.app import _hypothesis_ledger_block
+    out = _hypothesis_ledger_block(_ns([_H1]))
+    assert "[h1] supported" in out
+    assert "run_pseudobulk_de" in out                      # the step it ADDED to the plan
+    assert "arose from" in out and "rho < 0.5" in out      # provenance + the evidence it closed on
+
+
+def test_a_supported_hypothesis_with_no_rival_is_flagged_in_the_report_itself():
+    # The whole failure in one line: with nothing to weigh against, "supported" means only
+    # "not contradicted", and a reader must not have to work that out for themselves.
+    from bioagent.gateway.app import _hypothesis_ledger_block
+    out = _hypothesis_ledger_block(_ns([_H1]))
+    assert "no competing explanation was recorded" in out and "not contradicted" in out
+
+
+def test_the_flag_does_not_fire_once_a_rival_is_recorded():
+    from bioagent.gateway.app import _hypothesis_ledger_block
+    out = _hypothesis_ledger_block(_ns([dict(_H1, rival="DDX41 loss disrupts Muller junctions",
+                                             discriminator="confined to MG vs uniform")]))
+    assert "no competing explanation was recorded" not in out
+    assert "competing explanation: DDX41 loss" in out and "tells them apart" in out
+
+
+def test_an_empty_ledger_says_so_rather_than_rendering_nothing():
+    from bioagent.gateway.app import _hypothesis_ledger_block
+    assert "none" in _hypothesis_ledger_block(_ns([])).lower()
+    assert "none" in _hypothesis_ledger_block(_ns(None)).lower()
+
+
+def test_the_narrative_mirror_skips_only_what_the_log_chain_already_writes():
+    # The mirror puts every lab_progress line into the exported log. These types are written by the
+    # run loop's own chain, so mirroring them would double every entry (pi_agenda is the whole
+    # agenda); the reasoning events must NOT be in the skip set or the bug comes straight back.
+    from bioagent.gateway.app import _LOGGED_BY_EVENT_CHAIN
+    assert "pi_agenda" in _LOGGED_BY_EVENT_CHAIN and "tool_result" in _LOGGED_BY_EVENT_CHAIN
+    for reasoning in ("team_meeting_start", "expert_contribution", "meeting_critic",
+                      "meeting_synthesis", "hypothesis_formed", "hypothesis_resolved",
+                      "steps_pruned", "expert_tool"):
+        assert reasoning not in _LOGGED_BY_EVENT_CHAIN, reasoning

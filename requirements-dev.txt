@@ -1,9 +1,9 @@
 pytest>=9.0
 ruff>=0.6
 # Offline auth unit tests (tests/test_auth_accounts.py) import bioagent.gateway.auth,
-# which pulls in bcrypt (password hashing) + itsdangerous (signed cookies). These two
-# are pure-Python/offline — the heavier auth extras (sqlalchemy/psycopg/alembic/httpx)
-# stay out of CI and gate the app-level tests via pytest.importorskip.
+# which pulls in bcrypt (password hashing) + itsdangerous (signed cookies). Both are
+# pure-Python/offline. psycopg and alembic remain server-only (CI and local dev run on
+# SQLite, which is stdlib) and still gate via pytest.importorskip.
 bcrypt>=4.1
 itsdangerous>=2.1
 # scrna_pack._select_resolution imports sklearn.metrics.adjusted_rand_score UNCONDITIONALLY, so
@@ -13,3 +13,11 @@ itsdangerous>=2.1
 # since before this line existed. Adding the one real dependency restores the coverage instead of
 # skipping a decision rule that picks the clustering resolution.
 scikit-learn>=1.3
+# SQLAlchemy and httpx were held out of CI on the reasoning that the app-level tests would
+# importorskip. Measured 2026-09-08: they did not skip, they ERRORED — 13 of them, including
+# `_delete_run_dir`'s confinement to the results root and the cross-user ownership checks on chat
+# history. Those are a path-traversal guard and an access-control rule, exactly the class of thing
+# the scikit-learn line above was added to stop skipping. Both are pure-Python and the tests run
+# on SQLite (stdlib), so this costs CI a few seconds and buys back the coverage.
+sqlalchemy>=2.0
+httpx>=0.27

@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from bioagent.agents.dag import LabPlan, TaskNode, lift_agenda_to_dag
-from bioagent.agents.hypotheses import HypothesisLedger
+from bioagent.agents.hypotheses import DesignFacts, HypothesisLedger
 from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
 from bioagent.agents.research_lab import LabConfig, ResearchLab
 
@@ -85,7 +87,7 @@ def _proposal(statement="Rod cells in this sample carry a stress signature of te
                    "to determine whether the signature is biological or a contamination artefact"):
     return lambda _u: {
         "surprise": "rods show a stress signature the plan did not anticipate",
-        "hypotheses": [{"statement": statement,
+        "hypotheses": [{"statement": statement, "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival",
                         "prediction": "the stress genes track ambient contamination, not cell state",
                         "test": "contrast the stress genes with the ambient profile"}],
         "new_steps": [{"step": step, "hypothesis": statement}],
@@ -96,7 +98,9 @@ def _proposal(statement="Rod cells in this sample carry a stress signature of te
 
 def test_ledger_dedupes_and_resolves():
     led = HypothesisLedger()
-    h = led.add("Rods carry a stress signature", prediction="p", test="t", origin_step="QC")
+    h = led.add("Rods carry a stress signature", prediction="p", test="t",
+                rival="ambient RNA", discriminator="cell-type specific vs uniform",
+                origin_step="QC")
     assert h is not None and h.id == "h1" and h.status == "open"
     # same claim, different punctuation/casing -> not a second row
     assert led.add("rods carry a stress signature!") is None
@@ -113,7 +117,8 @@ def test_ledger_dedupes_and_resolves():
 
 def test_ledger_round_trips_through_dicts():
     led = HypothesisLedger()
-    led.add("A causes B", prediction="p", test="t")
+    led.add("A causes B", prediction="p", test="t", rival="C causes B",
+            discriminator="X favours A; Y favours C")
     led.link_test("h1", "Run the discriminating comparison")
     led.resolve("h1", "supported", "the comparison held")
     back = HypothesisLedger.from_list(led.to_list())
@@ -208,7 +213,7 @@ def test_a_later_step_can_refute_an_open_hypothesis_and_the_report_says_so():
             payload = json.loads(_user)
             assert [h["statement"] for h in payload["open_hypotheses"]] == [statement]
             return {"surprise": "nothing", "hypotheses": [], "new_steps": [],
-                    "resolve": [{"hypothesis": statement, "status": "refuted",
+                    "resolve": [{"hypothesis": statement, "favoured": "rival",
                                  "evidence": "the stress genes are absent from the ambient profile"}]}
         return {"surprise": "nothing", "hypotheses": [], "new_steps": []}
 
@@ -241,7 +246,7 @@ def test_unfalsifiable_hypothesis_is_refused_so_its_step_has_nothing_to_stand_on
     explore = lambda _u: {
         "surprise": "s",
         # no prediction and no test -> "investigate X further" dressed up as a hypothesis
-        "hypotheses": [{"statement": "Rods are interesting", "prediction": "", "test": ""}],
+        "hypotheses": [{"statement": "Rods are interesting", "prediction": "", "test": "", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
         "new_steps": [{"step": "Characterise the rods in more detail",
                        "hypothesis": "Rods are interesting"}]}
     result = _lab(agenda, explore=explore).run("Characterize the dataset")
@@ -273,7 +278,7 @@ def test_max_new_steps_caps_a_model_that_finds_everything_surprising():
         calls["n"] += 1
         n = calls["n"]
         return {"surprise": "everything",
-                "hypotheses": [{"statement": f"Claim number {n}", "prediction": "p", "test": "t"}],
+                "hypotheses": [{"statement": f"Claim number {n}", "prediction": "p", "test": "t", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
                 "new_steps": [{"step": f"Run the discriminating comparison number {n}",
                                "hypothesis": f"Claim number {n}"}]}
 
@@ -292,7 +297,7 @@ def test_max_steps_caps_total_plan_length():
         calls["n"] += 1
         n = calls["n"]
         return {"surprise": "everything",
-                "hypotheses": [{"statement": f"Claim {n}", "prediction": "p", "test": "t"}],
+                "hypotheses": [{"statement": f"Claim {n}", "prediction": "p", "test": "t", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
                 "new_steps": [{"step": f"Run comparison {n}", "hypothesis": f"Claim {n}"}]}
 
     cfg = LabConfig(hypothesis_driven=True, max_new_steps=99, max_steps=3)
@@ -400,3 +405,148 @@ def test_a_step_with_a_real_artifact_still_gets_explored():
     seen: list[str] = []
     _lab(["Run QC on the dataset"], explore=_QUIET, seen=seen).run("Characterize the dataset")
     assert _explore_calls(seen) == 1
+
+
+# --- the gate: what makes a hypothesis admissible ----------------------------------------------
+# Run c135ae589d96 generated ONE hypothesis, gave it no rival, and marked it supported on a
+# prediction its own design guaranteed. Each rule below is one half of that failure.
+
+def _h1_kwargs(**over):
+    """The real h1 from that run, so the regression is pinned to the actual text."""
+    kw = dict(
+        statement=("The transcriptional shifts between DDX41 and WT are primarily driven by a "
+                   "1.6x sequencing depth imbalance rather than genuine regulatory changes."),
+        prediction="Pseudobulk aggregation will collapse the massive log2FC values of the top DE genes",
+        rival="DDX41 loss disrupts Muller-cell junction and morphogenesis programmes",
+        discriminator="pseudobulk finds no significant genes -> artefact; it finds some -> biology",
+    )
+    kw.update(over)
+    return kw
+
+
+def test_a_hypothesis_with_no_rival_is_refused():
+    led = HypothesisLedger()
+    h, why = led.admit(**_h1_kwargs(rival=""))
+    assert h is None and "no rival" in why
+    assert len(led) == 0
+
+
+def test_a_rival_that_restates_the_hypothesis_is_not_a_rival():
+    led = HypothesisLedger()
+    stmt = "The shift is a depth artefact"
+    h, why = led.admit(statement=stmt, rival="the shift is a DEPTH artefact!",
+                       discriminator="x favours one, y the other")
+    assert h is None and "restates" in why
+
+
+def test_a_discriminator_that_restates_the_prediction_draws_no_contrast():
+    led = HypothesisLedger()
+    h, why = led.admit(statement="A explains it", rival="B explains it",
+                       prediction="the counts drop", discriminator="The counts drop!")
+    assert h is None and "restates the prediction" in why
+
+
+def test_the_h1_regression_a_design_that_forces_the_outcome_is_refused():
+    # The whole point. With one library per arm, "pseudobulk finds no significant genes" happens
+    # whether or not the biology is real, so it cannot separate the two explanations.
+    led = HypothesisLedger()
+    h, why = led.admit(**_h1_kwargs(), design=DesignFacts(replicates_per_arm=1))
+    assert h is None
+    assert "fixed by the design" in why and "1 replicate(s) per arm" in why
+
+
+def test_the_same_hypothesis_is_admitted_once_the_discriminator_can_actually_fail():
+    led = HypothesisLedger()
+    h, why = led.admit(**_h1_kwargs(
+        discriminator=("a uniform same-direction shift across every cell type favours the "
+                       "artefact; a shift confined to Muller glia and running against the depth "
+                       "gradient favours the biology")),
+        design=DesignFacts(replicates_per_arm=1))
+    assert why == "" and h is not None and h.id == "h1"
+    assert h.rival.startswith("DDX41 loss")
+
+
+def test_replicated_designs_are_not_blocked_by_the_significance_rule():
+    led = HypothesisLedger()
+    h, _ = led.admit(**_h1_kwargs(), design=DesignFacts(replicates_per_arm=3))
+    assert h is not None
+
+
+def test_an_unknown_design_never_blocks_a_hypothesis():
+    led = HypothesisLedger()
+    assert led.admit(**_h1_kwargs())[0] is not None            # design=None
+    assert HypothesisLedger().admit(**_h1_kwargs(), design=DesignFacts())[0] is not None
+
+
+# --- adjudication is a contest, not an assertion -----------------------------------------------
+
+def test_supported_is_only_reachable_by_the_evidence_favouring_the_hypothesis():
+    led = HypothesisLedger()
+    led.add(statement="A explains it", rival="B explains it", discriminator="x vs y")
+    assert led.adjudicate("h1", "hypothesis", "x was observed").status == "supported"
+
+
+def test_favouring_the_rival_refutes_and_favouring_neither_is_inconclusive():
+    led = HypothesisLedger()
+    led.add(statement="A", rival="B", discriminator="x vs y")
+    led.add(statement="C", rival="D", discriminator="x vs y")
+    assert led.adjudicate("h1", "rival", "y was observed").status == "refuted"
+    assert led.adjudicate("h2", "neither", "neither showed").status == "inconclusive"
+
+
+def test_a_garbled_favoured_value_is_a_no_op_not_a_corrupt_ledger():
+    led = HypothesisLedger()
+    led.add(statement="A", rival="B", discriminator="x vs y")
+    assert led.adjudicate("h1", "probably?") is None
+    assert led.items[0].status == "open"
+
+
+def test_the_render_shows_the_contest_so_the_adjudicator_sees_both_sides():
+    led = HypothesisLedger()
+    led.add(statement="depth artefact", rival="Muller biology", discriminator="uniform vs confined")
+    out = led.render()
+    assert "rival: Muller biology" in out and "tells them apart: uniform vs confined" in out
+    assert "CONTEST" in out or "contest" in out
+
+
+# --- the gate must not eat GOOD discriminators --------------------------------------------------
+# Measured against a corpus of discriminators a competent scientist would write for the SAME n=1
+# study: treating generic statistics vocabulary as disqualifying refused 2 of 7 of them. An ORA or
+# GSEA FDR is computed on ONE ranking and is perfectly usable without replicates; only a statistic
+# applied BETWEEN THE ARMS needs them.
+
+
+def _admit(discriminator, replicates=1):
+    led = HypothesisLedger()
+    return led.admit(statement="a depth artefact explains the shifts",
+                     rival="DDX41 loss disrupts Muller-cell junction programmes",
+                     prediction="the top log2FCs collapse", discriminator=discriminator,
+                     design=DesignFacts(replicates_per_arm=replicates))
+
+
+@pytest.mark.parametrize("discriminator", [
+    "a shift confined to Muller glia and running against the depth gradient favours the biology",
+    "cell-type specificity favours the hypothesis; uniformity across all types favours the rival",
+    "GSEA on the MG ranking showing adhesion terms at FDR < 0.05 favours the biology",
+    "a significant over-representation of cell-junction GO terms among the down genes",
+    "smFISH showing reduced Crb1 at the outer limiting membrane favours the biology",
+])
+def test_a_discriminator_that_works_without_replicates_is_admitted(discriminator):
+    h, why = _admit(discriminator)
+    assert h is not None, why
+
+
+@pytest.mark.parametrize("discriminator", [
+    "pseudobulk finds no significant genes -> artefact; it finds some -> biology",   # the real h1
+    "a DESeq2 test between the two arms decides it",
+    "run a t-test between DDX41 and WT samples and see if p < 0.05",
+    "the adjusted p value between the two arms decides it",
+    "whether the FDR between conditions clears 0.05",
+])
+def test_a_discriminator_the_design_cannot_answer_is_refused(discriminator):
+    h, why = _admit(discriminator)
+    assert h is None and "fixed by the design" in why
+
+
+def test_the_same_discriminators_are_fine_once_the_design_has_replicates():
+    assert _admit("pseudobulk between the arms decides it", replicates=3)[0] is not None

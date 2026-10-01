@@ -184,6 +184,7 @@ def build_analysis_script(
     gres: str = "",
     container_module: str = "",
     log_dir: str = ".",
+    exclude: str = "",
 ) -> str:
     """A batch sbatch script that runs one contained analysis command and exits.
 
@@ -193,6 +194,11 @@ def build_analysis_script(
     ``#SBATCH``)."""
     account_line = f"#SBATCH --account={account}\n" if account else ""
     gres_line = f"#SBATCH --gres={gres}\n" if gres else ""
+    # Nodes to keep this job off. Only the vLLM serve job used to honour BIOAGENT_SLURM_EXCLUDE,
+    # so the GPU jobs built here — scGPT and the VL report review — could still be scheduled onto
+    # hpc3-gpu-n54-01, whose GPU1 is dead but which Slurm keeps offering. A GPU job placed there
+    # fails for a reason that has nothing to do with the model, and reads like a model problem.
+    exclude_line = f"#SBATCH --exclude={exclude}\n" if exclude else ""
     module_line = f"module load {container_module} 2>/dev/null || true\n" if container_module else ""
     return (
         "#!/bin/bash\n"
@@ -200,6 +206,7 @@ def build_analysis_script(
         f"#SBATCH --partition={partition}\n"
         f"{account_line}"
         f"{gres_line}"
+        f"{exclude_line}"
         f"#SBATCH --cpus-per-task={cpus}\n"
         f"#SBATCH --mem={mem_gb}G\n"
         f"#SBATCH --time={time_limit}\n"

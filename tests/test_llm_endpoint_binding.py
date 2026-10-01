@@ -52,12 +52,15 @@ def store(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def calls(monkeypatch):
-    """Capture every outbound LLM call as (role, port, model, base_url, api_key)."""
+    """Capture every outbound LLM call as (role, port, model, base_url, api_key, max_tokens)."""
     seen: list[dict] = []
-    monkeypatch.setattr(vllm_client, "complete",
+    # The lab roles go through ``complete_ex`` (text AND the provider's usage) so the gateway can
+    # record what each call cost; it returns a (text, usage) pair rather than bare text.
+    monkeypatch.setattr(vllm_client, "complete_ex",
                         lambda port, model, messages, **kw: seen.append(
                             {"role": "lab", "port": port, "model": model,
-                             "base": kw.get("base_url"), "key": kw.get("api_key")}) or "x")
+                             "base": kw.get("base_url"), "key": kw.get("api_key"),
+                             "max_tokens": kw.get("max_tokens")}) or ("x", {}))
     monkeypatch.setattr(vllm_client, "chat_tools",
                         lambda port, model, messages, tools, **kw: seen.append(
                             {"role": "sci", "port": port, "model": model,
@@ -219,7 +222,8 @@ def test_status_summary_reports_a_deleted_credential_rather_than_pretending(stor
 
 def test_status_summary_for_the_cluster_default(store):
     summary = gw_app.Connection._llm_endpoint_summary(_Conn())
-    assert summary == {"kind": "cluster", "label": "vLLM (UCI GPU node)", "remote": False}
+    assert summary == {"kind": "cluster", "cluster_model_id": "", "label": "vLLM (UCI GPU node)",
+                       "model": None, "remote": False}
 
 
 # --- egress: consent is the control, the scanner is the backstop -------------

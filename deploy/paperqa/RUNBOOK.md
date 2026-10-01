@@ -102,7 +102,7 @@ If it returns relevant papers, the index works. **Tell the teammate: embedding r
 HPC3, index built at `retigene/index_pubmedbert`.**
 
 ### A6. Wire the full QA (step 2) onto the same index
-`src/bioagent/tools/paperqa_search.py` runs the actual question-answering with the local
+`src/bioagent/tools/deep_literature/tool.py` runs the actual question-answering with the local
 Qwen LLM. For it to **reuse** the index you just built (not re-embed 1739 papers per
 query), the gateway/serve environment must set these so both halves agree:
 ```bash

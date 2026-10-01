@@ -692,6 +692,300 @@
    "completion_tokens": 12519,
    "cost_usd": 0.0144,
    "seconds": 107.9026
+  },
+  "deepseek-v4-flash-low#s2#0": {
+   "calls": 9,
+   "prompt_tokens": 125793,
+   "completion_tokens": 3289,
+   "cost_usd": 0.007,
+   "seconds": 35.0914
+  },
+  "deepseek-v4-flash-low#s1#1": {
+   "calls": 9,
+   "prompt_tokens": 143942,
+   "completion_tokens": 5322,
+   "cost_usd": 0.0118,
+   "seconds": 55.2073
+  },
+  "deepseek-v4-flash-low#s3#0": {
+   "calls": 8,
+   "prompt_tokens": 126120,
+   "completion_tokens": 6777,
+   "cost_usd": 0.0096,
+   "seconds": 59.1742
+  },
+  "deepseek-v4-flash-low#s2#1": {
+   "calls": 9,
+   "prompt_tokens": 145731,
+   "completion_tokens": 5564,
+   "cost_usd": 0.012,
+   "seconds": 57.8791
+  },
+  "deepseek-v4-flash-low#s1#0": {
+   "calls": 8,
+   "prompt_tokens": 119720,
+   "completion_tokens": 6235,
+   "cost_usd": 0.0091,
+   "seconds": 52.6954
+  },
+  "deepseek-v4-flash-low#s3#1": {
+   "calls": 9,
+   "prompt_tokens": 144547,
+   "completion_tokens": 3194,
+   "cost_usd": 0.0075,
+   "seconds": 32.1673
+  },
+  "deepseek-v4-flash-low#s5#1": {
+   "calls": 6,
+   "prompt_tokens": 94298,
+   "completion_tokens": 2219,
+   "cost_usd": 0.0075,
+   "seconds": 23.1862
+  },
+  "deepseek-v4-flash-low#s5#0": {
+   "calls": 9,
+   "prompt_tokens": 166806,
+   "completion_tokens": 3525,
+   "cost_usd": 0.0115,
+   "seconds": 39.7839
+  },
+  "deepseek-v4-flash-low#s6#1": {
+   "calls": 7,
+   "prompt_tokens": 123732,
+   "completion_tokens": 2772,
+   "cost_usd": 0.0075,
+   "seconds": 30.9991
+  },
+  "deepseek-v4-flash-low#s7#0": {
+   "calls": 9,
+   "prompt_tokens": 170798,
+   "completion_tokens": 9414,
+   "cost_usd": 0.0131,
+   "seconds": 85.3266
+  },
+  "deepseek-v4-flash-low#s7#1": {
+   "calls": 9,
+   "prompt_tokens": 174529,
+   "completion_tokens": 6591,
+   "cost_usd": 0.012,
+   "seconds": 54.4364
+  },
+  "deepseek-v4-flash-low#s6#0": {
+   "calls": 9,
+   "prompt_tokens": 167023,
+   "completion_tokens": 3697,
+   "cost_usd": 0.0115,
+   "seconds": 38.7905
+  },
+  "deepseek-v4-flash-low#s4#0": {
+   "calls": 9,
+   "prompt_tokens": 169775,
+   "completion_tokens": 5269,
+   "cost_usd": 0.0113,
+   "seconds": 50.0557
+  },
+  "deepseek-v4-flash-low#s4#1": {
+   "calls": 9,
+   "prompt_tokens": 159873,
+   "completion_tokens": 6439,
+   "cost_usd": 0.0132,
+   "seconds": 60.2683
+  },
+  "laguna-s-2.1#s2#1": {
+   "calls": 9,
+   "prompt_tokens": 136229,
+   "completion_tokens": 1784,
+   "cost_usd": 0.0045,
+   "seconds": 24.1496
+  },
+  "laguna-s-2.1#s1#1": {
+   "calls": 9,
+   "prompt_tokens": 125300,
+   "completion_tokens": 2509,
+   "cost_usd": 0.0033,
+   "seconds": 33.8813
+  },
+  "laguna-s-2.1#s1#0": {
+   "calls": 8,
+   "prompt_tokens": 118519,
+   "completion_tokens": 13339,
+   "cost_usd": 0.0059,
+   "seconds": 139.177
+  },
+  "laguna-s-2.1#s2#0": {
+   "calls": 9,
+   "prompt_tokens": 156393,
+   "completion_tokens": 8432,
+   "cost_usd": 0.0055,
+   "seconds": 83.2262
+  },
+  "laguna-s-2.1#s3#0": {
+   "calls": 7,
+   "prompt_tokens": 106962,
+   "completion_tokens": 2603,
+   "cost_usd": 0.0053,
+   "seconds": 35.9184
+  },
+  "laguna-s-2.1#s3#1": {
+   "calls": 9,
+   "prompt_tokens": 186766,
+   "completion_tokens": 30612,
+   "cost_usd": 0.0109,
+   "seconds": 271.2777
+  },
+  "laguna-s-2.1#s4#0": {
+   "calls": 9,
+   "prompt_tokens": 175543,
+   "completion_tokens": 28184,
+   "cost_usd": 0.0095,
+   "seconds": 235.318
+  },
+  "laguna-s-2.1#s5#0": {
+   "calls": 9,
+   "prompt_tokens": 172653,
+   "completion_tokens": 3178,
+   "cost_usd": 0.0058,
+   "seconds": 33.1504
+  },
+  "laguna-s-2.1#s5#1": {
+   "calls": 8,
+   "prompt_tokens": 188265,
+   "completion_tokens": 3057,
+   "cost_usd": 0.0057,
+   "seconds": 34.0754
+  },
+  "laguna-s-2.1#s4#1": {
+   "calls": 9,
+   "prompt_tokens": 178847,
+   "completion_tokens": 5306,
+   "cost_usd": 0.0054,
+   "seconds": 51.6452
+  },
+  "laguna-s-2.1#s6#1": {
+   "calls": 9,
+   "prompt_tokens": 175616,
+   "completion_tokens": 5714,
+   "cost_usd": 0.0072,
+   "seconds": 58.7732
+  },
+  "laguna-s-2.1#s7#0": {
+   "calls": 9,
+   "prompt_tokens": 250032,
+   "completion_tokens": 13321,
+   "cost_usd": 0.0101,
+   "seconds": 120.9667
+  },
+  "laguna-s-2.1#s6#0": {
+   "calls": 9,
+   "prompt_tokens": 189880,
+   "completion_tokens": 2864,
+   "cost_usd": 0.0046,
+   "seconds": 28.3853
+  },
+  "laguna-s-2.1#s7#1": {
+   "calls": 9,
+   "prompt_tokens": 234017,
+   "completion_tokens": 15220,
+   "cost_usd": 0.0081,
+   "seconds": 141.1925
+  },
+  "laguna-s-2.1_ms24#s1#1": {
+   "calls": 7,
+   "prompt_tokens": 90628,
+   "completion_tokens": 1891,
+   "cost_usd": 0.0026,
+   "seconds": 23.4403
+  },
+  "laguna-s-2.1_ms24#s2#1": {
+   "calls": 10,
+   "prompt_tokens": 178574,
+   "completion_tokens": 3858,
+   "cost_usd": 0.0049,
+   "seconds": 40.491
+  },
+  "laguna-s-2.1_ms24#s2#0": {
+   "calls": 10,
+   "prompt_tokens": 173285,
+   "completion_tokens": 4997,
+   "cost_usd": 0.0042,
+   "seconds": 56.8002
+  },
+  "laguna-s-2.1_ms24#s1#0": {
+   "calls": 3,
+   "prompt_tokens": 26569,
+   "completion_tokens": 26106,
+   "cost_usd": 0.0054,
+   "seconds": 256.5554
+  },
+  "laguna-s-2.1_ms24#s3#1": {
+   "calls": 7,
+   "prompt_tokens": 105133,
+   "completion_tokens": 29537,
+   "cost_usd": 0.0075,
+   "seconds": 267.6412
+  },
+  "laguna-s-2.1_ms24#s3#0": {
+   "calls": 12,
+   "prompt_tokens": 264392,
+   "completion_tokens": 31384,
+   "cost_usd": 0.0127,
+   "seconds": 293.8511
+  },
+  "laguna-s-2.1_ms24#s5#1": {
+   "calls": 14,
+   "prompt_tokens": 329075,
+   "completion_tokens": 2785,
+   "cost_usd": 0.0065,
+   "seconds": 33.5396
+  },
+  "laguna-s-2.1_ms24#s5#0": {
+   "calls": 18,
+   "prompt_tokens": 591808,
+   "completion_tokens": 7105,
+   "cost_usd": 0.0126,
+   "seconds": 73.3349
+  },
+  "laguna-s-2.1_ms24#s6#1": {
+   "calls": 6,
+   "prompt_tokens": 111050,
+   "completion_tokens": 2426,
+   "cost_usd": 0.0031,
+   "seconds": 25.2315
+  },
+  "laguna-s-2.1_ms24#s6#0": {
+   "calls": 25,
+   "prompt_tokens": 879840,
+   "completion_tokens": 12551,
+   "cost_usd": 0.0157,
+   "seconds": 123.4844
+  },
+  "laguna-s-2.1_ms24#s7#0": {
+   "calls": 12,
+   "prompt_tokens": 360981,
+   "completion_tokens": 33608,
+   "cost_usd": 0.0135,
+   "seconds": 330.2114
+  },
+  "laguna-s-2.1_ms24#s4#0": {
+   "calls": 14,
+   "prompt_tokens": 337414,
+   "completion_tokens": 15643,
+   "cost_usd": 0.0102,
+   "seconds": 175.2453
+  },
+  "laguna-s-2.1_ms24#s7#1": {
+   "calls": 14,
+   "prompt_tokens": 615448,
+   "completion_tokens": 30086,
+   "cost_usd": 0.0176,
+   "seconds": 283.6797
+  },
+  "laguna-s-2.1_ms24#s4#1": {
+   "calls": 15,
+   "prompt_tokens": 421669,
+   "completion_tokens": 21398,
+   "cost_usd": 0.0156,
+   "seconds": 240.1782
   }
  },
  "qwen35-122b": {
@@ -730,18 +1024,18 @@
   "seconds": 1152.779693365097
  },
  "judge-opus5": {
-  "calls": 6,
-  "prompt_tokens": 51331,
-  "completion_tokens": 1724,
-  "cost_usd": 0.299755,
-  "seconds": 44.297792196273804
+  "calls": 28,
+  "prompt_tokens": 144380,
+  "completion_tokens": 2680,
+  "cost_usd": 0.7889,
+  "seconds": 103.97640371322632
  },
  "judge-gemini31": {
-  "calls": 6,
-  "prompt_tokens": 35940,
-  "completion_tokens": 6177,
-  "cost_usd": 0.14600400000000002,
-  "seconds": 59.20081901550293
+  "calls": 28,
+  "prompt_tokens": 114779,
+  "completion_tokens": 7988,
+  "cost_usd": 0.32541400000000004,
+  "seconds": 119.56596541404724
  },
  "minimax-m2.7": {
   "calls": 12,
@@ -758,11 +1052,11 @@
   "seconds": 1055.2635157108307
  },
  "deepseek-v4-flash": {
-  "calls": 12,
-  "prompt_tokens": 154451,
-  "completion_tokens": 251865,
-  "cost_usd": 0.09134252400000001,
-  "seconds": 1970.3217182159424
+  "calls": 17,
+  "prompt_tokens": 176736,
+  "completion_tokens": 270306,
+  "cost_usd": 0.21455312499999998,
+  "seconds": 2361.235444545746
  },
  "deepseek-v4-flash-low": {
   "calls": 12,
@@ -770,5 +1064,19 @@
   "completion_tokens": 187713,
   "cost_usd": 0.07979034000000002,
   "seconds": 1164.3442499637604
+ },
+ "laguna-s-2.1": {
+  "calls": 19,
+  "prompt_tokens": 190800,
+  "completion_tokens": 45624,
+  "cost_usd": 0.013170816,
+  "seconds": 479.74912118911743
+ },
+ "dsv4-local": {
+  "calls": 10,
+  "prompt_tokens": 0,
+  "completion_tokens": 0,
+  "cost_usd": 0.0,
+  "seconds": 489.00026082992554
  }
 }

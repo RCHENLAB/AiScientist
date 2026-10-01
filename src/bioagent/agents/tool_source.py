@@ -38,14 +38,39 @@ MAX_CHARS = 20_000
 
 
 def _unwrap(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Follow ``functools.wraps`` / closures to the function that actually holds the source.
-
-    Several tools are built by factories (``make_run_code_tool(...)``) and their executor is a
-    closure. ``inspect.getsource`` on the closure gives the factory body, which is the honest
-    answer — it IS the code that runs — so no special handling is needed beyond unwrapping
-    decorators.
-    """
+    """Follow ``functools.wraps`` to the function that actually holds the source."""
     return inspect.unwrap(fn)
+
+
+def _injected(fn: Callable[..., Any]) -> dict[str, Any]:
+    """Callables the executor closed over — the code a thin dispatcher actually DELEGATES to.
+
+    ``inspect.getsource`` on a factory-built executor returns the wrapper, which for most tools is
+    the whole story. For a gateway-INJECTED one it is not: ``scgpt_annotate``'s body checks for a
+    runner and calls it, and everything a reviewer would want to check — the reference, the
+    preprocessing, the bindings — lives in that runner. Run 3c5fbc8608a7's scGPT step was written
+    to verify exactly those before running inference, read the tool source, got the dispatcher, and
+    reported "lookup of its injected runner failed". It then withheld inference, correctly, on what
+    it could see.
+
+    Returned as a map of free-variable name -> location so the agent can fetch it with ``symbol``.
+    """
+    out: dict[str, Any] = {}
+    names = getattr(getattr(fn, "__code__", None), "co_freevars", ()) or ()
+    for name, cell in zip(names, fn.__closure__ or ()):
+        try:
+            val = cell.cell_contents
+        except ValueError:                       # an empty cell (recursive closure being built)
+            continue
+        if not callable(val) or inspect.isclass(val):
+            continue
+        try:
+            out[name] = {"where": f"{inspect.getsourcefile(val)}:{inspect.getsourcelines(val)[1]}",
+                         "qualname": getattr(val, "__qualname__", getattr(val, "__name__", name))}
+        except (OSError, TypeError):
+            out[name] = {"where": "<unavailable>",
+                         "qualname": getattr(val, "__qualname__", name)}
+    return out
 
 
 def _source_of(obj: Any) -> tuple[str, str, int]:
@@ -93,15 +118,25 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
 
         symbol = str(args.get("symbol", "")).strip()
         module = inspect.getmodule(fn)
+        injected = _injected(fn)
         target: Any = fn
         if symbol:
             # Helpers a tool leans on (`_write_table`, `_slug`, a threshold constant) are where
-            # behaviour often actually lives, so they must be reachable too.
-            if module is None or not hasattr(module, symbol):
+            # behaviour often actually lives, so they must be reachable too — and so must the
+            # callables a dispatcher closed over, which is where an INJECTED implementation lives.
+            closed = {n: c.cell_contents for n, c in
+                      zip(getattr(getattr(fn, "__code__", None), "co_freevars", ()) or (),
+                          fn.__closure__ or ())}
+            if symbol in injected and symbol in closed:
+                target = closed[symbol]
+            elif module is None or not hasattr(module, symbol):
                 return {"error": f"{name!r} does not resolve a symbol named {symbol!r}",
                         "module": getattr(module, "__name__", "<unknown>"),
-                        "hint": "call without `symbol` first to read the tool body and see what it calls"}
-            target = getattr(module, symbol)
+                        "injected": injected,
+                        "hint": "call without `symbol` first to read the tool body; anything listed "
+                                "under `dispatches_to` can be fetched as `symbol`"}
+            else:
+                target = getattr(module, symbol)
 
         try:
             src, file, line = _source_of(target)
@@ -118,6 +153,9 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
             "first_line": line,
             "source": src,
             "truncated": truncated,
+            # Names this body delegates to. Empty for a self-contained tool; for an injected one
+            # this is where the behaviour actually is, and each is fetchable as `symbol`.
+            "dispatches_to": injected,
             # The declared contract, next to the code, so the agent can compare what the
             # description PROMISES against what the body DOES. Divergence between those two is
             # exactly the class of defect this tool exists to surface.

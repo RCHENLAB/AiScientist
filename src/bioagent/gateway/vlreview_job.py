@@ -21,7 +21,7 @@ tests — no real Slurm, no GPU.
 Cost note: this job is billed by time to ``ruic20_lab_gpu``. It targets a CHEAP 24GB card
 (A30 / RTX6000) via a typed ``gres`` (``settings.vlreview_gres``), NOT an A100 — the 7B VL
 model needs ~16GB. The render loop that consumes ``review.json`` lives in
-:mod:`bioagent.tools.visual_review`.
+:mod:`bioagent.reporting.visual_review`.
 """
 
 from __future__ import annotations
@@ -68,10 +68,10 @@ class VlReviewResult:
 def build_vlreview_command(settings: HPCSettings, *, pdf: str, model_dir: str, out_dir: str,
                            source_dir: str | None = None) -> str:
     """The in-container review command, fed --pdf/--model/--out (all quoted). With ``source_dir``
-    (the synced bioagent source on dfs3b) the LIVE reviewer ``bioagent.tools.vlreview_run`` runs
+    (the synced bioagent source on dfs3b) the LIVE reviewer ``bioagent.reporting.vlreview_run`` runs
     instead of the copy baked into the image — a detector added in the repo reaches production on
     the next code sync, no image rebuild (the analysis line's pattern)."""
-    entry = (f"env PYTHONPATH={shlex.quote(source_dir)} python -m bioagent.tools.vlreview_run"
+    entry = (f"env PYTHONPATH={shlex.quote(source_dir)} python -m bioagent.reporting.vlreview_run"
              if source_dir else settings.vlreview_entrypoint)
     return (
         f"{entry} "
@@ -121,6 +121,7 @@ def build_vlreview_script(
         time_limit=settings.vlreview_time_limit,
         account=settings.account or "",
         gres=settings.vlreview_gres,        # e.g. "gpu:A30:1" — cheap 24GB card, NOT A100
+        exclude=settings.exclude or "",     # keep GPU jobs off known-dead nodes
         container_module=settings.container_module,
         log_dir=out_dir,
     )

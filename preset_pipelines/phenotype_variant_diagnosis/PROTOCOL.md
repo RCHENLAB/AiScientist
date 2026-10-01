@@ -165,7 +165,7 @@ the token budget before emitting any JSON, returning an empty profile. The call 
 clinician can **audit** the mapping instead of trusting it · negated findings landed in `excluded`, not
 `observed` · a family member's disease ("her mother had RP") did **not** become the patient's phenotype.
 
-<sub>Source: `src/bioagent/tools/hpo_terms/mapper.py` (extract → retrieve → select → validate) · `src/bioagent/tools/hpo_terms/index.py` (the ontology gate)</sub>
+<sub>Source: `src/bioagent/tools/map_phenotype_to_hpo/tool.py` (extract → retrieve → select → validate) · `src/bioagent/tools/map_phenotype_to_hpo/index.py` (the ontology gate)</sub>
 </details>
 
 <details open>
@@ -193,7 +193,7 @@ the compositeLR; treat the percentage as a sorting key, not a probability of bei
 **✅ Verify this step:** the mode is stated · `phenotype_notes` are reported · the ranking is presented by
 rank + compositeLR, with the saturation caveat attached to any percentage shown.
 
-<sub>Source: `src/bioagent/tools/phenotype_dx.py` (`parse_lirical_tsv`, `hpo_release_drift`, `normalize_assembly`) · LIRICAL v2.4.1 in `lirical.sif`</sub>
+<sub>Source: `src/bioagent/tools/run_lirical/tool.py` (`parse_lirical_tsv`, `hpo_release_drift`, `normalize_assembly`) · LIRICAL v2.4.1 in `lirical.sif`</sub>
 </details>
 
 <details open>
@@ -211,7 +211,7 @@ disagree — the disagreement is often the finding.**
 **✅ Verify this step:** both tracks are reported · a variant-only hit is framed as a curation gap, not a
 refutation · the named answer cites *both* its phenotype evidence and its variant evidence.
 
-<sub>Source: `src/bioagent/tools/phenotype_dx.py` (`reconcile`)</sub>
+<sub>Source: `src/bioagent/tools/diagnose_disease/tool.py` (`reconcile`)</sub>
 </details>
 
 <details>

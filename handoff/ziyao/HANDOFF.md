@@ -1,3 +1,174 @@
+## 2026-09-30 — deep_literature on Qwen3.8: a timeout sized for a reasoning model, low effort, and "ok" with no answer is now "failed"
+
+Author: claude (literature line; asked by Yijun, whose run found it)
+Status: **merged to main and deployed as `ddf043c` at 16:15 PDT** (Yijun approved). Before that,
+verified on HPC3 with paperqa.sif against a test Qwen3.8 serve job. Prod's `.env` sets none of the
+new knobs, so prod runs the defaults measured below. Cross-ref: `handoff/yijun/HANDOFF.md`,
+2026-09-30 (latest), "Open".
+
+### What went wrong in prod (runs f107bcf7b660, f3731e0b7136)
+
+No deep_literature call that night returned a cited answer. The second run's job files are in
+`/dfs3b/ruic20_lab/software/AiScientist/Temp/yijus12/scratch/paperqa/bioagent_paperqa_deep_literature_{2..9}.*`.
+The first run's files were overwritten by the second run's, which reused the same names. The jobs
+failed in three different ways:
+- **Job 7 (RP: do cones degenerate before rods?)** gathered 35 passages from 24 papers, then never
+  answered. paperqa.sif ships lmi 1.0.4, whose per-request timeout (`ModelSpec.timeout`) defaults
+  to **60 s**. The answer call at Qwen3.8's default effort (xhigh) needs minutes.
+  - One answer call = 12 requests of 60 s each: the OpenAI SDK re-sends a timed-out request twice
+    ("timeout value=60.0, time taken=181 s"), and lmi retries that 3 more times.
+  - PaperQA's own budget for the rollout (`AgentSettings.timeout`, 500 s) ran out at 03:45:19.
+    Its "just answering" retry burned another 4 × 181 s.
+  - The job ran 21 min and returned `status: ok`, 35 contexts and an **empty answer**. The lab
+    accepted that as the literature step (`_run_deep_literature_step`: `if ok and cites`): a bare
+    citation list, and no Europe PMC fallback.
+- **Jobs 2, 4, 5 and 6 (DDX41 retinal phenotype)** took about 2 min and logged no errors. 93
+  candidate papers were retrieved and every passage was judged irrelevant. RetiGene has no
+  DDX41-retina papers, so "0 passages" was the right result. The red litellm "Provider List"
+  banners in those outputs are cost-lookup noise, one per LLM call.
+- **Jobs 3 and 8** answered "I cannot answer" from 6 and 3 passages. Their topics were DDX41
+  splicing and snRNA-seq nuclear retention, which are off-corpus. **Job 9** hit the stale
+  endpoint, already fixed by 6e7c95a.
+
+### Cause, measured
+
+- **In the container** (`echo_check.py`: paperqa.sif on a CPU node, with a fake
+  `/v1/chat/completions` that delays its first reply by 65 s):
+  - HEAD's config gives the lmi spec `timeout=60, max_retries=3`. The client gave up at 60 s and
+    the SDK re-sent the same request, so one call reached the server twice.
+  - The new config gives `timeout=600`. The prose calls' JSON body carries a top-level
+    `"reasoning_effort": "low"`, and the summary calls' body carries
+    `"chat_template_kwargs": {"enable_thinking": false}`.
+  - The 65-s call succeeded on its first request.
+- **vLLM does stop a request whose client gave up.** vLLM 0.28 just does not count that as
+  `finished_reason="abort"`, which is why prod's /metrics showed no aborts. In the reproduction
+  below, vLLM never ran more than 1 request, while the same 6,532-token answer prompt was
+  re-submitted every 60 s (19 times). The waste is the retry loop: each attempt thought for about
+  4,500 tokens and was killed. 80k generated tokens, about 18 GPU-minutes, went to answers that
+  were all thrown away.
+
+### The change
+
+- `tools/paperqa_search.py`:
+  - **Timeout.** Every PaperQA LLM config carries `"timeout": 600` (`BIOAGENT_PAPERQA_LLM_TIMEOUT`).
+    lmi maps it onto its per-request timeout.
+  - **Effort for prose.** The calls that write prose (search queries, the answer, the closing
+    `complete` tool call) send `reasoning_effort: "low"` (`BIOAGENT_PAPERQA_REASONING_EFFORT`).
+    It goes inside litellm's `extra_body`, which is merged verbatim into the JSON vLLM receives.
+    As a top-level litellm param it would be rejected, because litellm rejects `reasoning_effort`
+    for a model it has not mapped.
+  - **No thinking for summaries.** The per-passage summaries (40 per question) get their own
+    config with `chat_template_kwargs: {"enable_thinking": false}`
+    (`BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT=off`; a level such as `low` makes them think).
+  - **Unknown effort values.** Anything outside low/medium/high/xhigh/none/minimal, e.g.
+    `default`, sends nothing, i.e. the model's own default. Qwen3.8 takes low/medium/xhigh and
+    rejects "high" with HTTP 400.
+  - **Rollout budget.** PaperQA's rollout budget is now explicit and tunable:
+    `BIOAGENT_PAPERQA_AGENT_TIMEOUT`, default 500 s, which is PaperQA's own default.
+  - **Result status.** Every result carries `agent_status` (success / unsure / truncated / fail).
+    Passages with an empty answer now return `status: failed`, so the lab falls back to Europe
+    PMC. A truncated rollout with 0 passages now says the budget ran out, instead of blaming the
+    question or the corpus.
+- `tools/paperqa_cli.py`, `gateway/app.py::_build_literature_executor`: the four knobs travel as
+  job args (`llm_timeout`, `reasoning_effort`, `summary_reasoning_effort`, `agent_timeout`),
+  because the job runs with `--containall`.
+- `configs/aiscientist.example.env`: the four knobs are documented. The prod `.env` needs nothing,
+  because the defaults are in code.
+
+### Verified on HPC3 (2026-09-30)
+
+**Setup.**
+- Serve job: a test copy of prod's serve job (decoded from `~/.bioagent/vllm.57287386.spec`):
+  vllm-0.28.0.sif, RedHatAI/Qwen3.8-27B-INT4, 262K context, `--reasoning-parser qwen3`,
+  free-gpu32 RTX6000, 3 CPU / 18G.
+- PaperQA job: prod's sbatch (paperqa.sif, same binds and args, standard partition 8 CPU / 64G).
+- One query at a time, with vLLM `/metrics` sampled every 10 s.
+
+| Run | Settings | Wall-clock | Result |
+|---|---|---|---|
+| Stargardt, before | HEAD 6bda2a7: 60 s, model default effort | **1,277 s** | `ok`, 37 contexts, **empty answer**; 19 answer attempts killed at 60 s |
+| Stargardt, after | this change: 600 s, answer low, summaries off | **156 s** | ok, 36 contexts / 16 papers, `success`, 0 failed calls |
+| Stargardt | summaries at low | 119 s | ok, 38 / 17 |
+| Stargardt | 600 s but answer at the model default (xhigh), summaries off | 521 s | ok, 35 / 16 |
+| Müller glia gliosis | this change | 82 s | ok, 12 / 4 |
+
+- **Where the time goes (Stargardt).** Evidence gathering (40 passages, 12 in parallel) took
+  115 s at the default effort, 34 s at low and 18 s with thinking off.
+- **The answer call.**
+  - At low effort it took 68 s (35 s in the other low run).
+  - At xhigh it took 452 s, about 6 s inside PaperQA's 500-s budget.
+  - Under the old 60-s timeout it never finished.
+- **Timeout alone is not enough.** Any contention on the GPU would push the xhigh answer past the
+  budget, and PaperQA would then start a second answer from zero.
+- **Generated tokens per query:** 136k before, 11k after (19k with summaries at low, 39k with
+  the answer at xhigh).
+- **Quality.** Summaries off vs low retrieve the same evidence (36/16 vs 38/17), so off is the
+  default: it halves gathering and uses 40% fewer tokens.
+- **Answers.**
+  - Stargardt: ABCA4 as the recessive STGD1 gene, then ELOVL4 (STGD3) and PROM1 (STGD4), then
+    PRPH2, CRX and BEST1 as Stargardt-like genes. Citations include Allikmets 1997 and
+    Cremers 2020.
+  - Müller glia: GFAP up-regulation as the hallmark of reactive gliosis, and hypertrophy with
+    INL/IPL thickening (CEP290 / rd16 papers).
+- **Raw records** (results, timing, vLLM metrics, the scripts) are in
+  `/dfs3b/ruic20_lab/software/AiScientist/Temp/yijus12/pqa_timeout_test/`. The Temp sweep
+  removes them after 3 days.
+- **Tests.** `tests/test_paperqa_search.py` has 19 tests, 12 of them new. Ten of the new ones fail
+  on HEAD. The gateway test asserts that every knob `paperqa_cli` maps to an env var is forwarded
+  by `_build_literature_executor` from the same env var; on HEAD's gateway with the new CLI it
+  names the 4 missing keys. Full suite: 1,970 passed, 3 skipped.
+
+### Verified in production (16:37–16:44 PDT, after the deploy)
+
+**How.** One headless quick-chat turn through the public URL: a scratch script reusing
+`scripts/e2e_prod_drive.py`'s transport, connecting as yijus12 with BioAdmin's saved key. Chat's
+forced grounding runs deep_literature for every gene/disease question, so the model does not
+decide whether to call it.
+- **Session:** ready in 223 s on an RTX6000 (n54-02), serving Qwen3.8.
+- **Timeline for "Which genes cause Stargardt disease?":** deep_literature started 4 s after the
+  question and returned `ok` at 159 s; the answer was complete at 183 s.
+- **The HPC3 job** (57390456, standard partition):
+  - it queued 6 s and ran 2 min 26 s;
+  - its args carried no tuning keys, so it ran the in-code defaults;
+  - result: `ok`, 36 passages from 16 papers, `agent_status: success`, 0 timeouts;
+  - the source the gateway synced to HPC3 at connect contains the new code.
+- **The answer.**
+  - Genes: ABCA4 as the main STGD1 gene, then ELOVL4, RDH8, CERKL and BEST1/CRB1; PROM1, PRPH2,
+    WDR19 and CRX as Stargardt-like.
+  - Nine corpus references back it, e.g. Allikmets 1997, Rozet 1998, Zaneveld 2015.
+  - Chat's automated citation check flagged 4 labels the evidence does not support. For example,
+    it says BEST1/CRB1 "cause Stargardt", where the evidence says Stargardt-like.
+- **One request cut at max_tokens.** vLLM counted 1 during the turn, on chat's side: this PaperQA
+  query had 0 in all five HPC3 runs, and this job abandoned no passages. The answer and the
+  citation check came through whole.
+- **Cleanup:** the e2e serve job (57389485) was cancelled afterwards.
+
+### Follow-up: passages without an answer, in chat (`7933492`, on main, NOT deployed)
+
+- **The problem.** The first version of this fix (`ddf043c`) dropped the passages from a `failed`
+  result. Chat's forced grounding then rendered such a result as "NO relevant papers … The corpus
+  has nothing on this", although passages existed. Before `ddf043c`, chat answered from them.
+- **The fix.** The failed result now keeps its passages; the lab still falls back, because the
+  status is `failed`. When a rollout is truncated with 0 passages, chat now says the search did
+  not finish, instead of claiming the corpus has nothing.
+- **Tests:** +2 in `test_quick_chat.py`. Full suite: 1,990 passed.
+
+### Still open (literature line)
+
+- **Deploy `7933492`:** ask Yijun. It restarts the gateway.
+- **`llm_timeout` (600 s) is longer than `agent_timeout` (500 s).** Inside the rollout, a slow
+  call is cut by the 500-s budget first. The 600 s applies to the "just answering" call after a
+  cut. If runs start ending `truncated`, raise `BIOAGENT_PAPERQA_AGENT_TIMEOUT` rather than the
+  effort.
+- **The retry loop is still there** (the SDK re-sends a request twice, and lmi retries 3 times).
+  It now only fires when a call runs past 600 s. lmi does not let a config set the SDK's
+  retry count.
+- **DDX41 questions.** The DDX41 "0 passages" results were correct: the planner keeps asking
+  deep_literature about a gene RetiGene does not cover. Europe PMC is the right source for
+  those questions.
+
+---
+
 # Handoff — RetiGene corpus recovery (literature line)
 
 ## 2026-07-16 — Re-downloaded 67 problem papers to journal (VoR) versions

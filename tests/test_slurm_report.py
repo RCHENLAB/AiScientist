@@ -12,7 +12,7 @@ from pathlib import Path
 from bioagent.gateway.errors import GatewayError
 from bioagent.gateway.executor import ExecResult
 from bioagent.gateway.slurm_report import SlurmReportRenderer
-from bioagent.tools import report
+from bioagent.reporting import report
 
 
 class FakeHPC:

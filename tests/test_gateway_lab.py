@@ -23,8 +23,10 @@ def test_lab_llm_defaults_to_session_vllm_tunnel(monkeypatch):
     for v in ("BIOAGENT_LLM_BASE_URL", "BIOAGENT_LLM_API_KEY", "BIOAGENT_LLM_MODEL"):
         monkeypatch.delenv(v, raising=False)
     cap: dict = {}
-    monkeypatch.setattr(vllm_client, "complete",
-                        lambda port, model, messages, **kw: cap.update(port=port, model=model, base=kw.get("base_url")) or "x")
+    monkeypatch.setattr(vllm_client, "complete_ex",
+                        lambda port, model, messages, **kw: cap.update(
+                            port=port, model=model, base=kw.get("base_url"),
+                            max_tokens=kw.get("max_tokens")) or ("x", {}))
 
     _r = gw_app._lab_llm(_FakeConn())
     complete_fn, model, label = _r.complete_fn, _r.model, _r.label
@@ -913,10 +915,11 @@ def test_lab_role_endpoint_splits_reasoning_from_tool_calling(monkeypatch):
     monkeypatch.setenv("BIOAGENT_LAB_LLM_MODEL", "vendor/big-model")
     monkeypatch.setenv("BIOAGENT_LAB_LLM_API_KEY", "sk-lab")
     seen: list[dict] = []
-    monkeypatch.setattr(vllm_client, "complete",
+    monkeypatch.setattr(vllm_client, "complete_ex",
                         lambda port, model, messages, **kw:
                         seen.append({"role": "lab", "port": port, "model": model,
-                                     "base": kw.get("base_url"), "key": kw.get("api_key")}) or "x")
+                                     "base": kw.get("base_url"), "key": kw.get("api_key"),
+                                     "max_tokens": kw.get("max_tokens")}) or ("x", {}))
     monkeypatch.setattr(vllm_client, "chat_tools",
                         lambda port, model, messages, tools, **kw:
                         seen.append({"role": "sci", "port": port, "model": model,

@@ -35,7 +35,10 @@ from typing import Any, Callable
 from .loop_utils import CheckpointWriter, safe_json_loads
 from ..integrations.biomni_adapter import BiomniAdapter
 from ..integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
-from ..tools.execution import build_de_marker_execution, build_single_cell_qc_execution
+from ..tools.api import build_de_marker_execution, build_single_cell_qc_execution
+# The tool record lives in the tools' contract module so the tools never import this package;
+# re-exported here because the whole platform (and its tests) import it from this name.
+from ..tools.sdk import HarnessTool  # noqa: F401
 
 # chat_fn(messages, tools) -> {"content": str, "tool_calls": list}
 ChatToolFn = Callable[[list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]
@@ -70,25 +73,6 @@ _NUDGE = (
     "call `finish` with your final answer. If you cannot use native tool-calling, reply with a "
     'single JSON object: {"tool": "<tool_name>", "args": {...}}.'
 )
-
-
-@dataclass(frozen=True)
-class HarnessTool:
-    """One callable tool: an OpenAI/vLLM function schema + a Python executor."""
-
-    name: str
-    description: str
-    parameters: dict[str, Any]  # JSON-schema for the args object
-    executor: Callable[[dict[str, Any], "HarnessContext"], dict[str, Any]]
-    reads_private_data: bool = False
-    category: str = "general"            # registry metadata: qc | analysis | figure | codeact | backend | control
-    requires: tuple[str, ...] = ()       # capability deps (e.g. "scanpy", "gseapy", "graphviz", "biomni")
-
-    def schema(self) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {"name": self.name, "description": self.description, "parameters": self.parameters},
-        }
 
 
 def nondefault_params(parameters: dict[str, Any], args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -166,9 +150,38 @@ def _default_max_model_len() -> int:
         return 262144
 
 
+#: Injected once, when the turn budget is nearly gone. The model cannot otherwise see the cap.
+_LOW_TURNS = (
+    "TURN BUDGET: {left} model turn(s) left for this step. Do not start new analysis — anything "
+    "begun now is cut off mid-flight and the step is judged on nothing. Finish the work already "
+    "running, then write your closing answer: what you found, with the numbers, naming the files "
+    "your tool calls wrote."
+)
+
+#: The reserved closing turn. Tool calls made here are ignored, so the instruction says so.
+_CLOSING_TURN = (
+    "TURN BUDGET EXHAUSTED — this is a closing turn and no further tool call will run; any you "
+    "make now are discarded. Write the step's answer from the results you ALREADY have: state "
+    "what the completed tool calls showed, with their numbers, and name the files they wrote. "
+    "Say plainly which part of the step did not get done, rather than implying it did."
+)
+
+
 @dataclass(frozen=True)
 class HarnessConfig:
     max_steps: int = 8          # model turns before we force-stop
+    # Turns left at which the model is TOLD the budget is running out. Measured on run
+    # ed4cfce52a2a: 5 of 16 rounds ended on ``max_steps``, and those scored 0.52 on average
+    # against 0.73 for rounds that finished — because the cap was invisible. The model spent its
+    # last turn starting more analysis, was cut off, and the Critic judged a deterministic
+    # auto-summary instead of the model's own account of its results.
+    warn_turns_left: int = 2
+    # One EXTRA model call, granted only to a step that exhausted its turns without an answer,
+    # in which tool calls are ignored and the only useful output is the closing text. It buys
+    # what the budget denied — a real answer over results already on disk — for one cheap
+    # text-only call instead of another tool round (a Slurm job, minutes). Off => the old
+    # deterministic digest, which the Critic reliably marks down.
+    closing_turn_on_budget: bool = True
     max_bad_calls: int = 3      # consecutive invalid/empty turns before giving up
     # Two cheap early-outs so a step doesn't grind all the way to ``max_steps`` (which wastes
     # GPU + context on a stuck loop — see the 5bd05b3f5880 post-mortem). NOTE the first is on
@@ -286,7 +299,7 @@ class ResearchHarness:
 
     def run(self, brief: str, ctx: HarnessContext, on_event: EventFn | None = None,
             should_cancel: Callable[[], bool] | None = None,
-            untrusted_text: str | None = None) -> HarnessResult:
+            untrusted_text: str | None = None, extra_steps: int = 0) -> HarnessResult:
         emit: EventFn = on_event or (lambda _event: None)
         steps: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -340,6 +353,12 @@ class ResearchHarness:
 
         final_answer: str | None = None
         stop_reason: str | None = None
+        # Turns for THIS attempt. ``extra_steps`` is how a retry after a budget-exhausted attempt
+        # gets more room than the attempt that already proved the default too small — re-running a
+        # heavy step with the identical cap walks into the same wall (run ed4cfce52a2a spent
+        # rounds 14 AND 15 on one step, both ending on max_steps).
+        budget = max(1, self.config.max_steps + max(0, int(extra_steps or 0)))
+        warned = False
         bad_calls = 0
         repeated_errors = 0          # consecutive IDENTICAL tool errors (the model is stuck)
         last_error_sig: str | None = None
@@ -347,13 +366,20 @@ class ResearchHarness:
         had_success = False
         succeeded_keys: set[str] = set()   # (tool,args) that already ran ok — repeats are redundant
         try:
-            for step_index in range(1, self.config.max_steps + 1):
+            for step_index in range(1, budget + 1):
                 # Cooperative cancel: the user can stop a long step between model turns,
                 # not just between agenda steps (a single scanpy step can take a while).
                 if should_cancel is not None and should_cancel():
                     stop_reason = "cancelled"
                     emit({"type": "cancelled", "where": "scientist", "step": step_index})
                     break
+                # Make the cap VISIBLE. Injected once, not every turn: repeating it would push the
+                # real work out of a context window this loop is already trimming.
+                left = budget - step_index + 1
+                if not warned and left <= max(1, self.config.warn_turns_left):
+                    messages.append({"role": "user", "content": _LOW_TURNS.format(left=left)})
+                    warned = True
+                    emit({"type": "turn_budget_low", "left": left, "budget": budget})
                 emit({"type": "model_call", "step": step_index})
                 # Keep the prompt inside the served context window: the history grows every
                 # step (assistant turns + piled-up tool results) and the full tool catalog is
@@ -476,10 +502,24 @@ class ResearchHarness:
                         stop_reason = "cancelled"
                         break
 
-                    # A real (non-finish) tool succeeded → reset the error streak; repeats now redundant.
-                    repeated_errors, last_error_sig = 0, None
-                    had_success = True
-                    succeeded_keys.add(call_key)
+                    # A tool that CAUGHT its own failure returns {"status": "error", ...} instead of
+                    # raising. That is still a failure for the stuck-detector: it used to reset the
+                    # streak as a success, so max_repeated_errors never fired on the 25% of calls that
+                    # fail this way (6 rounds in prod repeated one returned error 3-5x; the guard fired
+                    # 0 times). Same signature rule as a raised error. The step record is unchanged
+                    # (step_succeeded already reads the status), and a failed call is not "done" —
+                    # re-issuing it is a retry, not a redundant repeat.
+                    failed_sig = _returned_failure_sig(output)
+                    if failed_sig:
+                        repeated_errors = repeated_errors + 1 if failed_sig == last_error_sig else 1
+                        last_error_sig = failed_sig
+                        if had_success:
+                            wasted_after_success += 1
+                    else:
+                        # A real (non-finish) tool succeeded → reset the error streak; repeats now redundant.
+                        repeated_errors, last_error_sig = 0, None
+                        had_success = True
+                        succeeded_keys.add(call_key)
                     summary = _summarize(output)
                     # Keep the FULL structured tool return on the step (not just a one-line
                     # status): the Critic and synthesis need to see what was actually
@@ -518,6 +558,25 @@ class ResearchHarness:
             if checkpoint:
                 checkpoint.stop()
 
+        # The step ran out of turns with no answer of its own. Spend ONE text-only model call to
+        # get a real one over the results already on disk, instead of handing the Critic a
+        # deterministic digest it reliably marks down (0.52 vs 0.73 on run ed4cfce52a2a). Any tool
+        # call this turn makes is discarded — the point is the prose, and running another tool here
+        # would reopen the budget we just closed. Guarded end to end: the digest below is still the
+        # fallback, so a failed closing turn costs one call and changes nothing else.
+        if (stop_reason == "max_steps" and not (final_answer or "").strip() and steps
+                and self.config.closing_turn_on_budget
+                and not (should_cancel is not None and should_cancel())):
+            emit({"type": "closing_turn", "after_steps": len(steps)})
+            try:
+                closing = list(messages) + [{"role": "user", "content": _CLOSING_TURN}]
+                closing = self._budget_messages(closing, tool_schemas, emit)
+                text = (chat(closing, tool_schemas).get("content") or "").strip()
+                if text:
+                    final_answer, stop_reason = text, "closing_turn"
+            except Exception as exc:  # noqa: BLE001 - advisory; fall through to the digest
+                emit({"type": "closing_turn_failed", "error": f"{type(exc).__name__}: {exc}"})
+
         status = "ok" if final_answer is not None else "incomplete"
         # NEVER end a step with an empty answer: a step that ran out of turn budget mid-workflow
         # (max_steps / done_early) used to return final_answer="" — the Critic then bounced a step
@@ -543,7 +602,8 @@ class ResearchHarness:
             ok = st.get("ok")
             res = st.get("result")
             digest = result_digest(res) if isinstance(res, dict) else {}
-            frag = json.dumps(digest, default=str)[:400] if digest else str(st.get("summary", ""))[:200]
+            frag = (json.dumps(digest, default=str)[:_DIGEST_ANSWER_CHARS] if digest
+                    else str(st.get("summary", ""))[:200])
             lines.append(f"- {st.get('tool')}: {'ok' if ok else 'ERROR'} {frag}")
         pointers: list[str] = []
         for st in steps:
@@ -604,8 +664,15 @@ class ResearchHarness:
         """Feed a tool result back to the model. A *native* tool-call requires an
         OpenAI ``role:tool`` message carrying the matching ``tool_call_id`` — strict
         OpenAI-compatible servers (vLLM, OpenRouter) return 400 without it. The
-        JSON-text fallback path has no id, so its result goes back as a user message."""
-        text = json.dumps(payload)[:4000]
+        JSON-text fallback path has no id, so its result goes back as a user message.
+
+        At most ``_FEED_RESULT_CHARS`` characters. A result that fits goes back verbatim; a longer
+        one goes back with its reporting keys first, so the cut lands on data (a preview table, a
+        stdout tail) instead of on the status, warnings, notes and skipped groups that say how the
+        result may be reported."""
+        text = json.dumps(payload)
+        if len(text) > _FEED_RESULT_CHARS:
+            text = json.dumps(_reporting_first(payload))[:_FEED_RESULT_CHARS]
         if native and call_id:
             messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
         else:
@@ -733,6 +800,10 @@ _PER_MESSAGE_OVERHEAD = 8       # role/formatting tokens the chat template adds 
 _MIN_BODY_TOKENS = 2048         # floor so a pathological schema/window still leaves working room
 _COMPRESS_CONTENT_HEAD = 400    # chars of assistant prose kept when compressing an old turn
 _COMPRESS_ARGS_HEAD = 300       # chars of a tool-call's arguments kept when compressing
+# (chars per string, items per list, data keys per dict) of the stub an old tool result is
+# compressed to. Smaller than the Critic's digest on purpose: compression only runs when the window
+# is full, and a stub the size of the Critic's view would not free the room it is there to free.
+_COMPRESS_DIGEST_SIZES = (300, 10, 30)
 _TOOL_RESULT_PREFIX = "Tool result: "
 
 
@@ -801,9 +872,10 @@ def _is_failure_payload(payload: Any) -> bool:
 def _compress_message(message: dict[str, Any]) -> dict[str, Any]:
     """A size-reduced COPY of an older message, preserving role/ids (so pairing holds).
 
-    Tool results: a success collapses to a ``result_digest`` stub (paths/counts/status
-    kept); a failure elides to a one-line marker. Assistant turns keep a head of their
-    prose and truncate each tool-call's argument blob (e.g. a long ``run_code`` body)."""
+    Tool results: a success collapses to a digest stub at ``_COMPRESS_DIGEST_SIZES`` (paths/
+    counts/status and every reporting key kept); a failure elides to a one-line marker. Assistant
+    turns keep a head of their prose and truncate each tool-call's argument blob (e.g. a long
+    ``run_code`` body)."""
     role = message.get("role")
     out = dict(message)
 
@@ -822,7 +894,7 @@ def _compress_message(message: dict[str, Any]) -> dict[str, Any]:
             new = json.dumps({"_elided": "earlier failed tool attempt",
                               "status": parsed.get("status") or "error"})
         else:
-            new = json.dumps(result_digest(parsed))
+            new = json.dumps(_digest(parsed, 0, *_COMPRESS_DIGEST_SIZES))
         out["content"] = new if role == "tool" else _TOOL_RESULT_PREFIX + new
         return out
 
@@ -867,6 +939,18 @@ _FAILED_TOOL_STATUSES = frozenset(
 )
 
 
+def _returned_failure_sig(output: Any) -> str | None:
+    """Signature of a failure the tool RETURNED (status error/blocked/failed), numbers masked like a
+    raised error's; None when the output is a success."""
+    if not isinstance(output, dict):
+        return None
+    status = str(output.get("status", "ok")).lower()
+    if not (status in _FAILED_TOOL_STATUSES or status.startswith(("error", "blocked", "fail"))):
+        return None
+    text = str(output.get("error") or output.get("stderr") or output.get("message") or status)
+    return re.sub(r"\d+", "#", f"{status}:{text}")[:200]
+
+
 def step_succeeded(step: dict[str, Any]) -> bool:
     """True if a step ran a real (non-``finish``) tool that produced a usable result.
 
@@ -886,23 +970,86 @@ def step_succeeded(step: dict[str, Any]) -> bool:
     return result is not None
 
 
+# --- shortened views of a tool result ------------------------------------------
+#
+# A tool result reaches the models SHORTENED: the Scientist is fed its JSON cut at
+# ``_FEED_RESULT_CHARS`` (``ResearchHarness._feed_result``), and the Critic, the report writer and
+# the plan reviews see ``result_digest``, which caps each dict at ``_DIGEST_MAX_KEYS`` keys. Both
+# used to cut by POSITION, and tools put their caveats LAST — so the part of a result that says how
+# it may be reported was the part that went. run_de's `skipped_groups` and `warnings` are keys 35-36
+# of 38: the Critic's digest stopped at key 30 in runs 8847d521ba32 and c135ae589d96, and in
+# c135ae589d96 the Scientist was fed 221 of the 1,428 characters of those warnings (the
+# direction-bias, extreme-fold-change and untested-groups warnings never reached it). Now, when a
+# view has to drop something, it drops data, never a reporting key.
+#
+# The sizes were also raised (2026-09-28). The feed was 4000, a fifth of what run_code / run_shell /
+# read_tool_source already cap their own output at (20,000), inside a 262,144-token window. It cut
+# 98 of the 561 archived tool results; at 24,000 it cuts none, for +37% fed characters. The digest's
+# 300-character strings cut 28 archived warnings mid-sentence; at 1000 they cut none, for +24%
+# (Critic, per step) and +22% (report writer, per run).
+_FEED_RESULT_CHARS = 24_000  # chars of one tool result fed back to the Scientist (was 4000)
+_DIGEST_MAX_KEYS = 50        # data keys kept per dict; reporting keys don't count (was 30)
+_DIGEST_MAX_STR = 1000       # chars kept per string (was 300)
+_DIGEST_MAX_ITEMS = 20       # items kept per list (was 10)
+_DIGEST_ANSWER_CHARS = 1200  # chars of each tool's digest in the deterministic auto-summary (was 400)
+
+# Keys that decide HOW a result may be reported: its outcome, the tool's own statement of what is
+# wrong with it or what it did not cover, and how its numbers may be read. Matched by NAME, not by
+# tool, so a new tool that follows the repo's conventions is covered with no change here.
+_REPORTING_KEYS = frozenset({
+    "status", "error", "errors", "warning", "warnings", "note", "notes", "caveat", "caveats",
+    "limitations", "inference", "interpretation", "skipped", "skipped_groups",
+})
+_REPORTING_KEY_SUFFIXES = ("_note", "_notes", "_warning", "_warnings", "_inference")
+
+
+def _is_reporting_key(key: Any) -> bool:
+    name = str(key)
+    return name in _REPORTING_KEYS or name.endswith(_REPORTING_KEY_SUFFIXES)
+
+
+def _reporting_first(value: Any) -> Any:
+    """``value`` with its reporting keys moved to the front; both groups keep their own order.
+    Anything but a dict comes back unchanged."""
+    if not isinstance(value, dict):
+        return value
+    lead = {k: v for k, v in value.items() if _is_reporting_key(k)}
+    return {**lead, **{k: v for k, v in value.items() if k not in lead}}
+
+
 def result_digest(value: Any, _depth: int = 0) -> Any:
     """A size-bounded, type-AGNOSTIC copy of a tool result for the Critic prompt: long
     strings are truncated, long lists capped, dicts recurse (keys kept). The Critic sees
     WHAT was produced (paths, counts, status) without a per-artifact field list and
-    without dumping a huge payload into the prompt."""
+    without dumping a huge payload into the prompt.
+
+    A dict keeps every reporting key (``_is_reporting_key``) plus its first
+    ``_DIGEST_MAX_KEYS`` other keys, in their original order, and names the keys it leaves
+    out. A dict that fits is copied as it was."""
+    return _digest(value, _depth, _DIGEST_MAX_STR, _DIGEST_MAX_ITEMS, _DIGEST_MAX_KEYS)
+
+
+def _digest(value: Any, depth: int, max_str: int, max_items: int, max_keys: int) -> Any:
+    """``result_digest`` at explicit sizes; ``_compress_message`` uses smaller ones."""
     if isinstance(value, str):
-        return value if len(value) <= 300 else value[:300] + "…"
+        return value if len(value) <= max_str else value[:max_str] + "…"
     if isinstance(value, dict):
-        if _depth >= 4:
+        if depth >= 4:
             return "{…}"
-        return {k: result_digest(v, _depth + 1) for k, v in list(value.items())[:30]}
+        left_out = [k for k in value if not _is_reporting_key(k)][max_keys:]
+        skip = set(left_out)
+        out = {k: _digest(v, depth + 1, max_str, max_items, max_keys)
+               for k, v in value.items() if k not in skip}
+        if left_out:
+            out["…"] = (f"+{len(left_out)} more keys: " + ", ".join(str(k) for k in left_out[:10])
+                        + (", …" if len(left_out) > 10 else ""))
+        return out
     if isinstance(value, (list, tuple)):
-        if _depth >= 4:
+        if depth >= 4:
             return "[…]"
-        head = [result_digest(v, _depth + 1) for v in list(value)[:10]]
-        if len(value) > 10:
-            head.append(f"… (+{len(value) - 10} more)")
+        head = [_digest(v, depth + 1, max_str, max_items, max_keys) for v in list(value)[:max_items]]
+        if len(value) > max_items:
+            head.append(f"… (+{len(value) - max_items} more)")
         return head
     return value
 

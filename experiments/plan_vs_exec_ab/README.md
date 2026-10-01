@@ -57,3 +57,50 @@ OpenRouter providers per model (Venice returned empty content for Qwen tool call
 keeps tool-less endpoints out); (3) the client streams and abandons a call that delivers nothing for
 120 s; (4) `--stage B` must not be killed with a bare `pkill` — the spawn workers survive and keep
 writing into the trial workspaces (kill `multiprocessing.spawn` children too).
+
+## Round 6 (2026-09-25): Qwen3.6-35B-A3B-AWQ vs Qwen3.8-27B-INT4, both on our own RTX PRO 6000s
+
+Results are in `results_qwen38/SUMMARY.md`. Arms `qwen36-awq-local` / `qwen38-int4-local[-low|-medium]`
+are reached over SSH tunnels (`QWEN36_LOCAL_URL` / `QWEN38_LOCAL_URL`).
+
+- **Planning (A, 8 plans per arm, judges: sound / specific / dataset fidelity):** 3.6 scored
+  8.81 / 9.00 / 9.31 at 72 s. 3.8-low scored 9.12 / 9.38 / 9.50 at 147 s, and 3.8-medium
+  9.06 / 9.38 / 9.56 at 179 s.
+- **3.8 at default effort** could not finish a plan: about 22k thinking tokens, truncated at the
+  24k cap. So prod runs with `BIOAGENT_VLLM_REASONING_EFFORT=low`.
+- **Writing (C, n=2, current prompts):** judged quality was a tie (7.25 each). 3.8 writes longer
+  (28k vs 19k chars) and takes twice as long (~380 s vs ~195 s). It over-claims more often
+  (75% vs 25%, 3 vs 0.5 "significant"). This is a small sample, so treat it as a caution, not a
+  verdict.
+
+
+### Round 6b (2026-09-28): does the model KNOW what its report got wrong?
+
+`results_qwen38/reasoning_probe.py` asks each report error as a short standalone question, 2 samples
+per model (3.8 at prod's low effort, 3.6, Sonnet 5 as reference; results in `reasoning_probe.json`):
+
+| question | 3.8 | 3.6 | Sonnet 5 |
+|---|---|---|---|
+| same-direction ribosomal up-shift in all 5 cell types with a 1.6x depth gap: headline finding? (NO) | 2/2 | 2/2 | 2/2 |
+| rod genes (Rho/Gnat1/Pde6g) "down" in amacrine cells: explanation? (contamination) | 2/2 | 2/2 | 2/2 |
+| does total-count normalisation + log1p remove a 1.6x depth effect on a Wilcoxon test? (NO) | 0/2 | 1/2 | 2/2 |
+| two contradictory count tables: does it flag the contradiction? | 1/2 | 0/2 | 2/2 |
+
+Both Qwens answer the first two correctly in isolation, yet their full reports headlined the
+up-shift and (3.8) explained the rod genes as a "paracrine cascade". The knowledge is there, but
+it is not applied during long synthesis. The last two rows are genuine reasoning gaps.
+
+### Round 6c/6d (2026-09-28): the claim audit (`agents/claim_audit.py`), writing stage C
+
+Same inputs and model (3.8 INT4 at low effort), 3 reports per arm, 2 blind judges:
+
+| arm | overclaims | invents | raises depth artefact | quality |
+|---|---|---|---|---|
+| no audit | 83% | 50% | 67% | 6.0 |
+| audit v1 | 17% | 83%* | 100% | 7.0 |
+| audit v2 (authoritative design numbers in the block, no "ROBUST" label) | 33% | **0%** | 100% | **8.67** |
+
+\* v1's "invents" flags were mostly the upstream misreported per-arm cell counts of run 8847's DE step,
+copied from the findings. v2 states the dataset's own counts and depth ratio as authoritative, and
+they disappeared. What remains: FDR-filtered GSEA term counts reported as findings. A rule against
+it was added after this measurement and has not been re-measured.

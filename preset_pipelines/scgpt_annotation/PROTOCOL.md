@@ -104,7 +104,7 @@ distribution is reported (from the tool, not fabricated) · the query was **not*
 before the call · a `not_enabled` / `error` result is surfaced honestly, not papered over with invented
 labels.
 
-<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 1) + `src/bioagent/tools/scgpt_annotate.py`</sub>
+<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 1) + `src/bioagent/tools/scgpt_annotate/tool.py`</sub>
 </details>
 
 <details>

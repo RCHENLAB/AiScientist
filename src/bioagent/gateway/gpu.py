@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import time
 from dataclasses import dataclass, replace
 from typing import Callable
@@ -23,6 +24,10 @@ PORT_FILE = "$HOME/.bioagent/vllm.port"                       # legacy fixed pat
 # Inside the sbatch script the job writes its own port here ($SLURM_JOB_ID is in the job env,
 # and survives the `sg <group>` sub-shell). The gateway reads the SAME path by the sbatch job id.
 PORT_FILE_JOB = '"$HOME/.bioagent/vllm.${SLURM_JOB_ID}.port"'
+# What the serve job should be running: line 1 is the model tag, line 2 the base64 serve body. The
+# job writes it at start and watches it; the gateway rewrites it to switch the model IN PLACE, so
+# the Slurm allocation — the card — is kept instead of being released and re-queued.
+SPEC_FILE = "$HOME/.bioagent/vllm.{job_id}.spec"
 
 
 def job_name(username: str) -> str:
@@ -38,6 +43,12 @@ class GPUAllocation:
     port: int
     owner: str = ""
     reused: bool = False
+    # The job's Slurm comment, "model=<repo id>" for jobs submitted since the tag was added; "" for
+    # older jobs. ensure_serve_job refuses to reuse a job whose tag is not the configured model.
+    model_tag: str = ""
+    # True when ensure_serve_job re-pointed this (already running) job at a different model rather
+    # than submitting a new one: same node, same port, new weights loading.
+    swapped: bool = False
 
 
 @dataclass
@@ -95,19 +106,55 @@ def _vllm_serve_body(settings: HPCSettings) -> str:
     )
 
 
+def _runner(settings: HPCSettings) -> str:
+    """How the decoded serve body is run: under the lab group when the image/weights live on the
+    DFS lab storage (``newgrp ruic20_hpc``), else plain bash."""
+    group = settings.data_group()
+    return f"sg {group} -c 'bash -s'" if group else "bash -s"
+
+
+def _encoded_body(settings: HPCSettings) -> str:
+    return base64.b64encode(_vllm_serve_body(settings).encode("utf-8")).decode("ascii")
+
+
 def _serve_script(settings: HPCSettings, username: str) -> str:
+    """The serve job. It does not run vLLM directly: it runs a small SUPERVISOR that serves whatever
+    the job's spec file names, and swaps to a new spec when the gateway rewrites it. The allocation
+    therefore outlives any one model: switching models keeps the card (no queue, no chance of the
+    free RTX6000 going to someone else in between) and only costs the model load.
+
+    Failure semantics are unchanged: if vLLM exits on its own (crash, OOM, bad weights), the job
+    exits with vLLM's status, exactly as when vLLM was the job's only process. Only a spec change
+    restarts it. The old server is stopped as a whole session (``setsid`` + kill the session and its
+    process group), and the port is waited free before the new one binds it, so the gateway's
+    existing tunnel keeps working."""
     account = f"#SBATCH --account={settings.account}\n" if settings.account else ""
     exclude = f"#SBATCH --exclude={settings.exclude}\n" if settings.exclude else ""
     constraint = f"#SBATCH --constraint={settings.constraint}\n" if settings.constraint else ""
-    body = _vllm_serve_body(settings)
-    # If the install dir is on DFS lab storage, the job must run under the
-    # ruic20_hpc group to read it; base64 + `sg` avoids quoting headaches.
-    group = settings.data_group()
-    if group:
-        encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
-        run_line = f"printf %s {encoded} | base64 --decode | sg {group} -c 'bash -s'\n"
-    else:
-        run_line = body
+    tag = _model_tag(settings)
+    supervisor = (
+        'SPEC="$HOME/.bioagent/vllm.${SLURM_JOB_ID}.spec"\n'
+        f"printf '%s\\n%s\\n' '{tag}' '{_encoded_body(settings)}' > \"$SPEC\"\n"
+        "set +e\n"
+        "while true; do\n"
+        '  _sum=$(cksum < "$SPEC")\n'
+        '  echo "AiScientist: serving $(sed -n 1p "$SPEC" | cut -d= -f2-) ($(date))"\n'
+        f"  setsid bash -c \"printf %s '$(sed -n 2p \"$SPEC\")' | base64 --decode | {_runner(settings)}\" &\n"
+        "  _srv=$!\n"
+        "  _switch=0\n"
+        '  while kill -0 "$_srv" 2>/dev/null; do\n'
+        "    sleep 3\n"
+        '    if [ "$(cksum < "$SPEC" 2>/dev/null)" != "$_sum" ]; then _switch=1; break; fi\n'
+        "  done\n"
+        '  if [ "$_switch" = 0 ]; then wait "$_srv"; exit $?; fi\n'
+        '  echo "AiScientist: model switch requested; stopping the current server ($(date))"\n'
+        '  kill -TERM -- "-$_srv" 2>/dev/null; pkill -TERM -s "$_srv" 2>/dev/null\n'
+        '  for _i in $(seq 1 45); do pgrep -s "$_srv" >/dev/null 2>&1 || break; sleep 2; done\n'
+        '  pkill -KILL -s "$_srv" 2>/dev/null; kill -KILL -- "-$_srv" 2>/dev/null\n'
+        '  wait "$_srv" 2>/dev/null\n'
+        '  for _i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/$BIOAGENT_PORT) 2>/dev/null || break; sleep 2; done\n'
+        "done\n"
+    )
     return (
         "#!/bin/bash\n"
         f"#SBATCH --job-name={job_name(username)}\n"
@@ -119,10 +166,14 @@ def _serve_script(settings: HPCSettings, username: str) -> str:
         f"#SBATCH --cpus-per-task={settings.cpus}\n"
         f"#SBATCH --mem={settings.mem_gb}G\n"
         f"#SBATCH --time={settings.time_limit}\n"
+        # Which model this job serves, so a later connect can tell a stale job (started before the
+        # model was switched) from a reusable one without asking the server. See find_running_job.
+        # An in-place switch updates it (`scontrol update ... Comment=`, allowed for your own job).
+        f"#SBATCH --comment={tag}\n"
         # NOTE: Slurm does NOT expand $HOME inside #SBATCH directives, so the log
         # path must be relative to the submit dir (the gateway submits from $HOME).
         "#SBATCH --output=bioagent-vllm-%j.log\n\n"
-        "set -euo pipefail\n"
+        "set -uo pipefail\n"
         # Pick a free TCP port on THIS compute node (pure bash /dev/tcp probe — no
         # python/ss dependency) and record it for the gateway to tunnel to. A
         # connect that fails => nothing is listening => treat the port as free.
@@ -135,8 +186,62 @@ def _serve_script(settings: HPCSettings, username: str) -> str:
         f'[ -n "$BIOAGENT_PORT" ] || BIOAGENT_PORT={settings.serve_port}\n'
         f'echo "$BIOAGENT_PORT" > {PORT_FILE_JOB}\n'
         'echo "AiScientist LLM server will bind 0.0.0.0:$BIOAGENT_PORT on $(hostname)"\n'
-        f"{run_line}"
+        f"{supervisor}"
     )
+
+
+def serve_body_from_script(script: str) -> str:
+    """The vLLM serve body a serve script starts with (decoded from its initial spec line)."""
+    m = re.search(r"printf '%s\\n%s\\n' '[^']*' '([A-Za-z0-9+/=]+)' > \"\$SPEC\"", script)
+    return base64.b64decode(m.group(1)).decode("utf-8") if m else ""
+
+
+# nvidia-smi names -> the Slurm gres TYPE vocabulary BIOAGENT_GPU_CANDIDATES already uses, so a
+# model's allowed cards and the race's candidates speak the same words.
+_CARD_ALIASES = (("RTXPRO6000", "RTX6000"), ("H200", "H200"), ("H100", "H100"), ("A100", "A100"),
+                 ("L40S", "L40S"), ("A6000", "A6000"), ("A30", "A30"), ("V100", "V100"))
+
+
+def gres_type(gpu_name: str) -> str:
+    """``NVIDIA RTX PRO 6000 Blackwell Server Edition`` -> ``RTX6000``; ``NVIDIA A100 80GB PCIe``
+    -> ``A100``. Unknown names come back normalised (upper case, alphanumerics only)."""
+    n = re.sub(r"[^A-Z0-9]", "", (gpu_name or "").upper())
+    for key, t in _CARD_ALIASES:
+        if key in n:
+            return t
+    return n
+
+
+def allowed_cards(settings: HPCSettings) -> list[str]:
+    return [c.strip().upper() for c in (getattr(settings, "vllm_gpu_cards", "") or "").split(",") if c.strip()]
+
+
+def card_fits(executor: RemoteExecutor, settings: HPCSettings, alloc: GPUAllocation) -> tuple[bool, str]:
+    """Can the model in ``settings`` run on the card ``alloc`` already holds? No card list on the
+    model = any card the race could have given it, so yes without asking the node. Otherwise the
+    node is asked (nvidia-smi) and a card we cannot read counts as "does not fit" — releasing a
+    card by mistake costs a queue wait; loading weights onto the wrong one costs a failed session."""
+    allowed = allowed_cards(settings)
+    if not allowed:
+        return True, "any card"
+    health = check_health(executor, settings, alloc)
+    if not health.healthy:
+        return False, "the card could not be read"
+    return gres_type(health.name) in allowed, health.name
+
+
+def swap_in_place(executor: RemoteExecutor, settings: HPCSettings, alloc: GPUAllocation) -> bool:
+    """Point a running serve job at the model in ``settings`` without giving up its allocation.
+    Rewrites the job's spec file (atomically: tmp + mv) and its Slurm comment. False when the job
+    predates the supervisor (no spec file) — only a new job can serve a different model then."""
+    tag = _model_tag(settings)
+    spec = SPEC_FILE.format(job_id=alloc.job_id)
+    res = executor.exec(
+        f'f="{spec}"; [ -f "$f" ] || {{ echo NO_SUPERVISOR; exit 0; }}; '
+        f"printf '%s\\n%s\\n' '{tag}' '{_encoded_body(settings)}' > \"$f.tmp\" && mv \"$f.tmp\" \"$f\" "
+        f"&& echo SWAPPED; scontrol update JobId={alloc.job_id} Comment={tag} >/dev/null 2>&1 || true"
+    )
+    return "SWAPPED" in (getattr(res, "out", "") or "")
 
 
 def read_serve_port(
@@ -163,16 +268,21 @@ def read_serve_port(
     return settings.serve_port
 
 
+def _model_tag(settings: HPCSettings) -> str:
+    return "model=" + settings.serving_model()
+
+
 def find_running_job(executor: RemoteExecutor, settings: HPCSettings) -> GPUAllocation | None:
     """Return *the current user's own* running serve job to reuse, if any.
 
     Strictly scoped with ``squeue --me`` and the per-user job name, so it can
     never see, reuse, or touch another lab member's jobs. Reconnecting therefore
-    reuses your own GPU server instead of starting a second one.
+    reuses your own GPU server instead of starting a second one. Read-only: whether the job is
+    still the right one to reuse (``model_tag``) is decided by :func:`ensure_serve_job`.
     """
     result = executor.exec(
         f"squeue --me --name={job_name(executor.username)} --states=R --noheader "
-        "--format='%i|%u|%t|%N|%b|%M'"
+        "--format='%i|%u|%t|%N|%b|%M|%k'"
     )
     line = result.out.splitlines()[0] if result.out else ""
     if not line:
@@ -188,6 +298,7 @@ def find_running_job(executor: RemoteExecutor, settings: HPCSettings) -> GPUAllo
         port=read_serve_port(executor, settings, job_id=parts[0].strip(), retries=3, delay=1.0),
         owner=parts[1].strip() if len(parts) > 1 else executor.username,
         reused=True,
+        model_tag=parts[6].strip() if len(parts) > 6 else "",
     )
 
 
@@ -276,9 +387,30 @@ def ensure_serve_job(
 
     This is what guarantees "a GPU was actually allocated" on every connect. With
     ``settings.gpu_candidates`` set, submits every candidate at once and uses whichever is ALLOCATED
-    FIRST, scancelling the losers — so a session grabs the earliest-free card instead of queueing on
+    FIRST (ties and, with ``gpu_prefer_seconds``, a grace window go to the earlier-listed candidate),
+    scancelling the losers — so a session grabs the earliest-free card instead of queueing on
     one scarce type. Empty candidates → the classic single-job path (unchanged)."""
     existing = find_running_job(executor, settings)
+    if existing and existing.model_tag != _model_tag(settings):
+        # The running job serves another model. Keep its card when the new model fits that card and
+        # the job can switch in place; release it only when it cannot (the card is not one the model
+        # allows, or the job predates in-place switching). Reusing it unchanged would fail the
+        # connect at ensure_model.
+        want = settings.serving_model()
+        fits, card = card_fits(executor, settings, existing)
+        if fits and swap_in_place(executor, settings, existing):
+            existing.model_tag = _model_tag(settings)
+            existing.swapped = True
+            emit("info", "gpu_alloc",
+                 f"Keeping your GPU job {existing.job_id} on {existing.node} ({card}) and switching it to "
+                 f"{want} in place — no new queue wait; the new model loads in a few minutes.")
+            return existing
+        executor.exec(f"scancel {existing.job_id}")
+        why = (f"{card} is not a card {want} is configured for" if not fits
+               else "that job was started before in-place model switching existed")
+        emit("info", "gpu_alloc",
+             f"Released your GPU job {existing.job_id} ({why}); starting a fresh one for {want}.")
+        existing = None
     if existing:
         emit(
             "success",
@@ -312,10 +444,18 @@ def ensure_serve_job(
             stage="gpu_alloc",
         )
 
-    # Race: poll all jobs; the FIRST to reach RUNNING with a node wins, the rest are scancelled.
-    deadline = time.monotonic() + wait_seconds
+    # Race: poll all jobs. List order is preference order: among jobs RUNNING in the same poll the
+    # highest-priority one wins, and with ``gpu_prefer_seconds`` > 0 a lower-priority job that is
+    # already running is held until every higher-priority job still queued has waited that long.
+    # Losers are scancelled.
+    rank = {jid: i for i, jid in enumerate(jobs)}
+    started = time.monotonic()
+    prefer = max(0, int(getattr(settings, "gpu_prefer_seconds", 0) or 0))
+    deadline = started + wait_seconds
     last_pending_emit = 0.0
+    held_note: set[str] = set()
     while time.monotonic() < deadline:
+        running: list[tuple[str, str]] = []
         for jid, cand in list(jobs.items()):
             status = executor.exec(f"squeue -j {jid} --noheader --format='%t|%N|%r'")
             row = status.out.splitlines()[0] if status.out else ""
@@ -326,19 +466,32 @@ def ensure_serve_job(
             node = fields[1].strip() if len(fields) > 1 else ""
             reason = fields[2].strip() if len(fields) > 2 else ""
             if state == "R" and node:
+                running.append((jid, node))
+            elif state in ("F", "CA", "TO", "NF"):
+                emit("warning", "gpu_alloc",
+                     f"GPU candidate {cand.label()} (job {jid}) failed to start ({state} {reason}); dropping it.")
+                del jobs[jid]
+        running.sort(key=lambda r: rank[r[0]])
+        if running:
+            jid, node = running[0]
+            cand = jobs[jid]
+            better_pending = [j for j in jobs if rank[j] < rank[jid]]
+            if better_pending and time.monotonic() - started < prefer:
+                if jid not in held_note:
+                    held_note.add(jid)
+                    emit("info", "gpu_alloc",
+                         f"{cand.label()} started on {node}, but holding up to {prefer}s for the preferred "
+                         f"{', '.join(jobs[j].label() for j in better_pending)} ...")
+            else:
                 losers = [j for j in jobs if j != jid]
                 if losers:
                     executor.exec(f"scancel {' '.join(losers)}")
                     emit("info", "gpu_alloc",
-                         f"Winner: {cand.label()} on {node} — cancelled {len(losers)} slower candidate(s).")
+                         f"Winner: {cand.label()} on {node} — cancelled {len(losers)} other candidate(s).")
                 port = read_serve_port(executor, settings, job_id=jid)
                 emit("success", "gpu_alloc",
                      f"GPU job {jid} is RUNNING on node {node} (vLLM port {port}).")
                 return GPUAllocation(job_id=jid, node=node, port=port)
-            if state in ("F", "CA", "TO", "NF"):
-                emit("warning", "gpu_alloc",
-                     f"GPU candidate {cand.label()} (job {jid}) failed to start ({state} {reason}); dropping it.")
-                del jobs[jid]
         if not jobs:
             raise GatewayError("Every GPU candidate entered a failed state before starting.", stage="gpu_alloc")
         now = time.monotonic()

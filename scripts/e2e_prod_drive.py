@@ -100,6 +100,10 @@ def main() -> int:
     ap.add_argument("--exercise-plan-mode", action="store_true",
                     help="after the plan: ask a question, request a one-step change, Stop")
     ap.add_argument("--conv", default="e2e")
+    # Qwen3.8 at xhigh effort took 38 min to produce a plan card on 2026-09-30 (team research, then
+    # one ~35k-token PI call); the old fixed 25 min gave up while the plan was still being written.
+    ap.add_argument("--plan-timeout", type=float, default=3600, help="seconds to wait for the plan card")
+    ap.add_argument("--run-timeout", type=float, default=6 * 3600, help="seconds to wait for the run")
     a = ap.parse_args()
     d = Drive(a.base)
 
@@ -135,7 +139,7 @@ def main() -> int:
     tq = time.time()
     st, r = lab(a.question, a.conv)
     print("lab ->", st, r)
-    i, ev = d.wait(lambda e: e.get("type") in ("plan_prompt", "chat_error"), 1500)
+    i, ev = d.wait(lambda e: e.get("type") in ("plan_prompt", "chat_error"), a.plan_timeout)
     if not ev or ev[1].get("type") == "chat_error":
         d.check(False, f"no plan card: {ev[1].get('message') if ev else 'timeout'}")
         return 1
@@ -180,8 +184,21 @@ def main() -> int:
     st, r = plan(a.conv, "approve")
     print("approve ->", st, r)
     t1 = time.time()
-    j, done = d.wait(lambda e: e.get("type") in ("run_complete", "chat_done", "chat_error"),
-                     7200, since=n0)
+    # A manual-mode run can pause mid-way on a decision point (e.g. "use the existing labels or
+    # re-cluster?"). Nobody answers in a headless drive, so each one used to cost its full 600 s
+    # timeout (2026-09-30, run f107bcf7b660). Answer with the first option and say so.
+    since = n0
+    while True:
+        left = a.run_timeout - (time.time() - t1)
+        j, done = d.wait(lambda e: e.get("type") in ("run_complete", "chat_done", "chat_error",
+                                                     "decision_prompt"), max(left, 1), since=since)
+        if not done or done[1].get("type") != "decision_prompt":
+            break
+        options = list(done[1].get("options") or [])
+        pick = options[0] if options else ""
+        print(f"decision: {str(done[1].get('goal', ''))[:100]!r} -> {pick!r}", flush=True)
+        plan(a.conv, "approve", pick)
+        since = j + 1
     d.check(bool(done) and done[1].get("type") != "chat_error",
             f"run finished: {done[1].get('type') if done else 'TIMEOUT'} in {(time.time()-t1)/60:.1f} min")
     return 1 if d.fails else 0

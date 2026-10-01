@@ -107,7 +107,10 @@ class QuickChatConfig(ChatContextLimits):
 
     max_turns: int = 4
     max_tool_calls: int = 6          # total across the whole exchange
-    max_result_chars: int = 4000     # per tool result fed back into the context
+    # Per tool result fed back into the context. 8000 (was 4000): literature_search results run
+    # 4.1–4.4K and lost their last hits. Kept well under the lab's 24,000 because the whole chat
+    # prompt is bounded at 24K tokens.
+    max_result_chars: int = 8000
     verify_citations: bool = False   # tier-3: re-read sources & append a caution footer for
     #                                  inheritance claims the evidence does not support (off
     #                                  until validated live — needs one extra model call)
@@ -201,6 +204,10 @@ def _format_grounding(payload: dict) -> str:
     answer = payload.get("formatted_answer") or payload.get("answer") or ""
     if status not in ("", "ok") and not contexts and not answer:
         note = payload.get("note") or payload.get("error") or status
+        if payload.get("agent_status") == "truncated":
+            # PaperQA ran out of time before it had evidence. That says nothing about the corpus.
+            return (f"deep_literature did NOT finish ({note}). Tell the user the corpus search did "
+                    "not complete; do not say the corpus has nothing on this.")
         return f"deep_literature returned NO relevant papers ({note}). The corpus has nothing on this."
     parts = []
     if answer:
@@ -212,7 +219,7 @@ def _format_grounding(payload: dict) -> str:
         # from the "Sources" numbering built below from contexts. Handing the model BOTH numberings
         # is what makes its inline [n] and final References list disagree (drifted/duplicated/dangling
         # numbers). Strip them so the model cites by exactly ONE numbering — the Sources list below.
-        from ..tools.literature_references import strip_intext_citation_markers
+        from ..reporting.literature_references import strip_intext_citation_markers
         ans = strip_intext_citation_markers(ans)
         parts.append(ans)
     cites, seen = [], set()

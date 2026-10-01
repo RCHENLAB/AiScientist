@@ -195,3 +195,109 @@ def test_scgpt_runner_captures_job_log_on_failure(tmp_path, monkeypatch):
 
     assert any(g.endswith("-777.log") for g in gets)                       # fetched the job log
     assert (tmp_path / "artifacts" / "process" / "scgpt_job.log").exists()  # into the bundle
+
+
+# --- the scGPT job must stay off known-dead nodes -------------------------------------------
+#
+# Prod sets BIOAGENT_SLURM_EXCLUDE=hpc3-gpu-n54-01 (GPU1 dead; Slurm still offers it). Only the
+# vLLM serve job read it. build_analysis_script had no exclude parameter at all, so the scGPT and
+# VL-review GPU jobs could be placed on that node — and fail for a reason that has nothing to do
+# with the model, while reading exactly like a model failure.
+
+def test_scgpt_job_honours_the_node_exclude():
+    from bioagent.gateway.scgpt_job import build_scgpt_script
+    from bioagent.gateway.settings import HPCSettings
+
+    st = HPCSettings(exclude="hpc3-gpu-n54-01")
+    script = build_scgpt_script(st, job_name="j", input_h5ad="/dfs3b/x/q.h5ad",
+                                model_dir="/dfs3b/m", out_dir="/dfs3b/x/out")
+    assert "#SBATCH --exclude=hpc3-gpu-n54-01" in script
+
+
+def test_no_exclude_line_when_nothing_is_excluded():
+    """An empty --exclude= is a Slurm error, not a no-op."""
+    from bioagent.gateway.scgpt_job import build_scgpt_script
+    from bioagent.gateway.settings import HPCSettings
+
+    script = build_scgpt_script(HPCSettings(exclude=None), job_name="j", input_h5ad="/dfs3b/x/q.h5ad",
+                                model_dir="/dfs3b/m", out_dir="/dfs3b/x/out")
+    assert "--exclude" not in script
+
+
+def test_the_vl_review_gpu_job_honours_it_too():
+    """The same gap, the other GPU job that goes through build_analysis_script."""
+    from bioagent.gateway.settings import HPCSettings
+    from bioagent.gateway.vlreview_job import build_vlreview_script
+
+    script = build_vlreview_script(HPCSettings(exclude="hpc3-gpu-n54-01"), job_name="j",
+                                   pdf="/dfs3b/x/report.pdf", model_dir="/dfs3b/m",
+                                   out_dir="/dfs3b/x/out")
+    assert "#SBATCH --exclude=hpc3-gpu-n54-01" in script
+
+
+# --- species harmonization -----------------------------------------------------------------
+#
+# The shipped scGPT model's vocabulary is HUMAN symbols (TFRC, APOE, RHO) and it predicts 123 human
+# RETINA types. The DDX41 object is MOUSE (Tfrc, Apoe, Rho): exact matching kept 17 of 33,696 genes,
+# normalising 15,307 cells over 17 genes divided by zero, and the GPU job died in log1p with
+# "Input contains NaN" — measured on job 57187683. Case-folding recovers 16,599 genes and all 18
+# canonical retinal markers.
+
+import json
+import subprocess
+import sys
+
+import pytest
+
+
+def _run_harmonizer(tmp_path, var_names, vocab):
+    ad = pytest.importorskip("anndata")
+    np = pytest.importorskip("numpy")
+    from bioagent.gateway.scgpt_job import _HARMONIZE_PY
+
+    inp = tmp_path / "q.h5ad"
+    a = ad.AnnData(X=np.ones((4, len(var_names)), dtype="float32"))
+    a.var_names = var_names
+    a.write_h5ad(inp)
+    (tmp_path / "vocab.json").write_text(json.dumps({g: i for i, g in enumerate(vocab)}))
+    prog = tmp_path / "h.py"
+    prog.write_text(_HARMONIZE_PY)
+    out, rep = tmp_path / "harm.h5ad", tmp_path / "rep.json"
+    subprocess.run([sys.executable, str(prog), str(inp), str(tmp_path / "vocab.json"), str(out), str(rep)],
+                   check=True, capture_output=True)
+    return json.loads(rep.read_text()), out
+
+
+def test_a_mouse_query_is_case_folded_onto_a_human_vocabulary(tmp_path):
+    human = [f"GENE{i}" for i in range(1200)] + ["TFRC", "APOE", "RHO"]
+    mouse = [f"Gene{i}" for i in range(1200)] + ["Tfrc", "Apoe", "Rho"]
+    report, out = _run_harmonizer(tmp_path, mouse, human)
+
+    assert report["exact_match"] == 0 and report["uppercase_match"] == 1203
+    assert report["rule"] == "uppercase"
+    assert report["assumption"] and "across species" in report["assumption"]
+    import anndata as ad
+    assert "TFRC" in set(ad.read_h5ad(out).var_names)
+
+
+def test_a_human_query_passes_through_untouched(tmp_path):
+    """A query already in the vocabulary's case must not be rewritten — or the report would
+    claim a cross-species transfer that never happened."""
+    human = [f"GENE{i}" for i in range(1200)]
+    report, out = _run_harmonizer(tmp_path, human, human)
+    assert report["rule"] == "none" and report["assumption"] is None
+    assert not out.exists()                      # the original is used, unchanged
+
+
+def test_the_command_fails_fast_on_a_harmonizer_error_and_falls_back_cleanly():
+    from bioagent.gateway.scgpt_job import HARMONIZATION_NAME, build_scgpt_command
+    from bioagent.gateway.settings import HPCSettings
+
+    c = build_scgpt_command(HPCSettings(), input_h5ad="/dfs3b/x/q.h5ad", model_dir="/dfs3b/m",
+                            out_dir="/dfs3b/x/out")
+    assert "|| exit 1" in c                               # its own error, not a later NaN
+    assert "if [ -f /dfs3b/x/out/query_harmonized.h5ad ]" in c
+    assert 'INPUT=/dfs3b/x/q.h5ad;' in c                  # original unless a copy was written
+    assert HARMONIZATION_NAME in c and "/dfs3b/m/vocab.json" in c
+    import subprocess as _sp
+    assert _sp.run(["bash", "-n"], input=c, text=True).returncode == 0

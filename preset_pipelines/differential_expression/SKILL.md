@@ -82,6 +82,33 @@ enrichment on the changed genes"** — plan that without waiting for the user to
 
 ## Ordered plan
 
+0. **Establish what the matrix IS, and the rules, before touching it** (`run_code`) — read-only,
+   and BEFORE QC. Two outputs, written as tables the later steps read back:
+   * *Provenance.* Inspect `X`, `.raw`, `layers`, value ranges, sparsity and integer-ness, and
+     check whether matrix-derived totals reproduce any stored `nCount`/`nFeature` fields. A
+     published object often arrives already normalized and log1p'd: normalizing it again has NO
+     symptom — every tool succeeds, every figure renders, and every number after it is wrong. So
+     rule from the NUMBERS, and say which way you ruled:
+     - **Counts.** Every value non-negative and integer-valued to tolerance, the row sums
+       reproduce a stored total-count field (`nCount_RNA`, `total_counts`), the per-row non-zero
+       counts reproduce the stored detected-feature field, and no `layers`/`.raw` entry carries a
+       different scale. **That is sufficient — proceed.** An empty `uns` and a missing
+       transformation history are a LIMITATION TO REPORT, not a stop condition: a matrix that
+       reproduces its own stored QC fields exactly is not made unusable by the absence of a
+       written record, and stopping there forfeits the whole quantitative analysis over a
+       provenance note.
+     - **Not counts.** Any negative or non-integer value, row sums that do not reproduce the
+       stored totals, or a differently-scaled representation present. Then say so and drop the
+       count-dependent steps — never recover counts by exponentiating, rounding, or renaming.
+     Count-based tests (`run_pseudobulk_de`, `run_depth_matched_de`) need the first ruling; say
+     which one you applied and which representation supports which operation.
+   * *The decision rule.* Name the primary estimand, the unit of replication, the minimum cells
+     per arm per cell type, and the effect-size gate — and write them down NOW, while no DE
+     result is visible. A cutoff chosen after seeing which one flatters the answer is not a
+     cutoff. Say what happens when a gate FAILS: that stratum is reported unsupported, not
+     relaxed until it passes. Most of these numbers already have defaults in the Parameters
+     table below — this step is about COMMITTING to them (and to any change, with its reason)
+     before the results can influence the choice.
 1. **QC** (`run_scanpy_qc`): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor any QC columns already in the data (e.g. `percent.mt`, doublet calls).
 2. **Define the comparison** from the profile (above): name the condition column, the two groups,
@@ -186,6 +213,8 @@ exactly like a protocol-mandated one once it reaches a Methods section.
 | `max_pct_mt` | `10.0` | drop a cell whose reads are more than this percent mitochondrial (a stressed or lysed cell). 10 is the common working threshold for tissue; the Seurat and scanpy tutorials use 5 for PBMC, and single NUCLEI need far less (1-5) because a nucleus should carry almost no mitochondrial signal. Raise it only for a tissue known to be mitochondria-rich, and say so |
 | `n_top_genes` | `2000` | how many highly-variable genes to keep for the embedding — more genes carry more structure and more noise. 2000 is Seurat's default and the usual starting point |
 | `warn_removed_pct` | `50.0` | warn when QC discards more than this percent of cells. An ENGINEERING guard, not a literature threshold: losing half a dataset usually means a threshold is wrong for this tissue, and it should be checked before the result is used |
+| `mito_prefix` | `"MT-"` | the name prefix that marks a mitochondrial gene, matched without regard to case, so the default also covers mouse 'mt-'. It is the only way `max_pct_mt` knows which genes to count: a dataset whose genes match nothing gets no mitochondrial filter at all |
+| `gene_symbols_key` | `""` | a `var` column holding gene SYMBOLS, for data whose gene names are Ensembl IDs (cellxgene files keep the symbols in `feature_name`). The mitochondrial prefix is then matched against that column. Empty = match the gene names themselves |
 
 **`run_clustering`**
 
@@ -240,6 +269,26 @@ Report effect sizes (log fold-change) and ADJUSTED p-values, not just gene names
 claim in the DE / enrichment statistics the tools returned — never fabricate genes, fold-changes,
 or pathways. State the reference group and any cell types skipped for low cell count. Frame biology
 as hypotheses to validate, not established fact.
+
+**Pathway analysis: use `run_enrichment` / `run_gsea_prerank` when the design supports them, and
+when it does not, still take the gene sets from disk.** Both tools read `.gmt` libraries that are
+ALREADY ON DISK next to the tools — GO_Biological_Process_2023, Reactome_2022, MSigDB_Hallmark_2020
+(`BIOAGENT_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
+consume `run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
+replication forbids exactly those p-values and therefore often skips `run_de` entirely, which
+leaves both tools unusable through no fault of the plan. That is NOT a reason to go to the network:
+run 3c5fbc8608a7 hand-rolled a p-value-free pathway score, went looking for a collection to fetch,
+hit the confirmation guarding downloads from non-allowlisted hosts, was declined, and recorded
+`"collection_status": "no verified authorized species-compatible collection"` — with three verified
+libraries sitting in the directory the tools read. When you compute a pathway summary yourself,
+read the `.gmt` files from that same local directory and say in the step that you did.
+
+**Sensitivity analyses may not be shopped.** The depth-matched check, an alternative QC cutoff,
+a different mixture or standardization — each shows how much the answer depends on a choice. The
+PRIMARY estimate stays primary: a variant is never promoted because it produced a larger effect,
+a cleaner volcano, or a more attractive biology. Report them side by side with the cell mass each
+retains, and let them disagree — a disagreement is the result, not a problem to resolve by
+picking a winner.
 
 State the **unit of replication and how many there were** — "n = 3 donors per arm", not "n =
 4,812 cells". A reader cannot judge a condition contrast without it, and it is the single number

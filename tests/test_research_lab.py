@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from bioagent.agents.research_harness import (
     HarnessContext,
     HarnessTool,
@@ -976,7 +978,8 @@ def _dag_hitl_complete(messages):
     if "alternative ways to accomplish" in sys:       # failure fork: LLM-proposed alternatives
         return json.dumps(["Lower the resolution to 0.5", "Reuse the existing labels"])
     if "Principal Investigator of a bioinformatics lab" in sys:
-        return json.dumps({"agenda": ["Run QC", "Annotate the cells"]})
+        # The plan CLUSTERS de-novo, so labels-vs-re-cluster is a real open question here.
+        return json.dumps({"agenda": ["Run QC", "Cluster the cells with Leiden and annotate the clusters"]})
     if "rigorous scientific Critic" in sys:
         return json.dumps({"verdict": "accept", "score": 0.9})
     return "FINAL REPORT"
@@ -1025,6 +1028,47 @@ def test_dag_decision_without_hook_is_advisory_only():
     assert not any("The user was asked how to proceed" in b for b in briefs)
 
 
+def test_a_label_fork_the_plan_already_answered_is_not_asked():
+    """f3731e0b7136: the structurer copied the labels-vs-re-cluster fork onto "validate the existing
+    labels" in a plan with no clustering step, and the reviewed run paused to ask it again."""
+    def complete(messages):
+        sys = messages[0]["content"]
+        if "Principal Investigator of a bioinformatics lab" in sys:
+            return json.dumps({"agenda": ["Run QC", "Validate the existing majorclass labels, then "
+                                                    "compare the arms within each label"]})
+        return _dag_hitl_complete(messages)
+
+    lab = _dag_hitl_lab(complete, [])
+    seen, events = [], []
+    lab.run("Analyze retina and annotate the cells", on_event=events.append,
+            decision_review=lambda node: seen.append(node) or {"action": "proceed"})
+    assert seen == []
+    assert not any(e["type"] == "decision_point" for e in events)
+    settled = [e for e in events if e["type"] == "decision_settled"]
+    assert settled and settled[0]["choice"] == "Use the existing labels"
+
+
+@pytest.mark.parametrize("step,clusters", [
+    ("Reuse the existing labels and do not re-cluster", False),         # f107bcf7b660
+    ("Validate labels without re-clustering the cells", False),
+    ("Stratify by majorclass rather than re-clustering", False),
+    ("Do not run Leiden clustering; use the supplied labels", False),
+    ("Cluster the cells with Leiden at resolution 1.0", True),
+    ("Re-cluster de-novo and compare against the labels", True),
+    ("Run QC, then clustering", True),
+])
+def test_a_step_that_says_not_to_cluster_is_not_a_clustering_step(step, clusters):
+    from bioagent.agents import research_lab as rl
+    assert rl._clusters_de_novo(step) is clusters
+
+
+def test_the_linear_label_fork_ignores_a_negated_clustering_mention():
+    lab = _dag_hitl_lab(_dag_hitl_complete, [])
+    lab._annotation_label_col = lambda: "majorclass"
+    assert lab._label_decision(["Validate existing labels — reuse them and do not re-cluster"]) is None
+    assert lab._label_decision(["Cluster with Leiden, then run DE per cluster"]) is not None
+
+
 # --- Failure → HITL decision fork (a hard-failed step asks retry/skip/abort) ---------------------
 
 def _dag_always_revise_complete(agenda_steps):
@@ -1056,16 +1100,55 @@ def test_failure_decision_offers_llm_alternatives_and_maps_choice():
             return ans
         return _review
     noop = lambda _e: None   # noqa: E731
+    # Each assertion below is an INDEPENDENT scenario, so each gets a fresh run-level ask budget —
+    # otherwise the fourth would stop asking and self-heal (which is its own test, further down).
+    def fresh():
+        lab._human_failure_asks = 0
+        return lab
 
     # the LLM's alternatives become the options, followed by the Skip / Abort controls
     out = lab._failure_decision("q", node, "boom", [], dr({"action": "proceed", "choice": "Lower the resolution to 0.5"}), noop)
     assert seen["options"][:2] == ["Lower the resolution to 0.5", "Reuse the existing labels"]
     assert seen["options"][-2:] == ["Skip this step", "Abort the run"]
     assert out == ("retry", "Lower the resolution to 0.5")       # a chosen alternative -> retry with it
-    assert lab._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": "Skip this step"}), noop) == ("skip", "")
-    assert lab._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": "Abort the run"}), noop) == ("abort", "")
-    assert lab._failure_decision("q", node, "b", [], dr({"action": "cancel"}), noop) == ("abort", "")
-    assert lab._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": ""}), noop) == ("skip", "")  # timeout
+    assert fresh()._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": "Skip this step"}), noop) == ("skip", "")
+    assert fresh()._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": "Abort the run"}), noop) == ("abort", "")
+    assert fresh()._failure_decision("q", node, "b", [], dr({"action": "cancel"}), noop) == ("abort", "")
+    # An answer that names nothing is a REVIEWER saying "move on" -> skip. This is NOT the timeout
+    # case (see below); labelling it "timeout" here is how the timeout gap survived unnoticed.
+    assert fresh()._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": ""}), noop) == ("skip", "")
+
+
+def test_an_unanswered_failure_fork_self_heals_instead_of_dropping_the_step():
+    """Nobody clicked. The reviewer's contract for that is "proceed with the agent's judgment", and
+    for a failed step the agent's judgment is the alternative it just proposed — the same self-heal
+    the headless path takes. It used to land on Skip, discarding the step for the one reason that
+    says nothing about whether it deserved discarding: the human was away from the screen."""
+    from bioagent.agents.dag import TaskNode
+    lab = _dag_hitl_lab(_dag_hitl_complete, [])
+    node = TaskNode(id="s1", goal="Cluster the cells")
+    events: list[dict] = []
+
+    timed_out = lambda _fork: {"action": "proceed", "timed_out": True}   # noqa: E731
+    out = lab._failure_decision("q", node, "boom", [], timed_out, events.append)
+
+    assert out == ("retry", "Lower the resolution to 0.5")     # the top alternative, applied
+    healed = [e for e in events if e["type"] == "step_self_healed"]
+    assert len(healed) == 1 and healed[0]["reason"] == "decision point timed out"
+
+
+def test_headless_and_timeout_reach_the_same_self_heal():
+    """The two paths that mean "no human is answering" must not disagree. Headless has always
+    auto-applied the top alternative; an unattended manual run now does the same."""
+    from bioagent.agents.dag import TaskNode
+    lab = _dag_hitl_lab(_dag_hitl_complete, [])
+    node = TaskNode(id="s1", goal="Cluster the cells")
+    noop = lambda _e: None   # noqa: E731
+
+    headless = lab._failure_decision("q", node, "boom", [], None, noop)
+    timed_out = lab._failure_decision(
+        "q", node, "boom", [], lambda _f: {"action": "proceed", "timed_out": True}, noop)
+    assert headless == timed_out == ("retry", "Lower the resolution to 0.5")
 
 
 def test_failed_step_offers_alternatives_then_retries_then_skips():
@@ -2542,3 +2625,141 @@ def test_downstream_step_brief_carries_prior_evidence_and_verify_framing():
     assert "CLAIMS TO VERIFY" in last and "read-only" in last.lower()
     # Step 1's brief has no prior findings yet.
     assert "CLAIMS TO VERIFY" not in briefs[0]
+
+
+# --- Critic score bands ------------------------------------------------------
+# "quality 0.76" is unreadable without the rubric, and the rubric used to exist only inside the
+# Critic's prompt string. The bands are now data the console renders — which is only safe while the
+# data and the prompt still say the same thing, hence the drift test below.
+
+def test_critic_score_band_maps_each_rubric_range():
+    from bioagent.agents.research_lab import critic_score_band
+
+    top = "goal fully met; every quantitative claim tied to an evidence artifact"
+    assert critic_score_band(1.0) == top
+    assert critic_score_band(0.95) == top                       # inclusive lower bound
+    assert critic_score_band(0.94).startswith("solid, usable result")
+    assert critic_score_band(0.80).startswith("solid, usable result")
+    # The live case: a material claim resting on prose with no registered artifact.
+    assert critic_score_band(0.76).startswith("partially meets the goal")
+    assert critic_score_band(0.60).startswith("partially meets the goal")
+    assert critic_score_band(0.59).startswith("no usable result")
+    assert critic_score_band(0.1).startswith("no usable result")
+
+
+def test_critic_score_band_is_empty_for_a_missing_score():
+    from bioagent.agents.research_lab import critic_score_band
+
+    # Better a bare number than an invented band.
+    assert critic_score_band(None) == ""
+    assert critic_score_band("0.8") == ""
+    assert critic_score_band(True) == ""            # bool is an int; it is not a score
+
+
+def test_the_displayed_bands_match_the_rubric_the_critic_was_given():
+    """The console's band table and the Critic's prompt must state the same boundaries.
+
+    They are two representations of one rubric — prose for the model, data for the reader — and
+    nothing else would notice if an edit to one left the other behind.
+    """
+    from bioagent.agents.research_lab import CRITIC_SCORE_BANDS, _CRITIC_SYSTEM
+
+    for floor, _label in CRITIC_SCORE_BANDS:
+        if floor == 0.0:
+            assert "below 0.6" in _CRITIC_SYSTEM      # the bottom band is stated as "below X"
+            continue
+        spelled = f"{floor:g}"                        # 0.95 / 0.8 / 0.6 as the prompt writes them
+        assert spelled in _CRITIC_SYSTEM, f"band {spelled} is not stated in the Critic prompt"
+
+
+def test_bands_are_ordered_high_to_low_and_cover_the_range():
+    from bioagent.agents.research_lab import CRITIC_SCORE_BANDS
+
+    floors = [f for f, _ in CRITIC_SCORE_BANDS]
+    assert floors == sorted(floors, reverse=True), "lookup walks top-down; order is load-bearing"
+    assert floors[-1] == 0.0, "the lowest band must catch every remaining score"
+
+
+# --- a retry does not walk into the same wall --------------------------------------------
+#
+# Run ed4cfce52a2a spent rounds 14 AND 15 on "Standardize shared depth support", both ending on
+# max_steps, both marked revise, because the retry re-ran under the cap the first attempt had
+# already proved too small. The escalation is deliberately narrow: only the BUDGET stop earns
+# more turns.
+
+def test_budget_bonus_only_answers_the_stop_it_is_for():
+    from bioagent.agents.research_harness import HarnessResult
+    from bioagent.agents.research_lab import RETRY_TURN_BONUS, _budget_bonus
+
+    def _res(stop: str) -> HarnessResult:
+        return HarnessResult("incomplete", stop, "", [], [])
+
+    # A first attempt is never a retry, whatever came before it in another step.
+    assert _budget_bonus(None, 0) == 0
+    assert _budget_bonus(_res("max_steps"), 0) == 0
+    # Out of turns -> more turns, and a second revision gets more again.
+    assert _budget_bonus(_res("max_steps"), 1) == RETRY_TURN_BONUS
+    assert _budget_bonus(_res("max_steps"), 2) == 2 * RETRY_TURN_BONUS
+    # Every other ending means the content was wrong, not the room. More turns would only buy a
+    # longer version of the same mistake — and on the Slurm path each turn is a real job.
+    for stop in ("finished", "model_final_text", "done_early", "repeated_tool_errors",
+                 "no_tool_calls", "cancelled", "closing_turn"):
+        assert _budget_bonus(_res(stop), 1) == 0, stop
+
+
+# --- the HITL budget is per RUN, not per step ---------------------------------------------
+
+def test_the_human_is_asked_at_most_three_times_in_one_run():
+    """_MAX_FAILURE_FORKS bounds ONE node at two asks. Nothing bounded the RUN, so fifteen steps
+    could put thirty cards in front of a reviewer — and run 3c5fbc8608a7 had a single step fail
+    nine times. Past the budget the fork still happens and still self-heals; it just stops
+    interrupting. A fourth identical question is not more control."""
+    from bioagent.agents.dag import TaskNode
+    from bioagent.agents.research_lab import _MAX_HUMAN_FAILURE_ASKS
+
+    lab = _dag_hitl_lab(_dag_hitl_complete, [])
+    lab._human_failure_asks = 0
+    asked = {"n": 0}
+
+    def review(_fork):
+        asked["n"] += 1
+        return {"action": "proceed", "choice": "Lower the resolution to 0.5"}
+
+    events: list[dict] = []
+    outs = [lab._failure_decision("q", TaskNode(id=f"s{i}", goal="Cluster"), "boom", [],
+                                  review, events.append) for i in range(8)]
+
+    assert asked["n"] == _MAX_HUMAN_FAILURE_ASKS == 3
+    assert all(o[0] == "retry" for o in outs)          # every one still self-heals
+    exhausted = [e for e in events if e["type"] == "failure_asks_exhausted"]
+    assert len(exhausted) == 5 and exhausted[0]["asks"] == 3
+
+
+def test_the_ask_budget_is_reset_for_each_run():
+    """It lives on the lab OBJECT, which can serve more than one run. A budget carried over would
+    stop asking from the very first failure of the next run."""
+    from bioagent.agents.dag import TaskNode
+
+    lab = _dag_hitl_lab(_dag_hitl_complete, [])
+    lab._human_failure_asks = 3                         # as if a previous run had spent it
+    lab._human_failure_asks = 0                         # what _run_inner does at the top of a run
+    asked = {"n": 0}
+
+    def review(_fork):
+        asked["n"] += 1
+        return {"action": "proceed", "choice": "Lower the resolution to 0.5"}
+
+    lab._failure_decision("q", TaskNode(id="s1", goal="Cluster"), "boom", [], review, lambda _e: None)
+    assert asked["n"] == 1
+
+
+def test_headless_never_consumes_the_ask_budget():
+    """Nobody is being asked, so nothing should be spent — otherwise a headless run would silently
+    change behaviour three failures in for no reason a reader could see."""
+    from bioagent.agents.dag import TaskNode
+
+    lab = _dag_hitl_lab(_dag_hitl_complete, [])
+    lab._human_failure_asks = 0
+    for i in range(5):
+        lab._failure_decision("q", TaskNode(id=f"s{i}", goal="Cluster"), "boom", [], None, lambda _e: None)
+    assert lab._human_failure_asks == 0

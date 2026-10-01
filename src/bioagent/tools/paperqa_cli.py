@@ -51,6 +51,12 @@ _ARG_TO_ENV = {
     "answer_length": "BIOAGENT_PAPERQA_ANSWER_LENGTH",
     "concurrency": "BIOAGENT_PAPERQA_CONCURRENCY",
     "temperature": "BIOAGENT_PAPERQA_TEMPERATURE",
+    # How long one LLM call may take, how hard the model thinks, and PaperQA's budget for the
+    # whole rollout (see "LLM call budget" in paperqa_search).
+    "llm_timeout": "BIOAGENT_PAPERQA_LLM_TIMEOUT",
+    "reasoning_effort": "BIOAGENT_PAPERQA_REASONING_EFFORT",
+    "summary_reasoning_effort": "BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT",
+    "agent_timeout": "BIOAGENT_PAPERQA_AGENT_TIMEOUT",
 }
 
 
@@ -95,7 +101,7 @@ def run_tool(tool: str, workspace: str, args: dict[str, Any] | None) -> dict[str
 
     import types
 
-    from .paperqa_search import run_paperqa
+    from .deep_literature.tool import run_paperqa
 
     # Build the same context object the in-process harness threads onto a run. ``llm_base_url``
     # (the GPU node's OpenAI-compatible endpoint) takes precedence over ``tunnel_port`` inside

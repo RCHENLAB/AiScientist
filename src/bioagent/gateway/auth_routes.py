@@ -19,7 +19,8 @@ from sqlalchemy import func, or_, select
 
 from . import auth, email_send
 from .db import session_scope
-from .models import Conversation, Dataset, Message, PendingRegistration, Run, User
+from .models import (Conversation, Dataset, LlmCall, Message, PendingRegistration, Run,
+                     User)
 
 router = APIRouter(prefix="/api")
 
@@ -354,6 +355,64 @@ def record_run_start(user_id: int, run_id: str, question: str, plan_mode: bool,
         s.commit()
 
 
+def record_llm_call(*, run_id: str | None, user_id: int | None, role: str, model: str,
+                    endpoint: str, remote: bool, usage: dict | None,
+                    max_tokens: int | None, duration_ms: int) -> None:
+    """Persist what one completion cost. Best-effort, and deliberately so.
+
+    Accounting must never be able to fail an analysis: a dropped row costs a line in a cost report,
+    while a raised exception would kill a run mid-step. So every failure here is swallowed with a
+    log line. ``cost_usd`` is taken ONLY from what the provider reported — OpenRouter returns it in
+    ``usage`` — and left NULL otherwise, because a locally-computed price from a hard-coded table
+    goes stale silently and a wrong number is worse than a missing one.
+    """
+    try:
+        usage = usage or {}
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        total = int(usage.get("total_tokens") or (prompt + completion))
+        cost = usage.get("cost")
+        if cost is None:
+            cost = (usage.get("cost_details") or {}).get("upstream_inference_cost")
+        with session_scope() as s:
+            s.add(LlmCall(run_id=run_id, user_id=user_id, role=(role or "reason")[:24],
+                          model=(model or "")[:128], endpoint=(endpoint or "")[:128],
+                          remote=bool(remote), prompt_tokens=prompt,
+                          completion_tokens=completion, total_tokens=total,
+                          cost_usd=float(cost) if cost is not None else None,
+                          max_tokens=max_tokens, duration_ms=max(0, int(duration_ms))))
+            s.commit()
+    except Exception as exc:  # noqa: BLE001 - accounting never breaks a run
+        print(f"[llm-usage] call not recorded: {exc}")
+
+
+def run_llm_cost(run_id: str) -> dict:
+    """Totals for one run: calls, tokens, and USD where the provider reported it.
+
+    ``cost_usd`` sums only the rows that carry a provider number, so ``priced_calls`` is what makes
+    the total readable — 40 calls with 12 priced means the figure is a floor, not the bill.
+    """
+    with session_scope() as s:
+        rows = s.scalars(select(LlmCall).where(LlmCall.run_id == run_id)).all()
+    priced = [r for r in rows if r.cost_usd is not None]
+    by_role: dict[str, dict] = {}
+    for r in rows:
+        slot = by_role.setdefault(r.role, {"calls": 0, "total_tokens": 0, "cost_usd": 0.0})
+        slot["calls"] += 1
+        slot["total_tokens"] += r.total_tokens
+        slot["cost_usd"] += r.cost_usd or 0.0
+    return {
+        "run_id": run_id,
+        "calls": len(rows),
+        "priced_calls": len(priced),
+        "prompt_tokens": sum(r.prompt_tokens for r in rows),
+        "completion_tokens": sum(r.completion_tokens for r in rows),
+        "total_tokens": sum(r.total_tokens for r in rows),
+        "cost_usd": round(sum(r.cost_usd or 0.0 for r in priced), 6) if priced else None,
+        "by_role": by_role,
+    }
+
+
 def latest_run_id_for_conversation(user_id: int, conversation_id: str) -> str | None:
     """The most recent COMPLETED run this user produced in a conversation (``done``/``incomplete`` —
     i.e. one that reached the report stage, not a cancelled/errored/running one). Used by the
@@ -382,6 +441,39 @@ def record_run_finish(run_id: str, status: str, artifacts_path: str | None = Non
             run.summary = (summary or "")[:4000]
             run.finished_at = _dt2.datetime.now(_dt2.timezone.utc)
             s.commit()
+
+
+def mark_interrupted_runs() -> int:
+    """Close out runs left ``running`` by a process that is no longer alive. Returns the count.
+
+    A run row is opened as ``running`` and closed by ``record_run_finish``. Nothing closes it when
+    the gateway dies mid-run — a deploy restart, a crash, an OOM — so the row stays ``running``
+    for ever. Twelve had accumulated since July, and they are not merely untidy: every "how many
+    runs succeeded" number computed from this table counts them as still in flight, which is how a
+    success rate gets quoted with a denominator nobody can reconcile.
+
+    Safe to call ONLY from the server's own startup, and only because prod is a single stateful
+    replica: a process that has just started cannot own a live run, so anything still marked
+    running belongs to a process that is gone. Deliberately NOT in ``init_db`` — the admin CLI
+    calls that too, and it can run while the gateway is up.
+
+    ``interrupted`` rather than ``error``: nothing went wrong with the analysis, it was cut off,
+    and the two deserve different rows when the question is "does this pipeline work".
+    """
+    import datetime as _dt3
+
+    with session_scope() as s:
+        stale = list(s.scalars(select(Run).where(Run.status == "running")))
+        for run in stale:
+            run.status = "interrupted"
+            if run.finished_at is None:
+                run.finished_at = _dt3.datetime.now(_dt3.timezone.utc)
+            if not (run.summary or "").strip():
+                run.summary = ("The gateway stopped while this run was executing (deploy, restart "
+                               "or crash). Its artifacts on disk are whatever it had produced.")
+        if stale:
+            s.commit()
+        return len(stale)
 
 
 # --- chat history: conversations + messages ---------------------------------

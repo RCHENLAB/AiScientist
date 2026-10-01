@@ -11,7 +11,7 @@ import json
 import types
 from pathlib import Path
 
-from bioagent.tools.variant_annotation import (
+from bioagent.tools.annotate_variants.tool import (
     ANNOTATION_COLUMNS,
     classify_significance,
     make_variant_annotation_tool,
@@ -26,7 +26,7 @@ from bioagent.tools.variant_annotation import (
 
 
 def test_apply_variant_filters_af_and_gene_panel():
-    from bioagent.tools.variant_annotation import apply_variant_filters
+    from bioagent.tools.annotate_variants.tool import apply_variant_filters
     rows = [
         {"gene_symbol": "RPGR", "max_af": 0.0001},     # rare, in panel  -> kept
         {"gene_symbol": "RPGR", "max_af": 0.30},        # common          -> dropped by AF
@@ -72,7 +72,7 @@ def test_high_priority_ranks_disease_model_fits_above_offtarget():
 
 
 def test_high_priority_csv_carries_disease_model_column(tmp_path):
-    from bioagent.tools.variant_annotation import write_standard_tables
+    from bioagent.tools.annotate_variants.tool import write_standard_tables
     import csv as _csv
     s = summarize_annotations([
         {"gene_symbol": "CRB1", "location": "chr1:200", "impact": "HIGH", "consequence": "frameshift_variant",
@@ -141,7 +141,7 @@ def test_write_table_persists_full_schema_and_verifies(tmp_path):
 
 
 def test_annotate_variants_tool_reports_real_filter_counts(monkeypatch):
-    import bioagent.tools.variant_annotation as va
+    import bioagent.tools.annotate_variants.tool as va
 
     monkeypatch.setattr(va, "vep_annotate", lambda variants, **k: [parse_vep_result(_VEP_ITEM)])
     tool = make_variant_annotation_tool()
@@ -264,7 +264,7 @@ def test_summarize_annotations_counts_rarity_and_priority():
 def test_write_standard_tables_emits_five_deliverables(tmp_path):
     import csv as _csv
 
-    from bioagent.tools.variant_annotation import STANDARD_TABLES, write_standard_tables
+    from bioagent.tools.annotate_variants.tool import STANDARD_TABLES, write_standard_tables
     summary = summarize_annotations([
         parse_vep_result(_VEP_ITEM),                                              # TP53 pathogenic
         {"consequence": "frameshift_variant", "impact": "HIGH", "clinical_significance": "",
@@ -284,7 +284,7 @@ def test_write_standard_tables_emits_five_deliverables(tmp_path):
 
 def test_annotate_variants_tool_ok_path(monkeypatch):
     # Monkeypatch the network layer so the tool wiring (parse -> annotate -> summarise) runs offline.
-    import bioagent.tools.variant_annotation as va
+    import bioagent.tools.annotate_variants.tool as va
 
     monkeypatch.setattr(va, "vep_annotate", lambda variants, **k: [parse_vep_result(_VEP_ITEM)])
     tool = make_variant_annotation_tool()
@@ -297,7 +297,7 @@ def test_annotate_variants_tool_ok_path(monkeypatch):
 def test_annotate_variants_tool_flags_truncation_when_cap_reached(monkeypatch):
     # A VCF larger than the cap must NOT be silently reduced to the first N: the tool result has to
     # carry `truncated`/`warning` so the report can never pass a first-500 slice off as the whole file.
-    import bioagent.tools.variant_annotation as va
+    import bioagent.tools.annotate_variants.tool as va
 
     monkeypatch.setattr(va, "vep_annotate", lambda variants, **k: [parse_vep_result(_VEP_ITEM)])
     tool = make_variant_annotation_tool()
@@ -309,7 +309,7 @@ def test_annotate_variants_tool_flags_truncation_when_cap_reached(monkeypatch):
 
 
 def test_annotate_variants_tool_no_truncation_flag_when_under_cap(monkeypatch):
-    import bioagent.tools.variant_annotation as va
+    import bioagent.tools.annotate_variants.tool as va
 
     monkeypatch.setattr(va, "vep_annotate", lambda variants, **k: [parse_vep_result(_VEP_ITEM)])
     tool = make_variant_annotation_tool()

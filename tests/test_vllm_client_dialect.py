@@ -94,3 +94,77 @@ def test_remote_reasoning_effort_only_on_base_url(monkeypatch):
     sent2 = _capture(monkeypatch)
     vllm_client.complete(1234, "m", [{"role": "user", "content": "hi"}])
     assert "reasoning" not in sent2["payload"]
+
+
+# --- the Scientist's tool turns: reasoning effort + why generation stopped ------------------------
+
+
+def test_chat_tools_sends_the_configured_effort(monkeypatch):
+    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT", "medium")
+    sent = _capture(monkeypatch)
+    out = vllm_client.chat_tools(1234, "m", [{"role": "user", "content": "hi"}], [])
+    assert sent["payload"]["reasoning_effort"] == "medium"
+    assert out["finish_reason"] == ""                     # the fake reply names no reason
+
+
+def test_chat_tools_sends_no_effort_unless_configured(monkeypatch):
+    monkeypatch.delenv("BIOAGENT_VLLM_REASONING_EFFORT", raising=False)
+    sent = _capture(monkeypatch)
+    vllm_client.chat_tools(1234, "m", [{"role": "user", "content": "hi"}], [])
+    assert "reasoning_effort" not in sent["payload"]
+
+
+def test_chat_tools_explicit_effort_wins_and_never_goes_remote(monkeypatch):
+    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT", "medium")
+    sent = _capture(monkeypatch)
+    vllm_client.chat_tools(1234, "m", [], [], reasoning_effort="low")
+    assert sent["payload"]["reasoning_effort"] == "low"
+    vllm_client.chat_tools(0, "m", [], [], base_url="https://openrouter.ai/api/v1", reasoning_effort="low")
+    assert "reasoning_effort" not in sent["payload"]
+
+
+def test_chat_tools_reports_a_truncated_turn(monkeypatch):
+    class _Resp:
+        def read(self):
+            return json.dumps({"choices": [{"finish_reason": "length",
+                                            "message": {"content": "", "tool_calls": []}}]}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(vllm_client.urllib.request, "urlopen", lambda req, timeout=0: _Resp())
+    out = vllm_client.chat_tools(1234, "m", [], [])
+    assert out["finish_reason"] == "length" and out["tool_calls"] == []
+
+
+def test_chat_tools_retries_without_an_effort_the_model_rejects(monkeypatch):
+    import io
+    import urllib.error
+    sent: list[dict] = []
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok", "tool_calls": []}}]}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):  # noqa: ARG001
+        body = json.loads(req.data.decode())
+        sent.append(body)
+        if "reasoning_effort" in body:
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(
+                b'{"error": {"message": "Unexpected reasoning effort high. Supported types are '
+                b'xhigh (default), medium, and low."}}'))
+        return _Resp()
+
+    monkeypatch.setattr(vllm_client.urllib.request, "urlopen", fake_urlopen)
+    out = vllm_client.chat_tools(1234, "m", [], [], reasoning_effort="high")
+    assert out["content"] == "ok"
+    assert sent[0]["reasoning_effort"] == "high" and "reasoning_effort" not in sent[1]

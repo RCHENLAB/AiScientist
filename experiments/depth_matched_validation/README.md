@@ -17,6 +17,33 @@ depth alone must not.
 `DepthOnly` is the control that matters: every gene ordering it produces is an artefact of
 sampling more molecules per cell, so a check that calls it preserved would certify noise.
 
+## Result (2026-09-02, after the selection / robustness / direction fix — `result-2026-09-02.log`)
+
+| cell type | direction | Spearman rho | verdict |
+|---|---|---|---|
+| DepthOnly | up | 0.15 | **weak** (correctly not preserved) |
+| DepthOnly | down | -0.05 | **against_depth_untestable** |
+| RealBio | up | **0.84** | **preserved** |
+| RealBio | down | 0.32 | **against_depth_untestable** |
+
+Gene level, `RealBio up`: **27/30** of the genuinely changed genes and **0/30** of the background —
+the previous rule kept 30/30 but also passed 3/30 background, so specificity is now perfect at a
+cost of three true genes. `DepthOnly up` passes 19/54 of pure background (was 15/53); the ranking
+verdict `weak` is the guard there, not the gene count.
+
+**Two directions, and only one of them is testable.** Depth inflates detection in the deeper arm,
+so it can only manufacture apparent UP-regulation there. The DOWN direction runs against the
+gradient — depth cannot have produced it, so a low rho is not evidence of an artefact. But
+down-sampling the deeper arm also pushes every gene toward looking more down, so the check cannot
+CONFIRM those genes either: measured here, a surviving-effect rule passed 92 % of pure background
+in `RealBio down` at a 0.5 floor and 73 % at 0.8. The tool therefore reports
+`against_depth_untestable` and **no robustness count at all** for that direction, rather than a
+number that certifies noise. Those genes are neither validated nor refuted here.
+
+**The robustness floor is on the Wilcoxon z, and 0.8 was swept not chosen.** Floors 0.5 / 0.6 /
+0.8 / 1.0 keep 30/30, 30/30, 27/30, 7/30 of the real genes and 0/30 background throughout, while
+the pure-depth control passes 50 %, 43 %, 35 %, 28 %.
+
 ## Result (2026-08-20, `analysis.sif` on HPC3, full log in `result-2026-08-20.log`)
 
 | cell type | direction | Spearman rho | kept top rank | verdict |

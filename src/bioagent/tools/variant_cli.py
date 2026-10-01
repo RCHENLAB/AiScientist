@@ -33,7 +33,7 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None,
         return {"status": "error", "error": f"unknown variant tool: {tool}"}
     if not dataset_path:
         return {"status": "error", "error": "annotate_variants needs a VCF dataset path"}
-    from .vcf_offline import run_offline_annotation
+    from .annotate_variants.offline import run_offline_annotation
     return run_offline_annotation(
         dataset_path, workspace,
         cache_dir=str(args.get("cache_dir", "")),

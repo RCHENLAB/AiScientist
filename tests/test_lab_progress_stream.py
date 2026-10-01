@@ -223,6 +223,16 @@ def test_unknown_event_is_silent():
     assert _lab_event_to_chat({"type": "something_new"}) == []
 
 
+def test_contradicted_numbers_are_a_warning_line():
+    out = _lab_event_to_chat({"type": "numbers_contradicted", "step": "DE", "problems": [
+        "Endothelial: the answer states DDX41=27, WT=7, but run_de.skipped_groups computed "
+        "DDX41=7, WT=27 — the two arms are swapped.",
+        "HC: the answer states DDX41=11, WT=5, but run_de.skipped_groups computed DDX41=5, WT=11.",
+        "RGC: the answer states DDX41=8, WT=6, but run_de.skipped_groups computed DDX41=6, WT=8."]})
+    assert len(out) == 1 and out[0]["type"] == "lab_progress" and out[0]["level"] == "warning"
+    assert "Endothelial" in out[0]["text"] and "(+1 more line(s))" in out[0]["text"]
+
+
 def test_skills_loaded_surfaces_active_skill():
     out = _lab_event_to_chat({"type": "skills_loaded", "skills": [
         {"key": "celltype_annotation", "label": "Cell-type annotation",

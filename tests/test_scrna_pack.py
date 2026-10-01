@@ -17,7 +17,19 @@ import types
 
 import pytest
 
-from bioagent.tools import scrna_pack
+from bioagent.tools._lib import scrna as scrna_lib
+from bioagent.tools import catalog as tools_catalog
+from bioagent.tools.run_clustering import tool as run_clustering_tool
+from bioagent.tools.run_composition import tool as run_composition_tool
+from bioagent.tools.run_de import tool as run_de_tool
+from bioagent.tools.run_depth_matched_de import tool as run_depth_matched_de_tool
+from bioagent.tools.run_doublet_detection import tool as run_doublet_detection_tool
+from bioagent.tools.run_enrichment import tool as run_enrichment_tool
+from bioagent.tools.run_gsea_prerank import tool as run_gsea_prerank_tool
+from bioagent.tools.run_integration import tool as run_integration_tool
+from bioagent.tools.run_marker_annotation import tool as run_marker_annotation_tool
+from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _ctx(tmp_path, dataset_path=None):
@@ -28,7 +40,7 @@ def _ctx(tmp_path, dataset_path=None):
 
 
 def test_catalog_shape_matches_harness_tools():
-    cat = scrna_pack.scrna_catalog()
+    cat = tools_catalog.scrna_catalog()
     names = [t.name for t in cat]
     assert names == ["run_scanpy_qc", "run_clustering", "run_de", "run_enrichment",
                      # the depth-matched check: a tool, because three models could not write it
@@ -58,7 +70,7 @@ def test_qc_missing_dependency_is_graceful(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    out = scrna_pack.run_scanpy_qc({}, _ctx(tmp_path, tmp_path / "x.h5ad"))
+    out = run_scanpy_qc_tool.run_scanpy_qc({}, _ctx(tmp_path, tmp_path / "x.h5ad"))
     assert out["status"] == "dependency_missing"
     assert out["dependency"] in {"scanpy", "matplotlib", "anndata"}
 
@@ -72,7 +84,7 @@ def test_enrichment_missing_gseapy_is_graceful(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    out = scrna_pack.run_enrichment({}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment({}, _ctx(tmp_path))
     assert out["status"] == "dependency_missing" and out["dependency"] == "gseapy"
 
 
@@ -114,7 +126,7 @@ def test_enrichment_runs_offline_against_local_gmt(tmp_path, monkeypatch):
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment(
+    out = run_enrichment_tool.run_enrichment(
         {"gene_sets": ["TestPathways"], "background": 18000}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
@@ -143,7 +155,7 @@ def test_enrichment_uses_annotated_de_table_and_runs_per_class(tmp_path, monkeyp
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
     assert set(out["groups"]) == {"Rod", "AC"}          # per-class, not a single pooled "input"
@@ -168,7 +180,7 @@ def test_enrichment_background_is_the_tested_universe_not_a_round_number(tmp_pat
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
     assert cap["background"] == ["RHO", "PDE6A", "GRIA4"]     # the real universe, not 20000
@@ -190,7 +202,7 @@ def test_enrichment_records_the_constant_fallback_when_no_universe_exists(tmp_pa
     cap: dict = {}
     _install_fake_gseapy(monkeypatch, cap)
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["background_source"] == "constant_fallback"
     assert out["background_size"] == 20000 and cap["background"] == 20000
@@ -211,7 +223,7 @@ def test_group_labels_with_a_slash_do_not_lose_their_table(tmp_path, monkeypatch
         encoding="utf-8")
     _install_fake_gseapy(monkeypatch, {})
 
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok" and out["groups"] == ["Club/Secretory"]
     written = tables / "enrichment_Club_Secretory.csv"
@@ -274,7 +286,7 @@ def test_prerank_walks_the_whole_ranking_and_keeps_the_nes_sign(tmp_path, monkey
     cap: dict = {}
     _install_fake_prerank(monkeypatch, cap)
 
-    out = scrna_pack.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
+    out = run_gsea_prerank_tool.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
     call = cap["calls"][0]
@@ -300,7 +312,7 @@ def test_prerank_needs_run_de_first_and_says_so(tmp_path, monkeypatch):
     (gdir / "MSigDB_Hallmark_2020.gmt").write_text("term\tdesc\tRHO\n", encoding="utf-8")
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
     _install_fake_prerank(monkeypatch, {})
-    out = scrna_pack.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
+    out = run_gsea_prerank_tool.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
     assert out["status"] == "error" and "run_de" in out["error"]
 
 
@@ -316,7 +328,7 @@ def test_prerank_resolves_the_real_group_label_from_the_slug_index(tmp_path, mon
         "slug,group\nClub_Secretory,Club/Secretory\n", encoding="utf-8")
     _install_fake_prerank(monkeypatch, {})
 
-    out = scrna_pack.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
+    out = run_gsea_prerank_tool.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
 
     assert out["groups"] == ["Club/Secretory"]        # reported as the biologist wrote it
     assert (tables / "gsea_Club_Secretory.csv").exists()
@@ -331,7 +343,7 @@ def test_prerank_missing_gseapy_is_graceful(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    out = scrna_pack.run_gsea_prerank({}, _ctx(tmp_path))
+    out = run_gsea_prerank_tool.run_gsea_prerank({}, _ctx(tmp_path))
     assert out["status"] == "dependency_missing" and out["dependency"] == "gseapy"
 
 
@@ -339,7 +351,7 @@ def test_enrichment_missing_gmt_is_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(tmp_path / "empty"))   # no .gmt files
     (tmp_path / "empty").mkdir()
     _install_fake_gseapy(monkeypatch, {})
-    out = scrna_pack.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
     assert out["status"] == "error"
     assert out["missing_libraries"] == ["TestPathways"]
     assert "fetch_genesets" in out["error"]
@@ -349,20 +361,22 @@ def test_pipeline_order_is_enforced(tmp_path, monkeypatch):
     # With scanpy "available" (import succeeds enough to reach the checkpoint guard),
     # calling clustering/DE before their prerequisite returns a clear ordering error,
     # not a crash. We stub _import_scanpy so we don't need the real package.
-    monkeypatch.setattr(scrna_pack, "_import_scanpy", lambda: types.SimpleNamespace())
+    for _mod in (scrna_lib, run_clustering_tool, run_composition_tool, run_de_tool, run_depth_matched_de_tool, run_doublet_detection_tool, run_integration_tool, run_marker_annotation_tool, run_pseudobulk_de_tool, run_scanpy_qc_tool):  # every module that looks `_import_scanpy` up
+        monkeypatch.setattr(_mod, "_import_scanpy", lambda: types.SimpleNamespace())
     ctx = _ctx(tmp_path)
-    assert scrna_pack.run_clustering({}, ctx)["error"].startswith("run_scanpy_qc must run first")
+    assert run_clustering_tool.run_clustering({}, ctx)["error"].startswith("run_scanpy_qc must run first")
     # run_de's prerequisite is QC, NOT clustering: a dataset that already carries cell-type labels
     # is analysed straight off adata_qc.h5ad, and the DEG protocol explicitly tells the planner to
     # reuse those labels and skip clustering. Demanding adata_clustered.h5ad here turned that
     # documented path into an error and pushed the model into re-clustering the data anyway.
-    assert "run_scanpy_qc" in scrna_pack.run_de({}, ctx)["error"]
+    assert "run_scanpy_qc" in run_de_tool.run_de({}, ctx)["error"]
 
 
 def test_de_runs_off_the_qc_checkpoint_when_there_is_no_clustering(tmp_path, monkeypatch):
     """The labeled-dataset path: QC ran, clustering deliberately did not — run_de must proceed
     past the checkpoint guard rather than reporting an ordering error."""
-    monkeypatch.setattr(scrna_pack, "_import_scanpy", lambda: types.SimpleNamespace())
+    for _mod in (scrna_lib, run_clustering_tool, run_composition_tool, run_de_tool, run_depth_matched_de_tool, run_doublet_detection_tool, run_integration_tool, run_marker_annotation_tool, run_pseudobulk_de_tool, run_scanpy_qc_tool):  # every module that looks `_import_scanpy` up
+        monkeypatch.setattr(_mod, "_import_scanpy", lambda: types.SimpleNamespace())
     ctx = _ctx(tmp_path)
     (tmp_path / "work").mkdir(parents=True, exist_ok=True)
     (tmp_path / "work" / "adata_qc.h5ad").write_bytes(b"")   # presence is what the guard checks
@@ -370,17 +384,18 @@ def test_de_runs_off_the_qc_checkpoint_when_there_is_no_clustering(tmp_path, mon
     # The stub scanpy has no read_h5ad, so getting PAST the guard raises AttributeError —
     # which is precisely the evidence that the guard let it through.
     with pytest.raises(AttributeError):
-        scrna_pack.run_de({}, ctx)
+        run_de_tool.run_de({}, ctx)
 
 
 def test_qc_without_dataset_errors_clearly(tmp_path, monkeypatch):
-    monkeypatch.setattr(scrna_pack, "_import_scanpy", lambda: types.SimpleNamespace())
-    out = scrna_pack.run_scanpy_qc({}, _ctx(tmp_path))   # no dataset_path
+    for _mod in (scrna_lib, run_clustering_tool, run_composition_tool, run_de_tool, run_depth_matched_de_tool, run_doublet_detection_tool, run_integration_tool, run_marker_annotation_tool, run_pseudobulk_de_tool, run_scanpy_qc_tool):  # every module that looks `_import_scanpy` up
+        monkeypatch.setattr(_mod, "_import_scanpy", lambda: types.SimpleNamespace())
+    out = run_scanpy_qc_tool.run_scanpy_qc({}, _ctx(tmp_path))   # no dataset_path
     assert out["status"] == "error" and "no dataset" in out["error"]
 
 
 def test_summary_renders_from_step_results():
-    md = scrna_pack.scrna_analysis_summary({
+    md = scrna_lib.scrna_analysis_summary({
         "qc": {"cells_before": 2700, "cells_after": 2600, "genes_before": 32738,
                "genes_after": 13714, "n_hvg": 2000},
         "clustering": {"n_clusters": 8},

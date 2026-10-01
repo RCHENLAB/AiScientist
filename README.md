@@ -129,7 +129,7 @@ Flags (gateway env, all default off): `BIOAGENT_PLANNER=dag`,
   new artifacts, with a real per-snippet memory cap (runs on HPC3).
 - **Literature** — `literature_search` (Europe PMC keyword retrieval) and
   `deep_literature` (`tools/paperqa_search.py`, PaperQA2 RAG grounded on the on-host Qwen
-  + local embeddings — nothing leaves campus); `tools/literature_references.py` formats
+  + local embeddings — nothing leaves campus); `reporting/literature_references.py` formats
   the manuscript's references from accepted citations.
 - **`scgpt_annotate`** — per-cell type annotation via scGPT (separate short-lived GPU
   batch job).

@@ -245,6 +245,12 @@ class SlurmCodeExecutor:
                     submit_dir=scratch, state="SUBMITTED",
                 ))
 
+        # What the snippet WRITES is the step's evidence, and until now nothing reported it: the
+        # result carried stdout and a return code, so ``evidence_pointers`` found only the input
+        # dataset and every Critic verdict on a run_code step read "no backing artifact" — capping
+        # the score in the 0.6-0.8 band and leaving the report unable to cite tables that existed
+        # on disk the whole time. Snapshot before/after and diff.
+        before_files = self._artifact_snapshot()
         result = run_batch_job(
             self.remote, spec,
             acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s),
@@ -256,20 +262,72 @@ class SlurmCodeExecutor:
             self.job_store.mark(result.job_id, state=result.state, node=result.node,
                                 completed=result.completed)
         out = self._collect(result, out_f, err_f, rc_f)
-        self._sync_artifacts_back()
+        written = self._written_since(before_files)
+        self._sync_artifacts_back(changed=written)
+        out.update(classify_written(written))
         return out
 
-    def _sync_artifacts_back(self) -> None:
-        """Mirror any files the snippet wrote under the (dfs3b) artifacts dir back to the eyeserver run
-        dir, so the still-local report bundler picks them up — the analysis line does the same. Work
-        checkpoints stay on dfs3b for the next step. Best-effort; no-op without a local target."""
+    def _artifact_snapshot(self) -> "dict[str, str]":
+        """``{path relative to the artifacts dir: mtime}`` for every file under it, remotely.
+
+        Both snapshots are read from the SAME machine, so the before/after diff is immune to clock
+        skew between the gateway and HPC3 — which a "modified since <gateway timestamp>" filter
+        would not be. Carrying the mtime (not just the path) is what catches a table a step
+        OVERWROTE, which a path-set diff would miss entirely.
+        """
+        if not self.artifacts_dir or self.remote is None:
+            return {}
+        art = str(self.artifacts_dir)
+        try:
+            listing = self.remote.exec(
+                f"find {shlex_quote(art)} -type f -printf '%T@ %p\\n' 2>/dev/null").stdout or ""
+        except Exception:  # noqa: BLE001 - evidence reporting must never fail the snippet
+            return {}
+        snap: dict[str, str] = {}
+        for line in listing.splitlines():
+            parts = line.strip().split(" ", 1)
+            if len(parts) != 2:
+                continue
+            mtime, path = parts
+            if not path.startswith(art):
+                continue
+            rel = path[len(art):].lstrip("/")
+            if rel:
+                snap[rel] = mtime
+        return snap
+
+    def _written_since(self, before: "dict[str, str]") -> "list[str]":
+        """Files this snippet created or rewrote, as paths relative to the artifacts dir."""
+        after = self._artifact_snapshot()
+        return sorted(rel for rel, mtime in after.items() if before.get(rel) != mtime)
+
+    def _sync_artifacts_back(self, changed: "list[str] | None" = None) -> None:
+        """Mirror the snippet's output under the (dfs3b) artifacts dir back to the eyeserver run dir,
+        so the still-local report bundler picks it up — the analysis line does the same. Work
+        checkpoints stay on dfs3b for the next step. Best-effort; no-op without a local target.
+
+        ``changed`` limits the copy to the files THIS snippet wrote. Without it every call re-fetched
+        the whole directory: by late in a long run that was 168 files over SFTP per ``run_code``,
+        re-transferring output that had not changed in hours. Measured, that cost under a minute —
+        the run's real cost was elsewhere — but it grows with the artifact count and with file size,
+        and a step that writes one large checkpoint would make it expensive rather than merely
+        wasteful. ``None`` keeps the full copy, so a caller that does not know what changed is safe.
+
+        A file missing LOCALLY is always fetched, whatever ``changed`` says: an earlier transfer may
+        have failed (the except below swallows it), and an incremental copy must not turn a
+        transient loss into a permanent one.
+        """
         if not self.local_artifacts or not self.artifacts_dir or self.remote is None:
             return
         remote_art = str(self.artifacts_dir)
         listing = self.remote.exec(f"find {shlex_quote(remote_art)} -type f 2>/dev/null").stdout or ""
+        local_root = Path(self.local_artifacts)
+        changed_set = None if changed is None else set(changed)
         for remote_file in filter(None, (ln.strip() for ln in listing.splitlines())):
             rel = remote_file[len(remote_art):].lstrip("/")
-            local_file = Path(self.local_artifacts) / rel
+            local_file = local_root / rel
+            if changed_set is not None and rel not in changed_set and local_file.exists():
+                continue
             try:
                 local_file.parent.mkdir(parents=True, exist_ok=True)
                 self.remote.get_file(remote_file, str(local_file))
@@ -306,6 +364,44 @@ class SlurmCodeExecutor:
                         f"{self.mem_gb}G or reduce the snippet's peak memory)")
             out["error"] = (_tail(stderr, 2000).strip() or f"exited with code {returncode}{hint}")
         return out
+
+
+#: Artifact subdirectories that are step SCAFFOLDING, never a step's evidence — the job's own
+#: stdout/stderr logs live here, and offering them as backing for a scientific claim is noise.
+_NON_EVIDENCE_DIRS = frozenset({"process"})
+#: Bound on each reported list. ``evidence_pointers`` truncates at 50 anyway; capping here keeps a
+#: snippet that writes hundreds of files from crowding the result the Critic reads.
+_MAX_REPORTED = 50
+
+
+def classify_written(paths: "list[str]") -> "dict[str, list[str]]":
+    """Sort written artifact paths into the keys ``evidence_pointers`` already understands.
+
+    ``tables`` / ``figures`` / ``artifacts`` are the list keys the harness collects evidence from
+    (the curated scanpy tools emit the same ones), so reporting under these names needs no change
+    downstream — the Critic and the report writer pick them up as they already do for ``run_de``.
+    """
+    tables: list[str] = []
+    figures: list[str] = []
+    other: list[str] = []
+    for path in paths:
+        top = path.split("/", 1)[0].lower()
+        if top in _NON_EVIDENCE_DIRS:
+            continue
+        if top == "tables":
+            tables.append(path)
+        elif top == "figures":
+            figures.append(path)
+        else:
+            other.append(path)
+    out: dict[str, list[str]] = {}
+    if tables:
+        out["tables"] = tables[:_MAX_REPORTED]
+    if figures:
+        out["figures"] = figures[:_MAX_REPORTED]
+    if other:
+        out["artifacts"] = other[:_MAX_REPORTED]
+    return out
 
 
 def shlex_quote(value: str) -> str:

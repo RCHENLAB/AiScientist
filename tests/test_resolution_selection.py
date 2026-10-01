@@ -15,7 +15,7 @@ import types
 
 import numpy as np
 
-from bioagent.tools import scrna_pack
+from bioagent.tools.run_clustering import tool as run_clustering_tool
 
 
 class _Obs(dict):
@@ -71,7 +71,7 @@ def _select(adata, sc, **kw):
     params = dict(candidates=[0.2, 0.4, 0.6, 0.8, 1.0], n_boot=3, subsample=0.8,
                   stability_min=0.90, n_neighbors=15, n_pcs=30, max_cells=20000)
     params.update(kw)
-    return scrna_pack._select_resolution(sc, adata, **params)
+    return run_clustering_tool._select_resolution(sc, adata, **params)
 
 
 def test_picks_the_finest_resolution_that_still_reproduces():

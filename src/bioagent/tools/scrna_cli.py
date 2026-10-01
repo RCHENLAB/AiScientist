@@ -2,8 +2,9 @@
 
 Phase 4 of the HPC3 offload. This runs INSIDE ``analysis.sif`` on an HPC3 CPU node, driven by
 :class:`bioagent.gateway.slurm_analysis.SlurmAnalysisExecutor`. It imports the SAME tool functions
-the eyeserver uses (``scrna_pack`` / dataset preflight) and calls the named one with a reconstructed
-context, so identical code runs locally (fallback) or on HPC3 — no forked analysis logic.
+the eyeserver uses (the ``runs_on: hpc:analysis`` tool folders, and the dataset preflight) and calls
+the named one with a reconstructed context, so identical code runs locally (fallback) or on HPC3 —
+no forked analysis logic.
 
 The dataset + the run's ``work/``+``artifacts/`` all live on shared DFS (dfs3b), bind-mounted into
 the container, so checkpoints accumulate in place across steps with no round-trip.
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 RESULT_MARKER = "BIOAGENT_RESULT_JSON "
+INSTALL_DEPENDENCY = "_install_dependency"
 
 
 class _Ctx:
@@ -36,20 +38,13 @@ class _Ctx:
 
 
 def _analysis_tools() -> dict[str, Any]:
-    from . import scrna_advanced, scrna_pack
-    return {
-        "run_scanpy_qc": scrna_pack.run_scanpy_qc,
-        "run_clustering": scrna_pack.run_clustering,
-        "run_de": scrna_pack.run_de,
-        "run_enrichment": scrna_pack.run_enrichment,
-        "run_gsea_prerank": scrna_pack.run_gsea_prerank,
-        "run_depth_matched_de": scrna_pack.run_depth_matched_de,
-        "run_doublet_detection": scrna_advanced.run_doublet_detection,
-        "run_integration": scrna_advanced.run_integration,
-        "run_pseudobulk_de": scrna_advanced.run_pseudobulk_de,
-        "run_composition": scrna_advanced.run_composition,
-        "run_marker_annotation": scrna_advanced.run_marker_annotation,
-    }
+    """Every tool whose manifest says ``runs_on: hpc:analysis``, by name -> its executor.
+
+    Read from the tool folders' TOOL.md, the same source the registry routes from, so a tool the
+    registry sends to this image is always one this dispatcher knows (the hand-kept list once
+    lagged the routing, and the missing tools ran on the gateway against an empty work/)."""
+    from . import catalog
+    return {t.name: t.executor for t in catalog.build_tools(where=lambda m: m.runs_on == "hpc:analysis")}
 
 
 def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str, Any] | None) -> dict[str, Any]:
@@ -62,6 +57,11 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str
             return {"status": "error", "error": "preflight needs a dataset path"}
         out_dir = Path(workspace) / "artifacts" / "data"
         return run_dataset_smoke_analysis(Path(dataset_path), out_dir)
+    if tool == INSTALL_DEPENDENCY:
+        # Not a model-facing tool: the Slurm executor submits it when a tool reports a DECLARED
+        # dependency missing (see run_deps.ALLOWED); anything else is refused there.
+        from .run_deps import install
+        return install(workspace, str(args.get("dependency", "")))
     fn = _analysis_tools().get(tool)
     if fn is None:
         return {"status": "error", "error": f"unknown analysis tool: {tool}"}

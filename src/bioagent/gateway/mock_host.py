@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 
 from .executor import ExecResult
@@ -15,6 +17,7 @@ class MockState:
     serve_port: int = 11434
     gpu_job_id: str | None = None
     gpu_node: str | None = None
+    gpu_comment: str = ""       # the #SBATCH --comment of the last serve script written
     gpu_util: int = 0
     gpu_mem_used: int = 0
     gpu_mem_total: int = 49140  # ~48 GB, like an L40S
@@ -55,6 +58,9 @@ class MockExecutor:
         # "sbatch" inside the script body; treat it purely as
         # a file write with no side effects so those keywords don't misfire.
         if "BIOAGENT_EOF" in cmd or ("cat >" in cmd and "<<" in cmd):
+            m = re.search(r"#SBATCH --comment=(\S+)", cmd)
+            if m:
+                st.gpu_comment = m.group(1)
             return ok()
 
         # --- Slurm GPU allocation (checked before generic shell) ----------
@@ -72,8 +78,8 @@ class MockExecutor:
             if "-j" in cmd:
                 # ensure_serve_job polling format: %t|%N|%r
                 return ok(f"R|{st.gpu_node}|None")
-            # find_running_job format: %i|%u|%t|%N|%b|%M
-            return ok(f"{st.gpu_job_id}|{self.username}|R|{st.gpu_node}|gpu:l40s:1|0:42")
+            # find_running_job format: %i|%u|%t|%N|%b|%M|%k (%k = the job's model=<id> comment)
+            return ok(f"{st.gpu_job_id}|{self.username}|R|{st.gpu_node}|gpu:l40s:1|0:42|{st.gpu_comment}")
         if "sinfo" in cmd:
             return ok("gpu*    up   3-00:00:00   8   idle   gpu-3-[1-8]")
         if cmd.startswith("scancel") or "scancel " in cmd:

@@ -22,7 +22,8 @@ import pytest
 pytest.importorskip("scanpy")
 
 from bioagent.agents.preset_pipelines import _pipelines_dir, _parse_skill  # noqa: E402
-from bioagent.tools.scrna_pack import PARAMS, scrna_catalog  # noqa: E402
+from bioagent.tools._lib.scrna import PARAMS
+from bioagent.tools.catalog import scrna_catalog  # noqa: E402
 
 # `| `param` | `default` | meaning |` inside a `**`tool`**` block of a SKILL.md Parameters section.
 _TOOL_HEADING_RE = re.compile(r"^\*\*`([a-z_]+)`\*\*\s*$")
@@ -109,7 +110,7 @@ def test_the_schema_the_model_reads_carries_the_same_defaults_and_a_meaning():
 def test_the_tool_body_resolves_through_the_declared_table():
     """`_p` raises on an undeclared parameter on purpose: adding a knob to a tool body without
     adding it here would otherwise reintroduce exactly the invisible default this replaced."""
-    from bioagent.tools.scrna_pack import _p
+    from bioagent.tools._lib.scrna import _p
 
     assert _p("run_de", "n_genes", {}) == 50
     assert _p("run_de", "n_genes", {"n_genes": 200}) == 200

@@ -18,8 +18,8 @@ import re
 import pytest
 
 from bioagent.gateway.executor import ExecResult
-from bioagent.tools import hpc_shell as hs
-from bioagent.tools.hpc_shell import ConfirmRequest, HpcShell, HpcShellError, HpcWorkspace
+from bioagent.hpc import shell as hs
+from bioagent.hpc.shell import ConfirmRequest, HpcShell, HpcShellError, HpcWorkspace
 from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 HOME = "/data/homezvol0/alice"
@@ -322,3 +322,46 @@ def test_tool_errors_come_back_as_results_the_model_can_act_on():
     tool = next(t for t in hs.hpc_shell_catalog(_shell()) if t.name == "list_dir")
     out = tool.executor({"path": "/etc"}, None)
     assert out["status"] == "error" and "outside" in out["error"]
+
+
+# --- the lab's model assets must be readable ----------------------------------------------
+#
+# read_roots left out the model/reference asset dirs, and the symptom pointed nowhere near a path
+# list: a step told to verify scGPT's reference, taxonomy and preprocessing BEFORE inference could
+# not read the model directory, so it withheld inference and reported "compatibility could not be
+# verified". Run 3c5fbc8608a7 did exactly that -- and the Critic scored the withholding 0.95,
+# because the step was right to refuse on what it could see. A capability can be switched off by a
+# missing read path with no error anywhere.
+
+def test_the_shared_model_dirs_are_readable_but_never_writable(monkeypatch):
+    import types
+    from bioagent.gateway import app as gw_app
+    from bioagent.gateway.settings import HPCSettings
+
+    st = HPCSettings()
+    captured: dict = {}
+
+    class _WS:
+        def __init__(self, read_roots=(), write_roots=()):
+            captured["read"] = read_roots
+            captured["write"] = write_roots
+
+    # _build_hpc_shell imports these inside the function, so patch them at the source module.
+    from bioagent.hpc import shell as hs_mod
+    monkeypatch.setattr(hs_mod, "HpcWorkspace", _WS)
+    monkeypatch.setattr(gw_app, "_hpc_user", lambda _c: "tester")
+    # mock=False: _build_hpc_shell returns None for a mock session before it builds any roots.
+    conn = types.SimpleNamespace(settings=st, executor=object(), mock=False,
+                                 emit=lambda *a, **k: None, workspace=None)
+    try:
+        gw_app._build_hpc_shell(conn, None)
+    except Exception:
+        pass  # the builder does more than roots; we only need the roots it passed
+
+    assert captured, "the workspace was never constructed"
+    read, write = captured["read"], captured["write"]
+    for asset in (st.scgpt_model_dir, st.vlreview_model_dir):
+        assert asset in read, f"{asset} is not readable — the capability silently cannot verify itself"
+        assert asset not in write, f"{asset} must stay read-only — the lab account is shared"
+    # The containers the models run inside were already readable; keep it that way.
+    assert f"{st.shared_root.rstrip('/')}/containers" in read

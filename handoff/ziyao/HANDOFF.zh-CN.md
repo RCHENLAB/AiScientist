@@ -1,3 +1,150 @@
+## 2026-09-30 —— Qwen3.8 上的 deep_literature:按推理模型设定超时、低推理强度,"有段落没答案"不再算 ok
+
+作者:claude(文献线;Yijun 的运行发现了这个问题,由他安排)
+状态:**已合并到 main,并于 16:15 PDT 部署为 `ddf043c`**(Yijun 同意)。部署前已在 HPC3 上用
+paperqa.sif 对接一个测试用 Qwen3.8 serve job 验证。生产 `.env` 没有设置任何新参数,所以生产用的就是下面实测的默认值。
+交叉引用:`handoff/yijun/HANDOFF.md` 2026-09-30(latest)的 "Open"。
+
+### 生产环境出了什么问题(run f107bcf7b660、f3731e0b7136)
+
+那一晚没有一次 deep_literature 调用返回带引用的答案。第二个 run 的 job 文件在
+`/dfs3b/ruic20_lab/software/AiScientist/Temp/yijus12/scratch/paperqa/bioagent_paperqa_deep_literature_{2..9}.*`。
+第一个 run 的文件被第二个 run 用同样的文件名覆盖了。这些 job 以三种不同方式失败:
+- **Job 7(RP:视锥是否先于视杆退化?)** 从 24 篇论文收集到 35 个段落,然后一直没有给出答案。
+  paperqa.sif 里是 lmi 1.0.4,它每个请求的超时(`ModelSpec.timeout`)默认 **60 秒**。
+  而 Qwen3.8 在默认强度(xhigh)下,答案调用要好几分钟。
+  - 一次答案调用 = 12 个各 60 秒的请求:OpenAI SDK 会把超时的请求再发两次
+    ("timeout value=60.0, time taken=181 s"),lmi 又整体重试 3 次。
+  - PaperQA 自己的整体预算(`AgentSettings.timeout`,500 秒)在 03:45:19 用完,
+    它的 "just answering" 重试又耗掉 4 × 181 秒。
+  - job 跑了 21 分钟,返回 `status: ok`、35 个 contexts、**空答案**。lab 把它当成文献步骤接受了
+    (`_run_deep_literature_step` 里的 `if ok and cites`):只有一串引用,也没有走 Europe PMC 兜底。
+- **Job 2、4、5、6(DDX41 的视网膜表型)** 约 2 分钟跑完,没有报错:检索到 93 篇候选论文,
+  每个段落都被判为不相关。RetiGene 里没有 DDX41 与视网膜相关的论文,所以"0 个段落"是正确结果。
+  这些输出里红色的 litellm "Provider List" 是查价格的噪音,每次 LLM 调用一条。
+- **Job 3、8** 分别从 6 和 3 个段落回答"I cannot answer",主题是 DDX41 剪接和 snRNA-seq 核内
+  mRNA 滞留,都不在语料范围内。**Job 9** 是过期 endpoint 的问题,已由 6e7c95a 修复。
+
+### 原因(实测)
+
+- **容器内检查**(`echo_check.py`:在 CPU 节点上跑 paperqa.sif,对接一个假的
+  `/v1/chat/completions`,它的第一次回复延迟 65 秒):
+  - HEAD 的配置下,lmi spec 是 `timeout=60, max_retries=3`。客户端在 60 秒放弃,SDK 把同一个
+    请求重发了一次,一次调用到达服务器两次。
+  - 新配置下是 `timeout=600`。写正文的调用,JSON 里顶层带 `"reasoning_effort": "low"`;
+    摘要调用带 `"chat_template_kwargs": {"enable_thinking": false}`。
+  - 那个 65 秒的调用在第一个请求上就成功了。
+- **客户端放弃后,vLLM 会停止该请求。** 只是 vLLM 0.28 不把这算作 `finished_reason="abort"`,
+  所以生产的 /metrics 上看不到 abort。下面的复现里,vLLM 同时运行的请求从来没超过 1 个,
+  而同一个 6,532 token 的答案 prompt 每 60 秒被重新提交一次(共 19 次)。浪费来自这个重试循环:
+  每次尝试思考约 4,500 token 就被杀掉。一共生成了 8 万 token(约 18 分钟 GPU 时间),全部丢弃。
+
+### 改动
+
+- `tools/paperqa_search.py`:
+  - **超时。** PaperQA 的每个 LLM 配置都带 `"timeout": 600`(`BIOAGENT_PAPERQA_LLM_TIMEOUT`),
+    lmi 把它映射为每个请求的超时。
+  - **正文调用的推理强度。** 写正文的调用(检索查询、答案、收尾的 `complete` 工具调用)发送
+    `reasoning_effort: "low"`(`BIOAGENT_PAPERQA_REASONING_EFFORT`)。它放在 litellm 的 `extra_body`
+    里,会原样并入 vLLM 收到的 JSON。如果作为顶层 litellm 参数,会被拒绝:litellm 对没有登记为
+    推理模型的模型拒绝 `reasoning_effort`。
+  - **摘要不思考。** 逐段落摘要(每个问题 40 个)用单独的配置:
+    `chat_template_kwargs: {"enable_thinking": false}`
+    (`BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT=off`;设成 `low` 等级别则让它们思考)。
+  - **未知的强度值。** low/medium/high/xhigh/none/minimal 以外的值(例如 `default`)什么都不发,
+    即用模型自己的默认。Qwen3.8 只接受 low/medium/xhigh,"high" 会返回 HTTP 400。
+  - **整体预算。** PaperQA 的整体预算现在显式可调:`BIOAGENT_PAPERQA_AGENT_TIMEOUT`,
+    默认 500 秒,与 PaperQA 自己的默认相同。
+  - **结果状态。** 每个结果都带 `agent_status`(success / unsure / truncated / fail)。
+    有段落但答案为空,现在返回 `status: failed`,于是 lab 会走 Europe PMC 兜底。整体预算用完且
+    0 个段落时,错误信息会说明是预算用完,而不再归咎于问题写法或语料。
+- `tools/paperqa_cli.py`、`gateway/app.py::_build_literature_executor`:因为 job 以 `--containall`
+  运行,这四个参数作为 job args 传递(`llm_timeout`、`reasoning_effort`、`summary_reasoning_effort`、
+  `agent_timeout`)。
+- `configs/aiscientist.example.env`:写明了这四个参数。生产 `.env` 不需要改,默认值在代码里。
+
+### 在 HPC3 上的验证(2026-09-30)
+
+**环境。**
+- Serve job:生产 serve job 的测试副本(从 `~/.bioagent/vllm.57287386.spec` 解码):
+  vllm-0.28.0.sif、RedHatAI/Qwen3.8-27B-INT4、262K 上下文、`--reasoning-parser qwen3`、
+  free-gpu32 RTX6000、3 CPU / 18G。
+- PaperQA job:与生产相同的 sbatch(paperqa.sif、相同的 bind 和参数、standard 分区 8 CPU / 64G)。
+- 每次只跑一个查询,每 10 秒采样一次 vLLM `/metrics`。
+
+| 运行 | 设置 | 耗时 | 结果 |
+|---|---|---|---|
+| Stargardt,修改前 | HEAD 6bda2a7:60 秒、模型默认强度 | **1,277 秒** | `ok`、37 个 contexts、**空答案**;19 次答案尝试都在 60 秒被杀 |
+| Stargardt,修改后 | 本次改动:600 秒、答案 low、摘要 off | **156 秒** | ok,36 个 contexts / 16 篇论文,`success`,0 次失败调用 |
+| Stargardt | 摘要用 low | 119 秒 | ok,38 / 17 |
+| Stargardt | 600 秒,但答案用模型默认(xhigh),摘要 off | 521 秒 | ok,35 / 16 |
+| Müller 胶质细胞反应性胶质增生 | 本次改动 | 82 秒 | ok,12 / 4 |
+
+- **时间花在哪(Stargardt)。** 收集证据(40 个段落,12 路并行):默认强度 115 秒,low 34 秒,
+  关闭思考 18 秒。
+- **答案调用。**
+  - low 强度下 68 秒(另一次 low 运行 35 秒)。
+  - xhigh 下 452 秒,只比 PaperQA 的 500 秒预算少约 6 秒。
+  - 在原来的 60 秒超时下从来没完成过。
+- **只加超时不够。** GPU 上稍有竞争,xhigh 的答案就会超出预算,PaperQA 随后会从零开始再生成一次答案。
+- **每个查询生成的 token:** 修改前 13.6 万,修改后 1.1 万(摘要用 low 时 1.9 万,答案用 xhigh 时 3.9 万)。
+- **质量。** 摘要 off 与 low 取到的证据相同(36/16 对 38/17),所以默认用 off:收集时间减半,token 少 40%。
+- **答案内容。**
+  - Stargardt:ABCA4 是隐性 STGD1 的致病基因,其次 ELOVL4(STGD3)和 PROM1(STGD4),
+    再列出 PRPH2、CRX、BEST1 等 Stargardt 样基因;引用包括 Allikmets 1997、Cremers 2020。
+  - Müller 胶质:GFAP 上调是反应性胶质增生的标志,还有细胞肥大和 INL/IPL 增厚
+    (CEP290 / rd16 论文)。
+- **原始记录**(结果、计时、vLLM 指标、脚本)在
+  `/dfs3b/ruic20_lab/software/AiScientist/Temp/yijus12/pqa_timeout_test/`,Temp 清理会在 3 天后删除。
+- **测试。** `tests/test_paperqa_search.py` 共 19 个测试,其中 12 个是新的,新测试里有 10 个在 HEAD 上
+  失败。gateway 测试断言:`paperqa_cli` 映射到环境变量的每个参数,`_build_literature_executor` 都会从
+  同名环境变量转发;在 HEAD 的 gateway 配新 CLI 时,它会列出缺少的 4 个键。
+  全量测试:1,970 通过,3 跳过。
+
+### 在生产环境验证(部署后,16:37–16:44 PDT)
+
+**方法。** 通过公网地址跑一次无界面的快速聊天:一个临时脚本,复用 `scripts/e2e_prod_drive.py` 的传输部分,
+用 BioAdmin 保存的密钥以 yijus12 连接。聊天对每个基因/疾病问题都会强制先跑 deep_literature,
+所以是否调用这个工具不由模型决定。
+- **会话:** 223 秒就绪,RTX6000(n54-02),运行千问 3.8。
+- **"Which genes cause Stargardt disease?" 的时间线:** 提问后 4 秒启动 deep_literature,159 秒返回 `ok`,
+  183 秒答案完成。
+- **HPC3 作业**(57390456,standard 分区):
+  - 排队 6 秒,运行 2 分 26 秒;
+  - 参数里没有任何调参键,所以用的是代码里的默认值;
+  - 结果:`ok`,来自 16 篇论文的 36 个段落,`agent_status: success`,0 次超时;
+  - 网关在连接时同步到 HPC3 的源码里是新代码。
+- **答案。**
+  - 基因:ABCA4 是 STGD1 的主要致病基因,其次 ELOVL4、RDH8、CERKL、BEST1/CRB1;
+    PROM1、PRPH2、WDR19、CRX 列为 Stargardt 样。
+  - 有 9 篇语料参考文献支撑,例如 Allikmets 1997、Rozet 1998、Zaneveld 2015。
+  - 聊天自带的引用自动核查标出 4 处证据不支持的说法。例如它说 BEST1/CRB1 "导致 Stargardt",
+    而证据说的是 Stargardt 样。
+- **一个请求在 max_tokens 处被截断。** 这一轮里 vLLM 记到 1 个,来自聊天这一侧:这个 PaperQA 查询在 HPC3 的
+  五次运行里都是 0,这次作业也没有丢弃任何段落。答案和引用核查都完整返回。
+- **清理:** e2e 的 serve job(57389485)之后已取消。
+
+### 后续修复:有段落但没有答案时的聊天表现(`7933492`,已在 main,未部署)
+
+- **问题。** 这次修复的第一版(`ddf043c`)在 `failed` 结果里去掉了段落。聊天的强制检索于是把这种结果显示为
+  "NO relevant papers … The corpus has nothing on this",而实际上有段落。在 `ddf043c` 之前,聊天会根据这些段落回答。
+- **修复。** 失败结果现在保留段落;lab 仍会走兜底,因为状态是 `failed`。整体流程被截断且 0 个段落时,
+  聊天现在说检索没有完成,而不是说语料里什么都没有。
+- **测试:** `test_quick_chat.py` +2。全量测试 1,990 通过。
+
+### 仍未解决(文献线)
+
+- **部署 `7933492`:** 需要问 Yijun。部署会重启网关。
+- **`llm_timeout`(600 秒)比 `agent_timeout`(500 秒)长。** 在整体流程内,慢调用会先被 500 秒预算切断;
+  600 秒作用于切断之后的 "just answering" 调用。如果运行开始以 `truncated` 结束,应调高
+  `BIOAGENT_PAPERQA_AGENT_TIMEOUT`,而不是提高推理强度。
+- **重试循环还在**(SDK 重发两次 × lmi 重试 3 次),只是现在只有调用超过 600 秒时才会触发。
+  lmi 不允许通过配置设置 SDK 的重试次数。
+- **DDX41 问题。** DDX41 的"0 个段落"是正确结果:planner 仍在拿 RetiGene 不覆盖的基因去问
+  deep_literature。这类问题应该查 Europe PMC。
+
+---
+
 # 交接文档 — `deep_literature`(PaperQA2 接本地 Qwen)
 
 > ⚠️ **先读最上面的 `## 2026-06-28` 段** —— 它交接**新的 references 模块** + 定稿的远端 provider 决定

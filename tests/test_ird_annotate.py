@@ -1,7 +1,7 @@
 """Tests for the IRD annotation layers + reason_for_inclusion cascade (docs/ird_filter_spec.md)."""
 from __future__ import annotations
 
-from bioagent.tools.ird_annotate import (
+from bioagent.tools.annotate_variants.ird_annotate import (
     annotate_ird_layers,
     dbscsnv_scores,
     hgmd_nearby,

@@ -21,9 +21,9 @@ Build + weight staging is driven by `scripts/hpc3_vlreview_setup.sh` (mirrors
 
 ## Gateway / loop
 - `src/bioagent/gateway/vlreview_job.py` — submits + supervises the batch job (Route C).
-- `src/bioagent/tools/visual_review.py` — the render → review → **re-render with escalated
+- `src/bioagent/reporting/visual_review.py` — the render → review → **re-render with escalated
   format** loop; residual defects go to the technical-report Diagnostics only.
-- `src/bioagent/tools/report.py` — `build_pdf_report(format_overrides=...)` are the knobs the
+- `src/bioagent/reporting/report.py` — `build_pdf_report(format_overrides=...)` are the knobs the
   loop escalates (table font, body font, margins, table-wrap threshold, landscape, fig width).
 
 ## Build + stage (on HPC3 — macOS cannot build .sif)

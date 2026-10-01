@@ -23,8 +23,11 @@ import anndata as ad  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from bioagent.tools import scrna_pack  # noqa: E402
-from bioagent.tools.scrna_pack import PARAMS, _significant_both_directions  # noqa: E402
+from bioagent.tools import catalog as tools_catalog  # noqa: E402
+from bioagent.tools.run_de import tool as run_de_tool
+from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from bioagent.tools._lib.scrna import PARAMS
+from bioagent.tools.run_de.tool import _significant_both_directions  # noqa: E402
 
 
 def _ctx(tmp_path, dataset):
@@ -56,7 +59,7 @@ def _two_arm(tmp_path, *, n_cells=300, n_rare_cells=3):
 
 
 def _qc(tmp_path, dataset):
-    out = scrna_pack.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0},
+    out = run_scanpy_qc_tool.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0},
                                    _ctx(tmp_path, dataset))
     assert out["status"] == "ok"
     return _ctx(tmp_path, dataset)
@@ -64,7 +67,7 @@ def _qc(tmp_path, dataset):
 
 def _stratified(ctx, **over):
     args = {"groupby": "sampleid", "reference": "WT", "stratify_by": "majorclass", **over}
-    out = scrna_pack.run_de(args, ctx)
+    out = run_de_tool.run_de(args, ctx)
     assert out["status"] == "ok", out.get("error")
     return out
 
@@ -137,7 +140,7 @@ def test_the_declared_table_and_the_schema_carry_the_new_knobs():
     assert PARAMS["run_de"]["min_pct"][0] == 0.1
     assert PARAMS["run_de"]["tie_correct"][0] is True
     assert PARAMS["run_pseudobulk_de"]["min_count"][0] == 10
-    props = next(t for t in scrna_pack.scrna_catalog()
+    props = next(t for t in tools_catalog.scrna_catalog()
                  if t.name == "run_de").parameters["properties"]
     assert props["min_pct"]["default"] == 0.1
     assert props["tie_correct"]["default"] is True
@@ -167,9 +170,9 @@ def _four_sample(tmp_path):
 
 
 def _pseudobulk(tmp_path):
-    from bioagent.tools import scrna_advanced
+    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
     ctx = _qc(tmp_path, _four_sample(tmp_path))
-    return scrna_advanced.run_pseudobulk_de(
+    return run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "orig.ident", "condition_key": "sampleid"}, ctx)
 
 
@@ -195,14 +198,14 @@ def test_pseudobulk_universe_is_what_was_tested(tmp_path):
 
 
 def test_pseudobulk_falls_back_loudly_when_deseq2_is_missing(tmp_path, monkeypatch):
-    from bioagent.tools import scrna_advanced
+    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     def _no_deseq2(*_a, **_k):
-        scrna_advanced._deseq2_contrast.last_error = "pydeseq2 is not installed"
+        run_pseudobulk_de_tool._deseq2_contrast.last_error = "pydeseq2 is not installed"
         return None
-    monkeypatch.setattr(scrna_advanced, "_deseq2_contrast", _no_deseq2)
+    monkeypatch.setattr(run_pseudobulk_de_tool, "_deseq2_contrast", _no_deseq2)
     ctx = _qc(tmp_path, _four_sample(tmp_path))
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "orig.ident", "condition_key": "sampleid"}, ctx)
 
     assert out["status"] == "ok"
@@ -214,11 +217,13 @@ def test_pseudobulk_falls_back_loudly_when_deseq2_is_missing(tmp_path, monkeypat
 
 def test_extreme_fc_flagged_as_detection_artifact(tmp_path):
     """|log2FC| >= 5 rows in a contrast raise the EXTREME FOLD-CHANGES warning (Col25a1 8.74)."""
-    from bioagent.tools import scrna_pack
+    from bioagent.tools import catalog as tools_catalog
+    from bioagent.tools.run_de import tool as run_de_tool
+    from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
     rows = [{"group": "Rod", "gene": "Col25a1", "log2fc": 8.74, "pval": 1e-9, "pval_adj": 1e-6, "score": 9.0},
             {"group": "Rod", "gene": "Rho", "log2fc": 0.4, "pval": 1e-4, "pval_adj": 0.01, "score": 3.0}]
-    up, down, totals = scrna_pack._significant_both_directions(rows, 0.05, 0.25, 50)
+    up, down, totals = run_de_tool._significant_both_directions(rows, 0.05, 0.25, 50)
     assert any(abs(r["log2fc"]) >= 5 for r in up)  # the input reaches `combined` in run_de
 
 
@@ -226,7 +231,7 @@ def test_qc_noop_warns_prefiltered(tmp_path):
     import anndata as ad
     import numpy as np
     from pathlib import Path
-    from bioagent.tools.scrna_pack import run_scanpy_qc
+    from bioagent.tools.run_scanpy_qc.tool import run_scanpy_qc
 
     rng = np.random.default_rng(0)
     x = rng.poisson(3.0, size=(60, 50)).astype("float32") + 1  # every cell passes every threshold

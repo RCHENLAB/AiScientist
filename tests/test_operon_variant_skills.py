@@ -12,9 +12,9 @@ import json
 import runpy
 from pathlib import Path
 
-from bioagent.agents.skills import SKILLS
+from bioagent.agents.skills import SKILLS, _skills_dir
 
-_SKILLS = Path(__file__).resolve().parents[1] / "skills"
+_SKILLS = _skills_dir()   # the repo-root skills/, or $BIOAGENT_SKILLS_DIR once skills live apart
 
 
 def test_operon_skills_registered_with_summaries():

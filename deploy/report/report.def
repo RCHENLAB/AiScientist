@@ -6,10 +6,10 @@ From: pandoc/extra:latest
 # as a CPU Slurm job, so a multi-GB TeXLive + minutes of render never touch the eyeserver.
 #
 # DEPS-ONLY: pandoc is a self-contained binary and NO bioagent code runs here — so `--remote`
-# (Sylabs) builds work, and a report-format change (tools/report.py) never needs an image rebuild.
+# (Sylabs) builds work, and a report-format change (reporting/report.py) never needs an image rebuild.
 #
 # Base `pandoc/extra` already bundles pandoc + a TeXLive with XeLaTeX + common LaTeX packages +
-# fonts + Lua-filter support. We only ensure the few packages tools/report.py's preamble uses.
+# fonts + Lua-filter support. We only ensure the few packages reporting/report.py's preamble uses.
 #
 # Build on HPC3 (no fakeroot) with `--remote`; see deploy/report/build_and_stage.sh.
 

@@ -38,6 +38,7 @@ class _Endpoint:
 
     def __init__(self) -> None:
         self.seen: list[tuple] = []
+        self.probed: list[tuple] = []
         self._fail: tuple[str, str] | None = None
 
     def fail(self, cause: str = "auth", message: str = "bad key") -> None:
@@ -53,6 +54,13 @@ class _Endpoint:
             return llm_providers.VerifyResult(False, self._fail[0], self._fail[1])
         return llm_providers.VerifyResult(True, "ok", "fine", ["m1", "m2"], verified_model=model)
 
+    def probe(self, base_url, api_key, timeout=15.0):
+        from bioagent.gateway import llm_providers
+        self.probed.append((base_url, api_key))
+        if self._fail:
+            return llm_providers.ModelsResult(False, self._fail[0], self._fail[1])
+        return llm_providers.ModelsResult(True, "ok", "2 models available.", ["m1", "m2"])
+
 
 @pytest.fixture()
 def ok_endpoint(monkeypatch):
@@ -61,6 +69,7 @@ def ok_endpoint(monkeypatch):
     ep = _Endpoint()
     monkeypatch.setattr(llm_providers, "verify", ep.verify)
     monkeypatch.setattr(llm_providers, "list_models", lambda b, k, timeout=15.0: ["m1", "m2"])
+    monkeypatch.setattr(llm_providers, "probe_models", ep.probe)
     return ep
 
 
@@ -311,3 +320,106 @@ def test_selecting_another_owners_credential_is_404(client, ok_endpoint, conn):
     cred_id = _create(client).json()["credential"]["id"]
     conn.owner = "bob"
     assert _select(client, conn, cred_id).status_code == 404
+
+
+# --- listing models BEFORE anything is saved ---------------------------------
+#
+# The dialog used to have a cycle: a credential is refused at bind time unless it names a model,
+# the ids live on the provider, and the only route that could read them needed a saved credential.
+# The first save therefore always produced an endpoint that could not be used.
+
+
+def test_models_can_be_listed_for_an_endpoint_that_is_still_being_typed(client, ok_endpoint):
+    res = client.post("/api/llm-models", json={"base_url": "https://api.deepseek.com/v1/chat/completions",
+                                               "api_key": "sk-typed-99999999999", "user": "alice"})
+    assert res.status_code == 200
+    assert res.json()["models"] == ["m1", "m2"]
+    assert ok_endpoint.probed == [("https://api.deepseek.com/v1", "sk-typed-99999999999")]
+    assert client.get("/api/llm-credentials?user=alice").json()["credentials"] == [], "nothing was stored"
+
+
+def test_models_probe_names_the_cause_so_the_dialog_can_say_what_to_fix(client, ok_endpoint):
+    ok_endpoint.fail("auth", "the endpoint rejected this API key")
+    res = client.post("/api/llm-models", json={"base_url": "https://a/v1", "api_key": "sk-wrong-00000000000"})
+    assert res.status_code == 400
+    assert res.json()["cause"] == "auth"
+
+
+def test_models_probe_can_reuse_the_stored_key_for_an_edit(client, ok_endpoint):
+    """Providers show a key once. Editing an endpoint must not require finding it again."""
+    cred_id = _create(client).json()["credential"]["id"]
+
+    res = client.post("/api/llm-models", json={"credential_id": cred_id, "user": "alice"})
+    assert res.status_code == 200
+    assert ok_endpoint.probed == [("https://api.deepseek.com/v1", "sk-original-000000000")]
+
+
+def test_a_stored_key_is_never_aimed_at_a_url_from_the_request(client, ok_endpoint):
+    """Otherwise this route reads a key back out of the server: point it at a host you control
+    and we POST the user's key to you. The credential's own base URL is the only one it may use."""
+    cred_id = _create(client).json()["credential"]["id"]
+
+    client.post("/api/llm-models", json={"credential_id": cred_id, "user": "alice",
+                                         "base_url": "https://attacker.example/v1"})
+    assert ok_endpoint.probed == [("https://api.deepseek.com/v1", "sk-original-000000000")]
+
+
+def test_models_probe_confines_the_credential_to_its_owner(client, ok_endpoint):
+    cred_id = _create(client).json()["credential"]["id"]
+    assert client.post("/api/llm-models", json={"credential_id": cred_id, "user": "bob"}).status_code == 404
+
+
+# --- an edit re-proves itself -------------------------------------------------
+
+
+def test_changing_the_model_is_retested_with_the_key_already_on_file(client, ok_endpoint):
+    """A model change drops the stored verification. Re-proving it here is what turns "did the id
+    I picked work?" from a second click into part of the save."""
+    cred_id = _create(client).json()["credential"]["id"]
+    ok_endpoint.seen.clear()
+
+    res = client.put(f"/api/llm-credentials/{cred_id}", json={"model": "m2", "user": "alice"})
+    assert res.status_code == 200
+    assert ok_endpoint.seen == [("https://api.deepseek.com/v1", "sk-original-000000000", "m2")]
+    assert res.json()["credential"]["verified_at"] is not None
+    assert res.json()["verify"]["ok"] is True
+
+
+def test_a_model_the_endpoint_refuses_is_saved_but_flagged(client, ok_endpoint):
+    """Not rolled back: the user may be fixing the base URL and the model id in two steps. But it
+    must not quietly read as verified — that failure would otherwise surface mid-run."""
+    cred_id = _create(client).json()["credential"]["id"]
+    ok_endpoint.fail("model", "no such model here")
+
+    res = client.put(f"/api/llm-credentials/{cred_id}", json={"model": "nope", "user": "alice"})
+    assert res.status_code == 200
+    assert res.json()["verify"]["ok"] is False
+    cred = res.json()["credential"]
+    assert cred["model"] == "nope" and cred["verified_at"] is None
+    assert cred["last_error"] == "no such model here"
+
+
+def test_the_provider_preset_can_be_changed_by_an_edit(client, ok_endpoint):
+    cred_id = _create(client).json()["credential"]["id"]
+    res = client.put(f"/api/llm-credentials/{cred_id}",
+                     json={"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1",
+                           "user": "alice"})
+    assert res.json()["credential"]["provider"] == "openrouter"
+
+
+# --- where the key lives ------------------------------------------------------
+
+
+def test_the_list_says_where_keys_are_stored(client, ok_endpoint):
+    """"Where does my key go?" is answerable only here — the key itself never reaches the browser.
+
+    The path must be ABSOLUTE: BIOAGENT_STATE_DIR is unset in production, so an unresolved store
+    reads "llm_creds/<user>", which the reader cannot locate and which therefore answers nothing.
+    """
+    import os
+
+    d = client.get("/api/llm-credentials?user=alice").json()
+    assert d["storage"]["owner"] == "alice"
+    assert d["storage"]["dir"].endswith("llm_creds/alice")
+    assert os.path.isabs(d["storage"]["dir"])
+    assert d["storage"]["encrypted"] is False

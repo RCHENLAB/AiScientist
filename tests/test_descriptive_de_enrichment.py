@@ -9,7 +9,7 @@ a pseudoreplicated p-value was choosing the gene list, and its output read as si
 
 from __future__ import annotations
 
-from bioagent.tools.scrna_pack import _enrichment_input_rows
+from bioagent.tools.run_enrichment.tool import _enrichment_input_rows
 
 ROWS = [
     {"gene": "BIG_EFFECT_WEAK_P", "pval_adj": "0.90", "log2fc": "3.0"},

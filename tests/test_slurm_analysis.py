@@ -304,3 +304,134 @@ def test_memoize_off_by_default_reruns(tmp_path):
     ex.run_tool("annotate_variants", {"vcf_path": "x"}, ctx=None)
     ex.run_tool("annotate_variants", {"vcf_path": "x"}, ctx=None)
     assert len(hpc.submits) == 2                                    # both submitted — unchanged behavior
+
+
+# --- a tool's declared dependency: installed for this run, then the tool retried ---------------
+
+
+class SeqHPC(FakeHPC):
+    """Each job (one result file) gets the next scripted result, in submission order."""
+
+    def __init__(self, results: list[dict]):
+        super().__init__(results[0])
+        self._queue = list(results)
+        self._by_file: dict[str, dict] = {}
+
+    def read_bytes(self, remote_path, max_bytes=None):
+        if ".result.json" in remote_path:
+            if remote_path not in self._by_file:
+                self._by_file[remote_path] = self._queue.pop(0)
+            data = ("BIOAGENT_RESULT_JSON " + json.dumps(self._by_file[remote_path]) + "\n").encode()
+            return data[:max_bytes] if max_bytes is not None else data
+        return super().read_bytes(remote_path, max_bytes)
+
+    def scripts(self) -> list[str]:
+        return [c for c in self.all_cmds if "cat > " in c and "#SBATCH" in c]
+
+
+_MISSING = {"status": "dependency_missing", "step": "doublets", "dependency": "scikit-image"}
+_INSTALLED = {"status": "ok", "installed": "scikit-image==0.25.2", "module": "skimage",
+              "path": "/dfs/lab/run/_deps/pkgs/scikit-image-0.25.2", "site": "/dfs/lab/run/_deps/site"}
+
+
+def test_a_declared_missing_dependency_is_installed_for_the_run_and_the_tool_retried():
+    hpc = SeqHPC([_MISSING, _INSTALLED, {"status": "ok", "n_doublets": 12}])
+    said: list[tuple[str, str]] = []
+    ex = _ex(hpc, auto_install_deps=True, notify=lambda level, msg: said.append((level, msg)))
+
+    out = ex.run_tool("run_doublet_detection", {}, ctx=None)
+
+    assert out["status"] == "ok" and out["n_doublets"] == 12
+    assert out["dependency_installed"]["package"] == "scikit-image==0.25.2"
+    assert "run only" in out["dependency_installed"]["scope"]
+    assert len(hpc.submits) == 3                       # tool, install, tool again
+    first, install, retry = hpc.scripts()
+    assert "--tool _install_dependency" in install
+    assert "AISCIENTIST_PKG_CACHE" not in first
+    assert "AISCIENTIST_PKG_CACHE=/dfs/lab/run/_deps/pkgs/scikit-image-0.25.2" in retry
+    assert "PYTHONPATH=/dfs/lab/run/_deps/site:" in retry
+    assert any("for this run only" in m for _, m in said)
+
+
+def test_later_steps_reuse_the_runs_install_without_installing_again():
+    hpc = SeqHPC([_MISSING, _INSTALLED, {"status": "ok"}, {"status": "ok"}])
+    ex = _ex(hpc, auto_install_deps=True)
+    ex.run_tool("run_doublet_detection", {}, ctx=None)
+    ex.run_tool("run_clustering", {}, ctx=None)
+    assert len(hpc.submits) == 4
+    assert "AISCIENTIST_PKG_CACHE" in hpc.scripts()[-1]
+
+
+def test_an_undeclared_dependency_is_returned_unchanged():
+    hpc = SeqHPC([{"status": "dependency_missing", "dependency": "harmonypy"}])
+    out = _ex(hpc, auto_install_deps=True).run_tool("run_integration", {}, ctx=None)
+    assert out["status"] == "dependency_missing" and "dependency_install" not in out
+    assert len(hpc.submits) == 1
+
+
+def test_nothing_is_installed_unless_the_executor_enables_it():
+    hpc = SeqHPC([_MISSING])
+    out = _ex(hpc).run_tool("run_doublet_detection", {}, ctx=None)
+    assert out["status"] == "dependency_missing" and len(hpc.submits) == 1
+
+
+def test_a_failed_install_keeps_the_tools_answer_and_is_not_attempted_twice():
+    hpc = SeqHPC([_MISSING, {"status": "error", "error": "pip install scikit-image==0.25.2 failed: no wheel"},
+                  _MISSING])
+    ex = _ex(hpc, auto_install_deps=True)
+
+    out = ex.run_tool("run_doublet_detection", {}, ctx=None)
+    assert out["status"] == "dependency_missing"
+    assert out["dependency_install"]["status"] == "failed"
+    assert "no wheel" in out["dependency_install"]["reason"]
+
+    again = ex.run_tool("run_doublet_detection", {}, ctx=None)
+    assert again["dependency_install"]["status"] == "failed"
+    assert len(hpc.submits) == 3                       # the second call did not re-run the install
+
+
+def test_release_removes_the_runs_install_and_only_that():
+    hpc = SeqHPC([_MISSING, _INSTALLED, {"status": "ok"}])
+    ex = _ex(hpc, auto_install_deps=True)
+    ex.run_tool("run_doublet_detection", {}, ctx=None)
+
+    assert ex.release_run_deps() == ["scikit-image==0.25.2"]
+    assert hpc.all_cmds[-1] == "rm -rf /dfs/lab/run/_deps"
+
+    fresh = SeqHPC([{"status": "ok"}])
+    ex2 = _ex(fresh, auto_install_deps=True)
+    ex2.run_tool("run_clustering", {}, ctx=None)
+    assert ex2.release_run_deps() == []
+    assert not any(c.startswith("rm -rf") for c in fresh.all_cmds)
+
+
+def test_the_install_step_is_not_a_tool_the_model_can_call():
+    from bioagent.tools import scrna_cli
+    assert scrna_cli.INSTALL_DEPENDENCY not in scrna_cli._analysis_tools()
+
+
+# --- live args: an endpoint that moves mid-run -----------------------------------------------
+
+
+def test_live_args_are_read_at_every_job_and_beat_the_build_time_value():
+    """The vLLM serve job was replaced mid-run on another node/port; PaperQA jobs kept calling the
+    dead one because the URL was captured when the executor was built (run f3731e0b7136)."""
+    hpc = FakeHPC({"status": "ok"})
+    where = iter(["http://m54-01:39783/v1", "http://m54-03:41000/v1"])
+    ex = _ex(hpc, inject_args={"llm_base_url": "http://m54-02:49336/v1", "papers": "/p"},
+             live_args=lambda: {"llm_base_url": next(where)})
+    ex.run_tool("deep_literature", {"question": "q"}, ctx=None)
+    first = hpc.staged_args
+    ex.run_tool("deep_literature", {"question": "q"}, ctx=None)
+    assert "m54-01:39783" in first and "m54-02" not in first and '"/p"' in first
+    assert "m54-03:41000" in hpc.staged_args
+
+
+def test_a_failing_live_args_falls_back_to_the_build_time_value():
+    hpc = FakeHPC({"status": "ok"})
+
+    def boom():
+        raise RuntimeError("no allocation")
+    _ex(hpc, inject_args={"llm_base_url": "http://m54-02:49336/v1"}, live_args=boom).run_tool(
+        "deep_literature", {}, ctx=None)
+    assert "m54-02:49336" in hpc.staged_args

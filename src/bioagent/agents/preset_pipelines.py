@@ -58,6 +58,19 @@ class PresetPipeline:
     # the dataset wins (a scanpy pipeline is never forced onto a VCF). See ``research_lab.run``.
     data_type: str = ""
 
+    def missing_tools(self, available: "frozenset[str] | None") -> tuple[str, ...]:
+        """Declared tools this deployment cannot actually run, in declaration order.
+
+        ``available`` is the set of tool names that are BOTH in the catalog and usable here; pass
+        None (the default everywhere) to skip the check entirely and keep the previous behaviour.
+        A pipeline is not disqualified by a gap — it may still be the best available protocol and
+        its steps degrade honestly — but choosing one silently, as if whole, is how a run announces
+        "Loaded preset pipeline: scGPT foundation-model annotation" for a tool that cannot run.
+        """
+        if available is None:
+            return ()
+        return tuple(t for t in self.tools if t not in available)
+
 
 # Legacy alias: ``presets.py`` and older call sites refer to a "ResearchPreset".
 ResearchPreset = PresetPipeline
@@ -192,6 +205,7 @@ def select_pipeline(
     *,
     content_modality: str = "",
     content_confidence: str = "",
+    available_tools: "frozenset[str] | None" = None,
 ) -> PresetPipeline | None:
     """The PI picks the best-matching preset pipeline from the library itself, by its one-line
     descriptions AND the loaded dataset's profile (so a VCF / annotated .h5ad routes right even
@@ -224,15 +238,24 @@ def select_pipeline(
             content_routed = True
             if len(matches) == 1:
                 chosen = matches[0]
+                gaps = chosen.missing_tools(available_tools)
                 if emit is not None:
                     emit({"type": "skill_selected", "key": chosen.key, "label": chosen.label,
-                          "reason": f"content:{data_type}"})
+                          "reason": f"content:{data_type}",
+                          **({"unavailable_tools": list(gaps)} if gaps else {})})
                 return chosen
             route_library = matches   # >1 in the bucket → let the LLM pick within it
             dataset_hint = (f"The uploaded file's CONTENT is {data_type} data (detected by skimming the "
                             f"bytes, not the filename).\n" + dataset_hint).strip()
 
-    listing = "\n".join(f"- {p.key}: {p.label}" for p in route_library)
+    # The router picks by description; a protocol whose defining tool cannot run in this deployment
+    # must say so in its own line, or it reads as the best match right up until its first step.
+    def _line(p: "PresetPipeline") -> str:
+        gaps = p.missing_tools(available_tools)
+        suffix = (f"  [NOT AVAILABLE in this deployment: {', '.join(gaps)}]" if gaps else "")
+        return f"- {p.key}: {p.label}{suffix}"
+
+    listing = "\n".join(_line(p) for p in route_library)
     raw = complete([
         {"role": "system", "content": PIPELINE_SELECT_SYSTEM},
         {"role": "user", "content": (
@@ -245,10 +268,12 @@ def select_pipeline(
     key = parse_pipeline_choice(raw, [p.key for p in route_library])
     chosen = next((p for p in route_library if p.key == key), None)
     if emit is not None:
+        gaps = chosen.missing_tools(available_tools) if chosen else ()
         emit({"type": "skill_selected",
               "key": chosen.key if chosen else None,
               "label": chosen.label if chosen else None,
-              **({"reason": f"content:{data_type}"} if content_routed and chosen else {})})
+              **({"reason": f"content:{data_type}"} if content_routed and chosen else {}),
+              **({"unavailable_tools": list(gaps)} if gaps else {})})
     return chosen
 
 

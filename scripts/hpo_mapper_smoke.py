@@ -41,7 +41,7 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(ROOT / ".env")
 
-from bioagent.tools.hpo_terms.mapper import map_text_to_hpo   # noqa: E402
+from bioagent.tools.map_phenotype_to_hpo.tool import map_text_to_hpo   # noqa: E402
 
 # Realistic notes. `expect` = HPO IDs that must be OBSERVED, `excluded` = must be reported ABSENT,
 # `forbid` = must NOT appear at all (the family-history and treatment traps).

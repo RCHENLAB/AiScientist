@@ -102,6 +102,46 @@ def test_list_models_degrades_to_empty(monkeypatch, handler):
     assert lp.list_models("https://a/v1", "sk-x") == []
 
 
+# --- probe_models: the same call, with the reason kept -----------------------
+#
+# The credential dialog offers this list BEFORE anything is saved, so "it came back empty" has to
+# be distinguishable from "your key is wrong" and "that host isn't an API" — three different
+# things for the user to do, identical as a bare [].
+
+
+def test_probe_models_reports_the_ids_it_found(monkeypatch):
+    _install(monkeypatch, lambda url, _p: _Resp(json.dumps({"data": [{"id": "a"}, {"id": "b"}]})))
+    res = lp.probe_models("https://a/v1", "sk-x")
+    assert (res.ok, res.cause, res.models) == (True, "ok", ["a", "b"])
+
+
+@pytest.mark.parametrize("handler,cause", [
+    (lambda url, _p: _http_error(401, '{"error": "bad key"}'), "auth"),
+    (lambda url, _p: _http_error(402), "credit"),
+    (lambda url, _p: _http_error(404), "endpoint"),
+    (lambda url, _p: urllib.error.URLError("dns"), "network"),
+    (lambda url, _p: _Resp(json.dumps({"data": []})), "unsupported"),
+])
+def test_probe_models_names_the_cause(monkeypatch, handler, cause):
+    _install(monkeypatch, handler)
+    res = lp.probe_models("https://a/v1", "sk-x")
+    assert (res.ok, res.cause, res.models) == (False, cause, [])
+
+
+def test_probe_models_never_echoes_the_key(monkeypatch):
+    """Some gateways quote the Authorization header back in a 4xx body."""
+    _install(monkeypatch, lambda url, _p: _http_error(401, '{"seen": "Bearer sk-secret-12345678"}'))
+    assert "sk-secret-12345678" not in lp.probe_models("https://a/v1", "sk-secret-12345678").message
+
+
+@pytest.mark.parametrize("base,key,cause", [("", "sk-x", "endpoint"), ("https://a/v1", "", "auth")])
+def test_probe_models_asks_for_what_is_missing(monkeypatch, base, key, cause):
+    """No socket is opened for a request that cannot possibly work."""
+    calls = _install(monkeypatch, lambda url, _p: _Resp("{}"))
+    assert lp.probe_models(base, key).cause == cause
+    assert calls == []
+
+
 # --- verification ------------------------------------------------------------
 
 

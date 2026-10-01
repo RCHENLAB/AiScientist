@@ -2,7 +2,7 @@
 
 Build kit for `vep.sif` + the VEP caches — the OFFLINE variant-annotation line AiScientist runs
 **when `BIOAGENT_VARIANT_ON_HPC=1`**. The orchestration that *runs* the image is already built +
-offline-tested (`src/bioagent/tools/vcf_offline.py` + `variant_cli.py`, driven by
+offline-tested (`src/bioagent/tools/annotate_variants/offline.py` + `variant_cli.py`, driven by
 `SlurmAnalysisExecutor` with an injected runner — no cluster, no VEP, no network in CI:
 `tests/test_vcf_offline.py`). This folder is the **image + cache build kit**.
 

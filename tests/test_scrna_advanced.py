@@ -24,7 +24,16 @@ import pytest
 # pandas ships in the `analysis` extra, like scanpy — same convention the h5py-backed tests use.
 pd = pytest.importorskip("pandas")
 
-from bioagent.tools import scrna_advanced  # noqa: E402
+from bioagent.tools._lib import scrna as scrna_lib  # noqa: E402
+from bioagent.tools.run_clustering import tool as run_clustering_tool
+from bioagent.tools.run_composition import tool as run_composition_tool
+from bioagent.tools.run_de import tool as run_de_tool
+from bioagent.tools.run_depth_matched_de import tool as run_depth_matched_de_tool
+from bioagent.tools.run_doublet_detection import tool as run_doublet_detection_tool
+from bioagent.tools.run_integration import tool as run_integration_tool
+from bioagent.tools.run_marker_annotation import tool as run_marker_annotation_tool
+from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _ctx(tmp_path):
@@ -83,7 +92,8 @@ def _install_sc(monkeypatch, adata):
         tl=types.SimpleNamespace(),
         pp=types.SimpleNamespace(),
     )
-    monkeypatch.setattr(scrna_advanced, "_import_scanpy", lambda: sc)
+    for _mod in (scrna_lib, run_clustering_tool, run_composition_tool, run_de_tool, run_depth_matched_de_tool, run_doublet_detection_tool, run_integration_tool, run_marker_annotation_tool, run_pseudobulk_de_tool, run_scanpy_qc_tool):  # every module that looks `_import_scanpy` up
+        monkeypatch.setattr(_mod, "_import_scanpy", lambda: sc)
     return sc
 
 
@@ -104,7 +114,7 @@ def test_pseudobulk_refuses_when_there_is_no_replication(tmp_path, monkeypatch):
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
 
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
 
     assert out["status"] == "error"
@@ -120,7 +130,7 @@ def test_pseudobulk_runs_with_replication_and_names_the_unit(tmp_path, monkeypat
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
 
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
@@ -139,7 +149,7 @@ def test_pseudobulk_rejects_a_sample_spanning_two_conditions(tmp_path, monkeypat
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
 
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
 
     assert out["status"] == "error"
@@ -156,7 +166,7 @@ def test_pseudobulk_refuses_a_checkpoint_without_raw_counts(tmp_path, monkeypatc
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
 
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
 
     assert out["status"] == "error"
@@ -174,7 +184,7 @@ def test_pseudobulk_keeps_underpowered_groups_visible(tmp_path, monkeypatch):
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
 
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "sample", "condition_key": "cond", "group_key": "ct"}, _ctx(tmp_path))
 
     assert out["status"] == "ok"
@@ -184,11 +194,11 @@ def test_pseudobulk_keeps_underpowered_groups_visible(tmp_path, monkeypatch):
 
 def test_bh_fdr_is_monotone_and_bounded():
     p = [0.001, 0.01, 0.03, 0.2, 0.9]
-    q = scrna_advanced._bh_fdr(p)
+    q = scrna_lib._bh_fdr(p)
     assert all(0 <= v <= 1 for v in q)
     assert q == sorted(q)                    # monotone in p for an already-sorted input
     assert all(a <= b + 1e-12 for a, b in zip(p, q))   # adjustment never shrinks a p-value
-    assert scrna_advanced._bh_fdr([]) == []
+    assert scrna_lib._bh_fdr([]) == []
 
 
 # --- composition ---------------------------------------------------------------
@@ -200,11 +210,25 @@ def test_composition_will_not_test_without_replication(tmp_path, monkeypatch):
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_clustered.h5ad")
 
-    out = scrna_advanced.run_composition(
+    out = run_composition_tool.run_composition(
         {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
 
     assert out["status"] == "ok" and out["tested"] is False
     assert "not evidence of an effect" in out["note"]
+
+
+def test_composition_reports_the_counts_behind_its_percentages(tmp_path, monkeypatch):
+    ad = _make(sample=["S1"] * 20 + ["S2"] * 20, cond=["ctrl"] * 20 + ["dis"] * 20,
+               leiden=["0", "1"] * 20)
+    _install_sc(monkeypatch, ad)
+    _touch(tmp_path, "adata_clustered.h5ad")
+
+    out = run_composition_tool.run_composition(
+        {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
+
+    assert out["cells_by_group_and_arm"] == {"0": {"ctrl": 10, "dis": 10},
+                                             "1": {"ctrl": 10, "dis": 10}}
+    assert out["pct_by_condition"]["ctrl"]["0"] == 50.0
 
 
 def test_composition_tests_on_clr_and_returns_the_compositional_caveat(tmp_path, monkeypatch):
@@ -215,7 +239,7 @@ def test_composition_tests_on_clr_and_returns_the_compositional_caveat(tmp_path,
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_clustered.h5ad")
 
-    out = scrna_advanced.run_composition(
+    out = run_composition_tool.run_composition(
         {"sample_key": "sample", "condition_key": "cond"}, _ctx(tmp_path))
 
     assert out["tested"] is True
@@ -234,8 +258,31 @@ def test_doublets_refuse_without_counts(tmp_path, monkeypatch):
     ad.layers = {}
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
-    out = scrna_advanced.run_doublet_detection({}, _ctx(tmp_path))
+    out = run_doublet_detection_tool.run_doublet_detection({}, _ctx(tmp_path))
     assert out["status"] == "error" and "no raw-count layer" in out["error"]
+
+
+@pytest.mark.parametrize("message", [
+    # scanpy 1.11.5, the version inside analysis.sif (measured on HPC3, 2026-09-30)
+    "threshold is None and thus scrublet requires skimage, but skimage is not installed.",
+    # scanpy 1.12 names the distribution instead
+    "threshold is None and thus scrublet requires scikit-image, but it is not installed.",
+])
+def test_doublets_without_scikit_image_report_the_missing_dependency(tmp_path, monkeypatch,
+                                                                       message):
+    """Either scanpy wording must come back as dependency_missing naming scikit-image — an
+    opaque error gives the model (and any installer) nothing to act on."""
+    sc = _install_sc(monkeypatch, _make())
+
+    def _scrublet(_adata, **_kwargs):
+        raise ValueError(message)
+    sc.pp.scrublet = _scrublet
+    _touch(tmp_path, "adata_qc.h5ad")
+
+    out = run_doublet_detection_tool.run_doublet_detection({}, _ctx(tmp_path))
+
+    assert out["status"] == "dependency_missing"
+    assert out["dependency"] == "scikit-image"
 
 
 def test_integration_refuses_a_single_batch(tmp_path, monkeypatch):
@@ -244,7 +291,7 @@ def test_integration_refuses_a_single_batch(tmp_path, monkeypatch):
     ad = _make(donor=["D1"] * 40)
     _install_sc(monkeypatch, ad)
     _touch(tmp_path, "adata_qc.h5ad")
-    out = scrna_advanced.run_integration({"batch_key": "donor"}, _ctx(tmp_path))
+    out = run_integration_tool.run_integration({"batch_key": "donor"}, _ctx(tmp_path))
     assert out["status"] == "error"
     assert "nothing to integrate" in out["error"]
     assert out["batch_sizes"] == {"D1": 40}
@@ -253,7 +300,7 @@ def test_integration_refuses_a_single_batch(tmp_path, monkeypatch):
 def test_integration_requires_a_batch_key(tmp_path, monkeypatch):
     _install_sc(monkeypatch, _make(donor=["D1"] * 20 + ["D2"] * 20))
     _touch(tmp_path, "adata_qc.h5ad")
-    out = scrna_advanced.run_integration({}, _ctx(tmp_path))
+    out = run_integration_tool.run_integration({}, _ctx(tmp_path))
     assert out["status"] == "error" and "batch_key is required" in out["error"]
 
 
@@ -301,7 +348,7 @@ def test_raw_expression_overrules_the_z_argmax_and_the_correction_is_reported(tm
     _annotation_sc(monkeypatch, ad, scores, raw)
     _touch(tmp_path, "adata_de.h5ad")
 
-    out = scrna_advanced.run_marker_annotation({
+    out = run_marker_annotation_tool.run_marker_annotation({
         "panel": {"AT2": ["SFTPC"], "DC": ["CLEC9A"]},
         "discriminators": {"AT2": ["SFTPC"], "DC": ["CLEC9A"]},
     }, _ctx(tmp_path))
@@ -323,7 +370,7 @@ def test_a_cluster_with_no_dominant_signal_stays_unassigned(tmp_path, monkeypatc
                    {"0": {"SFTPC": 1.0, "CLEC9A": 1.0}})
     _touch(tmp_path, "adata_de.h5ad")
 
-    out = scrna_advanced.run_marker_annotation({
+    out = run_marker_annotation_tool.run_marker_annotation({
         "panel": {"AT2": ["SFTPC"], "DC": ["CLEC9A"]},
         "discriminators": {"AT2": ["SFTPC"], "DC": ["CLEC9A"]},
     }, _ctx(tmp_path))
@@ -335,7 +382,7 @@ def test_a_cluster_with_no_dominant_signal_stays_unassigned(tmp_path, monkeypatc
 def test_annotation_requires_a_panel_and_says_why(tmp_path, monkeypatch):
     _install_sc(monkeypatch, _make(leiden=["0"] * 40))
     _touch(tmp_path, "adata_de.h5ad")
-    out = scrna_advanced.run_marker_annotation({}, _ctx(tmp_path))
+    out = run_marker_annotation_tool.run_marker_annotation({}, _ctx(tmp_path))
     assert out["status"] == "error"
     assert "panel" in out["error"] and "another tissue" in out["error"]
 
@@ -349,8 +396,71 @@ def test_missing_scanpy_is_graceful_for_every_new_tool(tmp_path, monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    for fn in (scrna_advanced.run_doublet_detection, scrna_advanced.run_integration,
-               scrna_advanced.run_pseudobulk_de, scrna_advanced.run_composition,
-               scrna_advanced.run_marker_annotation):
+    for fn in (run_doublet_detection_tool.run_doublet_detection, run_integration_tool.run_integration,
+               run_pseudobulk_de_tool.run_pseudobulk_de, run_composition_tool.run_composition,
+               run_marker_annotation_tool.run_marker_annotation):
         out = fn({}, _ctx(tmp_path))
         assert out["status"] == "dependency_missing", fn.__name__
+
+
+# --- `input`: a file a run_code step wrote, instead of the usual checkpoint ------------------------
+
+
+def _scrublet_stub(sc):
+    def _scrublet(adata, **_kwargs):
+        adata.obs["doublet_score"] = np.linspace(0.0, 1.0, adata.n_obs)
+        adata.obs["predicted_doublet"] = adata.obs["doublet_score"] > 0.95
+    sc.pp.scrublet = _scrublet
+
+
+def test_doublets_on_an_input_file_are_written_back_to_it_not_to_the_qc_checkpoint(
+        tmp_path, monkeypatch):
+    """In-place tools annotate the file they READ. Writing the caller's own object over
+    adata_qc.h5ad would be exactly the checkpoint overwrite `input` exists to make unnecessary."""
+    ad = _make()
+    _scrublet_stub(_install_sc(monkeypatch, ad))
+    _touch(tmp_path, "adata_qc.h5ad")
+    _touch(tmp_path, "mine.h5ad")
+
+    out = run_doublet_detection_tool.run_doublet_detection({"input": "mine.h5ad", "filter": False},
+                                               _ctx(tmp_path))
+
+    assert out["status"] == "ok"
+    assert ad.written_to.name == "mine.h5ad"
+    assert out["read_from"] == "work/mine.h5ad" and out["checkpoint"] == "work/mine.h5ad"
+
+
+def test_doublets_without_input_still_update_the_qc_checkpoint(tmp_path, monkeypatch):
+    ad = _make()
+    _scrublet_stub(_install_sc(monkeypatch, ad))
+    _touch(tmp_path, "adata_qc.h5ad")
+
+    out = run_doublet_detection_tool.run_doublet_detection({"filter": False}, _ctx(tmp_path))
+
+    assert ad.written_to.name == "adata_qc.h5ad"
+    assert out["checkpoint"] == "adata_qc.h5ad" and out["read_from"] == "work/adata_qc.h5ad"
+
+
+def test_composition_reads_the_input_file(tmp_path, monkeypatch):
+    ad = _make(ct=["A"] * 20 + ["B"] * 20)
+    read: list[str] = []
+    sc = _install_sc(monkeypatch, ad)
+    sc.read_h5ad = lambda p: (read.append(p.name), ad)[1]
+    _touch(tmp_path, "adata_qc.h5ad")
+    _touch(tmp_path, "relabelled.h5ad")
+
+    out = run_composition_tool.run_composition({"group_key": "ct", "input": "relabelled.h5ad"},
+                                         _ctx(tmp_path))
+
+    assert out["status"] == "ok"
+    assert read == ["relabelled.h5ad"] and out["read_from"] == "work/relabelled.h5ad"
+
+
+def test_an_input_outside_the_run_is_refused_by_every_advanced_tool(tmp_path, monkeypatch):
+    _install_sc(monkeypatch, _make())
+    for fn in (run_doublet_detection_tool.run_doublet_detection, run_integration_tool.run_integration,
+               run_pseudobulk_de_tool.run_pseudobulk_de, run_composition_tool.run_composition,
+               run_marker_annotation_tool.run_marker_annotation):
+        out = fn({"input": "/tmp/somewhere_else.h5ad", "batch_key": "b", "sample_key": "s",
+                  "condition_key": "c", "panel": {"X": ["G0"]}}, _ctx(tmp_path))
+        assert out["status"] == "error" and "outside" in out["error"], fn.__name__

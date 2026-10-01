@@ -15,12 +15,14 @@ tool gets ``scgpt_runner=None`` and reports not-enabled instead.
 
 from __future__ import annotations
 
+import json
+
 import csv
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .executor import RemoteExecutor
-from .scgpt_job import run_scgpt_inference, scgpt_job_name
+from .scgpt_job import HARMONIZATION_NAME, run_scgpt_inference, scgpt_job_name
 from .settings import HPCSettings
 from .slurm_job import SlurmJobError
 
@@ -95,6 +97,17 @@ def build_scgpt_runner(executor: RemoteExecutor, settings: HPCSettings, *, clust
         executor.get_file(result.predictions_csv, str(local_csv))
 
         n_cells, counts = _label_counts(local_csv)
+        # How the query's genes were matched to the model's vocabulary. For a mouse query against
+        # the shipped HUMAN retina model this is a case-fold, i.e. labels transferred across
+        # species on name-assumed orthology — an assumption the step and the report must state, so
+        # it travels with the result instead of staying in a file on HPC3 nobody opens.
+        harmonization: dict[str, Any] | None = None
+        try:
+            local_h = local_out / HARMONIZATION_NAME
+            executor.get_file(f"{out_dir}/{HARMONIZATION_NAME}", str(local_h))
+            harmonization = json.loads(local_h.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - provenance is best-effort; never mask a good result
+            harmonization = None
         return {
             "status": "ok",
             "tool": "scgpt_annotate",
@@ -104,6 +117,7 @@ def build_scgpt_runner(executor: RemoteExecutor, settings: HPCSettings, *, clust
             "predictions_csv": str(local_csv),
             "job": result.job.as_dict(),
             "model_dir": model_dir,
+            "species_harmonization": harmonization,
         }
 
     return _run

@@ -139,6 +139,13 @@
                   <label class="model-row">LLM endpoint
                     <div class="model-row-controls">
                       <select id="connectLlmSelect"></select>
+                      <!-- Edit / delete act on WHATEVER IS SELECTED, and appear only once that is
+                           one of your own endpoints. Managing a saved endpoint used to mean
+                           opening the key dialog and finding the row again; the thing you want to
+                           change is already named in the box next to these. -->
+                      <button id="connectEditKeyBtn" type="button" class="icon-btn hidden" title="Edit the selected endpoint">✎</button>
+                      <button id="connectDeleteKeyBtn" type="button" class="icon-btn hidden" title="Delete the selected endpoint">🗑</button>
+                      <button id="connectManageClusterBtn" type="button" class="icon-btn" title="Cluster models (weights on HPC3)">🖥</button>
                       <button id="connectManageKeysBtn" type="button" class="icon-btn" title="Manage your API keys">🔑</button>
                     </div>
                   </label>
@@ -188,6 +195,11 @@
                 <label class="model-row">LLM endpoint
                   <div class="model-row-controls">
                     <select id="llmEndpointSelect"></select>
+                    <!-- Shown only while one of your own endpoints is selected: edit it, or delete
+                         it, without hunting for its row inside the key dialog. -->
+                    <button id="editKeyBtn" type="button" class="icon-btn hidden" title="Edit the selected endpoint">✎</button>
+                    <button id="deleteKeyBtn" type="button" class="icon-btn hidden" title="Delete the selected endpoint">🗑</button>
+                    <button id="manageClusterBtn" type="button" class="icon-btn" title="Cluster models (weights on HPC3)">🖥</button>
                     <button id="manageKeysBtn" type="button" class="icon-btn" title="Manage API keys">🔑</button>
                   </div>
                 </label>
@@ -392,6 +404,59 @@
     </div>
   </div>
 
+  <!-- The cluster models: which weight sets on HPC3 a session can serve, with the vLLM image and
+       flags each one needs. Everyone sees the list; an admin edits it. Removing a row never deletes
+       weights — that stays a deliberate act on HPC3. -->
+  <div id="clusterModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Cluster models</h2>
+        <button id="clusterClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="storage-note">
+        Weight sets the cluster GPU can serve. Pick one in the <em>LLM endpoint</em> box. Switching
+        during a session keeps your current card when the new model can run on it (only the model
+        reloads, a few minutes); otherwise the card is released and a new GPU job is queued. The
+        default is what a new session gets unless it picks another.
+      </p>
+      <p id="clusterScanNote" class="storage-note storage-where"></p>
+      <div id="clusterList" class="storage-items"><div class="storage-loading">Loading…</div></div>
+      <div id="clusterUnregistered"></div>
+
+      <form id="clusterForm" class="form api-key-form hidden">
+        <h3 id="clusterFormTitle">Add a model</h3>
+        <label>Label
+          <input id="clusterLabel" type="text" placeholder="Qwen3.8-27B INT4" autocomplete="off" />
+        </label>
+        <label>Weights (Hugging Face repo in the shared cache)
+          <span class="hint-inline">must fit ONE GPU — the serve job has no tensor parallelism, so 4-card models (DeepSeek-V4, GLM-5.3) cannot run from here</span>
+          <input id="clusterRepo" type="text" placeholder="org/name" autocomplete="off" />
+        </label>
+        <label>vLLM image <span class="hint-inline">.sif on HPC3 — newer models need a newer vLLM</span>
+          <input id="clusterImage" type="text" autocomplete="off" />
+        </label>
+        <label>Quantization <span class="hint-inline">blank = auto-detect; awq_marlin for AWQ checkpoints</span>
+          <input id="clusterQuant" type="text" autocomplete="off" />
+        </label>
+        <label>GPU types <span class="hint-inline">optional, e.g. RTX6000,A100 — blank = any card. Switching a live session keeps its card when the card is one of these.</span>
+          <input id="clusterCards" type="text" placeholder="any" autocomplete="off" />
+        </label>
+        <label>Extra vLLM args <span class="hint-inline">optional</span>
+          <input id="clusterExtra" type="text" autocomplete="off" />
+        </label>
+        <label>Notes <span class="hint-inline">optional — speed, context, caveats</span>
+          <input id="clusterNotes" type="text" autocomplete="off" />
+        </label>
+        <p id="clusterError" class="login-error hidden"></p>
+        <div class="btn-row">
+          <button id="clusterSave" type="submit" class="primary">Save</button>
+          <button id="clusterCancel" type="button" class="ghost">Cancel</button>
+        </div>
+      </form>
+      <div class="btn-row"><button id="clusterAddBtn" type="button" class="ghost hidden">＋ Add a model</button></div>
+    </div>
+  </div>
+
   <!-- Bring-your-own API key. The HPC3 account is still required (it runs the analysis jobs);
        this only chooses which LLM reasons, and on whose bill. A credential's id is stable, so
        replacing an expired key here keeps every session and saved preference pointing at it. -->
@@ -402,10 +467,14 @@
         <button id="apiKeysClose" type="button" class="icon-btn" aria-label="Close">✕</button>
       </div>
       <p class="storage-note">
-        Use your own LLM account instead of the cluster GPU. Keys are stored per user on this
-        server and are never shown again after you save them — only the last few characters.
-        Your HPC3 login is still what runs the analysis.
+        Use your own LLM account instead of the cluster GPU. Your HPC3 login is still what runs
+        the analysis. Most providers show a new key only once — paste it here and AiScientist
+        keeps it, so editing an endpoint later never asks you to find that key again.
       </p>
+      <!-- Filled from /api/llm-credentials. "Where does my key go?" deserves the actual path, not
+           a reassuring adjective — a user who cannot see the answer assumes the browser is
+           holding it, or that it travels with every request. -->
+      <p id="apiKeyStorage" class="storage-note storage-where"></p>
       <div id="apiKeyList" class="storage-items"><div class="storage-loading">Loading…</div></div>
 
       <form id="apiKeyForm" class="form api-key-form">
@@ -420,15 +489,25 @@
         <label>API key <span class="hint-inline" id="apiKeyHintLabel">required</span>
           <input id="apiKeyValue" type="password" placeholder="paste your key" autocomplete="off" />
         </label>
-        <label>Model
-          <div class="model-row-controls">
-            <input id="apiKeyModel" type="text" list="apiKeyModelList" placeholder="e.g. deepseek-chat" autocomplete="off" />
-            <button id="apiKeyFetchModels" type="button" class="icon-btn" title="List models this endpoint serves">↻</button>
+        <!-- Search-as-you-type over the ids this endpoint actually serves. A plain text box asks
+             the user to know a model id by heart (OpenRouter alone serves ~450), and a datalist
+             is close to invisible — it needs you to already suspect that typing will suggest
+             something. The list is fetched as soon as we have a key to fetch it with, so clicking
+             the box usually just shows it; ↻ re-asks. -->
+        <label>Model <span class="hint-inline">required — click the box to search what this endpoint serves</span>
+          <div class="model-row-controls combo">
+            <input id="apiKeyModel" type="text" placeholder="click to search, or type an id" autocomplete="off"
+                   role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="apiKeyModelMenu" />
+            <div id="apiKeyModelMenu" class="combo-menu hidden" role="listbox"></div>
+            <button id="apiKeyFetchModels" type="button" class="icon-btn" title="Re-read the model list from this endpoint">↻</button>
           </div>
-          <datalist id="apiKeyModelList"></datalist>
         </label>
         <label>Model for PI &amp; Critic <span class="hint-inline">optional — a stronger model for planning and critique only</span>
-          <input id="apiKeyLabModel" type="text" list="apiKeyModelList" placeholder="leave blank to use the same model" autocomplete="off" />
+          <div class="combo">
+            <input id="apiKeyLabModel" type="text" placeholder="leave blank to use the same model" autocomplete="off"
+                   role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="apiKeyLabModelMenu" />
+            <div id="apiKeyLabModelMenu" class="combo-menu hidden" role="listbox"></div>
+          </div>
         </label>
         <label>Label <span class="hint-inline">optional</span>
           <input id="apiKeyLabel" type="text" placeholder="My DeepSeek" autocomplete="off" />

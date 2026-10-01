@@ -39,6 +39,22 @@ def _safe_owner(owner: str) -> str:
     return cleaned or "guest"
 
 
+def _key_file(owner: str, row: dict) -> Path:
+    """Where this key actually is — the CURRENT store's path first, the recorded one second.
+
+    ``key_path`` is written once, at creation, and does not survive the store moving. Rows created
+    while ``BIOAGENT_STATE_DIR`` was unset hold a path relative to the then-current working
+    directory (``ssh_creds/<owner>/<id>.key``), so pointing the state dir elsewhere made every
+    saved key unopenable — and this path goes straight to paramiko, which means the user silently
+    loses key login and falls back to password + Duo. Deriving it from the current store instead
+    makes a move self-healing; the recorded path remains as a fallback for older layouts.
+    """
+    canonical = _owner_dir(owner) / f"{row.get('id')}.key"
+    if canonical.is_file():
+        return canonical
+    return Path(row.get("key_path") or canonical)
+
+
 def _owner_dir(owner: str) -> Path:
     d = _root() / _safe_owner(owner)
     d.mkdir(parents=True, exist_ok=True)
@@ -145,10 +161,17 @@ def list_credentials(owner: str) -> list[dict]:
 
 
 def get_credential(owner: str, cred_id: str) -> dict | None:
-    """Full row (incl. ``key_path``) for the login path, or None. Confined to ``owner``."""
+    """Full row (incl. ``key_path``) for the login path, or None. Confined to ``owner``.
+
+    ``key_path`` is re-resolved against the current store rather than returned as recorded — see
+    :func:`_key_file`. The login path hands this straight to paramiko, so a stale value there is
+    the difference between key login working and silently falling back to password + Duo.
+    """
     for r in _load_index(owner):
         if r["id"] == cred_id:
-            return r
+            row = dict(r)
+            row["key_path"] = str(_key_file(owner, r))
+            return row
     return None
 
 
@@ -159,7 +182,7 @@ def delete_credential(owner: str, cred_id: str) -> bool:
         return False
     gone = next(r for r in rows if r["id"] == cred_id)
     try:
-        kp = Path(gone["key_path"]).resolve()
+        kp = _key_file(owner, gone).resolve()
         if kp.is_relative_to(_owner_dir(owner).resolve()) and kp.is_file():
             kp.unlink()
     except OSError:

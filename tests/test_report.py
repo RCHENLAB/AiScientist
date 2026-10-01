@@ -5,7 +5,7 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
-from bioagent.tools import report
+from bioagent.reporting import report
 
 
 def test_markdown_only_when_pandoc_absent(tmp_path, monkeypatch):

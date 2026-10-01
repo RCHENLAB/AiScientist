@@ -30,7 +30,7 @@ def workflows() -> list[dict[str, Any]]:
     """The designed workflow PRESETS — the development-time view of "which flows exist".
     The analysis-pipeline stages are derived from the live scrna catalog order, so the
     preset can't drift. New research lines register a preset here."""
-    from ..tools.scrna_pack import scrna_catalog
+    from ..tools.api import scrna_catalog
 
     scrna_stages = [t.name for t in scrna_catalog()]   # run_scanpy_qc → clustering → de → enrichment
     return [
@@ -136,7 +136,7 @@ def workflow_graph() -> dict[str, Any]:
          description="Judges each step; a deterministic guard refuses to accept a failed or empty run.")
     node("pi_synth", "PI: synthesize report", "agent", where="agents/research_lab.py",
          description="Writes the final answer grounded only in accepted step results.")
-    node("report", "Report bundle (PDF / DOCX)", "output", where="tools/report.py",
+    node("report", "Report bundle (PDF / DOCX)", "output", where="reporting/report.py",
          description="Deterministic post-run bundle: schematic + manuscript + self-review, rendered via pandoc.")
     edge("pi_plan", "scientist")
     edge("scientist", "critic")
@@ -168,7 +168,7 @@ def workflow_graph() -> dict[str, Any]:
         edge("scientist", tid, "calls", "tool")
 
     # The scanpy analysis line is an ORDERED pipeline (real "Run AFTER" dependencies).
-    from ..tools.scrna_pack import scrna_catalog
+    from ..tools.api import scrna_catalog
 
     chain = [f"tool:{t.name}" for t in scrna_catalog()]
     for a, b in zip(chain, chain[1:]):

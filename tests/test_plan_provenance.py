@@ -172,8 +172,11 @@ def test_a_plan_naming_an_invented_tool_is_annotated_not_pruned():
     events: list[dict] = []
     result = lab.run("Compare the arms", on_event=events.append)
 
-    flagged = [e for e in events if e["type"] == "plan_unknown_tools"]
-    assert flagged and flagged[0]["tools"] == ["run_cell_bootstrapping", "run_wilcoxon_DE"]
+    flagged = [f for e in events if e["type"] == "plan_tooling" for f in e["findings"]]
+    # Neither name has a single obvious referent in THIS catalog (run_qc / run_de_markers / finish),
+    # so both are reported rather than corrected.
+    assert {f["tool"] for f in flagged} == {"run_cell_bootstrapping", "run_wilcoxon_DE"}
+    assert {f["kind"] for f in flagged} == {"unknown_tool"}
     assert list(result.agenda) == agenda, "annotation must not prune or rewrite the steps"
 
 

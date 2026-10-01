@@ -34,13 +34,13 @@ def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
         llm_backend="vllm",
         vllm_image=f"{LAB_STORAGE}/software/bioagent/containers/vllm.sif",
         vllm_model="QuantTrio/Qwen3.6-35B-A3B-AWQ",
+        vllm_quantization="awq_marlin",
         hf_home=f"{LAB_STORAGE}/software/bioagent/hf",
     )
     # group-wrap: vLLM image/HF on DFS -> body is base64'd into `sg ruic20_hpc`
     assert "sg ruic20_hpc -c 'bash -s'" in s
     # the real serve command lives inside the base64 blob — decode and assert on it
-    blob = s.split("printf %s ", 1)[1].split(" |", 1)[0]
-    body = base64.b64decode(blob).decode("utf-8")
+    body = gpu.serve_body_from_script(s)
     assert "singularity exec --nv" in body  # RCIC HPC3 uses Singularity, not Apptainer
     assert "vllm serve QuantTrio/Qwen3.6-35B-A3B-AWQ" in body
     assert "--enable-auto-tool-choice --tool-call-parser qwen3_coder" in body
@@ -53,9 +53,16 @@ def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
 
 def test_vllm_optional_flags_omitted_when_unset():
     s = _script(llm_backend="vllm", vllm_quantization="", vllm_reasoning_parser="", vllm_extra_args="")
-    blob = s.split("printf %s ", 1)[1].split(" |", 1)[0]
-    body = base64.b64decode(blob).decode("utf-8")
+    body = gpu.serve_body_from_script(s)
     assert "--quantization" not in body
     assert "--reasoning-parser" not in body
     # tool calling is always on
     assert "--enable-auto-tool-choice" in body
+
+
+def test_default_model_is_qwen38_int4_autodetected_quantization():
+    s = HPCSettings()
+    body = gpu._vllm_serve_body(s)
+    assert "vllm serve RedHatAI/Qwen3.8-27B-INT4 " in body
+    assert "/containers/vllm-0.28.0.sif" in body
+    assert "--quantization" not in body      # compressed-tensors is auto-detected

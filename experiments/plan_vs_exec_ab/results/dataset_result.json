@@ -137,7 +137,8 @@
     "WT": 0.16
    }
   },
-  "depth_imbalance": "median nCount_RNA differs 1.6x between arms ({'DDX41': 3078.0, 'WT': 1916.0}); a global, same-direction expression shift across cell types is consistent with this depth difference and must not be read as biology without a per-cell-type depth-matched check."
+  "depth_imbalance": "median nCount_RNA differs 1.6x between arms ({'DDX41': 3078.0, 'WT': 1916.0}); a global, same-direction expression shift across cell types is consistent with this depth difference and must not be read as biology without a per-cell-type depth-matched check.",
+  "snrna_hint": "a `nuclear_fraction` column is present and median mitochondrial content is low (1.5%) \u2014 this is likely single-NUCLEUS (snRNA-seq) data. For nuclei the mitochondrial QC threshold should be 1-5%, not the 10% single-cell default; state the protocol assumption explicitly in the report."
  },
  "x_encoding": "csr_matrix",
  "x_shape": [
@@ -150,6 +151,6 @@
  "mean_total_counts_sample": 4395.66,
  "mean_genes_detected_sample": 2146.828,
  "dataset_kind": "h5ad_single_cell",
- "dataset_path": "/private/tmp/claude-501/-Users-yijunsun-Documents-BioAgentPrototype---claude-worktrees-single-cell-pipeline-review-c760de/64913f19-7133-488c-a9e4-3bdc97b0e060/scratchpad/Ddx41_DEG.h5ad",
+ "dataset_path": "<ARCHIVE>/Ddx41_DEG.h5ad",
  "file_size_bytes": 66545512
 }

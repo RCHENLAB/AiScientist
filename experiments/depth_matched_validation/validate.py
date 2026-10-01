@@ -21,7 +21,7 @@ import scanpy as sc
 
 BASE = pathlib.Path(os.path.expanduser("~/dmcheck"))
 sys.path.insert(0, str(BASE / "src"))
-from bioagent.tools.scrna_pack import run_depth_matched_de  # noqa: E402
+from bioagent.tools.run_depth_matched_de.tool import run_depth_matched_de  # noqa: E402
 
 rng = np.random.default_rng(0)
 n_per, n_true = 400, 30

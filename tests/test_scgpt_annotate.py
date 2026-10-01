@@ -14,7 +14,7 @@ from bioagent.agents.registry import build_scientist_catalog
 from bioagent.gateway.executor import ExecResult
 from bioagent.gateway.scgpt_runner import build_scgpt_runner
 from bioagent.gateway.settings import HPCSettings
-from bioagent.tools.scgpt_annotate import make_scgpt_annotate_tool
+from bioagent.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
 from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 

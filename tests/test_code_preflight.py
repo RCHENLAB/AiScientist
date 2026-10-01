@@ -241,3 +241,97 @@ def test_a_missing_cache_root_is_not_bound():
 
     missing_modules(Shell(), Cache(), ["x"])
     assert seen == [()], "no bind, and no PYTHONPATH from an unreadable cache"
+
+
+# --- guarded imports are not dependencies ------------------------------------
+# One run spent ~605 seconds on EVERY run_code call re-discovering that `torch` was absent,
+# asking to install it, and being declined. `torch` is imported by the determinism preamble
+# (agents/provenance.py) inside `try: … except Exception: pass`, purely to seed an RNG that may
+# not exist — nothing waits on it. Six calls; roughly 60 of the run's 85 minutes.
+
+_PREAMBLE = (
+    "import os as _bio_os; _bio_os.environ.setdefault('PYTHONHASHSEED', '0')\n"
+    "try:\n    import random as _bio_r; _bio_r.seed(0)\nexcept Exception: pass\n"
+    "try:\n    import numpy as _bio_np; _bio_np.random.seed(0)\nexcept Exception: pass\n"
+    "try:\n    import torch as _bio_t; _bio_t.manual_seed(0)\nexcept Exception: pass\n"
+)
+
+
+def test_the_determinism_preamble_no_longer_demands_torch():
+    from bioagent.agents.code_imports import optional_imports, third_party_imports
+
+    code = _PREAMBLE + "import anndata as ad, pandas as pd\nprint(ad, pd)\n"
+    assert "torch" in optional_imports(code)
+    assert "torch" not in third_party_imports(code)
+    # The analysis code's own imports are unguarded and stay required.
+    assert "anndata" in third_party_imports(code)
+    assert "pandas" in third_party_imports(code)
+
+
+def test_a_module_imported_both_ways_stays_required():
+    from bioagent.agents.code_imports import optional_imports, third_party_imports
+
+    # The unguarded import is the one that would fail, so tolerance elsewhere does not excuse it.
+    code = "try:\n    import scvi\nexcept ImportError: pass\nimport scvi\n"
+    assert optional_imports(code) == []
+    assert "scvi" in third_party_imports(code)
+
+
+def test_only_import_tolerant_handlers_count():
+    from bioagent.agents.code_imports import optional_imports
+
+    assert "scvi" in optional_imports("try:\n    import scvi\nexcept ImportError: pass\n")
+    assert "scvi" in optional_imports("try:\n    import scvi\nexcept ModuleNotFoundError: pass\n")
+    assert "scvi" in optional_imports("try:\n    import scvi\nexcept Exception: pass\n")
+    assert "scvi" in optional_imports("try:\n    import scvi\nexcept: pass\n")          # bare
+    assert "scvi" in optional_imports("try:\n    import scvi\nexcept (KeyError, ImportError): pass\n")
+    # A handler that cannot catch an import failure leaves the import a hard dependency.
+    assert optional_imports("try:\n    import scvi\nexcept ValueError: pass\n") == []
+
+
+def test_a_handler_that_binds_a_fallback_keeps_the_import_required():
+    from bioagent.agents.code_imports import optional_imports, third_party_imports
+
+    # `except ImportError: cyvcf2 = None` says the snippet means to USE cyvcf2; failing to install
+    # it produces a baffling `None` downstream, so preflight should still offer. Only a handler
+    # that gives up entirely (pass / ...) marks an import as genuinely optional.
+    fallback = "try:\n    import cyvcf2\nexcept ImportError:\n    cyvcf2 = None\n"
+    assert optional_imports(fallback) == []
+    assert "cyvcf2" in third_party_imports(fallback)
+
+    # Same for a handler that reaches for an alternative package.
+    alt = "try:\n    import ujson\nexcept ImportError:\n    import simplejson\n"
+    assert optional_imports(alt) == []
+    assert "ujson" in third_party_imports(alt)
+
+
+def test_a_declined_package_is_not_re_probed_on_the_next_step():
+    from bioagent.gateway.code_preflight import PreflightingExecutor
+
+    probed: list[list[str]] = []
+
+    class _Cache:
+        def ensure(self, shell, req, import_name=None):
+            return {"status": "declined", "reason": "not approved for this deployment"}
+
+    def fake_missing(shell, cache, modules):
+        probed.append(list(modules))
+        return list(modules)
+
+    import bioagent.gateway.package_cache as pc
+    original = pc.missing_modules
+    pc.missing_modules = fake_missing
+    try:
+        ex = PreflightingExecutor(inner=lambda code: {"status": "ok"}, shell=object(),
+                                  cache=_Cache())
+        code = "import somepkg\nprint(somepkg)\n"
+        first = ex(code)
+        second = ex(code)
+    finally:
+        pc.missing_modules = original
+
+    assert first["dependency_preflight"]["unresolved"][0]["status"] == "declined"
+    # The probe is the expensive half — a container start per module — so the second call must
+    # not reach it at all, and must not re-report an install it already knows is refused.
+    assert probed == [["somepkg"]], f"re-probed after a decline: {probed}"
+    assert "dependency_preflight" not in second

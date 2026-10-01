@@ -43,6 +43,8 @@ const state = {
   lastRunId: null,             // last completed run on this conn (used to recognise our own run after a refresh)
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
   planPending: false,          // a PI plan/clarify is awaiting the user's decision
+  planRevisedSteps: [],        // 1-based step numbers this redraft actually changed (server-sent)
+  planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
 };
 
 const $ = (id) => document.getElementById(id);
@@ -421,7 +423,13 @@ async function loadSessions() {
       renderSessionList();
       renderChat();
       return;
-    } catch { /* fall back to localStorage on any server error */ }
+    } catch {
+      // Falling back is right; falling back SILENTLY is not. An empty localStorage renders exactly
+      // like an account with no history — a fresh blank chat — so a failed fetch and "you have
+      // never used this account" are indistinguishable on screen. That is the difference between a
+      // transient glitch and believing your work is gone, so say which one it is.
+      toast("Could not load your saved chats from the server — showing this device's local copy only.");
+    }
   }
   try {
     const raw = JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]");
@@ -840,12 +848,40 @@ function feedItemHtml(entry) {
   return `<div class="progress-line ${entry.level || "info"}${sub ? " sub" : ""}">${withSymbols(escapeHtml(raw.trim()))}</div>`;
 }
 
+// The dataset the chat is bound to, as a short stem for the title: "Ddx41_DEG1", or "Ddx41_DEG1 +2"
+// when several files are attached. "" when nothing is bound yet.
+function datasetLabel() {
+  const primary = primaryBoundPath();
+  if (!primary) return "";
+  const d = state.datasets.find((x) => x.path === primary);
+  const name = (d && d.name) || primary.split("/").pop() || "";
+  const stem = name.replace(/\.(gz|bgz|zip)$/i, "").replace(/\.[A-Za-z0-9]{1,6}$/, "").slice(0, 22);
+  const extra = state.boundPaths.length - 1;
+  return stem + (extra > 0 ? ` +${extra}` : "");
+}
+
+// A chat's title has to say WHICH DATASET as well as what was asked. Titled on the prompt alone,
+// 46 of the 60 conversations in production all read "What changes between DDX41 mutant and WT r"
+// and were impossible to tell apart in the sidebar. Dataset + question separates different studies;
+// re-running the SAME question on the SAME data is the common case and separates on nothing, so a
+// title that would collide with one already in the list is stamped with the time — the only thing
+// that actually differs between those runs.
+function sessionTitle(prompt) {
+  const gist = String(prompt || "").replace(/\s+/g, " ").trim().slice(0, 42);
+  const ds = datasetLabel();
+  const base = (ds ? `${ds} · ${gist}` : gist) || "New chat";
+  if (!state.sessions.some((x) => x.id !== state.activeId && (x.title || "") === base)) return base;
+  const t = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${base} · ${p2(t.getMonth() + 1)}-${p2(t.getDate())} ${p2(t.getHours())}:${p2(t.getMinutes())}`;
+}
+
 function pushMessage(msg) {
   const s = activeSession();
   if (!s) return;
   s.messages.push(msg);
   if (msg.role === "user" && (s.title === "New chat" || !s.title)) {
-    s.title = msg.content.slice(0, 42);
+    s.title = sessionTitle(msg.content);
     $("chatTitle").textContent = s.title;
     renderSessionList();
     if (authed() && s.cid) api("PATCH", `/api/conversations/${s.cid}`, { title: s.title }).catch(() => {});
@@ -1409,6 +1445,11 @@ function applyStatus(summary) {
   if (isReady) setStep("ready", "done");
 
   if (showConnected) {
+    // Remember whose HPC3 account this session logged in with. With accounts disabled that
+    // UCInetID IS the credential owner, and the login form's input is empty after a reload —
+    // so without this the key dialog would look in the anonymous "guest" store and report the
+    // user's own saved endpoints as missing.
+    state.hpcUser = summary.username || state.hpcUser || "";
     $("connUser").textContent = `${summary.username || "you"} @ ${(summary.host || "").split(".")[0]}`;
     // The non-ready branch is only reachable after the session HAS been live (showConnected keeps
     // the chat up while it comes back), so say what's happening rather than naming a model.
@@ -1538,46 +1579,166 @@ async function selectModel(model) {
 // costs nothing and needs no reconnect — an API serves whatever the provider offers.
 
 const apiKeys = { creds: [], providers: [], editing: null, pendingSelect: null,
-                  activeId: "", connectChoice: "" };
+                  activeId: "", connectChoice: "", models: [], storage: null,
+                  comboActive: -1, fetchedFor: "" };
 
 // The "add one" affordance belongs INSIDE the picker, not only beside it. A first-time user opens
 // the endpoint dropdown looking for their own endpoint, finds a single "Cluster GPU" entry, and
 // concludes there is no such thing here — the 🔑 next to the box never says that it is where an
 // endpoint comes from. This option makes the dropdown answer its own question.
 const ADD_KEY_OPTION = "__add_key__";
+
+// ---- cluster models ---------------------------------------------------------
+// "Cluster GPU" is no longer one thing: HPC3 holds several weight sets (Qwen3.8-27B INT4, the
+// previous Qwen3.6 AWQ, ...), each needing its own vLLM image and flags. The picker lists them as
+// "cluster:<id>" options; the 🖥 dialog shows which are on disk and lets an admin manage the list.
+const CLUSTER_PREFIX = "cluster:";
+const clusterModels = { models: [], unregistered: null, scanned: false, canManage: false, editing: null };
+
+function clusterValue(id) {
+  const m = clusterModels.models.find((x) => x.id === id && x.enabled)
+    || clusterModels.models.find((x) => x.default) || clusterModels.models[0];
+  return m ? CLUSTER_PREFIX + m.id : CLUSTER_PREFIX;
+}
+
+function isClusterValue(v) { return !v || v.startsWith(CLUSTER_PREFIX); }
+
+function clusterOptionsHtml() {
+  const enabled = clusterModels.models.filter((m) => m.enabled);
+  if (!enabled.length) return `<option value="${CLUSTER_PREFIX}">Cluster GPU (vLLM at UCI)</option>`;
+  return enabled.map((m) => `<option value="${CLUSTER_PREFIX}${escapeHtml(m.id)}">Cluster GPU · ${escapeHtml(m.label)}${m.default ? " (default)" : ""}</option>`).join("");
+}
+
+async function loadClusterModels({ scan = false } = {}) {
+  try {
+    const q = scan && state.connectionId ? `?connection_id=${encodeURIComponent(state.connectionId)}` : "";
+    const d = await (await fetch("/api/cluster-models" + q)).json();
+    clusterModels.models = d.models || [];
+    clusterModels.unregistered = d.unregistered;
+    clusterModels.scanned = !!d.scanned;
+    clusterModels.canManage = !!d.can_manage;
+  } catch { /* keep the last list; the picker still works with what it has */ }
+  renderEndpointSelect();
+  renderConnectEndpointSelect();
+  renderClusterModelList();
+}
 const ADD_KEY_HTML = `<option value="${ADD_KEY_OPTION}">＋ Add your own API key…</option>`;
 
+// The owner query every credential call has to carry when accounts are off: the server then files
+// keys under the UCInetID from the login form. One helper so list / probe / verify / delete can
+// never disagree about whose store they are touching — they did, and a key saved under one owner
+// and looked up under another is invisible in a way that looks like "the save didn't work".
+function apiKeyOwner() {
+  return (state.user && state.user.username) || $("userInput").value.trim() || state.hpcUser || "";
+}
+
+function apiKeyOwnerQuery() {
+  const u = apiKeyOwner();
+  return u ? `?user=${encodeURIComponent(u)}` : "";
+}
+
 async function loadApiCredentials() {
-  const q = state.connectionId ? "" : `?user=${encodeURIComponent($("userInput").value.trim())}`;
   try {
-    const d = await (await fetch("/api/llm-credentials" + q)).json();
+    const d = await (await fetch("/api/llm-credentials" + apiKeyOwnerQuery())).json();
     apiKeys.creds = d.credentials || [];
+    apiKeys.storage = d.storage || null;
   } catch { apiKeys.creds = []; }
   renderEndpointSelect();
   renderConnectEndpointSelect();
   renderApiKeyList();
+  renderApiKeyStorage();
 }
 
 function renderEndpointSelect(summary) {
   const sel = $("llmEndpointSelect");
   if (!sel) return;
   const current = summary && summary.llm_endpoint;
-  const activeId = current && current.kind === "credential" ? current.credential_id : "";
-  const opts = ['<option value="">Cluster GPU (vLLM at UCI)</option>'];
+  // The cluster list can arrive AFTER the status; remember the last endpoint the server reported so
+  // a re-render then still names the model the session actually serves, not the default.
+  if (current) apiKeys.lastEndpoint = current;
+  const known = current || apiKeys.lastEndpoint;
+  const activeId = current && current.kind === "credential" ? current.credential_id
+    : current ? clusterValue(current.cluster_model_id) : "";
+  // A refresh with no status attached (we just saved or deleted a key) must not silently move the
+  // selection to "Cluster GPU" — the picker would then name an endpoint that isn't the one in use.
+  const keep = summary ? activeId : (sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.activeId);
+  const opts = [clusterOptionsHtml()];
   for (const c of apiKeys.creds) {
     const bad = c.last_error ? " ⚠" : "";
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(c.model || "no model")}${bad}</option>`);
   }
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
-  apiKeys.activeId = activeId;   // what to snap back to when "＋ Add" is picked
-  if (activeId) sel.value = activeId;
-  else if (current && current.kind === "credential") {
+  if (summary) apiKeys.activeId = activeId;   // what to snap back to when "＋ Add" is picked
+  if (keep && apiKeys.creds.some((c) => c.id === keep)) sel.value = keep;
+  else if (keep && isClusterValue(keep) && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  else if (!known || known.kind !== "credential") sel.value = clusterValue(known && known.cluster_model_id);
+  if (current && current.kind === "credential" && !apiKeys.creds.some((c) => c.id === activeId)) {
     // The status names a credential we don't have in the list (another window added it, or the
     // list predates it). Reload rather than silently showing "Cluster GPU", which would misreport
     // where prompts are going.
     loadApiCredentials();
   }
+  syncEndpointActions();
+}
+
+// Put the picker back on the endpoint the session is ACTUALLY using — after a switch that failed,
+// or a consent card that was declined. The invariant is that this box never displays a choice that
+// did not take effect; a plain re-render preserves the selection, so the snap has to be explicit.
+function snapEndpointSelect() {
+  const sel = $("llmEndpointSelect");
+  if (!sel) return;
+  sel.value = apiKeys.activeId || clusterValue();
+  syncEndpointActions();
+}
+
+// Edit / delete belong next to the picker, not only inside the key dialog: the endpoint you want
+// to change is the one already named in the box. They act on the SELECTED row and hide themselves
+// for "Cluster GPU" and for the "＋ Add" item, which are not credentials and cannot be edited.
+function syncEndpointActions() {
+  const pairs = [["llmEndpointSelect", "editKeyBtn", "deleteKeyBtn"],
+                 ["connectLlmSelect", "connectEditKeyBtn", "connectDeleteKeyBtn"]];
+  for (const [selId, editId, delId] of pairs) {
+    const sel = $(selId), edit = $(editId), del = $(delId);
+    if (!sel || !edit || !del) continue;
+    const cred = apiKeys.creds.find((c) => c.id === sel.value);
+    edit.classList.toggle("hidden", !cred);
+    del.classList.toggle("hidden", !cred);
+    if (cred) {
+      edit.title = `Edit “${cred.label}”`;
+      del.title = `Delete “${cred.label}”`;
+    }
+  }
+}
+
+// The picker's ✎ — open the key dialog already in edit mode for that endpoint, rather than making
+// the user find its row again in a list that may be scrolled out of view.
+async function editSelectedEndpoint(selId) {
+  const sel = $(selId);
+  if (!sel || !sel.value || sel.value === ADD_KEY_OPTION) return;
+  await openApiKeys(sel.value);
+}
+
+// Deleting the endpoint a live session is USING would leave that session pointed at a credential
+// that no longer exists, so switch it back to the cluster GPU first. One function for both the
+// picker's 🗑 and the dialog's Delete, so neither can forget that step.
+async function deleteEndpointById(credId) {
+  const cred = apiKeys.creds.find((c) => c.id === credId);
+  if (!cred) return;
+  if (!confirm(`Delete “${cred.label}”? The stored key is removed from this server.`)) return;
+  const wasActive = state.connectionId && apiKeys.activeId === cred.id;
+  try {
+    const res = await fetch(`/api/llm-credentials/${cred.id}${apiKeyOwnerQuery()}`, { method: "DELETE" });
+    if (!res.ok) { toast("Could not delete that endpoint"); return; }
+  } catch (err) {
+    toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message);
+    return;
+  }
+  if (wasActive) await selectLlmEndpoint("");
+  if (apiKeys.editing === cred.id) resetApiKeyForm();
+  if (apiKeys.connectChoice === cred.id) apiKeys.connectChoice = "";
+  await loadApiCredentials();
+  toast(`Deleted “${cred.label}”`);
 }
 
 // A persistent banner, not a one-off toast: the session keeps sending prompts off-site for as
@@ -1595,20 +1756,31 @@ function renderEgressBanner(summary) {
   el.classList.remove("hidden");
 }
 
-async function selectLlmEndpoint(credId, { accept = false } = {}) {
+async function selectLlmEndpoint(value, { accept = false } = {}) {
   if (!state.connectionId) return;
+  // A cluster value is "cluster:<id>" (or "" = whatever cluster model the session already has);
+  // anything else is a saved credential id.
+  const cluster = isClusterValue(value);
+  const credId = cluster ? null : value;
+  const clusterId = cluster && value ? value.slice(CLUSTER_PREFIX.length) || null : null;
   try {
     const res = await fetch("/api/llm-endpoint", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, credential_id: credId || null,
-                             accept_egress: accept }),
+      body: JSON.stringify({ connection_id: state.connectionId, credential_id: credId,
+                             cluster_model_id: clusterId, accept_egress: accept }),
     });
     const d = await res.json();
     if (res.status === 409 && d.needs_consent) { openEgressDialog(credId, d); return; }
-    if (!res.ok) { toast(d.error || "Could not switch endpoint"); renderEndpointSelect(); return; }
-    toast(credId ? `LLM: ${d.credential ? d.credential.label : "your API endpoint"}` : "LLM: cluster GPU");
+    if (!res.ok) { toast(d.error || "Could not switch endpoint"); snapEndpointSelect(); return; }
+    apiKeys.activeId = credId || clusterValue(d.cluster_model_id || clusterId);
+    syncEndpointActions();
+    const cm = clusterModels.models.find((m) => m.id === (d.cluster_model_id || clusterId));
+    toast(credId ? `LLM: ${d.credential ? d.credential.label : "your API endpoint"}`
+      : d.status === "provisioning" ? `Starting ${cm ? cm.label : "the cluster model"} on a GPU — a few minutes`
+      : `LLM: cluster GPU${cm ? " · " + cm.label : ""}`);
   } catch (err) {
     toast(isUnreachable(err) ? "Can't reach the local server." : "Endpoint switch failed: " + err.message);
+    snapEndpointSelect();
   }
 }
 
@@ -1637,7 +1809,7 @@ function closeEgressDialog(accepted) {
   const credId = apiKeys.pendingSelect;
   apiKeys.pendingSelect = null;
   if (accepted && credId) selectLlmEndpoint(credId, { accept: true });
-  else renderEndpointSelect();          // snap the dropdown back to what is actually in use
+  else snapEndpointSelect();            // snap the dropdown back to what is actually in use
 }
 
 // Show the same consent card and RESOLVE with the answer. Used by connect(), which must know the
@@ -1655,15 +1827,17 @@ function renderConnectEndpointSelect() {
   const sel = $("connectLlmSelect");
   if (!sel) return;
   const keep = sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.connectChoice;
-  const opts = ['<option value="">Cluster GPU (vLLM at UCI)</option>'];
+  const opts = [clusterOptionsHtml()];
   for (const c of apiKeys.creds) {
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(c.model || "no model")}</option>`);
   }
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
-  if (keep && apiKeys.creds.some((c) => c.id === keep)) sel.value = keep;
+  if (keep && (apiKeys.creds.some((c) => c.id === keep)
+               || [...sel.options].some((o) => o.value === keep))) sel.value = keep;
   apiKeys.connectChoice = sel.value;
   renderConnectLlmHint();
+  syncEndpointActions();
 }
 
 // The line under the login picker is the only place that can tell a first-time user that an
@@ -1673,7 +1847,7 @@ function renderConnectLlmHint() {
   const el = $("connectLlmHint");
   if (!el) return;
   const sel = $("connectLlmSelect");
-  const chosen = sel && sel.value && sel.value !== ADD_KEY_OPTION;
+  const chosen = sel && sel.value && sel.value !== ADD_KEY_OPTION && !isClusterValue(sel.value);
   if (chosen) {
     el.textContent = "This session reasons on your own endpoint — no GPU queue. Your HPC3 account still runs the analysis jobs.";
   } else if (apiKeys.creds.length) {
@@ -1688,7 +1862,143 @@ function renderConnectLlmHint() {
 function connectEndpointChoice() {
   const sel = $("connectLlmSelect");
   const v = sel && sel.value;
-  return v && v !== ADD_KEY_OPTION ? v : null;
+  return v && v !== ADD_KEY_OPTION && !isClusterValue(v) ? v : null;
+}
+
+// The login picker's cluster model id, or null (= the lab default / an API endpoint was chosen).
+function connectClusterChoice() {
+  const sel = $("connectLlmSelect");
+  const v = sel && sel.value;
+  return v && v.startsWith(CLUSTER_PREFIX) ? v.slice(CLUSTER_PREFIX.length) || null : null;
+}
+
+// ---- cluster model manager ------------------------------------------------
+
+async function openClusterModels() {
+  $("clusterModal").classList.remove("hidden");
+  $("clusterList").innerHTML = '<div class="storage-loading">Loading…</div>';
+  await loadClusterModels({ scan: true });
+}
+
+function renderClusterModelList() {
+  const box = $("clusterList");
+  if (!box) return;
+  const cm = clusterModels;
+  $("clusterScanNote").textContent = cm.scanned
+    ? "Disk status read just now from the shared HF cache on HPC3."
+    : "Connect to HPC3 to see which weights are on disk and how big they are.";
+  $("clusterAddBtn").classList.toggle("hidden", !cm.canManage);
+  const inUse = apiKeys.lastEndpoint && apiKeys.lastEndpoint.kind === "cluster" ? apiKeys.lastEndpoint.cluster_model_id : null;
+  if (!cm.models.length) { box.innerHTML = '<div class="storage-loading">No cluster models configured.</div>'; }
+  else box.innerHTML = cm.models.map((m) => {
+    const disk = !cm.scanned ? "" : m.on_disk
+      ? `<span class="api-key-ok">✓ on disk${m.size_gb != null ? ` · ${m.size_gb} GB` : ""}</span>`
+      : '<span class="api-key-bad">⚠ weights not in the HF cache</span>';
+    const tags = [m.default ? "<strong>default</strong>" : "", m.enabled ? "" : "disabled",
+                  inUse === m.id ? "in use by this session" : ""].filter(Boolean).join(" · ");
+    const img = (m.image || "").split("/").pop();
+    const acts = cm.canManage ? `
+        ${m.default ? "" : `<button type="button" class="ghost" data-act="default">Make default</button>`}
+        <button type="button" class="ghost" data-act="toggle">${m.enabled ? "Disable" : "Enable"}</button>
+        <button type="button" class="ghost" data-act="edit">Edit</button>
+        ${m.default ? "" : `<button type="button" class="ghost" data-act="remove">Remove</button>`}` : "";
+    return `<div class="api-key-row${cm.editing === m.id ? " editing" : ""}" data-id="${escapeHtml(m.id)}">
+      <div class="api-key-main">
+        <strong>${escapeHtml(m.label)}</strong>${tags ? ` <small>${tags}</small>` : ""}
+        <small><code>${escapeHtml(m.repo)}</code></small>
+        <small>${escapeHtml(img)}${m.quantization ? " · " + escapeHtml(m.quantization) : " · quant auto"}${m.extra_args ? " · " + escapeHtml(m.extra_args) : ""} · ${m.cards ? "GPU: " + escapeHtml(m.cards) : "any GPU"}</small>
+        ${m.notes ? `<small>${escapeHtml(m.notes)}</small>` : ""}
+        ${disk ? `<small>${disk}</small>` : ""}
+      </div>
+      <div class="api-key-actions">${acts}</div>
+    </div>`;
+  }).join("");
+  const un = $("clusterUnregistered");
+  const rows = cm.unregistered || [];
+  un.innerHTML = rows.length ? `<h3>On HPC3 but not in the list</h3>
+    <div class="storage-items">${rows.map((r) => `<div class="api-key-row" data-repo="${escapeHtml(r.repo)}">
+      <div class="api-key-main"><strong>${escapeHtml(r.repo)}</strong><small>${r.size_gb != null ? r.size_gb + " GB" : ""}</small></div>
+      <div class="api-key-actions">${cm.canManage ? '<button type="button" class="ghost" data-act="register">Add</button>' : ""}</div>
+    </div>`).join("")}</div>` : "";
+}
+
+function fillClusterForm(m) {
+  clusterModels.editing = m && m.id ? m.id : null;
+  $("clusterFormTitle").textContent = clusterModels.editing ? `Edit “${m.label}”` : "Add a model";
+  $("clusterLabel").value = (m && m.label) || "";
+  $("clusterRepo").value = (m && m.repo) || "";
+  $("clusterRepo").readOnly = !!clusterModels.editing;
+  $("clusterImage").value = (m && m.image) || "";
+  $("clusterQuant").value = (m && m.quantization) || "";
+  $("clusterExtra").value = (m && m.extra_args) || "";
+  $("clusterCards").value = (m && m.cards) || "";
+  $("clusterNotes").value = (m && m.notes) || "";
+  $("clusterError").classList.add("hidden");
+  $("clusterForm").classList.remove("hidden");
+  renderClusterModelList();
+  $("clusterLabel").focus();
+}
+
+function closeClusterForm() {
+  clusterModels.editing = null;
+  $("clusterForm").classList.add("hidden");
+  renderClusterModelList();
+}
+
+async function clusterRequest(url, opts) {
+  const res = await fetch(url, opts);
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+  return d;
+}
+
+async function saveClusterForm(e) {
+  e.preventDefault();
+  const cur = clusterModels.models.find((m) => m.id === clusterModels.editing);
+  const body = { id: clusterModels.editing || null, repo: $("clusterRepo").value.trim(),
+                 label: $("clusterLabel").value.trim(), image: $("clusterImage").value.trim(),
+                 quantization: $("clusterQuant").value.trim(), extra_args: $("clusterExtra").value.trim(),
+                 cards: $("clusterCards").value.trim(),
+                 notes: $("clusterNotes").value.trim(),
+                 enabled: cur ? cur.enabled : true, default: cur ? cur.default : false };
+  try {
+    await clusterRequest("/api/cluster-models", { method: "PUT", headers: { "Content-Type": "application/json" },
+                                                  body: JSON.stringify(body) });
+  } catch (err) {
+    $("clusterError").textContent = err.message; $("clusterError").classList.remove("hidden"); return;
+  }
+  closeClusterForm();
+  await loadClusterModels({ scan: true });
+  toast("Cluster model saved");
+}
+
+async function clusterRowAction(e) {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const row = btn.closest(".api-key-row");
+  const act = btn.dataset.act;
+  if (act === "register") {
+    const repo = row.dataset.repo;
+    const r = (clusterModels.unregistered || []).find((x) => x.repo === repo) || { repo };
+    fillClusterForm({ ...r, id: null });
+    return;
+  }
+  const m = clusterModels.models.find((x) => x.id === row.dataset.id);
+  if (!m) return;
+  try {
+    if (act === "edit") { fillClusterForm(m); return; }
+    if (act === "default") {
+      await clusterRequest(`/api/cluster-models/${encodeURIComponent(m.id)}/default`, { method: "POST" });
+      toast(`New sessions now start on ${m.label}`);
+    } else if (act === "toggle") {
+      await clusterRequest("/api/cluster-models", { method: "PUT", headers: { "Content-Type": "application/json" },
+                                                    body: JSON.stringify({ ...m, enabled: !m.enabled }) });
+    } else if (act === "remove") {
+      if (!confirm(`Remove “${m.label}” from the list? The weights stay on HPC3.`)) return;
+      await clusterRequest(`/api/cluster-models/${encodeURIComponent(m.id)}`, { method: "DELETE" });
+    }
+  } catch (err) { toast(err.message); return; }
+  await loadClusterModels({ scan: true });
 }
 
 // ---- credential manager ---------------------------------------------------
@@ -1700,7 +2010,7 @@ function renderApiKeyList() {
   // form. Opening this dialog before typing it would list (and save into) the anonymous "guest"
   // bucket, which the session then never looks in — so say what is missing instead of showing an
   // empty list that looks like "no keys".
-  if (!state.user && !$("userInput").value.trim()) {
+  if (!apiKeyOwner()) {
     box.innerHTML = '<div class="storage-loading">Type your UCInetID on the login form first — saved keys belong to that account.</div>';
     return;
   }
@@ -1713,8 +2023,10 @@ function renderApiKeyList() {
       ? `<span class="api-key-bad">⚠ ${escapeHtml(c.last_error)}</span>`
       : c.verified_at ? '<span class="api-key-ok">✓ verified</span>' : "<span>not tested</span>";
     const roles = c.lab_model && c.lab_model !== c.model
-      ? `${escapeHtml(c.model)} · PI/Critic on ${escapeHtml(c.lab_model)}` : escapeHtml(c.model || "no model");
-    return `<div class="api-key-row" data-id="${escapeHtml(c.id)}">
+      ? `${escapeHtml(c.model)} · PI/Critic on ${escapeHtml(c.lab_model)}`
+      : c.model ? escapeHtml(c.model)
+      : '<span class="api-key-bad">no model — pick one before this endpoint can be used</span>';
+    return `<div class="api-key-row${apiKeys.editing === c.id ? " editing" : ""}" data-id="${escapeHtml(c.id)}">
       <div class="api-key-main">
         <strong>${escapeHtml(c.label)}</strong>
         <small>${roles}</small>
@@ -1728,6 +2040,19 @@ function renderApiKeyList() {
       </div>
     </div>`;
   }).join("");
+}
+
+// "Where is my key?" answered with the actual location. The key never reaches the browser and
+// never comes back over the wire, so the only place a user can learn this is here.
+function renderApiKeyStorage() {
+  const el = $("apiKeyStorage");
+  if (!el) return;
+  const s = apiKeys.storage;
+  if (!s) { el.textContent = ""; return; }
+  el.innerHTML = `Your key is stored on the AiScientist server — never in your browser — and is `
+    + `sent only to the endpoint you saved it for${s.encrypted ? ", encrypted at rest 🔒" : ""}.`
+    + `<br>Owner <code>${escapeHtml(s.owner)}</code> · <code>0600</code> file under `
+    + `<code>${escapeHtml(s.dir)}</code>`;
 }
 
 function renderProviderOptions() {
@@ -1745,6 +2070,133 @@ function applyProviderPreset() {
   // Only prefill an EMPTY base URL: a user editing a saved endpoint, or one who typed a custom
   // host, must not have it overwritten by flipping the dropdown to read a note.
   if (p.base_url && !$("apiKeyBaseUrl").value.trim()) $("apiKeyBaseUrl").value = p.base_url;
+  // Picking the provider can be what completes (base URL + key), so the model list follows either
+  // order of filling the form in.
+  maybeAutoFetchModels();
+}
+
+// ---- model combobox --------------------------------------------------------
+//
+// A model id is not something anyone knows by heart — OpenRouter alone serves ~450 — so the field
+// has to answer "what do I put here?" itself. It stays a text input (endpoints that publish no
+// catalogue still need one, and a picked id must stay editable) with the endpoint's own ids as a
+// searchable menu under it: click to open, type to filter, click or Enter to fill.
+
+const MODEL_COMBOS = [["apiKeyModel", "apiKeyModelMenu"], ["apiKeyLabModel", "apiKeyLabModelMenu"]];
+
+function renderModelChoices(models) {
+  apiKeys.models = models || [];
+  // Refresh whichever menu is open so a fetch that lands while the user is looking at it fills in
+  // rather than leaving "press ↻" under their cursor.
+  for (const [inputId, menuId] of MODEL_COMBOS) {
+    if (!$(menuId).classList.contains("hidden")) openModelMenu(inputId, menuId);
+  }
+}
+
+function matchingModels(query) {
+  const q = (query || "").trim().toLowerCase();
+  if (!q) return apiKeys.models;
+  return apiKeys.models.filter((m) => m.toLowerCase().includes(q));
+}
+
+function openModelMenu(inputId, menuId) {
+  const input = $(inputId), menu = $(menuId);
+  if (!input || !menu) return;
+  const q = input.value.trim();
+  const hits = matchingModels(q);
+  apiKeys.comboActive = -1;
+
+  if (!apiKeys.models.length) {
+    // Nothing fetched yet — say what would fetch it, and make the line itself do it, because a
+    // user who does not know what to type also does not know what the ↻ glyph is for.
+    menu.innerHTML = '<div class="combo-note clickable" data-act="fetch">Press ↻ to list what this endpoint serves</div>';
+  } else if (!hits.length) {
+    menu.innerHTML = `<div class="combo-note">No model here matches “${escapeHtml(q)}” · ${apiKeys.models.length} available</div>`;
+  } else {
+    // Cap the rendered rows: 450 ids is a scroll bar, not a choice. Typing narrows it.
+    const shown = hits.slice(0, 60);
+    menu.innerHTML = shown.map((m) => `<div class="combo-item" role="option" data-v="${escapeHtml(m)}">${highlightMatch(m, q)}</div>`).join("")
+      + (hits.length > shown.length
+         ? `<div class="combo-note">+${hits.length - shown.length} more — keep typing to narrow</div>` : "");
+  }
+  menu.classList.remove("hidden");
+  input.setAttribute("aria-expanded", "true");
+}
+
+function closeModelMenu(inputId, menuId) {
+  const menu = $(menuId);
+  if (!menu) return;
+  menu.classList.add("hidden");
+  $(inputId).setAttribute("aria-expanded", "false");
+  apiKeys.comboActive = -1;
+}
+
+// Show WHERE the typed text matched, so a filtered list of near-identical ids is readable.
+function highlightMatch(text, query) {
+  const q = (query || "").trim();
+  if (!q) return escapeHtml(text);
+  const at = text.toLowerCase().indexOf(q.toLowerCase());
+  if (at < 0) return escapeHtml(text);
+  return escapeHtml(text.slice(0, at)) + `<mark>${escapeHtml(text.slice(at, at + q.length))}</mark>`
+    + escapeHtml(text.slice(at + q.length));
+}
+
+function moveComboActive(menuId, delta) {
+  const items = [...$(menuId).querySelectorAll(".combo-item")];
+  if (!items.length) return;
+  const next = apiKeys.comboActive + delta;
+  apiKeys.comboActive = next < 0 ? items.length - 1 : next >= items.length ? 0 : next;
+  items.forEach((el, i) => el.classList.toggle("active", i === apiKeys.comboActive));
+  items[apiKeys.comboActive].scrollIntoView({ block: "nearest" });
+}
+
+function wireModelCombo(inputId, menuId) {
+  const input = $(inputId), menu = $(menuId);
+  if (!input || !menu) return;
+
+  input.addEventListener("focus", () => openModelMenu(inputId, menuId));
+  input.addEventListener("input", () => openModelMenu(inputId, menuId));
+  // Click as well as focus: clicking a field that ALREADY has focus fires no focus event, so
+  // without this the menu stays shut for anyone who dismissed it and clicked the box again —
+  // which reads as the box being broken.
+  input.addEventListener("click", () => openModelMenu(inputId, menuId));
+  input.addEventListener("keydown", (e) => {
+    const open = !menu.classList.contains("hidden");
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!open) { openModelMenu(inputId, menuId); return; }
+      moveComboActive(menuId, e.key === "ArrowDown" ? 1 : -1);
+    } else if (e.key === "Enter" && open) {
+      // Enter completes what is highlighted; with nothing highlighted it takes the top match,
+      // because a half-typed id is never what the user meant to save and the endpoint would
+      // refuse it anyway. Enter still submits the form when the text IS a real model id, or when
+      // there is nothing to complete it with (a custom id, or an endpoint that lists nothing) —
+      // and Escape closes the menu, so submitting exactly what you typed is always available.
+      const items = menu.querySelectorAll(".combo-item");
+      const el = items[apiKeys.comboActive >= 0 ? apiKeys.comboActive : 0];
+      if (el && !apiKeys.models.includes(input.value.trim())) {
+        e.preventDefault();
+        input.value = el.dataset.v;
+        closeModelMenu(inputId, menuId);
+      }
+    } else if (e.key === "Escape" && open) {
+      e.preventDefault(); e.stopPropagation();      // close the menu, not the whole dialog
+      closeModelMenu(inputId, menuId);
+    }
+  });
+  // mousedown, not click: the input's blur fires first and would hide the menu out from under
+  // the pointer, so the click would land on nothing.
+  menu.addEventListener("mousedown", (e) => {
+    const note = e.target.closest('[data-act="fetch"]');
+    if (note) { e.preventDefault(); fetchEndpointModels(); return; }
+    const item = e.target.closest(".combo-item");
+    if (!item) return;
+    e.preventDefault();
+    input.value = item.dataset.v;
+    $("apiKeyError").classList.add("hidden");
+    closeModelMenu(inputId, menuId);
+  });
+  input.addEventListener("blur", () => setTimeout(() => closeModelMenu(inputId, menuId), 120));
 }
 
 function resetApiKeyForm() {
@@ -1754,17 +2206,22 @@ function resetApiKeyForm() {
   $("apiKeySave").textContent = "Verify & save";
   $("apiKeyCancel").classList.add("hidden");
   for (const id of ["apiKeyBaseUrl", "apiKeyValue", "apiKeyModel", "apiKeyLabModel", "apiKeyLabel"]) $(id).value = "";
-  $("apiKeyModelList").innerHTML = "";
+  apiKeys.fetchedFor = "";
+  renderModelChoices([]);
+  for (const [inputId, menuId] of MODEL_COMBOS) closeModelMenu(inputId, menuId);
   $("apiKeyError").classList.add("hidden");
   applyProviderPreset();
+  renderApiKeyList();   // clears the "editing" marker on whichever row had it
 }
 
 function editApiKey(cred) {
   apiKeys.editing = cred.id;
   $("apiKeyFormTitle").textContent = `Edit “${cred.label}”`;
   // The stored key is never sent back to the browser, so an empty field here means "keep the
-  // current key" rather than "no key" — which is also exactly what a rotation needs.
-  $("apiKeyHintLabel").textContent = `leave blank to keep ${cred.key_hint || "the saved key"}`;
+  // current key" rather than "no key" — which is also exactly what a rotation needs. Providers
+  // show a key once and never again, so say plainly that this edit does not need it.
+  $("apiKeyHintLabel").textContent =
+    `keeping the saved key ${cred.key_hint || ""} — paste one only to replace it`;
   $("apiKeySave").textContent = "Save changes";
   $("apiKeyCancel").classList.remove("hidden");
   $("apiKeyProvider").value = cred.provider || "custom";
@@ -1775,6 +2232,13 @@ function editApiKey(cred) {
   $("apiKeyLabel").value = cred.label || "";
   $("apiKeyError").classList.add("hidden");
   $("apiKeyProviderNote").textContent = "";
+  apiKeys.fetchedFor = "";
+  renderModelChoices([]);
+  // The key is already on file, so nothing is needed from the user to answer "what can I put in
+  // Model?" — ask the endpoint now and have the list waiting when they click the box.
+  maybeAutoFetchModels();
+  renderApiKeyList();                       // mark which row this form now belongs to
+  $("apiKeyForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function apiKeyError(msg, cause) {
@@ -1800,14 +2264,21 @@ async function submitApiKey(ev) {
     api_key: $("apiKeyValue").value.trim(),
     lab_model: $("apiKeyLabModel").value.trim(),
     label: $("apiKeyLabel").value.trim() || null,
-    user: $("userInput").value.trim(),
+    user: apiKeyOwner(),
   };
   const editing = apiKeys.editing;
   if (!editing && !body.api_key) { apiKeyError("Paste an API key to save this endpoint."); return; }
+  // A credential with no model id is refused at bind time ("Set a model on this credential"),
+  // so saving one produces an endpoint that appears in the picker and then cannot be used.
+  // Catch it here, where ↻ is one button away, instead of at the start of a run.
+  if (!body.model) {
+    apiKeyError("Choose the model id this endpoint should answer with — press ↻ to list them.");
+    return;
+  }
   // Without an owner the server files this under "guest" and the session — which looks it up by
   // UCInetID — never finds it again. A key that verifies and then silently isn't there is worse
   // than a refused save, so refuse.
-  if (!state.user && !body.user) {
+  if (!body.user) {
     apiKeyError("Type your UCInetID on the login form first — saved keys belong to that account.");
     return;
   }
@@ -1822,36 +2293,94 @@ async function submitApiKey(ev) {
     const d = await res.json();
     if (!res.ok) { apiKeyError(d.error || "Could not save", d.cause); return; }
     $("apiKeyValue").value = "";
+    const saved = d.credential;
+    // An edit that changed the endpoint is re-tested server-side with the stored key. Saying so
+    // matters: a model id the provider does not serve otherwise saves quietly and only fails
+    // later, in the middle of a run.
+    const reverify = d.verify;
     resetApiKeyForm();
     await loadApiCredentials();
-    // A key added from the login form was added FOR this login: select it, so the user closes the
-    // dialog onto the choice they just made rather than back on "Cluster GPU".
-    const created = !editing && d.credential;
-    if (created && $("connectLlmSelect") && !state.connectionId) {
-      apiKeys.connectChoice = created.id;
-      $("connectLlmSelect").value = created.id;
-      renderConnectLlmHint();
+    if (saved && !editing) {
+      // The key was added FOR the picker the user came from: select it there, so they close the
+      // dialog onto the choice they just made rather than back on "Cluster GPU".
+      if (state.connectionId) {
+        await selectLlmEndpoint(saved.id);        // may ask for egress consent first
+      } else if ($("connectLlmSelect")) {
+        apiKeys.connectChoice = saved.id;
+        $("connectLlmSelect").value = saved.id;
+        renderConnectLlmHint();
+        syncEndpointActions();
+      }
     }
-    toast(editing ? "Endpoint updated" : "Endpoint saved");
+    if (reverify && !reverify.ok) toast(`Saved, but ${reverify.message}`);
+    else toast(editing ? "Endpoint updated" : "Endpoint saved");
   } catch (err) {
     apiKeyError(isUnreachable(err) ? "Can't reach the local server." : err.message);
   } finally {
+    // Restore the button for whatever mode the form is in NOW — a failed edit leaves us still
+    // editing, and the label used to stay stuck on "Verifying…" with no way back.
     $("apiKeySave").disabled = false;
-    if (!apiKeys.editing) $("apiKeySave").textContent = "Verify & save";
+    $("apiKeySave").textContent = apiKeys.editing ? "Save changes" : "Verify & save";
   }
 }
 
-async function fetchEndpointModels() {
-  // Only meaningful for a SAVED credential: listing models needs a key, and the key we would
-  // use lives on the server.
-  if (!apiKeys.editing) { apiKeyError("Save this endpoint first, then ↻ lists the models it serves."); return; }
-  const q = `?user=${encodeURIComponent($("userInput").value.trim())}`;
+// ↻ — list what this endpoint serves. Works on the form as typed, with nothing saved yet: a
+// credential is refused at bind time unless it names a model, and the ids live on the provider,
+// so "save first, then list" was a cycle whose first lap always produced a dead endpoint.
+// Fetch without being asked, as soon as the form holds enough to fetch with — a saved endpoint
+// being edited (key on file) or a base URL and key both filled in. Silent: a half-finished form
+// must not throw errors at someone who has not asked for anything yet. Once per input pair, so
+// tabbing through the form does not re-ask the provider.
+function maybeAutoFetchModels() {
+  const cred = apiKeys.editing ? apiKeys.creds.find((c) => c.id === apiKeys.editing) : null;
+  const baseUrl = $("apiKeyBaseUrl").value.trim();
+  const typedKey = $("apiKeyValue").value.trim();
+  if (!baseUrl) return;
+  if (!typedKey && !(cred && (cred.base_url || "") === baseUrl)) return;
+  const token = `${baseUrl}|${typedKey ? typedKey.slice(-6) : "stored:" + (cred ? cred.id : "")}`;
+  if (apiKeys.fetchedFor === token) return;
+  apiKeys.fetchedFor = token;
+  fetchEndpointModels({ silent: true });
+}
+
+async function fetchEndpointModels({ silent = false } = {}) {
+  const cred = apiKeys.editing ? apiKeys.creds.find((c) => c.id === apiKeys.editing) : null;
+  const typedKey = $("apiKeyValue").value.trim();
+  const baseUrl = $("apiKeyBaseUrl").value.trim();
+  const fail = (msg, cause) => { if (!silent) apiKeyError(msg, cause); };
+  if (!baseUrl) { fail("Enter the base URL first — that is where the model list comes from.", "endpoint"); return; }
+  // With no key typed we can fall back to the one already stored for this credential, but the
+  // server will then use the credential's OWN base URL (it must not aim a stored key at a host
+  // supplied in the request). So if the URL was edited, the key has to come with it.
+  const useStored = !typedKey && cred;
+  if (useStored && (cred.base_url || "") !== baseUrl) {
+    fail(`Paste the key for that base URL — the key on file belongs to ${cred.base_url}.`);
+    return;
+  }
+  if (!typedKey && !cred) { fail("Paste your API key first — listing models needs it.", "auth"); return; }
+
+  const btn = $("apiKeyFetchModels");
+  btn.disabled = true;
   try {
-    const d = await (await fetch(`/api/llm-credentials/${apiKeys.editing}/models${q}`)).json();
-    const models = d.models || [];
-    $("apiKeyModelList").innerHTML = models.map((m) => `<option value="${escapeHtml(m)}"></option>`).join("");
-    toast(models.length ? `${models.length} models available` : "This endpoint does not list models — type the id.");
-  } catch { toast("Could not list models"); }
+    const res = await fetch("/api/llm-models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_url: baseUrl, api_key: typedKey,
+                             credential_id: useStored ? cred.id : "", user: apiKeyOwner() }),
+    });
+    const d = await res.json();
+    if (!res.ok) { renderModelChoices([]); fail(d.error || "Could not list models", d.cause); return; }
+    renderModelChoices(d.models || []);
+    if (!silent) {
+      // Asked for explicitly: show the answer rather than leaving the user to guess that the
+      // closed box behind the button now knows something.
+      $("apiKeyError").classList.add("hidden");
+      openModelMenu("apiKeyModel", "apiKeyModelMenu");
+      $("apiKeyModel").focus();
+      toast(`${(d.models || []).length} models — type to filter`);
+    }
+  } catch (err) {
+    fail(isUnreachable(err) ? "Can't reach the local server." : err.message);
+  } finally { btn.disabled = false; }
 }
 
 async function apiKeyRowAction(ev) {
@@ -1860,16 +2389,10 @@ async function apiKeyRowAction(ev) {
   const id = btn.closest(".api-key-row").dataset.id;
   const cred = apiKeys.creds.find((c) => c.id === id);
   if (!cred) return;
-  const q = `?user=${encodeURIComponent($("userInput").value.trim())}`;
+  const q = apiKeyOwnerQuery();
 
   if (btn.dataset.act === "edit") { editApiKey(cred); return; }
-  if (btn.dataset.act === "del") {
-    if (!confirm(`Delete “${cred.label}”? The stored key is removed from this server.`)) return;
-    await fetch(`/api/llm-credentials/${id}${q}`, { method: "DELETE" });
-    await loadApiCredentials();
-    toast("Endpoint deleted");
-    return;
-  }
+  if (btn.dataset.act === "del") { await deleteEndpointById(id); return; }
   btn.disabled = true;
   btn.textContent = "Testing…";
   try {
@@ -1879,7 +2402,7 @@ async function apiKeyRowAction(ev) {
   } finally { btn.disabled = false; btn.textContent = "Test"; }
 }
 
-async function openApiKeys() {
+async function openApiKeys(editId) {
   $("apiKeysModal").classList.remove("hidden");
   if (!apiKeys.providers.length) {
     try { apiKeys.providers = (await (await fetch("/api/llm-providers")).json()).providers || []; } catch {}
@@ -1887,6 +2410,10 @@ async function openApiKeys() {
   }
   resetApiKeyForm();
   await loadApiCredentials();
+  // Opened from a picker's ✎ — land directly on that endpoint's form instead of making the user
+  // find its row again.
+  const cred = editId && apiKeys.creds.find((c) => c.id === editId);
+  if (cred) editApiKey(cred);
 }
 
 function renderGpu(summary) {
@@ -1977,6 +2504,7 @@ const STREAM_TYPES = new Set([
 // or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
+  "plan_status", "plan_expiring",
   // Context occupancy belongs to the conversation that asked, so another window's chat turn
   // never rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing
   // status, not part of the assistant bubble being replayed.
@@ -2027,10 +2555,12 @@ function handleWsMessage(msg) {
       break;
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
-    case "plan_prompt": showPlanPanel(msg.agenda); break;
+    case "plan_prompt": state.planRevisedSteps = msg.revised || []; showPlanPanel(msg.agenda); break;
     case "plan_clarify": showClarify(msg.questions); break;
     case "decision_prompt": showDecision(msg.goal, msg.options); break;
     case "plan_done": hidePlanPanel(); break;
+    case "plan_status": setPlanStatus(msg.text); break;
+    case "plan_expiring": setPlanStatus("⏳ This plan expires in a few minutes — reply, approve, or cancel to keep it."); break;
     case "error": toast(msg.message); break;
   }
 }
@@ -2056,6 +2586,7 @@ async function connect(e) {
     // Chosen on THIS form, so the server knows before it provisions: with your own endpoint it
     // skips the GPU allocation entirely instead of queueing for a card nothing will use.
     llm_credential_id: connectEndpointChoice(),
+    cluster_model_id: connectClusterChoice(),
     accept_egress: false,
   };
   if (!body.mock && !body.ucinetid) { toast("Enter your UCInetID."); return; }
@@ -2338,6 +2869,7 @@ const DEFAULT_PLACEHOLDER = "Ask AiScientist to plan or interpret an ocular bioi
 
 function removePlanCard() {
   if (state.planCardEl) { state.planCardEl.remove(); state.planCardEl = null; }
+  state.planStatusEl = null;   // the old card's status line went with it
 }
 
 function planCardShell() {
@@ -2357,12 +2889,36 @@ function showPlanPanel(agenda) {
   state.planAgenda = agenda || [];
   // Steps arrive as `**Short title** — detailed prose`. Render each as its own heading + body so
   // the plan scans as a pipeline (titles) with detail on demand (prose), instead of one dense
-  // numbered wall. Steps without a title (older runs, fallback plans) keep the plain list row.
+  // numbered wall.
+  //
+  // Two shapes had to be tolerated rather than assumed. A step may carry its own ordinal
+  // ("1. **QC & normalization** — …") when a model echoed the numbered plan back on the revision
+  // path; the old regex anchored `**` to the very start, so that step fell through to the untitled
+  // branch and rendered as a BARE "1" heading followed by raw markdown — the reviewer's only
+  // visible sign that a step had changed was that it looked broken (Ziyao, plan_mode_report_v2_5,
+  // 6/6 on that path). The server now strips the ordinal, and this tolerates it anyway so an older
+  // server or a fallback plan can't reproduce the bug. And a genuinely untitled step gets its
+  // FIRST CLAUSE as the heading instead of nothing, so no step is ever a number on its own.
+  // Which steps this revision touched, so "what did my change actually do?" is answerable from the
+  // card. Before this the plan simply came back different: the server knew the revised set (it had
+  // just applied a single-step patch) and said so only in the collapsed technical feed, so the
+  // reviewer's only route to the answer was diffing two plans by eye.
+  const revised = new Set((state.planRevisedSteps || []).map(Number));
   const stepMd = state.planAgenda.map((s, i) => {
-    const m = /^\*\*(.+?)\*\*\s*[—–:-]+\s*([\s\S]*)$/.exec(s);
-    return m ? `### ${i + 1} · ${m[1]}\n\n${m[2]}` : `### ${i + 1}\n\n${s}`;
+    const body = String(s == null ? "" : s).replace(/^\(?\d{1,2}[.)、]\s+/, "").trim();
+    const mark = revised.has(i + 1) ? " ✏️" : "";
+    const m = /^\*\*(.+?)\*\*\s*[—–:-]+\s*([\s\S]*)$/.exec(body);
+    if (m) return `### ${i + 1} · ${m[1]}${mark}\n\n${m[2]}`;
+    // No bold title: take a short leading clause as the heading so the step still scans.
+    const lead = /^(.{4,70}?)(?:\s+[—–-]\s+|[.:]\s+)([\s\S]*)$/.exec(body);
+    return lead ? `### ${i + 1} · ${lead[1]}${mark}\n\n${lead[2]}`
+                : `### ${i + 1} · ${body || "(empty step)"}${mark}`;
   }).join("\n\n");
-  const md = "## 📋 Proposed plan\n\n" + stepMd;
+  const badge = revised.size
+    ? `\n\n> ✏️ Revised step${revised.size > 1 ? "s" : ""} `
+      + `${[...revised].sort((a, b) => a - b).join(", ")} only — every other step is unchanged.`
+    : "";
+  const md = "## 📋 Proposed plan" + badge + "\n\n" + stepMd;
   el.innerHTML = renderMarkdown(md) +
     `<div class="plan-actions-row">
        <button class="primary small" data-plan="approve">▶ Run this plan</button>
@@ -2467,9 +3023,22 @@ function finalizePlanCard(note, persistMarkdown) {
   if (state.planCardEl) {
     const row = state.planCardEl.querySelector(".plan-actions-row");
     if (row) row.innerHTML = `<span class="plan-actions-status">${escapeHtml(note)}</span>`;
+    // Keep a handle to the STATUS line after the card is resolved. The card is the only thing on
+    // screen while the PI works, and what it says is the user's only signal about which of the two
+    // things is happening (answering vs re-planning) — see setPlanStatus.
+    state.planStatusEl = row ? row.querySelector(".plan-actions-status") : null;
     state.planCardEl = null;
   }
   if (persistMarkdown) pushToSession(state.runSessionId || state.activeId, { role: "assistant", content: persistMarkdown });
+}
+
+// Correct the resolved card's status line as the server learns what the reply actually was.
+// The client cannot classify question-vs-change itself (the rule lives in the lab, and a second
+// copy here would drift from it), so it opens with a NEUTRAL "sent to the PI" and the server
+// upgrades it. The old unconditional "Sent changes to the PI — re-planning…" asserted the wrong
+// one of the two for every question asked, for the 10-20 minutes an answer takes.
+function setPlanStatus(text) {
+  if (state.planStatusEl && text) state.planStatusEl.textContent = text;
 }
 
 function hidePlanPanel() {
@@ -2494,7 +3063,10 @@ async function submitPlan(action, feedback) {
     repaintWorking();
   }
   else if (action === "cancel") finalizePlanCard("✕ Cancelled");
-  else finalizePlanCard("✎ Sent changes to the PI — re-planning…");
+  // Neutral until the server says which it was: a reply may be a QUESTION (answered, plan
+  // untouched) or a CHANGE (re-planned). Claiming "re-planning" up front was wrong for every
+  // question, and stayed wrong on screen for the whole 10-20 min the answer took.
+  else finalizePlanCard("✎ Sent to the PI — reading your reply…");
   state.planPending = false;
   $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
@@ -3349,17 +3921,36 @@ function init() {
   // "＋ Add your own API key…" is a menu ITEM, not an endpoint: it opens the manager and snaps the
   // picker back to whatever is actually in use, so the dropdown never shows a selection that isn't.
   $("llmEndpointSelect").addEventListener("change", (e) => {
-    if (e.target.value === ADD_KEY_OPTION) { e.target.value = apiKeys.activeId || ""; openApiKeys(); return; }
+    if (e.target.value === ADD_KEY_OPTION) {
+      e.target.value = apiKeys.activeId || clusterValue(); syncEndpointActions(); openApiKeys(); return;
+    }
+    syncEndpointActions();
     selectLlmEndpoint(e.target.value);
   });
-  $("manageKeysBtn").addEventListener("click", openApiKeys);
+  $("manageKeysBtn").addEventListener("click", () => openApiKeys());
+  $("manageClusterBtn").addEventListener("click", openClusterModels);
+  $("connectManageClusterBtn").addEventListener("click", openClusterModels);
+  $("clusterClose").addEventListener("click", () => { closeClusterForm(); $("clusterModal").classList.add("hidden"); });
+  $("clusterModal").addEventListener("click", (e) => { if (e.target.id === "clusterModal") { closeClusterForm(); $("clusterModal").classList.add("hidden"); } });
+  $("clusterList").addEventListener("click", clusterRowAction);
+  $("clusterUnregistered").addEventListener("click", clusterRowAction);
+  $("clusterAddBtn").addEventListener("click", () => fillClusterForm(null));
+  $("clusterCancel").addEventListener("click", closeClusterForm);
+  $("clusterForm").addEventListener("submit", saveClusterForm);
+  $("editKeyBtn").addEventListener("click", () => editSelectedEndpoint("llmEndpointSelect"));
+  $("deleteKeyBtn").addEventListener("click", () => deleteEndpointById($("llmEndpointSelect").value));
   // The same manager, reachable from the LOGIN form. Without this the only way to register a key
   // was the post-connect panel — i.e. after the GPU wait the key exists to avoid.
-  $("connectManageKeysBtn").addEventListener("click", openApiKeys);
+  $("connectManageKeysBtn").addEventListener("click", () => openApiKeys());
+  $("connectEditKeyBtn").addEventListener("click", () => editSelectedEndpoint("connectLlmSelect"));
+  $("connectDeleteKeyBtn").addEventListener("click", () => deleteEndpointById($("connectLlmSelect").value));
   $("connectLlmSelect").addEventListener("change", (e) => {
-    if (e.target.value === ADD_KEY_OPTION) { e.target.value = apiKeys.connectChoice || ""; openApiKeys(); return; }
+    if (e.target.value === ADD_KEY_OPTION) {
+      e.target.value = apiKeys.connectChoice || ""; syncEndpointActions(); openApiKeys(); return;
+    }
     apiKeys.connectChoice = e.target.value;
     renderConnectLlmHint();
+    syncEndpointActions();
   });
   $("apiKeysClose").addEventListener("click", () => $("apiKeysModal").classList.add("hidden"));
   $("apiKeysModal").addEventListener("click", (e) => { if (e.target.id === "apiKeysModal") $("apiKeysModal").classList.add("hidden"); });
@@ -3368,6 +3959,13 @@ function init() {
   $("apiKeyCancel").addEventListener("click", resetApiKeyForm);
   $("apiKeyProvider").addEventListener("change", applyProviderPreset);
   $("apiKeyFetchModels").addEventListener("click", fetchEndpointModels);
+  for (const [inputId, menuId] of MODEL_COMBOS) wireModelCombo(inputId, menuId);
+  // Fetch the list the moment we have something to fetch it with, so clicking the model box just
+  // shows it. `change` (not `input`) so this fires when the user has finished a field, not on
+  // every keystroke of a half-typed key.
+  for (const id of ["apiKeyBaseUrl", "apiKeyValue"]) {
+    $(id).addEventListener("change", () => maybeAutoFetchModels());
+  }
   // The consent dialog has no silent dismissal: closing it counts as declining, so a click on
   // the backdrop or ✕ snaps the picker back to the endpoint actually in use rather than leaving
   // the dropdown showing a selection that never took effect.
@@ -3390,6 +3988,7 @@ function init() {
     loadApiCredentials();   // credentials are per-owner, so the picker follows the UCInetID
   });
   loadApiCredentials();     // populate the login picker on first paint, before any session exists
+  loadClusterModels();      // and its cluster-model options
   $("chatForm").addEventListener("submit", sendChat);
   $("chatStop").addEventListener("click", stopRun);
   $("datasetFile").addEventListener("change", (e) => { for (const f of e.target.files || []) uploadDataset(f); e.target.value = ""; });   // multi-attach: each file joins the bind-set

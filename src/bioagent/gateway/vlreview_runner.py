@@ -9,7 +9,7 @@ The eye server has no GPU, so each render is shipped to shared DFS and audited b
         -> read review.json back                 (returned parsed by run_vlreview)
 
 :func:`build_vlreview_review_fn` returns the ``review_fn(pdf_path) -> review dict`` callback the
-render↔re-render loop (:func:`bioagent.tools.visual_review.render_with_visual_review`) calls once
+render↔re-render loop (:func:`bioagent.reporting.visual_review.render_with_visual_review`) calls once
 per render pass. Each pass stages to its OWN sub-dir so a re-rendered PDF never clobbers the
 previous pass's inputs/outputs. This mirrors :mod:`bioagent.gateway.scgpt_runner` — same remote
 substrate, invoked in the finalization pipeline instead of as an agent tool, because the PDF it

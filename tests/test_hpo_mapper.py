@@ -11,14 +11,14 @@ import json
 
 import pytest
 
-from bioagent.tools.hpo_terms.index import get_index
-from bioagent.tools.hpo_terms.mapper import (
+from bioagent.tools.map_phenotype_to_hpo.index import get_index
+from bioagent.tools.map_phenotype_to_hpo.tool import (
     make_hpo_mapping_tool,
     map_phrase,
     map_text_to_hpo,
     validate_hpo_ids,
 )
-from bioagent.tools.phenotype_dx import run_lirical
+from bioagent.tools.run_lirical.tool import run_lirical
 
 
 def _chat(extract: list[dict], choices: "list[int] | None" = None):
@@ -227,7 +227,7 @@ def test_maps_every_diagnosis_in_the_real_case_sheet(diagnosis, expected):
 def test_short_aliases_do_not_fire_inside_unrelated_words(text):
     """'rp'/'ird'/'bbs' are real clinical abbreviations but dangerous substrings — matching is
     word-boundary anchored so 'RPE'/'RPGR'/'third' cannot be read as a phenotype."""
-    from bioagent.tools.hpo_terms import infer_hpo_terms
+    from bioagent.tools.map_phenotype_to_hpo import infer_hpo_terms
     assert infer_hpo_terms(text, default=False) == []
 
 
@@ -330,7 +330,7 @@ def _hp_json(tmp_path, release: str):
 
 
 def test_hp_json_release_is_read_without_parsing_the_whole_file(tmp_path):
-    from bioagent.tools.hpo_terms.index import hp_json_release, release_date
+    from bioagent.tools.map_phenotype_to_hpo.index import hp_json_release, release_date
 
     assert hp_json_release(_hp_json(tmp_path, "2026-06-23") / "hp.json") == "2026-06-23"
     assert hp_json_release(tmp_path / "nope.json") == ""              # unreadable → no claim
@@ -339,7 +339,7 @@ def test_hp_json_release_is_read_without_parsing_the_whole_file(tmp_path):
 
 
 def test_no_drift_note_when_we_and_lirical_agree(tmp_path):
-    from bioagent.tools.phenotype_dx import hpo_release_drift
+    from bioagent.tools.run_lirical.tool import hpo_release_drift
 
     assert hpo_release_drift(str(_hp_json(tmp_path, "2026-06-23")), get_index().version) == []
     assert hpo_release_drift("", get_index().version) == []           # no data dir → nothing to compare
@@ -348,7 +348,7 @@ def test_no_drift_note_when_we_and_lirical_agree(tmp_path):
 def test_drift_is_reported_when_lirical_ontology_moves_ahead(tmp_path):
     """The silent failure this guards: someone re-runs `lirical download`, LIRICAL's ontology advances,
     our committed lexicon does not, and terms retired in between just stop matching — no error."""
-    from bioagent.tools.phenotype_dx import hpo_release_drift
+    from bioagent.tools.run_lirical.tool import hpo_release_drift
 
     notes = hpo_release_drift(str(_hp_json(tmp_path, "2027-01-15")), get_index().version)
     assert len(notes) == 1

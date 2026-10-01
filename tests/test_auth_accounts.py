@@ -220,3 +220,63 @@ def test_secure_cookies_follows_public_https_env(monkeypatch):
         assert auth.secure_cookies() is True
     monkeypatch.setenv("BIOAGENT_PUBLIC_HTTPS", "0")
     assert auth.secure_cookies() is False
+
+
+# --- runs left open by a dead process --------------------------------------
+#
+# A run row opens as "running" and is closed by record_run_finish. Nothing closes it when the
+# gateway dies mid-run — a deploy restart, a crash, an OOM. Twelve had piled up in prod since
+# July, and they are not just untidy: every success rate computed from this table counts them as
+# still in flight. (One of them was a run a deploy of mine killed while the user was watching.)
+
+def test_a_run_left_running_by_a_dead_process_is_closed_at_startup(app_ctx):
+    client, _auth, routes, _db = app_ctx
+    _login(client, "root", "rootpass1")
+    uid = client.get("/api/auth/me").json()["user"]["id"]
+
+    routes.record_run_start(uid, "run_orphan", "killed by a restart", plan_mode=False)
+    routes.record_run_start(uid, "run_done", "finished normally", plan_mode=False)
+    routes.record_run_finish("run_done", "done", None, "all good")
+
+    assert routes.mark_interrupted_runs() == 1          # only the open one
+    runs = {r["run_id"]: r for r in client.get("/api/runs").json()["runs"]}
+    assert runs["run_orphan"]["status"] == "interrupted"
+    assert runs["run_done"]["status"] == "done"         # a closed run is never rewritten
+
+
+def test_the_sweep_is_idempotent_and_records_why(app_ctx):
+    client, _auth, routes, _db = app_ctx
+    _login(client, "root", "rootpass1")
+    uid = client.get("/api/auth/me").json()["user"]["id"]
+    routes.record_run_start(uid, "run_orphan2", "q", plan_mode=False)
+
+    assert routes.mark_interrupted_runs() == 1
+    assert routes.mark_interrupted_runs() == 0          # a second start must not re-sweep
+
+    row = next(r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == "run_orphan2")
+    assert row["status"] == "interrupted"
+    # "interrupted", not "error": nothing went wrong with the analysis, it was cut off, and the
+    # two must stay distinguishable when the question is whether the pipeline works.
+    assert row["status"] != "error"
+
+
+def test_an_interrupted_run_keeps_a_summary_it_already_had(app_ctx):
+    """The sweep explains itself only where there is nothing to overwrite — a run that managed to
+    say something before it died keeps what it said."""
+    client, _auth, routes, _db = app_ctx
+    _login(client, "root", "rootpass1")
+    uid = client.get("/api/auth/me").json()["user"]["id"]
+    routes.record_run_start(uid, "run_spoke", "q", plan_mode=False)
+
+    from bioagent.gateway.db import session_scope
+    from bioagent.gateway.models import Run
+    from sqlalchemy import select
+    with session_scope() as s:
+        s.scalar(select(Run).where(Run.run_id == "run_spoke")).summary = "got to step 4"
+        s.commit()
+
+    routes.mark_interrupted_runs()
+    row = next(r for r in client.get("/api/runs").json()["runs"] if r["run_id"] == "run_spoke")
+    assert row["status"] == "interrupted"
+    with session_scope() as s:
+        assert s.scalar(select(Run).where(Run.run_id == "run_spoke")).summary == "got to step 4"

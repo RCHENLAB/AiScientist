@@ -3,10 +3,10 @@
 **To:** the PaperQA2 / literature-embedding owner · **From:** Yijun's line · **Status:** ✅ **BUILT**
 (2026-08-05) — see the box below before reading the rest as a to-do.
 
-> **This contract is now implemented** in [`src/bioagent/tools/phenotype_evidence.py`](../src/bioagent/tools/phenotype_evidence.py),
+> **This contract is now implemented** in [`src/bioagent/tools/diagnose_disease/evidence.py`](../src/bioagent/tools/diagnose_disease/evidence.py),
 > as a runner over the `deep_literature` (PaperQA2) tool that already ships. Build
 > `make_deep_literature_runner(deep_literature_executor, ctx)` and pass it straight into
-> `paperqa2_evidence(runner=…)` — or just call `phenotype_dx.diagnose(...)`, which does the whole
+> `paperqa2_evidence(runner=…)` — or just call `diagnose_disease.tool.diagnose(...)`, which does the whole
 > thing. The rest of this document stands as the SPEC (the rules below are what the implementation
 > enforces); two things changed in the building:
 >

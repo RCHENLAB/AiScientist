@@ -1,27 +1,15 @@
-# Paths that must NEVER be published to the public mirror (RCHENLAB/AiScientist).
+# Paths to leave out of the public mirror (RCHENLAB/AiScientist).
 #
-# They stay in THIS private repository because the team needs them; they are stripped when the
-# public snapshot is built. Anyone regenerating that snapshot must honour this file — the first
-# public push did not, and shipped all of the below.
+# Policy (Yijun, 2026-09-30): the mirror publishes everything in this repository except
+# credentials, meaning database accounts and passwords, API keys, tokens and private keys.
+# Hostnames, paths, account names, handoffs, experiment records, reports and decks are published.
 #
-#   build the public snapshot with:
-#     git archive <sha> | tar -x -C <dir>
-#     (cd <dir> && grep -v '^#' /path/to/.publicexclude | grep . | xargs -I{} rm -rf -- {})
+# Credentials never belong in git: they live in the deployment's .env and BIOAGENT_STATE_DIR.
+# scripts/publish_public_mirror.py builds the snapshot (git archive minus the paths below), checks
+# every file for credentials, including the text inside .docx/.pptx/.pdf, and refuses to publish
+# if it finds one. List a path here only for a file that has to be committed but must stay
+# private, one path per line, with a comment saying why.
 #
-# --- internal proposals / documents ------------------------------------------------------------
-# Someone else's proposal document, with their name on it. Never ours to publish.
-VisionAnalysisAgentProposal - Jin Li copy.pdf
-#
-# --- reporting decks ---------------------------------------------------------------------------
-# 43-slide capability decks: they carry the roadmap and a "built but gated off" status table,
-# i.e. the progress of unreleased features. The same capability material lives in README.md and
-# docs/ in a form meant to be read by outsiders.
-reports/AiScientist-Capability-Overview-en.pptx
-reports/AiScientist-能力全览-zh.pptx
-#
-# --- literature corpus acquisition -------------------------------------------------------------
-# A step-by-step record of pulling ~1,700 papers through institutional subscriptions: which
-# databases, which titles were licensed, per-PMID outcomes, ILL lists, and how to retry past a
-# provider error. Publishing that invites a publisher terms-of-service problem, and it also
-# contains a colleague's local filesystem path.
-RETIGENE_PAPER_RECOVERY_HANDOFF.md
+# Until 2026-09-30 this file withheld the capability and technical-spec decks (with their build
+# script), the technical report (reports/aiscientist-manual/), RETIGENE_PAPER_RECOVERY_HANDOFF.md
+# and the original project proposal PDF. Under the policy above they are published.

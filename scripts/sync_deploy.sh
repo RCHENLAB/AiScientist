@@ -41,8 +41,8 @@
 #   --no-restart     sync + reinstall only; do not restart the service.
 #   --no-install     skip the `pip install -e` step (use when only static/frontend changed).
 #   --allow-dirty    deploy even if the local git tree has uncommitted changes.
-#   --delete         let rsync DELETE remote $APP_DIR files not present locally (off by
-#                    default — safer; the server-only excludes below are always protected).
+#   --delete         let rsync DELETE remote $APP_DIR files not present locally (off by default
+#                    — safer; EXCLUDE_PATTERNS and PROTECT_PATTERNS below are never deleted).
 #   -h | --help      this help.
 #
 # Put your settings in .deploy.env (gitignored, sourced automatically) so you don't retype
@@ -197,16 +197,49 @@ EXCLUDE_PATTERNS=(
   # sample_data/ holds test/demo VCFs + case notes + run scripts (also gitignored). They are for
   # local verification, never served — keep them out of the prod app dir.
   'sample_data/'
+  # THE USERS' SECRETS. BIOAGENT_STATE_DIR is unset in prod, so both credential stores resolve
+  # relative to the service WorkingDirectory and land INSIDE the synced app dir:
+  # ssh_creds/<user>/ holds private SSH keys for HPC3, llm_creds/<user>/ holds API keys. They were
+  # not excluded — so a `--delete` run, the mode this script's own help recommends for a divergent
+  # server, would have deleted every saved key on the box. Excluded here the same way .env and the
+  # DB are: the wire never carries them, and --delete can never remove them.
+  'ssh_creds/' 'llm_creds/'
 )
 RSYNC_EXCLUDES=()
 for _p in "${EXCLUDE_PATTERNS[@]}"; do RSYNC_EXCLUDES+=(--exclude "$_p"); done
 RSYNC_BASE=(-az --human-readable --itemize-changes "${RSYNC_EXCLUDES[@]}")
 [ "$DRY_RUN" -eq 1 ] && RSYNC_BASE+=(--dry-run)
+# Log label from the numeric flag — NOT `${DRY_RUN:+…}`, which also fires on DRY_RUN=0 (0 is
+# non-empty): every REAL deploy logged "rsync (dry-run) ->" until 2026-09-30.
+_dry=""; [ "$DRY_RUN" -eq 1 ] && _dry="(dry-run) "
+
+# PROTECT, not exclude: files ${APP_DIR} must KEEP when this tree lacks them, yet still RECEIVE when
+# it has them — an exclude would also keep them off the wire for good.
+#   The offline gene-set libraries (src/bioagent/tools/genesets/*.gmt), which run_enrichment and
+#   run_gsea_prerank refuse to run without. They are gitignored (scripts/fetch_genesets.py downloads
+#   them), so a fresh worktree has none, and a --delete deploy from one would remove them from prod.
+#   The loss would spread: at the next session the gateway's HPC3 source sync (rm -rf, then a tar
+#   of the LIVE package) would drop them from HPC3 too.
+# A 'P' rule only stops the receiver's deletions; the leading '/' anchors it at the transfer root.
+GMT_GLOB='src/bioagent/tools/genesets/*.gmt'
+PROTECT_PATTERNS=( "/${GMT_GLOB}" )
+RSYNC_PROTECTS=(); REMOTE_PROTECTS=""
+for _p in "${PROTECT_PATTERNS[@]}"; do
+  RSYNC_PROTECTS+=(--filter "P ${_p}")
+  REMOTE_PROTECTS="${REMOTE_PROTECTS} --filter='P ${_p}'"   # quoted so the remote shell can't glob it
+done
+if ! compgen -G "$GMT_GLOB" >/dev/null; then
+  say "⚠️  this tree has no ${GMT_GLOB} (gitignored; scripts/fetch_genesets.py downloads them)."
+  say "    ${APP_DIR} keeps its own copies: protected from --delete, and NOT updated by this deploy."
+  if [ -n "$SUDO" ]; then
+    say "    Staging mirrors this tree, so a '*deleting …genesets/*.gmt' line in the STAGING rsync is expected."
+  fi
+fi
 
 if [ -z "$SUDO" ]; then
   # ---- direct path: we ARE the service account; rsync straight into $APP_DIR ----------
-  say "rsync ${DRY_RUN:+(dry-run) }-> ${APP_DIR}/ (no sudo) ..."
-  rsync "${RSYNC_BASE[@]}" $RSYNC_DELETE ./ "${DEPLOY_SSH}:${APP_DIR}/"
+  say "rsync ${_dry}-> ${APP_DIR}/ (no sudo) ..."
+  rsync "${RSYNC_BASE[@]}" "${RSYNC_PROTECTS[@]}" $RSYNC_DELETE ./ "${DEPLOY_SSH}:${APP_DIR}/"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     say "dry-run only — no install, no restart. Restart plan: start.sh in ${APP_DIR}."
@@ -235,15 +268,24 @@ else
   # split the transfer (as you, into a world-readable staging dir) from the privileged
   # mirror (under `ssh -t`, which DOES give sudo a TTY to prompt on — exactly once).
   STAGE_EXCLUDES="${STAGE_DIR}.excludes"
-  say "rsync ${DRY_RUN:+(dry-run) }-> staging ${DEPLOY_SSH}:${STAGE_DIR}/ (as ${USER:-you}, no sudo) ..."
+  # The privileged mirror, built once so the dry-run prints the exact command the real run executes.
+  # The protect rules go in as --filter args, NOT as lines in ${STAGE_EXCLUDES}: rsync reads an
+  # --exclude-from file as exclude patterns (it parses only '- '/'+ ' prefixes), so a 'P …' line
+  # there is a literal pattern that matches nothing and protects nothing, silently. Checked
+  # 2026-09-30 with the eyeserver's rsync 3.4.1 against the real ${APP_DIR} (and with openrsync on
+  # scratch dirs): that form still deleted all three .gmt; --filter kept them.
+  PRIV_RSYNC="rsync -a ${RSYNC_DELETE}${REMOTE_PROTECTS} --exclude-from=${STAGE_EXCLUDES} ${STAGE_DIR}/ ${APP_DIR}/"
+  say "rsync ${_dry}-> staging ${DEPLOY_SSH}:${STAGE_DIR}/ (as ${USER:-you}, no sudo) ..."
   # Staging is a throwaway exact mirror of the local wanted-set, so always --delete it
-  # (independent of the user's --delete, which governs $APP_DIR below).
+  # (independent of the user's --delete, which governs $APP_DIR below). No protect rules here, on
+  # purpose: a .gmt kept in staging from an earlier deploy would ride into ${APP_DIR} and overwrite
+  # the server's copy. Protection belongs to the rsync that writes ${APP_DIR}.
   rsync "${RSYNC_BASE[@]}" --delete ./ "${DEPLOY_SSH}:${STAGE_DIR}/"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     say "dry-run only — privileged mirror to ${APP_DIR} skipped."
     say "Real run does, in ONE 'ssh -t ${ADMIN_SSH}' sudo session:"
-    say "  sudo -u ${SVC_USER} rsync ${RSYNC_DELETE:+--delete }staging -> ${APP_DIR}"
+    say "  sudo -u ${SVC_USER} ${PRIV_RSYNC}"
     [ "$DO_INSTALL" -eq 1 ] && say "  sudo -u ${SVC_USER} pip install -e ${APP_DIR}"
     [ "$DO_RESTART" -eq 1 ] && say "  sudo systemctl restart ${SERVICE}  (stops old + kills any orphan first)"
     exit 0
@@ -261,7 +303,7 @@ else
   # `sudo -u ${SVC_USER}` shell anymore — that account can't run systemctl, which is exactly
   # why the old start.sh path leaked an orphan and left systemd crash-looping on the port.
   REMOTE_STEPS="set -e"
-  REMOTE_STEPS="${REMOTE_STEPS}; sudo -u ${SVC_USER} rsync -a ${RSYNC_DELETE} --exclude-from=${STAGE_EXCLUDES} ${STAGE_DIR}/ ${APP_DIR}/"
+  REMOTE_STEPS="${REMOTE_STEPS}; sudo -u ${SVC_USER} ${PRIV_RSYNC}"
   # pip runs as ${SVC_USER} with:
   #   env -C ${APP_DIR} : CWD is a dir ${SVC_USER} CAN read. Without this, pip runs in the sudo
   #                caller's HOME (e.g. /home/<admin-ucinetid>, mode 700) and its editable-package

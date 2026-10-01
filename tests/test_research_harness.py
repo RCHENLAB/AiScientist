@@ -505,3 +505,154 @@ def test_run_reraises_non_overflow_errors() -> None:
         raise AssertionError("a non-overflow chat error must propagate, not be swallowed")
 
 
+
+
+# --- the turn budget is visible, and exhausting it still produces an answer ---------------
+#
+# Measured on run ed4cfce52a2a: 5 of 16 Scientist rounds ended on ``max_steps``, and those scored
+# 0.52 from the Critic against 0.73 for rounds that finished — every one of them handed over a
+# deterministic auto-summary instead of the model's own account, because the cap was invisible and
+# the model spent its last turn starting analysis that was then cut off. Two changes: the model is
+# TOLD when turns run low, and a step that runs out anyway gets one text-only closing turn.
+
+def _answering(text: str):
+    """A chat_fn that always answers in prose — what a closing turn should elicit."""
+    def _call(_messages, _tools):
+        return {"content": text, "tool_calls": []}
+    return _call
+
+
+def test_the_model_is_told_when_its_turns_are_running_out() -> None:
+    seen: list[list[dict]] = []
+    harness = ResearchHarness(
+        config=HarnessConfig(max_steps=3, warn_turns_left=2),
+        chat_fn=_scripted([_tool_call("run_qc", {}), _tool_call("run_qc", {}),
+                           _tool_call("finish", {"answer": "done"})], record=seen))
+    events: list[dict] = []
+    harness.run("Analyze.", _ctx(), on_event=events.append)
+
+    warned = [e for e in events if e["type"] == "turn_budget_low"]
+    assert len(warned) == 1 and warned[0]["left"] == 2 and warned[0]["budget"] == 3
+    # Injected ONCE — repeating it every turn would crowd out the work in a window we already trim.
+    budget_notes = [m for m in seen[-1] if "TURN BUDGET" in str(m.get("content", ""))]
+    assert len(budget_notes) == 1
+
+
+def test_a_step_that_runs_out_of_turns_still_answers_in_its_own_words() -> None:
+    """The closing turn: one text-only call rather than the deterministic digest the Critic
+    marks down. The digest remains the fallback, so this can only improve the verdict."""
+    calls: list[list[dict]] = []
+
+    def _chat(messages, tools):
+        calls.append([dict(m) for m in messages])
+        if len(calls) <= 2:
+            return _tool_call("run_qc", {})
+        return {"content": "QC ran on 400 cells; medians are in tables/qc.csv.", "tool_calls": []}
+
+    harness = ResearchHarness(config=HarnessConfig(max_steps=2), chat_fn=_chat)
+    events: list[dict] = []
+    result = harness.run("Analyze.", _ctx(), on_event=events.append)
+
+    assert len(calls) == 3                       # 2 budgeted turns + 1 closing turn
+    assert result.stop_reason == "closing_turn"
+    assert result.status == "ok"
+    assert result.final_answer.startswith("QC ran on 400 cells")
+    assert not result.answer_synthesized        # the model's words, not the auto-digest
+    assert any(e["type"] == "closing_turn" for e in events)
+    assert "TURN BUDGET EXHAUSTED" in str(calls[-1][-1]["content"])
+
+
+def _counting_tool() -> HarnessTool:
+    """A tool that always succeeds. Callers vary its ``n`` so each call is distinct — otherwise
+    the repeated-identical-call early-out (``max_wasted_after_success``) ends the step with
+    ``done_early`` and the turn budget is never what runs out."""
+    return HarnessTool("note", "records a number",
+                       {"type": "object", "properties": {"n": {"type": "integer"}}},
+                       lambda args, _ctx: {"noted": args.get("n")})
+
+
+def test_the_closing_turn_cannot_run_another_tool() -> None:
+    """It is a way to SPEND the last word, not to reopen the budget: a tool call made there is
+    discarded. Otherwise 'one more turn' becomes another Slurm job and the cap means nothing."""
+    n = iter(range(99))
+
+    def _chat(_messages, _tools):
+        return _tool_call("note", {"n": next(n)})   # never stops asking for tools
+
+    harness = ResearchHarness(catalog=[_counting_tool()], config=HarnessConfig(max_steps=2),
+                              chat_fn=_chat)
+    result = harness.run("Analyze.", _ctx(), on_event=lambda _e: None)
+
+    assert [s["tool"] for s in result.steps] == ["note", "note"]   # the 3rd call was discarded
+    assert result.stop_reason == "max_steps"     # no text came back, so nothing to promote
+    assert result.answer_synthesized             # falls back to the deterministic digest
+
+
+def test_a_step_that_finishes_normally_gets_no_closing_turn() -> None:
+    calls: list[int] = []
+
+    def _chat(messages, tools):
+        calls.append(1)
+        return _tool_call("finish", {"answer": "done early"}) if len(calls) > 1 \
+            else _tool_call("run_qc", {})
+
+    harness = ResearchHarness(config=HarnessConfig(max_steps=8), chat_fn=_chat)
+    result = harness.run("Analyze.", _ctx(), on_event=lambda _e: None)
+
+    assert len(calls) == 2 and result.stop_reason == "finished"   # no extra call was spent
+
+
+def test_a_failing_closing_turn_costs_one_call_and_nothing_else() -> None:
+    """The closing turn is advisory. A step whose artifacts are already on disk must never be
+    lost to a model call that errors at the very end."""
+    calls: list[int] = []
+
+    def _chat(_messages, _tools):
+        calls.append(1)
+        if len(calls) > 2:
+            raise RuntimeError("provider 500 on the closing turn")
+        return _tool_call("run_qc", {})
+
+    harness = ResearchHarness(config=HarnessConfig(max_steps=2), chat_fn=_chat)
+    events: list[dict] = []
+    result = harness.run("Analyze.", _ctx(), on_event=events.append)
+
+    assert result.stop_reason == "max_steps"
+    assert result.answer_synthesized and "run_qc" in result.final_answer
+    assert any(e["type"] == "closing_turn_failed" for e in events)
+
+
+def test_the_closing_turn_can_be_switched_off() -> None:
+    n = iter(range(99))
+
+    def _chat(_messages, _tools):
+        return _tool_call("note", {"n": next(n)})
+
+    harness = ResearchHarness(catalog=[_counting_tool()],
+                              config=HarnessConfig(max_steps=2, closing_turn_on_budget=False),
+                              chat_fn=_chat)
+    events: list[dict] = []
+    result = harness.run("Analyze.", _ctx(), on_event=events.append)
+    assert not any(e["type"] == "closing_turn" for e in events)
+    assert result.answer_synthesized
+
+
+def test_extra_steps_raises_the_ceiling_for_one_attempt() -> None:
+    """What a retry gets. The config is untouched — the bonus is per-call, so it cannot leak into
+    the next step."""
+    calls: list[int] = []
+
+    def _chat(_messages, _tools):
+        calls.append(1)
+        return _tool_call("note", {"n": len(calls)})
+
+    harness = ResearchHarness(catalog=[_counting_tool()],
+                              config=HarnessConfig(max_steps=2, closing_turn_on_budget=False),
+                              chat_fn=_chat)
+    harness.run("Analyze.", _ctx(), on_event=lambda _e: None, extra_steps=2)
+    assert len(calls) == 4
+    assert harness.config.max_steps == 2          # the config itself never changed
+
+    calls.clear()
+    harness.run("Analyze.", _ctx(), on_event=lambda _e: None)
+    assert len(calls) == 2                        # the next step is back to the default

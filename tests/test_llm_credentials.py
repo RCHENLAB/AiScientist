@@ -203,17 +203,34 @@ def test_one_owner_cannot_resolve_anothers_credential(lc):
     assert [c["id"] for c in lc.list_credentials("bob")] != [mine["id"]]
 
 
-def test_key_path_outside_the_owner_store_is_refused(lc, tmp_path):
+def _point_key_path_at(tmp_path, target) -> None:
+    index = tmp_path / "llm_creds" / "alice" / "index.json"
+    rows = json.loads(index.read_text(encoding="utf-8"))
+    rows[0]["key_path"] = str(target)
+    index.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def test_key_path_outside_the_owner_store_is_ignored(lc, tmp_path):
     """A hand-edited or tampered index.json must not turn resolve_secret into an arbitrary
-    file read."""
+    file read. The recorded path is not consulted at all while the real key is in its canonical
+    place, so the tampering achieves nothing — not an error, just no effect."""
     pub = _make(lc)
     outside = tmp_path / "elsewhere.txt"
     outside.write_text("root:x:0:0", encoding="utf-8")
+    _point_key_path_at(tmp_path, outside)
 
-    index = tmp_path / "llm_creds" / "alice" / "index.json"
-    rows = json.loads(index.read_text(encoding="utf-8"))
-    rows[0]["key_path"] = str(outside)
-    index.write_text(json.dumps(rows), encoding="utf-8")
+    assert lc.resolve_secret("alice", pub["id"]) != "root:x:0:0"
+    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefghijklmnop"
+
+
+def test_a_tampered_key_path_is_refused_when_there_is_no_canonical_file(lc, tmp_path):
+    """The one case where the recorded path IS consulted — a store whose layout predates the
+    canonical scheme — still may not escape the owner's directory."""
+    pub = _make(lc)
+    (tmp_path / "llm_creds" / "alice" / f"{pub['id']}.key").unlink()
+    outside = tmp_path / "elsewhere.txt"
+    outside.write_text("root:x:0:0", encoding="utf-8")
+    _point_key_path_at(tmp_path, outside)
 
     with pytest.raises(GatewayError):
         lc.resolve_secret("alice", pub["id"])
@@ -247,3 +264,33 @@ def test_mark_verified_records_success_and_failure(lc):
     bad = lc.mark_verified("alice", pub["id"], model=None, error="401 unauthorized")
     assert bad["last_error"] == "401 unauthorized"
     assert lc.mark_verified("alice", "nope", model=None) is None
+
+
+def test_the_key_survives_the_store_moving(tmp_path, monkeypatch):
+    """A stored row's key_path does not survive the state dir moving — the key must anyway.
+
+    Rows written while BIOAGENT_STATE_DIR was unset hold a path relative to the then-current
+    working directory. Setting the state dir (which is what takes the users' secrets OUT of the
+    directory the deploy rsyncs into) left every row naming a file that was no longer there: the
+    key sat intact on disk while every use of it failed with "outside the owner's store".
+    """
+    import importlib, json, os, shutil
+    from bioagent.gateway import llm_credentials as lc
+
+    old_root = tmp_path / "old"
+    old_root.mkdir()
+    monkeypatch.chdir(old_root)
+    monkeypatch.delenv("BIOAGENT_STATE_DIR", raising=False)   # the unset-in-prod case
+    importlib.reload(lc)
+    cred = lc.create("alice", provider="custom", base_url="https://a/v1", model="m1",
+                     api_key="sk-lives-through-a-move")
+    assert not os.path.isabs(json.loads((old_root / "llm_creds/alice/index.json").read_text())[0]["key_path"])
+
+    new_root = tmp_path / "new"
+    shutil.copytree(old_root / "llm_creds", new_root / "llm_creds")
+    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(new_root))
+    monkeypatch.chdir(tmp_path)                               # the old relative path now resolves nowhere
+    importlib.reload(lc)
+
+    assert lc.resolve_secret("alice", cred["id"]) == "sk-lives-through-a-move"
+    importlib.reload(lc)

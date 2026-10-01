@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..agents.sandbox import sandbox_network_enabled
+from ..tools.api import ANALYSIS_ENTRYPOINT
 from .executor import RemoteExecutor
 from .slurm_job import (
     AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
@@ -63,7 +64,7 @@ class SlurmAnalysisExecutor:
     # own loud fallbacks cover the gap.
     deps_dir: str | None = None
     scratch_dir: str = "$HOME/.bioagent/analysis"
-    entrypoint: str = "python -m bioagent.tools.scrna_cli"
+    entrypoint: str = f"python -m {ANALYSIS_ENTRYPOINT}"
     job_prefix: str = "bioagent_analysis"   # squeue job-name prefix (variant line overrides it)
     mem_gb: int = 64
     cpus: int = 8
@@ -105,6 +106,12 @@ class SlurmAnalysisExecutor:
     # Deploy config injected as DEFAULT args (the caller's args override) — lets the gateway pass
     # paths/flags the tool needs but the model never sends, e.g. the VEP cache dir + fork width.
     inject_args: dict[str, Any] = field(default_factory=dict)
+    # Deploy config that can CHANGE during a run, evaluated at every job and layered over
+    # inject_args. The LLM endpoint is one: the vLLM serve job hits its time limit mid-run and comes
+    # back on another node and port, and a URL captured when the executor was built then points at
+    # nothing (run f3731e0b7136: every deep_literature job after the 05:20 swap got
+    # "Connection error" from the dead m54-02:49336 while vLLM served on m54-01:39783).
+    live_args: Callable[[], dict[str, Any]] | None = None
     # Gateway-AUTHORITATIVE args the model must NOT override (the reverse of inject_args, which the
     # caller overrides). For the variant line: the genome assembly detected from the VCF header, and
     # max_variants=0 (the offline path annotates the WHOLE WGS VCF). Without this a model that passes
@@ -120,8 +127,19 @@ class SlurmAnalysisExecutor:
     # unaffected. Keyed on the full args, so a genuine change (different genes / AF / assembly / VCF)
     # still re-runs.
     memoize_result: bool = False
+    # When a tool reports a DECLARED dependency missing (tools.run_deps.ALLOWED), install it into
+    # this run's own workspace (`<remote_workspace>/_deps`) as a Slurm job, then retry the tool once.
+    # Off by default: only the scanpy line's tools declare dependencies, and the gateway turns it on
+    # for that executor (BIOAGENT_AUTO_INSTALL_DEPS=0 turns it off). `release_run_deps` removes the
+    # install when the run is published.
+    auto_install_deps: bool = False
+    # Progress lines for the console, e.g. "installing scikit-image for this run": (level, message).
+    notify: Callable[[str, str], None] | None = None
     _counter: int = field(default=0, repr=False)
     _scratch: str | None = field(default=None, repr=False)
+    _run_deps: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    _deps_failed: dict[str, str] = field(default_factory=dict, repr=False)
+    _deps_attempted: bool = field(default=False, repr=False)
 
     def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if self.remote is None or not self.remote_workspace:
@@ -133,6 +151,7 @@ class SlurmAnalysisExecutor:
                 return hit
         try:
             out = self._run_on_slurm(tool, args)
+            out = self._install_and_retry(tool, args, out)
         except JobCancelled:
             return {"status": "cancelled", "error": "Run cancelled by the user."}
         except SlurmJobError as exc:
@@ -150,6 +169,78 @@ class SlurmAnalysisExecutor:
         if self.memoize_result and isinstance(out, dict) and out.get("status") == "ok":
             self._memo_store(tool, args, out)   # only a SUCCESSFUL run is cached (a failure still retries)
         return out
+
+    # -- a tool's declared dependency, installed for this run only ------------------------------
+
+    def _say(self, level: str, message: str) -> None:
+        if callable(self.notify):
+            try:
+                self.notify(level, message)
+            except Exception:  # noqa: BLE001 - a console line must never break the step
+                pass
+
+    def _install_and_retry(self, tool: str, args: dict[str, Any], out: Any) -> Any:
+        """If ``out`` says a DECLARED dependency is missing, install it for this run and run the tool
+        again, once. Anything else — an undeclared name, the feature off — is returned unchanged."""
+        if not (self.auto_install_deps and isinstance(out, dict)
+                and out.get("status") == "dependency_missing"):
+            return out
+        from ..tools.api import resolve_run_dependency as resolve
+        from ..tools.api import INSTALL_DEPENDENCY
+        dep = str(out.get("dependency") or "").strip()
+        entry = resolve(dep)
+        if entry is None:
+            return out
+        requirement = entry[0]
+        if dep in self._deps_failed:
+            return {**out, "dependency_install": {"status": "failed", "package": requirement,
+                                                  "reason": self._deps_failed[dep]}}
+        if dep not in self._run_deps:
+            self._deps_attempted = True
+            self._say("info", f"{tool} needs {requirement}, which the analysis image lacks — "
+                              "installing it on HPC3 for this run only.")
+            try:
+                inst = self._run_on_slurm(INSTALL_DEPENDENCY, {"dependency": dep})
+            except SlurmJobError as exc:        # the install job never ran: keep the tool's own answer
+                inst = {"status": "error", "error": f"the install job failed: {exc}"}
+            if inst.get("status") not in ("ok", "already_available"):
+                reason = str(inst.get("error") or inst.get("status") or "unknown")[:600]
+                self._deps_failed[dep] = reason
+                self._say("warning", f"Could not install {requirement} for this run: {reason[:200]}")
+                return {**out, "dependency_install": {"status": "failed", "package": requirement,
+                                                      "reason": reason}}
+            self._run_deps[dep] = {"path": inst["path"], "site": inst["site"],
+                                   "installed": inst.get("installed") or requirement}
+            self._say("success", f"Installed {requirement} for this run; running {tool} again.")
+        retry = self._run_on_slurm(tool, args)
+        if isinstance(retry, dict):
+            retry["dependency_installed"] = {
+                "package": self._run_deps[dep]["installed"],
+                "scope": "installed for this run only; removed when the run is published"}
+        return retry
+
+    def _deps_env(self) -> str:
+        """Shell that puts this run's installed packages on the tool job's path — APPENDED after the
+        image's site-packages by the generated sitecustomize, whose dir goes first on PYTHONPATH."""
+        if not self._run_deps:
+            return ""
+        dirs = ":".join(dict.fromkeys(d["path"] for d in self._run_deps.values()))
+        site = next(iter(self._run_deps.values()))["site"]
+        return (f"export AISCIENTIST_PKG_CACHE={shlex.quote(dirs)}; "
+                f"export PYTHONPATH={shlex.quote(site)}:${{PYTHONPATH:-}}; ")
+
+    def release_run_deps(self) -> list[str]:
+        """Delete this run's installed packages from HPC3 (the whole ``<workspace>/_deps``, including
+        a half-finished install). Returns the requirements that had been installed. A no-op for a
+        run that never tried to install anything."""
+        if not self._deps_attempted or self.remote is None or not self.remote_workspace:
+            return []
+        from ..tools.api import DEPS_DIRNAME
+        installed = [d["installed"] for d in self._run_deps.values()]
+        self.remote.exec(f"rm -rf {shlex.quote(self.remote_workspace.rstrip('/') + '/' + DEPS_DIRNAME)}")
+        self._run_deps.clear()
+        self._deps_attempted = False
+        return installed
 
     # -- result memoization (opt-in; guards the ~45-min variant annotation from re-runs) ------------
 
@@ -238,7 +329,13 @@ class SlurmAnalysisExecutor:
     def _run_on_slurm(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         caller = args or {}
         # precedence: deploy defaults (inject_args) < caller args < forced args (gateway-authoritative).
-        args = {**self.inject_args, **caller, **self.force_args}
+        live: dict[str, Any] = {}
+        if callable(self.live_args):
+            try:
+                live = dict(self.live_args() or {})
+            except Exception:  # noqa: BLE001 - fall back to the values captured at build time
+                live = {}
+        args = {**self.inject_args, **live, **caller, **self.force_args}
         for k, v in self.force_args.items():
             if k in caller and caller[k] != v:
                 print(f"[{self.job_prefix}] forced {k}={v!r} over the model-supplied {caller[k]!r} "
@@ -272,7 +369,7 @@ class SlurmAnalysisExecutor:
         pypath = ":".join(p for p in (self.source_dir, self.deps_dir) if p)
         pysrc_env = f"export PYTHONPATH={shlex.quote(pypath)}:${{PYTHONPATH:-}}; " if pypath else ""
         inner_payload = (
-            f"{pysrc_env}export MPLBACKEND=Agg; "
+            f"{pysrc_env}{self._deps_env()}export MPLBACKEND=Agg; "
             f"{self.entrypoint} --tool {shlex.quote(tool)} --workspace {shlex.quote(ws)} "
             f"--dataset {shlex.quote(ds)} --args {shlex.quote(args_f)} > {res_f} 2> {log_f}"
         )

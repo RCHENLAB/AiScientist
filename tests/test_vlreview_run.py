@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_packaged_reviewer_is_byte_identical_to_the_deploy_copy():
     a = (ROOT / "deploy" / "vlreview" / "run_review.py").read_bytes()
-    b = (ROOT / "src" / "bioagent" / "tools" / "vlreview_run.py").read_bytes()
-    assert a == b, "cp deploy/vlreview/run_review.py src/bioagent/tools/vlreview_run.py"
+    b = (ROOT / "src" / "bioagent" / "reporting" / "vlreview_run.py").read_bytes()
+    assert a == b, "cp deploy/vlreview/run_review.py src/bioagent/reporting/vlreview_run.py"
 
 
 def test_the_geometric_detectors_catch_what_the_vision_model_missed(tmp_path):
@@ -21,7 +21,7 @@ def test_the_geometric_detectors_catch_what_the_vision_model_missed(tmp_path):
     `**`/backticks on it, and Qwen2.5-VL-7B called it clean. Both are decidable from the PDF's
     own text and geometry, so both are decided deterministically, before the model."""
     fitz = __import__("pytest").importorskip("fitz")
-    from bioagent.tools import vlreview_run as rr
+    from bioagent.reporting import vlreview_run as rr
 
     doc = fitz.open()
     page = doc.new_page(width=300, height=200)

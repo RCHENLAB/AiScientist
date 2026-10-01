@@ -136,3 +136,174 @@ def test_stop_cancels_the_runcode_job_without_fallback(monkeypatch):
                         lambda code: (_ for _ in ()).throw(JobCancelled("stopped")))
     out = ex("print(1)")
     assert out["status"] == "cancelled" and called["fallback"] is False
+
+
+# --- a step's evidence is what the snippet WROTE ------------------------------
+# Measured on a 12-hour production run: 141 tables and 21 figures reached disk, and every Critic
+# verdict on a run_code step read "none of the claimed output CSVs appears in the tool evidence;
+# each call lists only the input H5AD". The result carried stdout and a return code and nothing
+# else, so `evidence_pointers` had nothing to find — which capped every such step in the 0.6-0.8
+# band ("a material claim rests on prose with no backing artifact") and left the report unable to
+# cite tables that existed the whole time.
+
+def test_classify_written_uses_the_keys_the_harness_already_collects():
+    from bioagent.gateway.slurm_sandbox import classify_written
+
+    out = classify_written([
+        "tables/depth_overlap.csv", "figures/umap_by_arm.png",
+        "tables/subtype_support.csv", "data/checkpoint_note.json",
+    ])
+    assert out["tables"] == ["tables/depth_overlap.csv", "tables/subtype_support.csv"]
+    assert out["figures"] == ["figures/umap_by_arm.png"]
+    assert out["artifacts"] == ["data/checkpoint_note.json"]
+
+
+def test_job_logs_are_not_offered_as_scientific_evidence():
+    from bioagent.gateway.slurm_sandbox import classify_written
+
+    # process/ holds the job's own stdout/stderr — scaffolding, not backing for a claim.
+    assert classify_written(["process/runcode_7.log"]) == {}
+
+
+def test_nothing_written_declares_nothing():
+    from bioagent.gateway.slurm_sandbox import classify_written
+
+    # An empty key would read as "this step produced an empty table set", which is a different
+    # and false claim from "this step produced nothing".
+    assert classify_written([]) == {}
+
+
+def _executor_with_remote(listings):
+    """A SlurmCodeExecutor whose remote returns the queued `find` listings in order."""
+    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+
+    class _Out:
+        def __init__(self, text): self.stdout = text
+
+    class _Remote:
+        def __init__(self): self.calls = []
+        def exec(self, cmd):
+            self.calls.append(cmd)
+            return _Out(listings.pop(0) if listings else "")
+
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+                           artifacts_dir="/dfs/run/artifacts")
+    return ex
+
+
+def test_written_since_catches_new_files():
+    ex = _executor_with_remote([
+        "1700.5 /dfs/run/artifacts/tables/old.csv\n1800.0 /dfs/run/artifacts/tables/fresh.csv\n",
+    ])
+    before = {"tables/old.csv": "1700.5"}
+    assert ex._written_since(before) == ["tables/fresh.csv"]
+
+
+def test_written_since_catches_a_table_the_step_OVERWROTE():
+    # A path-set diff would miss this, and rewriting a table is exactly what a revision does.
+    ex = _executor_with_remote(["1900.0 /dfs/run/artifacts/tables/effects.csv\n"])
+    assert ex._written_since({"tables/effects.csv": "1700.5"}) == ["tables/effects.csv"]
+
+
+def test_untouched_files_from_earlier_steps_are_not_claimed():
+    # The sync mirrors EVERY file back each time; only this snippet's output is its evidence.
+    ex = _executor_with_remote(["1700.5 /dfs/run/artifacts/tables/from_step_two.csv\n"])
+    assert ex._written_since({"tables/from_step_two.csv": "1700.5"}) == []
+
+
+def test_a_broken_find_reports_no_evidence_rather_than_failing_the_snippet():
+    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+
+    class _Remote:
+        def exec(self, cmd): raise OSError("ssh died")
+
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+                           artifacts_dir="/dfs/run/artifacts")
+    assert ex._artifact_snapshot() == {}
+    assert ex._written_since({}) == []
+
+
+def test_the_declared_paths_are_what_evidence_pointers_collects():
+    """The point of reusing these key names: nothing downstream needs to change."""
+    from bioagent.agents.research_harness import evidence_pointers
+    from bioagent.gateway.slurm_sandbox import classify_written
+
+    result = {"status": "ok", "returncode": 0, "stdout": "…"}
+    result.update(classify_written(["tables/depth_overlap.csv", "figures/umap_by_arm.png"]))
+    found = evidence_pointers(result)
+    assert "tables/depth_overlap.csv" in found
+    assert "figures/umap_by_arm.png" in found
+
+
+# --- the mirror back only moves what changed ---------------------------------
+# Every run_code call re-fetched the entire artifacts directory over SFTP. Late in a production
+# run that was 168 files per call, re-transferring output untouched for hours. It measured under a
+# minute — the run's real cost was preflight — but it scales with both the file count and the file
+# size, so one step writing a large checkpoint turns it from wasteful into slow.
+
+def _sync_executor(tmp_path, remote_files, fetch_log):
+    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+
+    class _Out:
+        def __init__(self, text): self.stdout = text
+
+    class _Remote:
+        def exec(self, cmd):
+            return _Out("".join(f"/dfs/run/artifacts/{r}\n" for r in remote_files))
+        def get_file(self, remote, local):
+            fetch_log.append(remote.rsplit("/artifacts/", 1)[1])
+            from pathlib import Path as _P
+            _P(local).write_text("x")
+
+    return SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+                             artifacts_dir="/dfs/run/artifacts",
+                             local_artifacts=str(tmp_path))
+
+
+def test_only_the_files_this_snippet_wrote_are_fetched(tmp_path):
+    remote = ["tables/old_a.csv", "tables/old_b.csv", "tables/fresh.csv"]
+    fetched: list[str] = []
+    ex = _sync_executor(tmp_path, remote, fetched)
+    # Pretend the two older tables already came over on an earlier call.
+    for rel in ("tables/old_a.csv", "tables/old_b.csv"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("x")
+
+    ex._sync_artifacts_back(changed=["tables/fresh.csv"])
+    assert fetched == ["tables/fresh.csv"]
+
+
+def test_a_file_missing_locally_is_fetched_even_if_unchanged(tmp_path):
+    """An earlier transfer may have failed; incremental copying must not make that permanent."""
+    remote = ["tables/present.csv", "tables/lost_last_time.csv"]
+    fetched: list[str] = []
+    ex = _sync_executor(tmp_path, remote, fetched)
+    (tmp_path / "tables").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tables/present.csv").write_text("x")
+
+    ex._sync_artifacts_back(changed=[])          # this snippet wrote nothing
+    assert fetched == ["tables/lost_last_time.csv"]
+
+
+def test_no_changed_list_still_mirrors_everything(tmp_path):
+    """A caller that does not know what changed keeps the previous, safe behaviour."""
+    remote = ["tables/a.csv", "figures/b.png"]
+    fetched: list[str] = []
+    ex = _sync_executor(tmp_path, remote, fetched)
+    for rel in remote:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("x")
+
+    ex._sync_artifacts_back()
+    assert sorted(fetched) == sorted(remote)
+
+
+def test_sync_is_a_no_op_without_a_local_target(tmp_path):
+    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+
+    class _Remote:
+        def exec(self, cmd): raise AssertionError("must not touch the cluster")
+
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+                           artifacts_dir="/dfs/run/artifacts", local_artifacts=None)
+    ex._sync_artifacts_back(changed=["tables/a.csv"])      # no raise

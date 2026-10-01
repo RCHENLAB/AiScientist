@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import types
 
-from bioagent.tools import vcf_offline as vo
+from bioagent.tools.annotate_variants import offline as vo
 
 # A VEP --json element whose ClinVar significance comes from the colocated variants (REST-style).
 _LINE_COLOCATED = {

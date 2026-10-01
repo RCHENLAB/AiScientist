@@ -19,7 +19,7 @@ from bioagent.agents.tool_source import (
     _split_top_level,
     make_tool_source_tool,
 )
-from bioagent.tools.scrna_pack import scrna_catalog
+from bioagent.tools.catalog import scrna_catalog
 
 
 def _tool(catalog=None):
@@ -31,8 +31,8 @@ def test_reading_a_tool_returns_its_real_body_not_its_description():
     tool, ctx = _tool()
     out = tool.executor({"tool": "run_de"}, ctx)
     assert "def run_de" in out["source"]
-    assert out["module"] == "bioagent.tools.scrna_pack"
-    assert out["file"].endswith("scrna_pack.py") and out["first_line"] > 0
+    assert out["module"] == "bioagent.tools.run_de.tool"
+    assert out["file"].endswith("run_de/tool.py") and out["first_line"] > 0
     # The declared contract travels WITH the code, so the two can be compared. A description
     # that promises more than the body delivers is the defect class this exists to surface.
     assert out["declared_description"] == next(
@@ -149,3 +149,64 @@ def test_default_parsing_handles_the_shapes_that_appear_in_real_tools():
 def test_split_top_level_ignores_commas_inside_brackets_and_quotes():
     assert _split_top_level('"a", [1, 2], "x,y"') == ['"a"', ' [1, 2]', ' "x,y"']
     assert _split_top_level("only") == ["only"]
+
+
+# --- an injected implementation must be reachable ------------------------------------------
+#
+# read_tool_source returned the DISPATCHER for any tool the gateway injects an executor into.
+# For scgpt_annotate that wrapper is four lines of "is there a runner? call it" and everything a
+# reviewer would check -- reference, preprocessing, bind mounts -- is in the runner. Run
+# 3c5fbc8608a7's scGPT step was written to verify those before inference, read the source, got the
+# wrapper, reported "lookup of its injected runner failed", and withheld inference. Correct
+# behaviour on what it could see, and the capability was lost to what it could not.
+
+def _catalog_with_injected_runner():
+    from bioagent.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
+
+    def runner(args, ctx):
+        """SENTINEL_BODY — the injected implementation."""
+        return {"status": "ok"}
+
+    return [make_scgpt_annotate_tool(runner)], runner
+
+
+def test_the_tool_body_names_what_it_delegates_to():
+    from bioagent.agents.tool_source import make_tool_source_tool
+
+    cat, _ = _catalog_with_injected_runner()
+    out = make_tool_source_tool(lambda: cat).executor({"tool": "scgpt_annotate"}, None)
+    assert "runner" in out["dispatches_to"], "the dispatcher does not say what it dispatches to"
+    assert "SENTINEL_BODY" not in out["source"]          # the wrapper, as before
+
+
+def test_the_injected_implementation_can_be_fetched_as_a_symbol():
+    from bioagent.agents.tool_source import make_tool_source_tool
+
+    cat, _ = _catalog_with_injected_runner()
+    out = make_tool_source_tool(lambda: cat).executor(
+        {"tool": "scgpt_annotate", "symbol": "runner"}, None)
+    assert "error" not in out, out
+    assert "SENTINEL_BODY" in out["source"], "fetching the runner did not return the runner"
+
+
+def test_an_unknown_symbol_still_errors_and_now_points_at_the_way_in():
+    from bioagent.agents.tool_source import make_tool_source_tool
+
+    cat, _ = _catalog_with_injected_runner()
+    out = make_tool_source_tool(lambda: cat).executor(
+        {"tool": "scgpt_annotate", "symbol": "no_such_thing"}, None)
+    assert "error" in out
+    assert "runner" in out.get("injected", {}), "the error does not name what IS reachable"
+
+
+def test_a_self_contained_tool_reports_nothing_to_dispatch_to():
+    """The field has to be empty when there is no indirection, or it becomes noise the model
+    learns to ignore on exactly the tools where it matters."""
+    from bioagent.agents.research_harness import default_catalog
+    from bioagent.agents.tool_source import make_tool_source_tool
+
+    cat = [t for t in default_catalog() if t.name != "finish"]
+    if not cat:
+        return
+    out = make_tool_source_tool(lambda: cat).executor({"tool": cat[0].name}, None)
+    assert isinstance(out.get("dispatches_to"), dict)

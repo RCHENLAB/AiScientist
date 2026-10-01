@@ -51,7 +51,7 @@ def test_vllm_submitted_script_is_singularity_vllm():
     settings = _vllm_settings()
     script = gpu._serve_script(settings, "testuser")
     assert "sg ruic20_hpc -c 'bash -s'" in script           # DFS group wrapper
-    body = base64.b64decode(script.split("printf %s ", 1)[1].split(" |", 1)[0]).decode("utf-8")
+    body = gpu.serve_body_from_script(script)
     assert "singularity exec --nv" in body  # RCIC HPC3 uses Singularity
     assert "vllm serve QuantTrio/Qwen3.6-35B-A3B-AWQ" in body
     assert "--enable-auto-tool-choice --tool-call-parser qwen3_coder" in body

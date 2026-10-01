@@ -78,13 +78,13 @@ def test_recovery_reattaches_without_resubmit_when_tunnel_already_live(monkeypat
     conn, _ = _fake_conn()
     calls = {"chat": 0, "ensure": 0}
 
-    def fake_chat_tools(port, model, messages, **kw):
+    def fake_complete_ex(port, model, messages, **kw):
         calls["chat"] += 1
         if calls["chat"] == 1:
             raise VLLMNetworkError("Network error during vLLM completion.", stage="vllm_chat")
-        return "recovered"
+        return "recovered", {}          # (text, usage) — the lab roles record what a call cost
 
-    monkeypatch.setattr(gw.vllm_client, "complete", fake_chat_tools)
+    monkeypatch.setattr(gw.vllm_client, "complete_ex", fake_complete_ex)
     monkeypatch.setattr(gw.gpu, "ensure_serve_job",
                         lambda *a, **k: calls.__setitem__("ensure", calls["ensure"] + 1))
     monkeypatch.setattr(gw, "_wait_for_server", lambda conn, emit, **kw: None)

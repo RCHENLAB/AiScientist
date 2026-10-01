@@ -14,7 +14,7 @@ from pathlib import Path
 
 from bioagent.agents.research_harness import HarnessContext
 from bioagent.agents.research_lab import LabConfig, ResearchLab, Specialist
-from bioagent.tools.research_bundle import _render_transcript, write_process_artifacts
+from bioagent.reporting.research_bundle import _render_transcript, write_process_artifacts
 
 
 def _lab(tmp_path: Path, **cfg) -> ResearchLab:

@@ -5,7 +5,7 @@ This module no longer retrieves literature. Retrieval is tested in ``test_litera
 
 from __future__ import annotations
 
-from bioagent.tools import literature_references as lr
+from bioagent.reporting import literature_references as lr
 
 
 def test_citation_title_html_markup_is_stripped_at_source():
@@ -150,3 +150,77 @@ def test_degradation_note_describes_empty_without_hidden_fallback():
     assert "hidden fallback search" in note
     assert "no accepted literature_search citations" in note
     assert "fabricated" in note
+
+
+# --- design-phase background -------------------------------------------------
+# The expert team's meeting lookups are real and DOI-backed, but nobody adjudicated them: they
+# informed the PLAN, not any finding. Merging them into ``## References`` would claim support that
+# was never established; dropping them (the previous behaviour) hid a dozen real searches. They get
+# their own labelled section.
+
+_DESIGN = [
+    {"title": "Muller glia reactivity in inherited retinal disease", "doi": "10.1234/abc",
+     "pmid": "", "year": 2026, "journal": "Nat Neurosci", "consulted_by": "snRNA-seq Specialist"},
+    {"title": "DDX41 in haematopoiesis", "doi": "", "pmid": "39123456", "year": 2025,
+     "journal": "Blood", "consulted_by": "Statistical Design Specialist"},
+]
+
+
+def test_design_background_renders_a_separate_labelled_section():
+    from bioagent.reporting.literature_references import format_design_background_section
+
+    md = format_design_background_section(_DESIGN)
+    assert md.startswith("## Background consulted during study design")
+    # The disclaimer is the point of the section, not decoration.
+    assert "not** adjudicated as evidence" in md
+    assert "`## References`" in md
+    assert "https://doi.org/10.1234/abc" in md
+    assert "PMID:39123456" in md
+    assert "Nat Neurosci, 2026" in md
+
+
+def test_design_background_is_empty_when_the_meeting_consulted_nothing():
+    from bioagent.reporting.literature_references import format_design_background_section
+
+    assert format_design_background_section([]) == ""
+
+
+def test_append_design_background_leaves_the_manuscript_alone_when_empty():
+    from bioagent.reporting.literature_references import append_design_background
+
+    md = "## Results\n\nSomething.\n\n## References\n\n1. A paper.\n"
+    assert append_design_background(md, []) == md
+
+
+def test_append_design_background_lands_after_references():
+    from bioagent.reporting.literature_references import append_design_background
+
+    md = "## Results\n\nSomething.\n\n## References\n\n1. A paper.\n"
+    out = append_design_background(md, _DESIGN)
+    # The adjudicated list stays the one a reader meets first.
+    assert out.index("## References") < out.index("## Background consulted during study design")
+    assert "1. A paper." in out
+
+
+def test_append_design_background_is_idempotent():
+    from bioagent.reporting.literature_references import append_design_background
+
+    md = "## Results\n\nSomething.\n"
+    once = append_design_background(md, _DESIGN)
+    assert append_design_background(once, _DESIGN) == once
+
+
+def test_lab_result_carries_design_background_through_a_round_trip():
+    from bioagent.agents.research_lab import LabResult
+
+    r = LabResult("q", [], [], True, 0, "answer", [], list(_DESIGN))
+    assert r.to_dict()["design_background"][0]["doi"] == "10.1234/abc"
+    # Survives the run_state.json round trip the report builder reads back.
+    assert LabResult.from_dict(r.to_dict()).design_background == _DESIGN
+
+
+def test_lab_result_design_background_defaults_to_empty():
+    from bioagent.agents.research_lab import LabResult
+
+    # Every existing positional construction (twelve of them) must keep working untouched.
+    assert LabResult("q", [], [], False, 0, "").design_background == []

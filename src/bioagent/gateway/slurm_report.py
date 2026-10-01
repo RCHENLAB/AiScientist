@@ -1,6 +1,6 @@
 """Render the report (pandoc + XeLaTeX) as an **HPC3 CPU Slurm job** instead of on the eyeserver.
 
-Phase 5 of the HPC3 offload. ``tools/report.py`` normally shells out to ``pandoc``/``xelatex`` on
+Phase 5 of the HPC3 offload. ``reporting/report.py`` normally shells out to ``pandoc``/``xelatex`` on
 the gateway host — a texlive render is minutes of CPU that competes with every other session (and
 forces a multi-GB texlive install on the eyeserver). This renderer implements the SAME
 ``(cmd, cwd, out_path, timeout_s) -> (ok, err)`` contract as ``report._run_pandoc``, so

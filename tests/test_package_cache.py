@@ -20,7 +20,8 @@ import pytest
 
 from bioagent.gateway import package_cache as pc
 from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.package_cache import PackageCacheError, SharedPackageCache
+from bioagent.gateway.package_cache import (PackageCacheError, SharedPackageCache,
+                                            missing_modules)
 from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 ROOT = f"{SHARED_ROOT}/pkgs"
@@ -398,3 +399,84 @@ def test_pips_scratch_never_reaches_the_published_tree():
     order = [i for i, c in enumerate(sh.worker) if "rm -rf" in c and ".tmp" in c]
     publish = next(i for i, c in enumerate(sh.worker) if "mv -T" in c)
     assert order and order[0] < publish, "the scratch is dropped before the tree is published"
+
+
+# --- probe results are remembered for the session -----------------------------
+# Each probe is an `srun` + module load + `singularity exec` + interpreter start on a compute node.
+# Nothing remembered the answer, so every run_code call re-probed the same always-present packages.
+# Measured on a production run: ~605 seconds per call, seven calls per hour of "analysis".
+
+def _probe_count(shell) -> int:
+    return sum(1 for c in shell.worker if "find_spec" in c)
+
+
+def test_a_module_confirmed_present_is_not_probed_again():
+    shell = FakeShell(provides=("numpy", "pandas", "anndata"))
+    cache = _cache()
+    wanted = ["numpy", "pandas", "anndata"]
+
+    assert missing_modules(shell, cache, wanted) == []
+    first = _probe_count(shell)
+    assert first == 3, "the first call must actually ask the container"
+
+    assert missing_modules(shell, cache, wanted) == []
+    assert _probe_count(shell) == first, "the second call re-probed what it already knew"
+
+
+def test_only_the_unknown_module_is_probed_on_a_later_call():
+    shell = FakeShell(provides=("numpy", "pandas"))
+    cache = _cache()
+
+    missing_modules(shell, cache, ["numpy", "pandas"])
+    before = _probe_count(shell)
+    missing_modules(shell, cache, ["numpy", "pandas", "scipy"])
+    # Two known + one new = exactly one more probe.
+    assert _probe_count(shell) == before + 1
+
+
+def test_a_missing_module_is_still_reported_every_time():
+    # Absence is NOT cached: an install during the run would make it present, and a stale
+    # "missing" would keep offering an install that already happened.
+    shell = FakeShell(provides=("numpy",))
+    cache = _cache()
+
+    assert missing_modules(shell, cache, ["numpy", "torch"]) == ["torch"]
+    assert missing_modules(shell, cache, ["numpy", "torch"]) == ["torch"]
+
+
+def test_a_probe_that_could_not_run_is_never_cached_as_present():
+    """A failed probe says nothing; caching it would hide a real gap for the whole run."""
+    shell = FakeShell(provides=("numpy",))
+    cache = _cache()
+
+    real_worker = shell._worker
+
+    def broken(command, timeout_s=900):
+        if "find_spec" in command and "scipy" in command:
+            return ExecResult(command, 127, "", "singularity: command not found")
+        return real_worker(command, timeout_s)
+
+    shell._worker = broken
+    # status 127 is neither 0 nor 3 — treated as "present" for the decision (a false MISSING costs
+    # the user a bogus install prompt), but NOT remembered.
+    assert missing_modules(shell, cache, ["scipy"]) == []
+    assert "scipy" not in cache._present
+
+    shell._worker = real_worker
+    before = _probe_count(shell)
+    missing_modules(shell, cache, ["scipy"])
+    assert _probe_count(shell) > before, "a failed probe must be retried, not assumed"
+
+
+def test_an_all_known_module_set_skips_the_cluster_entirely():
+    shell = FakeShell(provides=("numpy",))
+    cache = _cache()
+
+    missing_modules(shell, cache, ["numpy"])
+    logins_before = len(shell.login)
+    workers_before = len(shell.worker)
+
+    assert missing_modules(shell, cache, ["numpy"]) == []
+    # Not even the cache-root bind check should reach the cluster when there is nothing to ask.
+    assert len(shell.login) == logins_before
+    assert len(shell.worker) == workers_before

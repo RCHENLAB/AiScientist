@@ -24,7 +24,7 @@ run that needs nothing behaves exactly as before.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -40,6 +40,12 @@ class PreflightingExecutor:
     shell: Any = None
     cache: Any = None
     emit: Callable[..., None] | None = None
+    #: Packages this run already offered to install and had refused. Asking again on the next step
+    #: cannot succeed — the answer is a property of the deployment, not of the snippet — and the
+    #: asking is not free: each unresolved module is re-probed inside the container on every
+    #: ``run_code`` call. One run spent ten minutes per call re-discovering the same declined
+    #: package. Scoped to this executor, i.e. to this run: a fresh run asks again.
+    _declined: set = field(default_factory=set)
 
     def __getattr__(self, name: str) -> Any:
         # Callers read attributes off the executor (``mem_mb`` feeds the run_code guidance, tests
@@ -75,6 +81,11 @@ class PreflightingExecutor:
         if not wanted:
             return None
 
+        # Never re-probe a package this run has already been refused: the probe is the expensive
+        # half (a container start per module), and the answer cannot have changed.
+        wanted = [m for m in wanted if m not in self._declined]
+        if not wanted:
+            return None
         missing = missing_modules(self.shell, self.cache, wanted)
         if not missing:
             return None
@@ -100,5 +111,6 @@ class PreflightingExecutor:
             else:
                 refused.append({"module": module, "package": req, "status": out.get("status"),
                                 "error": out.get("reason")})
+                self._declined.add(module)     # do not ask again for the rest of this run
         return {"required": wanted, "missing": missing,
                 "installed": installed, "unresolved": refused} or None

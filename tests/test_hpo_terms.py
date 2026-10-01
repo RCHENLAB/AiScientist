@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from bioagent.tools.hpo_terms import DEFAULT_IRD_HPO, infer_hpo_terms, load_hpo_table
+from bioagent.tools.map_phenotype_to_hpo import DEFAULT_IRD_HPO, infer_hpo_terms, load_hpo_table
 
 
 def test_all_ids_are_wellformed_and_unique():

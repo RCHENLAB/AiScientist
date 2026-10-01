@@ -14,7 +14,19 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from bioagent.gateway.app import _dataset_section, _insert_record_sections, _pipeline_section
+import pytest
+
+# The precondition is that gateway.app IMPORTS — it pulls fastapi and paramiko at module scope,
+# and guarding on one of them only moves the failure to the other. Without a guard the import
+# raises during COLLECTION, which pytest treats as fatal and aborts the whole session: unguarded
+# modules took CI from 1,525 passing tests to "33 skipped, 3 errors" and kept main red from
+# 2026-08-20 to 2026-09-08. CI installs the gateway extra so these actually RUN; the guard is
+# what keeps a leaner environment skipping cleanly instead of taking every other test down.
+pytest.importorskip("bioagent.gateway.app")
+
+from bioagent.gateway.app import (  # noqa: E402
+    _dataset_section, _insert_record_sections, _pipeline_section,
+)
 
 
 def _bundle(tmp_path: Path, dr: dict) -> Path:

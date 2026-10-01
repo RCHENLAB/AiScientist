@@ -18,7 +18,7 @@ def test_run_tool_dispatches_to_scrna_pack_with_ctx(monkeypatch):
         seen["ds"] = ctx.decisions.get("dataset_path")
         return {"status": "ok", "n": 1}
 
-    monkeypatch.setattr("bioagent.tools.scrna_pack.run_scanpy_qc", fake_qc)
+    monkeypatch.setattr("bioagent.tools.run_scanpy_qc.tool.run_scanpy_qc", fake_qc)
     out = scrna_cli.run_tool("run_scanpy_qc", "/dfs/run", "/dfs/ds.h5ad", {"min_genes": 100})
     assert out == {"status": "ok", "n": 1}
     assert seen == {"args": {"min_genes": 100}, "ws": "/dfs/run", "ds": "/dfs/ds.h5ad"}
@@ -51,7 +51,7 @@ def test_load_args_inline_and_file(tmp_path):
 
 
 def test_main_emits_result_marker(monkeypatch, capsys):
-    monkeypatch.setattr("bioagent.tools.scrna_pack.run_de", lambda a, c: {"status": "ok", "de": 3})
+    monkeypatch.setattr("bioagent.tools.run_de.tool.run_de", lambda a, c: {"status": "ok", "de": 3})
     rc = scrna_cli.main(["--tool", "run_de", "--workspace", "/w", "--args", "{}"])
     line = capsys.readouterr().out.strip()
     assert rc == 0 and line.startswith(scrna_cli.RESULT_MARKER)

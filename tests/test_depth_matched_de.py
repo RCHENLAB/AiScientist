@@ -12,13 +12,16 @@ import numpy as np
 import pytest
 
 from bioagent.agents.registry import _HPC_ANALYSIS_TOOLS
-from bioagent.tools.scrna_pack import (
-    PARAMS,
-    TOOL_SUMMARY,
+from bioagent.tools._lib.scrna import PARAMS, TOOL_SUMMARY
+from bioagent.tools.run_depth_matched_de.tool import (
+    _DEPTH_ROBUST_MIN_FRACTION,
     _depth_match_targets,
+    _depth_robust_genes,
+    _depth_verdict,
     _spearman,
-    scrna_catalog,
+    _with_depth_direction,
 )
+from bioagent.tools.catalog import scrna_catalog
 
 
 # --- the matcher ------------------------------------------------------------------------------
@@ -92,3 +95,78 @@ def test_the_container_cli_can_dispatch_it():
 def test_the_description_warns_the_model_off_writing_it_by_hand():
     tool = next(t for t in scrna_catalog() if t.name == "run_depth_matched_de")
     assert "run_code" in tool.description and "not a computable operation" in tool.description
+
+
+# --- the direction asymmetry ------------------------------------------------------------------
+# Depth inflates detection in the DEEPER arm, so it can only manufacture apparent up-regulation
+# there. Treating both directions with one rule is what let a run report "0 of 8 rankings
+# survived" about genes the gradient could never have produced. See scrna_pack for the story.
+
+def test_the_gradient_pushes_up_in_whichever_arm_is_deeper():
+    assert _with_depth_direction(deeper_is_test=True) == "up"      # test arm deeper -> fake "up"
+    assert _with_depth_direction(deeper_is_test=False) == "down"   # ref arm deeper  -> fake "down"
+
+
+def test_a_ranking_that_runs_against_the_gradient_is_never_called_an_artefact():
+    # Same collapsed rho, opposite meaning. WITH the gradient it is evidence of an artefact;
+    # AGAINST it, depth cannot have produced the genes — and down-sampling cannot confirm them
+    # either, so the tool reports that it has no verdict rather than a false one.
+    assert _depth_verdict(0.03, against_depth=False) == "weak"
+    assert _depth_verdict(0.03, against_depth=True) == "against_depth_untestable"
+    assert _depth_verdict(-0.4, against_depth=False) == "inverted"
+    assert _depth_verdict(-0.4, against_depth=True) == "against_depth_untestable"
+
+
+def test_a_surviving_ranking_is_preserved_whichever_way_it_runs():
+    assert _depth_verdict(0.8, against_depth=False) == "preserved"
+    assert _depth_verdict(0.8, against_depth=True) == "preserved"
+
+
+def test_an_uncomputable_rho_is_not_reported_as_an_inversion():
+    assert _depth_verdict(None, against_depth=False) == "weak"
+
+
+# --- what "depth-robust" means ------------------------------------------------------------------
+
+def test_a_gene_whose_effect_collapses_is_not_robust_even_though_its_sign_holds():
+    # The counter-example that ruled out a sign-only rule: 3.0 -> 0.02 keeps the sign and means
+    # nothing.
+    assert _depth_robust_genes(["A"], {"A": 3.0}, {"A": 0.02}) == []
+
+
+def test_a_gene_that_flips_sign_is_not_robust_however_large_it_stays():
+    assert _depth_robust_genes(["A"], {"A": -2.0}, {"A": 2.0}) == []
+
+
+def test_a_gene_that_keeps_its_sign_and_most_of_its_effect_is_robust():
+    # ...even though a strict top-N rank rule would have dropped it. This is the case that used to
+    # return 0 of 400.
+    assert _depth_robust_genes(["A"], {"A": -1.5}, {"A": -1.4}) == ["A"]   # 93% of the effect
+    assert _depth_robust_genes(["A"], {"A": -1.5}, {"A": -1.3}) == ["A"]   # 87%, still over 0.8
+    assert _depth_robust_genes(["A"], {"A": -1.5}, {"A": -1.1}) == []      # 73%, under the floor
+
+
+def test_a_gene_missing_from_the_matched_ranking_is_not_silently_robust():
+    assert _depth_robust_genes(["A", "B"], {"A": 1.0, "B": 1.0}, {"A": 0.9}) == ["A"]
+
+
+def test_the_robustness_floor_is_a_fraction_of_the_original_effect():
+    assert _depth_robust_genes(["A"], {"A": 4.0}, {"A": 1.0}, min_fraction=0.2) == ["A"]
+    assert _depth_robust_genes(["A"], {"A": 4.0}, {"A": 1.0}, min_fraction=0.5) == []
+
+
+def test_the_z_floor_is_what_separates_signal_from_background():
+    # The log2fc floor passes a gene whose effect is only retained because down-sampling pushed
+    # it down; the Wilcoxon z regresses toward zero for noise and holds for a real effect. Both
+    # rules are kept: the z one is used whenever the statistic is available.
+    orig, matched = {"A": -1.0}, {"A": -1.0}
+    assert _depth_robust_genes(["A"], orig, matched) == ["A"]                       # log2fc rule
+    assert _depth_robust_genes(["A"], orig, matched,
+                               {"A": -20.0}, {"A": -2.0}) == []                     # z collapsed
+    assert _depth_robust_genes(["A"], orig, matched,
+                               {"A": -20.0}, {"A": -18.0}) == ["A"]                 # z held
+
+
+def test_the_threshold_is_the_one_the_control_selected():
+    # Swept in experiments/depth_matched_validation; see the constant's comment for the numbers.
+    assert _DEPTH_ROBUST_MIN_FRACTION == 0.8

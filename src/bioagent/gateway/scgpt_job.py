@@ -60,13 +60,73 @@ class ScgptInferenceResult:
         return {"job": self.job.as_dict(), "predictions_csv": self.predictions_csv}
 
 
+#: Name of the audit record the species step leaves next to the predictions.
+HARMONIZATION_NAME = "species_harmonization.json"
+
+# Runs INSIDE the scGPT container, before inference. The shipped model's vocabulary is HUMAN gene
+# symbols (59,958 of its 60,697 entries are upper-case: TFRC, APOE, RHO) and it predicts 123 human
+# RETINA cell types. A mouse query spells the same genes Tfrc, Apoe, Rho, so exact matching kept 17
+# of 33,696 genes on the DDX41 retina object; normalising 15,307 cells over 17 genes divides by zero
+# and the job died in log1p with "Input contains NaN". Case-folding recovers 16,599 genes and all 18
+# canonical retinal markers — what stays unmatched is overwhelmingly Gm*/…Rik/ENSMUSG predicted genes
+# with no human name at all.
+#
+# Applied only when it clearly helps (>=5x the exact overlap AND >=1000 more genes), so a human query
+# — whose exact overlap is already high — passes through untouched. Either way the decision and both
+# overlap counts are written to species_harmonization.json, because cross-species label transfer is
+# an ASSUMPTION the report has to state, not a detail it may leave out.
+_HARMONIZE_PY = r"""
+import json, sys
+import anndata as ad
+inp, vocab_path, out_h5ad, report_path = sys.argv[1:5]
+vocab = json.load(open(vocab_path))
+a = ad.read_h5ad(inp)
+genes = [str(g) for g in a.var_names]
+exact = sum(g in vocab for g in genes)
+upper = sum(g.upper() in vocab for g in genes)
+rule = "none"
+if upper >= max(5 * exact, exact + 1000):
+    rule = "uppercase"
+    a.var_names = [g.upper() for g in genes]
+    a.var_names_make_unique()
+    if a.raw is not None:
+        raw = a.raw.to_adata()
+        raw.var_names = [str(g).upper() for g in raw.var_names]
+        raw.var_names_make_unique()
+        a.raw = raw
+    a.write_h5ad(out_h5ad)
+json.dump({"genes": len(genes), "exact_match": exact, "uppercase_match": upper, "rule": rule,
+           "assumption": ("query gene symbols were case-folded onto the model's human-symbol "
+                          "vocabulary; orthology is assumed by NAME, and labels are transferred "
+                          "across species") if rule == "uppercase" else None},
+          open(report_path, "w"), indent=2)
+print("species harmonization: %s (exact %d -> uppercase %d of %d)" % (rule, exact, upper, len(genes)))
+"""
+
+
 def build_scgpt_command(settings: HPCSettings, *, input_h5ad: str, model_dir: str, out_dir: str) -> str:
-    """The in-container scGPT step-2 command, fed --input/--model/--out (all quoted)."""
+    """The in-container scGPT step-2 command, fed --input/--model/--out (all quoted), preceded by
+    the species-harmonization step. The harmonizer is shipped base64-encoded in the command itself
+    so it needs no source sync and no image rebuild, and is written to ``out_dir`` for audit."""
+    import base64
+
+    out = out_dir.rstrip("/")
+    prog = f"{out}/harmonize_species.py"
+    harmonized = f"{out}/query_harmonized.h5ad"
+    b64 = base64.b64encode(_HARMONIZE_PY.encode()).decode()
+    q = shlex.quote
     return (
+        # Fail HERE, with the harmonizer's own error, rather than letting inference run on an input
+        # it cannot use and die later in log1p with a NaN that points nowhere near the cause.
+        f"echo {b64} | base64 -d > {q(prog)} && "
+        f"python {q(prog)} {q(input_h5ad)} {q(model_dir.rstrip('/') + '/vocab.json')} "
+        f"{q(harmonized)} {q(out + '/' + HARMONIZATION_NAME)} || exit 1; "
+        # Use the harmonized copy only if the step wrote one; otherwise the original, unchanged.
+        f"INPUT={q(input_h5ad)}; if [ -f {q(harmonized)} ]; then INPUT={q(harmonized)}; fi; "
         f"{settings.scgpt_entrypoint} "
-        f"--input {shlex.quote(input_h5ad)} "
-        f"--model {shlex.quote(model_dir)} "
-        f"--out {shlex.quote(out_dir)}"
+        f"--input \"$INPUT\" "
+        f"--model {q(model_dir)} "
+        f"--out {q(out_dir)}"
     )
 
 
@@ -103,6 +163,7 @@ def build_scgpt_script(
         time_limit=settings.time_limit,
         account=settings.account or "",
         gres=settings.scgpt_gres,           # "gpu:1" (any card) — decoupled from the LLM's A100 pin
+        exclude=settings.exclude or "",     # keep GPU jobs off known-dead nodes
         container_module=settings.container_module,
         log_dir=out_dir,
     )

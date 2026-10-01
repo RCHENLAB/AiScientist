@@ -6,7 +6,7 @@ BioAgent runs **when `BIOAGENT_PHENOTYPE_ON_HPC=1`**. It sits **downstream of th
 HPO terms with those findings into a **per-disease post-test probability** ("RP 70% / LCA 20% / …") —
 the calibrated confidence Rui Chen asked for.
 
-The orchestration that *runs* the image is built + offline-tested (`src/bioagent/tools/phenotype_dx.py`
+The orchestration that *runs* the image is built + offline-tested (`src/bioagent/tools/run_lirical/tool.py`
 + `phenotype_cli.py`, driven by `SlurmAnalysisExecutor` with an injected runner — no cluster, no
 LIRICAL, no network in CI: `tests/test_phenotype_dx.py`). This folder is the **image + data build kit**.
 

@@ -354,3 +354,180 @@ def test_run_lab_skips_report_when_plan_is_cancelled(tmp_path, monkeypatch):
     # No run_state.json written for a cancelled run (nothing to resume/regenerate).
     assert run_id is None or not (conn.workspace / run_id / "artifacts" / "process" / "run_state.json").exists()
     assert conn.chat_running is False
+
+
+# --- Stop covers the write-up too --------------------------------------------
+#
+# The first Stop ends the ANALYSIS loop and nothing more: the tail below it (report → literature →
+# self-review → PDF/DOCX render → post-render reviews → technical report) always ran, by design, so
+# a stopped run still ships a manuscript for the steps that completed. That salvage is worth
+# keeping — but it is five more model calls and two renders (run ed4cfce52a2a: 11 minutes on a
+# metered model, after a button that said "ending the current run"), and there was no way out of
+# it. A second Stop is now that way out.
+
+def test_a_second_stop_escalates_to_abandoning_the_write_up():
+    conn = _conn(chat_running=True)
+    run = conn.begin_run("conv-A")
+    conn.bind_run_id(run, "runA")
+    client = TestClient(gw_app.app)
+
+    r = client.post("/api/chat/stop", json={"connection_id": conn.id, "conversation_id": "conv-A"})
+    assert r.json()["status"] == "stopping"
+    assert run.chat_stop.is_set() and not run.hard_stop.is_set()   # analysis only — write-up still runs
+
+    r = client.post("/api/chat/stop", json={"connection_id": conn.id, "conversation_id": "conv-A"})
+    assert r.json()["status"] == "abandoning"
+    assert run.hard_stop.is_set()
+
+
+def _stopped_lab_result(question="analyze this"):
+    """A LabResult shaped like a mid-run Stop: one accepted round, not converged. This is the case
+    _run_produced_nothing deliberately lets through to the write-up."""
+    from bioagent.agents.research_lab import CriticVerdict, LabResult, LabRound
+    rnd = LabRound(1, 1, "Run QC", "Scientist",
+                   {"final_answer": "3,000 cells passed QC.", "evidence": []},
+                   CriticVerdict("accept", 0.9, ""))
+    return LabResult(question, ["Run QC", "Cluster"], [rnd], False, 1,
+                     "Run stopped by the user before completion — 1/2 planned steps completed:\n"
+                     "- Step 1 (Run QC): 3,000 cells passed QC.")
+
+
+def _lab_stopped_during(conn, monkeypatch, *, presses: int):
+    """Install a ResearchLab double whose loop is interrupted by `presses` Stop clicks, exactly as
+    the endpoint would set them — mid-run, i.e. AFTER _run_lab has armed the run's flags."""
+    from bioagent.agents import research_lab as rl
+
+    class _FakeLab:
+        def __init__(self, *a, **k):
+            self.guidance = None
+            self.protocols = []
+            self.self_sourced = ""
+            self.execution_profile = {}
+
+        # **_kw so a new optional control callable on ResearchLab.run does not break the double.
+        def run(self, question, on_event=None, plan_review=None, should_cancel=None,
+                pull_injections=None, resume=None, decision_review=None, **_kw):
+            run = conn.active_run
+            if presses >= 1:
+                run.chat_stop.set()
+            if presses >= 2:
+                run.hard_stop.set()
+            return _stopped_lab_result(question)
+
+    monkeypatch.setattr(rl, "ResearchLab", _FakeLab)
+    monkeypatch.setattr(conn, "_publish", lambda payload: None)
+    return gw_app.LabRequest(connection_id=conn.id, question="analyze this", conversation_id="conv-1")
+
+
+def test_run_lab_still_writes_up_a_single_stop(tmp_path, monkeypatch):
+    """The salvage path, pinned. Without it the escalation test below could pass because the
+    write-up broke rather than because Stop skipped it."""
+    conn = _conn(tmp_path)
+    req = _lab_stopped_during(conn, monkeypatch, presses=1)
+    called: list[str] = []
+    monkeypatch.setattr(gw_app, "_build_report", lambda *a, **k: called.append("report") or "# R\n")
+    monkeypatch.setattr(gw_app, "_review_and_finalize_report",
+                        lambda md, *a, **k: called.append("review") or md)
+    conn.begin_run("conv-1")
+    asyncio.run(gw_app._run_lab(conn, req))
+
+    assert called == ["report", "review"]                 # the model still wrote the manuscript
+
+
+def test_a_second_stop_skips_the_model_written_write_up_but_keeps_the_bundle(tmp_path, monkeypatch):
+    """Escalated Stop: no report call, no self-review, no render, no technical report — and still a
+    report.md and a resumable run_state, because every result they describe was already on disk
+    before Stop was pressed. Abandoning costs prose, never data."""
+    conn = _conn(tmp_path)
+    req = _lab_stopped_during(conn, monkeypatch, presses=2)
+
+    def _boom(name):
+        def _fail(*a, **k):
+            raise AssertionError(f"{name} must not run once the user abandoned the write-up")
+        return _fail
+
+    for fn in ("_build_report", "_review_and_finalize_report", "_build_technical_report"):
+        monkeypatch.setattr(gw_app, fn, _boom(fn))
+    # _run_lab imports the renderer inside the function, so patch it at its source module.
+    from bioagent.reporting import report as report_mod
+    monkeypatch.setattr(report_mod, "build_pdf_report", _boom("build_pdf_report"))
+
+    conn.begin_run("conv-1")
+    asyncio.run(gw_app._run_lab(conn, req))
+
+    run_id = conn.last_run_id
+    assert run_id, "an abandoned write-up still leaves a remembered, resumable run"
+    art = conn.workspace / run_id / "artifacts"
+    md = (art / "report" / "report.md").read_text()
+    assert "write-up skipped" in md.lower()
+    assert "1/2 planned steps completed" in md            # what actually ran is still stated
+    assert (art / "process" / "run_state.json").exists()  # …and the run can still be resumed
+
+
+def test_an_abandoned_write_up_does_not_leak_into_the_next_run(tmp_path, monkeypatch):
+    """_run_lab REUSES ``conn.active_run`` when one exists, so a stop flag left set by a previous
+    run would make the next run skip its own report having never been stopped. Worth pinning: the
+    symptom (a missing manuscript) looks nothing like the cause."""
+    conn = _conn(tmp_path)
+    req = _lab_stopped_during(conn, monkeypatch, presses=0)
+    called: list[str] = []
+    monkeypatch.setattr(gw_app, "_build_report", lambda *a, **k: called.append("report") or "# R\n")
+    monkeypatch.setattr(gw_app, "_review_and_finalize_report", lambda md, *a, **k: md)
+
+    run = conn.begin_run("conv-1")
+    run.chat_stop.set()
+    run.hard_stop.set()                                   # left over from a PREVIOUS, abandoned run
+    asyncio.run(gw_app._run_lab(conn, req))
+
+    assert called == ["report"]                           # armed fresh — this run wrote its report
+
+
+# --- decision points and Stop ------------------------------------------------------------------
+
+
+class _Fork:
+    goal = "Step failed after 3 attempts: Validate existing labels"
+    options = ["Retry with a narrower panel", "Skip this step"]
+
+
+def test_a_decision_raised_after_stop_is_not_asked():
+    """Run f107bcf7b660: Stop x2 ended the step, the failed step then raised a failure fork, and
+    the stopped run waited out the full timeout on a card nobody would answer."""
+    conn = _conn(chat_running=True)
+    run = conn.begin_run("conv-A")
+    run.chat_stop.set()
+    pushed: list[dict] = []
+    conn.push = pushed.append
+    out = gw_app._decision_review(conn, lambda *a, **k: None, _Fork(), timeout=30)
+    assert out == {"action": "cancel"}
+    assert pushed == [] and run.pending_plan is None
+
+
+def test_a_decision_is_asked_and_answered_when_the_run_is_live():
+    import threading
+    conn = _conn(chat_running=True)
+    run = conn.begin_run("conv-A")
+    pushed: list[dict] = []
+    conn.push = pushed.append
+
+    def answer():
+        for _ in range(200):
+            if run.pending_plan is not None:
+                run.plan_value = {"action": "approve", "feedback": "Skip this step"}
+                run.plan_event.set()
+                return
+            threading.Event().wait(0.01)
+
+    threading.Thread(target=answer, daemon=True).start()
+    out = gw_app._decision_review(conn, lambda *a, **k: None, _Fork(), timeout=5)
+    assert out == {"action": "proceed", "choice": "Skip this step"}
+    assert pushed and pushed[0]["type"] == "decision_prompt"
+    assert run.pending_plan is None
+
+
+def test_an_unanswered_decision_proceeds_on_the_agents_judgment():
+    conn = _conn(chat_running=True)
+    conn.begin_run("conv-A")
+    conn.push = lambda *_a: None
+    out = gw_app._decision_review(conn, lambda *a, **k: None, _Fork(), timeout=0.05)
+    assert out == {"action": "proceed", "timed_out": True}

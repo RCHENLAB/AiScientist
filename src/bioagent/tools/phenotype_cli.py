@@ -44,7 +44,7 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None,
     hpo_terms = args.get("hpo_terms") or []
     if not hpo_terms:
         return {"status": "error", "error": "run_lirical needs a non-empty hpo_terms list"}
-    from .phenotype_dx import run_lirical
+    from .run_lirical.tool import run_lirical
     return run_lirical(
         hpo_terms=hpo_terms,
         excluded_hpo=args.get("excluded_hpo") or (),

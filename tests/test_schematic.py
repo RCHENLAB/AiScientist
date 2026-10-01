@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import types
 
-from bioagent.tools import schematic
+from bioagent.tools.make_schematic import tool as schematic
 
 
 def test_workflow_dot_is_deterministic_and_ordered():

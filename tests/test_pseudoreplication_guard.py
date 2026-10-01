@@ -28,7 +28,9 @@ import anndata as ad  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from bioagent.tools import scrna_pack  # noqa: E402
+from bioagent.tools._lib import scrna as scrna_lib  # noqa: E402
+from bioagent.tools.run_de import tool as run_de_tool
+from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _ctx(tmp_path, dataset):
@@ -57,7 +59,7 @@ def _retina_like(tmp_path, *, n_cells=300, sample_levels=("s1",)):
 
 
 def _qc(tmp_path, dataset):
-    out = scrna_pack.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0},
+    out = run_scanpy_qc_tool.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0},
                                    _ctx(tmp_path, dataset))
     assert out["status"] == "ok"
     return _ctx(tmp_path, dataset)
@@ -68,7 +70,7 @@ def _qc(tmp_path, dataset):
 
 def test_pooling_every_cell_type_across_a_condition_is_refused(tmp_path):
     ctx = _qc(tmp_path, _retina_like(tmp_path))
-    out = scrna_pack.run_de({"groupby": "sampleid"}, ctx)
+    out = run_de_tool.run_de({"groupby": "sampleid"}, ctx)
 
     assert out["status"] == "error"
     err = out["error"]
@@ -85,13 +87,13 @@ def test_pooling_every_cell_type_across_a_condition_is_refused(tmp_path):
 def test_the_refusal_states_how_much_replication_there_actually_is(tmp_path):
     """The number that decides which test is legal. A refusal that omits it just moves the
     guesswork one step later."""
-    one = scrna_pack.run_de({"groupby": "sampleid"}, _qc(tmp_path, _retina_like(tmp_path)))
+    one = run_de_tool.run_de({"groupby": "sampleid"}, _qc(tmp_path, _retina_like(tmp_path)))
     assert "orig.ident" in one["error"]
     assert "1 distinct value" in one["error"]
 
     many = tmp_path / "many"
     many.mkdir()
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "sampleid"},
         _qc(many, _retina_like(many, sample_levels=("s1", "s2", "s3", "s4"))))
     assert "4 distinct value" in out["error"]
@@ -107,7 +109,7 @@ def test_a_dataset_with_no_sample_column_at_all_is_told_so(tmp_path):
     p = tmp_path / "bare.h5ad"
     adata.write(p)
 
-    out = scrna_pack.run_de({"groupby": "condition"}, _qc(tmp_path, p))
+    out = run_de_tool.run_de({"groupby": "condition"}, _qc(tmp_path, p))
     assert out["status"] == "error"
     assert "no replication information at all" in out["error"]
 
@@ -117,7 +119,7 @@ def test_a_dataset_with_no_sample_column_at_all_is_told_so(tmp_path):
 
 def test_marker_analysis_on_the_cell_type_column_is_untouched(tmp_path):
     """The valid use of this tool. A guard that also blocked markers would just be turned off."""
-    out = scrna_pack.run_de({"groupby": "majorclass"}, _qc(tmp_path, _retina_like(tmp_path)))
+    out = run_de_tool.run_de({"groupby": "majorclass"}, _qc(tmp_path, _retina_like(tmp_path)))
     assert out["status"] == "ok"
     assert not any("pseudorepl" in w.lower() for w in out.get("warnings", []))
 
@@ -126,7 +128,7 @@ def test_a_stratified_contrast_runs_but_is_labelled_exploratory(tmp_path):
     """The protocol's documented no-replicates path. Stratifying removes the composition confound
     but not the pseudoreplication, so it runs — carrying the label that keeps its output from being
     written up as inferential DE."""
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "sampleid", "reference": "WT", "stratify_by": "majorclass"},
         _qc(tmp_path, _retina_like(tmp_path)))
 
@@ -139,7 +141,7 @@ def test_a_stratified_contrast_runs_but_is_labelled_exploratory(tmp_path):
 def test_force_runs_the_pooled_test_and_says_what_it_just_did(tmp_path):
     """`force` is a deliberate override, not a way to make the problem go away: the result carries
     the label so a downstream writer cannot present it as ordinary DE."""
-    out = scrna_pack.run_de({"groupby": "sampleid", "force": True},
+    out = run_de_tool.run_de({"groupby": "sampleid", "force": True},
                             _qc(tmp_path, _retina_like(tmp_path)))
 
     assert out["status"] == "ok"
@@ -156,11 +158,11 @@ def test_orig_ident_reads_as_a_library_id_not_a_cell_type():
     """`ident` is a cell-type hint (Seurat's `Idents`), so `orig.ident` matched BOTH heuristics.
     It is a library id essentially always, and letting it read as a cell-type column would have it
     offered as a stratification target."""
-    assert scrna_pack._looks_like_condition_column("orig.ident")
-    assert not scrna_pack._looks_like_celltype_column("orig.ident")
-    assert scrna_pack._looks_like_celltype_column("majorclass")
-    assert scrna_pack._looks_like_celltype_column("celltype")
-    assert not scrna_pack._looks_like_condition_column("majorclass")
+    assert scrna_lib._looks_like_condition_column("orig.ident")
+    assert not scrna_lib._looks_like_celltype_column("orig.ident")
+    assert scrna_lib._looks_like_celltype_column("majorclass")
+    assert scrna_lib._looks_like_celltype_column("celltype")
+    assert not scrna_lib._looks_like_condition_column("majorclass")
 
 
 # --- the analyses a labelled two-arm dataset actually needs -------------------
@@ -174,10 +176,11 @@ def test_composition_runs_off_qc_when_the_labels_already_exist(tmp_path):
     """`run_de` was fixed to accept the QC checkpoint; `run_composition` was missed. It demanded
     `run_clustering` — the step the protocol explicitly forbids on a labelled dataset — so the
     analysis a two-arm annotated study needs FIRST refused to run on exactly those studies."""
-    from bioagent.tools import scrna_advanced
+    from bioagent.tools.run_composition import tool as run_composition_tool
+    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))
-    out = scrna_advanced.run_composition(
+    out = run_composition_tool.run_composition(
         {"group_key": "majorclass", "sample_key": "orig.ident", "condition_key": "sampleid"}, ctx)
     assert out["status"] == "ok", out.get("error")
 
@@ -190,10 +193,11 @@ def test_composition_reports_per_arm_proportions_even_with_one_library(tmp_path)
     object. On the real dataset that hid a 3x depletion of Cone cells between the arms — the shift
     that makes a pooled DE result unreadable as expression change.
     """
-    from bioagent.tools import scrna_advanced
+    from bioagent.tools.run_composition import tool as run_composition_tool
+    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))          # `orig.ident` holds ONE value
-    out = scrna_advanced.run_composition(
+    out = run_composition_tool.run_composition(
         {"group_key": "majorclass", "sample_key": "orig.ident", "condition_key": "sampleid"}, ctx)
 
     assert out["tested"] is False                         # one library — no test is valid
@@ -209,10 +213,11 @@ def test_pseudobulk_names_the_finding_instead_of_blaming_the_metadata(tmp_path):
     """Refusing is correct; the diagnosis was not. A one-library study got 'check the metadata',
     sending the reader after a bug that does not exist — the metadata is fine, the STUDY has no
     replicates, and that is the thing to report."""
-    from bioagent.tools import scrna_advanced
+    from bioagent.tools.run_composition import tool as run_composition_tool
+    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))
-    out = scrna_advanced.run_pseudobulk_de(
+    out = run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "orig.ident", "condition_key": "sampleid", "group_key": "majorclass"}, ctx)
 
     assert out["status"] == "error"
@@ -230,7 +235,7 @@ def test_the_significant_count_is_a_count_not_the_cap(tmp_path):
     table is right; truncating the count and still calling it a count is not.
     """
     ctx = _qc(tmp_path, _retina_like(tmp_path, n_cells=900))
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "sampleid", "reference": "WT", "stratify_by": "majorclass",
          "n_genes": 2, "padj": 1.1, "lfc": 0},   # padj>1 + no lfc floor = every tested gene
         ctx)

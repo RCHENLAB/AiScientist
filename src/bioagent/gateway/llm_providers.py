@@ -171,23 +171,58 @@ def _request(url: str, api_key: str, payload: dict | None, timeout: float) -> tu
         return exc.code, exc.read().decode("utf-8", errors="replace")
 
 
-def list_models(base_url: str, api_key: str, timeout: float = _TIMEOUT) -> list[str]:
-    """Live model ids from ``GET /models``, or ``[]`` when the endpoint doesn't serve one.
-    Best-effort by design: a missing model list is a UI inconvenience, not a failure."""
+@dataclass(frozen=True)
+class ModelsResult:
+    """The outcome of asking an endpoint what it serves — WHY it came back empty, not just that
+    it did. ``list_models`` throws that away on purpose (a missing list is a UI inconvenience
+    mid-verification); the model picker cannot, because "no models" and "wrong key" and "wrong
+    URL" need three different things from the user and look identical as an empty list."""
+
+    ok: bool
+    # 'ok' | 'auth' | 'credit' | 'model' | 'endpoint' | 'network' | 'unsupported'
+    cause: str
+    message: str
+    models: list[str] = field(default_factory=list)
+
+
+def probe_models(base_url: str, api_key: str, timeout: float = _TIMEOUT) -> ModelsResult:
+    """``GET /models`` with the reason attached. Used by the credential dialog so a user can see
+    the model ids BEFORE saving anything — which is the only order that works, since a credential
+    with no model id is refused at bind time and the ids live on the endpoint, not in our heads."""
+    base = normalize_base_url(base_url)
+    if not base:
+        return ModelsResult(False, "endpoint", "Enter the base URL first.")
+    if not api_key:
+        return ModelsResult(False, "auth", "Listing models needs the API key.")
     try:
-        status, body = _request(f"{normalize_base_url(base_url)}/models", api_key, None, timeout)
-    except (urllib.error.URLError, OSError, ValueError):
-        return []
+        status, body = _request(f"{base}/models", api_key, None, timeout)
+    except urllib.error.URLError as exc:
+        return ModelsResult(False, "network", f"Could not reach {base}: {exc.reason}")
+    except (OSError, ValueError) as exc:
+        return ModelsResult(False, "network", f"Could not reach {base}: {exc}")
+
     if status != 200:
-        return []
+        cause, message = _classify(status, body)
+        detail = _scrub(body, api_key)[:200].strip()
+        return ModelsResult(False, cause, f"{message} ({detail})" if detail else message)
     try:
         parsed = json.loads(body)
     except ValueError:
-        return []
+        return ModelsResult(False, "endpoint", f"{base}/models did not answer with JSON.")
     rows = parsed.get("data") if isinstance(parsed, dict) else None
-    if not isinstance(rows, list):
-        return []
-    return [str(r.get("id")) for r in rows if isinstance(r, dict) and r.get("id")]
+    models = ([str(r.get("id")) for r in rows if isinstance(r, dict) and r.get("id")]
+              if isinstance(rows, list) else [])
+    if not models:
+        # The key authenticated (HTTP 200) — this endpoint simply doesn't publish a catalogue.
+        return ModelsResult(False, "unsupported",
+                            "This endpoint does not publish a model list — type the model id.")
+    return ModelsResult(True, "ok", f"{len(models)} models available.", models)
+
+
+def list_models(base_url: str, api_key: str, timeout: float = _TIMEOUT) -> list[str]:
+    """Live model ids from ``GET /models``, or ``[]`` when the endpoint doesn't serve one.
+    Best-effort by design: a missing model list is a UI inconvenience, not a failure."""
+    return probe_models(base_url, api_key, timeout).models
 
 
 def _classify(status: int, body: str) -> tuple[str, str]:

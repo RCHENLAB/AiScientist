@@ -18,6 +18,237 @@ created by Claude then reworked by a human.
 
 ## Change log (newest first)
 
+### 2026-09-30 — `claude` — public mirror: publish script; `.publicexclude` emptied
+- **Added:** `scripts/publish_public_mirror.py` (builds the RCHENLAB/AiScientist snapshot, checks
+  every file for credentials, syncs into a clone; never commits or pushes) and
+  `tests/test_publish_public_mirror.py`.
+- **Changed:** `.publicexclude` keeps its header but lists no paths. The decks, `docs/decks/build_deck.js`,
+  `reports/aiscientist-manual/`, `RETIGENE_PAPER_RECOVERY_HANDOFF.md` and the proposal PDF are now
+  published.
+- **Why:** Yijun's policy, 2026-09-30: the public mirror carries everything except credentials.
+
+### 2026-09-30 — `claude` — one folder per tool; docs/architecture; split tooling
+- **Moved / split (by `scripts/refactor/split_tools.py`, re-runnable):** `tools/dataset_inspect.py` →
+  `tools/inspect_dataset/tool.py`; `literature_search.py` → `literature_search/tool.py`; `paperqa_search.py`
+  → `deep_literature/tool.py`; `variant_annotation.py`, `vcf_offline.py`, `ird_annotate.py`,
+  `ird_prioritize.py` → `annotate_variants/` (`tool.py`, `offline.py`, ...); `phenotype_evidence.py` →
+  `diagnose_disease/evidence.py`; `schematic.py` → `make_schematic/tool.py`; `scgpt_annotate.py` →
+  `scgpt_annotate/tool.py`; `hpo_terms/` → `map_phenotype_to_hpo/` (`mapper.py` → `tool.py`).
+  `scrna_pack.py` + `scrna_advanced.py` → eleven `run_*/tool.py` folders + `tools/_lib/scrna.py`;
+  `phenotype_dx.py` → `run_lirical/tool.py` + `diagnose_disease/tool.py`.
+- **Added:** `tools/<name>/TOOL.md` (20; manifest + documentation), `tools/README.md` (generated
+  index), `tools/catalog.py` (discovery), `tools/_lib/`, `scripts/tool_docs.py` (doc generator),
+  `scripts/refactor/split_tools.py` and `scripts/refactor/extract_repos.py` (split tooling),
+  `docs/architecture/` (README + REPO_SPLIT, en + zh-CN), tests `test_tool_catalog.py`,
+  `test_tool_manifests.py`, `test_registry_manifests.py`, `test_tool_contract.py`,
+  `test_tools_boundary.py`, `test_skills_library.py`, `test_pysrc_sync.py`, `test_tools_data_paths.py`.
+- **Unchanged on purpose:** the job entry points `tools/{scrna,variant,phenotype,paperqa}_cli.py`
+  (baked into image runscripts), `tools/genesets/` (the deploy fills it), `tools/gene_panels/`.
+- **Why:** prepare the split into AiScientist / AiScientist-tools / AiScientist-skills with low
+  coupling and documentation per tool (`docs/architecture/REPO_SPLIT.md`).
+
+### 2026-09-30 — `claude` — platform code moved out of `tools/` (`reporting/`, `hpc/shell.py`)
+- **Moved (git mv, history kept):** `tools/report.py`, `tools/research_bundle.py`,
+  `tools/visual_review.py`, `tools/vlreview_run.py`, `tools/literature_references.py` →
+  `src/bioagent/reporting/` (new package); `tools/hpc_shell.py` → `src/bioagent/hpc/shell.py`.
+  The vision-review job now runs `python -m bioagent.reporting.vlreview_run`;
+  `deploy/vlreview/run_review.py` stays byte-identical to it (its test checks the new path).
+- **Kept in `tools/`:** `datasets.py` and `execution.py` (the dataset profile and the smoke QC/DE).
+  They looked like platform code, but the profile runs inside analysis.sif as the analysis line's
+  `preflight` step, so they are domain code; the platform reaches them through `tools/api.py`.
+- **`tools/__init__.py`** no longer re-exports anything (it is imported at gateway start-up and
+  inside the job images).
+- **Why:** `tools/` is becoming the AiScientist-tools package and must hold only what the model
+  calls plus its runtime. The model never calls the report renderer, the bundle writer or the HPC3
+  shell session (its eight shell tools are platform tools, like `run_code`).
+
+### 2026-09-30 — `claude` — the tools' contract (`tools/sdk.py`), public surface (`tools/api.py`), boundary test
+- **Added:** `src/bioagent/tools/sdk.py`. `HarnessTool` moved here unchanged (re-exported by
+  `agents/research_harness.py`), plus the `ToolContext` protocol and `session_chat_fn` /
+  `register_llm_backend`, which replace the tools' direct imports of `gateway.vllm_client`
+  (`gateway/vllm_client.py` registers itself at import). The per-run `SITECUSTOMIZE` text moved from
+  `gateway/package_cache.py` to `tools/run_deps.py` (package_cache imports it back).
+- **Added:** `src/bioagent/tools/api.py`, the only door from the platform into the tools besides
+  `sdk`: a lazy name table (private helpers get public names here) and the HPC3 job entry-point
+  module paths. Every gateway/agents import of a tool module now goes through it.
+- **Added:** `tests/test_repo_boundaries.py`: tools import nothing from the platform; the platform
+  imports tools only through `sdk`/`api`; every `api` name resolves; `sdk` is stdlib-only.
+- **Why:** first step of the three-repo split (AiScientist / AiScientist-tools / AiScientist-skills,
+  branch `claude/aiscientist-architecture-refactor-b0fcaa`). With the contract in place, the tools can
+  be reorganised one folder per tool without touching the platform.
+
+### 2026-09-30 — `claude` — add `src/bioagent/tools/run_deps.py` + `tests/test_run_deps.py`
+- **Added:** `src/bioagent/tools/run_deps.py`. When a curated analysis tool reports a DECLARED
+  dependency missing (`ALLOWED`, pinned in code; first entry scikit-image for doublet detection),
+  the Slurm analysis executor installs it into the run's own HPC3 workspace (`<run>/_deps`) and
+  retries the tool. It runs in-container through `scrna_cli` (`_install_dependency`, not a model
+  tool) and is deleted when the run is published.
+- **Added:** `tests/test_run_deps.py` (7 tests): refusal of undeclared names, pruning of what the
+  image provides, appended-not-prepended import, failure cleanup, reuse. The executor cases went
+  into `test_slurm_analysis.py`.
+- **Why a new module:** it runs inside the container, like `scrna_cli`, so it lives with the tools
+  rather than in the gateway. It is named after its scope (dependencies for one run) to keep it
+  apart from the lab-shared `gateway/package_cache.py`.
+
+### 2026-09-29 — `claude` — add `tests/test_tool_input.py`
+- **Added:** `tests/test_tool_input.py` (12 tests). It pins the analysis tools' new `input` parameter,
+  which lets a tool read a file a run_code step wrote instead of only the previous tool's fixed-name
+  checkpoint. It covers where `input` may point (only inside the run's work/ and artifacts/), that
+  the default chain is unchanged, the "QC done in run_code" dead end, and GSEA on the model's own
+  `.rnk` files. The advanced tools' `input` cases went into `test_scrna_advanced.py`; the
+  mitochondrial-rule cases (`mito_prefix`, `gene_symbols_key`) went into `test_tool_self_diagnosis.py`.
+- **Why a new file:** the parameter spans both tool modules (`scrna_pack`, `scrna_advanced`) and the
+  harness's provenance record. It is named after what it opens up, so it is findable next to
+  `test_tool_result_truncation.py`.
+
+### 2026-09-28 — `claude` — add `tests/test_tool_result_truncation.py`
+- **Added:** `tests/test_tool_result_truncation.py` (8 tests). It pins the rule that the models'
+  shortened views of a tool result drop data, never the keys that say how the result may be
+  reported. The views are the Critic's `result_digest` (30 keys per dict) and the Scientist's
+  4000-character feed (`ResearchHarness._feed_result`). The fixture is run c135ae589d96's 38-key
+  run_de result, key for key.
+- **Why a new file:** the rule spans the harness (feed, digest) and the lab (`_critic` payload). It
+  is named after the failure, so the next "the model never saw X" search finds it.
+
+### 2026-09-28 — `claude` — claim audit + per-role effort / no wall-clock limit
+- **Added:** `src/bioagent/agents/claim_audit.py`. Before the report is written, the candidate headline
+  findings are checked one short question at a time (global shift under a depth gap, gene/cell-type
+  plausibility, pseudoreplicated p/FDR, causal wording). The verdicts bind both writers and are
+  shown in the technical report.
+- **Added:** `tests/test_claim_audit.py`, `tests/test_lab_call_no_wallclock.py`.
+
+### 2026-09-28 — `claude` — a step's answer is checked against its own tool results
+- **Added:** `src/bioagent/agents/step_numbers.py`. It is the deterministic check behind the Critic's
+  second floor. It reads the per-(group, arm) cell counts a step's final answer states, from
+  Markdown tables or lines like "Endothelial (WT: 7, DDX41: 27)", and compares them with what the
+  same step's tools counted (`run_de` `skipped_groups` / `cells_by_group_and_arm`,
+  `run_composition` `cells_by_group_and_arm`). It also treats the dataset profile's
+  `design_by_arm.cells_by_label_and_arm` as a ceiling. It is its own module because the claim
+  extraction is ~450 lines with no other home, and `research_lab.py` only calls three functions.
+- **Added:** `tests/test_step_numbers.py`. It replays run 8847d521ba32, using that run's verbatim
+  answer excerpt and real `run_de` result, with the profile computed from its `Ddx41_DEG.h5ad`. It
+  also covers the precision cases that must NOT be flagged.
+- **Why:** 8847's DE answer swapped the two arms of every skipped cell type and invented a split
+  for the tested ones, while run_de held the right numbers. The Critic accepted it at 0.95 and the
+  report copied it. The report writer had closed-set grounding; the step level had none.
+
+### 2026-09-25 — `claude` — Qwen3.6 vs Qwen3.8 A/B results
+- **Added:** `experiments/plan_vs_exec_ab/results_qwen38/` holds SUMMARY.md plus the raw A/C/judge
+  jsonl for the model swap. Both models were served from our own RTX6000s. Stages A and C only;
+  B (execution) was not run.
+
+### 2026-09-25 — `claude` — the cluster model list (several weight sets on HPC3)
+- **Added:** `src/bioagent/gateway/cluster_models.py`. This is the admin-managed list of weight sets
+  the cluster GPU can serve, each with its own vLLM image, quantization and args. It is stored at
+  `<BIOAGENT_STATE_DIR>/cluster_models.json` (server state, NOT in git) and seeded from the env plus
+  `KNOWN` recipes. It powers the "Cluster GPU · <model>" options and the 🖥 dialog.
+- **Added:** `tests/test_cluster_models.py`.
+
+### 2026-09-14 — `claude` — the environment manifest: what we have and where it is
+- **Added:** `src/bioagent/gateway/environment.py` — the asset/tool manifest. Where the container
+  images, model weights (scGPT, VL review), `.gmt` gene-set libraries, reference data and package
+  cache live, whether THIS session may read each one, and the `file:line` of every tool's
+  implementation. Derived from live code + settings, so it cannot drift. Sibling to
+  `system_info.py`, which answers "which agents/tools exist" for the console; this answers "where
+  are the files, and may I read them" — the question that had no answer anywhere.
+- **Added:** `scripts/write_environment_doc.py` — regenerates `docs/ENVIRONMENT.md` from that same
+  manifest, so the human document and the agent's view cannot disagree.
+- **Added:** `docs/ENVIRONMENT.md` — generated; do not hand-edit.
+- **Added:** `tests/test_environment_manifest.py` — 12 tests. The load-bearing one asserts every
+  tool resolves to a real `file:line`: the first version read `HarnessTool.runner` (the field is
+  `executor`), got `None` for all 21, and rendered a tools table with no locations.
+- **Why:** run `3c5fbc8608a7` lost two capabilities to facts nobody had written down where the
+  agent could read them — the scGPT step could not reach the model directory it was told to
+  verify, and the pathway step went to the network for gene sets that were already on disk in the
+  directory the enrichment tools read from. Both steps behaved correctly; both produced nothing.
+  Reachable by the agent as the `describe_environment` tool (progressive disclosure — fetched when
+  a step needs it, never prepended to every turn).
+
+### 2026-09-14 — `claude` — add `tests/test_literature_step_routing.py`
+- **Added:** `tests/test_literature_step_routing.py` — pins the rule that a plan step's ROLE comes
+  from the tool it declares, not from its prose. Covers the production failure where
+  "Run `scgpt_annotate` … reference-transferred labels" was routed to the literature path (four
+  `literature_search` calls, `scgpt_annotate` never invoked, Critic 0.1, then force-advanced
+  without retry because literature steps do not retry), plus the same trap for `annotate_variants`
+  / `map_phenotype_to_hpo` / `diagnose_disease`, and the reverse regression (a genuine
+  `literature_search` step must still classify as literature).
+- **Why a new file:** the routing rule is agent-loop behaviour shared by the linear loop, the DAG
+  scheduler, the literature backfill and step scoring (13 call sites) — it is not "a research_lab
+  detail", and naming it after the routing decision is what makes it findable the next time a
+  planned tool mysteriously never runs.
+
+### 2026-09-14 — `claude` — add `tests/test_llm_cost_controls.py`
+- **Added:** `tests/test_llm_cost_controls.py` — covers the cost controls on the LLM paths: the
+  per-role remote output ceiling (`vllm_client.lab_max_tokens`), the local `reasoning_effort`
+  field, `complete_ex` returning the provider's `usage`, and the `_call_with_role` adapter that
+  lets an injected `complete_fn` receive a role without breaking the `(messages) -> str` contract
+  every test double and the lab kernel share.
+- **Why a new file rather than extending `test_vllm_client_dialect.py`:** that file is about
+  served-model *dialect* knobs (chat templates for a given model). These are *spend* controls, and
+  they cut across `vllm_client`, `research_lab` and the gateway — a separate name is what makes
+  them findable when a bill, not a model, is the thing being debugged.
+- Related (content-only, no entry needed): `gateway/models.py` gained an `llm_calls` table,
+  `gateway/auth_routes.py` gained `record_llm_call` / `run_llm_cost`, and the two preset pipelines
+  `scgpt_annotation` + `celltype_annotation` gained an interpretation-evidence step.
+
+### 2026-09-05 — `claude` — add `reports/aiscientist-manual/`
+- **Added:** `reports/aiscientist-manual/` — the bilingual AiScientist technical report in
+  manuscript form (Abstract / Introduction / Methods / Results / Discussion / Supplementary),
+  written for Jin's review request. Contents: `manual.zh.md` + `manual.en.md` (sources),
+  `build.sh` (one command → 2 PDFs + 2 DOCX), `header.tex` (LaTeX preamble: table row rules,
+  CJK fonts, float placement), `addrules.py` (post-processes pandoc's `longtable` output to
+  draw a rule between every body row), `ref-bordered.docx` (pandoc reference doc patched to
+  give the `Table` style real borders — the stock one has none), and `shots/` (report-page
+  renders from run `c135ae589d96`, run figures, and production UI screenshots).
+- **Why here, not a scratch dir:** an earlier copy lived in the session scratchpad under
+  `/private/tmp` and was reclaimed by the OS, losing the sources. `reports/` already holds the
+  dated progress reports, so the manuscript belongs beside them.
+- Build: `./reports/aiscientist-manual/build.sh` (needs pandoc, tectonic, and the CJK system
+  fonts Songti SC / PingFang SC). Generated `*.pdf` / `*.docx` are committed alongside the
+  sources so a reader does not need the toolchain.
+- **Committed to the private repo only** — added to `.publicexclude`, so the public
+  RCHENLAB/AiScientist mirror strips it. It carries unpublished DDX41 results, internal UI
+  screenshots and unreleased-model deployment measurements.
+
+### 2026-09-04 — `claude` — rescue `deploy/mmfatlas-service.md` from a dead-history branch
+- **Replaced (content, 161 -> 376 lines):** `deploy/mmfatlas-service.md`, taken verbatim from
+  `claude/mmfatlas-service-setup-7ca4e1` @ `481003a`. Not a merge: that branch shares **no
+  merge-base** with `main` (it sits on the pre-reset history — see the branch-topology note), so
+  its five 2026-08-27 commits could never have arrived by merging. They touch only this one file,
+  which is why lifting the file is both sufficient and safe.
+- Why it was worth rescuing: it supersedes the old note rather than extending it — the confirmed
+  root cause (the app's listening port moves between 5005/5006 while the Service's `targetPort` is
+  hardcoded), the live cluster edits applied on 2026-08-27 with their backup paths, a readiness
+  probe, the ownership boundary (MMFAtlas is **Texera's** CELLxGENE instance, not ours), and a
+  5-command diagnosis runbook. Both prior incidents (2026-07-02, 2026-07-30→31) survive in a
+  "Failure history" table, and the personal admin account the old version named is gone.
+- The rest of that branch is pre-reset history and stays archived under
+  `archive/legacy-history/claude/mmfatlas-service-setup-7ca4e1`.
+
+### 2026-09-04 — `claude` — track `docs/decks/` (it was untracked, and held an irreplaceable source)
+- **Added (previously untracked):** `docs/decks/build_deck.js` + `docs/decks/AiScientist_Technical_Spec_EN.pptx`
+  + `docs/decks/AiScientist_技术规格说明_中文.pptx` — the 2026-07-28 technical-spec deck. Found during a
+  worktree audit as the only untracked path in `main`'s working tree. The `.pptx` pair can be
+  regenerated; `build_deck.js` cannot — it is a 95 KB pptxgenjs source that exists nowhere else
+  (the similarly named `~/Documents/BGI-Interview/build_deck.js` is a different, larger file), so
+  it was one `rm -rf` from gone. All four checksums differ from `reports/AiScientist-*.pptx`, so
+  this is a separate deck, not a duplicate.
+- Tracking the `.pptx` follows the existing precedent in `reports/`; all three are added to
+  `.publicexclude` for the same reason those are — the slides carry unreleased-feature status, and
+  the build script carries the same content in source form.
+- Convention reminder, per the deck rule: **edit `build_deck.js` and regenerate; never edit a `.pptx`
+  by hand.**
+
+### 2026-08-19 — `claude` — add `tests/test_plan_review_report_v25.py`
+- **Added:** `tests/test_plan_review_report_v25.py` — regression tests for the plan-mode defects in
+  Ziyao's `plan_mode_report_v2_5` (B-1 bare-number render / B-3 unregistered tools + illegal param
+  values / B-4 silent redraft loss / B-5 absent-step reference / B-6 ambiguous reference /
+  B-7 stale downstream threshold / C-3 timeout-vs-cancel attribution). Each case is pinned to the
+  production string that produced it, so a later refactor cannot quietly reintroduce a UX failure
+  that took two days of manual testing to characterise. No structural change beyond this one file;
+  everything else in the fix batch is edits to existing modules.
+
+
 ### 2026-08-19 — `claude` — add `deploy/dsv4/` (README, serve sbatch, sm_120 mHC patch); `tests/test_vllm_client_dialect.py`
 - **Added:** `deploy/dsv4/` — DeepSeek-V4-Flash serving kit + the sm_120 blocked-verdict README;
   `tests/test_vllm_client_dialect.py` — env-gated served-model dialect knobs in `vllm_client`
@@ -1398,3 +1629,7 @@ Modified (content, for orientation):
   reworked + committed by `user`.)
 - `src/bioagent/gateway/scgpt_job.py` — Route C GPU batch-inference engine for scGPT.
 - `deploy/` (k8s kit) — public Kubernetes deployment (see HANDOFF 2026-06-18).
+
+## 2026-09-02 — claude
+- **added** `experiments/depth_matched_validation/result-2026-09-02.log` — ground-truth control re-run after the `run_depth_matched_de` selection/robustness/direction fix (main `5ee2b3a`+). The 2026-08-20 log is kept beside it; the README now carries both results, newest first. Committed.
+- **added** `docs/discriminating-hypotheses.md` — design note for the `feat/discriminating-hypotheses` line: why the hypothesis ledger could only confirm, and the rival / gate / contest-adjudication change. Committed on that branch, not on main.

@@ -24,7 +24,9 @@ pytest.importorskip("scanpy")
 import anndata as ad  # noqa: E402
 import numpy as np  # noqa: E402
 
-from bioagent.tools import scrna_pack  # noqa: E402
+from bioagent.tools.run_clustering import tool as run_clustering_tool  # noqa: E402
+from bioagent.tools.run_de import tool as run_de_tool
+from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _dataset(tmp_path, gene_names, *, n_cells=200, mito_frac=0.0):
@@ -55,7 +57,7 @@ ENSEMBL = [f"ENSG{i:08d}" for i in range(100)]
 def test_zero_matched_mito_genes_is_reported_as_a_no_op_filter(tmp_path):
     """The headline defect: the filter silently did nothing, and the result used to look identical
     to a run where it worked."""
-    out = scrna_pack.run_scanpy_qc(
+    out = run_scanpy_qc_tool.run_scanpy_qc(
         {"min_genes": 1, "min_cells": 1, "max_pct_mt": 20.0},
         _ctx(tmp_path, _dataset(tmp_path, ENSEMBL)))
 
@@ -69,13 +71,67 @@ def test_zero_matched_mito_genes_is_reported_as_a_no_op_filter(tmp_path):
 
 
 def test_a_dataset_with_real_mito_genes_reports_the_filter_as_effective(tmp_path):
-    out = scrna_pack.run_scanpy_qc(
+    out = run_scanpy_qc_tool.run_scanpy_qc(
         {"min_genes": 1, "min_cells": 1, "max_pct_mt": 90.0},
         _ctx(tmp_path, _dataset(tmp_path, SYMBOLS)))
 
     assert out["n_mt_genes"] == 5
     assert out["mt_filter_effective"] is True
     assert not [w for w in out["warnings"] if "mitochondrial genes matched" in w]
+
+
+# --- the mitochondrial rule is a parameter, and the warning names the fix -------------------------
+
+
+def _ensembl_keyed(tmp_path, *, n_cells=200, mito_rich=100):
+    """Gene names are Ensembl IDs, symbols live in var['feature_name'] (how cellxgene ships
+    files), and the first `mito_rich` cells carry ~40% of their counts in the 5 mito genes."""
+    rng = np.random.default_rng(1)
+    x = rng.poisson(4.0, (n_cells, len(ENSEMBL))).astype(np.float32) + 1.0
+    x[:mito_rich, :5] += 60.0
+    adata = ad.AnnData(x)
+    adata.var_names = ENSEMBL
+    adata.var["feature_name"] = SYMBOLS
+    adata.obs_names = [f"c{i}" for i in range(n_cells)]
+    p = tmp_path / "ens.h5ad"
+    adata.write(p)
+    return p
+
+
+def test_ensembl_keyed_data_gets_a_warning_that_names_the_symbol_column(tmp_path):
+    out = run_scanpy_qc_tool.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 20.0},
+                                   _ctx(tmp_path, _ensembl_keyed(tmp_path)))
+
+    assert out["n_mt_genes"] == 0 and out["cells_after"] == 200     # nothing was filtered
+    joined = " ".join(out["warnings"])
+    assert "'feature_name' (5 genes)" in joined and "gene_symbols_key" in joined
+
+
+def test_gene_symbols_key_makes_the_filter_work_on_ensembl_keyed_data(tmp_path):
+    out = run_scanpy_qc_tool.run_scanpy_qc(
+        {"min_genes": 1, "min_cells": 1, "max_pct_mt": 20.0, "gene_symbols_key": "feature_name"},
+        _ctx(tmp_path, _ensembl_keyed(tmp_path)))
+
+    assert out["n_mt_genes"] == 5 and out["mt_filter_effective"] is True
+    assert out["cells_after"] == 100, "the 100 mitochondria-rich cells are the ones removed"
+    assert "var['feature_name']" in out["mito_rule"]
+
+
+def test_another_naming_convention_needs_only_the_prefix(tmp_path):
+    fly = ["mt:CoI", "mt:ND1", "mt:Cyt-b", "mt:ATPase6", "mt:CoII"] + [f"CG{i}" for i in range(95)]
+    ctx = _ctx(tmp_path, _dataset(tmp_path, fly))
+    base = {"min_genes": 1, "min_cells": 1, "max_pct_mt": 90.0}
+
+    assert run_scanpy_qc_tool.run_scanpy_qc(base, ctx)["n_mt_genes"] == 0
+    assert run_scanpy_qc_tool.run_scanpy_qc({**base, "mito_prefix": "mt:"}, ctx)["n_mt_genes"] == 5
+
+
+def test_an_unknown_symbol_column_is_an_error_that_names_the_real_ones(tmp_path):
+    out = run_scanpy_qc_tool.run_scanpy_qc(
+        {"min_genes": 1, "min_cells": 1, "gene_symbols_key": "gene_name"},
+        _ctx(tmp_path, _ensembl_keyed(tmp_path)))
+
+    assert out["status"] == "error" and "feature_name" in out["error"]
 
 
 def test_heavy_cell_loss_is_flagged(tmp_path):
@@ -87,7 +143,7 @@ def test_heavy_cell_loss_is_flagged(tmp_path):
     a.X[:120, :5] = a.X[:120, :5] * 200.0          # 60% of cells become mito-dominated
     a.write(ds)
 
-    out = scrna_pack.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 20.0},
+    out = run_scanpy_qc_tool.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 20.0},
                                    _ctx(tmp_path, ds))
 
     assert out["status"] == "ok"
@@ -98,7 +154,7 @@ def test_heavy_cell_loss_is_flagged(tmp_path):
 def test_thresholds_that_empty_the_object_fail_with_the_numbers_that_caused_it(tmp_path):
     """Left to scanpy this dies inside pandas with "Cannot cut empty array", which names neither
     the threshold nor the tool — and aborts before any diagnosis can be reported."""
-    out = scrna_pack.run_scanpy_qc(
+    out = run_scanpy_qc_tool.run_scanpy_qc(
         {"min_genes": 99999, "min_cells": 1, "max_pct_mt": 100.0},
         _ctx(tmp_path, _dataset(tmp_path, SYMBOLS)))
 
@@ -109,7 +165,7 @@ def test_thresholds_that_empty_the_object_fail_with_the_numbers_that_caused_it(t
 
 
 def test_a_clamped_hvg_request_is_disclosed(tmp_path):
-    out = scrna_pack.run_scanpy_qc(
+    out = run_scanpy_qc_tool.run_scanpy_qc(
         {"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0, "n_top_genes": 5000},
         _ctx(tmp_path, _dataset(tmp_path, SYMBOLS)))
 
@@ -118,7 +174,7 @@ def test_a_clamped_hvg_request_is_disclosed(tmp_path):
 
 def test_a_healthy_run_carries_no_warnings(tmp_path):
     """The signal is only useful if it stays quiet when nothing is wrong."""
-    out = scrna_pack.run_scanpy_qc(
+    out = run_scanpy_qc_tool.run_scanpy_qc(
         {"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0, "n_top_genes": 50},
         _ctx(tmp_path, _dataset(tmp_path, SYMBOLS)))
 
@@ -227,7 +283,7 @@ def test_clustering_warns_when_the_data_already_has_cell_type_labels(tmp_path):
     DE/enrichment then run on numeric leiden IDs that mean nothing biologically."""
     ctx = _qc_checkpoint(tmp_path, obs_cols={"majorclass": ["Rod"] * 60 + ["Cone"] * 60})
 
-    out = scrna_pack.run_clustering({"resolution": 1.0}, ctx)
+    out = run_clustering_tool.run_clustering({"resolution": 1.0}, ctx)
 
     assert out["status"] == "ok"
     assert out["existing_celltype_columns"] == ["majorclass"]
@@ -236,13 +292,13 @@ def test_clustering_warns_when_the_data_already_has_cell_type_labels(tmp_path):
 
 
 def test_clustering_without_labels_says_nothing_about_them(tmp_path):
-    out = scrna_pack.run_clustering({"resolution": 1.0}, _qc_checkpoint(tmp_path))
+    out = run_clustering_tool.run_clustering({"resolution": 1.0}, _qc_checkpoint(tmp_path))
     assert out["existing_celltype_columns"] == []
     assert not [w for w in out["warnings"] if "cell-type label" in w]
 
 
 def test_a_degenerate_single_cluster_partition_is_flagged(tmp_path):
-    out = scrna_pack.run_clustering({"resolution": 0.001}, _qc_checkpoint(tmp_path))
+    out = run_clustering_tool.run_clustering({"resolution": 0.001}, _qc_checkpoint(tmp_path))
     if out["n_clusters"] <= 1:
         assert any("degenerate" in w for w in out["warnings"])
 
@@ -254,7 +310,7 @@ def test_de_warns_when_a_contrast_finds_nothing(tmp_path):
         tmp_path, structured=False,
         obs_cols={"condition": ["KO"] * 60 + ["WT"] * 60, "ct": ["A"] * 120})
 
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "ct", "min_cells": 10}, ctx)
 
     assert out["status"] == "ok"
@@ -268,7 +324,7 @@ def test_de_reports_untested_groups_as_a_coverage_gap(tmp_path):
     ctx = _qc_checkpoint(
         tmp_path, obs_cols={"condition": ["KO"] * 60 + ["WT"] * 60, "ct": ["A"] * 120})
 
-    out = scrna_pack.run_de(
+    out = run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "ct", "min_cells": 10000}, ctx)
 
     assert any("NOT tested" in w and "full coverage" in w for w in out["warnings"])
@@ -279,7 +335,7 @@ def test_marker_de_flags_groups_backed_by_very_few_cells(tmp_path):
     ctx = _qc_checkpoint(
         tmp_path, obs_cols={"ct": ["A"] * 114 + ["Rare"] * 6})
 
-    out = scrna_pack.run_de({"groupby": "ct", "n_genes": 10, "min_cells": 30}, ctx)
+    out = run_de_tool.run_de({"groupby": "ct", "n_genes": 10, "min_cells": 30}, ctx)
 
     assert out["status"] == "ok"
     assert "Rare" in out.get("small_groups", {})
@@ -288,5 +344,5 @@ def test_marker_de_flags_groups_backed_by_very_few_cells(tmp_path):
 
 def test_a_healthy_marker_run_carries_no_warnings(tmp_path):
     ctx = _qc_checkpoint(tmp_path, obs_cols={"ct": ["A"] * 60 + ["B"] * 60})
-    out = scrna_pack.run_de({"groupby": "ct", "n_genes": 10, "min_cells": 30}, ctx)
+    out = run_de_tool.run_de({"groupby": "ct", "n_genes": 10, "min_cells": 30}, ctx)
     assert out["warnings"] == []

@@ -18,6 +18,24 @@ zero-downtime compat layer (phase 1) for an eventual full package/env/path renam
 <!-- PROJECT_NAME_END -->
 
 <!-- ADAPTIVE_KG_AGENT_INSTRUCTIONS_START -->
+## Tools: one folder per tool, behind a contract
+
+`src/bioagent/tools/<name>/` holds one model-callable tool: `TOOL.md` (front matter = the manifest the
+registry, the HPC3 routing and the fast chat read; body = its documentation) and `tool.py`. Rules,
+enforced by tests: tool code imports only `bioagent.tools.sdk` (never `agents`/`gateway`); the platform
+reaches the tools only through `bioagent.tools.sdk`, `.catalog` and `.api`, public names only. After
+changing a tool's schema or description, run `python scripts/tool_docs.py`. Adding a tool needs no
+platform change. The repository is being prepared to split into AiScientist / AiScientist-tools /
+AiScientist-skills: see `docs/architecture/REPO_SPLIT.md`.
+
+## Public mirror: everything except credentials
+
+This repository is published to the public RCHENLAB/AiScientist, docs and handoffs included; only
+credentials (database accounts and passwords, API keys, tokens, private keys) stay out. Never write
+a credential into a committed file: it belongs in the deployment's `.env` or `BIOAGENT_STATE_DIR`
+(use a placeholder such as `<password>` in docs). Publish with `scripts/publish_public_mirror.py`,
+which refuses a snapshot that contains one.
+
 ## Adaptive KG Repo Memory
 
 When Adaptive KG MCP tools are available, use them as the default repo-memory path. Do not wait for the user to explicitly ask for repo memory.

@@ -17,7 +17,7 @@ pytest.importorskip("fastapi")
 from bioagent.agents.research_lab import LabResult, LabRound  # noqa: E402
 from bioagent.agents.research_lab import CriticVerdict  # noqa: E402
 from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.tools.hpo_terms.mapper import make_hpo_mapping_tool  # noqa: E402
+from bioagent.tools.map_phenotype_to_hpo.tool import make_hpo_mapping_tool  # noqa: E402
 from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
