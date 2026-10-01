@@ -498,9 +498,13 @@ def _looks_like_celltype_column(name: str) -> bool:
     return any(h in n for h in _CELLTYPE_COL_HINTS)
 
 
-_CONDITION_COL_HINTS = ("sampleid", "sample_id", "condition", "genotype", "treatment", "status",
-                        "disease", "group", "cohort", "timepoint", "orig.ident", "orig_ident",
-                        "perturbation", "stim")
+# The sample/donor ids belong here too: `run_de` refuses a pooled per-cell test across them and
+# `_replication_note` counts them per arm. Only `sampleid`/`sample_id` used to be listed, so a
+# plain `sample`, `donor` or `patient` column passed the guard and the refusal then claimed the
+# object had no sample column at all.
+_CONDITION_COL_HINTS = ("sample", "donor", "patient", "subject", "individual", "condition",
+                        "genotype", "treatment", "status", "disease", "group", "cohort",
+                        "timepoint", "orig.ident", "orig_ident", "perturbation", "stim")
 
 
 def _looks_like_condition_column(name: str) -> bool:

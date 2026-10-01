@@ -165,6 +165,31 @@ def test_orig_ident_reads_as_a_library_id_not_a_cell_type():
     assert not scrna_lib._looks_like_condition_column("majorclass")
 
 
+def test_plain_sample_and_donor_columns_read_as_sample_ids():
+    """Only `sampleid`/`sample_id` used to match, so a plain `sample` column slipped past the
+    refusal and a `donor` column went uncounted in the replication note."""
+    for col in ("sample", "Sample", "sample_name", "SampleID", "donor", "donor_id", "patient",
+                "subject", "individual"):
+        assert scrna_lib._looks_like_condition_column(col), col
+        assert not scrna_lib._looks_like_celltype_column(col), col
+
+
+def test_a_plain_sample_column_is_refused_and_counted(tmp_path):
+    rng = np.random.default_rng(2)
+    adata = ad.AnnData(rng.poisson(4.0, (120, 30)).astype(np.float32) + 1.0)
+    adata.var_names = [f"Gene{i}" for i in range(30)]
+    adata.obs["sample"] = pd.Categorical(["KO1" if i % 2 else "WT1" for i in range(120)])
+    adata.obs["donor"] = pd.Categorical([f"d{i % 4}" for i in range(120)])
+    adata.obs["majorclass"] = pd.Categorical([["Rod", "Cone"][i % 2] for i in range(120)])
+    p = tmp_path / "plain.h5ad"
+    adata.write(p)
+
+    out = run_de_tool.run_de({"groupby": "sample"}, _qc(tmp_path, p))
+    assert out["status"] == "error"
+    assert "CONDITION column" in out["error"]
+    assert "'donor' takes 4 distinct value" in out["error"]
+
+
 # --- the analyses a labelled two-arm dataset actually needs -------------------
 #
 # Found by running the protocol's own pipeline end to end on the real DDX41 object rather than

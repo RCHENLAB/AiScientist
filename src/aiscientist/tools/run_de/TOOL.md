@@ -74,11 +74,13 @@ On the fast chat path: no (research runs only).
 > (default): each level of `groupby` vs the rest — 'what defines this cluster'. (2) CONTRAST: pass
 > `reference` (the CONTROL level of `groupby`, e.g. "WT") to compare condition vs control instead
 > of vs rest; add `stratify_by` (an EXISTING cell-type label column) to run that contrast
-> SEPARATELY WITHIN EACH CELL TYPE. Use (2) for any KO-vs-WT / disease-vs-control DEG study — do
-> NOT hand-write it in run_code, and do NOT re-cluster a dataset that already has labels. Reads
-> `adata_clustered.h5ad` if present, otherwise `adata_qc.h5ad`, so a labeled dataset needs
-> run_scanpy_qc ONLY (run_clustering is for unlabeled data). Writes `work/adata_de.h5ad` and CSV
-> tables `tables/de_<key>_all.csv` (+ one per group), where <key> is `stratify_by` when
+> SEPARATELY WITHIN EACH CELL TYPE. Use (2) for a KO-vs-WT / disease-vs-control DEG study whose
+> arms have fewer than 2 replicate samples each; with >=2 samples per arm use run_pseudobulk_de
+> instead — (2) treats cells as independent, so its p-values are pseudoreplicated. Either way do
+> NOT hand-write the contrast in run_code, and do NOT re-cluster a dataset that already has
+> labels. Reads `adata_clustered.h5ad` if present, otherwise `adata_qc.h5ad`, so a labeled dataset
+> needs run_scanpy_qc ONLY (run_clustering is for unlabeled data). Writes `work/adata_de.h5ad` and
+> CSV tables `tables/de_<key>_all.csv` (+ one per group), where <key> is `stratify_by` when
 > stratified, else `groupby`. The tables have EXACTLY these columns:
 > `group,gene,log2fc,pval,pval_adj,score` — if you ever read a DE table in run_code, use THOSE
 > names (NOT Seurat-style `gene_name`/`p_val_adj`/`avg_log2FC`). A contrast also writes a volcano
