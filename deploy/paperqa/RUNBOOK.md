@@ -1,7 +1,6 @@
-# RetiGene PaperQA — HPC3 run + Pull-Request runbook
+# RetiGene PaperQA — HPC3 runbook
 
-Two parts: **A.** get the embedding job running on HPC3; **B.** open the PR so a
-teammate can merge. Run the commands in order. `$USER` = your HPC3 username
+Get the embedding job running on HPC3. Run the commands in order. `$USER` = your HPC3 username
 (`<ucinetid>`). Connect the **UCI VPN (UCIFull) + Duo** before any HPC3 step.
 
 ---
@@ -102,65 +101,18 @@ If it returns relevant papers, the index works. **Tell the teammate: embedding r
 HPC3, index built at `retigene/index_pubmedbert`.**
 
 ### A6. Wire the full QA (step 2) onto the same index
-`src/bioagent/tools/deep_literature/tool.py` runs the actual question-answering with the local
+`src/aiscientist/tools/deep_literature/tool.py` runs the actual question-answering with the local
 Qwen LLM. For it to **reuse** the index you just built (not re-embed 1739 papers per
 query), the gateway/serve environment must set these so both halves agree:
 ```bash
-export BIOAGENT_PAPERQA_EMBEDDING=st-NeuML/pubmedbert-base-embeddings   # same model as the index
-export BIOAGENT_PAPERQA_PAPERS=/dfs3b/ruic20_lab/<ucinetid>/retigene/papers
-export BIOAGENT_PAPERQA_INDEX_DIR=/dfs3b/ruic20_lab/<ucinetid>/retigene/index_pubmedbert
-export BIOAGENT_PAPERQA_INDEX_NAME=retigene_full_pubmedbert
-export BIOAGENT_PAPERQA_MANIFEST=/dfs3b/ruic20_lab/<ucinetid>/retigene/paperqa_manifest.csv
+export AISCIENTIST_PAPERQA_EMBEDDING=st-NeuML/pubmedbert-base-embeddings   # same model as the index
+export AISCIENTIST_PAPERQA_PAPERS=/dfs3b/ruic20_lab/<ucinetid>/retigene/papers
+export AISCIENTIST_PAPERQA_INDEX_DIR=/dfs3b/ruic20_lab/<ucinetid>/retigene/index_pubmedbert
+export AISCIENTIST_PAPERQA_INDEX_NAME=retigene_full_pubmedbert
+export AISCIENTIST_PAPERQA_MANIFEST=/dfs3b/ruic20_lab/<ucinetid>/retigene/paperqa_manifest.csv
 ```
 These match the Slurm job's `EMBEDDING` / `PAPERS` / `INDEX_DIR` / `INDEX_NAME` /
 `MANIFEST`. The answering LLM comes from the run's local Qwen (tunnel port + served
 model name on the context), so no cloud LLM is used end-to-end.
 
 ---
-
-## Part B — open the Pull Request (so the teammate can merge)
-
-Only **code / config / docs** go through git. **Never commit the PDFs or the index**
-(GBs; GitHub rejects >100 MB files). Do this on your **Mac**, in the repo.
-
-### B1. Make sure the big data is ignored
-```bash
-cd "/Users/maziyao/Desktop/summer intern/code/BioAgentPrototype"
-grep -qxF 'output/' .gitignore || echo 'output/' >> .gitignore
-```
-(`output/` holds the 7 GB corpus + index-type artefacts — keep it out of git. The small
-manifest CSVs live there too; if you want them tracked, copy them somewhere outside
-`output/` or force-add them individually — but do NOT `git add output/`.)
-
-### B2. Stage only the code/config/docs
-```bash
-git add .gitignore \
-        deploy/paperqa/ \
-        scripts/build_paperqa_directory_index.py \
-        scripts/build_retigene_paperqa_manifest.py \
-        scripts/query_paperqa_index.py \
-        skills/literature-corpus-recovery/ \
-        handoff/
-git status        # SANITY CHECK: confirm NO *.pdf and NO output/ are staged
-```
-
-### B3. Commit + push to your fork
-```bash
-git commit -m "PaperQA embedding: HPC3 Slurm job, indexer, runbook, corpus-recovery skill"
-git push origin feat/paperqa-embedding
-```
-
-### B4. Open the PR
-- GitHub prints a "Create a pull request" link after the push — open it, **or** go to
-  your fork `<ucinetid>-stack/BioAgentPrototype` on github.com and click **Compare & pull
-  request**.
-- Base = the teammate's repo `KrimsonSun/BioAgentPrototype` (branch `main`); compare =
-  your `feat/paperqa-embedding`.
-- Title it e.g. *"PaperQA embedding pipeline + corpus recovery"*, describe what it does,
-  create the PR.
-- The teammate reviews and **merges**; then they pull/deploy as they described.
-
-### PR checklist (paste into the PR description)
-- [ ] Embedding job runs on HPC3, `indexed_file_count` ≈ 1739
-- [ ] Retrieval smoke test returns relevant papers
-- [ ] No PDFs / index files committed (only code, config, docs, small manifests)

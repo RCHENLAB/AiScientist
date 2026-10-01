@@ -18,8 +18,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

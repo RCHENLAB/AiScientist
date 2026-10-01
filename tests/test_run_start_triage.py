@@ -15,8 +15,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway import vllm_client  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway import vllm_client  # noqa: E402
 
 
 _VCF = (

@@ -5,7 +5,7 @@ This module no longer retrieves literature. Retrieval is tested in ``test_litera
 
 from __future__ import annotations
 
-from bioagent.reporting import literature_references as lr
+from aiscientist.reporting import literature_references as lr
 
 
 def test_citation_title_html_markup_is_stripped_at_source():
@@ -167,7 +167,7 @@ _DESIGN = [
 
 
 def test_design_background_renders_a_separate_labelled_section():
-    from bioagent.reporting.literature_references import format_design_background_section
+    from aiscientist.reporting.literature_references import format_design_background_section
 
     md = format_design_background_section(_DESIGN)
     assert md.startswith("## Background consulted during study design")
@@ -180,20 +180,20 @@ def test_design_background_renders_a_separate_labelled_section():
 
 
 def test_design_background_is_empty_when_the_meeting_consulted_nothing():
-    from bioagent.reporting.literature_references import format_design_background_section
+    from aiscientist.reporting.literature_references import format_design_background_section
 
     assert format_design_background_section([]) == ""
 
 
 def test_append_design_background_leaves_the_manuscript_alone_when_empty():
-    from bioagent.reporting.literature_references import append_design_background
+    from aiscientist.reporting.literature_references import append_design_background
 
     md = "## Results\n\nSomething.\n\n## References\n\n1. A paper.\n"
     assert append_design_background(md, []) == md
 
 
 def test_append_design_background_lands_after_references():
-    from bioagent.reporting.literature_references import append_design_background
+    from aiscientist.reporting.literature_references import append_design_background
 
     md = "## Results\n\nSomething.\n\n## References\n\n1. A paper.\n"
     out = append_design_background(md, _DESIGN)
@@ -203,7 +203,7 @@ def test_append_design_background_lands_after_references():
 
 
 def test_append_design_background_is_idempotent():
-    from bioagent.reporting.literature_references import append_design_background
+    from aiscientist.reporting.literature_references import append_design_background
 
     md = "## Results\n\nSomething.\n"
     once = append_design_background(md, _DESIGN)
@@ -211,7 +211,7 @@ def test_append_design_background_is_idempotent():
 
 
 def test_lab_result_carries_design_background_through_a_round_trip():
-    from bioagent.agents.research_lab import LabResult
+    from aiscientist.agents.research_lab import LabResult
 
     r = LabResult("q", [], [], True, 0, "answer", [], list(_DESIGN))
     assert r.to_dict()["design_background"][0]["doi"] == "10.1234/abc"
@@ -220,7 +220,7 @@ def test_lab_result_carries_design_background_through_a_round_trip():
 
 
 def test_lab_result_design_background_defaults_to_empty():
-    from bioagent.agents.research_lab import LabResult
+    from aiscientist.agents.research_lab import LabResult
 
     # Every existing positional construction (twelve of them) must keep working untouched.
     assert LabResult("q", [], [], False, 0, "").design_background == []

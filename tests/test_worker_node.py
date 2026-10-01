@@ -11,10 +11,10 @@ import re
 
 import pytest
 
-from bioagent.gateway import worker
-from bioagent.gateway.errors import GatewayError
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.settings import HPCSettings
+from aiscientist.gateway import worker
+from aiscientist.gateway.errors import GatewayError
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.settings import HPCSettings
 
 
 class FakeExec:

@@ -40,8 +40,8 @@ LFC = 1.0                      # |log2FC| threshold for "significant"
 PADJ = 0.05                    # adjusted-p threshold
 # --------------------------------------------------------------------------------------------
 
-work = Path(os.environ["BIOAGENT_WORK"])
-art = Path(os.environ["BIOAGENT_ARTIFACTS"])
+work = Path(os.environ["AISCIENTIST_WORK"])
+art = Path(os.environ["AISCIENTIST_ARTIFACTS"])
 tdir = art / "tables" / "DEG"
 fdir = art / "figures" / "DEG"
 tdir.mkdir(parents=True, exist_ok=True)
@@ -49,7 +49,7 @@ fdir.mkdir(parents=True, exist_ok=True)
 
 # Prefer the QC'd checkpoint (it preserves the original obs labels); fall back to the raw dataset.
 ckpt = work / "adata_qc.h5ad"
-adata = sc.read_h5ad(ckpt if ckpt.exists() else os.environ["BIOAGENT_DATASET"])
+adata = sc.read_h5ad(ckpt if ckpt.exists() else os.environ["AISCIENTIST_DATASET"])
 
 for col in (CONDITION_KEY, CELLTYPE_KEY):
     if col not in adata.obs:

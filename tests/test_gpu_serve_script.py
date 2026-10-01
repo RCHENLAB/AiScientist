@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import base64
 
-from bioagent.gateway import gpu
-from bioagent.gateway.settings import HPCSettings
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway import gpu
+from aiscientist.gateway.settings import HPCSettings
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 def _script(**over) -> str:
@@ -22,7 +22,7 @@ def test_serve_script_keeps_dynamic_port_and_jobname():
     s = _script(llm_backend="vllm")
     assert "#SBATCH --job-name=bioagent-vllm-testuser" in s
     assert "/dev/tcp/127.0.0.1/$_cand" in s          # free-port probe
-    assert f'echo "$BIOAGENT_PORT" > {gpu.PORT_FILE_JOB}' in s  # writes the PER-JOB port file
+    assert f'echo "$AISCIENTIST_PORT" > {gpu.PORT_FILE_JOB}' in s  # writes the PER-JOB port file
     assert "vllm.${SLURM_JOB_ID}.port" in s                  # per-job (not a single clobbered file)
     assert "ollama" not in s.lower()                 # no Ollama anywhere in the serve script
 
@@ -32,10 +32,10 @@ def test_serve_script_keeps_dynamic_port_and_jobname():
 def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
     s = _script(
         llm_backend="vllm",
-        vllm_image=f"{LAB_STORAGE}/software/bioagent/containers/vllm.sif",
+        vllm_image=f"{LAB_STORAGE}/software/AiScientist/containers/vllm.sif",
         vllm_model="QuantTrio/Qwen3.6-35B-A3B-AWQ",
         vllm_quantization="awq_marlin",
-        hf_home=f"{LAB_STORAGE}/software/bioagent/hf",
+        hf_home=f"{LAB_STORAGE}/software/AiScientist/hf",
     )
     # group-wrap: vLLM image/HF on DFS -> body is base64'd into `sg ruic20_hpc`
     assert "sg ruic20_hpc -c 'bash -s'" in s
@@ -47,7 +47,7 @@ def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
     assert "--quantization awq_marlin" in body
     assert "--reasoning-parser qwen3" in body
     assert f'--port "$(cat {gpu.PORT_FILE_JOB})"' in body      # binds the dynamic per-job port
-    assert "export HF_HOME=\"/dfs3b/ruic20_lab/software/bioagent/hf\"" in body
+    assert "export HF_HOME=\"/dfs3b/ruic20_lab/software/AiScientist/hf\"" in body
     assert "HF_HUB_OFFLINE=1" in body                          # weights pre-staged, no hub call
 
 

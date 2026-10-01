@@ -30,14 +30,14 @@ LFC = 1.0                      # |log2FC| threshold for "significant"
 PADJ = 0.05                    # adjusted-p threshold
 # --------------------------------------------------------------------------------------------
 
-work = Path(os.environ["BIOAGENT_WORK"])
-art = Path(os.environ["BIOAGENT_ARTIFACTS"])
+work = Path(os.environ["AISCIENTIST_WORK"])
+art = Path(os.environ["AISCIENTIST_ARTIFACTS"])
 tdir = art / "tables" / "perturbation_DE"
 tdir.mkdir(parents=True, exist_ok=True)
 
 # Prefer the QC'd checkpoint (preserves the original obs labels); fall back to the raw dataset.
 ckpt = work / "adata_qc.h5ad"
-adata = sc.read_h5ad(ckpt if ckpt.exists() else os.environ["BIOAGENT_DATASET"])
+adata = sc.read_h5ad(ckpt if ckpt.exists() else os.environ["AISCIENTIST_DATASET"])
 
 if PERT_KEY not in adata.obs:
     raise SystemExit(f"obs has no column {PERT_KEY!r}; available: {list(adata.obs.columns)}")

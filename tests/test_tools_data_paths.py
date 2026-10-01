@@ -7,19 +7,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.tools import api, catalog
+from aiscientist.tools import api, catalog
 
 TOOLS = Path(catalog.TOOLS_DIR)
 
 
 def test_gene_sets_are_read_from_tools_genesets(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_GENESETS_DIR", raising=False)
+    monkeypatch.delenv("AISCIENTIST_GENESETS_DIR", raising=False)
     assert Path(api.genesets_dir()).resolve() == (TOOLS / "genesets").resolve()
     assert (TOOLS / "genesets" / "README.md").is_file()     # the folder the deploy fills with .gmt
 
 
 def test_gene_sets_dir_can_be_overridden(monkeypatch, tmp_path):
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(tmp_path))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(tmp_path))
     assert Path(api.genesets_dir()) == tmp_path
 
 

@@ -9,7 +9,7 @@ pipeline, routing falls back to the full-library LLM router whose hint is the su
 
 from __future__ import annotations
 
-from bioagent.agents.preset_pipelines import (
+from aiscientist.agents.preset_pipelines import (
     PresetPipeline,
     drop_conflicting_pinned,
     get_pipeline,

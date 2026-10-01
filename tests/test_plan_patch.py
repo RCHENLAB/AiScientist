@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import LabConfig, ResearchLab, _parse_plan_patch
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import LabConfig, ResearchLab, _parse_plan_patch
 
 AGENDA = [
     "QC the cells: filter, normalize and log1p, report counts",

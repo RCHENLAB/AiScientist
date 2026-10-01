@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.agents.code_imports import distribution_for, third_party_imports, top_level_imports
-from bioagent.gateway.code_preflight import PreflightingExecutor
+from aiscientist.agents.code_imports import distribution_for, third_party_imports, top_level_imports
+from aiscientist.gateway.code_preflight import PreflightingExecutor
 
 
 # --- reading the imports -----------------------------------------------------
@@ -193,7 +193,7 @@ def test_a_broken_probe_never_reports_a_package_as_missing():
     """Measured on HPC3: binding a directory that does not exist aborts the container with exit
     255, and treating any non-zero as "missing" offered to install `pandas`, which the image has.
     A confirmation the user learns to distrust is worse than no confirmation at all."""
-    from bioagent.gateway.package_cache import missing_modules
+    from aiscientist.gateway.package_cache import missing_modules
 
     class Cache:
         root = "/nope"
@@ -208,7 +208,7 @@ def test_a_broken_probe_never_reports_a_package_as_missing():
 
 
 def test_only_the_definitive_missing_exit_code_counts():
-    from bioagent.gateway.package_cache import missing_modules
+    from aiscientist.gateway.package_cache import missing_modules
 
     class Cache:
         root = "/root"
@@ -225,7 +225,7 @@ def test_only_the_definitive_missing_exit_code_counts():
 
 def test_a_missing_cache_root_is_not_bound():
     """The bind is what aborted the container; skip it until the directory exists."""
-    from bioagent.gateway.package_cache import missing_modules
+    from aiscientist.gateway.package_cache import missing_modules
     seen = []
 
     class Cache:
@@ -258,7 +258,7 @@ _PREAMBLE = (
 
 
 def test_the_determinism_preamble_no_longer_demands_torch():
-    from bioagent.agents.code_imports import optional_imports, third_party_imports
+    from aiscientist.agents.code_imports import optional_imports, third_party_imports
 
     code = _PREAMBLE + "import anndata as ad, pandas as pd\nprint(ad, pd)\n"
     assert "torch" in optional_imports(code)
@@ -269,7 +269,7 @@ def test_the_determinism_preamble_no_longer_demands_torch():
 
 
 def test_a_module_imported_both_ways_stays_required():
-    from bioagent.agents.code_imports import optional_imports, third_party_imports
+    from aiscientist.agents.code_imports import optional_imports, third_party_imports
 
     # The unguarded import is the one that would fail, so tolerance elsewhere does not excuse it.
     code = "try:\n    import scvi\nexcept ImportError: pass\nimport scvi\n"
@@ -278,7 +278,7 @@ def test_a_module_imported_both_ways_stays_required():
 
 
 def test_only_import_tolerant_handlers_count():
-    from bioagent.agents.code_imports import optional_imports
+    from aiscientist.agents.code_imports import optional_imports
 
     assert "scvi" in optional_imports("try:\n    import scvi\nexcept ImportError: pass\n")
     assert "scvi" in optional_imports("try:\n    import scvi\nexcept ModuleNotFoundError: pass\n")
@@ -290,7 +290,7 @@ def test_only_import_tolerant_handlers_count():
 
 
 def test_a_handler_that_binds_a_fallback_keeps_the_import_required():
-    from bioagent.agents.code_imports import optional_imports, third_party_imports
+    from aiscientist.agents.code_imports import optional_imports, third_party_imports
 
     # `except ImportError: cyvcf2 = None` says the snippet means to USE cyvcf2; failing to install
     # it produces a baffling `None` downstream, so preflight should still offer. Only a handler
@@ -306,7 +306,7 @@ def test_a_handler_that_binds_a_fallback_keeps_the_import_required():
 
 
 def test_a_declined_package_is_not_re_probed_on_the_next_step():
-    from bioagent.gateway.code_preflight import PreflightingExecutor
+    from aiscientist.gateway.code_preflight import PreflightingExecutor
 
     probed: list[list[str]] = []
 
@@ -318,7 +318,7 @@ def test_a_declined_package_is_not_re_probed_on_the_next_step():
         probed.append(list(modules))
         return list(modules)
 
-    import bioagent.gateway.package_cache as pc
+    import aiscientist.gateway.package_cache as pc
     original = pc.missing_modules
     pc.missing_modules = fake_missing
     try:

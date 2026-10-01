@@ -1,4 +1,4 @@
-"""Offline tests for the DRAFT multi-agent lab kernel (src/bioagent/lab).
+"""Offline tests for the DRAFT multi-agent lab kernel (src/aiscientist/lab).
 
 No GPU / no real LLM: the LLM is a scripted fake. Proves the kernel runs end-to-end, the
 PI->dispatcher handoff works, each agent keeps its OWN memory, and the Lab Archive is
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 
-from bioagent.lab.archive import LabArchive
-from bioagent.lab.kernel import Agent, Lab, LabConfig, Registry, Tool
+from aiscientist.lab.archive import LabArchive
+from aiscientist.lab.kernel import Agent, Lab, LabConfig, Registry, Tool
 
 
 def _echo_tool() -> Tool:

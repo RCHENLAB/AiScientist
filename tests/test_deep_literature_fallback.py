@@ -2,9 +2,9 @@
 the Europe PMC keyword fallback (run 97dfc89dc5aa shipped an empty References because it did not)."""
 from __future__ import annotations
 
-from bioagent.agents.research_harness import HarnessTool
-from bioagent.agents.research_lab import LabConfig, ResearchLab, Specialist
-from bioagent.agents.research_harness import HarnessContext
+from aiscientist.agents.research_harness import HarnessTool
+from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
+from aiscientist.agents.research_harness import HarnessContext
 
 
 def _tool(name, payload):
@@ -13,7 +13,7 @@ def _tool(name, payload):
 
 
 def _lab(catalog):
-    from bioagent.agents.research_harness import ResearchHarness
+    from aiscientist.agents.research_harness import ResearchHarness
     sci = ResearchHarness(catalog=catalog, chat_fn=lambda m, t: {"content": "x", "tool_calls": []})
     return ResearchLab(HarnessContext(), LabConfig(max_rounds=1), complete_fn=lambda m: "{}",
                        scientist=sci)

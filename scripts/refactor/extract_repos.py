@@ -10,12 +10,12 @@ Produces three repositories under ``--out``:
 
 * ``AiScientist-skills``: ``skills/`` and ``pipelines/`` (renamed from ``preset_pipelines/``), with
   their history, plus a README commit.
-* ``AiScientist-tools``: ``src/bioagent/tools/``, the tests that import only ``bioagent.tools``,
+* ``AiScientist-tools``: ``src/aiscientist/tools/``, the tests that import only ``aiscientist.tools``,
   ``tests/fixtures/`` and ``scripts/tool_docs.py``, with their history, plus a commit adding
-  ``pyproject.toml`` (distribution ``aiscientist-tools``, import path still ``bioagent.tools``) and
+  ``pyproject.toml`` (distribution ``aiscientist-tools``, import path still ``aiscientist.tools``) and
   a README.
-* ``AiScientist``: everything else. One commit removes what moved and ``src/bioagent/__init__.py``,
-  so ``bioagent`` becomes a namespace package that the platform and AiScientist-tools both provide.
+* ``AiScientist``: everything else. One commit removes what moved and ``src/aiscientist/__init__.py``,
+  so ``aiscientist`` becomes a namespace package that the platform and AiScientist-tools both provide.
 
 It then prints the commands that test each repository the way the others will consume it.
 Needs ``git filter-repo`` on PATH.
@@ -48,7 +48,7 @@ pipelines/<name>/   SKILL.md (name, description, tools, data_type) + PROTOCOL.md
   that exist in AiScientist-tools.
 
 The platform (RCHENLAB/AiScientist) reads this repository from a checkout of a pinned tag:
-`BIOAGENT_SKILLS_DIR=<checkout>/skills`, `BIOAGENT_PIPELINES_DIR=<checkout>/pipelines`. Its contract
+`AISCIENTIST_SKILLS_DIR=<checkout>/skills`, `AISCIENTIST_PIPELINES_DIR=<checkout>/pipelines`. Its contract
 tests check that every tool a skill or pipeline names exists.
 
 History: extracted from KrimsonSun/BioAgentPrototype with git filter-repo (`preset_pipelines/` was
@@ -58,12 +58,12 @@ renamed to `pipelines/`).
 TOOLS_README = """# AiScientist-tools
 
 The model-callable tools of AiScientist, one folder per tool. The index of every tool, with what it
-does and where it runs, is [src/bioagent/tools/README.md](src/bioagent/tools/README.md); each tool's
+does and where it runs, is [src/aiscientist/tools/README.md](src/aiscientist/tools/README.md); each tool's
 own documentation is its `TOOL.md`.
 
-* Distribution `aiscientist-tools`; import path `bioagent.tools` (a portion of the `bioagent`
+* Distribution `aiscientist-tools`; import path `aiscientist.tools` (a portion of the `aiscientist`
   namespace package, shared with the platform repository, so the job images' `python -m
-  bioagent.tools...` entry points keep their names).
+  aiscientist.tools...` entry points keep their names).
 * The contract with the platform: `sdk.py` (the tool record and context), `catalog.py` (discovery
   from `TOOL.md`) and `api.py` (everything else the platform may use). The tools import nothing
   from the platform; `tests/test_tools_boundary.py` enforces it.
@@ -91,7 +91,7 @@ test = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["bioagent.tools*"]
+include = ["aiscientist.tools*"]
 namespaces = true
 
 [tool.setuptools.package-data]
@@ -111,22 +111,22 @@ def run(*args: str, cwd: Path | None = None) -> str:
 
 
 def tools_only_tests(repo: Path) -> list[str]:
-    """Tests whose every ``bioagent`` reference (imports and dotted string targets) is under
-    ``bioagent.tools``: they test the tools alone, so they move with them."""
+    """Tests whose every ``aiscientist`` reference (imports and dotted string targets) is under
+    ``aiscientist.tools``: they test the tools alone, so they move with them."""
     out = []
     for p in sorted((repo / "tests").glob("test_*.py")):
         text = p.read_text(encoding="utf-8")
         mods: set[str] = set()
         for n in ast.walk(ast.parse(text)):
-            if isinstance(n, ast.ImportFrom) and n.module and n.module.split(".")[0] == "bioagent":
+            if isinstance(n, ast.ImportFrom) and n.module and n.module.split(".")[0] == "aiscientist":
                 mods.add(n.module)
-                if n.module == "bioagent":
-                    mods |= {f"bioagent.{a.name}" for a in n.names}
+                if n.module == "aiscientist":
+                    mods |= {f"aiscientist.{a.name}" for a in n.names}
             elif isinstance(n, ast.Import):
-                mods |= {a.name for a in n.names if a.name.split(".")[0] == "bioagent"}
-        mods |= set(re.findall(r'"(bioagent\.[a-z_.]+)', text))
-        mods.discard("bioagent")
-        if mods and all(m.startswith("bioagent.tools") for m in mods):
+                mods |= {a.name for a in n.names if a.name.split(".")[0] == "aiscientist"}
+        mods |= set(re.findall(r'"(aiscientist\.[a-z_.]+)', text))
+        mods.discard("aiscientist")
+        if mods and all(m.startswith("aiscientist.tools") for m in mods):
             out.append(f"tests/{p.name}")
     return out
 
@@ -166,21 +166,21 @@ def main(argv: list[str] | None = None) -> int:
     # 2. AiScientist-tools
     tools = out / "AiScientist-tools"
     fresh_clone(tools, branch)
-    paths = ["src/bioagent/tools/", "tests/fixtures/", "scripts/tool_docs.py", *tests]
+    paths = ["src/aiscientist/tools/", "tests/fixtures/", "scripts/tool_docs.py", *tests]
     run("git", "filter-repo", "--force", *[x for p in paths for x in ("--path", p)], cwd=tools)
     (tools / "pyproject.toml").write_text(TOOLS_PYPROJECT, encoding="utf-8")
     (tools / "README.md").write_text(TOOLS_README, encoding="utf-8")
-    commit_all(tools, "build: package the tools as aiscientist-tools (import path bioagent.tools)")
+    commit_all(tools, "build: package the tools as aiscientist-tools (import path aiscientist.tools)")
 
     # 3. AiScientist (the platform keeps its history; one commit removes what moved)
     platform = out / "AiScientist"
     fresh_clone(platform, branch)
-    moved = ["skills", "preset_pipelines", "src/bioagent/tools", "scripts/tool_docs.py",
-             "src/bioagent/__init__.py", *tests]
+    moved = ["skills", "preset_pipelines", "src/aiscientist/tools", "scripts/tool_docs.py",
+             "src/aiscientist/__init__.py", *tests]
     run("git", "rm", "-r", "-q", *moved, cwd=platform)
     commit_all(platform, "split: the tools and the skills move to their own repositories\n\n"
-               "bioagent becomes a namespace package: src/bioagent/__init__.py is removed so that\n"
-               "AiScientist-tools can provide bioagent.tools.")
+               "aiscientist becomes a namespace package: src/aiscientist/__init__.py is removed so that\n"
+               "AiScientist-tools can provide aiscientist.tools.")
 
     py = sys.executable
     print(f"""Three repositories in {out}:
@@ -190,7 +190,7 @@ Test each the way the others consume it:
 
   cd {tools} && PYTHONPATH=src {py} -m pytest -q
   cd {platform} && PYTHONPATH=src:{tools}/src \\
-      BIOAGENT_SKILLS_DIR={skills}/skills BIOAGENT_PIPELINES_DIR={skills}/pipelines \\
+      AISCIENTIST_SKILLS_DIR={skills}/skills AISCIENTIST_PIPELINES_DIR={skills}/pipelines \\
       {py} -m pytest -q
 """)
     return 0

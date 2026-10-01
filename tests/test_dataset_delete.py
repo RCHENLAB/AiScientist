@@ -16,8 +16,8 @@ import pytest
 @pytest.fixture()
 def db_ctx(tmp_path, monkeypatch):
     pytest.importorskip("sqlalchemy")
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", f"sqlite:///{(tmp_path / 'd.db').as_posix()}")
-    from bioagent.gateway import auth_routes, db, models  # noqa: F401
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", f"sqlite:///{(tmp_path / 'd.db').as_posix()}")
+    from aiscientist.gateway import auth_routes, db, models  # noqa: F401
 
     importlib.reload(db)
     importlib.reload(models)

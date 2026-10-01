@@ -15,8 +15,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 def _seed_run(root: Path, owner: str, run_id: str, *, age_days: float) -> Path:
@@ -57,7 +57,7 @@ def test_expire_no_root_is_noop(tmp_path):
 
 
 def test_ttl_reads_from_env(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_CHECKPOINT_TTL_DAYS", "3")
+    monkeypatch.setenv("AISCIENTIST_CHECKPOINT_TTL_DAYS", "3")
     assert HPCSettings.from_env().checkpoint_ttl_days == 3
 
 

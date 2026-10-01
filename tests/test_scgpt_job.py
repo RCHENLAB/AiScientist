@@ -8,18 +8,18 @@ returns the predictions path on success and fails loudly otherwise.
 
 from __future__ import annotations
 
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.settings import HPCSettings
-from bioagent.gateway.scgpt_job import (
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.settings import HPCSettings
+from aiscientist.gateway.scgpt_job import (
     build_scgpt_script,
     run_scgpt_inference,
     scgpt_job_name,
 )
-from bioagent.gateway.slurm_job import AcquireConfig, RunConfig, SlurmJobError
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway.slurm_job import AcquireConfig, RunConfig, SlurmJobError
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 IN = f"{LAB_STORAGE}/runs/u1/query_aligned.h5ad"
-MODEL = f"{LAB_STORAGE}/software/bioagent/scgpt/reference_model"
+MODEL = f"{LAB_STORAGE}/software/AiScientist/scgpt/reference_model"
 OUT = f"{LAB_STORAGE}/runs/u1/scgpt_out"
 
 
@@ -50,7 +50,7 @@ class FakeScgptHost:
 
     def exec(self, command, timeout=60.0):
         cmd = command.strip()
-        if "BIOAGENT_EOF" in cmd or ("cat >" in cmd and "<<" in cmd):
+        if "AISCIENTIST_EOF" in cmd or ("cat >" in cmd and "<<" in cmd):
             return self._ok()
         if cmd.startswith("mkdir"):
             return self._ok()
@@ -165,7 +165,7 @@ def test_scgpt_runner_captures_job_log_on_failure(tmp_path, monkeypatch):
     import types
     from pathlib import Path
 
-    from bioagent.gateway import scgpt_runner as sr
+    from aiscientist.gateway import scgpt_runner as sr
 
     ds = tmp_path / "q.h5ad"
     ds.write_text("x")
@@ -199,14 +199,14 @@ def test_scgpt_runner_captures_job_log_on_failure(tmp_path, monkeypatch):
 
 # --- the scGPT job must stay off known-dead nodes -------------------------------------------
 #
-# Prod sets BIOAGENT_SLURM_EXCLUDE=hpc3-gpu-n54-01 (GPU1 dead; Slurm still offers it). Only the
+# Prod sets AISCIENTIST_SLURM_EXCLUDE=hpc3-gpu-n54-01 (GPU1 dead; Slurm still offers it). Only the
 # vLLM serve job read it. build_analysis_script had no exclude parameter at all, so the scGPT and
 # VL-review GPU jobs could be placed on that node — and fail for a reason that has nothing to do
 # with the model, while reading exactly like a model failure.
 
 def test_scgpt_job_honours_the_node_exclude():
-    from bioagent.gateway.scgpt_job import build_scgpt_script
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.scgpt_job import build_scgpt_script
+    from aiscientist.gateway.settings import HPCSettings
 
     st = HPCSettings(exclude="hpc3-gpu-n54-01")
     script = build_scgpt_script(st, job_name="j", input_h5ad="/dfs3b/x/q.h5ad",
@@ -216,8 +216,8 @@ def test_scgpt_job_honours_the_node_exclude():
 
 def test_no_exclude_line_when_nothing_is_excluded():
     """An empty --exclude= is a Slurm error, not a no-op."""
-    from bioagent.gateway.scgpt_job import build_scgpt_script
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.scgpt_job import build_scgpt_script
+    from aiscientist.gateway.settings import HPCSettings
 
     script = build_scgpt_script(HPCSettings(exclude=None), job_name="j", input_h5ad="/dfs3b/x/q.h5ad",
                                 model_dir="/dfs3b/m", out_dir="/dfs3b/x/out")
@@ -226,8 +226,8 @@ def test_no_exclude_line_when_nothing_is_excluded():
 
 def test_the_vl_review_gpu_job_honours_it_too():
     """The same gap, the other GPU job that goes through build_analysis_script."""
-    from bioagent.gateway.settings import HPCSettings
-    from bioagent.gateway.vlreview_job import build_vlreview_script
+    from aiscientist.gateway.settings import HPCSettings
+    from aiscientist.gateway.vlreview_job import build_vlreview_script
 
     script = build_vlreview_script(HPCSettings(exclude="hpc3-gpu-n54-01"), job_name="j",
                                    pdf="/dfs3b/x/report.pdf", model_dir="/dfs3b/m",
@@ -253,7 +253,7 @@ import pytest
 def _run_harmonizer(tmp_path, var_names, vocab):
     ad = pytest.importorskip("anndata")
     np = pytest.importorskip("numpy")
-    from bioagent.gateway.scgpt_job import _HARMONIZE_PY
+    from aiscientist.gateway.scgpt_job import _HARMONIZE_PY
 
     inp = tmp_path / "q.h5ad"
     a = ad.AnnData(X=np.ones((4, len(var_names)), dtype="float32"))
@@ -290,8 +290,8 @@ def test_a_human_query_passes_through_untouched(tmp_path):
 
 
 def test_the_command_fails_fast_on_a_harmonizer_error_and_falls_back_cleanly():
-    from bioagent.gateway.scgpt_job import HARMONIZATION_NAME, build_scgpt_command
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.scgpt_job import HARMONIZATION_NAME, build_scgpt_command
+    from aiscientist.gateway.settings import HPCSettings
 
     c = build_scgpt_command(HPCSettings(), input_h5ad="/dfs3b/x/q.h5ad", model_dir="/dfs3b/m",
                             out_dir="/dfs3b/x/out")

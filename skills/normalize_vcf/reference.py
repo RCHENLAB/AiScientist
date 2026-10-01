@@ -4,7 +4,7 @@ Run this BEFORE annotation / ClinVar+gnomAD matching / caller comparison. dbSNP,
 store variants in canonical **left-aligned, parsimonious** representation; a non-normalized indel or
 multiallelic site fails to match its database record, so a real pathogenic variant is silently
 reported as "not_in_clinvar". Ported from operon's variant-calling-variant-normalization protocol
-(bcftools norm), adapted to our BIOAGENT_WORK/BIOAGENT_ARTIFACTS conventions.
+(bcftools norm), adapted to our AISCIENTIST_WORK/AISCIENTIST_ARTIFACTS conventions.
 
 Pipeline (order matters): (1) --atomize splits MNPs into SNPs, (2) -m-any splits multiallelic into
 biallelic records, (3) -f REF left-aligns + trims indels against the reference FASTA.
@@ -18,13 +18,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
-WORK = Path(os.environ.get("BIOAGENT_WORK", "."))
-ART = Path(os.environ.get("BIOAGENT_ARTIFACTS", "."))
+WORK = Path(os.environ.get("AISCIENTIST_WORK", "."))
+ART = Path(os.environ.get("AISCIENTIST_ARTIFACTS", "."))
 (ART / "data").mkdir(parents=True, exist_ok=True)
 
 # ADAPT: the input VCF and the reference FASTA (must match the VCF's genome build).
-INPUT_VCF = os.environ.get("BIOAGENT_DATASET") or str(WORK / "input.vcf.gz")
-REF_FASTA = os.environ.get("BIOAGENT_REF_FASTA", "")   # e.g. .../GRCh38.primary_assembly.genome.fa
+INPUT_VCF = os.environ.get("AISCIENTIST_DATASET") or str(WORK / "input.vcf.gz")
+REF_FASTA = os.environ.get("AISCIENTIST_REF_FASTA", "")   # e.g. .../GRCh38.primary_assembly.genome.fa
 OUTPUT_VCF = str(WORK / "normalized.vcf.gz")
 
 if not shutil.which("bcftools"):
@@ -33,7 +33,7 @@ if not Path(INPUT_VCF).exists():
     raise SystemExit(f"input VCF not found: {INPUT_VCF}")
 if not REF_FASTA or not Path(REF_FASTA).exists():
     raise SystemExit("REF_FASTA not set / not found — left-alignment REQUIRES the reference genome "
-                     "FASTA (+ .fai) for the VCF's assembly. Set BIOAGENT_REF_FASTA.")
+                     "FASTA (+ .fai) for the VCF's assembly. Set AISCIENTIST_REF_FASTA.")
 
 
 def _count(vcf: str) -> int:

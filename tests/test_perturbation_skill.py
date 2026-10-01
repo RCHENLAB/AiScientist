@@ -6,8 +6,8 @@ executed in CI, so a syntax slip would otherwise ship silently. compile() parses
 imports, so the scanpy/pertpy-importing templates are safe to check this way."""
 from pathlib import Path
 
-from bioagent.agents.presets import get_preset, list_presets
-from bioagent.agents.skills import SKILLS
+from aiscientist.agents.presets import get_preset, list_presets
+from aiscientist.agents.skills import SKILLS
 
 
 def test_perturbation_analysis_skill_loads():
@@ -34,9 +34,9 @@ def test_perturbation_analysis_in_selector():
 def test_all_skill_scripts_compile():
     # Each skill is a folder skills/<name>/ with a SKILL.md + reference.py (+ any bundle); compile
     # every bundled .py so a syntax slip in a never-imported CodeAct template can't ship silently.
-    from bioagent.agents.skills import _skills_dir
+    from aiscientist.agents.skills import _skills_dir
 
-    skills = _skills_dir()        # the repo-root skills/, or $BIOAGENT_SKILLS_DIR once skills live apart
+    skills = _skills_dir()        # the repo-root skills/, or $AISCIENTIST_SKILLS_DIR once skills live apart
     scripts = sorted(skills.glob("*/*.py"))
     assert scripts, "no skills/*/*.py found — wrong dir?"
     for s in scripts:

@@ -152,7 +152,7 @@ first also removes off-target noise (mitochondrial, PRAMEF, lncRNA) that otherwi
 **State the panel and the AF cutoff.** If the in-panel search is negative, say so before expanding
 genome-wide. (For a general, non-Mendelian VCF with no candidate-gene prior: skip the panel, annotate
 genome-wide.) The default panel + rarity floor can be set once as deploy defaults
-(`BIOAGENT_DEFAULT_REGIONS_BED` / `BIOAGENT_DEFAULT_MAX_POP_AF`), and any caller-supplied value overrides them.
+(`AISCIENTIST_DEFAULT_REGIONS_BED` / `AISCIENTIST_DEFAULT_MAX_POP_AF`), and any caller-supplied value overrides them.
 
 **✅ Verify this step:** panel + AF cutoff are stated in the report · the variant count drops as expected
 (e.g. 4.67 M → 1,544 in-panel → 54 rare) · a negative in-panel result is called out explicitly.
@@ -237,7 +237,7 @@ files — Rui Chen authorised reuse; the HGMD there is a public version):
 > *History: until 2026-07-17 the gateway gated the whole predictor block on `assembly == GRCh38`, so
 > GRCh37 runs got no predictors at all even though CADD GRCh37 was already staged — a flag nobody
 > flipped, not missing data. SpliceAI kept that assembly check until 2026-07-27; it is now gated on the
-> reference FASTA it actually requires.* Set `BIOAGENT_VEP_ALPHAMISSENSE_GRCH37` once that is staged and
+> reference FASTA it actually requires.* Set `AISCIENTIST_VEP_ALPHAMISSENSE_GRCH37` once that is staged and
 > it lights up with no code change.
 
 **✅ Verify this step:** `execution_mode == offline_vep` (a `rest` run on a big VCF only sampled the top
@@ -327,8 +327,7 @@ functional work), not diagnoses.
 Ensembl VEP (offline cache) · ClinVar (dated VCF) · gnomAD exome+genome AF · SIFT/PolyPhen · CADD ·
 REVEL · AlphaMissense · SpliceAI (OpenSpliceAI) · IRD layers (public HGMD, retina-specific exons, retina
 ATAC, dbscSNV) · disease-model tiering — all inside `vep.sif` on HPC3. Full inventory (versions, sizes,
-staging status, env vars): [`docs/vcf_pipeline_tools.md`](../../docs/vcf_pipeline_tools.md) and the IRD
-parity plan [`docs/ird_pipeline_parity_roadmap.md`](../../docs/ird_pipeline_parity_roadmap.md).
+staging status, env vars): [`docs/vcf_pipeline_tools.md`](../../docs/vcf_pipeline_tools.md).
 
 <sub>This protocol's command excerpts are pulled from the cited source functions — regenerate to keep them
 faithful to what runs.</sub>

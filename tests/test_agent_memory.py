@@ -5,7 +5,7 @@ No network/LLM: reflection is driven by an injected ``complete_fn``. See docs/ag
 
 from __future__ import annotations
 
-from bioagent.agents.agent_memory import AgentMemory, slug_agent_id
+from aiscientist.agents.agent_memory import AgentMemory, slug_agent_id
 
 
 def test_slug_is_filesystem_safe():

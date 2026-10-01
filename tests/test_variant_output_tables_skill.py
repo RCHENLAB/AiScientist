@@ -12,8 +12,8 @@ import json
 import runpy
 from pathlib import Path
 
-from bioagent.agents.skills import SKILLS, _skills_dir
-from bioagent.tools.annotate_variants.tool import ANNOTATION_COLUMNS
+from aiscientist.agents.skills import SKILLS, _skills_dir
+from aiscientist.tools.annotate_variants.tool import ANNOTATION_COLUMNS
 
 _SKILL = _skills_dir() / "variant_output_tables" / "reference.py"
 
@@ -49,7 +49,7 @@ def test_skill_writes_all_five_tables_and_summary(tmp_path, monkeypatch):
          "impact": "HIGH", "max_af": "", "rsid": "rs4", "clinical_significance": ""},
     ]
     _write_tsv(tmp_path / "tables" / "variant_annotation.tsv", rows)
-    monkeypatch.setenv("BIOAGENT_ARTIFACTS", str(tmp_path))
+    monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(tmp_path))
 
     runpy.run_path(str(_SKILL), run_name="__main__")   # executes the template (stdlib-only)
 
@@ -74,7 +74,7 @@ def test_skill_writes_all_five_tables_and_summary(tmp_path, monkeypatch):
 
 
 def test_skill_errors_clearly_without_annotated_table(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_ARTIFACTS", str(tmp_path))       # no tables/variant_annotation.tsv
+    monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(tmp_path))       # no tables/variant_annotation.tsv
     try:
         runpy.run_path(str(_SKILL), run_name="__main__")
     except SystemExit as exc:

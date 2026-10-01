@@ -8,9 +8,9 @@ A scripted fake drives ``squeue``/``sacct`` per job_id — no real Slurm, no SSH
 
 from __future__ import annotations
 
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.job_store import JobRecord, JobStore
-from bioagent.gateway.slurm_job import (
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.job_store import JobRecord, JobStore
+from aiscientist.gateway.slurm_job import (
     RunConfig,
     SlurmJobSpec,
     reattach_job,

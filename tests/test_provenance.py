@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import hashlib
 
-from bioagent.agents import provenance as prov
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import make_run_code_tool
+from aiscientist.agents import provenance as prov
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import make_run_code_tool
 
 
 def test_sha256_and_git_and_seed_helpers():

@@ -33,4 +33,4 @@ single pooled gene list (every cell type collapsed into one "input" group) and t
 `run_enrichment` with **no** `genes` argument so it picks the table up itself.
 
 ## Run
-Fetch the template with `read_skill_reference("condition_by_celltype", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `BIOAGENT_WORK`, writes under `BIOAGENT_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.
+Fetch the template with `read_skill_reference("condition_by_celltype", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `AISCIENTIST_WORK`, writes under `AISCIENTIST_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.

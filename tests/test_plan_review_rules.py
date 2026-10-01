@@ -9,7 +9,7 @@ the checklist at all.
 
 from __future__ import annotations
 
-from bioagent.agents.research_lab import _PLAN_REVIEW_CRITIC_SYSTEM as CHECKLIST
+from aiscientist.agents.research_lab import _PLAN_REVIEW_CRITIC_SYSTEM as CHECKLIST
 
 
 def test_it_asks_whether_each_operation_can_be_computed_at_all():
@@ -39,5 +39,5 @@ def test_the_profile_counts_as_already_produced():
 
 
 def test_the_review_is_still_on_by_default():
-    from bioagent.agents.research_lab import LabConfig
+    from aiscientist.agents.research_lab import LabConfig
     assert LabConfig().plan_review is True

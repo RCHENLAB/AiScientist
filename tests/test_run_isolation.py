@@ -18,8 +18,8 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -223,14 +223,14 @@ def test_followup_without_conversation_id_uses_connection_last_run(tmp_path):
 @pytest.fixture
 def _auth_db(tmp_path, monkeypatch):
     """A temp DB with accounts enabled + a seeded user. Yields the user_id."""
-    from bioagent.gateway import db
+    from aiscientist.gateway import db
     url = f"sqlite:///{(tmp_path / 'iso.db').as_posix()}"
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", url)
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", url)
     db.reset(url)
     db.init_db()
     monkeypatch.setattr(gw_app, "_AUTH_ENABLED", True)
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import User
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import User
     with session_scope() as s:
         u = User(username="tester", password_hash="x")
         s.add(u); s.commit(); uid = u.id
@@ -239,13 +239,13 @@ def _auth_db(tmp_path, monkeypatch):
 
 
 def _finished_run(uid, run_id, conversation_id, status="done"):
-    from bioagent.gateway import auth_routes
+    from aiscientist.gateway import auth_routes
     auth_routes.record_run_start(uid, run_id, "q", plan_mode=False, conversation_id=conversation_id)
     auth_routes.record_run_finish(run_id, status)
 
 
 def test_latest_run_id_for_conversation_picks_latest_completed(_auth_db):
-    from bioagent.gateway import auth_routes
+    from aiscientist.gateway import auth_routes
     uid = _auth_db
     _finished_run(uid, "old_done", "conv-1", "done")
     _finished_run(uid, "new_done", "conv-1", "incomplete")   # later + still report-bearing
@@ -257,9 +257,9 @@ def test_latest_run_id_for_conversation_picks_latest_completed(_auth_db):
 
 
 def test_latest_run_id_is_scoped_to_the_user(_auth_db):
-    from bioagent.gateway import auth_routes
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import User
+    from aiscientist.gateway import auth_routes
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import User
     uid = _auth_db
     with session_scope() as s:
         other = User(username="other", password_hash="x"); s.add(other); s.commit(); other_id = other.id
@@ -297,7 +297,7 @@ def test_typed_followup_survives_restart_via_db(_auth_db, tmp_path):
 # --- skip report on a cancelled / empty run ----------------------------------
 
 def test_run_produced_nothing_detects_cancel_and_empty():
-    from bioagent.agents.research_lab import LabResult
+    from aiscientist.agents.research_lab import LabResult
     cancelled = LabResult("q", ["a", "b"], [], False, 0, "cancelled during review")
     assert gw_app._run_produced_nothing(cancelled, plan_cancelled=True) is True
     # 0 accepted AND no rounds executed -> nothing to write up (placeholder, dataless report).
@@ -314,8 +314,8 @@ def test_run_lab_skips_report_when_plan_is_cancelled(tmp_path, monkeypatch):
     """End-to-end through _run_lab: a plan cancelled during review renders NO report, writes no
     run_state, and does not become the conversation's last run — so the next message is a fresh,
     dataset-bound study (fixes the timeout→replan dataset-unbind + the placeholder dataless report)."""
-    from bioagent.agents import research_lab as rl
-    from bioagent.agents.research_lab import LabResult
+    from aiscientist.agents import research_lab as rl
+    from aiscientist.agents.research_lab import LabResult
 
     class _FakeLab:
         def __init__(self, *a, **k):
@@ -383,7 +383,7 @@ def test_a_second_stop_escalates_to_abandoning_the_write_up():
 def _stopped_lab_result(question="analyze this"):
     """A LabResult shaped like a mid-run Stop: one accepted round, not converged. This is the case
     _run_produced_nothing deliberately lets through to the write-up."""
-    from bioagent.agents.research_lab import CriticVerdict, LabResult, LabRound
+    from aiscientist.agents.research_lab import CriticVerdict, LabResult, LabRound
     rnd = LabRound(1, 1, "Run QC", "Scientist",
                    {"final_answer": "3,000 cells passed QC.", "evidence": []},
                    CriticVerdict("accept", 0.9, ""))
@@ -395,7 +395,7 @@ def _stopped_lab_result(question="analyze this"):
 def _lab_stopped_during(conn, monkeypatch, *, presses: int):
     """Install a ResearchLab double whose loop is interrupted by `presses` Stop clicks, exactly as
     the endpoint would set them — mid-run, i.e. AFTER _run_lab has armed the run's flags."""
-    from bioagent.agents import research_lab as rl
+    from aiscientist.agents import research_lab as rl
 
     class _FakeLab:
         def __init__(self, *a, **k):
@@ -449,7 +449,7 @@ def test_a_second_stop_skips_the_model_written_write_up_but_keeps_the_bundle(tmp
     for fn in ("_build_report", "_review_and_finalize_report", "_build_technical_report"):
         monkeypatch.setattr(gw_app, fn, _boom(fn))
     # _run_lab imports the renderer inside the function, so patch it at its source module.
-    from bioagent.reporting import report as report_mod
+    from aiscientist.reporting import report as report_mod
     monkeypatch.setattr(report_mod, "build_pdf_report", _boom("build_pdf_report"))
 
     conn.begin_run("conv-1")

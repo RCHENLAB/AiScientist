@@ -35,7 +35,7 @@ VCF ── normalize ── QC ── annotate (VEP + ClinVar + gnomAD + predict
 | **AlphaMissense** | DeepMind's missense pathogenicity score; >0.564 = likely pathogenic | VEP plugin + data | `vep_annotation/plugins/alphamissense/` (hg38) | **staged + verified** (643 MB; am_pathogenicity=0.9927) |
 | **REVEL** | Ensemble missense pathogenicity score; >0.5 = likely pathogenic | VEP plugin + data | `vep_annotation/plugins/revel/` | **staged + verified** (675 MB GRCh38-tabbed; BRAF V600E revel=0.931) |
 | **SpliceAI** (OpenSpliceAI) | Predicts whether a variant disrupts RNA splicing (the splice-prediction class VEP's protein predictors miss) — 4 delta scores (Acceptor/Donor × Gain/Loss); max ≥0.5 = likely splice-altering | PyTorch model (conda env) | `tools/vcf_offline.py` (`build_spliceai_cmd`/`parse_spliceai_vcf`, gated stage) | **installed + verified** — OpenSpliceAI 0.0.7 env + OSAI-MANE-10000nt models; BRAF/SAMD11 donor variants scored DS_DL 0.917/0.755 end-to-end INSIDE vep.sif |
-| MANE Select / HGVS | Pick the one clinically-standard transcript per gene; emit standard `c.`/`p.` variant names | VEP flags | `build_vep_cmd` (`--mane_select` with plugins; `--hgvs` with `BIOAGENT_REF_FASTA`) | **code done** — activates when plugins / ref FASTA are staged |
+| MANE Select / HGVS | Pick the one clinically-standard transcript per gene; emit standard `c.`/`p.` variant names | VEP flags | `build_vep_cmd` (`--mane_select` with plugins; `--hgvs` with `AISCIENTIST_REF_FASTA`) | **code done** — activates when plugins / ref FASTA are staged |
 | **TileDB-VCF** | A database that stores many samples' variants in one compressed, indexed array for fast population queries + incremental sample addition | Python lib | `skills/build_variant_db_tiledbvcf/` | **live** (skill; heavy dep, analysis image) |
 | cyvcf2 | Fast Python VCF reader | Python lib | `skills/vcf_qc_stats/` fallback path | **live** (optional) |
 
@@ -70,13 +70,13 @@ if the known-gene search is negative. The result carries `variant_filters` (how 
 
 `deploy/vep/stage_annotation_dbs.sh` — idempotent: checks which DB files already exist under the shared
 plugins dir and downloads only the missing ones (AlphaMissense, CADD, REVEL, reference FASTA), then
-prints the `BIOAGENT_VEP_*` env lines to set. Bind-mount that dir read-only into `vep.sif`.
+prints the `AISCIENTIST_VEP_*` env lines to set. Bind-mount that dir read-only into `vep.sif`.
 
 ## Reference-data footprint on HPC3
 
 Staged in the lab's SHARED reference dir `/dfs3b/ruic20_lab/software/reference/vep_annotation/` (Jin
 Li's convention — download once, mount read-only, reuse across projects; the `vep.sif` container stays
-under `.../bioagent/containers/`). The lab's dfs3b quota is **600 TiB, ~97% used
+under `.../AiScientist/containers/`). The lab's dfs3b quota is **600 TiB, ~97% used
 (~16 TiB free)**; Jin Li confirmed the lab keeps **>20 TB free (can grow past 50 TB)** for this, so
 the ~150 GB of predictor data is not a blocker — but download each DB ONCE and bind-mount it (see the
 staging script). Cohort variant databases are the real future consumer:
@@ -88,7 +88,7 @@ staging script). Cohort variant databases are the real future consumer:
 | ClinVar (both assemblies) | ~360 MB |
 | CADD GRCh38 (staging) | 87 GB |
 | AlphaMissense hg38 (staging) | 643 MB |
-| OpenSpliceAI conda env (torch/cuda libs, `bioagent/envs/openspliceai`) | ~7 GB |
+| OpenSpliceAI conda env (torch/cuda libs, `AiScientist/envs/openspliceai`) | ~7 GB |
 | OpenSpliceAI-MANE-10000nt models (5 × 2.8 MB, `reference/spliceai/`) | ~14 MB |
 | **Total (current + this week's plugins + SpliceAI)** | **~137 GB** |
 
@@ -102,46 +102,46 @@ is off/skipped unless its env var is set and the data exists, so the baseline SI
 runs unchanged until the deploy env is flipped.
 
 ```
-BIOAGENT_VARIANT_ON_HPC=1            # use the offline VEP line (default OFF → REST fallback, 500-cap)
-BIOAGENT_VEP_IMAGE=.../containers/vep.sif
-BIOAGENT_VEP_CACHE_DIR_GRCH38=.../vep_annotation/GRCh38
-BIOAGENT_VEP_CACHE_DIR_GRCH37=.../vep_annotation/GRCh37
-BIOAGENT_VEP_CLINVAR_GRCH38=.../vep_annotation/clinvar_GRCh38.vcf.gz
+AISCIENTIST_VARIANT_ON_HPC=1            # use the offline VEP line (default OFF → REST fallback, 500-cap)
+AISCIENTIST_VEP_IMAGE=.../containers/vep.sif
+AISCIENTIST_VEP_CACHE_DIR_GRCH38=.../vep_annotation/GRCh38
+AISCIENTIST_VEP_CACHE_DIR_GRCH37=.../vep_annotation/GRCh37
+AISCIENTIST_VEP_CLINVAR_GRCH38=.../vep_annotation/clinvar_GRCh38.vcf.gz
 
 # Predictor plugins — set once the data is staged (master switch defaults OFF):
-BIOAGENT_VEP_PLUGINS=1              # turn on CADD/AlphaMissense/REVEL + MANE-Select
-BIOAGENT_VEP_PLUGINS_DIR=.../vep_annotation/plugins/vep_plugins   # the .pm scripts (VEP --dir_plugins; no sif rebuild)
-BIOAGENT_VEP_CADD_SNV=.../vep_annotation/plugins/cadd/whole_genome_SNVs.tsv.gz
-BIOAGENT_VEP_CADD_INDELS=...       # optional
-BIOAGENT_VEP_ALPHAMISSENSE=.../vep_annotation/plugins/alphamissense/AlphaMissense_hg38.tsv.gz
-BIOAGENT_VEP_REVEL=.../vep_annotation/plugins/revel/new_tabbed_revel_grch38.tsv.gz
+AISCIENTIST_VEP_PLUGINS=1              # turn on CADD/AlphaMissense/REVEL + MANE-Select
+AISCIENTIST_VEP_PLUGINS_DIR=.../vep_annotation/plugins/vep_plugins   # the .pm scripts (VEP --dir_plugins; no sif rebuild)
+AISCIENTIST_VEP_CADD_SNV=.../vep_annotation/plugins/cadd/whole_genome_SNVs.tsv.gz
+AISCIENTIST_VEP_CADD_INDELS=...       # optional
+AISCIENTIST_VEP_ALPHAMISSENSE=.../vep_annotation/plugins/alphamissense/AlphaMissense_hg38.tsv.gz
+AISCIENTIST_VEP_REVEL=.../vep_annotation/plugins/revel/new_tabbed_revel_grch38.tsv.gz
 
 # Normalization + HGVS names — needs the reference genome FASTA (+ .fai) for the assembly:
-BIOAGENT_REF_FASTA=.../ref/GRCh38.primary_assembly.fa
+AISCIENTIST_REF_FASTA=.../ref/GRCh38.primary_assembly.fa
 
 # SpliceAI (OpenSpliceAI) — splice-disruption scoring; separate conda env, run INSIDE vep.sif (its
-# conda-forge python runs under the container's glibc — validated). OFF by default; needs BIOAGENT_REF_FASTA:
-BIOAGENT_SPLICEAI=1                                              # master switch (default OFF)
-BIOAGENT_SPLICEAI_BIN=.../bioagent/envs/openspliceai/bin/openspliceai
-BIOAGENT_SPLICEAI_MODELS=.../reference/spliceai/OSAI-MANE-10000nt   # 5-model ensemble (~14 MB)
-BIOAGENT_SPLICEAI_MAX_VARIANTS=0       # 0 = NO cap (default); set >0 as an optional safety valve
+# conda-forge python runs under the container's glibc — validated). OFF by default; needs AISCIENTIST_REF_FASTA:
+AISCIENTIST_SPLICEAI=1                                              # master switch (default OFF)
+AISCIENTIST_SPLICEAI_BIN=.../AiScientist/envs/openspliceai/bin/openspliceai
+AISCIENTIST_SPLICEAI_MODELS=.../reference/spliceai/OSAI-MANE-10000nt   # 5-model ensemble (~14 MB)
+AISCIENTIST_SPLICEAI_MAX_VARIANTS=0       # 0 = NO cap (default); set >0 as an optional safety valve
 #                                        (~50 s/variant on CPU, so keep the panel/AF filter tight)
 ```
 
 **How SpliceAI runs.** OpenSpliceAI needs PyTorch, which is NOT in `vep.sif`, so it lives in its own
-conda env (`.../bioagent/envs/openspliceai`, Python 3.10 + torch). The offline annotation runs inside
+conda env (`.../AiScientist/envs/openspliceai`, Python 3.10 + torch). The offline annotation runs inside
 `vep.sif`, and the SpliceAI stage execs the env's `openspliceai variant` binary as a subprocess — the
 conda-forge python runs cleanly under the container's glibc (verified on HPC3). The gateway bind-mounts
 the env dir + the model dir + the ref-FASTA dir (read-only; the `.fai` is present so pyfaidx never
 rebuilds) and points `HOME`/`TORCH_HOME` at a writable per-run dir. Because inference is ~50 s/variant
 on CPU, the stage is meant to run **on the variants left after the gene-panel / AF reduction** — there is
-NO hard cap by default (`BIOAGENT_SPLICEAI_MAX_VARIANTS=0`), but a `>0` value is an optional safety valve
+NO hard cap by default (`AISCIENTIST_SPLICEAI_MAX_VARIANTS=0`), but a `>0` value is an optional safety valve
 that skips it (with a loud note) if the set is still huge, so a mis-configured whole-WGS run can't hang
 for days. Adds `spliceai_max_ds` + `spliceai_site` columns;
 a max delta ≥0.5 also counts as damaging in the high-priority shortlist.
 
 Each predictor is added to the VEP command only when its var is set AND the file exists; the
-`bcftools norm` (left-align) stage runs only when `BIOAGENT_REF_FASTA` points at a real file.
+`bcftools norm` (left-align) stage runs only when `AISCIENTIST_REF_FASTA` points at a real file.
 `annotate_variants` reports `normalized` + `predictors` so a run states its annotation depth honestly.
 
 Build/stage kit: `deploy/vep/` (`build_and_stage.sh`, `vep.def`, `README.md`, `PREDICTOR_STAGING.md`).

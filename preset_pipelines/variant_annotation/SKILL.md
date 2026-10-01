@@ -14,7 +14,7 @@ Annotation is done by the curated `annotate_variants` tool, so you do NOT write 
 code for the core step. It has two execution modes behind the SAME interface — you don't choose, the
 gateway routes:
 
-* **Offline VEP on HPC3** (default when `BIOAGENT_VARIANT_ON_HPC` is enabled): `bcftools` PASS-filter
+* **Offline VEP on HPC3** (default when `AISCIENTIST_VARIANT_ON_HPC` is enabled): `bcftools` PASS-filter
   → `vep --offline --cache --fork` over a bind-mounted local cache, as a CPU Slurm job. Scales to a
   **WGS-size VCF** — annotates EVERY passing variant (no cap), no network, no rate limits (~30–60 min).
 * **REST fallback** (small VCFs, or the offline line unavailable): Ensembl VEP REST + ClinVar on the
@@ -69,7 +69,7 @@ trustworthy and focused; skipping those is how a variant study silently ships wr
    step is redundant. It also CANNOT run as its own `run_code` step: `run_code` executes in `analysis.sif`,
    which has no `bcftools` and no reference-FASTA bind, so the `normalize_vcf` template exits and the model
    degrades to a hand-rolled `cyvcf2` normalize — which is WRONG (cyvcf2 does not left-align) and just
-   burns retries. So under `BIOAGENT_VARIANT_ON_HPC` (the default) SKIP this as a step; annotation
+   burns retries. So under `AISCIENTIST_VARIANT_ON_HPC` (the default) SKIP this as a step; annotation
    normalizes for you. (Only a REST-path run on a small, indel-heavy, known-non-normalized VCF benefits
    from a prior `bcftools norm` — and that still needs bcftools + the reference present, not the analysis
    sandbox.)

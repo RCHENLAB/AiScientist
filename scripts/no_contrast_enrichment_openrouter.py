@@ -35,18 +35,18 @@ def _load_dotenv(p: Path) -> None:
 
 
 _load_dotenv(ROOT / ".env")
-KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("BIOAGENT_LLM_API_KEY")
+KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("AISCIENTIST_LLM_API_KEY")
 MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3.6-35b-a3b")
 if not KEY:
     print("OPENROUTER_API_KEY not set — cannot run.")
     sys.exit(2)
 
-from bioagent.agents.registry import build_scientist_catalog  # noqa: E402
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
-from bioagent.agents.research_lab import (  # noqa: E402
+from aiscientist.agents.registry import build_scientist_catalog  # noqa: E402
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
+from aiscientist.agents.research_lab import (  # noqa: E402
     LabConfig, ResearchLab, _annotated_without_contrast, _is_enrichment_step,
 )
-from bioagent.providers.openai_compatible import OpenRouterClient  # noqa: E402
+from aiscientist.providers.openai_compatible import OpenRouterClient  # noqa: E402
 
 CLIENT = OpenRouterClient(model=MODEL, api_key=KEY, reasoning_effort="none", timeout_seconds=120)
 CATALOG = build_scientist_catalog()

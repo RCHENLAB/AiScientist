@@ -4,16 +4,16 @@ From: ensemblorg/ensembl-vep:release_112.0
 # OFFLINE VCF variant-annotation image for AiScientist (variant_cli on HPC3).
 #
 # This is the container SlurmAnalysisExecutor runs the offline variant line inside
-# (src/bioagent/tools/variant_cli.py -> vcf_offline.run_offline_annotation) on an HPC3 CPU node,
+# (src/aiscientist/tools/variant_cli.py -> vcf_offline.run_offline_annotation) on an HPC3 CPU node,
 # so a WGS-size VCF is annotated where `#SBATCH --mem` is a REAL cgroup cap and there is NO network
 # dependency at run time. It carries ONLY the tools:
 #
 #   * Ensembl VEP (from the official ensemblorg/ensembl-vep base, PINNED to release_112.0), plus
 #   * bcftools (PASS-filter / region-subset streaming), and
-#   * python3 (to run `python -m bioagent.tools.variant_cli`).
+#   * python3 (to run `python -m aiscientist.tools.variant_cli`).
 #
 # The VEP CACHE and the ClinVar VCF are NOT baked in — they are ~20GB each and are staged on dfs3b by
-# deploy/vep/build_and_stage.sh, then bind-mounted READ-ONLY at run time (offline). The bioagent tools
+# deploy/vep/build_and_stage.sh, then bind-mounted READ-ONLY at run time (offline). The AiScientist tools
 # are likewise bind-mounted from dfs3b (pysrc) + put on PYTHONPATH by the executor, so a tool edit
 # needs only a code sync, never an image rebuild. Keeping the image deps-only also keeps `--remote`
 # builds working (no local %files to ship to the Sylabs cloud builder).
@@ -53,13 +53,13 @@ From: ensemblorg/ensembl-vep:release_112.0
 
 %help
     Offline Ensembl VEP + bcftools image for AiScientist's variant line on HPC3. The cache + ClinVar are
-    bind-mounted from dfs3b (NOT baked); the bioagent tools are bound from dfs3b + put on PYTHONPATH.
+    bind-mounted from dfs3b (NOT baked); the AiScientist tools are bound from dfs3b + put on PYTHONPATH.
 
       singularity exec --containall --net --network none \
         -B <vcf>:<vcf>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
         -B <cache>:<cache>:ro -B <clinvar.vcf.gz>:<clinvar.vcf.gz>:ro \
         --env PYTHONPATH=<pysrc> \
-        vep.sif python3 -m bioagent.tools.variant_cli \
+        vep.sif python3 -m aiscientist.tools.variant_cli \
           --tool annotate_variants --workspace <run_ws> --dataset <vcf> --args <args.json>
 
     where <args.json> carries {cache_dir, clinvar_vcf, assembly, fork, pass_only, ...} injected by the

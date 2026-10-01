@@ -9,12 +9,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from bioagent.agents.preset_pipelines import _pipelines_dir
-from bioagent.agents.skills import _load_from, _parse_front_matter, _skills_dir
-from bioagent.tools import catalog
+from aiscientist.agents.preset_pipelines import _pipelines_dir
+from aiscientist.agents.skills import _load_from, _parse_front_matter, _skills_dir
+from aiscientist.tools import catalog
 
 # Read from where the platform reads them: the repo-root folders today, the AiScientist-skills
-# checkout ($BIOAGENT_SKILLS_DIR / $BIOAGENT_PIPELINES_DIR) after the split.
+# checkout ($AISCIENTIST_SKILLS_DIR / $AISCIENTIST_PIPELINES_DIR) after the split.
 SKILLS_DIR = _skills_dir()
 PIPELINES_DIR = _pipelines_dir()
 PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",

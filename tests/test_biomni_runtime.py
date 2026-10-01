@@ -7,12 +7,12 @@ is installed on the eye server.
 
 import pytest
 
-from bioagent.integrations.biomni_adapter import (
+from aiscientist.integrations.biomni_adapter import (
     EXECUTE_MODE,
     BiomniAdapter,
     BiomniSafetyPolicy,
 )
-from bioagent.integrations.biomni_runtime import (
+from aiscientist.integrations.biomni_runtime import (
     BiomniNotInstalledError,
     BiomniRuntimeConfig,
     MockBiomniRuntime,
@@ -91,12 +91,12 @@ def test_to_dict_is_json_friendly() -> None:
 
 def test_runtime_config_from_env_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in (
-        "BIOAGENT_BIOMNI_MODEL",
-        "BIOAGENT_OLLAMA_MODEL",
-        "BIOAGENT_BIOMNI_DATA_PATH",
-        "BIOAGENT_BIOMNI_SOURCE",
-        "BIOAGENT_BIOMNI_BASE_URL",
-        "BIOAGENT_BIOMNI_API_KEY",
+        "AISCIENTIST_BIOMNI_MODEL",
+        "AISCIENTIST_OLLAMA_MODEL",
+        "AISCIENTIST_BIOMNI_DATA_PATH",
+        "AISCIENTIST_BIOMNI_SOURCE",
+        "AISCIENTIST_BIOMNI_BASE_URL",
+        "AISCIENTIST_BIOMNI_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -105,9 +105,9 @@ def test_runtime_config_from_env_defaults_and_overrides(monkeypatch: pytest.Monk
     assert default.base_url == "http://127.0.0.1:11434/v1"
 
     # Shared Ollama var is the fallback; the Biomni-specific var wins.
-    monkeypatch.setenv("BIOAGENT_OLLAMA_MODEL", "qwen3")
+    monkeypatch.setenv("AISCIENTIST_OLLAMA_MODEL", "qwen3")
     assert BiomniRuntimeConfig.from_env().model == "qwen3"
-    monkeypatch.setenv("BIOAGENT_BIOMNI_MODEL", "qwen3.6:35b-a3b")
+    monkeypatch.setenv("AISCIENTIST_BIOMNI_MODEL", "qwen3.6:35b-a3b")
     assert BiomniRuntimeConfig.from_env().model == "qwen3.6:35b-a3b"
 
 

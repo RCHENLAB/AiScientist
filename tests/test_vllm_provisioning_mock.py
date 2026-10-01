@@ -14,18 +14,18 @@ from __future__ import annotations
 
 import base64
 
-from bioagent.gateway import gpu
-from bioagent.gateway.mock_host import MockExecutor
-from bioagent.gateway.settings import HPCSettings
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway import gpu
+from aiscientist.gateway.mock_host import MockExecutor
+from aiscientist.gateway.settings import HPCSettings
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 def _vllm_settings() -> HPCSettings:
     return HPCSettings(
         llm_backend="vllm",
-        vllm_image=f"{LAB_STORAGE}/software/bioagent/containers/vllm.sif",
+        vllm_image=f"{LAB_STORAGE}/software/AiScientist/containers/vllm.sif",
         vllm_model="QuantTrio/Qwen3.6-35B-A3B-AWQ",
-        hf_home=f"{LAB_STORAGE}/software/bioagent/hf",
+        hf_home=f"{LAB_STORAGE}/software/AiScientist/hf",
     )
 
 

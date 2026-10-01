@@ -17,14 +17,14 @@ pytest.importorskip("fastapi")
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("BIOAGENT_LLM_KEY_ENCRYPTION", raising=False)
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("AISCIENTIST_LLM_KEY_ENCRYPTION", raising=False)
 
-    from bioagent.gateway import llm_credentials
+    from aiscientist.gateway import llm_credentials
     importlib.reload(llm_credentials)
 
     from fastapi.testclient import TestClient
-    from bioagent.gateway import app as gw_app
+    from aiscientist.gateway import app as gw_app
     return TestClient(gw_app.app)
 
 
@@ -48,14 +48,14 @@ class _Endpoint:
         self._fail = None
 
     def verify(self, base_url, api_key, model=None, timeout=15.0):
-        from bioagent.gateway import llm_providers
+        from aiscientist.gateway import llm_providers
         self.seen.append((base_url, api_key, model))
         if self._fail:
             return llm_providers.VerifyResult(False, self._fail[0], self._fail[1])
         return llm_providers.VerifyResult(True, "ok", "fine", ["m1", "m2"], verified_model=model)
 
     def probe(self, base_url, api_key, timeout=15.0):
-        from bioagent.gateway import llm_providers
+        from aiscientist.gateway import llm_providers
         self.probed.append((base_url, api_key))
         if self._fail:
             return llm_providers.ModelsResult(False, self._fail[0], self._fail[1])
@@ -64,7 +64,7 @@ class _Endpoint:
 
 @pytest.fixture()
 def ok_endpoint(monkeypatch):
-    from bioagent.gateway import llm_providers
+    from aiscientist.gateway import llm_providers
 
     ep = _Endpoint()
     monkeypatch.setattr(llm_providers, "verify", ep.verify)
@@ -152,7 +152,7 @@ def test_rotation_keeps_the_id_and_the_old_key_until_the_new_one_verifies(client
                      json={"api_key": "sk-broken-1111111111", "user": "alice"})
     assert bad.status_code == 400 and bad.json()["cause"] == "auth"
 
-    from bioagent.gateway import llm_credentials
+    from aiscientist.gateway import llm_credentials
     assert llm_credentials.resolve_secret("alice", cred_id) == "sk-original-000000000"
 
     ok_endpoint.succeed()
@@ -243,8 +243,8 @@ def test_delete_removes_it(client, ok_endpoint):
 def conn(client):
     """A ready mock session owned by "alice", registered so /api/llm-endpoint can find it."""
     import asyncio
-    from bioagent.gateway import app as gw_app
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway import app as gw_app
+    from aiscientist.gateway.settings import HPCSettings
 
     c = gw_app.Connection(HPCSettings(), mock=True, loop=asyncio.new_event_loop(), username="alice")
     c.status = "ready"
@@ -413,7 +413,7 @@ def test_the_provider_preset_can_be_changed_by_an_edit(client, ok_endpoint):
 def test_the_list_says_where_keys_are_stored(client, ok_endpoint):
     """"Where does my key go?" is answerable only here — the key itself never reaches the browser.
 
-    The path must be ABSOLUTE: BIOAGENT_STATE_DIR is unset in production, so an unresolved store
+    The path must be ABSOLUTE: AISCIENTIST_STATE_DIR is unset in production, so an unresolved store
     reads "llm_creds/<user>", which the reader cannot locate and which therefore answers nothing.
     """
     import os

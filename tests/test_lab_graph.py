@@ -20,8 +20,8 @@ import pytest
 
 pytest.importorskip("langgraph")
 
-from bioagent.agents.dag import LabPlan, TaskNode, _has_cycle  # noqa: E402
-from bioagent.agents.lab_graph import (  # noqa: E402
+from aiscientist.agents.dag import LabPlan, TaskNode, _has_cycle  # noqa: E402
+from aiscientist.agents.lab_graph import (  # noqa: E402
     build_lab_graph,
     order_rounds,
     serialize_conflicting_nodes,
@@ -178,8 +178,8 @@ def test_research_lab_runs_end_to_end_on_the_langgraph_planner(tmp_path):
     step through the SAME Scientist/Critic node code, and produces the same LabResult shape."""
     import json
 
-    from bioagent.agents.research_harness import HarnessContext, HarnessResult
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, HarnessResult
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["Step 1: QC the cells", "Step 2: differential expression"]
 

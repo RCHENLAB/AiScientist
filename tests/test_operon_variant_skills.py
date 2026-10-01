@@ -12,9 +12,9 @@ import json
 import runpy
 from pathlib import Path
 
-from bioagent.agents.skills import SKILLS, _skills_dir
+from aiscientist.agents.skills import SKILLS, _skills_dir
 
-_SKILLS = _skills_dir()   # the repo-root skills/, or $BIOAGENT_SKILLS_DIR once skills live apart
+_SKILLS = _skills_dir()   # the repo-root skills/, or $AISCIENTIST_SKILLS_DIR once skills live apart
 
 
 def test_operon_skills_registered_with_summaries():
@@ -53,8 +53,8 @@ def test_clinical_prioritization_tiers(tmp_path, monkeypatch):
         {"location": "2:300", "gene_symbol": "FOO", "consequence": "intron_variant",
          "impact": "MODIFIER", "max_af": "0.5", "rsid": "rs3", "clinical_significance": ""},
     ])
-    monkeypatch.setenv("BIOAGENT_ARTIFACTS", str(tmp_path))
-    monkeypatch.setenv("BIOAGENT_DISEASE_MODEL", "dominant")
+    monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(tmp_path))
+    monkeypatch.setenv("AISCIENTIST_DISEASE_MODEL", "dominant")
     runpy.run_path(str(_SKILLS / "clinical_variant_prioritization" / "reference.py"), run_name="__main__")
 
     tiers = {r["Gene"]: r["Tier"]
@@ -68,7 +68,7 @@ def test_clinical_prioritization_tiers(tmp_path, monkeypatch):
 
 
 def test_clinical_prioritization_needs_annotation_table(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_ARTIFACTS", str(tmp_path))   # no tables/variant_annotation.tsv
+    monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(tmp_path))   # no tables/variant_annotation.tsv
     try:
         runpy.run_path(str(_SKILLS / "clinical_variant_prioritization" / "reference.py"), run_name="__main__")
     except SystemExit as exc:
@@ -87,9 +87,9 @@ def test_vcf_qc_stats_stdlib_titv_and_flag(tmp_path, monkeypatch):
         "1\t300\t.\tA\tC\t50\tPASS\t.\n"
         "1\t400\t.\tG\tT\t50\tPASS\t.\n"
         "1\t500\t.\tAT\tA\t50\tPASS\t.\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_ARTIFACTS", str(tmp_path / "art"))
-    monkeypatch.setenv("BIOAGENT_DATASET", str(vcf))
-    monkeypatch.setenv("BIOAGENT_SEQ_TYPE", "WGS")
+    monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(tmp_path / "art"))
+    monkeypatch.setenv("AISCIENTIST_DATASET", str(vcf))
+    monkeypatch.setenv("AISCIENTIST_SEQ_TYPE", "WGS")
     # bcftools/cyvcf2 may or may not be installed in CI; force the stdlib path deterministically by
     # running the module and asserting on the JSON, whichever method was used still yields Ti/Tv=1.0.
     runpy.run_path(str(_SKILLS / "vcf_qc_stats" / "reference.py"), run_name="__main__")

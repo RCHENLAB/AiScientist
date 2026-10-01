@@ -15,14 +15,14 @@ import shutil
 import subprocess
 from pathlib import Path
 
-WORK = Path(os.environ.get("BIOAGENT_WORK", "."))
-ART = Path(os.environ.get("BIOAGENT_ARTIFACTS", "."))
+WORK = Path(os.environ.get("AISCIENTIST_WORK", "."))
+ART = Path(os.environ.get("AISCIENTIST_ARTIFACTS", "."))
 (ART / "tables").mkdir(parents=True, exist_ok=True)
 (ART / "data").mkdir(parents=True, exist_ok=True)
 
 # ADAPT: the VCF to QC, and whether it is whole-genome or exome (sets the expected Ti/Tv band).
-INPUT_VCF = os.environ.get("BIOAGENT_DATASET") or str(WORK / "normalized.vcf.gz")
-SEQ_TYPE = os.environ.get("BIOAGENT_SEQ_TYPE", "WGS").upper()   # "WGS" or "WES"
+INPUT_VCF = os.environ.get("AISCIENTIST_DATASET") or str(WORK / "normalized.vcf.gz")
+SEQ_TYPE = os.environ.get("AISCIENTIST_SEQ_TYPE", "WGS").upper()   # "WGS" or "WES"
 
 if not Path(INPUT_VCF).exists():
     raise SystemExit(f"input VCF not found: {INPUT_VCF}")

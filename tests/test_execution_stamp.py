@@ -12,9 +12,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import LabConfig, ResearchLab, Specialist
-from bioagent.reporting.research_bundle import _render_transcript, write_process_artifacts
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
+from aiscientist.reporting.research_bundle import _render_transcript, write_process_artifacts
 
 
 def _lab(tmp_path: Path, **cfg) -> ResearchLab:

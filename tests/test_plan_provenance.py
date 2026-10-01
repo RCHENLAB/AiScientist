@@ -17,9 +17,9 @@ is precisely why it stayed absent:
 
 from __future__ import annotations
 
-from bioagent.agents.research_harness import nondefault_params
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_harness import nondefault_params
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.agents.research_lab import (
     _is_readback_step,
     _is_report_busywork,
     _split_self_sourced,
@@ -146,8 +146,8 @@ def test_a_plan_naming_an_invented_tool_is_annotated_not_pruned():
     step must survive; what must not survive is the reviewer's belief that a tested tool will run."""
     import json as _json
 
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**Contrast** — Compare arms with `run_wilcoxon_DE` stratified by majorclass",
               "**Stability** — Bootstrap rankings with `run_cell_bootstrapping`"]
@@ -186,8 +186,8 @@ def test_enrichment_without_a_de_producer_gets_a_contrast_step_inserted():
     failed as 'no significant DE genes' and read like a null result."""
     import json as _json
 
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**QC** — Filter and normalize with `run_scanpy_qc`",
               "**Pathways** — Test enriched pathways with `run_enrichment` on the DE table"]
@@ -225,7 +225,7 @@ def test_enrichment_without_a_de_producer_gets_a_contrast_step_inserted():
 
 def test_the_literature_label_never_prints_instruction_residue():
     """The exact strings that reached production plan cards."""
-    from bioagent.agents.research_lab import _literature_step_text as f
+    from aiscientist.agents.research_lab import _literature_step_text as f
     generic = "Literature search for the key genes and pathways found"
     assert f("This dataset has 3 donors — please run pseudobulk differential expression for me.") == generic
     assert f("help me analyze this dataset and complete the report.") == generic
@@ -241,8 +241,8 @@ def test_an_inserted_step_is_written_by_the_pi_not_a_template():
     the offline fallback."""
     import json as _json
 
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**QC** — Filter and normalize with `run_scanpy_qc`",
               "**Pathways** — Test enriched pathways with `run_enrichment` on the DE table"]
@@ -281,7 +281,7 @@ def test_a_step_naming_an_analysis_tool_is_never_a_literature_step():
     """A production DE step ending '…to guide biological interpretation' matched the literature
     phrase list and was routed to the literature fast path: four literature_search calls, run_de
     never ran, the plan's central contrast was lost twice."""
-    from bioagent.agents.research_lab import _is_literature_step
+    from aiscientist.agents.research_lab import _is_literature_step
     de = ("**Descriptive differential ranking** — Rank genes with `run_de` (reference='WT', "
           "stratify_by='majorclass') … This yields a ranking to guide biological interpretation.")
     assert not _is_literature_step(de)
@@ -294,8 +294,8 @@ def test_every_checkpoint_reading_analysis_tool_is_offloaded_to_hpc():
     """run_composition ran IN-PROCESS on the eyeserver while QC's checkpoint sat on dfs3b — three
     rounds of 'no analysis checkpoint found' on a labelled two-arm dataset, i.e. the protocol's
     first analysis was structurally un-runnable. Every tool scrna_cli can dispatch must be routed."""
-    from bioagent.agents.registry import _HPC_ANALYSIS_TOOLS
-    from bioagent.tools.scrna_cli import _analysis_tools
+    from aiscientist.agents.registry import _HPC_ANALYSIS_TOOLS
+    from aiscientist.tools.scrna_cli import _analysis_tools
     assert set(_analysis_tools()) <= set(_HPC_ANALYSIS_TOOLS)
 
 
@@ -303,7 +303,7 @@ def test_mode_routing_is_decided_by_the_dataset_first():
     """Routing was an LLM call over the question alone: two near-identical questions on the same
     two-arm annotated dataset went team (7 min, 8-9 sound steps) and single (1 min, 4 steps, no
     composition). The dataset settles it deterministically; the LLM only breaks ties."""
-    from bioagent.agents.research_lab import _dataset_mode_rule
+    from aiscientist.agents.research_lab import _dataset_mode_rule
     two_arm_labelled = {"obs_categoricals": {"sampleid": {"n": 2, "values": ["DDX41", "WT"]},
                                              "majorclass": {"n": 11, "values": ["Rod"]},
                                              "orig.ident": {"n": 1, "values": ["0"]}}}
@@ -323,7 +323,7 @@ def test_remote_dfs3b_paths_are_not_reported_as_missing_evidence(tmp_path):
     those never exist, so a production ORA step was told ALL its evidence was missing while its
     tables sat in artifacts/. Remote artifacts map to their local mirror; other remote paths are
     unverifiable here, not missing."""
-    from bioagent.agents.research_lab import resolve_evidence
+    from aiscientist.agents.research_lab import resolve_evidence
     art = tmp_path / "artifacts" / "tables"; art.mkdir(parents=True)
     (art / "enrichment_AC_up.csv").write_text("x")
     present, missing = resolve_evidence([
@@ -347,8 +347,8 @@ def test_a_step_that_names_a_tool_the_scientist_never_called_is_nudged_once():
     import json as _json
     from types import SimpleNamespace
 
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-    from bioagent.agents.research_lab import LabConfig, ResearchLab, Specialist
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
 
     calls: list[str] = []
     def chat_fn(messages, tools):

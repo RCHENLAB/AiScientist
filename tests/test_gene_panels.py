@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.tools.gene_panels import available_panels, load_gene_panel
+from aiscientist.tools.gene_panels import available_panels, load_gene_panel
 
 
 def test_ird_panel_loads_and_is_sane():
@@ -44,8 +44,8 @@ def test_available_panels_deduplicated_by_file():
 
 def test_settings_reads_default_gene_panel(monkeypatch):
     # The gateway applies this panel deterministically as known-gene-first (no longer model-dependent).
-    from bioagent.gateway.settings import HPCSettings
-    monkeypatch.setenv("BIOAGENT_DEFAULT_GENE_PANEL", "ird")
+    from aiscientist.gateway.settings import HPCSettings
+    monkeypatch.setenv("AISCIENTIST_DEFAULT_GENE_PANEL", "ird")
     s = HPCSettings.from_env()
     assert s.default_gene_panel == "ird"
     assert len(load_gene_panel(s.default_gene_panel)) > 200
@@ -53,15 +53,15 @@ def test_settings_reads_default_gene_panel(monkeypatch):
 
 def test_settings_default_gene_panel_empty_by_default(monkeypatch):
     # Unset ⇒ empty ⇒ genome-wide (no accidental panel restriction for a non-IRD deployment).
-    from bioagent.gateway.settings import HPCSettings
-    monkeypatch.delenv("BIOAGENT_DEFAULT_GENE_PANEL", raising=False)
+    from aiscientist.gateway.settings import HPCSettings
+    monkeypatch.delenv("AISCIENTIST_DEFAULT_GENE_PANEL", raising=False)
     assert HPCSettings.from_env().default_gene_panel == ""
 
 
 def test_settings_reads_default_regions_bed(monkeypatch):
     # The PRE-VEP region restriction (the compute-saving panel) — separate from the gene-name filter.
-    from bioagent.gateway.settings import HPCSettings
-    monkeypatch.setenv("BIOAGENT_DEFAULT_REGIONS_BED", "/ref/retcap_v5.clean.bed")
+    from aiscientist.gateway.settings import HPCSettings
+    monkeypatch.setenv("AISCIENTIST_DEFAULT_REGIONS_BED", "/ref/retcap_v5.clean.bed")
     assert HPCSettings.from_env().default_regions_bed == "/ref/retcap_v5.clean.bed"
-    monkeypatch.delenv("BIOAGENT_DEFAULT_REGIONS_BED", raising=False)
+    monkeypatch.delenv("AISCIENTIST_DEFAULT_REGIONS_BED", raising=False)
     assert HPCSettings.from_env().default_regions_bed == ""

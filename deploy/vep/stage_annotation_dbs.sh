@@ -14,7 +14,7 @@
 #   download commands can. It also clones a git repo, which the restricted shell would refuse.)
 #
 # Toggle individual DBs with STAGE_<NAME>=0 (default 1). CADD is 87 GB — set STAGE_CADD=0 to skip it
-# (pending the keep/drop decision). Point BIOAGENT_VEP_* at these paths in prod .env once staged.
+# (pending the keep/drop decision). Point AISCIENTIST_VEP_* at these paths in prod .env once staged.
 set -uo pipefail
 
 DB_ROOT="${DB_ROOT:-/dfs3b/ruic20_lab/software/reference/vep_annotation/plugins}"
@@ -115,14 +115,14 @@ say "done. Present under $DB_ROOT and $REF_ROOT:"
 du -sh "$DB_ROOT"/* "$REF_ROOT"/* 2>/dev/null || true
 cat <<EOF
 
-Set in prod .env (point BIOAGENT_VEP_* at what got staged):
-  BIOAGENT_VEP_PLUGINS=1
-  BIOAGENT_VEP_PLUGINS_DIR=$DB_ROOT/vep_plugins
-  BIOAGENT_VEP_ALPHAMISSENSE=$DB_ROOT/alphamissense/AlphaMissense_hg38.tsv.gz
-  BIOAGENT_VEP_CADD_SNV=$DB_ROOT/cadd/whole_genome_SNVs.tsv.gz
-  BIOAGENT_VEP_REVEL=$DB_ROOT/revel/new_tabbed_revel_grch38.tsv.gz
-  BIOAGENT_REF_FASTA=$REF_ROOT/Homo_sapiens.GRCh38.dna.primary_assembly.fa
-  BIOAGENT_SPLICEAI=1
-  BIOAGENT_SPLICEAI_BIN=${SA_ENV:-/dfs3b/ruic20_lab/software/AiScientist/envs/openspliceai}/bin/openspliceai
-  BIOAGENT_SPLICEAI_MODELS=${SA_MODELS:-/dfs3b/ruic20_lab/software/reference/spliceai/OSAI-MANE-10000nt}
+Set in prod .env (point AISCIENTIST_VEP_* at what got staged):
+  AISCIENTIST_VEP_PLUGINS=1
+  AISCIENTIST_VEP_PLUGINS_DIR=$DB_ROOT/vep_plugins
+  AISCIENTIST_VEP_ALPHAMISSENSE=$DB_ROOT/alphamissense/AlphaMissense_hg38.tsv.gz
+  AISCIENTIST_VEP_CADD_SNV=$DB_ROOT/cadd/whole_genome_SNVs.tsv.gz
+  AISCIENTIST_VEP_REVEL=$DB_ROOT/revel/new_tabbed_revel_grch38.tsv.gz
+  AISCIENTIST_REF_FASTA=$REF_ROOT/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+  AISCIENTIST_SPLICEAI=1
+  AISCIENTIST_SPLICEAI_BIN=${SA_ENV:-/dfs3b/ruic20_lab/software/AiScientist/envs/openspliceai}/bin/openspliceai
+  AISCIENTIST_SPLICEAI_MODELS=${SA_MODELS:-/dfs3b/ruic20_lab/software/reference/spliceai/OSAI-MANE-10000nt}
 EOF

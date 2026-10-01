@@ -16,10 +16,10 @@ import json
 
 import pytest
 
-from bioagent.agents.dag import LabPlan, TaskNode, lift_agenda_to_dag
-from bioagent.agents.hypotheses import DesignFacts, HypothesisLedger
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-from bioagent.agents.research_lab import LabConfig, ResearchLab
+from aiscientist.agents.dag import LabPlan, TaskNode, lift_agenda_to_dag
+from aiscientist.agents.hypotheses import DesignFacts, HypothesisLedger
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 # The exploration prompt's unique marker (distinct from the post-step review's "reviewing a step
 # that JUST completed", so a router can tell the two PI turns apart).

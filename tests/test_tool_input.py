@@ -25,12 +25,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from bioagent.tools import catalog as tools_catalog
-from bioagent.tools.run_clustering import tool as run_clustering_tool
-from bioagent.tools.run_de import tool as run_de_tool
-from bioagent.tools.run_gsea_prerank import tool as run_gsea_prerank_tool
-from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
-from bioagent.tools._lib.scrna import _run_files
+from aiscientist.tools import catalog as tools_catalog
+from aiscientist.tools.run_clustering import tool as run_clustering_tool
+from aiscientist.tools.run_de import tool as run_de_tool
+from aiscientist.tools.run_gsea_prerank import tool as run_gsea_prerank_tool
+from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from aiscientist.tools._lib.scrna import _run_files
 
 _READS_A_FILE = ("run_scanpy_qc", "run_clustering", "run_de", "run_depth_matched_de",
                  "run_gsea_prerank", "run_doublet_detection", "run_integration",
@@ -57,11 +57,11 @@ def test_every_spelling_of_a_file_in_the_run_resolves_to_it(tmp_path):
     exported = _file(ws, "artifacts/data/cells.h5ad")
 
     for spelled in ("adata_subset.h5ad", "work/adata_subset.h5ad", "./work/adata_subset.h5ad",
-                    "$BIOAGENT_WORK/adata_subset.h5ad", "${BIOAGENT_WORK}/adata_subset.h5ad",
+                    "$AISCIENTIST_WORK/adata_subset.h5ad", "${AISCIENTIST_WORK}/adata_subset.h5ad",
                     str(mine)):
         found, why = _run_files(_ctx(ws), spelled, (".h5ad",))
         assert found == [mine.resolve()], (spelled, why)
-    for spelled in ("artifacts/data/cells.h5ad", "$BIOAGENT_ARTIFACTS/data/cells.h5ad"):
+    for spelled in ("artifacts/data/cells.h5ad", "$AISCIENTIST_ARTIFACTS/data/cells.h5ad"):
         found, why = _run_files(_ctx(ws), spelled, (".h5ad",))
         assert found == [exported.resolve()], (spelled, why)
 
@@ -124,7 +124,7 @@ def test_every_tool_that_reads_a_file_offers_input():
 
 def test_a_set_input_is_recorded_as_a_non_default_setting():
     """So the technical report says which step read a file of the model's choosing."""
-    from bioagent.agents.research_harness import nondefault_params
+    from aiscientist.agents.research_harness import nondefault_params
 
     schema = {t.name: t for t in tools_catalog.scrna_catalog()}["run_de"].parameters
 
@@ -234,7 +234,7 @@ def test_gsea_ranks_the_lists_it_is_given(tmp_path, monkeypatch):
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "TestPathways.gmt").write_text("SET_A\tdesc\tG1\tG2\tG3\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     seen: list[str] = []
 
     def _prerank(rnk, gene_sets, **_kwargs):

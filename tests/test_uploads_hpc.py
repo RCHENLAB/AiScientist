@@ -2,7 +2,7 @@
 
 Unit-level coverage of the staging helpers (put to dfs3b + drop the local copy; stage back
 for the still-local tools; remote-aware identification) using MockExecutor, which records
-put_file calls and no-ops get_file. See docs/hpc3_offload_migration.md.
+put_file calls and no-ops get_file.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway.mock_host import MockExecutor  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway.mock_host import MockExecutor  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 def _conn():
@@ -70,23 +70,23 @@ def test_ensure_local_dataset_stages_remote_back(tmp_path):
     assert gw_app._ensure_local_dataset(conn, str(local), cache) == local   # local passes through
 
 
-def test_sync_bioagent_source_to_hpc_tars_and_caches():
+def test_sync_aiscientist_source_to_hpc_tars_and_caches():
     conn = _conn()
     conn.executor = MockExecutor(username="tester")
 
-    pysrc = gw_app._sync_bioagent_source_to_hpc(conn)
+    pysrc = gw_app._sync_aiscientist_source_to_hpc(conn)
     assert pysrc == f"{SHARED_ROOT}/pysrc/tester"
     assert conn.hpc_pysrc == pysrc
     staged = conn.executor.state.staged_files
-    assert any(remote == f"{pysrc}/bioagent-src.tgz" for _l, remote in staged)   # tarball pushed
+    assert any(remote == f"{pysrc}/aiscientist-src.tgz" for _l, remote in staged)   # tarball pushed
 
     n = len(staged)
-    assert gw_app._sync_bioagent_source_to_hpc(conn) == pysrc     # cached — no re-stage
+    assert gw_app._sync_aiscientist_source_to_hpc(conn) == pysrc     # cached — no re-stage
     assert len(conn.executor.state.staged_files) == n
 
 
 def _fake_listing_conn(listing: str):
-    from bioagent.gateway.executor import ExecResult
+    from aiscientist.gateway.executor import ExecResult
 
     class FakeExec:
         username = "tester"
@@ -114,7 +114,7 @@ def test_find_primary_matrix_remote_none_when_no_dataset_file():
 
 
 # --- a VCF is a primary dataset too ----------------------------------------------------------
-# Uploads land on dfs3b in prod (BIOAGENT_UPLOADS_ON_HPC=1), so a folder upload resolves through the
+# Uploads land on dfs3b in prod (AISCIENTIST_UPLOADS_ON_HPC=1), so a folder upload resolves through the
 # REMOTE finder. It only knew single-cell matrices, so a folder holding a WGS callset resolved to
 # nothing and the run silently had no dataset.
 
@@ -161,7 +161,7 @@ def test_local_and_remote_finders_agree_on_the_same_tree(tmp_path):
 
 
 def test_uploads_on_hpc_flag_from_env(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_UPLOADS_ON_HPC", "1")
+    monkeypatch.setenv("AISCIENTIST_UPLOADS_ON_HPC", "1")
     assert HPCSettings.from_env().uploads_on_hpc is True
-    monkeypatch.delenv("BIOAGENT_UPLOADS_ON_HPC", raising=False)
+    monkeypatch.delenv("AISCIENTIST_UPLOADS_ON_HPC", raising=False)
     assert HPCSettings.from_env().uploads_on_hpc is False

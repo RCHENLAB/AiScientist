@@ -15,7 +15,7 @@ import urllib.request
 
 import pytest
 
-from bioagent.gateway import llm_providers as lp
+from aiscientist.gateway import llm_providers as lp
 
 
 class _Resp(io.BytesIO):

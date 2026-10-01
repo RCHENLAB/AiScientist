@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.gateway.errors import GatewayError
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.slurm_report import SlurmReportRenderer
-from bioagent.reporting import report
+from aiscientist.gateway.errors import GatewayError
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.slurm_report import SlurmReportRenderer
+from aiscientist.reporting import report
 
 
 class FakeHPC:

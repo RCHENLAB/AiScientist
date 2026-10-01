@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.tools.annotate_variants.ird_prioritize import (
+from aiscientist.tools.annotate_variants.ird_prioritize import (
     annotate_disease_model,
     gene_models,
     parse_af,

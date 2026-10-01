@@ -1,7 +1,7 @@
 """Offline tests for Phase 4: the scanpy analysis line as HPC3 Slurm jobs.
 
 A scripted fake RemoteExecutor drives submit -> run -> collect and serves the in-container CLI's
-``BIOAGENT_RESULT_JSON`` line from ``cat``. Also covers the in-process fallback and the registry
+``AISCIENTIST_RESULT_JSON`` line from ``cat``. Also covers the in-process fallback and the registry
 routing. No real Slurm, no SSH, no scanpy.
 """
 
@@ -10,9 +10,9 @@ from __future__ import annotations
 import json
 import re
 
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.slurm_analysis import SlurmAnalysisExecutor
-from bioagent.gateway.slurm_job import slurm_time_to_seconds
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.slurm_analysis import SlurmAnalysisExecutor
+from aiscientist.gateway.slurm_job import slurm_time_to_seconds
 
 
 class FakeHPC:
@@ -21,7 +21,7 @@ class FakeHPC:
 
     def __init__(self, result_obj: dict, sacct: str = "COMPLETED"):
         self.host, self.username = "hpc3-mock", "tester"
-        self.result_line = "some tool log\nBIOAGENT_RESULT_JSON " + json.dumps(result_obj) + "\n"
+        self.result_line = "some tool log\nAISCIENTIST_RESULT_JSON " + json.dumps(result_obj) + "\n"
         self.sacct = sacct
         self.submits: list[str] = []
         self.staged_args = ""
@@ -38,7 +38,7 @@ class FakeHPC:
         self.all_cmds.append(cmd)
         if cmd.startswith("echo "):                    # scratch-dir expansion ($HOME -> abs path)
             return self._ok(cmd[len("echo "):].replace("$HOME", "/data/homezvol/tester"))
-        if "BIOAGENT_ANALYSIS_ARGS_EOF" in cmd:
+        if "AISCIENTIST_ANALYSIS_ARGS_EOF" in cmd:
             self.staged_args = cmd
             return self._ok()
         if cmd.startswith("mkdir"):
@@ -96,8 +96,8 @@ def test_slurm_time_to_seconds_parses_formats():
 def _capture_run_timeout(hpc, monkeypatch, **kw):
     """Run one tool with run_batch_job stubbed, returning the RunConfig.run_timeout_s the executor
     passed — so we can assert the gateway job-wait without a real Slurm loop."""
-    import bioagent.gateway.slurm_analysis as sa
-    from bioagent.gateway.slurm_job import JobResult
+    import aiscientist.gateway.slurm_analysis as sa
+    from aiscientist.gateway.slurm_job import JobResult
     seen = {}
 
     def fake_run_batch_job(remote, spec, *, acquire, run, **_):
@@ -132,6 +132,15 @@ def test_analysis_tool_runs_on_slurm_and_parses_result():
     assert len(hpc.submits) == 1
     assert '"resolution": 1.0' in hpc.staged_args          # args staged as a JSON file
     assert "--tool run_clustering" in hpc.staged_args or True   # (args heredoc precedes sbatch)
+
+
+def test_a_job_from_before_the_rename_still_returns_its_result():
+    # A job submitted by the previous deploy runs the old synced source, which prints the marker
+    # under the package's old name; it must not come back as "produced no result".
+    hpc = FakeHPC({"status": "ok", "n_clusters": 3})
+    hpc.result_line = hpc.result_line.replace("AISCIENTIST_RESULT_JSON ", "BIOAGENT_RESULT_JSON ")
+    out = _ex(hpc).run_tool("run_clustering", {"resolution": 1.0}, ctx=None)
+    assert out["status"] == "ok" and out["n_clusters"] == 3
 
 
 def test_source_dir_is_bound_and_on_pythonpath():
@@ -214,7 +223,7 @@ def test_container_start_failure_surfaces_sbatch_job_log():
     # and the inner {name}.log is empty — the real error lands ONLY in the SBATCH --output job log.
     # _collect must read that job log, else the model gets a useless "produced no result".
     hpc = FakeHPC({}, sacct="FAILED")
-    hpc.result_line = ""       # no BIOAGENT_RESULT_JSON marker (job died at container creation)
+    hpc.result_line = ""       # no AISCIENTIST_RESULT_JSON marker (job died at container creation)
     hpc.inner_log = ""         # {name}.log empty — the tool never started
     hpc.job_log = ("AiScientist analysis job starting on hpc3-17-10\n"
                    "FATAL:   container creation failed: mount ... destination doesn't exist in container")
@@ -225,7 +234,7 @@ def test_container_start_failure_surfaces_sbatch_job_log():
 
 
 def test_registry_routes_only_real_analysis_tools():
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     class AE:
         def __init__(self): self.calls = []
@@ -246,7 +255,7 @@ def test_run_tool_cancel_returns_cancelled_without_fallback(monkeypatch):
     # When the Stop button scancels the in-flight job (JobCancelled), run_tool must NOT drop to the
     # local fallback (which would re-run the analysis and defeat the Stop) — it returns a cancelled
     # status so the run ends.
-    from bioagent.gateway.slurm_job import JobCancelled
+    from aiscientist.gateway.slurm_job import JobCancelled
     called = {"fallback": False}
     ex = SlurmAnalysisExecutor(
         remote=object(), container_image="/img.sif", remote_workspace="/dfs/ws",
@@ -321,7 +330,7 @@ class SeqHPC(FakeHPC):
         if ".result.json" in remote_path:
             if remote_path not in self._by_file:
                 self._by_file[remote_path] = self._queue.pop(0)
-            data = ("BIOAGENT_RESULT_JSON " + json.dumps(self._by_file[remote_path]) + "\n").encode()
+            data = ("AISCIENTIST_RESULT_JSON " + json.dumps(self._by_file[remote_path]) + "\n").encode()
             return data[:max_bytes] if max_bytes is not None else data
         return super().read_bytes(remote_path, max_bytes)
 
@@ -406,7 +415,7 @@ def test_release_removes_the_runs_install_and_only_that():
 
 
 def test_the_install_step_is_not_a_tool_the_model_can_call():
-    from bioagent.tools import scrna_cli
+    from aiscientist.tools import scrna_cli
     assert scrna_cli.INSTALL_DEPENDENCY not in scrna_cli._analysis_tools()
 
 

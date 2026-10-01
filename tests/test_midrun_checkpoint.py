@@ -15,8 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import LabConfig, LabResult, ResearchLab, ResumeState
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import LabConfig, LabResult, ResearchLab, ResumeState
 
 
 def _lab(tmp_path: Path, steps: int = 3) -> tuple[ResearchLab, list]:
@@ -38,7 +38,7 @@ def _lab(tmp_path: Path, steps: int = 3) -> tuple[ResearchLab, list]:
             return None
 
         def run(self, *_a, **_k):
-            from bioagent.agents.research_harness import HarnessResult
+            from aiscientist.agents.research_harness import HarnessResult
             # A real successful tool step: the Critic's deterministic floor refuses to accept a
             # step that produced nothing, so an empty result would never reach the checkpoint.
             return HarnessResult(

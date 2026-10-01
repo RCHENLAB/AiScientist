@@ -9,7 +9,7 @@
 # What is protected on the server (never sent, never deleted):
 #   - .env / .env.local            (HPC3 config + secrets live only on the host)
 #   - .venv, runs/, caches, .git   (per .gitignore + explicit excludes below)
-#   - anything under $BIOAGENT_ROOT outside the app dir (we only sync the app dir)
+#   - anything under $AISCIENTIST_ROOT outside the app dir (we only sync the app dir)
 #
 # Config — set these in a gitignored ./.deploy.env (see .deploy.env.example):
 #   REMOTE_HOST   server hostname / IP            (REQUIRED, no default)
@@ -35,6 +35,9 @@ cd "$REPO_ROOT"
 # --- load gitignored config if present ---------------------------------------
 # shellcheck disable=SC1091
 [ -f "$REPO_ROOT/.deploy.env" ] && source "$REPO_ROOT/.deploy.env"
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-<ucinetid>}"

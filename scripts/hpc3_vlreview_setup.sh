@@ -19,13 +19,16 @@
 #   cd ~/vlreview-build && bash /path/to/scripts/hpc3_vlreview_setup.sh
 #     # (or copy this script into ~/vlreview-build and: bash hpc3_vlreview_setup.sh)
 set -uo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
-BASE="${BIOAGENT_LAB_BASE:-/dfs3b/ruic20_lab/software/bioagent}"
+BASE="${AISCIENTIST_LAB_BASE:-/dfs3b/ruic20_lab/software/AiScientist}"
 IMAGE="$BASE/containers/vlreview.sif"
-MODEL_DIR="${BIOAGENT_VLREVIEW_MODEL_DIR:-$BASE/vlreview_model}"
-VL_REPO="${BIOAGENT_VLREVIEW_HF_REPO:-Qwen/Qwen2.5-VL-7B-Instruct}"
-SING_MODULE="${BIOAGENT_CONTAINER_MODULE:-singularity/3.11.3}"
-BUILD_MODE="${BIOAGENT_VLREVIEW_BUILD_MODE:-fakeroot}"   # fakeroot | remote
+MODEL_DIR="${AISCIENTIST_VLREVIEW_MODEL_DIR:-$BASE/vlreview_model}"
+VL_REPO="${AISCIENTIST_VLREVIEW_HF_REPO:-Qwen/Qwen2.5-VL-7B-Instruct}"
+SING_MODULE="${AISCIENTIST_CONTAINER_MODULE:-singularity/3.11.3}"
+BUILD_MODE="${AISCIENTIST_VLREVIEW_BUILD_MODE:-fakeroot}"   # fakeroot | remote
 
 log() { echo "[hpc3-vlreview] $*"; }
 
@@ -74,7 +77,7 @@ else
         echo ""; echo "fakeroot build failed. Either your account lacks --fakeroot, or a dep"
         echo "conflict occurred. Retry with the Sylabs remote builder (no local root):"
         echo "    singularity remote login          # one-time, free Sylabs token"
-        echo "    BIOAGENT_VLREVIEW_BUILD_MODE=remote bash $0"
+        echo "    AISCIENTIST_VLREVIEW_BUILD_MODE=remote bash $0"
         exit 1; }
       ;;
     remote)
@@ -111,11 +114,11 @@ sinfo -o "%P %G" 2>/dev/null | grep -iE "gpu|a30|rtx|l40|a100" | sort -u || true
 cat <<EOF
 
 [hpc3-vlreview] DONE. Set these on the EYESERVER (.env / HPCSettings) so the gateway uses it:
-  BIOAGENT_VLREVIEW_ENABLED=1
-  BIOAGENT_VLREVIEW_IMAGE=$IMAGE
-  BIOAGENT_VLREVIEW_MODEL_DIR=$MODEL_DIR
-  BIOAGENT_VLREVIEW_ENTRYPOINT='python /opt/vlreview/run_review.py'
-  BIOAGENT_VLREVIEW_GRES='gpu:A30:1'      # <- match a typed gres printed above; NOT gpu:A100
+  AISCIENTIST_VLREVIEW_ENABLED=1
+  AISCIENTIST_VLREVIEW_IMAGE=$IMAGE
+  AISCIENTIST_VLREVIEW_MODEL_DIR=$MODEL_DIR
+  AISCIENTIST_VLREVIEW_ENTRYPOINT='python /opt/vlreview/run_review.py'
+  AISCIENTIST_VLREVIEW_GRES='gpu:A30:1'      # <- match a typed gres printed above; NOT gpu:A100
 
 Smoke test on a gpu job (from a compute node with a GPU):
   singularity exec --nv \\

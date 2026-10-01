@@ -15,7 +15,7 @@ import types
 
 import numpy as np
 
-from bioagent.tools.run_clustering import tool as run_clustering_tool
+from aiscientist.tools.run_clustering import tool as run_clustering_tool
 
 
 class _Obs(dict):

@@ -35,12 +35,12 @@ COPY frontend ./frontend
 RUN pip install --no-cache-dir ".[gateway,auth,analysis]"
 
 # Least privilege: run as a non-root user; no baked-in credentials of any kind.
-RUN useradd -m -u 10001 bioagent \
+RUN useradd -m -u 10001 aiscientist \
     && mkdir -p /data/runs \
-    && chown -R bioagent:bioagent /app /data
-USER bioagent
+    && chown -R aiscientist:aiscientist /app /data
+USER aiscientist
 
-ENV BIOAGENT_RESULTS_DIR=/data/runs \
+ENV AISCIENTIST_RESULTS_DIR=/data/runs \
     MPLBACKEND=Agg \
     PYTHONUNBUFFERED=1
 EXPOSE 8800
@@ -48,4 +48,4 @@ EXPOSE 8800
 # Bind 0.0.0.0 INSIDE the pod: the container network namespace is isolated, and the app is only
 # reachable via the k8s Service/Ingress — never published directly. (On a bare host we'd bind
 # 127.0.0.1; in k8s the pod boundary is the network boundary.)
-CMD ["python", "-m", "bioagent.gateway", "--host", "0.0.0.0", "--port", "8800"]
+CMD ["python", "-m", "aiscientist.gateway", "--host", "0.0.0.0", "--port", "8800"]

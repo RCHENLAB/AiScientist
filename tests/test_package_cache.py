@@ -18,11 +18,11 @@ import re
 
 import pytest
 
-from bioagent.gateway import package_cache as pc
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.package_cache import (PackageCacheError, SharedPackageCache,
+from aiscientist.gateway import package_cache as pc
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.package_cache import (PackageCacheError, SharedPackageCache,
                                             missing_modules)
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 ROOT = f"{SHARED_ROOT}/pkgs"
 IMAGE = f"{SHARED_ROOT}/containers/analysis.sif"

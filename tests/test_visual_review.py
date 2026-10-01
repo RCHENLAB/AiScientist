@@ -8,7 +8,7 @@ as a DEGRADATION (technical-report Diagnostics + an honest feed line), never as 
 
 from __future__ import annotations
 
-from bioagent.reporting.visual_review import (
+from aiscientist.reporting.visual_review import (
     VisualReviewOutcome,
     format_diagnostics,
     render_with_visual_review,

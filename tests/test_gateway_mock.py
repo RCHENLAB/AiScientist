@@ -7,9 +7,9 @@ paramiko SSH executor are intentionally not imported here.)
 
 from __future__ import annotations
 
-from bioagent.gateway import gpu
-from bioagent.gateway.mock_host import MockExecutor
-from bioagent.gateway.settings import HPCSettings
+from aiscientist.gateway import gpu
+from aiscientist.gateway.mock_host import MockExecutor
+from aiscientist.gateway.settings import HPCSettings
 
 
 def _settings() -> HPCSettings:
@@ -20,7 +20,7 @@ def test_vllm_ensure_installed_against_mock() -> None:
     """The connect flow's image-presence check: vllm_client.ensure_installed runs
     `test -f <image>.sif` against the host — the mock answers it, so provisioning
     proceeds (no Ollama binary install anymore)."""
-    from bioagent.gateway import vllm_client
+    from aiscientist.gateway import vllm_client
 
     ex = MockExecutor(preinstalled=True)
     info = vllm_client.ensure_installed(ex, HPCSettings(), lambda *a: None)

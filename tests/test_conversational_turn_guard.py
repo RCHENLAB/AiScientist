@@ -18,9 +18,9 @@ import pytest
 # modules took CI from 1,525 passing tests to "33 skipped, 3 errors" and kept main red from
 # 2026-08-20 to 2026-09-08. CI installs the gateway extra so these actually RUN; the guard is
 # what keeps a leaner environment skipping cleanly instead of taking every other test down.
-pytest.importorskip("bioagent.gateway.app")
+pytest.importorskip("aiscientist.gateway.app")
 
-from bioagent.gateway.app import _is_conversational_turn  # noqa: E402
+from aiscientist.gateway.app import _is_conversational_turn  # noqa: E402
 
 
 def test_the_word_that_started_a_study():
@@ -69,40 +69,40 @@ class _Req:
 
 
 def _with_model(monkeypatch, reply):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     monkeypatch.setattr(gw, "_lab_llm", lambda conn: (lambda msgs: reply, None, None))
 
 
 def test_the_model_recognises_a_request_the_word_list_never_could(monkeypatch):
     """"wait, I don't get it" is not on any list — the model is what makes this work."""
-    from bioagent.gateway.app import _starts_no_study
+    from aiscientist.gateway.app import _starts_no_study
     _with_model(monkeypatch, '{"intent": "conversational", "confidence": 0.93, "reason": "no request"}')
     assert _starts_no_study(_Conn(), _Req("wait, I don't get it"))
 
 
 def test_a_study_verdict_is_believed_even_for_a_listed_word(monkeypatch):
-    from bioagent.gateway.app import _starts_no_study
+    from aiscientist.gateway.app import _starts_no_study
     _with_model(monkeypatch, '{"intent": "study", "confidence": 0.9, "reason": "asks for analysis"}')
     assert not _starts_no_study(_Conn(), _Req("why"))
 
 
 def test_low_confidence_falls_to_the_floor_not_to_blocking(monkeypatch):
     """Uncertainty must cost compute, never strand the user."""
-    from bioagent.gateway.app import _starts_no_study
+    from aiscientist.gateway.app import _starts_no_study
     _with_model(monkeypatch, '{"intent": "conversational", "confidence": 0.3, "reason": "unsure"}')
     assert not _starts_no_study(_Conn(), _Req("look at the rod cells again"))
     assert _starts_no_study(_Conn(), _Req("why"))       # floor still catches the bare word
 
 
 def test_a_broken_model_reply_falls_to_the_floor(monkeypatch):
-    from bioagent.gateway.app import _starts_no_study
+    from aiscientist.gateway.app import _starts_no_study
     _with_model(monkeypatch, "I think this is a question about cells")
     assert not _starts_no_study(_Conn(), _Req("run the enrichment"))
     assert _starts_no_study(_Conn(), _Req("ok"))
 
 
 def test_a_raising_model_never_blocks_the_run(monkeypatch):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     def _boom(conn):
         raise RuntimeError("no endpoint")
     monkeypatch.setattr(gw, "_lab_llm", _boom)
@@ -111,7 +111,7 @@ def test_a_raising_model_never_blocks_the_run(monkeypatch):
 
 def test_a_cold_session_is_not_woken_just_to_judge_a_sentence(monkeypatch):
     """No allocation → no GPU cold start; the floor answers."""
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     monkeypatch.setattr(gw, "_lab_llm", lambda conn: (_ for _ in ()).throw(AssertionError("asked")))
     assert gw._starts_no_study(_Conn(alloc=None), _Req("why"))
     assert not gw._starts_no_study(_Conn(alloc=None), _Req("run QC"))

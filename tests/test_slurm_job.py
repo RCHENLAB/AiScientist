@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.slurm_job import (
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.slurm_job import (
     AcquireConfig,
     JobCancelled,
     RunConfig,
@@ -47,7 +47,7 @@ class FakeSlurm:
 
     def exec(self, command, timeout=60.0):
         cmd = command.strip()
-        if "BIOAGENT_EOF" in cmd or ("cat >" in cmd and "<<" in cmd):
+        if "AISCIENTIST_EOF" in cmd or ("cat >" in cmd and "<<" in cmd):
             return self._ok()
         if cmd.startswith("mkdir"):
             return self._ok()

@@ -18,12 +18,12 @@ def app_ctx(tmp_path, monkeypatch):
     """Fresh SQLite DB + a bootstrapped admin + a TestClient mounting the auth router."""
     pytest.importorskip("httpx")
     url = f"sqlite:///{(tmp_path / 'chat.db').as_posix()}"
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", url)
-    monkeypatch.setenv("BIOAGENT_SECRET_KEY", "test-secret-key")
-    monkeypatch.setenv("BIOAGENT_ADMIN_USER", "root")
-    monkeypatch.setenv("BIOAGENT_ADMIN_PASSWORD", "rootpass1")
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", url)
+    monkeypatch.setenv("AISCIENTIST_SECRET_KEY", "test-secret-key")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_USER", "root")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_PASSWORD", "rootpass1")
 
-    from bioagent.gateway import auth, auth_routes, db, models  # noqa: F401
+    from aiscientist.gateway import auth, auth_routes, db, models  # noqa: F401
     importlib.reload(db)
     importlib.reload(models)
     importlib.reload(auth)

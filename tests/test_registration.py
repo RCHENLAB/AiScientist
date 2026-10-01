@@ -16,14 +16,14 @@ pytest.importorskip("sqlalchemy")
 @pytest.fixture()
 def ctx(tmp_path, monkeypatch):
     pytest.importorskip("httpx")
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
-    monkeypatch.setenv("BIOAGENT_SECRET_KEY", "test-secret-key")
-    monkeypatch.setenv("BIOAGENT_ADMIN_USER", "root")
-    monkeypatch.setenv("BIOAGENT_ADMIN_PASSWORD", "rootpass1")
-    monkeypatch.delenv("BIOAGENT_SMTP_HOST", raising=False)          # dev mode → code in response
-    monkeypatch.delenv("BIOAGENT_ALLOW_SELF_REGISTER", raising=False)  # default: enabled
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+    monkeypatch.setenv("AISCIENTIST_SECRET_KEY", "test-secret-key")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_USER", "root")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_PASSWORD", "rootpass1")
+    monkeypatch.delenv("AISCIENTIST_SMTP_HOST", raising=False)          # dev mode → code in response
+    monkeypatch.delenv("AISCIENTIST_ALLOW_SELF_REGISTER", raising=False)  # default: enabled
 
-    from bioagent.gateway import auth, auth_routes, db, email_send, models  # noqa: F401
+    from aiscientist.gateway import auth, auth_routes, db, email_send, models  # noqa: F401
     importlib.reload(db)
     importlib.reload(models)
     importlib.reload(auth)
@@ -131,7 +131,7 @@ def test_duplicate_email_allowed_across_accounts(ctx):
 
 def test_self_register_can_be_disabled(ctx, monkeypatch):
     client, _ = ctx
-    monkeypatch.setenv("BIOAGENT_ALLOW_SELF_REGISTER", "0")
+    monkeypatch.setenv("AISCIENTIST_ALLOW_SELF_REGISTER", "0")
     r = _register(client, "erin", "erin@uci.edu")
     assert r.status_code == 403
 
@@ -143,7 +143,7 @@ def test_missing_pending_table_returns_clean_json_500(ctx):
     client, _ = ctx
     from sqlalchemy import text
 
-    from bioagent.gateway.db import get_engine
+    from aiscientist.gateway.db import get_engine
     with get_engine().begin() as conn:
         conn.execute(text("DROP TABLE pending_registrations"))
     r = _register(client, "zoe", "zoe@uci.edu")
@@ -159,9 +159,9 @@ def test_admin_search_by_email_and_id(ctx):
     client, _ = ctx
     from sqlalchemy import select
 
-    from bioagent.gateway import auth
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import User
+    from aiscientist.gateway import auth
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import User
     with session_scope() as s:
         s.add(User(username="frank", email="frank@uci.edu", password_hash=auth.hash_password("pw12345")))
         s.add(User(username="grace", email="grace@hs.uci.edu", password_hash=auth.hash_password("pw12345")))
@@ -183,9 +183,9 @@ def test_admin_set_and_clear_email(ctx):
     client, _ = ctx
     from sqlalchemy import select
 
-    from bioagent.gateway import auth
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import User
+    from aiscientist.gateway import auth
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import User
     with session_scope() as s:
         s.add(User(username="ivan", password_hash=auth.hash_password("pw12345")))
         s.commit()
@@ -205,9 +205,9 @@ def test_admin_set_role_promote_demote_and_guards(ctx):
     client, _ = ctx
     from sqlalchemy import select
 
-    from bioagent.gateway import auth
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import User
+    from aiscientist.gateway import auth
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import User
     with session_scope() as s:
         s.add(User(username="mallory", email="m@uci.edu", password_hash=auth.hash_password("pw123456")))
         s.commit()
@@ -239,9 +239,9 @@ def test_admin_delete_user_and_guards(ctx):
     client, _ = ctx
     from sqlalchemy import select
 
-    from bioagent.gateway import auth
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import User
+    from aiscientist.gateway import auth
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import User
     with session_scope() as s:
         s.add(User(username="heidi", email="heidi@uci.edu", password_hash=auth.hash_password("pw12345")))
         s.commit()

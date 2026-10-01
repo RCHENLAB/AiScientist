@@ -22,4 +22,4 @@ ADAPT the CONFIG. Writes a ranked table + (optional) a pairwise perturbation×pe
 matrix (for grouping perturbations that act alike) and prints a JSON summary for the report.
 
 ## Run
-Fetch the template with `read_skill_reference("perturbation_edistance", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `BIOAGENT_WORK`, writes under `BIOAGENT_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.
+Fetch the template with `read_skill_reference("perturbation_edistance", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `AISCIENTIST_WORK`, writes under `AISCIENTIST_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.

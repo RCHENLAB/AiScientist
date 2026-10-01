@@ -12,8 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from bioagent.gateway import vllm_client
-from bioagent.gateway.errors import VLLMNetworkError
+from aiscientist.gateway import vllm_client
+from aiscientist.gateway.errors import VLLMNetworkError
 
 
 def _serve(chunks, gap: float, stall_after: int | None = None):
@@ -73,20 +73,20 @@ def test_silence_is_what_ends_a_call(monkeypatch):
 
 
 def test_role_effort_env(monkeypatch):
-    from bioagent.gateway import app as gw
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT_PLAN", "high")
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT_CLASSIFY", "low")
-    monkeypatch.delenv("BIOAGENT_VLLM_REASONING_EFFORT_CRITIC", raising=False)
+    from aiscientist.gateway import app as gw
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT_PLAN", "high")
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT_CLASSIFY", "low")
+    monkeypatch.delenv("AISCIENTIST_VLLM_REASONING_EFFORT_CRITIC", raising=False)
     assert gw._role_effort("plan") == "high" and gw._role_effort("classify") == "low"
     assert gw._role_effort("critic") is None          # falls back to the global effort inside complete_ex
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT_WRITER", "bogus")
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT_WRITER", "bogus")
     assert gw._role_effort("writer") is None
 
 
 def test_lab_roles_reach_the_cluster_call(monkeypatch):
     """The PI plan call carries role=plan all the way to complete_ex, with the idle (not total) limit."""
-    from bioagent.gateway import app as gw
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT_PLAN", "high")
+    from aiscientist.gateway import app as gw
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT_PLAN", "high")
     calls = []
     monkeypatch.setattr(vllm_client, "complete_ex",
                         lambda port, model, messages, **kw: calls.append(kw) or ("ok", {}))
@@ -137,7 +137,7 @@ def test_an_effort_the_model_rejects_falls_back_to_its_default():
 
 def _scientist_chat(monkeypatch, replies):
     """The session's bound Scientist chat, with chat_tools scripted to return ``replies`` in order."""
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     calls: list[dict] = []
     queue = list(replies)
 
@@ -156,7 +156,7 @@ def _scientist_chat(monkeypatch, replies):
 
 
 def test_the_scientist_turn_carries_its_role_effort(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT_SCIENTIST", "medium")
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT_SCIENTIST", "medium")
     chat, calls, _ = _scientist_chat(monkeypatch, [{"content": "", "tool_calls": [{"x": 1}],
                                                     "finish_reason": "tool_calls"}])
     out = chat([{"role": "user", "content": "step"}], [])
@@ -164,7 +164,7 @@ def test_the_scientist_turn_carries_its_role_effort(monkeypatch):
 
 
 def test_a_turn_cut_off_while_reasoning_is_asked_again_at_low_effort(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_VLLM_REASONING_EFFORT_SCIENTIST", raising=False)
+    monkeypatch.delenv("AISCIENTIST_VLLM_REASONING_EFFORT_SCIENTIST", raising=False)
     chat, calls, warned = _scientist_chat(monkeypatch, [
         {"content": "", "tool_calls": [], "finish_reason": "length"},
         {"content": "", "tool_calls": [{"x": 1}], "finish_reason": "tool_calls"}])
@@ -182,7 +182,7 @@ def test_a_turn_that_simply_answers_is_not_retried(monkeypatch):
 
 
 def test_live_llm_args_follow_the_current_allocation():
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     conn = type("C", (), {"alloc": type("A", (), {"node": "hpc3-gpu-m54-01", "port": 39783})(),
                           "selected_model": "RedHatAI/Qwen3.8-27B-INT4"})()
     assert gw._live_llm_args(conn) == {"llm_base_url": "http://hpc3-gpu-m54-01:39783/v1",

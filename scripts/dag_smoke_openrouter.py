@@ -34,9 +34,9 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(ROOT / ".env")
 
-from bioagent.agents.research_harness import HarnessContext, HarnessTool, ResearchHarness  # noqa: E402
-from bioagent.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
-from bioagent.providers.openai_compatible import OpenRouterClient  # noqa: E402
+from aiscientist.agents.research_harness import HarnessContext, HarnessTool, ResearchHarness  # noqa: E402
+from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
+from aiscientist.providers.openai_compatible import OpenRouterClient  # noqa: E402
 
 
 def make_complete_fn():

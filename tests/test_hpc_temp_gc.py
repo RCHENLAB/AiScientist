@@ -27,10 +27,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from bioagent.gateway import hpc_gc  # noqa: E402
-from bioagent.gateway.executor import ExecResult  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway import hpc_gc  # noqa: E402
+from aiscientist.gateway.executor import ExecResult  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 GC_SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "hpc3" / "aiscientist_temp_gc.sh"
 
@@ -71,8 +71,8 @@ def test_shared_root_and_ttl_have_the_documented_defaults():
 
 
 def test_shared_root_and_ttl_come_from_env(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_HPC_SHARED_ROOT", f"{LAB_STORAGE}/elsewhere/AiScientist/")
-    monkeypatch.setenv("BIOAGENT_TEMP_TTL_DAYS", "7")
+    monkeypatch.setenv("AISCIENTIST_HPC_SHARED_ROOT", f"{LAB_STORAGE}/elsewhere/AiScientist/")
+    monkeypatch.setenv("AISCIENTIST_TEMP_TTL_DAYS", "7")
     st = HPCSettings.from_env()
     assert st.shared_root == f"{LAB_STORAGE}/elsewhere/AiScientist"   # trailing slash normalized
     assert st.temp_ttl_days == 7
@@ -84,7 +84,7 @@ def test_process_files_go_to_shared_temp_never_a_personal_dir():
     # gateway.app pulls in fastapi, which CI deliberately does not install (see
     # requirements-dev.txt) — skip like every other app-level test rather than erroring.
     pytest.importorskip("fastapi")
-    from bioagent.gateway import app as gw_app
+    from aiscientist.gateway import app as gw_app
 
     conn = types.SimpleNamespace(
         executor=types.SimpleNamespace(username="tester"), owner="tester",
@@ -121,7 +121,7 @@ def test_missing_shared_root_is_reported_with_the_exact_fix():
     # /dfs3b/ruic20_lab is drwxr-s--- ruic20, so this one mkdir is a human prerequisite. The
     # message has to carry it, or every offloaded job later dies on an unexplained mkdir.
     assert "mkdir -p /dfs3b/ruic20_lab/software/AiScientist" in message
-    assert "BIOAGENT_HPC_SHARED_ROOT" in message
+    assert "AISCIENTIST_HPC_SHARED_ROOT" in message
     assert not any(c.startswith("umask") for c in remote.commands)   # nothing attempted
 
 
@@ -193,7 +193,7 @@ def test_a_failed_sweep_is_reported_not_raised():
 
 def test_storage_delete_guard_covers_the_new_roots_but_not_another_member():
     pytest.importorskip("fastapi")
-    from bioagent.gateway import app as gw_app
+    from aiscientist.gateway import app as gw_app
 
     conn = types.SimpleNamespace(
         executor=types.SimpleNamespace(username="tester"), owner="tester",

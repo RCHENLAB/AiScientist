@@ -18,7 +18,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway.app import _lab_event_to_chat  # noqa: E402
+from aiscientist.gateway.app import _lab_event_to_chat  # noqa: E402
 
 
 def _kinds(payloads):

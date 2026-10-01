@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("httpx")  # gateway extra; offline CI subset doesn't install it
 
 import httpx  # noqa: E402
-from bioagent.tools.literature_search.tool import (
+from aiscientist.tools.literature_search.tool import (
     focus_literature_query,
     make_literature_search_tool,
     search_europepmc,

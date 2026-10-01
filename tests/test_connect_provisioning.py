@@ -1,6 +1,6 @@
 """One connection lifecycle: /api/connect brings SSH and the GPU/vLLM up TOGETHER.
 
-The gateway used to be able to defer GPU provisioning to the first run (``BIOAGENT_LAZY_GPU``),
+The gateway used to be able to defer GPU provisioning to the first run (``AISCIENTIST_LAZY_GPU``),
 which left a half-connected session — SSH up, no model — that both the run endpoints and the
 console had to special-case. That path is gone: ``_provision_blocking`` is the only way a session
 comes up, status walks connecting → provisioning → ready, and a run may only start from "ready".
@@ -17,8 +17,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 def _conn():
@@ -128,6 +128,6 @@ def test_lab_endpoint_rejects_session_without_ssh():
 
 
 def test_no_lazy_gpu_env_knob(monkeypatch):
-    """BIOAGENT_LAZY_GPU is dead: setting it must not resurrect a setting or change anything."""
-    monkeypatch.setenv("BIOAGENT_LAZY_GPU", "1")
+    """AISCIENTIST_LAZY_GPU is dead: setting it must not resurrect a setting or change anything."""
+    monkeypatch.setenv("AISCIENTIST_LAZY_GPU", "1")
     assert not hasattr(HPCSettings.from_env(), "lazy_gpu")

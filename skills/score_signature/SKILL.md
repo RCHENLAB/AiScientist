@@ -9,4 +9,4 @@ No curated tool covers per-cell signature scoring. This template uses scanpy `sc
 and summarizes the score per cluster/condition. ADAPT SIGNATURE (gene SYMBOLS) and GROUP_KEY.
 
 ## Run
-Fetch the template with `read_skill_reference("score_signature", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `BIOAGENT_WORK`, writes under `BIOAGENT_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.
+Fetch the template with `read_skill_reference("score_signature", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `AISCIENTIST_WORK`, writes under `AISCIENTIST_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.

@@ -3,13 +3,16 @@
 # scanpy/pandas/gseapy — NO GPU. Build on HPC3 or any Linux+singularity host (macOS cannot
 # build .sif). This is the image SlurmCodeExecutor runs each run_code snippet inside.
 set -euo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DFS_DIR="${BIOAGENT_CONTAINERS_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
+DFS_DIR="${AISCIENTIST_CONTAINERS_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
 SIF="${DFS_DIR}/analysis.sif"
 
-# The bioagent TOOLS are NOT in this image — they are synced to dfs3b + bind-mounted at run time
-# (see gateway/slurm_analysis.py / app._sync_bioagent_source_to_hpc). So the image is DEPS-ONLY
+# The AiScientist TOOLS are NOT in this image — they are synced to dfs3b + bind-mounted at run time
+# (see gateway/slurm_analysis.py / app._sync_aiscientist_source_to_hpc). So the image is DEPS-ONLY
 # and only needs rebuilding when the Python deps change — a tool edit needs no rebuild. It also
 # means `--remote` works (no local-file %files to ship to the cloud builder).
 
@@ -34,20 +37,20 @@ cp -v "${HERE}/analysis.sif" "${SIF}"
 
 echo "== 3. Smoke-test the image on a CPU node (no GPU needed) =="
 cat <<EOF
-  # analysis stack (deps only — the bioagent tools are bound at run time, not in the image):
+  # analysis stack (deps only — the AiScientist tools are bound at run time, not in the image):
   singularity exec --containall --writable-tmpfs --net --network none \\
     ${SIF} python -c "import scanpy, gseapy, pandas, h5py; print('ok', scanpy.__version__)"
 
 Then enable the HPC paths (in .env / HPCSettings):
-  BIOAGENT_ANALYSIS_IMAGE=${SIF}
-  BIOAGENT_CPU_PARTITION=standard          # RCIC HPC3 free CPU partition
-  BIOAGENT_CPU_ACCOUNT=ruic20_lab
-  BIOAGENT_RUN_CODE_MEM_GB=64              # the real per-job memory cap
-  BIOAGENT_RUN_CODE_ON_HPC=1               # CodeAct run_code as CPU Slurm jobs
-  BIOAGENT_ANALYSIS_ON_HPC=1               # scanpy QC/cluster/DE/enrichment as CPU Slurm jobs (Phase 4)
-  BIOAGENT_UPLOADS_ON_HPC=1                # uploads land on dfs3b so analysis reads them in place (Phase 2)
+  AISCIENTIST_ANALYSIS_IMAGE=${SIF}
+  AISCIENTIST_CPU_PARTITION=standard          # RCIC HPC3 free CPU partition
+  AISCIENTIST_CPU_ACCOUNT=ruic20_lab
+  AISCIENTIST_RUN_CODE_MEM_GB=64              # the real per-job memory cap
+  AISCIENTIST_RUN_CODE_ON_HPC=1               # CodeAct run_code as CPU Slurm jobs
+  AISCIENTIST_ANALYSIS_ON_HPC=1               # scanpy QC/cluster/DE/enrichment as CPU Slurm jobs (Phase 4)
+  AISCIENTIST_UPLOADS_ON_HPC=1                # uploads land on dfs3b so analysis reads them in place (Phase 2)
 
-The bioagent TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway (over its SSH session)
+The AiScientist TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway (over its SSH session)
 and bind-mounted in — so a tool edit needs only a normal code deploy, NOT an image rebuild. The
 dataset lives on dfs3b; the analysis run dir is created under <lab_storage>/<user>/analysis/<run_id>.
 If HPC is unreachable (or the tool sync fails), analysis falls back in-process.

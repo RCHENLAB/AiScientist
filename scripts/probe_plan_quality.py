@@ -20,7 +20,7 @@ the SAME dataset profile:
       stratifies, and does NOT plan a per-donor pseudobulk. Each of those is a regex away.
 
 Usage:
-    BIOAGENT_PROBE_BASE=http://127.0.0.1:PORT/v1 \\
+    AISCIENTIST_PROBE_BASE=http://127.0.0.1:PORT/v1 \\
     PYTHONPATH=src .venv/bin/python scripts/probe_plan_quality.py --trials 10
 """
 
@@ -40,8 +40,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-MODEL = os.environ.get("BIOAGENT_PROBE_MODEL", "QuantTrio/Qwen3.6-35B-A3B-AWQ")
-BASE = os.environ.get("BIOAGENT_PROBE_BASE", "http://127.0.0.1:8000/v1")
+MODEL = os.environ.get("AISCIENTIST_PROBE_MODEL", "QuantTrio/Qwen3.6-35B-A3B-AWQ")
+BASE = os.environ.get("AISCIENTIST_PROBE_BASE", "http://127.0.0.1:8000/v1")
 
 QUESTION = 'Call the run_de tool with groupby="sampleid" on this dataset and report exactly what it returns.'
 
@@ -143,7 +143,7 @@ _RE = {
 
 
 def score(agenda: list[str], disclosure: str = "") -> dict[str, Any]:
-    from bioagent.agents.research_lab import _is_readback_step
+    from aiscientist.agents.research_lab import _is_readback_step
     text = " \n".join(agenda)
     return {
         "n_steps": len(agenda),
@@ -162,8 +162,8 @@ def score(agenda: list[str], disclosure: str = "") -> dict[str, Any]:
 
 
 def experiment_dag(trials: int, complete) -> None:
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     print(f"\n=== E1  DAG structuring stability — {trials} structurings of ONE fixed agenda ===")
     lab = ResearchLab(HarnessContext(decisions={"dataset_result": _dataset_result()}),
@@ -188,9 +188,9 @@ def experiment_dag(trials: int, complete) -> None:
 def _plan_before(complete, trials: int) -> list[dict[str, Any]]:
     """The 2026-08-15 planning call: old prompt, old profile, no review."""
     import subprocess
-    from bioagent.agents.research_lab import _parse_plan
+    from aiscientist.agents.research_lab import _parse_plan
 
-    old_src = subprocess.run(["git", "show", "980b9c2:src/bioagent/agents/research_lab.py"],
+    old_src = subprocess.run(["git", "show", "980b9c2:src/aiscientist/agents/research_lab.py"],
                              cwd=ROOT, capture_output=True, text=True).stdout
     ns: dict[str, Any] = {}
     m = re.search(r"^_PI_SYSTEM = \((.*?)^\)$", old_src, re.S | re.M)
@@ -215,8 +215,8 @@ def _plan_before(complete, trials: int) -> list[dict[str, Any]]:
 
 def _plan_after(complete, trials: int) -> list[dict[str, Any]]:
     """The deployed planner: fixed profile, new prompt, plan review on."""
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     guidance = (ROOT / "preset_pipelines" / "differential_expression" / "SKILL.md").read_text()
     out = []

@@ -104,7 +104,7 @@ distribution is reported (from the tool, not fabricated) · the query was **not*
 before the call · a `not_enabled` / `error` result is surfaced honestly, not papered over with invented
 labels.
 
-<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 1) + `src/bioagent/tools/scgpt_annotate/tool.py`</sub>
+<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 1) + `src/aiscientist/tools/scgpt_annotate/tool.py`</sub>
 </details>
 
 <details>
@@ -260,8 +260,8 @@ assembled automatically — **do not plan a report-writing step.**
 **scGPT** pretrained gene/expression transformer — Route C: a short-lived `gpu:1` **Singularity batch
 job** on HPC3, orchestrated by `gateway/scgpt_job`, with `scgpt`/`torch` living only in the image ·
 **scanpy** QC / neighbors–Leiden–UMAP / DE for the independent, data-driven structure · **barcode-safe
-cross-validation** via the `crossvalidate_scgpt_vs_leiden` reference template. Full workflow and
-deployment details: [`docs/scgpt_workflow_integration.md`](../../docs/scgpt_workflow_integration.md).
+cross-validation** via the `crossvalidate_scgpt_vs_leiden` reference template. Deployment details:
+[`deploy/scgpt/README.md`](../../deploy/scgpt/README.md).
 
 <sub>This protocol's tool-call and merge excerpts are drawn from the cited SKILL and source files —
 regenerate to keep them faithful to what runs.</sub>

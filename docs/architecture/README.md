@@ -1,13 +1,13 @@
 # AiScientist architecture
 
 For whoever picks the project up: where it runs, how one research run flows, how the code is
-layered, and how the tools are found and routed. The split into three repositories is in
-[REPO_SPLIT.md](REPO_SPLIT.md). 中文版: [README.zh-CN.md](README.zh-CN.md).
+layered, and how the tools are found and routed. What has been measured and decided along the way
+is in [`../FINDINGS.md`](../FINDINGS.md).
 
 The same diagrams, editable, are on the FigJam board
 [AiScientist architecture](https://www.figma.com/board/OHeckC4jS6Yw5ET9UjBeQB) (AiScientist team).
 Every model-callable tool is documented in its own folder; the index is
-[src/bioagent/tools/README.md](../../src/bioagent/tools/README.md).
+[src/aiscientist/tools/README.md](../../src/aiscientist/tools/README.md).
 
 ## The system in one paragraph
 
@@ -17,15 +17,16 @@ plan, the user reviews it, the Scientist runs curated tools or its own code step
 jobs on UCI HPC3), the Critic reviews every step, and the run ends in a cited manuscript-style report
 (PDF / DOCX). The LLM is Qwen3.8, self-hosted with vLLM on an HPC3 GPU, or the user's own API key.
 
-The product is called AiScientist; the code namespace stays `bioagent` (package, `BIOAGENT_*`
-env vars, `/data/BioAgent`, the systemd service) for deploy compatibility. See `CLAUDE.md`.
+The code namespace is `aiscientist` (package, `AISCIENTIST_*` env vars). A `bioagent` import alias and
+the legacy `BIOAGENT_*` env names still work, and a few runtime identifiers outside the repository keep
+the old name (`/data/BioAgent`, the `bioagent` systemd unit, Slurm job names). See `CLAUDE.md`.
 
 ## Where it runs
 
 ```mermaid
 flowchart LR
     browser["Browser: console UI"] <-->|"HTTPS + WebSocket"| envoy["Envoy ingress<br/>AiScientist.eye.som.uci.edu"]
-    envoy -->|"proxies"| gw["bioagent service on eyeserver :8800<br/>FastAPI + WebSocket"]
+    envoy -->|"proxies"| gw["AiScientist gateway on eyeserver :8800<br/>systemd unit bioagent · FastAPI + WebSocket"]
     gw -->|"accounts, runs, chats"| pg[("Postgres")]
     gw -->|"run files, uploads, keys"| data[("/data/BioAgent")]
     gw -->|"sync code, stage data"| dfs[("dfs3b shared root")]
@@ -97,11 +98,11 @@ flowchart TB
 
 | Package | What it owns |
 |---|---|
-| `src/bioagent/gateway/` | The FastAPI app (`app.py`), accounts and the database, the HPC3 session (SSH, the held worker, the GPU serve job), LLM clients and bring-your-own keys, the Slurm job executors (one per image), the environment manifest |
-| `src/bioagent/agents/` | The orchestrator: the research lab, a step's tool loop, the catalog assembly, the DAG planner, the fast chat path, skills loading and induction, claim audit and step checks, agent memory |
-| `src/bioagent/reporting/` | Turning a finished run into deliverables: pandoc render, result bundle, reference list, the vision-model render review |
-| `src/bioagent/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
-| `src/bioagent/tools/` | Every model-callable domain tool, one folder each, plus the contract (`sdk.py`), discovery (`catalog.py`), the public surface (`api.py`), shared code (`_lib/`), reference data and the per-image job entry points |
+| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, the HPC3 session (SSH, the held worker, the GPU serve job), LLM clients and bring-your-own keys, the Slurm job executors (one per image), the environment manifest |
+| `src/aiscientist/agents/` | The orchestrator: the research lab, a step's tool loop, the catalog assembly, the DAG planner, the fast chat path, skills loading and induction, claim audit and step checks, agent memory |
+| `src/aiscientist/reporting/` | Turning a finished run into deliverables: pandoc render, result bundle, reference list, the vision-model render review |
+| `src/aiscientist/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
+| `src/aiscientist/tools/` | Every model-callable domain tool, one folder each, plus the contract (`sdk.py`), discovery (`catalog.py`), the public surface (`api.py`), shared code (`_lib/`), reference data and the per-image job entry points |
 | `skills/`, `preset_pipelines/` | Plain files: atomic CodeAct templates the Scientist adapts, and end-to-end protocols the PI picks |
 | `frontend/console/` | The web UI |
 

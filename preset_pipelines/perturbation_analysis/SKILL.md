@@ -68,7 +68,7 @@ category values are given at planning time) and infer:
    positive control, and flag guides where the target does NOT drop.
    **Memory:** load the AnnData ONCE; inside the per-perturbation loop subset with a **view**
    (`adata[mask]`), never `.copy()` every group or hold all subsets at once — an over-budget loop is
-   OOM-killed on the local sandbox (`returncode == -9`). Prefer `BIOAGENT_RUN_CODE_ON_HPC=1`
+   OOM-killed on the local sandbox (`returncode == -9`). Prefer `AISCIENTIST_RUN_CODE_ON_HPC=1`
    (see `skills/README.md`) for a real `--mem` cap on large screens.
 7. **(Optional) Pathway enrichment per strong perturbation** (`run_enrichment`): on the up-/down-gene
    sets of each perturbation with a substantial DE result. Send gene SYMBOLS only.

@@ -29,11 +29,11 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog  # noqa: E402
-from bioagent.agents.research_lab import LabConfig, ResearchLab, make_run_code_tool  # noqa: E402
-from bioagent.agents.sandbox import CodeSandbox  # noqa: E402
-from bioagent.core.config import load_project_env  # noqa: E402
-from bioagent.tools.datasets import run_dataset_smoke_analysis  # noqa: E402
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog  # noqa: E402
+from aiscientist.agents.research_lab import LabConfig, ResearchLab, make_run_code_tool  # noqa: E402
+from aiscientist.agents.sandbox import CodeSandbox  # noqa: E402
+from aiscientist.core.config import load_project_env  # noqa: E402
+from aiscientist.tools.datasets import run_dataset_smoke_analysis  # noqa: E402
 
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
 

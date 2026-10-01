@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import types
 
-from bioagent.agents.tool_source import (
+from aiscientist.agents.tool_source import (
     _declared_defaults,
     _split_top_level,
     make_tool_source_tool,
 )
-from bioagent.tools.catalog import scrna_catalog
+from aiscientist.tools.catalog import scrna_catalog
 
 
 def _tool(catalog=None):
@@ -31,7 +31,7 @@ def test_reading_a_tool_returns_its_real_body_not_its_description():
     tool, ctx = _tool()
     out = tool.executor({"tool": "run_de"}, ctx)
     assert "def run_de" in out["source"]
-    assert out["module"] == "bioagent.tools.run_de.tool"
+    assert out["module"] == "aiscientist.tools.run_de.tool"
     assert out["file"].endswith("run_de/tool.py") and out["first_line"] > 0
     # The declared contract travels WITH the code, so the two can be compared. A description
     # that promises more than the body delivers is the defect class this exists to surface.
@@ -161,7 +161,7 @@ def test_split_top_level_ignores_commas_inside_brackets_and_quotes():
 # behaviour on what it could see, and the capability was lost to what it could not.
 
 def _catalog_with_injected_runner():
-    from bioagent.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
+    from aiscientist.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
 
     def runner(args, ctx):
         """SENTINEL_BODY — the injected implementation."""
@@ -171,7 +171,7 @@ def _catalog_with_injected_runner():
 
 
 def test_the_tool_body_names_what_it_delegates_to():
-    from bioagent.agents.tool_source import make_tool_source_tool
+    from aiscientist.agents.tool_source import make_tool_source_tool
 
     cat, _ = _catalog_with_injected_runner()
     out = make_tool_source_tool(lambda: cat).executor({"tool": "scgpt_annotate"}, None)
@@ -180,7 +180,7 @@ def test_the_tool_body_names_what_it_delegates_to():
 
 
 def test_the_injected_implementation_can_be_fetched_as_a_symbol():
-    from bioagent.agents.tool_source import make_tool_source_tool
+    from aiscientist.agents.tool_source import make_tool_source_tool
 
     cat, _ = _catalog_with_injected_runner()
     out = make_tool_source_tool(lambda: cat).executor(
@@ -190,7 +190,7 @@ def test_the_injected_implementation_can_be_fetched_as_a_symbol():
 
 
 def test_an_unknown_symbol_still_errors_and_now_points_at_the_way_in():
-    from bioagent.agents.tool_source import make_tool_source_tool
+    from aiscientist.agents.tool_source import make_tool_source_tool
 
     cat, _ = _catalog_with_injected_runner()
     out = make_tool_source_tool(lambda: cat).executor(
@@ -202,8 +202,8 @@ def test_an_unknown_symbol_still_errors_and_now_points_at_the_way_in():
 def test_a_self_contained_tool_reports_nothing_to_dispatch_to():
     """The field has to be empty when there is no indirection, or it becomes noise the model
     learns to ignore on exactly the tools where it matters."""
-    from bioagent.agents.research_harness import default_catalog
-    from bioagent.agents.tool_source import make_tool_source_tool
+    from aiscientist.agents.research_harness import default_catalog
+    from aiscientist.agents.tool_source import make_tool_source_tool
 
     cat = [t for t in default_catalog() if t.name != "finish"]
     if not cat:

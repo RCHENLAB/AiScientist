@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from bioagent.agents.research_harness import (
+from aiscientist.agents.research_harness import (
     _DIGEST_MAX_ITEMS,
     _DIGEST_MAX_KEYS,
     _DIGEST_MAX_STR,
@@ -178,7 +178,7 @@ def test_the_digest_is_still_bounded() -> None:
 
 def test_the_critic_is_shown_skipped_groups_and_warnings(tmp_path) -> None:
     """End to end: the payload ``ResearchLab._critic`` actually sends to the model."""
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     seen: list = []
 
@@ -270,7 +270,7 @@ def test_a_long_result_that_is_not_a_dict_is_cut_as_before() -> None:
 def test_compressed_history_keeps_the_small_digest() -> None:
     """Compression only runs when the window is full, so its stub stays at the small sizes whatever
     the Critic's digest sizes are, and it still keeps the reporting keys."""
-    from bioagent.agents.research_harness import _COMPRESS_DIGEST_SIZES, _compress_message
+    from aiscientist.agents.research_harness import _COMPRESS_DIGEST_SIZES, _compress_message
 
     max_str = _COMPRESS_DIGEST_SIZES[0]
     reply = {"role": "tool", "tool_call_id": "c1", "content": json.dumps(

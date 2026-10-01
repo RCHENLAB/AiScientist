@@ -18,14 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from bioagent.gateway.errors import GatewayError
+from aiscientist.gateway.errors import GatewayError
 
 
 @pytest.fixture()
 def lc(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("BIOAGENT_LLM_KEY_ENCRYPTION", raising=False)
-    from bioagent.gateway import llm_credentials
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("AISCIENTIST_LLM_KEY_ENCRYPTION", raising=False)
+    from aiscientist.gateway import llm_credentials
     importlib.reload(llm_credentials)
     return llm_credentials
 
@@ -152,7 +152,7 @@ def test_lab_model_round_trips(lc):
 
 def test_encrypted_at_rest_when_enabled(lc, tmp_path, monkeypatch):
     pytest.importorskip("cryptography")
-    monkeypatch.setenv("BIOAGENT_LLM_KEY_ENCRYPTION", "1")
+    monkeypatch.setenv("AISCIENTIST_LLM_KEY_ENCRYPTION", "1")
 
     pub = _make(lc, key="sk-secret-value-1234567")
     raw = (tmp_path / "llm_creds" / "alice" / f"{pub['id']}.key").read_bytes()
@@ -170,7 +170,7 @@ def test_enabling_encryption_later_keeps_old_plaintext_rows_readable(lc, monkeyp
     pytest.importorskip("cryptography")
     old = _make(lc, key="sk-plaintext-000000000")
 
-    monkeypatch.setenv("BIOAGENT_LLM_KEY_ENCRYPTION", "1")
+    monkeypatch.setenv("AISCIENTIST_LLM_KEY_ENCRYPTION", "1")
     new = _make(lc, key="sk-encrypted-11111111")
 
     assert lc.resolve_secret("alice", old["id"]) == "sk-plaintext-000000000"
@@ -180,7 +180,7 @@ def test_enabling_encryption_later_keeps_old_plaintext_rows_readable(lc, monkeyp
 
 def test_lost_master_key_reports_a_recoverable_error(lc, tmp_path, monkeypatch):
     pytest.importorskip("cryptography")
-    monkeypatch.setenv("BIOAGENT_LLM_KEY_ENCRYPTION", "1")
+    monkeypatch.setenv("AISCIENTIST_LLM_KEY_ENCRYPTION", "1")
     pub = _make(lc, key="sk-gone-00000000000000")
 
     from cryptography.fernet import Fernet
@@ -269,18 +269,18 @@ def test_mark_verified_records_success_and_failure(lc):
 def test_the_key_survives_the_store_moving(tmp_path, monkeypatch):
     """A stored row's key_path does not survive the state dir moving — the key must anyway.
 
-    Rows written while BIOAGENT_STATE_DIR was unset hold a path relative to the then-current
+    Rows written while AISCIENTIST_STATE_DIR was unset hold a path relative to the then-current
     working directory. Setting the state dir (which is what takes the users' secrets OUT of the
     directory the deploy rsyncs into) left every row naming a file that was no longer there: the
     key sat intact on disk while every use of it failed with "outside the owner's store".
     """
     import importlib, json, os, shutil
-    from bioagent.gateway import llm_credentials as lc
+    from aiscientist.gateway import llm_credentials as lc
 
     old_root = tmp_path / "old"
     old_root.mkdir()
     monkeypatch.chdir(old_root)
-    monkeypatch.delenv("BIOAGENT_STATE_DIR", raising=False)   # the unset-in-prod case
+    monkeypatch.delenv("AISCIENTIST_STATE_DIR", raising=False)   # the unset-in-prod case
     importlib.reload(lc)
     cred = lc.create("alice", provider="custom", base_url="https://a/v1", model="m1",
                      api_key="sk-lives-through-a-move")
@@ -288,7 +288,7 @@ def test_the_key_survives_the_store_moving(tmp_path, monkeypatch):
 
     new_root = tmp_path / "new"
     shutil.copytree(old_root / "llm_creds", new_root / "llm_creds")
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(new_root))
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(new_root))
     monkeypatch.chdir(tmp_path)                               # the old relative path now resolves nowhere
     importlib.reload(lc)
 

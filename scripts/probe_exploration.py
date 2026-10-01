@@ -45,12 +45,12 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from bioagent.agents.research_harness import (  # noqa: E402
+from aiscientist.agents.research_harness import (  # noqa: E402
     HarnessContext, ResearchHarness, default_catalog,
 )
-from bioagent.agents.research_lab import CriticVerdict, LabConfig, ResearchLab  # noqa: E402
-from bioagent.core.config import load_project_env  # noqa: E402
-from bioagent.providers.openai_compatible import OpenRouterClient  # noqa: E402
+from aiscientist.agents.research_lab import CriticVerdict, LabConfig, ResearchLab  # noqa: E402
+from aiscientist.core.config import load_project_env  # noqa: E402
+from aiscientist.providers.openai_compatible import OpenRouterClient  # noqa: E402
 
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
@@ -228,16 +228,16 @@ def main() -> int:
     if args.offline:
         label = "offline (scripted replies — proves the harness, NOT a model)"
     else:
-        base_url = args.base_url or os.environ.get("BIOAGENT_LAB_LLM_BASE_URL") \
-            or os.environ.get("BIOAGENT_LLM_BASE_URL")
-        model = args.model or os.environ.get("BIOAGENT_LAB_LLM_MODEL") \
-            or os.environ.get("BIOAGENT_LLM_MODEL")
+        base_url = args.base_url or os.environ.get("AISCIENTIST_LAB_LLM_BASE_URL") \
+            or os.environ.get("AISCIENTIST_LLM_BASE_URL")
+        model = args.model or os.environ.get("AISCIENTIST_LAB_LLM_MODEL") \
+            or os.environ.get("AISCIENTIST_LLM_MODEL")
         key = os.environ.get(args.api_key_env) if args.api_key_env else (
-            os.environ.get("BIOAGENT_LAB_LLM_API_KEY") or os.environ.get("BIOAGENT_LLM_API_KEY")
+            os.environ.get("AISCIENTIST_LAB_LLM_API_KEY") or os.environ.get("AISCIENTIST_LLM_API_KEY")
             or os.environ.get("OPENROUTER_API_KEY"))
         if not base_url or not model:
-            print("no endpoint configured — pass --base-url/--model, set BIOAGENT_LAB_LLM_* or "
-                  "BIOAGENT_LLM_* in .env, or use --offline", file=sys.stderr)
+            print("no endpoint configured — pass --base-url/--model, set AISCIENTIST_LAB_LLM_* or "
+                  "AISCIENTIST_LLM_* in .env, or use --offline", file=sys.stderr)
             return 2
         client = OpenRouterClient(api_key=key, model=model, base_url=base_url,
                                   timeout_seconds=args.timeout, endpoint_name="probe")

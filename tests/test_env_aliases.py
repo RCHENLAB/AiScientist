@@ -7,7 +7,7 @@ EITHER ``AISCIENTIST_X`` or ``BIOAGENT_X`` and both reads resolve. When both are
 
 from __future__ import annotations
 
-from bioagent.core.config import apply_brand_env_aliases, env, load_project_env
+from aiscientist.core.config import apply_brand_env_aliases, env, load_project_env
 
 
 def test_old_prefix_is_mirrored_to_new():

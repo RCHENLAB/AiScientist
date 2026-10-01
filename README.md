@@ -3,7 +3,7 @@
 **A privacy-first, multi-agent bioinformatics research console for the UCI vision /
 ocular-biology lab.** A researcher logs in through the browser, points it at a dataset,
 and asks a scientific question in plain language. Behind the login, the console connects
-to **UCI HPC3** (SSH + Duo), serves an open-weights LLM (**Qwen3.6-35B-A3B**) on a GPU
+to **UCI HPC3** (SSH + Duo), serves an open-weights LLM (**Qwen3.8-27B**, INT4) on a GPU
 via Slurm + vLLM, and runs a role-based *research lab* — Principal Investigator →
 Scientist → Critic — that plans the work, executes real single-cell analysis and
 literature retrieval, and streams back a citable, publication-shaped report with
@@ -40,11 +40,11 @@ Design posture:
 
 ## What a run looks like
 
-1. **Log in & connect.** A AiScientist account (admin-created; no self-signup, `@uci.edu`
-   for registration) gates the app. The console then SSHes to `hpc3.rcic.uci.edu` with
-   your UCInetID + interactive **Duo**. HPC3 credentials are never stored — only a bcrypt
+1. **Log in & connect.** An AiScientist account gates the app: self-registration with a
+   verified `@uci.edu` email (a 6-digit code), or created by an admin. The console then
+   SSHes to `hpc3.rcic.uci.edu` with your UCInetID + interactive **Duo**. HPC3 credentials are never stored — only a bcrypt
    hash of the *app* password lives in the DB.
-2. **Serve the model.** A per-user Slurm GPU job serves `QuantTrio/Qwen3.6-35B-A3B-AWQ`
+2. **Serve the model.** A per-user Slurm GPU job serves `RedHatAI/Qwen3.8-27B-INT4`
    via **vLLM** (Singularity, OpenAI-compatible `/v1`) on a dynamic port; the console
    SSH-tunnels to it. Jobs are per-user-isolated (`squeue --me`) and the model is warmed
    on connect so the first query isn't stuck on the cold load from shared DFS.
@@ -70,11 +70,11 @@ Browser ──HTTPS──▶ Envoy Gateway (<PUBLIC_HOSTNAME>)
         (systemd `bioagent.service`, Postgres)    orchestration, report assembly
                         │  SSH + Duo, per-session tunnel
                         ▼
-        UCI HPC3 (Slurm): vLLM GPU serve (Qwen3.6-35B) · run_code · scanpy analysis ·
+        UCI HPC3 (Slurm): vLLM GPU serve (Qwen3.8-27B) · run_code · scanpy analysis ·
         pandoc/XeLaTeX report render · scGPT · VL review — all Singularity-contained
 ```
 
-The web console (`src/bioagent/gateway/`) is a deployable FastAPI + WebSocket app; the
+The web console (`src/aiscientist/gateway/`) is a deployable FastAPI + WebSocket app; the
 compute lives on HPC3 behind SSH. The two are decoupled by per-session SSH tunnels and
 Slurm job submission, so the eyeserver holds no GPU and no persistent dataset copy.
 
@@ -82,7 +82,7 @@ Slurm job submission, so the eyeserver holds no GPU and no persistent dataset co
 
 ## The research lab (PI → Scientist → Critic)
 
-The live agent system is a role-based loop in `src/bioagent/agents/`:
+The live agent system is a role-based loop in `src/aiscientist/agents/`:
 
 - **PI** turns the question into an ordered agenda of concrete steps (plan-mode pauses
   here for human review/edit — the same human-in-the-loop gate as the Duo prompt).
@@ -110,15 +110,13 @@ with a team of specialists — all **feature-flagged and additive** (default off
   **claim** tasks by expertise fit (real multi-agent, not a fixed router).
 - **Safe concurrency** — independent branches (e.g. literature vs analysis) run in
   parallel when their mutable footprints are disjoint; opt-in via
-  `BIOAGENT_MAX_CONCURRENCY`.
+  `AISCIENTIST_MAX_CONCURRENCY`.
 - **Per-agent evolving memory** (`agents/agent_memory.py`) — each specialist keeps a
   private, disk-backed memory (`episodes.jsonl` + distilled `lessons.md`) that it recalls
   into its brief and reflects on across runs (in-context learning on frozen weights).
 
-Flags (gateway env, all default off): `BIOAGENT_PLANNER=dag`,
-`BIOAGENT_MAX_CONCURRENCY=<n>`, `BIOAGENT_AGENT_MEMORY=1`. See
-[`docs/dag_planner_design.md`](docs/dag_planner_design.md) and
-[`docs/agent_memory_design.md`](docs/agent_memory_design.md).
+Flags (gateway env, all default off): `AISCIENTIST_PLANNER=dag`,
+`AISCIENTIST_MAX_CONCURRENCY=<n>`, `AISCIENTIST_AGENT_MEMORY=1`.
 
 ### The Scientist's tool catalog (`agents/registry.py`)
 
@@ -149,7 +147,7 @@ tests via an injected `chat_fn` with scripted tool calls.
   notice reserves `login-i15/16/17` for logging in and submitting Slurm jobs — not compute, and
   not `rsync`/`SFTP`/`rclone`/`wget` — and says offending processes may be killed. The gateway
   honours this automatically: `put_file`/`get_file` open their own connection to
-  `BIOAGENT_HPC_TRANSFER_HOST` while every `exec`, Slurm call and tunnel stays on the login node.
+  `AISCIENTIST_HPC_TRANSFER_HOST` while every `exec`, Slurm call and tunnel stays on the login node.
   That host mounts the same `$HOME` and `/dfs3b`, and its shell is restricted to transfer
   commands (`rsync`/`wget`/`curl`, not `bash`), so scripts still run on `hpc3.rcic.uci.edu`.
 - User SSH keys must have a non-empty passphrase and must not be shared.
@@ -170,20 +168,20 @@ Config/secrets are read from `/data/BioAgent/app/.env` (see
 `configs/aiscientist.example.env` and [`deploy/`](deploy/)). Redeploy backend changes with
 `./deploy/redeploy.sh` (rsync + `systemctl restart` — drops live sessions; there is no
 zero-downtime backend path). Full deploy kit, TLS, and systemd notes:
-[`deploy/README.md`](deploy/README.md), [`docs/archive/hpc3_console.md`](docs/archive/hpc3_console.md).
+[`deploy/README.md`](deploy/README.md).
 
 **Local / dev.**
 
 ```bash
 ./deploy.sh                       # create the venv + install (idempotent)
 ./start.sh                        # bind 127.0.0.1:8800 — SSH-tunnel to view
-# or: bioagent-console --port 8800     (tick "Mock mode" to demo without a cluster)
+# or: aiscientist-console --port 8800     (tick "Mock mode" to demo without a cluster)
 ```
 
 Off-cluster testing can point the LLM at any OpenAI-compatible endpoint via
-`BIOAGENT_LLM_BASE_URL` (e.g. OpenRouter) — a **test convenience**, not the product path
-(storage + compute still assume HPC3; see [`docs/BACKLOG.md`](docs/BACKLOG.md)). Admin
-user management is `bioagent-admin`.
+`AISCIENTIST_LLM_BASE_URL` (e.g. OpenRouter) — a **test convenience**, not the product path
+(storage + compute still assume HPC3). Admin
+user management is `aiscientist-admin`.
 
 ---
 
@@ -196,8 +194,6 @@ user management is `bioagent-admin`.
   memory, and safe concurrency — all feature-flagged over 0.1.0. Merges to and is
   maintained as the mainline.
 
-See [`handoff/yijun/HANDOFF.md`](handoff/yijun/HANDOFF.md) for the release model, the
-rollback procedure, and the DAG ↔ literature merge-coordination notes.
 
 ---
 
@@ -212,7 +208,7 @@ python3 -m pytest        # offline; no cluster, .env, or network needed
 ## Package layout
 
 ```text
-src/bioagent/
+src/aiscientist/
   agents/        the research lab (PI/Scientist/Critic), DAG planner, agent memory,
                  tool registry, CodeAct sandbox, provenance
   gateway/       web console: SSH+Duo, Slurm vLLM serve + tunnel, accounts, chat history,
@@ -232,15 +228,16 @@ deploy/            systemd unit, k8s/Envoy, nginx, HPC3 container defs, redeploy
 
 ## Status
 
-**Implemented + tested** (485 offline tests): the web console (accounts, SSH/Duo, Slurm
+**Implemented + tested** (about 2,000 offline tests): the web console (accounts, SSH/Duo, Slurm
 vLLM serve + tunnel, GPU isolation, mid-run tunnel/serve auto-recovery), the linear
 PI→Scientist→Critic lab, the DAG planner + real multi-agent + per-agent evolving memory
 (feature-flagged), the real scanpy/gseapy analysis line, the `run_code` sandbox, the
 literature line (Europe PMC + PaperQA2) with manuscript references, deterministic pandoc
 PDF/DOCX reports with regenerate-without-rerun, HPC3 offload of uploads/analysis/report,
-and server-side chat history + resumable upload.
+and server-side chat history + resumable upload. What has been measured (validation results)
+and decided (and why) is summarised in [`docs/FINDINGS.md`](docs/FINDINGS.md); how the code is
+laid out is in [`docs/architecture/README.md`](docs/architecture/README.md).
 
-**Direction** (see [`handoff/`](handoff/) and [`docs/BACKLOG.md`](docs/BACKLOG.md)):
-LangGraph + Postgres-checkpointer port of the loop, provenance stamping toward
-Kosmos-parity, multi-cycle research loops, and a pluggable backend so a user can bring
-their own external API in place of HPC3.
+**Direction:**
+LangGraph + Postgres-checkpointer port of the loop, provenance stamping, and moving the tools
+and skills into their own repositories so they can be contributed to independently.

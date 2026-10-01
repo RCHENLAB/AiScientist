@@ -13,12 +13,12 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app          # noqa: E402
-from bioagent.gateway.settings import HPCSettings   # noqa: E402
+from aiscientist.gateway import app as gw_app          # noqa: E402
+from aiscientist.gateway.settings import HPCSettings   # noqa: E402
 
 
 def _conn(tmp_path, monkeypatch, **settings_kw):
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
     import asyncio
     st = HPCSettings(**settings_kw)
     c = gw_app.Connection(st, mock=False, loop=asyncio.new_event_loop(), username="alice")
@@ -112,7 +112,7 @@ def test_a_confirmation_reaches_the_client_and_its_answer_unblocks_the_worker(tm
 def test_no_answer_within_the_timeout_declines(tmp_path, monkeypatch):
     """An unattended run must not hold a worker allocation forever waiting for a click that is
     never coming."""
-    monkeypatch.setenv("BIOAGENT_CONFIRM_TIMEOUT_S", "0.1")
+    monkeypatch.setenv("AISCIENTIST_CONFIRM_TIMEOUT_S", "0.1")
     c = _conn(tmp_path, monkeypatch)
     run = c.begin_run("conv-1")
     monkeypatch.setattr(c, "push", lambda *_a: None)
@@ -154,7 +154,7 @@ def test_the_confirm_route_resolves_to_the_owning_run(tmp_path, monkeypatch):
 def test_the_sandbox_binds_the_shared_cache_read_only():
     """A snippet may IMPORT from the cache but must never write to it: publishing goes through
     install_package, which prunes image collisions and publishes atomically."""
-    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
     ex = SlurmCodeExecutor(remote=None, container_image="/x/analysis.sif",
                            package_cache_root="/dfs3b/lab/AiScientist/pkgs")
@@ -170,7 +170,7 @@ def test_the_sandbox_binds_the_shared_cache_read_only():
 
 def test_an_unset_cache_root_changes_nothing():
     """The feature is additive: without a cache root the sandbox behaves exactly as before."""
-    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
     ex = SlurmCodeExecutor(remote=None, container_image="/x/analysis.sif")
     assert ex._package_cache_preamble() == ("", ())
@@ -180,7 +180,7 @@ def test_an_unset_cache_root_changes_nothing():
 
 
 def test_the_shell_tools_join_the_scientist_catalog(tmp_path, monkeypatch):
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     c = _conn(tmp_path, monkeypatch, worker_enabled=True)
     names = {t.name for t in build_scientist_catalog(hpc_shell=gw_app._build_hpc_shell(c, None))}
@@ -188,7 +188,7 @@ def test_the_shell_tools_join_the_scientist_catalog(tmp_path, monkeypatch):
 
 
 def test_a_catalog_without_a_session_gains_nothing(tmp_path):
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     with_none = {t.name for t in build_scientist_catalog(hpc_shell=None)}
     assert "run_shell" not in with_none and "list_dir" not in with_none
@@ -200,8 +200,8 @@ def test_a_catalog_without_a_session_gains_nothing(tmp_path):
 def test_bringing_your_own_key_skips_the_gpu_entirely(tmp_path, monkeypatch):
     """The point of Yijun's call: no accelerator is held for a session that reasons on an API,
     so connect is ready in seconds instead of waiting out the GPU queue."""
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
-    from bioagent.gateway import llm_credentials
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
+    from aiscientist.gateway import llm_credentials
     importlib.reload(llm_credentials)
     cred = llm_credentials.create("alice", provider="deepseek", base_url="https://api.deepseek.com/v1",
                                   model="deepseek-chat", api_key="sk-000000000000", label="Mine")

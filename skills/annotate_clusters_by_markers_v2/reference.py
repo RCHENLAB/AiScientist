@@ -68,8 +68,8 @@ DISCRIMINATORS = {
 }
 # ----------------------------------------------------------------------------------
 
-work = Path(os.environ["BIOAGENT_WORK"])
-out = Path(os.environ["BIOAGENT_ARTIFACTS"])
+work = Path(os.environ["AISCIENTIST_WORK"])
+out = Path(os.environ["AISCIENTIST_ARTIFACTS"])
 (out / "tables").mkdir(parents=True, exist_ok=True)
 
 adata = sc.read_h5ad(work / "adata_de.h5ad")     # obs[CLUSTER_KEY] + rank_genes_groups

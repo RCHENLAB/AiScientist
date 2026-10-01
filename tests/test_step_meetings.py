@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-from bioagent.agents.research_lab import LabConfig, ResearchLab
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 
 def _ctx(decisions=None) -> HarnessContext:

@@ -18,7 +18,7 @@ phenotype.
 |---|---|
 | **Input** | one scRNA-seq AnnData where each cell carries a CRISPR **guide/perturbation label** in `obs` |
 | **Output** | a perturbation **E-distance ranking** (which guides did something + which are silent) + **per-perturbation DE** tables vs the shared control (+ optional enrichment / module grouping / citations) |
-| **Engine** | `scanpy` (QC / PCA / DE) via the registered tools + scPerturb **E-distance** & **Mixscape** `run_code` templates in the analysis image; `pertpy` optional; large screens on HPC3 (`BIOAGENT_RUN_CODE_ON_HPC=1`) |
+| **Engine** | `scanpy` (QC / PCA / DE) via the registered tools + scPerturb **E-distance** & **Mixscape** `run_code` templates in the analysis image; `pertpy` optional; large screens on HPC3 (`AISCIENTIST_RUN_CODE_ON_HPC=1`) |
 | **Not for** | cell-type assignment (use `celltype_annotation`) or a simple two-group condition comparison (use `differential_expression`) |
 
 > **How to read the "parameters" in each step.** Two kinds of knob feed this pipeline, and the protocol
@@ -31,7 +31,7 @@ phenotype.
 > - **⚙️ Fixed (infra)** — the execution substrate; it never changes the science: the analysis image
 >   already ships **scanpy / numpy / pandas** (the E-distance + DE templates use only these); **pertpy**
 >   is a heavy **optional** dependency used *only* by Mixscape (Step 5); large screens should set
->   `BIOAGENT_RUN_CODE_ON_HPC=1` for a real `--mem` cap. Shown where relevant (Steps 4–6), not re-audited
+>   `AISCIENTIST_RUN_CODE_ON_HPC=1` for a real `--mem` cap. Shown where relevant (Steps 4–6), not re-audited
 >   per run.
 
 ---
@@ -243,7 +243,7 @@ perturbation and flags failures.
 > **⚙️ Memory discipline (infra, not science).** Load the AnnData **ONCE**; inside the per-perturbation loop
 > subset with a **view** (`adata[mask]`) — never `.copy()` every group or hold all subsets at once. An
 > over-budget loop is OOM-killed on the local sandbox (`returncode == -9`). Prefer
-> `BIOAGENT_RUN_CODE_ON_HPC=1` for a real `--mem` cap on large screens.
+> `AISCIENTIST_RUN_CODE_ON_HPC=1` for a real `--mem` cap on large screens.
 
 **✅ Verify this step:** DE used an **explicit `reference` = control** (shared reference), not per-cluster
 one-vs-rest · each perturbation reports adjusted p-values + log fold-changes · target **self-knockdown** is

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 
-from bioagent.agents.registry import build_scientist_catalog
+from aiscientist.agents.registry import build_scientist_catalog
 
 _HAS_SCANPY = importlib.util.find_spec("scanpy") is not None
 

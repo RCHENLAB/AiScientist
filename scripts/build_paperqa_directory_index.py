@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-dir", required=True, help="Directory where PaperQA stores the index.")
     parser.add_argument(
         "--embedding",
-        default=os.environ.get("BIOAGENT_PAPERQA_EMBEDDING", "st-NeuML/pubmedbert-base-embeddings"),
+        default=os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", "st-NeuML/pubmedbert-base-embeddings"),
         help="Local PaperQA embedding model, usually an st- sentence-transformers model. "
         "Default = biomedical PubMedBERT; MUST match tools/paperqa_search.py's embedding.",
     )

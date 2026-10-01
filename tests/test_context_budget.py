@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents import context_budget as cb
-from bioagent.agents.research_harness import (
+from aiscientist.agents import context_budget as cb
+from aiscientist.agents.research_harness import (
     HarnessConfig, HarnessContext, ResearchHarness, default_catalog,
 )
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_lab import (
     CriticVerdict, LabConfig, LabRound, ResearchLab, make_run_code_tool,
 )
 
@@ -145,7 +145,7 @@ def _lab(agenda, *, seen=None, digest="COMPACTED DIGEST", cfg=None, big=4000):
 
     catalog = [*default_catalog(), make_run_code_tool(
         lambda _c: {"status": "ok", "artifacts": ["tables/result.csv"]})]
-    # PIN the window. It otherwise comes from BIOAGENT_VLLM_MAX_MODEL_LEN, which another suite
+    # PIN the window. It otherwise comes from AISCIENTIST_VLLM_MAX_MODEL_LEN, which another suite
     # leaks into os.environ — and a test about thresholds must not inherit a deployment setting.
     harness_cfg = HarnessConfig(max_model_len=32768)
     return ResearchLab(_ctx(), cfg or LabConfig(context_management=True, compact_keep_recent=2),

@@ -13,7 +13,7 @@ import zlib
 
 import pytest
 
-from bioagent.tools.inspect_dataset.tool import (
+from aiscientist.tools.inspect_dataset.tool import (
     describe_dataset,
     inspect_dataset,
     make_inspect_dataset_tool,

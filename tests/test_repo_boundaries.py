@@ -1,7 +1,7 @@
 """The platform's side of the repository boundary (stays in AiScientist).
 
-The platform may import the tools, but only through their doors: ``bioagent.tools.sdk`` (the tool
-contract), ``bioagent.tools.catalog`` (discovery) and ``bioagent.tools.api`` (everything else), and
+The platform may import the tools, but only through their doors: ``aiscientist.tools.sdk`` (the tool
+contract), ``aiscientist.tools.catalog`` (discovery) and ``aiscientist.tools.api`` (everything else), and
 only public names, so a tool's internals can move without the platform noticing. The tools' side of
 the boundary is ``tests/test_tools_boundary.py`` (it moves with AiScientist-tools).
 
@@ -13,7 +13,7 @@ import ast
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-PKG = SRC / "bioagent"
+PKG = SRC / "aiscientist"
 TOOLS = PKG / "tools"          # absent once the tools live in their own repository
 
 
@@ -56,7 +56,7 @@ def _py_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
 
 
-PUBLIC_TOOL_MODULES = {"bioagent.tools", "bioagent.tools.sdk", "bioagent.tools.api", "bioagent.tools.catalog"}
+PUBLIC_TOOL_MODULES = {"aiscientist.tools", "aiscientist.tools.sdk", "aiscientist.tools.api", "aiscientist.tools.catalog"}
 
 
 def _platform_files() -> list[Path]:
@@ -67,14 +67,14 @@ def test_platform_imports_only_public_tool_names():
     offenders = []
     for path in _platform_files():
         for mod, names, line in _imports(path):
-            if not mod.startswith("bioagent.tools"):
+            if not mod.startswith("aiscientist.tools"):
                 continue
             private_mod = [p for p in mod.split(".")[2:] if p.startswith("_")]
             private_names = [n for n in names if n.startswith("_") and n != "__version__"]
             if private_mod or private_names:
                 offenders.append(f"{path.relative_to(SRC)}:{line} {mod} {private_names or private_mod}")
     assert not offenders, (
-        "the platform may import only public names from bioagent.tools (make it public in the tool, "
+        "the platform may import only public names from aiscientist.tools (make it public in the tool, "
         "or move the helper to the platform):\n" + "\n".join(offenders))
 
 
@@ -84,12 +84,12 @@ def test_platform_reaches_tools_only_through_sdk_catalog_and_api():
     offenders = []
     for path in _platform_files():
         for mod, names, line in _imports(path):
-            if not mod.startswith("bioagent.tools"):
+            if not mod.startswith("aiscientist.tools"):
                 continue
-            if mod == "bioagent.tools" and set(names) <= {"api", "sdk", "catalog"}:
+            if mod == "aiscientist.tools" and set(names) <= {"api", "sdk", "catalog"}:
                 continue
             if mod not in PUBLIC_TOOL_MODULES:
                 offenders.append(f"{path.relative_to(SRC)}:{line} imports {mod}")
     assert not offenders, (
-        "import tools through bioagent.tools.api (add the name to its table), .catalog or .sdk:\n"
+        "import tools through aiscientist.tools.api (add the name to its table), .catalog or .sdk:\n"
         + "\n".join(offenders))

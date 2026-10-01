@@ -7,7 +7,7 @@ The asset inventory of everything we own on HPC3 is a separate doc: `docs/hpc3_a
 
 ## The problem this fixes
 
-Results land on the **eyeserver** — `<BIOAGENT_RESULTS_DIR>/<ucinetid>/<run_id>/artifacts/`
+Results land on the **eyeserver** — `<AISCIENTIST_RESULTS_DIR>/<ucinetid>/<run_id>/artifacts/`
 (prod: `/data/BioAgent`). Every HPC3 executor mirrors its `artifacts/` back there when a step
 finishes, so the deliverables are never stranded on the cluster.
 
@@ -24,7 +24,7 @@ into the member's **personal** lab dir:
 | `run_code` snippets, sbatch scripts, args/result JSON, Slurm logs | `/dfs3b/ruic20_lab/<user>/.bioagent/{runcode,analysis,variant,phenotype,paperqa}/` |
 
 and **nothing ever cleaned any of it.** The product's only GC (`app._expire_old_checkpoints`,
-`BIOAGENT_CHECKPOINT_TTL_DAYS`, default 7d) sweeps the eyeserver's local run bundles and never
+`AISCIENTIST_CHECKPOINT_TTL_DAYS`, default 7d) sweeps the eyeserver's local run bundles and never
 touches HPC3. The only HPC3-side deletion was a human clicking an item in the storage panel.
 
 That was not fixable in place: you cannot safely automate `rm -rf` against a directory people
@@ -37,7 +37,7 @@ one member alone.
 ## The layout
 
 ```
-/dfs3b/ruic20_lab/software/AiScientist/  <- BIOAGENT_HPC_SHARED_ROOT (was software/bioagent)
+/dfs3b/ruic20_lab/software/AiScientist/  <- AISCIENTIST_HPC_SHARED_ROOT (was software/bioagent)
 ├── containers/ hf/ envs/ ollama/       <- 350+ GB of assets, NEVER swept (docs/hpc3_assets.md)
 │   scgpt_model/ vlreview_model/
 ├── Temp/<ucinetid>/                    <- process files, SWEPT after 3 days
@@ -49,7 +49,7 @@ one member alone.
 │   ├── paperqa/
 │   └── scratch/{runcode,analysis,variant,phenotype,paperqa}/   sbatch + args/result + job logs
 ├── uploads/<ucinetid>/                 <- raw research data, NEVER swept
-├── pysrc/<ucinetid>/                   <- synced bioagent source, rewritten each connect
+├── pysrc/<ucinetid>/                   <- synced AiScientist source, rewritten each connect
 └── bin/<ucinetid>/temp_gc.sh           <- the sweeper, staged from deploy/hpc3/
 ```
 
@@ -127,8 +127,8 @@ transfer: staging goes over `access-hpc3` (the DTN) via `put_file`.
 
 | env var | default | meaning |
 |---|---|---|
-| `BIOAGENT_HPC_SHARED_ROOT` | `/dfs3b/ruic20_lab/software/AiScientist` | shared project root |
-| `BIOAGENT_TEMP_TTL_DAYS` | `3` | age after which a cold Temp unit is removed; `0` disables |
+| `AISCIENTIST_HPC_SHARED_ROOT` | `/dfs3b/ruic20_lab/software/AiScientist` | shared project root |
+| `AISCIENTIST_TEMP_TTL_DAYS` | `3` | age after which a cold Temp unit is removed; `0` disables |
 
 Both also accept the `AISCIENTIST_*` prefix (`core.config.apply_brand_env_aliases`).
 
@@ -144,13 +144,13 @@ What is left is the eyeserver:
 1. Restart the gateway so the new defaults load.
 2. **Check `/data/BioAgent/app/.env` for pinned `software/bioagent` paths.** They still resolve
    through the compat symlink, so nothing breaks either way — but update them so the symlink can
-   eventually go. `BIOAGENT_HPC_SHARED_ROOT` itself needs no entry unless you want a non-default.
+   eventually go. `AISCIENTIST_HPC_SHARED_ROOT` itself needs no entry unless you want a non-default.
 3. Optional per-member cron backstop (above).
 
 `/dfs3b/ruic20_lab` (top level) is `drwxr-s--- ruic20 ruic20_hpc` — group members cannot mkdir
 there, and `newgrp`/`sg` do not change that (supplementary groups already count for the access
 check; the group simply has no `w`). If you ever want the root at `/dfs3b/ruic20_lab/AiScientist`
-instead, someone with `ruic20` rights has to create it, and `BIOAGENT_HPC_SHARED_ROOT` moves there
+instead, someone with `ruic20` rights has to create it, and `AISCIENTIST_HPC_SHARED_ROOT` moves there
 with no code change.
 
 ## Migrating the old files

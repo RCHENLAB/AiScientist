@@ -3,7 +3,7 @@ driven through ``agents/quick_chat.run_quick_chat``).
 
 Everything here is OFFLINE: the token counter, the summarizer and the model stream are all
 injected, and — as with ``tests/test_quick_chat.py`` — nothing imports
-``bioagent.gateway.app`` (which needs ``paramiko``), so this file runs on a bare checkout.
+``aiscientist.gateway.app`` (which needs ``paramiko``), so this file runs on a bare checkout.
 
 The behaviour under test is the one the old 12-message cutoff got wrong: a long conversation
 must keep its memory (in condensed form) instead of silently forgetting its own opening, and
@@ -17,11 +17,11 @@ import pathlib
 
 import pytest
 
-from bioagent.agents.chat_context import (
+from aiscientist.agents.chat_context import (
     ChatContextLimits,
     build_chat_messages,
 )
-from bioagent.agents.quick_chat import QuickChatConfig, run_quick_chat
+from aiscientist.agents.quick_chat import QuickChatConfig, run_quick_chat
 
 
 # --- helpers ------------------------------------------------------------------
@@ -398,12 +398,12 @@ def test_a_degenerate_window_still_leaves_working_room():
 
 
 def test_env_overrides_the_budget_and_the_verbatim_window(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_CHAT_MAX_PROMPT_TOKENS", "9000")
-    monkeypatch.setenv("BIOAGENT_CHAT_KEEP_EXCHANGES", "2")
+    monkeypatch.setenv("AISCIENTIST_CHAT_MAX_PROMPT_TOKENS", "9000")
+    monkeypatch.setenv("AISCIENTIST_CHAT_KEEP_EXCHANGES", "2")
     cfg = ChatContextLimits()
     assert cfg.max_prompt_tokens == 9000 and cfg.keep_last_exchanges == 2
     # Garbage in the env must not take the console down with it.
-    monkeypatch.setenv("BIOAGENT_CHAT_MAX_PROMPT_TOKENS", "not-a-number")
+    monkeypatch.setenv("AISCIENTIST_CHAT_MAX_PROMPT_TOKENS", "not-a-number")
     assert ChatContextLimits().max_prompt_tokens == 24_000
 
 

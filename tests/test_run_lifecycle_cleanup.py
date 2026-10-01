@@ -20,9 +20,9 @@ import pytest
 # modules took CI from 1,525 passing tests to "33 skipped, 3 errors" and kept main red from
 # 2026-08-20 to 2026-09-08. CI installs the gateway extra so these actually RUN; the guard is
 # what keeps a leaner environment skipping cleanly instead of taking every other test down.
-pytest.importorskip("bioagent.gateway.app")
+pytest.importorskip("aiscientist.gateway.app")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
 
 
 def _run_dir(tmp_path: Path) -> Path:
@@ -73,7 +73,7 @@ def test_a_symlinked_work_dir_is_left_alone(tmp_path):
 # --- deleting a chat deletes its bundles -------------------------------------------------------
 
 def test_delete_run_dir_is_confined_to_the_results_root(tmp_path, monkeypatch):
-    from bioagent.gateway import auth_routes
+    from aiscientist.gateway import auth_routes
     monkeypatch.setattr(gw_app, "CONSOLE_RUNS_DIR", tmp_path)
     victim = tmp_path / "someone_else" / "run999"
     victim.mkdir(parents=True)
@@ -84,7 +84,7 @@ def test_delete_run_dir_is_confined_to_the_results_root(tmp_path, monkeypatch):
 
 
 def test_delete_run_dir_removes_the_bundle(tmp_path, monkeypatch):
-    from bioagent.gateway import auth_routes
+    from aiscientist.gateway import auth_routes
     monkeypatch.setattr(gw_app, "CONSOLE_RUNS_DIR", tmp_path)
     mine = tmp_path / "testowner" / "run123" / "artifacts"
     mine.mkdir(parents=True)

@@ -12,10 +12,10 @@ import ast
 import re
 from pathlib import Path
 
-from bioagent.tools import catalog
+from aiscientist.tools import catalog
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src" / "bioagent"
+SRC = ROOT / "src" / "aiscientist"
 
 # Domain tools the platform's own code names as exact string literals, and where.
 PLATFORM_RELIES_ON = {
@@ -69,12 +69,12 @@ _TOOLISH = re.compile(r"`((?:run|make|map|annotate|diagnose|inspect|deep|literat
 
 
 def test_skills_and_pipelines_name_only_tools_and_skills_that_exist():
-    from bioagent.agents.skills import SKILLS
+    from aiscientist.agents.skills import SKILLS
 
     known = set(catalog.names()) | PLATFORM_TOOLS | set(SKILLS)
     bad = []
-    from bioagent.agents.preset_pipelines import _pipelines_dir
-    from bioagent.agents.skills import _skills_dir
+    from aiscientist.agents.preset_pipelines import _pipelines_dir
+    from aiscientist.agents.skills import _skills_dir
 
     for path in [*_skills_dir().rglob("*.md"), *_pipelines_dir().rglob("*.md")]:
         for name in _TOOLISH.findall(path.read_text(encoding="utf-8")):

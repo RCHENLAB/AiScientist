@@ -19,10 +19,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck disable=SC1091
 [ -f "$REPO_ROOT/.deploy.env" ] && source "$REPO_ROOT/.deploy.env"
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 REMOTE_HOST="${REMOTE_HOST:?set REMOTE_HOST in .deploy.env}"
 REMOTE_USER="${REMOTE_USER:-<ucinetid>}"
 REMOTE_PORT="${REMOTE_PORT:-}"
-SERVICE="${BIOAGENT_SERVICE:-bioagent}"
+SERVICE="${AISCIENTIST_SERVICE:-bioagent}"
 
 if [ "${1:-}" = "-n" ]; then
   exec ./scripts/push.sh -n

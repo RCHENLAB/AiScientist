@@ -28,9 +28,9 @@ import anndata as ad  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from bioagent.tools._lib import scrna as scrna_lib  # noqa: E402
-from bioagent.tools.run_de import tool as run_de_tool
-from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from aiscientist.tools._lib import scrna as scrna_lib  # noqa: E402
+from aiscientist.tools.run_de import tool as run_de_tool
+from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _ctx(tmp_path, dataset):
@@ -176,8 +176,8 @@ def test_composition_runs_off_qc_when_the_labels_already_exist(tmp_path):
     """`run_de` was fixed to accept the QC checkpoint; `run_composition` was missed. It demanded
     `run_clustering` — the step the protocol explicitly forbids on a labelled dataset — so the
     analysis a two-arm annotated study needs FIRST refused to run on exactly those studies."""
-    from bioagent.tools.run_composition import tool as run_composition_tool
-    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+    from aiscientist.tools.run_composition import tool as run_composition_tool
+    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))
     out = run_composition_tool.run_composition(
@@ -193,8 +193,8 @@ def test_composition_reports_per_arm_proportions_even_with_one_library(tmp_path)
     object. On the real dataset that hid a 3x depletion of Cone cells between the arms — the shift
     that makes a pooled DE result unreadable as expression change.
     """
-    from bioagent.tools.run_composition import tool as run_composition_tool
-    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+    from aiscientist.tools.run_composition import tool as run_composition_tool
+    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))          # `orig.ident` holds ONE value
     out = run_composition_tool.run_composition(
@@ -213,8 +213,8 @@ def test_pseudobulk_names_the_finding_instead_of_blaming_the_metadata(tmp_path):
     """Refusing is correct; the diagnosis was not. A one-library study got 'check the metadata',
     sending the reader after a bug that does not exist — the metadata is fine, the STUDY has no
     replicates, and that is the thing to report."""
-    from bioagent.tools.run_composition import tool as run_composition_tool
-    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+    from aiscientist.tools.run_composition import tool as run_composition_tool
+    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))
     out = run_pseudobulk_de_tool.run_pseudobulk_de(

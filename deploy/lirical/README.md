@@ -1,12 +1,12 @@
 # LIRICAL container — build & stage (phenotype → disease differential)
 
 Build kit for `lirical.sif` + the LIRICAL data — the **phenotype-driven differential-diagnosis** line
-BioAgent runs **when `BIOAGENT_PHENOTYPE_ON_HPC=1`**. It sits **downstream of the variant line**
+AiScientist runs **when `AISCIENTIST_PHENOTYPE_ON_HPC=1`**. It sits **downstream of the variant line**
 (`vep.sif`): the variant pipeline produces the gene/variant shortlist, then LIRICAL fuses the patient's
 HPO terms with those findings into a **per-disease post-test probability** ("RP 70% / LCA 20% / …") —
 the calibrated confidence Rui Chen asked for.
 
-The orchestration that *runs* the image is built + offline-tested (`src/bioagent/tools/run_lirical/tool.py`
+The orchestration that *runs* the image is built + offline-tested (`src/aiscientist/tools/run_lirical/tool.py`
 + `phenotype_cli.py`, driven by `SlurmAnalysisExecutor` with an injected runner — no cluster, no
 LIRICAL, no network in CI: `tests/test_phenotype_dx.py`). This folder is the **image + data build kit**.
 
@@ -66,26 +66,25 @@ a future LIRICAL renames one, run `lirical prioritize --help` in the image and t
 
 ## Enable it
 
-Set these in the gateway env (`.env` / `HPCSettings`) — until `BIOAGENT_PHENOTYPE_ON_HPC=1`, the
+Set these in the gateway env (`.env` / `HPCSettings`) — until `AISCIENTIST_PHENOTYPE_ON_HPC=1`, the
 phenotype step reports `not_installed` and the run continues without the differential:
 
 ```
-BIOAGENT_PHENOTYPE_ON_HPC=1
-BIOAGENT_LIRICAL_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/lirical.sif
-BIOAGENT_LIRICAL_DATA_DIR=/dfs3b/ruic20_lab/software/reference/lirical/data
+AISCIENTIST_PHENOTYPE_ON_HPC=1
+AISCIENTIST_LIRICAL_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/lirical.sif
+AISCIENTIST_LIRICAL_DATA_DIR=/dfs3b/ruic20_lab/software/reference/lirical/data
 # genotype-aware (optional — omit both for phenotype-only):
-BIOAGENT_LIRICAL_EXOMISER_HG19=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg19
-BIOAGENT_LIRICAL_EXOMISER_HG38=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg38
-BIOAGENT_UPLOADS_ON_HPC=1
+AISCIENTIST_LIRICAL_EXOMISER_HG19=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg19
+AISCIENTIST_LIRICAL_EXOMISER_HG38=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg38
+AISCIENTIST_UPLOADS_ON_HPC=1
 ```
 
 The VCF + the run's work/artifacts dirs must be reachable on the compute node (shared DFS — they are,
-via `uploads_on_hpc`). The bioagent **tools** are synced to `<lab_storage>/<user>/pysrc` and
+via `uploads_on_hpc`). The AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` and
 bind-mounted in, so a tool edit needs a code deploy, NOT an image rebuild.
 
 ## How it fits the two-track design
 
 LIRICAL is the **PRIMARY (calibrated)** track. The **EVIDENCE (literature / PaperQA2)** track is
 separate and never blended into LIRICAL's probability — see
-[`docs/phenotype_gene_confidence_rag_spec.md`](../../docs/phenotype_gene_confidence_rag_spec.md) and
-[`docs/paperqa2_evidence_layer_contract.md`](../../docs/paperqa2_evidence_layer_contract.md).
+[`src/aiscientist/tools/diagnose_disease/evidence.py`](../../src/aiscientist/tools/diagnose_disease/evidence.py).

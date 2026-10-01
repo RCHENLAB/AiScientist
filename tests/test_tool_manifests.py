@@ -10,10 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from bioagent.tools import catalog
+from aiscientist.tools import catalog
 
 TOOLS = Path(catalog.TOOLS_DIR)
-ROOT = TOOLS.parents[2]          # the repository that holds src/bioagent/tools and scripts/
+ROOT = TOOLS.parents[2]          # the repository that holds src/aiscientist/tools and scripts/
 
 # Directories under tools/ that are not tools: shared code and reference data.
 NOT_TOOLS = {"_lib", "genesets", "gene_panels", "__pycache__"}

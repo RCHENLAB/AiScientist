@@ -17,10 +17,10 @@ import pytest
 pytest.importorskip("scanpy")
 pytest.importorskip("leidenalg")
 
-from bioagent.agents.registry import build_scientist_catalog  # noqa: E402
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
-from bioagent.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
-from bioagent.agents.sandbox import CodeSandbox  # noqa: E402
+from aiscientist.agents.registry import build_scientist_catalog  # noqa: E402
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
+from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
+from aiscientist.agents.sandbox import CodeSandbox  # noqa: E402
 
 
 def _synthetic_h5ad(path):
@@ -78,8 +78,8 @@ def _smart_scientist():
         if "code" in step:
             return _tool_call("run_code", {"code":
                 "import os, anndata as ad\n"
-                "a = ad.read_h5ad(os.environ['BIOAGENT_DATASET'])\n"
-                "open(os.path.join(os.environ['BIOAGENT_ARTIFACTS'], 'tables', 'codeact_shape.txt'), 'w')"
+                "a = ad.read_h5ad(os.environ['AISCIENTIST_DATASET'])\n"
+                "open(os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 'tables', 'codeact_shape.txt'), 'w')"
                 ".write(f'{a.n_obs}x{a.n_vars}')\n"
                 "print('codeact read', a.shape)\n"})
         return _tool_call("finish", {"answer": "nothing to do"})
@@ -107,7 +107,7 @@ def test_full_lab_loop_runs_real_tools_locally(tmp_path):
     tables = list((art / "tables").glob("*.csv"))
     assert any("umap" in f.name for f in figs)            # clustering produced a UMAP
     assert any(t.name.startswith("de_") for t in tables)  # DE wrote ranked tables
-    # the CodeAct snippet read the dataset via BIOAGENT_DATASET and wrote an artifact
+    # the CodeAct snippet read the dataset via AISCIENTIST_DATASET and wrote an artifact
     assert (art / "tables" / "codeact_shape.txt").read_text() == "240x60"
 
     # Regression (read-out bug): run_de asked for 20 genes/group, so the RETURN must expose the

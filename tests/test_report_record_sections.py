@@ -22,9 +22,9 @@ import pytest
 # modules took CI from 1,525 passing tests to "33 skipped, 3 errors" and kept main red from
 # 2026-08-20 to 2026-09-08. CI installs the gateway extra so these actually RUN; the guard is
 # what keeps a leaner environment skipping cleanly instead of taking every other test down.
-pytest.importorskip("bioagent.gateway.app")
+pytest.importorskip("aiscientist.gateway.app")
 
-from bioagent.gateway.app import (  # noqa: E402
+from aiscientist.gateway.app import (  # noqa: E402
     _dataset_section, _insert_record_sections, _pipeline_section,
 )
 
@@ -109,7 +109,7 @@ def test_the_pipeline_section_reads_real_LabRound_objects_not_only_dicts():
     """Production hands LabRound dataclasses; the section read only the dict shape and came out
     EMPTY in every real report (verified on a live run: '## The dataset' present, '## What was
     run' absent). The tests all passed because they built dict rounds."""
-    from bioagent.agents.research_lab import CriticVerdict, LabRound
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
     rnd = LabRound(round_no=1, step_index=0, step="QC", specialist="s",
                    scientist_result={"steps": [{"tool": "run_scanpy_qc", "ok": True,
                                                 "args": {"max_pct_mt": 5.0},

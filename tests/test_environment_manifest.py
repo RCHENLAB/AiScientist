@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from bioagent.gateway.environment import (
+from aiscientist.gateway.environment import (
     asset_inventory,
     environment_manifest,
     render_for_agent,
@@ -54,7 +54,7 @@ def test_the_gene_sets_that_caused_the_failure_are_in_the_inventory():
 
 
 def test_model_and_container_paths_come_from_the_live_settings():
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     st = HPCSettings()
     paths = {a["path"] for a in asset_inventory(st)}
@@ -67,7 +67,7 @@ def test_model_and_container_paths_come_from_the_live_settings():
 
 
 def test_readability_reflects_the_sessions_roots_not_a_guess():
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     st = HPCSettings()
     shared = st.shared_root.rstrip("/")
@@ -103,13 +103,13 @@ def test_agent_rendering_is_non_empty_for_every_section(section):
 
 def test_the_markdown_carries_the_tool_locations():
     md = render_markdown(environment_manifest())
-    assert "src/bioagent/tools/run_de/tool.py:" in md
+    assert "src/aiscientist/tools/run_de/tool.py:" in md
     assert "regenerate it" in md            # the doc says not to hand-edit it
     assert "| tool | what it does | source | available |" in md
 
 
 def test_describe_environment_is_offered_to_the_scientist():
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     tool = next((t for t in build_scientist_catalog() if t.name == "describe_environment"), None)
     assert tool is not None, "the manifest exists but nothing can reach it"

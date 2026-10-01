@@ -17,10 +17,10 @@ import re
 
 import pytest
 
-from bioagent.gateway.executor import ExecResult
-from bioagent.hpc import shell as hs
-from bioagent.hpc.shell import ConfirmRequest, HpcShell, HpcShellError, HpcWorkspace
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.hpc import shell as hs
+from aiscientist.hpc.shell import ConfirmRequest, HpcShell, HpcShellError, HpcWorkspace
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 HOME = "/data/homezvol0/alice"
 TEMP = f"{SHARED_ROOT}/Temp/alice"
@@ -158,7 +158,7 @@ def test_worker_tools_explain_themselves_when_the_worker_is_off():
     sh = _shell(worker=False)
     with pytest.raises(HpcShellError) as exc:
         sh.run_shell("ls")
-    assert "BIOAGENT_WORKER_NODE=1" in str(exc.value)
+    assert "AISCIENTIST_WORKER_NODE=1" in str(exc.value)
 
 
 # --- HITL --------------------------------------------------------------------
@@ -335,8 +335,8 @@ def test_tool_errors_come_back_as_results_the_model_can_act_on():
 
 def test_the_shared_model_dirs_are_readable_but_never_writable(monkeypatch):
     import types
-    from bioagent.gateway import app as gw_app
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway import app as gw_app
+    from aiscientist.gateway.settings import HPCSettings
 
     st = HPCSettings()
     captured: dict = {}
@@ -347,7 +347,7 @@ def test_the_shared_model_dirs_are_readable_but_never_writable(monkeypatch):
             captured["write"] = write_roots
 
     # _build_hpc_shell imports these inside the function, so patch them at the source module.
-    from bioagent.hpc import shell as hs_mod
+    from aiscientist.hpc import shell as hs_mod
     monkeypatch.setattr(hs_mod, "HpcWorkspace", _WS)
     monkeypatch.setattr(gw_app, "_hpc_user", lambda _c: "tester")
     # mock=False: _build_hpc_shell returns None for a mock session before it builds any roots.

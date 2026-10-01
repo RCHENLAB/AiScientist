@@ -14,7 +14,7 @@ from __future__ import annotations
 import sys
 import types
 
-from bioagent.tools.deep_literature.tool import make_paperqa_tool, run_paperqa
+from aiscientist.tools.deep_literature.tool import make_paperqa_tool, run_paperqa
 
 
 class _Ctx:
@@ -170,8 +170,8 @@ def test_tool_self_describes():
 # --- LLM call budget: timeout + reasoning effort (2026-09-30, Qwen3.8) -------------------------
 
 
-_BUDGET_ENV = ("BIOAGENT_PAPERQA_LLM_TIMEOUT", "BIOAGENT_PAPERQA_REASONING_EFFORT",
-               "BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT", "BIOAGENT_PAPERQA_AGENT_TIMEOUT")
+_BUDGET_ENV = ("AISCIENTIST_PAPERQA_LLM_TIMEOUT", "AISCIENTIST_PAPERQA_REASONING_EFFORT",
+               "AISCIENTIST_PAPERQA_SUMMARY_REASONING_EFFORT", "AISCIENTIST_PAPERQA_AGENT_TIMEOUT")
 
 
 def _litellm_params(monkeypatch, env=None):
@@ -195,11 +195,11 @@ def test_llm_calls_get_a_timeout_sized_for_a_reasoning_model(monkeypatch):
 
 
 def test_llm_timeout_is_env_overridable_and_never_zero(monkeypatch):
-    llm, summary, _, _ = _litellm_params(monkeypatch, {"BIOAGENT_PAPERQA_LLM_TIMEOUT": "900"})
+    llm, summary, _, _ = _litellm_params(monkeypatch, {"AISCIENTIST_PAPERQA_LLM_TIMEOUT": "900"})
     assert llm["timeout"] == summary["timeout"] == 900.0
     # A zero or garbage value would fail every call at once; it falls back to the default.
     for bad in ("0", "-5", "ten minutes"):
-        llm, _, _, _ = _litellm_params(monkeypatch, {"BIOAGENT_PAPERQA_LLM_TIMEOUT": bad})
+        llm, _, _, _ = _litellm_params(monkeypatch, {"AISCIENTIST_PAPERQA_LLM_TIMEOUT": bad})
         assert llm["timeout"] == 600.0
 
 
@@ -219,14 +219,14 @@ def test_per_passage_summaries_do_not_think(monkeypatch):
 
 def test_effort_env_overrides(monkeypatch):
     llm, summary, _, _ = _litellm_params(monkeypatch, {
-        "BIOAGENT_PAPERQA_REASONING_EFFORT": "Medium",
-        "BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT": "low"})
+        "AISCIENTIST_PAPERQA_REASONING_EFFORT": "Medium",
+        "AISCIENTIST_PAPERQA_SUMMARY_REASONING_EFFORT": "low"})
     assert llm["extra_body"] == {"reasoning_effort": "medium"}
     assert summary["extra_body"] == {"reasoning_effort": "low"}
     # A value outside the known levels sends nothing: the served model's own default applies.
     llm, summary, _, _ = _litellm_params(monkeypatch, {
-        "BIOAGENT_PAPERQA_REASONING_EFFORT": "default",
-        "BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT": "default"})
+        "AISCIENTIST_PAPERQA_REASONING_EFFORT": "default",
+        "AISCIENTIST_PAPERQA_SUMMARY_REASONING_EFFORT": "default"})
     assert "extra_body" not in llm and "extra_body" not in summary
     # The rest of the endpoint config is unchanged by the effort.
     assert llm["api_base"] == "http://127.0.0.1:9000/v1" and llm["temperature"] == 0.0
@@ -235,7 +235,7 @@ def test_effort_env_overrides(monkeypatch):
 def test_agent_time_budget_is_set_and_env_overridable(monkeypatch):
     _, _, _, agent = _litellm_params(monkeypatch)
     assert agent["timeout"] == 500.0
-    _, _, _, agent = _litellm_params(monkeypatch, {"BIOAGENT_PAPERQA_AGENT_TIMEOUT": "1200"})
+    _, _, _, agent = _litellm_params(monkeypatch, {"AISCIENTIST_PAPERQA_AGENT_TIMEOUT": "1200"})
     assert agent["timeout"] == 1200.0
 
 
@@ -308,8 +308,8 @@ def test_success_reports_how_the_rollout_ended(monkeypatch):
 def test_cli_turns_budget_args_into_env_before_paperqa_reads_it(monkeypatch):
     """The job runs with --containall, so the knobs travel as --args and paperqa_cli turns them
     back into the env vars paperqa_search reads."""
-    from bioagent.tools import paperqa_cli
-    from bioagent.tools.deep_literature import tool as paperqa_search
+    from aiscientist.tools import paperqa_cli
+    from aiscientist.tools.deep_literature import tool as paperqa_search
 
     for name in _BUDGET_ENV:
         monkeypatch.delenv(name, raising=False)
@@ -320,10 +320,10 @@ def test_cli_turns_budget_args_into_env_before_paperqa_reads_it(monkeypatch):
     paperqa_cli.run_tool("deep_literature", "/tmp/ws", {
         "question": "q", "llm_timeout": 900, "reasoning_effort": "medium",
         "summary_reasoning_effort": "off", "agent_timeout": 1200})
-    assert seen == {"BIOAGENT_PAPERQA_LLM_TIMEOUT": "900",
-                    "BIOAGENT_PAPERQA_REASONING_EFFORT": "medium",
-                    "BIOAGENT_PAPERQA_SUMMARY_REASONING_EFFORT": "off",
-                    "BIOAGENT_PAPERQA_AGENT_TIMEOUT": "1200"}
+    assert seen == {"AISCIENTIST_PAPERQA_LLM_TIMEOUT": "900",
+                    "AISCIENTIST_PAPERQA_REASONING_EFFORT": "medium",
+                    "AISCIENTIST_PAPERQA_SUMMARY_REASONING_EFFORT": "off",
+                    "AISCIENTIST_PAPERQA_AGENT_TIMEOUT": "1200"}
     for name in _BUDGET_ENV:          # run_tool writes os.environ directly; do not leak
         monkeypatch.delenv(name, raising=False)
 
@@ -334,12 +334,12 @@ def test_gateway_forwards_every_cli_knob_from_its_env(monkeypatch, tmp_path):
     --containall. llm_base_url is the exception: it comes from the live allocation."""
     import threading
 
-    from bioagent.gateway import app as gw
-    from bioagent.gateway.settings import HPCSettings
-    from bioagent.tools.paperqa_cli import _ARG_TO_ENV
+    from aiscientist.gateway import app as gw
+    from aiscientist.gateway.settings import HPCSettings
+    from aiscientist.tools.paperqa_cli import _ARG_TO_ENV
 
-    monkeypatch.setenv("BIOAGENT_PAPERQA_ON_HPC", "1")
-    monkeypatch.setenv("BIOAGENT_PAPERQA_IMAGE", "/shared/containers/paperqa.sif")
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/shared/containers/paperqa.sif")
     expected = {}
     for arg_key, env_key in _ARG_TO_ENV.items():
         if arg_key == "llm_base_url":

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.agents.research_lab import resolve_evidence
+from aiscientist.agents.research_lab import resolve_evidence
 
 
 def _ws(tmp_path: Path, *rel: str) -> Path:
@@ -85,8 +85,8 @@ def test_nothing_claimed_is_not_a_failure(tmp_path):
 def test_the_critic_is_given_only_resolvable_evidence_and_told_about_the_rest(tmp_path):
     import json
 
-    from bioagent.agents.research_harness import HarnessContext, HarnessResult
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, HarnessResult
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     _ws(tmp_path, "figures/real.png")
     seen: list = []
@@ -123,8 +123,8 @@ def test_the_critic_is_given_only_resolvable_evidence_and_told_about_the_rest(tm
 def test_a_fully_resolvable_step_adds_no_noise(tmp_path):
     import json
 
-    from bioagent.agents.research_harness import HarnessContext, HarnessResult
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, HarnessResult
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     _ws(tmp_path, "figures/real.png")
     seen: list = []

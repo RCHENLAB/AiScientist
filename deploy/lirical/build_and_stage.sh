@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the LIRICAL .sif for BioAgent's phenotype->disease line + stage the LIRICAL phenotype data (and,
+# Build the LIRICAL .sif for AiScientist's phenotype->disease line + stage the LIRICAL phenotype data (and,
 # for genotype-aware scoring, an Exomiser variant database) on dfs3b. Run ON HPC3, as a COMPUTE JOB —
 # see "WHERE TO RUN THIS" below. macOS cannot build .sif.
 # See deploy/lirical/lirical.def and deploy/lirical/README.md.
@@ -26,15 +26,18 @@
 #   existing data CANNOT be reused for LIRICAL v2's genotype step; a fresh Exomiser DB must be staged
 #   (this script fetches it when EXOMISER=1). Phenotype-only LIRICAL needs NO Exomiser DB and works now.
 set -euo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LIRICAL_VERSION="${LIRICAL_VERSION:-2.4.1}"          # MUST match the LIRICAL_VERSION baked in lirical.def
 EXOMISER_DATA_VERSION="${EXOMISER_DATA_VERSION:-2406}"  # a LIRICAL-v2-compatible Exomiser data release
-DFS_ROOT="${BIOAGENT_DFS_ROOT:-/dfs3b/ruic20_lab/software/AiScientist}"
-DFS_DIR="${BIOAGENT_CONTAINERS_DIR:-${DFS_ROOT}/containers}"
+DFS_ROOT="${AISCIENTIST_DFS_ROOT:-/dfs3b/ruic20_lab/software/AiScientist}"
+DFS_DIR="${AISCIENTIST_CONTAINERS_DIR:-${DFS_ROOT}/containers}"
 # Data goes in the lab's SHARED reference dir (download-once, reuse), NOT under the bioagent-private
 # DFS_ROOT -- same convention as the VEP cache (reference/vep_annotation).
-REF_ROOT="${BIOAGENT_LIRICAL_REF_ROOT:-/dfs3b/ruic20_lab/software/reference/lirical}"
+REF_ROOT="${AISCIENTIST_LIRICAL_REF_ROOT:-/dfs3b/ruic20_lab/software/reference/lirical}"
 DATA_DIR="${REF_ROOT}/data"                          # LIRICAL `download` target (hp.json, hpoa, Jannovar)
 EXOMISER_DIR="${REF_ROOT}/exomiser"                  # fresh Exomiser variant DB(s) for LIRICAL v2
 SIF="${DFS_DIR}/lirical.sif"
@@ -116,15 +119,15 @@ EOF
 
 echo "== 6. Enable the phenotype line (in .env / HPCSettings) =="
 cat <<EOF
-  BIOAGENT_PHENOTYPE_ON_HPC=1          # route the phenotype step to the offline HPC3 LIRICAL line
-  BIOAGENT_LIRICAL_IMAGE=${SIF}
-  BIOAGENT_LIRICAL_DATA_DIR=${DATA_DIR}
+  AISCIENTIST_PHENOTYPE_ON_HPC=1          # route the phenotype step to the offline HPC3 LIRICAL line
+  AISCIENTIST_LIRICAL_IMAGE=${SIF}
+  AISCIENTIST_LIRICAL_DATA_DIR=${DATA_DIR}
   # genotype-aware scoring (optional -- omit for phenotype-only):
-  BIOAGENT_LIRICAL_EXOMISER_HG19=${EXOMISER_DIR}/${EXOMISER_DATA_VERSION}_hg19
-  BIOAGENT_LIRICAL_EXOMISER_HG38=${EXOMISER_DIR}/${EXOMISER_DATA_VERSION}_hg38
-  BIOAGENT_UPLOADS_ON_HPC=1            # so the VCF lands on dfs3b and is scored in place
+  AISCIENTIST_LIRICAL_EXOMISER_HG19=${EXOMISER_DIR}/${EXOMISER_DATA_VERSION}_hg19
+  AISCIENTIST_LIRICAL_EXOMISER_HG38=${EXOMISER_DIR}/${EXOMISER_DATA_VERSION}_hg38
+  AISCIENTIST_UPLOADS_ON_HPC=1            # so the VCF lands on dfs3b and is scored in place
 
-The bioagent TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway and bind-mounted in -- a
+The AiScientist TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway and bind-mounted in -- a
 tool edit needs only a code deploy, NOT an image rebuild. If HPC is unreachable (or LIRICAL is not
 staged), the phenotype step reports not_installed and the run continues without the differential.
 EOF

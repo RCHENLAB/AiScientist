@@ -10,7 +10,7 @@ From: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 # WEIGHTS are NOT baked in — they are bind-mounted read-only at run time (--model), so this
 # image stays small and reusable across models.
 #
-# Entry contract (matches src/bioagent/gateway/scgpt_job.py + settings.scgpt_entrypoint):
+# Entry contract (matches src/aiscientist/gateway/scgpt_job.py + settings.scgpt_entrypoint):
 #   python /opt/scgpt/run_infer.py --input <query.h5ad> --model <model_dir> --out <out_dir>
 # -> writes <out>/predictions.csv  (per-cell: barcode, predictions, confidence)
 #

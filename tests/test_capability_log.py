@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway.app import _scan_tool_invocation, _write_capability_log  # noqa: E402
+from aiscientist.gateway.app import _scan_tool_invocation, _write_capability_log  # noqa: E402
 
 
 def _conn(*, live=True, vl=False):

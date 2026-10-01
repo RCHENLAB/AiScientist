@@ -1,6 +1,6 @@
 # Variant-annotation APIs (reference)
 
-The `annotate_variants` tool (`src/bioagent/tools/annotate_variants/tool.py`) uses these public APIs — no
+The `annotate_variants` tool (`src/aiscientist/tools/annotate_variants/tool.py`) uses these public APIs — no
 key required. API notes adapted from the **k-dense-ai/scientific-agent-skills** references
 (`database-lookup/references/{ensembl,clinvar}.md`, `tiledbvcf`).
 

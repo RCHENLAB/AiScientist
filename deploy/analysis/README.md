@@ -1,8 +1,8 @@
 # Analysis container — build & stage (CPU CodeAct image)
 
 Build kit for `analysis.sif` — the CPU Singularity image that AiScientist runs each `run_code`
-(CodeAct) snippet inside **when `BIOAGENT_RUN_CODE_ON_HPC=1`**. The orchestration engine that
-*runs* the image is already built + offline-tested (`src/bioagent/gateway/slurm_sandbox.py`,
+(CodeAct) snippet inside **when `AISCIENTIST_RUN_CODE_ON_HPC=1`**. The orchestration engine that
+*runs* the image is already built + offline-tested (`src/aiscientist/gateway/slurm_sandbox.py`,
 driven by a `RemoteExecutor` mock — no cluster in CI). This folder is the **image build kit**.
 
 > ⚠️ macOS cannot build `.sif`. Build on **HPC3** or any Linux host with `singularity`.
@@ -36,20 +36,20 @@ singularity exec --containall --writable-tmpfs --net --network none \
 
 ## Enable it
 
-Set these in the gateway env (`.env` / `HPCSettings`) — until `BIOAGENT_RUN_CODE_ON_HPC=1`,
+Set these in the gateway env (`.env` / `HPCSettings`) — until `AISCIENTIST_RUN_CODE_ON_HPC=1`,
 `run_code` stays on the local sandbox and this image is unused:
 
 ```
-BIOAGENT_RUN_CODE_ON_HPC=1
-BIOAGENT_ANALYSIS_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif
-BIOAGENT_CPU_PARTITION=standard        # RCIC HPC3 free CPU partition (no GPU)
-BIOAGENT_CPU_ACCOUNT=ruic20_lab
-BIOAGENT_RUN_CODE_MEM_GB=64            # real per-snippet memory cap
+AISCIENTIST_RUN_CODE_ON_HPC=1
+AISCIENTIST_ANALYSIS_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif
+AISCIENTIST_CPU_PARTITION=standard        # RCIC HPC3 free CPU partition (no GPU)
+AISCIENTIST_CPU_ACCOUNT=ruic20_lab
+AISCIENTIST_RUN_CODE_MEM_GB=64            # real per-snippet memory cap
 ```
 
 The dataset + the run's work/artifacts dirs must be reachable on the compute node (shared DFS). If
 they are not the same paths as on the eyeserver, point the executor at the HPC3 paths with
-`BIOAGENT_HPC_DATASET` / `BIOAGENT_HPC_WORK` / `BIOAGENT_HPC_ARTIFACTS`. If HPC is unreachable at
+`AISCIENTIST_HPC_DATASET` / `AISCIENTIST_HPC_WORK` / `AISCIENTIST_HPC_ARTIFACTS`. If HPC is unreachable at
 run time, `run_code` falls back to the local sandbox automatically.
 
 ## Keep in sync

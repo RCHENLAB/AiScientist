@@ -19,4 +19,4 @@ skip silent guides. Everything else is generic. Writes a per-perturbation DE tab
 (with a target-self-knockdown positive-control check) and prints a JSON summary for the report.
 
 ## Run
-Fetch the template with `read_skill_reference("perturbation_de_vs_control", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `BIOAGENT_WORK`, writes under `BIOAGENT_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.
+Fetch the template with `read_skill_reference("perturbation_de_vs_control", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `AISCIENTIST_WORK`, writes under `AISCIENTIST_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.

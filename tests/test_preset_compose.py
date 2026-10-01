@@ -1,13 +1,13 @@
 """The multi-pipeline guidance composer (preset_pipelines.compose_pipeline_prompts): the loaded
 pipelines — pinned (console multi-select) + the PI's auto pick — are composed into ONE PI-steering
 block. One → its prompt verbatim; several → labeled sections + a reconcile header; empty/None → ''."""
-from bioagent.agents.preset_pipelines import (
+from aiscientist.agents.preset_pipelines import (
     PIPELINES,
     compose_pipeline_prompts,
     drop_conflicting_pinned,
     get_pipeline,
 )
-from bioagent.agents.registry import build_scientist_catalog
+from aiscientist.agents.registry import build_scientist_catalog
 
 
 def test_compose_empty_is_blank():
@@ -89,7 +89,7 @@ def test_modality_agnostic_pick_drops_nothing():
 
 def _pipe(key="scgpt_annotation", tools=("scgpt_annotate", "run_clustering", "run_code"),
           data_type="scrna"):
-    from bioagent.agents.preset_pipelines import PresetPipeline
+    from aiscientist.agents.preset_pipelines import PresetPipeline
     return PresetPipeline(key=key, label=f"{key} label", prompt="steer", tools=tuple(tools),
                           data_type=data_type)
 
@@ -106,7 +106,7 @@ def test_missing_tools_reports_only_the_gaps_in_declaration_order():
 
 
 def test_the_router_listing_flags_a_pipeline_it_cannot_run():
-    from bioagent.agents.preset_pipelines import select_pipeline
+    from aiscientist.agents.preset_pipelines import select_pipeline
 
     seen = {}
 
@@ -124,7 +124,7 @@ def test_the_router_listing_flags_a_pipeline_it_cannot_run():
 
 
 def test_the_deterministic_content_route_still_reports_the_gap():
-    from bioagent.agents.preset_pipelines import select_pipeline
+    from aiscientist.agents.preset_pipelines import select_pipeline
 
     events = []
     chosen = select_pipeline(lambda m: "none", "q", "", (_pipe(),), events.append,
@@ -138,7 +138,7 @@ def test_the_deterministic_content_route_still_reports_the_gap():
 
 
 def test_a_tool_is_enabled_by_default_and_scgpt_reports_its_own_state():
-    from bioagent.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
+    from aiscientist.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
 
     # Present either way — the roster stays honest about what exists — but not usable without a
     # live GPU session, which is exactly the distinction pipeline routing needs.
@@ -158,7 +158,7 @@ def test_a_tool_is_enabled_by_default_and_scgpt_reports_its_own_state():
 # make the analysis careful, it makes it impossible.
 
 def test_the_provenance_gate_says_when_to_proceed_not_only_when_to_stop():
-    from bioagent.agents.preset_pipelines import PIPELINES
+    from aiscientist.agents.preset_pipelines import PIPELINES
 
     for key in ("celltype_annotation", "differential_expression", "scgpt_annotation"):
         prompt = PIPELINES[key].prompt
@@ -177,7 +177,7 @@ def test_the_provenance_gate_says_when_to_proceed_not_only_when_to_stop():
 def test_the_provenance_gate_never_reverts_to_a_bare_prohibition():
     """The exact sentence that caused the stall. Keeping it out is the regression test — reading
     'nothing proves provenance' with no counter-clause is what sent the model into the dead end."""
-    from bioagent.agents.preset_pipelines import PIPELINES
+    from aiscientist.agents.preset_pipelines import PIPELINES
 
     banned = "Neither integer-like values nor a layer named `counts` proves original UMI"
     for key, pipe in PIPELINES.items():
@@ -190,7 +190,7 @@ def test_every_skill_points_pathway_work_at_the_offline_tool():
     recorded "no verified authorized species-compatible collection" -- while GO_Biological_Process_2023,
     Reactome_2022 and MSigDB_Hallmark_2020 sat in the directory run_enrichment reads from, on both
     the gateway host and HPC3. Nothing in the plan's context said those files existed."""
-    from bioagent.agents.preset_pipelines import PIPELINES
+    from aiscientist.agents.preset_pipelines import PIPELINES
 
     for key in ("celltype_annotation", "differential_expression", "scgpt_annotation"):
         # Collapse whitespace: these are wrapped markdown paragraphs, so a phrase that reads as one

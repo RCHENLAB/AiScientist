@@ -41,7 +41,7 @@ def _load_dotenv(path: Path) -> None:
 
 _load_dotenv(ROOT / ".env")
 
-from bioagent.tools.map_phenotype_to_hpo.tool import map_text_to_hpo   # noqa: E402
+from aiscientist.tools.map_phenotype_to_hpo.tool import map_text_to_hpo   # noqa: E402
 
 # Realistic notes. `expect` = HPO IDs that must be OBSERVED, `excluded` = must be reported ABSENT,
 # `forbid` = must NOT appear at all (the family-history and treatment traps).
@@ -82,7 +82,7 @@ CASES: list[dict] = [
 
 def build_chat_fn(args) -> "tuple[object, str]":
     if args.openrouter:
-        from bioagent.providers.openai_compatible import OpenRouterClient
+        from aiscientist.providers.openai_compatible import OpenRouterClient
 
         client = OpenRouterClient(reasoning_effort="none", timeout_seconds=90)
         if not client.available:
@@ -97,7 +97,7 @@ def build_chat_fn(args) -> "tuple[object, str]":
     if not args.port:
         print("Pass --port <tunnel port> (the session's vLLM) or --openrouter.")
         sys.exit(2)
-    from bioagent.gateway import vllm_client
+    from aiscientist.gateway import vllm_client
 
     def chat_fn(messages):
         return vllm_client.complete(args.port, args.model, messages, max_tokens=800, timeout=120.0)

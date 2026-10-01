@@ -33,7 +33,7 @@ from pathlib import Path
 HP_JSON_URL = "https://purl.obolibrary.org/obo/hp.json"
 PHENOTYPIC_ABNORMALITY = "HP:0000118"
 REPLACED_BY_PRED = "http://purl.obolibrary.org/obo/IAO_0100001"   # obo "term replaced by"
-OUT_DEFAULT = Path(__file__).resolve().parents[1] / "src/bioagent/tools/map_phenotype_to_hpo/hpo_lexicon.tsv.gz"
+OUT_DEFAULT = Path(__file__).resolve().parents[1] / "src/aiscientist/tools/map_phenotype_to_hpo/hpo_lexicon.tsv.gz"
 
 # Synonym classes. EXACT synonyms are alternative names for the SAME concept ("Retinitis pigmentosa"
 # for HP:0000510) and are safe to match at full weight. NARROW/BROAD/RELATED are looser (a narrow

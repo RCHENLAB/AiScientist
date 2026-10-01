@@ -19,7 +19,7 @@ import h5py  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from bioagent.tools.datasets import inspect_h5ad  # noqa: E402
+from aiscientist.tools.datasets import inspect_h5ad  # noqa: E402
 
 
 def _two_arm_h5ad(tmp_path, *, depth_ratio=1.6):
@@ -64,8 +64,8 @@ def test_matched_depth_is_not_flagged(tmp_path):
 def test_run_de_names_a_same_direction_skew_across_strata(tmp_path):
     """Every stratum up >> down is a technical signature; the tool says so where the numbers are."""
     from types import SimpleNamespace
-    from bioagent.tools.run_de import tool as run_de_tool
-    from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+    from aiscientist.tools.run_de import tool as run_de_tool
+    from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
     p = _two_arm_h5ad(tmp_path, depth_ratio=2.5)      # a big depth gap -> global 'up' in KO
     ctx = SimpleNamespace(workspace=tmp_path, decisions={"dataset_path": str(p)})
     assert run_scanpy_qc_tool.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0}, ctx)["status"] == "ok"
@@ -80,7 +80,7 @@ def test_run_de_names_a_same_direction_skew_across_strata(tmp_path):
 
 def test_the_dataset_section_renders_the_per_arm_table(tmp_path):
     from types import SimpleNamespace
-    from bioagent.gateway.app import _dataset_section
+    from aiscientist.gateway.app import _dataset_section
     (tmp_path / "data").mkdir()
     import json
     dr = {"dataset_path": "/u/x.h5ad", "cells": 600, "genes": 50, "dataset_kind": "h5ad_single_cell",
@@ -107,7 +107,7 @@ def test_snrna_hint_from_nuclear_fraction():
     guidance), so no model has to connect the dots itself."""
     import numpy as np
     import pandas as pd
-    from bioagent.tools.datasets import _design_by_arm
+    from aiscientist.tools.datasets import _design_by_arm
 
     n = 80
     obs = pd.DataFrame({
@@ -127,7 +127,7 @@ def test_snrna_hint_from_nuclear_fraction():
 def test_no_snrna_hint_without_the_column():
     import numpy as np
     import pandas as pd
-    from bioagent.tools.datasets import _design_by_arm
+    from aiscientist.tools.datasets import _design_by_arm
 
     obs = pd.DataFrame({
         "sampleid": ["KO"] * 40 + ["WT"] * 40,

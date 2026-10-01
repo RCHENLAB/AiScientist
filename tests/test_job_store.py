@@ -7,7 +7,7 @@ that can crash: atomic whole-file writes and tolerance of a missing/corrupt file
 
 from __future__ import annotations
 
-from bioagent.gateway.job_store import JobRecord, JobStore
+from aiscientist.gateway.job_store import JobRecord, JobStore
 
 
 def _store(tmp_path):

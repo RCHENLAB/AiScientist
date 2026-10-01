@@ -18,11 +18,11 @@ import pytest
 def client_conn(tmp_path, monkeypatch):
     pytest.importorskip("httpx")
     # keep any auth-startup DB off the repo (the upload path needs no login)
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", f"sqlite:///{(tmp_path / 'u.db').as_posix()}")
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", f"sqlite:///{(tmp_path / 'u.db').as_posix()}")
     from fastapi.testclient import TestClient
 
-    from bioagent.gateway.app import CONNECTIONS, Connection, app
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.app import CONNECTIONS, Connection, app
+    from aiscientist.gateway.settings import HPCSettings
 
     loop = asyncio.new_event_loop()
     conn = Connection(HPCSettings(), mock=True, loop=loop, username="tester")

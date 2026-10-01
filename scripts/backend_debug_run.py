@@ -184,8 +184,8 @@ def run_biomni_probe(question: str, dataset: Path | None, ollama_port: int | Non
     """One real BiomniAdapter.run — capture answer, A1 log, and full traceback."""
     from dataclasses import replace
 
-    from bioagent.integrations.biomni_adapter import EXECUTE_MODE, BiomniAdapter, BiomniSafetyPolicy
-    from bioagent.integrations.biomni_runtime import BiomniRuntimeConfig, RealBiomniRuntime
+    from aiscientist.integrations.biomni_adapter import EXECUTE_MODE, BiomniAdapter, BiomniSafetyPolicy
+    from aiscientist.integrations.biomni_runtime import BiomniRuntimeConfig, RealBiomniRuntime
 
     cfg = BiomniRuntimeConfig.from_env()
     if ollama_port:
@@ -232,8 +232,8 @@ def run_biomni_probe(question: str, dataset: Path | None, ollama_port: int | Non
 
 def run_pipeline(workspace: Path, question: str, dataset: Path | None, ollama_port: int | None, model: str | None) -> dict:
     """Full 13-agent pipeline; log every message + step, then summarize artifacts."""
-    from bioagent.core.models import AgentMessage
-    from bioagent.workflows.vision import VisionResearchAgent
+    from aiscientist.core.models import AgentMessage
+    from aiscientist.workflows.vision import VisionResearchAgent
 
     LOG("PIPELINE (VisionResearchAgent, full 13-agent run)")
     LOG(f"  workspace={workspace}  dataset={dataset}  port={ollama_port}  model={model}")
@@ -338,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    from bioagent.core.config import load_project_env
+    from aiscientist.core.config import load_project_env
     load_project_env(Path.cwd())  # pick up ./.env like the gateway does
 
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
@@ -376,8 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 72)
 
         # --- config snapshot ---
-        from bioagent.integrations.biomni_runtime import BiomniRuntimeConfig
-        from bioagent.integrations.execution import BiomniExecution
+        from aiscientist.integrations.biomni_runtime import BiomniRuntimeConfig
+        from aiscientist.integrations.execution import BiomniExecution
         ex = BiomniExecution.from_env(ollama_port=args.ollama_port, model=args.model)
         cfg = BiomniRuntimeConfig.from_env()
         base_url = f"http://127.0.0.1:{args.ollama_port}/v1" if args.ollama_port else cfg.base_url
@@ -388,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
         LOG(f"  data_path={cfg.data_path}  load_data_lake={cfg.load_data_lake}")
         LOG(f"  api_key={'<set>' if cfg.api_key else '<empty>'} (redacted)")
         if not ex.enabled:
-            LOG("  NOTE: BIOAGENT_BIOMNI_EXECUTE is off -> Biomni stays plan-only (no real A1 call).")
+            LOG("  NOTE: AISCIENTIST_BIOMNI_EXECUTE is off -> Biomni stays plan-only (no real A1 call).")
 
         # --- manual HPC3 setup pause ---
         if not args.no_pause:

@@ -10,7 +10,7 @@ import pytest
 
 h5py = pytest.importorskip("h5py")
 
-from bioagent.tools.datasets import _obs_categoricals, inspect_h5ad  # noqa: E402
+from aiscientist.tools.datasets import _obs_categoricals, inspect_h5ad  # noqa: E402
 
 
 def _write_categorical(group, name, categories, codes):

@@ -17,10 +17,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from test_research_harness import _ctx, _scripted, _tool_call  # noqa: E402
 
-from bioagent.agents.research_harness import HarnessTool, ResearchHarness, default_catalog  # noqa: E402
-from bioagent.agents.research_lab import _is_literature_step  # noqa: E402
-from bioagent.gateway.executor import ExecResult  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.agents.research_harness import HarnessTool, ResearchHarness, default_catalog  # noqa: E402
+from aiscientist.agents.research_lab import _is_literature_step  # noqa: E402
+from aiscientist.gateway.executor import ExecResult  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 # --- 1. a RETURNED error counts toward the stuck-guard ------------------------------------------
@@ -54,7 +54,7 @@ def test_different_returned_errors_are_debugging_not_stuck():
 # --- 2. inspect_dataset: the bound dataset wins over a path this host does not have -------------
 
 def test_bound_dataset_wins_over_a_model_typed_hpc3_path(monkeypatch, tmp_path):
-    from bioagent.tools.inspect_dataset import tool as dataset_inspect
+    from aiscientist.tools.inspect_dataset import tool as dataset_inspect
     bound = tmp_path / "bound.h5ad"
     bound.write_bytes(b"x")
     seen = []
@@ -84,7 +84,7 @@ def test_tool_less_analysis_steps_are_not_literature_steps():
 # --- 4. the session's real home and the lab's real reference root ------------------------------
 
 def test_shell_roots_use_the_real_home_and_reference(monkeypatch):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
 
     class Ex:
         username = "yijus12"
@@ -103,7 +103,7 @@ def test_shell_roots_use_the_real_home_and_reference(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-    import bioagent.hpc.shell as hs
+    import aiscientist.hpc.shell as hs
     monkeypatch.setattr(hs, "HpcShell", FakeShell)
     try:
         gw._build_hpc_shell(conn, None)
@@ -118,7 +118,7 @@ def test_shell_roots_use_the_real_home_and_reference(monkeypatch):
 
 
 def test_unknown_home_is_left_out_not_guessed():
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
 
     class Ex:
         def exec(self, cmd, timeout=None):

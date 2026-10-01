@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reorganise ``src/bioagent/tools`` into one folder per model-callable tool.
+"""Reorganise ``src/aiscientist/tools`` into one folder per model-callable tool.
 
 This is a program, not a diff, on purpose. The tools are being fixed on ``main`` while the
 repository split is prepared on a branch, and a hand-made move of 2.7k-line files into twenty
@@ -51,8 +51,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
-TOOLS = SRC / "bioagent" / "tools"
-PKG = "bioagent.tools"
+TOOLS = SRC / "aiscientist" / "tools"
+PKG = "aiscientist.tools"
 
 # ------------------------------------------------------------------------------------------------
 # The plan. Everything below is derived from these tables.
@@ -74,12 +74,12 @@ MODULE_MOVES: dict[str, str] = {
 # -> new ABSOLUTE module. Listed so that code merged in from main that still imports them by the old
 # name is re-pointed, and so the coverage check knows them.
 PLATFORM_MOVES: dict[str, str] = {
-    "report": "bioagent.reporting.report",
-    "research_bundle": "bioagent.reporting.research_bundle",
-    "visual_review": "bioagent.reporting.visual_review",
-    "vlreview_run": "bioagent.reporting.vlreview_run",
-    "literature_references": "bioagent.reporting.literature_references",
-    "hpc_shell": "bioagent.hpc.shell",
+    "report": "aiscientist.reporting.report",
+    "research_bundle": "aiscientist.reporting.research_bundle",
+    "visual_review": "aiscientist.reporting.visual_review",
+    "vlreview_run": "aiscientist.reporting.vlreview_run",
+    "literature_references": "aiscientist.reporting.literature_references",
+    "hpc_shell": "aiscientist.hpc.shell",
 }
 # Whole-package moves (directory renames): old package -> new package. Submodule renames inside.
 PACKAGE_MOVES: dict[str, tuple[str, dict[str, str]]] = {
@@ -91,7 +91,7 @@ PACKAGE_MOVES: dict[str, tuple[str, dict[str, str]]] = {
 class Split:
     """A module that holds several tools and is cut by symbol."""
 
-    sources: list[str]                       # old modules (bioagent.tools.<name>), analysed together
+    sources: list[str]                       # old modules (aiscientist.tools.<name>), analysed together
     lib: str                                 # shared module for symbols several tools use
     roots: dict[str, list[str]]              # tool -> the symbols that ARE the tool
     catalogs: dict[str, str] = field(default_factory=dict)   # old module -> its *_catalog() function
@@ -146,29 +146,29 @@ FUTURE = "from __future__ import annotations"
 # Applied after the rewrite; a missing `old` text is reported, not ignored.
 POST_EDITS: list[tuple[str, str, str]] = [
     ("tests/test_tool_source.py",
-     '    assert out["module"] == "bioagent.tools.scrna_pack"\n'
+     '    assert out["module"] == "aiscientist.tools.scrna_pack"\n'
      '    assert out["file"].endswith("scrna_pack.py") and out["first_line"] > 0\n',
-     '    assert out["module"] == "bioagent.tools.run_de.tool"\n'
+     '    assert out["module"] == "aiscientist.tools.run_de.tool"\n'
      '    assert out["file"].endswith("run_de/tool.py") and out["first_line"] > 0\n'),
     ("tests/test_environment_manifest.py",
-     '    assert "src/bioagent/tools/scrna_pack.py:" in md\n',
-     '    assert "src/bioagent/tools/run_de/tool.py:" in md\n'),
+     '    assert "src/aiscientist/tools/scrna_pack.py:" in md\n',
+     '    assert "src/aiscientist/tools/run_de/tool.py:" in md\n'),
 ]
 
 # Exact text edits for GENERATED modules: code that locates files relative to ``__file__`` and so
 # changes meaning when it moves. (new module, old text, new text)
 GENERATED_EDITS: list[tuple[str, str, str]] = [
     ("_lib.scrna",
-     '''    """Where the local ``.gmt`` gene-set files live. ``BIOAGENT_GENESETS_DIR`` overrides;
+     '''    """Where the local ``.gmt`` gene-set files live. ``AISCIENTIST_GENESETS_DIR`` overrides;
     otherwise a ``genesets/`` dir next to this module — which rides along with the dfs3b
     source bind, so the network-OFF analysis container finds it with no extra plumbing."""
-    d = os.environ.get("BIOAGENT_GENESETS_DIR")
+    d = os.environ.get("AISCIENTIST_GENESETS_DIR")
     return Path(d) if d else Path(__file__).resolve().parent / "genesets"''',
-     '''    """Where the local ``.gmt`` gene-set files live. ``BIOAGENT_GENESETS_DIR`` overrides;
+     '''    """Where the local ``.gmt`` gene-set files live. ``AISCIENTIST_GENESETS_DIR`` overrides;
     otherwise ``tools/genesets/`` — which rides along with the dfs3b source bind, so the
     network-OFF analysis container finds it with no extra plumbing. (This module sits in
     ``tools/_lib/``; the deploy keeps the .gmt files in ``tools/genesets/``.)"""
-    d = os.environ.get("BIOAGENT_GENESETS_DIR")
+    d = os.environ.get("AISCIENTIST_GENESETS_DIR")
     return Path(d) if d else Path(__file__).resolve().parents[1] / "genesets"'''),
     ("_lib.scrna",
      "same graceful-degrade contract as ``tools/report.py`` for pandoc",
@@ -185,11 +185,11 @@ REPLACED = {
 
 
 def _abs(mod: str) -> str:
-    return mod if mod.startswith("bioagent.") else f"{PKG}.{mod}"
+    return mod if mod.startswith("aiscientist.") else f"{PKG}.{mod}"
 
 
 def module_path(mod: str) -> Path:
-    """File of an absolute module name (``bioagent.tools.x.y`` -> src/bioagent/tools/x/y.py)."""
+    """File of an absolute module name (``aiscientist.tools.x.y`` -> src/aiscientist/tools/x/y.py)."""
     parts = mod.split(".")
     p = SRC.joinpath(*parts)
     if p.is_dir():
@@ -428,14 +428,14 @@ class Mapper:
         # The tool contract moved to tools/sdk.py (HarnessContext's tool-facing view is ToolContext).
         # Old files regenerated from main still import it from the agents package.
         self.redirect: dict[tuple[str, str], tuple[str, str]] = {
-            ("bioagent.agents.research_harness", "HarnessTool"): ("bioagent.tools.sdk", "HarnessTool"),
-            ("bioagent.agents.research_harness", "HarnessContext"): ("bioagent.tools.sdk", "ToolContext"),
+            ("aiscientist.agents.research_harness", "HarnessTool"): ("aiscientist.tools.sdk", "HarnessTool"),
+            ("aiscientist.agents.research_harness", "HarnessContext"): ("aiscientist.tools.sdk", "ToolContext"),
         }
         self.mod: dict[str, str] = {_abs(k): _abs(v) for k, v in MODULE_MOVES.items()}
         self.mod.update({_abs(k): v for k, v in PLATFORM_MOVES.items()})
         for old, (new, subs) in PACKAGE_MOVES.items():
             self.mod[_abs(old)] = _abs(new)
-            stems = ([Path(f).stem for f in _ls_tree(ref, f"src/bioagent/tools/{old}/") if f.endswith(".py")]
+            stems = ([Path(f).stem for f in _ls_tree(ref, f"src/aiscientist/tools/{old}/") if f.endswith(".py")]
                      if ref else [p.stem for p in (TOOLS / old).glob("*.py")])
             for stem in stems:
                 if stem == "__init__":
@@ -517,13 +517,13 @@ def rewrite_import_from(node: ast.ImportFrom, importer_pkg_old: str, importer_pk
             changed = True
             continue
         sub = f"{target}.{a.name}"
-        if exists_now(sub):               # `from bioagent.tools.run_de import tool`: already new layout
+        if exists_now(sub):               # `from aiscientist.tools.run_de import tool`: already new layout
             by_dest[target].append(a)
             continue
         if sub in mapper.split_mods:
             return None                   # module-object import of a split module: caller handles
         moved_sub = mapper.module_object(sub)
-        if moved_sub:                     # `from bioagent.tools import schematic`: a moved module
+        if moved_sub:                     # `from aiscientist.tools import schematic`: a moved module
             parent, leaf = moved_sub.rsplit(".", 1)
             by_dest[parent].append(ast.alias(name=leaf, asname=a.asname or (a.name if a.name != leaf else None)))
             changed = True
@@ -553,7 +553,7 @@ def _alias_src(a: ast.alias) -> str:
 
 
 def _spell(importer_pkg: str, target: str, rel: bool) -> str:
-    if rel and target.startswith("bioagent.") and importer_pkg.startswith("bioagent."):
+    if rel and target.startswith("aiscientist.") and importer_pkg.startswith("aiscientist."):
         return relative(importer_pkg, target)
     return target
 
@@ -598,7 +598,7 @@ def _trailing_comment(line: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------
-# Module-object uses of split modules (``from bioagent.tools import scrna_pack`` then ``scrna_pack.x``)
+# Module-object uses of split modules (``from aiscientist.tools import scrna_pack`` then ``scrna_pack.x``)
 
 
 def _alias_for(new_mod: str) -> str:
@@ -760,7 +760,7 @@ def _para(text: str) -> str:
 
 
 def header_tool(tool: str, origin: str, lib: str | None) -> str:
-    shared = f" Helpers that several tools use live in ``bioagent.tools.{lib}``." if lib else ""
+    shared = f" Helpers that several tools use live in ``aiscientist.tools.{lib}``." if lib else ""
     return ('"""' + f"The ``{tool}`` tool. Documentation: ``TOOL.md`` in this folder.\n\n"
             + _para(f"Split out of {origin} by ``scripts/refactor/split_tools.py``: the code is the old "
                     f"module's text, verbatim, with only the imports rewritten.{shared}") + '\n"""\n')
@@ -770,7 +770,7 @@ def header_lib(line: str, origin: str, tools: list[str], doc: str) -> str:
     return ('"""' + f"Code the {line} tools share.\n\n"
             + _para(f"Split out of {origin} by ``scripts/refactor/split_tools.py``: each top-level helper "
                     "or constant that more than one tool uses moved here verbatim. A tool's own code is "
-                    f"in ``bioagent.tools.<tool>.tool``. The tools: {', '.join(tools)}.")
+                    f"in ``aiscientist.tools.<tool>.tool``. The tools: {', '.join(tools)}.")
             + "\n\nThe original module docstring:\n\n" + doc + '\n"""\n')
 
 
@@ -941,7 +941,7 @@ def plan(ref: str | None = None) -> tuple[dict[str, Placement], dict[str, str]]:
     texts = {}
     for split in SPLITS:
         for m in split.sources:
-            texts[m] = (git("show", f"{ref}:src/bioagent/tools/{m}.py") if ref
+            texts[m] = (git("show", f"{ref}:src/aiscientist/tools/{m}.py") if ref
                         else module_path(_abs(m)).read_text(encoding="utf-8"))
     placements = {split.lib: place(split, texts) for split in SPLITS}
     return placements, texts
@@ -1069,7 +1069,7 @@ def apply() -> None:
             print(f"api.py: {mod}.{attr} was dropped; point its entry somewhere by hand")
             return m.group(0)
         return f'("{new}", "{attr}")'
-    rewritten[api] = re.sub(r'\("(bioagent\.tools\.[\w.]+)", "(\w+)"\)', api_repl, api_txt)
+    rewritten[api] = re.sub(r'\("(aiscientist\.tools\.[\w.]+)", "(\w+)"\)', api_repl, api_txt)
 
     # ---- phase 2: write ----
     for src, dst in moves:
@@ -1098,7 +1098,7 @@ def apply() -> None:
         init = TOOLS / f / "__init__.py"
         if not init.exists():
             init.write_text(f'"""The ``{f}`` tool: see ``TOOL.md`` here. Import a name from the module that\n'
-                            f'defines it (e.g. ``bioagent.tools.{f}.tool``), not from this package."""\n',
+                            f'defines it (e.g. ``aiscientist.tools.{f}.tool``), not from this package."""\n',
                             encoding="utf-8")
     for p, txt in rewritten.items():
         p.write_text(txt, encoding="utf-8")
@@ -1113,7 +1113,7 @@ def regenerate(ref: str) -> None:
     the moved files during the merge."""
     known = set(MODULE_MOVES) | set(PACKAGE_MOVES) | set(PLATFORM_MOVES) | STAY | \
         {m for x in SPLITS for m in x.sources} | {"_lib", "genesets", "README.md"}
-    new_on_ref = [n for n in _ls_tree(ref, "src/bioagent/tools/")
+    new_on_ref = [n for n in _ls_tree(ref, "src/aiscientist/tools/")
                   if (n[:-3] if n.endswith(".py") else n) not in known]
     if new_on_ref:
         raise SystemExit(f"{ref} has tools/ entries the plan does not place: {new_on_ref}; "
@@ -1166,8 +1166,8 @@ def _is_old_module_file(dotted: str) -> bool:
 
 
 def rewrite_string_targets(text: str, mapper: Mapper) -> str:
-    """Dotted strings that name a moved module (``"bioagent.tools.hpo_terms.mapper"``) or an
-    attribute of one (``"bioagent.tools.scrna_pack._p"``, a monkeypatch/mock target)."""
+    """Dotted strings that name a moved module (``"aiscientist.tools.hpo_terms.mapper"``) or an
+    attribute of one (``"aiscientist.tools.scrna_pack._p"``, a monkeypatch/mock target)."""
     def repl(m: re.Match) -> str:
         full = m.group(1)
         if exists_now(full):
@@ -1181,7 +1181,7 @@ def rewrite_string_targets(text: str, mapper: Mapper) -> str:
             return f'"{mapper.new_module(mod, attr)}.{attr}"'
         new = mapper.mod.get(mod)
         return f'"{new}.{attr}"' if new else m.group(0)
-    return re.sub(r'"(bioagent\.tools(?:\.\w+)+)"', repl, text)
+    return re.sub(r'"(aiscientist\.tools(?:\.\w+)+)"', repl, text)
 
 
 def main(argv: list[str] | None = None) -> int:

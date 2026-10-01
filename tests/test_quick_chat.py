@@ -3,7 +3,7 @@
 
 These run OFFLINE: the loop takes an injected ``stream_fn``, and the transport tests feed
 canned SSE bytes to a stubbed ``urlopen``. No GPU, no SSH, and — importantly — no import of
-``bioagent.gateway.app`` (which needs ``paramiko``), so this file runs on a bare checkout.
+``aiscientist.gateway.app`` (which needs ``paramiko``), so this file runs on a bare checkout.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ import json
 
 import pytest
 
-from bioagent.agents.quick_chat import (
+from aiscientist.agents.quick_chat import (
     QuickChatConfig,
     _parse_args,
     run_quick_chat,
 )
-from bioagent.gateway import vllm_client
+from aiscientist.gateway import vllm_client
 
 
 # --- test doubles -------------------------------------------------------------
@@ -296,7 +296,7 @@ def test_registry_quickchat_catalog_is_the_cheap_subset():
     """The fast path must NOT be able to reach the heavy analysis line. If a future tool lands in
     this catalog by accident, a chat turn could launch a multi-hour Slurm job with no run bundle to
     write into — so pin both the allow-list AND the exclusions."""
-    from bioagent.agents.registry import build_quickchat_catalog
+    from aiscientist.agents.registry import build_quickchat_catalog
 
     names = {t.name for t in build_quickchat_catalog()}
     assert names == {"literature_search", "map_phenotype_to_hpo"}
@@ -312,7 +312,7 @@ def test_registry_quickchat_catalog_is_the_cheap_subset():
 
 def test_schematic_tool_is_untouched_on_the_research_path():
     """Feature B adds INLINE chat diagrams; it must not have removed the backend figure tool."""
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     assert "make_schematic" in {t.name for t in build_scientist_catalog()}
 
@@ -321,7 +321,7 @@ def test_system_prompt_states_the_load_bearing_contracts():
     """Three behaviours the fast path depends on live only in the prompt, so regressions there are
     invisible: answer-first ordering, the refusal to fake an analysis, and the mermaid affordance
     that Feature B renders."""
-    from bioagent.agents.quick_chat import QUICK_CHAT_SYSTEM
+    from aiscientist.agents.quick_chat import QUICK_CHAT_SYSTEM
 
     lowered = QUICK_CHAT_SYSTEM.lower()
     assert "answer first" in lowered
@@ -358,7 +358,7 @@ def test_multiple_parallel_tool_calls_keep_their_indexes(monkeypatch):
 def test_grounding_keeps_the_passages_when_paperqa_could_not_answer():
     """deep_literature returns `failed` when it gathered passages but its answer step failed. Chat
     must still ground on the passages; before, it told the user the corpus had nothing."""
-    from bioagent.agents.quick_chat import _format_grounding
+    from aiscientist.agents.quick_chat import _format_grounding
 
     text = _format_grounding({
         "status": "failed", "n_contexts": 2, "agent_status": "truncated", "answer": "",
@@ -370,7 +370,7 @@ def test_grounding_keeps_the_passages_when_paperqa_could_not_answer():
 
 
 def test_grounding_for_a_search_that_ran_out_of_time_does_not_claim_an_empty_corpus():
-    from bioagent.agents.quick_chat import _format_grounding
+    from aiscientist.agents.quick_chat import _format_grounding
 
     text = _format_grounding({"status": "failed", "n_contexts": 0, "agent_status": "truncated",
                               "error": "PaperQA's time budget ran out"})

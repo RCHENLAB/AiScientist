@@ -24,9 +24,9 @@ pytest.importorskip("scanpy")
 import anndata as ad  # noqa: E402
 import numpy as np  # noqa: E402
 
-from bioagent.tools.run_clustering import tool as run_clustering_tool  # noqa: E402
-from bioagent.tools.run_de import tool as run_de_tool
-from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from aiscientist.tools.run_clustering import tool as run_clustering_tool  # noqa: E402
+from aiscientist.tools.run_de import tool as run_de_tool
+from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _dataset(tmp_path, gene_names, *, n_cells=200, mito_frac=0.0):
@@ -188,8 +188,8 @@ def test_a_healthy_run_carries_no_warnings(tmp_path):
 
 
 def test_the_critic_sees_tool_warnings_first(tmp_path):
-    from bioagent.agents.research_harness import HarnessContext, HarnessResult
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, HarnessResult
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     seen: list = []
 
@@ -225,8 +225,8 @@ def test_the_critic_sees_tool_warnings_first(tmp_path):
 
 
 def test_a_clean_step_adds_no_warning_block(tmp_path):
-    from bioagent.agents.research_harness import HarnessContext, HarnessResult
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, HarnessResult
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     seen: list = []
 

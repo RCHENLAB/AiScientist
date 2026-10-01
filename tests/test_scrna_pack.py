@@ -17,19 +17,19 @@ import types
 
 import pytest
 
-from bioagent.tools._lib import scrna as scrna_lib
-from bioagent.tools import catalog as tools_catalog
-from bioagent.tools.run_clustering import tool as run_clustering_tool
-from bioagent.tools.run_composition import tool as run_composition_tool
-from bioagent.tools.run_de import tool as run_de_tool
-from bioagent.tools.run_depth_matched_de import tool as run_depth_matched_de_tool
-from bioagent.tools.run_doublet_detection import tool as run_doublet_detection_tool
-from bioagent.tools.run_enrichment import tool as run_enrichment_tool
-from bioagent.tools.run_gsea_prerank import tool as run_gsea_prerank_tool
-from bioagent.tools.run_integration import tool as run_integration_tool
-from bioagent.tools.run_marker_annotation import tool as run_marker_annotation_tool
-from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
-from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from aiscientist.tools._lib import scrna as scrna_lib
+from aiscientist.tools import catalog as tools_catalog
+from aiscientist.tools.run_clustering import tool as run_clustering_tool
+from aiscientist.tools.run_composition import tool as run_composition_tool
+from aiscientist.tools.run_de import tool as run_de_tool
+from aiscientist.tools.run_depth_matched_de import tool as run_depth_matched_de_tool
+from aiscientist.tools.run_doublet_detection import tool as run_doublet_detection_tool
+from aiscientist.tools.run_enrichment import tool as run_enrichment_tool
+from aiscientist.tools.run_gsea_prerank import tool as run_gsea_prerank_tool
+from aiscientist.tools.run_integration import tool as run_integration_tool
+from aiscientist.tools.run_marker_annotation import tool as run_marker_annotation_tool
+from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
 
 def _ctx(tmp_path, dataset_path=None):
@@ -117,7 +117,7 @@ def test_enrichment_runs_offline_against_local_gmt(tmp_path, monkeypatch):
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "TestPathways.gmt").write_text("term\tdesc\tGRIA4\tDLGAP1\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     (tables / "de_leiden_all.csv").write_text(
@@ -143,7 +143,7 @@ def test_enrichment_uses_annotated_de_table_and_runs_per_class(tmp_path, monkeyp
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     # No de_leiden_all.csv — only the annotated majorclass DE table (two classes).
@@ -171,7 +171,7 @@ def test_enrichment_background_is_the_tested_universe_not_a_round_number(tmp_pat
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     (tables / "de_leiden_all.csv").write_text(
@@ -194,7 +194,7 @@ def test_enrichment_records_the_constant_fallback_when_no_universe_exists(tmp_pa
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "TestPathways.gmt").write_text("term\tdesc\tRHO\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     (tables / "de_leiden_all.csv").write_text(
@@ -215,7 +215,7 @@ def test_group_labels_with_a_slash_do_not_lose_their_table(tmp_path, monkeypatch
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "TestPathways.gmt").write_text("term\tdesc\tSCGB1A1\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     (tables / "de_cell_type_all.csv").write_text(
@@ -277,7 +277,7 @@ def test_prerank_walks_the_whole_ranking_and_keeps_the_nes_sign(tmp_path, monkey
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "MSigDB_Hallmark_2020.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     (tables / "rank_leiden_0.rnk").write_text(
@@ -310,7 +310,7 @@ def test_prerank_needs_run_de_first_and_says_so(tmp_path, monkeypatch):
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "MSigDB_Hallmark_2020.gmt").write_text("term\tdesc\tRHO\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     _install_fake_prerank(monkeypatch, {})
     out = run_gsea_prerank_tool.run_gsea_prerank({"gene_sets": ["MSigDB_Hallmark_2020"]}, _ctx(tmp_path))
     assert out["status"] == "error" and "run_de" in out["error"]
@@ -320,7 +320,7 @@ def test_prerank_resolves_the_real_group_label_from_the_slug_index(tmp_path, mon
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "MSigDB_Hallmark_2020.gmt").write_text("term\tdesc\tSCGB1A1\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     tables = tmp_path / "artifacts" / "tables"
     tables.mkdir(parents=True)
     (tables / "rank_cell_type_Club_Secretory.rnk").write_text("SCGB1A1\t9.0\n", encoding="utf-8")
@@ -348,7 +348,7 @@ def test_prerank_missing_gseapy_is_graceful(tmp_path, monkeypatch):
 
 
 def test_enrichment_missing_gmt_is_a_clear_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(tmp_path / "empty"))   # no .gmt files
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(tmp_path / "empty"))   # no .gmt files
     (tmp_path / "empty").mkdir()
     _install_fake_gseapy(monkeypatch, {})
     out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))

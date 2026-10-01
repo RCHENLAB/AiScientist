@@ -8,15 +8,15 @@ the container will read.
 
 Where to put the files
 ----------------------
-The tool resolves the gene-set dir as:  ``$BIOAGENT_GENESETS_DIR``  else
-``<...>/bioagent/tools/genesets/`` (next to the module — rides along with the dfs3b source
+The tool resolves the gene-set dir as:  ``$AISCIENTIST_GENESETS_DIR``  else
+``<...>/aiscientist/tools/genesets/`` (next to the module — rides along with the dfs3b source
 bind, so the container sees it with no extra mount).
 
 So either:
   * write into the dfs3b source tree the Slurm jobs bind, e.g.
-        python scripts/fetch_genesets.py /dfs3b/ruic20_lab/software/bioagent/app/src/bioagent/tools/genesets
+        python scripts/fetch_genesets.py /dfs3b/ruic20_lab/software/AiScientist/app/src/aiscientist/tools/genesets
     (the container already binds that source read-only + puts it on PYTHONPATH), OR
-  * write anywhere and set BIOAGENT_GENESETS_DIR to it (must be bind-mounted into the job).
+  * write anywhere and set AISCIENTIST_GENESETS_DIR to it (must be bind-mounted into the job).
 
 Usage
 -----
@@ -42,7 +42,7 @@ _DEFAULT_LIBS = ("GO_Biological_Process_2023", "Reactome_2022", "MSigDB_Hallmark
 
 def _default_dest() -> Path:
     # Mirror scrna_pack._genesets_dir()'s module-adjacent default.
-    return Path(__file__).resolve().parent.parent / "src" / "bioagent" / "tools" / "genesets"
+    return Path(__file__).resolve().parent.parent / "src" / "aiscientist" / "tools" / "genesets"
 
 
 def fetch(name: str, dest: Path, *, timeout: float = 60.0) -> int:

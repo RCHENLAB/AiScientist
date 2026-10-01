@@ -1,8 +1,8 @@
 """The tools' side of the repository boundary (moves with AiScientist-tools).
 
-The tools ship as their own package, so they import nothing from the platform (``bioagent.agents``,
-``bioagent.gateway``, ...): the one shared module is ``bioagent.tools.sdk``, and everything the
-platform may use from the tools is named in ``bioagent.tools.api``. The platform's side of the same
+The tools ship as their own package, so they import nothing from the platform (``aiscientist.agents``,
+``aiscientist.gateway``, ...): the one shared module is ``aiscientist.tools.sdk``, and everything the
+platform may use from the tools is named in ``aiscientist.tools.api``. The platform's side of the same
 boundary is ``tests/test_repo_boundaries.py`` in the platform repository.
 
 The checks read the source with ``ast`` (a docstring that mentions the gateway is fine; an import is
@@ -13,7 +13,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from bioagent.tools import catalog
+from aiscientist.tools import catalog
 
 TOOLS = Path(catalog.TOOLS_DIR)
 SRC = TOOLS.parents[1]
@@ -62,15 +62,15 @@ def test_tools_never_import_the_platform():
     offenders = []
     for path in _py_files(TOOLS):
         for mod, _names, line in _imports(path):
-            if mod == "bioagent" or (mod.startswith("bioagent.") and not mod.startswith("bioagent.tools")):
+            if mod == "aiscientist" or (mod.startswith("aiscientist.") and not mod.startswith("aiscientist.tools")):
                 offenders.append(f"{path.relative_to(SRC)}:{line} imports {mod}")
     assert not offenders, (
-        "tools must not import the platform (use bioagent.tools.sdk, or take the dependency as a "
+        "tools must not import the platform (use aiscientist.tools.sdk, or take the dependency as a "
         "factory argument):\n" + "\n".join(offenders))
 
 
 def test_api_exports_resolve():
-    from bioagent.tools import api
+    from aiscientist.tools import api
 
     missing = []
     for name in api._EXPORTS:

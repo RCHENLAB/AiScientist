@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from bioagent.reporting.research_bundle import write_process_artifacts
+from aiscientist.reporting.research_bundle import write_process_artifacts
 
 _RESULT = {
     "question": "Characterize the PBMC dataset",

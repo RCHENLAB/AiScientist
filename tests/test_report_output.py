@@ -18,7 +18,7 @@ import pytest
 
 def _title():
     pytest.importorskip("fastapi")
-    from bioagent.gateway.app import _promote_doc_title
+    from aiscientist.gateway.app import _promote_doc_title
     return _promote_doc_title
 
 
@@ -65,7 +65,7 @@ def test_first_h1_wins_with_leading_content():
 # ---- CodeSandbox matplotlib cache dir -------------------------------------
 
 def test_sandbox_pins_writable_mplconfigdir(tmp_path):
-    from bioagent.agents.sandbox import CodeSandbox
+    from aiscientist.agents.sandbox import CodeSandbox
 
     work = tmp_path / "work"
     sb = CodeSandbox(work_dir=str(work), artifacts_dir=str(tmp_path / "art"))
@@ -80,7 +80,7 @@ def test_sandbox_pins_writable_mplconfigdir(tmp_path):
 
 
 def test_sandbox_mplconfigdir_falls_back_to_home_when_no_dirs(tmp_path, monkeypatch):
-    from bioagent.agents.sandbox import CodeSandbox
+    from aiscientist.agents.sandbox import CodeSandbox
 
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     sb = CodeSandbox()  # no work/artifacts dirs
@@ -100,7 +100,7 @@ def _fake_result(rounds, agenda=None):
 
 def test_summarize_degradations_flags_maxsteps_and_oom():
     pytest.importorskip("fastapi")   # gateway extra; offline CI subset doesn't install it
-    from bioagent.gateway.app import _summarize_pipeline_degradations
+    from aiscientist.gateway.app import _summarize_pipeline_degradations
     rounds = [
         {"step_index": 4, "step": "DE DDX41 vs WT",
          "verdict": {"verdict": "accept", "score": 0.95},
@@ -116,7 +116,7 @@ def test_summarize_degradations_flags_maxsteps_and_oom():
 
 def test_summarize_degradations_empty_when_all_clean():
     pytest.importorskip("fastapi")   # gateway extra; offline CI subset doesn't install it
-    from bioagent.gateway.app import _summarize_pipeline_degradations
+    from aiscientist.gateway.app import _summarize_pipeline_degradations
     rounds = [
         {"step_index": 1, "step": "QC",
          "verdict": {"verdict": "accept", "score": 1.0},
@@ -128,7 +128,7 @@ def test_summarize_degradations_empty_when_all_clean():
 
 def test_step_failures_scans_steps_not_just_errors_list():
     pytest.importorskip("fastapi")   # gateway extra; offline CI subset doesn't install it
-    from bioagent.gateway.app import _step_failures
+    from aiscientist.gateway.app import _step_failures
     sr = {"errors": [], "steps": [
         {"tool": "run_code", "result": {"status": "error", "returncode": 1,
                                          "error": "Traceback\nValueError: bad"}},
@@ -160,7 +160,7 @@ _H1 = {
 
 
 def test_the_ledger_reaches_the_technical_report_with_its_provenance():
-    from bioagent.gateway.app import _hypothesis_ledger_block
+    from aiscientist.gateway.app import _hypothesis_ledger_block
     out = _hypothesis_ledger_block(_ns([_H1]))
     assert "[h1] supported" in out
     assert "run_pseudobulk_de" in out                      # the step it ADDED to the plan
@@ -170,13 +170,13 @@ def test_the_ledger_reaches_the_technical_report_with_its_provenance():
 def test_a_supported_hypothesis_with_no_rival_is_flagged_in_the_report_itself():
     # The whole failure in one line: with nothing to weigh against, "supported" means only
     # "not contradicted", and a reader must not have to work that out for themselves.
-    from bioagent.gateway.app import _hypothesis_ledger_block
+    from aiscientist.gateway.app import _hypothesis_ledger_block
     out = _hypothesis_ledger_block(_ns([_H1]))
     assert "no competing explanation was recorded" in out and "not contradicted" in out
 
 
 def test_the_flag_does_not_fire_once_a_rival_is_recorded():
-    from bioagent.gateway.app import _hypothesis_ledger_block
+    from aiscientist.gateway.app import _hypothesis_ledger_block
     out = _hypothesis_ledger_block(_ns([dict(_H1, rival="DDX41 loss disrupts Muller junctions",
                                              discriminator="confined to MG vs uniform")]))
     assert "no competing explanation was recorded" not in out
@@ -184,7 +184,7 @@ def test_the_flag_does_not_fire_once_a_rival_is_recorded():
 
 
 def test_an_empty_ledger_says_so_rather_than_rendering_nothing():
-    from bioagent.gateway.app import _hypothesis_ledger_block
+    from aiscientist.gateway.app import _hypothesis_ledger_block
     assert "none" in _hypothesis_ledger_block(_ns([])).lower()
     assert "none" in _hypothesis_ledger_block(_ns(None)).lower()
 
@@ -193,7 +193,7 @@ def test_the_narrative_mirror_skips_only_what_the_log_chain_already_writes():
     # The mirror puts every lab_progress line into the exported log. These types are written by the
     # run loop's own chain, so mirroring them would double every entry (pi_agenda is the whole
     # agenda); the reasoning events must NOT be in the skip set or the bug comes straight back.
-    from bioagent.gateway.app import _LOGGED_BY_EVENT_CHAIN
+    from aiscientist.gateway.app import _LOGGED_BY_EVENT_CHAIN
     assert "pi_agenda" in _LOGGED_BY_EVENT_CHAIN and "tool_result" in _LOGGED_BY_EVENT_CHAIN
     for reasoning in ("team_meeting_start", "expert_contribution", "meeting_critic",
                       "meeting_synthesis", "hypothesis_formed", "hypothesis_resolved",

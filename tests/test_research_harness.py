@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from bioagent.agents.research_harness import (
+from aiscientist.agents.research_harness import (
     HarnessConfig,
     HarnessContext,
     HarnessTool,

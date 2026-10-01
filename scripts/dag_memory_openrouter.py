@@ -31,15 +31,15 @@ def _load_dotenv(p: Path) -> None:
 
 
 _load_dotenv(ROOT / ".env")
-OR_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("BIOAGENT_LLM_API_KEY")
+OR_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("AISCIENTIST_LLM_API_KEY")
 MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3.6-35b-a3b")
 if not OR_KEY:
     print("OPENROUTER_API_KEY not set — cannot run.")
     sys.exit(2)
 
-from bioagent.agents.research_harness import HarnessContext, HarnessTool, ResearchHarness  # noqa: E402
-from bioagent.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
-from bioagent.providers.openai_compatible import OpenRouterClient  # noqa: E402
+from aiscientist.agents.research_harness import HarnessContext, HarnessTool, ResearchHarness  # noqa: E402
+from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
+from aiscientist.providers.openai_compatible import OpenRouterClient  # noqa: E402
 
 _CLIENT = OpenRouterClient(model=MODEL, api_key=OR_KEY, reasoning_effort="none", timeout_seconds=90)
 BRIEFS: list[str] = []

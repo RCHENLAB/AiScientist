@@ -62,7 +62,7 @@ are separate files:
   fetches, adapts to the dataset, and runs via `run_code` — a TEMPLATE to rewrite, not code to run
   blindly.
 - Loaded by `agents/skills.py` into `SKILLS` (keyed by folder/frontmatter name, no `.py`); override
-  the dir with `$BIOAGENT_SKILLS_DIR`. Grown by **induction** (deferred).
+  the dir with `$AISCIENTIST_SKILLS_DIR`. Grown by **induction** (deferred).
 
 **Three-level progressive disclosure** (see `agents/skills.py`):
 1. the brief lists only the MANIFEST (`- name — description`);
@@ -77,10 +77,10 @@ still resolve.
 1. **Moved** `skills/<name>/` → `preset_pipelines/<name>/` (6 folders); renamed the loader
    `agents/skills.py` → `agents/preset_pipelines.py` (pipeline vocab: `PresetPipeline`/`PIPELINES`/
    `get_pipeline`/`list_pipelines`/`select_pipeline`/`compose_pipeline_prompts`; env
-   `BIOAGENT_PIPELINES_DIR`). `presets.py` shim repointed.
+   `AISCIENTIST_PIPELINES_DIR`). `presets.py` shim repointed.
 2. **Promoted** the 9 `scripts/*.py` to a flat `skills/` atomic library and added a NEW
    `agents/skills.py` (the `Skill` model, `SKILLS` loader, `skill_manifest`, and the
-   `read_skill_reference` tool). `$BIOAGENT_SKILLS_DIR` now points at the atomic library.
+   `read_skill_reference` tool). `$AISCIENTIST_SKILLS_DIR` now points at the atomic library.
 3. **Wired** progressive disclosure: the Scientist's brief lists the GLOBAL atomic-skill manifest
    (name + summary), `read_skill_reference` fetches a body on demand; the fixed registry stays the
    always-on core. `PresetPipeline` no longer bundles scripts.
@@ -101,7 +101,7 @@ still resolve.
   preset-pipeline (which steers the whole plan shape).
 - **`search_skills(query)` retrieval** — a `search_skills` Scientist tool (`agents/skills.py`):
   keyword/token-overlap ranking over name > summary > body (offline, deterministic, no embedder).
-  The brief now switches on library size: ≤ `MANIFEST_MAX` (env `BIOAGENT_SKILL_MANIFEST_MAX`,
+  The brief now switches on library size: ≤ `MANIFEST_MAX` (env `AISCIENTIST_SKILL_MANIFEST_MAX`,
   default 12) → inline the manifest as before; beyond that → don't list any, tell the agent to call
   `search_skills(query)` first, then `read_skill_reference`. So even the name+summary list can't
   bloat every step as the library grows. Two small always-on tools (search + read); bodies still

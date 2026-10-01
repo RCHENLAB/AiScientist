@@ -9,8 +9,8 @@ from pathlib import Path
 
 import scanpy as sc
 
-work = Path(os.environ["BIOAGENT_WORK"])
-art = Path(os.environ["BIOAGENT_ARTIFACTS"])
+work = Path(os.environ["AISCIENTIST_WORK"])
+art = Path(os.environ["AISCIENTIST_ARTIFACTS"])
 (art / "tables").mkdir(parents=True, exist_ok=True)
 (art / "figures").mkdir(parents=True, exist_ok=True)
 

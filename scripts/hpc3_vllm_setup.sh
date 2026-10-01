@@ -10,13 +10,16 @@
 #   srun -c 4 -p free --time=2:00:00 --pty /bin/bash -i   # << RCIC: build/pull on a compute node
 #   bash scripts/hpc3_vllm_setup.sh
 set -uo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
-BASE="${BIOAGENT_LAB_BASE:-/dfs3b/ruic20_lab/software/bioagent}"
-IMAGE="${BIOAGENT_VLLM_IMAGE:-$BASE/containers/vllm-0.28.0.sif}"
+BASE="${AISCIENTIST_LAB_BASE:-/dfs3b/ruic20_lab/software/AiScientist}"
+IMAGE="${AISCIENTIST_VLLM_IMAGE:-$BASE/containers/vllm-0.28.0.sif}"
 HF="$BASE/hf"
-MODEL="${BIOAGENT_VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}"
+MODEL="${AISCIENTIST_VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}"
 VLLM_IMG="${VLLM_DOCKER:-docker://vllm/vllm-openai:v0.28.0}"
-SING_MODULE="${BIOAGENT_CONTAINER_MODULE:-singularity/3.11.3}"
+SING_MODULE="${AISCIENTIST_CONTAINER_MODULE:-singularity/3.11.3}"
 
 log() { echo "[hpc3-vllm] $*"; }
 

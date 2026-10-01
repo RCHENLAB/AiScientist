@@ -20,10 +20,10 @@ Build + weight staging is driven by `scripts/hpc3_vlreview_setup.sh` (mirrors
 `scripts/hpc3_vllm_setup.sh` — RCIC compute-node build, cache off `$HOME`, typed-gres probe).
 
 ## Gateway / loop
-- `src/bioagent/gateway/vlreview_job.py` — submits + supervises the batch job (Route C).
-- `src/bioagent/reporting/visual_review.py` — the render → review → **re-render with escalated
+- `src/aiscientist/gateway/vlreview_job.py` — submits + supervises the batch job (Route C).
+- `src/aiscientist/reporting/visual_review.py` — the render → review → **re-render with escalated
   format** loop; residual defects go to the technical-report Diagnostics only.
-- `src/bioagent/reporting/report.py` — `build_pdf_report(format_overrides=...)` are the knobs the
+- `src/aiscientist/reporting/report.py` — `build_pdf_report(format_overrides=...)` are the knobs the
   loop escalates (table font, body font, margins, table-wrap threshold, landscape, fig width).
 
 ## Build + stage (on HPC3 — macOS cannot build .sif)
@@ -36,7 +36,7 @@ ssh <ucinetid>@hpc3.rcic.uci.edu && newgrp ruic20_hpc
 srun -c 4 -p free --time=2:00:00 --pty /bin/bash -i
 cd ~/vlreview-build && bash hpc3_vlreview_setup.sh
 #   custom .def has no fakeroot on HPC3 (no /etc/subuid entry) -> it builds via --remote
-#   (Sylabs): `singularity remote login` once, then BIOAGENT_VLREVIEW_BUILD_MODE=remote.
+#   (Sylabs): `singularity remote login` once, then AISCIENTIST_VLREVIEW_BUILD_MODE=remote.
 ```
 Produces `…/containers/vlreview.sif` + `…/vlreview_model/` on dfs3b.
 
@@ -44,8 +44,8 @@ Produces `…/containers/vlreview.sif` + `…/vlreview_model/` on dfs3b.
 Defaults already match the RUIC20 cluster (paid `gpu` partition, `gpu:A30:1`, image/model at
 the dfs3b paths above), so on the eye server you only need:
 ```bash
-export BIOAGENT_VLREVIEW_ENABLED=1
-# override only if needed, e.g. a different card: BIOAGENT_VLREVIEW_GRES='gpu:RTX6000:1'
+export AISCIENTIST_VLREVIEW_ENABLED=1
+# override only if needed, e.g. a different card: AISCIENTIST_VLREVIEW_GRES='gpu:RTX6000:1'
 ```
 
 ## Cost

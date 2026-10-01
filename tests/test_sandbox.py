@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from bioagent.agents.sandbox import CodeSandbox
+from aiscientist.agents.sandbox import CodeSandbox
 
 
 def test_runs_code_and_captures_stdout():
@@ -38,8 +38,8 @@ def test_exposes_dataset_and_run_paths_to_codeact(tmp_path):
     sandbox = CodeSandbox(dataset_path=str(ds), work_dir=str(tmp_path / "work"), artifacts_dir=str(art))
     code = (
         "import os\n"
-        "print(open(os.environ['BIOAGENT_DATASET']).read().strip())\n"
-        "open(os.path.join(os.environ['BIOAGENT_ARTIFACTS'], 'out.txt'), 'w').write('made by codeact')\n"
+        "print(open(os.environ['AISCIENTIST_DATASET']).read().strip())\n"
+        "open(os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 'out.txt'), 'w').write('made by codeact')\n"
     )
     out = sandbox(code)
     assert out["status"] == "ok" and "a,b" in out["stdout"]
@@ -66,13 +66,13 @@ def test_runs_in_isolated_tempdir_not_the_repo():
     out = CodeSandbox()("import os; print(os.getcwd())")
     assert out["status"] == "ok"
     cwd = out["stdout"].strip()
-    assert "bioagent-code-" in cwd  # the TemporaryDirectory prefix
+    assert "aiscientist-code-" in cwd  # the TemporaryDirectory prefix
 
 
 # --- Execution-context injection (guides the CodeAct model) ----------------------------
 
 def test_build_run_code_context_lists_paths_and_cwd_warning():
-    from bioagent.agents.sandbox import build_run_code_context
+    from aiscientist.agents.sandbox import build_run_code_context
 
     sb = CodeSandbox(dataset_path=None, work_dir="/runs/x/work", artifacts_dir="/runs/x/art")
     ctx = build_run_code_context(sb)
@@ -83,34 +83,34 @@ def test_build_run_code_context_lists_paths_and_cwd_warning():
 
 
 def test_build_run_code_context_empty_without_executor():
-    from bioagent.agents.sandbox import build_run_code_context
+    from aiscientist.agents.sandbox import build_run_code_context
 
     assert build_run_code_context(None) == ""
     assert build_run_code_context(CodeSandbox()) == ""  # no dataset/work/artifacts set
 
 
 def test_describe_dataset_obs_missing_path_is_safe():
-    from bioagent.agents.sandbox import describe_dataset_obs
+    from aiscientist.agents.sandbox import describe_dataset_obs
 
     assert describe_dataset_obs(None) == ""
     assert describe_dataset_obs("/no/such/file.h5ad") == ""
 
 
 def test_sandbox_network_enabled_defaults_on_and_env_toggles_off(monkeypatch):
-    from bioagent.agents.sandbox import sandbox_network_enabled
+    from aiscientist.agents.sandbox import sandbox_network_enabled
 
-    monkeypatch.delenv("BIOAGENT_SANDBOX_NETWORK", raising=False)
+    monkeypatch.delenv("AISCIENTIST_SANDBOX_NETWORK", raising=False)
     assert sandbox_network_enabled() is True                 # default ON (Jin Li: prioritize effect)
     for off in ("0", "false", "off", "no", ""):
-        monkeypatch.setenv("BIOAGENT_SANDBOX_NETWORK", off)
+        monkeypatch.setenv("AISCIENTIST_SANDBOX_NETWORK", off)
         assert sandbox_network_enabled() is False, off
-    monkeypatch.setenv("BIOAGENT_SANDBOX_NETWORK", "1")
+    monkeypatch.setenv("AISCIENTIST_SANDBOX_NETWORK", "1")
     assert sandbox_network_enabled() is True
 
 
 def test_container_command_network_follows_env(monkeypatch):
     # With a container image, the singularity command isolates the network ONLY when disabled.
-    monkeypatch.delenv("BIOAGENT_SANDBOX_NETWORK", raising=False)   # default ON
+    monkeypatch.delenv("AISCIENTIST_SANDBOX_NETWORK", raising=False)   # default ON
     cmd, _ = CodeSandbox(container_image="/img/analysis.sif")._command("/tmp/s.py", "/tmp/wd")
     assert "--network" not in cmd and "none" not in cmd            # network allowed → no isolation flags
 

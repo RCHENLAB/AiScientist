@@ -24,26 +24,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from bioagent.tools import catalog  # noqa: E402
+from aiscientist.tools import catalog  # noqa: E402
 
-TOOLS = ROOT / "src" / "bioagent" / "tools"
+TOOLS = ROOT / "src" / "aiscientist" / "tools"
 
 RUNS_ON_TEXT = {
     "inprocess": "In the gateway process; it returns in seconds and needs no HPC3 job.",
     "hpc:analysis": (
         "As a Slurm CPU job inside `analysis.sif` on HPC3, through the analysis line's job entry "
-        "point `python -m bioagent.tools.scrna_cli`, reading and writing the run's `work/` and "
+        "point `python -m aiscientist.tools.scrna_cli`, reading and writing the run's `work/` and "
         "`artifacts/` on dfs3b. When the session has no HPC3 executor it runs in the gateway process."),
     "hpc:variant": (
         "As a Slurm job inside `vep.sif` on HPC3 (offline VEP with a local cache), through "
-        "`python -m bioagent.tools.variant_cli`. Small VCFs, or a session without HPC3, use the "
+        "`python -m aiscientist.tools.variant_cli`. Small VCFs, or a session without HPC3, use the "
         "Ensembl REST API from the gateway instead (capped at a few hundred variants)."),
     "hpc:phenotype": (
-        "As a Slurm job inside `lirical.sif` on HPC3, through `python -m bioagent.tools.phenotype_cli`. "
+        "As a Slurm job inside `lirical.sif` on HPC3, through `python -m aiscientist.tools.phenotype_cli`. "
         "Without HPC3 it returns `not_installed` rather than a guess."),
     "hpc:literature": (
         "As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through "
-        "`python -m bioagent.tools.paperqa_cli`, calling the session's served model. It is left out "
+        "`python -m aiscientist.tools.paperqa_cli`, calling the session's served model. It is left out "
         "of the catalog when the session has no GPU allocation."),
     "gpu:scgpt": (
         "As a GPU Slurm job inside `scgpt.sif`, through the runner the gateway injects "
@@ -84,7 +84,7 @@ image: `scrna_cli.py`, `variant_cli.py`, `phenotype_cli.py`, `paperqa_cli.py`.
    layout of an existing tool, leave the `generated` markers empty.
 3. Run `python scripts/tool_docs.py`, then the tests. No platform file changes: the registry, the
    HPC3 routing, the fast-chat selection and the System page all read the manifest.
-4. Import only `bioagent.tools.sdk` (and other tools' public names) from tool code; the platform
+4. Import only `aiscientist.tools.sdk` (and other tools' public names) from tool code; the platform
    is off limits (`tests/test_repo_boundaries.py`).
 """
 

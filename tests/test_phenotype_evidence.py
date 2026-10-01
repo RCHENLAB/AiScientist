@@ -7,7 +7,7 @@ corpus, no GPU, no network.
 """
 from __future__ import annotations
 
-from bioagent.tools.diagnose_disease.evidence import (
+from aiscientist.tools.diagnose_disease.evidence import (
     build_evidence_question,
     classify_study_type,
     evidence_ceiling,

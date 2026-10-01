@@ -8,7 +8,7 @@ computes a local perturbation signature and classifies each cell as perturbed (K
 pertpy is a HEAVY OPTIONAL dependency and its Mixscape API drifts across versions. This template
 degrades gracefully: if pertpy is not importable it writes a note and exits 0 (the skill then runs DE
 on all guide-assigned cells — a conservative, effect-diluting choice, which you must state). When it
-runs, it writes `adata_mixscape.h5ad` (NP cells removed) to BIOAGENT_WORK for the DE step to read, and
+runs, it writes `adata_mixscape.h5ad` (NP cells removed) to AISCIENTIST_WORK for the DE step to read, and
 reports the per-perturbation NP fraction. ADAPT the CONFIG and the API call to your installed pertpy.
 """
 import json
@@ -22,9 +22,9 @@ PERT_KEY = "perturbation"      # obs column naming the guide / perturbation per 
 CONTROL = "NT"                # the shared non-targeting control level in PERT_KEY
 # ----------------------------------------------------------------------------------------------
 
-work = Path(os.environ["BIOAGENT_WORK"])
+work = Path(os.environ["AISCIENTIST_WORK"])
 ckpt = work / "adata_qc.h5ad"
-adata = sc.read_h5ad(ckpt if ckpt.exists() else os.environ["BIOAGENT_DATASET"])
+adata = sc.read_h5ad(ckpt if ckpt.exists() else os.environ["AISCIENTIST_DATASET"])
 
 if PERT_KEY not in adata.obs:
     raise SystemExit(f"obs has no column {PERT_KEY!r}; available: {list(adata.obs.columns)}")

@@ -17,13 +17,13 @@ From: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 # they are bind-mounted read-only at run time (--model), so this image stays small and
 # reusable across VL model swaps (7B <-> 32B). Stage the weights once on shared DFS.
 #
-# Entry contract (matches src/bioagent/gateway/vlreview_job.py + settings.vlreview_entrypoint):
+# Entry contract (matches src/aiscientist/gateway/vlreview_job.py + settings.vlreview_entrypoint):
 #   python /opt/vlreview/run_review.py --pdf <report.pdf> --model <model_dir> --out <out_dir>
 # -> writes <out>/review.json  (per-page defects + escalating fix directives)
 #
 # GPU sizing: Qwen2.5-VL-7B in bf16 is ~16GB — fits a 24GB A30 / RTX6000 with room to
 # spare. Do NOT request an A100 for this; pin a cheap card with a typed gres in settings
-# (BIOAGENT_VLREVIEW_GRES="gpu:A30:1"). V100 (16GB, no flash-attn) is too tight — exclude it.
+# (AISCIENTIST_VLREVIEW_GRES="gpu:A30:1"). V100 (16GB, no flash-attn) is too tight — exclude it.
 
 %files
     # The in-container CLI: rasterize pdf -> deterministic bbox-overlap pre-check ->

@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-from bioagent.agents.research_lab import LabConfig, ResearchLab
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 _NEXT_CYCLE_MARK = "deciding whether to run ANOTHER cycle"
 _EXPLORE_MARK = "opened a research path the CURRENT PLAN DOES NOT COVER"
@@ -282,8 +282,8 @@ def test_a_team_campaign_reaches_its_interpretation_meeting(tmp_path):
     default config, and no test combined team mode with a campaign."""
     import json
 
-    from bioagent.agents.research_harness import HarnessContext, HarnessResult
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, HarnessResult
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     def fn(messages):
         system = messages[0]["content"]

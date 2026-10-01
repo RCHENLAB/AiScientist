@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from bioagent.gateway import vllm_client
+from aiscientist.gateway import vllm_client
 
 
 def _capture(monkeypatch):
@@ -33,35 +33,35 @@ def _capture(monkeypatch):
 
 
 def test_complete_think_true_sends_nothing_by_default(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_VLLM_THINK_ON_KWARGS", raising=False)
+    monkeypatch.delenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", raising=False)
     sent = _capture(monkeypatch)
     vllm_client.complete(1234, "m", [{"role": "user", "content": "hi"}])
     assert "chat_template_kwargs" not in sent["payload"]
 
 
 def test_complete_think_false_still_opts_out(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
     sent = _capture(monkeypatch)
     vllm_client.complete(1234, "m", [{"role": "user", "content": "hi"}], think=False)
     assert sent["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_complete_think_true_sends_opt_in_when_configured(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
     sent = _capture(monkeypatch)
     vllm_client.complete(1234, "m", [{"role": "user", "content": "hi"}])
     assert sent["payload"]["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_complete_opt_in_never_reaches_a_remote_base_url(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
     sent = _capture(monkeypatch)
     vllm_client.complete(0, "m", [{"role": "user", "content": "hi"}], base_url="https://openrouter.ai/api/v1")
     assert "chat_template_kwargs" not in sent["payload"]
 
 
 def test_chat_tools_defaults_unchanged(monkeypatch):
-    for k in ("BIOAGENT_SCIENTIST_MAX_TOKENS", "BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS"):
+    for k in ("AISCIENTIST_SCIENTIST_MAX_TOKENS", "AISCIENTIST_SCIENTIST_CHAT_TEMPLATE_KWARGS"):
         monkeypatch.delenv(k, raising=False)
     sent = _capture(monkeypatch)
     vllm_client.chat_tools(1234, "m", [{"role": "user", "content": "hi"}], [])
@@ -70,8 +70,8 @@ def test_chat_tools_defaults_unchanged(monkeypatch):
 
 
 def test_chat_tools_env_budget_and_kwargs(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_SCIENTIST_MAX_TOKENS", "8192")
-    monkeypatch.setenv("BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS", '{"enable_thinking": false}')
+    monkeypatch.setenv("AISCIENTIST_SCIENTIST_MAX_TOKENS", "8192")
+    monkeypatch.setenv("AISCIENTIST_SCIENTIST_CHAT_TEMPLATE_KWARGS", '{"enable_thinking": false}')
     sent = _capture(monkeypatch)
     vllm_client.chat_tools(1234, "m", [{"role": "user", "content": "hi"}], [])
     assert sent["payload"]["max_tokens"] == 8192
@@ -80,14 +80,14 @@ def test_chat_tools_env_budget_and_kwargs(monkeypatch):
 
 @pytest.mark.parametrize("raw", ["", "not json", "[]", "{}"])
 def test_bad_env_values_are_ignored(monkeypatch, raw):
-    monkeypatch.setenv("BIOAGENT_VLLM_THINK_ON_KWARGS", raw)
-    monkeypatch.setenv("BIOAGENT_SCIENTIST_CHAT_TEMPLATE_KWARGS", raw)
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", raw)
+    monkeypatch.setenv("AISCIENTIST_SCIENTIST_CHAT_TEMPLATE_KWARGS", raw)
     assert vllm_client._think_on_kwargs() is None
     assert vllm_client._scientist_kwargs() is None
 
 
 def test_remote_reasoning_effort_only_on_base_url(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_LAB_LLM_REASONING", '{"effort": "low"}')
+    monkeypatch.setenv("AISCIENTIST_LAB_LLM_REASONING", '{"effort": "low"}')
     sent = _capture(monkeypatch)
     vllm_client.complete(0, "m", [{"role": "user", "content": "hi"}], base_url="https://openrouter.ai/api/v1")
     assert sent["payload"]["reasoning"] == {"effort": "low"}
@@ -100,7 +100,7 @@ def test_remote_reasoning_effort_only_on_base_url(monkeypatch):
 
 
 def test_chat_tools_sends_the_configured_effort(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT", "medium")
     sent = _capture(monkeypatch)
     out = vllm_client.chat_tools(1234, "m", [{"role": "user", "content": "hi"}], [])
     assert sent["payload"]["reasoning_effort"] == "medium"
@@ -108,14 +108,14 @@ def test_chat_tools_sends_the_configured_effort(monkeypatch):
 
 
 def test_chat_tools_sends_no_effort_unless_configured(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_VLLM_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("AISCIENTIST_VLLM_REASONING_EFFORT", raising=False)
     sent = _capture(monkeypatch)
     vllm_client.chat_tools(1234, "m", [{"role": "user", "content": "hi"}], [])
     assert "reasoning_effort" not in sent["payload"]
 
 
 def test_chat_tools_explicit_effort_wins_and_never_goes_remote(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_VLLM_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT", "medium")
     sent = _capture(monkeypatch)
     vllm_client.chat_tools(1234, "m", [], [], reasoning_effort="low")
     assert sent["payload"]["reasoning_effort"] == "low"

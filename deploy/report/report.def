@@ -2,10 +2,10 @@ Bootstrap: docker
 From: pandoc/extra:latest
 
 # Report-render image for AiScientist (Phase 5 of the HPC3 offload). SlurmReportRenderer
-# (src/bioagent/gateway/slurm_report.py) runs `pandoc ... --pdf-engine=xelatex` inside this image
+# (src/aiscientist/gateway/slurm_report.py) runs `pandoc ... --pdf-engine=xelatex` inside this image
 # as a CPU Slurm job, so a multi-GB TeXLive + minutes of render never touch the eyeserver.
 #
-# DEPS-ONLY: pandoc is a self-contained binary and NO bioagent code runs here — so `--remote`
+# DEPS-ONLY: pandoc is a self-contained binary and NO AiScientist code runs here — so `--remote`
 # (Sylabs) builds work, and a report-format change (reporting/report.py) never needs an image rebuild.
 #
 # Base `pandoc/extra` already bundles pandoc + a TeXLive with XeLaTeX + common LaTeX packages +
@@ -36,7 +36,7 @@ From: pandoc/extra:latest
 
 %help
     pandoc + XeLaTeX report-render image for AiScientist on HPC3 (deps-only; tools bound at run time
-    is N/A here — pandoc needs no bioagent code). Per report the gateway runs:
+    is N/A here — pandoc needs no AiScientist code). Per report the gateway runs:
       singularity exec --containall --writable-tmpfs --net --network none -B <bundle>:<bundle> \
         report.sif pandoc <bundle>/report/report.md -o <bundle>/report/report.pdf \
           --pdf-engine=xelatex --toc --resource-path <bundle> ...

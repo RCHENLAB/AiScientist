@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from bioagent.gateway import system_info
+from aiscientist.gateway import system_info
 
 
 def test_overview_lists_agents_tools_capabilities_roadmap():

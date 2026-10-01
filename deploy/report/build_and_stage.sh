@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Build the pandoc/XeLaTeX report-render .sif for AiScientist (Phase 5) and stage it on dfs3b.
-# Deps-only (pandoc + texlive via the pandoc/extra base) — NO bioagent code, NO GPU. Build on
+# Deps-only (pandoc + texlive via the pandoc/extra base) — NO AiScientist code, NO GPU. Build on
 # HPC3 with `--remote` (no fakeroot there). This is the image SlurmReportRenderer runs pandoc in.
 set -euo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DFS_DIR="${BIOAGENT_CONTAINERS_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
+DFS_DIR="${AISCIENTIST_CONTAINERS_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
 SIF="${DFS_DIR}/report.sif"
 
 echo "== 1. Build report.sif — pick ONE route (then re-run with BUILT=1) =="
@@ -34,10 +37,10 @@ cat <<EOF
     "${SIF}" pandoc /work/t.md -o /work/t.pdf --pdf-engine=xelatex && echo "PDF OK"
 
 Then enable the HPC report path (in .env / HPCSettings):
-  BIOAGENT_REPORT_IMAGE=${SIF}
-  BIOAGENT_REPORT_ON_HPC=1     # render report.pdf/.docx as a CPU Slurm job (Phase 5)
-  BIOAGENT_CPU_PARTITION=standard
-  BIOAGENT_CPU_ACCOUNT=ruic20_lab
+  AISCIENTIST_REPORT_IMAGE=${SIF}
+  AISCIENTIST_REPORT_ON_HPC=1     # render report.pdf/.docx as a CPU Slurm job (Phase 5)
+  AISCIENTIST_CPU_PARTITION=standard
+  AISCIENTIST_CPU_ACCOUNT=ruic20_lab
 
 The report bundle (markdown + figures/tables) is staged to <lab_storage>/<user>/reports and the
 PDF/DOCX pulled back. If HPC is unreachable, rendering falls back to local pandoc on the eyeserver.

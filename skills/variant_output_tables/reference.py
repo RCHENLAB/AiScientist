@@ -14,7 +14,7 @@ import os
 from collections import Counter
 from pathlib import Path
 
-ART = Path(os.environ.get("BIOAGENT_ARTIFACTS", "."))
+ART = Path(os.environ.get("AISCIENTIST_ARTIFACTS", "."))
 TABLES = ART / "tables"
 DATA = ART / "data"
 TABLES.mkdir(parents=True, exist_ok=True)

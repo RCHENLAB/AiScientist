@@ -3,13 +3,13 @@
 # deploy_interactive.sh — coworker-friendly deploy. NO key / NO sudoers setup needed.
 #
 # You just type your own `<you>-admin` account password when prompted. It rsyncs YOUR
-# local working tree to the eyeserver and restarts the console as the `bioagent` service
+# local working tree to the eyeserver and restarts the console (systemd unit `bioagent`) as the `aiscientist` service
 # account. (For an automated/keyed/NOPASSWD deploy instead, use scripts/sync_deploy.sh.)
 #
 # How it avoids repeated password prompts:
 #   - one SSH "master" connection is opened (you type your SSH password ONCE);
 #   - your code is rsync'd to a staging dir you own (no sudo);
-#   - ONE `ssh -t` step runs as bioagent via sudo (you type your sudo password ONCE) to
+#   - ONE `ssh -t` step runs as aiscientist via sudo (you type your sudo password ONCE) to
 #     copy staging -> the app dir and restart.
 # So at most two prompts, both labelled. If your -admin account uses the same password for
 # login and sudo, it's just that one password, twice.
@@ -53,7 +53,7 @@ CONSOLE_PORT="${CONSOLE_PORT:-8800}"
 BIND_HOST="${BIND_HOST:-}"
 HEALTH_HOST="${HEALTH_HOST:-${BIND_HOST:-127.0.0.1}}"
 HOST_ENV=""
-[ -n "$BIND_HOST" ] && HOST_ENV="BIOAGENT_HOST=${BIND_HOST} "
+[ -n "$BIND_HOST" ] && HOST_ENV="AISCIENTIST_HOST=${BIND_HOST} "
 
 DELETE="--delete"; ALLOW_DIRTY=0
 while [ $# -gt 0 ]; do
@@ -81,7 +81,7 @@ if [ "$ALLOW_DIRTY" -eq 0 ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; t
 fi
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
-STAGE="/tmp/bioagent-deploy-${ADMIN_USER}"
+STAGE="/tmp/aiscientist-deploy-${ADMIN_USER}"
 say "deploy ${BRANCH}@${SHA}  ->  ${TARGET}:${APP_DIR}  (as ${SVC_USER}; delete=${DELETE:-off})"
 
 # --- shared excludes (protect server-only state from --delete) --------------
@@ -96,7 +96,7 @@ EXC=(); for p in "${PATTERNS[@]}"; do EXC+=(--exclude "$p"); done   # local rsyn
 EXC_STR=""; for p in "${PATTERNS[@]}"; do EXC_STR+=" --exclude '$p'"; done   # remote rsync (quoted)
 
 # --- 1. ONE ssh master connection (password #1: your SSH login) -------------
-CTL="$HOME/.ssh/cm-bioagent-$$"
+CTL="$HOME/.ssh/cm-aiscientist-$$"
 cleanup() { ssh -O exit -o ControlPath="$CTL" -p "$PORT" "$TARGET" 2>/dev/null || true; }
 trap cleanup EXIT
 say "[1/2] opening SSH connection — enter your ${ADMIN_USER} SSH password if asked ..."
@@ -111,8 +111,8 @@ say "syncing your local tree -> ${STAGE} (staging) ..."
 rsync -az --delete "${EXC[@]}" -e "ssh -o ControlPath=$CTL -p $PORT" \
   ./ "${TARGET}:${STAGE}/" || die "staging rsync failed."
 
-# --- 3. ONE privileged step as bioagent (password #2: your sudo) ------------
-# Written to a file on the server, then run under `sudo -u bioagent` with a TTY so the
+# --- 3. ONE privileged step as aiscientist (password #2: your sudo) ------------
+# Written to a file on the server, then run under `sudo -u aiscientist` with a TTY so the
 # sudo prompt works. It mirrors staging -> app (re-applying excludes so app's .env/DB/.git
 # survive --delete), reinstalls, and restarts the console.
 REMOTE_STEP="$(cat <<REMOTE
@@ -123,7 +123,7 @@ cd "${APP_DIR}"
 # Record what was deployed so local vs server can be compared.
 echo "${SHA} ${BRANCH} $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${APP_DIR}/.deployed_sha"
 # start.sh stops the old worker and starts a fresh one (prints a build fingerprint).
-# ${HOST_ENV} sets BIOAGENT_HOST (the internal node IP) so the restart binds where the ingress
+# ${HOST_ENV} sets AISCIENTIST_HOST (the internal node IP) so the restart binds where the ingress
 # expects; empty for a localhost dev deploy. Interpolated locally when this heredoc is built.
 ${HOST_ENV}setsid ./start.sh </dev/null >>"${ROOT_DIR}/console.log" 2>&1 &
 sleep 1

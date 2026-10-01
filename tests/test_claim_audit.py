@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents import claim_audit as ca
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import CriticVerdict, LabConfig, LabResult, LabRound, ResearchLab
+from aiscientist.agents import claim_audit as ca
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import CriticVerdict, LabConfig, LabResult, LabRound, ResearchLab
 
 # The real DDX41 profile's design facts (run 8847): one library per arm, 1.6x depth gap, snRNA-seq.
 DDX41 = {
@@ -89,7 +89,7 @@ def _round(i, answer):
 
 
 def test_synthesize_runs_the_audit_first_and_binds_the_writer(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_CLAIM_AUDIT", "1")
+    monkeypatch.setenv("AISCIENTIST_CLAIM_AUDIT", "1")
     calls: list = []
     ask = scripted_ask(calls)
     seen = {}
@@ -113,7 +113,7 @@ def test_synthesize_runs_the_audit_first_and_binds_the_writer(monkeypatch):
 
 
 def test_audit_can_be_switched_off(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_CLAIM_AUDIT", "0")
+    monkeypatch.setenv("AISCIENTIST_CLAIM_AUDIT", "0")
     seen = {}
 
     def complete(messages):
@@ -128,7 +128,7 @@ def test_audit_can_be_switched_off(monkeypatch):
 
 
 def test_technical_report_section_and_manuscript_block():
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     res = ca.audit(scripted_ask([]), "- Step 2 (DE): ...", "q", DDX41)
     lab_result = LabResult("q", [], [], True, 1, "", claim_audit=res)
     section = gw._claim_audit_section(lab_result)

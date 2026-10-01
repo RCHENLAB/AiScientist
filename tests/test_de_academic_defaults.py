@@ -23,11 +23,11 @@ import anndata as ad  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from bioagent.tools import catalog as tools_catalog  # noqa: E402
-from bioagent.tools.run_de import tool as run_de_tool
-from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
-from bioagent.tools._lib.scrna import PARAMS
-from bioagent.tools.run_de.tool import _significant_both_directions  # noqa: E402
+from aiscientist.tools import catalog as tools_catalog  # noqa: E402
+from aiscientist.tools.run_de import tool as run_de_tool
+from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from aiscientist.tools._lib.scrna import PARAMS
+from aiscientist.tools.run_de.tool import _significant_both_directions  # noqa: E402
 
 
 def _ctx(tmp_path, dataset):
@@ -170,7 +170,7 @@ def _four_sample(tmp_path):
 
 
 def _pseudobulk(tmp_path):
-    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
     ctx = _qc(tmp_path, _four_sample(tmp_path))
     return run_pseudobulk_de_tool.run_pseudobulk_de(
         {"sample_key": "orig.ident", "condition_key": "sampleid"}, ctx)
@@ -198,7 +198,7 @@ def test_pseudobulk_universe_is_what_was_tested(tmp_path):
 
 
 def test_pseudobulk_falls_back_loudly_when_deseq2_is_missing(tmp_path, monkeypatch):
-    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     def _no_deseq2(*_a, **_k):
         run_pseudobulk_de_tool._deseq2_contrast.last_error = "pydeseq2 is not installed"
@@ -217,9 +217,9 @@ def test_pseudobulk_falls_back_loudly_when_deseq2_is_missing(tmp_path, monkeypat
 
 def test_extreme_fc_flagged_as_detection_artifact(tmp_path):
     """|log2FC| >= 5 rows in a contrast raise the EXTREME FOLD-CHANGES warning (Col25a1 8.74)."""
-    from bioagent.tools import catalog as tools_catalog
-    from bioagent.tools.run_de import tool as run_de_tool
-    from bioagent.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+    from aiscientist.tools import catalog as tools_catalog
+    from aiscientist.tools.run_de import tool as run_de_tool
+    from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
     rows = [{"group": "Rod", "gene": "Col25a1", "log2fc": 8.74, "pval": 1e-9, "pval_adj": 1e-6, "score": 9.0},
             {"group": "Rod", "gene": "Rho", "log2fc": 0.4, "pval": 1e-4, "pval_adj": 0.01, "score": 3.0}]
@@ -231,7 +231,7 @@ def test_qc_noop_warns_prefiltered(tmp_path):
     import anndata as ad
     import numpy as np
     from pathlib import Path
-    from bioagent.tools.run_scanpy_qc.tool import run_scanpy_qc
+    from aiscientist.tools.run_scanpy_qc.tool import run_scanpy_qc
 
     rng = np.random.default_rng(0)
     x = rng.poisson(3.0, size=(60, 50)).astype("float32") + 1  # every cell passes every threshold

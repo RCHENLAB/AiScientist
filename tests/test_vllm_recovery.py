@@ -16,8 +16,8 @@ import pytest
 
 pytest.importorskip("fastapi")  # app.py imports fastapi; skip when the gateway extra isn't installed (CI offline)
 
-from bioagent.gateway import app as gw  # noqa: E402
-from bioagent.gateway.errors import VLLMNetworkError  # noqa: E402
+from aiscientist.gateway import app as gw  # noqa: E402
+from aiscientist.gateway.errors import VLLMNetworkError  # noqa: E402
 
 
 def _fake_conn() -> tuple[types.SimpleNamespace, list]:
@@ -39,7 +39,7 @@ def _fake_conn() -> tuple[types.SimpleNamespace, list]:
 
 
 def test_scientist_chat_heals_and_retries_once(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("AISCIENTIST_LLM_BASE_URL", raising=False)
     conn, _ = _fake_conn()
 
     calls = {"chat": 0, "ensure": 0}
@@ -74,7 +74,7 @@ def test_scientist_chat_heals_and_retries_once(monkeypatch):
 def test_recovery_reattaches_without_resubmit_when_tunnel_already_live(monkeypatch):
     """If the drop was transient and /v1 is reachable again by the time we hold the lock,
     heal is a no-op (no serve resubmit) and the retry just succeeds."""
-    monkeypatch.delenv("BIOAGENT_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("AISCIENTIST_LLM_BASE_URL", raising=False)
     conn, _ = _fake_conn()
     calls = {"chat": 0, "ensure": 0}
 
@@ -96,10 +96,10 @@ def test_recovery_reattaches_without_resubmit_when_tunnel_already_live(monkeypat
 
 
 def test_openrouter_base_url_does_not_heal(monkeypatch):
-    """The off-cluster test path (BIOAGENT_LLM_BASE_URL) has no tunnel to heal — a network
+    """The off-cluster test path (AISCIENTIST_LLM_BASE_URL) has no tunnel to heal — a network
     error must propagate unchanged, never touching Slurm."""
-    monkeypatch.setenv("BIOAGENT_LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("BIOAGENT_LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("AISCIENTIST_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("AISCIENTIST_LLM_API_KEY", "sk-test")
     conn, _ = _fake_conn()
     ensure_called = {"n": 0}
 
@@ -119,10 +119,10 @@ def test_openrouter_base_url_does_not_heal(monkeypatch):
 
 
 def test_serve_script_constraint_pins_gpu_flavour():
-    """BIOAGENT_SLURM_CONSTRAINT lets an operator pin the 80GB A100 so --max-model-len
+    """AISCIENTIST_SLURM_CONSTRAINT lets an operator pin the 80GB A100 so --max-model-len
     131072 fits (a bare gpu:A100:1 can land on a 40GB card where vLLM aborts at boot)."""
-    from bioagent.gateway import gpu
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway import gpu
+    from aiscientist.gateway.settings import HPCSettings
 
     off = gpu._serve_script(HPCSettings(), "tester")
     on = gpu._serve_script(HPCSettings(constraint="a100_80gb"), "tester")

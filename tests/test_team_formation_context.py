@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import LabConfig, ResearchLab
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 DATASET = {
     "cells": 21006, "genes": 33696,
@@ -108,7 +108,7 @@ def test_no_dataset_still_produces_a_usable_prompt(tmp_path):
 
 
 def test_the_design_meeting_sees_the_study_not_just_the_question(tmp_path):
-    from bioagent.agents.research_lab import Specialist
+    from aiscientist.agents.research_lab import Specialist
 
     cap: list = []
     lab = _lab(tmp_path, cap, skills=(_Skill("Differential expression"),))

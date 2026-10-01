@@ -34,8 +34,8 @@ SEED = 0
 # ----------------------------------------------------------------------------------------------
 
 rng = np.random.default_rng(SEED)
-work = Path(os.environ["BIOAGENT_WORK"])
-art = Path(os.environ["BIOAGENT_ARTIFACTS"])
+work = Path(os.environ["AISCIENTIST_WORK"])
+art = Path(os.environ["AISCIENTIST_ARTIFACTS"])
 tdir = art / "tables"; tdir.mkdir(parents=True, exist_ok=True)
 
 # Prefer the clustered checkpoint (has X_pca); else QC'd; else raw + compute PCA here.
@@ -43,7 +43,7 @@ for cand in ("adata_clustered.h5ad", "adata_qc.h5ad"):
     if (work / cand).exists():
         adata = sc.read_h5ad(work / cand); break
 else:
-    adata = sc.read_h5ad(os.environ["BIOAGENT_DATASET"])
+    adata = sc.read_h5ad(os.environ["AISCIENTIST_DATASET"])
 
 if PERT_KEY not in adata.obs:
     raise SystemExit(f"obs has no column {PERT_KEY!r}; available: {list(adata.obs.columns)}")

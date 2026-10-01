@@ -18,7 +18,7 @@ import os
 from collections import Counter
 from pathlib import Path
 
-ART = Path(os.environ.get("BIOAGENT_ARTIFACTS", "."))
+ART = Path(os.environ.get("AISCIENTIST_ARTIFACTS", "."))
 TABLES = ART / "tables"
 (ART / "data").mkdir(parents=True, exist_ok=True)
 
@@ -31,7 +31,7 @@ if not rows:
     raise SystemExit(f"{SRC} has no annotated variants.")
 
 # ADAPT: inheritance model sets the AF ceiling for "rare enough to be causal" (operon thresholds).
-DISEASE_MODEL = os.environ.get("BIOAGENT_DISEASE_MODEL", "dominant")   # "dominant" | "recessive"
+DISEASE_MODEL = os.environ.get("AISCIENTIST_DISEASE_MODEL", "dominant")   # "dominant" | "recessive"
 RARE_AF = {"dominant": 1e-4, "recessive": 1e-2}.get(DISEASE_MODEL, 1e-4)
 BA1_AF = 0.05                       # too common to be a rare-disease cause (ACMG BA1 stand-alone benign)
 LOF_CONSEQUENCES = ("frameshift", "stop_gained", "splice_donor", "splice_acceptor", "start_lost")

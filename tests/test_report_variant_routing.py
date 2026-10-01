@@ -15,7 +15,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw  # noqa: E402
+from aiscientist.gateway import app as gw  # noqa: E402
 
 
 def _variant_result():

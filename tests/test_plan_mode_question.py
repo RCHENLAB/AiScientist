@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-from bioagent.agents.research_lab import LabConfig, ResearchLab, classify_plan_reply
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_lab import LabConfig, ResearchLab, classify_plan_reply
 
 
 def test_english_questions_and_change_requests_are_told_apart():

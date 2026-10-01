@@ -3,18 +3,21 @@
 # scGPT has NO ready-made image to `singularity pull` — this is a BUILD, on HPC3 (or a
 # Linux+singularity host). macOS cannot build .sif.
 set -euo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DFS_DIR="${BIOAGENT_SCGPT_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
-MODEL_DIR="${BIOAGENT_SCGPT_MODEL_DIR:-/dfs3b/ruic20_lab/software/AiScientist/scgpt_model}"
+DFS_DIR="${AISCIENTIST_SCGPT_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
+MODEL_DIR="${AISCIENTIST_SCGPT_MODEL_DIR:-/dfs3b/ruic20_lab/software/AiScientist/scgpt_model}"
 SIF="${DFS_DIR}/scgpt.sif"
 # Where YOUR scGPT_refactor lives (it gets copied into the build context next to the .def).
-REFACTOR_SRC="${BIOAGENT_SCGPT_REFACTOR_SRC:-$HOME/scGPT_mwe/scGPT_refactor}"
+REFACTOR_SRC="${AISCIENTIST_SCGPT_REFACTOR_SRC:-$HOME/scGPT_mwe/scGPT_refactor}"
 
 echo "== 0. Stage the vendored harness into the build context =="
 # The .def's %files copies ./scGPT_refactor from the build context (this dir). Bring yours in.
 if [ ! -d "${HERE}/scGPT_refactor" ]; then
-    [ -d "${REFACTOR_SRC}" ] || { echo "MISSING ${REFACTOR_SRC} — set BIOAGENT_SCGPT_REFACTOR_SRC"; exit 1; }
+    [ -d "${REFACTOR_SRC}" ] || { echo "MISSING ${REFACTOR_SRC} — set AISCIENTIST_SCGPT_REFACTOR_SRC"; exit 1; }
     cp -a "${REFACTOR_SRC}" "${HERE}/scGPT_refactor"
     echo "copied ${REFACTOR_SRC} -> ${HERE}/scGPT_refactor"
 fi
@@ -50,8 +53,8 @@ cp -v "${HERE}/scgpt.sif" "${SIF}"
 cat <<EOF
 
 Done. Set these (in .env / HPCSettings) so the gateway finds the image:
-  BIOAGENT_SCGPT_IMAGE=${SIF}
-  BIOAGENT_SCGPT_ENTRYPOINT='python /opt/scgpt/run_infer.py'
+  AISCIENTIST_SCGPT_IMAGE=${SIF}
+  AISCIENTIST_SCGPT_ENTRYPOINT='python /opt/scgpt/run_infer.py'
   # model dir is passed per-run and bound read-only: ${MODEL_DIR}
 
 Smoke test on a gpu:1 job (after weights are staged):

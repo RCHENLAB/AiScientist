@@ -70,8 +70,8 @@ Use the template only when you need to change the PROCEDURE (a different first p
 confirmation step). Fetch it with
 `read_skill_reference("annotate_clusters_by_markers_v2", file="reference.py")`, **replace
 `PANEL` and `DISCRIMINATORS` with your tissue's markers** (the bundled ones are human retina),
-then execute via `run_code`. Reads checkpoints from `BIOAGENT_WORK`, writes under
-`BIOAGENT_ARTIFACTS`.
+then execute via `run_code`. Reads checkpoints from `AISCIENTIST_WORK`, writes under
+`AISCIENTIST_ARTIFACTS`.
 
 The labels are only as good as the panel. Search the literature for the canonical markers of
 the tissue in hand rather than reusing a panel from another tissue, and say in the write-up

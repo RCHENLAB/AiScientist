@@ -11,7 +11,7 @@ change-set.** The rebuild column is the point — a size and a path are not a ha
 ## Where everything lives
 
 ```
-/dfs3b/ruic20_lab/software/AiScientist/      <- our root (BIOAGENT_HPC_SHARED_ROOT)
+/dfs3b/ruic20_lab/software/AiScientist/      <- our root (AISCIENTIST_HPC_SHARED_ROOT)
 /dfs3b/ruic20_lab/software/bioagent          -> symlink to AiScientist  (back-compat, see below)
 /dfs3b/ruic20_lab/software/reference/        <- lab-shared reference dir (owner <ucinetid>), three of
                                                 its subdirs are ours
@@ -90,7 +90,7 @@ are kept on the cluster at `vep_annotation/_stage.log` (75 M) and `_stage.sh`.
 
 ## The literature line lives in a personal dir — the one real fragility
 
-`BIOAGENT_PAPERQA_*` in prod's `.env` points at **five paths inside `/dfs3b/ruic20_lab/<ucinetid>/`**,
+`AISCIENTIST_PAPERQA_*` in prod's `.env` points at **five paths inside `/dfs3b/ruic20_lab/<ucinetid>/`**,
 totalling ~6.6 GB:
 
 | path | size | what |
@@ -99,7 +99,7 @@ totalling ~6.6 GB:
 | `<ucinetid>/retigene/papers` | 3.6 G | the PDF corpus |
 | `<ucinetid>/retigene/index_pubmedbert` | 215 M | the PubMedBERT index |
 | `<ucinetid>/retigene/paperqa_manifest.csv` | 1.2 M | the manifest |
-| `<ucinetid>/retigene` | (root) | `BIOAGENT_PAPERQA_ROOT`, also holds `hf_cache` |
+| `<ucinetid>/retigene` | (root) | `AISCIENTIST_PAPERQA_ROOT`, also holds `hf_cache` |
 
 They are readable today (`<ucinetid>/` is `drwxr-s---`, group `r-x`), so prod works. But if that
 account reorganises or leaves, `deep_literature` silently drops to its `dependency_missing`

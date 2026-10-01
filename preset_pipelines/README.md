@@ -30,10 +30,10 @@ tools: <comma-separated registered tools this protocol composes>
  tools don't cover a step.>
 ```
 
-`src/bioagent/agents/presets.py` loads every `*/SKILL.md` here into the preset registry
+`src/aiscientist/agents/presets.py` loads every `*/SKILL.md` here into the preset registry
 (`name` → key, `description` → label, body → prompt, `tools:` → `ResearchPreset.tools`,
 `scripts/*.py` → `ResearchPreset.scripts`). **Adding a research path = dropping a new
-folder — no Python change.** Override the location with `BIOAGENT_SKILLS_DIR`.
+folder — no Python change.** Override the location with `AISCIENTIST_SKILLS_DIR`.
 
 ## scripts/ — reference code (CodeAct templates), surfaced by progressive disclosure
 
@@ -50,8 +50,8 @@ module docstring**, so start every `scripts/*.py` with a one-line `"""Reference 
 body, so make it decision-useful.
 
 Conventions a script may assume (set by the `run_code` sandbox): read the dataset from
-`BIOAGENT_DATASET`, checkpoints from `BIOAGENT_WORK` (`adata_qc.h5ad` → `adata_clustered.h5ad`
-→ `adata_de.h5ad`), and write figures/tables under `BIOAGENT_ARTIFACTS`. Scripts should
+`AISCIENTIST_DATASET`, checkpoints from `AISCIENTIST_WORK` (`adata_qc.h5ad` → `adata_clustered.h5ad`
+→ `adata_de.h5ad`), and write figures/tables under `AISCIENTIST_ARTIFACTS`. Scripts should
 **call the registered tools' outputs**, never reimplement what a tool already does.
 
 Because the body is never dumped into context, **script size is not a context cost** — a
@@ -66,7 +66,7 @@ AnnData and `.copy()`-s large subsets in a loop can exhaust host RAM and be OOM-
 (`returncode == -9`). So a script must keep peak memory modest: subset with a **view** (not
 `.copy()`), delete intermediates, and aggregate (pseudobulk) before heavy ops.
 
-Set `BIOAGENT_RUN_CODE_ON_HPC=1` to instead submit each snippet as a **Singularity-contained CPU
+Set `AISCIENTIST_RUN_CODE_ON_HPC=1` to instead submit each snippet as a **Singularity-contained CPU
 batch job on HPC3** (`SlurmCodeExecutor`), where CPU/RAM are effectively unlimited and
 `#SBATCH --mem` is a **real, cgroup-enforced cap** — an over-budget snippet fails cleanly as
 `OUT_OF_MEMORY` instead of taking down the shared server. The dataset is bind-mounted **read-only**;
@@ -86,15 +86,15 @@ falls back to the local sandbox. Example sbatch request it generates (CPU analys
 set -euo pipefail
 module load singularity/3.11.3 2>/dev/null || true
 singularity exec --containall --writable-tmpfs --net --network none \
-  -B "$BIOAGENT_DATASET":"$BIOAGENT_DATASET":ro \
-  -B "$BIOAGENT_WORK":"$BIOAGENT_WORK" -B "$BIOAGENT_ARTIFACTS":"$BIOAGENT_ARTIFACTS" \
+  -B "$AISCIENTIST_DATASET":"$AISCIENTIST_DATASET":ro \
+  -B "$AISCIENTIST_WORK":"$AISCIENTIST_WORK" -B "$AISCIENTIST_ARTIFACTS":"$AISCIENTIST_ARTIFACTS" \
   /dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif \
   bash -lc 'python $HOME/.bioagent/runcode/snippet_3.py > out 2> err; echo $? > rc'
 ```
 
-Tune with `BIOAGENT_RUN_CODE_MEM_GB` (default 64), `BIOAGENT_CPU_PARTITION`, `BIOAGENT_CPU_ACCOUNT`,
-`BIOAGENT_RUN_CODE_TIME_LIMIT`, `BIOAGENT_ANALYSIS_IMAGE`. A snippet reads the SAME
-`BIOAGENT_DATASET` / `BIOAGENT_WORK` / `BIOAGENT_ARTIFACTS` env vars either way, so scripts are
+Tune with `AISCIENTIST_RUN_CODE_MEM_GB` (default 64), `AISCIENTIST_CPU_PARTITION`, `AISCIENTIST_CPU_ACCOUNT`,
+`AISCIENTIST_RUN_CODE_TIME_LIMIT`, `AISCIENTIST_ANALYSIS_IMAGE`. A snippet reads the SAME
+`AISCIENTIST_DATASET` / `AISCIENTIST_WORK` / `AISCIENTIST_ARTIFACTS` env vars either way, so scripts are
 identical across the two backends.
 
 ## Boundary vs. tools

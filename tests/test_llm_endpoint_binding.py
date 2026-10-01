@@ -1,6 +1,6 @@
 """How a session's LLM choice binds to an endpoint — ``_lab_llm`` against saved credentials.
 
-The env-var path (``BIOAGENT_LLM_BASE_URL``) is covered in ``test_gateway_lab.py``; this file
+The env-var path (``AISCIENTIST_LLM_BASE_URL``) is covered in ``test_gateway_lab.py``; this file
 covers the product path, where the endpoint comes from the user's OWN stored API credential.
 
 The property worth naming: the key is resolved ONCE, at run start, and captured by the closures.
@@ -18,12 +18,12 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway import vllm_client  # noqa: E402
-from bioagent.gateway.errors import GatewayError  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway import vllm_client  # noqa: E402
+from aiscientist.gateway.errors import GatewayError  # noqa: E402
 
-_ENV = ("BIOAGENT_LLM_BASE_URL", "BIOAGENT_LLM_API_KEY", "BIOAGENT_LLM_MODEL",
-        "BIOAGENT_LAB_LLM_BASE_URL", "BIOAGENT_LAB_LLM_MODEL", "BIOAGENT_LAB_LLM_API_KEY")
+_ENV = ("AISCIENTIST_LLM_BASE_URL", "AISCIENTIST_LLM_API_KEY", "AISCIENTIST_LLM_MODEL",
+        "AISCIENTIST_LAB_LLM_BASE_URL", "AISCIENTIST_LAB_LLM_MODEL", "AISCIENTIST_LAB_LLM_API_KEY")
 
 
 class _Conn:
@@ -40,12 +40,12 @@ class _Conn:
 
 @pytest.fixture()
 def store(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("BIOAGENT_LLM_KEY_ENCRYPTION", raising=False)
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("AISCIENTIST_LLM_KEY_ENCRYPTION", raising=False)
     for v in _ENV:
         monkeypatch.delenv(v, raising=False)
 
-    from bioagent.gateway import llm_credentials
+    from aiscientist.gateway import llm_credentials
     importlib.reload(llm_credentials)
     return llm_credentials
 
@@ -120,8 +120,8 @@ def test_no_choice_still_uses_the_cluster_tunnel(store, calls):
 
 def test_a_credential_beats_the_env_fallback(store, calls, monkeypatch):
     """The env path was only ever a dev convenience; a user's own choice outranks it."""
-    monkeypatch.setenv("BIOAGENT_LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("BIOAGENT_LLM_API_KEY", "sk-server-wide")
+    monkeypatch.setenv("AISCIENTIST_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("AISCIENTIST_LLM_API_KEY", "sk-server-wide")
     cred = _cred(store)
 
     _, by_role = _drive(_Conn(credential_id=cred["id"]), calls)

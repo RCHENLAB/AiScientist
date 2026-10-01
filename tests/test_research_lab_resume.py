@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_lab import (
     CriticVerdict, LabConfig, LabResult, LabRound, ResearchLab, ResumeState)
 
 
@@ -134,7 +134,7 @@ def test_resume_modify_note_steers_the_resumed_step():
 def test_run_state_persist_round_trips_into_resume_state(tmp_path):
     import pytest
     pytest.importorskip("fastapi")
-    from bioagent.gateway import app as gw_app
+    from aiscientist.gateway import app as gw_app
 
     rounds = [LabRound(1, 1, "Run QC", "S", {"final_answer": "x"}, CriticVerdict("accept", 0.9, "ok")),
               LabRound(2, 2, "Cluster", "S", {"final_answer": "y"}, CriticVerdict("accept", 0.9, "ok"))]

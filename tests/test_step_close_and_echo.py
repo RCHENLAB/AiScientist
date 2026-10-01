@@ -2,8 +2,8 @@
 and steps that end their turn budget with an EMPTY final answer."""
 from __future__ import annotations
 
-from bioagent.agents.research_harness import ResearchHarness
-from bioagent.agents.research_lab import _drop_question_echo
+from aiscientist.agents.research_harness import ResearchHarness
+from aiscientist.agents.research_lab import _drop_question_echo
 
 Q = "What changes between DDX41 mutant and WT retina?"
 

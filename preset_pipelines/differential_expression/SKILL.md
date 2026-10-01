@@ -150,7 +150,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    paired/covariate, custom shared-signature rule): load the AnnData ONCE, and inside a
    per-cell-type loop subset with a **view** (`adata[mask]`) — do NOT `adata[mask].copy()` every
    cell type. On the local sandbox an over-budget loop is OOM-killed (`returncode == -9`); prefer
-   `BIOAGENT_RUN_CODE_ON_HPC=1` for a real `--mem` cap on large datasets. Keep the template's
+   `AISCIENTIST_RUN_CODE_ON_HPC=1` for a real `--mem` cap on large datasets. Keep the template's
    `de_<cell-type column>_all.csv` + `_universe.txt` writes — step 4 discovers DE results by
    exactly those names.
 
@@ -273,7 +273,7 @@ as hypotheses to validate, not established fact.
 **Pathway analysis: use `run_enrichment` / `run_gsea_prerank` when the design supports them, and
 when it does not, still take the gene sets from disk.** Both tools read `.gmt` libraries that are
 ALREADY ON DISK next to the tools — GO_Biological_Process_2023, Reactome_2022, MSigDB_Hallmark_2020
-(`BIOAGENT_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
+(`AISCIENTIST_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
 consume `run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
 replication forbids exactly those p-values and therefore often skips `run_de` entirely, which
 leaves both tools unusable through no fault of the plan. That is NOT a reason to go to the network:

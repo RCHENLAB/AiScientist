@@ -17,8 +17,8 @@ Three coordinated changes are pinned here:
 from __future__ import annotations
 
 
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.research_lab import (
     _MEETING_SYNTH_SYSTEM,
     _MEETING_TOOLS,
     CriticVerdict,
@@ -160,7 +160,7 @@ def test_low_scores_still_push_back_hard():
 def _tool_lab(tmp_path, chat_fn, *, catalog_names=("inspect_dataset", "literature_search",
                                                    "run_de", "run_code")):
     """A lab whose Scientist exposes a catalog, so `_expert_turns` takes its TOOL branch."""
-    from bioagent.agents.research_harness import HarnessTool
+    from aiscientist.agents.research_harness import HarnessTool
 
     tools = [HarnessTool(n, f"{n} desc", {"type": "object", "properties": {}},
                          lambda a, c, _n=n: {"status": "ok", "tool": _n})

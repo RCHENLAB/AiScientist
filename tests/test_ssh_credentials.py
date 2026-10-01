@@ -28,10 +28,10 @@ class _FakeExec:
 
 @pytest.fixture()
 def sc(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
     import importlib
 
-    from bioagent.gateway import ssh_credentials
+    from aiscientist.gateway import ssh_credentials
     importlib.reload(ssh_credentials)
     return ssh_credentials
 
@@ -75,7 +75,7 @@ def test_create_and_deploy_then_list_get_delete(sc):
 
 
 def test_deploy_failure_raises(sc):
-    from bioagent.gateway.errors import GatewayError
+    from aiscientist.gateway.errors import GatewayError
     ex = _FakeExec(exit_status=1)
     with pytest.raises(GatewayError):
         sc.create_and_deploy("yijun", ex, host="h", hpc_user="u")
@@ -85,18 +85,18 @@ def test_a_saved_ssh_key_survives_the_store_moving(tmp_path, monkeypatch):
     """Same trap as the LLM store, with a worse blast radius: this key_path goes to paramiko, so a
     stale one costs every user their key login and drops them back to password + Duo."""
     import importlib, shutil
-    from bioagent.gateway import ssh_credentials as sc
+    from aiscientist.gateway import ssh_credentials as sc
 
     old_root = tmp_path / "old"
     old_root.mkdir()
     monkeypatch.chdir(old_root)
-    monkeypatch.delenv("BIOAGENT_STATE_DIR", raising=False)
+    monkeypatch.delenv("AISCIENTIST_STATE_DIR", raising=False)
     importlib.reload(sc)
     cred = sc.create_and_deploy("alice", _FakeExec(), host="hpc3.rcic.uci.edu", hpc_user="alice")
 
     new_root = tmp_path / "new"
     shutil.copytree(old_root / "ssh_creds", new_root / "ssh_creds")
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(new_root))
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(new_root))
     monkeypatch.chdir(tmp_path)
     importlib.reload(sc)
 

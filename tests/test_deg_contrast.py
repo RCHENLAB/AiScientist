@@ -28,8 +28,8 @@ import numpy as np  # noqa: E402
 import anndata as ad  # noqa: E402
 import scanpy as sc  # noqa: E402
 
-from bioagent.tools.run_de import tool as run_de_tool  # noqa: E402
-from bioagent.tools.run_enrichment import tool as run_enrichment_tool
+from aiscientist.tools.run_de import tool as run_de_tool  # noqa: E402
+from aiscientist.tools.run_enrichment import tool as run_enrichment_tool
 
 
 N_GENES = 200
@@ -250,7 +250,7 @@ def test_enrichment_finds_the_contrast_table_and_splits_by_direction(ctx, tmp_pa
         "UP_PROGRAMME\tna\t" + "\t".join(UP_IN_KO) + "\n"
         "DOWN_PROGRAMME\tna\t" + "\t".join(DOWN_IN_KO) + "\n",
         encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
 
     out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestSets"], "top_n_terms": 5}, ctx)
 
@@ -271,7 +271,7 @@ def test_pseudobulk_writes_the_table_enrichment_discovers(tmp_path):
     ONLY as pseudobulk_all.csv, which run_enrichment does not look for — so the RECOMMENDED path
     silently lost per-cell-type enrichment and its ORA background."""
     pytest.importorskip("scipy")
-    from bioagent.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
+    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     work = tmp_path / "work"
     _synthetic_qc_checkpoint(work, n_per_arm=40)
@@ -306,7 +306,7 @@ def test_enrichment_reports_no_significant_genes_instead_of_asking_for_a_gene_li
     gdir.mkdir()
     (gdir / "TestSets.gmt").write_text("UP_PROGRAMME\tna\t" + "\t".join(UP_IN_KO) + "\n",
                                        encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     # A contrast that finds nothing: no cell type clears min_cells, so the combined table is empty.
     run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 1000},
@@ -327,7 +327,7 @@ def test_a_stub_gmt_is_refused_not_silently_enriched_against(ctx, monkeypatch, t
     gdir = tmp_path / "genesets"
     gdir.mkdir()
     (gdir / "GO_Biological_Process_2023.gmt").write_text("term\tdesc\tRHO\tPDE6A\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)
@@ -348,7 +348,7 @@ def test_a_real_library_reports_its_term_count(ctx, monkeypatch, tmp_path):
     gdir.mkdir()
     lines = [f"SET_{i}\tna\t" + "\t".join(UP_IN_KO) for i in range(20)]
     (gdir / "TestSets.gmt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    monkeypatch.setenv("BIOAGENT_GENESETS_DIR", str(gdir))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
     run_de_tool.run_de(
         {"groupby": "condition", "reference": "WT", "stratify_by": "celltype", "min_cells": 10},
         ctx)

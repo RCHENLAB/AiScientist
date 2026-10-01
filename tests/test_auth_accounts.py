@@ -22,12 +22,12 @@ pytest.importorskip("sqlalchemy")
 def app_ctx(tmp_path, monkeypatch):
     """Fresh SQLite DB + a clean engine + a bootstrapped admin, with a TestClient."""
     pytest.importorskip("httpx")
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
-    monkeypatch.setenv("BIOAGENT_SECRET_KEY", "test-secret-key")
-    monkeypatch.setenv("BIOAGENT_ADMIN_USER", "root")
-    monkeypatch.setenv("BIOAGENT_ADMIN_PASSWORD", "rootpass1")
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")
+    monkeypatch.setenv("AISCIENTIST_SECRET_KEY", "test-secret-key")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_USER", "root")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_PASSWORD", "rootpass1")
 
-    from bioagent.gateway import auth, auth_routes, db, models  # noqa: F401
+    from aiscientist.gateway import auth, auth_routes, db, models  # noqa: F401
     importlib.reload(db)            # rebuild Base/engine bound to the temp URL
     importlib.reload(models)
     importlib.reload(auth)
@@ -48,14 +48,14 @@ def _login(client, username, password):
 
 
 def test_password_hash_roundtrip_and_rejects_wrong():
-    from bioagent.gateway import auth
+    from aiscientist.gateway import auth
     h = auth.hash_password("hunter2")
     assert h != "hunter2" and auth.verify_password("hunter2", h)
     assert not auth.verify_password("wrong", h)
 
 
 def test_session_token_signed_and_tamper_proof():
-    from bioagent.gateway import auth
+    from aiscientist.gateway import auth
     tok = auth.make_session_token(42)
     assert auth.read_session_token(tok) == 42
     assert auth.read_session_token(tok + "x") is None          # tampered → rejected
@@ -180,23 +180,23 @@ def test_cli_create_admin_helper_creates_then_promotes(app_ctx):
 
 
 def test_bootstrap_prefers_password_hash_no_plaintext(tmp_path, monkeypatch):
-    # Seeding from BIOAGENT_ADMIN_PASSWORD_HASH means NO plaintext is ever needed.
+    # Seeding from AISCIENTIST_ADMIN_PASSWORD_HASH means NO plaintext is ever needed.
     # auth_routes imports fastapi and db/models import sqlalchemy — both heavier
     # extras the lightweight CI does not install; skip there (like the app_ctx tests).
     pytest.importorskip("sqlalchemy")
     pytest.importorskip("fastapi")
     import importlib
-    monkeypatch.setenv("BIOAGENT_DATABASE_URL", f"sqlite:///{(tmp_path / 'h.db').as_posix()}")
-    monkeypatch.setenv("BIOAGENT_SECRET_KEY", "k")
-    from bioagent.gateway import auth, auth_routes, db, models
+    monkeypatch.setenv("AISCIENTIST_DATABASE_URL", f"sqlite:///{(tmp_path / 'h.db').as_posix()}")
+    monkeypatch.setenv("AISCIENTIST_SECRET_KEY", "k")
+    from aiscientist.gateway import auth, auth_routes, db, models
     for mod in (db, models, auth, auth_routes):
         importlib.reload(mod)
     db.reset(f"sqlite:///{(tmp_path / 'h.db').as_posix()}")
     db.init_db()
     pw_hash = auth.hash_password("seeded-secret")
-    monkeypatch.setenv("BIOAGENT_ADMIN_USER", "hashadmin")
-    monkeypatch.setenv("BIOAGENT_ADMIN_PASSWORD_HASH", pw_hash)
-    monkeypatch.delenv("BIOAGENT_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("AISCIENTIST_ADMIN_USER", "hashadmin")
+    monkeypatch.setenv("AISCIENTIST_ADMIN_PASSWORD_HASH", pw_hash)
+    monkeypatch.delenv("AISCIENTIST_ADMIN_PASSWORD", raising=False)
     assert auth_routes.ensure_bootstrap_admin() == "hashadmin"
     assert auth_routes.ensure_bootstrap_admin() is None      # idempotent
 
@@ -211,14 +211,14 @@ def test_bootstrap_prefers_password_hash_no_plaintext(tmp_path, monkeypatch):
 
 def test_secure_cookies_follows_public_https_env(monkeypatch):
     """Session cookies are marked Secure only when the console is served behind HTTPS."""
-    from bioagent.gateway import auth
+    from aiscientist.gateway import auth
 
-    monkeypatch.delenv("BIOAGENT_PUBLIC_HTTPS", raising=False)
+    monkeypatch.delenv("AISCIENTIST_PUBLIC_HTTPS", raising=False)
     assert auth.secure_cookies() is False
     for on in ("1", "true", "YES"):
-        monkeypatch.setenv("BIOAGENT_PUBLIC_HTTPS", on)
+        monkeypatch.setenv("AISCIENTIST_PUBLIC_HTTPS", on)
         assert auth.secure_cookies() is True
-    monkeypatch.setenv("BIOAGENT_PUBLIC_HTTPS", "0")
+    monkeypatch.setenv("AISCIENTIST_PUBLIC_HTTPS", "0")
     assert auth.secure_cookies() is False
 
 
@@ -268,8 +268,8 @@ def test_an_interrupted_run_keeps_a_summary_it_already_had(app_ctx):
     uid = client.get("/api/auth/me").json()["user"]["id"]
     routes.record_run_start(uid, "run_spoke", "q", plan_mode=False)
 
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import Run
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import Run
     from sqlalchemy import select
     with session_scope() as s:
         s.scalar(select(Run).where(Run.run_id == "run_spoke")).summary = "got to step 4"

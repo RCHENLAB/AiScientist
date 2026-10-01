@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness
-from bioagent.integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
+from aiscientist.integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
 
 _BLOCK = DataBoundaryPolicy(allow_raw_data_to_llm=False)
 _ALLOW = DataBoundaryPolicy(allow_raw_data_to_llm=True)
@@ -148,7 +148,7 @@ def test_no_tunnel_and_no_flag_is_still_strict():
 
 
 def test_endpoint_is_off_host_classifies_conservatively():
-    from bioagent.integrations.safety import endpoint_is_off_host as _endpoint_is_off_host
+    from aiscientist.integrations.safety import endpoint_is_off_host as _endpoint_is_off_host
     # the session's own tunnel / an explicit loopback URL stays on the box
     assert _endpoint_is_off_host(None) is False
     assert _endpoint_is_off_host("http://127.0.0.1:11434/v1") is False

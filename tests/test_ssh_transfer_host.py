@@ -17,8 +17,8 @@ import pytest
 
 pytest.importorskip("paramiko")
 
-from bioagent.gateway.ssh_gateway import SSHExecutor  # noqa: E402
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.gateway.ssh_gateway import SSHExecutor  # noqa: E402
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 class _FakeRemoteFile:
@@ -125,7 +125,7 @@ def dtn(monkeypatch):
     """Make the transfer-host connection succeed, and hand back the client it produces."""
     import paramiko
 
-    from bioagent.gateway import ssh_gateway
+    from aiscientist.gateway import ssh_gateway
 
     made: list[_FakeClient] = []
     dialed: list[tuple[str, int]] = []
@@ -266,7 +266,7 @@ def test_password_session_falls_back_and_warns_once(dtn):
 
 
 def test_unreachable_transfer_host_falls_back_and_stops_retrying(monkeypatch):
-    from bioagent.gateway import ssh_gateway
+    from aiscientist.gateway import ssh_gateway
 
     attempts: list[tuple[str, int]] = []
 
@@ -287,7 +287,7 @@ def test_unreachable_transfer_host_falls_back_and_stops_retrying(monkeypatch):
 
 
 def test_opting_out_uses_the_login_node_silently(dtn):
-    """BIOAGENT_HPC_TRANSFER_HOST="" is a deliberate choice, so it gets no warning."""
+    """AISCIENTIST_HPC_TRANSFER_HOST="" is a deliberate choice, so it gets no warning."""
     ex = _executor(transfer_host="")
     ex.put_file("/local/a", "/dfs3b/a")
     assert ex._client.puts == [("/local/a", "/dfs3b/a")]
@@ -306,17 +306,17 @@ def test_close_tears_down_both_connections(dtn):
 
 
 def test_transfer_host_defaults_to_the_rcic_data_transfer_node(monkeypatch):
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
-    monkeypatch.delenv("BIOAGENT_HPC_TRANSFER_HOST", raising=False)
+    monkeypatch.delenv("AISCIENTIST_HPC_TRANSFER_HOST", raising=False)
     assert HPCSettings.from_env().transfer_host == "access-hpc3.rcic.uci.edu"
 
 
 def test_transfer_host_is_overridable_and_can_be_disabled(monkeypatch):
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
-    monkeypatch.setenv("BIOAGENT_HPC_TRANSFER_HOST", "dtn.example.edu")
+    monkeypatch.setenv("AISCIENTIST_HPC_TRANSFER_HOST", "dtn.example.edu")
     assert HPCSettings.from_env().transfer_host == "dtn.example.edu"
 
-    monkeypatch.setenv("BIOAGENT_HPC_TRANSFER_HOST", "")
+    monkeypatch.setenv("AISCIENTIST_HPC_TRANSFER_HOST", "")
     assert HPCSettings.from_env().transfer_host == ""

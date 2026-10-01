@@ -8,7 +8,7 @@ Requirements (heavy, optional — installed in the analysis image, NOT the gatew
   mamba install -c conda-forge -c bioconda -c tiledb tiledbvcf-py bcftools
 Ingested VCFs must be **single-sample** and **indexed** (.tbi via tabix or .csi via bcftools):
   bgzip sample.vcf && tabix -p vcf sample.vcf.gz
-Env conventions (see skills/README): BIOAGENT_WORK for the dataset dir, BIOAGENT_ARTIFACTS for exports.
+Env conventions (see skills/README): AISCIENTIST_WORK for the dataset dir, AISCIENTIST_ARTIFACTS for exports.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from pathlib import Path
 
 import tiledbvcf  # provided by the analysis image; do NOT import in the gateway env
 
-WORK = Path(os.environ.get("BIOAGENT_WORK", "."))
-ARTIFACTS = Path(os.environ.get("BIOAGENT_ARTIFACTS", "."))
+WORK = Path(os.environ.get("AISCIENTIST_WORK", "."))
+ARTIFACTS = Path(os.environ.get("AISCIENTIST_ARTIFACTS", "."))
 DATASET_URI = str(WORK / "variant_db")           # a local dir (or an s3:// / az:// / gs:// URI)
 
 # --- 1. Create the dataset once, then ingest samples incrementally --------------------------------

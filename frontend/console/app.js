@@ -2830,7 +2830,7 @@ async function sendChat(e) {
   // Bypass mode overrides plan review — don't also send plan_mode=true (avoids a stale plan card).
   const plan_mode = !autonomous && !!($("planMode") && $("planMode").checked);
   // DAG is the default execution model now (dependency-graph + Coordinator; no UI toggle). The
-  // classic linear order is still reachable server-side via BIOAGENT_PLANNER=linear.
+  // classic linear order is still reachable server-side via AISCIENTIST_PLANNER=linear.
   const planner = "dag";
   try {
     // The research lab (PI→Scientist→Critic + real scanpy/gseapy tools) is the one execution path.

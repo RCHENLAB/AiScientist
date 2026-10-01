@@ -15,8 +15,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway.app import Connection  # noqa: E402
-from bioagent.gateway.settings import HPCSettings  # noqa: E402
+from aiscientist.gateway.app import Connection  # noqa: E402
+from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 def _conn():

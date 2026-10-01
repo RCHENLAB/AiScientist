@@ -12,7 +12,7 @@ not merely on disk:
 
 from __future__ import annotations
 
-from bioagent.agents import skills
+from aiscientist.agents import skills
 
 V1 = "annotate_clusters_by_markers"
 V2 = "annotate_clusters_by_markers_v2"

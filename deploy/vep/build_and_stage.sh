@@ -16,18 +16,21 @@
 #         download commands can:
 #           ssh <ucinetid>@access-hpc3.rcic.uci.edu "wget -P <dest> <url>"
 #
-# The image is DEPS-ONLY (vep + bcftools + python3). The bioagent TOOLS are synced to dfs3b +
+# The image is DEPS-ONLY (vep + bcftools + python3). The AiScientist TOOLS are synced to dfs3b +
 # bind-mounted at run time (like the analysis line), so a tool edit needs no rebuild. The CACHE and
 # ClinVar VCFs are large and versioned, so they are staged SEPARATELY here and bind-mounted read-only.
 set -euo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VEP_RELEASE="${VEP_RELEASE:-112}"                 # MUST match the release_NNN.0 tag in vep.def
-DFS_ROOT="${BIOAGENT_DFS_ROOT:-/dfs3b/ruic20_lab/software/AiScientist}"
-DFS_DIR="${BIOAGENT_CONTAINERS_DIR:-${DFS_ROOT}/containers}"
+DFS_ROOT="${AISCIENTIST_DFS_ROOT:-/dfs3b/ruic20_lab/software/AiScientist}"
+DFS_DIR="${AISCIENTIST_CONTAINERS_DIR:-${DFS_ROOT}/containers}"
 # Annotation DBs go in the lab's SHARED reference dir (download-once, reuse across projects), NOT
 # under the bioagent-private DFS_ROOT. The vep.sif container stays under DFS_ROOT/containers.
-CACHE_ROOT="${BIOAGENT_VEP_CACHE_ROOT:-/dfs3b/ruic20_lab/software/reference/vep_annotation}"
+CACHE_ROOT="${AISCIENTIST_VEP_CACHE_ROOT:-/dfs3b/ruic20_lab/software/reference/vep_annotation}"
 SIF="${DFS_DIR}/vep.sif"
 ENSEMBL="https://ftp.ensembl.org/pub/release-${VEP_RELEASE}/variation/indexed_vep_cache"
 CLINVAR="https://ftp.ncbi.nlm.nih.gov/pub/clinvar"
@@ -108,17 +111,17 @@ EOF
 
 echo "== 5. Enable the offline variant line (in .env / HPCSettings) =="
 cat <<EOF
-  BIOAGENT_VEP_IMAGE=${SIF}
-  BIOAGENT_VEP_CACHE_DIR_GRCH38=${CACHE_ROOT}/GRCh38
-  BIOAGENT_VEP_CACHE_DIR_GRCH37=${CACHE_ROOT}/GRCh37
-  BIOAGENT_VEP_CLINVAR_GRCH38=${CACHE_ROOT}/clinvar_GRCh38.vcf.gz
-  BIOAGENT_VEP_CLINVAR_GRCH37=${CACHE_ROOT}/clinvar_GRCh37.vcf.gz
-  BIOAGENT_VEP_ASSEMBLY=GRCh38          # default; the LLM can override per call
-  BIOAGENT_VEP_FORK=8                   # == cpus-per-task on the CPU node
-  BIOAGENT_VARIANT_ON_HPC=1             # route annotate_variants to the offline HPC3 line
-  BIOAGENT_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
+  AISCIENTIST_VEP_IMAGE=${SIF}
+  AISCIENTIST_VEP_CACHE_DIR_GRCH38=${CACHE_ROOT}/GRCh38
+  AISCIENTIST_VEP_CACHE_DIR_GRCH37=${CACHE_ROOT}/GRCh37
+  AISCIENTIST_VEP_CLINVAR_GRCH38=${CACHE_ROOT}/clinvar_GRCh38.vcf.gz
+  AISCIENTIST_VEP_CLINVAR_GRCH37=${CACHE_ROOT}/clinvar_GRCh37.vcf.gz
+  AISCIENTIST_VEP_ASSEMBLY=GRCh38          # default; the LLM can override per call
+  AISCIENTIST_VEP_FORK=8                   # == cpus-per-task on the CPU node
+  AISCIENTIST_VARIANT_ON_HPC=1             # route annotate_variants to the offline HPC3 line
+  AISCIENTIST_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
 
-The bioagent TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway and bind-mounted in — a
+The AiScientist TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway and bind-mounted in — a
 tool edit needs only a code deploy, NOT an image rebuild. If HPC is unreachable (or the tool sync
 fails), annotate_variants falls back to the REST path in-process (fine for small VCFs).
 EOF

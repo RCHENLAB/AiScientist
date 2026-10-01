@@ -18,8 +18,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.agents.research_lab import CriticVerdict, LabResult, LabRound  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.agents.research_lab import CriticVerdict, LabResult, LabRound  # noqa: E402
 
 
 # --- _select_bound_datasets: the one place legacy + bind-set are reconciled -------------------

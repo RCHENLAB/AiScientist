@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.dag import (
+from aiscientist.agents.dag import (
     LabPlan,
     TaskNode,
     lift_agenda_to_dag,

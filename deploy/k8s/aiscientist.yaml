@@ -19,15 +19,15 @@ type: Opaque
 stringData:
   # Signs session cookies — MUST be strong & unique (NOT a default). Generate with:
   #   python -c "import secrets; print(secrets.token_urlsafe(48))"
-  BIOAGENT_SECRET_KEY: "<strong-random-secret>"
-  BIOAGENT_PUBLIC_HTTPS: "1"                 # marks session cookies Secure (HTTPS-only)
+  AISCIENTIST_SECRET_KEY: "<strong-random-secret>"
+  AISCIENTIST_PUBLIC_HTTPS: "1"                 # marks session cookies Secure (HTTPS-only)
   # PostgreSQL is REQUIRED (NOT SQLite) — UCI-wide / multi-project use needs real concurrency.
   # Point this at a dedicated PG (in-cluster StatefulSet with its own PVC, or managed):
-  BIOAGENT_DATABASE_URL: "postgresql+psycopg://bioagent:<db-password>@<pg-service>:5432/bioagent"
+  AISCIENTIST_DATABASE_URL: "postgresql+psycopg://bioagent:<db-password>@<pg-service>:5432/bioagent"
   # First admin — seed from a BCRYPT HASH, never a plaintext/default password:
-  #   bioagent-admin hash       # prompts, prints a bcrypt hash to paste here
-  BIOAGENT_ADMIN_USER: "<admin-username>"
-  BIOAGENT_ADMIN_PASSWORD_HASH: "<bcrypt-hash>"
+  #   aiscientist-admin hash       # prompts, prints a bcrypt hash to paste here
+  AISCIENTIST_ADMIN_USER: "<admin-username>"
+  AISCIENTIST_ADMIN_PASSWORD_HASH: "<bcrypt-hash>"
   # HPC3 / vLLM connection settings as already configured (host, account, image, etc.)
 ---
 apiVersion: v1

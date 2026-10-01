@@ -7,8 +7,8 @@ from ``cat``. No real Slurm, no SSH.
 
 from __future__ import annotations
 
-from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
-from bioagent.gateway.executor import ExecResult
+from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
+from aiscientist.gateway.executor import ExecResult
 
 
 class FakeHPC:
@@ -28,7 +28,7 @@ class FakeHPC:
 
     def exec(self, command, timeout=60.0):
         cmd = command.strip()
-        if "BIOAGENT_SNIPPET_EOF" in cmd:
+        if "AISCIENTIST_SNIPPET_EOF" in cmd:
             self.staged_snippet = cmd
             return self._ok()
         if cmd.startswith("mkdir") or ("cat >" in cmd and "<<" in cmd):
@@ -125,7 +125,7 @@ def test_empty_code_rejected():
 def test_stop_cancels_the_runcode_job_without_fallback(monkeypatch):
     # When Stop scancels the in-flight run_code job (JobCancelled), the executor must NOT drop to
     # the local fallback (which would re-run the snippet and defeat Stop) — it returns cancelled.
-    from bioagent.gateway.slurm_job import JobCancelled
+    from aiscientist.gateway.slurm_job import JobCancelled
     called = {"fallback": False}
     ex = SlurmCodeExecutor(
         remote=object(), container_image="/img.sif",
@@ -147,7 +147,7 @@ def test_stop_cancels_the_runcode_job_without_fallback(monkeypatch):
 # cite tables that existed the whole time.
 
 def test_classify_written_uses_the_keys_the_harness_already_collects():
-    from bioagent.gateway.slurm_sandbox import classify_written
+    from aiscientist.gateway.slurm_sandbox import classify_written
 
     out = classify_written([
         "tables/depth_overlap.csv", "figures/umap_by_arm.png",
@@ -159,14 +159,14 @@ def test_classify_written_uses_the_keys_the_harness_already_collects():
 
 
 def test_job_logs_are_not_offered_as_scientific_evidence():
-    from bioagent.gateway.slurm_sandbox import classify_written
+    from aiscientist.gateway.slurm_sandbox import classify_written
 
     # process/ holds the job's own stdout/stderr — scaffolding, not backing for a claim.
     assert classify_written(["process/runcode_7.log"]) == {}
 
 
 def test_nothing_written_declares_nothing():
-    from bioagent.gateway.slurm_sandbox import classify_written
+    from aiscientist.gateway.slurm_sandbox import classify_written
 
     # An empty key would read as "this step produced an empty table set", which is a different
     # and false claim from "this step produced nothing".
@@ -175,7 +175,7 @@ def test_nothing_written_declares_nothing():
 
 def _executor_with_remote(listings):
     """A SlurmCodeExecutor whose remote returns the queued `find` listings in order."""
-    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
     class _Out:
         def __init__(self, text): self.stdout = text
@@ -212,7 +212,7 @@ def test_untouched_files_from_earlier_steps_are_not_claimed():
 
 
 def test_a_broken_find_reports_no_evidence_rather_than_failing_the_snippet():
-    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
     class _Remote:
         def exec(self, cmd): raise OSError("ssh died")
@@ -225,8 +225,8 @@ def test_a_broken_find_reports_no_evidence_rather_than_failing_the_snippet():
 
 def test_the_declared_paths_are_what_evidence_pointers_collects():
     """The point of reusing these key names: nothing downstream needs to change."""
-    from bioagent.agents.research_harness import evidence_pointers
-    from bioagent.gateway.slurm_sandbox import classify_written
+    from aiscientist.agents.research_harness import evidence_pointers
+    from aiscientist.gateway.slurm_sandbox import classify_written
 
     result = {"status": "ok", "returncode": 0, "stdout": "…"}
     result.update(classify_written(["tables/depth_overlap.csv", "figures/umap_by_arm.png"]))
@@ -242,7 +242,7 @@ def test_the_declared_paths_are_what_evidence_pointers_collects():
 # size, so one step writing a large checkpoint turns it from wasteful into slow.
 
 def _sync_executor(tmp_path, remote_files, fetch_log):
-    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
     class _Out:
         def __init__(self, text): self.stdout = text
@@ -299,7 +299,7 @@ def test_no_changed_list_still_mirrors_everything(tmp_path):
 
 
 def test_sync_is_a_no_op_without_a_local_target(tmp_path):
-    from bioagent.gateway.slurm_sandbox import SlurmCodeExecutor
+    from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
     class _Remote:
         def exec(self, cmd): raise AssertionError("must not touch the cluster")

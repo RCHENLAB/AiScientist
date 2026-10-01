@@ -47,7 +47,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        # The gateway extra is NOT optional here. `bioagent.gateway.app` imports fastapi AND
+        # The gateway extra is NOT optional here. `aiscientist.gateway.app` imports fastapi AND
         # paramiko at module scope, and ~21 test modules import a pure helper out of it
         # (_is_conversational_turn, the report record sections, _delete_run_dir's confinement to
         # the results root). Without the extra those imports raise during COLLECTION, which pytest

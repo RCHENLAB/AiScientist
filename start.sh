@@ -2,24 +2,24 @@
 #
 # Start the AiScientist console (the web server). Run this AFTER ./deploy.sh.
 #
-# Run as the service account (<ucinetid> in dev, bioagent in prod) — NOT root.
+# Run as the service account (<ucinetid> in dev, aiscientist in prod) — NOT root.
 # The process keeps running and listening until you stop it (Ctrl-C). For an
 # always-on, auto-restart production service, use systemd instead (see below).
 #
 # On start it first STOPS any previous AiScientist console (so you never stack
 # workers on the same port) and prints a code fingerprint so you can tell which
-# build is live. Set BIOAGENT_NO_KILL=1 to skip the stop step.
+# build is live. Set AISCIENTIST_NO_KILL=1 to skip the stop step.
 #
 # Configurable via the same env vars as deploy.sh:
-#     BIOAGENT_ROOT  base dir   (default /data/BioAgent)
-#     BIOAGENT_APP   app dir    (default $ROOT/app)
-#     BIOAGENT_ENV   venv dir   (default $ROOT/env)
-#     BIOAGENT_HOST  bind host  (default 127.0.0.1 — localhost only, SAFE)
-#     BIOAGENT_PORT  bind port  (default 8800)
+#     AISCIENTIST_ROOT  base dir   (default /data/BioAgent)
+#     AISCIENTIST_APP   app dir    (default $ROOT/app)
+#     AISCIENTIST_ENV   venv dir   (default $ROOT/env)
+#     AISCIENTIST_HOST  bind host  (default 127.0.0.1 — localhost only, SAFE)
+#     AISCIENTIST_PORT  bind port  (default 8800)
 #
 # SECURITY: the default 127.0.0.1 binds localhost only, so the console is NOT
 # reachable from the network — reach it through an SSH tunnel (below) or an nginx
-# reverse proxy. Only set BIOAGENT_HOST=0.0.0.0 once the console has web auth +
+# reverse proxy. Only set AISCIENTIST_HOST=0.0.0.0 once the console has web auth +
 # a firewall + HTTPS in front; bare 0.0.0.0 on a public IP exposes it to anyone.
 #
 # View it from a laptop (the eye server has no GUI browser):
@@ -28,9 +28,9 @@
 #
 # Production (always-on) instead of this script — /etc/systemd/system/bioagent.service:
 #     [Service]
-#     User=bioagent
+#     User=aiscientist
 #     WorkingDirectory=/data/BioAgent/app
-#     ExecStart=/data/BioAgent/env/bin/python -m bioagent.gateway --host 127.0.0.1 --port 8800
+#     ExecStart=/data/BioAgent/env/bin/python -m aiscientist.gateway --host 127.0.0.1 --port 8800
 #     # ^ bind localhost; put nginx (HTTPS + auth) in front and proxy_pass to it
 #     Restart=always
 #     [Install]
@@ -38,21 +38,24 @@
 #   then: sudo systemctl enable --now bioagent
 #
 set -euo pipefail
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
-ROOT="${BIOAGENT_ROOT:-/data/BioAgent}"
-APP="${BIOAGENT_APP:-$ROOT/app}"
-ENV_DIR="${BIOAGENT_ENV:-$ROOT/env}"
-HOST="${BIOAGENT_HOST:-127.0.0.1}"
-PORT="${BIOAGENT_PORT:-8800}"
-# Dev hot-reload: BIOAGENT_RELOAD=1 ./start.sh  → uvicorn auto-restarts the worker when
+ROOT="${AISCIENTIST_ROOT:-/data/BioAgent}"
+APP="${AISCIENTIST_APP:-$ROOT/app}"
+ENV_DIR="${AISCIENTIST_ENV:-$ROOT/env}"
+HOST="${AISCIENTIST_HOST:-127.0.0.1}"
+PORT="${AISCIENTIST_PORT:-8800}"
+# Dev hot-reload: AISCIENTIST_RELOAD=1 ./start.sh  → uvicorn auto-restarts the worker when
 # a backend .py changes (e.g. after ./scripts/push.sh). NOTE: a reload drops in-memory
 # state — any live HPC3 connection/tunnel dies and must be reconnected, so use it for
 # dev iteration, NOT while a research run is in flight. (Frontend HTML/JS/CSS is always
 # hot — it's read from disk per request, so just refresh the browser.)
 RELOAD_FLAG=""
-[ "${BIOAGENT_RELOAD:-0}" = "1" ] && RELOAD_FLAG="--reload"
+[ "${AISCIENTIST_RELOAD:-0}" = "1" ] && RELOAD_FLAG="--reload"
 
-if [ ! -x "$ENV_DIR/bin/python" ] || ! "$ENV_DIR/bin/python" -c "import bioagent" 2>/dev/null; then
+if [ ! -x "$ENV_DIR/bin/python" ] || ! "$ENV_DIR/bin/python" -c "import aiscientist" 2>/dev/null; then
   echo "ERROR: AiScientist isn't installed in $ENV_DIR. Run ./deploy.sh first." >&2
   exit 1
 fi
@@ -61,9 +64,9 @@ fi
 # The #1 dev annoyance: each ./start.sh stacked a new worker while the old one
 # kept the port, so you'd hit "address already in use" and never know which
 # build was live. We now stop our own previous gateway BEFORE starting. Set
-# BIOAGENT_NO_KILL=1 to skip (e.g. if you intend to run a second instance on a
+# AISCIENTIST_NO_KILL=1 to skip (e.g. if you intend to run a second instance on a
 # different port). Only ever kills OUR gateway — never a stranger on the port.
-if [ "${BIOAGENT_NO_KILL:-0}" != "1" ]; then
+if [ "${AISCIENTIST_NO_KILL:-0}" != "1" ]; then
   # `[b]ioagent` keeps pgrep from matching its own command line.
   old="$(pgrep -f "[b]ioagent\.gateway" || true)"
   if [ -n "$old" ]; then
@@ -100,7 +103,7 @@ fi
 
 # --- which build is this? print a fingerprint so a restart is verifiable ------
 # Works even though push.sh rsyncs source but NOT .git: the fingerprint is a hash
-# of the deployed bioagent/*.py, so it changes whenever new code lands. If a real
+# of the deployed aiscientist/*.py, so it changes whenever new code lands. If a real
 # git checkout is present (local dev), show the commit too.
 gitline=""
 # Only trust the commit when the tree is CLEAN. On the server push.sh rsyncs source
@@ -115,7 +118,7 @@ fp="$("$ENV_DIR/bin/python" - "$APP" <<'PY'
 import hashlib, glob, os, sys, datetime as dt
 root = sys.argv[1]
 h, newest = hashlib.sha256(), 0.0
-for f in sorted(glob.glob(os.path.join(root, "src", "bioagent", "**", "*.py"), recursive=True)):
+for f in sorted(glob.glob(os.path.join(root, "src", "aiscientist", "**", "*.py"), recursive=True)):
     h.update(open(f, "rb").read())
     newest = max(newest, os.path.getmtime(f))
 ts = dt.datetime.fromtimestamp(newest).strftime("%Y-%m-%d %H:%M") if newest else "?"
@@ -138,4 +141,4 @@ fi
 echo "==> starting AiScientist console on http://$HOST:$PORT/  (Ctrl-C to stop)"
 echo "    from a laptop: ssh -p <ADMIN_SSH_PORT> -L $PORT:localhost:$PORT <you>@$(hostname)  then open http://localhost:$PORT/"
 cd "$APP"
-exec "$ENV_DIR/bin/python" -m bioagent.gateway --host "$HOST" --port "$PORT" $RELOAD_FLAG
+exec "$ENV_DIR/bin/python" -m aiscientist.gateway --host "$HOST" --port "$PORT" $RELOAD_FLAG

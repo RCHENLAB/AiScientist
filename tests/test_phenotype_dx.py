@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.tools.run_lirical.tool import (
+from aiscientist.tools.run_lirical.tool import (
     DiseaseCandidate,
     apply_entrez_symbols,
     build_lirical_cmd,
@@ -20,7 +20,7 @@ from bioagent.tools.run_lirical.tool import (
     strip_chr_prefix,
     vcf_uses_chr_prefix,
 )
-from bioagent.tools.diagnose_disease.tool import (
+from aiscientist.tools.diagnose_disease.tool import (
     adjudicate,
     diagnose,
     make_diagnose_disease_tool,
@@ -427,7 +427,7 @@ def _fake_lit_tool(answers):
 def test_diagnose_answers_from_the_literature_when_lirical_cannot_run():
     """The case this whole line exists for: LIRICAL is not staged, so run_lirical alone returns
     nothing usable. diagnose() must still produce a differential."""
-    from bioagent.tools.diagnose_disease.evidence import make_deep_literature_runner
+    from aiscientist.tools.diagnose_disease.evidence import make_deep_literature_runner
 
     runner = make_deep_literature_runner(_fake_lit_tool({"CRB1": {
         "status": "ok",

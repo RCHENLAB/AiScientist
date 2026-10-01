@@ -5,7 +5,7 @@ goes to the HPC3 job line its ``runs_on`` names. (The manifests' agreement with 
 is tests/test_tool_manifests.py, which moves with AiScientist-tools.)"""
 from __future__ import annotations
 
-from bioagent.tools import catalog
+from aiscientist.tools import catalog
 
 # The platform's own tools (assembled in agents/registry.py, not discovered from manifests).
 PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",
@@ -15,7 +15,7 @@ PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_en
 
 
 def test_the_scientist_catalog_is_the_manifests_plus_the_platform_tools():
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     built = [t.name for t in build_scientist_catalog()]
     domain = [n for n in built if n not in PLATFORM_TOOLS]
@@ -23,7 +23,7 @@ def test_the_scientist_catalog_is_the_manifests_plus_the_platform_tools():
 
 
 def test_hpc_routing_follows_runs_on():
-    from bioagent.agents.registry import build_scientist_catalog
+    from aiscientist.agents.registry import build_scientist_catalog
 
     seen = []
 

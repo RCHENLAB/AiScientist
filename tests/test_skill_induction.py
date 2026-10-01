@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_lab import (
     CriticVerdict, LabConfig, LabRound, ResearchLab, make_run_code_tool,
 )
-from bioagent.agents.skill_induction import (
+from aiscientist.agents.skill_induction import (
     InducedSkill, candidates, induce, write_skill,
 )
-from bioagent.agents.skills import Skill, register_skill
+from aiscientist.agents.skills import Skill, register_skill
 
 _INDUCE_MARK = "curating a lab's library of reusable analysis templates"
 
@@ -28,10 +28,10 @@ GOOD_CODE = (
     "GROUP_KEY = 'celltype'\n"
     "MIN_CELLS = 10\n"
     "# --------------------------------------\n"
-    "adata = sc.read_h5ad(os.environ['BIOAGENT_DATASET'])\n"
+    "adata = sc.read_h5ad(os.environ['AISCIENTIST_DATASET'])\n"
     "counts = adata.obs[GROUP_KEY].value_counts()\n"
     "keep = counts[counts >= MIN_CELLS].index\n"
-    "out = os.path.join(os.environ['BIOAGENT_ARTIFACTS'], 'tables', 'group_sizes.csv')\n"
+    "out = os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 'tables', 'group_sizes.csv')\n"
     "counts.loc[keep].to_csv(out)\n"
     "print('wrote', out)\n"
 )
@@ -164,12 +164,12 @@ def test_write_skill_produces_a_loadable_skill_folder(tmp_path):
 
     # it parses back through the SAME loader the curated library uses, and is marked as induced
     import os
-    from bioagent.agents import skills as skills_mod
-    os.environ["BIOAGENT_INDUCED_SKILLS_DIR"] = str(tmp_path)
+    from aiscientist.agents import skills as skills_mod
+    os.environ["AISCIENTIST_INDUCED_SKILLS_DIR"] = str(tmp_path)
     try:
         lib = skills_mod._load_skills()
     finally:
-        del os.environ["BIOAGENT_INDUCED_SKILLS_DIR"]
+        del os.environ["AISCIENTIST_INDUCED_SKILLS_DIR"]
     assert "my_new_skill" in lib
     assert lib["my_new_skill"].summary == "Does a thing."
     assert lib["my_new_skill"].files["reference.py"] == GOOD_CODE
@@ -193,18 +193,18 @@ def test_write_skill_refuses_a_traversing_name(tmp_path):
 
 def test_a_curated_skill_always_wins_over_an_induced_one_of_the_same_name(tmp_path):
     import os
-    from bioagent.agents import skills as skills_mod
+    from aiscientist.agents import skills as skills_mod
     curated, induced_root = tmp_path / "curated", tmp_path / "induced"
     for root, desc in ((curated, "the curated one"), (induced_root, "the induced one")):
         (root / "shared_name").mkdir(parents=True)
         (root / "shared_name" / "SKILL.md").write_text(
             f"---\nname: shared_name\ndescription: {desc}\n---\n\nbody\n")
-    os.environ["BIOAGENT_SKILLS_DIR"] = str(curated)
-    os.environ["BIOAGENT_INDUCED_SKILLS_DIR"] = str(induced_root)
+    os.environ["AISCIENTIST_SKILLS_DIR"] = str(curated)
+    os.environ["AISCIENTIST_INDUCED_SKILLS_DIR"] = str(induced_root)
     try:
         lib = skills_mod._load_skills()
     finally:
-        del os.environ["BIOAGENT_SKILLS_DIR"], os.environ["BIOAGENT_INDUCED_SKILLS_DIR"]
+        del os.environ["AISCIENTIST_SKILLS_DIR"], os.environ["AISCIENTIST_INDUCED_SKILLS_DIR"]
     assert lib["shared_name"].summary == "the curated one"
 
 
@@ -212,7 +212,7 @@ def test_register_skill_is_additive_only():
     existing = Skill(name="already_here", summary="original")
     assert register_skill(existing) is True
     assert register_skill(Skill(name="already_here", summary="impostor")) is False
-    from bioagent.agents.skills import SKILLS
+    from aiscientist.agents.skills import SKILLS
     assert SKILLS["already_here"].summary == "original"
     del SKILLS["already_here"]
 
@@ -261,7 +261,7 @@ def _run_lab(tmp_path, *, induction=True, seen=None):
 
 
 def test_a_run_induces_a_skill_at_the_end(tmp_path):
-    from bioagent.agents.skills import SKILLS
+    from aiscientist.agents.skills import SKILLS
     try:
         events = _run_lab(tmp_path)
         induced = [e for e in events if e["type"] == "skill_induced"]
@@ -339,7 +339,7 @@ def test_declaring_supersedes_lets_a_known_name_through():
 
 
 def test_the_manifest_prefers_the_newest_version_but_keeps_the_old_loadable():
-    from bioagent.agents.skills import Skill as S, skill_manifest, superseded_names
+    from aiscientist.agents.skills import Skill as S, skill_manifest, superseded_names
     lib = {"proc": S(name="proc", summary="v1"),
            "proc_v2": S(name="proc_v2", summary="v2", supersedes="proc"),
            "other": S(name="other", summary="unrelated")}
@@ -355,7 +355,7 @@ def test_the_manifest_prefers_the_newest_version_but_keeps_the_old_loadable():
 def test_a_folded_description_parses_to_its_text_not_the_marker(tmp_path):
     """`description: >-` followed by an indented block. Before this was handled, the skill
     advertised itself in the manifest as the literal '>-'."""
-    from bioagent.agents import skills as sk
+    from aiscientist.agents import skills as sk
     d = tmp_path / "folded"
     d.mkdir()
     (d / "SKILL.md").write_text(
@@ -368,7 +368,7 @@ def test_a_folded_description_parses_to_its_text_not_the_marker(tmp_path):
 
 
 def test_a_literal_block_keeps_its_line_breaks(tmp_path):
-    from bioagent.agents import skills as sk
+    from aiscientist.agents import skills as sk
     d = tmp_path / "lit"
     d.mkdir()
     (d / "SKILL.md").write_text("---\nname: lit\ndescription: |\n  line one\n  line two\n---\n\nb\n")
@@ -376,7 +376,7 @@ def test_a_literal_block_keeps_its_line_breaks(tmp_path):
 
 
 def test_plain_single_line_frontmatter_is_unchanged(tmp_path):
-    from bioagent.agents import skills as sk
+    from aiscientist.agents import skills as sk
     d = tmp_path / "plain"
     d.mkdir()
     (d / "SKILL.md").write_text("---\nname: plain\ndescription: One line.\ninduced: true\n---\n\nb\n")

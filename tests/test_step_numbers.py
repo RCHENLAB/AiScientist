@@ -21,14 +21,14 @@ from __future__ import annotations
 
 import json
 
-from bioagent.agents.research_harness import (
+from aiscientist.agents.research_harness import (
     HarnessContext,
     HarnessResult,
     HarnessTool,
     ResearchHarness,
 )
-from bioagent.agents.research_lab import LabConfig, ResearchLab
-from bioagent.agents.step_numbers import (
+from aiscientist.agents.research_lab import LabConfig, ResearchLab
+from aiscientist.agents.step_numbers import (
     contrast_arms,
     count_claims,
     describe_count_mismatches,

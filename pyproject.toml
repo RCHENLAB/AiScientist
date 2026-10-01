@@ -1,5 +1,5 @@
 [project]
-name = "bioagent-prototype"
+name = "aiscientist"
 version = "0.2.0"
 description = "AiScientist — a privacy-first, DAG-planned multi-agent bioinformatics research console (UCI HPC3 + vLLM) for single-cell / ocular biology workflows."
 requires-python = ">=3.10"
@@ -65,8 +65,11 @@ analysis = [
 ]
 
 [project.scripts]
-bioagent-console = "bioagent.gateway.app:main"
-bioagent-admin = "bioagent.gateway.admin_cli:main"
+aiscientist-console = "aiscientist.gateway.app:main"
+aiscientist-admin = "aiscientist.gateway.admin_cli:main"
+# Old command names, kept for operators' muscle memory and existing docs/scripts.
+bioagent-console = "aiscientist.gateway.app:main"
+bioagent-admin = "aiscientist.gateway.admin_cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

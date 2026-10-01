@@ -12,4 +12,4 @@ writes a cluster -> cell-type table. ADAPT the marker dictionary to YOUR tissue 
 the labels are only as good as the dictionary, so state uncertainty honestly in the write-up.
 
 ## Run
-Fetch the template with `read_skill_reference("annotate_clusters_by_markers", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `BIOAGENT_WORK`, writes under `BIOAGENT_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.
+Fetch the template with `read_skill_reference("annotate_clusters_by_markers", file="reference.py")`, adapt the CONFIG / marker / threshold values to THIS dataset, then execute it via `run_code` (reads checkpoints from `AISCIENTIST_WORK`, writes under `AISCIENTIST_ARTIFACTS`). If a purpose-built tool already covers the step, use the tool instead.

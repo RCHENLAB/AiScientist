@@ -16,7 +16,7 @@ Safe by construction: DRY-RUN by default (prints what it WOULD do); pass ``--com
 ever fills rows where ``conversation_id IS NULL`` (never overwrites), and skips a run_id that is
 referenced from MORE THAN ONE conversation (an ambiguous historical leak) rather than guess.
 
-Run it on the server as the ``bioagent`` service account (same env as the gateway, so it points at the
+Run it on the server as the ``aiscientist`` service account (same env as the gateway, so it points at the
 prod DB):  ``python -m scripts.backfill_run_conversation_id --commit``
 """
 
@@ -57,8 +57,8 @@ def _run_ids_in_meta(meta_text: str | None) -> set[str]:
 def _build_run_to_conversation() -> tuple[dict[str, str], dict[str, set[str]]]:
     """Map ``run_id -> str(conversation_id)`` from the chat history. Returns (unambiguous_map,
     ambiguous) where ``ambiguous`` lists run_ids referenced by more than one conversation."""
-    from bioagent.gateway.db import session_scope
-    from bioagent.gateway.models import Message
+    from aiscientist.gateway.db import session_scope
+    from aiscientist.gateway.models import Message
     from sqlalchemy import select
 
     seen: dict[str, set[str]] = defaultdict(set)
@@ -79,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--commit", action="store_true", help="write changes (default: dry-run)")
     args = ap.parse_args(argv)
 
-    from bioagent.gateway.db import init_db, session_scope
-    from bioagent.gateway.models import Run
+    from aiscientist.gateway.db import init_db, session_scope
+    from aiscientist.gateway.models import Run
     from sqlalchemy import select
 
     init_db()  # ensure the column exists (idempotent) before we read/write it

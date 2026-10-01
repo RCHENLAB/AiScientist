@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import re
 
-from bioagent.gateway import gpu
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.settings import HPCSettings
+from aiscientist.gateway import gpu
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.settings import HPCSettings
 
 
 class FakeExec:
@@ -182,7 +182,7 @@ def test_prefer_window_expires_then_a100_wins(monkeypatch):
 
 
 def test_prefer_seconds_env(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_GPU_PREFER_SECONDS", "120")
+    monkeypatch.setenv("AISCIENTIST_GPU_PREFER_SECONDS", "120")
     assert HPCSettings.from_env().gpu_prefer_seconds == 120
 
 

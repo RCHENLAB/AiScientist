@@ -5,7 +5,7 @@ local clone of that repository.
 What is published (decided 2026-09-30): everything in this repository except credentials, meaning
 database accounts and passwords, API keys, tokens and private keys. Hostnames, paths, account
 names, handoffs, experiment records, reports and decks are all published. Credentials never belong
-in git at all; they live in the deployment's ``.env`` and ``BIOAGENT_STATE_DIR``. The scan below
+in git at all; they live in the deployment's ``.env`` and ``AISCIENTIST_STATE_DIR``. The scan below
 normally finds nothing; it exists so that a pasted key cannot ride along unnoticed. A path that has
 to stay private goes in ``.publicexclude`` and is dropped from the snapshot.
 

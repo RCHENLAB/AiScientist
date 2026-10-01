@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 
-from bioagent.tools import scrna_cli
+from aiscientist.tools import scrna_cli
 
 
 def test_run_tool_dispatches_to_scrna_pack_with_ctx(monkeypatch):
@@ -18,7 +18,7 @@ def test_run_tool_dispatches_to_scrna_pack_with_ctx(monkeypatch):
         seen["ds"] = ctx.decisions.get("dataset_path")
         return {"status": "ok", "n": 1}
 
-    monkeypatch.setattr("bioagent.tools.run_scanpy_qc.tool.run_scanpy_qc", fake_qc)
+    monkeypatch.setattr("aiscientist.tools.run_scanpy_qc.tool.run_scanpy_qc", fake_qc)
     out = scrna_cli.run_tool("run_scanpy_qc", "/dfs/run", "/dfs/ds.h5ad", {"min_genes": 100})
     assert out == {"status": "ok", "n": 1}
     assert seen == {"args": {"min_genes": 100}, "ws": "/dfs/run", "ds": "/dfs/ds.h5ad"}
@@ -36,7 +36,7 @@ def test_preflight_dispatches_to_smoke_analysis(monkeypatch):
         called["out"] = str(out_dir)
         return {"status": "ok", "result": {}}
 
-    monkeypatch.setattr("bioagent.tools.datasets.run_dataset_smoke_analysis", fake_pre)
+    monkeypatch.setattr("aiscientist.tools.datasets.run_dataset_smoke_analysis", fake_pre)
     out = scrna_cli.run_tool("preflight", "/dfs/run", "/dfs/ds.h5ad", {})
     assert out["status"] == "ok"
     assert called["path"] == "/dfs/ds.h5ad"
@@ -51,7 +51,7 @@ def test_load_args_inline_and_file(tmp_path):
 
 
 def test_main_emits_result_marker(monkeypatch, capsys):
-    monkeypatch.setattr("bioagent.tools.run_de.tool.run_de", lambda a, c: {"status": "ok", "de": 3})
+    monkeypatch.setattr("aiscientist.tools.run_de.tool.run_de", lambda a, c: {"status": "ok", "de": 3})
     rc = scrna_cli.main(["--tool", "run_de", "--workspace", "/w", "--args", "{}"])
     line = capsys.readouterr().out.strip()
     assert rc == 0 and line.startswith(scrna_cli.RESULT_MARKER)

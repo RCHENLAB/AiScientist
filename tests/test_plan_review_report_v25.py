@@ -13,12 +13,12 @@ import json
 
 import pytest
 
-from bioagent.agents.research_harness import (
+from aiscientist.agents.research_harness import (
     HarnessContext,
     ResearchHarness,
     default_catalog,
 )
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_lab import (
     LabConfig,
     ResearchLab,
     _strip_step_ordinal,
@@ -28,7 +28,7 @@ from bioagent.agents.research_lab import (
     resolve_plan_reference,
     stale_downstream_settings,
 )
-from bioagent.agents.registry import build_scientist_catalog
+from aiscientist.agents.registry import build_scientist_catalog
 
 
 # The plan the report ran nearly everything against: a real production draft, verbatim in shape.
@@ -291,7 +291,7 @@ def test_a_packaging_step_whose_verb_is_innocent_is_still_pruned():
     already on disk: `run_de` writes the volcanoes and `run_enrichment` writes the bar plots. The
     reliable signal is the stated PURPOSE — no genuine analysis step exists in order to be put in
     the report."""
-    from bioagent.agents.research_lab import _is_report_busywork
+    from aiscientist.agents.research_lab import _is_report_busywork
 
     step = ("**Figures & tables** — Generate the visual summaries required for the report using "
             "`run_code`. The script will read the DE and enrichment tables to produce: (1) a "
@@ -322,6 +322,6 @@ def test_a_packaging_step_whose_verb_is_innocent_is_still_pruned():
 def test_real_analysis_steps_that_mention_figures_or_tables_survive(step):
     """A guard that eats analysis is worse than one that misses busywork: the third of these
     writes CSVs on purpose, and it is a real synthesis step."""
-    from bioagent.agents.research_lab import _is_report_busywork
+    from aiscientist.agents.research_lab import _is_report_busywork
 
     assert not _is_report_busywork(step)

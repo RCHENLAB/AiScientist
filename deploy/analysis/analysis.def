@@ -3,7 +3,7 @@ From: python:3.11-slim
 
 # CPU analysis image for AiScientist CodeAct (run_code on HPC3).
 #
-# This is the container SlurmCodeExecutor (src/bioagent/gateway/slurm_sandbox.py) runs each
+# This is the container SlurmCodeExecutor (src/aiscientist/gateway/slurm_sandbox.py) runs each
 # `run_code` snippet inside, so a snippet can `import scanpy/pandas/gseapy` on an HPC3 CPU node
 # where `#SBATCH --mem` is a REAL, cgroup-enforced cap. It mirrors the app's `analysis` extra
 # (pyproject.toml) so snippets behave the same as in the local CodeSandbox.
@@ -19,8 +19,8 @@ From: python:3.11-slim
 # deploy/analysis/build_and_stage.sh and deploy/analysis/README.md.
 #
 # Phase 4 of the HPC3 offload ALSO runs the scanpy analysis line here via
-# `python -m bioagent.tools.scrna_cli` (gateway/slurm_analysis.py::SlurmAnalysisExecutor). The
-# bioagent tools are NOT baked in — they are bind-mounted from dfs3b at run time and put on
+# `python -m aiscientist.tools.scrna_cli` (gateway/slurm_analysis.py::SlurmAnalysisExecutor). The
+# AiScientist tools are NOT baked in — they are bind-mounted from dfs3b at run time and put on
 # PYTHONPATH by the executor, so editing a tool needs only a code sync, never an image rebuild.
 # This image therefore carries ONLY the heavy deps below — which also keeps `--remote` builds
 # working (a %files copy of local source can't reach the Sylabs cloud builder).
@@ -74,7 +74,7 @@ print('analysis stack OK — scanpy', scanpy.__version__, 'pandas', pandas.__ver
     export MPLBACKEND=Agg
     export NUMBA_CACHE_DIR=/tmp/numba
     export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-8}
-    # bioagent tools are bind-mounted from dfs3b + put on PYTHONPATH by the executor at run time
+    # AiScientist tools are bind-mounted from dfs3b + put on PYTHONPATH by the executor at run time
     # (NOT baked here), so a tool edit needs only a code sync — never an image rebuild.
 
 %runscript
@@ -94,6 +94,6 @@ print('analysis stack OK — scanpy', scanpy.__version__, 'pandas', pandas.__ver
            singularity exec --containall --net --network none \
              -B <dataset>:<dataset>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
              --env PYTHONPATH=<pysrc> \
-             analysis.sif python -m bioagent.tools.scrna_cli \
+             analysis.sif python -m aiscientist.tools.scrna_cli \
                --tool run_scanpy_qc --workspace <run_ws> --dataset <dataset> --args <args.json>
-         (<pysrc> = <lab_storage>/<user>/pysrc, synced by the gateway; contains bioagent/)
+         (<pysrc> = <lab_storage>/<user>/pysrc, synced by the gateway; contains aiscientist/)

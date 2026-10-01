@@ -96,7 +96,7 @@ Reporting discipline — these belong in the write-up, not only in the logs:
 **Pathway analysis: use `run_enrichment` / `run_gsea_prerank` when the design supports them, and
 when it does not, still take the gene sets from disk.** Both tools read `.gmt` libraries that are
 ALREADY ON DISK next to the tools — GO_Biological_Process_2023, Reactome_2022, MSigDB_Hallmark_2020
-(`BIOAGENT_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
+(`AISCIENTIST_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
 consume `run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
 replication forbids exactly those p-values and therefore often skips `run_de` entirely, which
 leaves both tools unusable through no fault of the plan. That is NOT a reason to go to the network:

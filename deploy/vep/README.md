@@ -1,8 +1,8 @@
 # Offline VEP container — build & stage (variant annotation)
 
 Build kit for `vep.sif` + the VEP caches — the OFFLINE variant-annotation line AiScientist runs
-**when `BIOAGENT_VARIANT_ON_HPC=1`**. The orchestration that *runs* the image is already built +
-offline-tested (`src/bioagent/tools/annotate_variants/offline.py` + `variant_cli.py`, driven by
+**when `AISCIENTIST_VARIANT_ON_HPC=1`**. The orchestration that *runs* the image is already built +
+offline-tested (`src/aiscientist/tools/annotate_variants/offline.py` + `variant_cli.py`, driven by
 `SlurmAnalysisExecutor` with an injected runner — no cluster, no VEP, no network in CI:
 `tests/test_vcf_offline.py`). This folder is the **image + cache build kit**.
 
@@ -49,23 +49,23 @@ all three; bump the def tag too.
 
 ## Enable it
 
-Set these in the gateway env (`.env` / `HPCSettings`) — until `BIOAGENT_VARIANT_ON_HPC=1`,
+Set these in the gateway env (`.env` / `HPCSettings`) — until `AISCIENTIST_VARIANT_ON_HPC=1`,
 `annotate_variants` stays on the REST path and this image is unused:
 
 ```
-BIOAGENT_VARIANT_ON_HPC=1
-BIOAGENT_VEP_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/vep.sif
-BIOAGENT_VEP_CACHE_DIR_GRCH38=/dfs3b/ruic20_lab/software/reference/vep_annotation/GRCh38
-BIOAGENT_VEP_CACHE_DIR_GRCH37=/dfs3b/ruic20_lab/software/reference/vep_annotation/GRCh37
-BIOAGENT_VEP_CLINVAR_GRCH38=/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh38.vcf.gz
-BIOAGENT_VEP_CLINVAR_GRCH37=/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh37.vcf.gz
-BIOAGENT_VEP_ASSEMBLY=GRCh38          # default; LLM can override per call
-BIOAGENT_VEP_FORK=8
-BIOAGENT_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
+AISCIENTIST_VARIANT_ON_HPC=1
+AISCIENTIST_VEP_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/vep.sif
+AISCIENTIST_VEP_CACHE_DIR_GRCH38=/dfs3b/ruic20_lab/software/reference/vep_annotation/GRCh38
+AISCIENTIST_VEP_CACHE_DIR_GRCH37=/dfs3b/ruic20_lab/software/reference/vep_annotation/GRCh37
+AISCIENTIST_VEP_CLINVAR_GRCH38=/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh38.vcf.gz
+AISCIENTIST_VEP_CLINVAR_GRCH37=/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh37.vcf.gz
+AISCIENTIST_VEP_ASSEMBLY=GRCh38          # default; LLM can override per call
+AISCIENTIST_VEP_FORK=8
+AISCIENTIST_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
 ```
 
 The VCF + the run's work/artifacts dirs must be reachable on the compute node (shared DFS — they are,
-via `uploads_on_hpc`). The bioagent **tools** are synced to `<lab_storage>/<user>/pysrc` by the
+via `uploads_on_hpc`). The AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` by the
 gateway and bind-mounted in, so a tool edit needs a code deploy, NOT an image rebuild. If HPC is
 unreachable at run time, `annotate_variants` falls back to the REST path in-process (fine for small
 VCFs).

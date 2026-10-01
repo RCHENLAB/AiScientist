@@ -49,8 +49,8 @@ def load_dotenv(path: Path = Path(".env")) -> None:
 
 
 def default_llm() -> str:
-    if os.environ.get("BIOAGENT_PAPERQA_LLM"):
-        return os.environ["BIOAGENT_PAPERQA_LLM"]
+    if os.environ.get("AISCIENTIST_PAPERQA_LLM"):
+        return os.environ["AISCIENTIST_PAPERQA_LLM"]
     if os.environ.get("OPENROUTER_MODEL"):
         return f"openai/{os.environ['OPENROUTER_MODEL']}"
     return "openai/local-no-llm"
@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--embedding",
-        default=os.environ.get("BIOAGENT_PAPERQA_EMBEDDING", "st-multi-qa-MiniLM-L6-cos-v1"),
+        default=os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", "st-multi-qa-MiniLM-L6-cos-v1"),
         help="Local PaperQA embedding model, usually an st- sentence-transformers model.",
     )
     parser.add_argument("--name", default="retigene_pilot_50_minilm", help="PaperQA index name.")
@@ -108,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--api-base",
         default=(
-            os.environ.get("BIOAGENT_PAPERQA_API_BASE")
+            os.environ.get("AISCIENTIST_PAPERQA_API_BASE")
             or os.environ.get("OPENROUTER_BASE_URL")
             or "http://127.0.0.1:9/v1"
         ),
@@ -117,9 +117,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--api-key",
         default=(
-            os.environ.get("BIOAGENT_PAPERQA_API_KEY")
+            os.environ.get("AISCIENTIST_PAPERQA_API_KEY")
             or os.environ.get("OPENROUTER_API_KEY")
-            or os.environ.get("BIOAGENT_LLM_API_KEY")
+            or os.environ.get("AISCIENTIST_LLM_API_KEY")
             or "sk-local-disabled"
         ),
         help="API key for the local OpenAI-compatible endpoint.",
@@ -295,8 +295,8 @@ def chat_completion(args: argparse.Namespace, sources: list[dict[str, str]]) -> 
         headers={
             "Authorization": f"Bearer {args.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://localhost/bioagent-prototype"),
-            "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "BioAgent Prototype"),
+            "HTTP-Referer": os.environ.get("OPENROUTER_HTTP_REFERER", "http://localhost/aiscientist"),
+            "X-Title": os.environ.get("OPENROUTER_APP_TITLE", "AiScientist"),
         },
         method="POST",
     )

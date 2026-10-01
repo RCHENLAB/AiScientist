@@ -13,7 +13,7 @@ SECRET_TOKEN_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
 )
 ENV_API_KEY_PATTERN = re.compile(
-    r"(OPENROUTER|OPENAI|ANTHROPIC|GEMINI|GOOGLE|BIOAGENT_LLM)_API_KEY\s*=\s*([^#\s]+)"
+    r"(OPENROUTER|OPENAI|ANTHROPIC|GEMINI|GOOGLE|AISCIENTIST_LLM)_API_KEY\s*=\s*([^#\s]+)"
 )
 GENERIC_API_KEY_PATTERN = re.compile(r"api[_-]?key\s*[:=]\s*['\"]([^'\"]{12,})['\"]", re.IGNORECASE)
 
@@ -158,11 +158,6 @@ def required_files() -> list[Finding]:
     findings: list[Finding] = []
     for path in (
         Path("README.md"),
-        Path("README.zh-CN.md"),
-        Path("handoff/yijun/HANDOFF.md"),
-        Path("handoff/yijun/HANDOFF.zh-CN.md"),
-        Path("docs/archive/kosmos_kernel_guardrails.md"),
-        Path("docs/archive/project_plan.md"),
         Path(".gitignore"),
     ):
         if not path.exists():

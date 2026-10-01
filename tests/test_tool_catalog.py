@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.tools.catalog import ManifestError, parse_front_matter
+from aiscientist.tools.catalog import ManifestError, parse_front_matter
 
 
 def test_scalars_lists_comments_and_body():

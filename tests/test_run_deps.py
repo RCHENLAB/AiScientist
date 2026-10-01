@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from bioagent.tools import run_deps
+from aiscientist.tools import run_deps
 
 _real_run = subprocess.run
 

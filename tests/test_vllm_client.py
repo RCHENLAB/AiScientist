@@ -13,9 +13,9 @@ from contextlib import contextmanager
 
 import pytest
 
-from bioagent.gateway import vllm_client
-from bioagent.gateway.errors import GatewayError
-from bioagent.gateway.settings import HPCSettings
+from aiscientist.gateway import vllm_client
+from aiscientist.gateway.errors import GatewayError
+from aiscientist.gateway.settings import HPCSettings
 
 
 class _FakeResp(io.BytesIO):

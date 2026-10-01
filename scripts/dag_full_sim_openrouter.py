@@ -46,19 +46,19 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(ROOT / ".env")
 
 OR_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-OR_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("BIOAGENT_LLM_API_KEY")
+OR_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("AISCIENTIST_LLM_API_KEY")
 MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3.6-35b-a3b")
 
 if not OR_KEY:
     print("OPENROUTER_API_KEY not set — cannot run the full simulation.")
     sys.exit(2)
 
-from bioagent.agents.registry import build_scientist_catalog  # noqa: E402
-from bioagent.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
-from bioagent.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
-from bioagent.agents.sandbox import CodeSandbox  # noqa: E402
-from bioagent.gateway import vllm_client  # noqa: E402
-from bioagent.providers.openai_compatible import OpenRouterClient  # noqa: E402
+from aiscientist.agents.registry import build_scientist_catalog  # noqa: E402
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
+from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
+from aiscientist.agents.sandbox import CodeSandbox  # noqa: E402
+from aiscientist.gateway import vllm_client  # noqa: E402
+from aiscientist.providers.openai_compatible import OpenRouterClient  # noqa: E402
 
 
 def synthetic_h5ad(path: str) -> dict:

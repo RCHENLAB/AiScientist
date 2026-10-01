@@ -10,14 +10,14 @@ import json
 
 import pytest
 
-from bioagent.agents.research_harness import (
+from aiscientist.agents.research_harness import (
     HarnessContext,
     HarnessTool,
     ResearchHarness,
     _msg_tokens,
     default_catalog,
 )
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_lab import (
     DEFAULT_SPECIALISTS,
     LabConfig,
     ResearchLab,
@@ -137,7 +137,7 @@ def test_convergence_is_llm_judged_not_thresholded():
 # --- multi-specialist scientist roles ----------------------------------------
 
 def test_specialist_routing_by_step_wording():
-    from bioagent.agents.research_lab import DEFAULT_SPECIALISTS, GENERALIST, _route_specialist
+    from aiscientist.agents.research_lab import DEFAULT_SPECIALISTS, GENERALIST, _route_specialist
     r = DEFAULT_SPECIALISTS
     assert "QC" in _route_specialist("Run QC and filter cells", r).name
     assert "Pathway" in _route_specialist("Run GO pathway enrichment on the markers", r).name
@@ -251,7 +251,7 @@ def test_plan_mode_cancel_runs_nothing():
 # --- preset: STEERS the PI's planning (does not bypass it) -------------------
 
 def test_preset_prompt_steers_pi_planning_without_bypassing_it():
-    from bioagent.agents.presets import get_preset
+    from aiscientist.agents.presets import get_preset
 
     seen = {}
 
@@ -341,7 +341,7 @@ def test_pi_planner_sees_condition_groups_and_existing_labels():
 
 
 def test_pi_system_prompt_carries_design_aware_rules():
-    from bioagent.agents.research_lab import _PI_SYSTEM
+    from aiscientist.agents.research_lab import _PI_SYSTEM
     assert "DATASET PROFILE" in _PI_SYSTEM
     assert "COMPARES the groups" in _PI_SYSTEM               # condition -> comparison rule
     assert "REUSE it" in _PI_SYSTEM                          # existing labels -> reuse rule
@@ -563,7 +563,7 @@ def test_literature_backfill_does_not_rerun_a_step_already_executed():
 
 
 def test_literature_query_uses_findings_not_the_raw_question():
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, _literature_query
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, _literature_query
 
     def _rd(step, result):
         return LabRound(1, 1, step, "S",
@@ -584,7 +584,7 @@ def test_literature_query_uses_findings_not_the_raw_question():
 def test_literature_query_uses_variant_pathogenic_genes():
     # A VCF/variant run's findings live in pathogenic_variants / high_priority_variants (gene fields),
     # NOT the scanpy top_genes_by_group map — the query must still be the real genes, not the question.
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, _literature_query
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, _literature_query
 
     def _rd(step, result):
         return LabRound(1, 1, step, "S",
@@ -606,7 +606,7 @@ def test_literature_query_uses_variant_pathogenic_genes():
 def test_literature_step_label_strips_method_keywords():
     # The plan LABEL must keep the biological subject but drop the VEP-pipeline method words that
     # produced the garbled "Literature search for Ensembl VEP ClinVar GRCh38 filter PASS ..." label.
-    from bioagent.agents.research_lab import _literature_step_text
+    from aiscientist.agents.research_lab import _literature_step_text
     label = _literature_step_text(
         "Annotate the retinal-disease variants in this VCF with Ensembl VEP and ClinVar on GRCh38, "
         "filter to PASS, and provide the pathogenic findings.").lower()
@@ -619,7 +619,7 @@ def test_literature_step_label_falls_back_when_prompt_is_pure_filler():
     # A thin/generic run prompt (the preset default when no biological question is given) is all
     # instruction filler — it must NOT leak in as "Literature search for complete the research";
     # the label falls back to the clean generic form. (The real query comes from the findings.)
-    from bioagent.agents.research_lab import _literature_step_text
+    from aiscientist.agents.research_lab import _literature_step_text
     clean = "Literature search for the key genes and pathways found"
     assert _literature_step_text("complete the research") == clean
     assert _literature_step_text("Interpret this VCF and complete the research") == clean
@@ -794,8 +794,8 @@ def test_agent_memory_off_by_default_no_events(tmp_path):
 
 
 def test_concurrency_safe_classification():
-    from bioagent.agents.dag import TaskNode
-    from bioagent.agents.research_lab import _concurrency_safe
+    from aiscientist.agents.dag import TaskNode
+    from aiscientist.agents.research_lab import _concurrency_safe
 
     qc = TaskNode(id="a", goal="Run scanpy QC")
     de = TaskNode(id="b", goal="Run differential expression")
@@ -808,7 +808,7 @@ def test_concurrency_safe_classification():
 def test_concurrency_coruns_independent_literature_with_analysis():
     # After QC, an analysis node (enrichment) and an INDEPENDENT literature node are both ready —
     # they co-run in ONE batch. This is the "can be concurrent" half of the mixed scenario.
-    from bioagent.agents.dag import LabPlan, TaskNode
+    from aiscientist.agents.dag import LabPlan, TaskNode
 
     lab = _concurrency_lab(max_concurrency=2)
     plan = LabPlan((
@@ -827,7 +827,7 @@ def test_concurrency_coruns_independent_literature_with_analysis():
 def test_concurrency_never_coruns_two_analysis_nodes():
     # Two analysis nodes ready at once (cluster + DE both off QC) must NEVER co-run — they share the
     # checkpoint chain + scanpy global state. This is the "cannot be concurrent" half.
-    from bioagent.agents.dag import LabPlan, TaskNode
+    from aiscientist.agents.dag import LabPlan, TaskNode
 
     lab = _concurrency_lab(max_concurrency=3)
     plan = LabPlan((
@@ -844,7 +844,7 @@ def test_concurrency_never_coruns_two_analysis_nodes():
 
 
 def test_concurrency_off_by_default_is_sequential():
-    from bioagent.agents.dag import LabPlan, TaskNode
+    from aiscientist.agents.dag import LabPlan, TaskNode
 
     lab = _concurrency_lab(max_concurrency=1)            # default
     plan = LabPlan((
@@ -859,8 +859,8 @@ def test_concurrency_off_by_default_is_sequential():
 
 
 def test_claim_specialist_picks_the_llm_chosen_expert():
-    from bioagent.agents.dag import TaskNode
-    from bioagent.agents.research_lab import Specialist
+    from aiscientist.agents.dag import TaskNode
+    from aiscientist.agents.research_lab import Specialist
 
     roster = (Specialist("QC expert", "single-cell QC and filtering", ("qc",)),
               Specialist("Pathway expert", "GO/Reactome enrichment interpretation", ("enrich",)))
@@ -879,8 +879,8 @@ def test_claim_specialist_picks_the_llm_chosen_expert():
 
 
 def test_claim_specialist_falls_back_to_keyword_routing_on_bad_reply():
-    from bioagent.agents.dag import TaskNode
-    from bioagent.agents.research_lab import Specialist
+    from aiscientist.agents.dag import TaskNode
+    from aiscientist.agents.research_lab import Specialist
 
     roster = (Specialist("QC expert", "single-cell QC", ("qc", "filter")),
               Specialist("Pathway expert", "enrichment", ("enrich", "pathway")))
@@ -895,8 +895,8 @@ def test_claim_specialist_falls_back_to_keyword_routing_on_bad_reply():
 
 
 def test_claim_specialist_single_roster_takes_no_llm_call():
-    from bioagent.agents.dag import TaskNode
-    from bioagent.agents.research_lab import Specialist
+    from aiscientist.agents.dag import TaskNode
+    from aiscientist.agents.research_lab import Specialist
 
     calls = {"n": 0}
 
@@ -1058,7 +1058,7 @@ def test_a_label_fork_the_plan_already_answered_is_not_asked():
     ("Run QC, then clustering", True),
 ])
 def test_a_step_that_says_not_to_cluster_is_not_a_clustering_step(step, clusters):
-    from bioagent.agents import research_lab as rl
+    from aiscientist.agents import research_lab as rl
     assert rl._clusters_de_novo(step) is clusters
 
 
@@ -1089,7 +1089,7 @@ def _dag_always_revise_complete(agenda_steps):
 
 
 def test_failure_decision_offers_llm_alternatives_and_maps_choice():
-    from bioagent.agents.dag import TaskNode
+    from aiscientist.agents.dag import TaskNode
     lab = _dag_hitl_lab(_dag_hitl_complete, [])          # its complete_fn returns 2 alternatives
     node = TaskNode(id="s1", goal="Cluster the cells")
     seen = {}
@@ -1124,7 +1124,7 @@ def test_an_unanswered_failure_fork_self_heals_instead_of_dropping_the_step():
     for a failed step the agent's judgment is the alternative it just proposed — the same self-heal
     the headless path takes. It used to land on Skip, discarding the step for the one reason that
     says nothing about whether it deserved discarding: the human was away from the screen."""
-    from bioagent.agents.dag import TaskNode
+    from aiscientist.agents.dag import TaskNode
     lab = _dag_hitl_lab(_dag_hitl_complete, [])
     node = TaskNode(id="s1", goal="Cluster the cells")
     events: list[dict] = []
@@ -1140,7 +1140,7 @@ def test_an_unanswered_failure_fork_self_heals_instead_of_dropping_the_step():
 def test_headless_and_timeout_reach_the_same_self_heal():
     """The two paths that mean "no human is answering" must not disagree. Headless has always
     auto-applied the top alternative; an unattended manual run now does the same."""
-    from bioagent.agents.dag import TaskNode
+    from aiscientist.agents.dag import TaskNode
     lab = _dag_hitl_lab(_dag_hitl_complete, [])
     node = TaskNode(id="s1", goal="Cluster the cells")
     noop = lambda _e: None   # noqa: E731
@@ -1205,7 +1205,7 @@ def test_failed_step_fork_is_capped_against_infinite_retry():
 
 
 def test_celltype_column_detection():
-    from bioagent.agents.research_lab import _looks_like_celltype_col
+    from aiscientist.agents.research_lab import _looks_like_celltype_col
 
     for col in ("celltype", "cell_type", "majorclass", "major_class", "subclass",
                 "annotation", "predicted_label", "cell_label"):
@@ -1217,8 +1217,8 @@ def test_celltype_column_detection():
 def test_dataset_profile_flags_existing_annotation_for_groupby():
     # WITH a real experimental contrast (sampleid = KO vs WT): enrichment/DE IS meaningful, so the
     # profile steers DE/enrichment onto the annotation column (not de-novo leiden numbers).
-    from bioagent.agents.research_harness import HarnessContext
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     ctx = HarnessContext(decisions={"dataset_result": {
         "cells": 11977, "genes": 36601,
@@ -1241,8 +1241,8 @@ def test_dataset_profile_no_contrast_suppresses_enrichment():
     # The single-annotated-sample case (Dr. Chen's "meaningless enrichment"): already cell-type
     # annotated AND no 2+-category non-annotation column → NO differential question, so the profile
     # must steer the planner AWAY from pathway enrichment / discovery-DE rather than onto a groupby.
-    from bioagent.agents.research_harness import HarnessContext
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     ctx = HarnessContext(decisions={"dataset_result": {
         "cells": 11977, "genes": 36601,
@@ -1265,7 +1265,7 @@ def test_dataset_profile_no_contrast_suppresses_enrichment():
 
 
 def test_no_contrast_detection_and_enrichment_step_classification():
-    from bioagent.agents.research_lab import _annotated_without_contrast, _is_enrichment_step
+    from aiscientist.agents.research_lab import _annotated_without_contrast, _is_enrichment_step
 
     # already annotated + single sample (donor n=1) → no contrast
     retina = {"obs_categoricals": {"majorclass": {"n": 6, "values": []},
@@ -1298,8 +1298,8 @@ def test_no_contrast_detection_and_enrichment_step_classification():
 def test_run_prunes_enrichment_when_no_contrast(monkeypatch):
     # End-to-end wiring: a PI that plans an enrichment step on a single annotated retina sample must
     # have that step dropped before execution; QC / clustering / DE / literature survive.
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness
-    from bioagent.agents.research_lab import LabConfig, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = [
         "Run scanpy QC and select highly variable genes",
@@ -1324,7 +1324,7 @@ def test_run_prunes_enrichment_when_no_contrast(monkeypatch):
 
     def fake_run_loop(question, ag, emit, *a, **k):
         captured["agenda"] = list(ag)
-        from bioagent.agents.research_lab import LabResult
+        from aiscientist.agents.research_lab import LabResult
         return LabResult(question, ag, [], True, len(ag), "done")
     monkeypatch.setattr(lab, "_run_loop", fake_run_loop)
 
@@ -1339,7 +1339,7 @@ def test_run_prunes_enrichment_when_no_contrast(monkeypatch):
 
 
 def test_methods_performed_lists_only_executed_tools():
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, _methods_performed
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, _methods_performed
 
     def rnd(step, tools, verdict="accept"):
         return LabRound(1, 1, step, "sci",
@@ -1357,8 +1357,8 @@ def test_methods_performed_lists_only_executed_tools():
 
 
 def test_run_emits_skills_loaded_after_planning(monkeypatch):
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness
-    from bioagent.agents.research_lab import LabConfig, LabResult, ResearchLab
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
+    from aiscientist.agents.research_lab import LabConfig, LabResult, ResearchLab
 
     ctx = HarnessContext(decisions={}, tunnel_port=1, model="m")
     lab = ResearchLab(ctx, LabConfig(auto_select_skill=False), complete_fn=lambda m: "x",
@@ -1374,7 +1374,7 @@ def test_run_emits_skills_loaded_after_planning(monkeypatch):
 
 
 def test_literature_step_label_ignores_meeting_feedback():
-    from bioagent.agents.research_lab import _ensure_literature_agenda, _is_literature_step
+    from aiscientist.agents.research_lab import _ensure_literature_agenda, _is_literature_step
 
     out = _ensure_literature_agenda(
         ["Run QC", "Cluster cells"],
@@ -1389,7 +1389,7 @@ def test_literature_step_label_ignores_meeting_feedback():
 
 
 def test_accepted_findings_block_forbids_rerunning_upstream():
-    from bioagent.agents.research_lab import CriticVerdict, LabConfig, LabRound, ResearchLab
+    from aiscientist.agents.research_lab import CriticVerdict, LabConfig, LabRound, ResearchLab
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "x")
     rounds = [LabRound(1, 1, "Run QC", "S",
@@ -1401,7 +1401,7 @@ def test_accepted_findings_block_forbids_rerunning_upstream():
 
 
 def test_grounding_vocab_pins_classes_and_enrichment_terms():
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, _grounding_vocab
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, _grounding_vocab
 
     def _rd(step, result):
         return LabRound(1, 1, step, "S",
@@ -1423,7 +1423,7 @@ def test_grounding_facts_pins_numbers_assembly_and_pass_split():
     # Anti-fabrication: the report echoed the plan's "GRCh38" (real build was GRCh37) and invented
     # "0 non-PASS" (QC had n_filtered=212935). _grounding_facts pins the authoritative figures so the
     # synthesize prompt cannot do either.
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, _grounding_facts
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, _grounding_facts
 
     def _rd(step, result, verdict="accept"):
         return LabRound(1, 1, step, "S",
@@ -1449,7 +1449,7 @@ def test_grounding_facts_pins_numbers_assembly_and_pass_split():
 
 def test_verify_report_facts_corrects_wrong_assembly_and_pass_split():
     # The GUARANTEE layer catches fabrications the grounding prompt failed to prevent, deterministically.
-    from bioagent.agents.research_lab import verify_report_facts
+    from aiscientist.agents.research_lab import verify_report_facts
 
     facts = {"assembly": "GRCh37", "n_filtered": 212935}
     md = ("## Methods\n1. Processed the VCF using GRCh38 assembly parameters. "
@@ -1462,7 +1462,7 @@ def test_verify_report_facts_corrects_wrong_assembly_and_pass_split():
 
 
 def test_verify_report_facts_noop_when_consistent():
-    from bioagent.agents.research_lab import verify_report_facts
+    from aiscientist.agents.research_lab import verify_report_facts
 
     # assembly matches + n_nonpass IS genuinely 0 → nothing to correct, no false positives.
     facts = {"assembly": "GRCh37", "n_nonpass": 0}
@@ -1472,13 +1472,13 @@ def test_verify_report_facts_noop_when_consistent():
 
 
 def test_grounding_vocab_empty_without_findings():
-    from bioagent.agents.research_lab import _grounding_vocab
+    from aiscientist.agents.research_lab import _grounding_vocab
 
     assert _grounding_vocab([]) == ""
 
 
 def test_synthesize_prompt_carries_grounding_vocab():
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, ResearchLab
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, ResearchLab
 
     seen = {}
 
@@ -1500,7 +1500,7 @@ def test_synthesize_prompt_carries_grounding_vocab():
 
 
 def test_parse_query_list_sanitizes_dedupes_and_caps():
-    from bioagent.agents.research_lab import _parse_query_list
+    from aiscientist.agents.research_lab import _parse_query_list
 
     raw = json.dumps([
         "RHO GNAT1 rod photoreceptor",           # kept
@@ -1516,14 +1516,14 @@ def test_parse_query_list_sanitizes_dedupes_and_caps():
 
 
 def test_parse_query_list_returns_empty_on_non_json():
-    from bioagent.agents.research_lab import _parse_query_list
+    from aiscientist.agents.research_lab import _parse_query_list
 
     assert _parse_query_list("FINAL REPORT", 4) == []
     assert _parse_query_list('{"not": "a list"}', 4) == []
 
 
 def test_findings_digest_groups_markers_and_pathways_by_class():
-    from bioagent.agents.research_lab import CriticVerdict, LabRound, _literature_findings_digest
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound, _literature_findings_digest
 
     def _rd(step, result):
         return LabRound(1, 1, step, "S",
@@ -1652,7 +1652,7 @@ def test_literature_step_runs_once_even_if_critic_revises():
 
 
 def test_literature_step_detection_does_not_match_background_rna_cleanup():
-    from bioagent.agents.research_lab import _is_literature_step
+    from aiscientist.agents.research_lab import _is_literature_step
 
     assert _is_literature_step("Summarize findings with literature context")
     assert not _is_literature_step("Run ambient background RNA correction")
@@ -1667,7 +1667,7 @@ def test_no_dataset_means_no_profile_line():
 
 
 def test_preset_registry_lookup():
-    from bioagent.agents.presets import PRESETS, get_preset, list_presets
+    from aiscientist.agents.presets import PRESETS, get_preset, list_presets
 
     p = get_preset("celltype_annotation")
     assert p is not None and p.key in PRESETS and "annotation" in p.label.lower()
@@ -1678,7 +1678,7 @@ def test_preset_registry_lookup():
 # --- Axis B: the PI autonomously selects a skill (researcher does not pick) ---
 
 def test_pi_autonomously_selects_skill_when_no_preset_given():
-    from bioagent.agents.presets import ResearchPreset
+    from aiscientist.agents.presets import ResearchPreset
 
     lib = (
         ResearchPreset("celltype_annotation", "Cell-type annotation", "CANONICAL ANNOTATION GUIDANCE"),
@@ -1710,7 +1710,7 @@ def test_pi_autonomously_selects_skill_when_no_preset_given():
 
 
 def test_explicit_preset_overrides_pi_skill_selection():
-    from bioagent.agents.presets import ResearchPreset
+    from aiscientist.agents.presets import ResearchPreset
 
     lib = (ResearchPreset("celltype_annotation", "Cell-type annotation", "AUTO-PICKED GUIDANCE"),)
     seen = {}
@@ -1743,7 +1743,7 @@ def test_pinned_skills_are_mandatory_and_auto_augments():
     # The console multi-select PINS skills (mandatory); the PI's auto-select still runs and ADDS its
     # best-fit skill on top. Both reach the planning guidance, and skills_loaded lists both — emitted
     # BEFORE the plan (pi_agenda) so the user sees the active paths while reviewing.
-    from bioagent.agents.presets import ResearchPreset
+    from aiscientist.agents.presets import ResearchPreset
 
     pinned = ResearchPreset("variant_annotation", "Variant annotation", "PINNED GUIDANCE")
     auto_lib = (ResearchPreset("celltype_annotation", "Cell-type annotation", "AUTO GUIDANCE"),)
@@ -1779,7 +1779,7 @@ def test_pinned_skills_are_mandatory_and_auto_augments():
 def test_skill_selection_sees_the_dataset_profile():
     # Q1 — the skill router now gets the DATASET profile, not only the question, so a vague ask still
     # routes on what the data actually is.
-    from bioagent.agents.presets import ResearchPreset
+    from aiscientist.agents.presets import ResearchPreset
 
     lib = (ResearchPreset("variant_annotation", "Annotate a VCF's variants", "VG"),)
     seen = {}
@@ -1803,7 +1803,7 @@ def test_skill_selection_sees_the_dataset_profile():
 
 
 def test_no_skill_selected_means_free_planning():
-    from bioagent.agents.presets import ResearchPreset
+    from aiscientist.agents.presets import ResearchPreset
 
     lib = (ResearchPreset("celltype_annotation", "Cell-type annotation", "GUIDANCE"),)
     seen = {}
@@ -1827,8 +1827,8 @@ def test_no_skill_selected_means_free_planning():
 
 
 def test_pipeline_loader_reads_tools_and_atomic_skill_library():
-    from bioagent.agents.presets import PRESETS, get_preset
-    from bioagent.agents.skills import SKILLS
+    from aiscientist.agents.presets import PRESETS, get_preset
+    from aiscientist.agents.skills import SKILLS
 
     p = get_preset("scgpt_annotation")
     assert "scgpt_annotate" in p.tools                      # tools: frontmatter parsed
@@ -1842,8 +1842,8 @@ def test_pipeline_loader_reads_tools_and_atomic_skill_library():
 def test_atomic_skills_reach_the_scientist_by_manifest(monkeypatch):
     # The atomic-skill library is surfaced to the Scientist's brief by MANIFEST (name + summary)
     # via progressive disclosure — the full body is withheld until fetched with read_skill_reference.
-    import bioagent.agents.research_lab as rl
-    from bioagent.agents import skills as skills_mod
+    import aiscientist.agents.research_lab as rl
+    from aiscientist.agents import skills as skills_mod
 
     demo = {"demo_skill": skills_mod.Skill("demo_skill", summary="does a demo thing",
                                            doc="how to use the demo",
@@ -1879,7 +1879,7 @@ def test_atomic_skills_reach_the_scientist_by_manifest(monkeypatch):
 
 
 def test_read_skill_reference_fetches_guidance_then_code_on_demand():
-    from bioagent.agents.skills import Skill, make_skill_reference_tool
+    from aiscientist.agents.skills import Skill, make_skill_reference_tool
 
     lib: dict = {}
     tool = make_skill_reference_tool(lambda: lib)   # getter read at call time
@@ -1930,7 +1930,7 @@ def test_required_skills_inject_a_mandatory_directive():
 
 
 def test_search_skills_ranks_by_relevance_and_reports_no_match():
-    from bioagent.agents.skills import Skill, search_skills, make_search_skills_tool
+    from aiscientist.agents.skills import Skill, search_skills, make_search_skills_tool
 
     lib = {
         "edist": Skill("edist", summary="rank perturbations by E-distance to control"),
@@ -1950,8 +1950,8 @@ def test_search_skills_ranks_by_relevance_and_reports_no_match():
 def test_brief_switches_to_search_when_library_is_large(monkeypatch):
     # Small library -> inline manifest (tested elsewhere). Large library (> threshold) -> the brief
     # tells the agent to search_skills instead of listing all, so the manifest can't bloat context.
-    import bioagent.agents.research_lab as rl
-    from bioagent.agents.skills import Skill
+    import aiscientist.agents.research_lab as rl
+    from aiscientist.agents.skills import Skill
 
     big = {f"skill_{i}": Skill(f"skill_{i}", summary=f"does thing {i}") for i in range(20)}
     monkeypatch.setattr(rl, "ATOMIC_SKILLS", big)
@@ -2217,7 +2217,7 @@ def test_cancel_after_step_one_keeps_partial_results():
 
 
 def test_harness_cancel_stops_before_calling_the_model():
-    from bioagent.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
 
     calls = {"n": 0}
 
@@ -2262,7 +2262,7 @@ def test_step_with_artifact_but_no_final_answer_is_accepted():
     # 'incomplete' with NO textual final_answer (the model never called finish). The
     # artifact-aware guard must let the Critic's "accept" STAND — the artifact is the
     # result, not the prose. (The old guard buried this as a failure.)
-    from bioagent.agents.research_harness import HarnessConfig
+    from aiscientist.agents.research_harness import HarnessConfig
 
     # Always call a real tool, never `finish` -> the harness runs out of max_steps and
     # ends 'incomplete' with no final_answer (exactly the scgpt_annotate trace: tool kept
@@ -2333,8 +2333,8 @@ def test_run_code_without_executor_is_not_enabled():
 # --- end-to-end with the REAL sandbox: lab -> Scientist -> run_code -> subprocess
 
 def test_lab_run_code_executes_in_real_sandbox():
-    from bioagent.agents.research_harness import ResearchHarness, default_catalog
-    from bioagent.agents.sandbox import CodeSandbox
+    from aiscientist.agents.research_harness import ResearchHarness, default_catalog
+    from aiscientist.agents.sandbox import CodeSandbox
 
     complete = _make_complete(
         agenda=["Compute the answer with code"],
@@ -2493,7 +2493,7 @@ def test_injected_complete_fn_receives_the_budgeted_prompt() -> None:
 # Extraction is deterministic (no LLM); surfaced for grounding only — no new guard here.
 
 def test_evidence_pointers_extracts_paths_across_tool_shapes():
-    from bioagent.agents.research_harness import evidence_pointers
+    from aiscientist.agents.research_harness import evidence_pointers
 
     # scrna_pack-style: figures/tables lists of relative paths.
     assert evidence_pointers({
@@ -2525,7 +2525,7 @@ def test_evidence_pointers_extracts_paths_across_tool_shapes():
 
 
 def test_critic_payload_carries_evidence_for_each_tool_and_a_step_union():
-    from bioagent.agents.research_harness import HarnessTool
+    from aiscientist.agents.research_harness import HarnessTool
 
     def _exec(args, ctx):
         return {"status": "ok", "figures": ["figures/umap.png"],
@@ -2560,7 +2560,7 @@ def test_critic_payload_carries_evidence_for_each_tool_and_a_step_union():
 
 
 def test_critic_system_prompt_instructs_grounding_in_evidence():
-    from bioagent.agents.research_lab import _CRITIC_SYSTEM
+    from aiscientist.agents.research_lab import _CRITIC_SYSTEM
     assert "evidence" in _CRITIC_SYSTEM
     # Routing marker used by _make_complete must stay intact.
     assert "rigorous scientific Critic" in _CRITIC_SYSTEM
@@ -2572,7 +2572,7 @@ def test_critic_system_prompt_instructs_grounding_in_evidence():
 # enabled: the brief forbids modifying upstream artifacts, so no tampering with intermediates.
 
 def test_accepted_findings_block_frames_evidence_for_readonly_verification():
-    from bioagent.agents.research_lab import CriticVerdict, LabRound
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
 
     lab = ResearchLab(_ctx(), LabConfig(), scientist=ResearchHarness())
     accepted = LabRound(
@@ -2595,7 +2595,7 @@ def test_accepted_findings_block_frames_evidence_for_readonly_verification():
 
 
 def test_downstream_step_brief_carries_prior_evidence_and_verify_framing():
-    from bioagent.agents.research_harness import HarnessTool
+    from aiscientist.agents.research_harness import HarnessTool
 
     def _exec(args, ctx):
         return {"status": "ok", "figures": ["figures/umap.png"], "result_path": "data/x.json"}
@@ -2633,7 +2633,7 @@ def test_downstream_step_brief_carries_prior_evidence_and_verify_framing():
 # data and the prompt still say the same thing, hence the drift test below.
 
 def test_critic_score_band_maps_each_rubric_range():
-    from bioagent.agents.research_lab import critic_score_band
+    from aiscientist.agents.research_lab import critic_score_band
 
     top = "goal fully met; every quantitative claim tied to an evidence artifact"
     assert critic_score_band(1.0) == top
@@ -2648,7 +2648,7 @@ def test_critic_score_band_maps_each_rubric_range():
 
 
 def test_critic_score_band_is_empty_for_a_missing_score():
-    from bioagent.agents.research_lab import critic_score_band
+    from aiscientist.agents.research_lab import critic_score_band
 
     # Better a bare number than an invented band.
     assert critic_score_band(None) == ""
@@ -2662,7 +2662,7 @@ def test_the_displayed_bands_match_the_rubric_the_critic_was_given():
     They are two representations of one rubric — prose for the model, data for the reader — and
     nothing else would notice if an edit to one left the other behind.
     """
-    from bioagent.agents.research_lab import CRITIC_SCORE_BANDS, _CRITIC_SYSTEM
+    from aiscientist.agents.research_lab import CRITIC_SCORE_BANDS, _CRITIC_SYSTEM
 
     for floor, _label in CRITIC_SCORE_BANDS:
         if floor == 0.0:
@@ -2673,7 +2673,7 @@ def test_the_displayed_bands_match_the_rubric_the_critic_was_given():
 
 
 def test_bands_are_ordered_high_to_low_and_cover_the_range():
-    from bioagent.agents.research_lab import CRITIC_SCORE_BANDS
+    from aiscientist.agents.research_lab import CRITIC_SCORE_BANDS
 
     floors = [f for f, _ in CRITIC_SCORE_BANDS]
     assert floors == sorted(floors, reverse=True), "lookup walks top-down; order is load-bearing"
@@ -2688,8 +2688,8 @@ def test_bands_are_ordered_high_to_low_and_cover_the_range():
 # more turns.
 
 def test_budget_bonus_only_answers_the_stop_it_is_for():
-    from bioagent.agents.research_harness import HarnessResult
-    from bioagent.agents.research_lab import RETRY_TURN_BONUS, _budget_bonus
+    from aiscientist.agents.research_harness import HarnessResult
+    from aiscientist.agents.research_lab import RETRY_TURN_BONUS, _budget_bonus
 
     def _res(stop: str) -> HarnessResult:
         return HarnessResult("incomplete", stop, "", [], [])
@@ -2714,8 +2714,8 @@ def test_the_human_is_asked_at_most_three_times_in_one_run():
     could put thirty cards in front of a reviewer — and run 3c5fbc8608a7 had a single step fail
     nine times. Past the budget the fork still happens and still self-heals; it just stops
     interrupting. A fourth identical question is not more control."""
-    from bioagent.agents.dag import TaskNode
-    from bioagent.agents.research_lab import _MAX_HUMAN_FAILURE_ASKS
+    from aiscientist.agents.dag import TaskNode
+    from aiscientist.agents.research_lab import _MAX_HUMAN_FAILURE_ASKS
 
     lab = _dag_hitl_lab(_dag_hitl_complete, [])
     lab._human_failure_asks = 0
@@ -2738,7 +2738,7 @@ def test_the_human_is_asked_at_most_three_times_in_one_run():
 def test_the_ask_budget_is_reset_for_each_run():
     """It lives on the lab OBJECT, which can serve more than one run. A budget carried over would
     stop asking from the very first failure of the next run."""
-    from bioagent.agents.dag import TaskNode
+    from aiscientist.agents.dag import TaskNode
 
     lab = _dag_hitl_lab(_dag_hitl_complete, [])
     lab._human_failure_asks = 3                         # as if a previous run had spent it
@@ -2756,7 +2756,7 @@ def test_the_ask_budget_is_reset_for_each_run():
 def test_headless_never_consumes_the_ask_budget():
     """Nobody is being asked, so nothing should be spent — otherwise a headless run would silently
     change behaviour three failures in for no reason a reader could see."""
-    from bioagent.agents.dag import TaskNode
+    from aiscientist.agents.dag import TaskNode
 
     lab = _dag_hitl_lab(_dag_hitl_complete, [])
     lab._human_failure_asks = 0

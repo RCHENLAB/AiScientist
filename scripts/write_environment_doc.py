@@ -29,7 +29,7 @@ def main() -> int:
     ap.add_argument("-o", "--out", default=str(REPO / "docs" / "ENVIRONMENT.md"))
     args = ap.parse_args()
 
-    from bioagent.gateway.environment import environment_manifest, render_markdown
+    from aiscientist.gateway.environment import environment_manifest, render_markdown
 
     md = render_markdown(environment_manifest())
     if args.stdout:

@@ -1,7 +1,7 @@
 """Biomni ↔ HPC3 Qwen3.6 wiring — offline mock tests (deploy + run before going real).
 
 Biomni is the kept "real biomedical tools" backend. Before flipping
-``BIOAGENT_BIOMNI_RUNTIME=real`` on the eye server, these tests prove — with NO biomni
+``AISCIENTIST_BIOMNI_RUNTIME=real`` on the eye server, these tests prove — with NO biomni
 install and NO GPU — that:
 
   1. Biomni is pinned to THIS session's HPC3 Qwen3.6: the live SSH-tunnel port becomes
@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.integrations.biomni_adapter import EXECUTE_MODE, BiomniAdapter, BiomniSafetyPolicy
-from bioagent.integrations.biomni_runtime import MockBiomniRuntime, RealBiomniRuntime
-from bioagent.integrations.execution import BiomniExecution
+from aiscientist.integrations.biomni_adapter import EXECUTE_MODE, BiomniAdapter, BiomniSafetyPolicy
+from aiscientist.integrations.biomni_runtime import MockBiomniRuntime, RealBiomniRuntime
+from aiscientist.integrations.execution import BiomniExecution
 
-_BIOMNI_ENV = ("BIOAGENT_BIOMNI_EXECUTE", "BIOAGENT_BIOMNI_RUNTIME", "BIOAGENT_BIOMNI_BASE_URL", "BIOAGENT_BIOMNI_MODEL")
+_BIOMNI_ENV = ("AISCIENTIST_BIOMNI_EXECUTE", "AISCIENTIST_BIOMNI_RUNTIME", "AISCIENTIST_BIOMNI_BASE_URL", "AISCIENTIST_BIOMNI_MODEL")
 
 
 @pytest.fixture(autouse=True)
@@ -32,8 +32,8 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BIOAGENT_BIOMNI_EXECUTE", "1")
-    monkeypatch.setenv("BIOAGENT_BIOMNI_RUNTIME", "real")
+    monkeypatch.setenv("AISCIENTIST_BIOMNI_EXECUTE", "1")
+    monkeypatch.setenv("AISCIENTIST_BIOMNI_RUNTIME", "real")
 
 
 def test_biomni_runtime_pinned_to_session_tunnel_and_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,7 +50,7 @@ def test_biomni_runtime_pinned_to_session_tunnel_and_model(monkeypatch: pytest.M
     # can't reach the tunnel's dynamic port). Ollama's /v1 endpoint is OpenAI-compatible.
     assert cfg.source == "Custom"
     assert cfg.api_key == "ollama"
-    # data lake skipped by default — opt in with BIOAGENT_BIOMNI_LOAD_DATA_LAKE=1.
+    # data lake skipped by default — opt in with AISCIENTIST_BIOMNI_LOAD_DATA_LAKE=1.
     assert cfg.load_data_lake is False
 
 

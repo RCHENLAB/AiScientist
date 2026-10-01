@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from bioagent.agents.research_lab import _declared_tools, _is_literature_step
+from aiscientist.agents.research_lab import _declared_tools, _is_literature_step
 
 # The live failure, verbatim in shape: a non-``run_`` tool plus unavoidable domain vocabulary.
 _SCGPT_STEP = (

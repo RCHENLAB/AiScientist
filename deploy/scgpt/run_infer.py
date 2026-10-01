@@ -2,7 +2,7 @@
 """In-container entrypoint for scGPT per-cell annotation (Route C GPU batch job).
 
 Runs INSIDE the scGPT Singularity image ONLY (scgpt + torch live here, never in the
-gateway's Python env). Invoked by ``bioagent.gateway.scgpt_job`` via:
+gateway's Python env). Invoked by ``aiscientist.gateway.scgpt_job`` via:
 
     python /opt/scgpt/run_infer.py --input <query.h5ad> --model <model_dir> --out <out_dir>
 
@@ -13,7 +13,7 @@ relative paths) and runs ``step1_preprocess.py`` + ``step2_inference.py`` unchan
 copies their ``predictions.csv`` out. Single source of truth = the user's refactor code.
 
 I/O contract (must NOT change — the gateway depends on it; see
-``src/bioagent/gateway/scgpt_job.py`` + ``settings.scgpt_entrypoint``):
+``src/aiscientist/gateway/scgpt_job.py`` + ``settings.scgpt_entrypoint``):
   --input   query AnnData .h5ad  (step1 does vocab alignment + HVG + log1p)
   --model   dir with the pretrained reference model
             (best_model.pt, vocab.json, id2type.json, dev_train_args.yml)
@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 # Where the .def vendored the user's harness (see deploy/scgpt/scgpt.def %files).
-REFACTOR_SRC = Path(os.environ.get("BIOAGENT_SCGPT_REFACTOR", "/opt/scgpt/scGPT_refactor"))
+REFACTOR_SRC = Path(os.environ.get("AISCIENTIST_SCGPT_REFACTOR", "/opt/scgpt/scGPT_refactor"))
 
 
 def _run(cmd: list[str], cwd: Path) -> None:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import types
 
-from bioagent.tools.annotate_variants import offline as vo
+from aiscientist.tools.annotate_variants import offline as vo
 
 # A VEP --json element whose ClinVar significance comes from the colocated variants (REST-style).
 _LINE_COLOCATED = {
@@ -95,16 +95,16 @@ def test_build_vep_cmd_omits_custom_when_no_clinvar():
 
 
 def test_vep_plugin_flags_off_by_default(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_VEP_PLUGINS", raising=False)
+    monkeypatch.delenv("AISCIENTIST_VEP_PLUGINS", raising=False)
     assert vo.vep_plugin_flags({}) == ()                    # nothing unless explicitly enabled
 
 
 def test_vep_plugin_flags_adds_only_staged_predictors(tmp_path):
     cadd = tmp_path / "cadd.tsv.gz"; cadd.write_text("x")
     am = tmp_path / "am.tsv.gz"; am.write_text("x")
-    env = {"BIOAGENT_VEP_PLUGINS": "1", "BIOAGENT_VEP_CADD_SNV": str(cadd),
-           "BIOAGENT_VEP_ALPHAMISSENSE": str(am),
-           "BIOAGENT_VEP_REVEL": str(tmp_path / "missing_revel.tsv.gz")}   # REVEL file absent → skipped
+    env = {"AISCIENTIST_VEP_PLUGINS": "1", "AISCIENTIST_VEP_CADD_SNV": str(cadd),
+           "AISCIENTIST_VEP_ALPHAMISSENSE": str(am),
+           "AISCIENTIST_VEP_REVEL": str(tmp_path / "missing_revel.tsv.gz")}   # REVEL file absent → skipped
     flags = vo.vep_plugin_flags(env)
     joined = " ".join(flags)
     assert f"CADD,snv={cadd}" in joined and f"AlphaMissense,file={am}" in joined
@@ -123,7 +123,7 @@ def test_build_vep_cmd_adds_plugins_and_hgvs():
 
 def test_vep_plugin_flags_explicit_paths_win_over_env(tmp_path, monkeypatch):
     # The gateway injects paths (they resolve inside vep.sif) — explicit args must work with NO env set.
-    monkeypatch.delenv("BIOAGENT_VEP_PLUGINS", raising=False)
+    monkeypatch.delenv("AISCIENTIST_VEP_PLUGINS", raising=False)
     cadd = tmp_path / "cadd.tsv.gz"; cadd.write_text("x")
     flags = vo.vep_plugin_flags(enabled=True, cadd_snv=str(cadd))
     assert f"CADD,snv={cadd}" in " ".join(flags) and "--mane_select" in flags
@@ -162,8 +162,8 @@ def test_run_offline_normalizes_when_ref_fasta_staged(tmp_path, monkeypatch):
     ds = tmp_path / "s.vcf.gz"; ds.write_bytes(b"\x1f\x8b")
     cache = tmp_path / "cache"; cache.mkdir()
     ref = tmp_path / "ref.fa"; ref.write_text(">1\nACGT\n")
-    monkeypatch.setenv("BIOAGENT_REF_FASTA", str(ref))
-    monkeypatch.delenv("BIOAGENT_VEP_PLUGINS", raising=False)
+    monkeypatch.setenv("AISCIENTIST_REF_FASTA", str(ref))
+    monkeypatch.delenv("AISCIENTIST_VEP_PLUGINS", raising=False)
     seen: list[list[str]] = []
 
     def run(argv):
@@ -273,11 +273,11 @@ def test_run_offline_annotation_errors_on_missing_cache(tmp_path):
 
 
 def test_spliceai_is_enabled_gating(monkeypatch):
-    monkeypatch.delenv("BIOAGENT_SPLICEAI", raising=False)
+    monkeypatch.delenv("AISCIENTIST_SPLICEAI", raising=False)
     assert vo.spliceai_is_enabled({}) is False               # off by default
-    assert vo.spliceai_is_enabled({"BIOAGENT_SPLICEAI": "1"}) is True
+    assert vo.spliceai_is_enabled({"AISCIENTIST_SPLICEAI": "1"}) is True
     assert vo.spliceai_is_enabled(enabled=True) is True       # explicit wins over env
-    assert vo.spliceai_is_enabled({"BIOAGENT_SPLICEAI": "1"}, enabled=False) is False
+    assert vo.spliceai_is_enabled({"AISCIENTIST_SPLICEAI": "1"}, enabled=False) is False
 
 
 def test_build_spliceai_cmd_shape():

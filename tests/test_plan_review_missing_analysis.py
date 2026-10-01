@@ -6,7 +6,7 @@ read a DE table no step wrote. Measured before this guard existed, the Critic na
 in 10 of 10 reviews and the step still reached the final agenda about half the time: the loss was
 in the handoff (Critic prose -> Critic revised_agenda -> PI), not in the detection.
 """
-from bioagent.agents.research_lab import _missing_analysis_family, _names_tool
+from aiscientist.agents.research_lab import _missing_analysis_family, _names_tool
 
 DE_MISSING = ("MISSING PRIMARY ANALYSIS: The plan lacks a step to perform the actual differential "
               "expression (DE) analysis. Steps 3, 5 and 6 reference 'depth-matched DE tables' but "

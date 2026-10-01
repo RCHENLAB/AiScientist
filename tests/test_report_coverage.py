@@ -10,7 +10,7 @@ covered the dataset.
 
 from __future__ import annotations
 
-from bioagent.agents.research_lab import (
+from aiscientist.agents.research_lab import (
     CriticVerdict,
     LabRound,
     _grounding_facts,
@@ -151,7 +151,7 @@ def test_uncovered_is_optional_so_existing_callers_are_unaffected():
 # of nuclei, and run_de had tested and refused 5 / 22, 4 / 9, …, 57 / 21. The claim-audit block had
 # handed the writers the file's counts as the only authority.
 
-from bioagent.agents.research_lab import _tested_counts, correct_coverage_counts, pre_qc_counts  # noqa: E402
+from aiscientist.agents.research_lab import _tested_counts, correct_coverage_counts, pre_qc_counts  # noqa: E402
 
 _PRE = {"Endothelial": {"DDX41": 7, "WT": 27}, "HC": {"DDX41": 5, "WT": 11},
         "Microglia": {"DDX41": 60, "WT": 24}, "Pericyte": {"DDX41": 4, "WT": 2},
@@ -231,7 +231,7 @@ def test_the_manuscript_writer_path_is_corrected_too(tmp_path):
     import json as _json
     from types import SimpleNamespace
 
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "dataset_results.json").write_text(_json.dumps(
         {"design_by_arm": {"cells_by_label_and_arm": _PRE}}))

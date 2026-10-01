@@ -60,13 +60,13 @@
 #   PORT        [8800]                 console port for the health check
 #   SUDO        [sudo -u aiscientist]  how to act as the service account; set SUDO=""
 #                                      if you ARE already the service account on the server.
-#   STAGE_DIR   [/tmp/bioagent-deploy-$USER]   world-readable rsync staging dir on the
+#   STAGE_DIR   [/tmp/aiscientist-deploy-$USER]   world-readable rsync staging dir on the
 #                                      server (SUDO path only; reused across deploys).
 #   BIND_HOST   [empty]               internal node IP the console must bind so the cluster
 #                                      ingress (Envoy) can reach it — set to <GATEWAY_BIND_IP> in
 #                                      .deploy.env for the PUBLIC prod. Empty = localhost dev
 #                                      (start.sh keeps 127.0.0.1). Passed to the restart as
-#                                      BIOAGENT_HOST; without it a restart would rebind loopback
+#                                      AISCIENTIST_HOST; without it a restart would rebind loopback
 #                                      and drop the public site.
 #   HEALTH_HOST [=BIND_HOST or 127.0.0.1]  host the post-deploy health check curls on the server.
 #
@@ -107,6 +107,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=/dev/null
 [ -f "$REPO_ROOT/.deploy.env" ] && . "$REPO_ROOT/.deploy.env"
+# Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
+# Python side (aiscientist.core.config.apply_brand_env_aliases).
+for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
 DEPLOY_SSH="${DEPLOY_SSH:-eyeserver}"
 # ADMIN_SSH carries the PRIVILEGED (sudo) steps. It must log in as an account that can
@@ -124,9 +127,9 @@ SUDO="${SUDO-sudo -u ${SVC_USER}}"
 # SUDO path restarts THROUGH systemd (sudo systemctl) — never a detached start.sh, which
 # would spawn an orphan that fights the systemd-managed instance for the port and wedge it
 # in a crash-restart loop. SERVICE names that unit.
-SERVICE="${BIOAGENT_SERVICE:-bioagent}"
+SERVICE="${AISCIENTIST_SERVICE:-bioagent}"
 DEPLOY_STAMP="$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
-STAGE_DIR="${STAGE_DIR:-/tmp/bioagent-deploy-${USER:-$(id -un)}}"
+STAGE_DIR="${STAGE_DIR:-/tmp/aiscientist-deploy-${USER:-$(id -un)}}"
 # Public-domain deploy: the console now binds a SPECIFIC internal node IP (the Envoy Gateway
 # terminates TLS on :443 and routes there; 127.0.0.1 and the public NIC are refused). Set
 # BIND_HOST to that IP (e.g. <GATEWAY_BIND_IP> in .deploy.env) so the restart binds where the
@@ -143,10 +146,10 @@ if [ -z "$HEALTH_HOST" ]; then
   HEALTH_HOST="$(ssh "$DEPLOY_SSH" "ss -ltn 2>/dev/null | awk '/:${PORT} /{split(\$4,a,\":\"); print a[1]; exit}'" 2>/dev/null || true)"
   [ -z "$HEALTH_HOST" ] || [ "$HEALTH_HOST" = "0.0.0.0" ] || [ "$HEALTH_HOST" = "*" ] && HEALTH_HOST=127.0.0.1
 fi
-# Only export BIOAGENT_HOST into the restart when BIND_HOST is set, so an unset BIND_HOST never
+# Only export AISCIENTIST_HOST into the restart when BIND_HOST is set, so an unset BIND_HOST never
 # overrides a bind the server already has (never silently forces loopback in prod).
 HOST_ENV=""
-[ -n "$BIND_HOST" ] && HOST_ENV="BIOAGENT_HOST=${BIND_HOST} "
+[ -n "$BIND_HOST" ] && HOST_ENV="AISCIENTIST_HOST=${BIND_HOST} "
 
 DRY_RUN=0; DO_RESTART=1; DO_INSTALL=1; ALLOW_DIRTY=0; RSYNC_DELETE=""
 
@@ -197,7 +200,7 @@ EXCLUDE_PATTERNS=(
   # sample_data/ holds test/demo VCFs + case notes + run scripts (also gitignored). They are for
   # local verification, never served — keep them out of the prod app dir.
   'sample_data/'
-  # THE USERS' SECRETS. BIOAGENT_STATE_DIR is unset in prod, so both credential stores resolve
+  # THE USERS' SECRETS. AISCIENTIST_STATE_DIR is unset in prod, so both credential stores resolve
   # relative to the service WorkingDirectory and land INSIDE the synced app dir:
   # ssh_creds/<user>/ holds private SSH keys for HPC3, llm_creds/<user>/ holds API keys. They were
   # not excluded — so a `--delete` run, the mode this script's own help recommends for a divergent
@@ -215,13 +218,13 @@ _dry=""; [ "$DRY_RUN" -eq 1 ] && _dry="(dry-run) "
 
 # PROTECT, not exclude: files ${APP_DIR} must KEEP when this tree lacks them, yet still RECEIVE when
 # it has them — an exclude would also keep them off the wire for good.
-#   The offline gene-set libraries (src/bioagent/tools/genesets/*.gmt), which run_enrichment and
+#   The offline gene-set libraries (src/aiscientist/tools/genesets/*.gmt), which run_enrichment and
 #   run_gsea_prerank refuse to run without. They are gitignored (scripts/fetch_genesets.py downloads
 #   them), so a fresh worktree has none, and a --delete deploy from one would remove them from prod.
 #   The loss would spread: at the next session the gateway's HPC3 source sync (rm -rf, then a tar
 #   of the LIVE package) would drop them from HPC3 too.
 # A 'P' rule only stops the receiver's deletions; the leading '/' anchors it at the transfer root.
-GMT_GLOB='src/bioagent/tools/genesets/*.gmt'
+GMT_GLOB='src/aiscientist/tools/genesets/*.gmt'
 PROTECT_PATTERNS=( "/${GMT_GLOB}" )
 RSYNC_PROTECTS=(); REMOTE_PROTECTS=""
 for _p in "${PROTECT_PATTERNS[@]}"; do
@@ -333,9 +336,9 @@ else
   REMOTE_STEPS="${REMOTE_STEPS}; echo '${FULL_SHA} ${BRANCH} ${DEPLOY_STAMP}${_sha_note}' | sudo -u ${SVC_USER} tee ${APP_DIR}/.deployed_sha >/dev/null"
   # Restart THROUGH systemd. stop (disarms auto-restart) -> kill any non-systemd orphan
   # squatting the port (self-heals a prior start.sh deploy) -> start a single clean instance.
-  # pkill pattern uses a `[b]` char-class so the regex matches the real `bioagent.gateway`
+  # pkill pattern uses a `[b]` char-class so the regex matches the real `aiscientist.gateway`
   # process but NOT this deploy command's own line (which literally contains the pattern) —
-  # without it, `pkill -f 'bioagent.gateway'` kills the parent shell running the deploy
+  # without it, `pkill -f 'aiscientist.gateway'` kills the parent shell running the deploy
   # (self-suicide) and `systemctl start` never runs.
   # Warm the root credential ONCE, with a VISIBLE prompt, before any redirected step runs.
   # This is not cosmetic. `sudo systemctl stop … 2>/dev/null` sent sudo's OWN password prompt to

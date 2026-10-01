@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bioagent.agents.research_harness import HarnessContext
-from bioagent.agents.registry import build_scientist_catalog
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.scgpt_runner import build_scgpt_runner
-from bioagent.gateway.settings import HPCSettings
-from bioagent.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
-from bioagent.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
+from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.registry import build_scientist_catalog
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.scgpt_runner import build_scgpt_runner
+from aiscientist.gateway.settings import HPCSettings
+from aiscientist.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
+from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
 # --- the tool itself ---------------------------------------------------------
@@ -86,7 +86,7 @@ class FakeRunnerHost:
 
     def exec(self, command, timeout=60.0):
         cmd = command.strip()
-        if "BIOAGENT_EOF" in cmd or ("cat >" in cmd and "<<" in cmd) or cmd.startswith("mkdir"):
+        if "AISCIENTIST_EOF" in cmd or ("cat >" in cmd and "<<" in cmd) or cmd.startswith("mkdir"):
             return self._ok()
         if cmd.startswith("sbatch"):
             jid = str(self._next)

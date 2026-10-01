@@ -10,8 +10,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from bioagent.gateway import app as gw_app  # noqa: E402
-from bioagent.gateway import vllm_client  # noqa: E402
+from aiscientist.gateway import app as gw_app  # noqa: E402
+from aiscientist.gateway import vllm_client  # noqa: E402
 
 
 class _FakeConn:
@@ -20,7 +20,7 @@ class _FakeConn:
 
 
 def test_lab_llm_defaults_to_session_vllm_tunnel(monkeypatch):
-    for v in ("BIOAGENT_LLM_BASE_URL", "BIOAGENT_LLM_API_KEY", "BIOAGENT_LLM_MODEL"):
+    for v in ("AISCIENTIST_LLM_BASE_URL", "AISCIENTIST_LLM_API_KEY", "AISCIENTIST_LLM_MODEL"):
         monkeypatch.delenv(v, raising=False)
     cap: dict = {}
     monkeypatch.setattr(vllm_client, "complete_ex",
@@ -38,9 +38,9 @@ def test_lab_llm_defaults_to_session_vllm_tunnel(monkeypatch):
 
 
 def test_lab_llm_uses_openrouter_when_env_set(monkeypatch):
-    monkeypatch.setenv("BIOAGENT_LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("BIOAGENT_LLM_API_KEY", "sk-or-test")
-    monkeypatch.setenv("BIOAGENT_LLM_MODEL", "qwen/qwen3.6-35b-a3b")
+    monkeypatch.setenv("AISCIENTIST_LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("AISCIENTIST_LLM_API_KEY", "sk-or-test")
+    monkeypatch.setenv("AISCIENTIST_LLM_MODEL", "qwen/qwen3.6-35b-a3b")
     cap: dict = {}
     monkeypatch.setattr(vllm_client, "chat_tools",
                         lambda port, model, messages, tools, **kw:
@@ -145,7 +145,7 @@ def test_upload_saves_file_under_connection_workspace(tmp_path):
     import asyncio
     from pathlib import Path
 
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     loop = asyncio.new_event_loop()
     conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
@@ -176,7 +176,7 @@ def test_upload_uniquifies_on_name_collision(tmp_path):
     import asyncio
     from pathlib import Path
 
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     loop = asyncio.new_event_loop()
     conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
@@ -209,7 +209,7 @@ _VCF_UPLOAD = (
 def _mock_conn(tmp_path):
     import asyncio
 
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     loop = asyncio.new_event_loop()
     conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
@@ -274,7 +274,7 @@ def test_reserve_folder_avoids_collision(tmp_path):
     """Reserving the same folder name twice yields distinct top-level dirs (data, data (1))."""
     import asyncio
 
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     loop = asyncio.new_event_loop()
     conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
@@ -294,7 +294,7 @@ def test_reserve_folder_avoids_collision(tmp_path):
 def test_lab_plan_review_sets_decision_event(tmp_path):
     import asyncio
 
-    from bioagent.gateway.settings import HPCSettings
+    from aiscientist.gateway.settings import HPCSettings
 
     loop = asyncio.new_event_loop()
     conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
@@ -898,8 +898,8 @@ def test_results_delete_rejects_traversal_run_id(tmp_path, monkeypatch):
 
 # --- role split: reasoning roles may run on a different endpoint than the Scientist ----------
 
-_LAB_ENV = ("BIOAGENT_LAB_LLM_BASE_URL", "BIOAGENT_LAB_LLM_MODEL", "BIOAGENT_LAB_LLM_API_KEY")
-_BASE_ENV = ("BIOAGENT_LLM_BASE_URL", "BIOAGENT_LLM_API_KEY", "BIOAGENT_LLM_MODEL")
+_LAB_ENV = ("AISCIENTIST_LAB_LLM_BASE_URL", "AISCIENTIST_LAB_LLM_MODEL", "AISCIENTIST_LAB_LLM_API_KEY")
+_BASE_ENV = ("AISCIENTIST_LLM_BASE_URL", "AISCIENTIST_LLM_API_KEY", "AISCIENTIST_LLM_MODEL")
 
 
 def _clear(monkeypatch, *groups):
@@ -911,9 +911,9 @@ def _clear(monkeypatch, *groups):
 def test_lab_role_endpoint_splits_reasoning_from_tool_calling(monkeypatch):
     """PI/Critic go to the paid API; the Scientist stays on the session's local vLLM."""
     _clear(monkeypatch, _BASE_ENV, _LAB_ENV)
-    monkeypatch.setenv("BIOAGENT_LAB_LLM_BASE_URL", "https://api.example.com/v1")
-    monkeypatch.setenv("BIOAGENT_LAB_LLM_MODEL", "vendor/big-model")
-    monkeypatch.setenv("BIOAGENT_LAB_LLM_API_KEY", "sk-lab")
+    monkeypatch.setenv("AISCIENTIST_LAB_LLM_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setenv("AISCIENTIST_LAB_LLM_MODEL", "vendor/big-model")
+    monkeypatch.setenv("AISCIENTIST_LAB_LLM_API_KEY", "sk-lab")
     seen: list[dict] = []
     monkeypatch.setattr(vllm_client, "complete_ex",
                         lambda port, model, messages, **kw:
@@ -952,6 +952,6 @@ def test_without_the_lab_override_both_roles_share_one_endpoint(monkeypatch):
 def test_a_loopback_lab_endpoint_is_not_reported_as_egress(monkeypatch):
     """Self-hosting a bigger model on the gateway box is a role split with no data leaving."""
     _clear(monkeypatch, _BASE_ENV, _LAB_ENV)
-    monkeypatch.setenv("BIOAGENT_LAB_LLM_BASE_URL", "http://127.0.0.1:8001/v1")
+    monkeypatch.setenv("AISCIENTIST_LAB_LLM_BASE_URL", "http://127.0.0.1:8001/v1")
     r = gw_app._lab_llm(_FakeConn())
     assert r.lab_role_remote is False

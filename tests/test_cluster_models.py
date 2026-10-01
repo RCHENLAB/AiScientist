@@ -10,17 +10,17 @@ import asyncio
 
 import pytest
 
-from bioagent.gateway import cluster_models as cm
-from bioagent.gateway.executor import ExecResult
-from bioagent.gateway.gpu import GPUAllocation
-from bioagent.gateway.settings import HPCSettings
+from aiscientist.gateway import cluster_models as cm
+from aiscientist.gateway.executor import ExecResult
+from aiscientist.gateway.gpu import GPUAllocation
+from aiscientist.gateway.settings import HPCSettings
 
 Q38, Q36 = "RedHatAI/Qwen3.8-27B-INT4", "QuantTrio/Qwen3.6-35B-A3B-AWQ"
 
 
 @pytest.fixture(autouse=True)
 def state_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("BIOAGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
     return tmp_path
 
 
@@ -82,13 +82,13 @@ def test_scan_disk_parses_hf_cache_listing():
 def client(monkeypatch):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     monkeypatch.setattr(gw, "_AUTH_ENABLED", False)
     return TestClient(gw.app)
 
 
 def _conn(mock: bool, model: str = Q38):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     c = gw.Connection(HPCSettings(vllm_model=model), mock=mock, loop=asyncio.new_event_loop(), username="alice")
     c.status = "ready"
     c.cluster_model_id = cm.slug(model)
@@ -107,7 +107,7 @@ def test_list_and_admin_edits(client):
 
 
 def test_non_admin_cannot_edit(client, monkeypatch):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     monkeypatch.setattr(gw, "_AUTH_ENABLED", True)
     monkeypatch.setattr(gw, "_optional_user", lambda request: type("U", (), {"role": "user"})())
     assert client.put("/api/cluster-models", json={"repo": "org/x"}).status_code == 403
@@ -115,7 +115,7 @@ def test_non_admin_cannot_edit(client, monkeypatch):
 
 
 def test_switching_to_the_model_already_served_is_instant(client):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     c = _conn(mock=False)
     c.alloc = GPUAllocation(job_id="555", node="hpc3-gpu-m54-00", port=30000)
     try:
@@ -127,7 +127,7 @@ def test_switching_to_the_model_already_served_is_instant(client):
 
 
 def test_switching_cluster_model_reprovisions_with_the_new_recipe(client, monkeypatch):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     started = []
 
     async def fake(conn, reason):
@@ -146,7 +146,7 @@ def test_switching_cluster_model_reprovisions_with_the_new_recipe(client, monkey
 
 
 def test_switch_is_refused_mid_run(client, monkeypatch):
-    from bioagent.gateway import app as gw
+    from aiscientist.gateway import app as gw
     c = _conn(mock=False)
     c.alloc = GPUAllocation(job_id="555", node="hpc3-gpu-m54-00", port=30000)
     monkeypatch.setattr(type(c), "chat_running", property(lambda self: True), raising=False)
@@ -176,7 +176,7 @@ def test_apply_filters_race_candidates_by_allowed_cards_and_restores_them():
 def test_in_place_switch_keeps_the_tunnel_and_waits_for_the_new_model(monkeypatch):
     """Right after the spec is rewritten the same port still answers with the OLD model; a plain
     reachability check would pass against it. The provisioning must wait for the new one."""
-    from bioagent.gateway import app as gw, gpu, vllm_client
+    from aiscientist.gateway import app as gw, gpu, vllm_client
     c = _conn(mock=False, model=Q36)
     c.executor = type("Ex", (), {"exec": lambda self, cmd, timeout=None: ExecResult(cmd, 0, "RUNNING", "")})()
     c.alloc = GPUAllocation(job_id="555", node="hpc3-gpu-m54-00", port=30000)

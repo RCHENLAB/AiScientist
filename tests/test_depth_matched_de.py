@@ -11,9 +11,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from bioagent.agents.registry import _HPC_ANALYSIS_TOOLS
-from bioagent.tools._lib.scrna import PARAMS, TOOL_SUMMARY
-from bioagent.tools.run_depth_matched_de.tool import (
+from aiscientist.agents.registry import _HPC_ANALYSIS_TOOLS
+from aiscientist.tools._lib.scrna import PARAMS, TOOL_SUMMARY
+from aiscientist.tools.run_depth_matched_de.tool import (
     _DEPTH_ROBUST_MIN_FRACTION,
     _depth_match_targets,
     _depth_robust_genes,
@@ -21,7 +21,7 @@ from bioagent.tools.run_depth_matched_de.tool import (
     _spearman,
     _with_depth_direction,
 )
-from bioagent.tools.catalog import scrna_catalog
+from aiscientist.tools.catalog import scrna_catalog
 
 
 # --- the matcher ------------------------------------------------------------------------------
@@ -88,7 +88,7 @@ def test_it_runs_where_the_checkpoints_live():
 
 
 def test_the_container_cli_can_dispatch_it():
-    from bioagent.tools import scrna_cli
+    from aiscientist.tools import scrna_cli
     assert "run_depth_matched_de" in scrna_cli._analysis_tools()
 
 
