@@ -27,8 +27,11 @@ from __future__ import annotations
 import inspect
 import json
 import textwrap
+from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable
 
+from ..tools import catalog as tool_catalog
 from .research_harness import HarnessContext, HarnessTool
 
 # A tool implementation is normally 50-150 lines. The cap exists so that one call cannot eat a
@@ -40,6 +43,46 @@ MAX_CHARS = 20_000
 def _unwrap(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Follow ``functools.wraps`` to the function that actually holds the source."""
     return inspect.unwrap(fn)
+
+
+def _in_folder(obj: Any, manifest: "tool_catalog.ToolManifest") -> bool:
+    """True when ``obj`` is defined under the tool's own folder (``tools/<name>/``)."""
+    try:
+        file = inspect.getsourcefile(obj)
+    except TypeError:
+        return False
+    return bool(file) and Path(file).resolve().is_relative_to(manifest.folder.resolve())
+
+
+def _implementation(tool: HarnessTool, manifest: "tool_catalog.ToolManifest | None") -> Callable[..., Any]:
+    """The function that holds the tool's behaviour, whatever the platform wrapped around it.
+
+    A tool routed to HPC3 is registered with a dispatcher as its executor (``registry._exec``: "send
+    this to the line's Slurm executor"), and that dispatcher is all ``tool.executor`` shows. Run
+    78a707cd79e9 asked twice for ``run_enrichment`` and got ``registry._exec`` both times; asking for
+    ``symbol="run_enrichment"`` then failed, because the lookup searched registry.py. The step ended
+    without ever calling the tool. The registry now marks its dispatcher with ``__wrapped__``; for any
+    other wrapper, the tool's own folder is the authority (one folder per tool), so the executor is
+    rebuilt from its manifest's factory — the same function the HPC3 job imports and runs.
+    """
+    fn = _unwrap(tool.executor)
+    if manifest is None or _in_folder(fn, manifest):
+        return fn
+    try:
+        own = _unwrap(tool_catalog.build(manifest).executor)
+    except Exception:                        # a factory that cannot build here: report what we have
+        return fn
+    return own if _in_folder(own, manifest) else fn
+
+
+def _folder_module(manifest: "tool_catalog.ToolManifest | None") -> ModuleType | None:
+    """The tool's own ``tool.py`` module (where its factory lives), or None for a platform tool."""
+    if manifest is None:
+        return None
+    try:
+        return inspect.getmodule(manifest.factory())
+    except Exception:                        # an import error is reported by the main lookup
+        return None
 
 
 def _injected(fn: Callable[..., Any]) -> dict[str, Any]:
@@ -64,6 +107,9 @@ def _injected(fn: Callable[..., Any]) -> dict[str, Any]:
             continue
         if not callable(val) or inspect.isclass(val):
             continue
+        # A composite (``diagnose_disease``) closes over the ROUTED executors of the tools it
+        # wraps; point at those tools' code, not at the HPC dispatcher in front of them.
+        val = _unwrap(val)
         try:
             out[name] = {"where": f"{inspect.getsourcefile(val)}:{inspect.getsourcelines(val)[1]}",
                          "qualname": getattr(val, "__qualname__", getattr(val, "__name__", name))}
@@ -114,7 +160,8 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
         if name not in by_name:
             return {"error": f"unknown tool {name!r}", "available": sorted(by_name)}
         tool = by_name[name]
-        fn = _unwrap(tool.executor)
+        manifest = tool_catalog.manifest(name)
+        fn = _implementation(tool, manifest)
 
         symbol = str(args.get("symbol", "")).strip()
         module = inspect.getmodule(fn)
@@ -127,16 +174,20 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
             closed = {n: c.cell_contents for n, c in
                       zip(getattr(getattr(fn, "__code__", None), "co_freevars", ()) or (),
                           fn.__closure__ or ())}
+            # The executor's module first, then the tool folder's own tool.py, in case the
+            # executor itself is defined elsewhere (a shared ``_lib`` function).
+            homes = [m for m in (module, _folder_module(manifest)) if m is not None]
+            home = next((m for m in homes if hasattr(m, symbol)), None)
             if symbol in injected and symbol in closed:
-                target = closed[symbol]
-            elif module is None or not hasattr(module, symbol):
+                target = _unwrap(closed[symbol])
+            elif home is None:
                 return {"error": f"{name!r} does not resolve a symbol named {symbol!r}",
                         "module": getattr(module, "__name__", "<unknown>"),
                         "injected": injected,
                         "hint": "call without `symbol` first to read the tool body; anything listed "
                                 "under `dispatches_to` can be fetched as `symbol`"}
             else:
-                target = getattr(module, symbol)
+                target, module = getattr(home, symbol), home
 
         try:
             src, file, line = _source_of(target)
@@ -162,6 +213,14 @@ def make_tool_source_tool(get_catalog: "Callable[[], list[HarnessTool]] | None" 
             "declared_description": tool.description,
             "declared_parameters": tool.parameters,
         }
+        if manifest is not None:
+            out["runs_on"] = manifest.runs_on
+            if manifest.runs_on.startswith("hpc:"):
+                # Run 78a707cd79e9, given only the dispatcher, went looking for the real file with
+                # run_shell — on HPC3, at the gateway's path — and failed.
+                out["note"] = ("This tool runs as a Slurm job on HPC3, and the job imports this same "
+                               "source. `file` is its path on the gateway host, not on HPC3: fetch "
+                               "helpers with `symbol` instead of searching for the file with run_shell.")
         if not symbol:
             out["defaults"] = _merge_defaults(tool.parameters, src)
             out["review_prompt"] = (

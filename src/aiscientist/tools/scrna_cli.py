@@ -30,24 +30,30 @@ INSTALL_DEPENDENCY = "_install_dependency"
 
 class _Ctx:
     """Minimal stand-in for the harness context the scrna tools read (``.workspace`` +
-    ``.decisions['dataset_path']``)."""
+    ``.decisions['dataset_path']``, and ``['dataset_root']`` for a folder dataset)."""
 
-    def __init__(self, workspace: str, dataset_path: str | None) -> None:
+    def __init__(self, workspace: str, dataset_path: str | None, dataset_root: str | None = None) -> None:
         self.workspace = Path(workspace)
         self.decisions: dict[str, Any] = {"dataset_path": dataset_path} if dataset_path else {}
+        if dataset_root:
+            self.decisions["dataset_root"] = dataset_root
 
 
-def _analysis_tools() -> dict[str, Any]:
-    """Every tool whose manifest says ``runs_on: hpc:analysis``, by name -> its executor.
+def _analysis_tools(only: str | None = None) -> dict[str, Any]:
+    """Every tool whose manifest says ``runs_on: hpc:analysis``, by name -> its executor (or just
+    ``only``, when given: a job builds the one tool it runs, which matters when that tool's job runs
+    in its own image, where another tool's module need not import).
 
     Read from the tool folders' TOOL.md, the same source the registry routes from, so a tool the
     registry sends to this image is always one this dispatcher knows (the hand-kept list once
     lagged the routing, and the missing tools ran on the gateway against an empty work/)."""
     from . import catalog
-    return {t.name: t.executor for t in catalog.build_tools(where=lambda m: m.runs_on == "hpc:analysis")}
+    return {t.name: t.executor for t in catalog.build_tools(
+        where=lambda m: m.runs_on == "hpc:analysis" and (only is None or m.name == only))}
 
 
-def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str, Any] | None) -> dict[str, Any]:
+def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str, Any] | None,
+             dataset_root: str | None = None) -> dict[str, Any]:
     """Dispatch ONE step against the workspace. ``preflight`` is the dataset smoke analysis
     (different signature); the rest are the standard ``(args, ctx) -> dict`` scrna tools."""
     args = args or {}
@@ -62,10 +68,10 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str
         # dependency missing (see run_deps.ALLOWED); anything else is refused there.
         from .run_deps import install
         return install(workspace, str(args.get("dependency", "")))
-    fn = _analysis_tools().get(tool)
+    fn = _analysis_tools(only=tool).get(tool)
     if fn is None:
         return {"status": "error", "error": f"unknown analysis tool: {tool}"}
-    return fn(args, _Ctx(workspace, dataset_path))
+    return fn(args, _Ctx(workspace, dataset_path, dataset_root))
 
 
 def _load_args(raw: str) -> dict[str, Any]:
@@ -81,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tool", required=True)
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--dataset", default="")
+    ap.add_argument("--dataset-root", default="")
     ap.add_argument("--args", default="{}")
     ns = ap.parse_args(argv)
     try:
@@ -88,7 +95,8 @@ def main(argv: list[str] | None = None) -> int:
     except (json.JSONDecodeError, OSError) as exc:
         result: dict[str, Any] = {"status": "error", "error": f"bad --args: {exc}"}
     else:
-        result = run_tool(ns.tool, ns.workspace, ns.dataset or None, args)
+        result = run_tool(ns.tool, ns.workspace, ns.dataset or None, args,
+                          dataset_root=ns.dataset_root or None)
     print(RESULT_MARKER + json.dumps(result))
     return 0 if result.get("status") != "error" else 1
 

@@ -47,6 +47,7 @@ from . import claim_audit
 from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from .hypotheses import DesignFacts, HypothesisLedger
 from .loop_utils import safe_json_loads
+from .marker_claims import check_marker_claims
 from .preset_pipelines import (
     PresetPipeline,
     compose_pipeline_prompts,
@@ -54,13 +55,15 @@ from .preset_pipelines import (
     select_pipeline,
 )
 from .skills import (
-    MANIFEST_MAX as SKILL_MANIFEST_MAX,
     SKILLS as ATOMIC_SKILLS,
     Skill,
     get_skill,
     make_search_skills_tool,
     make_skill_reference_tool,
+    plan_skill_lines,
+    refresh_skills,
     skill_manifest,
+    skills_named_in,
 )
 from .step_numbers import contrast_arms, describe_count_mismatches, find_count_mismatches
 from .tool_source import make_tool_source_tool
@@ -226,6 +229,31 @@ _PI_SYSTEM = (
     "so do not add an 'other' option yourself. Prefer drafting a sensible default plan over asking; "
     "never ask about formatting/packaging (those are automatic)."
 )
+
+# The skill library goes into every plan the PI drafts, next to the tools. Before this the PI planned
+# from one preset pipeline and the tools alone; a skill reached a run only when the Scientist went
+# looking for one mid-step, or when the user ticked it in the console.
+_PLAN_SKILLS_HEADER = (
+    "Skills the scientist can also use: vetted code templates it reads, adapts to this dataset and "
+    "runs with `run_code`, for analyses the tools above do not cover. When a step needs one, plan it "
+    "as a `run_code` step that applies the skill and name the skill in backticks, e.g. \"apply "
+    "skill `pairwise_de` with `run_code` to ...\". Prefer a tool whenever one covers the step; never "
+    "plan a skill that only repeats what a tool does. Describe a skill's method only as its line below "
+    "states it: if the line does not name the algorithm, say the step uses the skill's template and "
+    "do not name a different one.")
+
+
+def plan_skills_block(query: str, skills: "dict[str, Skill] | None" = None,
+                      limit: "int | None" = None) -> str:
+    """The planning prompt's skill section for ``query`` (the question plus the dataset profile);
+    '' when the library is empty. See :func:`~aiscientist.agents.skills.plan_skill_lines`."""
+    lines, left_out = plan_skill_lines(query, skills, limit)
+    if not lines:
+        return ""
+    tail = (f"\n({left_out} more skills exist; the scientist can find them with `search_skills`.)"
+            if left_out else "")
+    return _PLAN_SKILLS_HEADER + "\n" + "\n".join(lines) + tail
+
 
 _CRITIC_SYSTEM = (
     "You are a rigorous scientific Critic. You are given the research question, the current step, "
@@ -604,6 +632,50 @@ def _parse_verdict(raw: str) -> dict[str, Any] | None:
                 parsed = json.loads(m.group(0))
             except json.JSONDecodeError:
                 parsed = None
+    if parsed is None:
+        parsed = _close_unterminated_json(raw)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _close_unterminated_json(raw: str) -> "dict[str, Any] | None":
+    """A JSON object whose only fault is missing closing brackets — the model stopped after the
+    last complete value. Measured on the plan review of an 18-step DDX41 plan: the Critic's ~15k-
+    character reply (issues + a verbatim revised agenda) ended ``…"]`` without the final ``}``, the
+    parse failed, and the review fell through as "no issues" with five correct ones in the text.
+
+    Only that case is repaired: the text must open with ``{`` and must NOT end inside a string. A
+    reply cut mid-string is left unparsed — closing it would invent the end of a step's text."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text[4:].strip() if text.lower().startswith("json") else text
+    start = text.find("{")
+    if start < 0:
+        return None
+    text = text[start:]
+    stack: list[str] = []
+    in_string = escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                return None
+    if in_string or not stack:
+        return None
+    try:
+        parsed = json.loads(text.rstrip().rstrip(",") + "".join(reversed(stack)))
+    except json.JSONDecodeError:
+        return None
     return parsed if isinstance(parsed, dict) else None
 
 
@@ -673,6 +745,88 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
         name="run_code",
         description=description,
         parameters={"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+        executor=_exec,
+        reads_private_data=False, category="codeact",
+    )
+
+
+def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
+    """``run_in_environment`` — run a skill's shell commands inside the environment its SKILL.md
+    declares (``image:``), as a Slurm job on HPC3. None when ``executor`` cannot run images (no HPC
+    session), so a local run's roster does not list a tool that cannot work.
+
+    This is what lets a skill that needs its own software stack (an R/Snakemake pipeline such as
+    CellQC) work by being dropped into skills/: the platform builds its declared image once for the
+    lab, and the agent follows the skill's commands here. Only a skill's DECLARED image can be used —
+    the agent never names an image itself, so what runs is what the skill's author pinned."""
+    runner = getattr(executor, "run_in_image", None)
+    if not callable(runner):
+        return None
+
+    def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
+        import hashlib
+        from pathlib import Path as _Path
+        from .skills import SKILLS, refresh_skills
+        refresh_skills()
+        wanted = str(args.get("skill") or "").strip()
+        command = str(args.get("command") or "").strip()
+        with_env = sorted(s.name for s in list(SKILLS.values()) if s.image)
+        skill = SKILLS.get(wanted) or next(
+            (s for s in list(SKILLS.values()) if s.name.lower() == wanted.lower()), None)
+        if skill is None:
+            return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "
+                                                f"environment: {with_env or 'none'}"}
+        if not skill.image:
+            why = f" ({skill.env_problem})" if skill.env_problem else ""
+            return {"status": "error",
+                    "error": f"skill {skill.name!r} declares no environment{why}: use run_code or "
+                             f"the typed tools. Skills that declare one: {with_env or 'none'}"}
+        if not command:
+            return {"status": "error", "error": "no command provided"}
+        folder = _Path(skill.folder) if skill.folder else None
+        files = {rel: str(folder / rel) for rel in skill.files
+                 if folder is not None and (folder / rel).is_file()}
+        workdir = "env/" + re.sub(r"[^\w.\-]", "_", skill.name)
+        result = runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
+                        mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=files)
+        if isinstance(result, dict):
+            result["skill"] = skill.name
+            result["provenance"] = {
+                "skill": skill.name, "image": skill.image,
+                "command_sha256": hashlib.sha256(command.encode()).hexdigest()[:16]}
+        return result
+
+    from .skills import SKILLS, refresh_skills
+    refresh_skills()
+    declared = [f"  - {s.name}: {s.image}" for s in sorted(SKILLS.values(), key=lambda s: s.name)
+                if s.image]
+    description = (
+        "Run SHELL commands inside the software environment a SKILL declares (the `image:` in its "
+        "SKILL.md), as a CPU Slurm job on HPC3. Use it to follow a skill whose steps are "
+        "command-line programs that no tool in this catalog runs (e.g. an R/Snakemake pipeline): "
+        "read the skill first (read_skill_reference), then send its commands here, adapted to this "
+        "run's paths. The environment already has the software: do NOT install anything, and skip "
+        "the skill's own installation steps. Inside the job: the working directory, also "
+        "$AISCIENTIST_ENV_DIR, is this skill's own directory and persists across calls in this run "
+        "(put a pipeline's intermediate output there); $AISCIENTIST_DATASET_ROOT is the bound "
+        "dataset folder, READ-ONLY (link or copy what a pipeline must write next to); "
+        "$AISCIENTIST_DATASET is the primary file in it; $AISCIENTIST_WORK holds the run's "
+        "checkpoints (the analysis tools read adata_qc.h5ad there after QC); write deliverables "
+        "under $AISCIENTIST_ARTIFACTS (tables/, figures/, or a folder named after the pipeline); "
+        "$AISCIENTIST_SKILL_DIR has the skill's bundled files; $AISCIENTIST_JOB_CPUS is the CPU "
+        "count. CPUs, memory and time come from the skill. The first use of an environment builds "
+        "it once for the whole lab, which can take 10-30 minutes. Returns the exit code, the tails "
+        "of stdout/stderr, and the files written under $AISCIENTIST_ARTIFACTS.")
+    if declared:
+        description += "\nSkills that declare an environment:\n" + "\n".join(declared)
+    return HarnessTool(
+        name="run_in_environment",
+        description=description,
+        parameters={"type": "object", "properties": {
+            "skill": {"type": "string", "description": "the skill whose environment to use"},
+            "command": {"type": "string",
+                        "description": "bash to run in it (several lines are fine)"}},
+            "required": ["skill", "command"]},
         executor=_exec,
         reads_private_data=False, category="codeact",
     )
@@ -823,7 +977,9 @@ def _known_tool_names() -> frozenset[str]:
     """
     try:
         from .registry import build_scientist_catalog
-        return frozenset(t.name for t in build_scientist_catalog())
+        # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
+        # a step that names it must still be recognised as that tool's step.
+        return frozenset(t.name for t in build_scientist_catalog()) | {"run_in_environment"}
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
@@ -925,8 +1081,8 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
         text = str(step)
         # 1. Names. Correct the unambiguous ones in place; report the rest.
         for raw in set(_BACKTICK_TOOL_RE.findall(text)) | {m.group(1) for m in _TOOL_CALL_RE.finditer(text)}:
-            if raw in schemas:
-                continue
+            if raw in schemas or get_skill(raw) is not None:
+                continue                      # a tool, or a skill the step applies with run_code
             target = _TOOL_NAME_FIXES.get(raw.lower())
             if target and target in schemas:
                 text = re.sub(rf"\b{re.escape(raw)}\b", target, text)
@@ -1083,8 +1239,32 @@ _DE_PRODUCER_RE = re.compile(
     r"express|marker genes?|pseudobulk|wilcoxon|deseq2?|DEGs?)\b", re.I)
 
 
+_ENRICHMENT_TOOLS = frozenset({"run_enrichment", "run_gsea_prerank"})
+_DE_PRODUCER_TOOLS = frozenset({"run_de", "run_pseudobulk_de", "run_depth_matched_de"})
+# Tools that can do anything: naming one says nothing about what the step is, so its prose decides.
+_GENERIC_TOOLS = frozenset({"run_code", "run_shell", "run_in_environment"})
+
+
+def _primary_tool(step: str) -> "str | None":
+    """The tool a step itself runs: the FIRST catalog tool it names. Later names are usually what it
+    reads or feeds ("…ranked by Wilcoxon z, from `run_de`'s ranking files"), not what it runs."""
+    text = step or ""
+    declared = _declared_tools(text)
+    first: "tuple[int, str] | None" = None
+    for rx in (_BACKTICK_NAME_RE, _ANY_TOOL_CALL_RE):
+        for m in rx.finditer(text):
+            if m.group(1) in declared and (first is None or m.start() < first[0]):
+                first = (m.start(), m.group(1))
+    return first[1] if first else None
+
+
 def _is_de_producer_step(step: str) -> bool:
-    if _is_literature_step(step) or _is_enrichment_step(step):
+    if _is_literature_step(step):
+        return False
+    tool = _primary_tool(step)
+    if tool and tool not in _GENERIC_TOOLS:
+        return tool in _DE_PRODUCER_TOOLS
+    if _is_enrichment_step(step):
         return False
     return bool(_DE_PRODUCER_RE.search((step or "").replace("_", " ")))
 
@@ -1095,6 +1275,14 @@ def _is_enrichment_step(step: str) -> bool:
     # prune (only the actual ORA/pathway analysis step should be dropped).
     if _is_literature_step(step):
         return False
+    # A step that names its tool is that tool's step, whatever its prose says. On 2026-10-03 the
+    # prose test called four steps of one plan "enrichment" and dropped them: the marker-DE step (it
+    # said what its markers would feed: "pathway"), ORA, GSEA, and the cell-type annotation step
+    # ("a label is assigned only when a marker is ENRICHED in the cluster"). With the DE step gone
+    # nothing produced a DE table, so the run lost its markers and its labels.
+    tool = _primary_tool(step)
+    if tool and tool not in _GENERIC_TOOLS:
+        return tool in _ENRICHMENT_TOOLS
     return bool(_ENRICHMENT_STEP_RE.search((step or "").replace("_", " ")))
 
 
@@ -1902,13 +2090,16 @@ _ASSEMBLY_CANON = {"grch38": "GRCh38", "hg38": "GRCh38", "grch37": "GRCh37", "hg
 def verify_report_facts(report_md: str, facts: "dict[str, Any]",
                         uncovered: "dict[str, str] | None" = None, *,
                         tested_counts: "dict[str, dict[str, int]] | None" = None,
-                        pre_counts: "dict[str, dict[str, int]] | None" = None) -> "tuple[str, list[str]]":
+                        pre_counts: "dict[str, dict[str, int]] | None" = None,
+                        marker_reference: "dict[str, Any] | None" = None) -> "tuple[str, list[str]]":
     """The GUARANTEE layer: a deterministic post-generation fact-check of the manuscript against the
     authoritative figures, so a fabrication that slipped past the grounding prompt is caught regardless of
     whether the LLM obeyed it. Corrects two UNAMBIGUOUS cases in place — a wrong genome assembly (the
     report named a build other than the one actually used), and a '0/no/zero non-PASS' claim when the QC
-    reported non-PASS records — and returns ``(corrected_md, issues)``. It only swaps those tokens/numbers,
-    never narrative prose; ``issues`` are for the technical-report Diagnostics."""
+    reported non-PASS records — and returns ``(corrected_md, issues)``. It only swaps those tokens/numbers;
+    the one prose edit is removing a sentence that calls a gene a marker of a lineage the run's curated
+    ``marker_reference`` gives to another (``marker_claims``). ``issues`` are for the technical-report
+    Diagnostics."""
     import re
     md = report_md or ""
     issues: list[str] = []
@@ -1949,7 +2140,25 @@ def verify_report_facts(report_md: str, facts: "dict[str, Any]",
     # 4. Coverage counts — a refused group described with the uploaded file's counts, not the tested ones.
     md, count_issues = correct_coverage_counts(md, uncovered or {}, tested_counts or {}, pre_counts or {})
     issues += count_issues
+    # 5. Marker claims — "RLBP1 is a canonical rod photoreceptor marker" (run c57071e7dc94) when the
+    # curated reference the annotation used lists RLBP1 under Muller glia: the sentence is removed.
+    md, marker_issues = check_marker_claims(md, marker_reference)
+    issues += marker_issues
     return md, issues
+
+
+def _marker_reference(rounds: "list[LabRound]") -> "dict[str, Any] | None":
+    """The curated marker reference (tissue JSON) an accepted ``run_marker_annotation`` step used."""
+    from ..tools.api import available_references, load_marker_reference
+    names = set(available_references())
+    for r in reversed(rounds):
+        if r.verdict.verdict != "accept":
+            continue
+        for s in r.scientist_result.get("steps", []):
+            ref = s.get("result", {}).get("reference") if isinstance(s.get("result"), dict) else None
+            if isinstance(ref, dict) and ref.get("name") in names:
+                return load_marker_reference(ref["name"])
+    return None
 
 
 def _term_label(t: Any) -> str:
@@ -2297,7 +2506,9 @@ _NEXT_CYCLE_SYSTEM = (
 )
 _PLAN_REVIEW_CRITIC_SYSTEM = (
     "You are the Scientific Critic reviewing a DRAFT analysis plan with the PI, BEFORE any step runs. "
-    "You are given the research question, the dataset profile, and the ordered draft agenda. "
+    "You are given the research question, the dataset profile, the ordered draft agenda, and "
+    "`tools_named_in_plan` — what each tool the plan names computes and returns, in the words "
+    "the tool's own contract uses. "
     "USE YOUR OWN KNOWLEDGE OF SINGLE-CELL AND GENOMICS METHOD, not only the protocol you were "
     "handed: a plan can follow a protocol's wording and still be scientifically incoherent, and "
     "catching that is exactly your job. Judge the plan AS A WHOLE, not step by step:\n"
@@ -2314,6 +2525,14 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "an earlier step's output for this purpose; and a 'figures and tables' step re-drew the "
     "volcano plots and enrichment heatmaps that run_de and run_enrichment already write to "
     "figures/, which is the re-RENDERING case above wearing a different name. "
+    "Re-DERIVING is the same waste: read `tools_named_in_plan`, and when a `run_code` step "
+    "recomputes a verdict, label or table a named tool already returns, merge it into the step "
+    "that runs that tool. The miss: a step re-applied a per-direction depth rule and a rho "
+    "filter to run_depth_matched_de's tables, when that tool already labels each direction and "
+    "marks its depth-robust genes — and applied the rule backwards. Likewise a step that repeats "
+    "another step's operation on a subset under a new name (keeping only the reference arm's "
+    "cells inside the other arm's depth range IS depth matching, whatever the step calls it). "
+    "Name the tool and the output the step duplicates; that is a reason ON THIS DATA. "
     "But a NARROWLY WORDED QUESTION IS NOT A REASON TO DROP AN ANALYSIS. A researcher who writes "
     "'run tool X and report what it returns' is naming a starting point, not commissioning a "
     "one-line study, and the standard is what the DATA warrants: quality control, the "
@@ -2357,7 +2576,8 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "committed to showing a number nothing calculated. Either add the step that computes it "
     "(here `run_composition`) or drop the promise.\n"
     "(8) THE DESCRIPTION MATCHES THE TOOL — when a step names a tool, its prose must describe "
-    "what that tool actually does. The failure to catch: a step said preranked GSEA would return "
+    "what that tool actually does: check it against `tools_named_in_plan`, not against memory. "
+    "The failure to catch: a step said preranked GSEA would return "
     "scores 'based on log2FC ranks' when `run_gsea_prerank` ranks on the Wilcoxon z-score, and "
     "the same sentence claimed both. A wrong description is copied verbatim into the paper's "
     "Methods, where nobody can check it against the code.\n"
@@ -2383,9 +2603,10 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "drafts whose DE step was missing, this review named the omission correctly every time and "
     "then returned an agenda without the DE step in three of four attempts. Before you answer, "
     "re-read your issues list against your revised_agenda and make them agree.\n"
-    "``revised_agenda`` is your proposed corrected plan — add the missing analysis or reconciliation "
-    "step where one is needed, drop orphan/circular/contradictory steps, keep the other step text "
-    "verbatim; return the ORIGINAL agenda unchanged if it is already sound.\n"
+    "``revised_agenda`` is your proposed corrected plan — add the missing analysis step where one is "
+    "needed (not a step that only reconciles or re-checks other steps' results: the claim audit "
+    "before the write-up does that), drop orphan/circular/contradictory steps, keep the other step "
+    "text verbatim; return the ORIGINAL agenda unchanged if it is already sound.\n"
     "WEIGH ADDING AND DROPPING DIFFERENTLY. The two mistakes do not cost the same: a step you "
     "wrongly drop is gone silently — no later step reports its absence, and the result simply "
     "lacks an analysis nobody sees was missing — while a step you wrongly keep costs some compute "
@@ -2414,7 +2635,7 @@ _ANALYSIS_FAMILIES: "tuple[tuple[Any, tuple[str, ...]], ...]" = (
     (re.compile(r"\b(enrichment|pathway|GSEA|ORA)\b", re.I), ("run_enrichment", "run_gsea_prerank")),
     (re.compile(r"\b(clustering|cluster|annotation|cell[- ]type label)\b", re.I),
      ("run_clustering", "scgpt_annotate")),
-    (re.compile(r"\b(quality control|\bQC\b|filtering)\b", re.I), ("run_scanpy_qc",)),
+    (re.compile(r"\b(quality control|\bQC\b|filtering)\b", re.I), ("run_scanpy_qc", "run_cellqc")),
     (re.compile(r"\b(depth|library size|down-?sampl)\b", re.I), ("run_depth_matched_de",)),
 )
 
@@ -2440,13 +2661,30 @@ def _names_tool(agenda: "list[str]", tools: "tuple[str, ...]") -> bool:
     return any(re.search(r"`%s`" % re.escape(t), text) for t in tools)
 
 
+def plan_tool_contracts(agenda: "list[str]", catalog: "list[Any]") -> "dict[str, str]":
+    """``{tool name: what the model is told it does}`` for every catalog tool the agenda names.
+
+    The plan review judges redundancy ("this step recomputes what a tool already returns") and
+    fidelity ("the step describes the tool wrongly"), and both are questions about the tool, not
+    the plan. Only the tools the plan names are sent: they are the ones a step can duplicate or
+    misdescribe, and the whole catalog would bury them."""
+    text = "\n".join(agenda)
+    return {t.name: str(getattr(t, "description", "") or "")
+            for t in catalog
+            if t.name != "finish" and re.search(r"`%s`" % re.escape(t.name), text)}
+
+
 _PLAN_REVIEW_PI_SYSTEM = (
     "You are the Principal Investigator finalizing the analysis plan after the Critic reviewed it, "
     "BEFORE any step runs. You OWN the plan. You are given the question, the dataset profile, the draft "
     "agenda, and the Critic's issues + proposed revision. Decide the FINAL agenda: adopt the fixes you "
     "agree with, keep steps you still want, never drop a step you believe is needed — but DO remove a "
-    "genuinely orphan, circular, or redundant step and DO add a reconciliation step where a claim needs "
-    'one. Reply with ONLY a JSON object: {"final_agenda": ["<step>", ...], "reason": "<one sentence>"}.'
+    "genuinely orphan, circular, or redundant step. Do NOT put back, in its place, a 'reconciliation', "
+    "'cross-check' or 'claim gate' step that re-reads other steps' results: before the report is "
+    "written, a claim audit checks every candidate conclusion against the design (depth gap, "
+    "replication) and the artifacts, so such a step duplicates it. Add a step only for an analysis no "
+    "step computes. "
+    'Reply with ONLY a JSON object: {"final_agenda": ["<step>", ...], "reason": "<one sentence>"}.'
 )
 
 _MEETING_SYNTH_SYSTEM = (
@@ -2765,6 +3003,27 @@ class LabRound:
         )
 
 
+def _rounds_by_agenda_index(agenda: list[str], rounds: "list[LabRound]") -> "dict[int, LabRound]":
+    """Map each round to the 0-based agenda step it ran, by the step's TEXT.
+
+    ``LabRound.step_index`` is the agenda position only on the linear loop. The DAG scheduler, the
+    LangGraph path and multi-cycle runs number rounds in completion order instead: in run
+    78a707cd79e9 round 5 is the clustering step, agenda step 4, so keying a resume by ``step_index``
+    handed the marker-gene step the clustering result. ``step_index`` still decides between two steps
+    with the same text. A later round for the same step wins (a revise, then its accept). A round
+    whose text is no longer in the agenda (a resume replaced that step's text) maps nowhere."""
+    positions: dict[str, list[int]] = {}
+    for i, text in enumerate(agenda):
+        positions.setdefault(text, []).append(i)
+    by_index: dict[int, LabRound] = {}
+    for r in rounds:
+        candidates = positions.get(r.step)
+        if not candidates:
+            continue
+        by_index[r.step_index - 1 if (r.step_index - 1) in candidates else candidates[0]] = r
+    return by_index
+
+
 @dataclass
 class LabResult:
     question: str
@@ -2847,6 +3106,21 @@ class ResumeState:
         return cls(list(state.get("agenda", [])), kept, int(from_step_index),
                    modify_note=modify_note, guidance=guidance or state.get("guidance"),
                    redo_indices=frozenset(redo_indices) if redo_indices is not None else None)
+
+    @classmethod
+    def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
+        """Pick up a run that stopped part-way — a crash, a gateway restart, a dropped session — from
+        the run_state.json it checkpoints after every round: keep every step that has an accepted
+        result and run every step that has none, starting with the first. Nothing is re-evaluated or
+        re-run that already finished. Raises ``ValueError`` when no step is left to run."""
+        resume = cls.from_run_state(state, 0, guidance=guidance)
+        done = _rounds_by_agenda_index(resume.agenda, resume.prior_rounds)
+        todo = [i for i in range(len(resume.agenda)) if i not in done]
+        if not todo:
+            raise ValueError("Every planned step of this run already has an accepted result — "
+                             "there is nothing left to continue. Re-run a chosen step instead.")
+        return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
+                   redo_indices=frozenset(todo))
 
 
 # --- plan revision: patch ONE step instead of re-drafting the whole plan -----------------------
@@ -3133,8 +3407,8 @@ class ResearchLab:
                 else self._evaluate_redo_indices(agenda, k, resume.modify_note, resume.prior_rounds, emit)
             # Reuse the prior accepted round for every step NOT being re-run (by 0-based index); any
             # step without a reusable round falls into the re-run set so nothing is silently skipped.
-            kept_by_index = {r.step_index - 1: r for r in resume.prior_rounds
-                             if (r.step_index - 1) not in redo}
+            kept_by_index = {i: r for i, r in _rounds_by_agenda_index(agenda, resume.prior_rounds).items()
+                             if i not in redo}
             redo_indices = frozenset(i for i in range(len(agenda))
                                      if i in redo or i not in kept_by_index)
             emit({"type": "run_resumed", "agenda": len(agenda), "from_step": k + 1,
@@ -3622,14 +3896,16 @@ class ResearchLab:
         if not (self.config.skill_induction and self.config.induced_skills_dir):
             return []
         from .skill_induction import candidates, induce, write_skill
-        from .skills import SKILLS as _LIB, register_skill
+        # ALL_SKILLS, not SKILLS: a skill still awaiting review is invisible to the models but its
+        # name is taken, and the inducer must not re-learn it under another name.
+        from .skills import ALL_SKILLS as _LIB, register_skill
         try:
             cands = candidates(rounds)
             if not cands:
                 return []
             kept, rejected = induce(
                 cands, self._complete,
-                existing_manifest=skill_manifest(),
+                existing_manifest=skill_manifest(_LIB),
                 tool_names=", ".join(t.name for t in self.scientist.catalog if t.name != "finish"),
                 taken=set(_LIB), max_new=self.config.max_induced_skills)
             written: list[str] = []
@@ -3646,7 +3922,7 @@ class ResearchLab:
                                      doc=skill.skill_md(), files={"reference.py": skill.code},
                                      induced=True, supersedes=skill.supersedes))
                 written.append(written_name)
-                emit({"type": "skill_induced", "name": written_name,
+                emit({"type": "skill_induced", "name": written_name, "review": "pending",
                       "description": skill.description, "reason": skill.reason,
                       "origin_step": skill.origin_step, "path": str(folder),
                       "supersedes": skill.supersedes})
@@ -3672,6 +3948,8 @@ class ResearchLab:
             "hypotheses": self._ledger.to_list(),
             "dataset_profile": self._dataset_context(),
             "tools_available": ", ".join(t.name for t in self.scientist.catalog if t.name != "finish"),
+            # Code templates the scientist runs with run_code; a step that should use one names it.
+            "skills_available": plan_skill_lines(f"{question}\n{self._dataset_context() or ''}")[0],
             "max_steps": self.config.max_steps,
         }
         try:
@@ -3708,7 +3986,7 @@ class ResearchLab:
         redo_all = {k, *downstream}
         if not downstream or self._complete_fn is None:
             return redo_all
-        by_index = {r.step_index - 1: r for r in prior_rounds}
+        by_index = _rounds_by_agenda_index(agenda, prior_rounds)
 
         def _line(i: int) -> str:
             r = by_index.get(i)
@@ -3875,9 +4153,14 @@ class ResearchLab:
             verdict = self._critic(question, step, result, emit)                           # Critic node
             rounds.append(LabRound(len(rounds) + 1, step_idx + 1, step, specialist.name, result.to_dict(), verdict))
             # Durably record the run BEFORE deciding what comes next: if the process dies here, the
-            # work this round just produced is still resumable.
-            self._checkpoint_state(question, agenda, rounds,
-                                   accepted_steps + (1 if verdict.verdict == "accept" else 0))
+            # work this round just produced is still resumable. A resume appends its kept rounds only
+            # as it walks past them, so the ones still ahead go into the snapshot too — otherwise a
+            # second crash forgets steps the first run finished (seen live resuming 78a707cd79e9).
+            ahead = [r for i, r in sorted((kept_by_index or {}).items())
+                     if i > step_idx and i not in pruned]
+            self._checkpoint_state(question, agenda, rounds + ahead,
+                                   accepted_steps + (1 if verdict.verdict == "accept" else 0)
+                                   + sum(r.verdict.verdict == "accept" for r in ahead))
 
             # Convergence is LLM-judged: the step advances when the Critic says "accept".
             # (The Critic's deterministic guard still forces "revise" on a failed/empty
@@ -3956,7 +4239,7 @@ class ResearchLab:
         # OUTSIDE the budget, with a deterministic verdict (accept iff it returned DOI/PMID-backed
         # citations). This is what "the run actually calls and accepts literature_search" requires
         # (see handoff/ziyao) — the tool is cheap and needs no LLM Critic to judge a DOI/PMID hit.
-        executed_indices = {r.step_index - 1 for r in rounds}
+        executed_indices = set(_rounds_by_agenda_index(agenda, rounds))   # kept DAG rounds count too
         for i, step in enumerate(agenda):
             if i in executed_indices or i in pruned or not _is_literature_step(step):
                 continue
@@ -4996,6 +5279,11 @@ class ResearchLab:
         if dr.get("dataset_kind"):
             head.append(str(dr["dataset_kind"]))
         lines = ["Dataset profile" + (f": {', '.join(head)}." if head else ":")]
+        # What the uploaded FOLDER is, when the gateway recognised it (a Cell Ranger delivery, say),
+        # and the QC route that implies. Decided from the file layout before planning, so the plan
+        # starts on the right branch instead of being corrected after a wrong QC step has run.
+        if dr.get("input_layout_hint"):
+            lines.append("⚠ " + str(dr["input_layout_hint"]))
 
         cats = dr.get("obs_categoricals") or {}
         if isinstance(cats, dict) and cats:
@@ -5013,6 +5301,21 @@ class ResearchLab:
         other = [k for k in (dr.get("obs_keys") or []) if k not in cats and not str(k).startswith("_")]
         if other:
             lines.append("Other obs columns (numeric / high-cardinality): " + ", ".join(map(str, other)))
+        # SPECIES, read off the gene identifiers. Without it a DDX41 plan on a mouse retina called
+        # the species "unknown" and wrote every marker in human upper case (GFAP, SAG) — symbols
+        # an exact-match lookup on this matrix does not find.
+        gs = dr.get("gene_symbols") if isinstance(dr.get("gene_symbols"), dict) else None
+        if gs and gs.get("species_hint"):
+            ex = [str(g) for g in (gs.get("examples") or [])]
+            if gs.get("identifiers") == "symbols":
+                lines.append(
+                    f"Gene identifiers: {gs.get('symbol_case')} symbols ({gs.get('evidence')}), so "
+                    f"the species is {gs['species_hint']}. Write every gene symbol in a step in "
+                    "this form" + (f" ({', '.join(ex)})" if ex else "") + ", and choose markers "
+                    f"and gene sets for {gs['species_hint']}.")
+            else:
+                lines.append(f"Gene identifiers: Ensembl IDs ({gs.get('evidence')}), so the "
+                             f"species is {gs['species_hint']}.")
 
         # NON-single-cell modalities. The block above renders cells/genes/obs, which a VCF has none
         # of — so a variant study's whole profile was the single line "Dataset profile:
@@ -5089,21 +5392,32 @@ class ResearchLab:
                              + f" (order {'/'.join(arms)})."
                              + (f" {len(small)} label(s) have <30 cells in an arm and cannot be "
                                 f"tested per cell type: {', '.join(small)}." if small else ""))
+            # The direction bookkeeping lives in run_depth_matched_de, not in the plan. This text
+            # once told the PI that genes DOWN in the deeper arm were "the most credible set", and
+            # the PI turned it into a step of its own that demoted EVERY up gene and filtered the
+            # down genes on rho — the opposite of what the tool reports per direction, and a rule
+            # that throws away a real effect running with the gradient (Gfap +6 in DDX41 Muller
+            # glia). So: say what the tool already returns, and that no step should redo it.
             if dba.get("depth_imbalance"):
-                parts.append("⚠ DEPTH IMBALANCE: " + str(dba["depth_imbalance"]) + " Plan for it: "
-                             "state it, and treat a same-direction shift across all cell types "
-                             "(especially ribosomal / translation genes) as technical until a "
-                             "depth-matched or pseudobulk-normalised comparison says otherwise. "
-                             "But the two DIRECTIONS are not symmetric, and a write-up that "
-                             "misses this reaches a confidently wrong conclusion: depth inflates "
-                             "detection, so it can only manufacture apparent UP-regulation in the "
-                             "DEEPER arm. Genes DOWN in the deeper arm ran against the gradient "
-                             "and cannot be a depth artefact — they are the most credible set in "
-                             "the whole comparison, and a lopsided up/down count (e.g. 5,028 up "
-                             "vs 508 down) is itself the depth signature pointing at which side "
-                             "to trust. Never write 'all shifts are depth artefacts' without "
-                             "saying, per cell type, which direction ran with the gradient and "
-                             "which against it.")
+                parts.append("⚠ DEPTH IMBALANCE: " + str(dba["depth_imbalance"]) + " Plan for it "
+                             "with ONE `run_depth_matched_de` step after the contrast, and treat a "
+                             "same-direction shift across all cell types (especially ribosomal / "
+                             "translation genes) as technical until that check says otherwise. "
+                             "The two DIRECTIONS are not symmetric, and the tool already does the "
+                             "bookkeeping per cell type: its summary table labels each direction "
+                             "`with_depth` (UP in the deeper arm — what depth can manufacture) or "
+                             "`against_depth`. With the gradient, its `depth_robust` genes kept "
+                             "their sign and most of their Wilcoxon z after down-sampling and are "
+                             "the credible ones; a real effect can run with the gradient, so do "
+                             "NOT demote every up gene wholesale. Against the gradient, depth "
+                             "cannot have manufactured the genes, but the check cannot confirm "
+                             "them either (verdict `against_depth_untestable`, no rho rule "
+                             "applies): they are unrefuted candidates, not a validated set. Do "
+                             "not plan a separate step to re-derive directions, credible sets or "
+                             "a rho filter from these tables — read them from the tool's output "
+                             "where they are needed. Never write 'all shifts are depth artefacts' "
+                             "without saying, per cell type, which direction ran with the "
+                             "gradient and which against it.")
             if dba.get("snrna_hint"):
                 parts.append("⚠ PROTOCOL: " + str(dba["snrna_hint"]))
             lines.append(" ".join(parts))
@@ -5300,6 +5614,11 @@ class ResearchLab:
         if dataset_ctx:
             parts.append(dataset_ctx + "\n")
         parts.append(f"The scientist can run ONLY these tools (plan steps achievable with them):\n{tools_desc}\n")
+        # Read for every plan, so each request planned in full is matched against the skills as they
+        # are now (including any induced since the last run), not only the one preset pipeline.
+        skills_block = plan_skills_block(f"{question}\n{dataset_ctx or ''}")
+        if skills_block:
+            parts.append(skills_block + "\n")
         if prior_agenda:
             prev = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(prior_agenda))
             parts.append(f"Your previous draft plan was:\n{prev}\n")
@@ -5722,31 +6041,34 @@ class ResearchLab:
             "prepared with run_code goes to a tool through its `input` parameter (a file in "
             "AISCIENTIST_WORK) — do not re-implement the tool's analysis in code to use it."
         )
-        # Atomic SKILLS by PROGRESSIVE DISCLOSURE: never the full bodies (they'd bloat context), only
-        # a pointer. Small library → list the name+summary MANIFEST inline; large library (> the
-        # threshold) → don't list any, tell the agent to search_skills(query) first. Either way the
-        # fixed registry stays the small always-on core, and read_skill_reference fetches a body on
-        # demand ONLY when a step needs analysis the tools don't cover. Global (pipeline-independent).
+        # Atomic SKILLS by PROGRESSIVE DISCLOSURE: the brief lists EVERY skill's name + description
+        # (no cap — the agent reads the whole list before it chooses), never the bodies or code;
+        # read_skill_reference fetches those on demand ONLY when a step needs analysis the tools
+        # don't cover. Re-scanned first, so a skill folder dropped in since the last step is listed.
+        refresh_skills()
         n_skills = len(ATOMIC_SKILLS)
-        # Each skill is a folder: SKILL.md (guidance) + reference.py (code), revealed in two levels —
-        # `read_skill_reference(name)` for the when-to-use/how-to-adapt guidance, then
-        # `read_skill_reference(name, file="reference.py")` for the code to adapt and run.
-        _fetch = ("call `read_skill_reference(name)` for its guidance, then "
-                  "`read_skill_reference(name, file=\"reference.py\")` for the code, adapt it, and run it "
-                  "via run_code (read checkpoints from AISCIENTIST_WORK, write under AISCIENTIST_ARTIFACTS). "
-                  "If a tool already covers the step, use the tool instead")
-        if n_skills and n_skills <= SKILL_MANIFEST_MAX:
+        # A skill is a folder whose SKILL.md is the only required file: a short skill keeps its code
+        # or shell commands inline there, a longer one bundles files (reference.py, scripts/...).
+        has_shell = any(t.name == "run_shell" for t in self.scientist.catalog)
+        _run = ("run Python with run_code and shell commands with run_shell" if has_shell else
+                "run it with run_code (shell commands too, through subprocess inside the snippet)")
+        _fetch = ("call `read_skill_reference(name)` for its SKILL.md — the guidance, which may itself "
+                  "hold the code or commands — and its list of bundled files; fetch a bundled file "
+                  "with `read_skill_reference(name, file=...)`. Adapt it to THIS dataset, then "
+                  f"{_run} (read checkpoints from AISCIENTIST_WORK, write under "
+                  "AISCIENTIST_ARTIFACTS). If a tool already covers the step, use the tool instead")
+        # A skill the plan wrote into this step is named outright, so the Scientist does not have to
+        # rediscover by search what the PI already chose.
+        named = skills_named_in(step)
+        if named:
+            parts.append(("The plan assigns skill " if len(named) == 1 else "The plan assigns skills ")
+                         + ", ".join(f"`{n}`" for n in named) + f" to this step: {_fetch}.")
+        if n_skills:
             parts.append(
-                "Atomic skills — VETTED, adaptable code templates (not auto-run), NOT in your context. "
-                f"If — and only if — THIS step needs analysis the tools above do not cover, {_fetch}:\n"
-                + skill_manifest()
-            )
-        elif n_skills:
-            parts.append(
-                f"{n_skills} atomic skills are available — VETTED, adaptable code templates (not "
-                "auto-run), NOT listed here to save context. If — and only if — THIS step needs "
-                "analysis the tools above do not cover, call `search_skills(query)` to find the "
-                f"relevant ones by capability, then {_fetch}."
+                f"Atomic skills ({n_skills}) — VETTED, adaptable guidance and code (not auto-run), "
+                "listed by name and description; their bodies are NOT in your context. If — and only "
+                f"if — THIS step needs analysis the tools above do not cover, {_fetch}. "
+                "`search_skills(query)` ranks them by keyword:\n" + skill_manifest()
             )
         parts.append("Execute THIS step with the tools, then call `finish` with what you found for this step.")
         brief = "\n\n".join(parts)
@@ -5764,14 +6086,17 @@ class ResearchLab:
         # ("stop_reason: model_final_text", zero evidence). The Critic bounces that, correctly,
         # but at the price of a whole extra round. One deterministic nudge, once, is cheaper: if
         # the step names catalog tools, none of them ran, and the model stopped on its own, tell
-        # it exactly that and let it finish the step. Never applied to a step that stopped for a
-        # cancel, an error budget or a step limit — those are not "forgot to call it".
+        # it exactly that and let it finish the step. ``done_early`` counts as stopping on its own
+        # when the named tool never ran: what "succeeded" was a side probe (run f3b8268c4fd4's ORA
+        # step: one exploratory run_code, two failed ones, run_enrichment never called). Never
+        # applied to a step that stopped for a cancel, an error budget or a step limit — those are
+        # not "forgot to call it".
         named = {n for n in _BACKTICK_TOOL_RE.findall(step or "")}
         catalog = {t.name for t in getattr(self.scientist, "catalog", [])}
         named &= catalog
         called = {str(st.get("tool")) for st in (result.steps or [])}
         if (named and not (named & called)
-                and getattr(result, "stop_reason", "") == "model_final_text"
+                and getattr(result, "stop_reason", "") in ("model_final_text", "done_early")
                 and not (should_cancel is not None and should_cancel())):
             emit({"type": "tool_nudge", "step": step, "tools": sorted(named)})
             nudge = ("\n\nNOTE: your last attempt ended without calling "
@@ -6174,11 +6499,25 @@ class ResearchLab:
         if not self.config.plan_review or len(agenda) < 2:
             return agenda
         profile = self._dataset_context()
-        critic = _parse_verdict(self._complete([
+        # What each tool the plan names actually computes and returns. Without it the Critic was
+        # asked to judge redundancy against tool outputs and "does the description match the
+        # tool" while seeing only the question, the profile and the agenda — so a DDX41 plan kept
+        # a run_code step that re-derived the per-direction depth verdict run_depth_matched_de
+        # already returns, and a figures step re-drawing what run_de/run_enrichment write.
+        contracts = plan_tool_contracts(agenda, self.scientist.catalog)
+        raw_critic = self._complete([
             {"role": "system", "content": _PLAN_REVIEW_CRITIC_SYSTEM},
             {"role": "user", "content": json.dumps(
-                {"research_question": question, "dataset_profile": profile, "draft_agenda": agenda})},
-        ], role="critic")) or {}
+                {"research_question": question, "dataset_profile": profile, "draft_agenda": agenda,
+                 "tools_named_in_plan": contracts})},
+        ], role="critic")
+        critic = _parse_verdict(raw_critic)
+        if critic is None:
+            # An unreadable review is not a clean one. It used to fall through as "no issues", so
+            # a plan the Critic had objected to reached the reviewer looking approved.
+            emit({"type": "plan_review_unparsed", "chars": len(raw_critic or ""),
+                  "preview": " ".join((raw_critic or "").split())[:200]})
+            critic = {}
         issues = [str(x).strip() for x in (critic.get("issues") or []) if str(x).strip()]
         proposed = [str(s).strip() for s in (critic.get("revised_agenda") or []) if str(s).strip()]
         if not issues and (not proposed or proposed == agenda):
@@ -6187,6 +6526,7 @@ class ResearchLab:
             {"role": "system", "content": _PLAN_REVIEW_PI_SYSTEM},
             {"role": "user", "content": json.dumps(
                 {"research_question": question, "dataset_profile": profile, "draft_agenda": agenda,
+                 "tools_named_in_plan": contracts,
                  "critic_issues": issues, "critic_revised_agenda": proposed})},
         ], role="plan")) or {}
         final = [str(s).strip() for s in (pi.get("final_agenda") or []) if str(s).strip()]
@@ -6351,7 +6691,8 @@ class ResearchLab:
         facts_dict, _dists = _collect_facts(accepted)
         report, fact_issues = verify_report_facts(
             report, facts_dict, _uncovered_groups(accepted), tested_counts=_tested_counts(accepted),
-            pre_counts=pre_qc_counts((self.ctx.decisions or {}).get("dataset_result")))
+            pre_counts=pre_qc_counts((self.ctx.decisions or {}).get("dataset_result")),
+            marker_reference=_marker_reference(accepted))
         if fact_issues:
             emit({"type": "report_fact_check", "issues": fact_issues})
         return report

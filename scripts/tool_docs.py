@@ -118,6 +118,16 @@ def parameters_md(tool) -> str:
 
 def runs_on_md(m, tool) -> str:
     lines = [RUNS_ON_TEXT[m.runs_on]]
+    if m.image:
+        lines[0] = lines[0].replace(" inside `analysis.sif`", "")
+        how = ("built on first use from conda-forge + bioconda (" + m.image.split(":", 1)[1] + ")"
+               if m.image.startswith("bioconda:") else "pulled on first use")
+        lines.append(f"Its job runs in its OWN image instead of the line's: `{m.image}`, {how} into "
+                     "the shared containers directory on HPC3 and reused by every later run.")
+    resources = [f"{m.cpus} CPUs" if m.cpus else "", f"{m.mem_gb} GB" if m.mem_gb else "",
+                 f"up to {m.time_limit}" if m.time_limit else ""]
+    if any(resources):
+        lines.append("Slurm resources for its job: " + ", ".join(r for r in resources if r) + ".")
     if tool.requires:
         lines.append("Needs: " + ", ".join(f"`{r}`" for r in tool.requires) + ".")
     lines.append("Reads private data: " + ("yes; its results stay inside the run." if tool.reads_private_data

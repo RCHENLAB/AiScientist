@@ -40,9 +40,9 @@ Tests genes for expression differences with scanpy's `rank_genes_groups` (Wilcox
 ## Outputs
 
 - `work/adata_de.h5ad`.
-- Tables: `tables/de_<key>_all.csv` with exactly the columns `group,gene,log2fc,pval,pval_adj,score`, one CSV per group, `de_<key>_universe.txt` (the tested genes, which `run_enrichment` uses as its background), `rank_<key>_*.rnk` (for `run_gsea_prerank`), and `de_<key>_inference.json` so the inference label travels with the tables.
+- Tables: `tables/de_<key>_all.csv` with exactly the columns `group,gene,log2fc,pval,pval_adj,score`, one CSV per group, `de_<key>_universe.txt` (the tested genes, which `run_enrichment` uses as its background), `rank_<key>_*.rnk` (for `run_gsea_prerank`), `de_<key>_inference.json` so the inference label travels with the tables, and `de_<key>_significance.json` (the true significant counts per group, and whether the per-group tables are complete or a top-`n_genes` view) so `run_enrichment` can tell a top-N from the significant set.
 - Figures: a marker dotplot; in a contrast, one volcano per group.
-- Result: `significant_by_group`, `skipped_groups`, `cells_by_group_and_arm`, `inference`, `warnings`.
+- Result: `significant_by_group` (true counts in both shapes; for markers the tables are the top `n_genes` by score, and `table_truncation_note` says so), `skipped_groups`, `cells_by_group_and_arm`, `inference`, `warnings`.
 
 ## Where it runs
 

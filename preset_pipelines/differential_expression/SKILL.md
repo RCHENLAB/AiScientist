@@ -2,7 +2,7 @@
 name: differential_expression
 version: 2
 description: Compare an experimental condition vs control (e.g. KO vs WT) per cell type, with pathway interpretation (v2 — pseudobulk when replicates exist, and honest about it when they don't)
-tools: run_scanpy_qc, run_clustering, run_de, run_pseudobulk_de, run_depth_matched_de, run_composition, run_enrichment, run_gsea_prerank, deep_literature, run_code
+tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_pseudobulk_de, run_depth_matched_de, run_composition, run_enrichment, run_gsea_prerank, deep_literature, run_code
 data_type: scrna
 ---
 
@@ -84,8 +84,12 @@ enrichment on the changed genes"** — plan that without waiting for the user to
 
 0. **Establish what the matrix IS, and the rules, before touching it** (`run_code`) — read-only,
    and BEFORE QC. Two outputs, written as tables the later steps read back:
-   * *Provenance.* Inspect `X`, `.raw`, `layers`, value ranges, sparsity and integer-ness, and
-     check whether matrix-derived totals reproduce any stored `nCount`/`nFeature` fields. A
+   * *Provenance.* **Not for a 10x Cell Ranger input whose data profile already rules on it**
+     (its `.h5` matrices were read at upload: integer UMI counts, checked against Cell Ranger's
+     `metrics_summary.csv`). Cite that ruling; do NOT plan a `run_code` step to re-derive it, and
+     write the decision rule below into the plan's first step instead. Otherwise: inspect `X`,
+     `.raw`, `layers`, value ranges, sparsity and integer-ness, and check whether matrix-derived
+     totals reproduce any stored `nCount`/`nFeature` fields. A
      published object often arrives already normalized and log1p'd: normalizing it again has NO
      symptom — every tool succeeds, every figure renders, and every number after it is wrong. So
      rule from the NUMBERS, and say which way you ruled:
@@ -109,7 +113,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
      relaxed until it passes. Most of these numbers already have defaults in the Parameters
      table below — this step is about COMMITTING to them (and to any change, with its reason)
      before the results can influence the choice.
-1. **QC** (`run_scanpy_qc`): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
+1. **QC** (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor any QC columns already in the data (e.g. `percent.mt`, doublet calls).
 2. **Define the comparison** from the profile (above): name the condition column, the two groups,
    the reference group, and the cell-type column you will stratify by. If labels already exist,

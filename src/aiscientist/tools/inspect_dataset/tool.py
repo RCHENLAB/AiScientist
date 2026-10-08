@@ -287,12 +287,17 @@ def _peek_hdf5(path: str) -> dict[str, Any]:
 
 
 def _scalar(v: Any) -> Any:
-    """Make an HDF5 attribute JSON-safe (bytes -> str, numpy -> python)."""
+    """Make an HDF5 attribute JSON-safe (bytes -> str, numpy -> python), including the elements of
+    an array attribute: Cell Ranger's ``.h5`` stores ``library_ids`` as an array of bytes, and
+    ``tolist()`` alone returned a list of bytes that crashed the whole run at serialisation
+    (``Object of type bytes is not JSON serializable``, 2026-10-02)."""
     try:
         if isinstance(v, bytes):
             return v.decode("utf-8", "replace")
         if hasattr(v, "tolist"):
-            return v.tolist()
+            v = v.tolist()
+        if isinstance(v, (list, tuple)):
+            return [_scalar(x) for x in v]
         return v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
     except Exception:  # noqa: BLE001
         return str(v)

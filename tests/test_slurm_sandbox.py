@@ -106,6 +106,30 @@ def test_snippet_is_staged_and_data_env_exposed():
     assert "--mem=64G".replace("=", "=")  # sanity
 
 
+def test_a_bound_folder_is_mounted_whole_so_the_files_beside_the_primary_are_readable():
+    # 2026-10-03: a snippet checking a Cell Ranger delivery could open the filtered matrix (the
+    # primary, the only path bound) but not the raw matrix in the same folder.
+    class Recording(FakeHPC):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.commands: list[str] = []
+
+        def exec(self, command, timeout=60.0):
+            self.commands.append(command)
+            return super().exec(command, timeout)
+
+    hpc = Recording({".out": "", ".err": "", ".rc": "0\n"})
+    SlurmCodeExecutor(
+        remote=hpc, container_image="/dfs/lab/analysis.sif",
+        dataset_path="/dfs/up/lib/outs/filtered_feature_bc_matrix.h5", dataset_root="/dfs/up/lib",
+        work_dir="/dfs/lab/run/work", artifacts_dir="/dfs/lab/run/art",
+        startup_timeout_s=5, run_timeout_s=5)("print(1)")
+    script = "\n".join(hpc.commands)
+    assert "-B /dfs/up/lib:/dfs/up/lib:ro" in script
+    assert "filtered_feature_bc_matrix.h5:/dfs" not in script      # inside the root: not bound twice
+    assert "AISCIENTIST_DATASET_ROOT=/dfs/up/lib" in script
+
+
 def test_no_remote_uses_local_fallback():
     calls = {}
     def fake_local(code):

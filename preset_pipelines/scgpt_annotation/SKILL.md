@@ -1,7 +1,7 @@
 ---
 name: scgpt_annotation
 description: scGPT foundation-model per-cell annotation for a .h5ad — transfers reference cell-type labels + calibrated confidence to every cell, AND independently cross-validates ANY existing celltype/majorclass labels the data already carries. Use for scGPT / .sif / foundation-model annotation, per-cell labelling, OR an independent second-opinion check of a dataset's existing cell-type labels.
-tools: scgpt_annotate, run_scanpy_qc, run_clustering, run_de, run_enrichment, literature_search, run_code
+tools: scgpt_annotate, run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, literature_search, run_code
 data_type: scrna
 ---
 
@@ -28,8 +28,12 @@ Adapt parameters to THIS dataset; plan ordered steps that:
 1b. **Establish what the matrix IS, and the rules** (`run_code`) — read-only, and before the QC
    step below. scGPT (step 1) preprocesses internally from the raw upload, so this audits the
    object for everything AFTER it. Two outputs, written as tables the later steps read back:
-   * *Provenance.* Inspect `X`, `.raw`, `layers`, value ranges, sparsity and integer-ness, and
-     check whether matrix-derived totals reproduce any stored `nCount`/`nFeature` fields. A
+   * *Provenance.* **Not for a 10x Cell Ranger input whose data profile already rules on it**
+     (its `.h5` matrices were read at upload: integer UMI counts, checked against Cell Ranger's
+     `metrics_summary.csv`). Cite that ruling; do NOT plan a `run_code` step to re-derive it, and
+     write the decision rule below into the plan's first step instead. Otherwise: inspect `X`,
+     `.raw`, `layers`, value ranges, sparsity and integer-ness, and check whether matrix-derived
+     totals reproduce any stored `nCount`/`nFeature` fields. A
      published object often arrives already normalized and log1p'd: normalizing it again has NO
      symptom — every tool succeeds, every figure renders, and every number after it is wrong. So
      rule from the NUMBERS, and say which way you ruled:
@@ -51,7 +55,7 @@ Adapt parameters to THIS dataset; plan ordered steps that:
      labels — and write them down NOW, before any agreement percentage is visible. An agreement
      threshold chosen after seeing the confusion table is not a threshold. Say what happens when
      a gate fails: the comparison is marked unsupported, not relaxed until it passes.
-2. QC the dataset (`run_scanpy_qc`) — this prepares the data for the INDEPENDENT structure/figures below, not for scGPT.
+2. QC the dataset (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint) — this prepares the data for the INDEPENDENT structure/figures below, not for scGPT.
 3. Cluster independently (`run_clustering`): neighbors -> Leiden -> UMAP, giving data-driven structure that does NOT depend on the scGPT labels.
 4. Find marker genes per cluster (`run_de`) so the clusters' biology can be read directly from the data.
 5. CROSS-VALIDATE the scGPT per-cell labels: a confusion-style comparison against the independent Leiden cluster structure AND — when the dataset carries a `celltype`/`majorclass` column — directly against those existing labels (agreement %, per-label confidence, the populations where scGPT disagrees), plus the scGPT confidence distribution flagging low-confidence cells/populations. **Merge the predictions by BARCODE, never by row order (see the ⚑ callout below).** No curated tool covers this — adapt the reference template `crossvalidate_scgpt_vs_leiden.py` via `run_code`; it does the barcode-safe merge and covers BOTH the Leiden confusion table AND the existing majorclass/celltype agreement, so adapt it rather than writing the merge from scratch.

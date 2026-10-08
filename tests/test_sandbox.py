@@ -82,6 +82,14 @@ def test_build_run_code_context_lists_paths_and_cwd_warning():
     assert "SIGKILL" in ctx                                             # memory caveat
 
 
+def test_a_10x_h5_dataset_comes_with_how_to_read_it():
+    from aiscientist.agents.sandbox import build_run_code_context
+
+    ctx = build_run_code_context(CodeSandbox(dataset_path="/up/S1/filtered_feature_bc_matrix.h5"))
+    assert "sc.read_10x_h5(path)" in ctx and "ONE COLUMN PER BARCODE" in ctx
+    assert "read_10x_h5" not in build_run_code_context(CodeSandbox(dataset_path="/up/a.h5ad"))
+
+
 def test_build_run_code_context_empty_without_executor():
     from aiscientist.agents.sandbox import build_run_code_context
 
@@ -117,3 +125,12 @@ def test_container_command_network_follows_env(monkeypatch):
     isolated = CodeSandbox(container_image="/img/analysis.sif", allow_network=False)
     cmd2, _ = isolated._command("/tmp/s.py", "/tmp/wd")
     assert "--net" in cmd2 and "--network" in cmd2 and "none" in cmd2   # explicit off → isolated
+
+
+def test_a_bound_folder_reaches_run_code_as_dataset_root():
+    from aiscientist.agents.sandbox import CodeSandbox, build_run_code_context
+    box = CodeSandbox(dataset_path="/srv/lib/outs/filtered_feature_bc_matrix.h5",
+                      dataset_root="/srv/lib")
+    assert box._env()["AISCIENTIST_DATASET_ROOT"] == "/srv/lib"
+    assert "AISCIENTIST_DATASET_ROOT = /srv/lib" in build_run_code_context(box)
+    assert "AISCIENTIST_DATASET_ROOT" not in CodeSandbox(dataset_path="/srv/a.h5ad")._env()

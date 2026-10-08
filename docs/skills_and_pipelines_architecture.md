@@ -63,10 +63,15 @@ are separate files:
   blindly.
 - Loaded by `agents/skills.py` into `SKILLS` (keyed by folder/frontmatter name, no `.py`); override
   the dir with `$AISCIENTIST_SKILLS_DIR`. Grown by **induction** (deferred).
+- **Since 2026-10-01, a skill is dropped in, not wired in:** any folder holding a `SKILL.md`, at any
+  depth (`skills/<category>/<name>/` works), is a skill; `SKILL.md` is the only required file (a short
+  skill keeps its code or shell commands inline); bundled files may sit in subfolders; Agent-Skills
+  frontmatter (`license`, `compatibility`, a nested `metadata:` block) is read as-is; and
+  `refresh_skills()` re-scans before every step, so no restart is needed. See `skills/README.md`.
 
 **Three-level progressive disclosure** (see `agents/skills.py`):
-1. the brief lists only the MANIFEST (`- name — description`);
-2. `read_skill_reference(name)` returns the SKILL.md **guidance** + the bundled-file list (no code);
+1. the brief lists only the MANIFEST (`- name — description`), every skill, grouped by category;
+2. `read_skill_reference(name)` returns the SKILL.md **guidance** + the bundled-file list;
 3. `read_skill_reference(name, file="reference.py")` returns one file's **code**, on demand.
 
 Name lookups tolerate a legacy `.py` suffix, so older configs / preset prose that say `<name>.py`
@@ -101,11 +106,11 @@ still resolve.
   preset-pipeline (which steers the whole plan shape).
 - **`search_skills(query)` retrieval** — a `search_skills` Scientist tool (`agents/skills.py`):
   keyword/token-overlap ranking over name > summary > body (offline, deterministic, no embedder).
-  The brief now switches on library size: ≤ `MANIFEST_MAX` (env `AISCIENTIST_SKILL_MANIFEST_MAX`,
-  default 12) → inline the manifest as before; beyond that → don't list any, tell the agent to call
-  `search_skills(query)` first, then `read_skill_reference`. So even the name+summary list can't
-  bloat every step as the library grows. Two small always-on tools (search + read); bodies still
-  fetched only on demand.
+  The brief used to stop listing above `AISCIENTIST_SKILL_MANIFEST_MAX` (12) skills and say "search"
+  instead; with 15 skills in the repo no run ever saw the list. **The cap was removed on 2026-10-01**
+  (Yijun's call): every brief lists every skill's name + description, grouped by category, so the
+  agent reads the whole library before it chooses; `search_skills` stays as a ranking aid. Bodies are
+  still fetched only on demand.
 
 ## Migrated flat files → folder skills (2026-07-08)
 
@@ -121,6 +126,55 @@ template). Changes:
 - Manifest/`list_skills`/`search_skills` unchanged in shape (name + one-line summary), so the
   `/api/skills` console picker and its round-trip keep working (names now carry no `.py`).
 - Progressive disclosure is now genuinely three-level (manifest → guidance → code).
+
+## Induced skills are reviewed before any model sees them (2026-10-07)
+
+An induced skill is one run's `run_code` frozen into a template, with that dataset's file format and
+column names inside it. Listed for planning on every later run, it got planned onto data it could not
+read: run f3b8268c4fd4 put `verify_matrix_provenance` (DDX41's `read_h5ad` + `nCount_RNA` / `sampleid`
+/ `majorclass`) in front of a 10x Cell Ranger `.h5`, and the step failed three times. So:
+
+- `agents/skills.py` keeps two views. `ALL_SKILLS` is everything on disk; `SKILLS`, the library the PI
+  plans with and the Scientist lists, searches and reads, holds the curated skills plus only the
+  induced skills an admin has **approved**. Everything in the induced root counts as induced and starts
+  `pending`, so a folder dropped there cannot skip the review; `retired` stays on disk, never offered.
+- Decisions live in `<AISCIENTIST_INDUCED_SKILLS_DIR>/_review.json` (status, who, when, note, and a
+  short history), written by `set_review`; they apply at the next step of every run, no restart.
+- The console's **Admin → Skill review** tab (`/api/admin/skills`, admin only) lists each induced skill
+  with the step it was learned from, shows its SKILL.md and code, and approves, retires or resets it.
+- Induction still checks names and duplicates against `ALL_SKILLS`, so a skill awaiting review is not
+  learned a second time under another name. A newly induced skill is announced as awaiting review.
+
+## The PI plans with the skill library (2026-10-01)
+
+Until then a skill reached a plan only when the user ticked it (REQUIRED skills above) or when the
+Scientist went looking mid-step for something no tool covered: the PI drafted every plan from one
+preset pipeline and the tool list. Now every draft (`_pi_plan` in `agents/research_lab.py`) carries
+the skill manifest after the tools, read from the library as it is at that moment, so each request
+that is planned in full is matched against the skills, including ones induced since the last run.
+
+- **What the PI sees** (`plan_skill_lines` in `agents/skills.py`): the whole library, superseded
+  versions hidden. It was capped at 40 skills with descriptions cut at 200 characters; on 2026-10-02
+  the count cap was removed (Yijun: no list caps) and the cut raised to the Agent-Skills maximum of
+  1,024 characters, because 200 cut off the sentence that routes a skill (the CellQC skill's
+  description ENDS with "inside an AiScientist analysis ... is the run_cellqc tool, not this
+  skill"). A caller can still pass `limit` to get the best keyword matches first.
+- **How a plan uses one:** a step that needs a skill is a `run_code` step that names the skill in
+  backticks. Tools still come first: the prompt says not to plan a skill that repeats a tool.
+- **Execution:** the Scientist's brief names the skill a step mentions (`skills_named_in`), so it
+  reads that skill instead of rediscovering it with `search_skills`.
+- The multi-cycle re-plan gets the same list, and `check_plan_tooling` does not report a skill
+  name (an induced skill may be called `run_…`) as an unknown tool.
+- **A skill's description must name its method.** The PI is required to state each step's method,
+  and when a description did not name one it guessed (1 plan in 7 said AUCell for a template that
+  runs `sc.tl.score_genes`). The prompt now forbids attributing a method the description does not
+  state, and `score_signature` names its method. Write new descriptions the same way.
+- Measured on Qwen3.8-27B (`experiments/plan_vs_exec_ab/skills_ab.py`, Rounds 7 and 7b in that
+  README), on OpenRouter and then on our own INT4 serve job with the production settings: where the
+  loaded protocol does not name the needed skill, plans with the list applied `score_signature`
+  (15/15 and 8/8) and plans without it wrote their own scoring code (0/8 and 0/8); where the protocol
+  already names it, both arms used it; a plain DE question named no skill either way, and no plan
+  replaced a tool with a skill.
 
 ## Not yet built (deferred)
 

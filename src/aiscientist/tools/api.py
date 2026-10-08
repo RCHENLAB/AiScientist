@@ -46,6 +46,15 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
     # the scRNA analysis line
     "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
+    # curated marker references (run_marker_annotation), also read by the report's marker-claim check
+    "available_references": ("aiscientist.tools.run_marker_annotation.tool", "available_references"),
+    "load_marker_reference": ("aiscientist.tools.run_marker_annotation.tool", "_load_reference"),
+    # Cell Ranger deliveries in an uploaded folder: what they are, and the QC route they imply
+    "describe_cellranger_layout": ("aiscientist.tools._lib.cellranger", "describe_cellranger_layout"),
+    "cellranger_layout_hint": ("aiscientist.tools._lib.cellranger", "cellranger_layout_hint"),
+    "profile_cellranger_libraries": ("aiscientist.tools._lib.cellranger", "profile_cellranger_libraries"),
+    "CELLRANGER_FIND_NAMES": ("aiscientist.tools._lib.cellranger", "FIND_NAMES"),
+    "CELLRANGER_FIND_MAXDEPTH": ("aiscientist.tools._lib.cellranger", "FIND_MAXDEPTH"),
     "genesets_dir": ("aiscientist.tools._lib.scrna", "_genesets_dir"),
     "looks_like_celltype_column": ("aiscientist.tools._lib.scrna", "_looks_like_celltype_column"),
     "looks_like_condition_column": ("aiscientist.tools._lib.scrna", "_looks_like_condition_column"),

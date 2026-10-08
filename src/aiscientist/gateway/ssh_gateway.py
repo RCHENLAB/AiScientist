@@ -22,6 +22,15 @@ def _noop_emit(level: str, stage: str, message: str) -> None:
     return None
 
 
+def _close_quietly(transport: "paramiko.Transport | None") -> None:
+    if transport is None:
+        return
+    try:
+        transport.close()
+    except Exception:  # noqa: BLE001 - closing a dead transport must never raise
+        pass
+
+
 def wrap_in_group(command: str, group: str) -> str:
     """Run ``command`` under a different UNIX group via ``sg``.
 
@@ -44,7 +53,19 @@ class SSHExecutor:
 
     Commands capture full stdout/stderr/exit status. Local port forwarding lets
     the gateway reach a vLLM server running on a compute node.
+
+    A dropped transport is re-established in place (:meth:`_live_transport`) with the session's
+    SSH key, so the objects a run holds on to — the Slurm executors, the tunnels — keep working
+    on the same executor instead of failing on the first command after a network blip.
     """
+
+    # Seconds to wait before each reconnect attempt: ~2 minutes in all, long enough for a VPN or
+    # Wi-Fi hand-over to come back, short enough that a network that is really gone fails the run
+    # with a clear message instead of hanging it.
+    _reconnect_delays: tuple[float, ...] = (0.0, 5.0, 15.0, 30.0, 60.0)
+    # The key a dropped session reconnects with: the login key on key auth, or one armed after a
+    # password + Duo login (:meth:`arm_reconnect_key`). None = no silent reconnect is possible.
+    _reconnect_pkey: "paramiko.PKey | None" = None
 
     def __init__(
         self,
@@ -75,6 +96,12 @@ class SSHExecutor:
         self._transfer_client: paramiko.SSHClient | None = None
         self._transfer_pkey: paramiko.PKey | None = None  # set on key auth; reused for the DTN
         self._transfer_disabled = False  # set after the one-time fallback warning
+        # Serializes reconnects: several threads hit a dead transport at once, and only ONE of
+        # them should redial. ``_reconnect_rounds`` counts finished attempts, so a thread that
+        # waited out someone else's failed round reports it instead of starting another.
+        self._reconnect_lock = threading.Lock()
+        self._reconnect_rounds = 0
+        self._reconnect_error: GatewayError | None = None
 
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -116,18 +143,18 @@ class SSHExecutor:
         connect_timeout: float,
     ) -> None:
         self._emit("step", "ssh_connect", f"Opening TCP socket to {self.host}:{self.port} ...")
-        sock = socket.create_connection((self.host, self.port), timeout=connect_timeout)
-        transport = paramiko.Transport(sock)
-        transport.start_client(timeout=connect_timeout)
+        transport = self._open_transport(self.host, connect_timeout)
         self._emit("info", "ssh_connect", "SSH transport established; authenticating ...")
 
         if key_path:
             pkey = self._load_key(key_path, key_passphrase)
             self._emit("step", "ssh_auth", f"Authenticating with SSH key {key_path} ...")
             transport.auth_publickey(self.username, pkey)
-            # Keep the LOADED key (not the path) so the data-transfer connection can authenticate
-            # without re-reading the file or re-prompting for a passphrase.
+            # Keep the LOADED key (not the path) so the data-transfer connection — and a reconnect
+            # after a drop — can authenticate without re-reading the file or re-prompting for a
+            # passphrase.
             self._transfer_pkey = pkey
+            self._reconnect_pkey = pkey
         else:
             self._interactive_auth(transport, password or "", duo_response, duo_callback)
 
@@ -135,15 +162,26 @@ class SSHExecutor:
             raise paramiko.AuthenticationException("Transport did not authenticate.")
 
         self._client._transport = transport  # reuse the authenticated transport
-        # Keep the transport (and every port-forward channel riding on it — the vLLM
-        # tunnel especially) alive across idle gaps. Without this, a user who walks away
-        # mid-run has the SSH connection reaped by the server/firewall, and the next vLLM
-        # call fails with a bare "Network error". 30s is well under typical idle timeouts.
+        self._keep_alive(transport)
+        self._emit("success", "ssh_auth", f"Authenticated to {self.host} as {self.username}.")
+
+    def _open_transport(self, host: str, timeout: float) -> paramiko.Transport:
+        """TCP-connect to ``host`` and run the SSH handshake. Authentication is the caller's."""
+        sock = socket.create_connection((host, self.port), timeout=timeout)
+        transport = paramiko.Transport(sock)
+        transport.start_client(timeout=timeout)
+        return transport
+
+    @staticmethod
+    def _keep_alive(transport: paramiko.Transport) -> None:
+        """Keep the transport (and every port-forward channel riding on it — the vLLM tunnel
+        especially) alive across idle gaps. Without this, a user who walks away mid-run has the SSH
+        connection reaped by the server/firewall, and the next vLLM call fails with a bare "Network
+        error". 30s is well under typical idle timeouts."""
         try:
             transport.set_keepalive(30)
         except Exception:  # noqa: BLE001 - keepalive is best-effort, never block the connect
             pass
-        self._emit("success", "ssh_auth", f"Authenticated to {self.host} as {self.username}.")
 
     def _interactive_auth(
         self,
@@ -205,17 +243,114 @@ class SSHExecutor:
             detail=error_detail(last_error) if last_error else None,
         )
 
+    # -- reconnecting a dropped session ---------------------------------------
+
+    def arm_reconnect_key(self, key_path: str, passphrase: str | None = None) -> bool:
+        """Let a password + Duo session reconnect with the user's saved SSH key.
+
+        Such a session has no key of its own, and redialling it would need another Duo push that
+        nobody is watching for mid-run. A key the user already deployed to HPC3 authenticates with
+        no prompt. Returns False when the key cannot be loaded; the session then just cannot
+        reconnect silently, exactly as before."""
+        try:
+            self._reconnect_pkey = self._load_key(key_path, passphrase)
+        except GatewayError:
+            return False
+        return True
+
+    def _live_transport(self) -> paramiko.Transport:
+        """The login session's transport, reconnected first if it has dropped.
+
+        Raises ``GatewayError`` when the session is down and cannot be brought back."""
+        transport = self._client.get_transport()
+        if transport is not None and transport.is_active():
+            return transport
+        rounds_seen = self._reconnect_rounds
+        with self._reconnect_lock:
+            transport = self._client.get_transport()
+            if transport is not None and transport.is_active():
+                return transport                       # another thread reconnected while we waited
+            if self._reconnect_rounds != rounds_seen and self._reconnect_error is not None:
+                # Another thread just spent a whole round of attempts and failed; a second round
+                # right behind it would only double the wait before the same error.
+                err = self._reconnect_error
+                raise GatewayError(err.message, stage=err.stage, detail=err.detail)
+            try:
+                self._reconnect()
+                self._reconnect_error = None
+            except GatewayError as exc:
+                self._reconnect_error = exc
+                raise
+            finally:
+                self._reconnect_rounds += 1
+        return self._client.get_transport()
+
+    def _reconnect(self) -> None:
+        """Re-open the login session with the reconnect key and swap it in under ``self._client``.
+
+        Everything that holds this executor (Slurm executors, job stores, tunnels) carries on over
+        the new transport. Only a network failure is retried; HPC3 refusing the key is final."""
+        pkey = self._reconnect_pkey
+        if pkey is None:
+            raise GatewayError(
+                "SSH session is no longer active. It was opened with a password and Duo and there "
+                "is no saved SSH key to reconnect with — reconnect from the login panel.",
+                stage="ssh_exec")
+        attempts = len(self._reconnect_delays)
+        last_error: Exception | None = None
+        for attempt, delay in enumerate(self._reconnect_delays, start=1):
+            if delay:
+                time.sleep(delay)
+            self._emit("warning", "ssh_reconnect",
+                       f"SSH session to {self.host} dropped — reconnecting with your SSH key "
+                       f"(attempt {attempt}/{attempts}) ...")
+            transport: paramiko.Transport | None = None
+            try:
+                transport = self._open_transport(self.host, min(self._connect_timeout, 15.0))
+                transport.auth_publickey(self.username, pkey)
+                if not transport.is_authenticated():
+                    raise paramiko.AuthenticationException("Transport did not authenticate.")
+            except paramiko.AuthenticationException as exc:
+                _close_quietly(transport)
+                raise GatewayError(
+                    f"SSH session to {self.host} dropped, and HPC3 refused the saved SSH key when "
+                    "reconnecting. Log in again from the login panel.",
+                    stage="ssh_auth", detail=error_detail(exc)) from exc
+            except (paramiko.SSHException, OSError, EOFError) as exc:
+                _close_quietly(transport)
+                last_error = exc
+                continue
+            self._keep_alive(transport)
+            _close_quietly(self._client.get_transport())
+            self._client._transport = transport
+            self._emit("success", "ssh_reconnect", f"SSH session to {self.host} re-established.")
+            return
+        raise GatewayError(
+            f"SSH session is no longer active, and {attempts} attempts to reconnect to {self.host} "
+            f"over {int(sum(self._reconnect_delays))}s failed. Check the network or VPN, then "
+            "reconnect from the login panel.",
+            stage="ssh_exec", detail=error_detail(last_error) if last_error else None)
+
+    def _open_channel(self, timeout: float) -> paramiko.Channel:
+        transport = self._live_transport()
+        try:
+            return transport.open_session(timeout=timeout)
+        except (paramiko.SSHException, EOFError, OSError):
+            if transport.is_active():
+                raise
+            # The transport died between the liveness check and the channel open. Nothing has been
+            # sent yet, so reconnecting and sending the command once is safe — unlike a drop after
+            # exec_command, where a non-idempotent command (sbatch) may already have run.
+            return self._live_transport().open_session(timeout=timeout)
+
     # -- commands -----------------------------------------------------------
 
     def exec(self, command: str, timeout: float = 60.0) -> ExecResult:
-        transport = self._client.get_transport()
-        if transport is None or not transport.is_active():
-            raise GatewayError("SSH session is no longer active.", stage="ssh_exec")
         started = time.monotonic()
         # When a lab group is configured, run under it (DFS lab dirs need it).
         wire_command = wrap_in_group(command, self.group) if self.group else command
         try:
-            channel = transport.open_session(timeout=timeout)
+            channel = self._open_channel(timeout)
             channel.settimeout(timeout)
             channel.exec_command(wire_command)
             stdout_chunks: list[bytes] = []
@@ -320,7 +455,10 @@ class SSHExecutor:
         SFTP subsystem is available there — every ``exec``, Slurm call and tunnel stays on the login
         node. It mounts the same $HOME and /dfs3b, so remote paths are unchanged either way.
         """
-        client = self._transfer_session() or self._client
+        client = self._transfer_session()
+        if client is None:
+            self._live_transport()   # staging over the login session: bring it back if it dropped
+            client = self._client
         return client.open_sftp()
 
     def put_file(self, local_path: str, remote_path: str) -> None:
@@ -337,6 +475,60 @@ class SSHExecutor:
         sftp = self._open_sftp()
         try:
             sftp.put(local_path, remote_path)
+        except (OSError, paramiko.SSHException) as exc:
+            raise GatewayError(
+                f"Failed to upload {local_path} -> {remote_path}.",
+                stage="ssh_put",
+                detail=error_detail(exc),
+            ) from exc
+        finally:
+            sftp.close()
+
+    def put_file_resumable(self, local_path: str, remote_path: str,
+                           progress: "Callable[[int, int], None] | None" = None,
+                           make_parent: bool = True) -> None:
+        """:meth:`put_file` for large files. Writes ``<remote>.part``, continuing from where an
+        interrupted copy stopped, then renames it into place, so a dropped 30 GB BAM transfer
+        resumes and a half-written file is never mistaken for the real one. ``progress(sent, total)``
+        is called per chunk; an exception it raises aborts the copy and leaves the ``.part``."""
+        import os
+        import posixpath
+
+        parent = posixpath.dirname(remote_path)
+        if parent and make_parent:
+            self.exec(f"mkdir -p {shlex.quote(parent)}")
+        part = remote_path + ".part"
+        total = os.path.getsize(local_path)
+        sftp = self._open_sftp()
+        try:
+            try:
+                offset = int(sftp.stat(part).st_size or 0)
+            except OSError:
+                offset = 0
+            if offset > total:
+                offset = 0
+            with open(local_path, "rb") as src, sftp.open(part, "r+b" if offset else "wb") as dst:
+                dst.set_pipelined(True)
+                src.seek(offset)
+                dst.seek(offset)
+                sent = offset
+                while True:
+                    chunk = src.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    sent += len(chunk)
+                    if progress is not None:
+                        progress(sent, total)
+            try:
+                sftp.posix_rename(part, remote_path)
+            except (OSError, paramiko.SSHException):
+                # A server without the posix-rename extension: plain rename refuses to overwrite.
+                try:
+                    sftp.remove(remote_path)
+                except OSError:
+                    pass
+                sftp.rename(part, remote_path)
         except (OSError, paramiko.SSHException) as exc:
             raise GatewayError(
                 f"Failed to upload {local_path} -> {remote_path}.",
@@ -403,16 +595,24 @@ class SSHExecutor:
         """Forward 127.0.0.1:local_port -> remote_host:remote_port over the SSH
         session. ``local_port=0`` lets the OS pick a free ephemeral port (default);
         a fixed port gives Biomni/Kosmos a stable base_url to reach Qwen3.6."""
-        transport = self._client.get_transport()
-        if transport is None or not transport.is_active():
-            raise GatewayError("Cannot open tunnel: SSH session is not active.", stage="ssh_tunnel")
+        try:
+            self._live_transport()
+        except GatewayError as exc:
+            raise GatewayError(f"Cannot open tunnel: {exc.message}", stage="ssh_tunnel",
+                               detail=exc.detail) from exc
 
-        ssh_transport = transport
+        executor = self
 
         class _Handler(socketserver.BaseRequestHandler):
             def handle(self) -> None:
+                # Resolve the transport per forwarded connection, not once when the tunnel opens:
+                # after a reconnect the same local port rides the new session, so whatever still
+                # holds the old port (a run's tool context, a literature job's base_url) keeps working.
+                transport = executor._client.get_transport()
+                if transport is None or not transport.is_active():
+                    return
                 try:
-                    channel = ssh_transport.open_channel(
+                    channel = transport.open_channel(
                         "direct-tcpip",
                         (remote_host, remote_port),
                         self.request.getpeername(),

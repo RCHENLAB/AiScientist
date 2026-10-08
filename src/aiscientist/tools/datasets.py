@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 import urllib.request
 from pathlib import Path
 from statistics import mean
@@ -145,7 +146,10 @@ def run_dataset_smoke_analysis(dataset_path: Path, output_dir: Path) -> dict[str
     # those formats just record the path and let the analysis line handle it.
     if dataset_path.suffix.lower() not in {".csv", ".tsv", ".txt"} or dataset_path.is_dir():
         result = {"dataset_kind": "single_cell_other", "format": dataset_path.suffix.lower() or "dir",
+                  "dataset_path": str(dataset_path),
                   "note": "read directly by the scanpy analysis tools (no text preflight)"}
+        if dataset_path.suffix.lower() == ".h5" and dataset_path.is_file():
+            result.update(_tenx_h5_profile(dataset_path))
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "dataset_results.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return {"result": result, "result_path": output_dir / "dataset_results.json"}
@@ -196,6 +200,27 @@ def run_dataset_smoke_analysis(dataset_path: Path, output_dir: Path) -> dict[str
         "preflight_path": preflight_path,
         "trace_path": trace_path,
     }
+
+
+def _tenx_h5_profile(dataset_path: Path) -> dict[str, Any]:
+    """The profile of a 10x Cell Ranger matrix ``.h5`` ({} when the file is not one): its size, and a
+    note stating what it holds, so the planner does not schedule a hand-written audit to find out."""
+    from ._lib.cellranger import RAW, describe_10x_h5, is_count_matrix, matrix_facts
+
+    matrix = describe_10x_h5(str(dataset_path))
+    if not matrix:
+        return {}
+    profile: dict[str, Any] = {"tenx_h5": matrix}
+    # A raw (unfiltered) matrix's barcodes are mostly empty droplets: they are not cells.
+    if RAW not in dataset_path.name:
+        profile.update(cells=matrix["n_barcodes"], genes=matrix["n_features"])
+    ruling = ("These are integer UMI counts as Cell Ranger writes them: their provenance needs no "
+              "`run_code` audit." if is_count_matrix(matrix) else
+              "⚠ Cell Ranger writes integer UMI counts only, so this file was changed after Cell "
+              "Ranger: establish what it holds before any count-based step.")
+    profile["note"] = (f"a 10x Cell Ranger feature-barcode matrix, read at upload: "
+                       f"{matrix_facts(matrix)}. {ruling}")
+    return profile
 
 
 def fetch_public_dataset(name: str, output_dir: Path, max_bytes: int = MAX_PUBLIC_DATASET_BYTES) -> Path:
@@ -323,6 +348,50 @@ def run_h5ad_preflight(dataset_path: Path, output_dir: Path) -> dict[str, Any]:
 _PLAIN_COL_SCAN = 50_000
 
 
+def _decode(v: Any) -> str:
+    return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+
+
+def _is_group(node: Any) -> bool:
+    # an h5py Group has keys and no dtype; a Dataset has no keys; a pandas Series (an obs passed
+    # as a DataFrame) has both
+    return hasattr(node, "keys") and not hasattr(node, "dtype")
+
+
+def _is_categorical(node: Any) -> bool:
+    return _is_group(node) and "categories" in node and "codes" in node
+
+
+def _h5_head(node: Any, n: "int | None" = None) -> "tuple[Any, Any]":
+    """The first ``n`` entries (all when None) of a NON-categorical obs element, plus its
+    missing-value mask (None when the encoding has none).
+
+    anndata writes the same logical column more than one way, and these readers must take all of
+    them: a plain dataset (``array`` / ``string-array``), or a group holding ``values`` and a
+    boolean ``mask`` (True = missing). The group form has always been used for ``nullable-integer``
+    and ``nullable-boolean``; since anndata 0.13 under pandas 3, whose default ``str`` dtype is
+    nullable, it is also ``nullable-string-array`` — the obs INDEX and every string column not
+    converted to a categorical. Reading those with ``node[:n]`` / ``node.shape`` raised inside the
+    callers' never-raise guards, so a file written by a current anndata silently lost its
+    ``design_by_arm`` table. Raises on anything else; callers catch."""
+    if _is_group(node):
+        values = node["values"][:n]
+        return values, (node["mask"][:n] if "mask" in node else None)
+    return node[:n], None
+
+
+def _h5_len(node: Any) -> int:
+    """Row count of an obs element in any of the encodings above."""
+    if _is_group(node):
+        node = node["codes"] if _is_categorical(node) else node["values"]
+    return int(node.shape[0])
+
+
+def _categories(node: Any) -> list[str]:
+    raw, _ = _h5_head(node["categories"])
+    return [_decode(v) for v in raw]
+
+
 def _obs_categoricals(obs: Any, *, max_cols: int = 30, list_max: int = 30) -> dict[str, Any]:
     """Category values for the CATEGORICAL obs columns (anndata stores these as a subgroup with
     a ``categories`` child). Surfaces the dataset's experimental design — a condition/group
@@ -350,22 +419,23 @@ def _obs_categoricals(obs: Any, *, max_cols: int = 30, list_max: int = 30) -> di
             continue
         try:
             node = obs[key]
-            if hasattr(node, "keys") and "categories" in node:
-                raw = node["categories"][:]
-                values = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
-                          for v in raw]
+            if _is_categorical(node):
+                values = _categories(node)
                 n = len(values)
                 out[key] = {"n": n, "values": values[:list_max] if n <= list_max else []}
                 continue
             # Plain column. Read a bounded head rather than the whole thing (an obs column can be
             # millions of rows) and only record it when it is genuinely low-cardinality — a float
             # measurement or a per-cell barcode has nothing to say about the design.
-            head = node[:_PLAIN_COL_SCAN]
+            head, mask = _h5_head(node, _PLAIN_COL_SCAN)
             if getattr(head, "dtype", None) is not None and head.dtype.kind == "f":
                 continue                          # continuous measurement, not a design column
+            missing = mask if mask is not None else [False] * len(head)
             seen: list[str] = []
-            for v in head:
-                s = v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+            for v, m in zip(head, missing):
+                if m:
+                    continue                      # a missing entry is not a level, as NA is no category
+                s = _decode(v)
                 if s not in seen:
                     seen.append(s)
                     if len(seen) > list_max:
@@ -373,7 +443,7 @@ def _obs_categoricals(obs: Any, *, max_cols: int = 30, list_max: int = 30) -> di
             if not seen or len(seen) > list_max:
                 continue
             entry: dict[str, Any] = {"n": len(seen), "values": sorted(seen)}
-            if getattr(node, "shape", (0,))[0] > _PLAIN_COL_SCAN:
+            if _h5_len(node) > _PLAIN_COL_SCAN:
                 entry["scanned"] = _PLAIN_COL_SCAN   # count is from a head sample, not the column
             out[key] = entry
         except Exception:  # noqa: BLE001 - skip an unreadable column, keep the rest
@@ -389,17 +459,17 @@ _ARM_TABLE_MAX_CELLS = 400_000
 
 
 def _obs_column_values(obs: Any, key: str, n: int) -> "list[str] | None":
-    """The first ``n`` values of an obs column as strings — categorical (codes → categories) or
-    plain — or None when unreadable."""
+    """The first ``n`` values of an obs column as strings — categorical (codes → categories),
+    plain or nullable (masked entries → "NA") — or None when unreadable."""
     try:
         node = obs[key]
-        if hasattr(node, "keys") and "categories" in node:
-            cats = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
-                    for v in node["categories"][:]]
+        if _is_categorical(node):
+            cats = _categories(node)
             codes = node["codes"][:n]
             return [cats[int(c)] if 0 <= int(c) < len(cats) else "NA" for c in codes]
-        raw = node[:n]
-        return [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for v in raw]
+        raw, mask = _h5_head(node, n)
+        missing = mask if mask is not None else [False] * len(raw)
+        return ["NA" if m else _decode(v) for v, m in zip(raw, missing)]
     except Exception:  # noqa: BLE001
         return None
 
@@ -462,12 +532,14 @@ def _design_by_arm(obs: Any, cats: dict[str, Any], n_cells: int) -> "dict[str, A
         try:
             if col not in obs.keys():
                 continue
-            vals = obs[col][:n]
+            vals, mask = _h5_head(obs[col], n)     # a nullable-integer count column is a group
             if getattr(vals, "dtype", None) is None or vals.dtype.kind not in "fiu":
                 continue
+            missing = mask if mask is not None else [False] * len(vals)
             per: dict[str, float] = {}
             for a in arms:
-                sel = [float(v) for v, x in zip(vals, arm) if x == a]
+                # a masked or NaN entry is a missing measurement, not a value to take the median of
+                sel = [float(v) for v, x, m in zip(vals, arm, missing) if x == a and not m and v == v]
                 if sel:
                     per[a] = round(statistics.median(sel), 3)
             if per:
@@ -509,6 +581,66 @@ def _design_by_arm(obs: Any, cats: dict[str, Any], n_cells: int) -> "dict[str, A
     return out
 
 
+# Ensembl gene-ID prefixes, most specific first ("ENSG" is a prefix of none of the others, but the
+# order keeps a future ENSxxxG entry from being shadowed).
+_ENSEMBL_SPECIES = (("ENSMUSG", "mouse"), ("ENSRNOG", "rat"), ("ENSDARG", "zebrafish"),
+                    ("ENSG", "human"))
+_TITLE_SYMBOL = re.compile(r"^[A-Z][a-z0-9][a-z0-9.\-]*$")     # Gfap, Rpl13a, Actb
+_UPPER_SYMBOL = re.compile(r"^[A-Z][A-Z0-9.\-]*[A-Z0-9]$")     # GFAP, RPL13A, ACTB
+_HOUSEKEEPING = ("Actb", "Gapdh", "Rho", "Glul", "Rlbp1", "Malat1")
+
+
+def _gene_symbol_species(var: Any) -> "dict[str, Any] | None":
+    """The species the gene identifiers point to, read off the var index.
+
+    A plan writes gene symbols, and a mouse matrix spells them `Gfap` while a human one spells
+    them `GFAP`. The profile never said which, so a DDX41 plan on a mouse retina declared the
+    species "unknown" and wrote every marker and signature gene in human upper case — symbols an
+    exact-match lookup does not find. The case convention (and the mitochondrial prefix: mouse
+    `mt-`, rat `Mt-`, human `MT-`) settles it from the file, without a model guessing.
+    ``None`` when the index cannot be read or says nothing either way."""
+    try:
+        idx_key = var.attrs.get("_index", "_index") if hasattr(var, "attrs") else "_index"
+        idx_key = _decode(idx_key)
+        if idx_key not in var:
+            return None
+        names = _obs_column_values(var, idx_key, _h5_len(var[idx_key])) or []
+    except Exception:  # noqa: BLE001 - the hint is an extra, never a blocker
+        return None
+    if not names:
+        return None
+    ids = [n for n in names if n.startswith("ENS")]
+    if len(ids) > len(names) / 2:
+        for prefix, species in _ENSEMBL_SPECIES:
+            if sum(1 for n in ids if n.startswith(prefix)) > len(ids) / 2:
+                return {"identifiers": "ensembl", "species_hint": species,
+                        "evidence": f"{len(ids)} of {len(names)} var names are Ensembl {prefix} IDs"}
+        return {"identifiers": "ensembl", "species_hint": None,
+                "evidence": f"{len(ids)} of {len(names)} var names are Ensembl IDs"}
+    title = sum(1 for n in names if _TITLE_SYMBOL.match(n))
+    upper = sum(1 for n in names if _UPPER_SYMBOL.match(n))
+    mito = {p: sum(1 for n in names if n.startswith(p)) for p in ("mt-", "Mt-", "MT-")}
+    if title + upper == 0:
+        return None
+    frac_title = title / (title + upper)
+    mito_note = ", ".join(f"{k}: {v}" for k, v in mito.items() if v)
+    evidence = (f"{title} Title-case vs {upper} upper-case symbols"
+                + (f"; mitochondrial prefix {mito_note}" if mito_note else ""))
+    if frac_title >= 0.8:
+        species = "rat" if mito["Mt-"] > mito["mt-"] else "mouse"
+        present = set(names)
+        return {"identifiers": "symbols", "symbol_case": "Title-case (e.g. Gfap)",
+                "species_hint": species, "evidence": evidence,
+                "examples": [g for g in _HOUSEKEEPING if g in present][:4]}
+    if frac_title <= 0.2:
+        present = set(names)
+        return {"identifiers": "symbols", "symbol_case": "UPPER-case (e.g. GFAP)",
+                "species_hint": "human", "evidence": evidence,
+                "examples": [g.upper() for g in _HOUSEKEEPING if g.upper() in present][:4]}
+    return {"identifiers": "symbols", "symbol_case": "mixed", "species_hint": None,
+            "evidence": evidence}
+
+
 def _looks_like_label_col(name: str) -> bool:
     n = name.lower()
     return any(k in n for k in ("celltype", "cell_type", "majorclass", "cluster", "leiden",
@@ -541,12 +673,17 @@ def inspect_h5ad(handle: Any) -> dict[str, Any]:
                 if not n_obs:
                     idx_key = obs.attrs.get("_index", "_index") if hasattr(obs, "attrs") else "_index"
                     idx_key = idx_key.decode() if isinstance(idx_key, bytes) else str(idx_key)
-                    n_obs = int(obs[idx_key].shape[0]) if idx_key in obs else 0
+                    # the index is a `nullable-string-array` GROUP under anndata 0.13 + pandas 3
+                    n_obs = _h5_len(obs[idx_key]) if idx_key in obs else 0
                 design = _design_by_arm(obs, cats, n_obs)
             except Exception:  # noqa: BLE001 - the arm table is an extra, never a blocker
                 design = None
             if design:
                 result["design_by_arm"] = design
+    if var is not None and hasattr(var, "keys"):
+        symbols = _gene_symbol_species(var)
+        if symbols:
+            result["gene_symbols"] = symbols
 
     if x is None:
         result["x_encoding"] = "missing"

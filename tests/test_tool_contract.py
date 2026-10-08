@@ -26,6 +26,7 @@ PLATFORM_RELIES_ON = {
     "make_schematic": "agents/research_lab.py: figure steps",
     "run_clustering": "agents/research_lab.py: the label-reuse / re-cluster decision",
     "run_composition": "agents/research_lab.py: condition-study steps",
+    "run_cellqc": "gateway/app.py, agents/research_lab.py: QC steps (the Cell Ranger route)",
     "run_de": "agents/research_lab.py: DE producers and their tested-count checks",
     "run_depth_matched_de": "agents/research_lab.py: depth checks",
     "run_doublet_detection": "agents/research_lab.py: QC steps",
@@ -39,7 +40,7 @@ PLATFORM_RELIES_ON = {
 PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",
                   "search_skills", "read_skill_reference", "read_tool_source",
                   "list_dir", "stat_path", "find_files", "read_text", "disk_usage", "run_shell",
-                  "fetch_url", "install_package"}
+                  "fetch_url", "install_package", "run_in_environment"}
 
 
 def _platform_literals() -> set[str]:

@@ -14,6 +14,10 @@ the platform needs and whose body is the documentation people read::
     order: 220                   # position in the Scientist's catalog (ascending)
     line: scrna                  # the analysis line it belongs to (optional)
     owner: analysis              # the team line that maintains it
+    image: "docker://quay.io/biocontainers/cellqc:0.3.6--pyhdfd78af_1"   # optional, hpc:* only
+    cpus: 16                     # optional Slurm resources for THIS tool's job (hpc:* only);
+    mem_gb: 80                   #   unset = the line's executor defaults
+    time_limit: "08:00:00"
     ---
     # run_de
     ...documentation...
@@ -21,6 +25,14 @@ the platform needs and whose body is the documentation people read::
 Adding a tool is adding a folder: the registry, the HPC3 routing, the fast-chat selection and the
 System page all read these manifests, so no platform file names a tool. The parser is standard
 library only, because the HPC3 job images import this module too.
+
+A tool that needs software the line's container lacks (R, Bioconductor, a pinned Python, any
+bioconda package) names a container ``image`` instead of asking anyone to install it: the platform
+provisions that image on HPC3 the first time the tool runs, keeps it in the shared containers
+directory, and runs the tool's job inside it. ``docker://...`` is pulled (a BioContainers image
+exists for every bioconda package); ``bioconda:<pkg>=<version> ...`` is built from conda-forge +
+bioconda, for a combination or a pin no published image has. Versions must be pinned (never
+``latest``), so a run can be traced to the exact software that made it.
 """
 
 from __future__ import annotations
@@ -43,6 +55,43 @@ PACKAGE = __name__.rsplit(".", 1)[0]          # "aiscientist.tools"
 RUNS_ON = ("inprocess", "hpc:analysis", "hpc:variant", "hpc:phenotype", "hpc:literature", "gpu:scgpt")
 CATEGORIES = ("qc", "analysis", "annotation", "literature", "figure")
 _REQUIRED = ("name", "summary", "category", "runs_on", "order")
+# ``docker://<registry>/<repo>:<tag>`` or ``...@sha256:<digest>``; a floating tag is refused.
+_IMAGE_RE = re.compile(r"^docker://[\w.\-/]+(?::[\w.\-]+|@sha256:[0-9a-f]{64})$")
+# ``bioconda:<spec> <spec> ...`` — conda packages built into an image; the first spec is the tool's
+# own package and must be pinned to a version.
+_CONDA_SPEC_RE = re.compile(r"^[A-Za-z0-9_.\-]+(?:(?:==?|>=|<=|<|>|!=)[\w.*,<>=!\-]+)?$")
+
+
+def image_problem(image: str) -> str:
+    """Why ``image`` is not an acceptable ``image`` value (a TOOL.md's, or a SKILL.md's that declares
+    the environment its commands run in), or '' when it is."""
+    if image.startswith("bioconda:"):
+        specs = image[len("bioconda:"):].split()
+        if not specs or not all(_CONDA_SPEC_RE.match(s) for s in specs):
+            return "bioconda: must be followed by space-separated conda package specs"
+        if "=" not in specs[0]:
+            return f"the first package ({specs[0]}) must be pinned, e.g. {specs[0]}=1.2.3"
+        return ""
+    if not _IMAGE_RE.match(image):
+        return "must be docker://<repo>:<pinned tag> or @sha256, or bioconda:<pkg>=<version> ..."
+    if image.endswith(":latest"):
+        return "the tag 'latest' is not reproducible; pin a version"
+    return ""
+_image_problem = image_problem          # the old private name, kept for existing callers
+_TIME_RE = re.compile(r"^(?:\d+-)?\d{1,2}:\d{2}:\d{2}$")
+
+
+def resources_problem(cpus: Any, mem_gb: Any, time_limit: Any) -> str:
+    """Why these Slurm resources (each optional: 0, '' or None = the executor's default) are not
+    acceptable, or '' when they are. Shared by TOOL.md and SKILL.md."""
+    for key, value in (("cpus", cpus), ("mem_gb", mem_gb)):
+        if value in (None, "", 0):
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return f"{key} must be a positive integer"
+    if time_limit and not _TIME_RE.match(str(time_limit)):
+        return f"time_limit {time_limit!r} must be [D-]HH:MM:SS"
+    return ""
 
 
 class ManifestError(ValueError):
@@ -130,6 +179,10 @@ class ToolManifest:
     chat: bool = False
     line: str = ""
     owner: str = ""
+    image: str = ""               # container the tool's HPC3 job runs in ("" = the line's image)
+    cpus: int = 0                 # Slurm resources for this tool's job (0 / "" = the line's defaults)
+    mem_gb: int = 0
+    time_limit: str = ""
     doc: str = field(default="", repr=False, compare=False)
 
     @property
@@ -166,10 +219,23 @@ def load_manifest(folder: Path) -> ToolManifest:
         raise ManifestError(f"{path}: runs_on {fields['runs_on']!r} is not one of {RUNS_ON}")
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
-    known = set(_REQUIRED) | {"entry", "needs", "chat", "line", "owner"}
+    known = set(_REQUIRED) | {"entry", "needs", "chat", "line", "owner",
+                              "image", "cpus", "mem_gb", "time_limit"}
     unknown = set(fields) - known
     if unknown:
         raise ManifestError(f"{path}: unknown field(s) {sorted(unknown)}")
+    image = str(fields.get("image") or "")
+    time_limit = str(fields.get("time_limit") or "")
+    job_fields = [k for k in ("image", "cpus", "mem_gb", "time_limit") if fields.get(k)]
+    if job_fields and not fields["runs_on"].startswith("hpc:"):
+        raise ManifestError(f"{path}: {', '.join(job_fields)} only apply to an hpc:* tool")
+    if image and _image_problem(image):
+        raise ManifestError(f"{path}: image {image!r}: {_image_problem(image)}")
+    for key in ("cpus", "mem_gb"):
+        if key in fields and (not isinstance(fields[key], int) or fields[key] <= 0):
+            raise ManifestError(f"{path}: {key} must be a positive integer")
+    if time_limit and not _TIME_RE.match(time_limit):
+        raise ManifestError(f"{path}: time_limit {time_limit!r} must be [D-]HH:MM:SS")
     needs = fields.get("needs") or []
     return ToolManifest(
         name=fields["name"], summary=str(fields["summary"]), category=fields["category"],
@@ -177,7 +243,9 @@ def load_manifest(folder: Path) -> ToolManifest:
         entry=str(fields.get("entry") or "tool:make_tool"),
         needs=tuple(str(n) for n in (needs if isinstance(needs, list) else [needs])),
         chat=bool(fields.get("chat", False)), line=str(fields.get("line") or ""),
-        owner=str(fields.get("owner") or ""), doc=body)
+        owner=str(fields.get("owner") or ""), image=image,
+        cpus=int(fields.get("cpus") or 0), mem_gb=int(fields.get("mem_gb") or 0),
+        time_limit=time_limit, doc=body)
 
 
 @lru_cache(maxsize=1)

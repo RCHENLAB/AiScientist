@@ -210,3 +210,112 @@ def test_a_self_contained_tool_reports_nothing_to_dispatch_to():
         return
     out = make_tool_source_tool(lambda: cat).executor({"tool": cat[0].name}, None)
     assert isinstance(out.get("dispatches_to"), dict)
+
+
+# --- a tool dispatched to HPC3 must read as ITS OWN code, not the dispatcher --------------------
+#
+# The registry routes every `runs_on: hpc:*` tool through a three-line dispatcher
+# (`registry._exec`: "hand this to the line's Slurm executor"). read_tool_source introspected that
+# dispatcher. Run 78a707cd79e9's ORA step called read_tool_source("run_enrichment") twice and got
+# `_exec` from agents/registry.py both times; `symbol="run_enrichment"` then failed because the
+# lookup searched registry.py; the model went grepping on HPC3 for a gateway path, and the step ended
+# `done_early` without ever calling run_enrichment.
+
+
+class _RecordingLine:
+    """Stands in for a SlurmAnalysisExecutor: records what was dispatched, runs nothing."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def run_tool(self, name, args, ctx):
+        self.calls.append(name)
+        return {"status": "dispatched", "tool": name}
+
+
+def _routed_catalog():
+    from aiscientist.agents.registry import build_scientist_catalog
+
+    lines = {k: _RecordingLine() for k in
+             ("analysis_executor", "variant_executor", "phenotype_executor", "literature_executor")}
+    return build_scientist_catalog(**lines), lines
+
+
+def test_an_hpc_dispatched_tool_reads_its_own_tool_py_not_the_registry_dispatcher():
+    cat, lines = _routed_catalog()
+    enrichment = next(t for t in cat if t.name == "run_enrichment")
+    # Precondition: this IS the routed tool, so the test exercises the wrapper that misled the run.
+    assert enrichment.executor({}, None)["status"] == "dispatched"
+    assert lines["analysis_executor"].calls == ["run_enrichment"]
+
+    out = make_tool_source_tool(lambda: cat).executor({"tool": "run_enrichment"}, None)
+    assert "error" not in out, out
+    assert out["module"] == "aiscientist.tools.run_enrichment.tool"
+    assert out["file"].endswith("tools/run_enrichment/tool.py")
+    assert out["symbol"] == "run_enrichment"
+    assert "def run_enrichment" in out["source"]
+    assert "registry" not in out["file"] and "run_tool" not in out["source"]
+    assert out["defaults"], "the defaults of the real body, not of the dispatcher"
+    # Where it runs travels with the code, so the model does not go hunting for the file on HPC3.
+    assert out["runs_on"] == "hpc:analysis"
+    assert "symbol" in out["note"] and "run_shell" in out["note"]
+
+
+def test_a_symbol_inside_an_hpc_dispatched_tools_module_is_found():
+    cat, _ = _routed_catalog()
+    tool = make_tool_source_tool(lambda: cat)
+
+    # The exact call that errored in run 78a707cd79e9.
+    out = tool.executor({"tool": "run_enrichment", "symbol": "run_enrichment"}, None)
+    assert "error" not in out, out
+    assert "def run_enrichment" in out["source"]
+    assert out["module"] == "aiscientist.tools.run_enrichment.tool"
+
+    out = tool.executor({"tool": "run_enrichment", "symbol": "_enrichment_input_rows"}, None)
+    assert "error" not in out, out
+    assert "def _enrichment_input_rows" in out["source"]
+
+    # The other one from the same run: a helper run_de imports from the shared scRNA library.
+    out = tool.executor({"tool": "run_de", "symbol": "_write_table"}, None)
+    assert "error" not in out, out
+    assert "def _write_table" in out["source"]
+    assert out["module"] == "aiscientist.tools.run_de.tool"
+
+
+def test_a_wrapper_that_does_not_say_what_it_wraps_still_resolves_to_the_tool_folder():
+    """The registry now marks its dispatcher with `__wrapped__`; any other layer that wraps an
+    executor without doing so must not bring the defect back. The tool's folder is the authority."""
+    import dataclasses
+
+    base = next(t for t in scrna_catalog() if t.name == "run_enrichment")
+
+    def opaque_dispatch(args, ctx):
+        return {"status": "dispatched"}
+
+    cat = [dataclasses.replace(base, executor=opaque_dispatch)]
+    tool = make_tool_source_tool(lambda: cat)
+    out = tool.executor({"tool": "run_enrichment"}, None)
+    assert out["file"].endswith("tools/run_enrichment/tool.py")
+    assert "def run_enrichment" in out["source"]
+    out = tool.executor({"tool": "run_enrichment", "symbol": "_gmt_term_count"}, None)
+    assert "def _gmt_term_count" in out["source"]
+
+
+def test_a_composite_points_at_the_tools_it_composes_not_at_their_dispatchers():
+    # diagnose_disease closes over the ROUTED executors of run_lirical and deep_literature.
+    cat, _ = _routed_catalog()
+    tool = make_tool_source_tool(lambda: cat)
+    out = tool.executor({"tool": "diagnose_disease"}, None)
+    where = {k: v["where"] for k, v in out["dispatches_to"].items()}
+    assert "tools/run_lirical/tool.py:" in where["lirical_fn"], where
+    assert "tools/deep_literature/tool.py:" in where["literature_fn"], where
+
+    out = tool.executor({"tool": "diagnose_disease", "symbol": "lirical_fn"}, None)
+    assert out["file"].endswith("tools/run_lirical/tool.py")
+
+
+def test_platform_tools_carry_no_runs_on():
+    # `runs_on` comes from a tool folder's manifest; a platform tool has none and must not guess.
+    cat, _ = _routed_catalog()
+    out = make_tool_source_tool(lambda: cat).executor({"tool": "finish"}, None)
+    assert "runs_on" not in out and "note" not in out

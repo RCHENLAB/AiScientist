@@ -118,3 +118,99 @@ def test_the_pipeline_section_reads_real_LabRound_objects_not_only_dicts():
     out = _pipeline_section(SimpleNamespace(rounds=[rnd]))
     assert "## What was run" in out and "`run_scanpy_qc`" in out
     assert "`max_pct_mt` = `5.0`" in out and "chosen for this run" in out
+
+
+# --- a folder of Cell Ranger libraries ------------------------------------------------------------
+# Prod run c57071e7dc94 bound a whole Cell Ranger delivery, and its report said only "**Input.**
+# `dataset` — single_cell_other (single_cell_other).": the run-start profile cannot parse a 10x .h5,
+# and the layout recognised afterwards stayed in memory, never reaching data/dataset_results.json.
+
+def _delivery(root: Path) -> Path:
+    """Two fake libraries that differ in everything the section reports."""
+    one = root / "Sample1_WT" / "outs"
+    (one / "raw_feature_bc_matrix").mkdir(parents=True)
+    (one / "filtered_feature_bc_matrix").mkdir()
+    (one / "analysis").mkdir()
+    for name in ("raw_feature_bc_matrix.h5", "filtered_feature_bc_matrix.h5", "metrics_summary.csv",
+                 "possorted_genome_bam.bam", "possorted_genome_bam.bam.bai"):
+        (one / name).write_bytes(b"")
+    two = root / "Sample2_KO"          # a 10x Cloud download: packed directories, no BAM, no analysis/
+    two.mkdir()
+    for name in ("raw_feature_bc_matrix.tar.gz", "filtered_feature_bc_matrix.h5",
+                 "filtered_feature_bc_matrix.tar.gz"):
+        (two / name).write_bytes(b"")
+    return root
+
+
+def _cellqc_round(libs: list[dict]):
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
+    before = sum(lib["cells_cellranger"] or 0 for lib in libs)
+    return SimpleNamespace(rounds=[LabRound(
+        round_no=1, step_index=0, step="QC", specialist="s",
+        scientist_result={"steps": [{"tool": "run_cellqc", "ok": True, "args": {}, "result": {
+            "status": "ok", "libraries": libs, "n_libraries": len(libs), "cells_before": before,
+            "cells_after": sum(lib["cells_after_doublets"] for lib in libs), "genes_after": 21000}}]},
+        verdict=CriticVerdict(verdict="accept", score=0.9, critique=""))])
+
+
+_LIBS = [{"sample": "Sample1_WT", "cells_cellranger": 7000, "cells_after_filter": 6900,
+          "cells_after_doublets": 6200},
+         {"sample": "Sample2_KO", "cells_cellranger": 6559, "cells_after_filter": 6450,
+          "cells_after_doublets": 5815}]
+
+
+def test_a_cell_ranger_delivery_is_named_in_the_dataset_section(tmp_path):
+    from aiscientist.gateway.app import _cellranger_layout_local, _record_input_layout
+    from aiscientist.tools.datasets import run_dataset_smoke_analysis
+
+    folder = _delivery(tmp_path / "CellQC_testdata")
+    art = tmp_path / "artifacts"
+    primary = folder / "Sample1_WT" / "outs" / "filtered_feature_bc_matrix.h5"
+    decisions = {"dataset_result": run_dataset_smoke_analysis(primary, art / "data")["result"]}
+    assert _record_input_layout(decisions, _cellranger_layout_local(folder), art / "data")
+
+    on_disk = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
+    assert on_disk["cellranger_layout"]["n_libraries"] == 2, "the layout must reach the profile on disk"
+
+    out = _dataset_section(art, _cellqc_round(_LIBS))
+    input_line = next(ln for ln in out.splitlines() if ln.startswith("**Input.**"))
+    assert "`CellQC_testdata/`" in input_line
+    assert "2 libraries (`Sample1_WT`, `Sample2_KO`)" in input_line
+    assert "13,559 cells as called by Cell Ranger, summed over the 2 libraries CellQC read" in input_line
+    assert "genes" not in input_line, "CellQC reports no pre-QC gene count; none may be made up"
+    assert "single_cell_other" not in out
+    assert "| Sample1_WT | `.h5`, directory | `.h5`, directory | yes | yes | yes |" in out
+    assert "| Sample2_KO | `.tar.gz` | `.h5`, `.tar.gz` | no | no | no |" in out
+    assert "10x Cloud" in out, "a packed matrix directory must be explained"
+    # The QC paragraph, from a LabRound (the production shape) — it used to read dicts only.
+    assert "12,015 of 13,559 cells kept (1,544 removed) and 21,000 genes retained" in out
+    assert "Sample2_KO: 6559 → 6450 → 5815" in out
+
+
+def test_a_delivery_without_counts_gets_none_invented(tmp_path):
+    """No QC step, or one library CellQC could not count: the delivery is described, sized never."""
+    layout = {"root": "/data/Users/shared/jinl14/CellQC_testdata/Sample3_GSM5676874", "n_libraries": 1,
+              "libraries": [{"sample": "Sample3_GSM5676874", "raw": ["h5"], "filtered": ["h5", "dir"],
+                             "bam": True, "clusters": False, "metrics": True, "packed": False}]}
+    art = _bundle(tmp_path, {"dataset_kind": "single_cell_other", "cellranger_layout": layout})
+    out = _dataset_section(art, _result([]))
+    assert ("**Input.** `Sample3_GSM5676874/` — a 10x Cell Ranger delivery of 1 library "
+            "(`Sample3_GSM5676874`).") in out
+    assert "| Sample3_GSM5676874 | `.h5` | `.h5`, directory | yes | no | yes |" in out
+    assert "cells" not in out
+
+    uncounted = [dict(_LIBS[0], cells_cellranger=None), _LIBS[1]]
+    input_line = next(ln for ln in _dataset_section(art, _cellqc_round(uncounted)).splitlines()
+                      if ln.startswith("**Input.**"))
+    assert "cells" not in input_line, "a sum over a library with no count is a floor, not the size"
+
+
+def test_a_single_10x_h5_takes_its_size_from_the_qc_step(tmp_path):
+    art = _bundle(tmp_path, {"dataset_kind": "single_cell_other", "format": ".h5",
+                             "dataset_path": "/staged/filtered_feature_bc_matrix.h5"})
+    out = _dataset_section(art, _result([
+        {"tool": "run_scanpy_qc", "ok": True,
+         "result": {"status": "ok", "cells_before": 8000, "genes_before": 36601,
+                    "cells_after": 7400, "genes_after": 21000}}]))
+    assert ("**Input.** `filtered_feature_bc_matrix.h5` — single_cell_other; 8,000 cells x 36,601 "
+            "genes, as counted by the QC step.") in out

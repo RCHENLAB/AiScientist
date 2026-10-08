@@ -61,6 +61,11 @@ def _route_to_executor(tool: "HarnessTool", executor: Any, names: tuple[str, ...
     def _exec(args: dict, ctx: Any, _ex=executor, _name=tool.name) -> dict:
         return _ex.run_tool(_name, args, ctx)
 
+    # The job on HPC3 runs the tool's own code, so whatever introspects this executor
+    # (read_tool_source, describe_environment's source index) must land there, not on this
+    # three-line dispatcher. Run 78a707cd79e9's ORA step read `_exec` twice, could not fetch
+    # `run_enrichment` as a symbol of registry.py, and ended without ever calling the tool.
+    _exec.__wrapped__ = tool.executor        # type: ignore[attr-defined]
     try:
         return dataclasses.replace(tool, executor=_exec)
     except TypeError:                       # not a (replaceable) dataclass — mutate in place
@@ -103,13 +108,18 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     import importlib.util
 
     from .research_harness import default_catalog
-    from .research_lab import make_run_code_tool
+    from .research_lab import make_run_code_tool, make_run_in_environment_tool
 
     executors = {"hpc:analysis": analysis_executor, "hpc:variant": variant_executor,
                  "hpc:phenotype": phenotype_executor, "hpc:literature": literature_executor}
     catalog: list[HarnessTool] = list(default_catalog())                  # finish + smoke QC/DE
     catalog += tool_catalog.build_tools({"scgpt_runner": scgpt_runner}, route=_router(executors))
     catalog.append(make_run_code_tool(code_executor))                      # CodeAct (needs the sandbox)
+    # A skill's declared environment (SKILL.md ``image:``) — only when the executor can run images
+    # on HPC3, so a local run's roster stays honest.
+    env_tool = make_run_in_environment_tool(code_executor)
+    if env_tool is not None:
+        catalog.append(env_tool)
     if importlib.util.find_spec("scanpy") is not None:
         catalog = [t for t in catalog if t.name not in _SUPERSEDED_WHEN_SCANPY]
     # The HPC3 filesystem/shell line — appended LAST so it never displaces a typed tool in the

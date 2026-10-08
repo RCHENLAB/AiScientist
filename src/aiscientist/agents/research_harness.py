@@ -189,8 +189,9 @@ class HarnessConfig:
     # model debugging/converging and are allowed to run up to ``max_steps``, so a legitimately
     # iterating step is never cut off after a few distinct failures.
     max_repeated_errors: int = 3    # same tool error N times in a row → bail (stuck)
-    max_wasted_after_success: int = 2  # once a tool has succeeded, this many non-productive turns
-                                       # (a repeated identical call, or an error) → stop with the win
+    max_wasted_after_success: int = 2  # once a tool has produced a result (a LOOKUP_TOOLS success
+                                       # does not count), this many non-productive turns (a repeated
+                                       # identical call, or an error) → stop with the win
     checkpoint_seconds: float = 60.0  # heartbeat/stall cadence (only if workspace is set)
     # Context-window budgeting for the running history (the served model caps prompt+output
     # at ``max_model_len``; the full tool catalog is resent every turn and the tool results
@@ -263,6 +264,20 @@ def default_catalog() -> list[HarnessTool]:
             _exec_finish, category="control",
         ),
     ]
+
+
+def _json_safe(obj: Any) -> Any:
+    """``json.dumps`` fallback for what a tool result may carry besides JSON types: bytes (an HDF5
+    attribute), numpy scalars and arrays, paths, sets. A tool that returned one of these used to end
+    the whole run with ``TypeError: Object of type bytes is not JSON serializable`` (2026-10-02,
+    inspect_dataset on a Cell Ranger ``.h5``); the model now sees the value as text instead."""
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", "replace")
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj, key=str)
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    return str(obj)
 
 
 class ResearchHarness:
@@ -518,7 +533,9 @@ class ResearchHarness:
                     else:
                         # A real (non-finish) tool succeeded → reset the error streak; repeats now redundant.
                         repeated_errors, last_error_sig = 0, None
-                        had_success = True
+                        # Only a result arms the done_early stop below; a lookup is not one.
+                        if name not in LOOKUP_TOOLS:
+                            had_success = True
                         succeeded_keys.add(call_key)
                     summary = _summarize(output)
                     # Keep the FULL structured tool return on the step (not just a one-line
@@ -646,7 +663,16 @@ class ResearchHarness:
         required = self._by_name[name].parameters.get("required", [])
         missing = [key for key in required if key not in args]
         if missing:
-            return name, args, f"missing required args for '{name}': {missing}"
+            # Say WHY, or the model resends the same call: on 2026-10-03 a Scientist sent run_code
+            # three times in a row with no arguments at all. An empty call is what a reply cut off
+            # at the output limit looks like (a long snippet), and the cure is a shorter one.
+            if not args:
+                return name, args, (f"the call to '{name}' arrived with NO arguments (missing "
+                                    f"{missing}). This usually means the reply was cut off at the "
+                                    "output limit before the arguments were written: send a "
+                                    "SHORTER call (split long code into several smaller snippets).")
+            return name, args, (f"missing required args for '{name}': {missing} (got "
+                                f"{sorted(args)}; use the parameter names in the tool schema)")
         return name, args, None
 
     def _fallback_tool_call(self, content: str) -> dict[str, Any] | None:
@@ -670,9 +696,9 @@ class ResearchHarness:
         one goes back with its reporting keys first, so the cut lands on data (a preview table, a
         stdout tail) instead of on the status, warnings, notes and skipped groups that say how the
         result may be reported."""
-        text = json.dumps(payload)
+        text = json.dumps(payload, default=_json_safe)
         if len(text) > _FEED_RESULT_CHARS:
-            text = json.dumps(_reporting_first(payload))[:_FEED_RESULT_CHARS]
+            text = json.dumps(_reporting_first(payload), default=_json_safe)[:_FEED_RESULT_CHARS]
         if native and call_id:
             messages.append({"role": "tool", "tool_call_id": call_id, "content": text})
         else:
@@ -937,6 +963,15 @@ def _summarize(output: Any) -> str:
 _FAILED_TOOL_STATUSES = frozenset(
     {"error", "failed", "timeout", "unavailable", "not_enabled", "dependency_missing", "cancelled"}
 )
+
+#: Read-only lookups: they say where things are and what a tool does, and produce none of a step's
+#: result. Their success does not arm the ``done_early`` stop, which means "the step has its result
+#: and the model is spinning". Run f3b8268c4fd4's ORA step opened with read_tool_source, hit two
+#: different run_code errors, and was stopped "with the win" without ever calling run_enrichment
+#: (78a707cd79e9's ORA step ended the same way).
+LOOKUP_TOOLS = frozenset({"read_tool_source", "describe_environment", "search_skills",
+                          "read_skill_reference", "list_dir", "stat_path", "find_files",
+                          "read_text", "disk_usage"})
 
 
 def _returned_failure_sig(output: Any) -> str | None:

@@ -377,3 +377,46 @@ def test_a_step_that_names_a_tool_the_scientist_never_called_is_nudged_once():
     assert any(st.get("tool") == "run_qc" for st in res.steps), "the nudged attempt ran the tool"
     assert "never called" not in (calls[0] or ""), "first attempt is un-nudged"
     assert any("without calling `run_qc`" in c for c in calls[1:]), "the nudge names the tool"
+
+
+def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
+    """Run f3b8268c4fd4's second ORA attempt: an exploratory run_code succeeded, two more failed,
+    and the harness stopped "with the win" (done_early) though run_enrichment never ran. That is
+    the same "forgot to call it" as stopping on final text, and gets the same single nudge."""
+    from aiscientist.agents.research_harness import (HarnessContext, HarnessTool, ResearchHarness,
+                                                     default_catalog)
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
+
+    probes = iter([{"status": "ok", "stdout": "50 rows per group"},
+                   {"status": "error", "stderr": "KeyError: '0'"},
+                   {"status": "error", "stderr": "IndexError: too many indices"}])
+    empty = {"type": "object", "properties": {}}
+    catalog = [HarnessTool("run_code", "python", empty, lambda _a, _c: next(probes)),
+               HarnessTool("run_enrichment", "ORA", empty, lambda _a, _c: {"status": "ok"}),
+               *[t for t in default_catalog() if t.name == "finish"]]
+
+    calls: list[str] = []
+    def chat_fn(messages, tools):
+        calls.append(messages[-1]["content"] if messages else "")
+        n = len(calls)
+        if n <= 3:                                    # first attempt: three run_code probes
+            return {"content": "", "tool_calls": [{"id": f"c{n}", "type": "function",
+                    "function": {"name": "run_code", "arguments": f'{{"n": {n}}}'}}]}
+        if n == 4:                                    # nudged attempt: the step's tool, then finish
+            return {"content": "", "tool_calls": [{"id": "e", "type": "function",
+                    "function": {"name": "run_enrichment", "arguments": "{}"}}]}
+        return {"content": "", "tool_calls": [{"id": "f", "type": "function",
+                "function": {"name": "finish", "arguments": '{"answer": "done"}'}}]}
+
+    lab = ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="m"), LabConfig(),
+                      complete_fn=lambda m: "x",
+                      scientist=ResearchHarness(catalog=catalog, chat_fn=chat_fn))
+    events: list[dict] = []
+    res = lab._scientist("q", "**ORA** — Map each cluster with `run_enrichment`.",
+                         Specialist("Sci", "persona"), "", [], events.append)
+
+    assert any(e["type"] == "early_stop" and e["reason"] == "done_early" for e in events)
+    nudges = [e for e in events if e["type"] == "tool_nudge"]
+    assert len(nudges) == 1 and nudges[0]["tools"] == ["run_enrichment"]
+    assert res.stop_reason == "finished"
+    assert any(st.get("tool") == "run_enrichment" for st in res.steps)

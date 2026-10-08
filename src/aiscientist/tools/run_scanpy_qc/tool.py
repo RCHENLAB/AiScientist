@@ -241,7 +241,8 @@ def make_tool() -> HarnessTool:
         "REAL scanpy QC on the uploaded single-cell dataset: per-cell metrics, "
         "cell/gene filtering, normalization, log1p, and HVG selection. Writes QC "
         "violin/scatter figures and a checkpoint. Returns pre/post cell-gene counts "
-        "and the thresholds used. Run this FIRST.",
+        "and the thresholds used. Run this FIRST on a single matrix; for a folder of 10x Cell "
+        "Ranger outputs (raw + filtered matrices) use run_cellqc instead.",
         _schema("run_scanpy_qc", input={
             **_INPUT_SPEC,
             "description": (

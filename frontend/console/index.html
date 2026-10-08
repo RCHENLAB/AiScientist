@@ -274,6 +274,11 @@
                   <div id="dataMenu" class="data-menu hidden">
                     <button type="button" class="data-menu-item" data-act="file" title="Attach one or more data files — each joins the run's bind-set"><span class="material-symbols-outlined msym">upload_file</span> Upload file(s)</button>
                     <button type="button" class="data-menu-item" data-act="folder"><span class="material-symbols-outlined msym">drive_folder_upload</span> Upload a folder</button>
+                    <button type="button" id="serverDataItem" class="data-menu-item hidden" data-act="server" title="Bind a dataset that is already on the server by its path: nothing is uploaded, and a run copies what it needs to HPC3"><span class="material-symbols-outlined msym">folder_shared</span> Use data on the server</button>
+                    <div id="serverPathRow" class="server-path-row hidden">
+                      <input id="serverPathInput" type="text" spellcheck="false" autocomplete="off" placeholder="/data/…" aria-label="Server path to bind" />
+                      <button id="serverPathBind" type="button" class="primary small">Bind</button>
+                    </div>
                     <div class="data-menu-sep"></div>
                     <button type="button" class="data-menu-item" data-act="note" title="Attach the patient's clinical description (.txt/.md) — it is mapped to HPO terms for the phenotype step, and does NOT replace the dataset"><span class="material-symbols-outlined msym">clinical_notes</span> Attach a case note</button>
                     <div class="data-menu-sep"></div>
@@ -299,6 +304,7 @@
                 <div id="skillList" class="preset-list" role="group" aria-label="Required atomic skills"></div>
                 <div class="preset-hint">Optional. Tick atomic <b>skills</b> the run must apply (e.g. E-distance ranking) — they compose, so pick several. Leave empty and the agent fetches skills on demand.</div>
               </details>
+              <div id="serverPathOffer" class="server-path-offer hidden" role="status"></div>
               <form id="chatForm" class="chat-input">
                 <textarea id="chatInput" rows="2" placeholder="Ask AiScientist to plan or interpret an ocular bioinformatics analysis..."></textarea>
                 <button id="chatSend" type="submit" class="primary">Send</button>
@@ -337,6 +343,11 @@
         <!-- ===== ADMIN view (role=admin only) ===== -->
         <section id="view-admin" class="view">
           <div class="page">
+            <div class="admin-tabs" role="tablist">
+              <button class="admin-tab active" role="tab" data-admin-tab="users">Users</button>
+              <button class="admin-tab" role="tab" data-admin-tab="skills">Skill review <span id="skillPendingBadge" class="tab-badge hidden"></span></button>
+            </div>
+            <div id="adminPane-users" class="admin-pane">
             <div class="page-head"><h2>User management</h2><button id="adminRefresh" class="ghost small">Refresh</button></div>
             <p class="page-sub">Create accounts, disable/enable them, reset a forgotten password, or delete an account. Admin only.</p>
             <form id="createUserForm" class="create-user">
@@ -355,6 +366,18 @@
               <thead><tr><th>ID</th><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Last login</th><th>Actions</th></tr></thead>
               <tbody id="userTableBody"><tr><td colspan="7" class="empty-hint">Loading…</td></tr></tbody>
             </table>
+            </div>
+            <div id="adminPane-skills" class="admin-pane hidden">
+              <div class="page-head"><h2>Skill review</h2><button id="skillReviewRefresh" class="ghost small">Refresh</button></div>
+              <p class="page-sub">Skills the lab learned on its own from earlier runs. Each is one run's code turned into a template, with that dataset's format and column names inside it, so no run can plan with it or use it until an admin approves it. Hand-written skills are not listed here; they are always available.</p>
+              <div class="skill-filters" role="group" aria-label="Filter by status">
+                <button class="skill-chip active" data-skill-filter="pending">Pending</button>
+                <button class="skill-chip" data-skill-filter="approved">Approved</button>
+                <button class="skill-chip" data-skill-filter="retired">Retired</button>
+                <button class="skill-chip" data-skill-filter="all">All</button>
+              </div>
+              <div id="skillReviewList" class="card-list"><div class="empty-hint">Loading…</div></div>
+            </div>
           </div>
         </section>
 

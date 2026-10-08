@@ -59,7 +59,7 @@ def test_other_families_resolve_too():
         "The plan lacks any pathway enrichment, so the GSEA figure has no input.":
             ("run_enrichment", "run_gsea_prerank"),
         "There is no quality-control step; filtering is never computed.":
-            ("run_scanpy_qc",),
+            ("run_scanpy_qc", "run_cellqc"),
     }
     for issue, family in cases.items():
         assert _missing_analysis_family([issue]) == family, issue

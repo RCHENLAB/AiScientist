@@ -35,8 +35,21 @@ which is why our root lives there.
 ## Containers — `<root>/containers/` (17 G)
 
 Built with `singularity build --remote` (Sylabs cloud): **HPC3 has no fakeroot** — the user has no
-mapping in `/etc/subuid` — so a local `singularity build` cannot work. Each has a
-`deploy/<name>/build_and_stage.sh` in the repo.
+mapping in `/etc/subuid` — so a `singularity build` from a definition file cannot work there. Each has
+a `deploy/<name>/build_and_stage.sh` in the repo.
+
+**Since 2026-10-02 a tool can also declare its image in its `TOOL.md`** (`image:`), and the platform
+provisions it on first use (`gateway/tool_images.py`): a `docker://` image is PULLED, a
+`bioconda:<pkg>=<version> ...` recipe is BUILT without root — a micromamba base unpacked into a
+sandbox the job owns, conda packages installed into it, packed into a SIF (verified on HPC3: job
+57631153, ~7 min for CellQC + R + Bioconductor). Such images need no build script and no row edit by
+hand to come back: delete the file and the next run rebuilds it. They are listed below anyway.
+
+**Since 2026-10-04 a skill can declare one too** (`image:` in its SKILL.md; `run_in_environment` runs
+the skill's commands inside it). Builds now leave `<image>.sif.lock.txt` beside the image (the
+explicit package list, to rebuild it exactly). They also read the lab's shared conda download cache
+`<root>/conda-pkgs/`: read-only while building, with new archives added afterwards. So a second
+image that shares R/Bioconductor packages does not download them again.
 
 | file | size | built | purpose | rebuild |
 |---|---|---|---|---|
@@ -48,6 +61,8 @@ mapping in `/etc/subuid` — so a local `singularity build` cannot work. Each ha
 | `analysis.sif.bak-20260711` | 411 M | 2026-07-02 | the pre-toolkit image, kept as the rollback | — |
 | `vep.sif` | 241 M | 2026-07-07 | offline Ensembl VEP (+ OpenSpliceAI runs inside it) | `deploy/vep/build_and_stage.sh` |
 | `lirical.sif` | 135 M | 2026-07-14 | LIRICAL v2.4.1 phenotype→disease | `deploy/lirical/build_and_stage.sh` |
+| `cellqc-0.3.6_4509649d69.sif` | ~1.1 G | 2026-10-02 | `run_cellqc`'s image: CellQC 0.3.6, Python 3.12.14, R 4.5.3, Seurat/DoubletFinder/SoupX/scDblFinder (package list at `/opt/conda/aiscientist-packages.txt` inside) | automatic: built on first use from `run_cellqc/TOOL.md` `image:` |
+| `cellqc_0.3.6--pyhdfd78af_1.sif` | 1.1 G | 2026-10-02 | the published BioContainer, pulled to inspect it: **Python 3.14.7**, on which CellQC's nuclear_fraction fails — NOT used; safe to delete | `singularity pull docker://quay.io/biocontainers/cellqc:0.3.6--pyhdfd78af_1` |
 
 **`paperqa.sif` is NOT in this directory** — it was built, but it lives in Ziyao's personal dir
 (see the warning below), so `deploy/paperqa/build_and_stage.sh` has never staged a copy here.

@@ -332,6 +332,14 @@ def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: st
         return d.id
 
 
+def dataset_path_recorded(user_id: int, path: str) -> bool:
+    """True when this user already has a dataset row for ``path`` (binding a server folder twice
+    must not list it twice)."""
+    with session_scope() as s:
+        return s.scalars(select(Dataset.id).where(Dataset.user_id == user_id,
+                                                  Dataset.path == path).limit(1)).first() is not None
+
+
 def delete_dataset_record(user_id: int, dataset_id: int) -> str | None:
     """Remove ONE dataset-history row, but only if it belongs to ``user_id`` (so a user
     can never delete another account's dataset by guessing an id). Returns the stored
@@ -781,6 +789,55 @@ def set_role(user_id: int, req: SetRoleRequest, admin: User = Depends(require_ad
         user.role = role
         s.commit()
         return {"status": "ok", "user": user.public()}
+
+
+# --- admin: induced-skill review ----------------------------------------------
+# An induced skill reaches the PI and the Scientist only once an admin approves it here
+# (agents/skills.py, "review gate"). Curated skills are not listed: they are always on.
+
+
+class SkillReviewRequest(BaseModel):
+    status: str                 # 'approved' | 'retired' | 'pending'
+    note: str = ""
+
+
+@router.get("/admin/skills")
+def list_skill_reviews(_admin: User = Depends(require_admin)) -> dict:
+    """Admin: every induced skill with its review status and provenance, newest first."""
+    from ..agents import skills as skills_mod
+    rows = skills_mod.review_listing()
+    counts = {st: sum(1 for r in rows if r["status"] == st) for st in skills_mod.REVIEW_STATUSES}
+    return {"skills": rows, "counts": counts,
+            "curated": sum(1 for s in list(skills_mod.ALL_SKILLS.values()) if not s.induced),
+            "induced_dir_configured": skills_mod._induced_dir() is not None}
+
+
+@router.get("/admin/skills/{name}")
+def skill_review_detail(name: str, _admin: User = Depends(require_admin)) -> dict:
+    """Admin: one induced skill in full — its SKILL.md and bundled files — to judge it by."""
+    from ..agents.skills import review_detail
+    detail = review_detail(name)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="no induced skill by that name")
+    return detail
+
+
+@router.post("/admin/skills/{name}/review")
+def review_skill(name: str, req: SkillReviewRequest, admin: User = Depends(require_admin)) -> dict:
+    """Admin: approve (the models may use it), retire (kept on disk, never offered) or reset to
+    pending. Applies to the next step of every run — no restart."""
+    from ..agents.skills import set_review
+    try:
+        rec = set_review(name, (req.status or "").strip().lower(), by=admin.username, note=req.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="no induced skill by that name") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not record the review: {exc}") from exc
+    return {"status": "ok", "name": name, "review": rec}
 
 
 # --- account helpers (shared by the admin CLI; no plaintext ever on disk) -----

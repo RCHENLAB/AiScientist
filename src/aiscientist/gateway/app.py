@@ -14,7 +14,7 @@ import time
 import traceback
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
 from uuid import uuid4
 
@@ -697,12 +697,33 @@ def _ssh_connect_blocking(conn: Connection, req: ConnectRequest) -> None:
                          "Saved a reusable SSH key on HPC3 — next login can use it (no password or Duo).")
             except Exception as exc:  # noqa: BLE001 - key setup must never fail the login
                 emit("warning", "ssh_auth", f"Couldn't set up a reusable SSH key (login still fine): {exc}")
+        if req.auth_method == "password_duo":
+            _arm_reconnect_key(conn, req.ucinetid, req.key_passphrase)
         conn.push({"type": "duo_done"})
 
     _prepare_shared_storage(conn)
 
     emit("success", "ssh_connect",
          f"SSH session to {settings.host} is ready — allocating the GPU and starting the model next.")
+
+
+def _arm_reconnect_key(conn: Connection, hpc_user: str, passphrase: str | None) -> None:
+    """Give a password + Duo session a key to reconnect with if its transport drops mid-run.
+
+    Without one, the only way back is another Duo push that nobody is watching for, so the run
+    fails on its first command after a network blip (run 78a707cd79e9, 7 steps in). A key the user
+    saved for this host — minted on this login or an earlier one — authenticates with no prompt.
+    Best-effort: with no usable key the session behaves exactly as before."""
+    from . import ssh_credentials
+    try:
+        rows = [c for c in ssh_credentials.list_credentials(conn.owner)
+                if c["host"] == conn.settings.host and c["hpc_user"] == hpc_user]
+        for row in reversed(rows):                     # newest first
+            cred = ssh_credentials.get_credential(conn.owner, row["id"])
+            if cred and conn.executor.arm_reconnect_key(cred["key_path"], passphrase):
+                return
+    except Exception as exc:  # noqa: BLE001 - reconnect support must never fail the login
+        print(f"[ssh] no reconnect key armed for {hpc_user}: {type(exc).__name__}: {exc}")
 
 
 def _prepare_shared_storage(conn: Connection) -> None:
@@ -782,7 +803,8 @@ def _provision_gpu_blocking(conn: Connection) -> None:
 
     # 3. GPU allocation running the vLLM serve job (singularity + vllm serve)
     before = conn.alloc
-    conn.alloc = gpu.ensure_serve_job(conn.executor, settings, emit)
+    conn.alloc = gpu.ensure_serve_job(conn.executor, settings, emit,
+                                      wait_seconds=int(getattr(settings, "gpu_wait_seconds", 300) or 300))
     conn.broadcast_status()
 
     # 4. Tunnel to the compute node's vLLM port (dynamic per node; see gpu.py)
@@ -970,13 +992,25 @@ def _heal_vllm_session(conn: Connection) -> None:
         emit("warning", "vllm_recover",
              "vLLM connection dropped (idle tunnel or the GPU job hit its time limit) — "
              "recovering the serve job and tunnel …")
-        # 1. Reattach to the running serve job; resubmit only if Slurm reaped it.
-        conn.alloc = gpu.ensure_serve_job(conn.executor, settings, emit)
-        # 2. Reopen the local port-forward to the (possibly new) node/port.
+        # 1. Reattach to the running serve job; resubmit only if Slurm reaped it. When the SSH
+        #    session itself dropped, this first command is what reconnects it (SSHExecutor).
+        before = (conn.alloc.node, conn.alloc.port) if conn.alloc else None
+        # A run is waiting on this: queue for a GPU much longer than a connect would, rather than
+        # throw away every step it has already done.
+        conn.alloc = gpu.ensure_serve_job(
+            conn.executor, settings, emit,
+            wait_seconds=int(getattr(settings, "gpu_heal_wait_seconds", 1800) or 1800))
+        # 2. Same serve job and the existing tunnel answers again: a reconnected session carries the
+        #    old local port (the tunnel resolves the transport per connection), so keep it rather
+        #    than stacking a new forward — which a fixed AISCIENTIST_LOCAL_TUNNEL_PORT cannot bind.
+        if before == (conn.alloc.node, conn.alloc.port) and _vllm_reachable(conn):
+            emit("success", "vllm_recover", "vLLM session recovered — retrying the interrupted call.")
+            return
+        # 3. Otherwise reopen the local port-forward to the (possibly new) node/port.
         conn.tunnel_port = conn.executor.open_tunnel(
             conn.alloc.node, conn.alloc.port, local_port=settings.local_tunnel_port
         )
-        # 3. Block until /v1 answers again (the model reloads if the job was resubmitted).
+        # 4. Block until /v1 answers again (the model reloads if the job was resubmitted).
         _wait_for_server(conn, emit)
         emit("success", "vllm_recover", "vLLM session recovered — retrying the interrupted call.")
 
@@ -1620,14 +1654,22 @@ def _primary_suffix(name: str) -> "str | None":
     return None
 
 
+# Cell Ranger writes several .h5 files per library. Only the filtered matrix is the cell-by-gene
+# matrix a QC tool should read; "largest .h5" picked molecule_info.h5 (per-molecule records) or the
+# raw matrix (every barcode, mostly empty droplets) instead.
+_CELLRANGER_H5_RANK = {"filtered_feature_bc_matrix.h5": 0, "sample_filtered_feature_bc_matrix.h5": 0,
+                       "raw_feature_bc_matrix.h5": 2, "molecule_info.h5": 3}
+
+
 def _primary_rank(name: str, depth: int, size: int) -> "tuple | None":
-    """Sort key for one candidate (lower = better): recognized-format priority → shallowest →
-    largest. None when the file is not a dataset at all. ONE ranking, shared by the local and the
-    remote finders — they used to implement it twice and had already drifted apart."""
+    """Sort key for one candidate (lower = better): recognized-format priority → Cell Ranger role →
+    shallowest → largest. None when the file is not a dataset at all. ONE ranking, shared by the
+    local and the remote finders — they used to implement it twice and had already drifted apart."""
     suffix = _primary_suffix(name)
     if suffix is None:
         return None
-    return (_PRIMARY_SUFFIXES.index(suffix), depth, -size)
+    role = _CELLRANGER_H5_RANK.get((name or "").rsplit("/", 1)[-1].lower(), 1)
+    return (_PRIMARY_SUFFIXES.index(suffix), role, depth, -size)
 
 
 # --- multi-file bind-set (feature ②) -----------------------------------------
@@ -1709,6 +1751,105 @@ def _find_primary_matrix(folder: Path) -> Path | None:
         if key is not None and (best_key is None or key < best_key):
             best_key, best_path = key, p
     return best_path
+
+
+def _cellranger_layout(paths: "list[str]", root: str) -> "dict | None":
+    """The Cell Ranger libraries in an uploaded folder (see tools/_lib/cellranger.py), or None."""
+    from ..tools.api import describe_cellranger_layout
+    try:
+        return describe_cellranger_layout(paths, root)
+    except Exception:  # noqa: BLE001 - recognising the layout is a hint, never a blocker
+        return None
+
+
+def _profile_cellranger_libraries(layout: "dict | None", local_path: "Callable[[str], str | None]",
+                                  read_text: "Callable[[str], str | None]") -> None:
+    """Add what each library's filtered matrix holds, and whether it reproduces the library's
+    metrics_summary.csv, to ``layout`` (see tools/_lib/cellranger.py). A hint: never raises."""
+    if not layout:
+        return
+    from ..tools.api import profile_cellranger_libraries
+    try:
+        profile_cellranger_libraries(layout, local_path=local_path, read_text=read_text)
+    except Exception:  # noqa: BLE001 - the facts are a hint, never a blocker
+        pass
+
+
+def _read_small_text(path: str) -> "str | None":
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(65536)
+    except OSError:
+        return None
+
+
+def _cellranger_layout_remote(conn: Connection, remote_dir: str,
+                              staged: "dict[str, str] | None" = None) -> "dict | None":
+    """:func:`_cellranger_layout` for a dfs3b folder: one metadata-only ``find`` for the few names
+    that mark a Cell Ranger library. ``staged`` maps a remote file to its local staged copy: those
+    matrices (the primary's) are read here; every library's small metrics_summary.csv is fetched
+    over SFTP."""
+    from ..tools.api import CELLRANGER_FIND_MAXDEPTH, CELLRANGER_FIND_NAMES
+    base = remote_dir.rstrip("/")
+    names = " -o ".join(f"-name {shlex.quote(n)}" for n in CELLRANGER_FIND_NAMES)
+    listing = conn.executor.exec(
+        f"find {shlex.quote(base)} -maxdepth {CELLRANGER_FIND_MAXDEPTH} \\( {names} \\) -print "
+        "2>/dev/null").out or ""
+    layout = _cellranger_layout([ln for ln in listing.splitlines() if ln.strip()], base)
+
+    def _remote_text(path: str) -> "str | None":
+        # Content, so over SFTP (the transfer host), never `cat`/`head` on the login node.
+        try:
+            return conn.executor.read_bytes(path, 65536).decode("utf-8", "replace") or None
+        except Exception:  # noqa: BLE001 - an unreadable summary just goes unchecked
+            return None
+
+    # Compared as normalised paths: a listing and a finder can differ by a doubled or trailing slash.
+    local = {str(PurePosixPath(k)): v for k, v in (staged or {}).items()}
+    _profile_cellranger_libraries(layout, lambda q: local.get(str(PurePosixPath(q))), _remote_text)
+    return layout
+
+
+def _cellranger_layout_local(folder: Path) -> "dict | None":
+    """:func:`_cellranger_layout` for a folder on the gateway host, with each library's matrix read."""
+    from ..tools.api import CELLRANGER_FIND_MAXDEPTH
+    paths = [str(p) for p in folder.rglob("*")
+             if len(p.relative_to(folder).parts) <= CELLRANGER_FIND_MAXDEPTH]
+    layout = _cellranger_layout(paths, str(folder))
+    _profile_cellranger_libraries(layout, lambda p: p if os.path.isfile(p) else None,
+                                  _read_small_text)
+    return layout
+
+
+def _record_input_layout(decisions: dict, layout: "dict | None",
+                         data_dir: "Path | None" = None) -> "str | None":
+    """Put a recognised Cell Ranger delivery where the planner reads the data profile, with the QC
+    route it implies, and — given the run's ``artifacts/data`` — into the profile on disk, which the
+    report's "The dataset" section reads. Returns the one-line console summary, or None when nothing
+    was recognised."""
+    if not layout:
+        return None
+    from ..tools.api import cellranger_layout_hint
+    decisions["cellranger_layout"] = layout
+    dr = decisions.setdefault("dataset_result", {})
+    if isinstance(dr, dict):
+        dr["cellranger_layout"] = layout
+        dr["input_layout_hint"] = cellranger_layout_hint(layout)
+        if dr.get("tenx_h5") and any(lib.get("matrix") == dr["tenx_h5"] for lib in layout["libraries"]):
+            # The hint states the primary matrix's facts with the rest of the delivery's: once is enough.
+            dr["note"] = "the primary file is one of this delivery's filtered matrices (read above)"
+        # The profile was written before the layout was known: a 10x .h5 is not parsed at run start,
+        # so without this the report described a whole delivery as "`dataset` — single_cell_other".
+        if data_dir is not None:
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+                (data_dir / "dataset_results.json").write_text(json.dumps(dr, indent=2),
+                                                               encoding="utf-8")
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"[lab] could not record the Cell Ranger layout in the profile: {exc}")
+    n = layout["n_libraries"]
+    return (f"🧬 Cell Ranger delivery: {n} librar{'y' if n == 1 else 'ies'} "
+            f"({', '.join(lib['sample'] for lib in layout['libraries'][:6])}) — QC route: CellQC")
 
 
 def _find_primary_matrix_remote(conn: Connection, remote_dir: str) -> str | None:
@@ -2058,6 +2199,112 @@ def _stage_upload_to_hpc(conn: Connection, local_path: Path, rel: str) -> str:
     except OSError:
         pass
     return remote_path
+
+
+# --- datasets already on the gateway host, bound by path (see server_data.py) -------------------
+
+def _server_data_to_hpc(conn: Connection) -> bool:
+    """True when a bound server path must be copied to HPC3: something computes there, and HPC3's
+    nodes cannot see the gateway host's disks."""
+    st = conn.settings
+    return bool(conn.executor is not None and not conn.mock
+                and (st.analysis_on_hpc or st.run_code_on_hpc))
+
+
+def _server_dataset_kind(is_dir: bool) -> str:
+    return "server-folder" if is_dir else "server-file"
+
+
+def _sync_server_path(conn: Connection, path: Path, root: Path,
+                      say: "Callable[[str], None]") -> "tuple[str, set[str]]":
+    """Copy what an analysis needs from a bound server path to this user's HPC3 uploads area.
+    Returns ``(mirror path, the relative paths now there)``. SSH-bound: call via a thread."""
+    from . import server_data as sd
+    from ..tools.api import describe_cellranger_layout
+    found = sd.scan(path, root, sd.server_data_roots(), describe_cellranger_layout)
+    if found.copy_bytes > sd.max_bytes():
+        raise sd.ServerPathError(
+            f"{path} needs {found.copy_bytes / 1024 ** 3:.0f} GB on HPC3, over the "
+            f"{sd.max_bytes() / 1024 ** 3:.0f} GB limit for one bound dataset. Bind a subfolder.")
+    remote = sd.mirror_dir(_hpc_uploads_dir(conn), root, path)
+    try:
+        res = sd.sync_to_hpc(conn.executor, found, remote, progress=say,
+                             should_cancel=conn.chat_stop.is_set)
+    except sd.TransferCancelled as exc:
+        raise GatewayError("Stopped while copying the data to HPC3. The next run continues the "
+                           "copy where it stopped.", stage="data", detail=str(exc)) from exc
+    if res["copied"]:
+        say(f"✓ Copied {res['copied']} file(s), {res['copied_bytes'] / 1024 ** 3:.1f} GB, to your "
+            f"HPC3 storage in {res['seconds']:.0f} s")
+    else:
+        say(f"✓ The HPC3 copy of {path.name} is up to date ({res['kept']} file(s))")
+    return remote, {rel for rel, _ in found.copy}
+
+
+async def _admit_bound_paths(conn: Connection, bound: "list[dict]",
+                             say_key: "Callable[..., None]",
+                             emit: "Callable[..., None]") -> "tuple[list[dict], dict[str, tuple[str, set[str]]]]":
+    """Check every bound path before the run reads it, and copy server paths to HPC3 when needed.
+
+    A path is admitted when it is on dfs3b (an HPC3 upload), inside this user's own workspace on the
+    gateway host (a local upload), or inside an allowlisted server folder. Anything else is dropped
+    with a warning when accounts are on: the request comes from the browser, and one user must not
+    be able to point a run at another user's uploads or at the host's own files. Returns the
+    admitted entries and ``{server path: (mirror on HPC3, relative paths copied)}``."""
+    from . import server_data as sd
+    roots = sd.server_data_roots()
+    try:
+        own = conn.workspace.resolve()
+    except OSError:
+        own = conn.workspace
+    admitted: list[dict] = []
+    mirrors: dict[str, tuple[str, set[str]]] = {}
+    for entry in bound:
+        path = entry["path"]
+        if conn.executor is not None and _is_remote_dataset(conn, path):
+            admitted.append(entry)
+            continue
+        root = sd.root_of(path, roots) if roots else None
+        if root is None:
+            try:
+                inside_own = Path(path).resolve().is_relative_to(own)
+            except OSError:
+                inside_own = False
+            if _AUTH_ENABLED and not inside_own:
+                emit("warning", "lab", f"Not bound: {path} is neither one of your uploads nor "
+                                       "inside a server folder that can be bound.")
+                say_key(f"⚠ Not bound: {entry['name']} (outside your uploads and the server "
+                        "folders that can be bound)", "warning")
+                continue
+            admitted.append(entry)
+            continue
+        if _server_data_to_hpc(conn):
+            say_key(f"🔗 Server data: {path}")
+            try:
+                mirrors[path] = await asyncio.to_thread(
+                    _sync_server_path, conn, Path(path).resolve(), root, say_key)
+            except sd.ServerPathError as exc:
+                emit("warning", "lab", f"Not bound: {exc}")
+                say_key(f"⚠ Not bound: {entry['name']}: {exc}", "warning")
+                continue
+        admitted.append(entry)
+    return admitted, mirrors
+
+
+def _mirror_of(mirrors: "dict[str, tuple[str, set[str]]]", bound_path: str,
+               file_path: "Path | None" = None) -> "str | None":
+    """The HPC3 copy of ``file_path`` (a file inside the bound folder ``bound_path``, or the bound
+    file itself when None), or None when it was not copied."""
+    if bound_path not in mirrors:
+        return None
+    remote, copied = mirrors[bound_path]
+    if file_path is None:
+        return remote
+    try:
+        rel = file_path.relative_to(Path(bound_path)).as_posix()
+    except ValueError:
+        return None
+    return f"{remote}/{rel}" if rel in copied else None
 
 
 def _primary_dataset_record(primary: dict, decisions: dict) -> dict:
@@ -3099,6 +3346,9 @@ class ContinueRunRequest(BaseModel):
     from_step_index: int = 0         # 0-based agenda step to REDO (that step + everything after it)
     modify_note: str | None = None   # steering for the redone step ("re-cluster at resolution 1.0")
     edited_step: str | None = None   # optional: replace the redone step's agenda TEXT outright
+    # Pick up an INTERRUPTED run (crash, restart, dropped session) where it stopped: keep every step
+    # with an accepted result and run the rest. from_step_index / modify_note / edited_step are ignored.
+    resume_interrupted: bool = False
 
 
 class PlanReviewRequest(BaseModel):
@@ -3226,6 +3476,103 @@ async def register_folder(payload: dict) -> JSONResponse:
             print(f"[auth] record_dataset (folder) failed: {exc}")
     return JSONResponse({"status": "registered", "name": folder, "path": recorded_path,
                          "size": size, "count": count, "kind": "folder"})
+
+
+# --- binding a dataset that is already on the server (see server_data.py) ------------------------
+# Lab data shared on the gateway host is bound by PATH, never uploaded: the console sends the path,
+# the gateway checks it against AISCIENTIST_SERVER_DATA_ROOTS, and a run copies what it needs to HPC3.
+# The console offers this from the Data menu and when such a path is pasted into the chat — always as
+# an explicit "bind" the user clicks, never from the model reading the message.
+
+
+def _server_path_info(conn: Connection, raw: str) -> dict:
+    """Validate and scan a server path: what it is, and what a run would copy to HPC3. Raises
+    ``server_data.ServerPathError``. Lists the folder: call via a thread."""
+    from . import server_data as sd
+    from ..tools.api import describe_cellranger_layout
+    roots = sd.server_data_roots()
+    path, root = sd.resolve(raw, roots)
+    found = sd.scan(path, root, roots, describe_cellranger_layout)
+    info = found.summary()
+    to_hpc = _server_data_to_hpc(conn)
+    if to_hpc and found.copy_bytes > sd.max_bytes():
+        raise sd.ServerPathError(
+            f"{path} needs {found.copy_bytes / 1024 ** 3:.0f} GB on HPC3, over the "
+            f"{sd.max_bytes() / 1024 ** 3:.0f} GB limit for one bound dataset. Bind a subfolder.")
+    primary = _find_primary_matrix(path) if found.is_dir else path
+    info["primary"] = (primary.relative_to(path).as_posix() if found.is_dir else path.name) if primary else None
+    info["copies_to_hpc"] = to_hpc
+    info["confirm"] = bool(to_hpc and found.copy_bytes > sd.confirm_bytes())
+    gb = lambda n: f"{n / 1024 ** 3:.1f} GB"  # noqa: E731
+    what = f"{info['n_files']} files, {gb(info['size_bytes'])}" if found.is_dir else gb(info["size_bytes"])
+    parts = [f"{path} ({what})."]
+    cr = info.get("cellranger")
+    if cr:
+        n = cr["n_libraries"]
+        parts.append(f"Cell Ranger delivery: {n} librar{'y' if n == 1 else 'ies'} "
+                     f"({', '.join(cr['samples'][:6])}{'…' if n > 6 else ''}); QC route: CellQC.")
+    elif info["primary"]:
+        parts.append(f"Primary file: {info['primary']}.")
+    else:
+        parts.append("No recognised dataset file: the agent can still read the folder.")
+    if to_hpc:
+        skipped = sum(s["bytes"] for s in info["skipped"])
+        parts.append(f"A run copies {info['copy_files']} file(s), {gb(info['copy_bytes'])}, to your "
+                     "HPC3 storage (only what has changed since the last copy)"
+                     + (f", skipping {gb(skipped)} no tool reads" if skipped >= 1024 ** 2 else "")
+                     + ".")
+    info["message"] = " ".join(parts)
+    return info
+
+
+@app.get("/api/server-data/roots")
+async def server_data_roots_endpoint(request: Request) -> JSONResponse:
+    """The server folders a dataset can be bound from. Empty = the feature is off."""
+    if _AUTH_ENABLED and _optional_user(request) is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    from . import server_data as sd
+    roots = sd.display_roots()
+    return JSONResponse({"enabled": bool(roots), "roots": roots})
+
+
+@app.post("/api/server-data/check")
+async def server_data_check(payload: dict) -> JSONResponse:
+    """What binding this server path would mean (size, layout, what a run copies), without binding."""
+    conn = CONNECTIONS.get(payload.get("connection_id"))
+    if not conn:
+        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    from . import server_data as sd
+    try:
+        info = await asyncio.to_thread(_server_path_info, conn, str(payload.get("path") or ""))
+    except sd.ServerPathError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"status": "ok", **info})
+
+
+@app.post("/api/server-data/bind")
+async def server_data_bind(payload: dict) -> JSONResponse:
+    """Bind a server path as one of the user's datasets (one history row; nothing is copied yet:
+    the run copies what it needs to HPC3 when it starts). Re-checks the path: the browser's earlier
+    /check result is never trusted."""
+    conn = CONNECTIONS.get(payload.get("connection_id"))
+    if not conn:
+        return JSONResponse({"error": "Unknown connection id"}, status_code=404)
+    from . import server_data as sd
+    try:
+        info = await asyncio.to_thread(_server_path_info, conn, str(payload.get("path") or ""))
+    except sd.ServerPathError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    kind = _server_dataset_kind(info["kind"] == "folder")
+    if _AUTH_ENABLED and conn.app_user_id:
+        try:
+            if not auth_routes.dataset_path_recorded(conn.app_user_id, info["path"]):
+                auth_routes.record_dataset(conn.app_user_id, info["name"], info["path"],
+                                           info["size_bytes"], kind)
+        except Exception as exc:  # noqa: BLE001 - history is best-effort
+            print(f"[auth] record_dataset (server path) failed: {exc}")
+    conn.emit("success", "upload", f"Bound server data: {info['message']}")
+    return JSONResponse({"status": "bound", "name": info["name"], "path": info["path"],
+                         "kind": kind, "size": info["size_bytes"], "info": info})
 
 
 # --- resumable (chunked) upload for large datasets --------------------------
@@ -3397,6 +3744,19 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
     if stored is None:
         return JSONResponse({"error": "Dataset not found."}, status_code=404)
     conn = _active_conn_for_user(user)
+    from . import server_data as sd
+    server_root = sd.root_of(stored, sd.server_data_roots())
+    if server_root is not None:
+        # A bound server path: the server's data is the lab's, never deleted from here. Only this
+        # user's HPC3 copy goes (another bound folder that shares files re-copies them next run).
+        if conn is not None:
+            mirror = sd.mirror_dir(_hpc_uploads_dir(conn), server_root, Path(stored).resolve())
+            if mirror.startswith(f"{_hpc_uploads_dir(conn)}/server-data/"):
+                try:
+                    await asyncio.to_thread(conn.executor.exec, f"rm -rf {shlex.quote(mirror)}")
+                except Exception as exc:  # noqa: BLE001 - the history row is already removed
+                    print(f"[datasets] could not rm HPC3 copy {mirror}: {exc}")
+        return JSONResponse({"ok": True, "deleted": dataset_id})
     if conn is not None and _is_remote_dataset(conn, stored):
         # Dataset lives on HPC3 dfs3b — remove it over the user's SSH session, strictly scoped
         # to their own uploads dir (never rm outside it). Best-effort: if no live session, the
@@ -4062,47 +4422,84 @@ async def lab_continue(req: ContinueRunRequest) -> JSONResponse:
     except (OSError, ValueError) as exc:
         return JSONResponse({"error": f"run_state.json is unreadable: {exc}"}, status_code=422)
     try:
-        resume, resume_decisions, cont_req, idx = _prepare_continue(
-            req.connection_id, conn, run_id, art, state, req.from_step_index,
-            modify_note=req.modify_note, edited_step=req.edited_step)
+        # In a thread: finding the checkpoints of a run that analysed on HPC3 is an SSH round trip.
+        resume, resume_decisions, cont_req, idx = await asyncio.to_thread(
+            _prepare_continue, req.connection_id, conn, run_id, art, state, req.from_step_index,
+            modify_note=req.modify_note, edited_step=req.edited_step,
+            interrupted=req.resume_interrupted, hpc_checkpoints=True)
     except ValueError as exc:
-        # No agenda (422) vs expired checkpoints (409) — distinguish for the caller.
+        # No agenda (422) vs expired checkpoints / nothing left to continue (409).
         code = 422 if "no agenda" in str(exc).lower() else 409
         return JSONResponse({"error": str(exc)}, status_code=code)
     conn.begin_run(req.conversation_id, run_id=run_id)
     asyncio.create_task(_run_lab(conn, cont_req, resume=resume, resume_run_id=run_id,
                                  resume_decisions=resume_decisions))
-    return JSONResponse({"status": "running", "run_id": run_id, "from_step": idx + 1})
+    body: dict[str, Any] = {"status": "running", "run_id": run_id, "from_step": idx + 1}
+    if req.resume_interrupted:
+        body["steps_to_run"] = sorted(i + 1 for i in (resume.redo_indices or ()))
+    return JSONResponse(body)
+
+
+def _analysis_checkpoints_exist(conn: Connection, run_id: str, *, look_on_hpc: bool) -> bool:
+    """Are this run's analysis checkpoints (``work/adata_*.h5ad``) still there?
+
+    They sit in the run directory on the gateway host when the analysis ran in-process, and in the
+    run's HPC3 workspace (``<Temp>/<user>/analysis/<run_id>/work``, swept after ``temp_ttl_days``)
+    when it ran on HPC3 — where a look at the local directory alone reported every such run as
+    expired. An unreachable HPC3 reads as "not there", which the caller reports."""
+    work = conn.workspace / safe_name(run_id) / "work"
+    if work.exists() and any(work.glob("adata_*.h5ad")):
+        return True
+    if not (look_on_hpc and conn.settings.analysis_on_hpc and conn.executor is not None
+            and not conn.mock):
+        return False
+    remote = f"{_temp_base(conn)}/analysis/{run_id}/work"
+    try:
+        return conn.executor.exec(f"ls {shlex.quote(remote)}/adata_*.h5ad >/dev/null 2>&1",
+                                  timeout=30).ok
+    except Exception:  # noqa: BLE001 - see the docstring
+        return False
 
 
 def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Path, state: dict,
                       from_step_index: int, *, modify_note: str | None = "",
-                      edited_step: str | None = None):
+                      edited_step: str | None = None, interrupted: bool = False,
+                      hpc_checkpoints: bool = False):
     """Build the (ResumeState, resume_decisions, LabRequest, idx) to re-run ONE step of a prior
     run in place, reusing earlier steps' checkpoints. Shared by /api/lab/continue and the
     follow-up router. Raises ValueError when the run can't be continued (no agenda, or the
-    upstream analysis checkpoints for a mid-pipeline step have expired)."""
+    upstream analysis checkpoints for a mid-pipeline step have expired).
+
+    ``interrupted`` continues a run that stopped part-way instead: every step with an accepted
+    result is kept and every other step runs, from the first of them (``from_step_index``,
+    ``modify_note`` and ``edited_step`` are ignored). ``hpc_checkpoints`` also looks for the
+    checkpoints in the run's HPC3 workspace — an SSH round trip, so call it off the event loop."""
+    from ..agents.research_lab import ResumeState
     agenda = list(state.get("agenda", []))
     if not agenda:
         raise ValueError("Prior run has no agenda to continue.")
-    idx = max(0, min(int(from_step_index), len(agenda) - 1))
+    if interrupted:
+        resume = ResumeState.from_interrupted(state, guidance=state.get("guidance"))
+        idx = resume.from_step_index
+    else:
+        idx = max(0, min(int(from_step_index), len(agenda) - 1))
     # Resuming PAST step 0 reads the prior step's analysis checkpoint. Those expire
     # (checkpoint_ttl_days), so if they're gone the resumed step has no input — raise instead
     # of dispatching a run that would silently produce nothing. (Step 0 reads the raw dataset,
     # not a checkpoint, so it's always resumable.)
-    work = conn.workspace / safe_name(run_id) / "work"
-    if idx > 0 and not (work.exists() and any(work.glob("adata_*.h5ad"))):
+    if idx > 0 and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints):
         raise ValueError(
             f"Run {run_id}'s analysis checkpoints have expired — its process files are released "
-            "once the report is written. Re-run the study to continue from a middle step; the "
-            "report, figures and tables from the original run are still available.")
-    # Optional: replace the redone step's text outright (e.g. "Cluster the cells at resolution 1.0").
-    if edited_step and edited_step.strip():
-        agenda = [*agenda[:idx], edited_step.strip(), *agenda[idx + 1:]]
-        state = {**state, "agenda": agenda}
-    from ..agents.research_lab import ResumeState
-    resume = ResumeState.from_run_state(state, idx, modify_note=(modify_note or ""),
-                                        guidance=state.get("guidance"))
+            "once the report is written (on HPC3, once they sit untouched for "
+            f"{conn.settings.temp_ttl_days} days). Re-run the study to continue from a middle step; "
+            "the report, figures and tables from the original run are still available.")
+    if not interrupted:
+        # Optional: replace the redone step's text outright (e.g. "Cluster the cells at resolution 1.0").
+        if edited_step and edited_step.strip():
+            agenda = [*agenda[:idx], edited_step.strip(), *agenda[idx + 1:]]
+            state = {**state, "agenda": agenda}
+        resume = ResumeState.from_run_state(state, idx, modify_note=(modify_note or ""),
+                                            guidance=state.get("guidance"))
     resume_decisions: dict[str, Any] = {}
     if state.get("dataset_path"):
         resume_decisions["dataset_path"] = state["dataset_path"]
@@ -4114,6 +4511,9 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
     if state.get("content_modality"):
         resume_decisions["content_modality"] = state["content_modality"]
         resume_decisions["content_confidence"] = state.get("content_confidence")
+    for key in _STAGING_DECISIONS:
+        if state.get(key):
+            resume_decisions[key] = state[key]
     cont_req = LabRequest(connection_id=connection_id, question=str(state.get("question", "")),
                           dataset_path=state.get("dataset_path"),
                           datasets=state.get("datasets"),
@@ -4675,6 +5075,11 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         progress("❓ Ambiguous change request — asked for clarification; the plan is unchanged.")
     elif t == "plan_review_rejected":
         progress(f"🔬 Plan review overruled — {str(ev.get('reason', ''))[:200]}", level="warning")
+    elif t == "plan_review_unparsed":
+        # Without this a failed review and a clean one look the same: the plan below has NOT been
+        # read back by the Critic.
+        progress("⚠️ The plan review's reply could not be read, so this plan was NOT checked by "
+                 "the Critic. Read it yourself before approving.", level="warning")
     elif t == "plan_self_sourced":
         # What the PI decided on its OWN knowledge rather than from the protocol. Shown with the
         # plan, because the moment to question a choice the protocol never made is before the run.
@@ -4837,7 +5242,8 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         # The library grew. Say it plainly, with provenance — an auto-written template that shows
         # up unannounced in a later run's skill list is the kind of thing a user should have seen
         # being created.
-        progress(f"🧠 Learned a reusable skill '{ev.get('name')}': {str(ev.get('description', ''))[:160]}")
+        progress(f"🧠 Learned a reusable skill '{ev.get('name')}' — awaiting admin review before any "
+                 f"run can use it: {str(ev.get('description', ''))[:160]}")
         activity(f"induced skill {ev.get('name')} from step: {str(ev.get('origin_step', ''))[:120]}")
     elif t == "skill_induction_none":
         activity("nothing worth keeping as a skill: " + "; ".join(
@@ -4951,6 +5357,14 @@ def _build_report_render_fn(conn: "Connection"):
     return None
 
 
+# Decisions that run-start staging sets and a resume skips, so they must ride in run_state.json or a
+# resumed run silently goes without them: the dataset profile (the Scientist's brief, the Critic's
+# per-step count check and the report's pre-QC counts all read ``dataset_result``), the bound folder
+# run_code and run_cellqc read whole (``dataset_root`` / ``hpc_dataset_root``), and the recognised
+# Cell Ranger delivery.
+_STAGING_DECISIONS = ("dataset_result", "dataset_root", "hpc_dataset_root", "cellranger_layout")
+
+
 def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: dict[str, Any],
                      execution: dict[str, Any] | None = None,
                      protocols: "list[dict[str, str]] | None" = None,
@@ -4992,6 +5406,9 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
             # The attached note defined the run's phenotype; a resume that lost it would silently
             # re-run the phenotype step against nothing.
             state["case_note"] = decisions["case_note"]
+        for key in _STAGING_DECISIONS:
+            if decisions.get(key):
+                state[key] = decisions[key]
         p = art / "process" / "run_state.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(state, default=str, indent=2), encoding="utf-8")
@@ -5205,6 +5622,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # yield a one-element list holding exactly ``dataset_path`` — so everything below (which stages
         # the PRIMARY) is byte-for-byte today's behaviour. The SECONDARY files are staged after.
         bound = _select_bound_datasets(req)
+        # Every bound path is checked here, and a path on the gateway host's shared disks is copied
+        # to HPC3 when the analysis runs there (incremental: a second run copies nothing).
+        server_mirrors: dict[str, tuple[str, set[str]]] = {}
+        if resume is None and bound:
+            bound, server_mirrors = await _admit_bound_paths(conn, bound, say_key, emit)
         primary_path = bound[0]["path"] if bound else None
         if resume is not None:
             # Resume: reuse the prior run's decisions (dataset_path / hpc_primary / datasets already
@@ -5228,8 +5650,20 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 decisions["hpc_primary"] = remote_matrix    # analysis-on-HPC reads this dfs3b path in place
                 emit("step", "lab", f"Loading {p.name} from your HPC3 storage ...")
                 say_key(f"📂 Loaded dataset: {p.name}" + (f" (primary in {dp.rsplit('/', 1)[-1]}/)" if is_dir else ""))
-                decisions["dataset_result"] = run_dataset_smoke_analysis(p, art / "data")["result"]
+                # Off the event loop: a 10x .h5 profile reads the whole matrix (~1-3 s).
+                decisions["dataset_result"] = (await asyncio.to_thread(
+                    run_dataset_smoke_analysis, p, art / "data"))["result"]
                 decisions["dataset_path"] = str(p)
+                if is_dir:
+                    # The whole folder is bound to the analysis jobs, not only the primary file: a
+                    # tool such as run_cellqc reads every library in it.
+                    decisions["hpc_dataset_root"] = dp
+                    layout_line = _record_input_layout(
+                        decisions, await asyncio.to_thread(_cellranger_layout_remote, conn, dp,
+                                                           {remote_matrix: str(p)}),
+                        art / "data")
+                    if layout_line:
+                        say_key(layout_line)
             else:
                 # No recognized dataset file in the folder. Keep the folder BOUND anyway (parity with
                 # the local branch below): run_code can still read the tree, and hpc_primary lets an
@@ -5250,18 +5684,35 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 if primary is not None:
                     emit("step", "lab", f"Loading folder {p.name}/ — primary dataset {primary.name} (the whole folder is available to the code sandbox) ...")
                     say_key(f"📂 Loaded folder: {p.name}/ (primary: {primary.name})")
-                    decisions["dataset_result"] = run_dataset_smoke_analysis(primary, art / "data")["result"]
+                    decisions["dataset_result"] = (await asyncio.to_thread(
+                        run_dataset_smoke_analysis, primary, art / "data"))["result"]
                     decisions["dataset_path"] = str(primary)
+                    decisions["dataset_root"] = str(p)
+                    if primary_path in server_mirrors:
+                        # A server folder: the HPC3 jobs read its copy, the local tools the original.
+                        decisions["hpc_dataset_root"] = _mirror_of(server_mirrors, primary_path)
+                        hpc_file = _mirror_of(server_mirrors, primary_path, primary)
+                        if hpc_file:
+                            decisions["hpc_primary"] = hpc_file
+                    layout_line = _record_input_layout(
+                        decisions, await asyncio.to_thread(_cellranger_layout_local, p), art / "data")
+                    if layout_line:
+                        say_key(layout_line)
                 else:
                     emit("info", "lab", f"Folder {p.name}/ has no recognized dataset file (.h5ad/.h5/.loom/.csv/.vcf/.vcf.gz) — the agent can still read its files via run_code (AISCIENTIST_UPLOADS).")
                     say_key(f"📂 Loaded folder: {p.name}/ (no primary dataset auto-detected)")
                     decisions["dataset_path"] = str(p)
+                    if primary_path in server_mirrors:
+                        decisions["hpc_primary"] = _mirror_of(server_mirrors, primary_path)
             elif p.exists():
                 emit("step", "lab", f"Loading {p.name} (the raw matrix isn't pasted into the prompt — only derived metrics are; the model reads the full data through the code sandbox) ...")
                 say_key(f"📂 Loaded dataset: {p.name}")
                 # Preflight/input records go in the categorized data/ subdir.
-                decisions["dataset_result"] = run_dataset_smoke_analysis(p, art / "data")["result"]
+                decisions["dataset_result"] = (await asyncio.to_thread(
+                    run_dataset_smoke_analysis, p, art / "data"))["result"]
                 decisions["dataset_path"] = str(p)
+                if primary_path in server_mirrors:
+                    decisions["hpc_primary"] = _mirror_of(server_mirrors, primary_path)
             else:
                 emit("warning", "lab", f"Dataset not found: {p} — {_no_data_warning}")
                 say_key(f"⚠ Dataset not found: {p.name} — analysis will have no data figures.", "warning")
@@ -5287,6 +5738,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                            f"{type(exc).__name__}: {exc}")
                     rec = {"path": entry["path"], "name": entry["name"],
                            "role": entry.get("role"), "error": str(exc)[:200]}
+                if entry["path"] in server_mirrors:
+                    rec["hpc_primary"] = _mirror_of(server_mirrors, entry["path"])
                 records.append(rec)
                 say_key(f"📎 Bound extra file: {rec['name']}"
                         + (f" ({rec['role']})" if rec.get("role") else ""))
@@ -5334,6 +5787,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             # Expose the WHOLE per-user uploads tree so run_code can reach every uploaded
             # file/folder — incl. folders added after the primary dataset was chosen.
             uploads_dir=str(conn.workspace / "uploads"),
+            dataset_root=decisions.get("dataset_root"),
         )
         # Opt-in: run CodeAct snippets as CPU Slurm batch jobs on HPC3 so `#SBATCH --mem` gives a
         # REAL, cgroup-enforced memory cap (the durable fix for the OOM/-9 kills) on effectively
@@ -5393,6 +5847,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     # dfs3b paths the compute node CAN bind (env overrides still win for a genuinely
                     # shared-mounted deployment).
                     dataset_path=os.environ.get("AISCIENTIST_HPC_DATASET") or rc_remote_ds,
+                    dataset_root=decisions.get("hpc_dataset_root"),
                     work_dir=os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work",
                     artifacts_dir=os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{rc_remote_ws}/artifacts",
                     local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
@@ -5408,6 +5863,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     # installed via install_package, so the image no longer has to be rebuilt for
                     # every missing library and nobody downloads the same package twice.
                     package_cache_root=f"{st.shared_root.rstrip('/')}/pkgs",
+                    # Environments skills declare (SKILL.md ``image:``) for run_in_environment: built
+                    # once into the shared containers dir, from the lab's shared conda downloads.
+                    images_dir=f"{st.shared_root.rstrip('/')}/containers",
+                    pkgs_cache_dir=f"{st.shared_root.rstrip('/')}/conda-pkgs",
+                    notify=lambda level, message: emit(level, "lab", message),
                 )
                 emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
                 # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
@@ -5474,6 +5934,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     container_module=st.container_module, container_bin=st.container_bin,
                     local_fallback=_analysis_local_fallback,
                     should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight analysis job
+                    # Images tools declare in TOOL.md (e.g. run_cellqc's BioContainer) are pulled here
+                    # on first use; a folder dataset's whole tree is bound for tools that read it.
+                    images_dir=f"{st.shared_root.rstrip('/')}/containers",
+                    pkgs_cache_dir=f"{st.shared_root.rstrip('/')}/conda-pkgs",
+                    dataset_root=decisions.get("hpc_dataset_root"),
                     # A tool's DECLARED missing dependency (tools.run_deps.ALLOWED) is installed into
                     # this run's HPC3 workspace and the tool retried; released at publish below.
                     auto_install_deps=os.environ.get("AISCIENTIST_AUTO_INSTALL_DEPS", "1").strip().lower()
@@ -5897,7 +6362,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         pinned_skills = tuple(p for p in (get_preset(k) for k in _keys) if p is not None)
         # The console's atomic-skill multi-select: names the run MUST apply. Validate against the
         # loaded library (drop unknown names) so a stale client can't inject bad guidance.
-        from ..agents.skills import SKILLS as _ATOMIC_SKILLS
+        from ..agents.skills import SKILLS as _ATOMIC_SKILLS, refresh_skills
+        refresh_skills()       # a skill folder dropped in since the last run is valid to require
         required_skills = tuple(n for n in (req.skills or []) if n in _ATOMIC_SKILLS)
         preset_prompt = req.preset_prompt
         # Axis A — the user picks the MODE (single agent vs Virtual-Lab team); the PI still
@@ -6312,6 +6778,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             report_md = await asyncio.to_thread(
                 _review_and_finalize_report, report_md, art, complete_fn, req.question, lit)
             emit("info", "lab", "Self-reviewed the report draft before rendering.")
+        # Checked on the FINAL text: the writer and the self-review both write prose of their own.
+        report_md = _correct_manuscript_markers(report_md, result)
         say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
                 else "💾 Saving report.md — skipping the render.", "info")
         # Title the document by CONTENT (the report's own H1 / main finding), not a generic
@@ -7047,6 +7515,79 @@ def _manuscript_run_status_block(result: Any) -> str:
     return "\n".join(lines)
 
 
+# The QC steps whose return value the report's data section quotes: the scanpy route for a single
+# matrix, and the CellQC route for a folder of Cell Ranger libraries.
+_QC_TOOLS = ("run_scanpy_qc", "run_cellqc")
+# How each matrix form tools/_lib/cellranger.py recognises reads in the report.
+_MATRIX_FORMS = {"h5": "`.h5`", "dir": "directory", "tar.gz": "`.tar.gz`"}
+
+
+def _qc_step_result(result: Any) -> "tuple[str, dict] | None":
+    """The first QC step that completed and counted its input: ``(tool, return value)``, or None.
+
+    Reads both round shapes: LabRound dataclasses in production, dicts in tests and run_state.json
+    replays. This section used to read only dicts — the defect _pipeline_section had — so a live
+    run's report never carried its QC paragraph."""
+    for rnd in (getattr(result, "rounds", None) or []):
+        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
+              else getattr(rnd, "scientist_result", None))
+        for st in ((sr or {}).get("steps") or []):
+            r = st.get("result") if isinstance(st, dict) else None
+            if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
+                    and r.get("cells_before") is not None):
+                return str(st["tool"]), r
+    return None
+
+
+def _qc_input_counts(qc: "tuple[str, dict] | None", primary: str) -> str:
+    """The input's size as the QC step counted it, for a profile that has none (a 10x ``.h5`` is not
+    parsed at run start). '' when the step did not report it: a count is quoted, never estimated."""
+    if not qc:
+        return ""
+    tool, r = qc
+    if tool == "run_cellqc":
+        libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
+        # cells_before is a SUM over the libraries: with one library uncounted it is only a floor.
+        if not libs or any(not isinstance(lib.get("cells_cellranger"), int) for lib in libs):
+            return ""
+        return (f"{int(r['cells_before']):,} cells as called by Cell Ranger, summed over the "
+                f"{len(libs)} librar{'y' if len(libs) == 1 else 'ies'} CellQC read")
+    # CellQC reports no pre-QC gene count; the scanpy QC step does.
+    shape = f"{int(r['cells_before']):,} cells"
+    if r.get("genes_before") is not None:
+        shape += f" x {int(r['genes_before']):,} genes"
+    return shape + (f" in `{primary}`" if primary else "") + ", as counted by the QC step"
+
+
+def _cellranger_delivery_lines(layout: dict, counts: str) -> "list[str]":
+    """The Input paragraph for a folder of Cell Ranger libraries: the folder, its libraries, and what
+    each holds — the matrix forms, the BAM (with its index) and Cell Ranger's own clustering."""
+    libs = [lib for lib in (layout.get("libraries") or []) if isinstance(lib, dict)]
+    n = len(libs)
+    names = ", ".join(f"`{lib.get('sample')}`" for lib in libs)
+    folder = Path(str(layout.get("root") or "")).name or "dataset"
+    lines = [f"**Input.** `{folder}/` — a 10x Cell Ranger delivery of {n} "
+             f"librar{'y' if n == 1 else 'ies'} ({names})" + (f"; {counts}" if counts else "") + ".",
+             "",
+             "| library | raw matrix | filtered matrix | BAM + index | Cell Ranger clustering "
+             "| metrics_summary.csv |",
+             "|---|---|---|:---:|:---:|:---:|"]
+
+    def forms(fs: Any) -> str:
+        return ", ".join(_MATRIX_FORMS.get(f, f"`{f}`") for f in (fs or [])) or "—"
+
+    def yes(v: Any) -> str:
+        return "yes" if v else "no"
+
+    for lib in libs:
+        lines.append(f"| {lib.get('sample')} | {forms(lib.get('raw'))} | {forms(lib.get('filtered'))} "
+                     f"| {yes(lib.get('bam'))} | {yes(lib.get('clusters'))} "
+                     f"| {yes(lib.get('metrics'))} |")
+    if any(lib.get("packed") for lib in libs):
+        lines += ["", "`.tar.gz` is a matrix directory packed as one archive, as 10x Cloud delivers it."]
+    return lines
+
+
 def _dataset_section(art: Path, result: Any = None) -> str:
     """"The dataset" — what came in, written from the preflight profile, not from prose.
 
@@ -7072,9 +7613,23 @@ def _dataset_section(art: Path, result: Any = None) -> str:
         shape.append(f"{int(dr['cells']):,} cells")
     if dr.get("genes"):
         shape.append(f"{int(dr['genes']):,} genes")
-    lines.append(f"**Input.** `{Path(str(dr.get('dataset_path') or 'dataset')).name}` — "
-                 + (" x ".join(shape) if shape else str(dr.get("dataset_kind") or "unknown"))
-                 + (f" ({dr['dataset_kind']})." if dr.get("dataset_kind") else "."))
+    primary = Path(str(dr["dataset_path"])).name if dr.get("dataset_path") else ""
+    kind = dr.get("dataset_kind")
+    qc = _qc_step_result(result)
+    layout = dr.get("cellranger_layout")
+    if isinstance(layout, dict) and layout.get("libraries"):
+        # A folder of Cell Ranger libraries (recorded by _record_input_layout): name the delivery.
+        # Its size comes from the profile when one of its files was parsed, else from the QC step.
+        counts = (f"the primary matrix `{primary or 'dataset'}` holds {' x '.join(shape)}" if shape
+                  else _qc_input_counts(qc, primary))
+        lines += _cellranger_delivery_lines(layout, counts)
+    elif shape:
+        lines.append(f"**Input.** `{primary or 'dataset'}` — " + " x ".join(shape)
+                     + (f" ({kind})." if kind else "."))
+    else:
+        counts = _qc_input_counts(qc, "")
+        lines.append(f"**Input.** `{primary or 'dataset'}` — {kind or 'unknown'}"
+                     + (f"; {counts}." if counts else "."))
 
     # The experimental design, and the number every conclusion about a condition depends on.
     design, labels, qc_cols = [], [], []
@@ -7136,28 +7691,26 @@ def _dataset_section(art: Path, result: Any = None) -> str:
             lines += ["", f"**Protocol check.** {dba['snrna_hint']}"]
 
     # What the QC step actually did to it, from the step's own return value.
-    for rnd in (getattr(result, "rounds", None) or []):
-        sr = rnd.get("scientist_result") if isinstance(rnd, dict) else None
-        for st in ((sr or {}).get("steps") or []):
-            if st.get("tool") != "run_scanpy_qc" or not isinstance(st.get("result"), dict):
-                continue
-            r = st["result"]
-            if r.get("status") != "ok":
-                continue
-            before, after = r.get("cells_before"), r.get("cells_after")
-            if before is None:
-                continue
-            removed = int(before) - int(after or 0)
-            note = (f"**After quality control.** {int(after or 0):,} of {int(before):,} cells kept "
-                    f"({removed:,} removed) and {int(r.get('genes_after') or 0):,} genes retained.")
-            if removed == 0:
-                note += (" No cell fell below the thresholds — consistent with data that had "
-                         "already been quality-controlled before it reached this pipeline.")
-            if r.get("mt_filter_effective") is False:
-                note += (" NOTE: no mitochondrial genes matched, so that filter removed nothing "
-                         "regardless of its threshold.")
-            lines += ["", note]
-            break
+    if qc:
+        tool, r = qc
+        before, after = int(r["cells_before"]), int(r.get("cells_after") or 0)
+        removed = before - after
+        note = (f"**After quality control.** {after:,} of {before:,} cells kept "
+                f"({removed:,} removed) and {int(r.get('genes_after') or 0):,} genes retained.")
+        if removed == 0:
+            note += (" No cell fell below the thresholds — consistent with data that had "
+                     "already been quality-controlled before it reached this pipeline.")
+        if r.get("mt_filter_effective") is False:
+            note += (" NOTE: no mitochondrial genes matched, so that filter removed nothing "
+                     "regardless of its threshold.")
+        if tool == "run_cellqc":
+            libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
+            if libs:
+                note += (" Per library (Cell Ranger cells → after filtering → after doublets): "
+                         + "; ".join(f"{lib.get('sample')}: {lib.get('cells_cellranger')} → "
+                                     f"{lib.get('cells_after_filter')} → "
+                                     f"{lib.get('cells_after_doublets')}" for lib in libs) + ".")
+        lines += ["", note]
     return "\n".join(lines) + "\n"
 
 
@@ -7351,12 +7904,37 @@ def _correct_manuscript_coverage(body: str, art: Path, result: Any) -> str:
     except Exception as exc:  # noqa: BLE001 - a check must never cost the manuscript
         print(f"[report] coverage-count check skipped: {type(exc).__name__}: {exc}")
         return body
+    _record_report_corrections(result, issues)
+    return fixed
+
+
+def _correct_manuscript_markers(body: str, result: Any) -> str:
+    """The manuscript's marker claims, checked against the curated reference the annotation used.
+
+    Run c57071e7dc94's report said "RLBP1 is a canonical rod photoreceptor marker"; RLBP1 marks Muller
+    glia and RPE. The synthesis is checked in research_lab, but the manuscript is new prose, so the
+    sentence is removed here too (``agents/marker_claims.py``), on the text that gets rendered."""
+    rounds = list(getattr(result, "rounds", None) or [])
+    if not rounds or not body:
+        return body
+    from ..agents.marker_claims import check_marker_claims
+    from ..agents.research_lab import _marker_reference
+    try:
+        fixed, issues = check_marker_claims(body, _marker_reference(rounds))
+    except Exception as exc:  # noqa: BLE001 - a check must never cost the manuscript
+        print(f"[report] marker-claim check skipped: {type(exc).__name__}: {exc}")
+        return body
+    _record_report_corrections(result, issues)
+    return fixed
+
+
+def _record_report_corrections(result: Any, issues: "list[str]") -> None:
+    """Log each correction and keep it on ``result.claim_audit["report_corrections"]``."""
     for issue in issues:
         print(f"[report] {issue}")
     audit = getattr(result, "claim_audit", None)
     if issues and isinstance(audit, dict):
         audit.setdefault("report_corrections", []).extend(issues)
-    return fixed
 
 
 def _insert_record_sections(body: str, *sections: str) -> str:

@@ -14,6 +14,10 @@ Usage (from the eyeserver's point of view the key path is SERVER-side — the ga
         --dataset /dfs3b/ruic20_lab/software/AiScientist/uploads/<user>/Ddx41_DEG.h5ad \
         [--question "..."] [--plan-only] [--exercise-plan-mode]
 
+With --record DIR every request the drive sends (the first prompt included), every event the gateway
+streams back, the plan card and the PASS/FAIL lines are written there as they happen, so a run can
+be audited from the first prompt to the report.
+
 Phases: connect -> ready | ask (plan mode) -> plan card | [question reply -> plan unchanged;
 change reply -> one-step patch; Stop while pending -> immediate cancel] | approve -> run to
 completion | verify: composition offloaded (hpc_slurm), DE step ran run_de, report sections.
@@ -38,15 +42,28 @@ except ImportError:  # pragma: no cover
 
 
 class Drive:
-    def __init__(self, base: str) -> None:
+    def __init__(self, base: str, record: "str | None" = None) -> None:
         self.base = base.rstrip("/")
         self.ws_base = self.base.replace("http", "ws", 1)
         self.events: list[tuple[float, dict]] = []
         self.lock = threading.Lock()
         self.fails = 0
+        self.record = None
+        if record:
+            from pathlib import Path
+            self.record = Path(record)
+            self.record.mkdir(parents=True, exist_ok=True)
+
+    def _log(self, name: str, obj: dict) -> None:
+        """Append one JSON line to ``<record>/<name>.jsonl`` (no-op without --record)."""
+        if self.record is None:
+            return
+        with (self.record / f"{name}.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": time.time(), **obj}, ensure_ascii=False, default=str) + "\n")
 
     # --- transport ------------------------------------------------------------------------
     def post(self, path: str, body: dict) -> tuple[int, dict]:
+        self._log("requests", {"path": path, "body": {k: v for k, v in body.items() if k != "key_path"}})
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:
@@ -67,6 +84,7 @@ class Drive:
                 return
             with self.lock:
                 self.events.append((time.time(), ev))
+                self._log("events", {"event": ev})
         threading.Thread(target=lambda: websocket.WebSocketApp(
             f"{self.ws_base}/ws/{cid}", on_message=on_msg).run_forever(ping_interval=20),
             daemon=True).start()
@@ -87,6 +105,7 @@ class Drive:
         if ok is False:
             self.fails += 1
         print(f"{tag} {msg}", flush=True)
+        self._log("checks", {"result": tag.strip(), "message": msg})
 
 
 def main() -> int:
@@ -94,18 +113,33 @@ def main() -> int:
     ap.add_argument("--base", required=True)
     ap.add_argument("--user", required=True)
     ap.add_argument("--key", required=True, help="SERVER-side path to the SSH key")
-    ap.add_argument("--dataset", required=True, help="dfs3b path (uploads/, never Temp/)")
+    ap.add_argument("--dataset", default=None, help="dfs3b path (uploads/, never Temp/)")
+    ap.add_argument("--server-path", default=None,
+                    help="instead of --dataset: a path on the gateway host inside "
+                         "AISCIENTIST_SERVER_DATA_ROOTS, bound the way the console binds it")
     ap.add_argument("--question", default="What changes between DDX41 mutant and WT retina?")
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument("--exercise-plan-mode", action="store_true",
                     help="after the plan: ask a question, request a one-step change, Stop")
     ap.add_argument("--conv", default="e2e")
+    ap.add_argument("--continue-run", default=None,
+                    help="instead of a new study: redo step --from-step of this run_id and everything after "
+                         "it (POST /api/lab/continue), reusing the earlier steps' checkpoints")
+    ap.add_argument("--from-step", type=int, default=0, help="0-based agenda step to redo (--continue-run)")
+    ap.add_argument("--modify-note", default=None, help="steering for the redone step (--continue-run)")
+    ap.add_argument("--resume-interrupted", action="store_true",
+                    help="with --continue-run: pick up a run that crashed or was cut off where it stopped "
+                         "(keeps every accepted step, runs the rest; --from-step is ignored)")
+    ap.add_argument("--record", default=None,
+                    help="directory to write requests/events/checks (JSONL) and the plan into")
     # Qwen3.8 at xhigh effort took 38 min to produce a plan card on 2026-09-30 (team research, then
     # one ~35k-token PI call); the old fixed 25 min gave up while the plan was still being written.
     ap.add_argument("--plan-timeout", type=float, default=3600, help="seconds to wait for the plan card")
     ap.add_argument("--run-timeout", type=float, default=6 * 3600, help="seconds to wait for the run")
     a = ap.parse_args()
-    d = Drive(a.base)
+    if not (a.dataset or a.server_path or a.continue_run):
+        ap.error("give --dataset or --server-path")
+    d = Drive(a.base, record=a.record)
 
     st, r = d.post("/api/connect", {"ucinetid": a.user, "auth_method": "ssh_key",
                                     "key_path": a.key, "campus_network_confirmed": True})
@@ -124,6 +158,20 @@ def main() -> int:
             return 1
         time.sleep(15)
     d.check(True, f"ready in {time.time()-t0:.0f}s on {(s.get('gpu') or {}).get('node')}")
+
+    if a.continue_run:
+        return _continue(d, cid, a)
+    if a.server_path:
+        st, info = d.post("/api/server-data/check", {"connection_id": cid, "path": a.server_path})
+        d.check(st == 200, f"server path check: {info.get('message') or info.get('error')}")
+        if st != 200:
+            return 1
+        st, bound = d.post("/api/server-data/bind", {"connection_id": cid, "path": a.server_path})
+        d.check(st == 200 and bound.get("kind", "").startswith("server-"),
+                f"server path bound as {bound.get('kind')}: {bound.get('path')}")
+        if st != 200:
+            return 1
+        a.dataset = bound["path"]
 
     def lab(q, conv):
         return d.post("/api/lab", {"connection_id": cid, "conversation_id": conv, "question": q,
@@ -145,6 +193,10 @@ def main() -> int:
         return 1
     agenda = list(ev[1].get("agenda") or [])
     d.check(True, f"plan card in {time.time()-tq:.0f}s, {len(agenda)} steps")
+    if d.record is not None:
+        (d.record / "plan.md").write_text(
+            f"# Plan card\n\nQuestion: {a.question}\n\nDataset: {a.dataset}\n\n"
+            + "\n".join(f"{n}. {s_}" for n, s_ in enumerate(agenda, 1)) + "\n", encoding="utf-8")
     for n, s_ in enumerate(agenda, 1):
         print(f"   {n}. {s_[:150]}")
     titled = sum(1 for s_ in agenda if re.match(r"^\*\*.+?\*\*\s*[—–:-]", s_))
@@ -201,6 +253,33 @@ def main() -> int:
         since = j + 1
     d.check(bool(done) and done[1].get("type") != "chat_error",
             f"run finished: {done[1].get('type') if done else 'TIMEOUT'} in {(time.time()-t1)/60:.1f} min")
+    if a.server_path:
+        lines = [e.get("text", "") for _, e in d.events if e.get("type") == "lab_progress"]
+        d.check(any(t.startswith("🔗 Server data:") for t in lines), "the run admitted the server path")
+        d.check(any(t.startswith("✓ Copied") or "is up to date" in t for t in lines),
+                "the server data reached HPC3: " + next(
+                    (t for t in lines if t.startswith("✓ ")), "no copy line"))
+    return 1 if d.fails else 0
+
+
+def _continue(d: "Drive", cid: str, a: "argparse.Namespace") -> int:
+    """Redo one step of an existing run and everything downstream (or, with --resume-interrupted,
+    finish an interrupted run), then wait for the report."""
+    t1 = time.time()
+    n0 = len(d.events)
+    st, r = d.post("/api/lab/continue", {"connection_id": cid, "conversation_id": a.conv,
+                                          "run_id": a.continue_run, "from_step_index": a.from_step,
+                                          "modify_note": a.modify_note,
+                                          "resume_interrupted": a.resume_interrupted})
+    print("continue ->", st, r, flush=True)
+    if st != 200:
+        d.check(False, f"continue refused: {r.get('error')}")
+        return 1
+    j, done = d.wait(lambda e: e.get("type") in ("run_complete", "chat_done", "chat_error"),
+                     a.run_timeout, since=n0)
+    d.check(bool(done) and done[1].get("type") != "chat_error",
+            f"continued run finished: {done[1].get('type') if done else 'TIMEOUT'} in "
+            f"{(time.time()-t1)/60:.1f} min")
     return 1 if d.fails else 0
 
 

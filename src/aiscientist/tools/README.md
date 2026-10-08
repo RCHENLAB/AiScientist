@@ -7,6 +7,7 @@ Every model-callable domain tool lives in its own folder here. This file is gene
 |---|---|---|---|---|
 | [`inspect_dataset`](inspect_dataset/TOOL.md) | Identifies what an uploaded file is (format, genome build, samples, matrix layout) from a bounded read of its head. | qc | `inprocess` | data |
 | [`run_scanpy_qc`](run_scanpy_qc/TOOL.md) | Filters cells and genes by quality, normalises and log-transforms the counts, and selects highly variable genes. | analysis | `hpc:analysis` | scrna |
+| [`run_cellqc`](run_cellqc/TOOL.md) | CellQC on a folder of 10x Cell Ranger libraries — ambient correction, filtering, doublets — then the merged, normalised checkpoint. | qc | `hpc:analysis` | scrna |
 | [`run_clustering`](run_clustering/TOOL.md) | PCA, a neighbourhood graph, Leiden clustering and a UMAP layout; can choose the resolution by bootstrap stability. | analysis | `hpc:analysis` | scrna |
 | [`run_de`](run_de/TOOL.md) | Differential expression with a Wilcoxon test over cells: each group against the rest, or condition against control, optionally within each cell type. | analysis | `hpc:analysis` | scrna |
 | [`run_enrichment`](run_enrichment/TOOL.md) | Over-representation analysis of DE genes against local gene-set libraries, with the genes actually tested as the background. | analysis | `hpc:analysis` | scrna |

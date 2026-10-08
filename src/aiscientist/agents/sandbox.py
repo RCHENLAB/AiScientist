@@ -113,8 +113,9 @@ def build_run_code_context(executor: object) -> str:
     work = getattr(executor, "work_dir", None)
     artifacts = getattr(executor, "artifacts_dir", None)
     uploads = getattr(executor, "uploads_dir", None)
+    root = getattr(executor, "dataset_root", None)
     mem_mb = getattr(executor, "mem_mb", None)
-    if not any((dataset, work, artifacts, uploads)):
+    if not any((dataset, work, artifacts, uploads, root)):
         return ""
     parts = [
         "",
@@ -125,6 +126,23 @@ def build_run_code_context(executor: object) -> str:
     ]
     if dataset:
         parts.append(f"- AISCIENTIST_DATASET = {dataset}  (raw input dataset)")
+    if dataset and str(dataset).lower().endswith(".h5"):
+        # Run f3b8268c4fd4 hand-parsed a Cell Ranger .h5 with h5py: 6 of 11 snippets failed on a
+        # guessed v2 layout and on the matrix orientation, before any number was computed.
+        parts.append(
+            "- A .h5 with a top-level 'matrix' group (or one group per genome) is a 10x Cell Ranger "
+            "feature-barcode matrix, NOT an .h5ad: read it with sc.read_10x_h5(path) -> AnnData of "
+            "cells x genes, raw integer UMI counts in X, Ensembl ids in var['gene_ids'] "
+            "(gex_only=False keeps antibody/CRISPR features). Do not hand-parse it with h5py: the "
+            "matrix is CSC with ONE COLUMN PER BARCODE and shape = [n_features, n_barcodes]. A "
+            "delivery's raw_feature_bc_matrix.h5 reads the same way (mostly empty droplets).")
+    if root:
+        parts.append(
+            f"- AISCIENTIST_DATASET_ROOT = {root}  (the whole folder the user bound; "
+            "AISCIENTIST_DATASET is the one primary file picked inside it. Read its other files — "
+            "e.g. a Cell Ranger delivery's raw_feature_bc_matrix, analysis/, web_summary.html — "
+            "from here, read-only.)"
+        )
     if work:
         parts.append(
             f"- AISCIENTIST_WORK = {work}  (pipeline checkpoints: adata_qc.h5ad after QC, "
@@ -182,6 +200,10 @@ class CodeSandbox:
     # Exposed as AISCIENTIST_UPLOADS so run_code can reach EVERY upload — incl. folders added
     # after the run's primary dataset — just like a general file workspace.
     uploads_dir: str | None = None
+    # The folder the primary dataset was picked from, when the user bound a folder. Exposed as
+    # AISCIENTIST_DATASET_ROOT: a delivery's other files (the raw matrix beside the filtered one)
+    # are part of the dataset, not separate uploads.
+    dataset_root: str | None = None
     # Stop button: polled while the snippet runs so a Stop KILLS the in-flight subprocess (and
     # its whole process group) within ~a second, instead of the old blocking subprocess.run that
     # ignored Stop until the 180s timeout. Set to conn.chat_stop.is_set.
@@ -323,4 +345,6 @@ class CodeSandbox:
             env["AISCIENTIST_ARTIFACTS"] = str(self.artifacts_dir)
         if self.uploads_dir:
             env["AISCIENTIST_UPLOADS"] = str(self.uploads_dir)
+        if self.dataset_root:
+            env["AISCIENTIST_DATASET_ROOT"] = str(self.dataset_root)
         return env

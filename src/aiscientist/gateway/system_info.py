@@ -26,13 +26,25 @@ AGENTS = [
                     "refuses to accept a failed run.", "where": "agents/research_lab.py"},
 ]
 
+# Interchangeable first steps of the scanpy line: each writes the checkpoint the rest of the line
+# reads, from a different input (one matrix -> run_scanpy_qc; a folder of 10x Cell Ranger libraries
+# -> run_cellqc). Shown as alternatives, not as two steps run one after the other.
+_SCRNA_ALTERNATIVES: dict[str, tuple[str, ...]] = {"run_scanpy_qc": ("run_cellqc",)}
+
+
+def _scrna_chain(names: list[str]) -> list[str]:
+    """The scanpy line's stages in catalog order, with each alternative folded into its primary."""
+    alts = {a for group in _SCRNA_ALTERNATIVES.values() for a in group}
+    return [n for n in names if n not in alts]
+
+
 def workflows() -> list[dict[str, Any]]:
     """The designed workflow PRESETS — the development-time view of "which flows exist".
     The analysis-pipeline stages are derived from the live scrna catalog order, so the
     preset can't drift. New research lines register a preset here."""
     from ..tools.api import scrna_catalog
 
-    scrna_stages = [t.name for t in scrna_catalog()]   # run_scanpy_qc → clustering → de → enrichment
+    scrna_stages = _scrna_chain([t.name for t in scrna_catalog()])   # QC → clustering → de → enrichment
     return [
         {
             "name": "Research Lab (PI → Scientist → Critic)",
@@ -50,6 +62,7 @@ def workflows() -> list[dict[str, Any]]:
                            "QC → clustering → per-cluster DE → pathway enrichment, emitting figures + tables, "
                            "then a categorized report bundle.",
             "stages": [*scrna_stages, "figures + report (PDF/DOCX)"],
+            "alternatives": {k: list(v) for k, v in _SCRNA_ALTERNATIVES.items()},
         },
     ]
 
@@ -170,9 +183,15 @@ def workflow_graph() -> dict[str, Any]:
     # The scanpy analysis line is an ORDERED pipeline (real "Run AFTER" dependencies).
     from ..tools.api import scrna_catalog
 
-    chain = [f"tool:{t.name}" for t in scrna_catalog()]
+    names = [t.name for t in scrna_catalog()]
+    chain = [f"tool:{n}" for n in _scrna_chain(names)]
     for a, b in zip(chain, chain[1:]):
         edge(a, b, "then", "pipeline")
+    for primary, alts in _SCRNA_ALTERNATIVES.items():
+        nxt = chain[chain.index(f"tool:{primary}") + 1] if f"tool:{primary}" in chain[:-1] else None
+        for alt in alts:
+            if nxt and alt in names:
+                edge(f"tool:{alt}", nxt, "then", "pipeline")    # an alternative feeds the same step
 
     return {"nodes": nodes, "edges": edges}
 

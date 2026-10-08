@@ -42,7 +42,10 @@ def _ctx(tmp_path, dataset_path=None):
 def test_catalog_shape_matches_harness_tools():
     cat = tools_catalog.scrna_catalog()
     names = [t.name for t in cat]
-    assert names == ["run_scanpy_qc", "run_clustering", "run_de", "run_enrichment",
+    assert names == ["run_scanpy_qc",
+                     # the Cell Ranger route: CellQC in its own image (tools/run_cellqc)
+                     "run_cellqc",
+                     "run_clustering", "run_de", "run_enrichment",
                      # the depth-matched check: a tool, because three models could not write it
                      # as ad-hoc code (see tests/test_depth_matched_de.py)
                      "run_depth_matched_de", "run_gsea_prerank",
@@ -186,6 +189,79 @@ def test_enrichment_background_is_the_tested_universe_not_a_round_number(tmp_pat
     assert cap["background"] == ["RHO", "PDE6A", "GRIA4"]     # the real universe, not 20000
     assert out["background_source"] == "tested_universe"
     assert out["background_size"] == 3
+
+
+def _marker_tables(tmp_path, monkeypatch, n_rows, *, sidecar=None, padj_last="1e-10"):
+    """Marker DE tables for three clusters, ``n_rows`` genes each and every one significant except
+    possibly the last (``padj_last``) — the shape run_de's top-n_genes marker tables have on a big
+    dataset. ``sidecar`` is written as de_leiden_significance.json when given."""
+    import json
+
+    gdir = tmp_path / "genesets"
+    gdir.mkdir()
+    (gdir / "TestPathways.gmt").write_text("term\tdesc\tG0_0\tG1_0\n", encoding="utf-8")
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
+    tables = tmp_path / "artifacts" / "tables"
+    tables.mkdir(parents=True)
+    header = "group,gene,log2fc,pval,pval_adj,score\n"
+    combined = header
+    for g in ("0", "1", "2"):
+        rows = "".join(f"{g},G{g}_{i},2.0,1e-12,{padj_last if i == n_rows - 1 else '1e-10'},"
+                       f"{30 - i}\n" for i in range(n_rows))
+        (tables / f"de_leiden_{g}.csv").write_text(header + rows, encoding="utf-8")
+        combined += rows
+    (tables / "de_leiden_all.csv").write_text(combined, encoding="utf-8")
+    if sidecar is not None:
+        (tables / "de_leiden_significance.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    _install_fake_gseapy(monkeypatch, {})
+    return tables
+
+
+def test_enrichment_says_when_its_input_is_the_marker_tables_top_n(tmp_path, monkeypatch):
+    # Run f3b8268c4fd4: every cluster's top-50 marker table passed the gate in full, the result
+    # said "50 selected by padj and |log2FC|, no cap", and 2,300-9,644 genes per cluster were in
+    # fact significant. run_de's sidecar gives the true counts; the result must report them.
+    _marker_tables(tmp_path, monkeypatch, 12, sidecar={
+        "per_group_tables": "top_12", "padj_max": 0.05, "abs_log2fc_min": 0.25,
+        "significant_by_group": {"0": {"up": 900, "down": 4000, "shown": 12, "truncated": True},
+                                 "1": {"up": 300, "down": 20, "shown": 12, "truncated": True},
+                                 "2": {"up": 12, "down": 0, "shown": 12, "truncated": False}}})
+
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+
+    assert out["status"] == "ok"
+    assert out["genes_per_group"] == {"0": 12, "1": 12, "2": 12}
+    sel = out["selection"]
+    assert sel["upstream_table"] == "top_12"
+    assert sel["significant_upstream_by_group"] == {"0": 4900, "1": 320, "2": 12}
+    (warning,) = [w for w in out["warnings"] if w.startswith("INPUT IS A TOP-N")]
+    assert "2 of 3 groups" in warning and "range 320-4900" in warning
+
+
+def test_an_old_run_without_the_sidecar_is_flagged_when_the_gate_kept_every_row(tmp_path,
+                                                                               monkeypatch):
+    _marker_tables(tmp_path, monkeypatch, 12)
+
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+
+    assert out["selection"]["upstream_table"] == "top_12 (inferred)"
+    assert any(w.startswith("INPUT IS PROBABLY A TOP-N") for w in out["warnings"])
+
+
+def test_a_gate_that_selected_or_complete_tables_raise_no_top_n_warning(tmp_path, monkeypatch):
+    # The last row of each table fails the gate, so the thresholds did select something.
+    _marker_tables(tmp_path, monkeypatch, 12, padj_last="0.5")
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    assert out["genes_per_group"] == {"0": 11, "1": 11, "2": 11}
+    assert "warnings" not in out and out["selection"]["upstream_table"] == "not recorded"
+
+
+def test_a_contrasts_complete_tables_raise_no_top_n_warning(tmp_path, monkeypatch):
+    _marker_tables(tmp_path, monkeypatch, 12, sidecar={
+        "per_group_tables": "complete", "padj_max": 0.05, "abs_log2fc_min": 0.25,
+        "significant_by_group": {"0": {"up": 12, "down": 0}}})
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestPathways"]}, _ctx(tmp_path))
+    assert "warnings" not in out and out["selection"]["upstream_table"] == "complete"
 
 
 def test_enrichment_records_the_constant_fallback_when_no_universe_exists(tmp_path, monkeypatch):

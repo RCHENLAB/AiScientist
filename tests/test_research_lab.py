@@ -296,6 +296,156 @@ def test_no_preset_means_no_guidance_line():
     assert "research-path guidance" not in seen["pi_user"]
 
 
+# --- the PI plans with the skill library in view ----------------------------------------
+
+def _skill_library():
+    from aiscientist.agents.skills import Skill
+    return {
+        "pairwise_de": Skill("pairwise_de", "Pairwise differential expression between two named groups."),
+        "score_signature": Skill("score_signature", "Score every cell for a gene signature."),
+        "old_markers": Skill("old_markers", "Label clusters from their markers."),
+        "new_markers": Skill("new_markers", "Label clusters from a marker panel.", supersedes="old_markers"),
+    }
+
+
+def _planning_prompt(question="Compare Ddx41 KO vs WT retina"):
+    seen = {}
+
+    def complete(messages):
+        if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+            seen["pi_user"] = messages[1]["content"]
+            return json.dumps(["Run QC"])
+        raise AssertionError("only planning should run")
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog()))
+    kind, _ = lab._pi_plan(question, lambda _event: None)
+    assert kind == "agenda"
+    return seen["pi_user"]
+
+
+def test_pi_plan_lists_the_skill_library_after_the_tools(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    monkeypatch.setattr(skills_mod, "SKILLS", _skill_library())
+    prompt = _planning_prompt()
+    assert "Skills the scientist can also use" in prompt
+    # a plan must not credit a skill with a method its description does not name (measured: one
+    # plan in seven said AUCell for a template that runs sc.tl.score_genes)
+    assert "Describe a skill's method only as its line below states it" in prompt
+    assert "- pairwise_de — Pairwise differential expression between two named groups." in prompt
+    assert "- score_signature — " in prompt
+    # the newest version of a superseded skill is listed, the old one is not
+    assert "- new_markers — " in prompt and "old_markers" not in prompt
+    assert prompt.index("these tools") < prompt.index("Skills the scientist can also use")
+
+
+def test_pi_plan_reads_the_library_as_it_is_at_planning_time(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    from aiscientist.agents.skills import Skill
+    lib = _skill_library()
+    monkeypatch.setattr(skills_mod, "SKILLS", lib)
+    assert "atlas_compare" not in _planning_prompt()
+    lib["atlas_compare"] = Skill("atlas_compare", "Compare a dataset against a precalculated atlas.")
+    assert "- atlas_compare — Compare a dataset against a precalculated atlas." in _planning_prompt()
+
+
+def test_an_empty_skill_library_adds_no_skill_section(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    monkeypatch.setattr(skills_mod, "SKILLS", {})
+    assert "Skills the scientist" not in _planning_prompt()
+
+
+def test_a_large_skill_library_lists_the_best_matches_first():
+    from aiscientist.agents.research_lab import plan_skills_block
+    from aiscientist.agents.skills import Skill
+    lib = {f"template_{i}": Skill(f"template_{i}", f"Unrelated template number {i}.") for i in range(5)}
+    lib["pairwise_de"] = Skill("pairwise_de", "Pairwise differential expression between two groups.")
+    block = plan_skills_block("differential expression of KO vs WT", skills=lib, limit=3)
+    lines = [line for line in block.splitlines() if line.startswith("- ")]
+    assert len(lines) == 3
+    assert lines[0].startswith("- pairwise_de — ")
+    assert "3 more skills exist" in block
+
+
+def test_only_an_overlong_skill_description_is_cut_in_the_planning_list():
+    # The cut is the Agent-Skills maximum (1024): a routing sentence at the END of a normal
+    # description ("... is the run_cellqc tool, not this skill") must reach the PI.
+    from aiscientist.agents.skills import Skill, plan_skill_lines
+    normal = "Run the pipeline by hand. " * 20 + "Inside an analysis, use the tool instead."
+    lines, left_out = plan_skill_lines("q", skills={"n": Skill("n", normal),
+                                                    "long": Skill("long", "word " * 400)})
+    assert left_out == 0 and lines[0].endswith("use the tool instead.")
+    assert lines[1].endswith(" …") and len(lines[1]) < 1050
+
+
+def test_the_planning_list_has_no_count_limit():
+    from aiscientist.agents.skills import Skill, plan_skill_lines
+    lib = {f"s{i}": Skill(f"s{i}", f"thing {i}") for i in range(120)}
+    lines, left_out = plan_skill_lines("q", skills=lib)
+    assert len(lines) == 120 and left_out == 0
+
+
+def test_skills_named_in_a_step_match_whole_names_only():
+    from aiscientist.agents.skills import Skill, skills_named_in
+    lib = {name: Skill(name) for name in (
+        "annotate_clusters_by_markers", "annotate_clusters_by_markers_v2", "literature-corpus-recovery")}
+    assert skills_named_in("apply skill `annotate_clusters_by_markers_v2` with `run_code`", lib) \
+        == ["annotate_clusters_by_markers_v2"]
+    assert skills_named_in("Label clusters with annotate_clusters_by_markers.", lib) \
+        == ["annotate_clusters_by_markers"]
+    assert skills_named_in("Fetch the PDFs with literature-corpus-recovery", lib) \
+        == ["literature-corpus-recovery"]
+    assert skills_named_in("Run QC with `run_qc`", lib) == []
+
+
+def test_the_scientist_is_pointed_at_the_skill_its_step_names(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    from aiscientist.agents.research_lab import Specialist
+    monkeypatch.setattr(skills_mod, "SKILLS", _skill_library())
+    briefs = []
+
+    def chat(messages, tools):
+        briefs.append(next(m["content"] for m in messages if m.get("role") == "user"))
+        return {"content": "", "tool_calls": [{"id": "f", "type": "function", "function": {
+            "name": "finish", "arguments": json.dumps({"answer": "done"})}}]}
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "x",
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=chat))
+    lab._scientist("q", "**KO vs WT** — apply skill `pairwise_de` with `run_code` to compare KO and WT.",
+                   Specialist("Sci", "persona"), "", [], lambda _event: None)
+    assert "The plan assigns skill `pairwise_de` to this step: call `read_skill_reference(name)`" \
+        in briefs[0]
+
+    briefs.clear()
+    lab._scientist("q", "**QC** — Filter cells with `run_qc` at the defaults.",
+                   Specialist("Sci", "persona"), "", [], lambda _event: None)
+    assert "The plan assigns" not in briefs[0]
+
+
+def test_the_next_cycle_plan_is_offered_the_skills(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    monkeypatch.setattr(skills_mod, "SKILLS", _skill_library())
+    seen = {}
+
+    def complete(messages):
+        seen["payload"] = json.loads(messages[1]["content"])
+        return json.dumps({"continue": False, "reason": "answered"})
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog()))
+    lab._plan_next_cycle("q", [], 2, lambda _event: None)
+    assert any(line.startswith("- pairwise_de — ") for line in seen["payload"]["skills_available"])
+
+
+def test_a_skill_named_like_a_tool_is_not_reported_as_an_unknown_tool(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    from aiscientist.agents.research_lab import check_plan_tooling
+    from aiscientist.agents.skills import Skill
+    monkeypatch.setattr(skills_mod, "SKILLS", {"run_custom_qc": Skill("run_custom_qc", "Induced QC.")})
+    _, findings = check_plan_tooling(["Apply skill `run_custom_qc` with `run_code`."], default_catalog())
+    assert not any(f["tool"] == "run_custom_qc" for f in findings)
+
+
 # --- the PI planner sees the dataset's design (condition columns + existing labels) ----
 
 def _ctx_with_dataset(dataset_result):
@@ -1295,6 +1445,36 @@ def test_no_contrast_detection_and_enrichment_step_classification():
     assert not _is_enrichment_step("Synthesize the biological interpretation of the enriched pathways")
 
 
+def test_a_step_is_classified_by_the_tool_it_names_not_by_its_prose():
+    """2026-10-03, Sample3 e2e: the prose test called four steps of one plan "enrichment" and the
+    no-DE-producer guard dropped all four. The marker-DE step had said what its table feeds
+    ("pathway"); the annotation step had required a marker "enriched" in the cluster. The run lost
+    its markers and its cell-type labels. Abridged from that plan card, trigger words verbatim."""
+    from aiscientist.agents.research_lab import _is_de_producer_step, _is_enrichment_step
+    marker_de = ("**Marker genes per cluster** — Identify the genes that define each cluster with "
+                 "`run_de` in marker (default) mode: a Wilcoxon rank-sum test (`rank_genes_groups`) "
+                 "comparing every cell of one cluster against all remaining cells, writing a table "
+                 "per cluster (group, gene, log2fc, pval, pval_adj, score) that the pathway steps "
+                 "consume.")
+    ora = ("**ORA pathway context per cluster** — Put pathway context on each cluster with "
+           "`run_enrichment`: an offline over-representation test against the background of the "
+           "ACTUAL tested universe that `run_de` wrote, with the top enriched terms per cluster.")
+    gsea = ("**Preranked GSEA per cluster** — Complement the thresholded ORA with "
+            "`run_gsea_prerank`: a preranked GSEA that walks the COMPLETE ranked gene list per "
+            "cluster (every tested gene, ranked by Wilcoxon z, from `run_de`'s ranking files).")
+    annotation = ("**Marker-based cell-type annotation** — Assign a cell type to each cluster with "
+                  "`run_marker_annotation`, passing `reference: \"retina\"` and NO hand-built "
+                  "panel: a label is assigned only when that lineage's markers dominate the cluster "
+                  "AND at least one is enriched in it versus other lineages.")
+    assert _is_de_producer_step(marker_de) and not _is_enrichment_step(marker_de)
+    assert _is_enrichment_step(ora) and not _is_de_producer_step(ora)
+    assert _is_enrichment_step(gsea) and not _is_de_producer_step(gsea)
+    assert not _is_enrichment_step(annotation) and not _is_de_producer_step(annotation)
+    # A generic tool says nothing about what the step is, so its prose still decides.
+    assert _is_enrichment_step("**Pathways** — Run GO over-representation with `run_code` (gseapy)")
+    assert _is_de_producer_step("**Markers** — `run_code`: rank_genes_groups per cluster (Wilcoxon)")
+
+
 def test_run_prunes_enrichment_when_no_contrast(monkeypatch):
     # End-to-end wiring: a PI that plans an enrichment step on a single annotated retina sample must
     # have that step dropped before execution; QC / clustering / DE / literature survive.
@@ -1947,15 +2127,19 @@ def test_search_skills_ranks_by_relevance_and_reports_no_match():
     assert miss["results"] == [] and "hint" in miss and miss["available_count"] == 3
 
 
-def test_brief_switches_to_search_when_library_is_large(monkeypatch):
-    # Small library -> inline manifest (tested elsewhere). Large library (> threshold) -> the brief
-    # tells the agent to search_skills instead of listing all, so the manifest can't bloat context.
+def test_brief_lists_every_skill_however_large_the_library(monkeypatch):
+    # There is no manifest cap: the agent reads the WHOLE list (name + description, grouped by
+    # category) before it chooses. It used to stop listing above 12 skills and say "search", so with
+    # the 15 skills the repo already had, no run ever saw the list.
     import aiscientist.agents.research_lab as rl
+    from aiscientist.agents import skills as skills_mod
     from aiscientist.agents.skills import Skill
 
-    big = {f"skill_{i}": Skill(f"skill_{i}", summary=f"does thing {i}") for i in range(20)}
+    big = {f"skill_{i}": Skill(f"skill_{i}", summary=f"does thing {i}",
+                               category="single-cell" if i % 2 else "")
+           for i in range(40)}
+    monkeypatch.setattr(skills_mod, "SKILLS", big)
     monkeypatch.setattr(rl, "ATOMIC_SKILLS", big)
-    monkeypatch.setattr(rl, "SKILL_MANIFEST_MAX", 12)
     captured = {}
 
     def recording_chat(messages, tools):
@@ -1977,9 +2161,11 @@ def test_brief_switches_to_search_when_library_is_large(monkeypatch):
     scientist = ResearchHarness(catalog=default_catalog(), chat_fn=recording_chat)
     lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False), complete_fn=complete, scientist=scientist)
     lab.run("do the analysis")
-    assert "search_skills" in captured["brief"]           # large library -> search instruction
-    assert "20 atomic skills are available" in captured["brief"]
-    assert "skill_0" not in captured["brief"]             # the full manifest is NOT dumped
+    brief = captured["brief"]
+    assert "Atomic skills (40)" in brief
+    assert all(f"- skill_{i} — does thing {i}" in brief for i in range(40))   # every one listed
+    assert "[single-cell]" in brief                       # grouped by category
+    assert "search_skills" in brief                       # still offered for ranking
 
 
 def test_unknown_required_skill_is_dropped_not_injected():

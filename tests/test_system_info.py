@@ -31,6 +31,7 @@ def test_overview_lists_agents_tools_capabilities_roadmap():
     assert any("Research Lab" in n for n in flows) and any("analysis pipeline" in n for n in flows)
     pipeline = next(w for w in o["workflows"] if w["kind"] == "pipeline")
     assert pipeline["stages"][:2] == ["run_scanpy_qc", "run_clustering"]   # derived from scrna_catalog order
+    assert pipeline["alternatives"] == {"run_scanpy_qc": ["run_cellqc"]}  # QC routes are alternatives
     assert "roadmap" not in o
 
     # the Scientist's multi-specialist roster is surfaced for dev visibility
@@ -68,3 +69,5 @@ def test_workflow_graph_is_consistent_and_code_derived():
     if system_info._have("scanpy"):
         pipe = [e for e in g["edges"] if e["type"] == "pipeline"]
         assert any(e["source"] == "tool:run_scanpy_qc" and e["target"] == "tool:run_clustering" for e in pipe)
+        assert any(e["source"] == "tool:run_cellqc" and e["target"] == "tool:run_clustering" for e in pipe)
+        assert not any(e["source"] == "tool:run_scanpy_qc" and e["target"] == "tool:run_cellqc" for e in pipe)

@@ -1,0 +1,455 @@
+{
+ "tissue": "retina",
+ "source": "Curated for AiScientist from skills/annotate_clusters_by_markers_v2 (canonical lineage markers of the vertebrate retina); mouse symbols are the MGI orthologues.",
+ "expected": [
+  "Muller glia"
+ ],
+ "usually": [
+  "Rod photoreceptor",
+  "Cone photoreceptor",
+  "Bipolar cell",
+  "Amacrine cell"
+ ],
+ "species": {
+  "human": {
+   "Rod photoreceptor": {
+    "panel": [
+     "RHO",
+     "PDE6A",
+     "PDE6B",
+     "NRL",
+     "NR2E3",
+     "GNAT1",
+     "CNGA1"
+    ],
+    "discriminators": [
+     "RHO",
+     "NRL",
+     "GNAT1"
+    ],
+    "aliases": [
+     "rod"
+    ]
+   },
+   "Cone photoreceptor": {
+    "panel": [
+     "ARR3",
+     "PDE6H",
+     "GNAT2",
+     "OPN1SW",
+     "OPN1MW",
+     "OPN1LW",
+     "PDE6C"
+    ],
+    "discriminators": [
+     "ARR3",
+     "PDE6H",
+     "GNAT2"
+    ],
+    "aliases": [
+     "cone"
+    ]
+   },
+   "Bipolar cell": {
+    "panel": [
+     "VSX2",
+     "GRM6",
+     "TRPM1",
+     "PRKCA",
+     "GRIK1",
+     "CABP5"
+    ],
+    "discriminators": [
+     "VSX2",
+     "GRM6",
+     "TRPM1",
+     "GRIK1"
+    ],
+    "aliases": [
+     "bipolar"
+    ]
+   },
+   "Amacrine cell": {
+    "panel": [
+     "GAD1",
+     "GAD2",
+     "SLC6A9",
+     "TFAP2B",
+     "CHAT"
+    ],
+    "discriminators": [
+     "GAD1",
+     "SLC6A9",
+     "TFAP2B"
+    ],
+    "aliases": [
+     "amacrine"
+    ]
+   },
+   "Horizontal cell": {
+    "panel": [
+     "ONECUT1",
+     "ONECUT2",
+     "LHX1",
+     "CALB1",
+     "SEPTIN4",
+     "SEPT4"
+    ],
+    "discriminators": [
+     "ONECUT1",
+     "LHX1"
+    ],
+    "aliases": [
+     "horizontal"
+    ]
+   },
+   "Retinal ganglion cell": {
+    "panel": [
+     "RBPMS",
+     "NEFL",
+     "SNCG",
+     "POU4F1",
+     "POU4F2",
+     "THY1"
+    ],
+    "discriminators": [
+     "RBPMS",
+     "SNCG",
+     "POU4F1"
+    ],
+    "aliases": [
+     "ganglion",
+     "rgc"
+    ]
+   },
+   "Muller glia": {
+    "panel": [
+     "RLBP1",
+     "SLC1A3",
+     "GLUL",
+     "CLU",
+     "APOE",
+     "SOX9",
+     "AQP4"
+    ],
+    "discriminators": [
+     "RLBP1",
+     "GLUL"
+    ],
+    "aliases": [
+     "muller",
+     "mueller"
+    ]
+   },
+   "Retinal astrocyte": {
+    "panel": [
+     "GFAP",
+     "PAX2",
+     "S100B"
+    ],
+    "discriminators": [
+     "GFAP",
+     "PAX2"
+    ],
+    "aliases": [
+     "astrocyte"
+    ]
+   },
+   "Microglia": {
+    "panel": [
+     "C1QA",
+     "C1QB",
+     "P2RY12",
+     "CX3CR1",
+     "AIF1"
+    ],
+    "discriminators": [
+     "C1QA",
+     "P2RY12",
+     "CX3CR1"
+    ],
+    "aliases": [
+     "microglia",
+     "macrophage",
+     "immune"
+    ]
+   },
+   "Vascular endothelium": {
+    "panel": [
+     "PECAM1",
+     "VWF",
+     "CLDN5",
+     "CDH5"
+    ],
+    "discriminators": [
+     "PECAM1",
+     "VWF",
+     "CLDN5"
+    ],
+    "aliases": [
+     "endotheli",
+     "vascular",
+     "choroid"
+    ]
+   },
+   "Pericyte/SMC": {
+    "panel": [
+     "ACTA2",
+     "PDGFRB",
+     "NOTCH3",
+     "MYH11",
+     "TAGLN"
+    ],
+    "discriminators": [
+     "ACTA2",
+     "PDGFRB",
+     "NOTCH3"
+    ],
+    "aliases": [
+     "pericyte",
+     "smoothmuscle",
+     "smc"
+    ]
+   },
+   "RPE": {
+    "panel": [
+     "RPE65",
+     "BEST1",
+     "TTR",
+     "TYR"
+    ],
+    "discriminators": [
+     "RPE65",
+     "BEST1"
+    ],
+    "aliases": [
+     "rpe",
+     "pigmentepitheli"
+    ]
+   }
+  },
+  "mouse": {
+   "Rod photoreceptor": {
+    "panel": [
+     "Rho",
+     "Pde6a",
+     "Pde6b",
+     "Nrl",
+     "Nr2e3",
+     "Gnat1",
+     "Cnga1"
+    ],
+    "discriminators": [
+     "Rho",
+     "Nrl",
+     "Gnat1"
+    ],
+    "aliases": [
+     "rod"
+    ]
+   },
+   "Cone photoreceptor": {
+    "panel": [
+     "Arr3",
+     "Pde6h",
+     "Gnat2",
+     "Opn1sw",
+     "Opn1mw",
+     "Opn1lw",
+     "Pde6c"
+    ],
+    "discriminators": [
+     "Arr3",
+     "Pde6h",
+     "Gnat2"
+    ],
+    "aliases": [
+     "cone"
+    ]
+   },
+   "Bipolar cell": {
+    "panel": [
+     "Vsx2",
+     "Grm6",
+     "Trpm1",
+     "Prkca",
+     "Grik1",
+     "Cabp5"
+    ],
+    "discriminators": [
+     "Vsx2",
+     "Grm6",
+     "Trpm1",
+     "Grik1"
+    ],
+    "aliases": [
+     "bipolar"
+    ]
+   },
+   "Amacrine cell": {
+    "panel": [
+     "Gad1",
+     "Gad2",
+     "Slc6a9",
+     "Tfap2b",
+     "Chat"
+    ],
+    "discriminators": [
+     "Gad1",
+     "Slc6a9",
+     "Tfap2b"
+    ],
+    "aliases": [
+     "amacrine"
+    ]
+   },
+   "Horizontal cell": {
+    "panel": [
+     "Onecut1",
+     "Onecut2",
+     "Lhx1",
+     "Calb1",
+     "Septin4",
+     "Sept4"
+    ],
+    "discriminators": [
+     "Onecut1",
+     "Lhx1"
+    ],
+    "aliases": [
+     "horizontal"
+    ]
+   },
+   "Retinal ganglion cell": {
+    "panel": [
+     "Rbpms",
+     "Nefl",
+     "Sncg",
+     "Pou4f1",
+     "Pou4f2",
+     "Thy1"
+    ],
+    "discriminators": [
+     "Rbpms",
+     "Sncg",
+     "Pou4f1"
+    ],
+    "aliases": [
+     "ganglion",
+     "rgc"
+    ]
+   },
+   "Muller glia": {
+    "panel": [
+     "Rlbp1",
+     "Slc1a3",
+     "Glul",
+     "Clu",
+     "Apoe",
+     "Sox9",
+     "Aqp4"
+    ],
+    "discriminators": [
+     "Rlbp1",
+     "Glul"
+    ],
+    "aliases": [
+     "muller",
+     "mueller"
+    ]
+   },
+   "Retinal astrocyte": {
+    "panel": [
+     "Gfap",
+     "Pax2",
+     "S100b"
+    ],
+    "discriminators": [
+     "Gfap",
+     "Pax2"
+    ],
+    "aliases": [
+     "astrocyte"
+    ]
+   },
+   "Microglia": {
+    "panel": [
+     "C1qa",
+     "C1qb",
+     "P2ry12",
+     "Cx3cr1",
+     "Aif1"
+    ],
+    "discriminators": [
+     "C1qa",
+     "P2ry12",
+     "Cx3cr1"
+    ],
+    "aliases": [
+     "microglia",
+     "macrophage",
+     "immune"
+    ]
+   },
+   "Vascular endothelium": {
+    "panel": [
+     "Pecam1",
+     "Vwf",
+     "Cldn5",
+     "Cdh5"
+    ],
+    "discriminators": [
+     "Pecam1",
+     "Vwf",
+     "Cldn5"
+    ],
+    "aliases": [
+     "endotheli",
+     "vascular",
+     "choroid"
+    ]
+   },
+   "Pericyte/SMC": {
+    "panel": [
+     "Acta2",
+     "Pdgfrb",
+     "Notch3",
+     "Myh11",
+     "Tagln"
+    ],
+    "discriminators": [
+     "Acta2",
+     "Pdgfrb",
+     "Notch3"
+    ],
+    "aliases": [
+     "pericyte",
+     "smoothmuscle",
+     "smc"
+    ]
+   },
+   "RPE": {
+    "panel": [
+     "Rpe65",
+     "Best1",
+     "Ttr",
+     "Tyr"
+    ],
+    "discriminators": [
+     "Rpe65",
+     "Best1"
+    ],
+    "aliases": [
+     "rpe",
+     "pigmentepitheli"
+    ]
+   }
+  }
+ },
+ "also_marks": {
+  "RLBP1": [
+   "RPE"
+  ]
+ },
+ "notes": "Bipolar discriminators cover both classes: VSX2 (all bipolar cells), GRM6/TRPM1 (ON) and GRIK1 (OFF). Without GRIK1, OFF cone bipolar clusters (2026-10-02, human macula: 5 clusters, GRIK1 log2FC +3.1 to +5.2) failed the canonical check. also_marks lists lineages a discriminator canonically marks besides its own (RLBP1/CRALBP: RPE as well as Muller glia); the annotation ignores it, the report's marker-claim check accepts those attributions."
+}

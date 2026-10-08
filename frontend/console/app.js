@@ -30,6 +30,9 @@ const state = {
   skills: {},                  // name -> {name, summary} from /api/skills (atomic skills)
   skillOrder: [],              // atomic-skill names in load order (for the Advanced required-skills list)
   datasets: [],                // uploaded files/folders this session: {name, path, kind}
+  serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
+  serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
+  serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
   uploads: [],                 // in-flight/failed uploads shown in the Datasets tab: {id,name,size,sent,status,file,error}
   boundPaths: [],              // the BIND-SET (feature ②): the server paths of every data file attached
                                // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
@@ -2738,6 +2741,7 @@ function updateComposerButton() {
   }
   send.classList.toggle("hidden", !showSend);
   stop.classList.toggle("hidden", showSend);
+  renderServerPathOffer();   // a server path in the text → offer to bind it; gone once the box clears
 }
 
 // Cancel the in-flight run so the GPU + compute are released. Used by the Stop
@@ -3244,6 +3248,93 @@ function primaryBoundPath() {
   return meta[0].p;
 }
 
+// A dataset row's kind → its icon. Server kinds are bound by path from the gateway host's disks.
+function isFolderKind(kind) { return kind === "folder" || kind === "server-folder"; }
+function datasetIcon(kind) {
+  return { folder: "folder", "server-folder": "folder_shared", "server-file": "dns" }[kind] || "draft";
+}
+
+// ---- data already on the server, bound by path (no upload) ---------------------------------
+// The gateway allowlists folders (AISCIENTIST_SERVER_DATA_ROOTS). A path inside one can be bound from
+// the Data menu, or — when one is pasted into the chat — from the offer above the composer. Binding
+// is always the user's click: a path the model reads in a message is never bound on its own. A run
+// copies what it needs to HPC3 when it starts (only what changed since the last copy).
+const _SERVER_PATH_RE = /(?<![\w/])(\/[^\s'"`<>|;,()[\]{}]+)/g;
+
+async function loadServerRoots() {
+  try {
+    const d = await (await fetch("/api/server-data/roots")).json();
+    state.serverRoots = d.enabled ? (d.roots || []) : [];
+  } catch { state.serverRoots = []; }
+  const item = $("serverDataItem");
+  if (item) item.classList.toggle("hidden", !state.serverRoots.length);
+  const inp = $("serverPathInput");
+  if (inp && state.serverRoots.length) inp.placeholder = state.serverRoots[0] + "/…";
+  renderServerPathOffer();
+}
+
+function serverPathsIn(text) {
+  const out = [];
+  if (!state.serverRoots.length) return out;
+  // Copied from wrapped text, a path arrives split at a slash ("…/jinl14/ CellQC_testdata/Sample1_WT"):
+  // rejoin it when what follows the break is itself a relative path, never plain words.
+  text = (text || "").replace(/\/\s+(?=[^\s/'"`<>|;,()[\]{}]+\/)/g, "/");
+  for (const m of text.matchAll(_SERVER_PATH_RE)) {
+    const p = m[1].replace(/[.:]+$/, "").replace(/\/+$/, "");
+    if (state.serverRoots.some((r) => p === r || p.startsWith(r + "/")) && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+function renderServerPathOffer() {
+  const host = $("serverPathOffer"), input = $("chatInput");
+  if (!host || !input) return;
+  const offers = serverPathsIn(input.value).filter((p) =>
+    !state.boundPaths.includes(p) && !state.serverBoundTyped.has(p) && !state.serverOfferDismissed.has(p));
+  if (!offers.length) { host.classList.add("hidden"); host.innerHTML = ""; return; }
+  const p = offers[0];
+  // A long path shows its last segments (the dataset's own name); the whole path is the tooltip.
+  let shown = p;
+  if (shown.length > 60) { const tail = shown.slice(-56); shown = "…" + tail.slice(Math.max(tail.indexOf("/"), 0)); }
+  host.innerHTML = `<span class="material-symbols-outlined msym">folder_shared</span>` +
+    `<span class="spo-text" title="${escapeHtml(p)}">Bind <code>${escapeHtml(shown)}</code> as data for this run?</span>` +
+    (offers.length > 1 ? `<span class="spo-more">+${offers.length - 1} more</span>` : "") +
+    `<button type="button" class="primary small" data-spo-bind="${escapeHtml(p)}">Bind</button>` +
+    `<button type="button" class="ghost small" data-spo-dismiss="${escapeHtml(p)}">Not now</button>`;
+  host.classList.remove("hidden");
+}
+
+async function bindServerPath(path) {
+  path = (path || "").trim();
+  if (!path) return false;
+  if (!state.connectionId) { toast("Connect first: binding server data needs a session."); return false; }
+  const post = async (url) => {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, path }) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+    return d;
+  };
+  try {
+    setUploadProgress(`Checking ${path} on the server…`);
+    const info = await post("/api/server-data/check");
+    setUploadProgress("");
+    // Large copies are confirmed first: the size and what will be skipped are in the message.
+    if (info.confirm && !confirm(info.message + "\n\nBind it?")) return false;
+    const d = await post("/api/server-data/bind");
+    state.serverBoundTyped.add(path);
+    addDataset({ name: d.name + (isFolderKind(d.kind) ? "/" : ""), path: d.path, kind: d.kind,
+      gist: d.info && d.info.message });
+    toast(d.info && d.info.message ? d.info.message : `Bound ${d.name}`);
+    renderServerPathOffer();
+    return true;
+  } catch (err) {
+    setUploadProgress("");
+    toast("Can't bind that path: " + err.message);
+    return false;
+  }
+}
+
 function addDataset(d) {
   if (!d || !d.path) return;
   if (!state.datasets.some((x) => x.path === d.path)) state.datasets.unshift(d);
@@ -3280,7 +3371,7 @@ function renderDatasetChips() {
   const primary = primaryBoundPath();
   host.innerHTML = state.boundPaths.map((path) => {
     const d = state.datasets.find((x) => x.path === path) || { name: path.split("/").pop(), path, kind: "file" };
-    const ico = d.kind === "folder" ? "folder" : "draft";
+    const ico = datasetIcon(d.kind);
     const isPrimary = path === primary && state.boundPaths.length > 1;
     const gist = d.gist ? ` — ${d.gist}` : "";                 // the file's ① skim, when known
     return `<span class="dataset-chip active" title="${escapeHtml(d.path + gist)}">` +
@@ -3326,7 +3417,7 @@ function renderDataMenuRecent() {
   if (!state.datasets.length) { host.innerHTML = '<div class="data-menu-empty">No uploads yet</div>'; return; }
   host.innerHTML = state.datasets.map((d) => {
     const active = state.boundPaths.includes(d.path) ? " active" : "";   // in the bind-set → checked
-    const ico = d.kind === "folder" ? "folder" : "draft";
+    const ico = datasetIcon(d.kind);
     return `<button type="button" class="data-menu-recent-item${active}" data-path="${escapeHtml(d.path)}" title="${escapeHtml(d.path)} (click to add/remove)">` +
       `<span class="material-symbols-outlined msym">${ico}</span><span class="dmr-name">${escapeHtml(d.name)}</span>` +
       (active ? `<span class="material-symbols-outlined msym dmr-check">check</span>` : "") + `</button>`;
@@ -3357,7 +3448,7 @@ async function loadDatasetChips() {
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
     for (const x of items) {
-      const name = x.kind === "folder" ? x.name + "/" : x.name;
+      const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
       if (!state.datasets.some((d) => d.path === x.path)) state.datasets.push({ name, path: x.path, kind: x.kind });
     }
   } catch { /* datasets need accounts; the list just stays empty otherwise */ }
@@ -3634,6 +3725,14 @@ function initShell() {
   $("userSearch").addEventListener("input", () => { clearTimeout(_userSearchTimer); _userSearchTimer = setTimeout(loadAdminUsers, 250); });
   $("userSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); clearTimeout(_userSearchTimer); loadAdminUsers(); } });
   $("userSearchClear").addEventListener("click", () => { $("userSearch").value = ""; loadAdminUsers(); });
+  document.querySelectorAll(".admin-tab").forEach((b) => b.addEventListener("click", () => switchAdminTab(b.dataset.adminTab)));
+  $("skillReviewRefresh").addEventListener("click", loadSkillReviews);
+  document.querySelectorAll(".skill-chip").forEach((b) => b.addEventListener("click", () => {
+    skillReview.filter = b.dataset.skillFilter;
+    document.querySelectorAll(".skill-chip").forEach((c) => c.classList.toggle("active", c === b));
+    renderSkillReviews();
+  }));
+  $("skillReviewList").addEventListener("click", onSkillReviewClick);
   $("datasetsList").addEventListener("click", onDatasetsClick);
   $("uploadsPanel").addEventListener("click", (e) => {
     const r = e.target.closest("[data-resume]"); if (r) { resumeUpload(r.dataset.resume); return; }
@@ -3648,7 +3747,7 @@ function switchView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
   if (name === "datasets") loadDatasets();
   else if (name === "runs") loadRuns();
-  else if (name === "admin") loadAdminUsers();
+  else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
   else if (name === "account") renderAccount(state.user);
   else if (name === "system") loadSystem();
 }
@@ -3767,10 +3866,10 @@ async function loadDatasets() {
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
     el.innerHTML = items.length ? items.map((x) =>
-      `<div class="card"><div class="card-main"><strong>${icon(x.kind === "folder" ? "folder" : "draft")} ${escapeHtml(x.name)}${x.kind === "folder" ? "/" : ""}</strong>` +
+      `<div class="card"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
       `<span class="muted">${escapeHtml(x.kind)} · ${(x.size_bytes / 1e6).toFixed(1)} MB · ${fmtDate(x.uploaded_at)}</span></div>` +
       `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>` +
-      `<button class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}">Delete</button></div>`).join("")
+      `<button class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
 }
@@ -3784,7 +3883,11 @@ async function onDatasetsClick(e) {
   }
   const d = e.target.closest("[data-del]");
   if (d) {
-    if (!confirm(`Delete dataset "${d.dataset.name}" from the server?\n\nThis removes the uploaded file and its history. This cannot be undone.`)) return;
+    const fromServer = (d.dataset.kind || "").startsWith("server-");
+    const ask = fromServer
+      ? `Remove "${d.dataset.name}" from your datasets?\n\nThe data on the server is not touched. Your HPC3 copy of it is deleted (a later run copies it again).`
+      : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes the uploaded file and its history. This cannot be undone.`;
+    if (!confirm(ask)) return;
     try {
       const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
       const j = await res.json();
@@ -3840,6 +3943,98 @@ async function loadAdminUsers() {
       `</td></tr>`).join("");
   } catch { body.innerHTML = '<tr><td colspan="7" class="empty-hint">Failed to load.</td></tr>'; }
 }
+// ---- Admin: skill review ----
+// Induced skills are one run's code frozen into a template; none reaches the PI or the Scientist
+// until an admin approves it here (agents/skills.py, "review gate").
+const skillReview = { rows: [], filter: "pending", open: {} };
+
+function switchAdminTab(tab) {
+  document.querySelectorAll(".admin-tab").forEach((b) => b.classList.toggle("active", b.dataset.adminTab === tab));
+  document.querySelectorAll(".admin-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "adminPane-" + tab));
+  if (tab === "skills") loadSkillReviews();
+}
+
+async function loadSkillReviews() {
+  const el = $("skillReviewList");
+  try {
+    const r = await fetch("/api/admin/skills");
+    if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
+    const j = await r.json();
+    skillReview.rows = j.skills || [];
+    skillReview.configured = j.induced_dir_configured;
+    const pending = (j.counts && j.counts.pending) || 0;
+    const badge = $("skillPendingBadge");
+    badge.textContent = pending ? String(pending) : "";
+    badge.classList.toggle("hidden", !pending);
+    renderSkillReviews();
+  } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+}
+
+function renderSkillReviews() {
+  const el = $("skillReviewList");
+  const rows = skillReview.rows.filter((x) => skillReview.filter === "all" || x.status === skillReview.filter);
+  if (!rows.length) {
+    el.innerHTML = `<div class="empty-hint">${skillReview.configured === false
+      ? "Skill induction is not configured on this server, so there is nothing to review."
+      : `No ${skillReview.filter === "all" ? "" : skillReview.filter + " "}skills.`}</div>`;
+    return;
+  }
+  const actions = (x) => {
+    const b = [];
+    if (x.status !== "approved") b.push(`<button class="ghost small" data-skill-act="approved" data-skill="${escapeHtml(x.name)}">Approve</button>`);
+    if (x.status !== "retired") b.push(`<button class="ghost small danger" data-skill-act="retired" data-skill="${escapeHtml(x.name)}">Retire</button>`);
+    if (x.status !== "pending") b.push(`<button class="ghost small" data-skill-act="pending" data-skill="${escapeHtml(x.name)}">Back to pending</button>`);
+    return b.join("");
+  };
+  el.innerHTML = rows.map((x) => {
+    const decided = x.reviewed_by ? `${x.status} by ${escapeHtml(x.reviewed_by)} · ${fmtDate(x.reviewed_at)}` : "not reviewed";
+    const open = skillReview.open[x.name];
+    return `<div class="skill-card" data-card="${escapeHtml(x.name)}">` +
+      `<div class="skill-card-head"><div class="card-main"><strong>${escapeHtml(x.name)}</strong>` +
+      `<span class="muted">learned ${fmtDate(x.created_at)}${x.origin_run ? " · run " + escapeHtml(x.origin_run) : ""}` +
+      `${x.supersedes ? " · newer version of " + escapeHtml(x.supersedes) : ""} · ${decided}</span></div>` +
+      `<span class="status-pill ${x.status}">${x.status}</span></div>` +
+      `<p class="skill-summary">${escapeHtml(x.summary || "")}</p>` +
+      (x.origin_step ? `<p class="skill-origin"><span class="muted">Learned from the step:</span> ${escapeHtml(x.origin_step)}</p>` : "") +
+      (x.note ? `<p class="skill-origin"><span class="muted">Review note:</span> ${escapeHtml(x.note)}</p>` : "") +
+      `<div class="row-actions"><button class="ghost small" data-skill-view="${escapeHtml(x.name)}">${open ? "Hide code" : "View SKILL.md and code"}</button>${actions(x)}</div>` +
+      (open ? `<div class="skill-detail">${open}</div>` : "") +
+      `</div>`;
+  }).join("");
+}
+
+async function onSkillReviewClick(e) {
+  const view = e.target.closest("[data-skill-view]");
+  if (view) {
+    const name = view.dataset.skillView;
+    if (skillReview.open[name]) { delete skillReview.open[name]; renderSkillReviews(); return; }
+    try {
+      const r = await fetch(`/api/admin/skills/${encodeURIComponent(name)}`);
+      const j = await r.json();
+      if (!r.ok) { toast(j.detail || "Could not load the skill."); return; }
+      skillReview.open[name] = `<h4>SKILL.md</h4><pre>${escapeHtml(j.skill_md || "")}</pre>` +
+        Object.entries(j.files || {}).map(([f, code]) => `<h4>${escapeHtml(f)}</h4><pre>${escapeHtml(code)}</pre>`).join("");
+      renderSkillReviews();
+    } catch (err) { toast("Could not load the skill: " + err.message); }
+    return;
+  }
+  const act = e.target.closest("[data-skill-act]");
+  if (!act) return;
+  const name = act.dataset.skill, status = act.dataset.skillAct;
+  const verb = { approved: "Approve", retired: "Retire", pending: "Move back to pending" }[status];
+  const note = prompt(`${verb} '${name}'? Optional note for the record:`, "");
+  if (note === null) return;
+  try {
+    const r = await fetch(`/api/admin/skills/${encodeURIComponent(name)}/review`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status, note }) });
+    const j = await r.json();
+    if (!r.ok) { toast(j.detail || "Review failed."); return; }
+    toast(status === "approved" ? `${name} approved: runs can now plan with it.`
+      : status === "retired" ? `${name} retired: no run will be offered it.` : `${name} is pending review again.`);
+    loadSkillReviews();
+  } catch (err) { toast("Review failed: " + err.message); }
+}
+
 async function createUser(e) {
   e.preventDefault();
   const payload = { username: $("cuUser").value.trim(), password: $("cuPass").value, role: $("cuRole").value, email: $("cuEmail").value.trim() || null };
@@ -4000,6 +4195,11 @@ function init() {
   $("dataMenuBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleDataMenu(); });
   $("dataMenu").addEventListener("click", (e) => {
     const act = e.target.closest("[data-act]");
+    if (act && act.dataset.act === "server") {
+      $("serverPathRow").classList.remove("hidden");
+      $("serverPathInput").focus();
+      return;
+    }
     if (act) {
       const target = { file: "datasetFile", folder: "datasetDir", note: "caseNoteFile" }[act.dataset.act];
       if (target) $(target).click();
@@ -4023,6 +4223,18 @@ function init() {
   $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chatForm").requestSubmit(); } });
   // Live-swap Send⇄Stop as the user types during a run / plan review.
   $("chatInput").addEventListener("input", updateComposerButton);
+  $("serverPathOffer").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-spo-bind]");
+    if (b) { bindServerPath(b.dataset.spoBind); return; }
+    const x = e.target.closest("[data-spo-dismiss]");
+    if (x) { state.serverOfferDismissed.add(x.dataset.spoDismiss); renderServerPathOffer(); }
+  });
+  const bindTyped = async () => {
+    const inp = $("serverPathInput");
+    if (await bindServerPath(inp.value)) { inp.value = ""; $("serverPathRow").classList.add("hidden"); toggleDataMenu(false); }
+  };
+  $("serverPathBind").addEventListener("click", bindTyped);
+  $("serverPathInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); bindTyped(); } });
   { const ps = $("presetSearch"); if (ps) ps.addEventListener("input", () => renderPresetList(ps.value)); }
   $("modeSelect").addEventListener("change", onModeChange);
   { const rs = $("routeSelect"); if (rs) rs.addEventListener("change", onRouteChange); }
@@ -4047,6 +4259,7 @@ function init() {
   applyStatus({ status: "disconnected", model: "" });
   renderDatasetChips();
   loadDatasetChips();    // show prior uploads (incl. folders) as selectable chips
+  loadServerRoots();     // server folders that can be bound by path (Data menu + chat offer)
   restoreConnection();   // re-subscribe to a still-live HPC3 session after a reload / back-nav
 }
 

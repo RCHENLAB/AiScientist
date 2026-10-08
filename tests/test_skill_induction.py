@@ -212,9 +212,10 @@ def test_register_skill_is_additive_only():
     existing = Skill(name="already_here", summary="original")
     assert register_skill(existing) is True
     assert register_skill(Skill(name="already_here", summary="impostor")) is False
-    from aiscientist.agents.skills import SKILLS
+    from aiscientist.agents.skills import ALL_SKILLS, SKILLS
     assert SKILLS["already_here"].summary == "original"
     del SKILLS["already_here"]
+    ALL_SKILLS.pop("already_here", None)
 
 
 # --- wired into a run --------------------------------------------------------
@@ -261,16 +262,20 @@ def _run_lab(tmp_path, *, induction=True, seen=None):
 
 
 def test_a_run_induces_a_skill_at_the_end(tmp_path):
-    from aiscientist.agents.skills import SKILLS
+    from aiscientist.agents.skills import ALL_SKILLS, SKILLS
     try:
         events = _run_lab(tmp_path)
         induced = [e for e in events if e["type"] == "skill_induced"]
         assert induced and induced[0]["name"] == "summarize_group_sizes"
+        assert induced[0]["review"] == "pending"
         assert (tmp_path / "summarize_group_sizes" / "reference.py").exists()
-        # available in-process to the NEXT run, without a restart
-        assert "summarize_group_sizes" in SKILLS
+        # in the library in-process, without a restart — but no run is offered it until an admin
+        # approves it (tests/test_skill_review_gate.py)
+        assert ALL_SKILLS["summarize_group_sizes"].review == "pending"
+        assert "summarize_group_sizes" not in SKILLS
     finally:
         SKILLS.pop("summarize_group_sizes", None)
+        ALL_SKILLS.pop("summarize_group_sizes", None)
 
 
 def test_induction_off_by_default_never_asks_and_writes_nothing(tmp_path):

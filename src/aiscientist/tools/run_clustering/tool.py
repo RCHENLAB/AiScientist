@@ -23,6 +23,14 @@ from .._lib.scrna import (
 )
 from ..sdk import HarnessTool
 
+# Leiden as scanpy recommends it from 1.10 on: igraph's implementation, two refinement passes, an
+# undirected graph. The stability sweep and the final partition of a SELECTED resolution both use
+# it, so the resolution that was validated is applied with the algorithm that validated it. The
+# sweep is ~88 Leiden calls, and leidenalg's default (iterate to convergence) took 50-56 s per call
+# at resolution 1-2 on 16,750 cells against 0.7 s here (HPC3, 2026-10-07): the sweep alone ran
+# into the job's 1-hour limit. The default path (no selection) keeps leidenalg.
+_SWEEP_LEIDEN = {"flavor": "igraph", "n_iterations": 2, "directed": False}
+
 
 def _select_resolution(sc: Any, adata: Any, *, candidates: list[float], n_boot: int,
                        subsample: float, stability_min: float, n_neighbors: int,
@@ -57,14 +65,14 @@ def _select_resolution(sc: Any, adata: Any, *, candidates: list[float], n_boot: 
     n_sub = max(2, int(subsample * base.n_obs))
     sweep: list[dict[str, Any]] = []
     for res in candidates:
-        sc.tl.leiden(base, resolution=res, random_state=0, key_added="_ref")
+        sc.tl.leiden(base, resolution=res, random_state=0, key_added="_ref", **_SWEEP_LEIDEN)
         ref = base.obs["_ref"].astype(str).values
         aris: list[float] = []
         for _ in range(n_boot):
             idx = rng.choice(base.n_obs, n_sub, replace=False)
             sub = base[idx].copy()
             sc.pp.neighbors(sub, n_neighbors=n_neighbors, n_pcs=n_pcs, random_state=0)
-            sc.tl.leiden(sub, resolution=res, random_state=0, key_added="_boot")
+            sc.tl.leiden(sub, resolution=res, random_state=0, key_added="_boot", **_SWEEP_LEIDEN)
             aris.append(float(adjusted_rand_score(ref[idx], sub.obs["_boot"].astype(str).values)))
         sweep.append({"resolution": res, "n_clusters": int(base.obs["_ref"].nunique()),
                       "stability": round(float(np.mean(aris)), 4),
@@ -158,7 +166,8 @@ def run_clustering(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
             selection_note = (f"resolution selection failed ({type(exc).__name__}: {exc}); "
                               f"clustered at resolution={resolution} instead.")
 
-    sc.tl.leiden(adata, resolution=resolution, random_state=0, key_added="leiden")
+    leiden_kw = _SWEEP_LEIDEN if resolution_source == "bootstrap_stability" else {}
+    sc.tl.leiden(adata, resolution=resolution, random_state=0, key_added="leiden", **leiden_kw)
     sc.tl.umap(adata, random_state=0)
 
     sc.settings.figdir = str(figs)
@@ -203,7 +212,8 @@ def run_clustering(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "n_small_clusters": len(tiny),
         "existing_celltype_columns": existing,
         "warnings": warnings,
-        "params": {"resolution": resolution, "n_pcs": n_pcs, "n_neighbors": n_neighbors},
+        "params": {"resolution": resolution, "n_pcs": n_pcs, "n_neighbors": n_neighbors,
+                   "leiden_flavor": leiden_kw.get("flavor", "leidenalg")},
         # How the resolution was arrived at. Every downstream cell-type label inherits this
         # partition, so "the default" and "the finest reproducible value" are very different
         # claims and the write-up must be able to tell them apart.

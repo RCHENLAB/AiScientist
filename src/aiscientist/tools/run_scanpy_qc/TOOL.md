@@ -13,8 +13,17 @@ The first step of the single-cell line. It computes per-cell quality metrics (ge
 
 ## When the agent uses it
 
-- First, on any single-cell matrix: `.h5ad`, a 10x `.h5` or `filtered_feature_bc_matrix/` folder, loom, or a text matrix.
+- First, on a single-cell matrix: `.h5ad`, a 10x `.h5` or `filtered_feature_bc_matrix/` folder, loom, or a text matrix.
 - On a subset or merge that a `run_code` step saved, through `input`.
+
+## When the agent does NOT use it
+
+- The bound dataset is a folder of 10x Cell Ranger outputs with raw AND filtered matrices: use
+  `run_cellqc`, which corrects ambient RNA from the raw matrix and QCs every library. This tool
+  reads one filtered matrix and cannot correct ambient RNA. The gateway flags such a folder in the
+  data profile (`⚠ INPUT is a 10x Cell Ranger delivery …`).
+- After `run_cellqc`: it already wrote the filtered, normalised checkpoint. Running this tool on top
+  would filter a second time with different thresholds.
 
 ## Inputs
 
@@ -65,5 +74,6 @@ On the fast chat path: no (research runs only).
 <!-- generated:model-description -->
 > REAL scanpy QC on the uploaded single-cell dataset: per-cell metrics, cell/gene filtering,
 > normalization, log1p, and HVG selection. Writes QC violin/scatter figures and a checkpoint.
-> Returns pre/post cell-gene counts and the thresholds used. Run this FIRST.
+> Returns pre/post cell-gene counts and the thresholds used. Run this FIRST on a single matrix;
+> for a folder of 10x Cell Ranger outputs (raw + filtered matrices) use run_cellqc instead.
 <!-- /generated:model-description -->

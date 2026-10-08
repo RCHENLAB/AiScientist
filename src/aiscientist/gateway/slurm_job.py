@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
+from .errors import GatewayError
 from .executor import RemoteExecutor
 
 EmitFn = Callable[[str, str, str], None]
@@ -238,9 +239,22 @@ def _submit(executor: RemoteExecutor, spec: SlurmJobSpec) -> str:
     return submit.stdout.strip().split()[-1]
 
 
+def _query(executor: RemoteExecutor, command: str):
+    """Run a READ-ONLY Slurm query, sending it once more if the SSH session failed under it.
+
+    A poll is the command most likely to be in flight when the session drops, and one failed
+    ``squeue`` used to end the whole step although the job itself was fine (run 78a707cd79e9). A
+    query is safe to repeat, and the repeat is what reconnects the session (``SSHExecutor``).
+    Never use this for ``sbatch``/``scancel``."""
+    try:
+        return executor.exec(command)
+    except GatewayError:
+        return executor.exec(command)
+
+
 def _queue_state(executor: RemoteExecutor, job_id: str) -> tuple[str, str]:
     """``(state, node)`` from squeue, or ``("", "")`` if the job already left the queue."""
-    r = executor.exec(f"squeue -j {job_id} --noheader --format='%t|%N'")
+    r = _query(executor, f"squeue -j {job_id} --noheader --format='%t|%N'")
     row = r.out.splitlines()[0] if r.out else ""
     if not row:
         return "", ""
@@ -252,7 +266,7 @@ def _terminal_state(executor: RemoteExecutor, job_id: str) -> str:
     """The job's sacct State (COMPLETED|FAILED|RUNNING|...), or ``""`` if sacct has no
     record yet. Unlike before, this does NOT optimistically default to ``COMPLETED`` —
     the caller distinguishes a real terminal state from a lagging/absent one."""
-    r = executor.exec(f"sacct -j {job_id} --noheader --format=State --parsable2")
+    r = _query(executor, f"sacct -j {job_id} --noheader --format=State --parsable2")
     line = r.out.splitlines()[0] if r.out else ""
     return line.strip()
 

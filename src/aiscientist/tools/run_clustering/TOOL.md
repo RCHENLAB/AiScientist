@@ -52,7 +52,7 @@ On the fast chat path: no (research runs only).
 ## Known limits
 
 - Cluster numbers are not cell types. Naming them is `run_marker_annotation` or `scgpt_annotate`.
-- It uses scanpy's `leidenalg` backend; scanpy warns that igraph will become the default.
+- Without `select_resolution` it uses scanpy's `leidenalg` backend, which iterates to convergence; scanpy warns that igraph will become the default. With `select_resolution`, the sweep and the final partition use igraph's two-pass Leiden (`flavor="igraph", n_iterations=2`, undirected), reported as `params.leiden_flavor`. The sweep is about 88 Leiden calls, and leidenalg took 50-56 s per call at resolution 1-2 on 16,750 cells against 0.7 s for igraph, which pushed the sweep into the job's 1-hour limit.
 
 ## Code and tests
 

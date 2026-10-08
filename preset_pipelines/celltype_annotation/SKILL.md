@@ -2,7 +2,7 @@
 name: celltype_annotation
 version: 2
 description: Single-cell cell-type annotation + report (v2 — stability-selected resolution, raw-expression label confirmation, preranked GSEA)
-tools: run_scanpy_qc, run_doublet_detection, run_integration, run_clustering, run_de, run_marker_annotation, run_composition, run_enrichment, run_gsea_prerank, literature_search, run_code
+tools: run_scanpy_qc, run_cellqc, run_doublet_detection, run_integration, run_clustering, run_de, run_marker_annotation, run_composition, run_enrichment, run_gsea_prerank, literature_search, run_code
 data_type: scrna
 ---
 
@@ -12,8 +12,12 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
 
 0. **Establish what the matrix IS, and the rules, before touching it** (`run_code`) — read-only,
    and BEFORE any normalization. Two outputs, both written as tables the later steps read back:
-   * *Provenance.* Inspect `X`, `.raw`, `layers`, value ranges, sparsity and integer-ness, and
-     check whether matrix-derived totals reproduce any stored `nCount`/`nFeature` fields. A
+   * *Provenance.* **Not for a 10x Cell Ranger input whose data profile already rules on it**
+     (its `.h5` matrices were read at upload: integer UMI counts, checked against Cell Ranger's
+     `metrics_summary.csv`). Cite that ruling; do NOT plan a `run_code` step to re-derive it, and
+     write the decision rule below into the plan's first step instead. Otherwise: inspect `X`,
+     `.raw`, `layers`, value ranges, sparsity and integer-ness, and check whether matrix-derived
+     totals reproduce any stored `nCount`/`nFeature` fields. A
      published object often arrives already normalized and log1p'd: normalizing it again has NO
      symptom — every tool succeeds, every figure renders, and every number after it is wrong. So
      rule from the NUMBERS, and say which way you ruled:
@@ -35,12 +39,13 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
      down NOW, while no differential or marker result is visible yet. A threshold chosen after
      seeing which one flatters the answer is not a threshold. Say what happens when a gate
      FAILS: the estimate is marked unsupported and omitted, not softened until it passes.
-1. QC the dataset (`run_scanpy_qc`): per-cell metrics, filter low-quality cells/genes,
+1. QC the dataset (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter low-quality cells/genes,
    normalize + log1p + HVG. Report pre/post counts. For snRNA-seq, a few hundred UMIs per
    nucleus is EXPECTED — do not treat it as a failed run and do not filter it away.
 1b. **Doublets** (`run_doublet_detection`): two cells in one droplet express both parents'
    programmes and form an "intermediate" cluster that reads as a novel transitional cell type.
-   Run this before clustering. Report the rate.
+   Run this before clustering. Report the rate. SKIP it after `run_cellqc`, which already called
+   and removed the doublets (DoubletFinder, with scDblFinder as a second opinion).
 1c. **Integration** (`run_integration`) — REQUIRED when the object holds more than one sample.
    Check the obs profile for a donor/sample/batch column first. Without it the cells cluster by
    donor and every label below is really a donor label, with no visible symptom. Report
@@ -61,13 +66,19 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
    cluster and the results incomparable), GSEA walks the entire ranking and returns a signed
    NES, so GSEA can see coordinated shifts that no per-gene cutoff keeps. They use different inputs and different null hypotheses, so **do
    not require them to agree**, and do not report disagreement as an error in either.
-5. Assign a cell-type label to each cluster with **`run_marker_annotation`**, passing a `panel`
-   and `discriminators` built for THIS tissue (the `annotate_clusters_by_markers_v2` skill
-   explains how to build them and why the discriminator list is not just the panel again).
+5. Assign a cell-type label to each cluster with **`run_marker_annotation`**. For a tissue with a
+   curated reference (retina, human or mouse) pass `reference: "retina"` and NO panel: the
+   markers then come from the curated reference, not from memory (a model-written retina panel
+   once labelled 1,631 Muller glia "Unassigned"/"ganglion"). Otherwise pass a `panel` and
+   `discriminators` built for THIS tissue (the `annotate_clusters_by_markers_v2` skill explains
+   how to build them and why the discriminator list is not just the panel again).
    Signature scores are a first pass only: the z-scored argmax confidently mislabels lineages
    that share markers, so the final call comes from raw marker expression, and a cluster with
    no dominant coherent signal stays `Unassigned` rather than being forced into the nearest
-   label. Report which clusters the raw check CORRECTED and which stayed unassigned.
+   label. A label whose lineage-specific markers are not enriched in the cluster is WITHDRAWN.
+   Report which clusters the raw check CORRECTED, which were withdrawn or stayed unassigned, the
+   tool's warnings, and its composition notes (e.g. a lineage absent because the sample was
+   depleted of it).
 5b. **Composition** (`run_composition`): the proportion each label makes up, per sample.
 6. Produce figures: a UMAP colored by cluster and by assigned cell type, and violin/dot plots
    of canonical marker genes.

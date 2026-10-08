@@ -64,9 +64,16 @@ On the fast chat path: no (research runs only).
 > the per-cell UMI distributions match, re-runs the SAME Wilcoxon contrast, and Spearman-
 > correlates the original ranking against the depth-matched one PER DIRECTION. Use it whenever the
 > dataset profile flags a depth imbalance, and always before interpreting a pan-cell-type
-> signature. rho >= 0.5 = preserved; rho < 0 = the ranking INVERTS once depth is equalised, i.e. a
-> detection artefact that must not be reported as regulation. Reads the raw `counts` layer
-> run_scanpy_qc stores, and writes `tables/depth_matched_summary.csv`,
-> `tables/depth_matched_genes.csv` and a figure. Do NOT hand-write this as run_code: correlating
-> per-gene fold-changes against a single median library size is not a computable operation.
+> signature. It returns the per-direction verdict itself, so no later step needs to re-derive it:
+> each (cell type, direction) is labelled `with_depth` (UP in the deeper arm, what depth can
+> manufacture) or `against_depth`. With the gradient: rho >= 0.5 = preserved; rho < 0 = the
+> ranking INVERTS once depth is equalised, a detection artefact that must not be reported as
+> regulation; and the `depth_robust` column of `tables/depth_matched_genes.csv` marks the genes
+> that kept their sign and >= 80% of their Wilcoxon z — the credible with-gradient set. Against
+> the gradient the verdict is `against_depth_untestable`: depth cannot have produced those genes
+> and this check cannot confirm them either, so their rho is NOT evidence and must not be used as
+> a filter. Reads the raw `counts` layer run_scanpy_qc stores, and writes
+> `tables/depth_matched_summary.csv`, `tables/depth_matched_genes.csv` and a figure. Do NOT hand-
+> write this as run_code: correlating per-gene fold-changes against a single median library size
+> is not a computable operation.
 <!-- /generated:model-description -->

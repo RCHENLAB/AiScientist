@@ -304,6 +304,14 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         else:
             combined.extend(rows_file)
             top_by_group[label] = [r["gene"] for r in rows_file[:10]]
+            # The TRUE count, as for a contrast. A marker table is the top n_genes by score, so
+            # "50 markers" read as "50 significant genes" hid that 2,300-9,644 per cluster cleared
+            # the gate in run f3b8268c4fd4, and its ORA step was asked for the complete set.
+            _, _, totals = _significant_both_directions(rows_full, padj_max, lfc_min, 0)
+            shown = sum(1 for r in rows_file
+                        if r["pval_adj"] < padj_max and abs(r["log2fc"]) >= lfc_min)
+            sig_by_group[label] = {"up": totals["up"], "down": totals["down"], "shown": shown,
+                                   "truncated": totals["up"] + totals["down"] > shown}
         universe.update(r["gene"] for r in rows_full)
         rnk = tables / f"rank_{key}_{_slug(label)}.rnk"
         rnk.write_text("".join(f"{r['gene']}\t{r['score']:.6g}\n" for r in rows_full),
@@ -566,6 +574,17 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 f"({', '.join(one_sided[:6])}). Check this is biology and not a normalisation or "
                 "composition artefact before interpreting it as a coherent programme.")
     else:
+        out["significant_by_group"] = sig_by_group          # {group: {up, down, shown, truncated}}
+        out["significance"] = {"padj_max": padj_max, "abs_log2fc_min": lfc_min}
+        out["n_genes_cap_per_group"] = int(n_genes)
+        if any(v["truncated"] for v in sig_by_group.values()):
+            totals = sorted(v["up"] + v["down"] for v in sig_by_group.values())
+            out["table_truncation_note"] = (
+                f"significant_by_group gives the TRUE counts (median {totals[len(totals) // 2]} "
+                f"of {len(universe)} tested genes per group clear adjusted p < {padj_max} and "
+                f"|log2FC| >= {lfc_min}); the written tables and the gene lists passed downstream "
+                f"are the top {n_genes} per group by score. Report a marker list as a top-N, not "
+                "as the significant set.")
         # Markers from a handful of cells are unstable, and nothing in the marker path had a
         # cell-count floor at all — the contrast path's min_cells does not apply here.
         try:
@@ -608,6 +627,17 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 encoding="utf-8")
         except OSError:
             pass    # a sidecar we could not write must never fail the DE step itself
+    # The same reason for the true significant counts: run_enrichment selects its input from the
+    # per-group tables, and only this says whether such a table is the complete test (a
+    # contrast) or a top-n_genes view of it (markers).
+    try:
+        (tables / f"de_{key}_significance.json").write_text(
+            json.dumps({"per_group_tables": "complete" if contrast else f"top_{n_genes}",
+                        "padj_max": padj_max, "abs_log2fc_min": lfc_min,
+                        "significant_by_group": sig_by_group}),
+            encoding="utf-8")
+    except OSError:
+        pass
     return out
 
 

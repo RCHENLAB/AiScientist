@@ -91,6 +91,12 @@ class HPCSettings:
     # the window, and the paid A100 only takes over when the free pool is genuinely busy. 0 = pure
     # first-come-first-served (the original behaviour). See AISCIENTIST_GPU_PREFER_SECONDS.
     gpu_prefer_seconds: int = 0
+    # How long a GPU request may queue before giving up: at connect (the user is watching and can
+    # retry), and when a RUN loses its serve job mid-way (the job hit its time limit) and needs a new
+    # one. The second is long on purpose: on 2026-10-05 a run with QC, integration and clustering done
+    # was thrown away because no GPU started within 300 s of its serve job expiring.
+    gpu_wait_seconds: int = 300
+    gpu_heal_wait_seconds: int = 1800
 
     # STRICT per-user isolation. The console only ever finds, reuses, or stops
     # the *current user's own* serve job (named bioagent-vllm-<ucinetid> and
@@ -475,6 +481,8 @@ class HPCSettings:
             constraint=os.environ.get("AISCIENTIST_SLURM_CONSTRAINT") or None,
             gpu_candidates=os.environ.get("AISCIENTIST_GPU_CANDIDATES", cls.gpu_candidates),
             gpu_prefer_seconds=_int("AISCIENTIST_GPU_PREFER_SECONDS", cls.gpu_prefer_seconds),
+            gpu_wait_seconds=_int("AISCIENTIST_GPU_WAIT_SECONDS", cls.gpu_wait_seconds),
+            gpu_heal_wait_seconds=_int("AISCIENTIST_GPU_HEAL_WAIT_SECONDS", cls.gpu_heal_wait_seconds),
             # New names, with backward-compat fallback to the old AISCIENTIST_OLLAMA_* so a
             # deployed .env keeps working until it's updated.
             serve_port=_int("AISCIENTIST_VLLM_PORT", _int("AISCIENTIST_OLLAMA_PORT", cls.serve_port)),

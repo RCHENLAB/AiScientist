@@ -74,7 +74,9 @@ sequenceDiagram
 The fast chat path (`agents/quick_chat.py`) splits off before the plan: the same LLM, only the
 `chat: true` tools, a streamed answer and no run directory. Anti-fabrication layers: the Critic's
 deterministic floors (`agents/step_numbers.py`), the claim audit before writing
-(`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing.
+(`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing. The final
+manuscript loses any sentence that attributes a gene to a lineage the curated marker reference contradicts
+(`agents/marker_claims.py`, run just before rendering).
 
 ## How the code is layered
 

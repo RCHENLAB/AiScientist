@@ -1,7 +1,7 @@
 ---
 name: perturbation_analysis
 description: Analyze a pooled CRISPR / Perturb-seq screen — rank which perturbations change the transcriptome, then per-perturbation DE vs the non-targeting control
-tools: run_scanpy_qc, run_clustering, run_de, run_enrichment, run_code, literature_search
+tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, run_code, literature_search
 data_type: scrna
 ---
 
@@ -38,7 +38,7 @@ category values are given at planning time) and infer:
 
 ## Ordered plan
 
-1. **QC** (`run_scanpy_qc`): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
+1. **QC** (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor QC columns already in the data. Do NOT drop the control cells.
 2. **Embedding** (`run_clustering`): compute PCA/neighbors/UMAP. The PCA embedding is what the
    effect-size ranking (step 4) measures distances in; a UMAP colored by perturbation is a useful

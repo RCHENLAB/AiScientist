@@ -19,6 +19,7 @@ Endpoint differences vs Ollama's native API:
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -503,6 +504,7 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
     usage: dict = {}
     finish = ""
     served_model = ""
+    done = False
     try:
         with urllib.request.urlopen(req, timeout=idle_timeout) as resp:  # noqa: S310 - local tunnel
             for raw in resp:
@@ -511,6 +513,7 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    done = True
                     break
                 try:
                     chunk = json.loads(data)
@@ -532,9 +535,16 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise GatewayError(f"vLLM completion error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise VLLMNetworkError(f"vLLM sent nothing for {idle_timeout:.0f}s (or the connection dropped).",
                                stage="vllm_chat", detail=error_detail(exc)) from exc
+    if not done and not finish:
+        # The stream ended with neither [DONE] nor a finish_reason: the server stopped mid-reply.
+        # Returning what had arrived made a cut-off reply look like the answer — in run 78a707cd79e9
+        # the serve job hit its Slurm --time while the PI was writing the synthesis, and the run
+        # kept an EMPTY synthesis instead of healing the session and asking again.
+        raise VLLMNetworkError("vLLM stopped mid-reply (the stream ended before the reply finished).",
+                               stage="vllm_chat", detail={"chars_received": sum(map(len, parts))})
     usage.setdefault("model", served_model or model)
     usage.setdefault("finish_reason", finish)
     return "".join(parts), usage

@@ -54,7 +54,7 @@ def _fake_sc(unstable_at):
     it, labels are drawn at random per call — the signature of over-clustering."""
     rng = np.random.default_rng(1234)
 
-    def leiden(ad, resolution, random_state=0, key_added="leiden"):
+    def leiden(ad, resolution, random_state=0, key_added="leiden", **_kw):
         idx = ad._idx
         if resolution >= unstable_at:
             ad.obs[key_added] = rng.integers(0, 12, size=ad.n_obs)
@@ -111,7 +111,7 @@ def test_a_single_cluster_never_wins_however_stable_it_looks():
     def one_cluster_below(threshold):
         rng = np.random.default_rng(7)
 
-        def leiden(ad, resolution, random_state=0, key_added="leiden"):
+        def leiden(ad, resolution, random_state=0, key_added="leiden", **_kw):
             if resolution < threshold:
                 ad.obs[key_added] = np.zeros(ad.n_obs, dtype=int)      # everything in one group
             else:
@@ -129,7 +129,7 @@ def test_a_single_cluster_never_wins_however_stable_it_looks():
 
 
 def test_no_structure_at_any_resolution_is_reported_as_such():
-    def always_one(ad, resolution, random_state=0, key_added="leiden"):
+    def always_one(ad, resolution, random_state=0, key_added="leiden", **_kw):
         ad.obs[key_added] = np.zeros(ad.n_obs, dtype=int)
 
     sc = types.SimpleNamespace(tl=types.SimpleNamespace(leiden=always_one),
@@ -144,3 +144,22 @@ def test_stability_floor_is_honoured_as_given():
     assert strict == 0.6
     lax, sweep, _ = _select(_AData(400), _fake_sc(unstable_at=1.0), stability_min=0.90)
     assert lax == 0.8 and {r["resolution"] for r in sweep} == {0.2, 0.4, 0.6, 0.8, 1.0}
+
+
+def test_every_sweep_clustering_uses_the_fast_leiden():
+    # The sweep is n_candidates x (1 + n_boot) Leiden calls. leidenalg's default iterates to
+    # convergence, 50-56 s a call at resolution 1-2 on 16,750 cells, and put the default sweep
+    # (88 calls) at the job's 1-hour limit on HPC3 (run f3b8268c4fd4). Every call must use
+    # igraph's two-pass Leiden, which took 0.7 s on the same graph.
+    seen = []
+    sc = _fake_sc(unstable_at=0.8)
+    inner = sc.tl.leiden
+
+    def leiden(ad, resolution, random_state=0, key_added="leiden", **kw):
+        seen.append(kw)
+        inner(ad, resolution, random_state=random_state, key_added=key_added)
+
+    sc.tl.leiden = leiden
+    _select(_AData(400), sc, n_boot=3)
+    assert len(seen) == 5 * (1 + 3)
+    assert all(kw == {"flavor": "igraph", "n_iterations": 2, "directed": False} for kw in seen)
