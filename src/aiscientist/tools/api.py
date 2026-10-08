@@ -63,6 +63,11 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # HPC3 job runtime
     "run_analysis_tool": ("aiscientist.tools.scrna_cli", "run_tool"),
     "INSTALL_DEPENDENCY": ("aiscientist.tools.scrna_cli", "INSTALL_DEPENDENCY"),
+    # the processed dataset a run hands on (built from its checkpoints at the end of the run)
+    "EXPORT_RESULT_DATASET": ("aiscientist.tools.scrna_cli", "EXPORT_RESULT_DATASET"),
+    "export_result_dataset": ("aiscientist.tools._lib.result_dataset", "export"),
+    "result_dataset_name": ("aiscientist.tools._lib.result_dataset", "result_name"),
+    "RESULT_DATASET_POINTER": ("aiscientist.tools._lib.result_dataset", "POINTER"),
     "resolve_run_dependency": ("aiscientist.tools.run_deps", "resolve"),
     "DEPS_DIRNAME": ("aiscientist.tools.run_deps", "DEPS_DIRNAME"),
     "SITECUSTOMIZE": ("aiscientist.tools.run_deps", "SITECUSTOMIZE"),

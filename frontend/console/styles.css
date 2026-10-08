@@ -1001,6 +1001,8 @@ button.full { width: 100%; margin-top: 6px; }
 .card-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .card-main strong { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-main .muted { font-size: 12px; }
+.run-dataset { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.run-dataset .muted.small, .run-dataset .ok.small { font-size: 12px; overflow-wrap: anywhere; }
 
 /* run artifacts panel */
 .run-artifacts { margin-top: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px; }

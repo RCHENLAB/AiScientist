@@ -3715,6 +3715,7 @@ function initShell() {
   document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
   $("datasetsRefresh").addEventListener("click", loadDatasets);
   $("runsRefresh").addEventListener("click", loadRuns);
+  $("runsList").addEventListener("click", onRunsClick);
   $("adminRefresh").addEventListener("click", loadAdminUsers);
   $("systemRefresh").addEventListener("click", loadSystem);
   $("createUserForm").addEventListener("submit", createUser);
@@ -3906,15 +3907,42 @@ async function loadRuns() {
   const owner = state.user ? state.user.username : "";
   try {
     const items = (await (await fetch("/api/runs")).json()).runs || [];
+    // The processed dataset each run handed on (an .h5ad kept beside the run, not in the zip).
+    let results = {};
+    try {
+      const rd = (await (await fetch("/api/result-datasets")).json()).result_datasets || [];
+      results = Object.fromEntries(rd.map((r) => [r.run_id, r]));
+    } catch {}
     el.innerHTML = items.length ? items.map((x) => {
       const done = x.status === "done" || x.status === "incomplete";
       const zip = done
         ? `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
         : `<span class="muted small">${escapeHtml(x.status)}</span>`;
-      return `<div class="card"><div class="card-main"><strong>${escapeHtml((x.question || "").slice(0, 90))}</strong>` +
-        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span></div>${zip}</div>`;
+      const r = results[x.run_id];
+      const dataset = r ? `<div class="run-dataset">` +
+        `<span class="muted small">📦 ${escapeHtml(r.name || "")} · ${r.n_cells} cells × ${r.n_genes} genes · ${(Number(r.size_bytes || 0) / 1e6).toFixed(0)} MB</span>` +
+        (r.saved_to
+          ? `<span class="ok small" title="${escapeHtml(r.saved_to)}">Saved to my data</span>`
+          : `<span class="muted small">kept ${escapeHtml(String(r.kept_days ?? ""))} days ${r.location === "hpc3" ? "on HPC3" : "on the server"}</span>` +
+            `<button class="ghost small" data-save-result="${escapeHtml(x.run_id)}">Save to my data</button>`) +
+        `</div>` : "";
+      return `<div class="card run-card"><div class="card-main"><strong>${escapeHtml((x.question || "").slice(0, 90))}</strong>` +
+        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${dataset}</div>${zip}</div>`;
     }).join("") : '<div class="empty-hint">No runs yet.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+}
+
+async function onRunsClick(e) {
+  const b = e.target.closest("[data-save-result]");
+  if (!b) return;
+  b.disabled = true; b.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/result-datasets/${encodeURIComponent(b.dataset.saveResult)}/save`, { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) { toast(j.error || "Could not save the dataset."); b.disabled = false; b.textContent = "Save to my data"; return; }
+    toast(`Saved to ${j.path} — it is in your Datasets now.`);
+    loadRuns();
+  } catch (err) { toast("Could not save the dataset: " + err.message); b.disabled = false; b.textContent = "Save to my data"; }
 }
 
 // ---- Admin view ----

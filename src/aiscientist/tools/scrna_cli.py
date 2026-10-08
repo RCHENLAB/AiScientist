@@ -26,6 +26,7 @@ from typing import Any
 
 RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
 INSTALL_DEPENDENCY = "_install_dependency"
+EXPORT_RESULT_DATASET = "_export_result_dataset"
 
 
 class _Ctx:
@@ -68,6 +69,11 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str
         # dependency missing (see run_deps.ALLOWED); anything else is refused there.
         from .run_deps import install
         return install(workspace, str(args.get("dependency", "")))
+    if tool == EXPORT_RESULT_DATASET:
+        # Not a model-facing tool: the gateway submits it once at the end of a run, before the
+        # checkpoints are released, to hand on the processed dataset (see _lib/result_dataset).
+        from ._lib.result_dataset import export
+        return export(workspace, str(args.get("name", "")), args.get("meta") or {})
     fn = _analysis_tools(only=tool).get(tool)
     if fn is None:
         return {"status": "error", "error": f"unknown analysis tool: {tool}"}

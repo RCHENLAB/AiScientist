@@ -15,7 +15,8 @@ import traceback
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, NamedTuple
+from types import SimpleNamespace
+from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -5416,6 +5417,54 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
         print(f"[lab] run_state persist failed: {exc}")
 
 
+async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dict, analysis_executor: Any,
+                                 question: str, emit: Callable[..., Any]) -> "dict | None":
+    """Hand on the processed dataset before the checkpoints are released (tools/_lib/result_dataset).
+
+    A run used to deliver a report and no dataset: its ``work/adata_*.h5ad`` checkpoints were
+    deleted at publish and nothing copied them anywhere. Now the QC checkpoint, with the clusters,
+    labels and embeddings of the later ones, is written as ``<input>.processed.<time>.<run>.h5ad``
+    next to the run's checkpoints (on HPC3 for an HPC3 run: it is not pulled back), and a pointer
+    plus a per-cell table land in ``artifacts``. It stays as long as the run's process files do
+    (``temp_ttl_days`` on HPC3); "save to my data" moves it to the user's personal folder.
+    Best-effort: an export that fails costs the dataset, never the run."""
+    from ..tools.api import EXPORT_RESULT_DATASET, export_result_dataset, result_dataset_name
+    source = str(decisions.get("hpc_primary") or decisions.get("dataset_path") or "")
+    name = result_dataset_name(source, run_id)
+    on_hpc = analysis_executor is not None
+    kept_days = conn.settings.temp_ttl_days if on_hpc else conn.settings.checkpoint_ttl_days
+    meta = {"run_id": run_id, "owner": conn.owner, "question": (question or "")[:500],
+            "source_dataset": source, "location": "hpc3" if on_hpc else "gateway",
+            "kept_days": kept_days}
+    try:
+        if on_hpc:
+            ctx = SimpleNamespace(workspace=conn.workspace / run_id, decisions=dict(decisions))
+            out = await asyncio.to_thread(analysis_executor.run_tool, EXPORT_RESULT_DATASET,
+                                          {"name": name, "meta": meta}, ctx)
+        else:
+            out = await asyncio.to_thread(export_result_dataset, conn.workspace / run_id, name, meta)
+    except Exception as exc:  # noqa: BLE001 - the analysis and report are done; never fail the run
+        emit("warning", "lab", f"Processed dataset not exported (non-fatal): {exc}")
+        return None
+    status = (out or {}).get("status")
+    if status == "ok":
+        rd = out.get("result_dataset") or {}
+        where = "on HPC3" if on_hpc else "on the server"
+        emit("success", "lab",
+             f"📦 Processed dataset ready: {name} — {rd.get('n_cells')} cells × {rd.get('n_genes')} "
+             f"genes, {int(rd.get('size_bytes') or 0) / 1e6:.0f} MB, with the clusters, cell types "
+             f"and embeddings. Kept {kept_days} days {where}; Runs → “Save to my data” moves it "
+             "to your personal folder as a dataset the next analysis can start from. A per-cell "
+             "table (tables/cells.csv) is in the bundle.")
+        return rd
+    if status == "skipped":
+        emit("info", "lab", f"No processed dataset to export: {out.get('reason', '')}")
+    else:
+        emit("warning", "lab", f"Processed dataset not exported (non-fatal): "
+                               f"{str((out or {}).get('error', out))[:200]}")
+    return None
+
+
 def _drop_process_files(run_dir: Path) -> int:
     """Delete a finished run's PROCESS files, keeping ``artifacts/``. Returns bytes freed.
 
@@ -5477,14 +5526,17 @@ def _expire_old_checkpoints(runs_root: Path, ttl_days: int, *, now: float | None
     the report keeps working; only step-level ``continue`` needs the run re-run once after expiry.
     Since :func:`_drop_process_files` releases ``work/`` the moment the report exists, this TTL
     sweeper is now a backstop for runs that never reached that point. ``ttl_days <= 0`` disables. Returns how many ``work/`` dirs were
-    removed. Best-effort and path-guarded to stay strictly under ``runs_root``."""
+    removed. Best-effort and path-guarded to stay strictly under ``runs_root``.
+
+    A local run's exported ``result/`` (the processed dataset, see :func:`_export_result_dataset`)
+    expires the same way unless the user saved it to their data, which MOVES it out of the run."""
     if ttl_days <= 0 or not runs_root.exists():
         return 0
     import time as _time
     cutoff = (now if now is not None else _time.time()) - ttl_days * 86400
     root = runs_root.resolve()
     removed = 0
-    for work in root.glob("*/*/work"):
+    for work in [*root.glob("*/*/work"), *root.glob("*/*/result")]:
         try:
             if not work.is_dir() or root not in work.resolve().parents:
                 continue
@@ -6880,6 +6932,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("info", "lab", "Technical report skipped — you stopped the write-up.")
         except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
             emit("warning", "lab", f"Technical report step failed: {exc}")
+
+        # The processed dataset, BEFORE the cleanup below releases the checkpoints it is built from.
+        await _export_result_dataset(conn, run_id, decisions, analysis_executor, req.question, emit)
 
         say_key("✅ Report ready — see below and the Downloads panel." if not abandoned()
                 else "🛑 Write-up skipped — the run's figures, tables and report.md are in the "
@@ -8910,6 +8965,131 @@ async def get_bundle(owner: str, run_id: str) -> Response:
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="aiscientist_results_{run_id}.zip"'},
     )
+
+
+# --- the processed dataset a run hands on (see _export_result_dataset) ------------------------
+# Saved results go to the user's personal lab folder on HPC3 (never swept), in one subfolder, so a
+# member finds them outside AiScientist too; a local run's go to their uploads.
+_RESULTS_FOLDER = "AiScientist_results"
+_RESULT_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.processed\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+\.h5ad")
+
+
+def _result_pointer_path(owner: str, run_id: str) -> Path:
+    from ..tools.api import RESULT_DATASET_POINTER
+    return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / RESULT_DATASET_POINTER
+
+
+def _move_on_hpc(conn: "Connection", src: str, dest: str) -> "tuple[bool, str]":
+    """Move ``src`` (and its ``.json`` record) to ``dest`` on dfs3b. On one filesystem that is a
+    rename, metadata only, fine on the login node. Across filesystems ``mv`` would copy the whole
+    matrix on the login node, which RCIC forbids, so it then runs as a short CPU Slurm job."""
+    q = shlex.quote
+    dest_dir = dest.rsplit("/", 1)[0]
+    check = conn.executor.exec(
+        f"mkdir -p {q(dest_dir)} && test -f {q(src)} && test ! -e {q(dest)} && "
+        f"echo \"$(stat -c %d {q(src)}) $(stat -c %d {q(dest_dir)})\"")
+    if not check.ok:
+        return False, ("the processed file is no longer on HPC3 (process files are swept after a "
+                       "few days), or a file of that name is already in your folder")
+    devices = (check.stdout or "").split()[-2:]
+    mv = f"mv {q(src)} {q(dest)} && (mv {q(src + '.json')} {q(dest + '.json')} 2>/dev/null || true)"
+    if len(devices) == 2 and devices[0] == devices[1]:
+        res = conn.executor.exec(mv)
+    else:
+        st = conn.settings
+        acct = f"--account={q(st.cpu_account)} " if st.cpu_account else ""
+        res = conn.executor.exec(f"srun --partition={q(st.cpu_partition)} {acct}--time=00:30:00 "
+                                 f"--mem=2G --cpus-per-task=1 --job-name=aiscientist_save_result "
+                                 f"bash -c {q(mv)}")
+    return res.ok, (res.stderr or res.stdout or "")[-300:]
+
+
+@app.get("/api/result-datasets")
+async def list_result_datasets(request: Request) -> JSONResponse:
+    """The caller's runs that exported a processed dataset, newest first, with where it is now."""
+    if not _AUTH_ENABLED:
+        return JSONResponse({"result_datasets": []})
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    from ..tools.api import RESULT_DATASET_POINTER
+    rows = []
+    for p in (CONSOLE_RUNS_DIR / safe_name(user.username)).glob(f"*/artifacts/data/{RESULT_DATASET_POINTER}"):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            rows.append({"run_id": p.parents[2].name,
+                         **{k: rec.get(k) for k in ("name", "size_bytes", "n_cells", "n_genes",
+                                                    "created_at", "kept_days", "location",
+                                                    "saved_to", "saved_at")}})
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return JSONResponse({"result_datasets": rows})
+
+
+@app.post("/api/result-datasets/{run_id}/save")
+async def save_result_dataset(run_id: str, request: Request) -> JSONResponse:
+    """Move a run's processed dataset into the caller's personal folder — named with its input,
+    a ``processed`` marker, the time and the run — and list it among their datasets, so the next
+    analysis can start from it without anyone downloading it."""
+    if not _AUTH_ENABLED:
+        return JSONResponse({"error": "Saving a dataset requires accounts."}, status_code=400)
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if not run_id.isalnum():
+        return JSONResponse({"error": "bad run id"}, status_code=400)
+    pointer_path = _result_pointer_path(user.username, run_id)
+    try:
+        rec = json.loads(pointer_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return JSONResponse({"error": "This run has no processed dataset."}, status_code=404)
+    if rec.get("saved_to"):
+        return JSONResponse({"ok": True, "path": rec["saved_to"], "already": True})
+    name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
+    if not _RESULT_NAME_RE.fullmatch(name):
+        return JSONResponse({"error": "unexpected result file name"}, status_code=400)
+    if rec.get("location") == "hpc3":
+        conn = _active_conn_for_user(user)
+        if conn is None:
+            return JSONResponse({"error": "Connect to HPC3 first: the processed dataset is there."},
+                                status_code=409)
+        if src != f"{_temp_base(conn)}/analysis/{run_id}/result/{name}":
+            return JSONResponse({"error": "unexpected source path"}, status_code=400)
+        dest = f"{_storage_base(conn)}/{_RESULTS_FOLDER}/{name}"
+        ok, detail = await asyncio.to_thread(_move_on_hpc, conn, src, dest)
+        if not ok:
+            return JSONResponse({"error": f"Could not move the dataset: {detail}"}, status_code=409)
+    else:
+        owner_dir = (CONSOLE_RUNS_DIR / safe_name(user.username)).resolve()
+        src_p = Path(src).resolve()
+        if src_p.parent != (owner_dir / run_id / "result").resolve() or not src_p.is_file():
+            return JSONResponse({"error": "The processed file is no longer on the server."},
+                                status_code=409)
+        dest_p = owner_dir / "uploads" / "processed" / name
+        if dest_p.exists():
+            return JSONResponse({"error": "A file of that name is already saved."}, status_code=409)
+        dest_p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_p), str(dest_p))
+        sidecar = src_p.with_name(src_p.name + ".json")
+        if sidecar.is_file():
+            shutil.move(str(sidecar), str(dest_p.with_name(dest_p.name + ".json")))
+        dest = str(dest_p)
+    dataset_id = None
+    try:
+        if not auth_routes.dataset_path_recorded(user.id, dest):
+            dataset_id = auth_routes.record_dataset(user.id, name, dest,
+                                                    int(rec.get("size_bytes") or 0), "h5ad")
+    except Exception as exc:  # noqa: BLE001 - the file is moved; the history row is best-effort
+        print(f"[result-dataset] record_dataset failed: {exc}")
+    rec.update(saved_to=dest, path=dest,
+               saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    try:
+        pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[result-dataset] could not update {pointer_path}: {exc}")
+    return JSONResponse({"ok": True, "path": dest, "dataset_id": dataset_id})
 
 
 @app.get("/api/system")
