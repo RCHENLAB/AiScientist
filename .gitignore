@@ -54,3 +54,6 @@ output/
 ssh_creds/
 llm_creds/
 src/aiscientist/gateway/_app_prefix_9d72d43.py
+
+# scripts/inspect_run.py output: a run's question and chat messages, never committed
+run_inspect/

@@ -23,8 +23,9 @@ const [appPath, tusPath] = JSON.parse(process.env.TUS_TEST_PATHS);
 const tus = require(tusPath);
 const src = fs.readFileSync(appPath, "utf8");
 const block = src.slice(src.indexOf("// -- resuming over tus"), src.indexOf("// Send one file over tus"));
-const api = vm.runInNewContext(block + "\n;({ tusShouldRetry, tusResumeGuard, tusResponseOf, pickPreviousUpload })",
-  { window: { tus }, tusHeaders: () => ({ "Tus-Resumable": "1.0.0" }), console,
+const api = vm.runInNewContext(block + "\n;({ tusShouldRetry, tusResumeGuard, tusResponseOf, pickPreviousUpload, findServerUpload, previousUploadFor })",
+  { window: { tus, location: { href: "http://test/console" } }, tusHeaders: () => ({ "Tus-Resumable": "1.0.0" }), console,
+    UPLOAD_CHUNK: 4, state: { connectionId: "c1" }, crypto: globalThis.crypto, URL,
     fetch: async () => { throw new TypeError("the page asked the server unexpectedly"); } });
 
 // A scripted tus server: `answer(request)` gives [status, headers] for each request.
@@ -53,8 +54,10 @@ function storage(entries) {
     addUpload: async (fp, v) => { const k = `tus::${fp}::n${items.size}`; items.set(k, v); return k; } };
 }
 const stored = (s) => [...s.items.values()].map((v) => v.uploadUrl.replace("http://test", ""));
-// The page's way of continuing a file (tusUpload): pick the stored upload, resume it, start.
-function upload(answer, { guard = true, entries = [{ uploadUrl: "http://test/api/tus/old", size: 10 }], probe } = {}) {
+// The page's way of continuing a file (tusUpload): the stored upload, else the one the server holds,
+// resumed, started.
+function upload(answer, { guard = true, entries = [{ uploadUrl: "http://test/api/tus/old", size: 10 }], probe,
+                          file = new Blob([Buffer.alloc(10)]) } = {}) {
   return new Promise((resolve) => {
     const http = stack(answer), urls = storage(entries);
     const done = (ok, err) => resolve({ ok, log: http.log, stored: stored(urls),
@@ -63,8 +66,8 @@ function upload(answer, { guard = true, entries = [{ uploadUrl: "http://test/api
       httpStack: http, urlStorage: urls, fingerprint: async () => "fp",
       onShouldRetry: api.tusShouldRetry, onSuccess: () => done(true), onError: (err) => done(false, err) };
     if (guard) options.onAfterResponse = api.tusResumeGuard;
-    const up = new tus.Upload(new Blob([Buffer.alloc(10)]), options);
-    up.findPreviousUploads().then((previous) => api.pickPreviousUpload(previous, up.options.urlStorage, probe))
+    const up = new tus.Upload(file, options);
+    api.previousUploadFor(up, file, {}, probe)
       .then((previous) => { if (previous) up.resumeFromPreviousUpload(previous); up.start(); });
   });
 }
@@ -91,6 +94,17 @@ function probe(states) {
   return { fetch, calls };
 }
 const at = (offset, length = 10) => ({ "Upload-Offset": String(offset), "Upload-Length": String(length) });
+// The server's answer to POST /api/tus/find: [status, body], or "down" for no answer at all.
+function finder(answer) {
+  const calls = [];
+  const fetch = async (url, init) => {
+    calls.push({ method: init.method, url, body: init.body ? JSON.parse(init.body) : null });
+    if (answer === "down") throw new TypeError("Failed to fetch");
+    return { ok: answer[0] < 300, status: answer[0], json: async () => answer[1] };
+  };
+  return { fetch, calls };
+}
+const picked = () => new File([Buffer.alloc(10)], "data.bin", { lastModified: 1760400000000 });
 const two = [{ uploadUrl: "http://test/api/tus/old", size: 10, creationTime: "Tue Oct 13 2026 21:00:10 GMT-0700" },
              { uploadUrl: "http://test/api/tus/new", size: 10, creationTime: "Tue Oct 13 2026 21:03:00 GMT-0700" }];
 
@@ -120,6 +134,27 @@ const two = [{ uploadUrl: "http://test/api/tus/old", size: 10, creationTime: "Tu
   // The whole page, two stored uploads: the further one continues, nothing is created.
   out.page_two_stored = await upload(server([200]), { entries: two,
     probe: probe({ "/api/tus/old": [200, at(2)], "/api/tus/new": [200, at(5)] }).fetch });
+
+  // Nothing stored in this browser: the server's upload of the file continues from its offset.
+  const elsewhere = async (answer) => {
+    const f = finder(answer);
+    const run = await upload(server([200]), { entries: [], probe: f.fetch, file: picked() });
+    return { ...run, finds: f.calls };
+  };
+  out.server_found = await elsewhere([200, { upload: { url: "/api/tus/srv", offset: 5, length: 10 } }]);
+  out.server_none = await elsewhere([200, { upload: null }]);
+  out.server_error = await elsewhere([500, {}]);
+  out.server_down = await elsewhere("down");
+  const asked = finder([200, { upload: { url: "/api/tus/srv", offset: 5, length: 10 } }]);
+  out.stored_first = { ...(await upload(server([200]), { probe: asked.fetch, file: picked() })), finds: asked.calls };
+  const quiet = finder([200, { upload: null }]);
+  out.not_asked = {
+    one_chunk: await api.findServerUpload(new File([Buffer.alloc(4)], "s.csv", { lastModified: 1 }), {}, quiet.fetch),
+    no_time: await api.findServerUpload(new Blob([Buffer.alloc(10)]), {}, quiet.fetch),
+    calls: quiet.calls.length };
+  const folder = finder([200, { upload: null }]);
+  await api.findServerUpload(picked(), { folder: "study", rel_path: "study/raw/data.bin" }, folder.fetch);
+  out.folder_body = folder.calls[0].body;
   console.log(JSON.stringify(out));
 })();
 """
@@ -226,3 +261,42 @@ def test_the_page_continues_the_further_of_two_stored_uploads(runs):
     assert run["ok"] is True
     assert _methods(run) == ["HEAD /api/tus/new", "PATCH /api/tus/new"]
     assert run["stored"] == ["/api/tus/new"]
+
+
+# --- a browser with nothing stored continues the server's upload of the file ------------------------
+
+def test_the_server_upload_of_the_file_continues_from_its_offset(runs):
+    """Another computer, a private window, cleared site data: nothing stored for the file."""
+    import hashlib
+    run = runs["server_found"]
+    assert run["ok"] is True
+    assert _methods(run) == ["HEAD /api/tus/srv", "PATCH /api/tus/srv"]     # no POST: nothing created
+    assert run["log"][-1]["offset"] == "5"
+    assert run["stored"] == ["/api/tus/srv"]          # now stored here too: a reload brings it back
+    assert run["finds"] == [{"method": "POST", "url": "/api/tus/find", "body": {
+        "connection_id": "c1", "name": "data.bin", "rel_path": "", "size": 10, "last_modified": 1760400000000,
+        "head_sha256": hashlib.sha256(bytes(4)).hexdigest()}}]
+
+
+@pytest.mark.parametrize("case", ("server_none", "server_error", "server_down"))
+def test_without_a_server_upload_the_file_starts_as_before(runs, case):
+    run = runs[case]
+    assert run["ok"] is True
+    assert _methods(run) == ["POST /api/tus", "PATCH /api/tus/new"]
+    assert run["log"][-1]["offset"] == "0"
+    assert len(run["finds"]) == 1
+
+
+def test_an_upload_stored_in_this_browser_is_not_looked_up(runs):
+    run = runs["stored_first"]
+    assert _methods(run) == ["HEAD /api/tus/old", "PATCH /api/tus/old"]
+    assert run["finds"] == []
+
+
+def test_a_file_that_cannot_be_left_part_way_is_not_looked_up(runs):
+    assert runs["not_asked"] == {"one_chunk": None, "no_time": None, "calls": 0}
+
+
+def test_a_folder_file_is_looked_up_by_its_path(runs):
+    body = runs["folder_body"]
+    assert body["rel_path"] == "study/raw/data.bin" and body["name"] == "data.bin"

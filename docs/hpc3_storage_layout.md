@@ -23,7 +23,7 @@ the server when a step finishes, to `<AISCIENTIST_RESULTS_DIR>/<ucinetid>/<run_i
 │   ├── reports/<run_id>/               <- the render bundle
 │   ├── server-data/<session>/          <- this session's copies of datasets bound from the server
 │   ├── paperqa/
-│   └── scratch/{analysis,runcode,variant,phenotype,paperqa,report,worker}/
+│   └── scratch/{analysis,runcode,variant,phenotype,paperqa,report,worker}/<run_id>/
 │                                       <- each job's sbatch script, args/result JSON, Slurm log
 │                                          and tool log (see "Job files")
 ├── uploads/<ucinetid>/                 <- raw research data, never swept
@@ -54,7 +54,9 @@ Never deleted automatically:
 
 Every job a run starts on HPC3 has a few small files of its own: the sbatch script, the args JSON
 it is given, the result JSON it prints, the Slurm log (`#SBATCH --output`) and the tool's stderr
-log. They go to `Temp/<ucinetid>/scratch/<line>/`, one directory per job line:
+log. They go to `Temp/<ucinetid>/scratch/<line>/<run_id>/`: one directory per job line, and in
+it one per run, so two runs in flight at once (two chats of one session) never share a file name.
+The session's CPU worker belongs to no run and writes to `scratch/worker/` itself.
 
 | Job line | Directory under `Temp/<ucinetid>/` |
 |---|---|
@@ -80,8 +82,9 @@ It runs as a Slurm batch job, never on a login node. The gateway's login-node se
 `sbatch --wrap`; the `find` and `rm` happen on a compute node in the free `standard` partition
 (1 CPU, 2 G, 30 min cap).
 
-A **unit** is one `Temp/<user>/<kind>/<entry>` directory (a run directory, or a flat scratch
-directory with no per-run subdirectories). A unit is deleted only when its entire subtree has gone
+A **unit** is one `Temp/<user>/<kind>/<entry>` directory: a run directory such as
+`analysis/<run_id>`, or one job line's directory such as `scratch/runcode`, with the run folders in
+it. A unit is deleted only when its entire subtree has gone
 untouched for `--ttl-days`. A long-running job keeps writing, so it is never half-deleted, and a run
 with files of mixed age is either removed whole or kept whole.
 

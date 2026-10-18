@@ -100,8 +100,10 @@ def test_vep_plugin_flags_off_by_default(monkeypatch):
 
 
 def test_vep_plugin_flags_adds_only_staged_predictors(tmp_path):
-    cadd = tmp_path / "cadd.tsv.gz"; cadd.write_text("x")
-    am = tmp_path / "am.tsv.gz"; am.write_text("x")
+    cadd = tmp_path / "cadd.tsv.gz"
+    cadd.write_text("x")
+    am = tmp_path / "am.tsv.gz"
+    am.write_text("x")
     env = {"AISCIENTIST_VEP_PLUGINS": "1", "AISCIENTIST_VEP_CADD_SNV": str(cadd),
            "AISCIENTIST_VEP_ALPHAMISSENSE": str(am),
            "AISCIENTIST_VEP_REVEL": str(tmp_path / "missing_revel.tsv.gz")}   # REVEL file absent → skipped
@@ -124,7 +126,8 @@ def test_build_vep_cmd_adds_plugins_and_hgvs():
 def test_vep_plugin_flags_explicit_paths_win_over_env(tmp_path, monkeypatch):
     # The gateway injects paths (they resolve inside vep.sif) — explicit args must work with NO env set.
     monkeypatch.delenv("AISCIENTIST_VEP_PLUGINS", raising=False)
-    cadd = tmp_path / "cadd.tsv.gz"; cadd.write_text("x")
+    cadd = tmp_path / "cadd.tsv.gz"
+    cadd.write_text("x")
     flags = vo.vep_plugin_flags(enabled=True, cadd_snv=str(cadd))
     assert f"CADD,snv={cadd}" in " ".join(flags) and "--mane_select" in flags
     assert vo.vep_plugin_flags(enabled=False, cadd_snv=str(cadd)) == ()   # master switch off → nothing
@@ -159,9 +162,12 @@ def test_parse_offline_line_reads_predictors_and_review():
 
 
 def test_run_offline_normalizes_when_ref_fasta_staged(tmp_path, monkeypatch):
-    ds = tmp_path / "s.vcf.gz"; ds.write_bytes(b"\x1f\x8b")
-    cache = tmp_path / "cache"; cache.mkdir()
-    ref = tmp_path / "ref.fa"; ref.write_text(">1\nACGT\n")
+    ds = tmp_path / "s.vcf.gz"
+    ds.write_bytes(b"\x1f\x8b")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    ref = tmp_path / "ref.fa"
+    ref.write_text(">1\nACGT\n")
     monkeypatch.setenv("AISCIENTIST_REF_FASTA", str(ref))
     monkeypatch.delenv("AISCIENTIST_VEP_PLUGINS", raising=False)
     seen: list[list[str]] = []
@@ -351,11 +357,16 @@ def _fake_runner_with_spliceai(jsonl_lines, ds_by_pos):
 
 
 def test_run_offline_spliceai_stage_scores_rows(tmp_path):
-    ds = tmp_path / "sample.vcf.gz"; ds.write_bytes(b"\x1f\x8b")
-    cache = tmp_path / "cache"; cache.mkdir()
-    ref = tmp_path / "GRCh38.fa"; ref.write_text(">1\nACGT\n", encoding="utf-8")
-    sa_bin = tmp_path / "openspliceai"; sa_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-    models = tmp_path / "models"; models.mkdir()
+    ds = tmp_path / "sample.vcf.gz"
+    ds.write_bytes(b"\x1f\x8b")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    ref = tmp_path / "GRCh38.fa"
+    ref.write_text(">1\nACGT\n", encoding="utf-8")
+    sa_bin = tmp_path / "openspliceai"
+    sa_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    models = tmp_path / "models"
+    models.mkdir()
 
     out = vo.run_offline_annotation(
         ds, tmp_path / "run", cache_dir=str(cache), assembly="GRCh38", fork=4,
@@ -370,11 +381,16 @@ def test_run_offline_spliceai_stage_scores_rows(tmp_path):
 
 
 def test_run_offline_spliceai_skips_over_cap(tmp_path):
-    ds = tmp_path / "sample.vcf.gz"; ds.write_bytes(b"\x1f\x8b")
-    cache = tmp_path / "cache"; cache.mkdir()
-    ref = tmp_path / "GRCh38.fa"; ref.write_text(">1\nACGT\n", encoding="utf-8")
-    sa_bin = tmp_path / "openspliceai"; sa_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-    models = tmp_path / "models"; models.mkdir()
+    ds = tmp_path / "sample.vcf.gz"
+    ds.write_bytes(b"\x1f\x8b")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    ref = tmp_path / "GRCh38.fa"
+    ref.write_text(">1\nACGT\n", encoding="utf-8")
+    sa_bin = tmp_path / "openspliceai"
+    sa_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    models = tmp_path / "models"
+    models.mkdir()
 
     out = vo.run_offline_annotation(
         ds, tmp_path / "run", cache_dir=str(cache), ref_fasta=str(ref),

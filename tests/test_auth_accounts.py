@@ -222,6 +222,144 @@ def test_secure_cookies_follows_public_https_env(monkeypatch):
     assert auth.secure_cookies() is False
 
 
+# --- the session secret lives in a 0600 file in the state dir -----------------
+#
+# The secret signs every login cookie: whoever can read it can sign a cookie for any account. So it
+# is kept in <AISCIENTIST_STATE_DIR>/session_secret (0600, generated on first start), not in the
+# environment; AISCIENTIST_SECRET_KEY still wins when set, for older deployments.
+
+_SECRET_ENV = ("AISCIENTIST_SECRET_KEY", "BIOAGENT_SECRET_KEY",
+               "AISCIENTIST_SECRET_KEY_FILE", "BIOAGENT_SECRET_KEY_FILE",
+               "AISCIENTIST_STATE_DIR", "BIOAGENT_STATE_DIR", "AISCIENTIST_PUBLIC_HTTPS")
+
+
+@pytest.fixture()
+def fresh_auth(tmp_path, monkeypatch):
+    """The auth module with no secret configured anywhere and an empty per-process cache."""
+    for name in _SECRET_ENV:
+        monkeypatch.delenv(name, raising=False)
+    from aiscientist.gateway import auth
+    importlib.reload(auth)
+    yield auth
+    importlib.reload(auth)
+
+
+def _mode(path):
+    import stat
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_session_secret_file_is_created_0600_and_reused_across_reloads(fresh_auth, tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(state))
+    auth = fresh_auth
+
+    secret = auth.secret_key()
+    path = state / "session_secret"
+    assert path.read_text().strip() == secret
+    assert len(secret) == 64 and int(secret, 16) >= 0          # 32 random bytes, hex
+    assert _mode(path) == 0o600
+    assert not auth.using_dev_secret() and auth.secret_source() == "file"
+    notes = auth.startup_notes()
+    assert len(notes) == 1 and "created a new session secret" in notes[0]
+    token = auth.make_session_token(7)
+
+    importlib.reload(auth)                                       # a restart
+    assert auth.secret_key() == secret
+    assert auth.read_session_token(token) == 7                   # sessions survive a restart
+    assert auth.startup_notes() == [f"[auth] session secret: {path}"]
+    assert [p.name for p in state.iterdir()] == ["session_secret"]   # no temp file left behind
+
+
+def test_secret_in_the_environment_still_wins_and_warns_once(fresh_auth, tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(state))
+    monkeypatch.setenv("AISCIENTIST_SECRET_KEY", "from-the-env")
+    auth = fresh_auth
+
+    assert auth.secret_key() == "from-the-env" and auth.secret_source() == "env"
+    assert not (state / "session_secret").exists()               # nothing written while env wins
+    notes = auth.startup_notes()
+    assert len(notes) == 1
+    assert "AISCIENTIST_SECRET_KEY is set in the environment" in notes[0]
+    assert "session_secret" in notes[0]
+
+
+def test_a_cookie_signed_with_one_secret_is_refused_under_another(app_ctx, tmp_path, monkeypatch):
+    client, auth, _routes, _db = app_ctx
+    monkeypatch.delenv("AISCIENTIST_SECRET_KEY")
+    monkeypatch.delenv("BIOAGENT_SECRET_KEY", raising=False)
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path / "state-a"))
+    assert _login(client, "root", "rootpass1").status_code == 200
+    assert client.get("/api/auth/me").json()["authenticated"] is True
+
+    # A new secret (the old file deleted, or a different state dir): the same cookie no longer passes.
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path / "state-b"))
+    assert client.get("/api/auth/me").json()["authenticated"] is False
+    token = auth.make_session_token(1)
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path / "state-a"))
+    assert auth.read_session_token(token) is None
+    assert client.get("/api/auth/me").json()["authenticated"] is True   # it was only the secret
+
+
+def test_secret_key_file_setting_names_the_file(fresh_auth, tmp_path, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path / "state"))
+    custom = tmp_path / "secrets" / "aiscientist-session"
+    monkeypatch.setenv("AISCIENTIST_SECRET_KEY_FILE", str(custom))
+    auth = fresh_auth
+
+    secret = auth.secret_key()
+    assert custom.read_text().strip() == secret and _mode(custom) == 0o600
+    assert not (tmp_path / "state" / "session_secret").exists()
+
+
+def test_dev_secret_only_when_no_state_dir_is_configured(fresh_auth, monkeypatch):
+    auth = fresh_auth
+    assert auth.secret_file() is None and auth.secret_source() == "dev"
+    assert auth.using_dev_secret()
+    assert "dev secret" in auth.startup_notes()[0] and "SECURITY" not in auth.startup_notes()[0]
+    monkeypatch.setenv("AISCIENTIST_PUBLIC_HTTPS", "1")
+    notes = auth.startup_notes()
+    assert len(notes) == 1 and "SECURITY" in notes[0] and "AISCIENTIST_STATE_DIR" in notes[0]
+
+
+def test_a_hand_made_secret_file_is_closed_and_an_empty_one_refused(fresh_auth, tmp_path, monkeypatch):
+    path = tmp_path / "state" / "session_secret"
+    path.parent.mkdir()
+    path.write_text("operator-chosen-secret\n")
+    path.chmod(0o644)
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(path.parent))
+    auth = fresh_auth
+
+    assert auth.secret_key() == "operator-chosen-secret"
+    assert _mode(path) == 0o600
+    assert not any("SECURITY" in n for n in auth.startup_notes())
+
+    empty = tmp_path / "empty" / "session_secret"
+    empty.parent.mkdir()
+    empty.write_text("\n")
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(empty.parent))
+    with pytest.raises(RuntimeError, match="empty"):
+        auth.secret_key()                    # never an empty key, never the dev secret instead
+
+
+def test_two_processes_creating_the_secret_at_once_share_one(fresh_auth, tmp_path, monkeypatch):
+    """The new file is linked into place, which never replaces: the process that loses the race
+    reads the winner's secret instead of signing with its own."""
+    state = tmp_path / "state"
+    monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(state))
+    auth = fresh_auth
+
+    def other_process_got_there_first(src, dst):
+        open(dst, "w").write("the-winners-secret\n")
+        raise FileExistsError(dst)
+
+    monkeypatch.setattr(auth.os, "link", other_process_got_there_first)
+    assert auth.secret_key() == "the-winners-secret"
+    assert "created" not in auth.startup_notes()[0]
+    assert [p.name for p in state.iterdir()] == ["session_secret"]
+
+
 # --- runs left open by a dead process --------------------------------------
 #
 # A run row opens as "running" and is closed by record_run_finish. Nothing closes it when the

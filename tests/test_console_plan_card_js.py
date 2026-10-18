@@ -31,7 +31,7 @@ const src = require("fs").readFileSync(0, "utf8");
 const escapeHtml = __ESCAPE__;
 const sandbox = { state: { planDoc: null, planProblems: [], planDraftYaml: "" }, escapeHtml,
   renderMarkdown: (s) => escapeHtml(s).replace(/`([^`]+)`/g, "<code>$1</code>") };
-const api = vm.runInNewContext(src + "\n;({ planStepParts, planStepHtml, planCardHtml, planEditorHtml, planRunsOnText })", sandbox);
+const api = vm.runInNewContext(src + "\n;({ planStepParts, planStepHtml, planCardHtml, planEditorHtml, planRunsOnText, planEntryHtml })", sandbox);
 const agenda = [
   "**QC & normalization** — Filter cells with `run_scanpy_qc` below 200 genes.",
   "2. **Clustering <UMAP>** — Cluster at resolution 1.2.",
@@ -54,6 +54,15 @@ out.editor = api.planEditorHtml(doc);
 sandbox.state.planProblems = ["step 1: bad setting"];
 sandbox.state.planDraftYaml = "plan: 1\nsteps:\n  - id: s1\n    title: MY EDIT\n";
 out.refused = api.planEditorHtml(doc);
+sandbox.state.planProblems = [];
+sandbox.state.planDraftYaml = "";
+out.status = api.planCardHtml(agenda, doc, [], { mode: "status", status: "✎ Applying your edit…" });
+out.saved = api.planCardHtml(agenda, doc, [], { mode: "saved", status: "Approved" });
+out.expiring = api.planCardHtml(agenda, doc, [], { expiry: "This plan expires at 9:30 PM — run it, change it or reply before then, or nothing will run." });
+out.entry = api.planEntryHtml(agenda, doc, { pending: true, revised: [2] });
+out.entryDirty = api.planEntryHtml(agenda, doc, { pending: true, dirty: true });
+out.entryRefused = api.planEntryHtml(agenda, doc, { pending: true, problems: ["x"] });
+out.entrySaved = api.planEntryHtml(agenda, doc, { status: "Approved" });
 console.log(JSON.stringify(out));
 """.replace("__ESCAPE__", ESCAPE)
 
@@ -128,6 +137,36 @@ def test_a_resolved_card_loses_its_editor_with_its_buttons():
     finalize = source[source.index("function finalizePlanCard"):source.index("function setPlanStatus")]
     assert 'querySelector(".plan-yaml")' in finalize and "editor.remove()" in finalize
 
+
+
+def test_a_plan_no_longer_waiting_has_no_editor_and_no_buttons():
+    """The side panel shows a plan the PI has taken back, or one this chat approved: to read."""
+    out = _card()
+    for card in (out["status"], out["saved"]):
+        assert "<textarea" not in card and 'data-plan="edit"' not in card and 'data-plan="approve"' not in card
+    assert "✎ Applying your edit…" in out["status"]
+    assert '<details class="plan-yaml plan-yaml-read">' in out["saved"] and "&lt;QC&gt;" in out["saved"], \
+        "a saved plan keeps its document, to read"
+    assert '<div class="plan-title">Plan</div>' in out["saved"]
+
+
+def test_the_waiting_plan_in_the_panel_says_when_it_expires():
+    row = _card()["expiring"].split('<div class="plan-actions-row">', 1)[1]
+    assert row.startswith('<div class="plan-expiry" role="status">') and "This plan expires at 9:30 PM" in row
+
+
+def test_the_chat_shows_the_plan_as_an_entry_titles_and_tools_with_the_decision():
+    out = _card()
+    entry = out["entry"]
+    assert entry.count('<li class="plan-entry-step') == 3 and "Clustering &lt;UMAP&gt;" in entry
+    assert "below 200 genes" not in entry, "the prose is in the side panel, not in the chat"
+    assert '<code class="plan-step-tool">run_scanpy_qc</code>' in entry
+    assert [b in entry for b in ('data-plan="approve"', 'data-plan="open"', 'data-plan="cancel"')] == [True] * 3
+    assert entry.count("plan-entry-step revised") == 1 and "Step 2 was revised" in entry
+    assert 'data-plan="approve" disabled' in out["entryDirty"], "Run waits while the document holds an unapplied edit"
+    assert "plan-note bad" in out["entryRefused"]
+    saved = out["entrySaved"]
+    assert 'data-plan="approve"' not in saved and "View plan" in saved and "Approved" in saved
 
 # --- the pipelines & skills picker, run under node -----------------------------------------------------
 

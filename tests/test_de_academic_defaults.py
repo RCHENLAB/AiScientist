@@ -101,8 +101,10 @@ def test_padj_is_readjusted_over_the_genes_actually_tested(tmp_path):
     """The point of the filter is the BH denominator, so the surviving genes' adjusted p-values
     must be computed over the kept set — not inherited from a correction whose n included the
     undetected genes. With one gene dropped out of 41, every kept padj can only move DOWN."""
-    base = tmp_path / "a"; base.mkdir()
-    filt = tmp_path / "b"; filt.mkdir()
+    base = tmp_path / "a"
+    base.mkdir()
+    filt = tmp_path / "b"
+    filt.mkdir()
     def _padj(dir_, **over):
         _stratified(_qc(dir_, _two_arm(dir_)), **over)
         with (dir_ / "artifacts" / "tables" / "de_majorclass_Rod.csv").open() as fh:
@@ -217,9 +219,7 @@ def test_pseudobulk_falls_back_loudly_when_deseq2_is_missing(tmp_path, monkeypat
 
 def test_extreme_fc_flagged_as_detection_artifact(tmp_path):
     """|log2FC| >= 5 rows in a contrast raise the EXTREME FOLD-CHANGES warning (Col25a1 8.74)."""
-    from aiscientist.tools import catalog as tools_catalog
     from aiscientist.tools.run_de import tool as run_de_tool
-    from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
 
     rows = [{"group": "Rod", "gene": "Col25a1", "log2fc": 8.74, "pval": 1e-9, "pval_adj": 1e-6, "score": 9.0},
             {"group": "Rod", "gene": "Rho", "log2fc": 0.4, "pval": 1e-4, "pval_adj": 0.01, "score": 3.0}]
@@ -230,7 +230,6 @@ def test_extreme_fc_flagged_as_detection_artifact(tmp_path):
 def test_qc_noop_warns_prefiltered(tmp_path):
     import anndata as ad
     import numpy as np
-    from pathlib import Path
     from aiscientist.tools.run_scanpy_qc.tool import run_scanpy_qc
 
     rng = np.random.default_rng(0)
@@ -238,7 +237,8 @@ def test_qc_noop_warns_prefiltered(tmp_path):
     a = ad.AnnData(x)
     a.var_names = [f"G{i}" for i in range(50)]
     a.obs_names = [f"c{i}" for i in range(60)]
-    p = tmp_path / "pre.h5ad"; a.write_h5ad(p)
+    p = tmp_path / "pre.h5ad"
+    a.write_h5ad(p)
 
     class Ctx:
         workspace = tmp_path

@@ -1,137 +1,64 @@
-# Research-path skills
+# Pipelines
 
-Each folder here is one **research path** the PI can be steered toward — the
-operon-style (`swaruplab/operon`) skill pattern, ported to our PI → Scientist → Critic
-loop. A skill is *guidance that steers the PI's planning*, not a hard agenda: the PI
-still drafts the agenda adaptively, plan mode still lets the user edit it, and the
-Scientist + Critic still execute and verify each step.
+Each folder here is a pipeline: a protocol for one kind of study, which the PI plans from. A
+pipeline steers the plan and does not replace it. The PI still drafts the steps for the actual
+dataset and question, the user reviews and edits the plan, and the Scientist and the Critic run
+and check every step.
+
+How pipelines relate to tools and skills, and how a run gets its pipeline, is in
+[`docs/skills_and_pipelines_architecture.md`](../docs/skills_and_pipelines_architecture.md).
+
+| Pipeline | Data | For |
+|---|---|---|
+| `celltype_annotation` | single-cell | QC, clustering, cell-type labels and a report |
+| `differential_expression` | single-cell | a condition against a control, per cell type, with pathways |
+| `gene_signature_scoring` | single-cell | scoring cells for a gene signature across clusters and conditions |
+| `perturbation_analysis` | single-cell | a pooled CRISPR or Perturb-seq screen |
+| `scgpt_annotation` | single-cell | per-cell labels from scGPT, and a cross-check of existing labels |
+| `variant_annotation` | VCF | annotating and prioritizing the variants of a VCF |
+| `phenotype_variant_diagnosis` | VCF and clinical notes | a rare-disease case: variants and phenotype reconciled |
 
 ## Layout
 
 ```
-skills/
-  <name>/
-    SKILL.md        # frontmatter (name + description + tools) + markdown body = PI guidance
-    scripts/        # runnable reference code the Scientist adapts via run_code (CodeAct)
-    references/     # (optional) supporting notes/specs
+preset_pipelines/<name>/
+  SKILL.md       required: front matter and the guidance the PI plans from
+  PROTOCOL.md    required: the same protocol written for a researcher to read and audit
+  references/    optional: supporting notes
+  examples/      optional: a small input to try it on
 ```
 
-## SKILL.md format
+`SKILL.md`:
 
 ```markdown
 ---
-name: <kebab-or-snake slug, also the preset key>
-description: <one-line label shown in the selector / used for PI routing>
-tools: <comma-separated registered tools this protocol composes>
+name: <the folder name; also the key the console sends>
+description: <one line: shown in the console, and what the router reads to pick a pipeline>
+tools: <comma-separated tools this protocol composes>
+data_type: scrna        # or: variants. Leave it out for a protocol that fits any data.
 ---
 
-<the default PI-planning guidance — when to use this path, ordered steps that name the
- tools, grounding/honesty constraints. Reference a bundled script by file name where the
- tools don't cover a step.>
+<The guidance: when this protocol applies, the ordered steps and the tool each one uses, and the
+ rules the results must respect. Where no tool covers a step, name the skill to adapt.>
 ```
 
-`src/aiscientist/agents/presets.py` loads every `*/SKILL.md` here into the preset registry
-(`name` → key, `description` → label, body → prompt, `tools:` → `ResearchPreset.tools`,
-`scripts/*.py` → `ResearchPreset.scripts`). **Adding a research path = dropping a new
-folder — no Python change.** Override the location with `AISCIENTIST_SKILLS_DIR`.
+The platform loads `SKILL.md` only (`src/aiscientist/agents/preset_pipelines.py`). `PROTOCOL.md` is
+for people, so keep the two in step when one changes.
 
-## scripts/ — reference code (CodeAct templates), surfaced by progressive disclosure
+## Adding a pipeline
 
-Each `scripts/*.py` is a **vetted template the Scientist adapts via `run_code`**, NOT code
-that runs automatically. Scripts stay in **separate files on purpose** — the Scientist's
-per-step brief lists only a **manifest** (each script's `name` + a one-line summary), and the
-full body is fetched **on demand** via the `read_skill_reference(name)` tool *only when a step
-needs analysis the tools don't cover*. So a large template costs context exactly when it is
-used, and "the template needs a local tweak first" is the normal path: fetch → adapt → run.
+Add the folder and restart the gateway: pipelines are loaded when it starts. No code changes.
+`AISCIENTIST_PIPELINES_DIR` points the loader at another directory.
 
-**Summary line (the manifest label).** The manifest shows the **first line of the script's
-module docstring**, so start every `scripts/*.py` with a one-line `"""Reference template —
-…"""` that says what it does. That single line is all the Scientist sees until it fetches the
-body, so make it decision-useful.
+`tests/test_skills_library.py` checks that every folder has both files, that `name` equals the
+folder name, and that `tools` lists only tools that exist.
 
-Conventions a script may assume (set by the `run_code` sandbox): read the dataset from
-`AISCIENTIST_DATASET`, checkpoints from `AISCIENTIST_WORK` (`adata_qc.h5ad` → `adata_clustered.h5ad`
-→ `adata_de.h5ad`), and write figures/tables under `AISCIENTIST_ARTIFACTS`. Scripts should
-**call the registered tools' outputs**, never reimplement what a tool already does.
+## Writing one
 
-Because the body is never dumped into context, **script size is not a context cost** — a
-template can be as long as it needs to be. (The old worry "don't let reference code grow" only
-applied to the eager/inline scheme; progressive disclosure removes it.)
-
-## Where `run_code` executes — local sandbox vs. HPC3 Slurm
-
-By default a `run_code` snippet runs in the **local `CodeSandbox`** on the eyeserver: an isolated
-subprocess with a wall-clock timeout, but **no hard memory cap**. A snippet that loads the full
-AnnData and `.copy()`-s large subsets in a loop can exhaust host RAM and be OOM-killed
-(`returncode == -9`). So a script must keep peak memory modest: subset with a **view** (not
-`.copy()`), delete intermediates, and aggregate (pseudobulk) before heavy ops.
-
-Set `AISCIENTIST_RUN_CODE_ON_HPC=1` to instead submit each snippet as a **Apptainer-contained CPU
-batch job on HPC3** (`SlurmCodeExecutor`), where CPU/RAM are effectively unlimited and
-`#SBATCH --mem` is a **real, cgroup-enforced cap** — an over-budget snippet fails cleanly as
-`OUT_OF_MEMORY` instead of taking down the shared server. The dataset is bind-mounted **read-only**;
-only the run's work/artifacts are writable; the network is off. If HPC is unavailable the executor
-falls back to the local sandbox **only on a console without accounts**. On a deployment with
-accounts a snippet never runs on the gateway host (the service user there can read every account's
-saved keys): `run_code` needs this switch, and a snippet that cannot run on HPC3 fails with the
-reason instead. Example sbatch request it generates (CPU analysis job):
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=bioagent_runcode_3
-#SBATCH --partition=standard            # RCIC HPC3 free CPU partition (no --gres)
-#SBATCH --account=ruic20_lab
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G                        # <-- the real, cgroup-enforced memory cap
-#SBATCH --time=01:00:00
-#SBATCH --output=/dfs3b/ruic20_lab/software/AiScientist/Temp/<user>/scratch/runcode/bioagent_runcode_3-%j.log
-
-set -euo pipefail
-module load apptainer/1.4.5 2>/dev/null || true
-apptainer exec --containall --writable-tmpfs --net --network none \
-  -B "$AISCIENTIST_DATASET":"$AISCIENTIST_DATASET":ro \
-  -B "$AISCIENTIST_WORK":"$AISCIENTIST_WORK" -B "$AISCIENTIST_ARTIFACTS":"$AISCIENTIST_ARTIFACTS" \
-  /dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif \
-  bash -lc 'python <scratch>/snippet_3.py > out 2> err; echo $? > rc'   # <scratch> = the --output dir
-```
-
-Tune with `AISCIENTIST_RUN_CODE_MEM_GB` (default 64), `AISCIENTIST_CPU_PARTITION`, `AISCIENTIST_CPU_ACCOUNT`,
-`AISCIENTIST_RUN_CODE_TIME_LIMIT`, `AISCIENTIST_ANALYSIS_IMAGE`. A snippet reads the SAME
-`AISCIENTIST_DATASET` / `AISCIENTIST_WORK` / `AISCIENTIST_ARTIFACTS` env vars either way, so scripts are
-identical across the two backends.
-
-## Boundary vs. tools
-
-A skill is the **workflow layer** (how/when to compose tools). It is NOT the place for
-structured capabilities — `scgpt_annotate`, the biotools, etc. stay registered Python
-tools so the vLLM tool-parser stays reliable. Skill bodies should *call* existing tools,
-and only reach for custom `run_code` where no tool covers the step.
-
-> Today the loader reads frontmatter + body + `scripts/*.py` (surfaced to the Scientist by
-> progressive disclosure — manifest in the brief, body fetched via `read_skill_reference`).
-> Deferred: `references/` supporting notes and description-based skill selection at scale.
-
-## Which layer does my change belong in? (decision rule)
-
-When you add functionality, default to the **highest** layer that can express it. Touch the
-engine only when nothing above it can.
-
-| You are adding… | Layer | Where | Engine edit? |
-|---|---|---|---|
-| A research **workflow / protocol** ("do X kind of study") | **skill** | `skills/<name>/SKILL.md` (+ `scripts/`) | none — drop a folder |
-| A one-off computation a single protocol needs | **skill script** | that skill's `scripts/*.py`, run via `run_code` | none |
-| A **deterministic capability** many protocols call | **tool** | register in `agents/registry.py` catalog | light (one entry; not the dispatcher) |
-| An **expert persona / perspective** | **agent** | registry data | none |
-| A mechanic **every run must have** (what context enters planning, the dispatch loop, checkpointing, a new event/UI type) | **engine** | `agents/research_lab.py` / `lab/kernel.py` / preflight | yes — rare |
-
-**The test:** *is this one workflow's logic, or a property the whole kernel must have?*
-One workflow → skill/tool (data-driven, no kernel edit). Whole kernel → engine.
-
-**Why a skill cannot substitute for an engine fix.** A SKILL.md is a steering prompt read by
-the PI planner. It cannot (a) change *what data reaches* the planner, (b) *add a capability*
-to extract/compute something, or (c) enforce a property across *all* skills + free planning.
-Those are code. Example (2026-06-30): "the planner must see the dataset's experimental design"
-is a kernel property + a preflight capability → it lives in `.py` (`_dataset_context`,
-`_obs_categoricals`), and it is what makes the `differential_expression` skill reachable on a
-KO-vs-WT dataset in the first place. Engine work exists to make the **skill layer** stronger,
-not to absorb features that belong in a skill.
+- **Compose tools, do not reimplement them.** A step that a tool covers names the tool. A step
+  that no tool covers names a skill from [`skills/`](../skills/README.md), which the Scientist
+  adapts and runs with `run_code`.
+- **State what the data must have** (a condition column with two groups, a VCF with a known genome
+  build), so the plan can say when the protocol does not apply.
+- **A pipeline is text the planner reads.** It cannot change what the planner is shown about the
+  dataset, and it cannot add a capability. Those are code: a new tool, or a change to the platform.

@@ -106,6 +106,27 @@ def test_the_manuscript_carries_a_short_summary(tmp_path):
     assert "did not complete" in note and "not checked against published literature" in note
 
 
+def test_a_count_of_one_is_grammatical_and_a_short_report_has_no_discussion(tmp_path):
+    """Run 6275df1213ab's statement said "1 are arithmetic" and pointed at "the Discussion" of a
+    short QC report that has none."""
+    art = _art(tmp_path)
+    md, s = build_verification(art, "Only 37 cells carried Best2, and 83.8% of those were in Muller "
+                               "glia.\n", _AGENDA[:1], _ROUNDS[:1], {"citations": [], "reason": "none"},
+                               brief=True)
+    assert s["numbers_checked"] == 1 and s["numbers_derived"] == 1
+    assert "1 number in the report was checked" in md and "**1** is arithmetic" in md
+    assert "**0** appear as they are" in md
+    assert "- The one planned step completed and was accepted by the reviewer." in md
+    assert "Discussion" not in md
+    assert "- Nothing in the report was checked against published literature (none)." in md
+    note = manuscript_note(s)
+    assert ("Of 1 number checked, 0 appear in a result table or tool output, 1 is arithmetic on one "
+            "table (listed there with its formula)") in note
+    assert "Nothing in the report was checked against published literature." in note
+    wrong = manuscript_note({"numbers_checked": 2, "numbers_inconsistent": 1})
+    assert "1 percentage does not match the counts stated beside it" in wrong
+
+
 def test_the_gateway_places_the_note_before_references():
     from aiscientist.gateway.app import _insert_verification_note
     md = "# T\n\nBody.\n\n## References\n\n1. X\n"

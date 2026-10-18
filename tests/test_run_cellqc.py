@@ -449,8 +449,14 @@ def test_cellqc_end_to_end_with_a_fake_pipeline(tmp_path, delivery, fake_cellqc)
     assert "S1: mean ambient contamination 31%" in text
     assert out["libraries"][0]["ambient_decontx_contamination_mean"] == 0.07   # the compared method
     assert "agree poorly (kappa 0.10)" in text
+    assert "Report it" not in text          # the warnings reach the user's report as they are
     assert "nuclear_fraction" not in text                       # skipped without a BAM is expected
     assert out["libraries"][0]["removed_only_by"]["max_pct_mt"] == 7
+    # The kept cells' median % mito beside CellQC's own, which is over the cells before filtering.
+    for lib in out["libraries"]:
+        kept = adata.obs.loc[adata.obs["sampleid"] == lib["sample"], "pct_counts_mt"]
+        assert lib["median_pct_mt_kept"] == round(float(kept.median()), 4)
+        assert lib["median_pct_mt"] == 1.2
 
 
 # CellQC's result/ directory, as a single-library run writes it (RCHENLAB/AiScientist issue 3).

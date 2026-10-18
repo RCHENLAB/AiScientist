@@ -520,12 +520,12 @@ def _design_by_arm(obs: Any, cats: dict[str, Any], n_cells: int) -> "dict[str, A
         lab = _obs_column_values(obs, label_col, n)
         if lab:
             tab: dict[str, dict[str, int]] = {}
-            for a, l in zip(arm, lab):
-                tab.setdefault(l, {}).setdefault(a, 0)
-                tab[l][a] += 1
+            for a, label in zip(arm, lab):
+                tab.setdefault(label, {}).setdefault(a, 0)
+                tab[label][a] += 1
             out["label_column"] = label_col
-            out["cells_by_label_and_arm"] = {l: {a: tab[l].get(a, 0) for a in arms}
-                                             for l in sorted(tab)}
+            out["cells_by_label_and_arm"] = {label: {a: tab[label].get(a, 0) for a in arms}
+                                             for label in sorted(tab)}
     # per-arm medians of whatever QC columns exist
     qc: dict[str, dict[str, float]] = {}
     for col in _QC_NUMERIC_COLS:

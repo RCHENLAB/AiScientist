@@ -1,9 +1,9 @@
 # Atomic skills
 
 A skill is **any folder holding a `SKILL.md`**, at any depth under `skills/` — the atomic,
-model-rewritable layer between the fixed registry tools (`src/aiscientist/agents/registry.py`) and
-the fixed preset pipelines (`preset_pipelines/`). See `docs/skills_and_pipelines_architecture.md` for
-the full three-layer model.
+model-rewritable layer between the fixed tools (`src/aiscientist/tools/`) and the fixed preset
+pipelines (`preset_pipelines/`). See `docs/skills_and_pipelines_architecture.md` for the three
+layers, and for how skills learned from runs are reviewed.
 
 ## Adding a skill
 
@@ -63,10 +63,9 @@ When this capability applies, and what curated tool (if any) it complements rath
 The code or commands inline, or how to adapt the bundled file.
 ```
 
-`reference.py` is a **template to rewrite**, not code to run blindly. It reads checkpoints from
-`$AISCIENTIST_WORK` and writes deliverables under `$AISCIENTIST_ARTIFACTS`. Files the user attached
-beside the primary dataset (a reference atlas, a BED panel) arrive read-only as `$AISCIENTIST_INPUTS`
-(a JSON list of `{name, role, path}`); the one marked as reference is also `$AISCIENTIST_REFERENCE`.
+Files the user attached beside the primary dataset (a reference atlas, a BED panel) arrive
+read-only as `$AISCIENTIST_INPUTS` (a JSON list of `{name, role, path}`); the one marked as
+reference is also `$AISCIENTIST_REFERENCE`.
 
 ### A skill that needs its own software
 

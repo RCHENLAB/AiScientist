@@ -35,7 +35,7 @@ def run_composition(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """
     try:
         sc = _import_scanpy()
-        import numpy as np
+        import numpy as np  # noqa: F401  (availability check: a missing numpy is reported by _missing)
     except ImportError as exc:
         return _missing(getattr(exc, "name", None) or "scanpy")
 

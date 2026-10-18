@@ -93,6 +93,33 @@ def test_a_refused_call_is_not_reported_as_what_ran(tmp_path):
     assert "`force` = `False`" not in out
 
 
+def test_a_script_that_wrote_nothing_is_described_as_a_check():
+    """Run 6275df1213ab's only run_code call reloaded the QC checkpoint to print its shape; the
+    report said it ran "a purpose-written analysis script ... for a step no packaged tool covers"."""
+    look = ("import os, scanpy as sc\n"
+            "a = sc.read_h5ad(os.path.join(os.environ['AISCIENTIST_WORK'], 'adata_qc.h5ad'))\n"
+            "print(a.shape, list(a.layers.keys()))\n")
+    out = _pipeline_section(_result([{"tool": "run_code", "ok": True, "args": {"code": look},
+                                      "result": {"status": "ok"}}]))
+    assert "only read the run's data to check it" in out and "no packaged tool" not in out
+    # One call that writes a table makes the run_code entry an analysis again.
+    for writes in ("df.to_csv(os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 't.csv'))",
+                   "plt.savefig('figures/x.png')", "open('tables/n.txt', 'w').write('1')",
+                   "a.write_h5ad('x.h5ad')"):
+        out = _pipeline_section(_result([
+            {"tool": "run_code", "ok": True, "args": {"code": look}, "result": {"status": "ok"}},
+            {"tool": "run_code", "ok": True, "args": {"code": writes}, "result": {"status": "ok"}}]))
+        assert "no packaged tool covers" in out, writes
+    # A write the pattern misses (torch.save) but the sandbox reported: not a check either.
+    out = _pipeline_section(_result([
+        {"tool": "run_code", "ok": True, "args": {"code": look + "torch.save(m, p)\n"},
+         "result": {"status": "ok", "artifacts": ["model.pt"]}}]))
+    assert "no packaged tool covers" in out
+    # No code on record: nothing says it only read.
+    out = _pipeline_section(_result([{"tool": "run_code", "ok": True, "result": {"status": "ok"}}]))
+    assert "no packaged tool covers" in out
+
+
 def test_the_sections_land_after_the_abstract():
     body = "# T\n\n## Abstract\n\nabs\n\n## Results\n\nres\n"
     out = _insert_record_sections(body, "## The dataset\n\nd", "## What was run\n\nw")

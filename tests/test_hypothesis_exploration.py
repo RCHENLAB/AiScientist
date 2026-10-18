@@ -239,21 +239,23 @@ def test_a_later_step_can_refute_an_open_hypothesis_and_the_report_says_so():
 
 def test_orphan_step_without_a_hypothesis_is_refused():
     agenda = ["Run QC on the dataset", "Identify marker genes"]
-    explore = lambda _u: {"surprise": "s", "hypotheses": [],
-                          "new_steps": [{"step": "Do some more analysis of the rods",
-                                         "hypothesis": "nothing we hold"}]}
+    def explore(_u):
+        return {"surprise": "s", "hypotheses": [],
+                "new_steps": [{"step": "Do some more analysis of the rods",
+                               "hypothesis": "nothing we hold"}]}
     result = _lab(agenda, explore=explore).run("Characterize the dataset")
     assert result.agenda == agenda and result.hypotheses == []
 
 
 def test_unfalsifiable_hypothesis_is_refused_so_its_step_has_nothing_to_stand_on():
     agenda = ["Run QC on the dataset", "Identify marker genes"]
-    explore = lambda _u: {
-        "surprise": "s",
-        # no prediction and no test -> "investigate X further" dressed up as a hypothesis
-        "hypotheses": [{"statement": "Rods are interesting", "prediction": "", "test": "", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
-        "new_steps": [{"step": "Characterise the rods in more detail",
-                       "hypothesis": "Rods are interesting"}]}
+    def explore(_u):
+        return {
+            "surprise": "s",
+            # no prediction and no test -> "investigate X further" dressed up as a hypothesis
+            "hypotheses": [{"statement": "Rods are interesting", "prediction": "", "test": "", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
+            "new_steps": [{"step": "Characterise the rods in more detail",
+                           "hypothesis": "Rods are interesting"}]}
     result = _lab(agenda, explore=explore).run("Characterize the dataset")
     assert result.hypotheses == [] and result.agenda == agenda
 
@@ -374,7 +376,8 @@ def test_dag_planner_adds_a_node_that_depends_on_the_step_that_provoked_it():
 # time. The lever is not issuing calls that can only come back empty. These tests use a stub that
 # proposes NOTHING, so the count reflects only how many turns were issued.
 
-_QUIET = lambda _u: {"surprise": "nothing", "hypotheses": [], "new_steps": []}
+def _QUIET(_u):
+    return {"surprise": "nothing", "hypotheses": [], "new_steps": []}
 
 
 def _explore_calls(seen):

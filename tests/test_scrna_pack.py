@@ -111,7 +111,8 @@ def _install_fake_gseapy(monkeypatch, cap):
         def sort_values(self, _k): return self
         def head(self, n): return _Res(self._rows[:n])
         def iterrows(self):
-            for i, r in enumerate(self._rows): yield i, r
+            for i, r in enumerate(self._rows):
+                yield i, r
 
     def _enrich(gene_list, gene_sets, background=None, outdir=None, verbose=False):
         cap.update(gene_sets=gene_sets, background=background, n_genes=len(gene_list))
@@ -326,7 +327,8 @@ def _install_fake_prerank(monkeypatch, cap):
 
         def __init__(self, rows): self._rows = rows
         def iterrows(self):
-            for i, r in enumerate(self._rows): yield i, r
+            for i, r in enumerate(self._rows):
+                yield i, r
 
     def _prerank(rnk, gene_sets, min_size=15, max_size=500, permutation_num=1000,
                  outdir=None, seed=42, verbose=False, **_kw):

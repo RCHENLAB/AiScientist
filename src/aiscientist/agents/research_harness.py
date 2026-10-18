@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .loop_utils import CheckpointWriter, safe_json_loads
+from .plan_doc import pin_args
 from ..integrations.biomni_adapter import BiomniAdapter
 from ..integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
 from ..tools.api import build_de_marker_execution, build_single_cell_qc_execution
@@ -314,7 +315,8 @@ class ResearchHarness:
 
     def run(self, brief: str, ctx: HarnessContext, on_event: EventFn | None = None,
             should_cancel: Callable[[], bool] | None = None,
-            untrusted_text: str | None = None, extra_steps: int = 0) -> HarnessResult:
+            untrusted_text: str | None = None, extra_steps: int = 0,
+            pinned_args: "dict[str, dict[str, Any]] | None" = None) -> HarnessResult:
         emit: EventFn = on_event or (lambda _event: None)
         steps: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -468,6 +470,17 @@ class ResearchHarness:
                         stop_reason = "finished"
                         break
 
+                    # Settings the researcher approved with the plan (``pinned_args``: tool ->
+                    # arguments). The approved value is what runs, whatever the model sent: a plan
+                    # card that says resolution 1.0 over an analysis run at 0.5 is the one
+                    # disagreement nobody downstream can see, because the report is written from
+                    # the plan. Applied before the duplicate check so that compares what will run.
+                    enforced: list[dict[str, Any]] = []
+                    if pinned_args and name in pinned_args:
+                        args, enforced = pin_args(args, pinned_args[name])
+                        if enforced:
+                            emit({"type": "plan_setting_enforced", "tool": name, "overrode": enforced})
+
                     # Redundant repeat: the model re-issued a call that ALREADY succeeded this
                     # step (e.g. re-running clustering mid-DE). Don't re-execute — nudge it to
                     # finish and count the wasted turn toward the correct-early-stop below.
@@ -552,12 +565,18 @@ class ResearchHarness:
                                   # Carried on the step, not just emitted, so the technical report
                                   # can list every non-default setting the run actually used
                                   # instead of re-deriving it from prose.
-                                  **({"nondefault_params": deviations} if deviations else {})})
+                                  **({"nondefault_params": deviations} if deviations else {}),
+                                  **({"plan_enforced": enforced} if enforced else {})})
                     # Carry ``args`` on success so the UI can surface a step's FINAL successful
                     # code (run_code) as a formatted block, without pasting the raw snippet into
                     # the always-visible progress feed.
                     emit({"type": "tool_result", "tool": name, "summary": summary, "args": args})
-                    self._feed_result(messages, native, call.get("id"), output)
+                    fed = output
+                    if enforced and isinstance(output, dict):
+                        # The model must reason from the call that ran, not the one it wrote.
+                        fed = {"approved_settings_applied": {e["param"]: e["approved"] for e in enforced},
+                               **output}
+                    self._feed_result(messages, native, call.get("id"), fed)
 
                 if stop_reason in ("finished", "cancelled"):
                     break

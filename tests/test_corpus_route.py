@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -117,7 +118,12 @@ def test_corpus_scan_runs_the_tool_and_publishes_the_csvs(tmp_path, monkeypatch)
     token = next(p for p in pushed if p.get("type") == "chat_token")["token"]
     assert "PRPF31" in token and "1739" in token and "⚠ w1" in token
     arts = next(p for p in pushed if p.get("type") == "artifacts")
-    assert {a["name"] for a in arts["items"]} == {"genes.csv", "hits.csv"}
+    # the two tables, and the result's Croissant metadata describing them (issue 9)
+    assert {a["name"] for a in arts["items"]} == {"genes.csv", "hits.csv", "croissant.json"}
+    meta = json.loads((conn.workspace / run_id / "artifacts" / "croissant.json").read_text())
+    assert meta["prov:wasGeneratedBy"]["@id"] == f"urn:aiscientist:run:{run_id}"
+    assert {d["contentUrl"] for d in meta["distribution"]} == {"haploinsufficiency/genes.csv",
+                                                              "haploinsufficiency/hits.csv"}
     assert all(a["url"].startswith(f"/api/file/{conn.owner}/{run_id}/") for a in arts["items"])
     assert arts["bundle_url"] == f"/api/bundle/{conn.owner}/{run_id}"
     assert conn.chat_running is False

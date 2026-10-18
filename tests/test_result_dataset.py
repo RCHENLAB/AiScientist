@@ -110,7 +110,6 @@ def test_cell_types_come_from_the_label_table_when_no_checkpoint_has_them(tmp_pa
 
 
 def test_nothing_to_export_is_skipped_and_a_bad_name_is_refused(tmp_path, libs):
-    ad, pd = libs.ad, libs.pd
     from aiscientist.tools._lib.result_dataset import export
     (tmp_path / "empty" / "work").mkdir(parents=True)
     assert export(tmp_path / "empty", "a.processed.20261007-2215.r.h5ad", {})["status"] == "skipped"
@@ -119,7 +118,6 @@ def test_nothing_to_export_is_skipped_and_a_bad_name_is_refused(tmp_path, libs):
 
 
 def test_the_hpc3_job_entry_point_runs_the_export(tmp_path, libs):
-    ad, pd = libs.ad, libs.pd
     from aiscientist.tools.api import EXPORT_RESULT_DATASET, run_analysis_tool
     ws = _workspace(tmp_path, libs)
     out = run_analysis_tool(EXPORT_RESULT_DATASET, str(ws), None,
@@ -163,7 +161,7 @@ def test_save_moves_a_local_result_into_the_users_data_and_lists_it(tmp_path, mo
     recorded: list = []
     monkeypatch.setattr(gw_app.auth_routes, "dataset_path_recorded", lambda uid, path: False)
     monkeypatch.setattr(gw_app.auth_routes, "record_dataset",
-                        lambda *a: recorded.append(a) or 42)
+                        lambda *a, **kw: recorded.append(a) or 42)
     name = _seed_local_result(tmp_path, "yijus12", "abc123")
 
     listed = _client(gw_app).get("/api/result-datasets").json()["result_datasets"]

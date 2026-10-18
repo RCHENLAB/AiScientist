@@ -75,9 +75,12 @@ _TOOLISH = re.compile(r"`((?:run|make|map|annotate|diagnose|inspect|deep|literat
 def test_skills_and_pipelines_name_only_tools_and_skills_that_exist():
     from aiscientist.agents.skills import SKILLS
 
-    known = set(catalog.names()) | PLATFORM_TOOLS | set(SKILLS)
+    from aiscientist.agents.preset_pipelines import PIPELINES, _pipelines_dir
+
+    # A pipeline's own name is a legitimate thing for these documents to mention (`scgpt_annotation`
+    # is a pipeline, not a misspelt `scgpt_annotate`).
+    known = set(catalog.names()) | PLATFORM_TOOLS | set(SKILLS) | set(PIPELINES)
     bad = []
-    from aiscientist.agents.preset_pipelines import _pipelines_dir
     from aiscientist.agents.skills import _skills_dir
 
     for path in [*_skills_dir().rglob("*.md"), *_pipelines_dir().rglob("*.md")]:

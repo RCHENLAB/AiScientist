@@ -15,11 +15,12 @@ AiScientist is a web research agent for biomedical data (single-cell RNA-seq, VC
 phenotypes). A user uploads data and asks a question. LLM roles form a virtual lab: the PI drafts a
 plan, the user reviews it, the Scientist runs curated tools or its own code step by step (as Slurm
 jobs on UCI HPC3), the Critic reviews every step, and the run ends in a cited manuscript-style report
-(PDF / DOCX). The LLM is Qwen3.8, self-hosted with vLLM on an HPC3 GPU, or the user's own API key.
+(PDF / DOCX). A session runs on one LLM for all of its calls: Qwen3.8 in a GPU job of its own, the lab's shared model
+on HPC3 GPUs (DeepSeek-V4-Flash), both self-hosted with vLLM, or the user's own API key.
 
 The code namespace is `aiscientist` (package, `AISCIENTIST_*` env vars). A `bioagent` import alias and
 the legacy `BIOAGENT_*` env names still work, and a few runtime identifiers outside the repository keep
-the old name (Slurm job names, `~/.bioagent` on HPC3, the Postgres role). See `CLAUDE.md`.
+the old name (Slurm job names, `~/.bioagent` on HPC3, the Postgres role and database).
 
 ## Where it runs
 
@@ -106,17 +107,18 @@ flowchart TB
 
 | Package | What it owns |
 |---|---|
-| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, the HPC3 session (SSH, the held worker, the GPU serve job), LLM clients and bring-your-own keys, the Slurm job executors (one per image), the environment manifest |
+| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, the HPC3 session (SSH, the held worker, the GPU serve job), LLM clients and bring-your-own keys, LLM usage and estimated cost (`llm_usage.py`, prices in `configs/llm_pricing.yaml`), the Slurm job executors (one per image), the environment manifest |
 | `src/aiscientist/agents/` | The orchestrator: the research lab, a step's tool loop, the catalog assembly, the DAG planner, the fast chat path, skills loading and induction, claim audit and step checks, agent memory |
 | `src/aiscientist/reporting/` | Turning a finished run into deliverables: pandoc render, result bundle, reference list, the vision-model render review |
+| `src/aiscientist/metadata/` | Croissant 1.1 metadata of datasets and results: built from what was measured plus the owner's review, validated (mlcroissant when installed), never hand-written. The gateway keeps it in the account database and serves it through the API and the MCP server at `/mcp` ([guideline](../development/metadata.md)) |
 | `src/aiscientist/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
 | `src/aiscientist/tools/` | Every model-callable domain tool, one folder each, plus the contract (`sdk.py`), discovery (`catalog.py`), the public surface (`api.py`), shared code (`_lib/`), reference data and the per-image job entry points |
 | `skills/`, `preset_pipelines/` | Plain files: atomic CodeAct templates the Scientist adapts, and end-to-end protocols the PI picks |
 | `frontend/console/` | The web UI |
 
 Two files are large enough to deserve a warning: `gateway/app.py` and
-`agents/research_lab.py`. Read the matching notes in `handoff/yijun/HANDOFF.md` before
-changing either; many branches that look redundant fix a specific production incident.
+`agents/research_lab.py`. Read the comments around a branch before changing it; many branches
+that look redundant fix a specific production incident, and the comment says which.
 
 ## Tools, skills and pipelines
 
@@ -161,6 +163,8 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 | The catalog is the manifests plus the platform tools; routing follows `runs_on` | `tests/test_registry_manifests.py` |
 | Tool names the platform keys logic on, and the ones skills/pipelines name, all exist | `tests/test_tool_contract.py` |
 | Skills and pipelines are well-formed | `tests/test_skills_library.py` |
+| Every generated `croissant.json` is valid Croissant 1.1 (mlcroissant), and holds no server path, sample id or credential | `tests/test_croissant_metadata.py` |
+| Metadata and MCP answer one account only, as `/api/datasets` does | `tests/test_metadata_gateway.py` |
 
 ## Where to start reading
 
@@ -172,4 +176,4 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 6. `tools/run_de/`: a typical tool (`TOOL.md`, then `tool.py`).
 7. `skills/README.md`, `preset_pipelines/README.md`.
 8. `deploy/README.md`, `scripts/sync_deploy.sh`: deploys.
-9. `handoff/yijun/HANDOFF.md`: latest progress and known issues.
+9. `docs/FINDINGS.md`: what has been measured and decided, and why.

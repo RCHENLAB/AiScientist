@@ -127,7 +127,7 @@ const sandbox = {
                { id: "B", title: "Other chat", messages: [] }],
     activeId: "A", connectionId: "conn", planCardEl: null, planStatusEl: null,
   },
-  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun",
+  PLANDRAFT_KEY: "draft", RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", LASTRUN_KEY: "lastrun", COMPOSER_KEY: "composer",
   localStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)),
                   removeItem: (k) => store.delete(k) },
   document: { createElement: (t) => makeEl(String(t).toLowerCase()) },
@@ -135,6 +135,8 @@ const sandbox = {
   escapeHtml, renderMarkdown: (s) => "<p>" + escapeHtml(s) + "</p>", absTime: () => "", relTime: () => "1m ago",
   toast: (t) => log.push("toast:" + t), updateComposerButton() {}, mountStream() {}, repaintWorking() {},
   refreshDownloads() {}, syncPresetUI() {}, messageEl: () => makeEl("div"),
+  renderChatUsage() {}, refreshChatUsage() {}, checkBudgetNotices() {}, onUsageUpdate() {},   // usage counter: not under test here
+  setPanel() {},   // the side panel opening for a plan; its tab and contents are drawn into $() elements
   activeSession: () => sandbox.state.sessions.find((x) => x.id === sandbox.state.activeId) || null,
   pushToSession: (sid) => log.push("saved:" + sid), appendArtifacts() {},
   ownerVisible: () => false, setChatRunning: (c, r) => { c.running = r; },

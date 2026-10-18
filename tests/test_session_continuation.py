@@ -322,6 +322,7 @@ def test_a_continuing_run_starts_from_the_earlier_runs_dataset(tmp_path, libs, m
             return LabResult(question, [step], [rnd], True, 1, "Three cell types were assigned.")
 
     monkeypatch.setattr(rl, "ResearchLab", _FakeLab)
+    monkeypatch.delenv("AISCIENTIST_PLAN_YAML", raising=False)
     monkeypatch.setattr(gw_app, "_build_report", lambda *a, **k: "# Annotation\n\nThree cell types.\n")
     monkeypatch.setattr(gw_app, "_review_and_finalize_report", lambda md, *a, **k: md)
     said: list[str] = []
@@ -336,6 +337,7 @@ def test_a_continuing_run_starts_from_the_earlier_runs_dataset(tmp_path, libs, m
     assert seen["profile"]["handed_on"]["run_id"] == "run1"
     assert seen["checkpoints"] == ["adata_clustered.h5ad", "adata_qc.h5ad"]
     assert any("Continuing from run run1" in line for line in said)
+    assert seen["config"].plan_yaml is True, "a run carries the plan as a YAML document unless turned off"
     # The planner was told what the conversation had done.
     block = seen["config"].prior_work
     assert "EARLIER IN THIS CONVERSATION" in block and "2. Clustering & UMAP" in block
@@ -364,3 +366,30 @@ def test_a_continuing_run_starts_from_the_earlier_runs_dataset(tmp_path, libs, m
     assert pointer["name"].startswith("Sample1_WT.processed.") and pointer["name"].count(".processed.") == 1
     handed = libs.ad.read_h5ad(pointer["path"])
     assert list(handed.uns["aiscientist"]["builds_on"]) == ["run1"]
+
+
+def test_a_continuing_run_is_given_the_plan_document_the_earlier_run_was_approved_as(tmp_path):
+    """With the plan as a document, the earlier run left report/plan.yaml: the tools and the settings
+    that ran. "The same clustering at 0.8" is planned from that, not from a step title."""
+    (tmp_path / "report").mkdir()
+    (tmp_path / "report" / "plan.yaml").write_text(
+        "# AiScientist plan. Run it as it is, or edit it.\nplan: 1\nsteps:\n  - id: s2\n"
+        "    title: Clustering & UMAP\n    tool: run_clustering\n    settings:\n      resolution: 0.5\n",
+        encoding="utf-8")
+    prior = gw_app._prior_work("run1", tmp_path, _state())
+    assert prior["plan_yaml"].startswith("plan: 1") and "#" not in prior["plan_yaml"]
+    block = gw_app._prior_work_block(prior, from_dataset=True)
+    assert "approved as" in block and "resolution: 0.5" in block and "```yaml" in block
+    # A run from before the plan document (or with the flag off) has none, and says nothing about it.
+    assert gw_app._prior_work("run0", tmp_path / "nowhere", _state())["plan_yaml"] == ""
+    assert "approved as" not in gw_app._prior_work_block(
+        gw_app._prior_work("run0", tmp_path / "nowhere", _state()), from_dataset=True)
+
+
+@pytest.mark.parametrize("value, on", [(None, True), ("1", True), ("", True), ("0", False), ("off", False), ("false", False)])
+def test_the_plan_document_is_on_unless_the_operator_turns_it_off(monkeypatch, value, on):
+    if value is None:
+        monkeypatch.delenv("AISCIENTIST_PLAN_YAML", raising=False)
+    else:
+        monkeypatch.setenv("AISCIENTIST_PLAN_YAML", value)
+    assert gw_app._plan_yaml_on() is on

@@ -27,8 +27,11 @@ Browser ──HTTPS──▶ Envoy ingress
 
 1. **Sign in and connect.** The gateway opens an SSH session to HPC3 as the user, with their
    password and Duo or with a saved SSH key.
-2. **Choose the model.** By default a Slurm GPU job of the user's serves Qwen3.8-27B with vLLM, and
-   the gateway reaches it through an SSH tunnel. A user can bring their own LLM API key instead.
+2. **Choose the model.** The model a session chooses answers all of its calls, the tool-calling
+   Scientist included: Qwen3.8-27B in a Slurm GPU job of the user's own (it waits for a free card),
+   the lab's shared model (DeepSeek-V4-Flash, one long-lived job on several HPC3 GPUs; no wait), or
+   the user's own LLM API key (no wait; [guide](docs/claude_api_guide.md)). The gateway reaches a
+   cluster model through an SSH tunnel. What a key spends is tracked under Account › Usage.
 3. **Add data.** Upload it in the browser (resumable), or point to data already on the lab server.
 4. **Ask.** A quick question is answered in the chat. A research question becomes a plan, a
    dependency graph of steps, which the user approves, edits or cancels before anything runs.
@@ -51,6 +54,10 @@ The diagrams, the code layers and the tool routing are in
 - **Results are checked.** A tool reports a failure instead of faking success, the Critic
   cannot accept a step whose tool call failed or returned nothing, and the report's claims and
   numbers are checked against the tool results before and after it is written.
+- **Every dataset and result is described.** Each carries a Croissant 1.1 `croissant.json` (files,
+  checksums, table columns, ontology terms, license, and for a result its inputs and run), which its
+  owner reviews on the Datasets page and MCP clients read at `/mcp`. See
+  [`docs/development/metadata.md`](docs/development/metadata.md).
 
 ## Tools, skills and pipelines
 
@@ -88,6 +95,7 @@ src/aiscientist/
   agents/        the research lab (PI, Scientist, Critic), the planner, the fast chat path
   tools/         every model-callable tool, one folder each
   reporting/     report rendering, the result bundle, the reference list
+  metadata/      Croissant metadata for datasets and results
   hpc/           the HPC3 shell session and its tools
 frontend/console/  the browser UI
 skills/            code templates for the Scientist
@@ -108,5 +116,10 @@ tests/             the offline test suite
 - [`docs/hpc3_storage_layout.md`](docs/hpc3_storage_layout.md) and
   [`docs/hpc3_assets.md`](docs/hpc3_assets.md): what lives where on HPC3, and what is cleaned up.
 - [`deploy/README.md`](deploy/README.md): deploying and updating the server.
+- [`docs/claude_api_guide.md`](docs/claude_api_guide.md): using your Claude subscription's API
+  credits with AiScientist, keeping the key safe, and watching what it spends.
+- [`docs/development/metadata.md`](docs/development/metadata.md): the metadata guideline, the
+  metadata API and the MCP server.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute.
 
 Released under the [MIT License](LICENSE).

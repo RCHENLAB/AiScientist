@@ -339,7 +339,8 @@ def test_a_too_long_prompt_reads_as_a_context_overflow_to_the_harness(fake):
 
 
 def test_the_fast_chat_stream_yields_text_then_calls_then_blocks(fake):
-    ev = lambda kind, **kw: SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type=kind, **kw))
+    def ev(kind, **kw):
+        return SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(type=kind, **kw))
     fake(_final([{"type": "text", "text": "Hello world"}]),
          events=[ev("text_delta", text="Hello "), ev("text_delta", text="world"),
                  SimpleNamespace(type="message_stop")])

@@ -12,8 +12,6 @@ BEFORE the full Ollama removal + app.py rewire.
 
 from __future__ import annotations
 
-import base64
-
 from aiscientist.gateway import gpu
 from aiscientist.gateway.mock_host import MockExecutor
 from aiscientist.gateway.settings import HPCSettings

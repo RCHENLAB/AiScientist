@@ -1,10 +1,11 @@
-"""The lab's shared reasoning-model server.
+"""The lab's shared model server.
 
 A session's own GPU job is one card and one model that fits it. A model that needs several cards
 (DeepSeek-V4-Flash on four 96 GB cards) cannot be asked for per session: four free cards on one
 node can take hours or days to get. So one Slurm job holds them for as long as the partition
-allows, every session's reasoning roles (plan / critic / writer / audit) use it while it answers,
-and they fall back to the session's own model when it does not.
+allows, and a session can choose it as its LLM endpoint, like a saved API key: it then holds no GPU
+of its own and every call of the session goes to it. A session on another endpoint (its own GPU's
+Qwen, or an API key) never uses it — each session is on one model.
 
 This module is the keeper of that job:
 
@@ -43,16 +44,14 @@ JOB_NAME = "aiscientist-llm-shared"
 # directory the session serve job already uses; it keeps its old name (see CLAUDE.md).
 REMOTE_DIR = "$HOME/.bioagent/shared-llm"
 
-# Roles a lab completion names (``complete_fn(messages, role=...)``). ``classify`` stays on the
-# session's model by default: it is the high-volume routing call, and a short one.
-DEFAULT_ROLES = "plan,critic,writer,audit,reason"
-
 # The serve flags of the verified run: DeepSeek-V4-Flash NVFP4 on stock vLLM 0.28.0, four RTX PRO
-# 6000 cards (HPC3 job 55644297: KV pool 823,709 tokens at a 131,072 window, tool calls correct).
+# 6000 cards (HPC3 job 55644297: KV pool 823,709 tokens, tool calls correct). That run used a 131,072
+# window; the model takes 1,048,576 (YaRN x16 over 65,536). 262,144 matches the session GPU's Qwen
+# window and leaves room for about three full-length requests at once (Yijun, 2026-10-15).
 # ``--tensor-parallel-size`` is added from the card count.
 _DSV4_SERVE_ARGS = (
     "--trust-remote-code --tokenizer-mode deepseek_v4 --kv-cache-dtype fp8 --block-size 256 "
-    "--max-model-len 131072 --gpu-memory-utilization 0.90 --enable-auto-tool-choice "
+    "--max-model-len 262144 --gpu-memory-utilization 0.90 --enable-auto-tool-choice "
     "--tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 --disable-custom-all-reduce"
 )
 # Multi-card serving on these nodes: the cards talk over PCIe, not InfiniBand or NVLink.
@@ -102,8 +101,7 @@ class SharedLLMSettings:
     drain_s: int = 1800                # after moving to a newer job, let the old one finish calls
     poll_s: int = 60
     local_port: int = 0                # 0 = any free port; fixed = a stable URL on this host
-    # How it is used.
-    roles: frozenset = frozenset(DEFAULT_ROLES.split(","))
+    # How it is called.
     reasoning_effort: str = "low"
     think_kwargs: tuple = (("enable_thinking", True),)
 
@@ -118,7 +116,6 @@ class SharedLLMSettings:
                 think = tuple(sorted(val.items())) if isinstance(val, dict) else ()
             except json.JSONDecodeError:
                 think = cls.think_kwargs
-        roles = env("AISCIENTIST_SHARED_LLM_ROLES", DEFAULT_ROLES)
         return cls(
             enabled=_flag("AISCIENTIST_SHARED_LLM"),
             owner=env("AISCIENTIST_SHARED_LLM_OWNER", "").strip(),
@@ -141,7 +138,6 @@ class SharedLLMSettings:
             drain_s=_int_env("AISCIENTIST_SHARED_LLM_DRAIN_SECONDS", cls.drain_s),
             poll_s=max(15, _int_env("AISCIENTIST_SHARED_LLM_POLL_SECONDS", cls.poll_s)),
             local_port=_int_env("AISCIENTIST_SHARED_LLM_LOCAL_PORT", 0),
-            roles=frozenset(r.strip().lower() for r in roles.split(",") if r.strip()),
             reasoning_effort=env("AISCIENTIST_SHARED_LLM_REASONING_EFFORT",
                                  cls.reasoning_effort).strip().lower(),
             think_kwargs=think,
@@ -329,21 +325,17 @@ def parse_listing(text: str) -> tuple[str, bool, list[SharedJob]]:
 
 @dataclass(frozen=True)
 class Binding:
-    """Where a reasoning call goes while the shared server answers."""
+    """Where a call goes while the shared server answers."""
     port: int
     model: str
     api_key: str = field(repr=False, default="")
     effort: str | None = None
     think_kwargs: dict | None = None
-    roles: frozenset = frozenset()
     job_id: str = ""
 
     @property
     def label(self) -> str:
         return f"{self.model} @ shared GPU"
-
-    def serves(self, role: str | None) -> bool:
-        return (role or "reason").strip().lower() in self.roles
 
 
 def _probe(port: int, api_key: str, served_name: str, timeout: float = 10.0) -> tuple[bool, str]:
@@ -649,7 +641,7 @@ class SharedLLM:
             s = self.settings
             return Binding(port=self._local_port, model=s.served_name, api_key=self._api_key,
                            effort=s.reasoning_effort or None, think_kwargs=dict(s.think_kwargs) or None,
-                           roles=s.roles, job_id=self._active.job_id)
+                           job_id=self._active.job_id)
 
     def note_failure(self, reason: str) -> None:
         """A call to the shared server failed. Stop handing it out until the next pass has looked."""
@@ -667,7 +659,6 @@ class SharedLLM:
                 "detail": self._detail,
                 "model": self.settings.served_name,
                 "gpus": self.settings.gres,
-                "roles": sorted(self.settings.roles),
                 "job_id": a.job_id if a else "",
                 "node": a.node if a else "",
                 "expires_at": (self._updated_at + a.time_left_s) if a and a.time_left_s is not None else None,
@@ -712,11 +703,62 @@ def stop() -> None:
         manager.stop()
 
 
-def binding(role: str | None = None) -> Binding | None:
-    """The shared server, if it is answering and takes this role; else None."""
+# --- the shared server as a session's own endpoint ----------------------------------------------------
+#
+# A session chooses the shared server the way it chooses one of its saved API keys
+# (``conn.llm_choice = {"credential_id": ENDPOINT_ID}``): it then holds no GPU of its own and EVERY
+# call — the Scientist's tool loop and the fast chat included — goes to the shared model. The address
+# and the key stay in this process; the console only ever sees ``endpoint_public()``.
+
+ENDPOINT_ID = "lab-shared"
+
+
+def endpoint_binding() -> Binding | None:
+    """The shared server for a session that chose it as its endpoint, while it answers; else None."""
     manager = _MANAGER
-    b = manager.binding() if manager is not None else None
-    return b if b is not None and b.serves(role) else None
+    return manager.binding() if manager is not None else None
+
+
+def served_window(bound: Binding, timeout: float = 5.0) -> int | None:
+    """The context window the running server reports (vLLM's ``max_model_len`` on /v1/models), or
+    None when it does not say."""
+    req = urllib.request.Request(f"http://127.0.0.1:{bound.port}/v1/models",
+                                 headers={"Authorization": f"Bearer {bound.api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - loopback tunnel
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    for m in (body or {}).get("data") or []:
+        if isinstance(m, dict) and m.get("id") == bound.model and isinstance(m.get("max_model_len"), int):
+            return m["max_model_len"]
+    return None
+
+
+def context_window() -> int:
+    """The shared model's context window, so a session on it trims the Scientist's context to what
+    the server takes: what the RUNNING server reports, because a job submitted with older flags keeps
+    its window until it is renewed; else the configured ``--max-model-len``."""
+    bound = endpoint_binding()
+    reported = served_window(bound) if bound is not None else None
+    if reported:
+        return reported
+    manager = _MANAGER
+    args = manager.settings.serve_args if manager is not None else _DSV4_SERVE_ARGS
+    m = re.search(r"--max-model-len[ =](\d+)", args or "")
+    return int(m.group(1)) if m else 262144
+
+
+def endpoint_public() -> dict[str, Any] | None:
+    """The shared server as the console lists it among the LLM endpoints; None when it is not kept.
+    No address, no key, no job: the model, and whether it answers now."""
+    st = status()
+    if not st.get("enabled"):
+        return None
+    model = str(st.get("model") or "")
+    return {"id": ENDPOINT_ID, "label": "Shared model on HPC3", "model": model, "lab_model": model,
+            "state": st.get("state") or "", "up": endpoint_binding() is not None,
+            "expires_at": st.get("expires_at")}
 
 
 def note_failure(reason: str) -> None:

@@ -19,7 +19,7 @@ import json
 import os
 import re
 import threading
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 

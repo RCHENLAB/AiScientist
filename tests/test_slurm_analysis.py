@@ -47,7 +47,8 @@ class FakeHPC:
         if cmd.startswith("mkdir"):
             return self._ok()
         if cmd.startswith("sbatch"):
-            jid = str(self._next); self._next += 1
+            jid = str(self._next)
+            self._next += 1
             self.submits.append(jid)
             return self._ok(f"Submitted batch job {jid}")
         if cmd.startswith("squeue"):

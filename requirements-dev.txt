@@ -27,3 +27,7 @@ httpx>=0.27
 # aborted collection and CI ran nothing at all. numpy already arrives with scikit-learn.
 pandas>=2.0
 matplotlib>=3.8
+# The reference Croissant validator (RCHENLAB/AiScientist issue 9): tests/test_croissant_metadata.py
+# checks every document AiScientist generates from the fixture datasets with it, and fails in CI when
+# it is missing, so a green build means mlcroissant accepted them.
+mlcroissant>=1.1

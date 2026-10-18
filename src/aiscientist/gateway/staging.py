@@ -71,6 +71,7 @@ class StagingJob:
     peek: dict | None = None
     hpc_user: str = ""        # the HPC3 account the copy belongs to; only its sessions may push it
     upload_id: str = ""       # the upload layer's own id for this file (e.g. the tus upload id)
+    conversation_id: str = ""  # the console chat the upload was started from ("" = none known)
     client_sha256: str = ""   # SHA-256 the browser computed; "" = not given
     unpack: bool = False      # an archive to unpack on HPC3 once it is verified
     unpack_dest: str = ""     # the folder it unpacks to, chosen once so a retry reuses it

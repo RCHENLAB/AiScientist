@@ -84,7 +84,8 @@ def test_deploy_failure_raises(sc):
 def test_a_saved_ssh_key_survives_the_store_moving(tmp_path, monkeypatch):
     """Same trap as the LLM store, with a worse blast radius: this key_path goes to paramiko, so a
     stale one costs every user their key login and drops them back to password + Duo."""
-    import importlib, shutil
+    import importlib
+    import shutil
     from aiscientist.gateway import ssh_credentials as sc
 
     old_root = tmp_path / "old"

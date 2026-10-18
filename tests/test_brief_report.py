@@ -70,10 +70,15 @@ def test_the_short_report_is_the_tools_own_numbers_and_nothing_else(tmp_path):
     md = _build_brief_report(art, "只做 QC，报告尽量简短", _Result(_QC_STEPS),
                              RunScope(keep=("run_cellqc",), brief_report=True))
     assert md.startswith("# Quality-control summary: Sample1_WT")
-    assert "As requested (only run_cellqc; brief report), this run did quality control only" in md
+    assert "As requested, this run did quality control only (`run_cellqc`)" in md
+    # A result without the kept cells' median says whose median it shows.
+    assert "median % mito before filtering |" in md
     assert "| Sample1_WT | 18,681 | 18,011 | 16,750 | 89.7% | 2.5% | 0.75 |" in md
-    assert "4 too few counts, 27 too few genes, 541 too much mitochondrial RNA, 98 several of these" in md
-    assert "doublets removed: 1,261 (the two doublet callers agree at kappa 0.07)" in md
+    assert ("the count, gene and mitochondrial filters removed 670 cells: 4 only for too few counts, "
+            "27 only for too few genes, 541 only for too much mitochondrial RNA, 98 for more than "
+            "one of these.") in md
+    assert "Doublets removed: 1,261 of the 18,011 filtered cells (7.0%)." in md
+    assert "The two doublet callers agree at kappa 0.07." in md   # no metrics table: no detail
     assert "agree poorly" in md                                  # the tool's warning is kept
     assert "Sample1_WT.processed.20261011-1200.abc.h5ad" in md   # the result matrix is named
     assert "figures/violin_cellqc_after_qc.png" in md and "## What was run" in md
@@ -93,4 +98,148 @@ def test_a_short_report_of_a_longer_run_shows_its_cell_types(tmp_path):
     md = _build_brief_report(art, "QC and annotate, brief report", _Result(steps),
                              RunScope(brief_report=True))
     assert md.startswith("# Analysis summary: Sample1_WT")
-    assert "| Rod photoreceptor | 13,520 | 80.72 |" in md and "this is the short report" in md
+    assert "| Rod photoreceptor | 13,520 | 80.72 |" in md and "This is the short report" in md
+
+
+# --- prod run 6275df1213ab: CellQC alone on one mouse retina library (Sample2_Ddx41) -------------
+# Every headline number was right; the wording was not. The values below are that run's own.
+_DDX41 = {"status": "ok", "cells_before": 15872, "cells_after": 14553, "genes_after": 33696,
+          "thresholds": {"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0},
+          "doublets": {"decider": "doubletfinder", "callers": ["doubletfinder", "scdblfinder"]},
+          "warnings": ["Sample2_Ddx41: the two doublet callers agree poorly (kappa 0.14), so the "
+                       "choice of decider drives which cells are removed."],
+          "libraries": [{"sample": "Sample2_Ddx41", "cells_cellranger": 15872,
+                         "cells_after_filter": 15482, "cells_after_doublets": 14553,
+                         "frac_retained": 0.9169, "doublets_removed": 929,
+                         "doublet_kappa": 0.1447634434698273,
+                         "ambient_soupx_contamination_mean": 0.016,
+                         "median_pct_mt": 0.7745, "median_pct_mt_kept": 0.6897,
+                         "removed_by_mito_total": 360,
+                         "removed_only_by": {"min_counts": 2, "min_features": 28, "max_pct_mt": 317,
+                                             "several_thresholds": 43},
+                         "nuclear_fraction_median": 0.342894251649782,
+                         "nuclear_fraction_iqr": [0.246474851059584, 0.41493278242629855]}]}
+# A subset of CellQC's metrics.csv columns, as tables/cellqc_metrics.csv holds them.
+_DDX41_METRICS = {
+    "sampleid": "Sample2_Ddx41", "cellranger_estimated_number_of_cells": '"15,872"',
+    "filter_ncell_before": "15872", "filter_ncell_after": "15482", "filter_ncell_removed": "390",
+    "filter_fail_mincount": "3", "filter_fail_minfeature": "71", "filter_fail_mito": "360",
+    "filter_fail_mincount_only": "2", "filter_fail_minfeature_only": "28",
+    "filter_fail_mito_only": "317", "filter_fail_multiple": "43",
+    "filter_median_pct_counts_mt": "0.7745", "doublet_doubletfinder_ndoublet": "929",
+    "doublet_doubletfinder_frac": "0.0600051672910476", "doublet_decider": "doubletfinder",
+    "doublet_ncell_before": "15482", "doublet_ncell_after": "14553",
+    "ambient_soupx_contamination_mean": "0.016", "ambient_soupx_counts_removed_frac": "0.0160163",
+    "doublet_scdblfinder_ndoublet": "1437", "doublet_scdblfinder_frac": "0.0928174654437411",
+    "concordance_doubletfinder_vs_scdblfinder_kappa": "0.1447634434698273",
+    "concordance_doubletfinder_vs_scdblfinder_both_doublet": "245",
+    "nf_median": "0.342894251649782", "nf_q25": "0.246474851059584", "nf_q75": "0.41493278242629855",
+    "frac_retained": "0.9169"}
+# The run's one run_code call: it reloaded the checkpoint to print its shape and layers.
+_CHECK_CODE = ("import os, scanpy as sc\n"
+               "a = sc.read_h5ad(os.path.join(os.environ['AISCIENTIST_WORK'], 'adata_qc.h5ad'))\n"
+               "print(a.shape, a.obs.columns.tolist()[:40], list(a.layers.keys()))\n")
+_DDX41_STEPS = [{"tool": "run_cellqc", "ok": True, "args": {"species": "mouse"}, "result": _DDX41},
+                {"tool": "run_code", "ok": True, "args": {"code": _CHECK_CODE},
+                 "result": {"status": "ok", "stdout": "(14553, 33696) ['sampleid'] ['counts']"}},
+                {"tool": "finish", "ok": True, "result": {}}]
+
+
+def _ddx41_art(tmp_path: Path) -> Path:
+    art = tmp_path / "artifacts"
+    for sub in ("data", "tables", "figures", "report"):
+        (art / sub).mkdir(parents=True)
+    (art / "data" / "dataset_results.json").write_text(json.dumps({
+        "dataset_path": "/x/Sample2_Ddx41/filtered_feature_bc_matrix.h5",
+        "cellranger_layout": {"n_libraries": 1, "libraries": [{"sample": "Sample2_Ddx41"}]}}))
+    (art / "tables" / "cellqc_metrics.csv").write_text(
+        ",".join(_DDX41_METRICS) + "\n" + ",".join(_DDX41_METRICS.values()) + "\n")
+    # The QC-only cells.csv header, verbatim: no cluster, label or UMAP column.
+    (art / "tables" / "cells.csv").write_text(
+        "barcode,sampleid,n_genes_by_counts,total_counts,total_counts_mt,pct_counts_mt,"
+        "total_counts_ribo,pct_counts_ribo,total_counts_hb,pct_counts_hb,raw_total_counts,"
+        "raw_n_genes_by_counts,raw_pct_counts_mt,raw_pct_counts_ribo,raw_pct_counts_hb,"
+        "doubletfinder_pANN,doubletfinder_class,scdblfinder_score,scdblfinder_class,"
+        "nuclear_fraction,exon,intron,nuclear_fraction_primary_only\n")
+    return art
+
+
+def _ddx41_report(tmp_path: Path) -> "tuple[Path, str]":
+    art = _ddx41_art(tmp_path)
+    # "Do only cellqc ..." read as a keep-list of every QC tool: what the run was ALLOWED to run.
+    scope = RunScope(keep=("run_cellqc", "run_scanpy_qc", "run_doublet_detection"))
+    return art, _build_brief_report(
+        art, "Do only cellqc quality controll part and generate the report and result to me",
+        _Result(_DDX41_STEPS), scope)
+
+
+def test_the_scope_says_what_ran_not_what_the_scope_allowed(tmp_path):
+    _, md = _ddx41_report(tmp_path)
+    scope = next(line for line in md.splitlines() if line.startswith("**Scope.**"))
+    assert scope.startswith("**Scope.** As requested, this run did quality control only "
+                            "(`run_cellqc`);")
+    assert "run_scanpy_qc" not in scope and "run_doublet_detection" not in scope
+    # A limit that is not "QC only" is not presented as the reason the run stopped at QC.
+    other = _build_brief_report(_ddx41_art(tmp_path / "b"), "no DE", _Result(_DDX41_STEPS),
+                                RunScope(exclude=("run_de",)))
+    assert "**Scope.** This run did quality control only (`run_cellqc`)" in other
+
+
+def test_the_cells_table_is_described_by_its_columns(tmp_path):
+    art, md = _ddx41_report(tmp_path)
+    assert ("- `tables/cells.csv` — one row per cell: QC metrics, doublet calls, nuclear fraction."
+            in md)
+    files = md.split("## Files", 1)[1]
+    assert "cluster" not in files and "UMAP" not in files and "label" not in files
+    (art / "tables" / "cells.csv").write_text("barcode,n_genes_by_counts,leiden,cell_type,UMAP_1,"
+                                              "UMAP_2\n")
+    md = _build_brief_report(art, "q", _Result(_DDX41_STEPS), None)
+    assert "one row per cell: QC metrics, cluster, cell-type label, UMAP." in md
+
+
+def test_the_qc_numbers_say_what_they_count(tmp_path):
+    _, md = _ddx41_report(tmp_path)
+    # The kept cells' median % mito, not CellQC's over every barcode before filtering (0.77).
+    assert "| median % mito (kept cells) |" in md
+    assert "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | 91.7% | 1.6% | 0.69 |" in md
+    # The *_only counts are said to be "only", with each threshold's total beside them.
+    assert ("— the count, gene and mitochondrial filters removed 390 cells: 2 only for too few counts "
+            "(3 in total), 28 only for too few genes (71 in total), 317 only for too much "
+            "mitochondrial RNA (360 in total), 43 for more than one of these.") in md
+    assert "Doublets removed: 929 of the 15,482 filtered cells (6.0%), called by DoubletFinder." in md
+    # Neutral counts: the other caller's further calls are not "doublets left in the data" (an
+    # audit of the run found most of the 1,192 to be high-UMI rods with no second lineage's markers).
+    assert ("The two doublet callers agree poorly (kappa 0.14): scDblFinder agrees on 245 of "
+            "DoubletFinder's 929 removals and flags 1,192 of the 14,553 kept cells (8.2%), which "
+            "stay in the dataset (its `scdblfinder_class` column marks them).") in md
+    assert "residual" not in md and "1,192 of the 14,553 kept cells (8.2%) doublets" not in md
+    # The column is named only when the per-cell table has it.
+    art = _ddx41_art(tmp_path / "nocol")
+    (art / "tables" / "cells.csv").write_text("barcode,n_genes_by_counts,doubletfinder_class\n")
+    md = _build_brief_report(art, "q", _Result(_DDX41_STEPS), None)
+    assert "(8.2%), which stay in the dataset. " in md and "scdblfinder_class" not in md
+    assert "Nuclear fraction (share of intronic reads): median 0.34, IQR 0.25–0.41." in md
+
+
+def test_no_instruction_to_the_model_and_a_check_is_called_a_check(tmp_path):
+    _, md = _ddx41_report(tmp_path)
+    assert "Report it." not in md
+    assert ("**2. `run_code`** — Ran a short purpose-written script that only read the run's data "
+            "to check it; it wrote no table, figure or file.") in md
+    assert "a step no packaged tool covers" not in md
+
+
+def test_every_number_in_the_short_report_traces_and_the_statement_reads_right(tmp_path):
+    from aiscientist.reporting.verification import build_verification, manuscript_note
+    art, md = _ddx41_report(tmp_path)
+    result = _Result(_DDX41_STEPS)
+    statement, summary = build_verification(art, md, result.agenda, result.rounds,
+                                            {"citations": [], "reason": "none"}, brief=True)
+    assert summary["numbers_untraced"] == 0, summary["untraced"]
+    assert summary["numbers_inconsistent"] == 0
+    assert "Discussion" not in statement
+    assert "Nothing in the report was checked against published literature (none)." in statement
+    note = manuscript_note(summary)
+    assert "Nothing in the report was checked against published literature." in note
+    assert "1 are" not in note and "1 are" not in statement
+    assert "- The one planned step completed and was accepted by the reviewer." in statement

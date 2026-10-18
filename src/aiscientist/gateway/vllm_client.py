@@ -663,8 +663,12 @@ def chat_tools(
         body = _post({k: v for k, v in payload.items() if k != "reasoning_effort"})
     choices = (body or {}).get("choices") or [{}]
     message = choices[0].get("message") or {}
-    return {"content": message.get("content") or "", "tool_calls": message.get("tool_calls") or [],
-            "finish_reason": str(choices[0].get("finish_reason") or "")}
+    out = {"content": message.get("content") or "", "tool_calls": message.get("tool_calls") or [],
+           "finish_reason": str(choices[0].get("finish_reason") or "")}
+    usage = (body or {}).get("usage")
+    if isinstance(usage, dict):        # what the turn cost, for the usage record
+        out["usage"] = {**usage, "model": str((body or {}).get("model") or model)}
+    return out
 
 
 def _tokenize_root(local_port: int, base_url: str | None) -> str | None:

@@ -324,7 +324,8 @@ def test_remote_dfs3b_paths_are_not_reported_as_missing_evidence(tmp_path):
     tables sat in artifacts/. Remote artifacts map to their local mirror; other remote paths are
     unverifiable here, not missing."""
     from aiscientist.agents.research_lab import resolve_evidence
-    art = tmp_path / "artifacts" / "tables"; art.mkdir(parents=True)
+    art = tmp_path / "artifacts" / "tables"
+    art.mkdir(parents=True)
     (art / "enrichment_AC_up.csv").write_text("x")
     present, missing = resolve_evidence([
         "tables/enrichment_AC_up.csv",                                       # relative, exists
@@ -344,9 +345,6 @@ def test_a_step_that_names_a_tool_the_scientist_never_called_is_nudged_once():
     """From E2E run 3: the DE step ended on the model's own final text after five reconnaissance
     calls, run_de never called; the Critic bounced it and a whole extra round fixed it. One
     deterministic nudge is cheaper. Never applied when the tool WAS called."""
-    import json as _json
-    from types import SimpleNamespace
-
     from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
     from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
 

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -381,3 +382,251 @@ def test_the_same_folder_chosen_again_with_copies_to_hpc3(env):
     assert state["recorded"] is True and state["count"] == 2 and state["size"] == 7
     remotes = [r for _l, r in conn.executor.state.staged_files]
     assert sorted(r.rsplit("/study/", 1)[1] for r in remotes) == ["b.csv", "nested/a.csv"]   # each copied once
+
+
+# --- continuing an upload from another browser ------------------------------------------------------
+# A browser keeps its unfinished uploads in its own storage. Another computer, a private window or
+# cleared site data had none, and the file started again from byte 0 while the server held most of
+# it. Here the "first chunk" is 4 bytes, so the files stay small.
+
+MODIFIED = 1_760_400_000_000          # File.lastModified, ms
+BIG = b"0123456789AB"                 # three chunks of 4
+
+
+@pytest.fixture()
+def small_head(monkeypatch):
+    from aiscientist.gateway import tus_upload
+    monkeypatch.setattr(tus_upload, "_HEAD_BYTES", 4)
+    return tus_upload
+
+
+def _other_browser(gw, conn):
+    """A second connection of the same account: another browser, with nothing stored."""
+    other = gw.Connection(conn.settings, mock=True, loop=conn.loop, username="tester")
+    other.workspace = conn.workspace
+    other.executor = conn.executor
+    gw.CONNECTIONS[other.id] = other
+    return other
+
+
+def _find(client, conn, data=BIG, *, name="data.csv", rel_path="", modified=MODIFIED, head=None):
+    head = head if head is not None else hashlib.sha256(data[:4]).hexdigest()
+    response = client.post("/api/tus/find", json={"connection_id": conn.id, "name": name, "rel_path": rel_path,
+                                                   "size": len(data), "last_modified": modified,
+                                                   "head_sha256": head})
+    assert response.status_code == 200, response.text
+    return response.json()["upload"]
+
+
+def _started(client, conn, data=BIG, chunks=1, **fields):
+    """An upload begun in one browser and left after ``chunks`` chunks of 4."""
+    fields.setdefault("last_modified", MODIFIED)
+    if fields["last_modified"] is None:                             # a page that does not send it
+        del fields["last_modified"]
+    url = _create(client, conn, len(data), **fields).headers["location"]
+    for i in range(chunks):
+        piece = data[4 * i:4 * i + 4]
+        assert _patch(client, url, 4 * i, piece, hashlib.sha256(piece).digest()).status_code == 204
+    return url
+
+
+def test_another_browser_continues_a_partial_upload_from_its_offset(env, small_head):
+    client, conn, gw = env
+    url = _started(client, conn)
+    other = _other_browser(gw, conn)
+    try:
+        found = _find(client, other)
+        assert found == {"url": url, "offset": 4, "length": len(BIG)}
+        assert client.head(url, headers={"Tus-Resumable": "1.0.0", "X-Connection-ID": other.id}).headers["upload-offset"] == "4"
+        rest = BIG[4:]
+        assert _patch(client, url, 4, rest, hashlib.sha256(rest).digest(),
+                      final_sha=hashlib.sha256(BIG).hexdigest()).status_code == 204
+        assert (conn.workspace / "uploads" / "data.csv").read_bytes() == BIG
+        assert _find(client, other) is None                        # complete: nothing left to continue
+    finally:
+        gw.CONNECTIONS.pop(other.id, None)
+    from aiscientist.gateway import upload_log
+    events = [e["event"] for e in upload_log.tail(conn.workspace)]
+    assert events.count("created") == 1 and "resume_found" in events
+
+
+def test_a_different_file_of_the_same_name_size_and_time_gets_a_new_upload(env, small_head):
+    client, conn, _gw = env
+    url = _started(client, conn)
+    other = BIG.replace(b"0123", b"wxyz")                           # same name, size and time
+    assert _find(client, conn, other) is None
+    fresh = _started(client, conn, other, chunks=0)
+    assert fresh != url
+    assert client.head(url, headers={"Tus-Resumable": "1.0.0"}).headers["upload-offset"] == "4"   # untouched
+    from aiscientist.gateway import upload_log
+    assert [e["event"] for e in upload_log.tail(conn.workspace)].count("resume_mismatch") == 1
+
+
+def test_an_expired_failed_or_unmatched_partial_is_not_offered(env, small_head):
+    client, conn, _gw = env
+    url = _started(client, conn)
+    sidecar = conn.workspace / "uploads" / ".parts" / f"{url.rsplit('/', 1)[-1]}.json"
+    assert _find(client, conn)["url"] == url
+    assert _find(client, conn, modified=MODIFIED + 1) is None       # another modification time
+    assert _find(client, conn, name="other.csv") is None
+    assert _find(client, conn, BIG + b"!") is None                  # another size
+    week_ago = time.time() - 7 * 86400 - 60
+    os.utime(sidecar, (week_ago, week_ago))
+    assert _find(client, conn) is None                              # expired, even before the sweep removes it
+    os.utime(sidecar, None)
+    meta = json.loads(sidecar.read_text())
+    sidecar.write_text(json.dumps({**meta, "status": "failed"}))
+    assert _find(client, conn) is None
+    sidecar.write_text(json.dumps(meta))
+    assert _find(client, conn)["url"] == url
+
+
+def test_nothing_is_offered_before_the_first_chunk_or_for_an_older_page(env, small_head):
+    client, conn, _gw = env
+    _started(client, conn, chunks=0)                                # created, nothing received
+    assert _find(client, conn) is None
+    _started(client, conn, chunks=1, last_modified=None)            # a page that did not send the time
+    assert _find(client, conn) is None
+    assert _find(client, conn, b"0123") is None                     # one chunk or less: never part-way
+
+
+def test_of_two_partial_uploads_the_one_further_along_is_offered(env, small_head):
+    client, conn, _gw = env
+    _started(client, conn, chunks=1)
+    further = _started(client, conn, chunks=2)
+    _started(client, conn, chunks=1)
+    assert _find(client, conn) == {"url": further, "offset": 8, "length": len(BIG)}
+
+
+def test_find_needs_the_file_described(env):
+    client, conn, _gw = env
+    base = {"connection_id": conn.id, "name": "data.csv", "size": 12, "last_modified": MODIFIED}
+    assert client.post("/api/tus/find", json={**base, "head_sha256": "zz"}).status_code == 400
+    assert client.post("/api/tus/find", json={**base, "size": None, "head_sha256": "0" * 64}).status_code == 400
+    assert client.post("/api/tus/find", json={**base, "connection_id": "nope", "head_sha256": "0" * 64}).status_code == 404
+
+
+@pytest.mark.parametrize("on_hpc", (False, True), ids=("kept-on-server", "copied-to-hpc3"))
+def test_a_folder_whose_files_all_stopped_part_way_is_continued(env, small_head, on_hpc):
+    """Before any file of it was complete, choosing the folder again in another browser reserved a
+    new folder (study_2) and sent everything again."""
+    client, conn, gw = env
+    conn.settings.uploads_on_hpc = on_hpc
+    files = [("big.bin", BIG), ("small.csv", b"abc")]
+    assert _reserve_files(client, conn, "study", files)["folder"] == "study"
+    url = _started(client, conn, folder="study", rel_path="study/big.bin")
+    other = _other_browser(gw, conn)
+    try:
+        again = _reserve_files(client, other, "study", files)
+        assert again == {"status": "reserved", "folder": "study", "merged": True, "have": []}
+        assert _find(client, other, rel_path="study/big.bin", name="big.bin")["url"] == url
+        assert _find(client, other, rel_path="study_2/big.bin", name="big.bin") is None
+        # a folder of that name holding a different file is still not this folder
+        assert _reserve_files(client, other, "study", [("big.bin", BIG + b"!")])["folder"] == "study_2"
+    finally:
+        gw.CONNECTIONS.pop(other.id, None)
+
+
+def _unfinished(client, conn):
+    response = client.get("/api/tus/unfinished", params={"connection_id": conn.id})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_a_new_browser_is_told_which_uploads_wait(env, small_head):
+    """Nothing stored in this browser, so nothing said the account had uploads waiting: the user had
+    to remember to choose the file again. The server lists the ones choosing it again continues."""
+    client, conn, gw = env
+    single = _started(client, conn)
+    _reserve_files(client, conn, "study", [("raw/a.bin", BIG), ("b.bin", BIG)])
+    in_a = _started(client, conn, chunks=2, folder="study", rel_path="study/raw/a.bin")
+    in_b = _started(client, conn, folder="study", rel_path="study/b.bin")
+    _started(client, conn, chunks=0)                                # created, nothing received
+    _started(client, conn, last_modified=None)                      # a page that did not send the time
+    _started(client, conn, chunks=3)                                # complete
+    failed = _started(client, conn)
+    expired = _started(client, conn)
+    parts = conn.workspace / "uploads" / ".parts"
+    sidecar = parts / f"{failed.rsplit('/', 1)[-1]}.json"
+    sidecar.write_text(json.dumps({**json.loads(sidecar.read_text()), "status": "failed"}))
+    week_ago = time.time() - 7 * 86400 - 60
+    os.utime(parts / f"{expired.rsplit('/', 1)[-1]}.json", (week_ago, week_ago))
+    other = _other_browser(gw, conn)
+    try:
+        listed = _unfinished(client, other)
+    finally:
+        gw.CONNECTIONS.pop(other.id, None)
+    (one,) = listed["files"]
+    assert {k: one[k] for k in ("id", "url", "name", "rel_path", "folder", "size", "offset")} == {
+        "id": single.rsplit("/", 1)[-1], "url": single, "name": "data.csv", "rel_path": "", "folder": "",
+        "size": len(BIG), "offset": 4}
+    assert one["created_at"] > 0
+    (study,) = listed["folders"]
+    assert {k: study[k] for k in ("folder", "size", "offset")} == {"folder": "study", "size": 24, "offset": 12}
+    assert [(f["url"], f["rel_path"], f["offset"]) for f in study["files"]] == [
+        (in_b, "study/b.bin", 4), (in_a, "study/raw/a.bin", 8)]
+    # Discard on a card: the server forgets the upload, and it is not listed again
+    assert client.delete(single, headers={"Tus-Resumable": "1.0.0"}).status_code == 204
+    assert _unfinished(client, conn)["files"] == []
+
+
+def test_the_list_names_a_file_as_the_browser_does(env, small_head):
+    """The server keeps "my data.csv" as mydata.csv; the card says what the user picked."""
+    client, conn, _gw = env
+    made = client.post("/api/tus", headers={"Tus-Resumable": "1.0.0", "Upload-Length": str(len(BIG)),
+                                             "Upload-Metadata": _metadata(connection_id=conn.id, filename="my data.csv",
+                                                                          last_modified=MODIFIED)})
+    url = made.headers["location"]
+    assert _patch(client, url, 0, BIG[:4], hashlib.sha256(BIG[:4]).digest()).status_code == 204
+    (listed,) = _unfinished(client, conn)["files"]
+    assert listed["name"] == "my data.csv"
+    assert _find(client, conn, name="my data.csv")["url"] == url    # the page asks with the same name
+
+
+def test_a_listed_upload_continues_when_its_file_is_chosen_again(env, small_head):
+    client, conn, gw = env
+    url = _started(client, conn)
+    other = _other_browser(gw, conn)
+    try:
+        (listed,) = _unfinished(client, other)["files"]
+        assert listed["url"] == url
+        assert _find(client, other) == {"url": url, "offset": listed["offset"], "length": listed["size"]}
+        rest = BIG[4:]
+        assert _patch(client, url, 4, rest, hashlib.sha256(rest).digest()).status_code == 204
+        assert _unfinished(client, other) == {"files": [], "folders": []}
+    finally:
+        gw.CONNECTIONS.pop(other.id, None)
+    from aiscientist.gateway import upload_log
+    assert [e["event"] for e in upload_log.tail(conn.workspace)].count("created") == 1
+
+
+def test_the_list_needs_a_connection(env):
+    client, conn, _gw = env
+    assert _unfinished(client, conn) == {"files": [], "folders": []}    # no uploads yet
+    assert client.get("/api/tus/unfinished", params={"connection_id": "nope"}).status_code == 404
+    assert client.get("/api/tus/unfinished").status_code == 404
+
+
+def test_the_sweep_keeps_an_index_entry_while_its_upload_lives(env, small_head):
+    client, conn, _gw = env
+    url = _started(client, conn)
+    parts = conn.workspace / "uploads" / ".parts"
+    sidecar = parts / f"{url.rsplit('/', 1)[-1]}.json"
+    (entry,) = (parts / "by-file").iterdir()
+    long_ago = time.time() - 8 * 86400
+    os.utime(entry, (long_ago, long_ago))                           # created long ago, still receiving bytes
+    small_head._last_cleanup.clear()
+    small_head._cleanup_parts(parts)
+    assert entry.exists() and _find(client, conn)["url"] == url
+    os.utime(sidecar, (long_ago, long_ago))                         # and now abandoned
+    small_head._last_cleanup.clear()
+    small_head._cleanup_parts(parts)
+    assert not sidecar.exists() and not entry.exists()
+
+
+def test_the_first_chunk_is_the_browsers_chunk():
+    from pathlib import Path
+    from aiscientist.gateway import tus_upload
+    app_js = (Path(__file__).resolve().parents[1] / "frontend" / "console" / "app.js").read_text()
+    assert "const UPLOAD_CHUNK = 8 * 1024 * 1024;" in app_js
+    assert tus_upload._HEAD_BYTES == 8 * 1024 * 1024

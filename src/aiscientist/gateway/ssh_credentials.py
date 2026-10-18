@@ -232,3 +232,16 @@ def delete_credential(owner: str, cred_id: str) -> bool:
         pass
     _save_index(owner, keep)
     return True
+
+
+def delete_owner(owner: str) -> int:
+    """Remove every saved key of ``owner`` when the account is deleted. The public halves stay in
+    HPC3's ``authorized_keys`` (they grant nothing without the private keys removed here).
+    Returns how many keys there were."""
+    d = _root() / _safe_owner(owner)
+    if not d.is_dir():
+        return 0
+    n = len(_load_index(owner))
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+    return n

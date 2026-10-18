@@ -308,8 +308,9 @@ def _validate(libs: list[dict[str, Any]], status_rows: list[dict[str, str]],
     for lib in libs:
         k = lib["doublet_kappa"]
         if k is not None and k < _KAPPA_LOW:
+            # The warnings are copied into the user's report as they are: facts, no instructions.
             warnings.append(f"{lib['sample']}: the two doublet callers agree poorly (kappa {k:.2f}), "
-                            "so the choice of decider drives which cells are removed. Report it.")
+                            "so the choice of decider drives which cells are removed.")
     return warnings
 
 
@@ -449,6 +450,23 @@ def _merge_and_preprocess(sc: Any, h5ads: list[Path], n_top_genes: int, figs: Pa
     return adata
 
 
+def _add_kept_median_mt(adata: Any, libs: list[dict[str, Any]]) -> None:
+    """Each library's median % mitochondrial over the cells it KEPT, as ``median_pct_mt_kept``.
+    CellQC's own ``median_pct_mt`` is the filter step's, over every Cell Ranger cell before the
+    filters (run 6275df1213ab: 0.77 there, 0.69 over the 14,553 kept cells)."""
+    if "pct_counts_mt" not in adata.obs:
+        return
+    import numpy as np  # noqa: PLC0415
+    pct = adata.obs["pct_counts_mt"].to_numpy(dtype=float)
+    sample = (adata.obs["sampleid"].astype(str).to_numpy() if "sampleid" in adata.obs else None)
+    if sample is None and len(libs) > 1:
+        return
+    for lib in libs:
+        sel = pct if sample is None else pct[sample == str(lib["sample"])]
+        sel = sel[~np.isnan(sel)]
+        lib["median_pct_mt_kept"] = round(float(np.median(sel)), 4) if sel.size else None
+
+
 def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """CellQC over the bound folder's Cell Ranger libraries -> ``work/adata_qc.h5ad`` + CellQC's
     own report and tables, with its validation checklist turned into warnings."""
@@ -577,6 +595,7 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     except ImportError as exc:
         return {"status": "error", "step": "qc", "error": f"scanpy is missing: {exc}"}
     adata = _merge_and_preprocess(sc, h5ads, int(_p(_TOOL, "n_top_genes", args)), figs)
+    _add_kept_median_mt(adata, lib_summaries)
     adata.uns["cellqc"] = {"species": species, "chemistry": chemistry, "decider": decider,
                            "ambient_method": ambient, "libraries": included}
     # What the counts layer IS. CellQC writes the AMBIENT-CORRECTED matrix, so these are not Cell

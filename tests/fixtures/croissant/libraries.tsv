@@ -1,0 +1,5 @@
+library	condition	n_cells	pass_qc
+lib_A	control	5120	true
+lib_B	control	4980	true
+lib_C	treated	3015	false
+lib_D	treated	5410	true

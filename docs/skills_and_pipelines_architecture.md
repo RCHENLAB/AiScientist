@@ -1,187 +1,136 @@
-# Skills / Preset-pipelines / Registry — architecture
+# Tools, skills and pipelines
 
-Status: **BUILT** (2026-07-07). The three layers exist and are wired end-to-end (full suite green).
-What remains is additive, not structural: **skill induction** (grow the library from successful
-runs), a **`search_skills(query)`** retrieval step for when the library gets large, and making the
-console Advanced multi-select offer composable **atomic skills** (today it still offers
-preset-pipelines). Owner: Yijun + Claude.
+A run has three kinds of capability to draw on. They differ in who may change them and in how
+much of the model's context they cost.
 
-## The three layers
-
-| Layer | What it is | Rewritable by the model? | Lives in |
+| Layer | What it is | Can the model rewrite it? | Where |
 |---|---|---|---|
-| **Registry (fixed core)** | A SMALL set of verified, infra-backed primitives, always available in the Scientist's tool list. | No — fixed. | `agents/registry.py` + `tools/*.py` |
-| **Skills (atomic, adaptable)** | A large, growable library of atomic capabilities the agent picks, composes, and **rewrites via `run_code`**. Surfaced ON DEMAND (manifest → fetch), not dumped into the tool list. | Yes — the point. | `skills/<name>/` |
-| **Preset-pipelines** | Fixed, reproducible, prompt-driven full research workflows that compose skills + registry tools. Secondary ("额外的东西"). | No — fixed guidance. | `preset_pipelines/<name>/SKILL.md` |
+| **Tool** | Fixed, tested code the Scientist calls by name. Most tools are Slurm jobs on HPC3. | No | [`src/aiscientist/tools/<name>/`](../src/aiscientist/tools/README.md) |
+| **Skill** | Guidance plus a code template that the Scientist reads, adapts to the dataset and runs. | Yes, that is its purpose | [`skills/`](../skills/README.md), and the induced-skill directory |
+| **Pipeline** | A protocol for a whole study. It steers the PI's plan and names the tools it composes. | No | [`preset_pipelines/<name>/`](../preset_pipelines/README.md) |
 
-## Why the registry still earns its place
+Adding any of the three is adding a folder. No platform code changes.
 
-The registry is NOT "just some tools" — its members carry infrastructure the model must not
-casually rewrite:
+Which layer a new capability belongs in: code that carries infrastructure (a Slurm job, a
+checkpoint, a container, an external service) or that must behave the same in every run is a tool.
+Analysis code that has to be adapted to each dataset is a skill. The order and the rules of a kind
+of study are a pipeline.
 
-- `run_scanpy_qc` / `run_clustering` / `run_de` / `run_enrichment` — routed to **HPC3 Slurm jobs**
-  with **checkpointing** (`_route_analysis`, `_HPC_ANALYSIS_TOOLS`). Rewriting them loses the
-  offload + resume.
-- `run_code` — the **CodeAct engine** every skill runs on.
-- `finish` — control primitive.
-- (Candidate) `annotate_variants` (VEP REST), `scgpt_annotate` (GPU job), `literature_search`
-  (Europe PMC) — thin wrappers over external services / GPU infra; stable, keep in the registry
-  unless we want them rewritable.
+## Tools
 
-Rule of thumb: **infra-backed / verified / control → registry; adaptable analysis code → skill.**
+A tool is a folder with a `TOOL.md` and a `tool.py`. The front matter of `TOOL.md` is the tool's
+manifest: its name, category, where it runs (`runs_on`), and optionally a container image.
+`tools/catalog.py` discovers the folders, and `agents/registry.py` builds the Scientist's tool list
+from them and routes each tool by its manifest: in the gateway process, or as a job on the
+analysis, variant, phenotype, literature or scGPT line of HPC3. The index of tools is generated
+from the manifests into [`src/aiscientist/tools/README.md`](../src/aiscientist/tools/README.md).
 
-## Why this saves context — and when it does NOT
+The platform adds its own tools to that list: `finish`, `run_code` (the sandbox every skill runs
+in), the HPC3 shell tools when the session has a shell, `describe_environment`, and the tools that
+read the other layers (`read_skill_reference`, `search_skills`, `read_tool_source`,
+`run_in_environment`).
 
-Today `build_scientist_catalog` puts EVERY registry tool's name + description + JSON schema into the
-LLM tool list on EVERY step. That cost grows with the tool count.
+Every tool's name, description and argument schema is in the model's tool list on every step. That
+cost grows with the number of tools, which is why adaptable analysis code is kept in skills.
 
-The saving comes from **progressive disclosure**, not the folder split:
-- Registry stays ~8–10 tools → always in the tool list, cheap.
-- Skills are surfaced as a SHORT manifest (name + one-line summary) and the full body is fetched +
-  adapted only when a step uses it (`read_skill_reference` + `run_code`) — exactly today's
-  `scripts/*.py` mechanism, generalized.
+## Skills
 
-⚠️ **If skills are instead injected as always-on tools, there is NO saving.** Progressive disclosure
-is the load-bearing mechanism; the folder split is just its organization.
+A skill is any folder that holds a `SKILL.md`, at any depth, in the Agent-Skills layout. Only
+`SKILL.md` is required: its front matter gives `name` and `description`, and its body is the
+guidance. A longer skill bundles files beside it, usually a `reference.py` template. The format
+and the rules for writing one are in [`skills/README.md`](../skills/README.md).
 
-⚠️ **As the skill library grows, the manifest itself bloats.** Reserve a place for skill
-**discovery/retrieval** (`search_skills(query)` or a retrieval step) so the agent finds the right
-skill by description instead of reading the whole catalog. Not needed on day one; the schema must
-allow it.
+`agents/skills.py` loads skills from two roots:
 
-## Skill = atomic, adaptable code capability  (as built)
+- the curated library, `skills/` in the repository (`AISCIENTIST_SKILLS_DIR` overrides it), whose
+  skills are reviewed like code before they are merged;
+- the induced-skill directory (`AISCIENTIST_INDUCED_SKILLS_DIR`), outside the repository, where
+  the platform writes the skills it learns from runs.
 
-An atomic skill (Yijun's confirmed definition) = a capability that sits ABOVE the fixed `run_*`
-primitives and that the model can rewrite/adapt via `run_code`. **As built (2026-07-08)**, each skill
-is a **folder** `skills/<name>/` in the Anthropic Agent-Skills shape — description and demonstration
-are separate files:
-- `SKILL.md` — frontmatter (`name` + one-line `description`) and a markdown body
-  (`## When to use` / `## Details & adaptation` / `## Run`). The `description` is the manifest label;
-  the body is the human-readable **when-to-use + how-to-adapt** guidance.
-- `reference.py` (and any other bundled file) — the adaptable CodeAct **demonstration** the Scientist
-  fetches, adapts to the dataset, and runs via `run_code` — a TEMPLATE to rewrite, not code to run
-  blindly.
-- Loaded by `agents/skills.py` into `SKILLS` (keyed by folder/frontmatter name, no `.py`); override
-  the dir with `$AISCIENTIST_SKILLS_DIR`. Grown by **induction** (deferred).
-- **Since 2026-10-01, a skill is dropped in, not wired in:** any folder holding a `SKILL.md`, at any
-  depth (`skills/<category>/<name>/` works), is a skill; `SKILL.md` is the only required file (a short
-  skill keeps its code or shell commands inline); bundled files may sit in subfolders; Agent-Skills
-  frontmatter (`license`, `compatibility`, a nested `metadata:` block) is read as-is; and
-  `refresh_skills()` re-scans before every step, so no restart is needed. See `skills/README.md`.
+The loader scans both again before every step, so a folder that is added, edited or removed takes
+effect at the next step of a running analysis, without a restart. A curated skill always wins
+over an induced skill of the same name.
 
-**Three-level progressive disclosure** (see `agents/skills.py`):
-1. the brief lists only the MANIFEST (`- name — description`), every skill, grouped by category;
-2. `read_skill_reference(name)` returns the SKILL.md **guidance** + the bundled-file list;
-3. `read_skill_reference(name, file="reference.py")` returns one file's **code**, on demand.
+### How a skill reaches the model
 
-Name lookups tolerate a legacy `.py` suffix, so older configs / preset prose that say `<name>.py`
-still resolve.
+A skill's text enters the model's context only when a step uses it:
 
-## What was built (2026-07-07, one focused effort, full suite green)
+1. **The list.** Each step's brief lists every skill as `- <name> — <description>`, grouped by
+   category. There is no cap on the list.
+2. **The guidance.** `read_skill_reference(name)` returns the body of `SKILL.md` and the names of
+   the bundled files.
+3. **The code.** `read_skill_reference(name, file="reference.py")` returns one bundled file.
 
-1. **Moved** `skills/<name>/` → `preset_pipelines/<name>/` (6 folders); renamed the loader
-   `agents/skills.py` → `agents/preset_pipelines.py` (pipeline vocab: `PresetPipeline`/`PIPELINES`/
-   `get_pipeline`/`list_pipelines`/`select_pipeline`/`compose_pipeline_prompts`; env
-   `AISCIENTIST_PIPELINES_DIR`). `presets.py` shim repointed.
-2. **Promoted** the 9 `scripts/*.py` to a flat `skills/` atomic library and added a NEW
-   `agents/skills.py` (the `Skill` model, `SKILLS` loader, `skill_manifest`, and the
-   `read_skill_reference` tool). `$AISCIENTIST_SKILLS_DIR` now points at the atomic library.
-3. **Wired** progressive disclosure: the Scientist's brief lists the GLOBAL atomic-skill manifest
-   (name + summary), `read_skill_reference` fetches a body on demand; the fixed registry stays the
-   always-on core. `PresetPipeline` no longer bundles scripts.
+The Scientist adapts the template and runs it with `run_code`, or runs its shell commands with
+`run_shell`. `search_skills(query)` ranks the library by keyword overlap with the name, the
+description and the body.
 
-## Resolved decisions
+A skill whose steps are command-line programs that no tool runs declares an `image:` in its
+`SKILL.md`. The platform builds that image on HPC3 at first use, and the Scientist runs the skill's
+commands inside it with `run_in_environment(skill, command)`.
 
-- External-service wrappers (`annotate_variants`, `scgpt_annotate`, `literature_search`) stay in the
-  **registry** (fixed infra wrappers, per Yijun's "固定不太重写" rule) — not moved to skills.
-- `preset_pipelines` and `skills` are **fully separate modules** (independent loaders/schemas).
+### How a plan uses a skill
 
-## Built (additive, 2026-07-07)
+- **The PI sees the library when it plans.** Every draft carries the skill list after the tool
+  list, with each description kept up to 1,024 characters. A step that needs a skill is planned as
+  a `run_code` step that names the skill in backticks. The prompt tells the PI to prefer a tool
+  whenever one covers the step, and to describe a skill's method only as its description states it.
+  So a skill's description must name its method.
+- **The Scientist is told which skill a step uses.** The brief of a step names the skills its text
+  mentions, so the Scientist reads them instead of searching.
+- **The user can require skills.** In the console's *Pipelines & skills* sheet, a ticked skill is
+  required for that run: the PI's guidance says the plan must apply each of them.
 
-- **Advanced multi-select over atomic skills** — the console's Advanced panel now has a second
-  checklist: checked atomic skills are REQUIRED for the run (the plan MUST apply each). Wiring:
-  `/api/skills` + `agents/skills.list_skills()` → the picker; `LabRequest.skills` →
-  `LabConfig.required_skills` (validated against the library) → a "REQUIRED skills" directive
-  appended to the PI's planning guidance; a `🧩 Required skills` feed line. Distinct from pinning a
-  preset-pipeline (which steers the whole plan shape).
-  Since 2026-10-12 both checklists (preset pipelines and atomic skills) are in the composer's
-  **Pipelines & skills** sheet instead of an inline "Advanced" disclosure: each entry is shown whole
-  (description, the tools a pipeline composes, its protocol), and what a chat requires appears as
-  removable chips above the composer.
-- **`search_skills(query)` retrieval** — a `search_skills` Scientist tool (`agents/skills.py`):
-  keyword/token-overlap ranking over name > summary > body (offline, deterministic, no embedder).
-  The brief used to stop listing above `AISCIENTIST_SKILL_MANIFEST_MAX` (12) skills and say "search"
-  instead; with 15 skills in the repo no run ever saw the list. **The cap was removed on 2026-10-01**
-  (Yijun's call): every brief lists every skill's name + description, grouped by category, so the
-  agent reads the whole library before it chooses; `search_skills` stays as a ranking aid. Bodies are
-  still fetched only on demand.
+### Skills learned from runs
 
-## Migrated flat files → folder skills (2026-07-08)
+With `AISCIENTIST_SKILL_INDUCTION=1` and `AISCIENTIST_INDUCED_SKILLS_DIR` set, a run ends with an
+induction step (`agents/skill_induction.py`):
 
-Per Yijun: the flat `skills/<name>.py` form did not match the Anthropic Skill definition (separate
-description + demonstration). Each skill is now a folder `skills/<name>/` with `SKILL.md` (curated
-frontmatter `description` + `## When to use` guidance) and `reference.py` (the demonstration
-template). Changes:
-- `agents/skills.py` — `Skill(name, summary, doc, files)`; loader globs `skills/*/SKILL.md`, parses
-  frontmatter (reuses the preset-pipeline convention), reads bundled files. `read_skill_reference`
-  now takes an optional `file` (guidance first, code on `file=`). `.py`-tolerant `get_skill`/lookup.
-- `agents/research_lab.py` — brief text + REQUIRED-skills directive describe the two-call fetch;
-  required-skill matching goes through `get_skill` (tolerant).
-- Manifest/`list_skills`/`search_skills` unchanged in shape (name + one-line summary), so the
-  `/api/skills` console picker and its round-trip keep working (names now carry no `.py`).
-- Progressive disclosure is now genuinely three-level (manifest → guidance → code).
+1. The candidates are the successful `run_code` calls of the steps the Critic accepted.
+2. A model decides for each whether it is a reusable procedure, and if so generalizes it: the
+   dataset's paths, columns and thresholds move into a config block at the top. The prompt's
+   default answer is no.
+3. Checks that do not depend on the model follow: a plain snake_case name, code that compiles and
+   is between 120 and 12,000 characters, no clash with an existing name. At most two skills are
+   kept per run.
+4. The skill is written to the induced-skill directory as `<name>/SKILL.md` and `reference.py`,
+   never into the repository and never over an existing folder. An improved version of an existing
+   skill is written beside it as `<name>_v2`, and lists show only the newest version; the older
+   one can still be read by name.
 
-## Induced skills are reviewed before any model sees them (2026-10-07)
+**An induced skill is reviewed before any model sees it.** It is one run's code turned into a
+template, and it can carry that dataset's file format and column names. Everything in the
+induced-skill directory starts as `pending`. An admin approves or retires it in the console's
+*Admin → Skill review* tab, which shows its `SKILL.md`, its code and the step it came from. Only
+approved skills are listed for planning, for the Scientist and in search. The decisions are kept
+in `_review.json` in that directory and take effect at the next step of every run. A pending skill
+still reserves its name, so the same procedure is not learned twice.
 
-An induced skill is one run's `run_code` frozen into a template, with that dataset's file format and
-column names inside it. Listed for planning on every later run, it got planned onto data it could not
-read: run f3b8268c4fd4 put `verify_matrix_provenance` (DDX41's `read_h5ad` + `nCount_RNA` / `sampleid`
-/ `majorclass`) in front of a 10x Cell Ranger `.h5`, and the step failed three times. So:
+## Pipelines
 
-- `agents/skills.py` keeps two views. `ALL_SKILLS` is everything on disk; `SKILLS`, the library the PI
-  plans with and the Scientist lists, searches and reads, holds the curated skills plus only the
-  induced skills an admin has **approved**. Everything in the induced root counts as induced and starts
-  `pending`, so a folder dropped there cannot skip the review; `retired` stays on disk, never offered.
-- Decisions live in `<AISCIENTIST_INDUCED_SKILLS_DIR>/_review.json` (status, who, when, note, and a
-  short history), written by `set_review`; they apply at the next step of every run, no restart.
-- The console's **Admin → Skill review** tab (`/api/admin/skills`, admin only) lists each induced skill
-  with the step it was learned from, shows its SKILL.md and code, and approves, retires or resets it.
-- Induction still checks names and duplicates against `ALL_SKILLS`, so a skill awaiting review is not
-  learned a second time under another name. A newly induced skill is announced as awaiting review.
+A pipeline is a folder with a `SKILL.md` whose front matter gives `name`, `description`, the
+`tools` it composes and the `data_type` it is for (`scrna` or `variants`), and whose body is the
+guidance the PI plans from. A `PROTOCOL.md` beside it is the same protocol written for a
+researcher to read and audit; the platform does not load it. `agents/preset_pipelines.py` loads
+the folders when the gateway starts.
 
-## The PI plans with the skill library (2026-10-01)
+A pipeline steers the plan and does not replace it. The PI still drafts the steps for the actual
+dataset and question, the user reviews and edits the plan, and the Scientist and the Critic run
+and check every step.
 
-Until then a skill reached a plan only when the user ticked it (REQUIRED skills above) or when the
-Scientist went looking mid-step for something no tool covered: the PI drafted every plan from one
-preset pipeline and the tool list. Now every draft (`_pi_plan` in `agents/research_lab.py`) carries
-the skill manifest after the tools, read from the library as it is at that moment, so each request
-that is planned in full is matched against the skills, including ones induced since the last run.
+How a run gets its pipeline:
 
-- **What the PI sees** (`plan_skill_lines` in `agents/skills.py`): the whole library, superseded
-  versions hidden. It was capped at 40 skills with descriptions cut at 200 characters; on 2026-10-02
-  the count cap was removed (Yijun: no list caps) and the cut raised to the Agent-Skills maximum of
-  1,024 characters, because 200 cut off the sentence that routes a skill (the CellQC skill's
-  description ENDS with "inside an AiScientist analysis ... is the run_cellqc tool, not this
-  skill"). A caller can still pass `limit` to get the best keyword matches first.
-- **How a plan uses one:** a step that needs a skill is a `run_code` step that names the skill in
-  backticks. Tools still come first: the prompt says not to plan a skill that repeats a tool.
-- **Execution:** the Scientist's brief names the skill a step mentions (`skills_named_in`), so it
-  reads that skill instead of rediscovering it with `search_skills`.
-- The multi-cycle re-plan gets the same list, and `check_plan_tooling` does not report a skill
-  name (an induced skill may be called `run_…`) as an unknown tool.
-- **A skill's description must name its method.** The PI is required to state each step's method,
-  and when a description did not name one it guessed (1 plan in 7 said AUCell for a template that
-  runs `sc.tl.score_genes`). The prompt now forbids attributing a method the description does not
-  state, and `score_signature` names its method. Write new descriptions the same way.
-- Measured on Qwen3.8-27B (`experiments/plan_vs_exec_ab/skills_ab.py`, Rounds 7 and 7b in that
-  README), on OpenRouter and then on our own INT4 serve job with the production settings: where the
-  loaded protocol does not name the needed skill, plans with the list applied `score_signature`
-  (15/15 and 8/8) and plans without it wrote their own scoring code (0/8 and 0/8); where the protocol
-  already names it, both arms used it; a plain DE question named no skill either way, and no plan
-  replaced a tool with a skill.
+- **By the dataset.** At the start of a run the platform reads what the dataset is. If one
+  pipeline matches that data type it is chosen directly; if several match, a model picks among
+  them from the question and the dataset profile; if the data type is unknown, the model picks
+  from the whole library or answers that none fits, and the PI then plans from the tool and skill
+  lists alone.
+- **By the user.** Pipelines ticked in the *Pipelines & skills* sheet are mandatory for that run,
+  and the automatic choice is added to them. A ticked pipeline for another data type than the
+  dataset's is dropped: a single-cell protocol is never applied to a VCF. If the user edits the
+  guidance text itself, the automatic choice is off.
+- **No automatic choice** when the request limits the run to named analyses ("only QC"): a
+  protocol lays out a whole study, which the user has just declined.
 
-## Not yet built (deferred)
-
-- **Skill induction** — distil a successful run into a new `skills/<name>/`. **SHELVED per Yijun
-  (2026-07-07) — not the focus right now.** (Upgrade `search_skills` to embeddings if/when keyword
-  overlap stops being enough.)
+When a pipeline is loaded, the console shows the tools it composes and marks those this deployment
+cannot run.

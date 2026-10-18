@@ -79,7 +79,9 @@ unchanged.
     process files.
 - `tables/cellqc_metrics.csv`; a per-library QC violin in `figures/`.
 - Result: per-library cells in → after filtering → after doublets, which threshold removed them
-  (`removed_only_by`), ambient load, doublet counts and caller agreement (kappa), nuclear fraction;
+  (`removed_only_by`), median % mitochondrial before filtering (`median_pct_mt`, CellQC's) and
+  over the kept cells (`median_pct_mt_kept`), ambient load, doublet counts and caller agreement
+  (kappa), nuclear fraction;
   the assumptions it made (species, chemistry, doublet rate, `nreaction`) and where each came from;
   and `warnings` — the CellQC validation checklist (a failed or fallback step, an excluded library,
   an inert mitochondrial filter, a library with low retention or high ambient load, poor doublet

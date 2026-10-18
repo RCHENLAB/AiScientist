@@ -48,7 +48,7 @@ ENV_DIR="${AISCIENTIST_ENV:-$ROOT/env}"
 HOST="${AISCIENTIST_HOST:-127.0.0.1}"
 PORT="${AISCIENTIST_PORT:-8800}"
 # Dev hot-reload: AISCIENTIST_RELOAD=1 ./start.sh  → uvicorn auto-restarts the worker when
-# a backend .py changes (e.g. after ./scripts/push.sh). NOTE: a reload drops in-memory
+# a backend .py changes. NOTE: a reload drops in-memory
 # state — any live HPC3 connection/tunnel dies and must be reconnected, so use it for
 # dev iteration, NOT while a research run is in flight. (Frontend HTML/JS/CSS is always
 # hot — it's read from disk per request, so just refresh the browser.)
@@ -102,11 +102,11 @@ if [ -n "${holder// /}" ]; then
 fi
 
 # --- which build is this? print a fingerprint so a restart is verifiable ------
-# Works even though push.sh rsyncs source but NOT .git: the fingerprint is a hash
+# Works even though a deploy rsyncs the source but NOT .git: the fingerprint is a hash
 # of the deployed aiscientist/*.py, so it changes whenever new code lands. If a real
 # git checkout is present (local dev), show the commit too.
 gitline=""
-# Only trust the commit when the tree is CLEAN. On the server push.sh rsyncs source
+# Only trust the commit when the tree is CLEAN. On the server a deploy rsyncs the source
 # but not .git, so .git is a stale old checkout and rsync leaves it "dirty" — its HEAD
 # is NOT what we just deployed, so showing it would mislead. A clean tree (local dev)
 # means the commit really matches the files; the fingerprint is the truth either way.

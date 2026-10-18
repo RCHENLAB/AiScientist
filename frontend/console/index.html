@@ -237,12 +237,17 @@
               <div class="chat-head">
                 <h2 id="chatTitle">New chat</h2>
                 <small id="chatModel"></small>
+                <!-- What this chat's model calls cost so far (tokens, estimated $), and the running
+                     total of its research run while one is going. Hidden with nothing to count. -->
+                <button id="chatUsage" type="button" class="chat-usage hidden" title="Tokens and estimated cost of this chat. Open Account › Usage for the details."></button>
               </div>
               <!-- Lightweight GPU cold-start status (shown only while provisioning; a
                    liveness cue so the user knows it isn't stuck). Auto-closes when live. -->
               <div id="bootStatus" class="boot-status hidden"></div>
+              <!-- A budget threshold reached (Account › Usage › Budget); shown once per cycle. -->
+              <div id="budgetNotice" class="budget-notice hidden" role="status"></div>
               <div id="chatStream" class="chat-stream">
-                <div class="empty-hint">Connect to a GPU-backed Qwen3 on HPC3, then ask a research question.</div>
+                <div class="empty-hint">Connect to HPC3, then ask a research question.</div>
               </div>
               <div class="chat-controls">
                 <!-- Axis B: WHICH ENGINE answers. Explicit and user-visible on purpose — a
@@ -310,9 +315,17 @@
             </section>
 
             <aside class="panel side-panel right-panel" id="rightPanel">
-              <h2 class="results-title">Results</h2>
-              <div id="downloads" class="downloads">
-                <div class="downloads-empty">Run a pipeline to get a results bundle (.zip) and browse the report, figures, and tables here.</div>
+              <!-- Two tabs: the chat's plan (the whole plan, its settings and its YAML document,
+                   drawn from state — see renderPlanPanel) and the run's results. -->
+              <div class="side-tabs" role="tablist" aria-label="Side panel">
+                <button id="sideTabPlan" class="side-tab" type="button" role="tab">Plan</button>
+                <button id="sideTabResults" class="side-tab active" type="button" role="tab">Results</button>
+              </div>
+              <div id="planPanel" class="plan-panel hidden" role="tabpanel"></div>
+              <div id="resultsPane" role="tabpanel">
+                <div id="downloads" class="downloads">
+                  <div class="downloads-empty">Run a pipeline to get a results bundle (.zip) and browse the report, figures, and tables here.</div>
+                </div>
               </div>
             </aside>
           </main>
@@ -323,8 +336,20 @@
           <div class="page">
             <div class="page-head"><h2>My datasets</h2><button id="datasetsRefresh" class="ghost small">Refresh</button></div>
             <div id="uploadsPanel" class="uploads-panel hidden"></div>
-            <p class="page-sub">Files you've uploaded to the server. Click "Use" to load one into a Research run.</p>
+            <p class="page-sub">Files you've uploaded to the server. Preview one to see what it holds, download it, review how it is described ("Metadata"), or click "Use" to load it into a Research run.</p>
             <div id="datasetsList" class="card-list"><div class="empty-hint">Loading…</div></div>
+            <!-- Personal access tokens for MCP clients (RCHENLAB/AiScientist issue 9): an assistant the
+                 user chooses reads these datasets' Croissant metadata, as this account and only this one. -->
+            <div id="mcpSection" class="page-section hidden">
+              <h3>Use your datasets from an AI assistant (MCP)</h3>
+              <p class="page-sub">An MCP client you choose (Claude Code, an IDE assistant, a script) can list, search and read your datasets' and results' metadata, follow their lineage and preview their tables, with a token you make here. A token sees exactly what you see here, nothing more; revoke it when you no longer use it.</p>
+              <div id="mcpTokens" class="storage-items"></div>
+              <form id="mcpTokenForm" class="form mcp-token-form">
+                <input id="mcpTokenName" type="text" maxlength="64" placeholder="Name it, e.g. my laptop" autocomplete="off" />
+                <button type="submit" class="primary small">Create token</button>
+              </form>
+              <div id="mcpTokenShown" class="mcp-token-shown hidden"></div>
+            </div>
           </div>
         </section>
 
@@ -343,6 +368,7 @@
             <div class="admin-tabs" role="tablist">
               <button class="admin-tab active" role="tab" data-admin-tab="users">Users</button>
               <button class="admin-tab" role="tab" data-admin-tab="skills">Skill review <span id="skillPendingBadge" class="tab-badge hidden"></span></button>
+              <button class="admin-tab" role="tab" data-admin-tab="usage">Usage</button>
             </div>
             <div id="adminPane-users" class="admin-pane">
             <div class="page-head"><h2>User management</h2><button id="adminRefresh" class="ghost small">Refresh</button></div>
@@ -375,6 +401,18 @@
               </div>
               <div id="skillReviewList" class="card-list"><div class="empty-hint">Loading…</div></div>
             </div>
+            <div id="adminPane-usage" class="admin-pane hidden">
+              <div class="page-head"><h2>LLM usage, all accounts</h2>
+                <div class="usage-actions">
+                  <select id="adminUsageDays" class="workflow-select" aria-label="Period">
+                    <option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option>
+                  </select>
+                  <button id="adminUsageRefresh" class="ghost small">Refresh</button>
+                </div>
+              </div>
+              <p class="page-sub">Tokens and estimated cost by account, model and day. No key, prompt or answer is stored with these figures. The Claude Console is the authoritative record of what each key spent.</p>
+              <div id="adminUsageBody"><div class="empty-hint">Loading…</div></div>
+            </div>
           </div>
         </section>
 
@@ -383,6 +421,56 @@
           <div class="page">
             <div class="page-head"><h2>My account</h2></div>
             <div id="accountInfo" class="account-info"></div>
+
+            <!-- Your own API key, and what it has been used for here. -->
+            <h3>Claude API key</h3>
+            <div class="account-info account-key">
+              <p>Bring your own Claude API key — for example one that uses your Claude Max or Team plan's monthly API credits. AiScientist stores it encrypted on this server and only ever shows its last 4 characters.</p>
+              <div class="btn-row">
+                <button id="accountKeysBtn" type="button" class="primary small">Manage API keys</button>
+                <a class="ghost small guide-link" target="_blank" rel="noopener" data-guide>Guide: use your Claude subscription</a>
+              </div>
+            </div>
+
+            <section id="usageSection" class="usage-section">
+              <div class="page-head"><h3>Usage</h3>
+                <div class="usage-actions">
+                  <select id="usagePeriod" class="workflow-select" aria-label="Breakdown period">
+                    <option value="today">Today</option><option value="7d">Last 7 days</option>
+                    <option value="cycle" selected>This billing cycle</option><option value="30d">Last 30 days</option><option value="all">All time</option>
+                  </select>
+                  <a id="usageExport" class="ghost small" download>Export CSV</a>
+                  <button id="usageRefresh" type="button" class="ghost small">Refresh</button>
+                </div>
+              </div>
+              <p id="usageNote" class="usage-note"></p>
+              <div id="usageBody"><div class="empty-hint">Loading…</div></div>
+
+              <h3>Budget</h3>
+              <p class="page-sub">Your plan's monthly API credit and the day it resets. The usage page then compares the estimated spend with it, warns you at the thresholds, and can ask for confirmation — or refuse — before a new run on your API key once a hard limit is reached. Runs on the cluster GPU cost you nothing and are never limited.</p>
+              <form id="budgetForm" class="form budget-form">
+                <label>Monthly credit (USD) <span class="hint-inline">e.g. 100 for Max 5x; blank = none</span>
+                  <input id="budgetCredit" type="number" min="0" step="0.01" placeholder="100" />
+                </label>
+                <label>Billing cycle resets on day
+                  <input id="budgetResetDay" type="number" min="1" max="31" step="1" value="1" />
+                </label>
+                <label>Warn me at (% of the credit)
+                  <input id="budgetThresholds" type="text" value="50, 80, 100" autocomplete="off" />
+                </label>
+                <label>Hard limit (USD) <span class="hint-inline">optional</span>
+                  <input id="budgetHardLimit" type="number" min="0" step="0.01" placeholder="none" />
+                </label>
+                <label>When the hard limit is reached
+                  <select id="budgetHardMode">
+                    <option value="confirm">Ask me before each new run</option>
+                    <option value="block">Block new runs until the cycle resets</option>
+                  </select>
+                </label>
+                <button type="submit" class="primary small">Save budget</button>
+              </form>
+            </section>
+
             <h3>Change my password</h3>
             <form id="changePwForm" class="form narrow">
               <label>Current password<input id="cpOld" type="password" autocomplete="current-password" /></label>
@@ -507,6 +595,27 @@
   <!-- Bring-your-own API key. The HPC3 account is still required (it runs the analysis jobs);
        this only chooses which LLM reasons, and on whose bill. A credential's id is stable, so
        replacing an expired key here keeps every session and saved preference pointing at it. -->
+  <!-- A dataset's Croissant metadata (RCHENLAB/AiScientist issue 9). The descriptive fields are a
+       form; the files, sizes, checksums and table columns were measured and are shown, not edited.
+       Each drafted value says where it came from and how sure the drafting was. -->
+  <div id="metadataModal" class="modal hidden">
+    <div class="modal-card metadata-card" role="dialog" aria-modal="true" aria-labelledby="metadataTitle">
+      <div class="modal-head">
+        <h2 id="metadataTitle">Dataset metadata</h2>
+        <button id="metadataClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p id="metadataMeasured" class="storage-note md-measured"></p>
+      <p id="metadataHint" class="storage-note md-hint"></p>
+      <form id="metadataForm" class="form md-form"></form>
+      <p id="metadataError" class="login-error hidden"></p>
+      <div class="btn-row">
+        <button id="metadataSave" type="submit" form="metadataForm" class="primary">Save</button>
+        <a id="metadataDownload" class="ghost small" href="#" target="_blank" rel="noopener">croissant.json</a>
+      </div>
+      <p id="metadataValidation" class="storage-note"></p>
+    </div>
+  </div>
+
   <div id="apiKeysModal" class="modal hidden">
     <div class="modal-card">
       <div class="modal-head">
@@ -522,6 +631,7 @@
            a reassuring adjective — a user who cannot see the answer assumes the browser is
            holding it, or that it travels with every request. -->
       <p id="apiKeyStorage" class="storage-note storage-where"></p>
+      <p class="storage-note"><a class="guide-link" target="_blank" rel="noopener" data-guide>Guide: use your Claude subscription's monthly API credits, and keep your key safe</a> · <a href="#" id="apiKeysUsageLink" class="guide-link">See your usage</a></p>
       <div id="apiKeyList" class="storage-items"><div class="storage-loading">Loading…</div></div>
 
       <form id="apiKeyForm" class="form api-key-form">
@@ -604,6 +714,22 @@
         </div>
       </div>
       <div id="filePreviewBody" class="preview-body"></div>
+    </div>
+  </div>
+
+  <div id="datasetPreviewModal" class="modal hidden">
+    <div class="modal-card ds-preview-card" role="dialog" aria-modal="true" aria-labelledby="dsPreviewTitle">
+      <div class="modal-head ds-preview-head">
+        <div class="ds-preview-titles">
+          <h2 id="dsPreviewTitle">Dataset</h2>
+          <div id="dsPreviewMeta" class="ds-preview-meta"></div>
+        </div>
+        <div class="preview-actions">
+          <a id="dsPreviewDownload" class="ghost small" download>Download</a>
+          <button id="dsPreviewClose" type="button" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+      </div>
+      <div id="dsPreviewBody" class="ds-preview-body"></div>
     </div>
   </div>
 

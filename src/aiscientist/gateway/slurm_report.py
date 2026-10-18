@@ -22,7 +22,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from .executor import RemoteExecutor
 from .slurm_job import (

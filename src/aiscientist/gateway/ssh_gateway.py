@@ -10,8 +10,9 @@ import socketserver
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import paramiko
 
@@ -779,6 +780,19 @@ class SSHExecutor:
         except (OSError, paramiko.SSHException) as exc:
             raise GatewayError(f"Failed to read {remote_path}.", stage="ssh_get",
                                detail=error_detail(exc)) from exc
+        finally:
+            sftp.close()
+
+    @contextmanager
+    def open_read(self, remote_path: str, bufsize: int = 1 << 16) -> Iterator[Any]:
+        """A remote file open for random-access reads over SFTP on the transfer host, for a reader
+        that seeks: h5py reading an ``.h5ad``'s metadata and first rows pulls only the byte ranges it
+        asks for, never the matrix. Each read that misses the buffer fetches at least ``bufsize``
+        bytes, so the many small metadata reads cost a few dozen round trips, not hundreds."""
+        sftp = self._open_sftp()
+        try:
+            with sftp.open(remote_path, "rb", bufsize=bufsize) as handle:
+                yield handle
         finally:
             sftp.close()
 

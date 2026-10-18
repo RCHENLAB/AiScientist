@@ -1141,8 +1141,6 @@ def test_dag_agent_memory_writes_reflects_and_reads_across_runs(tmp_path):
 
 
 def test_agent_memory_off_by_default_no_events(tmp_path):
-    briefs: list[str] = []
-
     def scientist_chat(messages, tools):
         if any(m.get("role") == "tool" for m in messages):
             return {"content": "", "tool_calls": [{"id": "f", "type": "function",

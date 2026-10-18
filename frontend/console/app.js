@@ -8,6 +8,7 @@ const RUNOWNER_KEY = "bioagent_runowner_v1"; // {connId, sids}: the chats whose 
 const LASTRUN_KEY = "bioagent_lastrun_v1";   // last COMPLETED run_id — survives a refresh so we can still recognise this conn's own run
 const STREAMS_KEY = "aiscientist_streams_v1"; // stream ids of answers this browser already saved — a reconnect replay of one is dropped
 const PLANDRAFT_KEY = "aiscientist_plandraft_v1"; // {<chat id>: {run, base, text, open}}: each plan editor's unapplied text — survives a reload while that plan is still waiting
+const COMPOSER_KEY = "aiscientist_composer_v1";   // {<chat id>: {draft, bound, roles, planFirst, bypass, saveResults, mode, route}}: each chat's composer — survives a reload
 
 const state = {
   connectionId: null,
@@ -34,6 +35,9 @@ const state = {
   leftAutoCollapsed: false,    // collapse the connect panel once, on first ready
   planCardEl: null,            // the visible chat's live plan / clarify / decision card
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
+  planAnsweredEl: null,        // the visible chat's entry for a plan it answered (drawAnsweredPlan)
+  planView: null,              // a saved plan opened from the chat into the side panel ({agenda, doc, status})
+  sideTab: "results",          // which of the side panel's two tabs is showing: "plan" | "results"
 };
 
 const $ = (id) => document.getElementById(id);
@@ -67,6 +71,11 @@ function newChatRecord(sid) {
     planDraftYaml: "",     // what is typed in the plan editor and not applied (or an edit just sent)
     planDraftBase: "",     // the plan document (its YAML) that text and the open editor belong to
     planEditorOpen: false, // the plan editor is open on the waiting card
+    planShown: "",         // which version of the waiting plan has opened the side panel already
+    answered: null,        // the plan as it stood when it was answered and the PI took it back (a reply
+                           // in words, an edit, a cancel, a review the server closed): {agenda, doc,
+                           // revised, status}. Its entry and the side panel show it, read-only, until
+                           // the next prompt or the chat's next run.
     bound: [],             // the BIND-SET (feature ②): the server paths of every data file attached
                            // for the next run (a VCF + a BED panel + a 2nd VCF). Ordered by attach;
                            // the server re-ranks to pick the primary. Posted as `datasets`.
@@ -76,6 +85,9 @@ function newChatRecord(sid) {
     caseNote: null,        // the attached clinical description: {name, text} — held as TEXT, not
                            // uploaded: its only consumer (map_phenotype_to_hpo) runs on the gateway.
     draft: "",             // what was typed in the composer and not sent yet
+    planFirst: true,       // "Plan first": the PI proposes a plan for review before any tool runs
+    bypass: false,         // "Bypass": this chat's runs have no review gates
+    saveResults: null,     // "Save results to my data"; null = the user's standing choice (savedResultsDefault)
     ctx: null,             // the last context-occupancy report of this chat's fast-chat turn
   };
 }
@@ -84,7 +96,7 @@ function chatOf(sid) {
   if (!sid) return null;
   sid = String(sid);
   let c = chats.get(sid);
-  if (!c) { c = newChatRecord(sid); chats.set(sid, c); }
+  if (!c) { c = newChatRecord(sid); restoreComposer(c); chats.set(sid, c); }
   return c;
 }
 function activeChat() { return chatOf(state.activeId); }
@@ -116,6 +128,78 @@ for (const [key, field] of Object.entries({ planDoc: "doc", planProblems: "probl
     get() { const c = activeChat(); const v = c && c.plan ? c.plan[field] : undefined; return v === undefined ? emptyChatField(field) : v; },
     set(v) { const c = activeChat(); if (c) { c.plan = c.plan || {}; c.plan[field] = v; } },
   });
+}
+
+// ---- each chat's composer, kept across a reload -------------------------------------------------
+// What was typed and not sent, the data attached for the next run and the run options belong to the
+// chat they were set in (RCHENLAB/AiScientist issue 7). This browser keeps them per chat, so a reload
+// gives every chat back its own and nothing of another's. The case note is not kept: it is a
+// patient's clinical text, held only while the page is open. Logging out clears them all.
+function readComposers() {
+  let all = null;
+  try { all = JSON.parse(localStorage.getItem(COMPOSER_KEY) || "null"); } catch {}
+  return all && typeof all === "object" && !Array.isArray(all) ? all : {};
+}
+function writeComposers(all) {
+  try {
+    if (Object.keys(all).length) localStorage.setItem(COMPOSER_KEY, JSON.stringify(all));
+    else localStorage.removeItem(COMPOSER_KEY);
+  } catch { /* private mode or a full store: the chat keeps its composer until the page closes */ }
+}
+// Only what differs from a new chat is stored; a chat with nothing of its own has no entry.
+function saveComposer(c) {
+  if (!c) return;
+  const s = state.sessions.find((x) => String(x.id) === c.sid);
+  const route = s && (s.route === "corpus" ? s.routeBeforeCorpus : s.route);   // a corpus scan is one action, not an engine
+  const entry = {};
+  if (c.draft) entry.draft = c.draft;
+  if (c.bound.length) entry.bound = [...c.bound];
+  const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
+  if (roles.length) entry.roles = Object.fromEntries(roles);
+  if (!c.planFirst) entry.planFirst = false;
+  if (c.bypass) entry.bypass = true;
+  if (typeof c.saveResults === "boolean") entry.saveResults = c.saveResults;
+  if (s && s.mode && s.mode !== "auto") entry.mode = s.mode;
+  if (route && route !== "research") entry.route = route;
+  const all = readComposers();
+  if (Object.keys(entry).length) all[c.sid] = entry; else delete all[c.sid];
+  writeComposers(all);
+}
+function restoreComposer(c) {
+  const e = readComposers()[c.sid];
+  if (!e || typeof e !== "object") return;
+  if (typeof e.draft === "string") c.draft = e.draft;
+  if (Array.isArray(e.bound)) c.bound = e.bound.filter((p) => typeof p === "string" && p);
+  for (const [p, role] of Object.entries((e.roles && typeof e.roles === "object") ? e.roles : {})) {
+    if (c.bound.includes(p) && typeof role === "string") c.roles[p] = role;
+  }
+  if (e.planFirst === false) c.planFirst = false;
+  if (e.bypass === true) c.bypass = true;
+  if (typeof e.saveResults === "boolean") c.saveResults = e.saveResults;
+}
+// A chat's mode and engine are kept on its session (onModeChange, onRouteChange): a reload brings
+// them back from here.
+const CHAT_MODES = ["auto", "single", "team"], CHAT_ROUTES = ["research", "chat"];
+function restoreChatModes(sessions) {
+  const all = readComposers();
+  for (const s of sessions) {
+    const e = all[String(s.id)];
+    if (!e) continue;
+    if (!s.mode && CHAT_MODES.includes(e.mode)) s.mode = e.mode;
+    if (!s.route && CHAT_ROUTES.includes(e.route)) s.route = e.route;
+  }
+}
+function forgetComposer(sid) {
+  const all = readComposers();
+  delete all[String(sid)];
+  writeComposers(all);
+}
+// Entries of chats that no longer exist (deleted elsewhere, or another account's on this browser) go.
+function pruneComposers(sessions) {
+  const keep = new Set(sessions.map((s) => String(s.id)));
+  const all = readComposers();
+  for (const sid of Object.keys(all)) if (!keep.has(sid)) delete all[sid];
+  writeComposers(all);
 }
 
 // The chats whose run is in flight, kept across a reload so their replayed results land in them.
@@ -172,6 +256,7 @@ const EMOJI_SYMBOL = {
   "🙋": "front_hand", "✋": "front_hand", "⚠": "warning", "❗": "priority_high", "✂": "content_cut",
   "✏": "edit", "📏": "straighten", "🗜": "compress", "📚": "menu_book", "🔀": "alt_route",
   "❓": "help", "📥": "download", "📤": "upload", "🔴": "error", "🟢": "check_circle", "⏳": "hourglass_empty",
+  "💲": "payments",
 };
 // Match any mapped emoji, swallowing a trailing variation-selector (U+FE0F) so "⚠️" maps cleanly.
 const EMOJI_RE = new RegExp("(" + Object.keys(EMOJI_SYMBOL).join("|") + ")️?", "g");
@@ -411,18 +496,36 @@ function renderMarkdown(text) {
       stash('<pre class="md-code"><code>' + escapeHtml(body.replace(/\n+$/, "")) + "</code></pre>"))
     .replace(/`([^`\n]+)`/g, (_m, c) => stash("<code>" + escapeHtml(c) + "</code>"));
   s = mdTables(escapeHtml(s))
+    .replace(/^#### (.+)$/gm, "<h4>$1</h4>")
     .replace(/^### (.+)$/gm, "<h3>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2>$1</h2>")
     .replace(/^# (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$/gm, "<hr>")
+    // "> " lines (escaped to &gt; above) become one quote block
+    .replace(/(?:^&gt; ?.*(?:\n|$))+/gm, (block) =>
+      "<blockquote>" + block.replace(/\n$/, "").split("\n").map((l) => l.replace(/^&gt; ?/, "")).join("\n") + "</blockquote>")
     // group consecutive "- " / "* " lines into a real bullet list
     .replace(/(?:^[ \t]*[-*] .+(?:\n|$))+/gm, (block) =>
       "<ul>" + block.trim().split(/\n/).map((l) =>
         "<li>" + l.replace(/^[ \t]*[-*] /, "") + "</li>").join("") + "</ul>")
+    // and consecutive "1. " / "1) " lines into a numbered one, keeping the first number
+    .replace(/(?:^[ \t]*\d{1,3}[.)] .+(?:\n|$))+/gm, (block) => {
+      const items = block.trim().split(/\n/);
+      const first = parseInt(items[0], 10);
+      return (first > 1 ? `<ol start="${first}">` : "<ol>") + items.map((l) =>
+        "<li>" + l.replace(/^[ \t]*\d{1,3}[.)] /, "") + "</li>").join("") + "</ol>";
+    })
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     // italic: underscores NOT flanked by word chars, so snake_case identifiers stay intact
     .replace(/(?<![A-Za-z0-9_])_([^_\n]+?)_(?![A-Za-z0-9_])/g, "<em>$1</em>");
-  return withSymbols(s).replace(/￼C(\d+)￼/g, (_m, i) => codes[+i]);
+  // The answer is shown with white-space: pre-wrap, so a newline next to a block (a heading, a
+  // list, a table, a code block) would add an empty line on top of the block's own margin. Drop
+  // those newlines and let the CSS margins space the blocks.
+  return withSymbols(s).replace(/￼C(\d+)￼/g, (_m, i) => codes[+i])
+    .replace(MD_BLOCK_OPEN, "$1").replace(MD_BLOCK_CLOSE, "$1");
 }
+const MD_BLOCK_OPEN = /\n+(<(?:h2|h3|h4|ul|ol|table|pre|blockquote|hr)[\s>])/g;
+const MD_BLOCK_CLOSE = /(<\/(?:h2|h3|h4|ul|ol|table|pre|blockquote)>|<hr>)\n+/g;
 
 function isUnreachable(err) {
   return err instanceof TypeError; // fetch rejects with TypeError when the server is unreachable
@@ -464,6 +567,7 @@ async function api(method, url, body) {
 
 // Map a stored server message row -> the in-memory shape messageEl() renders.
 function msgFromServer(m) {
+  if (m.kind === "plan") return { role: m.role || "assistant", kind: "plan", content: m.content || "", plan: (m.meta || {}).plan || null };
   if (m.kind === "artifacts") {
     const meta = m.meta || {};
     return { role: m.role || "assistant", kind: "artifacts", items: meta.items || [], bundleUrl: meta.bundleUrl,
@@ -484,6 +588,7 @@ function msgFromServer(m) {
 // The payload to persist a message server-side (artifacts: text empty, blobs by URL in meta).
 function serverMsgPayload(msg) {
   // stream_id: the server keeps one copy of an answer that several windows save (see add_message).
+  if (msg.kind === "plan") return { role: msg.role || "assistant", content: msg.content || "", kind: "plan", meta: { plan: msg.plan || null } };
   if (msg.kind === "artifacts") {
     return { role: msg.role || "assistant", content: "", kind: "artifacts",
              meta: { items: msg.items || [], bundleUrl: msg.bundleUrl, ...(msg.streamId ? { stream_id: msg.streamId } : {}) } };
@@ -522,8 +627,10 @@ async function loadSessions() {
         id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false,
         createdAt: c.created_at, updatedAt: c.updated_at,
       }));
+      restoreChatModes(state.sessions);
+      pruneComposers(state.sessions);
       if (!state.sessions.length) { await newSession(); }
-      else { state.activeId = state.sessions[0].id; await ensureMessages(activeSession()); }
+      else { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
       renderSessionList();
       renderChat();
       return;
@@ -539,8 +646,9 @@ async function loadSessions() {
     const raw = JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]");
     state.sessions = Array.isArray(raw) ? raw : [];
   } catch { state.sessions = []; }
+  restoreChatModes(state.sessions);
   if (!state.sessions.length) newSession();
-  else state.activeId = state.sessions[0].id;
+  else { state.activeId = state.sessions[0].id; showDialog(); }
 }
 
 function persistSessions() {
@@ -560,6 +668,8 @@ async function newSession() {
       state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
       createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
       state.activeId = String(c.id);
+      startComposer(activeChat());
+      state.planView = null;
       renderSessionList();
       renderChat();
       showDialog();
@@ -569,6 +679,8 @@ async function newSession() {
   const s = { id: rid(), title: "New chat", messages: [], loaded: true, createdAt: Date.now() };
   state.sessions.unshift(s);
   state.activeId = s.id;
+  startComposer(activeChat());
+  state.planView = null;
   persistSessions();
   renderSessionList();
   renderChat();
@@ -578,6 +690,7 @@ async function newSession() {
 async function selectSession(id) {
   leaveDialog();
   state.activeId = id;
+  state.planView = null;
   renderSessionList();
   showDialog();
   await ensureMessages(activeSession());
@@ -585,15 +698,17 @@ async function selectSession(id) {
 }
 
 // Keep what was typed in the chat being left; show the dialog of the chat being entered — its
-// attachments, case note, draft and context meter, never the previous chat's.
+// attachments, case note, draft, run options, uploads and context meter, never the previous chat's.
 function leaveDialog() {
   const c = activeChat(), input = $("chatInput");
-  if (c && input) c.draft = input.value;
+  if (c && input) { c.draft = input.value; saveComposer(c); }
 }
 function showDialog() {
   const c = activeChat(), input = $("chatInput");
   if (input) input.value = (c && c.draft) || "";
   syncDatasetSelection();
+  syncRunOptions(c);
+  renderUploadLine();
   renderCaseNoteChip();
   // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
   // conversation's number would be worse than showing nothing.
@@ -855,6 +970,38 @@ function onModeChange() {
   if (!s) return;
   s.mode = $("modeSelect").value || "auto";
   persistSessions();
+  saveComposer(activeChat());
+}
+
+// "Plan first", "Bypass" and "Save results to my data" are the chat's own. A new chat starts with
+// a plan to review and no bypass; "Save results" starts as the user last left it, a standing choice
+// (see applyUiPrefs), and from then on is this chat's.
+function savedResultsDefault() {
+  let prefs = {};
+  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
+  return prefs.saveResults === true;
+}
+function chatSavesResults(c) {
+  return c && typeof c.saveResults === "boolean" ? c.saveResults : savedResultsDefault();
+}
+function startComposer(c) {
+  if (!c) return;
+  c.saveResults = savedResultsDefault();
+  saveComposer(c);
+}
+function syncRunOptions(c = activeChat()) {
+  const plan = $("planMode"), bypass = $("autonomousMode"), save = $("saveResults");
+  if (plan) plan.checked = c ? c.planFirst : true;
+  if (bypass) bypass.checked = c ? c.bypass : false;
+  if (save) save.checked = chatSavesResults(c);
+}
+function onRunOptionChange() {
+  const c = activeChat();
+  if (!c) return;
+  c.planFirst = !!$("planMode").checked;
+  c.bypass = !!$("autonomousMode").checked;
+  c.saveResults = !!$("saveResults").checked;
+  saveComposer(c);
 }
 
 // ---- Axis B: chat (fast path) vs research (full lab) ----------------------
@@ -901,6 +1048,7 @@ function onRouteChange() {
   else if (s.route !== "corpus") s.routeBeforeCorpus = s.route || "research";
   s.route = next;
   persistSessions();
+  saveComposer(activeChat());
   applyRouteUI();
 }
 
@@ -994,6 +1142,7 @@ async function deleteSession(id) {
   if (authed() && gone && gone.cid) api("DELETE", `/api/conversations/${gone.cid}`).catch(() => {});
   state.sessions = state.sessions.filter((s) => s.id !== id);
   chats.delete(String(id));
+  forgetComposer(id);
   saveRunOwners();
   if (state.activeId === id) {
     if (state.sessions.length) { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
@@ -1061,6 +1210,8 @@ function renderChat() {
   const s = activeSession();
   const c = activeChat();
   $("chatTitle").textContent = s ? s.title || "New chat" : "New chat";
+  renderChatUsage();
+  if (c && !c.usage) refreshChatUsage(c);
   const stream = $("chatStream");
   stream.innerHTML = "";
   state.streamDom = null;
@@ -1068,13 +1219,15 @@ function renderChat() {
   // waiting in this chat is drawn again below, from the chat's record.
   state.planCardEl = null;
   state.planStatusEl = null;
+  state.planAnsweredEl = null;
   // Always re-derive the downloads panel from the ACTIVE session — including the
   // empty-session case below, which used to early-return and leave the previous
   // session's downloads stranded in the panel.
   refreshDownloads();
   syncPresetUI();   // reflect this chat's research-path context in the controls
   if (!s || (!s.messages.length && !ownerVisible() && !planPromptVisible())) {
-    stream.innerHTML = '<div class="empty-hint">Connect to a GPU-backed Qwen3 on HPC3, then ask a research question.</div>';
+    stream.innerHTML = '<div class="empty-hint">Connect to HPC3, then ask a research question.</div>';
+    renderPlanPanel();
     updateComposerButton();
     return;
   }
@@ -1086,6 +1239,9 @@ function renderChat() {
   // Same for a plan, a question or a decision point that is waiting in this chat: its card with
   // its buttons comes back, instead of a composer that says a plan is pending and nothing to act on.
   drawPlanPrompt();
+  // …and the side panel's Plan tab follows the chat on screen: its waiting plan, else its last one.
+  renderPlanPanel();
+  if (c && c.plan && c.plan.kind === "plan") selectSideTab("plan");
   // The composer follows the chat on screen: its Send/Stop button and its placeholder are this
   // chat's, and both were last set for the chat that was left.
   updateComposerButton();
@@ -1100,6 +1256,14 @@ function refreshDownloads() {
 }
 
 function messageEl(m) {
+  if (m.kind === "plan" && m.plan) {
+    // An approved plan: its entry, which opens the whole plan in the side panel.
+    const el = document.createElement("div");
+    el.className = "msg assistant plan-card plan-sheet plan-entry saved";
+    el.innerHTML = planEntryHtml(m.plan.agenda || [], m.plan.doc || null, { status: m.plan.status || "Approved" });
+    el.querySelector('[data-plan="open"]').addEventListener("click", () => { state.planView = m.plan; openPlanPanel(); renderPlanPanel(); });
+    return el;
+  }
   if (m.kind === "artifacts") {
     const el = document.createElement("div");
     el.className = "artifacts-block";
@@ -1387,6 +1551,7 @@ function streamCode(c, code) {
 // event at all, so the chip simply never appears — it must not render an empty or "NaN" box.
 function fmtTokens(n) {
   if (!(n >= 1000)) return String(n);
+  if (n >= 1e6) { const m = n / 1e6; return (m >= 10 ? Math.round(m) : Math.round(m * 10) / 10) + "M"; }
   const k = n / 1000;
   return (k >= 10 ? Math.round(k) : Math.round(k * 10) / 10) + "K";
 }
@@ -1452,6 +1617,7 @@ function appendArtifacts(c, items, bundleUrl) {
     $("chatStream").appendChild(messageEl(msg));
     stickToBottom();
     renderDownloads(items, bundleUrl);
+    if (!c.plan) selectSideTab("results");
   }
 }
 
@@ -1550,7 +1716,9 @@ function fmtSize(n) {
   if (!n && n !== 0) return "";
   if (n < 1024) return n + " B";
   if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
-  return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n < 1024 ** 3) return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n < 1024 ** 4) return (n / 1024 ** 3).toFixed(2) + " GB";
+  return (n / 1024 ** 4).toFixed(2) + " TB";
 }
 
 // Human label + sort order for the bundle's top-level folders.
@@ -1915,7 +2083,19 @@ async function selectModel(model) {
 
 const apiKeys = { creds: [], providers: [], editing: null, pendingSelect: null,
                   activeId: "", connectChoice: "", models: [], storage: null,
-                  comboActive: -1, fetchedFor: "" };
+                  comboActive: -1, fetchedFor: "", shared: null };
+
+// The lab's shared model on HPC3, offered as an endpoint like a saved key. Whatever a session chooses
+// answers all of its calls: the cluster GPU's Qwen, the shared model, or the user's own API. A session
+// on the shared model holds no GPU of its own. The server lists it (`shared` on /api/llm-credentials)
+// only when it keeps one; its address and key never reach the page.
+const SHARED_ENDPOINT = "lab-shared";
+function sharedOptionHtml() {
+  const s = apiKeys.shared;
+  if (!s) return "";
+  return `<option value="${SHARED_ENDPOINT}">${escapeHtml(s.label)} · ${escapeHtml(s.model)}${s.up ? "" : " (starting…)"}</option>`;
+}
+function isEndpointValue(v) { return v === SHARED_ENDPOINT ? !!apiKeys.shared : apiKeys.creds.some((c) => c.id === v); }
 
 // The "add one" affordance belongs INSIDE the picker, not only beside it. A first-time user opens
 // the endpoint dropdown looking for their own endpoint, finds a single "Cluster GPU" entry, and
@@ -1976,6 +2156,7 @@ async function loadApiCredentials() {
   try {
     const d = await (await fetch("/api/llm-credentials" + apiKeyOwnerQuery())).json();
     apiKeys.creds = d.credentials || [];
+    apiKeys.shared = d.shared || null;
     apiKeys.storage = d.storage || null;
   } catch { apiKeys.creds = []; }
   renderEndpointSelect();
@@ -1992,12 +2173,13 @@ function renderEndpointSelect(summary) {
   // a re-render then still names the model the session actually serves, not the default.
   if (current) apiKeys.lastEndpoint = current;
   const known = current || apiKeys.lastEndpoint;
-  const activeId = current && current.kind === "credential" ? current.credential_id
+  const onKey = current && (current.kind === "credential" || current.kind === "shared");
+  const activeId = onKey ? current.credential_id
     : current ? clusterValue(current.cluster_model_id) : "";
   // A refresh with no status attached (we just saved or deleted a key) must not silently move the
   // selection to "Cluster GPU" — the picker would then name an endpoint that isn't the one in use.
   const keep = summary ? activeId : (sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.activeId);
-  const opts = [clusterOptionsHtml()];
+  const opts = [clusterOptionsHtml(), sharedOptionHtml()];
   for (const c of apiKeys.creds) {
     const bad = c.last_error ? " ⚠" : "";
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}${bad}</option>`);
@@ -2005,10 +2187,10 @@ function renderEndpointSelect(summary) {
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
   if (summary) apiKeys.activeId = activeId;   // what to snap back to when "＋ Add" is picked
-  if (keep && apiKeys.creds.some((c) => c.id === keep)) sel.value = keep;
+  if (keep && isEndpointValue(keep)) sel.value = keep;
   else if (keep && isClusterValue(keep) && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
-  else if (!known || known.kind !== "credential") sel.value = clusterValue(known && known.cluster_model_id);
-  if (current && current.kind === "credential" && !apiKeys.creds.some((c) => c.id === activeId)) {
+  else if (!known || (known.kind !== "credential" && known.kind !== "shared")) sel.value = clusterValue(known && known.cluster_model_id);
+  if (current && onKey && !isEndpointValue(activeId)) {
     // The status names a credential we don't have in the list (another window added it, or the
     // list predates it). Reload rather than silently showing "Cluster GPU", which would misreport
     // where prompts are going.
@@ -2175,14 +2357,13 @@ function renderConnectEndpointSelect() {
   const sel = $("connectLlmSelect");
   if (!sel) return;
   const keep = sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.connectChoice;
-  const opts = [clusterOptionsHtml()];
+  const opts = [clusterOptionsHtml(), sharedOptionHtml()];
   for (const c of apiKeys.creds) {
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}</option>`);
   }
   opts.push(ADD_KEY_HTML);
   sel.innerHTML = opts.join("");
-  if (keep && (apiKeys.creds.some((c) => c.id === keep)
-               || [...sel.options].some((o) => o.value === keep))) sel.value = keep;
+  if (keep && (isEndpointValue(keep) || [...sel.options].some((o) => o.value === keep))) sel.value = keep;
   apiKeys.connectChoice = sel.value;
   renderConnectLlmHint();
   syncEndpointActions();
@@ -2196,8 +2377,12 @@ function renderConnectLlmHint() {
   if (!el) return;
   const sel = $("connectLlmSelect");
   const chosen = sel && sel.value && sel.value !== ADD_KEY_OPTION && !isClusterValue(sel.value);
-  if (chosen) {
+  if (chosen && sel.value === SHARED_ENDPOINT) {
+    el.textContent = "Every call of this session goes to the lab's shared model on HPC3 — no GPU queue, and nothing leaves UCI. Your HPC3 account still runs the analysis jobs.";
+  } else if (chosen) {
     el.textContent = "This session reasons on your own endpoint — no GPU queue. Your HPC3 account still runs the analysis jobs.";
+  } else if (apiKeys.shared) {
+    el.textContent = "Cluster GPU runs Qwen on a card of your own for the whole session and waits for a free one, which can take hours. The shared model or your own API key start at once.";
   } else if (apiKeys.creds.length) {
     el.textContent = "Cluster GPU waits for a free card. Pick one of your own endpoints above to start in seconds — your HPC3 account still runs the analysis jobs either way.";
   } else {
@@ -2904,6 +3089,7 @@ function handleWsMessage(msg) {
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
     case "gpu_health": renderGpu({ gpu: { health: msg.health, job_id: state.lastJobId, node: state.lastNode, gres: state.lastGres } }); break;
     case "upload_staging": onStagingEvent(msg.job); break;       // a copy to HPC3 moved on
+    case "usage_update": onUsageUpdate(msg); break;              // a model call was recorded
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
     case "error": toast(msg.message); break;
@@ -2920,6 +3106,7 @@ function handleRunEvent(c, msg) {
     if (c.suppress) return;
     setChatRunning(c, true);
     startAssistantStream(c);
+    c.answered = null;
     c.run.runId = msg.run_id || null;
     c.run.streamId = c.lastStreamId = msg.stream_id || null;
     return;
@@ -2932,7 +3119,7 @@ function handleRunEvent(c, msg) {
     case "run_status": streamStatus(c, msg.text); break;
     case "step_code": streamCode(c, msg.code); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
-    case "chat_done": finishAssistantStream(c); setChatRunning(c, false); break;
+    case "chat_done": finishAssistantStream(c); setChatRunning(c, false); renderChatUsage(); checkBudgetNotices(); break;
     case "chat_stopped":
       if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
       finishAssistantStream(c); setChatRunning(c, false);
@@ -3195,6 +3382,7 @@ async function sendChat(e) {
     appendUserMessage(text);
     input.value = "";
     c.draft = "";
+    saveComposer(c);
     updateComposerButton();
     submitPlan("revise", text, undefined, c);
     return;
@@ -3205,6 +3393,7 @@ async function sendChat(e) {
     appendUserMessage(text);
     input.value = "";
     c.draft = "";
+    saveComposer(c);
     updateComposerButton();
     injectPrompt(c, text);
     return;
@@ -3226,9 +3415,11 @@ async function sendChat(e) {
   c.owned = true;
   input.value = "";
   c.draft = "";
+  saveComposer(c);
   setChatRunning(c, true);
   const sess = activeSession();
-  const history = sess.messages.filter((m) => !m.kind && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
+  // An approved plan is part of the conversation a model is given: its steps and its document.
+  const history = sess.messages.filter((m) => (!m.kind || m.kind === "plan") && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
   const dataset_path = c.primary || null;
   // The BIND-SET (feature ②): every data file attached to THIS chat, ordered as attached (the server
   // re-ranks to pick the primary). Legacy single-file runs still send `dataset_path`; both together
@@ -3237,17 +3428,18 @@ async function sendChat(e) {
     const d = state.datasets.find((x) => x.path === p) || {};
     return { path: p, name: d.name || p.split("/").pop(), role: c.roles[p] || null };
   });
-  const autonomous = !!($("autonomousMode") && $("autonomousMode").checked);
+  const autonomous = !!c.bypass;
   // Bypass mode overrides plan review — don't also send plan_mode=true (avoids a stale plan card).
-  const plan_mode = !autonomous && !!($("planMode") && $("planMode").checked);
+  const plan_mode = !autonomous && !!c.planFirst;
   // DAG is the default execution model now (dependency-graph + Coordinator; no UI toggle). The
   // classic linear order is still reachable server-side via AISCIENTIST_PLANNER=linear.
   const planner = "dag";
   // A refused send leaves the chat idle and gives the text back, so it can be sent again.
   const giveBack = () => {
     setChatRunning(c, false);
-    if (chatVisible(c) && !input.value.trim()) { input.value = text; updateComposerButton(); }
+    if (chatVisible(c) && !input.value.trim()) { input.value = text; c.draft = text; updateComposerButton(); }
     else if (!c.draft) c.draft = text;
+    saveComposer(c);
   };
   try {
     // The research lab (PI→Scientist→Critic + real scanpy/gseapy tools) is the one execution path.
@@ -3257,7 +3449,18 @@ async function sendChat(e) {
     // it and scopes a study by question + dataset instead). An older client omitting `route` still
     // gets today's research behaviour, because the server defaults it.
     const route = activeRoute();
-    const res = await fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, case_note: (c.caseNote && c.caseNote.text) || null, plan_mode, autonomous, save_results: !!($("saveResults") && $("saveResults").checked), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null }) });
+    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, case_note: (c.caseNote && c.caseNote.text) || null, plan_mode, autonomous, save_results: chatSavesResults(c), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null, tz: userTz() };
+    const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
+    let res = await postLab();
+    // The budget hard limit (Account › Usage): "confirm" asks once, then sends the same run again.
+    if (res.status === 409) {
+      const d = await res.clone().json().catch(() => ({}));
+      if (d.needs_budget_confirm) {
+        if (!confirm(`${d.error}\n\nThe figure is an estimate; the Claude Console has the actual spend.`)) { giveBack(); return; }
+        labBody.budget_ack = true;
+        res = await postLab();
+      }
+    }
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       if (res.status === 404 && /unknown connection/i.test(d.error || "")) {
@@ -3320,13 +3523,18 @@ function holdPlanPrompt(c, kind, payload, msg) {
   if (same && expiry) next.expiry = expiry;
   c.plan = next;
   c.planPending = true;
+  c.answered = null;
   if (kind === "plan") keepPlanDraft(c, next);
   saveRunOwners();
   // The prompt that is already on screen, sent again: its card stays as it is, with the caret
   // where the person left it.
   if (same && chatVisible(c) && state.planCardEl && state.planCardEl.isConnected) return;
   renderSessionList();
-  if (chatVisible(c)) { drawPlanPrompt(c); return; }
+  if (chatVisible(c)) {
+    state.planView = null;
+    drawPlanPrompt(c);
+    return;
+  }
   // Another chat is on screen. The prompt is not drawn into it (it would be a card for a plan that
   // chat never asked for, and the owning chat would then show none); it waits for its own chat.
   updateComposerButton();
@@ -3335,7 +3543,8 @@ function holdPlanPrompt(c, kind, payload, msg) {
 
 function drawPlanPrompt(c = activeChat()) {
   const p = c && c.plan;
-  if (!p || !chatVisible(c)) return;
+  if (!c || !chatVisible(c)) return;
+  if (!p) { drawAnsweredPlan(c); return; }
   if (p.kind === "clarify") showClarify(p.questions);
   else if (p.kind === "decision") showDecision(p.goal, p.options);
   else showPlanPanel(p.agenda);
@@ -3443,6 +3652,7 @@ function removePlanCard() {
 // kind: "plan" | "clarify" | "decision" — what the card waits for, which is what its expiry line says.
 function planCardShell(kind) {
   removePlanCard();
+  if (state.planAnsweredEl) { state.planAnsweredEl.remove(); state.planAnsweredEl = null; }
   const stream = $("chatStream");
   const hint = stream.querySelector(".empty-hint"); if (hint) hint.remove();
   const el = document.createElement("div");
@@ -3517,37 +3727,96 @@ function planStepHtml(text, n, step, revised, showWhere) {
     + meta + `</div></li>`;
 }
 
-// The whole card. Which steps the last revision touched comes from the server (it has just applied
-// the edit), so "what did my change actually do?" is answered on the card instead of by diffing two
-// plans by eye.
-function planCardHtml(agenda, doc, revisedSteps) {
-  const docSteps = (doc && doc.steps) || [];
-  const revised = new Set((revisedSteps || []).map(Number));
+// The line under a plan's title: how many steps, how many settings the plan fixes, and where the
+// steps run when that is the same for all of them (a step only carries its own line when the plan
+// mixes places).
+function planSub(agenda, docSteps) {
   const fixed = docSteps.reduce((n, st) => n + Object.keys((st && st.settings) || {}).length, 0);
-  // Where the steps run is said once, under the title, when it is the same for all of them; a
-  // step only carries its own line when the plan mixes places.
   const places = [...new Set(docSteps.map((st) => planRunsOnText(st && st.runs_on)).filter(Boolean))];
   const onePlace = places.length === 1 ? places[0] : "";
   const sub = `${agenda.length} step${agenda.length === 1 ? "" : "s"}`
     + (fixed ? ` · ${fixed} setting${fixed === 1 ? "" : "s"} passed to the tools as written` : "")
     + (onePlace ? ` · ${onePlace.startsWith("Runs") ? onePlace.toLowerCase() : "runs as " + onePlace.replace(/ job /, " jobs ")}` : "");
-  const note = revised.size
-    ? `<div class="plan-note">${planIcon("edit")}<span>Step${revised.size > 1 ? "s" : ""} `
-      + `${[...revised].sort((x, y) => x - y).join(", ")} ${revised.size > 1 ? "were" : "was"} revised — `
-      + `every other step is unchanged.</span></div>`
-    : "";
-  return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
-    + `<div><div class="plan-title">Proposed plan</div><div class="plan-sub">${sub}</div></div></div>`
-    + note
-    + `<ol class="plan-steps">`
+  return { sub, onePlace };
+}
+
+// Which steps the last revision touched comes from the server (it has just applied the edit), so
+// "what did my change actually do?" is answered on the plan instead of by diffing two plans by eye.
+function planRevisedNote(revised) {
+  if (!revised.size) return "";
+  return `<div class="plan-note">${planIcon("edit")}<span>Step${revised.size > 1 ? "s" : ""} `
+    + `${[...revised].sort((x, y) => x - y).join(", ")} ${revised.size > 1 ? "were" : "was"} revised — `
+    + `every other step is unchanged.</span></div>`;
+}
+
+// The whole plan, as the side panel shows it. `opts.mode`:
+//   "review" (default) — waiting for a decision: the document's editor and Run / Cancel;
+//   "status"           — answered, the PI has it: `opts.status` instead of the buttons;
+//   "saved"            — a plan this chat approved: read-only, with its document.
+// `opts.expiry` is the waiting plan's expiry line.
+function planCardHtml(agenda, doc, revisedSteps, opts) {
+  const o = opts || {};
+  const mode = o.mode || "review";
+  const docSteps = (doc && doc.steps) || [];
+  const revised = new Set((revisedSteps || []).map(Number));
+  const { sub, onePlace } = planSub(agenda, docSteps);
+  const head = `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
+    + `<div><div class="plan-title">${mode === "saved" ? "Plan" : "Proposed plan"}</div><div class="plan-sub">${sub}</div></div></div>`;
+  const steps = `<ol class="plan-steps">`
     + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace)).join("")
-    + `</ol>`
+    + `</ol>`;
+  if (mode !== "review") {
+    return head + steps + planDocumentHtml(doc)
+      + `<div class="plan-actions-row"><span class="plan-actions-status">${escapeHtml(o.status || "")}</span></div>`;
+  }
+  return head + planRevisedNote(revised) + steps
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
+    + (o.expiry ? `<div class="plan-expiry" role="status">${planIcon("hourglass_bottom")}<span>${escapeHtml(o.expiry)}</span></div>` : "")
     + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
     + (doc && doc.yaml ? `<button class="secondary" data-plan="yaml">${planIcon("data_object")}<span>Edit as YAML</span></button>` : "")
     + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
     + `<span class="plan-actions-hint">or reply below to change it</span></div>`;
+}
+
+// The document of a plan that is no longer waiting: there to read and copy, not to edit.
+function planDocumentHtml(doc) {
+  if (!doc || !doc.yaml) return "";
+  return `<details class="plan-yaml plan-yaml-read"><summary class="plan-yaml-file">${planIcon("data_object")}plan.yaml</summary>`
+    + `<pre class="plan-yaml-text">${escapeHtml(doc.yaml)}</pre></details>`;
+}
+
+// The plan as the chat shows it: the step titles and the tool each one runs, with the decision
+// beside them. The prose, the settings and the document are one click away in the side panel's Plan
+// tab, so the chat stays a conversation and a long plan does not push it off the screen. `opts`:
+// `pending` (waiting: Run / Open plan / Cancel), else `status` (what happened to it) with View plan;
+// `revised`, `problems` (why the last edit of the document was refused), `dirty` (the document holds
+// an edit that was not applied, so Run would run the plan without it).
+function planEntryHtml(agenda, doc, opts) {
+  const o = opts || {};
+  const docSteps = (doc && doc.steps) || [];
+  const revised = new Set((o.revised || []).map(Number));
+  const { sub } = planSub(agenda, docSteps);
+  const rows = agenda.map((s, i) => `<li class="plan-entry-step${revised.has(i + 1) ? " revised" : ""}">`
+    + `<span class="plan-entry-num">${i + 1}</span>`
+    + `<span class="plan-entry-title">${escapeHtml(planStepParts(s).title.replace(/[*`]/g, ""))}</span>`
+    + (docSteps[i] && docSteps[i].tool ? `<code class="plan-step-tool">${escapeHtml(docSteps[i].tool)}</code>` : "")
+    + `</li>`).join("");
+  const refused = (o.problems || []).length
+    ? `<div class="plan-note bad">${planIcon("error")}<span>Your edit was not applied — the plan is unchanged. Open the plan to see why.</span></div>`
+    : "";
+  const actions = o.pending
+    ? `<button class="primary" data-plan="approve"${o.dirty ? ' disabled title="Apply or reset your edit first"' : ""}>${planIcon("play_arrow")}Run this plan</button>`
+      + `<button class="secondary" data-plan="open">${planIcon("right_panel_open")}<span>Open plan</span></button>`
+      + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
+      + `<span class="plan-actions-hint">or reply below to change it</span>`
+    : `<span class="plan-actions-status">${escapeHtml(o.status || "")}</span>`
+      + `<button class="secondary small" data-plan="open">${planIcon("right_panel_open")}<span>View plan</span></button>`;
+  return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
+    + `<div><div class="plan-title">${o.pending ? "Proposed plan" : "Plan"}</div><div class="plan-sub">${sub}</div></div></div>`
+    + (o.pending ? planRevisedNote(revised) + refused : "")
+    + `<ol class="plan-entry-steps">${rows}</ol>`
+    + `<div class="plan-actions-row">${actions}</div>`;
 }
 
 // The plan document's editor. Present only when the server sends the plan as a document (`plan`
@@ -3582,16 +3851,22 @@ function planEditorHtml(doc) {
     + `<button class="secondary quiet small" data-plan="reset">Reset</button></div></div>`;
 }
 
+// The waiting plan: its entry in the chat (titles, Run / Open plan / Cancel) and the whole plan, with
+// its document's editor, in the side panel.
 function showPlanPanel(agenda) {
   const el = planCardShell("plan");
-  el.classList.add("plan-sheet");
+  el.classList.add("plan-sheet", "plan-entry");
   state.planAgenda = agenda || [];
-  el.innerHTML = planCardHtml(state.planAgenda, state.planDoc, state.planRevisedSteps);
-  const c = activeChat();     // the card's buttons answer THIS chat's run, whatever is on screen later
-  el.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
-  el.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
-  wirePlanEditor(el, c);
+  const c = activeChat();     // the buttons answer THIS chat's run, whatever is on screen later
+  el.innerHTML = planEntryHtml(state.planAgenda, state.planDoc, { pending: true, revised: state.planRevisedSteps,
+    problems: state.planProblems, dirty: !!state.planDraftYaml });
+  wirePlanEntry(el, c);
   drawPlanExpiry();
+  // The whole plan is in the side panel: it opens the first time each version of the plan is shown
+  // in its chat (also when it arrived while another chat was on screen), not on every redraw.
+  const seen = JSON.stringify([state.planAgenda, (state.planDoc && state.planDoc.yaml) || ""]);
+  if (c && c.planShown !== seen) { c.planShown = seen; openPlanPanel(); }
+  renderPlanPanel();
   $("chatInput").placeholder = "Tell the PI what to change (e.g. 'drop the enrichment step')…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
@@ -3603,7 +3878,8 @@ function wirePlanEditor(el, c) {
   const box = panel.querySelector(".plan-yaml-text");
   const original = state.planDoc.yaml;
   const apply = panel.querySelector('[data-plan="edit"]');
-  const approve = el.querySelector('[data-plan="approve"]');
+  const runButtons = () => [el.querySelector('[data-plan="approve"]'),
+    chatVisible(c) && state.planCardEl ? state.planCardEl.querySelector('[data-plan="approve"]') : null].filter(Boolean);
   const toggle = el.querySelector('[data-plan="yaml"]');
   const label = () => { toggle.querySelector("span:last-child").textContent = panel.classList.contains("hidden") ? "Edit as YAML" : "Hide YAML"; };
   // While the box holds an edit that has not been applied, "Run this plan" would run the plan
@@ -3613,8 +3889,10 @@ function wirePlanEditor(el, c) {
     apply.disabled = !dirty;
     apply.classList.toggle("primary", dirty);
     apply.classList.toggle("secondary", !dirty);
-    approve.disabled = dirty;
-    approve.title = dirty ? "Apply or reset your edit first" : "";
+    for (const run of runButtons()) {
+      run.disabled = dirty;
+      run.title = dirty ? "Apply or reset your edit first" : "";
+    }
   };
   toggle.addEventListener("click", () => {
     panel.classList.toggle("hidden");
@@ -3637,6 +3915,100 @@ function wirePlanEditor(el, c) {
   });
   label();
   sync();
+}
+
+// The chat entry's own buttons. They answer THIS chat's run, whatever is on screen when clicked.
+function wirePlanEntry(el, c) {
+  const on = (name, fn) => { const b = el.querySelector(`[data-plan="${name}"]`); if (b) b.addEventListener("click", fn); };
+  on("approve", () => submitPlan("approve", undefined, undefined, c));
+  on("cancel", () => submitPlan("cancel", undefined, undefined, c));
+  on("open", () => { state.planView = null; openPlanPanel(); renderPlanPanel(); });
+}
+
+// A plan this chat answered (a reply in words, an edit, a cancel, or a review the server closed):
+// its entry, with what happened to it and "View plan", drawn again from the chat's record.
+// It is not a card waiting for anything (`state.planCardEl` stays empty); the next prompt's card
+// takes its place (planCardShell), so a review is one entry however many rounds it takes.
+function drawAnsweredPlan(c = activeChat()) {
+  const a = c && c.answered;
+  if (!a || !chatVisible(c)) return;
+  if (state.planAnsweredEl) state.planAnsweredEl.remove();
+  const stream = $("chatStream");
+  const el = document.createElement("div");
+  el.className = "msg assistant plan-card plan-sheet plan-entry";
+  el.dataset.prompt = "plan";
+  el.innerHTML = planEntryHtml(a.agenda, a.doc, { status: a.status });
+  stream.appendChild(el);
+  wirePlanEntry(el, c);
+  state.planAnsweredEl = el;
+  state.planStatusEl = el.querySelector(".plan-actions-status");
+}
+
+// ---- the side panel's "Plan" tab ------------------------------------------------------------------
+// What the panel shows for the chat on screen: a saved plan the person opened from the chat
+// (`state.planView`), else the plan waiting in this chat, else the one it answered and the PI has,
+// else the last plan this chat approved.
+function chatPlanView(c = activeChat()) {
+  if (state.planView) return { mode: "saved", ...state.planView };
+  if (c && c.plan && c.plan.kind === "plan") {
+    return { mode: "review", agenda: c.plan.agenda || [], doc: c.plan.doc || null, revised: c.plan.revised || [],
+             expiry: c.plan.expiry ? planExpiryText("plan", c.plan.expiry.at) : "" };
+  }
+  if (c && c.answered) return { mode: "status", ...c.answered };
+  const s = activeSession();
+  const saved = s && [...s.messages].reverse().find((m) => m.kind === "plan" && m.plan);
+  return saved ? { mode: "saved", ...saved.plan } : null;
+}
+
+function renderPlanPanel() {
+  const host = $("planPanel");
+  if (!host) return;
+  const c = activeChat();
+  const tab = $("sideTabPlan");
+  if (tab) tab.classList.toggle("waiting", !!(c && c.plan && c.plan.kind === "plan"));
+  const view = chatPlanView(c);
+  if (!view) {
+    host.innerHTML = '<div class="downloads-empty">No plan in this chat yet. When the PI proposes one it opens here: every step, the settings it fixes, and the plan as a YAML document you can edit.</div>';
+    return;
+  }
+  host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
+    + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
+                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "" })
+    + `</div>`;
+  if (view.mode !== "review") return;
+  host.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
+  host.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
+  wirePlanEditor(host, c);
+}
+
+// The right-hand panel holds two things, one at a time: the plan and the results.
+function selectSideTab(name) {
+  state.sideTab = name === "plan" ? "plan" : "results";
+  const plan = state.sideTab === "plan";
+  $("planPanel").classList.toggle("hidden", !plan);
+  $("resultsPane").classList.toggle("hidden", plan);
+  $("sideTabPlan").classList.toggle("active", plan);
+  $("sideTabResults").classList.toggle("active", !plan);
+  $("layout").classList.toggle("side-plan", plan);   // a plan is prose: the panel gets more room for it
+}
+
+// Open the side panel on the plan. Not remembered as the panel's own setting: a plan arriving must
+// not turn "results panel collapsed" into "always open" for the next visit.
+function openPlanPanel() {
+  selectSideTab("plan");
+  setPanel("right", true, false);
+}
+
+// The approved plan as the chat keeps it. `content` is what a model reading this conversation later
+// is given (the steps, and the document with the settings that ran); `plan` is what the entry and
+// the side panel are drawn from.
+function planSavedMessage(p) {
+  const docMd = (p.doc && p.doc.yaml)
+    ? "\n\n**Approved plan document**\n\n```yaml\n" + p.doc.yaml.trim() + "\n```"
+    : "";
+  return { role: "assistant", kind: "plan",
+           content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd,
+           plan: { agenda: p.agenda, doc: p.doc || null, status: "Approved" } };
 }
 
 function showClarify(questions) {
@@ -3732,8 +4104,25 @@ async function submitDecision(choice, c = activeChat()) {
 
 // Resolve the live plan/clarify card with a short status line (drop the buttons), and on
 // approval persist the plan to history so it survives a reload.
-function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
-  if (state.planCardEl && chatVisible(c)) {
+function finalizePlanCard(note, persist, c = activeChat()) {
+  const p = c && c.plan;
+  const saved = !persist ? null : typeof persist === "string" ? { role: "assistant", content: persist } : persist;
+  // A plan answered in words, by an edit or by a cancel stays readable — in its entry and in the side
+  // panel — while the PI works on the answer. An approved plan is saved instead (below).
+  if (c && p && p.kind === "plan") c.answered = saved ? null : { agenda: p.agenda || [], doc: p.doc || null, revised: p.revised || [], status: note };
+  if (state.planCardEl && chatVisible(c) && p && p.kind === "plan") {
+    const entry = state.planCardEl;
+    if (saved && saved.kind === "plan") {
+      const fresh = messageEl(saved);
+      if (typeof entry.replaceWith === "function") entry.replaceWith(fresh); else entry.remove();
+    } else {
+      entry.innerHTML = planEntryHtml(p.agenda || [], p.doc || null, { status: note });
+      wirePlanEntry(entry, c);
+      state.planStatusEl = entry.querySelector(".plan-actions-status");
+      state.planAnsweredEl = entry;
+    }
+    state.planCardEl = null;
+  } else if (state.planCardEl && chatVisible(c)) {
     // A resolved card is a record: its editor goes with its buttons, or "Apply edits" would stay
     // clickable on a plan that is no longer waiting for anything.
     const editor = state.planCardEl.querySelector(".plan-yaml");
@@ -3748,7 +4137,8 @@ function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
     state.planStatusEl = row ? row.querySelector(".plan-actions-status") : null;
     state.planCardEl = null;
   }
-  if (persistMarkdown && c) pushToSession(c.sid, { role: "assistant", content: persistMarkdown });
+  if (saved && c) pushToSession(c.sid, saved);
+  if (chatVisible(c)) renderPlanPanel();
 }
 
 // Correct the resolved card's status line as the server learns what the reply actually was.
@@ -3758,6 +4148,8 @@ function finalizePlanCard(note, persistMarkdown, c = activeChat()) {
 // one of the two for every question asked, for the 10-20 minutes an answer takes.
 function setPlanStatus(text) {
   if (state.planStatusEl && text) state.planStatusEl.textContent = text;
+  const c = activeChat();
+  if (c && c.answered && text) { c.answered.status = text; renderPlanPanel(); }
 }
 
 // ---- the waiting prompt's expiry warning ----------------------------------------------------------
@@ -3773,7 +4165,7 @@ function notePlanExpiring(c, msg) {
   if (!p) return;   // nothing is waiting, so there is nothing for it to be about
   const secs = Number(msg && msg.seconds_left);
   p.expiry = { at: Number.isFinite(secs) && secs >= 0 ? Date.now() + secs * 1000 : null };
-  if (chatVisible(c)) drawPlanExpiry();
+  if (chatVisible(c)) { drawPlanExpiry(); renderPlanPanel(); }
   else toast(`What is waiting in “${chatTitle(c.sid).trim()}” expires soon — open that chat to answer it.`);
 }
 
@@ -3815,7 +4207,12 @@ function hidePlanPanel(c = activeChat()) {
   // plan_done (any resolution). Card finalization happens in submitPlan; here we only
   // clear the pending state + restore the composer (idempotent).
   if (!c) return;
+  // A plan still held here was not answered on this page: the review expired or the run stopped.
+  const closed = c.plan && c.plan.kind === "plan" ? c.plan : null;
+  if (closed) c.answered = { agenda: closed.agenda || [], doc: closed.doc || null, revised: closed.revised || [],
+                             status: "This plan is no longer waiting for a decision." };
   releasePlanPrompt(c);
+  if (closed && chatVisible(c)) { removePlanCard(); drawAnsweredPlan(c); renderPlanPanel(); }
   if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
 }
@@ -3826,12 +4223,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (!state.connectionId || !c) return;
   // The approved document is saved with the plan: it is what the run was held to.
   const plan = c.plan || {};
-  const docMd = (plan.doc && plan.doc.yaml)
-    ? "\n\n**Approved plan document**\n\n```yaml\n" + plan.doc.yaml.trim() + "\n```"
-    : "";
-  const agendaMd = (plan.agenda && plan.agenda.length)
-    ? "## 📋 Research plan\n\n" + plan.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd
-    : null;
+  const savedPlan = (plan.agenda && plan.agenda.length) ? planSavedMessage(plan) : null;
   // An edit that is sent stays as the draft until the server answers: refused, it comes back in the
   // editor. A reply in words leaves the draft alone too — the PI may answer a question and send the
   // same plan again. Only a plan that is run or cancelled has no use for it (keepPlanDraft drops it
@@ -3839,7 +4231,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (action === "edit") c.planDraftYaml = planYaml || "";
   else if (action !== "revise") dropPlanDraft(c);
   if (action === "approve") {
-    finalizePlanCard("▶ Approved — running…", agendaMd, c);
+    finalizePlanCard("▶ Approved — running…", savedPlan, c);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
     // (reasoning / running code / report) streams in AFTER it, where the user is looking.
     if (chatVisible(c)) { mountStream(); repaintWorking(); }
@@ -3851,6 +4243,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   // question, and stayed wrong on screen for the whole 10-20 min the answer took.
   else finalizePlanCard("✎ Sent to the PI — reading your reply…", null, c);
   releasePlanPrompt(c);
+  if (chatVisible(c)) renderPlanPanel();   // now without the prompt: the answered plan, read-only
   if (chatVisible(c)) $("chatInput").placeholder = DEFAULT_PLACEHOLDER;
   updateComposerButton();
   try {
@@ -3937,7 +4330,7 @@ function postJson(url, body) {
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 20 GB reads badly as "21474.8 MB"
-const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${((n || 0) / 1e9).toFixed(2)} GB` : `${((n || 0) / 1e6).toFixed(1)} MB`);
+const fmtUploadSize = (n) => ((n || 0) >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : (n || 0) >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : (n || 0) >= 1e3 ? `${(n / 1e3).toFixed(1)} kB` : `${n || 0} B`);
 
 // -- speed and time left ----------------------------------------------------------------------------
 // Each card measures its own bytes over the last seconds, in both halves: the browser sending to the
@@ -4072,6 +4465,31 @@ async function pickPreviousUpload(previous, storage, request = fetch) {
   }
   return alive[0].up;
 }
+// The upload of this file the server holds for the account, for a browser that has none stored: one
+// begun on another computer, in a private window, or before the site's data was cleared. The server
+// matches the path (or name), size and modification time, and offers the upload only when its first
+// chunk is this file's first chunk; no answer, or any other, starts a new upload as before. A file of
+// one chunk or less goes in one request and is never left part-way, so it is not looked for.
+// urlStorageKey null: tus-js-client stores the upload in this browser once the server says where it stands.
+async function findServerUpload(file, fields, request = fetch) {
+  if (!(file.size > UPLOAD_CHUNK) || !Number.isSafeInteger(file.lastModified) || !state.connectionId) return null;
+  try {
+    const head = new Uint8Array(await crypto.subtle.digest("SHA-256", await file.slice(0, UPLOAD_CHUNK).arrayBuffer()));
+    const r = await request("/api/tus/find", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, name: file.name, rel_path: fields.rel_path || "",
+        size: file.size, last_modified: file.lastModified,
+        head_sha256: Array.from(head, (b) => b.toString(16).padStart(2, "0")).join("") }) });
+    const found = r.ok ? (await r.json()).upload : null;
+    if (!found || !found.url) return null;
+    // absolute, as tus-js-client stores the uploads it creates
+    return { uploadUrl: new URL(found.url, window.location.href).href, urlStorageKey: null, size: file.size, offset: found.offset };
+  } catch { return null; }
+}
+// The upload to continue for this file: the one this browser stored, else one the server holds.
+async function previousUploadFor(upload, file, fields, request = fetch) {
+  const stored = await pickPreviousUpload(await upload.findPreviousUploads(), upload.options.urlStorage, request);
+  return stored || findServerUpload(file, fields, request);
+}
 
 // Send one file over tus; resolves with the gateway's answer for the finished upload
 // ({status: "staging", job_id, …} when a copy to HPC3 follows, {status: "complete", …} otherwise).
@@ -4094,7 +4512,9 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
       removeFingerprintOnSuccess: true,
       fingerprint: async (f) => `tus:${apiKeyOwner()}:${fields.rel_path || f.name}:${f.size}:${f.lastModified}`,
       headers: { "X-Connection-ID": state.connectionId },
-      metadata: { filename: file.name, connection_id: state.connectionId, ...fields },
+      // last_modified lets another browser find this upload again (findServerUpload)
+      metadata: { filename: file.name, connection_id: state.connectionId,
+        ...(Number.isSafeInteger(file.lastModified) ? { last_modified: String(file.lastModified) } : {}), ...fields },
       onShouldRetry(err) {
         const again = tusShouldRetry(err);
         if (again) {
@@ -4151,12 +4571,18 @@ function tusUpload(file, fields, ctrl, hashPromise, onProgress, onWaitingForHash
     });
     tusKicks.add(kick);
     ctrl.signal.addEventListener("abort", () => {
-      upload.abort(true).catch(() => {});
-      reject(new DOMException("cancelled", "AbortError"));
+      upload.abort(true).then(() => reject(new DOMException("cancelled", "AbortError"))).catch((error) => {
+        error.cleanupFailed = true;
+        reject(error);
+      });
     }, { once: true });
-    upload.findPreviousUploads().then((previous) => pickPreviousUpload(previous, upload.options.urlStorage)).then((previous) => {
+    previousUploadFor(upload, file, fields).then((previous) => {
       if (ctrl.signal.aborted) return;
-      if (previous) upload.resumeFromPreviousUpload(previous);
+      if (previous) { upload.resumeFromPreviousUpload(previous); dropPendingCardFor(previous.uploadUrl); }
+      // a folder's card already says how much of the folder is there
+      if (previous && previous.urlStorageKey === null && !fields.rel_path && previous.offset > 0) {
+        toast(`Continuing ${file.name} from ${Math.floor((100 * previous.offset) / file.size)}%: the server kept what was sent earlier.`);
+      }
       upload.start();
     }).catch(reject);
   });
@@ -4201,7 +4627,7 @@ async function finishStaging(d, id, name, size, signal) {
         // "queued" with an error is a copy waiting for its retry, or for an HPC3 session: say so
         upsertUpload({ id, status, sent: job.sent || 0, size: job.size || size,
           note: job.state === "queued" && job.error ? `Waiting — ${job.error}` : "" });
-        setUploadProgress(status === "verifying" ? `Verifying ${name} on HPC3…`
+        setUploadProgress(id, status === "verifying" ? `Verifying ${name} on HPC3…`
           : status === "unpacking" ? `Unpacking ${name} on HPC3…`
           : `Copying ${name} to HPC3… ${job.size ? Math.floor((100 * (job.sent || 0)) / job.size) : 0}%${uploadPaceTextFor(id)}`);
       }
@@ -4211,6 +4637,21 @@ async function finishStaging(d, id, name, size, signal) {
       job = now && now !== seen ? now : await stagingJob(d.job_id).catch(() => null);
     }
   } finally { if (signal) signal.removeEventListener("abort", onAbort); }
+}
+// Each file's row during the copy to HPC3: a file whose copy failed says so (until a retry copies
+// it); once the server has recorded the folder, every copied file is uploaded.
+const COPY_FAILED = "the copy to HPC3 failed";
+function markFolderCopies(id, f) {
+  const card = state.uploads.find((u) => u.id === id);
+  if (!card || !card.fileProgress) return;
+  const failed = new Set(f.failed_files || []);
+  for (const row of card.fileProgress) {
+    const rel = String(row.name || "").split("/").slice(1).join("/");
+    if (failed.has(rel)) { row.status = "error"; row.error = COPY_FAILED; }
+    else if (row.status === "copying" || (row.status === "error" && row.error === COPY_FAILED)) {
+      row.status = f.recorded ? "done" : "copying"; row.error = "";
+    }
+  }
 }
 // The server records a folder once every file of it is verified on HPC3; follow that.
 async function finishFolderStaging(folder, d, id, signal) {
@@ -4226,12 +4667,13 @@ async function finishFolderStaging(folder, d, id, signal) {
       const r = await fetch(`/api/upload/staging?connection_id=${encodeURIComponent(state.connectionId)}&folder=${encodeURIComponent(folder)}`).catch(() => null);
       const f = r && r.ok ? ((await r.json().catch(() => ({}))).folder || {}) : null;
       if (f) {
-        if (f.recorded) return { ...d, status: "registered", name: folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
+        markFolderCopies(id, f);
+        if (f.recorded) return { ...d, status: "registered", name: d.name || f.original_name || folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
         if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files did not reach HPC3`);
         // what is on HPC3 before this page first looks (copied meanwhile, or there from an earlier upload) is not speed
         if (first) { uploadPaces.delete(id); first = false; }
-        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, sent: f.sent || 0, size: f.size || 0 });
-        setUploadProgress(`Copying ${folder}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
+        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, filesFailed: f.failed || 0, sent: f.sent || 0, size: f.size || 0 });
+        setUploadProgress(id, `Copying ${shownFolder(folder, f.original_name)}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
       }
       await nextStagingEvent(STAGING_POLL_MS);
       // every file of a big folder sends events: ask the server at most once a second
@@ -4264,6 +4706,11 @@ async function settleUpload(id, d, name, size, ctrl, attach) {
   setTimeout(() => removeUpload(id), 4000);                        // clear the "Done" card after a beat
 }
 function failUpload(id, err, name, ctrl) {
+  if (err.cleanupFailed) {
+    upsertUpload({ id, status: "error", error: `Cancellation cleanup failed: ${err.message}`, note: "" });
+    toast(`Cancellation cleanup failed for ${name}: ${err.message}`);
+    return;
+  }
   if ((ctrl && ctrl.signal.aborted) || err.name === "AbortError") {      // the user cancelled: not an error
     upsertUpload({ id, status: "cancelled", note: "" });
     toast(`Cancelled ${name}`);
@@ -4300,7 +4747,7 @@ async function uploadDataset(file) {
   upsertUpload({ id, kind: "file", name: file.name, size: file.size, sent: (before && before.sent) || 0, status: "queued", file,
     error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", ctrl,
     chat: (before && before.chat) || state.activeId });   // the chat this upload attaches to when done
-  setUploadProgress(`Uploading ${file.name}…`);
+  setUploadProgress(id, `Uploading ${file.name}…`);
   try {
     if (!fields) {
       fields = ARCHIVE_RE.test(file.name) && window.confirm(`Unpack ${file.name} after verified transfer to HPC3?`)
@@ -4314,17 +4761,17 @@ async function uploadDataset(file) {
       const hashPromise = hashUploadFile(file, ctrl);
       hashPromise.catch(() => {}); // cancellation before the final PATCH still has a handled promise
       upsertUpload({ id, status: "uploading" });
-      d = await tusUpload(file, fields, ctrl, hashPromise, (sent, total) => {
+      d = await tusUpload(file, { ...fields, ...uploadChatField(id) }, ctrl, hashPromise, (sent, total) => {
         upsertUpload({ id, sent, size: total, status: "uploading" });
-        setUploadProgress(`Uploading ${file.name}… ${total ? Math.floor((100 * sent) / total) : 0}%${uploadPaceTextFor(id)}`);
+        setUploadProgress(id, `Uploading ${file.name}… ${total ? Math.floor((100 * sent) / total) : 0}%${uploadPaceTextFor(id)}`);
       }, (waiting) => {
         upsertUpload({ id, note: waiting ? "Finishing the checksum of the whole file…" : "" });
-        if (waiting) setUploadProgress(`Finishing the checksum of ${file.name}…`);
+        if (waiting) setUploadProgress(id, `Finishing the checksum of ${file.name}…`);
       }, (retrying) => upsertUpload({ id, retrying }));
     } finally { releaseUploadSlot(); }
     await settleUpload(id, d, file.name, file.size, ctrl, true);
   } catch (err) { failUpload(id, err, file.name, ctrl); }
-  finally { setUploadProgress(null); }
+  finally { setUploadProgress(id, null); }
 }
 
 // -- the cards ---------------------------------------------------------------------------------------
@@ -4335,7 +4782,14 @@ function upsertUpload(rec) {
   noteUploadPace(state.uploads[i >= 0 ? i : 0]);
   renderUploads();
 }
-function removeUpload(id) { state.uploads = state.uploads.filter((u) => u.id !== id); uploadPaces.delete(id); renderUploads(); }
+function removeUpload(id) { state.uploads = state.uploads.filter((u) => u.id !== id); uploadPaces.delete(id); uploadLines.delete(id); renderUploads(); }
+// An "Interrupted" card stands for one upload on the server. Once that upload continues, the card of
+// the file being sent says how it goes. Matched by upload, not by name: a card from the server's list
+// may carry the server's cleaned name ("my data.bam" is "mydata.bam" there).
+function dropPendingCardFor(url) {
+  const id = tusId(url);
+  for (const u of state.uploads.filter((x) => x.status === "pending" && x.tusUrl && tusId(x.tusUrl) === id)) removeUpload(u.id);
+}
 function resumeUpload(id) {
   const u = state.uploads.find((x) => x.id === id);
   if (u && u.kind === "folder" && u.files) uploadFolder(u.files);    // only the missing files are sent
@@ -4343,8 +4797,9 @@ function resumeUpload(id) {
 }
 // Cancel: abort whatever is in flight for this card; the code driving it finalises the card.
 function cancelUpload(id) { const u = state.uploads.find((x) => x.id === id); if (u && u.ctrl) u.ctrl.abort(); }
+// The composer's Cancel: the uploads of the chat on screen, never another chat's.
 function cancelActiveUploads() {
-  state.uploads.filter((u) => UPLOAD_ACTIVE.includes(u.status)).forEach((u) => cancelUpload(u.id));
+  chatUploads(state.activeId).forEach((u) => cancelUpload(u.id));
 }
 // The copy to HPC3 failed (the file is still on the server): run it again, without uploading again.
 async function retryUpload(id) {
@@ -4359,7 +4814,7 @@ async function retryUpload(id) {
     if (u.serverFolder) await followFolder(id, u.serverFolder, {}, ctrl, u.attach !== false);
     else await settleUpload(id, { status: "staging", job_id: u.jobId, name: u.name, size: u.size }, u.name, u.size, ctrl, u.attach !== false);
   } catch (err) { failUpload(id, err, u.name, ctrl); }
-  finally { setUploadProgress(null); }
+  finally { setUploadProgress(id, null); }
 }
 // Give a failed upload up: the server drops the job and what it had kept for a retry.
 async function dismissUpload(id) {
@@ -4375,7 +4830,9 @@ async function discardUpload(id) {
   const u = state.uploads.find((x) => x.id === id);
   if (!u) return;
   try {
-    if (u.tusUrl) await fetch(u.tusUrl, { method: "DELETE", headers: tusHeaders() }).catch(() => {});
+    for (const url of [u.tusUrl, ...(u.tusUrls || [])].filter(Boolean)) {   // tusUrls: a folder's part-way files
+      await fetch(url, { method: "DELETE", headers: tusHeaders() }).catch(() => {});
+    }
     if (u.tusKey && window.tus) await window.tus.defaultOptions.urlStorage.removeUpload(u.tusKey);
     if (u.folderKey) { localStorage.removeItem(u.folderKey); localStorage.removeItem(`${u.folderKey}:completed`); }
   } catch { /* the card goes either way */ }
@@ -4389,10 +4846,33 @@ function uploadAction(act, id) {
   else if (act === "discard") discardUpload(id);
   else if (act === "pickfile") $("datasetFile").click();
   else if (act === "pickdir") $("datasetDir").click();
+  else if (act === "openchat") openChat(uploadChat(id));
+}
+function uploadFileCounts(u) {
+  const rows = u.serverFolder ? [] : (u.fileProgress || []);
+  if (rows.length && u.status === "staging") {
+    // the copy to HPC3: the server counts which files are verified there
+    const done = u.filesDone || 0, failed = u.filesFailed || 0;
+    return { done, failed, cancelled: 0, remaining: Math.max(0, (u.filesTotal || rows.length) - done - failed) };
+  }
+  const done = rows.length ? rows.filter((f) => f.status === "done").length : (u.filesDone || 0);
+  const failed = rows.length ? rows.filter((f) => f.status === "error").length : (u.filesFailed || 0);
+  const cancelled = rows.filter((f) => f.status === "cancelled").length;
+  return { done, failed, cancelled, remaining: Math.max(0, (u.filesTotal || rows.length) - done - failed - cancelled) };
+}
+function uploadFileRows(u) {
+  return (u.fileProgress || []).map((f) => {
+    const pct = f.size ? Math.min(100, Math.round(f.sent / f.size * 100)) : f.status === "done" ? 100 : 0;
+    const label = { queued: "Waiting", uploading: "Uploading", verifying: "Verifying", copying: "Copying to HPC3", done: "Uploaded", error: "Failed", cancelled: "Cancelled" }[f.status] || f.status;
+    return `<div class="upload-file ${f.status}"><span class="upload-file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>` +
+      `<span>${fmtUploadSize(f.sent)} / ${fmtUploadSize(f.size)} · ${pct}%</span>` +
+      `<span title="${escapeHtml(f.error || "")}">${escapeHtml(label)}${f.error ? `: ${escapeHtml(f.error)}` : ""}</span></div>`;
+  }).join("");
 }
 function uploadCardView(u) {
-  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : 0;
-  const files = u.filesTotal ? `${u.filesDone || 0}/${u.filesTotal} files` : "";
+  const pct = u.size ? Math.min(100, Math.round(((u.sent || 0) / u.size) * 100)) : u.status === "done" ? 100 : 0;
+  const counts = uploadFileCounts(u);
+  const files = u.filesTotal ? `${counts.done} completed · ${counts.remaining} remaining · ${counts.failed} failed${counts.cancelled ? ` · ${counts.cancelled} cancelled` : ""}` : "";
   const pace = uploadPaceText(u);
   let stat;
   if (u.status === "done") stat = "Done";
@@ -4409,7 +4889,7 @@ function uploadCardView(u) {
   if (UPLOAD_ACTIVE.includes(u.status)) buttons.push(["cancel", "Cancel"]);
   else if (u.status === "error") {
     if (u.jobId || u.serverFolder) buttons.push(["retry", "Retry copy"]);
-    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Resume"] : ["pickdir", "Choose the folder again"]);
+    else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Retry failed files"] : ["pickdir", "Choose the folder again"]);
     else if (u.file) buttons.push(["resume", "Resume"]);
     buttons.push(["dismiss", "Dismiss"]);
   } else if (u.status === "pending") {
@@ -4420,6 +4900,8 @@ function uploadCardView(u) {
     : u.kind === "folder" ? "drive_folder_upload" : "upload_file";
   // the upload library's own wording, for whoever has to debug it
   const tip = u.status === "error" && u.detail && u.detail !== u.error ? `${stat}\n\n${u.detail}` : stat;
+  if (u.status !== "uploading") stat += ` · ${pct}% · ${fmtUploadSize(u.sent)} / ${fmtUploadSize(u.size)}`;
+  if (files && u.status !== "uploading" && u.status !== "staging") stat += ` · ${files}`;
   return { stat, pct, buttons, icon, tip };
 }
 // Cards are updated in place. Rebuilding them on every progress event replaced the buttons several
@@ -4442,23 +4924,43 @@ function renderUploads() {
       fresh.dataset.uploadId = u.id;
       fresh.dataset.shape = shape;
       fresh.innerHTML = `<div class="upload-row"><span class="material-symbols-outlined msym">${v.icon}</span>` +
-        `<span class="upload-name"></span><span class="upload-stat"></span>` +
+        `<span class="upload-name"></span><button type="button" class="upload-chat hidden" data-act="openchat"></button>` +
+        `<span class="upload-stat"></span>` +
         v.buttons.map(([act, label]) => `<button type="button" class="ghost small" data-act="${act}">${escapeHtml(label)}</button>`).join("") +
-        `</div><div class="meter"><div class="meter-fill"></div></div>`;
-      if (el) el.replaceWith(fresh);
+        `</div><div class="meter"><div class="meter-fill"></div></div>` +
+        `<details class="upload-files"><summary>File progress</summary><div class="upload-file-list"></div></details>`;
+      if (el) {
+        fresh.querySelector(".upload-files").open = !!el.querySelector(".upload-files")?.open;
+        el.replaceWith(fresh);
+      }
       el = fresh;
     }
     const nameEl = el.querySelector(".upload-name");
     nameEl.textContent = u.name; nameEl.title = u.name;
+    const from = chatLabel(u.chat);
+    const chatEl = el.querySelector(".upload-chat");
+    chatEl.classList.toggle("hidden", !from);
+    chatEl.disabled = !from || !from.open;
+    chatEl.textContent = from ? from.text : "";
+    chatEl.title = from && from.open ? "Open the chat this upload was started from" : "";
     const statEl = el.querySelector(".upload-stat");
     statEl.textContent = v.stat; statEl.title = v.tip;
     const fill = el.querySelector(".meter-fill");
     fill.style.width = `${v.pct}%`;
     fill.classList.toggle("mem", u.status === "done");
+    const details = el.querySelector(".upload-files");
+    details.hidden = !(u.fileProgress && u.fileProgress.length);
+    if (details.open) {
+      const list = details.querySelector(".upload-file-list");
+      const html = uploadFileRows(u);
+      if (list.innerHTML !== html) list.innerHTML = html;
+    }
+    details.ontoggle = () => { if (details.open) details.querySelector(".upload-file-list").innerHTML = uploadFileRows(state.uploads.find((x) => x.id === u.id) || u); };
     const at = prev ? prev.nextElementSibling : host.firstElementChild;
     if (at !== el) host.insertBefore(el, at);
     prev = el;
   }
+  renderUploadLine();
 }
 
 // -- a folder: one card ------------------------------------------------------------------------------
@@ -4486,6 +4988,12 @@ function folderDoneText(d) {
 // Upload a WHOLE folder (webkitdirectory) — every file keeps its nested relative path, so
 // a multi-level folder round-trips intact. Registered as ONE dataset entry; all uploads
 // this session stay reachable to the agent (server exposes the uploads tree to run_code).
+// The folder's name as the user knows it: the server's own name ("data_2"), unless it is a managed
+// storage id, which says nothing to the user.
+const STORAGE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function shownFolder(serverName, userName) {
+  return serverName && !STORAGE_ID.test(serverName) ? serverName : (userName || serverName || "folder");
+}
 async function uploadFolder(fileList) {
   const files = Array.from(fileList || []).filter((f) => f && f.size >= 0)
     .sort((a, b) => {
@@ -4512,39 +5020,52 @@ async function uploadFolder(fileList) {
   const ctrl = new AbortController();
   // `files` stays on the card: while the page is open, a Resume does not need the folder chosen again
   const earlier = state.uploads.find((u) => u.id === id);
-  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length,
+  if (earlier && earlier.fileProgress) earlier.fileProgress.forEach((f, i) => {
+    if (f.status === "done") doneBits[i >> 3] |= 1 << (i & 7);
+  });
+  const fileProgress = files.map((f, i) => ({ name: f.webkitRelativePath || f.name, size: f.size,
+    sent: isDone(i) ? f.size : 0, status: isDone(i) ? "done" : "queued", error: "" }));
+  upsertUpload({ id, kind: "folder", name: `${folder0}/`, size: total, sent: 0, filesDone: 0, filesTotal: files.length, fileProgress,
     status: "uploading", error: "", detail: "", lost: false, retrying: false, note: "", jobId: "", serverFolder: "", folderKey, files, ctrl,
     chat: (earlier && earlier.chat) || state.activeId });
-  setUploadProgress(`Preparing ${folder0}/…`);
+  setUploadProgress(id, `Preparing ${folder0}/…`);
   let folder = folder0, failedRel = "";
   try {
     // Ask the server which folder this goes to. It is told what the folder holds, so it recognises
     // one that is already uploaded, in part or whole (an upload that stopped, in this browser or
     // another, or the same folder chosen again): the answer is then that folder, and `have` lists
     // the files, by position, that are there and are not sent again. A different folder of the
-    // same name lands in "name_2/" instead of merging into / overwriting the first.
-    let savedFolder = "", kept = 0;
-    try { savedFolder = localStorage.getItem(folderKey) || ""; } catch { /* private mode */ }
-    if (!savedFolder) {
+    // same name lands in "name_2/" (or, with managed storage, gets a storage id of its own) instead of
+    // merging into / overwriting the first. A folder this browser started before is named in the
+    // request: with managed storage the server checks it again (a browser note can outlive the
+    // server's 24-hour upload expiry) and only the files it still holds are skipped; without, it is
+    // taken as it is ("resume") and the browser's own record of finished files stands.
+    let savedFolder = (earlier && earlier.reservedFolder) || "", kept = 0;
+    try { savedFolder = localStorage.getItem(folderKey) || savedFolder; } catch { /* private mode */ }
+    const rr = await postJson("/api/upload/reserve-folder", { name: folder0, folder: savedFolder, ...uploadChatField(id),
+      files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
+    const rd = await rr.json().catch(() => ({}));
+    if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
+    folder = rd.folder;
+    if (!rd.resume) {
       doneBits.fill(0);
-      const rr = await postJson("/api/upload/reserve-folder", { name: folder0,
-        files: files.map((f) => [(f.webkitRelativePath || `${folder0}/${f.name}`).split("/").slice(1).join("/"), f.size]) });
-      const rd = await rr.json().catch(() => ({}));
-      if (!rr.ok || !rd.folder) throw new Error(rd.error || "folder reservation failed");
-      folder = rd.folder;
+      fileProgress.forEach((f) => { f.sent = 0; f.status = "queued"; f.error = ""; });
       for (const i of rd.have || []) {
         if (Number.isInteger(i) && i >= 0 && i < files.length && !isDone(i)) { doneBits[i >> 3] |= 1 << (i & 7); kept++; }
       }
-      try {
-        localStorage.setItem(folderKey, folder);
-        if (kept) localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
-      } catch { /* upload still works this session */ }
-      // (all of them there: the closing message says so, see folderDoneText)
-      if (kept && kept < files.length) toast(`${folder}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
-    } else folder = savedFolder;
+    }
+    try {
+      localStorage.setItem(folderKey, folder);
+      localStorage.setItem(bitsKey, btoa(String.fromCharCode(...doneBits)));
+    } catch { /* upload still works this session */ }
+    // (all of them there: the closing message says so, see folderDoneText)
+    if (kept && kept < files.length) toast(`${folder0}/ is already uploaded in part: ${kept} of ${files.length} files are there, sending the other ${files.length - kept}`);
+    upsertUpload({ id, reservedFolder: folder });
+    // the server's card for this folder's part-way files (restoreServerCards): this card continues them
+    for (const u of state.uploads.filter((x) => x.status === "pending" && x.partsFolder === folder)) removeUpload(u.id);
     let done = 0, doneBytes = 0, nextFile = 0, stopped = false, firstError = null, storageWarned = false, painted = 0;
     let retryingFiles = 0;
-    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; } });
+    files.forEach((f, i) => { if (isDone(i)) { done++; doneBytes += f.size; fileProgress[i].sent = f.size; fileProgress[i].status = "done"; } });
     uploadPaces.delete(id);             // files that are already there are not speed: measure from here
     const inFlight = new Map();         // file index -> bytes of it sent so far
     const controllers = new Set();
@@ -4554,8 +5075,8 @@ async function uploadFolder(fileList) {
       painted = Date.now();
       let sent = doneBytes;
       for (const n of inFlight.values()) sent += n;
-      upsertUpload({ id, name: `${folder}/`, sent, filesDone: done, status: "uploading" });
-      setUploadProgress(`Uploading ${folder}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
+      upsertUpload({ id, name: `${shownFolder(folder, folder0)}/`, sent, filesDone: done, fileProgress, status: "uploading" });
+      setUploadProgress(id, `Uploading ${shownFolder(folder, folder0)}/ — ${done}/${files.length} files${uploadPaceTextFor(id)}`);
     };
     paint(true);
     async function folderWorker() {
@@ -4573,10 +5094,11 @@ async function uploadFolder(fileList) {
           let d;
           try {
             if (stopped || fctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
+            fileProgress[index].status = "uploading";
             const hashPromise = hashUploadFile(f, fctrl);
             hashPromise.catch(() => {});
-            d = await tusUpload(f, { folder, rel_path: rel }, fctrl, hashPromise, (sent) => { inFlight.set(index, sent); paint(false); },
-              null, (retrying) => {
+            d = await tusUpload(f, { folder, rel_path: rel, ...uploadChatField(id) }, fctrl, hashPromise, (sent) => { fileProgress[index].sent = sent; inFlight.set(index, sent); paint(false); },
+              (waiting) => { fileProgress[index].status = waiting ? "verifying" : "uploading"; paint(true); }, (retrying) => {
                 retryingFiles += retrying ? 1 : -1;
                 upsertUpload({ id, retrying: retryingFiles > 0 });
               });
@@ -4587,19 +5109,22 @@ async function uploadFolder(fileList) {
           catch { storageWarned = true; }
           inFlight.delete(index);
           done++; doneBytes += f.size;
+          fileProgress[index].sent = f.size;
+          fileProgress[index].status = d.status === "staging" ? "copying" : "done";
           paint(true);
         } catch (error) {
-          inFlight.delete(index);
-          if (!firstError && !stopped) { firstError = error; failedRel = rel; }   // the error itself: it says what kind of failure
-          stopped = true;
-          for (const other of controllers) if (other !== fctrl) other.abort();
+          fileProgress[index].status = ctrl.signal.aborted ? "cancelled" : "error";
+          fileProgress[index].error = ctrl.signal.aborted ? "" : (error.message || "Upload failed");
+          if (!firstError && !stopped) { firstError = error; failedRel = rel; }
+          // A failed file keeps its resumable partial. Other files finish independently.
+          paint(true);
         } finally { controllers.delete(fctrl); }
       }
     }
     await Promise.all(Array.from({ length: Math.min(TUS_CONCURRENCY, files.length) }, () => folderWorker()));
     if (ctrl.signal.aborted) throw new DOMException("cancelled", "AbortError");
     if (firstError) throw firstError;
-    const reg = await postJson("/api/upload/register-folder", { folder, count: files.length });
+    const reg = await postJson("/api/upload/register-folder", { folder, count: files.length, ...uploadChatField(id) });
     const d = await reg.json().catch(() => ({}));
     if (!reg.ok) throw new Error(d.error || "folder registration failed");
     const forget = () => {
@@ -4621,21 +5146,32 @@ async function uploadFolder(fileList) {
   } catch (err) {
     if (ctrl.signal.aborted || err.name === "AbortError") {
       upsertUpload({ id, status: "cancelled", note: "" });
-      toast(`Cancelled ${folder}/ — choose the folder again to continue where it stopped.`);
+      fileProgress.forEach((f) => { if (f.status !== "done") f.status = "cancelled"; });
+      try {
+        const response = await postJson("/api/upload/staging/cancel", { folder, discard_upload: true });
+        if (!response.ok) throw new Error("Server could not remove temporary files");
+        localStorage.removeItem(folderKey); localStorage.removeItem(bitsKey);
+        toast(`Cancelled ${folder0}/`);
+      } catch (cleanupError) {
+        upsertUpload({ id, status: "error", error: `Cancellation cleanup failed: ${cleanupError.message}` });
+        toast(`Cancellation cleanup failed for ${folder0}/: ${cleanupError.message}`);
+        return;
+      }
       setTimeout(() => removeUpload(id), 4000);
     } else {
       const f = uploadFailure(err, "", "Resume uploads only the files that are still missing.");
       const text = failedRel && !f.lost ? `${failedRel}: ${f.text}` : f.text;   // a refusal names its file
       upsertUpload({ id, status: "error", note: "", error: text, detail: f.detail, lost: f.lost });
-      reportUploadError(id, `${folder}/`, err);
-      toast(`${folder}/: ${text}`);
+      reportUploadError(id, `${folder0}/`, err);
+      toast(`${folder0}/: ${text}`);
     }
-  } finally { setUploadProgress(null); }
+  } finally { setUploadProgress(id, null); }
 }
 
 // -- after a page reload -----------------------------------------------------------------------------
 // Copies to HPC3 run on the server whether or not a page is open; uploads the browser had not finished
-// wait in its storage. Bring both back as cards, once per connection.
+// wait in its storage, and the server lists those of any browser. Bring them back as cards, once per
+// connection.
 let uploadsRestoredFor = "";
 async function restoreUploads() {
   const cid = state.connectionId;
@@ -4651,30 +5187,35 @@ async function restoreStagingCards() {
   for (const job of d.jobs || []) {
     if (tracked.has(job.id) || job.state === "done" || job.state === "cancelled") continue;
     const id = `j${job.id}`;
-    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, attach: false, note: "" };
+    // the chat it was started from gets its progress back, and the data once it is there
+    const chat = job.conversation_id || null;
+    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, chat, attach: !!chat, note: "" };
     if (job.state === "failed") { upsertUpload({ ...base, status: "error", error: job.error || "the copy to HPC3 failed" }); continue; }
     const ctrl = new AbortController();
     upsertUpload({ ...base, status: "staging", error: "", ctrl });
-    settleUpload(id, { status: "staging", job_id: job.id, name: job.name, size: job.size }, job.name, job.size, ctrl, false)
-      .catch((err) => failUpload(id, err, job.name, ctrl)).finally(() => setUploadProgress(null));
+    settleUpload(id, { status: "staging", job_id: job.id, name: job.name, size: job.size }, job.name, job.size, ctrl, !!chat)
+      .catch((err) => failUpload(id, err, job.name, ctrl)).finally(() => setUploadProgress(id, null));
   }
   for (const f of d.folders || []) {
     // not registered = the browser had not sent every file: the "interrupted" card below covers it
     if (f.recorded || !f.registered || tracked.has(`folder:${f.name}`)) continue;
     const id = `jf${Math.abs(hashStr(f.name)).toString(36)}`;
+    const chat = f.conversation_id || null;
     const base = { id, kind: "folder", name: `${f.name}/`, size: f.size || 0, sent: f.sent || 0, filesDone: f.done || 0,
-      filesTotal: f.count || 0, serverFolder: f.name, attach: false, note: "" };
+      filesTotal: f.count || 0, serverFolder: f.name, chat, attach: !!chat, note: "" };
     if (!f.pending && f.failed) { upsertUpload({ ...base, status: "error", error: `${f.failed} of ${f.count} files did not reach HPC3` }); continue; }
     const ctrl = new AbortController();
     upsertUpload({ ...base, status: "staging", error: "", ctrl });
-    followFolder(id, f.name, {}, ctrl, false).catch((err) => failUpload(id, err, `${f.name}/`, ctrl)).finally(() => setUploadProgress(null));
+    followFolder(id, f.name, {}, ctrl, !!chat).catch((err) => failUpload(id, err, `${f.name}/`, ctrl)).finally(() => setUploadProgress(id, null));
   }
 }
 async function restorePendingCards() {
   const owner = apiKeyOwner();
+  const stored = new Set();                            // the server's ids of every upload this browser keeps
   if (window.tus && window.tus.defaultOptions && window.tus.defaultOptions.urlStorage) {
     const storage = window.tus.defaultOptions.urlStorage;
     for (const up of await storage.findAllUploads()) {
+      if (up.uploadUrl) stored.add(tusId(up.uploadUrl));
       // key: tus::<fingerprint>::<n>, fingerprint: tus:<owner>:<name or path>:<size>:<modified>
       const fingerprint = String(up.urlStorageKey || "").split("::")[1] || "";
       const meta = up.metadata || {};
@@ -4688,7 +5229,7 @@ async function restorePendingCards() {
       if (state.uploads.some((u) => u.name === name && u.size === length && u.status !== "pending")) continue;   // already running again
       const id = `p${Math.abs(hashStr(fingerprint)).toString(36)}`;
       if (state.uploads.some((u) => u.id === id && (u.sent || 0) >= offset)) continue;   // one file stored twice: show the one further along
-      upsertUpload({ id, kind: "file", name, size: length, sent: offset,
+      upsertUpload({ id, kind: "file", name, size: length, sent: offset, chat: meta.conversation_id || null,
         status: "pending", error: "", note: `Interrupted at ${Math.floor((100 * offset) / length)}% — choose the file again to continue`,
         tusUrl: up.uploadUrl, tusKey: up.urlStorageKey });
     }
@@ -4705,6 +5246,38 @@ async function restorePendingCards() {
     upsertUpload({ id, kind: "folder", name: `${localStorage.getItem(key) || parts.slice(2, -2).join(":")}/`, size: 0, sent: 0,
       filesDone: done, filesTotal: count, status: "pending", error: "", folderKey: key,
       note: `Interrupted — ${done} of ${count} files uploaded; choose the folder again to continue` });
+  }
+  await restoreServerCards(stored);
+}
+// The account's uploads left part-way where this browser stored nothing: another computer, a private
+// window, or this browser before its site data was cleared. The server lists them (GET
+// /api/tus/unfinished); without a card nothing said they wait. Choosing the file or folder again
+// continues each one (findServerUpload) and Discard deletes it. An upload this browser stores, or one
+// a card here already stands for, is left to that card; so is a file or folder that has a card here.
+async function restoreServerCards(stored, request = fetch) {
+  let d = null;
+  try {
+    const r = await request(`/api/tus/unfinished?connection_id=${encodeURIComponent(state.connectionId)}`);
+    d = r.ok ? await r.json() : null;
+  } catch { /* no answer: the cards this browser keeps are all there is */ }
+  if (!d) return;
+  const shown = new Set(state.uploads.flatMap((u) => [u.tusUrl, ...(u.tusUrls || [])]).filter(Boolean).map(tusId));
+  const fresh = (up) => !!(up && up.url && up.size > 0) && !stored.has(tusId(up.url)) && !shown.has(tusId(up.url));
+  for (const up of (d.files || []).filter(fresh)) {
+    if (state.uploads.some((u) => u.kind === "file" && u.name === up.name && u.size === up.size)) continue;
+    upsertUpload({ id: `s${tusId(up.url)}`, kind: "file", name: up.name, size: up.size, sent: up.offset,
+      status: "pending", error: "", tusUrl: up.url, chat: up.conversation_id || null,
+      note: `Interrupted at ${Math.floor((100 * up.offset) / up.size)}% in another browser — choose the file again to continue` });
+  }
+  for (const f of d.folders || []) {
+    const parts = (f.files || []).filter(fresh);
+    if (!f.folder || !parts.length || state.uploads.some((u) => u.kind === "folder" && u.name === `${f.folder}/`)) continue;
+    const n = parts.length;
+    upsertUpload({ id: `sf${Math.abs(hashStr(f.folder)).toString(36)}`, kind: "folder", name: `${f.folder}/`,
+      size: parts.reduce((s, p) => s + p.size, 0), sent: parts.reduce((s, p) => s + p.offset, 0),
+      status: "pending", error: "", partsFolder: f.folder, tusUrls: parts.map((p) => p.url),
+      chat: (parts.find((p) => p.conversation_id) || {}).conversation_id || null,
+      note: `Interrupted in another browser — ${n} ${n === 1 ? "file" : "files"} part-way; choose the folder again to continue` });
   }
 }
 
@@ -4794,28 +5367,29 @@ async function bindServerPath(path) {
   path = (path || "").trim();
   if (!path) return false;
   if (!state.connectionId) { toast("Connect first: binding server data needs a session."); return false; }
+  const sid = state.activeId, line = `bind:${sid}`;   // the chat it was asked in, which may be left meanwhile
   const post = async (url) => {
     const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, path }) });
+      body: JSON.stringify({ connection_id: state.connectionId, path, conversation_id: String(sid || "") }) });
     const d = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
     return d;
   };
   try {
-    setUploadProgress(`Checking ${path} on the server…`);
+    setUploadProgress(line, `Checking ${path} on the server…`, sid);
     const info = await post("/api/server-data/check");
-    setUploadProgress("");
+    setUploadProgress(line, "");
     // Large copies are confirmed first: the size and what will be skipped are in the message.
     if (info.confirm && !confirm(info.message + "\n\nBind it?")) return false;
     const d = await post("/api/server-data/bind");
     state.serverBoundTyped.add(path);
     addDataset({ name: d.name + (isFolderKind(d.kind) ? "/" : ""), path: d.path, kind: d.kind,
-      gist: d.info && d.info.message });
+      gist: d.info && d.info.message }, sid);
     toast(d.info && d.info.message ? d.info.message : `Bound ${d.name}`);
     renderServerPathOffer();
     return true;
   } catch (err) {
-    setUploadProgress("");
+    setUploadProgress(line, "");
     toast("Can't bind that path: " + err.message);
     return false;
   }
@@ -4837,14 +5411,43 @@ function addDataset(d, sid) {
   const c = chatOf(sid || state.activeId);
   if (c && !c.bound.includes(d.path)) c.bound.push(d.path);
   if (!c || chatVisible(c)) syncDatasetSelection();
-  else renderDataMenuRecent();      // its chips appear when that chat is opened (showDialog)
+  else { saveComposer(c); renderDataMenuRecent(); }   // its chips appear when that chat is opened (showDialog)
 }
 
-// The chat an upload attaches to: the one it was started from (cards restored after a reload
-// have none, and attach nothing).
+// A deleted dataset leaves every chat it was attached to, the ones not opened since the reload too.
+function unbindEverywhere(path) {
+  state.datasets = state.datasets.filter((d) => d.path !== path);
+  for (const s of state.sessions) {
+    const c = chatOf(s.id);
+    if (!c.bound.includes(path)) continue;
+    c.bound = c.bound.filter((p) => p !== path);
+    delete c.roles[path];
+    saveComposer(c);
+  }
+  syncDatasetSelection();
+}
+
+// The chat an upload attaches to: the one it was started from. The server keeps it too, so a card
+// restored after a reload knows it; one from before the server kept it has none and attaches nothing.
 function uploadChat(id) {
   const u = state.uploads.find((x) => x.id === id);
   return (u && u.chat) || null;
+}
+// What an upload request tells the server about its chat (tus metadata and the folder calls).
+function uploadChatField(id) {
+  const sid = uploadChat(id);
+  return sid ? { conversation_id: String(sid) } : {};
+}
+// "from “Retina scRNA”" for the Datasets page: { text, open } (open = the chat still exists), or null.
+function chatLabel(sid) {
+  if (!sid) return null;
+  const s = state.sessions.find((x) => String(x.id) === String(sid));
+  return s ? { text: `from “${s.title || "New chat"}”`, open: true } : { text: "from a deleted chat", open: false };
+}
+function openChat(sid) {
+  if (!sid || !state.sessions.some((s) => String(s.id) === String(sid))) return;
+  switchView("research");
+  if (String(state.activeId) !== String(sid)) selectSession(String(sid));
 }
 
 // Add/remove one path from the bind-set (a recent-list toggle or a chip ×).
@@ -4860,8 +5463,9 @@ function clearBound() { state.boundPaths = []; state.boundRoles = {}; syncDatase
 function syncDatasetSelection() {
   state.datasetPath = primaryBoundPath();
   $("datasetInput").value = state.datasetPath || "";   // legacy primary, for back-compat readers
-  // Not persisted across reloads on purpose: a new chat should start with an empty bind-set
-  // rather than silently re-attaching the last one (see loadDatasetChips).
+  // Kept per chat across a reload (saveComposer); a new chat starts with an empty bind-set rather
+  // than silently re-attaching the last one (see loadDatasetChips).
+  saveComposer(activeChat());
   renderDatasetChips();
   renderDataMenuRecent();
 }
@@ -4935,14 +5539,34 @@ function renderDataMenuRecent() {
   }).join("");
 }
 
-function setUploadProgress(text) {
+// The composer's upload line belongs to the chat the upload was started from (issue 7). Each upload
+// has its own line; the composer shows only those of the chat on screen. Another chat's upload goes
+// on meanwhile, its progress is there again when that chat is opened, and the Datasets page lists
+// every upload with the chat it came from.
+const uploadLines = new Map();          // upload id (or "bind:<chat>") -> { chat, text }
+function setUploadProgress(id, text, chat) {
+  if (!text) uploadLines.delete(id);
+  else {
+    const had = uploadLines.get(id);
+    const sid = chat || uploadChat(id) || (had && had.chat) || "";
+    uploadLines.set(id, { chat: String(sid), text });
+  }
+  renderUploadLine();
+}
+// Uploads in flight that were started from chat `sid`.
+function chatUploads(sid) {
+  return state.uploads.filter((u) => u.chat && String(u.chat) === String(sid) && UPLOAD_ACTIVE.includes(u.status));
+}
+function renderUploadLine() {
   const el = $("uploadStatus"), cb = $("uploadCancel");
   if (!el) return;
-  if (!text) { el.classList.add("hidden"); el.textContent = ""; if (cb) cb.classList.add("hidden"); return; }
-  el.classList.remove("hidden");
+  const here = String(state.activeId || "");
+  const lines = here ? [...uploadLines.values()].filter((l) => l.chat === here) : [];
+  const text = lines.length ? lines[0].text + (lines.length > 1 ? ` (+${lines.length - 1} more)` : "") : "";
+  el.classList.toggle("hidden", !text);
   el.textContent = text;
-  // Show the composer's Cancel button while any upload is actually in flight.
-  if (cb) cb.classList.toggle("hidden", !state.uploads.some((u) => UPLOAD_ACTIVE.includes(u.status)));
+  // Cancel stops this chat's uploads, so it is there only while one of them is in flight.
+  if (cb) cb.classList.toggle("hidden", !text || !chatUploads(here).length);
 }
 
 function toggleDataMenu(force) {
@@ -5018,7 +5642,8 @@ function applyUiPrefs() {
   try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
   setPanel("left", prefs.left !== false);
   setPanel("right", prefs.right === true);   // downloads/log panel collapsed by default
-  // "Save results to my data" is a standing choice, not a per-run one: it stays as it was left.
+  // "Save results to my data" is a standing choice, not a per-run one: a new chat starts as it was
+  // last left. Each chat keeps its own from then on (syncRunOptions).
   const save = $("saveResults");
   if (save) {
     save.checked = prefs.saveResults === true;
@@ -5031,9 +5656,10 @@ function applyUiPrefs() {
   }
 }
 
-function setPanel(side, open) {
+function setPanel(side, open, remember = true) {
   $("layout").classList.toggle(`collapse-${side}`, !open);
   $(side === "left" ? "toggleLeft" : "toggleRight").classList.toggle("active", open);
+  if (!remember) return;
   let prefs = {};
   try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
   prefs[side] = open;
@@ -5150,6 +5776,7 @@ function showApp(user) {
   if (!_appInited) { init(); initShell(); _appInited = true; }
   renderAccount(user);
   switchView("research");
+  checkBudgetNotices();
 }
 
 async function doLogin(e) {
@@ -5165,6 +5792,7 @@ async function doLogin(e) {
 
 async function doLogout() {
   try { await fetch("/api/auth/logout", { method: "POST" }); } catch {}
+  try { localStorage.removeItem(COMPOSER_KEY); } catch {}   // drafts and attachments stay with the account
   location.reload();
 }
 
@@ -5192,6 +5820,12 @@ function initShell() {
   }));
   $("skillReviewList").addEventListener("click", onSkillReviewClick);
   $("datasetsList").addEventListener("click", onDatasetsClick);
+  $("metadataForm").addEventListener("submit", saveMetadata);
+  $("metadataForm").addEventListener("change", (e) => { if (e.target.id === "mdf_human_data") mdSyncShowIf(); });
+  $("metadataClose").addEventListener("click", () => $("metadataModal").classList.add("hidden"));
+  $("metadataModal").addEventListener("click", (e) => { if (e.target.id === "metadataModal") $("metadataModal").classList.add("hidden"); });
+  $("mcpTokenForm").addEventListener("submit", createMcpToken);
+  $("mcpTokens").addEventListener("click", onMcpTokensClick);
   $("uploadsPanel").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-act]");
     const card = b && b.closest("[data-upload-id]");
@@ -5199,6 +5833,7 @@ function initShell() {
   });
   const uc = $("uploadCancel");
   if (uc) uc.addEventListener("click", cancelActiveUploads);   // composer-side Cancel
+  wireUsage();
 }
 
 function switchView(name) {
@@ -5207,7 +5842,7 @@ function switchView(name) {
   if (name === "datasets") loadDatasets();
   else if (name === "runs") loadRuns();
   else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
-  else if (name === "account") renderAccount(state.user);
+  else if (name === "account") { renderAccount(state.user); loadUsage(); }
   else if (name === "system") loadSystem();
 }
 
@@ -5324,15 +5959,32 @@ async function loadDatasets() {
   const el = $("datasetsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
-    el.innerHTML = items.length ? items.map((x) =>
-      `<div class="card"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
-      `<span class="muted">${escapeHtml(x.kind)} · ${(x.size_bytes / 1e6).toFixed(1)} MB · ${fmtDate(x.uploaded_at)}</span></div>` +
+    el.innerHTML = items.length ? items.map((x) => {
+      const from = chatLabel(x.conversation_id);
+      const fromHtml = !from ? ""
+        : from.open ? ` · <button type="button" class="upload-chat" data-open-chat="${escapeHtml(String(x.conversation_id))}" title="Open the chat this upload was started from">${escapeHtml(from.text)}</button>`
+        : ` · ${escapeHtml(from.text)}`;
+      return `<div class="card"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
+      `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${metadataBadge(x.metadata)}</span></div>` +
+      `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
+      `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
+      `<a class="ghost small" href="/api/datasets/${x.id}/download" download data-dl-size="${Number(x.size_bytes) || 0}" data-name="${escapeHtml(x.name)}" title="${isFolderKind(x.kind) ? "Download the folder as one .zip" : "Download the file"}">Download</a>` +
       `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>` +
-      `<button class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`).join("")
+      `<button class="ghost small danger" data-del="${x.id}" data-path="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`;
+    }).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  loadMcpTokens();
 }
 async function onDatasetsClick(e) {
+  const open = e.target.closest("[data-open-chat]");
+  if (open) { openChat(open.dataset.openChat); return; }
+  const pv = e.target.closest("[data-preview]");
+  if (pv) { openDatasetPreview(Number(pv.dataset.preview), pv.dataset.name || ""); return; }
+  const dl = e.target.closest("[data-dl-size]");
+  if (dl) { if (!confirmLargeDownload(Number(dl.dataset.dlSize), dl.dataset.name)) e.preventDefault(); return; }
+  const meta = e.target.closest("[data-meta]");
+  if (meta) { openMetadata(meta.dataset.meta); return; }
   const b = e.target.closest("[data-use]");
   if (b) {
     addDataset({ name: b.dataset.name || b.dataset.use.split("/").pop(), path: b.dataset.use, kind: b.dataset.kind || "file" });
@@ -5351,10 +6003,361 @@ async function onDatasetsClick(e) {
       const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
       const j = await res.json();
       if (!res.ok) { toast(j.error || "Delete failed"); return; }
+      if (d.dataset.path) unbindEverywhere(d.dataset.path);
       toast("Dataset deleted.");
       loadDatasets();
     } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
   }
+}
+
+// ---- Dataset metadata (Croissant; RCHENLAB/AiScientist issue 9) ----
+// The review form edits only what cannot be measured. Each value the owner has not set says where
+// it came from and how sure the drafting was; the ones to check first are marked.
+const MD_SOURCE_LABEL = {
+  "owner": "yours", "upload-check": "measured at upload", "computed": "measured", "run-record": "from the run",
+  "account": "from your account", "registry": "from the registry", "file-content": "drafted from the file's content",
+  "file-name": "drafted from the file name", "default": "placeholder",
+};
+let mdVocab = null;            // a promise of /api/metadata/vocabulary
+let mdCurrent = null;          // { ref, view } of the open dialog
+
+function metadataBadge(m) {
+  if (!m) return "";
+  if (m.valid === false) return ' · <span class="md-badge md-bad" title="Its croissant.json did not validate">metadata invalid</span>';
+  return m.status === "reviewed"
+    ? ' · <span class="md-badge md-ok">metadata reviewed</span>'
+    : ' · <span class="md-badge md-draft" title="Drafted automatically — review it">metadata draft</span>';
+}
+
+function mdSourceHtml(src) {
+  if (!src || !src.source) return "";
+  const label = MD_SOURCE_LABEL[src.source] || src.source;
+  if (src.reviewed) return `<span class="md-src md-src-owner">${escapeHtml(label)}</span>`;
+  const conf = typeof src.confidence === "number" ? ` · ${Math.round(src.confidence * 100)}% sure` : "";
+  const low = typeof src.confidence === "number" && src.confidence < 0.7;
+  return `<span class="md-src ${low ? "md-src-low" : ""}" title="${escapeHtml(src.detail || "")}">${escapeHtml(label + conf)}${low ? " — check" : ""}</span>`;
+}
+
+function mdFieldHtml(f, value, src, vocab) {
+  const id = `mdf_${f.key}`;
+  const head = `<span class="md-field-head">${escapeHtml(f.label)} ${mdSourceHtml(src)}</span>`;
+  const hint = f.hint ? `<span class="hint-inline md-hint-line">${escapeHtml(f.hint)}</span>` : "";
+  const show = f.show_if ? ` data-show-if="${escapeHtml(f.show_if)}"` : "";
+  if (f.type === "bool") {
+    return `<label class="check"${show}><input id="${id}" name="${f.key}" type="checkbox" ${value ? "checked" : ""}/> ${escapeHtml(f.label)}</label>`;
+  }
+  if (f.type === "textarea") {
+    return `<label${show}>${head}<textarea id="${id}" name="${f.key}" rows="3">${escapeHtml(value || "")}</textarea>${hint}</label>`;
+  }
+  if (f.type === "select") {
+    const opts = (vocab.license || []).map((o) =>
+      `<option value="${escapeHtml(o.id)}" ${o.id === value ? "selected" : ""}>${escapeHtml(o.label)}</option>`).join("");
+    return `<label${show}>${head}<select id="${id}" name="${f.key}"><option value="" ${value ? "" : "selected"}>— not chosen (private) —</option>${opts}</select>${hint}</label>`;
+  }
+  const text = Array.isArray(value) ? value.join(", ") : (value || "");
+  const list = f.type === "terms" ? ` list="${id}_list"` : "";
+  const datalist = f.type === "terms"
+    ? `<datalist id="${id}_list">${(vocab[f.vocab] || []).map((t) => `<option value="${escapeHtml(t.label)}">${escapeHtml(t.id)}</option>`).join("")}</datalist>` : "";
+  return `<label${show}>${head}<input id="${id}" name="${f.key}" type="text" value="${escapeHtml(text)}"${list} autocomplete="off" />${datalist}${hint}</label>`;
+}
+
+function mdSyncShowIf() {
+  const human = $("mdf_human_data");
+  document.querySelectorAll("#metadataForm [data-show-if]").forEach((el) => {
+    el.classList.toggle("hidden", !(human && human.checked));
+  });
+}
+
+function renderMetadata(view, vocab) {
+  const form = view.form || { fields: [], values: {}, sources: {}, measured: {}, needs_review: [] };
+  const m = form.measured || {};
+  const files = m.file_count != null ? `${m.file_count} file${m.file_count === 1 ? "" : "s"}` : "files not listed";
+  const sums = m.files_listed ? ` · ${m.files_with_sha256} of ${m.files_listed} with a SHA-256 checksum` : "";
+  const tables = (m.record_sets || []).length
+    ? ` · tables: ${(m.record_sets || []).map((r) => `${escapeHtml(r.name)} (${r.fields} columns)`).join(", ")}` : "";
+  $("metadataTitle").textContent = view.name || "Dataset metadata";
+  $("metadataMeasured").innerHTML = `Measured: ${files} · ${fmtSize(m.size_bytes)}${sums}${tables}. ` +
+    `ID <code>${escapeHtml(view.uuid)}</code>`;
+  const todo = form.needs_review || [];
+  $("metadataHint").innerHTML = view.status === "reviewed" && !todo.length
+    ? "You have reviewed this description."
+    : `Drafted automatically. ${todo.length ? `Check first: <strong>${todo.map((k) => escapeHtml(((form.fields || []).find((f) => f.key === k) || {}).label || k)).join(", ")}</strong>. ` : ""}` +
+      "Never enter a patient's name or identifier, or a path on the server.";
+  $("metadataForm").innerHTML = (form.fields || []).map((f) => mdFieldHtml(f, form.values[f.key], form.sources[f.key], vocab)).join("");
+  mdSyncShowIf();
+  const v = view.validation || {};
+  $("metadataValidation").innerHTML = v.ok
+    ? `${icon("verified")} Valid Croissant 1.1 (checked by ${escapeHtml(v.validator || "")}${(v.warnings || []).length ? `; ${v.warnings.length} warning(s): ${escapeHtml(v.warnings.join("; "))}` : ""}).`
+    : `<span class="md-badge md-bad">Not valid</span> ${escapeHtml((v.errors || []).join("; "))}`;
+  $("metadataDownload").href = `/api/datasets/${encodeURIComponent(view.uuid)}/croissant.json`;
+}
+
+async function openMetadata(ref) {
+  $("metadataError").classList.add("hidden");
+  $("metadataForm").innerHTML = '<div class="storage-loading">Loading…</div>';
+  $("metadataMeasured").textContent = ""; $("metadataHint").textContent = ""; $("metadataValidation").textContent = "";
+  $("metadataModal").classList.remove("hidden");
+  try {
+    if (!mdVocab) mdVocab = fetch("/api/metadata/vocabulary").then((r) => r.json()).catch(() => { mdVocab = null; return {}; });
+    const res = await fetch(`/api/datasets/${encodeURIComponent(ref)}/metadata`);
+    const view = await res.json();
+    if (!res.ok) throw new Error(view.detail || "not found");
+    mdCurrent = { ref, view };
+    renderMetadata(view, await mdVocab);
+  } catch (err) {
+    $("metadataForm").innerHTML = "";
+    $("metadataError").textContent = isUnreachable(err) ? "Can't reach the server." : "Could not load the metadata: " + err.message;
+    $("metadataError").classList.remove("hidden");
+  }
+}
+
+async function saveMetadata(e) {
+  e.preventDefault();
+  if (!mdCurrent) return;
+  const out = {};
+  for (const f of (mdCurrent.view.form || {}).fields || []) {
+    const el = $(`mdf_${f.key}`);
+    if (!el) continue;
+    out[f.key] = f.type === "bool" ? el.checked : el.value;
+  }
+  $("metadataSave").disabled = true;
+  $("metadataError").classList.add("hidden");
+  try {
+    const res = await fetch(`/api/datasets/${encodeURIComponent(mdCurrent.ref)}/metadata`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(out) });
+    const view = await res.json();
+    if (!res.ok) throw new Error(view.detail || "save failed");
+    mdCurrent.view = view;
+    renderMetadata(view, await (mdVocab || {}));
+    toast("Metadata saved.");
+    loadDatasets();
+  } catch (err) {
+    $("metadataError").textContent = isUnreachable(err) ? "Can't reach the server." : err.message;
+    $("metadataError").classList.remove("hidden");
+  } finally { $("metadataSave").disabled = false; }
+}
+
+// Personal access tokens for MCP clients.
+async function loadMcpTokens() {
+  const box = $("mcpSection");
+  if (!box) return;
+  try {
+    const res = await fetch("/api/account/tokens");
+    if (!res.ok) { box.classList.add("hidden"); return; }
+    const tokens = (await res.json()).tokens || [];
+    box.classList.remove("hidden");
+    $("mcpTokens").innerHTML = tokens.length ? tokens.map((t) =>
+      `<div class="storage-item"><span class="si-name">${icon("key")} ${escapeHtml(t.name)} <code>${escapeHtml(t.prefix)}…</code></span>` +
+      `<span class="si-size">${t.last_used_at ? "used " + fmtDate(t.last_used_at) : "never used"}</span>` +
+      `<button type="button" class="si-del" data-revoke-token="${t.id}">Revoke</button></div>`).join("")
+      : '<div class="storage-note">No tokens yet.</div>';
+  } catch { box.classList.add("hidden"); }
+}
+
+async function createMcpToken(e) {
+  e.preventDefault();
+  try {
+    const res = await fetch("/api/account/tokens", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: $("mcpTokenName").value.trim() || "MCP client" }) });
+    const j = await res.json();
+    if (!res.ok) { toast(j.detail || "Could not create a token."); return; }
+    $("mcpTokenName").value = "";
+    const url = `${location.origin}/mcp`;
+    const shown = $("mcpTokenShown");
+    shown.innerHTML = `<p><strong>Copy this token now:</strong> it is shown only once.</p>` +
+      `<pre class="md-code">${escapeHtml(j.token)}</pre>` +
+      `<p class="storage-note">Claude Code:</p><pre class="md-code">claude mcp add --transport http aiscientist ${escapeHtml(url)} --header "Authorization: Bearer ${escapeHtml(j.token)}"</pre>` +
+      `<p class="storage-note">Any MCP client (Streamable HTTP): URL <code>${escapeHtml(url)}</code>, header <code>Authorization: Bearer &lt;token&gt;</code>.</p>`;
+    shown.classList.remove("hidden");
+    loadMcpTokens();
+  } catch (err) { toast(isUnreachable(err) ? "Can't reach the server." : "Could not create a token."); }
+}
+
+async function onMcpTokensClick(e) {
+  const b = e.target.closest("[data-revoke-token]");
+  if (!b || !confirm("Revoke this token? A client using it stops working at once.")) return;
+  const res = await fetch(`/api/account/tokens/${encodeURIComponent(b.dataset.revokeToken)}`, { method: "DELETE" });
+  toast(res.ok ? "Token revoked." : "Could not revoke it.");
+  $("mcpTokenShown").classList.add("hidden");
+  loadMcpTokens();
+}
+
+// ---- Dataset preview (RCHENLAB/AiScientist issue 10) ----
+// What a dataset holds, read on the server where it is kept: an .h5ad's cells, genes, metadata
+// columns and first rows; a table's first rows; a VCF's header and first records; a folder's files.
+// The server reads only a bounded part, so a 15 GB matrix opens as fast as a small one.
+
+const LARGE_DOWNLOAD = 2 * 1024 ** 3;
+const dsPreview = { id: null, name: "", folder: null };
+
+function confirmLargeDownload(size, name) {
+  if (!size || size < LARGE_DOWNLOAD) return true;
+  return confirm(`"${name}" is ${fmtSize(size)}. Download it anyway?\n\nLarge downloads take a while; keep this tab open until it finishes.`);
+}
+
+function dsDownloadUrl(id, file, inline) {
+  const q = new URLSearchParams();
+  if (file) q.set("file", file);
+  if (inline) q.set("inline", "1");
+  const qs = q.toString();
+  return `/api/datasets/${id}/download${qs ? "?" + qs : ""}`;
+}
+
+async function openDatasetPreview(id, name, file) {
+  const modal = $("datasetPreviewModal"), body = $("dsPreviewBody");
+  if (dsPreview.id !== id) dsPreview.folder = null;
+  Object.assign(dsPreview, { id, name });
+  $("dsPreviewTitle").textContent = file ? file.split("/").pop() : name;
+  $("dsPreviewMeta").textContent = "";
+  const dl = $("dsPreviewDownload");
+  dl.href = dsDownloadUrl(id, file);
+  dl.onclick = null;
+  body.innerHTML = `<div class="ds-loading">${icon("hourglass_top")} Reading ${escapeHtml(file || name)}…</div>`;
+  modal.classList.remove("hidden");
+  let data;
+  try {
+    const q = file ? `?file=${encodeURIComponent(file)}` : "";
+    const res = await fetch(`/api/datasets/${id}/preview${q}`);
+    data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  } catch (err) {
+    body.innerHTML = `<div class="ds-error">${icon("error")} ${escapeHtml(isUnreachable(err) ? "Can't reach the server." : err.message)}</div>`;
+    return;
+  }
+  if (dsPreview.id !== id) return;                    // another preview was opened meanwhile
+  const ds = data.dataset || {};
+  const where = ds.location === "hpc3" ? "kept on HPC3" : "kept on the server";
+  if (data.folder) {
+    dsPreview.folder = data.folder;
+    $("dsPreviewMeta").textContent = `Folder · ${data.folder.total_files} files · ${fmtSize(data.folder.total_bytes)} · ${where}`;
+    dl.onclick = (e) => { if (!confirmLargeDownload(data.folder.total_bytes, name)) e.preventDefault(); };
+    dl.textContent = "Download (.zip)";
+    body.innerHTML = dsFolderHtml(id, data.folder);
+    return;
+  }
+  const f = data.file || {};
+  dl.textContent = "Download";
+  dl.onclick = (e) => { if (!confirmLargeDownload(f.size_bytes, f.name)) e.preventDefault(); };
+  $("dsPreviewMeta").textContent = [dsKindLabel(f.kind, data.preview), fmtSize(f.size_bytes), where].filter(Boolean).join(" · ");
+  const back = file && ds.is_folder
+    ? `<button type="button" class="ds-back ghost small" data-ds-back="1">${icon("arrow_back")} ${escapeHtml(name)}/</button>` : "";
+  body.innerHTML = back + dsPreviewHtml(id, file, data.preview || {});
+}
+
+function dsKindLabel(kind, p) {
+  if (p && p.compressed && p.type !== "binary") return ({ table: "Table", vcf: "VCF", text: "Text" }[p.type] || "File") + " (gzip)";
+  return { h5ad: "AnnData (.h5ad)", hdf5: "HDF5", vcf: "VCF", table: "Table", json: "JSON",
+           image: "Image", pdf: "PDF", text: "Text", binary: "Binary file" }[kind] || "File";
+}
+
+function dsTable(columns, rows, opts = {}) {
+  if (!columns || !columns.length) return "";
+  const head = "<tr>" + (opts.index ? `<th class="ds-idx"></th>` : "") +
+    columns.map((c, k) => `<th>${escapeHtml(c)}${opts.types && opts.types[k] ? `<span class="ds-type">${escapeHtml(opts.types[k])}</span>` : ""}</th>`).join("") + "</tr>";
+  const body = (rows || []).map((r, i) => "<tr>" + (opts.index ? `<th class="ds-idx">${escapeHtml(opts.index[i] ?? "")}</th>` : "") +
+    columns.map((_c, k) => `<td>${escapeHtml(r[k] ?? "")}</td>`).join("") + "</tr>").join("");
+  return `<div class="ds-table-wrap"><table class="ds-table"><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+}
+
+function dsSection(title, inner, note) {
+  if (!inner) return "";
+  return `<section class="ds-section"><h3>${escapeHtml(title)}</h3>${inner}${note ? `<p class="ds-note">${escapeHtml(note)}</p>` : ""}</section>`;
+}
+
+function dsFacts(items) {
+  const xs = items.filter((x) => x && x[1] !== undefined && x[1] !== null && x[1] !== "");
+  return xs.length ? `<dl class="ds-facts">${xs.map(([k, v]) => `<div><dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd></div>`).join("")}</dl>` : "";
+}
+
+function dsNames(list) {
+  return (list || []).length
+    ? `<ul class="ds-names">${list.map((x) => `<li><code>${escapeHtml(x.name ?? x)}</code>${x.shape ? ` <span class="ds-dim">${escapeHtml(x.shape.join(" × "))}</span>` : ""}</li>`).join("")}</ul>` : "";
+}
+
+function dsFolderHtml(id, folder) {
+  const rows = (folder.entries || []).map((e) => {
+    const p = escapeHtml(e.path);
+    return `<tr><td class="ds-path"><button type="button" class="linklike" data-ds-file="${p}">${p}</button></td>` +
+      `<td class="ds-size">${fmtSize(e.size)}</td>` +
+      `<td class="ds-act"><a class="ghost small" href="${dsDownloadUrl(id, e.path)}" download>Download</a></td></tr>`;
+  }).join("");
+  const more = folder.truncated ? `<p class="ds-note">Showing the first ${folder.entries.length} of ${folder.total_files} files. The .zip has all of them.</p>` : "";
+  return rows
+    ? `<div class="ds-table-wrap"><table class="ds-table ds-files"><thead><tr><th>File</th><th>Size</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>${more}`
+    : `<div class="ds-note">This folder has no files.</div>`;
+}
+
+function dsXValues(x) {
+  const s = x && x.sample;
+  if (!s) return "";
+  const range = `${+s.min.toPrecision(4)} to ${+s.max.toPrecision(4)}`;
+  if (s.all_integer && !s.any_negative) return `whole numbers, ${range}, in the first ${s.n} stored values: looks like raw counts`;
+  return `${range} in the first ${s.n} stored values, not all whole numbers: already normalized or transformed`;
+}
+
+function dsPreviewHtml(id, file, p) {
+  switch (p.type) {
+    case "h5ad": {
+      if (p.note && !p.obs) return `<div class="ds-note">${escapeHtml(p.note)}</div>`;
+      const x = p.X || {};
+      const facts = dsFacts([
+        ["Cells (obs)", (p.n_obs ?? "").toLocaleString()], ["Genes (var)", (p.n_vars ?? "").toLocaleString()],
+        ["Matrix X", x.present ? [x.encoding, x.dtype].filter(Boolean).join(", ") : "none"],
+        ["Values in X", dsXValues(x)],
+        [".raw", p.raw && p.raw.present ? `yes${p.raw.n_vars ? `, ${p.raw.n_vars.toLocaleString()} genes` : ""}` : "no"],
+      ]);
+      const cols = (frame) => frame && frame.columns && frame.columns.length ? dsTable(["Column", "Type", "Values"],
+        frame.columns.map((c) => [c.name, c.dtype || "", c.categories ? `${c.n_categories} ${c.n_categories === 1 ? "category" : "categories"}: ${c.categories.join(", ")}${c.n_categories > c.categories.length ? ", …" : ""}` : (c.note || "")])) : "";
+      const head = (frame) => frame && frame.head && frame.head.columns.length ? dsTable(frame.head.columns, frame.head.rows, { index: frame.head.index }) : "";
+      return facts +
+        dsSection("Cell metadata (obs)", cols(p.obs), p.obs && p.obs.n_columns > (p.obs.columns || []).length ? `${p.obs.n_columns} columns; the first ${p.obs.columns.length} are listed.` : "") +
+        dsSection("First cells", head(p.obs)) +
+        dsSection("Gene metadata (var)", cols(p.var)) +
+        dsSection("First genes", head(p.var)) +
+        dsSection("Layers", dsNames(p.layers)) +
+        dsSection("Embeddings (obsm)", dsNames(p.obsm)) +
+        dsSection("Graphs (obsp)", dsNames(p.obsp)) +
+        dsSection("Unstructured (uns)", dsNames(p.uns)) +
+        (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
+    }
+    case "hdf5": {
+      const cr = p.cellranger;
+      const facts = cr ? dsFacts([["Features", cr.features.toLocaleString()], ["Barcodes", cr.barcodes.toLocaleString()],
+        ["Feature types", Object.entries(cr.feature_types || {}).map(([k, v]) => `${k} (${v.toLocaleString()})`).join(", ")]]) : "";
+      const nodes = (p.nodes || []).map((n) => [n.path, n.kind, n.shape ? n.shape.join(" × ") : "", n.dtype || ""]);
+      return facts + dsSection("Structure", dsTable(["Path", "Kind", "Shape", "Type"], nodes), p.more_nodes ? "The first nodes are listed." : "") +
+        (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
+    }
+    case "table":
+      return dsTable(p.columns, p.rows, { types: p.column_types }) +
+        `<p class="ds-note">${escapeHtml(p.note || "")} ${p.more_rows ? `Showing the first ${p.rows_shown} rows.` : `${p.rows_shown} ${p.rows_shown === 1 ? "row" : "rows"}.`}</p>`;
+    case "vcf":
+      return dsFacts([["Format", p.fileformat], ["Reference", p.reference], ["Contigs", p.n_contigs],
+                      ["Samples", p.n_samples ? `${p.n_samples}: ${p.samples.slice(0, 12).join(", ")}${p.n_samples > 12 ? ", …" : ""}` : "none (sites only)"],
+                      ["INFO fields", (p.info_fields || []).join(", ")], ["FORMAT fields", (p.format_fields || []).join(", ")]]) +
+        dsSection("First records", dsTable(p.columns, p.rows), p.more_rows ? `Showing the first ${p.rows.length} records.` : "") +
+        (p.header_complete ? "" : `<p class="ds-note">The header is longer than the part read for the preview.</p>`);
+    case "image":
+      return `<div class="ds-media"><img src="${dsDownloadUrl(id, file, true)}" alt="${escapeHtml(file || dsPreview.name)}" /></div>`;
+    case "pdf":
+      return `<iframe class="ds-pdf" src="${dsDownloadUrl(id, file, true)}" title="${escapeHtml(file || dsPreview.name)}"></iframe>`;
+    case "text":
+      return `<pre class="ds-text">${escapeHtml(p.text || "")}</pre>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
+    default:
+      return `<div class="ds-note">${escapeHtml(p.note || "This file has no preview. Download it to open it.")}</div>`;
+  }
+}
+
+function onDatasetPreviewClick(e) {
+  const f = e.target.closest("[data-ds-file]");
+  if (f) { openDatasetPreview(dsPreview.id, dsPreview.name, f.dataset.dsFile); return; }
+  if (e.target.closest("[data-ds-back]")) openDatasetPreview(dsPreview.id, dsPreview.name);
+}
+
+function closeDatasetPreview() {
+  $("datasetPreviewModal").classList.add("hidden");
+  $("dsPreviewBody").innerHTML = "";                   // stop a PDF or image that is still loading
+  dsPreview.id = null;
 }
 
 // ---- Runs view ----
@@ -5369,10 +6372,12 @@ async function loadRuns() {
     el.innerHTML = items.length ? items.map((x) => {
       const done = x.status === "done" || x.status === "incomplete";
       const zip = done
-        ? `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
+        ? `<a class="ghost small" href="/api/results/${encodeURIComponent(x.run_id)}/croissant.json" target="_blank" rel="noopener" title="The result's Croissant metadata: its files, inputs and provenance">croissant.json</a>` +
+          `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
         : `<span class="muted small">${escapeHtml(x.status)}</span>`;
       return `<div class="card run-card"><div class="card-main"><strong>${escapeHtml((x.question || "").slice(0, 90))}</strong>` +
-        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>${zip}</div>`;
+        `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>` +
+        `<div class="run-card-actions"><button type="button" class="ghost small" data-run-usage="${escapeHtml(x.run_id)}" title="Tokens and estimated cost of this run, by pipeline step and model">Usage</button>${zip}</div></div>`;
     }).join("") : '<div class="empty-hint">No runs yet.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
 }
@@ -5432,7 +6437,11 @@ async function onSaveResultClick(e) {
     loadDatasets();
   } catch (err) { toast("Could not save it: " + err.message); b.disabled = false; b.textContent = label; }
 }
-const onRunsClick = onSaveResultClick;
+function onRunsClick(e) {
+  const u = e.target.closest("[data-run-usage]");
+  if (u) { toggleRunUsage(u); return; }
+  onSaveResultClick(e);
+}
 
 // ---- Admin view ----
 async function loadAdminUsers() {
@@ -5469,6 +6478,7 @@ function switchAdminTab(tab) {
   document.querySelectorAll(".admin-tab").forEach((b) => b.classList.toggle("active", b.dataset.adminTab === tab));
   document.querySelectorAll(".admin-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "adminPane-" + tab));
   if (tab === "skills") loadSkillReviews();
+  else if (tab === "usage") loadAdminUsage();
 }
 
 async function loadSkillReviews() {
@@ -5616,6 +6626,271 @@ async function changePassword(e) {
   toast("Password updated"); $("changePwForm").reset();
 }
 
+// ---- LLM usage and estimated cost (Account › Usage, the chat counter, run details, budgets) ----
+// Every model call is recorded server-side with its token counts; the dollars are ESTIMATES from a
+// configurable price table (or the provider's own figure when it reports one). The Claude Console
+// stays the authoritative bill, and every view here says so.
+const GUIDE_URL = "https://github.com/RCHENLAB/AiScientist/blob/main/docs/claude_api_guide.md";
+
+function userTz() { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; } }
+
+function fmtUsd(x, { approx = true } = {}) {
+  const v = Number(x || 0);
+  const s = v === 0 ? "$0" : v < 0.01 ? "<$0.01" : v < 100 ? `$${v.toFixed(2)}` : `$${Math.round(v).toLocaleString()}`;
+  return (approx && v > 0 ? "~" : "") + s;
+}
+
+function usageTitle(t) {
+  if (!t) return "";
+  const unpriced = t.unpriced_calls ? `\n${t.unpriced_calls} call(s) on a model the price table does not list are not in the dollar figure.` : "";
+  return `${(t.calls || 0).toLocaleString()} model calls · ${(t.total_tokens || 0).toLocaleString()} tokens · ${fmtUsd(t.spend_usd)} estimated.` +
+    unpriced + "\nAn estimate from AiScientist's own record; the Claude Console is the authoritative bill. Click for Account › Usage.";
+}
+
+// The chat header counter: this chat's totals, plus the running total of its run while one is going.
+function renderChatUsage() {
+  const el = $("chatUsage");
+  if (!el) return;
+  const c = activeChat();
+  const u = c && c.usage;
+  if (!authed() || !u || !u.chat || !u.chat.calls) { el.classList.add("hidden"); return; }
+  let text = `${fmtTokens(u.chat.total_tokens || 0)} tokens · ${fmtUsd(u.chat.spend_usd)}`;
+  if (c.running && u.run && u.run.calls) text += ` · this run ${fmtUsd(u.run.spend_usd)}`;
+  el.textContent = text;
+  el.title = usageTitle(u.chat);
+  el.classList.remove("hidden");
+}
+
+async function refreshChatUsage(c = activeChat()) {
+  if (!authed() || !c || !c.sid) return;
+  try {
+    const r = await fetch(`/api/usage/chat/${encodeURIComponent(c.sid)}`);
+    if (!r.ok) return;
+    const t = await r.json();
+    c.usage = { ...(c.usage || {}), chat: t };
+    if (chatVisible(c)) renderChatUsage();
+  } catch { /* the counter is best-effort */ }
+}
+
+function onUsageUpdate(msg) {
+  const c = msg.conversation_id && chats.get(String(msg.conversation_id));
+  if (!c) return;
+  c.usage = { ...(c.usage || {}), ...(msg.chat ? { chat: msg.chat } : {}), ...(msg.run ? { run: msg.run } : {}) };
+  if (chatVisible(c)) renderChatUsage();
+}
+
+// A budget threshold reached: a notice above the chat, once per threshold and billing cycle.
+async function checkBudgetNotices() {
+  if (!authed()) return;
+  try {
+    const r = await fetch(`/api/usage/summary?tz=${encodeURIComponent(userTz())}`);
+    if (!r.ok) return;
+    const s = await r.json();
+    const fresh = s.new_notices || [];
+    if (!fresh.length) return;
+    const top = Math.max(...fresh);
+    const b = s.budget || {};
+    const el = $("budgetNotice");
+    const over = s.remaining_usd != null && s.remaining_usd <= 0;
+    const left = s.remaining_usd != null && s.remaining_usd > 0 ? ` (${fmtUsd(s.remaining_usd)} left)` : "";
+    const when = over ? " The estimate is past the credit: once the Console shows it used up, Claude API requests stop until the cycle resets."
+      : s.projected_exhaustion ? ` At the current rate it runs out around ${escapeHtml(s.projected_exhaustion)}.` : "";
+    el.innerHTML = `<span class="material-symbols-outlined msym">savings</span>` +
+      `<span><strong>${top}% of your monthly API credit used</strong> — an estimated ${fmtUsd(s.spent_usd)} of ` +
+      `${fmtUsd(b.monthly_credit_usd, { approx: false })} this cycle${left}.${when} ` +
+      `<a href="#" data-usage-open>See usage</a> · <a href="${escapeHtml(s.console_url || "")}" target="_blank" rel="noopener">Claude Console</a></span>` +
+      `<button type="button" class="icon-btn" data-dismiss aria-label="Dismiss">✕</button>`;
+    el.classList.remove("hidden");
+    toast(`${top}% of your monthly API credit used (estimate).`);
+    fetch("/api/usage/notices/ack", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thresholds: fresh, tz: userTz() }) }).catch(() => {});
+  } catch { /* best-effort */ }
+}
+
+function usageCards(totals) {
+  const card = (label, t) => `<div class="usage-card"><span class="usage-card-label">${label}</span>` +
+    `<strong>${fmtUsd(t.spend_usd)}</strong><span class="muted">${fmtTokens(t.total_tokens || 0)} tokens · ${(t.calls || 0).toLocaleString()} calls` +
+    `${t.errors ? ` · <span class="bad">${t.errors} failed</span>` : ""}</span></div>`;
+  return `<div class="usage-cards">${card("Today", totals.today)}${card("Last 7 days", totals.last_7_days)}${card("This billing cycle", totals.cycle)}</div>`;
+}
+
+function nextDay(iso) {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+function budgetHtml(b) {
+  const bud = b.budget;
+  const cyc = b.cycle || {};
+  const range = `${escapeHtml(cyc.start || "")} – ${escapeHtml(cyc.end || "")}`;
+  if (!bud || !bud.monthly_credit_usd) {
+    return `<div class="usage-budget muted">Billing cycle ${range}. Set your monthly credit below to see your estimated spend against it.</div>`;
+  }
+  const pct = Math.min(100, b.percent || 0);
+  const tone = (b.percent || 0) >= 100 ? "over" : (b.percent || 0) >= 80 ? "warn" : "";
+  const proj = b.remaining_usd != null && b.remaining_usd <= 0
+    ? `The estimated spend is past the credit by ${fmtUsd(-b.remaining_usd)}. Check the Claude Console for what is actually left.`
+    : b.lasts_cycle === false && b.projected_exhaustion
+      ? `At the current rate the credit runs out around <strong>${escapeHtml(b.projected_exhaustion)}</strong>, before the cycle resets on ${escapeHtml(nextDay(cyc.end))}.`
+      : b.lasts_cycle ? `At the current rate the credit lasts until the cycle resets on ${escapeHtml(nextDay(cyc.end))}.` : "";
+  const marks = (bud.thresholds || []).filter((t) => t <= 100).map((t) => `<i class="usage-mark" style="left:${t}%" title="${t}%"></i>`).join("");
+  const hard = bud.hard_limit_usd != null
+    ? `<p class="muted small">Hard limit ${fmtUsd(bud.hard_limit_usd, { approx: false })} — ${bud.hard_limit_mode === "block" ? "new runs on your API key are blocked once it is reached" : "you are asked before each new run once it is reached"}${b.hard_limit_reached ? ' · <span class="bad">reached</span>' : ""}.</p>` : "";
+  return `<div class="usage-budget"><div class="usage-budget-head"><span>Estimated ${fmtUsd(b.spent_usd)} of ${fmtUsd(bud.monthly_credit_usd, { approx: false })} (${(b.percent || 0).toFixed(0)}%) · cycle ${range}</span></div>` +
+    `<div class="usage-bar ${tone}"><i style="width:${pct}%"></i>${marks}</div><p class="muted small">${proj}</p>${hard}</div>`;
+}
+
+function usageChart(daily) {
+  if (!daily || !daily.length) return "";
+  const max = Math.max(...daily.map((d) => d.spend_usd || 0), 0);
+  const tokMax = Math.max(...daily.map((d) => d.total_tokens || 0), 0);
+  const useTokens = max === 0;           // only the cluster GPU was used: chart the tokens
+  const bars = daily.map((d) => {
+    const v = useTokens ? d.total_tokens || 0 : d.spend_usd || 0;
+    const top = useTokens ? tokMax : max;
+    const h = top > 0 ? Math.max(v > 0 ? 2 : 0, Math.round((v / top) * 100)) : 0;
+    return `<div class="usage-day" title="${escapeHtml(d.date)}: ${fmtUsd(d.spend_usd)} · ${(d.total_tokens || 0).toLocaleString()} tokens · ${d.calls} calls"><i style="height:${h}%"></i></div>`;
+  }).join("");
+  const first = daily[0].date, last = daily[daily.length - 1].date;
+  return `<div class="usage-chart-wrap"><div class="usage-chart-head"><span>Daily ${useTokens ? "tokens" : "estimated spend"}</span>` +
+    `<span class="muted">peak ${useTokens ? fmtTokens(tokMax) + " tokens" : fmtUsd(max)}</span></div>` +
+    `<div class="usage-chart">${bars}</div><div class="usage-axis"><span>${escapeHtml(first)}</span><span>${escapeHtml(last)}</span></div></div>`;
+}
+
+function usageTable(rows, nameCol, nameOf) {
+  if (!rows || !rows.length) return '<p class="muted small">Nothing in this period.</p>';
+  return `<table class="user-table usage-table"><thead><tr><th>${nameCol}</th><th>Calls</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th><th>Est. cost</th></tr></thead><tbody>` +
+    rows.map((x) => `<tr><td>${nameOf(x)}</td><td>${x.calls}${x.errors ? ` <span class="bad small">(${x.errors} failed)</span>` : ""}</td>` +
+      `<td>${fmtTokens(x.input_tokens || 0)}</td><td>${fmtTokens(x.cache_write_tokens || 0)}</td><td>${fmtTokens(x.cache_read_tokens || 0)}</td>` +
+      `<td>${fmtTokens(x.output_tokens || 0)}</td><td>${fmtUsd(x.spend_usd)}${x.unpriced_calls ? ' <span class="muted small" title="Calls on a model the price table does not list">+?</span>' : ""}</td></tr>`).join("") +
+    "</tbody></table>";
+}
+
+const ERROR_TEXT = {
+  credit: "Out of credit — the key's balance is used up for this cycle",
+  rate: "Rate-limited — too many requests or tokens per minute for the key's tier",
+  auth: "Authentication failed — the key was revoked or mistyped",
+  model: "Model not available to this key",
+  context: "Prompt longer than the model's context window",
+  network: "Could not reach the provider",
+  endpoint: "The provider returned an error",
+  refusal: "The model declined the request",
+};
+
+async function loadUsage() {
+  const body = $("usageBody");
+  if (!body) return;
+  if (!authed()) { body.innerHTML = '<p class="muted">Usage tracking needs an account.</p>'; return; }
+  const period = ($("usagePeriod") && $("usagePeriod").value) || "cycle";
+  $("usageExport").href = `/api/usage/export.csv?period=${encodeURIComponent(period)}&tz=${encodeURIComponent(userTz())}`;
+  try {
+    const r = await fetch(`/api/usage?period=${encodeURIComponent(period)}&tz=${encodeURIComponent(userTz())}`);
+    if (!r.ok) { body.innerHTML = '<div class="empty-hint">Failed to load usage.</div>'; return; }
+    const d = await r.json();
+    $("usageNote").innerHTML = `${escapeHtml(d.note || "")} <a href="${escapeHtml(d.console_url || "")}" target="_blank" rel="noopener">Open the Claude Console usage page</a>.` +
+      (d.pricing && d.pricing.as_of ? ` <span class="muted">Prices as of ${escapeHtml(d.pricing.as_of)}.</span>` : "");
+    const errs = (d.errors || []).length
+      ? `<h4>Failed requests</h4><ul class="usage-errors">${d.errors.map((e) => `<li><strong>${e.calls}×</strong> ${escapeHtml(ERROR_TEXT[e.error_type] || e.error_type)} <span class="muted small">· last ${fmtDate(e.last_at)}</span></li>`).join("")}</ul>` : "";
+    const chatName = (x) => {
+      const t = x.title || chatTitle(x.conversation_id) || `chat ${x.conversation_id}`;
+      return `<a href="#" data-open-chat="${escapeHtml(String(x.conversation_id))}">${escapeHtml(t)}</a>`;
+    };
+    const runName = (x) => `<span title="${escapeHtml(x.run_id)}">${escapeHtml((x.question || x.run_id).slice(0, 70))}</span>` +
+      (x.status ? ` <span class="muted small">${escapeHtml(x.status)}</span>` : "");
+    body.innerHTML = usageCards(d.totals) + budgetHtml(d.budget) + usageChart(d.daily) + errs +
+      `<h4>By model</h4>${usageTable(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}` +
+      `<h4>By chat</h4>${usageTable(d.by_chat, "Chat", chatName)}` +
+      `<h4>By run</h4>${usageTable(d.by_run, "Run", runName)}`;
+    fillBudgetForm(d.budget && d.budget.budget);
+  } catch (err) { body.innerHTML = `<div class="empty-hint">Failed to load usage: ${escapeHtml(err.message)}</div>`; }
+}
+
+function fillBudgetForm(b) {
+  if (!$("budgetForm") || $("budgetForm").dataset.dirty) return;
+  $("budgetCredit").value = b && b.monthly_credit_usd != null ? b.monthly_credit_usd : "";
+  $("budgetResetDay").value = (b && b.reset_day) || 1;
+  $("budgetThresholds").value = ((b && b.thresholds) || [50, 80, 100]).join(", ");
+  $("budgetHardLimit").value = b && b.hard_limit_usd != null ? b.hard_limit_usd : "";
+  $("budgetHardMode").value = (b && b.hard_limit_mode) || "confirm";
+}
+
+async function saveBudget(e) {
+  e.preventDefault();
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? null : Number(v); };
+  const thresholds = $("budgetThresholds").value.split(/[,\s]+/).map((x) => parseInt(x, 10)).filter((x) => x > 0);
+  const payload = { monthly_credit_usd: num("budgetCredit"), reset_day: parseInt($("budgetResetDay").value, 10) || 1,
+    thresholds, hard_limit_usd: num("budgetHardLimit"), hard_limit_mode: $("budgetHardMode").value };
+  const r = await fetch("/api/usage/budget", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { toast(d.detail || "Could not save the budget."); return; }
+  delete $("budgetForm").dataset.dirty;
+  toast("Budget saved.");
+  loadUsage();
+  checkBudgetNotices();
+}
+
+// A run's breakdown by pipeline step and model, under its card in Runs.
+async function toggleRunUsage(btn) {
+  const card = btn.closest(".run-card");
+  let box = card && card.querySelector(".run-usage");
+  if (box) { box.remove(); btn.textContent = "Usage"; return; }
+  box = document.createElement("div");
+  box.className = "run-usage";
+  box.innerHTML = '<span class="muted small">Loading…</span>';
+  card.appendChild(box);
+  btn.textContent = "Hide usage";
+  try {
+    const d = await (await fetch(`/api/usage/run/${encodeURIComponent(btn.dataset.runUsage)}`)).json();
+    if (!d.calls) { box.innerHTML = '<span class="muted small">No model calls were recorded for this run (runs before usage tracking have none).</span>'; return; }
+    const errs = (d.errors || []).map((e) => `${e.calls}× ${escapeHtml(ERROR_TEXT[e.error_type] || e.error_type)}`).join("; ");
+    box.innerHTML = `<p class="small"><strong>${fmtUsd(d.spend_usd)}</strong> estimated · ${(d.total_tokens || 0).toLocaleString()} tokens · ${d.calls} calls` +
+      (errs ? ` · <span class="bad">${errs}</span>` : "") + `</p>` +
+      `<h4>By step</h4>${usageTable(d.by_step, "Step", (x) => escapeHtml(x.step))}` +
+      `<h4>By model</h4>${usageTable(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}`;
+  } catch (err) { box.innerHTML = `<span class="bad small">Could not load: ${escapeHtml(err.message)}</span>`; }
+}
+
+async function loadAdminUsage() {
+  const el = $("adminUsageBody");
+  if (!el) return;
+  el.innerHTML = '<div class="empty-hint">Loading…</div>';
+  try {
+    const days = ($("adminUsageDays") && $("adminUsageDays").value) || 30;
+    const r = await fetch(`/api/admin/usage?days=${encodeURIComponent(days)}&tz=${encodeURIComponent(userTz())}`);
+    if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
+    const d = await r.json();
+    const t = d.totals || {};
+    el.innerHTML = `<p><strong>${fmtUsd(t.spend_usd)}</strong> estimated · ${(t.total_tokens || 0).toLocaleString()} tokens · ${(t.calls || 0).toLocaleString()} calls since ${escapeHtml(d.since)}` +
+      `${t.errors ? ` · <span class="bad">${t.errors} failed</span>` : ""}</p>` +
+      usageChart((d.by_day || []).map((x) => ({ date: x.date, spend_usd: x.spend_usd, total_tokens: x.total_tokens, calls: x.calls }))) +
+      `<h4>By account</h4>${usageTable(d.by_user, "Account", (x) => escapeHtml(x.username))}` +
+      `<h4>By model</h4>${usageTable(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}` +
+      `<h4>By day</h4>${usageTable([...(d.by_day || [])].filter((x) => x.calls).reverse(), "Day", (x) => escapeHtml(x.date))}`;
+  } catch (err) { el.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(err.message)}</div>`; }
+}
+
+function wireUsage() {
+  document.querySelectorAll("[data-guide]").forEach((a) => { a.href = GUIDE_URL; });
+  $("accountKeysBtn").addEventListener("click", () => openApiKeys());
+  $("usageRefresh").addEventListener("click", loadUsage);
+  $("usagePeriod").addEventListener("change", loadUsage);
+  $("budgetForm").addEventListener("submit", saveBudget);
+  $("budgetForm").addEventListener("input", () => { $("budgetForm").dataset.dirty = "1"; });
+  $("usageBody").addEventListener("click", (e) => {
+    const a = e.target.closest("[data-open-chat]");
+    if (a) { e.preventDefault(); openChat(a.dataset.openChat); }
+  });
+  $("adminUsageRefresh").addEventListener("click", loadAdminUsage);
+  $("adminUsageDays").addEventListener("change", loadAdminUsage);
+  $("chatUsage").addEventListener("click", () => switchView("account"));
+  $("apiKeysUsageLink").addEventListener("click", (e) => { e.preventDefault(); $("apiKeysModal").classList.add("hidden"); switchView("account"); });
+  $("budgetNotice").addEventListener("click", (e) => {
+    if (e.target.closest("[data-dismiss]")) { $("budgetNotice").classList.add("hidden"); return; }
+    if (e.target.closest("[data-usage-open]")) { e.preventDefault(); switchView("account"); }
+  });
+}
+
 // ---- init -----------------------------------------------------------------
 
 function init() {
@@ -5741,10 +7016,21 @@ function init() {
     if (cell) { e.preventDefault(); openResultFile(cell.dataset.url, cell.dataset.kind, cell.dataset.name); }
   });
   $("filePreviewClose").addEventListener("click", () => $("filePreviewModal").classList.add("hidden"));
+  $("dsPreviewClose").addEventListener("click", closeDatasetPreview);
+  $("dsPreviewBody").addEventListener("click", onDatasetPreviewClick);
+  $("datasetPreviewModal").addEventListener("click", (e) => { if (e.target.id === "datasetPreviewModal") closeDatasetPreview(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
+  });
   $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") $("filePreviewModal").classList.add("hidden"); });
   $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chatForm").requestSubmit(); } });
-  // Live-swap Send⇄Stop as the user types during a run / plan review.
-  $("chatInput").addEventListener("input", updateComposerButton);
+  // Live-swap Send⇄Stop as the user types during a run / plan review; the text is this chat's draft.
+  $("chatInput").addEventListener("input", () => {
+    const c = activeChat();
+    if (c) { c.draft = $("chatInput").value; saveComposer(c); }
+    updateComposerButton();
+  });
+  for (const id of ["planMode", "autonomousMode", "saveResults"]) $(id).addEventListener("change", onRunOptionChange);
   $("serverPathOffer").addEventListener("click", (e) => {
     const b = e.target.closest("[data-spo-bind]");
     if (b) { bindServerPath(b.dataset.spoBind); return; }
@@ -5769,6 +7055,8 @@ function init() {
   });
   $("toggleLeft").addEventListener("click", () => togglePanel("left"));
   $("toggleRight").addEventListener("click", () => togglePanel("right"));
+  $("sideTabPlan").addEventListener("click", () => { state.planView = null; selectSideTab("plan"); renderPlanPanel(); });
+  $("sideTabResults").addEventListener("click", () => selectSideTab("results"));
   $("leftLogoutBtn").addEventListener("click", doLogout);
 
   syncAuthMethod();

@@ -313,7 +313,7 @@ def test_a_dead_endpoint_stops_the_pass_at_once(tmp_path, monkeypatch):
     assert res["status"] == "failed" and res["model_unreachable"] is True
     assert "stopped answering" in res["error"] and res["n_judged"] == 0
     jl = ctx.workspace / "work" / "haploinsufficiency" / "judgments.jsonl"
-    assert not jl.exists() or all(json.loads(l)["error"] != "model unreachable" for l in jl.open())
+    assert not jl.exists() or all(json.loads(line)["error"] != "model unreachable" for line in jl.open())
     # Back with a live model: everything is judged, nothing was lost.
     res2 = hi.run_extract({"concurrency": 2}, ctx, judge_fn=_fake_model(), embed_fn=None, log=lambda s: None)
     assert res2["status"] == "ok" and res2["n_genes"] == 1 and not res2["warnings"][1:]

@@ -1,0 +1,9 @@
+##fileformat=VCFv4.2
+##source=bcftools
+##contig=<ID=chr1,length=248956422>
+##contig=<ID=chr2,length=242193529>
+##INFO=<ID=DP,Number=1,Type=Integer,Description="Depth">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SYNTHETIC_SAMPLE_1	SYNTHETIC_SAMPLE_2
+chr1	1014143	.	C	T	50	PASS	DP=30	GT	0/1	0/0
+chr2	47403318	.	G	A	60	PASS	DP=25	GT	1/1	0/1

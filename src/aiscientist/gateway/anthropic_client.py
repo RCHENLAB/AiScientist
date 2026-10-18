@@ -432,11 +432,17 @@ def _usage(message: Any, model: str) -> dict:
     u = getattr(message, "usage", None)
     get = (lambda k: getattr(u, k, None) or 0) if u is not None else (lambda k: 0)
     cache_read, cache_write = int(get("cache_read_input_tokens")), int(get("cache_creation_input_tokens"))
+    # The cache writes split by lifetime (they are billed at 1.25x and 2x input); requests here only
+    # write 5-minute entries, but a proxy or a server tool may add 1-hour ones.
+    by_ttl = get("cache_creation") if u is not None else None
+    write_1h = int(getattr(by_ttl, "ephemeral_1h_input_tokens", 0) or 0) if by_ttl else 0
     prompt = int(get("input_tokens")) + cache_read + cache_write
     stop = str(getattr(message, "stop_reason", "") or "")
     return {"prompt_tokens": prompt, "completion_tokens": int(get("output_tokens")),
             "total_tokens": prompt + int(get("output_tokens")),
+            "input_tokens": int(get("input_tokens")),
             "cache_read_input_tokens": cache_read, "cache_creation_input_tokens": cache_write,
+            "cache_creation_1h_input_tokens": write_1h,
             "finish_reason": {"max_tokens": "length", "tool_use": "tool_calls",
                               "end_turn": "stop", "stop_sequence": "stop"}.get(stop, stop),
             "stop_reason": stop, "model": str(getattr(message, "model", "") or model)}

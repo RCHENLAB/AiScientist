@@ -77,6 +77,9 @@ def _routes(cid: str) -> list[tuple[str, str, dict]]:
         ("post", "/api/upload", {"data": j, "files": {"file": ("planted.csv", b"a,b\n1,2\n")}}),
         ("post", "/api/tus", tus),
         ("post", "/api/tus/", tus),
+        ("post", "/api/tus/find", {"json": {**j, "name": "x.bin", "size": 9 * 2**20, "last_modified": 1,
+                                            "head_sha256": "0" * 64}}),
+        ("get", "/api/tus/unfinished", {"params": j}),
         ("post", "/api/upload/reserve-folder", {"json": {**j, "name": "data"}}),
         ("post", "/api/upload/register-folder", {"json": {**j, "folder": "data"}}),
         ("post", "/api/server-data/check", {"json": {**j, "path": "/data/x"}}),
@@ -191,6 +194,49 @@ def test_a_tus_upload_without_a_live_connection_answers_only_its_owner(site):
     assert site.client.head(made.headers["location"], **head).status_code == 404
     site.who["user"] = None
     assert site.client.head(made.headers["location"], **head).status_code == 401
+
+
+def test_another_accounts_partial_upload_is_never_offered(site, monkeypatch):
+    """A browser with nothing stored asks the server for an unfinished upload of its file
+    (POST /api/tus/find) and for the list of them (GET /api/tus/unfinished). Only the caller's own
+    account's uploads are ever offered or listed."""
+    import hashlib
+    from aiscientist.gateway import tus_upload
+    monkeypatch.setattr(tus_upload, "_HEAD_BYTES", 4)
+    data = b"0123456789AB"
+    meta = ",".join(f"{k} {base64.b64encode(v.encode()).decode()}" for k, v in
+                    (("connection_id", site.conn.id), ("filename", "x.bin"), ("last_modified", "1")))
+    made = site.client.post("/api/tus", headers={"Tus-Resumable": "1.0.0", "Upload-Length": str(len(data)),
+                                                  "Upload-Metadata": meta})
+    url = made.headers["location"]
+    assert site.client.patch(url, headers={"Tus-Resumable": "1.0.0", "Upload-Offset": "0",
+                                           "Content-Type": "application/offset+octet-stream"},
+                             content=data[:4]).status_code == 204
+    ask = {"name": "x.bin", "size": len(data), "last_modified": 1,
+           "head_sha256": hashlib.sha256(data[:4]).hexdigest()}
+
+    def find(conn):
+        r = site.client.post("/api/tus/find", json={"connection_id": conn.id, **ask})
+        assert r.status_code == 200, r.text
+        listed = site.client.get("/api/tus/unfinished", params={"connection_id": conn.id})
+        assert listed.status_code == 200, listed.text
+        urls = [f["url"] for f in listed.json()["files"]]
+        assert urls == ([r.json()["upload"]["url"]] if r.json()["upload"] else [])   # listed = offered
+        return r.json()["upload"]
+
+    assert find(site.conn)["url"] == url                         # the owner, from any browser
+    other = gw_app.Connection(HPCSettings(), mock=True, loop=site.conn.loop, username="mallory")
+    other.workspace, other.app_user_id, other.status = site.runs / "mallory", MALLORY.id, "ready"
+    gw_app.CONNECTIONS[other.id] = other
+    site.who["user"] = MALLORY
+    assert find(other) is None                                   # her own connection: not alice's file
+    # A workspace of the same name under another account id (an account made again): the uploads
+    # the earlier account left are not this one's.
+    renamed = gw_app.Connection(HPCSettings(), mock=True, loop=site.conn.loop, username="alice")
+    renamed.workspace, renamed.app_user_id, renamed.status = site.conn.workspace, 99, "ready"
+    gw_app.CONNECTIONS[renamed.id] = renamed
+    site.who["user"] = types.SimpleNamespace(id=99, username="alice", role="user")
+    assert find(renamed) is None
 
 
 def test_every_route_that_reads_a_connection_id_is_guarded():

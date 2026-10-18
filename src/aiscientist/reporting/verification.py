@@ -597,11 +597,12 @@ def steps_section(agenda: "list[str]", rounds: "list[Any]") -> "tuple[list[str],
             lines.append(f"- Step {i}, {title}: accepted with reservations ({score:.2f}). {first}")
     if not lines:
         lines.append(f"- All {len(agenda or [])} planned steps completed and were accepted by the "
-                     "reviewer.")
+                     "reviewer." if len(agenda or []) != 1 else
+                     "- The one planned step completed and was accepted by the reviewer.")
     return lines, {"steps_incomplete": incomplete, "steps_reserved": reserved}
 
 
-def scope_section(art: Path, lit: "dict | None") -> "tuple[list[str], dict]":
+def scope_section(art: Path, lit: "dict | None", discussion: bool = True) -> "tuple[list[str], dict]":
     lines: list[str] = []
     cites = list((lit or {}).get("citations") or [])
     if cites:
@@ -611,7 +612,8 @@ def scope_section(art: Path, lit: "dict | None") -> "tuple[list[str], dict]":
         reason = str((lit or {}).get("reason") or "no literature step produced citations")
         lines.append(f"- The interpretation was NOT checked against published literature ({reason}). "
                      "Statements about known biology in the Discussion are the writer's background "
-                     "knowledge and are not verified here.")
+                     "knowledge and are not verified here." if discussion else
+                     f"- Nothing in the report was checked against published literature ({reason}).")
     samples = None
     got = _read_table(art / "tables" / "composition_by_sample.csv")
     if got:
@@ -634,15 +636,22 @@ def scope_section(art: Path, lit: "dict | None") -> "tuple[list[str], dict]":
                              f"{top[ci]}, not a property of those clusters.")
         except (ValueError, IndexError):
             pass
-    return lines, {"literature_checked": bool(cites), "samples": samples}
+    return lines, {"literature_checked": bool(cites), "samples": samples, "discussion": discussion}
+
+
+def _verb(n: int, plural: str, singular: str) -> str:
+    """"1 is", "2 are": the counts here are often 0 or 1 ("1 are arithmetic", run 6275df1213ab)."""
+    return singular if n == 1 else plural
 
 
 # --- the statement ----------------------------------------------------------------------------
 
 def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | None" = None,
                        rounds: "list[Any] | None" = None, lit: "dict | None" = None,
-                       corrections: "list[str] | None" = None) -> "tuple[str, dict]":
-    """``(markdown, summary)`` — the full statement for ``report/verification.md``."""
+                       corrections: "list[str] | None" = None,
+                       brief: bool = False) -> "tuple[str, dict]":
+    """``(markdown, summary)`` — the full statement for ``report/verification.md``. ``brief``: the
+    report is the short one, which has no Discussion."""
     art = Path(art)
     rounds = list(rounds or [])
     claims = manuscript_numbers(report_md)
@@ -661,18 +670,23 @@ def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | N
            "", "## 1. Numbers in the report", ""]
     if claims:
         out.append(
-            f"{len(claims)} numbers in the report were checked (every percentage, every decimal and "
-            f"every whole number of 100 or more). **{len(exact)}** appear as they are in a result table "
-            f"or a tool's returned values"
-            + (f" ({coarse} of them have only one or two significant digits, such as a parameter "
-               "value of 0.8, where a match is weak evidence)" if coarse else "")
-            + f". **{len(derived)}** are arithmetic on numbers of one table "
-            "column, row or tool result: each is listed with its formula — check that the formula "
-            f"says what the sentence says. **{len(printed)}** were found only in output printed by "
+            f"{len(claims)} {_verb(len(claims), 'numbers', 'number')} in the report "
+            f"{_verb(len(claims), 'were', 'was')} checked (every percentage, every decimal and "
+            f"every whole number of 100 or more). **{len(exact)}** "
+            f"{_verb(len(exact), 'appear', 'appears')} as {_verb(len(exact), 'they are', 'it is')} "
+            f"in a result table or a tool's returned values"
+            + (f" ({coarse} of them {_verb(coarse, 'have', 'has')} only one or two significant "
+               "digits, such as a parameter value of 0.8, where a match is weak evidence)"
+               if coarse else "")
+            + f". **{len(derived)}** {_verb(len(derived), 'are', 'is')} arithmetic on numbers of one "
+            "table column, row or tool result: each is listed with its formula — check that the "
+            f"formula says what the sentence says. **{len(printed)}** "
+            f"{_verb(len(printed), 'were', 'was')} found only in output printed by "
             "analysis code the model wrote: the number was computed, but the words describing it "
             f"were the model's, so its meaning is not verified. **{len(untraced)}** could not be "
             "traced to anything this run computed."
-            + (f" **{len(wrong)}** do not match the counts stated beside them." if wrong else ""))
+            + (f" **{len(wrong)}** {_verb(len(wrong), 'do', 'does')} not match the counts stated "
+               f"beside {_verb(len(wrong), 'them', 'it')}." if wrong else ""))
         for title, rows, with_source in (
                 ("Arithmetic that does not add up", wrong, True),
                 ("Not traced — treat these as unverified", untraced, False),
@@ -694,7 +708,7 @@ def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | N
     label_lines, label_sum = labels_section(art)
     qc_lines, qc_sum = qc_section(rounds)
     step_lines, step_sum = steps_section(list(agenda or []), rounds)
-    scope_lines, scope_sum = scope_section(art, lit)
+    scope_lines, scope_sum = scope_section(art, lit, discussion=not brief)
     out += ["", "## 2. Cell-type labels", "", *label_lines,
             "", "## 3. Quality-control accounting", "", *qc_lines,
             "", "## 4. Planned steps that did not finish as planned", "", *step_lines,
@@ -714,18 +728,22 @@ def manuscript_note(summary: dict) -> str:
     """The short ``## Verification`` section the manuscript carries; the full statement is a file."""
     if not summary:
         return ""
-    bits = [f"After the analysis, code checked this report against the run's own outputs; the full "
-            f"statement is `report/verification.md`."]
+    bits = ["After the analysis, code checked this report against the run's own outputs; the full "
+            "statement is `report/verification.md`."]
     n = summary.get("numbers_checked") or 0
     if n:
-        bits.append(f"Of {n} numbers checked, {summary.get('numbers_exact', 0)} appear in a result table "
-                    f"or tool output, {summary.get('numbers_derived', 0)} are arithmetic on one table "
-                    f"(listed there with their formulas), {summary.get('numbers_printed', 0)} appear only "
-                    "in output printed by model-written code, and "
-                    f"{summary.get('numbers_untraced', 0)} could not be traced.")
+        exact, derived, printed = (int(summary.get(k) or 0) for k in
+                                   ("numbers_exact", "numbers_derived", "numbers_printed"))
+        bits.append(f"Of {n} {_verb(n, 'numbers', 'number')} checked, {exact} "
+                    f"{_verb(exact, 'appear', 'appears')} in a result table or tool output, {derived} "
+                    f"{_verb(derived, 'are', 'is')} arithmetic on one table (listed there with "
+                    f"{_verb(derived, 'their formulas', 'its formula')}), {printed} "
+                    f"{_verb(printed, 'appear', 'appears')} only in output printed by model-written "
+                    f"code, and {summary.get('numbers_untraced', 0)} could not be traced.")
     if summary.get("numbers_inconsistent"):
-        bits.append(f"{summary['numbers_inconsistent']} percentage(s) do not match the counts stated "
-                    "beside them (listed in the statement).")
+        wrong = int(summary["numbers_inconsistent"])
+        bits.append(f"{wrong} {_verb(wrong, 'percentages do', 'percentage does')} not match the "
+                    f"counts stated beside {_verb(wrong, 'them', 'it')} (listed in the statement).")
     if summary.get("labels_checked"):
         bits.append(f"Each of the {summary.get('labels', 0)} cell-type labels rests on lineage markers "
                     f"enriched in its clusters; {summary.get('unassigned_clusters', 0)} cluster(s) "
@@ -738,5 +756,7 @@ def manuscript_note(summary: dict) -> str:
     if summary.get("steps_incomplete"):
         bits.append(f"{summary['steps_incomplete']} planned step(s) did not complete.")
     if summary.get("literature_checked") is False:
-        bits.append("The interpretation was not checked against published literature.")
+        bits.append("The interpretation was not checked against published literature."
+                    if summary.get("discussion", True) else
+                    "Nothing in the report was checked against published literature.")
     return "## Verification\n\n" + " ".join(bits) + "\n"

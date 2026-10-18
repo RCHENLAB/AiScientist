@@ -180,7 +180,7 @@ def test_a_pointer_cannot_send_the_download_anywhere_else(tmp_path, gw, monkeypa
 def test_the_directory_is_saved_as_a_folder_dataset_and_still_downloads(tmp_path, gw, monkeypatch):
     recorded: list = []
     monkeypatch.setattr(gw.auth_routes, "dataset_path_recorded", lambda uid, path: False)
-    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a: recorded.append(a) or 77)
+    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a, **kw: recorded.append((a, kw)) or 77)
     full = _seed_local(tmp_path, "yijus12", "run7")
 
     (row,) = _client(gw).get("/api/result-datasets").json()["result_datasets"]
@@ -191,7 +191,11 @@ def test_the_directory_is_saved_as_a_folder_dataset_and_still_downloads(tmp_path
     assert r.status_code == 200 and r.json()["dataset_id"] == 77 and r.json()["kind"] == "folder"
     dest = tmp_path / "yijus12" / "uploads" / "processed" / NAME
     assert {p.name for p in dest.iterdir()} == set(FILES) and not full.exists()   # moved, not copied
-    assert recorded == [(5, NAME, str(dest), sum(map(len, FILES.values())), "folder")]
+    ((args, kw),) = recorded
+    assert args == (5, NAME, str(dest), sum(map(len, FILES.values())), "folder")
+    # its metadata names the run's result it came from, and every file with its size (issue 9)
+    assert kw["source"] == "result" and kw["derived_from"]["run_id"] == "run7"
+    assert sorted(f["path"] for f in kw["files"]) == sorted(FILES)
     (row,) = _client(gw).get("/api/result-datasets").json()["result_datasets"]
     assert row["cellqc"]["saved_to"] == str(dest)
     assert _client(gw).post("/api/result-datasets/run7/save?what=cellqc").json()["already"] is True
@@ -202,7 +206,7 @@ def test_the_directory_is_saved_as_a_folder_dataset_and_still_downloads(tmp_path
 
 def test_on_hpc3_the_directory_is_moved_into_the_personal_lab_folder(tmp_path, gw, monkeypatch):
     monkeypatch.setattr(gw.auth_routes, "dataset_path_recorded", lambda uid, path: False)
-    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a: 78)
+    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a, **kw: 78)
     root = f"{HPC_TEMP}/analysis/run7/result/cellqc"
     hpc = _Hpc(root)
     _hpc_conn(gw, monkeypatch, hpc)
@@ -261,7 +265,7 @@ def test_the_gateway_names_the_directory_and_says_how_long_it_is_kept(tmp_path, 
 def test_a_run_asked_to_save_its_results_registers_them_itself(tmp_path, gw, monkeypatch):
     recorded: list = []
     monkeypatch.setattr(gw.auth_routes, "dataset_path_recorded", lambda uid, path: False)
-    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a: recorded.append(a) or len(recorded))
+    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *a, **kw: recorded.append(a) or len(recorded))
     _seed_local(tmp_path, "yijus12", "run7")
     name = "Sample3_GSM5676874.processed.20261012-1630.run7.h5ad"
     res = tmp_path / "yijus12" / "run7" / "result"

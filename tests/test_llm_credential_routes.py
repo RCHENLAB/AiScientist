@@ -107,7 +107,7 @@ def test_create_verifies_then_returns_masked_metadata(client, ok_endpoint):
     cred = res.json()["credential"]
 
     assert "sk-original-000000000" not in res.text
-    assert cred["key_hint"] == "sk-ori…0000"
+    assert cred["key_hint"] == "…0000"          # the last 4 only (RCHENLAB/AiScientist issue 8)
     assert cred["verified_at"] is not None
     assert ok_endpoint.seen == [("https://api.deepseek.com/v1", "sk-original-000000000", "m1")]
 
@@ -116,16 +116,16 @@ def test_an_anthropic_key_is_verified_through_the_native_api(client, ok_endpoint
     """Jin, 2026-10-09: there was no way to pick Anthropic. The preset fills the base URL, and the
     provider reaches the verifier so the key is tested with /v1/messages, not /chat/completions."""
     res = _create(client, provider="anthropic", base_url="", model="claude-opus-5-5",
-                  api_key="sk-ant-api03-example-0000")
+                  api_key="sk-ant-example-0000")
     assert res.status_code == 200
-    assert ok_endpoint.seen == [("https://api.anthropic.com", "sk-ant-api03-example-0000", "claude-opus-5-5")]
+    assert ok_endpoint.seen == [("https://api.anthropic.com", "sk-ant-example-0000", "claude-opus-5-5")]
     assert ok_endpoint.providers == ["anthropic"]
     assert res.json()["credential"]["provider"] == "anthropic"
 
 
 def test_the_model_probe_passes_the_provider_through(client, ok_endpoint):
     res = client.post("/api/llm-models", json={"base_url": "https://api.anthropic.com", "provider": "anthropic",
-                                               "api_key": "sk-ant-api03-example-0000", "user": "alice"})
+                                               "api_key": "sk-ant-example-0000", "user": "alice"})
     assert res.status_code == 200
     assert ok_endpoint.providers == ["anthropic"]
 
@@ -286,7 +286,7 @@ def test_list_never_leaks_a_key(client, ok_endpoint):
     _create(client)
     res = client.get("/api/llm-credentials?user=alice")
     assert "sk-original-000000000" not in res.text
-    assert res.json()["encryption"] is False
+    assert res.json()["encryption"] is True          # on by default (issue 8)
 
 
 def test_credentials_are_scoped_to_their_owner(client, ok_endpoint):
@@ -365,7 +365,7 @@ def test_consent_does_not_carry_across_credentials(client, ok_endpoint, conn):
     _select(client, conn, trusted)
 
     commercial = _create(client, provider="openrouter", base_url="https://openrouter.ai/api/v1",
-                         api_key="sk-or-second-key-00000").json()["credential"]["id"]
+                         api_key="sk-or-example-2").json()["credential"]["id"]
     assert _select(client, conn, commercial).status_code == 409
 
 
@@ -490,4 +490,4 @@ def test_the_list_says_where_keys_are_stored(client, ok_endpoint):
     assert d["storage"]["owner"] == "alice"
     assert d["storage"]["dir"].endswith("llm_creds/alice")
     assert os.path.isabs(d["storage"]["dir"])
-    assert d["storage"]["encrypted"] is False
+    assert d["storage"]["encrypted"] is True

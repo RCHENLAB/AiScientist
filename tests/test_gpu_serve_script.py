@@ -5,8 +5,6 @@ sbatch) so it can't silently break.
 
 from __future__ import annotations
 
-import base64
-
 from aiscientist.gateway import gpu
 from aiscientist.gateway.settings import HPCSettings
 from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401

@@ -4,7 +4,6 @@ atomic skills are in the shared skills/ library, and every skill template at lea
 The skills are CodeAct templates the Scientist adapts via run_code — they are never imported or
 executed in CI, so a syntax slip would otherwise ship silently. compile() parses without running any
 imports, so the scanpy/pertpy-importing templates are safe to check this way."""
-from pathlib import Path
 
 from aiscientist.agents.presets import get_preset, list_presets
 from aiscientist.agents.skills import SKILLS

@@ -25,15 +25,15 @@ import pytest
 pd = pytest.importorskip("pandas")
 
 from aiscientist.tools._lib import scrna as scrna_lib  # noqa: E402
-from aiscientist.tools.run_clustering import tool as run_clustering_tool
-from aiscientist.tools.run_composition import tool as run_composition_tool
-from aiscientist.tools.run_de import tool as run_de_tool
-from aiscientist.tools.run_depth_matched_de import tool as run_depth_matched_de_tool
-from aiscientist.tools.run_doublet_detection import tool as run_doublet_detection_tool
-from aiscientist.tools.run_integration import tool as run_integration_tool
-from aiscientist.tools.run_marker_annotation import tool as run_marker_annotation_tool
-from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
-from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
+from aiscientist.tools.run_clustering import tool as run_clustering_tool  # noqa: E402
+from aiscientist.tools.run_composition import tool as run_composition_tool  # noqa: E402
+from aiscientist.tools.run_de import tool as run_de_tool  # noqa: E402
+from aiscientist.tools.run_depth_matched_de import tool as run_depth_matched_de_tool  # noqa: E402
+from aiscientist.tools.run_doublet_detection import tool as run_doublet_detection_tool  # noqa: E402
+from aiscientist.tools.run_integration import tool as run_integration_tool  # noqa: E402
+from aiscientist.tools.run_marker_annotation import tool as run_marker_annotation_tool  # noqa: E402
+from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool  # noqa: E402
+from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool  # noqa: E402
 
 
 def _ctx(tmp_path):

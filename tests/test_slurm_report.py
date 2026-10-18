@@ -36,7 +36,8 @@ class FakeHPC:
         cmd = command.strip()
         self.all_cmds.append(cmd)
         if cmd.startswith("sbatch"):
-            jid = str(self._next); self._next += 1
+            jid = str(self._next)
+            self._next += 1
             self.submits.append(jid)
             return self._ok(f"Submitted batch job {jid}")
         if cmd.startswith("squeue"):
@@ -187,7 +188,8 @@ def test_report_render_resolves_home_no_literal_in_job(tmp_path):
     # $HOME, the ABSOLUTE path must be baked into the submitted job, with no literal "$HOME" anywhere.
     bundle = tmp_path / "run" / "artifacts"
     (bundle / "report").mkdir(parents=True)
-    md = bundle / "report" / "report.md"; md.write_text("# hi")
+    md = bundle / "report" / "report.md"
+    md.write_text("# hi")
     out = bundle / "report" / "report.pdf"
     cmd = ["pandoc", str(md), "-o", str(out), "--pdf-engine=xelatex"]
 

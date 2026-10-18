@@ -8,6 +8,12 @@ returns the predictions path on success and fails loudly otherwise.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+
+import pytest
+
 from aiscientist.gateway.executor import ExecResult
 from aiscientist.gateway.settings import HPCSettings
 from aiscientist.gateway.scgpt_job import (
@@ -242,12 +248,6 @@ def test_the_vl_review_gpu_job_honours_it_too():
 # normalising 15,307 cells over 17 genes divided by zero, and the GPU job died in log1p with
 # "Input contains NaN" — measured on job 57187683. Case-folding recovers 16,599 genes and all 18
 # canonical retinal markers.
-
-import json
-import subprocess
-import sys
-
-import pytest
 
 
 def _run_harmonizer(tmp_path, var_names, vocab):

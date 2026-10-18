@@ -103,8 +103,10 @@ def test_stream_replay_carries_conversation_id():
 
 def test_each_run_has_independent_cancel_and_plan_events():
     c = _conn()
-    a = c.begin_run("conv-A"); c.bind_run_id(a, "runA")
-    b = c.begin_run("conv-B"); c.bind_run_id(b, "runB")
+    a = c.begin_run("conv-A")
+    c.bind_run_id(a, "runA")
+    b = c.begin_run("conv-B")
+    c.bind_run_id(b, "runB")
     assert a.chat_stop is not b.chat_stop and a.plan_event is not b.plan_event
     a.chat_stop.set()
     assert a.chat_stop.is_set() and not b.chat_stop.is_set()   # cancelling A never touches B
@@ -112,9 +114,11 @@ def test_each_run_has_independent_cancel_and_plan_events():
 
 def test_resolve_run_only_matches_a_live_run():
     c = _conn()
-    a = c.begin_run("conv-A"); c.bind_run_id(a, "runA")
+    a = c.begin_run("conv-A")
+    c.bind_run_id(a, "runA")
     c.end_run(a)                                               # A finished
-    b = c.begin_run("conv-B"); c.bind_run_id(b, "runB")        # B is now active
+    b = c.begin_run("conv-B")
+    c.bind_run_id(b, "runB")                                   # B is now active
     assert c.resolve_run(run_id="runB") is b
     assert c.resolve_run(conversation_id="conv-B") is b
     assert c.resolve_run() is b                                # no ids -> active (back-compat)
@@ -174,7 +178,8 @@ def test_summary_exposes_active_run_identity():
     # that drifted across a WS reconnect) and the in-flight job runs on to its Slurm --time.
     c = _conn(alloc=None)                                      # summary() reads alloc.job_id
     assert c.summary()["active_run"] is None                   # no run yet
-    run = c.begin_run("conv-A"); c.bind_run_id(run, "runA")
+    run = c.begin_run("conv-A")
+    c.bind_run_id(run, "runA")
     assert c.summary()["active_run"] == {"run_id": "runA", "conversation_id": "conv-A"}
     c.end_run(run)
     assert c.summary()["active_run"] is None                   # cleared once the run ends
@@ -237,7 +242,9 @@ def _auth_db(tmp_path, monkeypatch):
     from aiscientist.gateway.models import User
     with session_scope() as s:
         u = User(username="tester", password_hash="x")
-        s.add(u); s.commit(); uid = u.id
+        s.add(u)
+        s.commit()
+        uid = u.id
     yield uid
     db.reset()   # drop the cached engine so a later test doesn't reuse this temp DB
 
@@ -266,7 +273,10 @@ def test_latest_run_id_is_scoped_to_the_user(_auth_db):
     from aiscientist.gateway.models import User
     uid = _auth_db
     with session_scope() as s:
-        other = User(username="other", password_hash="x"); s.add(other); s.commit(); other_id = other.id
+        other = User(username="other", password_hash="x")
+        s.add(other)
+        s.commit()
+        other_id = other.id
     _finished_run(other_id, "theirs", "conv-1", "done")
     assert auth_routes.latest_run_id_for_conversation(uid, "conv-1") is None   # not this user's run
 

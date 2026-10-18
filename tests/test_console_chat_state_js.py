@@ -26,7 +26,7 @@ const localStorage = { getItem: (k) => (k in store ? store[k] : null), setItem: 
   removeItem: (k) => { delete store[k]; } };
 const sandbox = { localStorage, JSON, String, Array, Object,
   state: { activeId: "A", connectionId: "conn-1", sessions: [{ id: "A", title: "Retina" }, { id: "B", title: "" }] },
-  RUNOWNER_KEY: "bioagent_runowner_v1", STREAMS_KEY: "aiscientist_streams_v1" };
+  RUNOWNER_KEY: "bioagent_runowner_v1", STREAMS_KEY: "aiscientist_streams_v1", COMPOSER_KEY: "aiscientist_composer_v1" };
 const api = vm.runInNewContext(src + "\n;({ chatOf, activeChat, chatVisible, chatTitle, saveRunOwners, loadRunOwners, seenStream, rememberStream })", sandbox);
 const st = sandbox.state;
 const out = {};

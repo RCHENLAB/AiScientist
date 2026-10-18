@@ -12,7 +12,7 @@ import types
 import pytest
 
 from aiscientist.gateway import shared_llm
-from aiscientist.gateway.errors import GatewayError, VLLMNetworkError
+from aiscientist.gateway.errors import GatewayError
 from aiscientist.gateway.executor import ExecResult
 from aiscientist.gateway.settings import HPCSettings
 from aiscientist.gateway.shared_llm import SharedLLM, SharedLLMSettings
@@ -211,8 +211,6 @@ def test_a_running_job_that_answers_is_served_from():
     bound = keeper.binding()
     assert bound and (bound.port, bound.model, bound.api_key, bound.effort) == (18811, "deepseek-v4-flash", "sk-aisci-test", "low")
     assert bound.think_kwargs == {"enable_thinking": True}
-    assert bound.serves("plan") and bound.serves("writer") and bound.serves(None)
-    assert not bound.serves("classify")
     st = keeper.status()
     assert (st["state"], st["job_id"], st["node"]) == ("up", jid, "gpu-a")
     assert st["expires_at"] == keeper.clock.now + 60 * 3600
@@ -385,14 +383,13 @@ def test_an_identity_needs_a_user_with_an_explicit_key(monkeypatch):
 def test_settings_come_from_the_environment(monkeypatch):
     for k, v in {"AISCIENTIST_SHARED_LLM": "1", "AISCIENTIST_SHARED_LLM_OWNER": "labadmin",
                  "AISCIENTIST_SHARED_LLM_RENEW_LEAD_HOURS": "12",
-                 "AISCIENTIST_SHARED_LLM_ROLES": "plan, writer",
                  "AISCIENTIST_SHARED_LLM_THINK_KWARGS": '{"thinking": true}',
                  "AISCIENTIST_SHARED_LLM_LOCAL_PORT": "8811"}.items():
         monkeypatch.setenv(k, v)
     hpc = HPCSettings()
     s = SharedLLMSettings.from_env(hpc)
     assert s.enabled and s.owner == "labadmin" and s.renew_lead_s == 12 * 3600
-    assert s.roles == frozenset({"plan", "writer"}) and dict(s.think_kwargs) == {"thinking": True}
+    assert dict(s.think_kwargs) == {"thinking": True}
     assert s.local_port == 8811 and s.image == hpc.vllm_image
     monkeypatch.delenv("AISCIENTIST_SHARED_LLM")
     assert not SharedLLMSettings.from_env(hpc).enabled
@@ -403,10 +400,10 @@ def test_off_by_default(monkeypatch):
     monkeypatch.setattr(shared_llm, "_MANAGER", None)
     assert shared_llm.start(HPCSettings()) is None
     assert shared_llm.status() == {"enabled": False, "state": "off"}
-    assert shared_llm.binding("plan") is None
+    assert shared_llm.endpoint_binding() is None and shared_llm.endpoint_public() is None
 
 
-# -- what the reasoning roles do with it ---------------------------------------------------------
+# -- which sessions use it ---------------------------------------------------------
 
 fastapi = pytest.importorskip("fastapi")
 
@@ -451,61 +448,14 @@ def lab(monkeypatch):
     return types.SimpleNamespace(keeper=keeper, calls=calls, replies=replies, conn=_Conn())
 
 
-def test_planning_runs_on_the_shared_server_and_classification_does_not(lab):
+def test_a_session_on_its_own_gpu_never_uses_the_shared_server(lab):
+    """Each session is on one model: the shared server answers only the sessions that chose it as
+    their endpoint (tests/test_shared_endpoint.py). Yijun, 2026-10-15: with Qwen, Qwen throughout."""
     llm = gw._lab_llm(lab.conn)
-    assert llm.complete_fn([{"role": "user", "content": "plan"}], role="plan") == "fine"
-    shared = lab.calls[-1]
-    assert (shared["port"], shared["model"], shared["api_key"]) == (18811, "deepseek-v4-flash", "sk-aisci-test")
-    assert shared["reasoning_effort"] == "low" and shared["think_kwargs"] == {"enable_thinking": True}
-    assert shared["idle_timeout"]                  # streamed: silence ends it, not length
-
-    llm.complete_fn([{"role": "user", "content": "route"}], role="classify")
-    own = lab.calls[-1]
-    assert (own["port"], own["model"]) == (37219, "RedHatAI/Qwen3.8-27B-INT4")
-    assert llm.shared_label == "deepseek-v4-flash @ shared GPU"
-    assert llm.shared_calls == {"shared": 1, "fallback": 0}
-    assert not llm.lab_role_remote                 # nothing left the cluster
-
-
-def test_a_call_the_shared_server_drops_runs_on_the_session_model(lab):
-    lab.replies[:] = [VLLMNetworkError("vLLM stopped mid-reply.", stage="vllm_chat"), "from the session model"]
-    llm = gw._lab_llm(lab.conn)
-    assert llm.complete_fn([{"role": "user", "content": "plan"}], role="plan") == "from the session model"
-    assert [c["port"] for c in lab.calls] == [18811, 37219]
-    assert lab.keeper.binding() is None            # not handed out again until the keeper has looked
-    assert any("stopped answering" in e[2] for e in lab.conn.events)
-    assert llm.shared_calls == {"shared": 0, "fallback": 1}
-    llm.complete_fn([{"role": "user", "content": "critique"}], role="critic")
-    assert lab.calls[-1]["port"] == 37219 and len(lab.calls) == 3   # straight to the session model
-
-
-def test_an_empty_or_refused_reply_falls_back_without_marking_the_server_down(lab):
-    lab.replies[:] = ["   ", "answer one", GatewayError("vLLM completion error: context too long", stage="vllm_chat"), "answer two"]
-    llm = gw._lab_llm(lab.conn)
-    assert llm.complete_fn([{"role": "user", "content": "write"}], role="writer") == "answer one"
-    assert llm.complete_fn([{"role": "user", "content": "write"}], role="writer") == "answer two"
-    assert [c["port"] for c in lab.calls] == [18811, 37219, 18811, 37219]
-    assert lab.keeper.binding() is not None
-    notes = [e[2] for e in lab.conn.events]
-    assert any("empty reply" in n for n in notes) and any("refused the call" in n for n in notes)
-
-
-def test_the_methods_note_says_which_model_planned_and_how_often_it_fell_back(lab):
-    lab.replies[:] = ["a plan", VLLMNetworkError("gone", stage="vllm_chat"), "a critique"]
-    llm = gw._lab_llm(lab.conn)
-    llm.complete_fn([{"role": "user", "content": "plan"}], role="plan")
-    llm.complete_fn([{"role": "user", "content": "critique"}], role="critic")
-    note = gw._llm_provenance_note(llm)
-    assert "deepseek-v4-flash @ shared GPU (1 call(s))" in note
-    assert "1 such call(s) ran on RedHatAI/Qwen3.8-27B-INT4 instead" in note
-    assert "No prompt left UCI." in note
-
-
-def test_without_a_shared_server_the_note_and_the_calls_are_as_before(monkeypatch, lab):
-    monkeypatch.setattr(shared_llm, "_MANAGER", None)
-    llm = gw._lab_llm(lab.conn)
-    llm.complete_fn([{"role": "user", "content": "plan"}], role="plan")
-    assert lab.calls[-1]["port"] == 37219 and llm.shared_label == ""
+    for role in ("plan", "critic", "writer", "classify"):
+        llm.complete_fn([{"role": "user", "content": role}], role=role)
+    assert {(c["port"], c["model"]) for c in lab.calls} == {(37219, "RedHatAI/Qwen3.8-27B-INT4")}
+    assert lab.keeper.binding() is not None, "although the shared server is up"
     assert gw._llm_provenance_note(llm).startswith("All model calls ran on the cluster's own vLLM")
 
 
