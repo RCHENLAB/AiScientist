@@ -6,6 +6,8 @@ weights) is in [`hpc3_assets.md`](hpc3_assets.md).
 
 A run's deliverables do not depend on any of this. Every HPC3 job copies its `artifacts/` back to
 the server when a step finishes, to `<AISCIENTIST_RESULTS_DIR>/<ucinetid>/<run_id>/artifacts/`.
+With a data root on the server, users' datasets are kept there too
+([`dataset_storage.md`](dataset_storage.md)): HPC3 holds only the copies a session's runs read.
 
 ## The layout
 
@@ -21,12 +23,14 @@ the server when a step finishes, to `<AISCIENTIST_RESULTS_DIR>/<ucinetid>/<run_i
 │   ├── scgpt/<run_id>/
 │   ├── vlreview/<run_id>/
 │   ├── reports/<run_id>/               <- the render bundle
-│   ├── server-data/<session>/          <- this session's copies of datasets bound from the server
+│   ├── server-data/<session>/          <- this session's copies of the datasets its runs read from
+│   │                                      the server (the user's own, and bound server folders)
 │   ├── paperqa/
 │   └── scratch/{analysis,runcode,variant,phenotype,paperqa,report,worker}/<run_id>/
 │                                       <- each job's sbatch script, args/result JSON, Slurm log
 │                                          and tool log (see "Job files")
-├── uploads/<ucinetid>/                 <- raw research data, never swept
+├── uploads/<ucinetid>/                 <- uploads of a deployment without a data root, and those
+│                                          from before one; never swept
 ├── pysrc/<ucinetid>/                   <- synced AiScientist source, rewritten at each connect
 └── bin/<ucinetid>/                     <- staged from deploy/hpc3/ at each connect:
     ├── temp_gc.sh                         the sweep
@@ -38,9 +42,12 @@ the server when a step finishes, to `<AISCIENTIST_RESULTS_DIR>/<ucinetid>/<run_i
 
 Never deleted automatically:
 
-* `uploads/`: raw uploaded data. It is deleted by hand only, from the storage panel or the dataset
-  list. With `AISCIENTIST_UPLOADS_ON_HPC` a file uploaded through the browser is moved here and
-  removed from the server, so this is its only copy.
+* `uploads/`: raw uploaded data of a deployment without a data root (with
+  `AISCIENTIST_UPLOADS_ON_HPC`, a file uploaded through the browser is moved here and removed from
+  the server, so this is its only copy), and data uploaded before a data root was configured. It is
+  deleted by hand only, from the storage panel or the dataset list. With a data root nothing new is
+  written here, and each dataset kept only here is copied to the server when its owner connects;
+  the original stays until it is removed by hand (the server copy's `source.json` names it).
 * `pysrc/`: bind-mounted read-only by running jobs for their whole lifetime.
 * `<root>/{containers,hf,envs,ollama,scgpt_model,vlreview_model}/`: the built assets.
 * `/dfs3b/ruic20_lab/<ucinetid>/`: each member's personal folder. Neither the sweep nor the cleanup
@@ -119,7 +126,7 @@ owner: what this session alone left on HPC3.
 | Removed at disconnect | Why it is safe |
 |---|---|
 | `Temp/<ucinetid>/<kind>/<run_id>/` for every run this session started or resumed (analysis, variant, phenotype, reports, scgpt, vlreview, corpus) | the deliverables are already on the server (`artifacts/`); what goes is the working copy |
-| `Temp/<ucinetid>/server-data/<session>/` | a copy of data that lives on the server; the next session copies it again |
+| `Temp/<ucinetid>/server-data/<session>/` | a copy of data that lives on the server (the user's datasets, bound server folders); the next session copies it again |
 | `uploads/<ucinetid>/server-data/` | copies of server data left by earlier versions of AiScientist; nothing reads them |
 
 `deploy/hpc3/aiscientist_session_clean.sh`, staged to `<root>/bin/<ucinetid>/session_clean.sh` at
@@ -136,8 +143,9 @@ What a disconnect does **not** remove:
 * **A run another live session also knows** (the same run resumed from a second device).
 * **Anything of another session.** Server data is copied per session for this reason: two sessions
   bound to the same folder each have their own copy, so one ending cannot take the other's files.
-* **Uploads and saved results.** A dataset uploaded through the browser, and anything "Save to my
-  data" moved into the user's folder, is never a target.
+* **Uploads and saved results kept here.** A dataset uploaded to `uploads/`, and anything "Save to
+  my data" moved into the user's personal folder (without a data root), is never a target. With a
+  data root, "Save to my data" copies the result to the server instead.
 * **`scratch/` and `paperqa/`**: per-job scripts and logs, shared by the user's sessions. The sweep
   removes them once they are old enough.
 

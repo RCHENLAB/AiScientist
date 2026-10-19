@@ -1,74 +1,133 @@
 # Dataset storage
 
-Where uploaded datasets live on the gateway host, how they are named, and how they are removed.
+Where users' datasets live, how they reach HPC3 when a run needs them there, and how they are
+removed.
 
-## Two layouts
+## Where data is kept
 
-**Managed storage** is on when the deployment sets `AISCIENTIST_DATA_ROOT` (or `DATA_ROOT`) to a
-volume outside the code directory:
+With a data root (`AISCIENTIST_DATA_ROOT`, or `DATA_ROOT`) on a volume outside the code directory,
+the gateway host is the one persistent home of every user's data. HPC3 holds a copy only while a
+session's runs use it.
 
 ```
-<AISCIENTIST_DATA_ROOT>/
-  datasets/<uuid>/original/    # verified uploaded files
-  datasets/<uuid>/processed/   # files derived from them
-  analysis_results/            # the results dir, unless AISCIENTIST_RESULTS_DIR says otherwise
-  temp/<owner>/uploads/        # uploads in progress, never shown as datasets
-  exports/
+<AISCIENTIST_DATA_ROOT>/                    e.g. /data/aiscientist/data
+├── users/<account>/
+│   └── datasets/<uuid>/                    one dataset
+│       ├── original/                       its files: an upload as sent (one file or a folder
+│       │                                   tree), a result saved from a run, or a dataset that
+│       │                                   was kept on HPC3 and brought here
+│       ├── processed/                      what an uploaded archive unpacked to
+│       └── source.json                     only for a dataset brought from HPC3: where it was
+├── temp/<account>/
+│   ├── uploads/                            uploads in progress: never shown as datasets
+│   └── stage/<uuid>/                       a dataset being assembled (copied back from HPC3)
+├── analysis_results/                       the run store, unless AISCIENTIST_RESULTS_DIR says otherwise
+└── exports/
 ```
 
-Each dataset gets a UUID; its name is only shown, so the same name uploaded twice never makes a
-`(1)` or `_2` folder. An upload stays in `temp/` until every file of it (a folder's whole manifest)
-is there with the right size, and only then moves to `datasets/<uuid>/`. With uploads on HPC3, the
-same layout is used below the account's HPC3 uploads folder (`temp/<uuid>/original`, then
-`datasets/<uuid>/{original,processed}` once the copy is verified), and the registry records the
-HPC3 path.
+`<account>` is the AiScientist account name as the gateway writes it everywhere else (letters,
+digits, `-` and `_`), so one account's data is one folder: its size is one `du`, and its backup or
+removal touches nothing of anyone else's. `<uuid>` is the dataset's `datasets.uuid`, also its
+Croissant `@id` (`urn:uuid:<uuid>`). A name is only shown, so the same name uploaded twice never
+makes a `(1)` or `_2` folder.
 
-**Without a data root** nothing moves: uploads stay in `<AISCIENTIST_RESULTS_DIR>/<owner>/uploads/`
-(or `runs/console/` for local development) under their own names, as do rows written before a data
-root was configured. Configuring one later does not move existing files (see *Migration*), and an
-upload that was still in progress at that moment starts again.
+Back up `users/` together with the registry database (`AISCIENTIST_DATABASE_URL`), so UUIDs and
+folders still match after a restore. `temp/` needs no backup.
 
-Back up the data root together with the registry database (`AISCIENTIST_DATABASE_URL`), so UUIDs
-and folders still match after a restore.
+**Without a data root** uploads stay in `<AISCIENTIST_RESULTS_DIR>/<owner>/uploads/` (or
+`runs/console/` for local development) under their own names, and with `AISCIENTIST_UPLOADS_ON_HPC=1`
+they are copied to the account's HPC3 uploads folder instead. Once a data root is configured,
+datasets kept only on HPC3 are brought to it when their owner connects; files already on this host
+stay where they are until migrated (see *Moving existing datasets*).
+
+## Uploads
+
+A file reaches the gateway over tus (8 MiB chunks, each checked by its SHA-256). Its last request
+answers at once; a background queue, per account, then
+
+1. compares the whole file with the SHA-256 the browser sent, when it sent one (a mismatch fails the
+   upload: the file on the server is not the user's);
+2. checks its size and moves it from `temp/<account>/uploads/` into `users/<account>/datasets/<uuid>/original/`;
+3. for an archive the user asked to unpack, unpacks it into `processed/<name>` (links, absolute
+   paths and decompression bombs are refused, as on HPC3);
+4. records the dataset.
+
+A folder is one dataset: it is published and recorded once every file of its manifest is there and
+checked, whichever arrives last, the browser's "that was the last file" or the last check. A check
+that a restart interrupted continues when the gateway starts again, whether or not the account is
+connected. Nothing is written to HPC3 at upload time.
+
+## When a run needs the data on HPC3
+
+HPC3's compute nodes cannot see the gateway host's disks. When a run's analysis or `run_code` runs on
+HPC3, each dataset it reads from the account's dataset folder (and each bound server folder) is
+copied, at the start of the run, into the session's own area,
+`<HPC3 shared root>/Temp/<ucinetid>/server-data/<session>/` (see
+[`hpc3_storage_layout.md`](hpc3_storage_layout.md)). The copy is incremental (a second run in the
+same session copies nothing) and resumable, and goes through the transfer host, not a login node.
+Tools on the gateway host read the original in place. The session's copies are removed when it
+disconnects, and the 3-day `Temp/` sweep removes those a session left without disconnecting; a run
+continued in a later session copies its inputs again.
+
+## Results
+
+A run's deliverables (report, figures, tables) come back to `analysis_results/` (or
+`AISCIENTIST_RESULTS_DIR`) after each step. Its processed dataset and CellQC's result folder stay
+beside the run, on HPC3 for an HPC3 run, until "Save to my data" makes one a dataset:
+
+- kept on HPC3: copied back in the background into a new `users/<account>/datasets/<uuid>/original/`,
+  each file checked by size, and listed when it is all there. The request answers 202 at once, and
+  the console says when the dataset is in Datasets. The HPC3 copy goes with the run's other files;
+- kept on the gateway host: moved there.
+
+## Moving existing datasets
+
+**Kept only on HPC3.** When an account connects, each of its datasets that lives only on HPC3, in a
+place its session may read (its uploads there, or results saved to its personal lab folder), is
+copied in the background into `users/<account>/datasets/<uuid>/original/`, file by file through
+`temp/<account>/stage/<uuid>/` so an interrupted copy continues at the next connection. Once every
+file has arrived at the size HPC3 reports, the dataset's row points at the copy, and `source.json`
+beside it names the HPC3 path. The HPC3 original is not deleted; it is safe to remove once the copy
+is backed up. A row whose data is gone from HPC3 is left as it is. Bound server folders are never
+moved. `AISCIENTIST_MOVE_HPC_DATASETS=0` turns this off.
+
+**On this host, in an older layout.** `POST /api/datasets/migrate` with
+`{"dataset_id": <id>, "apply": false}` shows where a dataset would go; `apply: true` copies it into
+`users/<account>/datasets/<uuid>/original/` and points its row at the copy. The source is never
+deleted, an existing destination is never overwritten, and a symlink is refused.
 
 ## The registry
 
 Each row of `datasets` carries `uuid`, owner, name, storage path, size, `status`, `uploaded_at` and
-`updated_at`. Start-up adds these columns to an existing database and fills them in for old rows,
-without changing their paths. Numeric ids stay valid.
+`updated_at`. `GET /api/datasets` also says where each one is (`location`: `server` or `hpc3`). Start-up
+adds these columns to an existing database and fills them in for old rows, without changing their
+paths. Numeric ids stay valid.
 
 ## Removing data
 
 - **Delete a dataset** (Datasets page): its files are removed first, then its row. If the files
-  cannot be removed (no HPC3 session for a dataset kept there, a permission error), the row stays and
-  the page says why. What can be removed: the managed `datasets/<uuid>` tree, the owner's own
-  uploads folder (on this host or on HPC3, current or legacy layout), and results saved with
-  "Save to my data" (`<lab folder>/<user>/AiScientist_results/`). Nothing else in the personal lab
-  folder, no symlink, and no path another dataset row also covers. A bound server folder is the
-  lab's: deleting it removes its row and this session's HPC3 copy, never the folder.
-- **Cancel an upload**: its partial and temporary files go, on this host and on HPC3.
+  cannot be removed (no HPC3 session for a dataset still kept there, a permission error), the row
+  stays and the page says why. What can be removed: the account's own `users/<account>/datasets/<uuid>`
+  folder (and the session's HPC3 copy of it), the account's uploads folder (on this host or on HPC3,
+  current or legacy layout), and results saved to the personal lab folder on HPC3
+  (`<lab folder>/<user>/AiScientist_results/`). Never another account's folder, nothing else in the
+  personal lab folder, no symlink, and no path another dataset row also covers. A bound server
+  folder is the lab's: deleting it removes its row and this session's HPC3 copy, never the folder.
+- **Cancel an upload**: its partial and temporary files go.
 - **An interrupted upload** stays resumable for `AISCIENTIST_UPLOAD_TTL_SECONDS` (default 86400,
   24 hours) after its last write, from this browser or another one of the account's. After that a
-  sweep (at start-up, then every 5 minutes) removes it; an HPC3 temp folder of a disconnected
-  account goes at its next connection. A copy to HPC3 that failed is kept for "Retry copy" for the
-  same time, unless `AISCIENTIST_UPLOAD_KEEP_SETTLED_DAYS` says otherwise.
+  sweep (at start-up, then every 5 minutes) removes it. A check that failed is kept for "Retry" for
+  the same time, unless `AISCIENTIST_UPLOAD_KEEP_SETTLED_DAYS` says otherwise.
 
 ## Reconciliation
 
 `POST /api/datasets/reconcile` with `{"cleanup": false, "all_owners": false}` (the defaults) reports,
 for the caller's own rows on this host, those whose files are missing. An admin with
-`all_owners: true` also gets the folders that no row refers to: UUID folders under
-`<data root>/datasets/` and entries of each account's legacy uploads folder (under
-`AISCIENTIST_RESULTS_DIR` and `AISCIENTIST_LEGACY_RESULTS_DIR`, which defaults to the code
-directory's `runs/console`). `cleanup: true` deletes the missing rows and those folders, except a
-folder published less than an hour ago (its row is being written), anything the HPC3 copy queue
-still holds (a folder still uploading, a file kept for "Retry copy"), hidden entries and symlinks.
-Paths on HPC3 and bound server folders are never touched.
-
-## Migration
-
-`POST /api/datasets/migrate` with `{"dataset_id": <id>, "apply": false}` shows where a legacy dataset
-on this host would go; `apply: true` copies it into `datasets/<uuid>/original/` and points its row
-at the copy. The source is never deleted, an existing destination is never overwritten, and a
-symlink is refused. Back up the database and the data first, and keep the sources until the copies
-and the backup are checked.
+`all_owners: true` also gets the folders that no row refers to: UUID folders under every
+`users/<account>/datasets/` (and the flat `<data root>/datasets/` of earlier versions), and entries of
+each account's legacy uploads folder (under `AISCIENTIST_RESULTS_DIR` and
+`AISCIENTIST_LEGACY_RESULTS_DIR`, which defaults to the code directory's `runs/console`).
+`cleanup: true` deletes the missing rows and those folders, except a folder published less than an
+hour ago (its row is being written), anything the upload queue still holds (a folder still
+uploading, a file kept for "Retry"), hidden entries and symlinks. Paths on HPC3 and bound server
+folders are never touched.

@@ -17,7 +17,7 @@ from aiscientist.agents.scope import LITERATURE_TOOLS, RunScope, read_scope
 _NAMES = ["run_cellqc", "run_scanpy_qc", "run_doublet_detection", "run_clustering", "run_de",
           "run_pseudobulk_de", "run_depth_matched_de", "run_enrichment", "run_gsea_prerank",
           "run_marker_annotation", "scgpt_annotate", "run_composition", "run_integration",
-          "deep_literature", "literature_search", "run_code", "inspect_dataset"]
+          "deep_literature", "search_corpus", "literature_search", "run_code", "inspect_dataset"]
 _TOOLS = {n: f"{n} tool" for n in _NAMES}
 
 _QC_ONLY_ZH = ("只做 QC：用 run_cellqc 对这个 Cell Ranger 文件夹做质控并输出结果矩阵，"
@@ -199,3 +199,23 @@ def test_a_limited_run_does_not_grow_new_steps():
     lab = _lab(lambda _m: "{}", hypothesis_driven=True)
     lab._scope = RunScope(keep=("run_cellqc",))
     assert lab._explore_after_step("q", "step", None, {}, [], [], lambda _e: None) == []
+
+
+# A run that only did QC answers in the chat unless the request asks for a written report
+# (Yijun, 2026-10-18). A short report is still a report; only one ruled out altogether is not.
+@pytest.mark.parametrize("question, wanted", [
+    ("Do only cellqc quality controll part and generate the report and result to me", True),
+    ("Run CellQC on the uploaded sample to generate quality control report.", True),
+    ("只做 QC：用 run_cellqc 对这个 Cell Ranger 文件夹做质控，输出结果矩阵。报告尽量简短，不需要完整报告。", True),
+    ("只做质控并写一份书面报告", True),
+    ("QC only and write a short PDF", True),
+    ("Only run CellQC, no report needed", False),
+    ("Run QC only, without a report", False),
+    ("Only QC, I don't need a report", False),
+    ("只做 QC，不需要报告", False),
+    ("只做质控，不要写报告，结果矩阵给我", False),
+    ("Just run QC and give me the matrix", False),
+])
+def test_a_written_report_is_read_from_the_request(question, wanted):
+    from aiscientist.agents.scope import wants_written_report
+    assert wants_written_report(question) is wanted

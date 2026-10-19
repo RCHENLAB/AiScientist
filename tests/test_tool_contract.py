@@ -21,6 +21,7 @@ SRC = ROOT / "src" / "aiscientist"
 PLATFORM_RELIES_ON = {
     "annotate_variants": "gateway/app.py: VCF staging and the variant executor",
     "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab.py: literature steps",
+    "search_corpus": "agents/quick_chat.py, agents/research_lab.py, agents/registry.py: literature steps in a session with no served model",
     "extract_haploinsufficient_genes": "gateway/app.py: the corpus-scan line (route \"corpus\")",
     "inspect_dataset": "agents/research_lab.py: dataset triage steps",
     "literature_search": "gateway/app.py, agents/research_lab.py: literature steps and citations",

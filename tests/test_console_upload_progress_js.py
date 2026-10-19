@@ -144,3 +144,34 @@ assert.deepEqual(rows.map(r => r.status), ["done", "done"]);
 '''
     result = subprocess.run([node, "-"], input=harness, text=True, capture_output=True, encoding="utf-8")
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_an_upload_kept_on_the_server_never_says_hpc3():
+    """Issue 6: with a data root the queue only checks an upload on the server (job.dest "server"),
+    so its rows, card and failure say so, not "Copying to HPC3"."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = APP.read_text(encoding="utf-8")
+    blocks = [
+        source[source.index("function uploadFileCounts"):source.index("function uploadCardView")],
+        source[source.index("const COPY_FAILED"):source.index("// The server records a folder once")],
+    ]
+    harness = r'''
+const assert = require("assert");
+const fmtUploadSize = n => `${n || 0} bytes`;
+const escapeHtml = s => String(s).replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const rows = [{name: "study/a.csv", size: 3, sent: 3, status: "copying"}];
+const state = { uploads: [{ id: "F1", status: "staging", dest: "server", fileProgress: rows, filesTotal: 1, filesDone: 0 }] };
+''' + "\n".join(blocks) + r'''
+const html = uploadFileRows(state.uploads[0]);
+assert(html.includes("Checking") && !html.includes("HPC3"), html);
+markFolderCopies("F1", { dest: "server", failed_files: ["a.csv"], recorded: false });
+assert.equal(rows[0].error, "the check on the server failed");
+markFolderCopies("F1", { dest: "server", failed_files: [], recorded: false });   // retried
+assert.equal(rows[0].status, "copying");
+assert.equal(stagingWords({ dest: "hpc3" }).copying, "Copying to HPC3");
+assert.equal(stagingWords({}).failed, "the copy to HPC3 failed");               // jobs from before issue 6
+'''
+    result = subprocess.run([node, "-"], input=harness, text=True, capture_output=True, encoding="utf-8")
+    assert result.returncode == 0, result.stdout + result.stderr

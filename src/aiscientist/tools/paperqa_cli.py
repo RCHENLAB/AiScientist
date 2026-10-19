@@ -62,7 +62,7 @@ _ARG_TO_ENV = {
 
 # The literature tools this entry point runs, all inside paperqa.sif with the same injected
 # deployment config (corpus paths + the served model's endpoint).
-LITERATURE_TOOLS = ("deep_literature", "extract_haploinsufficient_genes")
+LITERATURE_TOOLS = ("deep_literature", "extract_haploinsufficient_genes", "search_corpus")
 # Injected by the executor, never a tool parameter: stripped before a tool sees its args.
 _DEPLOY_KEYS = frozenset({"model", "llm_base_url", "tunnel_port", *_ARG_TO_ENV})
 
@@ -108,6 +108,13 @@ def run_tool(tool: str, workspace: str, args: dict[str, Any] | None) -> dict[str
 
 
     import types
+
+    ctx_ws = types.SimpleNamespace(workspace=workspace)
+    if tool == "search_corpus":
+        # Retrieval only: no model, no paperqa import (the job may run without a served model).
+        from .search_corpus.tool import run_search
+
+        return run_search({k: v for k, v in args.items() if k not in _DEPLOY_KEYS}, ctx_ws)
 
     from .deep_literature.tool import run_paperqa
 

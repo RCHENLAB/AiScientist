@@ -97,7 +97,9 @@ class AgentMemory:
         ranked = sorted(enumerate(episodes), key=lambda iv: (_score(iv[1]), iv[0]), reverse=True)
         picked = [ep for _, ep in ranked[:max_episodes]]
 
-        lines = ["Your PRIVATE memory from past work (advisory — steer, don't override the data):"]
+        lines = ["Your PRIVATE memory from past work (advisory — steer, don't override the data). "
+                 "It says how to do the step well; it never adds a tool call the step did not ask "
+                 "for, such as reloading a file a tool wrote or re-checking what a tool reported:"]
         if lessons:
             lines.append("Lessons you've learned:\n" + lessons[:_MAX_LESSONS_CHARS])
         if picked:
@@ -154,6 +156,9 @@ _REFLECT_SYSTEM = (
     "list of reusable METHODOLOGICAL lessons — heuristics that help it do better next time (e.g. good "
     "default thresholds, pitfalls to check, what the reviewer tends to reject). Merge with the existing "
     "lessons, remove duplicates, keep it concise (at most ~10 bullets). METHODOLOGY ONLY: never include "
-    "dataset-specific numbers, donor/sample ids, or one-off details — those don't transfer. Reply with "
-    "ONLY the updated lessons as markdown bullet points."
+    "dataset-specific numbers, donor/sample ids, or one-off details — those don't transfer. A lesson "
+    "never adds work: none may ask for an extra tool call — reloading or re-opening a file a tool "
+    "wrote, recounting what a tool reported, an audit or a check the step did not ask for. The "
+    "platform checks a tool's outputs itself, and every extra call costs the user time. Drop any "
+    "existing lesson that asks for one. Reply with ONLY the updated lessons as markdown bullet points."
 )

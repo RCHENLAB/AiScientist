@@ -111,7 +111,7 @@ function matches(el, sel) {
   for (const part of rest.match(/\.[\w-]+|\[[^\]]+\]|:last-child/g) || []) {
     if (part[0] === ".") { if (!el.classList.contains(part.slice(1))) return false; }
     else if (part === ":last-child") { const sib = el.parent ? el.parent.children : []; if (sib[sib.length - 1] !== el) return false; }
-    else { const a = /^\[([^=\]]+)(?:="([^"]*)")?\]$/.exec(part); if (el.getAttribute(a[1]) !== (a[2] === undefined ? el.getAttribute(a[1]) : a[2])) return false; }
+    else { const a = /^\[([^=\]]+)(?:="([^"]*)")?\]$/.exec(part); const v = el.getAttribute(a[1]); if (a[2] === undefined ? v === null : v !== a[2]) return false; }
   }
   return true;
 }
@@ -137,6 +137,7 @@ const sandbox = {
   refreshDownloads() {}, syncPresetUI() {}, messageEl: () => makeEl("div"),
   renderChatUsage() {}, refreshChatUsage() {}, checkBudgetNotices() {}, onUsageUpdate() {},   // usage counter: not under test here
   setPanel() {},   // the side panel opening for a plan; its tab and contents are drawn into $() elements
+  getComputedStyle: () => ({ lineHeight: "" }),   // no layout here: every step keeps its chevron
   activeSession: () => sandbox.state.sessions.find((x) => x.id === sandbox.state.activeId) || null,
   pushToSession: (sid) => log.push("saved:" + sid), appendArtifacts() {},
   ownerVisible: () => false, setChatRunning: (c, r) => { c.running = r; },

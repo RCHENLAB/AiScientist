@@ -31,7 +31,7 @@ Browser ──HTTPS──▶ Envoy ingress
    Scientist included: Qwen3.8-27B in a Slurm GPU job of the user's own (it waits for a free card),
    the lab's shared model (DeepSeek-V4-Flash, one long-lived job on several HPC3 GPUs; no wait), or
    the user's own LLM API key (no wait; [guide](docs/claude_api_guide.md)). The gateway reaches a
-   cluster model through an SSH tunnel. What a key spends is tracked under Account › Usage.
+   cluster model through an SSH tunnel. What a key spends is tracked under Account › API usage; the cluster models cost nothing per token.
 3. **Add data.** Upload it in the browser (resumable), or point to data already on the lab server.
 4. **Ask.** A quick question is answered in the chat. A research question becomes a plan, a
    dependency graph of steps, which the user approves, edits or cancels before anything runs.

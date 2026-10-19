@@ -317,7 +317,9 @@ def my_datasets(request: Request) -> dict:
                                "needs_review": r.status != "reviewed"}
                 for r in s.scalars(select(MetadataRecord).where(MetadataRecord.user_id == user.id,
                                                                 MetadataRecord.kind == "dataset")).all()}
-        return {"datasets": [{**d.public(), "metadata": meta.get(d.id)} for d in rows]}
+        from .dataset_storage import location_of
+        return {"datasets": [{**d.public(), "metadata": meta.get(d.id), "location": location_of(d.path)}
+                             for d in rows]}
 
 
 @router.get("/runs")
@@ -421,7 +423,30 @@ def get_dataset_record(user_id: int, dataset_id: int) -> dict | None:
         if row is None or row.user_id != user_id:
             return None
         return {"id": row.id, "name": row.name, "path": row.path, "kind": row.kind,
-                "size_bytes": row.size_bytes}
+                "size_bytes": row.size_bytes, "uuid": row.uuid, "status": row.status}
+
+
+def list_dataset_records(user_id: int) -> list[dict]:
+    """This user's dataset rows, oldest first, as :func:`get_dataset_record` gives one."""
+    with session_scope() as s:
+        rows = s.scalars(select(Dataset).where(Dataset.user_id == user_id).order_by(Dataset.id)).all()
+        return [{"id": r.id, "name": r.name, "path": r.path, "kind": r.kind, "size_bytes": r.size_bytes,
+                 "uuid": r.uuid, "status": r.status} for r in rows]
+
+
+def repoint_dataset(user_id: int, dataset_id: int, old_path: str, new_path: str,
+                    size_bytes: int | None = None) -> bool:
+    """Point one of this user's rows at the copy of its data in ``new_path`` (a dataset moved from
+    HPC3 to the gateway host), only while it still names ``old_path``. True when it was changed."""
+    with session_scope() as s:
+        row = s.get(Dataset, dataset_id)
+        if row is None or row.user_id != user_id or row.path != old_path:
+            return False
+        row.path = new_path
+        if size_bytes is not None:
+            row.size_bytes = size_bytes
+        s.commit()
+        return True
 
 
 def delete_dataset_record(user_id: int, dataset_id: int, delete_files=None) -> str | None:
@@ -439,9 +464,8 @@ def delete_dataset_record(user_id: int, dataset_id: int, delete_files=None) -> s
             delete_files(path)       # a bound server folder: only its session copy goes, see the caller
         elif delete_files is not None:
             from pathlib import Path
-            from .dataset_storage import managed_uuid, dataset_dir
-            identity = managed_uuid(path)
-            target = dataset_dir(identity) if identity else Path(path).resolve()
+            from .dataset_storage import managed_tree
+            target = managed_tree(path) or Path(path).resolve()
             for other in s.scalars(select(Dataset).where(Dataset.id != dataset_id)):
                 if not other.path:            # "" resolves to the working directory: no overlap
                     continue

@@ -44,11 +44,12 @@ name and limit it.
 
 ## 4. Add the key to AiScientist
 
-Sign in at AiScientist and open **Account** in the left bar. The **Claude API key** box has
+Sign in at AiScientist and open **Account** in the left bar. On its **API usage** tab, the
+**Claude API key** box has
 **Manage API keys**, which opens the **API endpoints** dialog. The same dialog opens from the 🔑
 button next to **LLM endpoint** on the connect form.
 
-![The Account page: the Claude API key box and the usage summary](images/account_key_and_usage.png)
+![The API usage tab of the Account page: the Claude API key box and the billing cycle so far](images/account_key_and_usage.png)
 
 In the dialog, under **Add an endpoint**:
 
@@ -134,12 +135,18 @@ AiScientist records every model call it makes with its token counts (input, cach
 read, output), the model, the chat, the run and the pipeline step, and prices it from a table of
 Claude API prices.
 
-- **In a chat:** the counter in the chat header shows the chat's tokens and estimated cost, and
-  the running total of its research run while one is going.
+- **In a chat:** the counter in the chat header shows the chat's API tokens and estimated cost, and
+  the running cost of its research run while one is going. Calls on the cluster GPU read as free:
+  "12K API tokens · ~$0.18 · cluster GPU free", or "9.9K tokens · free on the cluster GPU" for a
+  chat that ran only there.
 - **In Runs:** **Usage** on a run shows its cost by pipeline step and by model.
-- **Account › Usage:** totals for today, the last 7 days and the billing cycle; a daily chart; the
-  cost by model, by chat and by run; failed requests and why they failed; and **Export CSV**.
-- **Budget:** under Account › Usage, enter your monthly credit (for example 100 for Max 5x) and the
+- **Account › API usage:** at the top, the billing cycle so far: the estimated spend (with today,
+  the last 7 days and the pace for the whole cycle), the tokens your API key paid for, and where the
+  spend stands against your budget. Below that, a daily chart of the last 30 days, then the cost of
+  a period you pick by model, by run or by chat, the failed requests and why they failed, and
+  **Export CSV**. Calls on the cluster GPU are shown apart as free: HPC3 charges GPU time, not
+  tokens, so they are in no dollar figure and count against no budget.
+- **Budget:** under Account › API usage, enter your monthly credit (for example 100 for Max 5x) and the
   day your billing cycle resets. The page then shows the estimated spend against it and when it
   would run out at the current rate, and the console shows a notice when you reach each warning
   threshold (50%, 80% and 100% unless you change them). An optional hard limit asks before, or
@@ -156,12 +163,12 @@ Console organization, which share the same credit balance.
 
 | What you see | Likely cause |
 |---|---|
-| An error about credits or billing | This cycle's credits are used up. Check Account › Usage and the Console, then wait for the refresh or add purchased credits. |
-| Usage higher than expected | Open Account › Usage and look at the chats and runs that cost the most. If anything looks unfamiliar, revoke the key. |
+| An error about credits or billing | This cycle's credits are used up. Check Account › API usage and the Console, then wait for the refresh or add purchased credits. |
+| Usage higher than expected | Open Account › API usage and look at the chats and runs that cost the most. If anything looks unfamiliar, revoke the key. |
 | "Anthropic is rate-limiting this key" | Too many requests or tokens per minute for the key's usage tier; several chats running at once reach it sooner. Wait, or run fewer at once. |
 | An authentication error | The key was revoked or copied incorrectly. Create a new key and use **Edit / rotate key**. |
 | The plan's credits are not being used | The key comes from a Console organization that is not linked to the plan. |
 | Linking fails on claude.ai | Retry after a few hours, and check that you have the Owner, Admin or Billing role in the Console organization. |
 
-Account › Usage lists failed requests with their cause (out of credit, rate-limited,
+Account › API usage lists failed requests with their cause (out of credit, rate-limited,
 authentication), so you can see why a chat or run stopped.

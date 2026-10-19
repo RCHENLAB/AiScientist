@@ -309,7 +309,8 @@ def test_a_team_campaign_reaches_its_interpretation_meeting(tmp_path):
         def run(self, *_a, **_k):
             return HarnessResult(
                 status="ok", stop_reason=None, final_answer="did it",
-                steps=[{"tool": "run_scanpy_qc", "ok": True,
+                # Not a QC tool: a run that only did QC is answered without the writer.
+                steps=[{"tool": "run_clustering", "ok": True,
                         "result": {"status": "ok", "figures": ["figures/a.png"]}}],
                 errors=[])
 

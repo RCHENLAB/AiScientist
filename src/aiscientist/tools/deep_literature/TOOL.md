@@ -6,6 +6,7 @@ runs_on: hpc:literature
 entry: tool:make_paperqa_tool
 chat: true
 order: 410
+served_model: true
 line: literature
 owner: literature
 ---
@@ -33,7 +34,7 @@ Runs PaperQA2 (search, gather evidence, synthesize) over a local paper index and
 ## Where it runs
 
 <!-- generated:runs-on -->
-As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`, calling the session's served model. It is left out of the catalog when the session has no GPU allocation.
+As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`. Its job calls the session's served model, so it is offered only to a session with a GPU allocation.
 
 Needs: `paper-qa`.
 
@@ -45,7 +46,7 @@ On the fast chat path: yes.
 ## Known limits
 
 - Minutes, not seconds. Since 2026-09-30 its LLM calls use a timeout sized for a reasoning model and a low reasoning effort (`ddf043c`); before that they timed out on Qwen3.8.
-- It needs the session's GPU allocation (it calls the served model from HPC3), so it is absent in sessions that use only an external API.
+- It needs the session's GPU allocation (it calls the served model from HPC3), so it is absent in sessions that use only an external API; those sessions get `search_corpus` instead.
 
 ## Code and tests
 

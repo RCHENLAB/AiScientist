@@ -40,16 +40,17 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .._lib.corpus import (  # noqa: F401 - re-exported: scripts/build_mechanism_cache.py imports them from here
+    CorpusPaths, chunk_vectors, l2 as _l2, load_chunks, read_manifest, sentence_transformer_embed)
+from .._lib.corpus import corpus_paths as _corpus_paths
 from ..sdk import HarnessTool
 
 _TOOL = "extract_haploinsufficient_genes"
 _OUT_SUBDIR = "haploinsufficiency"
-_CACHE_DIRNAME = "mechanism_cache"
-_DEFAULT_EMBEDDING = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", "st-NeuML/pubmedbert-base-embeddings")
 
 # ---------------------------------------------------------------------------------------------
 # The definition (Jin Li, 2026-10-05) and the model's instructions — verbatim from the delivery run
@@ -151,17 +152,6 @@ class Judgment:
     error: str = ""
 
 
-@dataclass
-class CorpusPaths:
-    papers: Path
-    manifest: Path | None
-    cache: Path
-    cache_writable: bool
-    hgnc: Path | None
-    hf_cache: Path | None
-    notes: list[str] = field(default_factory=list)
-
-
 # ---------------------------------------------------------------------------------------------
 # 1. Text: PDF -> blocks -> chunks -> sentences (reparse_pdfs.py)
 # ---------------------------------------------------------------------------------------------
@@ -252,14 +242,6 @@ def chunk_sentences(pmid: str, ci: int, page: int, text: str) -> list[Sentence]:
             for si, s in enumerate(sents)]
 
 
-def read_manifest(path: Path | None) -> list[dict[str, str]]:
-    """The corpus manifest rows (``file_location``, ``title``, ``doc_id`` = PMID, ...)."""
-    if not path or not path.is_file():
-        return []
-    with path.open(encoding="utf-8", newline="") as fh:
-        return list(csv.DictReader(fh))
-
-
 def corpus_files(papers: Path, manifest: list[dict[str, str]]) -> list[tuple[str, Path]]:
     """``(pmid, pdf)`` for every paper: the manifest's order and PMIDs when there is one, else
     every PDF under ``papers`` filed under the digits in its name."""
@@ -329,11 +311,6 @@ def load_sentences(sent_path: Path, pmids: set[str] | None = None) -> list[Sente
     return out
 
 
-def load_chunks(chunk_path: Path) -> list[dict[str, Any]]:
-    with chunk_path.open(encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh]
-
-
 # ---------------------------------------------------------------------------------------------
 # 2. Candidates
 # ---------------------------------------------------------------------------------------------
@@ -344,40 +321,6 @@ def keyword_hits(text: str) -> list[str]:
 
 def is_garbled(text: str) -> bool:
     return bool(GARBLED_MARK.search(text)) or len(re.findall(r"[a-z]- [a-z]", text)) >= 2
-
-
-def _l2(v: Any) -> Any:
-    import numpy as np  # noqa: PLC0415
-    v = np.asarray(v, dtype="float32")
-    n = np.linalg.norm(v, axis=-1, keepdims=True)
-    n[n == 0] = 1.0
-    return v / n
-
-
-def chunk_vectors(chunks: list[dict[str, Any]], cache_dir: Path, embed_fn: Callable[[list[str]], Any],
-                  writable: bool, log: Callable[[str], None]) -> Any:
-    """PubMedBERT vectors for every chunk (cached as ``chunk_vecs.npy`` beside the text cache)."""
-    import numpy as np  # noqa: PLC0415
-    path = cache_dir / "chunk_vecs.npy"
-    if path.exists():
-        vecs = np.load(path, mmap_mode="r")
-        if vecs.shape[0] == len(chunks):
-            return vecs
-        log(f"chunk_vecs.npy has {vecs.shape[0]} rows for {len(chunks)} chunks; re-embedding")
-    t0 = time.time()
-    parts = []
-    for i in range(0, len(chunks), 256):
-        parts.append(_l2(embed_fn([c["text"] for c in chunks[i:i + 256]])))
-        if (i // 256) % 20 == 0:
-            log(f"embedded {min(i + 256, len(chunks))}/{len(chunks)} chunks")
-    vecs = np.concatenate(parts) if parts else np.zeros((0, 1), dtype="float32")
-    log(f"embedding done in {time.time() - t0:.0f}s")
-    if writable:
-        try:
-            np.save(path, vecs)
-        except OSError as exc:
-            log(f"could not cache vectors: {exc}")
-    return vecs
 
 
 def select_candidates(sentences: list[Sentence], chunks: list[dict[str, Any]], vecs: Any | None,
@@ -719,34 +662,6 @@ def write_csv(path: Path, rows: list[dict[str, Any]], columns: tuple[str, ...]) 
 # Deployment: where the corpus, cache, HGNC table and model are
 # ---------------------------------------------------------------------------------------------
 
-def corpus_paths(ctx: Any) -> CorpusPaths | None:
-    papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    if not papers or not Path(papers).is_dir():
-        return None
-    papers_p = Path(papers)
-    root = papers_p.parent
-    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
-    manifest_p = Path(manifest) if manifest and Path(manifest).is_file() else None
-    notes: list[str] = []
-    shared = Path(os.environ.get("AISCIENTIST_MECHANISM_CACHE", "") or root / _CACHE_DIRNAME)
-    ws = getattr(ctx, "workspace", None)
-    if (shared / "chunks.jsonl").is_file():
-        cache, writable = shared, os.access(shared, os.W_OK)
-    elif ws:
-        cache, writable = Path(ws) / "work" / _OUT_SUBDIR / _CACHE_DIRNAME, True
-        notes.append(f"No corpus cache at {shared}; extracting the PDFs into the run's work/ "
-                     "(build it once with scripts/build_mechanism_cache.py to make this fast).")
-    else:
-        cache, writable = shared, os.access(root, os.W_OK)
-    hgnc = os.environ.get("AISCIENTIST_HGNC_TABLE", "") or str(root / "hgnc_complete_set.txt")
-    hgnc_p = Path(hgnc) if Path(hgnc).is_file() else None
-    if hgnc_p is None:
-        notes.append("No HGNC table (hgnc_complete_set.txt next to the papers, or AISCIENTIST_HGNC_TABLE): "
-                     "gene symbols are reported as written and gene_status is 'unchecked'.")
-    hf = root / "hf_cache"
-    return CorpusPaths(papers_p, manifest_p, cache, writable, hgnc_p, hf if hf.is_dir() else None, notes)
-
-
 def local_endpoint(ctx: Any) -> tuple[str, str] | None:
     """``(model, api_base)`` for the session's served model, the way deep_literature finds it."""
     model = getattr(ctx, "model", None)
@@ -759,25 +674,6 @@ def local_endpoint(ctx: Any) -> tuple[str, str] | None:
     if not port:
         return None
     return str(model), f"http://127.0.0.1:{port}/v1"
-
-
-def sentence_transformer_embed(hf_cache: Path | None) -> Callable[[list[str]], Any] | None:
-    """The corpus embedding model (PubMedBERT, offline from the corpus' hf_cache), or None."""
-    try:
-        from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-    except ImportError:
-        return None
-    name = _DEFAULT_EMBEDDING.split("st-", 1)[-1]
-    if hf_cache:
-        os.environ.setdefault("HF_HOME", str(hf_cache))
-        os.environ.setdefault("HF_HUB_CACHE", str(hf_cache / "hub"))
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    try:
-        model = SentenceTransformer(name)
-    except Exception:  # noqa: BLE001 - offline cache missing: keyword candidates only
-        return None
-    return lambda texts: model.encode(texts, batch_size=32, show_progress_bar=False, normalize_embeddings=True)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -815,7 +711,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     if not ws:
         return {"status": "error", "step": "literature", "error": f"{_TOOL} needs a run workspace"}
     ws = Path(ws)
-    paths = corpus_paths(ctx)
+    paths = _corpus_paths(ctx, work_subdir=_OUT_SUBDIR)
     if paths is None:
         return {"status": "not_enabled", "step": "literature",
                 "note": (f"{_TOOL} reads the PaperQA corpus on HPC3 (AISCIENTIST_PAPERQA_PAPERS), which is "

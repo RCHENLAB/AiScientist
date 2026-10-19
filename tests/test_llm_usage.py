@@ -180,6 +180,56 @@ def test_the_usage_page_totals_breaks_down_and_says_it_is_an_estimate(ctx):
     assert d["pricing"]["as_of"]
 
 
+def test_the_cluster_gpu_share_is_counted_apart_from_what_an_api_key_paid_for(ctx):
+    # HPC3 bills the cluster GPU by the hour, not by token: the page counts API tokens only and
+    # shows the cluster calls beside them, so every total and every row carries them apart.
+    client, routes, usage, db, models, ids = ctx
+    _record(routes, ids["alice"], run_id="r1", conversation_id="1")
+    _record(routes, ids["alice"], run_id="r1", conversation_id="1", remote=False, provider="vllm",
+            model="qwen3.8", usage={"prompt_tokens": 9000, "completion_tokens": 100, "total_tokens": 9100})
+    _as(client, "alice", "alicepw1")
+    d = client.get("/api/usage?tz=UTC").json()
+    cyc = d["totals"]["cycle"]
+    assert cyc["calls"] == 2 and cyc["cluster"]["calls"] == 1
+    assert cyc["cluster"]["total_tokens"] == 9100 and cyc["cluster"]["input_tokens"] == 9000
+    assert cyc["total_tokens"] - cyc["cluster"]["total_tokens"] == 13_500     # the Claude call alone
+    rows = {m["model"]: m for m in d["by_model"]}
+    assert rows["qwen3.8"]["cluster"]["calls"] == rows["qwen3.8"]["calls"] == 1
+    assert rows["qwen3.8"]["spend_usd"] == 0 and rows["claude-opus-5-5"]["cluster"]["calls"] == 0
+    assert d["by_run"][0]["cluster"]["calls"] == 1 and d["by_run"][0]["calls"] == 2
+    assert client.get("/api/usage/run/r1").json()["cluster"]["output_tokens"] == 100
+
+
+def test_the_chat_counter_sums_the_cluster_gpu_apart_and_its_live_push_agrees(ctx):
+    # The chat header counter reads /api/usage/chat/{id} on load and the usage_update push after
+    # each call: both sum in the database, and both carry the cluster share apart, as the page does.
+    client, routes, usage, db, models, ids = ctx
+    qwen = dict(remote=False, provider="vllm", model="qwen3.8",
+                usage={"prompt_tokens": 9000, "completion_tokens": 100, "total_tokens": 9100})
+    _record(routes, ids["alice"], run_id="r5", conversation_id="5")
+    _record(routes, ids["alice"], run_id="r5", conversation_id="5", **qwen)
+    _record(routes, ids["alice"], conversation_id="5", step="Chat", role="chat", **qwen)
+    _record(routes, ids["root"], conversation_id="5", **qwen)            # another account's chat 5
+    _record(routes, ids["alice"], conversation_id="6", step="Chat", role="chat", **qwen)
+    _as(client, "alice", "alicepw1")
+    chat = client.get("/api/usage/chat/5").json()
+    assert chat["calls"] == 3 and chat["cluster"] == {"calls": 2, "total_tokens": 18_200}
+    assert chat["total_tokens"] - chat["cluster"]["total_tokens"] == 13_500   # the Claude call alone
+    assert chat["spend_usd"] > 0
+    live = usage.live_totals(ids["alice"], "5", "r5")
+    assert {"conversation_id": "5", **live["chat"]} == chat
+    assert live["run"]["cluster"] == {"calls": 1, "total_tokens": 9100}
+    run = client.get("/api/usage/run/r5").json()       # summed row by row, as the page does
+    assert live["run"]["calls"] == run["calls"] and live["run"]["total_tokens"] == run["total_tokens"]
+    assert run["cluster"]["calls"] == 1 and run["cluster"]["total_tokens"] == 9100
+    # A chat entirely on the cluster GPU: every call and token is in the cluster share, at $0.
+    only = client.get("/api/usage/chat/6").json()
+    assert only == {"conversation_id": "6", "calls": 1, "total_tokens": 9100, "spend_usd": 0.0,
+                    "unpriced_calls": 0, "cluster": {"calls": 1, "total_tokens": 9100}}
+    assert usage.live_totals(ids["alice"], "6", None) == {"chat": {k: v for k, v in only.items()
+                                                                   if k != "conversation_id"}}
+
+
 def test_the_csv_export_has_one_line_per_call_of_the_user(ctx):
     client, routes, usage, db, models, ids = ctx
     _record(routes, ids["alice"], conversation_id="1")

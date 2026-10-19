@@ -135,6 +135,10 @@ class HarnessContext:
     # the tunnel as proof of locality would send raw tables off-site. Defaults False so every
     # existing caller (tests, scripts, the all-local production path) behaves exactly as before.
     llm_is_remote: bool = False
+    # Directories beyond the workspace and the bound datasets that a tool running on the gateway may
+    # read when the model names a file (``tools.sdk.confine_read``): the owner's uploads. Set by the
+    # gateway, which knows the owner; empty for tests and scripts.
+    read_roots: tuple[Path, ...] = ()
 
 
 def _default_max_model_len() -> int:

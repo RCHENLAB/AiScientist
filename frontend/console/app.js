@@ -37,7 +37,8 @@ const state = {
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
   planAnsweredEl: null,        // the visible chat's entry for a plan it answered (drawAnsweredPlan)
   planView: null,              // a saved plan opened from the chat into the side panel ({agenda, doc, status})
-  sideTab: "results",          // which of the side panel's two tabs is showing: "plan" | "results"
+  planStepOpen: new Map(),     // step text -> shown in full (true) or as two lines (false), as the person left it
+  sideTab: "results",         // which of the side panel's two tabs is showing: "plan" | "results"
 };
 
 const $ = (id) => document.getElementById(id);
@@ -71,7 +72,8 @@ function newChatRecord(sid) {
     planDraftYaml: "",     // what is typed in the plan editor and not applied (or an edit just sent)
     planDraftBase: "",     // the plan document (its YAML) that text and the open editor belong to
     planEditorOpen: false, // the plan editor is open on the waiting card
-    planShown: "",         // which version of the waiting plan has opened the side panel already
+    planWords: "",         // a change to the plan typed in the side panel's box and not sent yet
+    planShown: "",        // which version of the waiting plan has opened the side panel already
     answered: null,        // the plan as it stood when it was answered and the PI took it back (a reply
                            // in words, an edit, a cancel, a review the server closed): {agenda, doc,
                            // revised, status}. Its entry and the side panel show it, read-only, until
@@ -3089,6 +3091,8 @@ function handleWsMessage(msg) {
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
     case "gpu_health": renderGpu({ gpu: { health: msg.health, job_id: state.lastJobId, node: state.lastNode, gres: state.lastGres } }); break;
     case "upload_staging": onStagingEvent(msg.job); break;       // a copy to HPC3 moved on
+    case "datasets_changed": onDatasetsChanged(); break;         // a dataset moved from HPC3 to the server
+    case "result_saved": onResultSaved(msg); break;              // a result copied back from HPC3 is saved
     case "usage_update": onUsageUpdate(msg); break;              // a model call was recorded
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
@@ -3379,12 +3383,11 @@ async function sendChat(e) {
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
   if (c.planPending) {
-    appendUserMessage(text);
     input.value = "";
     c.draft = "";
     saveComposer(c);
     updateComposerButton();
-    submitPlan("revise", text, undefined, c);
+    revisePlanInWords(c, text);
     return;
   }
   // A run is already executing in this chat (post-plan): the message is mid-run steering — queue it
@@ -3452,7 +3455,7 @@ async function sendChat(e) {
     const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, case_note: (c.caseNote && c.caseNote.text) || null, plan_mode, autonomous, save_results: chatSavesResults(c), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null, tz: userTz() };
     const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
     let res = await postLab();
-    // The budget hard limit (Account › Usage): "confirm" asks once, then sends the same run again.
+    // The budget hard limit (Account › API usage): "confirm" asks once, then sends the same run again.
     if (res.status === 409) {
       const d = await res.clone().json().catch(() => ({}));
       if (d.needs_budget_confirm) {
@@ -3701,29 +3704,96 @@ function planIcon(name) {
   return `<span class="material-symbols-outlined msym" aria-hidden="true">${name}</span>`;
 }
 
+// The numbers in a step's prose are what a reviewer checks (a cut-off, a threshold, a count), so
+// they are set in bold, and a value the plan passes to the tool (one of its settings) is marked as
+// that setting. Runs over the HTML renderMarkdown made, on its text only: never inside a tag, an
+// entity (`&#039;`), a code span or a link. A digit inside a word (DDX41, log1p) is not a number.
+function planEmphasisHtml(html, settings) {
+  const s = settings || {};
+  const words = new Map();     // a text setting as it appears in the escaped prose -> its name
+  for (const [k, v] of Object.entries(s)) {
+    for (const x of Array.isArray(v) ? v : [v]) {
+      if (typeof x === "string" && x.trim().length > 1) words.set(escapeHtml(x.trim()), k);
+    }
+  }
+  const alt = [...words.keys()].sort((a, b) => b.length - a.length)
+    .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const re = new RegExp("(^|[^\\w.#&-])(?:([~≈]?\\d+(?:[.,]\\d+)*(?:%|x(?![a-z])|×|-fold)?)"
+    + (alt ? `|(${alt})` : "") + ")(?!\\w)", "g");
+  const pinOf = (num) => {
+    const n = parseFloat(num.replace(/[~≈,]/g, ""));
+    const pct = num.endsWith("%");
+    for (const [k, v] of Object.entries(s)) {
+      for (const x of Array.isArray(v) ? v : [v]) {
+        if (typeof x === "number" && (Math.abs(x - n) < 1e-9 || (pct && Math.abs(x - n / 100) < 1e-9))) return k;
+      }
+    }
+    return "";
+  };
+  let skip = 0;
+  return String(html).split(/(<[^>]*>)/).map((part) => {
+    if (part.startsWith("<")) {
+      if (/^<(code|a|pre)[\s>]/i.test(part)) skip += 1;
+      else if (/^<\/(code|a|pre)>/i.test(part)) skip = Math.max(0, skip - 1);
+      return part;
+    }
+    if (skip) return part;
+    return part.replace(re, (_m, pre, num, word) => {
+      const key = num ? pinOf(num) : words.get(word);
+      return pre + (key
+        ? `<strong class="plan-pin" title="Passed to the tool as ${escapeHtml(key)}">${num || word}</strong>`
+        : `<strong class="plan-num">${num}</strong>`);
+    });
+  }).join("");
+}
+
+// Shown in full or as its first two lines: as the person left it, else in full only when the last
+// revision rewrote it (what changed is what they need to read).
+function planStepOpen(text, revised) {
+  const kept = state.planStepOpen;
+  return kept && kept.has(text) ? kept.get(text) : !!revised;
+}
+
 // One step of the card. `step` is its entry in the plan document (tool, settings, where it runs)
-// when the server sent one; without it the step is its title and prose alone.
-function planStepHtml(text, n, step, revised, showWhere) {
+// when the server sent one; without it the step is its title and prose alone. The title, the tool
+// and the settings are always shown; the prose is two lines until the step is opened.
+// `edit`: the plan is waiting and has a document, so its title and setting values can be changed
+// in place and (`edit.remove`) the step removed (wirePlanCardEdits).
+function planStepHtml(text, n, step, revised, showWhere, edit) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
+  const editable = !!(edit && step && step.id);
+  const editAttrs = (what, key) => editable
+    ? ` data-edit="${what}"${key ? ` data-key="${escapeHtml(key)}"` : ""} tabindex="0" role="button" `
+      + `title="${what === "title" ? "Change the title" : `Change ${escapeHtml(key)}`}"`
+    : "";
   const chips = Object.keys(settings).map((k) =>
     `<span class="plan-setting" title="Passed to the tool exactly as written">`
     + `<span class="plan-setting-k">${escapeHtml(k)}</span>`
-    + `<span class="plan-setting-v">${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
+    + `<span class="plan-setting-v${editable ? " editable" : ""}"${editAttrs("setting", k)}>`
+    + `${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
   const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
   const meta = (chips || where)
     ? `<div class="plan-step-meta">${chips}`
       + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
       + `</div>`
     : "";
-  return `<li class="plan-step${revised ? " revised" : ""}">`
+  const open = !!parts.body && planStepOpen(text, revised);
+  return `<li class="plan-step${revised ? " revised" : ""}${open ? " open" : ""}"`
+    + (editable ? ` data-id="${escapeHtml(step.id)}"` : "") + `>`
     + `<span class="plan-step-num">${n}</span>`
     + `<div class="plan-step-main">`
-    + `<div class="plan-step-head"><span class="plan-step-title">${renderMarkdown(parts.title)}</span>`
+    + `<div class="plan-step-head"><span class="plan-step-title${editable ? " editable" : ""}"${editAttrs("title")}>`
+    + `${renderMarkdown(parts.title)}</span>`
     + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
     + (step && step.tool ? `<code class="plan-step-tool">${escapeHtml(step.tool)}</code>` : "")
-    + `</div>`
-    + (parts.body ? `<div class="plan-step-body">${renderMarkdown(parts.body)}</div>` : "")
+    + `<span class="plan-step-acts">`
+    + (editable && edit.remove ? `<button type="button" class="plan-step-remove" data-step-remove `
+      + `aria-label="Remove step ${n}" title="Remove this step">${planIcon("delete")}</button>` : "")
+    + (parts.body ? `<button type="button" class="plan-step-more" data-step-more aria-expanded="${open}" `
+      + `aria-label="Show the whole step" title="Show the whole step">${planIcon("expand_more")}</button>` : "")
+    + `</span></div>`
+    + (parts.body ? `<div class="plan-step-body">${planEmphasisHtml(renderMarkdown(parts.body), settings)}</div>` : "")
     + meta + `</div></li>`;
 }
 
@@ -3760,30 +3830,56 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
   const docSteps = (doc && doc.steps) || [];
   const revised = new Set((revisedSteps || []).map(Number));
   const { sub, onePlace } = planSub(agenda, docSteps);
+  const prose = agenda.map((s, i) => [s, i + 1]).filter(([s]) => planStepParts(s).body);
+  const allOpen = prose.length > 0 && prose.every(([s, n]) => planStepOpen(s, revised.has(n)));
   const head = `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
-    + `<div><div class="plan-title">${mode === "saved" ? "Plan" : "Proposed plan"}</div><div class="plan-sub">${sub}</div></div></div>`;
+    + `<div><div class="plan-title">${mode === "saved" ? "Plan" : "Proposed plan"}</div><div class="plan-sub">${sub}</div></div>`
+    + (prose.length ? `<button type="button" class="plan-expand" data-plan-expand>${allOpen ? "Collapse all" : "Expand all"}</button>` : "")
+    + `</div>`;
+  // A waiting plan with a document is changed on its cards; one step is never removed (to run
+  // nothing, the plan is cancelled).
+  const edit = mode === "review" && doc && doc.yaml ? { remove: agenda.length > 1 } : null;
   const steps = `<ol class="plan-steps">`
-    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace)).join("")
+    + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace, edit)).join("")
     + `</ol>`;
   if (mode !== "review") {
     return head + steps + planDocumentHtml(doc)
       + `<div class="plan-actions-row"><span class="plan-actions-status">${escapeHtml(o.status || "")}</span></div>`;
   }
-  return head + planRevisedNote(revised) + steps
+  const tip = edit ? `<div class="plan-edit-tip">${planIcon("edit")}<span>Click a title or a value to change it, `
+    + `or remove a step. Applied as written, without the model; the other steps stay as they are.</span></div>` : "";
+  return head + planRevisedNote(revised) + tip + steps
+    + planReviseHtml(o.words)
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
     + (o.expiry ? `<div class="plan-expiry" role="status">${planIcon("hourglass_bottom")}<span>${escapeHtml(o.expiry)}</span></div>` : "")
     + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
     + (doc && doc.yaml ? `<button class="secondary" data-plan="yaml">${planIcon("data_object")}<span>Edit as YAML</span></button>` : "")
-    + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
-    + `<span class="plan-actions-hint">or reply below to change it</span></div>`;
+    + `<button class="secondary quiet" data-plan="cancel">Cancel</button></div>`;
+}
+
+// The two ways to change a waiting plan sit together in the panel: say what to change, here or in
+// the chat (the PI makes the change), or edit the document itself (Edit as YAML, applied by code).
+// `words` is what was typed here and not sent, so a redraw of the panel keeps it.
+function planReviseHtml(words) {
+  return `<div class="plan-revise">`
+    + `<div class="plan-revise-head">${planIcon("chat")}<span>Change it in words</span></div>`
+    + `<div class="plan-revise-row"><textarea class="plan-revise-text" rows="2" `
+    + `aria-label="Tell the PI what to change in the plan" `
+    + `placeholder="e.g. drop the enrichment step, and cluster at resolution 0.8">${escapeHtml(words || "")}</textarea>`
+    + `<button class="secondary small" data-plan="revise" disabled>${planIcon("send")}<span>Send</span></button></div>`
+    + `<div class="plan-revise-draft" hidden>${planIcon("info")}<span>Your YAML edit is not applied yet: it is applied `
+    + `first, and the PI changes the plan with it.</span></div>`
+    + `<div class="plan-revise-tip">The PI changes the plan as it stands, with your own changes, and shows it to you `
+    + `again; nothing runs until you run it. A question gets an answer and leaves the plan as it is. Same as replying `
+    + `in the chat.</div></div>`;
 }
 
 // The document of a plan that is no longer waiting: there to read and copy, not to edit.
 function planDocumentHtml(doc) {
   if (!doc || !doc.yaml) return "";
   return `<details class="plan-yaml plan-yaml-read"><summary class="plan-yaml-file">${planIcon("data_object")}plan.yaml</summary>`
-    + `<pre class="plan-yaml-text">${escapeHtml(doc.yaml)}</pre></details>`;
+    + `<div class="plan-yaml-code"><pre class="plan-yaml-hl">${planYamlHtml(doc.yaml)}</pre></div></details>`;
 }
 
 // The plan as the chat shows it: the step titles and the tool each one runs, with the decision
@@ -3845,10 +3941,260 @@ function planEditorHtml(doc) {
     + `<span class="plan-yaml-tip">Change a setting, reword, remove, reorder or add a step. `
     + `Your edit is applied exactly as written; nothing else in the plan changes.</span></div>`
     + banner
+    // The text is typed into the textarea and read from the highlighted copy under it: the textarea's
+    // own text is transparent, and the copy follows its scrolling (wirePlanEditor).
+    + `<div class="plan-yaml-code plan-yaml-stack">`
+    + `<pre class="plan-yaml-hl" aria-hidden="true">${planYamlHtml(text)}</pre>`
     + `<textarea class="plan-yaml-text" rows="${rows}" spellcheck="false" autocapitalize="off" `
-    + `autocomplete="off" aria-label="The plan as YAML">${escapeHtml(text)}</textarea>`
+    + `autocomplete="off" aria-label="The plan as YAML">${escapeHtml(text)}</textarea></div>`
     + `<div class="plan-yaml-actions"><button class="secondary small" data-plan="edit" disabled>Apply edits</button>`
     + `<button class="secondary quiet small" data-plan="reset">Reset</button></div></div>`;
+}
+
+// The plan document as text to read: keys quiet, and what a reviewer looks for — each step's id and
+// title, its tool, the settings passed to it — in bold. Line by line, character for character: the
+// editor draws this under its own (transparent) text, so it must never add or drop one.
+function planYamlHtml(text) {
+  let block = -1;      // column of the key whose block scalar (`does: >-`) the deeper lines belong to
+  let settings = -1;   // column of `settings:`; the keys under it are the tool's arguments
+  const VALUE = { id: "y-id", title: "y-title", tool: "y-tool", plan: "y-meta", request: "y-meta", runs_on: "y-meta" };
+  return String(text == null ? "" : text).split("\n").map((line) => {
+    const col = line.length - line.trimStart().length;
+    if (block >= 0 && (!line.trim() || col > block)) return line.trim() ? `<span class="y-prose">${escapeHtml(line)}</span>` : escapeHtml(line);
+    block = -1;
+    if (line.trimStart().startsWith("#")) return `<span class="y-c">${escapeHtml(line)}</span>`;
+    const m = /^(\s*)(-\s+)?([^\s:#"'][^:#]*?):(?=\s|$)(\s*)(.*)$/.exec(line);
+    if (!m) return escapeHtml(line);
+    const [, sp, dash = "", key, gap, rest] = m;
+    const keyCol = sp.length + dash.length;
+    if (settings >= 0 && keyCol <= settings) settings = -1;
+    const inSettings = settings >= 0;
+    if (key === "settings" && !rest) settings = keyCol;
+    const c = /^([^"'#]*?)(\s+#.*)$/.exec(rest);
+    const value = c ? c[1] : rest;
+    const scalar = /^[>|][+-]?\d*$/.test(value);
+    if (scalar) block = keyCol;
+    const cls = inSettings ? "y-val" : scalar ? "y-ind" : (VALUE[key] || "y-v");
+    return escapeHtml(sp)
+      + (dash ? `<span class="y-d">-</span>${escapeHtml(dash.slice(1))}` : "")
+      + `<span class="${inSettings ? "y-sk" : "y-k"}">${escapeHtml(key)}</span><span class="y-p">:</span>${escapeHtml(gap)}`
+      + (value ? `<span class="${cls}">${escapeHtml(value)}</span>` : "")
+      + (c ? `<span class="y-c">${escapeHtml(c[2])}</span>` : "");
+  }).join("\n");
+}
+
+// ---- changing the plan on its cards ----------------------------------------------------------------
+// A title, a setting's value or a removed step is written into the plan DOCUMENT, line by line, and
+// sent as an edit: the server parses it, checks it against the tools and applies it by code, with no
+// model, exactly like an edit made in the YAML editor. Every other line stays as the server wrote it,
+// so the edit holds this one change and nothing else.
+
+function planYamlUnquote(text) {
+  const s = String(text == null ? "" : text).trim();
+  if (s.startsWith('"')) { try { return String(JSON.parse(s)); } catch { return s; } }
+  if (s.startsWith("'") && s.endsWith("'") && s.length > 1) return s.slice(1, -1).replace(/''/g, "'");
+  return s;
+}
+
+const PLAN_YAML_NUMBER = /^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/;
+
+// A number as the server's YAML reader reads one: `1e-07` would be a STRING to it, `1.0e-07` a float.
+function planYamlNumber(n, float) {
+  if (!float && Number.isInteger(n)) return String(n);
+  const s = String(n).toLowerCase();
+  if (s.includes("e")) {
+    let [m, e] = s.split("e");
+    if (!m.includes(".")) m += ".0";
+    if (!/^[-+]/.test(e)) e = "+" + e;
+    return `${m}e${e}`;
+  }
+  return s.includes(".") ? s : s + ".0";
+}
+
+function planYamlItem(text) {
+  if (PLAN_YAML_NUMBER.test(text)) return planYamlNumber(Number(text), /[.eE]/.test(text));
+  if (/^(true|false)$/i.test(text)) return text.toLowerCase();
+  return JSON.stringify(text);
+}
+
+// What was typed for a setting, written as the same kind of value the document had there: a number
+// stays a number (and a float a float), a list a list, true/false a boolean; anything else is a
+// quoted string. {text} or {error}.
+function planYamlValue(literal, typed) {
+  const raw = String(typed == null ? "" : typed).trim();
+  const was = String(literal == null ? "" : literal).trim();
+  if (/^\[.*\]$/.test(was)) {
+    const items = raw.split(",").map((x) => x.trim()).filter(Boolean);
+    return items.length ? { text: "[" + items.map(planYamlItem).join(", ") + "]" }
+      : { error: "Give at least one value, separated by commas." };
+  }
+  if (/^(true|false)$/i.test(was)) {
+    return /^(true|false)$/i.test(raw) ? { text: raw.toLowerCase() } : { error: "true or false is expected." };
+  }
+  if (PLAN_YAML_NUMBER.test(was)) {
+    return raw && PLAN_YAML_NUMBER.test(raw) ? { text: planYamlNumber(Number(raw), /[.eE]/.test(was)) }
+      : { error: "A number is expected." };
+  }
+  return raw ? { text: JSON.stringify(raw) } : { error: "A value is expected." };
+}
+
+// The plan document with one change made to it. `change`: {id, title} | {id, setting, value} (the
+// value as typed) | {id, remove: true}. {yaml} or {error}: a value of the wrong kind, or a document
+// edited by hand into a shape where the line is not where the server writes it.
+function planYamlEdit(yaml, change) {
+  const lines = String(yaml == null ? "" : yaml).split("\n");
+  const indent = (l) => l.length - l.trimStart().length;
+  const start = lines.findIndex((l) => {
+    const m = /^\s*-\s+id:\s*(.*?)\s*$/.exec(l);
+    return !!m && planYamlUnquote(m[1]) === String(change.id);
+  });
+  if (start < 0) return { error: "This step is no longer in the plan document." };
+  const dash = indent(lines[start]);
+  const keyCol = lines[start].indexOf("id:");
+  let end = start + 1;
+  while (end < lines.length && (!lines[end].trim() || indent(lines[end]) > dash)) end += 1;
+  while (end > start + 1 && !lines[end - 1].trim()) end -= 1;
+  if (change.remove) {
+    lines.splice(start, end - start);
+    return { yaml: lines.join("\n") };
+  }
+  if (change.title !== undefined) {
+    const title = String(change.title).replace(/\s+/g, " ").trim();
+    if (!title) return { error: "A step needs a title." };
+    for (let i = start + 1; i < end; i += 1) {
+      const m = /^(\s*)title:\s*(.*)$/.exec(lines[i]);
+      if (!m || indent(lines[i]) !== keyCol) continue;
+      if (/^[>|]/.test(m[2])) break;
+      lines[i] = `${m[1]}title: ${JSON.stringify(title)}`;
+      return { yaml: lines.join("\n") };
+    }
+    return { error: "The title is not where the plan document keeps it: change it in the YAML editor." };
+  }
+  let settings = -1;
+  for (let i = start + 1; i < end; i += 1) {
+    if (settings < 0) {
+      if (indent(lines[i]) === keyCol && /^\s*settings:\s*$/.test(lines[i])) settings = keyCol;
+      continue;
+    }
+    if (lines[i].trim() && indent(lines[i]) <= settings) break;
+    const m = /^(\s*)("[^"]*"|'[^']*'|[^\s:#"'][^:#]*?):(\s+)(.*)$/.exec(lines[i]);
+    if (!m || planYamlUnquote(m[2]) !== String(change.setting)) continue;
+    const c = /^["']/.test(m[4]) ? null : /^(.*?)(\s+#.*)$/.exec(m[4]);
+    const value = planYamlValue(c ? c[1] : m[4], change.value);
+    if (value.error) return value;
+    lines[i] = `${m[1]}${m[2]}:${m[3]}${value.text}${c ? c[2] : ""}`;
+    return { yaml: lines.join("\n") };
+  }
+  return { error: `${change.setting} is not where the plan document keeps it: change it in the YAML editor.` };
+}
+
+// Make a change on the cards of the plan waiting in chat `c`, and send it. An edit typed in the YAML
+// editor and not applied yet is part of what the person has: the change is made on it, and both go
+// together. Returns why it could not be made, or "".
+function commitPlanChange(c, change) {
+  const doc = c && c.plan && c.plan.kind === "plan" ? c.plan.doc : null;
+  if (!doc || !doc.yaml) return "This plan has no document to change.";
+  const out = planYamlEdit(c.planDraftYaml || doc.yaml, change);
+  if (out.error) return out.error;
+  submitPlan("edit", "", out.yaml, c);
+  return "";
+}
+
+// A title or a setting's value turned into a text box. Enter (or leaving the box) applies a change,
+// Escape puts the value back. A value that cannot be written stays open with the reason on Enter.
+function planInlineEdit(li, el, initial, label, commit) {
+  if (el.querySelector("input")) return;
+  const before = el.innerHTML;
+  const input = document.createElement("input");
+  input.className = "plan-inline-input";
+  input.value = initial;
+  input.setAttribute("aria-label", label);
+  input.spellcheck = false;
+  if (el.classList.contains("plan-setting-v")) input.style.width = `${Math.max(6, String(initial).length + 2)}ch`;
+  el.innerHTML = "";
+  el.appendChild(input);
+  el.classList.add("editing");
+  input.focus();
+  input.select();
+  let done = false;
+  const restore = () => { el.innerHTML = before; el.classList.remove("editing"); };
+  const finish = (save, leaving) => {
+    if (done) return;
+    if (save && input.value.trim() !== String(initial).trim()) {
+      // Sending draws the panel again at once, which takes the focus from this box: `done` first,
+      // so that blur does not send the change a second time.
+      done = true;
+      const why = commit(input.value);
+      if (!why) return;
+      if (!leaving) { done = false; planStepError(li, why); input.focus(); return; }
+      restore();
+      planStepError(li, why);
+      return;
+    }
+    done = true;
+    restore();
+    planStepError(li, "");
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); finish(true, false); }
+    else if (ev.key === "Escape") { ev.preventDefault(); finish(false, false); }
+  });
+  // Leaving the box applies the change, but a box that left because the panel was drawn again (an
+  // expiry warning, a status line) is not the person leaving it: nothing is sent for that.
+  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, true); }, 0));
+}
+
+function planStepError(li, why) {
+  const main = li.querySelector(".plan-step-main");
+  let line = main.querySelector(".plan-step-error");
+  if (!why) { if (line) line.remove(); return; }
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "plan-step-error";
+    line.setAttribute("role", "alert");
+    main.appendChild(line);
+  }
+  line.textContent = why;
+}
+
+function wirePlanCardEdits(host, c, doc) {
+  const steps = (doc && doc.steps) || [];
+  host.querySelectorAll(".plan-step[data-id]").forEach((li) => {
+    const id = li.dataset.id;
+    const step = steps.find((s) => s.id === id) || {};
+    li.querySelectorAll("[data-edit]").forEach((el) => {
+      const isTitle = el.dataset.edit === "title";
+      const key = el.dataset.key || "";
+      const start = () => planInlineEdit(li, el,
+        isTitle ? (step.title || el.textContent) : planSettingText((step.settings || {})[key]),
+        isTitle ? "The step's title" : `The value of ${key}`,
+        (value) => commitPlanChange(c, isTitle ? { id, title: value } : { id, setting: key, value }));
+      el.addEventListener("click", start);
+      el.addEventListener("keydown", (ev) => {
+        if (ev.target !== el || (ev.key !== "Enter" && ev.key !== " ")) return;
+        ev.preventDefault();
+        start();
+      });
+    });
+    const remove = li.querySelector("[data-step-remove]");
+    if (!remove) return;
+    remove.addEventListener("click", () => {
+      const main = li.querySelector(".plan-step-main");
+      if (main.querySelector(".plan-step-confirm")) return;
+      const ask = document.createElement("div");
+      ask.className = "plan-step-confirm";
+      ask.innerHTML = `<span>Remove this step from the plan?</span>`
+        + `<button type="button" class="secondary small" data-yes>Remove</button>`
+        + `<button type="button" class="secondary quiet small" data-no>Keep</button>`;
+      main.appendChild(ask);
+      ask.querySelector("[data-no]").addEventListener("click", () => ask.remove());
+      ask.querySelector("[data-yes]").addEventListener("click", () => {
+        const why = commitPlanChange(c, { id, remove: true });
+        if (why) { ask.remove(); planStepError(li, why); }
+      });
+      ask.querySelector("[data-yes]").focus();
+    });
+  });
 }
 
 // The waiting plan: its entry in the chat (titles, Run / Open plan / Cancel) and the whole plan, with
@@ -3876,6 +4222,7 @@ function wirePlanEditor(el, c) {
   const panel = el.querySelector(".plan-yaml");
   if (!panel) return;
   const box = panel.querySelector(".plan-yaml-text");
+  const shown = panel.querySelector(".plan-yaml-hl");
   const original = state.planDoc.yaml;
   const apply = panel.querySelector('[data-plan="edit"]');
   const runButtons = () => [el.querySelector('[data-plan="approve"]'),
@@ -3884,7 +4231,9 @@ function wirePlanEditor(el, c) {
   const label = () => { toggle.querySelector("span:last-child").textContent = panel.classList.contains("hidden") ? "Edit as YAML" : "Hide YAML"; };
   // While the box holds an edit that has not been applied, "Run this plan" would run the plan
   // WITHOUT it. So the edit becomes the primary action and Run waits for Apply or Reset.
+  const follow = () => { if (shown) { shown.scrollTop = box.scrollTop; shown.scrollLeft = box.scrollLeft; } };
   const sync = () => {
+    if (shown) { shown.innerHTML = planYamlHtml(box.value); follow(); }
     const dirty = notePlanDraft(box.value, c);
     apply.disabled = !dirty;
     apply.classList.toggle("primary", dirty);
@@ -3893,6 +4242,7 @@ function wirePlanEditor(el, c) {
       run.disabled = dirty;
       run.title = dirty ? "Apply or reset your edit first" : "";
     }
+    refreshPlanRevise(el, c);
   };
   toggle.addEventListener("click", () => {
     panel.classList.toggle("hidden");
@@ -3901,6 +4251,7 @@ function wirePlanEditor(el, c) {
     if (!panel.classList.contains("hidden")) box.focus();
   });
   box.addEventListener("input", sync);
+  box.addEventListener("scroll", follow);
   // Tab indents (YAML is indentation) instead of leaving the box.
   box.addEventListener("keydown", (ev) => {
     if (ev.key !== "Tab" || ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
@@ -3968,17 +4319,112 @@ function renderPlanPanel() {
   if (tab) tab.classList.toggle("waiting", !!(c && c.plan && c.plan.kind === "plan"));
   const view = chatPlanView(c);
   if (!view) {
-    host.innerHTML = '<div class="downloads-empty">No plan in this chat yet. When the PI proposes one it opens here: every step, the settings it fixes, and the plan as a YAML document you can edit.</div>';
+    host.innerHTML = '<div class="downloads-empty">No plan in this chat yet. When the PI proposes one it opens here: every step and the settings it fixes. You can change it in words, or edit it as a YAML document.</div>';
     return;
   }
   host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
     + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
-                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "" })
+                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "",
+                     words: (c && c.planWords) || "" })
     + `</div>`;
+  wirePlanSteps(host, view.agenda || []);
   if (view.mode !== "review") return;
   host.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
   host.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
+  wirePlanRevise(host, c);
+  wirePlanCardEdits(host, c, view.doc);
   wirePlanEditor(host, c);
+}
+
+// The panel's "Change it in words" box. Enter sends (Shift+Enter is a new line). An edit in the YAML
+// editor that is not applied goes with the words (revisePlanInWords), and the box says so.
+function wirePlanRevise(host, c) {
+  const box = host.querySelector(".plan-revise-text");
+  const send = host.querySelector('[data-plan="revise"]');
+  if (!box || !send) return;
+  const go = () => {
+    const text = box.value.trim();
+    if (!text || send.disabled) return;
+    box.value = "";
+    revisePlanInWords(c, text);
+  };
+  box.addEventListener("input", () => { c.planWords = box.value; refreshPlanRevise(host, c); });
+  box.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;
+    ev.preventDefault();
+    go();
+  });
+  send.addEventListener("click", go);
+  refreshPlanRevise(host, c);
+}
+
+function refreshPlanRevise(host, c) {
+  const box = host.querySelector(".plan-revise-text");
+  const send = host.querySelector('[data-plan="revise"]');
+  if (!box || !send) return;
+  send.disabled = !box.value.trim();
+  const note = host.querySelector(".plan-revise-draft");
+  if (note) note.hidden = !(c && c.planDraftYaml);
+}
+
+// A step opens and closes by its chevron, or opens by a click on its two lines; "Expand all" does
+// every step. What the person chose is kept per step text, so a redraw (a status line, an expiry
+// warning, a revision that left the step alone) does not fold it again.
+function wirePlanSteps(host, agenda) {
+  const items = [...host.querySelectorAll(".plan-step")];
+  const setOpen = (li, i, open) => {
+    li.classList.toggle("open", open);
+    const more = li.querySelector("[data-step-more]");
+    if (more) more.setAttribute("aria-expanded", String(open));
+    state.planStepOpen.set(agenda[i], open);
+  };
+  items.forEach((li, i) => {
+    const body = li.querySelector(".plan-step-body");
+    const more = li.querySelector("[data-step-more]");
+    if (!body || !more) return;
+    more.addEventListener("click", () => { setOpen(li, i, !li.classList.contains("open")); fitPlanSteps(host); });
+    body.addEventListener("click", () => {
+      if (li.classList.contains("open") || !planStepFoldable(li) || String(window.getSelection() || "")) return;
+      setOpen(li, i, true);
+      fitPlanSteps(host);
+    });
+  });
+  const all = host.querySelector("[data-plan-expand]");
+  if (all) {
+    all.addEventListener("click", () => {
+      const open = items.filter(planStepFoldable).some((li) => !li.classList.contains("open"));
+      items.forEach((li, i) => { if (planStepFoldable(li)) setOpen(li, i, open); });
+      fitPlanSteps(host);
+    });
+  }
+  // The panel slides open after it is drawn, and its width changes with the window: whether a step's
+  // prose fits in two lines is measured again whenever its size does.
+  if (!host.planFitObserver && typeof ResizeObserver === "function") {
+    host.planFitObserver = new ResizeObserver(() => fitPlanSteps(host));
+    host.planFitObserver.observe(host);
+  }
+  fitPlanSteps(host);
+}
+
+function planStepFoldable(li) {
+  return !!li.querySelector(".plan-step-body") && !li.classList.contains("fits");
+}
+
+// Prose that fits in two lines has nothing to open, so its step has no chevron. Measured only while
+// the panel is laid out: hidden, every step keeps its chevron.
+function fitPlanSteps(host) {
+  const items = [...host.querySelectorAll(".plan-step")];
+  for (const li of items) {
+    const body = li.querySelector(".plan-step-body");
+    if (!body) continue;
+    const lh = parseFloat(getComputedStyle(body).lineHeight);
+    li.classList.toggle("fits", body.clientWidth > 0 && lh > 0 && body.scrollHeight <= lh * 2 + 2);
+  }
+  const all = host.querySelector("[data-plan-expand]");
+  if (!all) return;
+  const foldable = items.filter(planStepFoldable);
+  all.hidden = !foldable.length;
+  all.textContent = foldable.every((li) => li.classList.contains("open")) ? "Collapse all" : "Expand all";
 }
 
 // The right-hand panel holds two things, one at a time: the plan and the results.
@@ -4217,6 +4663,18 @@ function hidePlanPanel(c = activeChat()) {
   updateComposerButton();
 }
 
+// A change to the waiting plan asked for in words, typed in the composer or in the side panel's box:
+// it shows in the chat as the person's message and goes to the PI as feedback. The PI answers a
+// question and sends the plan back as it was, or makes the change on the plan document and sends
+// it back for review; nothing runs until the person runs it. Words are always about the plan as the
+// person has it: an edit of the document they have not applied yet goes with them, and the server
+// applies it first (by code) and makes the change on the edited plan.
+function revisePlanInWords(c, text) {
+  c.planWords = "";
+  if (chatVisible(c)) appendUserMessage(text);
+  submitPlan("revise", text, c.planDraftYaml || "", c);
+}
+
 // action: "approve" | "revise" | "edit" | "cancel"; feedback only for "revise", planYaml only
 // for "edit" (the plan document as the user edited it).
 async function submitPlan(action, feedback, planYaml, c = activeChat()) {
@@ -4249,7 +4707,8 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   try {
     await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "", plan_yaml: action === "edit" ? (planYaml || "") : "" }),
+      body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "",
+                             plan_yaml: action === "edit" || action === "revise" ? (planYaml || "") : "" }),
     });
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
@@ -4625,10 +5084,12 @@ async function finishStaging(d, id, name, size, signal) {
         if (job.state === "failed" || job.state === "cancelled") return { ...d, status: job.state, error: job.error };
         const status = job.state === "verifying" ? "verifying" : job.state === "unpacking" ? "unpacking" : "staging";
         // "queued" with an error is a copy waiting for its retry, or for an HPC3 session: say so
-        upsertUpload({ id, status, sent: job.sent || 0, size: job.size || size,
+        upsertUpload({ id, status, sent: job.sent || 0, size: job.size || size, dest: job.dest,
           note: job.state === "queued" && job.error ? `Waiting — ${job.error}` : "" });
-        setUploadProgress(id, status === "verifying" ? `Verifying ${name} on HPC3…`
-          : status === "unpacking" ? `Unpacking ${name} on HPC3…`
+        const w = stagingWords(job);
+        setUploadProgress(id, status === "verifying" ? `${w.verify} ${name}…`
+          : status === "unpacking" ? `${w.unpack}: ${name}…`
+          : job.dest === "server" ? `Checking ${name} on the server…`
           : `Copying ${name} to HPC3… ${job.size ? Math.floor((100 * (job.sent || 0)) / job.size) : 0}%${uploadPaceTextFor(id)}`);
       }
       const seen = stagingJobs.get(d.job_id);
@@ -4638,17 +5099,17 @@ async function finishStaging(d, id, name, size, signal) {
     }
   } finally { if (signal) signal.removeEventListener("abort", onAbort); }
 }
-// Each file's row during the copy to HPC3: a file whose copy failed says so (until a retry copies
-// it); once the server has recorded the folder, every copied file is uploaded.
-const COPY_FAILED = "the copy to HPC3 failed";
+// Each file's row during the copy to HPC3 (or its check on the server): a file whose copy failed says
+// so (until a retry copies it); once the server has recorded the folder, every copied file is uploaded.
+const COPY_FAILED = new Set([stagingWords({ dest: "hpc3" }).failed, stagingWords({ dest: "server" }).failed]);
 function markFolderCopies(id, f) {
   const card = state.uploads.find((u) => u.id === id);
   if (!card || !card.fileProgress) return;
   const failed = new Set(f.failed_files || []);
   for (const row of card.fileProgress) {
     const rel = String(row.name || "").split("/").slice(1).join("/");
-    if (failed.has(rel)) { row.status = "error"; row.error = COPY_FAILED; }
-    else if (row.status === "copying" || (row.status === "error" && row.error === COPY_FAILED)) {
+    if (failed.has(rel)) { row.status = "error"; row.error = stagingWords(f).failed; }
+    else if (row.status === "copying" || (row.status === "error" && COPY_FAILED.has(row.error))) {
       row.status = f.recorded ? "done" : "copying"; row.error = "";
     }
   }
@@ -4669,11 +5130,13 @@ async function finishFolderStaging(folder, d, id, signal) {
       if (f) {
         markFolderCopies(id, f);
         if (f.recorded) return { ...d, status: "registered", name: d.name || f.original_name || folder, path: f.remote_root || d.path, size: f.size, count: f.count, kept: f.kept_count || 0 };
-        if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files did not reach HPC3`);
+        if (f.pending === 0 && f.failed > 0) throw new Error(`${f.failed} of ${f.count} files ${stagingWords(f).missing}`);
         // what is on HPC3 before this page first looks (copied meanwhile, or there from an earlier upload) is not speed
         if (first) { uploadPaces.delete(id); first = false; }
-        upsertUpload({ id, status: "staging", filesDone: f.done || 0, filesTotal: f.count || 0, filesFailed: f.failed || 0, sent: f.sent || 0, size: f.size || 0 });
-        setUploadProgress(id, `Copying ${shownFolder(folder, f.original_name)}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
+        upsertUpload({ id, status: "staging", dest: f.dest, filesDone: f.done || 0, filesTotal: f.count || 0, filesFailed: f.failed || 0, sent: f.sent || 0, size: f.size || 0 });
+        setUploadProgress(id, f.dest === "server"
+          ? `Checking ${shownFolder(folder, f.original_name)}/ on the server — ${f.done || 0}/${f.count || "?"} files`
+          : `Copying ${shownFolder(folder, f.original_name)}/ to HPC3 — ${f.done || 0}/${f.count || "?"} files${uploadPaceTextFor(id)}`);
       }
       await nextStagingEvent(STAGING_POLL_MS);
       // every file of a big folder sends events: ask the server at most once a second
@@ -4690,7 +5153,7 @@ async function settleUpload(id, d, name, size, ctrl, attach) {
     upsertUpload({ id, jobId: d.job_id, status: "staging", sent: 0, error: "" });
     d = await finishStaging(d, id, name, size, ctrl.signal);
   }
-  if (d.status === "failed" || d.status === "cancelled") throw new Error(d.error || `copy to HPC3 ${d.status}`);
+  if (d.status === "failed" || d.status === "cancelled") throw new Error(d.error || `upload ${d.status}`);
   upsertUpload({ id, sent: size, status: "done", note: "" });
   const unpacked = d.unpacked;
   // Carry the upload-time content skim (the deterministic peek gist) onto the chip so the user sees
@@ -4860,10 +5323,20 @@ function uploadFileCounts(u) {
   const cancelled = rows.filter((f) => f.status === "cancelled").length;
   return { done, failed, cancelled, remaining: Math.max(0, (u.filesTotal || rows.length) - done - failed - cancelled) };
 }
+// What the background step after an upload is called: with a data root the upload is kept on the
+// server (job.dest "server") and the queue only checks it there (and unpacks an archive); otherwise
+// it is copied to HPC3. A declaration, so the code above it can use it too.
+function stagingWords(x) {
+  return x && x.dest === "server"
+    ? { copying: "Checking", verify: "Checking", unpack: "Unpacking on the server", failed: "the check on the server failed",
+        missing: "failed their check on the server" }
+    : { copying: "Copying to HPC3", verify: "Verifying on HPC3", unpack: "Unpacking on HPC3", failed: "the copy to HPC3 failed",
+        missing: "did not reach HPC3" };
+}
 function uploadFileRows(u) {
   return (u.fileProgress || []).map((f) => {
     const pct = f.size ? Math.min(100, Math.round(f.sent / f.size * 100)) : f.status === "done" ? 100 : 0;
-    const label = { queued: "Waiting", uploading: "Uploading", verifying: "Verifying", copying: "Copying to HPC3", done: "Uploaded", error: "Failed", cancelled: "Cancelled" }[f.status] || f.status;
+    const label = { queued: "Waiting", uploading: "Uploading", verifying: "Verifying", copying: stagingWords(u).copying, done: "Uploaded", error: "Failed", cancelled: "Cancelled" }[f.status] || f.status;
     return `<div class="upload-file ${f.status}"><span class="upload-file-name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</span>` +
       `<span>${fmtUploadSize(f.sent)} / ${fmtUploadSize(f.size)} · ${pct}%</span>` +
       `<span title="${escapeHtml(f.error || "")}">${escapeHtml(label)}${f.error ? `: ${escapeHtml(f.error)}` : ""}</span></div>`;
@@ -4878,9 +5351,9 @@ function uploadCardView(u) {
   if (u.status === "done") stat = "Done";
   else if (u.status === "cancelled") stat = "Cancelled";
   else if (u.status === "queued") stat = "Waiting for an upload slot…";
-  else if (u.status === "staging") stat = u.note || `Copying to HPC3… ${files || `${pct}%`}${pace}`;
-  else if (u.status === "verifying") stat = "Verifying on HPC3…";
-  else if (u.status === "unpacking") stat = "Unpacking on HPC3…";
+  else if (u.status === "staging") stat = u.note || (u.dest === "server" ? `Checking on the server… ${files}` : `Copying to HPC3… ${files || `${pct}%`}${pace}`);
+  else if (u.status === "verifying") stat = `${stagingWords(u).verify}…`;
+  else if (u.status === "unpacking") stat = `${stagingWords(u).unpack}…`;
   else if (u.status === "error") stat = `${u.lost ? "Interrupted" : "Failed"} — ${u.error || "interrupted"}`;
   else if (u.status === "pending") stat = u.note || "Interrupted — choose it again to continue";
   else if (u.retrying) stat = `Connection lost at ${files ? files + ", " : ""}${pct}% — trying again…`;
@@ -4888,7 +5361,7 @@ function uploadCardView(u) {
   const buttons = [];
   if (UPLOAD_ACTIVE.includes(u.status)) buttons.push(["cancel", "Cancel"]);
   else if (u.status === "error") {
-    if (u.jobId || u.serverFolder) buttons.push(["retry", "Retry copy"]);
+    if (u.jobId || u.serverFolder) buttons.push(["retry", u.dest === "server" ? "Retry check" : "Retry copy"]);
     else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Retry failed files"] : ["pickdir", "Choose the folder again"]);
     else if (u.file) buttons.push(["resume", "Resume"]);
     buttons.push(["dismiss", "Dismiss"]);
@@ -5189,8 +5662,8 @@ async function restoreStagingCards() {
     const id = `j${job.id}`;
     // the chat it was started from gets its progress back, and the data once it is there
     const chat = job.conversation_id || null;
-    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, chat, attach: !!chat, note: "" };
-    if (job.state === "failed") { upsertUpload({ ...base, status: "error", error: job.error || "the copy to HPC3 failed" }); continue; }
+    const base = { id, kind: "file", name: job.name, size: job.size, sent: job.sent || 0, jobId: job.id, dest: job.dest, chat, attach: !!chat, note: "" };
+    if (job.state === "failed") { upsertUpload({ ...base, status: "error", error: job.error || stagingWords(job).failed }); continue; }
     const ctrl = new AbortController();
     upsertUpload({ ...base, status: "staging", error: "", ctrl });
     settleUpload(id, { status: "staging", job_id: job.id, name: job.name, size: job.size }, job.name, job.size, ctrl, !!chat)
@@ -5201,9 +5674,9 @@ async function restoreStagingCards() {
     if (f.recorded || !f.registered || tracked.has(`folder:${f.name}`)) continue;
     const id = `jf${Math.abs(hashStr(f.name)).toString(36)}`;
     const chat = f.conversation_id || null;
-    const base = { id, kind: "folder", name: `${f.name}/`, size: f.size || 0, sent: f.sent || 0, filesDone: f.done || 0,
-      filesTotal: f.count || 0, serverFolder: f.name, chat, attach: !!chat, note: "" };
-    if (!f.pending && f.failed) { upsertUpload({ ...base, status: "error", error: `${f.failed} of ${f.count} files did not reach HPC3` }); continue; }
+    const base = { id, kind: "folder", name: `${shownFolder(f.name, f.original_name)}/`, size: f.size || 0, sent: f.sent || 0, filesDone: f.done || 0,
+      filesTotal: f.count || 0, serverFolder: f.name, dest: f.dest, chat, attach: !!chat, note: "" };
+    if (!f.pending && f.failed) { upsertUpload({ ...base, status: "error", error: `${f.failed} of ${f.count} files ${stagingWords(f).missing}` }); continue; }
     const ctrl = new AbortController();
     upsertUpload({ ...base, status: "staging", error: "", ctrl });
     followFolder(id, f.name, {}, ctrl, !!chat).catch((err) => failUpload(id, err, `${f.name}/`, ctrl)).finally(() => setUploadProgress(id, null));
@@ -5803,6 +6276,9 @@ function initShell() {
   $("runsList").addEventListener("click", onRunsClick);
   $("adminRefresh").addEventListener("click", loadAdminUsers);
   $("systemRefresh").addEventListener("click", loadSystem);
+  $("systemRuns").addEventListener("click", onSystemRunsClick);
+  wireSysCatalog();
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && sysLive.timer) pollSystemLive(); });
   $("createUserForm").addEventListener("submit", createUser);
   $("changePwForm").addEventListener("submit", changePassword);
   $("logoutBtn").addEventListener("click", doLogout);
@@ -5844,11 +6320,14 @@ function switchView(name) {
   else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
   else if (name === "account") { renderAccount(state.user); loadUsage(); }
   else if (name === "system") loadSystem();
+  if (name !== "system") stopSystemLive();
 }
 
-// ---- System view (live agents / tools / capabilities / roadmap) ----
+// ---- System view (capabilities / agents / pipelines, tools and skills) ----
 async function loadSystem() {
-  const el = $("systemBody"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
+  const el = $("systemBody");
+  const query = ($("sysSearch") || {}).value || "";       // a Refresh keeps the search
+  el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
     const d = await (await fetch("/api/system")).json();
     const cap = (k, v) => `<span class="cap ${v ? "on" : "off"}">${v ? "✓" : "✕"} ${escapeHtml(k)}</span>`;
@@ -5857,100 +6336,564 @@ async function loadSystem() {
       `<div class="card"><div class="card-main"><strong>${escapeHtml(a.name)}</strong>` +
       `<span class="muted">${escapeHtml(a.role)} · ${escapeHtml(a.where)}</span>` +
       `<span class="sys-desc">${escapeHtml(a.description)}</span></div></div>`).join("");
-    // tools grouped by category
-    const byCat = {};
-    (d.tools || []).forEach((t) => { (byCat[t.category] = byCat[t.category] || []).push(t); });
-    const tools = Object.keys(byCat).sort().map((c) =>
-      `<div class="sys-cat"><h4>${escapeHtml(c)}</h4>` + byCat[c].map((t) =>
-        `<div class="card"><div class="card-main"><strong>${escapeHtml(t.name)}` +
-        `${t.reads_private_data ? ' <span class="tag-priv">private data</span>' : ""}</strong>` +
-        `<span class="sys-desc">${escapeHtml(t.description)}</span>` +
-        `${t.requires.length ? `<span class="muted">needs: ${t.requires.map(escapeHtml).join(", ")}</span>` : ""}</div>` +
-        `<span class="cap ${t.available ? "on" : "off"}">${t.available ? "available" : "unavailable"}</span></div>`
-      ).join("") + "</div>").join("");
-    const flows = (d.workflows || []).map((w) =>
-      `<div class="card flow"><div class="card-main"><strong>${escapeHtml(w.name)} ` +
-      `<span class="flow-kind">${escapeHtml(w.kind)}</span></strong>` +
-      `<span class="sys-desc">${escapeHtml(w.description)}</span>` +
-      `<div class="flow-stages">${(w.stages || []).map((s) =>
-        `<span class="flow-stage">${escapeHtml(s)}</span>`).join('<span class="flow-arrow">→</span>')}</div>` +
-      `</div></div>`).join("");
     const specialists = (d.specialists || []).map((s) =>
       `<div class="card"><div class="card-main"><strong>${escapeHtml(s.name)}</strong>` +
       `<span class="sys-desc">${escapeHtml(s.persona)}</span></div></div>`).join("");
     el.innerHTML =
       `<h3>Capabilities (this server)</h3><div class="cap-row">${caps}</div>` +
+      `<p class="sys-note">What the web server has itself. A tool that runs on HPC3 brings its software in ` +
+      `its job's container, so it is not checked here: each tool below says where it runs.</p>` +
       `<h3>Agents</h3><div class="card-list">${agents}</div>` +
       (specialists ? `<h3>Scientist specialists</h3><div class="card-list">${specialists}</div>` : "") +
-      `<h3>Workflow presets</h3><div class="card-list">${flows}</div>` +
-      `<h3>Tools / skills</h3>${tools}`;
+      sysCatalogHtml(d);
+    if (query) { $("sysSearch").value = query; sysCatalogFilter(query); }
     renderWorkflowGraph(d.graph);
+    startSystemLive();
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load system overview.</div>'; }
 }
 
-// ---- Live workflow graph (read-only; reflects the current code) ----
-let _cy = null;
-const _GRAPH_FILL = { agent: "#DCCCFF", output: "#C6FAF6", preset: "#FFE0C2", persona: "#FFECBD", tool: "#CDF4D3" };
-const _GRAPH_STROKE = { agent: "#874FFF", output: "#5AD8CC", preset: "#FF9E42", persona: "#FFC943", tool: "#66D575" };
+// Pipelines, tools and skills: one line each (name, summary, where it runs), the whole text when a
+// row is opened, and one search over all three. A row's data-q holds everything the search reads.
+function sysSearchText(parts) {
+  const raw = parts.filter((p) => p !== undefined && p !== null && p !== "").join(" \n ").toLowerCase();
+  return raw + " \n " + raw.replace(/[_\-·]+/g, " ");      // "cell type" finds cell-type and cell_type
+}
+
+function sysMatch(query, text) {
+  const terms = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+  return terms.every((t) => text.includes(t));
+}
+
+function sysKv(rows) {
+  const html = rows.filter(([, v]) => v).map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${v}</dd>`).join("");
+  return html ? `<dl class="sys-kv">${html}</dl>` : "";
+}
+
+const sysCode = (s) => `<code>${escapeHtml(s)}</code>`;
+
+// Whether an opened row's full text starts with its summary line, which then need not show twice.
+function sysRepeats(summary, full) {
+  const head = String(summary || "").replace(/…$/, "").replace(/[*`]/g, "").trim();
+  return !!head && String(full || "").replace(/[*`]/g, "").replace(/\s+/g, " ").startsWith(head);
+}
+
+function sysPipelineItem(p) {
+  const type = METHOD_DATA_TYPES[p.data_type] || p.data_type || "";
+  const tools = (p.tools || []).map((t) =>
+    `<button type="button" class="sys-q" data-sys-tool="${escapeHtml(t)}" title="Show ${escapeHtml(t)} in Tools">${escapeHtml(t)}</button>`).join("");
+  const long = p.description && p.description !== p.summary ? `<div class="sys-md">${renderMarkdown(p.description)}</div>` : "";
+  return {
+    id: `pipeline:${p.key}`, name: p.title || p.key, summary: p.summary, repeats: !!long && sysRepeats(p.summary, p.description),
+    tags: type ? [{ text: type }] : [],
+    body: long + sysKv([["Tools", tools && `<div class="sys-qs">${tools}</div>`], ["Key", sysCode(p.key)],
+                        ["Protocol", sysCode(`preset_pipelines/${p.key}/`)]]),
+    text: sysSearchText([p.title, p.key, p.summary, p.description, type, ...(p.tools || [])]),
+  };
+}
+
+function sysToolItem(t) {
+  const tags = [{ text: t.where || t.runs_on || "", title: "Where it runs" }];
+  if (t.available === false) tags.push({ text: "unavailable here", cls: "off" });
+  if (t.reads_private_data) tags.push({ text: "private data", cls: "priv", title: "Reads the user's data" });
+  return {
+    id: `tool:${t.name}`, name: t.name, mono: true, summary: t.summary || t.description, tags,
+    body: `<div class="sys-k">What the model is told</div><div class="sys-md">${renderMarkdown(t.description)}</div>` +
+      sysKv([["Runs on", escapeHtml(t.where || t.runs_on || "")], ["Category", escapeHtml(t.category || "")],
+             ["Needs", (t.requires || []).map(escapeHtml).join(", ")],
+             ["Here", typeof t.available === "boolean" ? (t.available ? "available on this server" : "not installed on this server") : ""],
+             ["Code", t.code ? sysCode(t.code) : ""]]),
+    text: sysSearchText([t.name, t.summary, t.description, t.category, t.where, t.runs_on, ...(t.requires || []),
+                         t.reads_private_data ? "private data" : ""]),
+  };
+}
+
+function sysSkillItem(s) {
+  const tags = [];
+  if (s.category) tags.push({ text: s.category });
+  if (s.image) tags.push({ text: "own environment", title: s.image });
+  if (s.induced) tags.push({ text: "induced", title: "Written by the system from a past run, approved by an admin" });
+  const long = s.description && s.description !== s.summary ? `<div class="sys-md">${renderMarkdown(s.description)}</div>` : "";
+  const use = s.use ? `<div class="sys-k">When to use</div><div class="sys-md">${renderMarkdown(methodUnwrap(s.use))}</div>` : "";
+  return {
+    id: `skill:${s.name}`, name: s.name, mono: true, summary: s.summary, tags, repeats: !!long && sysRepeats(s.summary, s.description),
+    body: long + use + sysKv([["Files", (s.files || []).map(sysCode).join(" ")], ["Runs in", s.image ? sysCode(s.image) : ""],
+                              ["Replaces", s.supersedes ? sysCode(s.supersedes) : ""]]),
+    text: sysSearchText([s.name, s.summary, s.description, s.use, s.category, ...(s.files || [])]),
+  };
+}
+
+function sysItemHtml(it) {
+  const tags = (it.tags || []).filter((g) => g.text).map((g) =>
+    `<span class="sys-tag${g.cls ? " " + g.cls : ""}"${g.title ? ` title="${escapeHtml(g.title)}"` : ""}>${escapeHtml(g.text)}</span>`).join("");
+  return `<details class="sys-item${it.repeats ? " repeats" : ""}" data-id="${escapeHtml(it.id)}" data-q="${escapeHtml(it.text)}">` +
+    `<summary><span class="sys-item-name${it.mono ? " mono" : ""}">${escapeHtml(it.name)}</span>` +
+    `<span class="sys-item-sum">${escapeHtml(it.summary || "")}</span>` +
+    (tags ? `<span class="sys-item-tags">${tags}</span>` : "") + `</summary>` +
+    `<div class="sys-item-body">${it.body}</div></details>`;
+}
+
+function sysCatalogHtml(d) {
+  const lists = [
+    ["pipelines", "Pipelines", "The protocols the PI picks from for a request", (d.pipelines || []).map(sysPipelineItem)],
+    ["tools", "Tools", "What the Scientist can call, and where each one runs", (d.tools || []).map(sysToolItem)],
+    ["skills", "Skills", "Templates the Scientist fetches when a step needs one", (d.skills || []).map(sysSkillItem)],
+  ];
+  return `<div class="sys-catalog-head"><h3>Pipelines, tools and skills</h3>` +
+    `<input id="sysSearch" type="search" class="preset-search sys-search" autocomplete="off" ` +
+    `placeholder="Search names, descriptions, where it runs…" aria-label="Search pipelines, tools and skills" /></div>` +
+    lists.map(([key, title, hint, items]) =>
+      `<section class="sys-list" data-list="${key}"><h4>${title} <span class="sys-n" data-total="${items.length}">${items.length}</span>` +
+      `<span class="sys-hint">${escapeHtml(hint)}</span></h4>` +
+      `<div class="sys-items">${items.map(sysItemHtml).join("")}</div>` +
+      `<div class="sys-none hidden">Nothing here matches.</div></section>`).join("");
+}
+
+function sysCatalogFilter(query) {
+  for (const list of document.querySelectorAll("#systemBody .sys-list")) {
+    let shown = 0;
+    for (const row of list.querySelectorAll(".sys-item")) {
+      const hit = sysMatch(query, row.dataset.q || "");
+      row.classList.toggle("hidden", !hit);
+      shown += hit;
+    }
+    const n = list.querySelector(".sys-n");
+    n.textContent = query.trim() ? `${shown} of ${n.dataset.total}` : n.dataset.total;
+    list.querySelector(".sys-items").classList.toggle("hidden", !shown);
+    list.querySelector(".sys-none").classList.toggle("hidden", !!shown);
+  }
+}
+
+// A pipeline's tool opens that tool in the Tools list.
+function sysShowTool(name) {
+  const box = $("sysSearch");
+  box.value = name;
+  sysCatalogFilter(name);
+  const row = document.querySelector(`#systemBody .sys-item[data-id="tool:${CSS.escape(name)}"]`);
+  if (row) { row.open = true; row.scrollIntoView({ behavior: "smooth", block: "center" }); }
+}
+
+function wireSysCatalog() {
+  const body = $("systemBody");
+  body.addEventListener("input", (e) => { if (e.target.id === "sysSearch") sysCatalogFilter(e.target.value); });
+  body.addEventListener("keydown", (e) => {
+    if (e.target.id === "sysSearch" && e.key === "Escape" && e.target.value) { e.target.value = ""; sysCatalogFilter(""); }
+  });
+  body.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-sys-tool]");
+    if (b) sysShowTool(b.dataset.sysTool);
+  });
+}
+
+// ---- Live workflow graph: the pipeline from /api/system, the running tasks from /api/system/live ----
+// The graph is drawn once per /api/system load; the tasks move over it. Its stage nodes are the
+// stages the server moves runs through (gateway/run_monitor.py STAGES), its tool nodes the live
+// catalog grouped by where each tool runs, so the picture is the code's, not a drawing of it.
+const SG = { W: 1040, M: 12, NW: 104, NH: 46, LANE_Y: 74, SIDE_Y0: 150, SIDE_DY: 44, SW: 120, SH: 34,
+  AGENT_Y: 268, AW: 116, AH: 36, PLACE_Y: 330, COLW: 128, ROW_H: 22, HEAD: 30, PAD: 8, GAP: 10, BOTTOM: 14 };
+const SG_COLORS = ["#ad5a2b", "#1f7a8c", "#6b4fbb", "#2f8a4a", "#c0446b", "#b07d12"];
+const SG_ROLE = { plan: "PI", critic: "Critic", scientist: "Scientist", audit: "Claim auditor",
+  writer: "Writer", classify: "Router", chat: "Chat", reason: "Model" };
+
+// Positions for every node and a path for every edge. Pure: the same graph always lays out the same.
+function sysGraphLayout(graph) {
+  const nodes = (graph && graph.nodes) || [];
+  const byType = (t) => nodes.filter((n) => n.type === t);
+  const stages = byType("stage").slice().sort((a, b) => ((a.meta || {}).order || 0) - ((b.meta || {}).order || 0));
+  const isMain = (n) => ((n.meta || {}).kinds || []).includes("research");
+  const main = stages.filter(isMain), side = stages.filter((n) => !isMain(n));
+  const pos = {};
+  const step = main.length > 1 ? (SG.W - 2 * SG.M - SG.NW) / (main.length - 1) : 0;
+  main.forEach((n, i) => { pos[n.id] = { x: SG.M + SG.NW / 2 + i * step, y: SG.LANE_Y, w: SG.NW, h: SG.NH, kind: "stage" }; });
+  const first = main[0] ? pos[main[0].id] : { x: SG.M + SG.NW / 2, y: SG.LANE_Y };
+  const last = main.length ? pos[main[main.length - 1].id] : first;
+  const sideX = main.length > 3 ? (pos[main[2].id].x + pos[main[3].id].x) / 2 : SG.W / 2;
+  side.forEach((n, i) => { pos[n.id] = { x: sideX, y: SG.SIDE_Y0 + i * SG.SIDE_DY, w: SG.SW, h: SG.SH, kind: "side" }; });
+
+  const exec = pos.execute || { x: SG.W / 2 };
+  const agentX = { scientist: exec.x, critic: exec.x + 168, model: exec.x - 190 };
+  byType("agent").forEach((n, i) => {
+    pos[n.id] = { x: agentX[n.id] != null ? agentX[n.id] : SG.M + SG.AW / 2 + i * (SG.AW + 20), y: SG.AGENT_Y, w: SG.AW, h: SG.AH, kind: "agent" };
+  });
+
+  // Places as boxes of tool chips, packed into rows and centred; a big box gets more columns.
+  const tools = byType("tool");
+  const boxes = byType("place").map((p) => {
+    const chips = tools.filter((t) => (t.meta || {}).place === p.id);
+    const cols = chips.length > 8 ? 3 : chips.length > 4 ? 2 : 1;
+    const rows = Math.max(1, Math.ceil(chips.length / cols));
+    const inner = cols * SG.COLW + SG.PAD * 2 - 8;
+    // Wide enough for its title too (10.5px bold ≈ 6.4px a character), chips centred under it.
+    const w = Math.max(inner, Math.ceil(String(p.label || "").length * 6.4 + 22));
+    return { p, chips, cols, w, inset: (w - inner) / 2, h: SG.HEAD + rows * SG.ROW_H + SG.PAD };
+  });
+  const rowsOfBoxes = [];
+  let cur = [], width = 0;
+  boxes.forEach((b) => {
+    const need = (cur.length ? SG.GAP : 0) + b.w;
+    if (cur.length && width + need > SG.W - 2 * SG.M) { rowsOfBoxes.push(cur); cur = []; width = 0; }
+    width += (cur.length ? SG.GAP : 0) + b.w;
+    cur.push(b);
+  });
+  if (cur.length) rowsOfBoxes.push(cur);
+  let y = SG.PLACE_Y;
+  rowsOfBoxes.forEach((row) => {
+    const total = row.reduce((s, b) => s + b.w, 0) + SG.GAP * (row.length - 1);
+    let x = (SG.W - total) / 2;
+    const rowH = Math.max(...row.map((b) => b.h));
+    row.forEach((b) => {
+      pos[b.p.id] = { x: x + b.w / 2, y: y + b.h / 2, w: b.w, h: b.h, kind: "place" };
+      b.chips.forEach((t, i) => {
+        const c = i % b.cols, r = Math.floor(i / b.cols);
+        pos[t.id] = { x: x + b.inset + SG.PAD + c * SG.COLW + (SG.COLW - 8) / 2, y: y + SG.HEAD + r * SG.ROW_H + 9,
+          w: SG.COLW - 8, h: 18, kind: "tool" };
+      });
+      x += b.w + SG.GAP;
+    });
+    y += rowH + SG.GAP;
+  });
+  const height = Math.ceil(y - SG.GAP + SG.BOTTOM);
+
+  const edges = [];
+  ((graph && graph.edges) || []).forEach((e, i) => {
+    const a = pos[e.source], b = pos[e.target];
+    if (!a || !b || e.type === "pipeline") return;   // the scRNA order is the chips' own order
+    let d = "", lx = (a.x + b.x) / 2, ly = (a.y + b.y) / 2;
+    if (e.type === "skip") {
+      const top = SG.LANE_Y - SG.NH / 2, x1 = a.x + 14, x2 = b.x - 14, peak = top - 30;
+      d = `M${x1},${top} C${x1},${peak} ${x2},${peak} ${x2},${top}`;
+      lx = (x1 + x2) / 2; ly = peak + 6;
+    } else if (a.kind === "stage" && b.kind === "stage") {
+      d = `M${a.x + a.w / 2},${a.y} L${b.x - b.w / 2},${b.y}`;
+    } else if (b.kind === "side") {          // request -> a side lane: down, then right
+      const r = 10, x0 = a.x, y1 = b.y;
+      d = `M${x0},${a.y + a.h / 2} L${x0},${y1 - r} Q${x0},${y1} ${x0 + r},${y1} L${b.x - b.w / 2},${y1}`;
+    } else if (a.kind === "side") {          // a side lane -> done: right, then up
+      const r = 10, x1 = b.x, y0 = a.y;
+      d = `M${a.x + a.w / 2},${y0} L${x1 - r},${y0} Q${x1},${y0} ${x1},${y0 - r} L${x1},${b.y + b.h / 2}`;
+    } else if (e.source === "scientist" && e.target === "critic") {
+      d = `M${a.x + a.w / 2},${a.y - 6} C${a.x + a.w / 2 + 26},${a.y - 22} ${b.x - b.w / 2 - 26},${b.y - 22} ${b.x - b.w / 2},${b.y - 6}`;
+      ly = a.y - 22;
+    } else if (e.source === "critic" && e.target === "scientist") {
+      d = `M${a.x - a.w / 2},${a.y + 6} C${a.x - a.w / 2 - 26},${a.y + 22} ${b.x + b.w / 2 + 26},${b.y + 22} ${b.x + b.w / 2},${b.y + 6}`;
+      ly = a.y + 24;
+    } else if (b.kind === "place") {
+      const y0 = a.y + a.h / 2, y1 = b.y - b.h / 2;
+      d = `M${a.x},${y0} C${a.x},${(y0 + y1) / 2} ${b.x},${(y0 + y1) / 2} ${b.x},${y1}`;
+      lx = null;
+    } else {
+      d = `M${a.x},${a.y + a.h / 2} L${b.x},${b.y - b.h / 2}`;
+    }
+    edges.push({ id: "e" + i, source: e.source, target: e.target, type: e.type, label: e.label || "", d, lx, ly });
+  });
+  return { width: SG.W, height, pos, edges, first, last };
+}
+
+function _sgAvail(n) { return (n.meta || {}).available === false; }
+
+// The static picture: lanes, agents, places with their tools. Tasks go in the #sgTasks layer.
+function sysGraphSvg(graph, layout) {
+  const L = layout, P = L.pos, out = [];
+  out.push(`<svg class="sg" viewBox="0 0 ${L.width} ${L.height}" role="img" aria-label="Workflow graph with the running tasks">`);
+  out.push('<defs><marker id="sgArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+    '<path d="M0,0 L8,4 L0,8 z" class="sg-arrowhead"/></marker></defs>');
+  out.push('<g class="sg-edges">');
+  // The side lanes cross the Run steps → Scientist line: drawn last, over a halo, they read as a bridge.
+  const isSide = (e) => (P[e.source] || {}).kind === "side" || (P[e.target] || {}).kind === "side";
+  [...L.edges.filter((e) => !isSide(e)), ...L.edges.filter(isSide)].forEach((e) => {
+    const arrow = e.type === "tool" ? "" : ' marker-end="url(#sgArrow)"';
+    if (isSide(e)) out.push(`<path class="sg-edge-halo" d="${e.d}"/>`);
+    out.push(`<path class="sg-edge sg-e-${escapeHtml(e.type)}" data-edge="${escapeHtml(e.source)}>${escapeHtml(e.target)}" d="${e.d}"${arrow}/>`);
+    if (e.label && e.lx != null) out.push(`<text class="sg-elabel" x="${e.lx}" y="${e.ly}">${escapeHtml(e.label)}</text>`);
+  });
+  out.push('</g><g class="sg-links" id="sgLinks"></g><g class="sg-nodes">');
+  (graph.nodes || []).forEach((n) => {
+    const p = P[n.id];
+    if (!p) return;
+    const m = n.meta || {}, x = p.x - p.w / 2, y = p.y - p.h / 2;
+    const attrs = `data-node="${escapeHtml(n.id)}" tabindex="0" role="button" aria-label="${escapeHtml(n.label)}"`;
+    if (p.kind === "place") {
+      out.push(`<g class="sg-node sg-place" ${attrs}><rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="12"/>` +
+        `<text class="sg-place-label" x="${x + 10}" y="${y + 19}">${escapeHtml(n.label)}</text></g>`);
+    } else if (p.kind === "tool") {
+      out.push(`<g class="sg-node sg-tool${_sgAvail(n) ? " sg-off" : ""}" ${attrs}><rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="6"/>` +
+        `<text x="${p.x}" y="${p.y + 3.5}">${escapeHtml(n.label)}</text></g>`);
+    } else {
+      const sub = p.kind === "agent"
+        ? (n.id === "model" ? "every role" : n.id === "scientist" ? `${(m.specialists || []).length} specialists` : "judges each step")
+        : (m.roles || []).map((r) => SG_ROLE[r] || r).join(" · ");
+      const rx = p.kind === "agent" ? p.h / 2 : 12;
+      out.push(`<g class="sg-node sg-${p.kind}" ${attrs}><rect x="${x}" y="${y}" width="${p.w}" height="${p.h}" rx="${rx}"/>` +
+        `<text class="sg-label" x="${p.x}" y="${p.y + (sub ? -2 : 4)}">${escapeHtml(n.label)}</text>` +
+        (sub ? `<text class="sg-sub" x="${p.x}" y="${p.y + 12}">${escapeHtml(sub)}</text>` : "") + "</g>");
+    }
+  });
+  out.push('</g><g class="sg-tasks" id="sgTasks"></g></svg>');
+  return out.join("");
+}
+
+const SG_PER_NODE = 4;          // dots drawn on one node; the rest are a "+n"
+const SG_DONE_LINGER = 90;      // seconds a finished run's dot stays on Done (its card stays 10 minutes)
+
+// Where each run's markers go, and what lights up. Pure (no DOM), so it is tested under node.
+// ``now`` is the server's clock in seconds. Returns { tokens: [{key, run, node, x, y, color, cls, title}],
+// more: [{node, count, x, y}], hot: {node: "hot"|"waiting"}, links: [...], flows: [...] }.
+function sysTaskTargets(graph, layout, runs, now) {
+  const P = layout.pos, has = (id) => !!P[id];
+  const tokens = [], hot = {}, links = [], flows = [], more = {};
+  const atNode = {};
+  const place = (key, run, nodeId, cls, title) => {
+    const p = P[nodeId];
+    if (!p) return;
+    if (!run.ended) hot[nodeId] = hot[nodeId] === "waiting" || cls.includes("waiting") ? "waiting" : "hot";
+    const k = atNode[nodeId] = (atNode[nodeId] || 0) + 1;
+    if (k > SG_PER_NODE) { more[nodeId] = (more[nodeId] || 0) + 1; return; }
+    const small = p.kind === "tool";
+    const x = p.x + p.w / 2 - (small ? 9 : 12) - (k - 1) * (small ? 15 : 19);
+    const y = p.y - p.h / 2 + (small ? 1 : 0);
+    tokens.push({ key, run: run.ordinal, node: nodeId, x, y, color: run.color, cls, title, small });
+  };
+  (runs || []).forEach((r) => {
+    const label = r.mine ? (r.question || "Your run") : (r.owner ? `${r.owner}'s run` : "Another account's run");
+    if (r.ended) {
+      // A finished run arrives at Done and leaves it after a while, without lighting it.
+      if (now == null || now - r.ended <= SG_DONE_LINGER)
+        place(r.key, r, has("done") ? "done" : r.stage, `sg-tok-ended sg-out-${r.outcome || "ended"}`,
+          `${label} — ${r.outcome || "ended"}`);
+      return;
+    }
+    const lane = r.kind === "research" ? null : r.kind;           // chat / corpus
+    const home = lane && has(lane) ? lane : null;
+    const active = r.active || [];
+    if (active.length && ["execute", "chat", "corpus"].includes(r.stage)) {
+      active.forEach((a, i) => {
+        const key = i === 0 ? r.key : `${r.key}:${a.n || i}`;
+        const stepTxt = a.step ? `Step ${a.n ? a.n + ": " : ""}${a.step}` : "";
+        let nodeId = home || "scientist";
+        if (a.phase === "tool" && has("tool:" + a.tool)) nodeId = "tool:" + a.tool;
+        else if (a.phase === "critic" && has("critic")) nodeId = "critic";
+        const what = a.phase === "tool" ? `running ${a.tool}` : a.phase === "critic" ? "the Critic is judging it" : "the model is choosing the next action";
+        place(key, r, nodeId, `sg-tok-${a.phase}`, [label, stepTxt, what].filter(Boolean).join(" — "));
+        if (a.phase === "tool" && nodeId.startsWith("tool:")) links.push({ from: home || "scientist", to: nodeId, color: r.color, cls: "sg-link-tool" });
+        if (a.phase === "model" && has("model")) links.push({ from: "model", to: nodeId, color: r.color, cls: "sg-link-model" });
+      });
+    } else {
+      const nodeId = home || (has(r.stage) ? r.stage : "request");
+      place(r.key, r, nodeId, r.waiting ? "sg-tok-waiting" : "sg-tok-stage",
+        `${label} — ${r.stage_label || r.stage}${r.waiting ? " (waiting for you)" : ""}`);
+      if ((r.llm && (r.llm.thinking || []).length) && has("model")) links.push({ from: "model", to: nodeId, color: r.color, cls: "sg-link-model" });
+    }
+    // The lane edge the run came in on keeps flowing while it is in that stage.
+    const into = (layout.edges || []).find((e) => e.target === (home || r.stage) && e.type === "flow");
+    if (into) flows.push(`${into.source}>${into.target}`);
+  });
+  const extra = Object.entries(more).map(([node, count]) => {
+    const p = P[node], small = p.kind === "tool";
+    return { node, count, x: p.x + p.w / 2 - (small ? 9 : 12) - SG_PER_NODE * (small ? 15 : 19), y: p.y - p.h / 2 };
+  });
+  return { tokens, more: extra, hot, links, flows };
+}
+
+function _sgLinkPath(P, from, to) {
+  const a = P[from], b = P[to];
+  if (!a || !b) return "";
+  const y0 = a.y + (b.y > a.y ? a.h / 2 : -a.h / 2), y1 = b.y + (b.y > a.y ? -b.h / 2 : b.h / 2);
+  const x0 = a.x + (b.x - a.x) * 0.15, x1 = b.x;
+  return `M${x0},${y0} C${x0},${(y0 + y1) / 2} ${x1},${(y0 + y1) / 2} ${x1},${y1}`;
+}
+
+const sysLive = { timer: null, graph: null, layout: null, runs: [], now: null, selected: null, failed: 0, node: null };
 
 function renderWorkflowGraph(graph) {
   const host = $("systemGraph");
   if (!host) return;
-  if (typeof cytoscape === "undefined") { host.innerHTML = '<div class="empty-hint">Graph library not loaded.</div>'; return; }
   if (!graph || !(graph.nodes || []).length) { host.innerHTML = '<div class="empty-hint">No workflow graph.</div>'; return; }
-  if (_cy) { try { _cy.destroy(); } catch {} _cy = null; }
-  host.innerHTML = "";
-  const elements = [];
-  graph.nodes.forEach((n) => elements.push({ data: {
-    id: n.id, label: n.label, ntype: n.type, meta: n.meta || {},
-    dim: n.type === "tool" && n.meta && n.meta.available === false,
-  } }));
-  graph.edges.forEach((e, i) => elements.push({ data: {
-    id: "e" + i, source: e.source, target: e.target, label: e.label || "", etype: e.type || "flow",
-  } }));
-  const roots = graph.nodes.filter((n) => n.type === "preset").map((n) => n.id);
-  _cy = cytoscape({
-    container: host,
-    elements,
-    wheelSensitivity: 0.2,
-    style: [
-      { selector: "node", style: {
-        label: "data(label)", "font-size": "10px", "text-wrap": "wrap", "text-max-width": "120px",
-        "text-valign": "center", "text-halign": "center", shape: "round-rectangle",
-        width: "label", height: "label", padding: "9px", color: "#1E1E1E",
-        "background-color": (n) => _GRAPH_FILL[n.data("ntype")] || "#C2E5FF",
-        "border-color": (n) => _GRAPH_STROKE[n.data("ntype")] || "#3DADFF", "border-width": 1.4,
-      } },
-      { selector: "node[?dim]", style: { opacity: 0.45, "border-style": "dashed" } },
-      { selector: "node:selected", style: { "border-width": 3, "border-color": "#1E1E1E" } },
-      { selector: "edge", style: {
-        label: "data(label)", "font-size": "8px", color: "#8a929c", "curve-style": "bezier",
-        "target-arrow-shape": "triangle", width: 1.2, "line-color": "#b8bfc8", "target-arrow-color": "#b8bfc8",
-        "text-background-color": "#ffffff", "text-background-opacity": 1, "text-background-padding": "1px",
-      } },
-      { selector: 'edge[etype="steer"]', style: { "line-style": "dashed", "line-color": "#FF9E42", "target-arrow-color": "#FF9E42" } },
-      { selector: 'edge[etype="persona"]', style: { "line-style": "dashed", "line-color": "#FFC943", "target-arrow-color": "#FFC943" } },
-      { selector: 'edge[etype="tool"]', style: { "line-style": "dashed", "line-color": "#66D575", "target-arrow-color": "#66D575" } },
-      { selector: 'edge[etype="pipeline"]', style: { "line-color": "#3DADFF", "target-arrow-color": "#3DADFF", width: 2 } },
-    ],
-    layout: { name: "breadthfirst", directed: true, roots: roots.length ? roots : undefined, spacingFactor: 1.15, padding: 14 },
-  });
-  _cy.on("tap", "node", (ev) => showGraphNodeInfo(ev.target.data()));
-  _cy.fit(undefined, 24);
+  sysLive.graph = graph;
+  sysLive.layout = sysGraphLayout(graph);
+  host.innerHTML = sysGraphSvg(graph, sysLive.layout);
+  host.onclick = (ev) => {
+    const g = ev.target.closest("[data-node]");
+    if (g) { sysLive.node = g.dataset.node; showGraphNodeInfo(g.dataset.node); }
+  };
+  host.onkeydown = (ev) => {
+    const g = ev.target.closest && ev.target.closest("[data-node]");
+    if (g && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); sysLive.node = g.dataset.node; showGraphNodeInfo(g.dataset.node); }
+  };
+  paintSystemTasks();
 }
 
-function showGraphNodeInfo(d) {
+// Colour and number each run once, so a run keeps its marker while others come and go.
+const _sgOrdinals = {};
+let _sgNextOrdinal = 1;
+function _sgDecorate(runs) {
+  return (runs || []).map((r) => {
+    if (!_sgOrdinals[r.key]) _sgOrdinals[r.key] = _sgNextOrdinal++;
+    const ordinal = _sgOrdinals[r.key];
+    return { ...r, ordinal, color: SG_COLORS[(ordinal - 1) % SG_COLORS.length] };
+  });
+}
+
+function paintSystemTasks() {
+  const L = sysLive.layout, svg = document.querySelector("#systemGraph svg.sg");
+  if (!L || !svg) return;
+  const t = sysTaskTargets(sysLive.graph, L, sysLive.runs, sysLive.now);
+  svg.querySelectorAll(".sg-node").forEach((g) => {
+    const h = t.hot[g.dataset.node];
+    g.classList.toggle("is-hot", h === "hot");
+    g.classList.toggle("is-waiting", h === "waiting");
+  });
+  const flowing = new Set(t.flows);
+  svg.querySelectorAll(".sg-edge").forEach((p) => p.classList.toggle("is-flowing", flowing.has(p.dataset.edge)));
+  $("sgLinks").innerHTML = t.links.map((l) =>
+    `<path class="sg-link ${l.cls}" d="${_sgLinkPath(L.pos, l.from, l.to)}" style="stroke:${l.color}"/>`).join("");
+  // Markers are kept by key and moved, so a step travelling from the Scientist to a tool to the
+  // Critic glides there instead of blinking.
+  const layer = $("sgTasks"), seen = new Set();
+  t.tokens.forEach((k) => {
+    seen.add(k.key);
+    let g = layer.querySelector(`[data-key="${CSS.escape(k.key)}"]`);
+    if (!g) {
+      g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.setAttribute("data-key", k.key);
+      g.innerHTML = '<circle class="sg-tok-halo" r="13"/><circle class="sg-tok-dot" r="9"/><text class="sg-tok-num" y="3.5"></text><title></title>';
+      const start = L.pos.request || L.first;
+      g.style.transform = `translate(${start.x}px, ${start.y - SG.NH / 2}px)`;
+      layer.appendChild(g);
+      g.getBoundingClientRect();     // commit the start position so the move below animates
+    }
+    g.setAttribute("class", `sg-token ${k.cls}${k.small ? " sg-tok-small" : ""}${sysLive.selected === k.key.split(":")[0] ? " is-selected" : ""}`);
+    g.style.transform = `translate(${k.x}px, ${k.y}px)`;
+    g.style.setProperty("--tok", k.color);
+    g.querySelector(".sg-tok-dot").setAttribute("r", k.small ? "7.5" : "9");
+    g.querySelector(".sg-tok-num").textContent = String(k.run);
+    g.querySelector("title").textContent = k.title;
+  });
+  layer.querySelectorAll(".sg-token").forEach((g) => { if (!seen.has(g.dataset.key)) g.remove(); });
+  layer.querySelectorAll(".sg-more").forEach((g) => g.remove());
+  t.more.forEach((m) => layer.insertAdjacentHTML("beforeend",
+    `<text class="sg-more" x="${m.x}" y="${m.y + 4}">+${m.count}</text>`));
+}
+
+function _sgAgo(sec) {
+  if (sec < 60) return `${Math.max(0, Math.round(sec))}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ${String(Math.floor(sec % 60)).padStart(2, "0")}s`;
+  return `${Math.floor(sec / 3600)}h ${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}m`;
+}
+
+const SG_KIND = { research: "Research", chat: "Chat", corpus: "Corpus scan" };
+const SG_OUTCOME = { finished: "Finished", stopped: "Stopped", cancelled: "Cancelled", failed: "Failed", ended: "Ended" };
+
+// One card in "Running now". ``now`` is the server's clock (seconds), so elapsed times are the
+// server's, whatever the viewer's clock says.
+function sysRunCardHtml(r, now) {
+  const who = r.mine ? "" : `<span class="sr-who">${escapeHtml(r.owner ? r.owner : "another account")}</span>`;
+  const head = `<span class="sr-dot" style="background:${r.color}">${r.ordinal}</span>` +
+    `<span class="sr-kind">${escapeHtml(SG_KIND[r.kind] || r.kind)}</span>${who}` +
+    `<span class="sr-stage${r.waiting ? " waiting" : ""}">${escapeHtml(r.ended ? (SG_OUTCOME[r.outcome] || "Ended") : r.stage_label || r.stage)}</span>` +
+    `<span class="sr-time">${r.ended ? _sgAgo(now - r.ended) + " ago" : _sgAgo(now - r.started)}</span>`;
+  const q = r.question ? `<div class="sr-q" title="${escapeHtml(r.question)}">${escapeHtml(r.question)}</div>` : "";
+  const lines = [];
+  if (!r.ended) {
+    const whom = r.mine ? "you" : "its owner";
+    if (r.waiting === "plan") lines.push(`Waiting for ${whom} to review the plan.`);
+    else if (r.waiting === "confirm") lines.push(`Waiting for ${whom} to confirm an action.`);
+    (r.active || []).forEach((a) => {
+      const what = a.phase === "tool" ? `<code>${escapeHtml(a.tool)}</code>` : a.phase === "critic" ? "Critic judging" : "model thinking";
+      const step = a.n ? `Step ${a.n}` : a.step ? "Step" : "";
+      const spec = a.specialist && a.specialist !== "Scientist" ? ` · ${escapeHtml(a.specialist)}` : "";
+      lines.push(`${step ? `<b>${step}</b>${spec} · ` : ""}${what} <span class="muted">${_sgAgo(now - a.since)}</span>` +
+        (a.step ? `<div class="sr-step" title="${escapeHtml(a.step)}">${escapeHtml(a.step)}</div>` : ""));
+    });
+    if (!(r.active || []).length && r.llm && (r.llm.thinking || []).length)
+      lines.push(`${escapeHtml(r.llm.thinking.map((x) => SG_ROLE[x] || x).join(", "))} thinking <span class="muted">${_sgAgo(now - r.stage_since)}</span>`);
+  }
+  const s = r.steps || {};
+  const bar = s.total ? `<div class="sr-bar" title="${s.accepted} of ${s.total} steps accepted"><span style="width:${Math.min(100, Math.round(100 * s.accepted / s.total))}%;background:${r.color}"></span></div>` +
+    `<div class="sr-meta">${s.accepted}/${s.total} steps accepted · ${r.tools_called || 0} tool call${r.tools_called === 1 ? "" : "s"}${r.tool_errors ? ` · ${r.tool_errors} failed` : ""}</div>` : "";
+  const last = (r.recent || []).slice(-1)[0];
+  const note = last && !r.ended ? `<div class="sr-note">${escapeHtml(last.text)}</div>` : "";
+  return `<div class="sr-card${r.ended ? " ended" : ""}${sysLive.selected === r.key ? " selected" : ""}" data-run="${escapeHtml(r.key)}" tabindex="0">` +
+    `<div class="sr-head">${head}</div>${q}${lines.map((l) => `<div class="sr-line">${l}</div>`).join("")}${bar}${note}</div>`;
+}
+
+function paintSystemRuns(data) {
+  const el = $("systemRuns");
+  if (!el) return;
+  const now = (data && data.now) || Date.now() / 1000;
+  const runs = sysLive.runs;
+  const live = runs.filter((r) => !r.ended), ended = runs.filter((r) => r.ended).slice(0, 6);
+  const head = `<div class="sr-title">Running now <span class="muted">${live.length ? live.length : "nothing"}` +
+    `${data && data.sessions != null ? ` · ${data.sessions} session${data.sessions === 1 ? "" : "s"} open` : ""}</span></div>`;
+  el.innerHTML = head + (live.length ? live.map((r) => sysRunCardHtml(r, now)).join("")
+    : '<div class="empty-hint sr-empty">No task is running. Start one in Research and watch it move through the graph.</div>') +
+    (ended.length ? `<div class="sr-sub">Finished in the last 10 minutes</div>${ended.map((r) => sysRunCardHtml(r, now)).join("")}` : "");
+}
+
+async function pollSystemLive() {
+  if (document.hidden || !$("view-system").classList.contains("active")) return;
+  try {
+    const res = await fetch("/api/system/live", { cache: "no-store" });
+    if (res.status === 401) { $("systemRuns").innerHTML = '<div class="empty-hint">Sign in to see the running tasks.</div>'; return; }
+    const data = await res.json();
+    sysLive.failed = 0;
+    sysLive.runs = _sgDecorate(data.runs || []);
+    sysLive.now = data.now;
+    paintSystemTasks();
+    paintSystemRuns(data);
+    if (sysLive.node) showGraphNodeInfo(sysLive.node);
+  } catch {
+    if (++sysLive.failed === 3) $("systemRuns").innerHTML = '<div class="empty-hint">Lost contact with the server — retrying.</div>';
+  }
+}
+
+function startSystemLive() {
+  stopSystemLive();
+  pollSystemLive();
+  sysLive.timer = setInterval(pollSystemLive, 1500);
+}
+function stopSystemLive() {
+  if (sysLive.timer) { clearInterval(sysLive.timer); sysLive.timer = null; }
+}
+
+function showGraphNodeInfo(id) {
   const box = $("systemGraphInfo");
-  if (!box) return;
-  const m = d.meta || {};
-  const rows = [`<div class="gi-title">${escapeHtml(d.label)} <span class="gi-type">${escapeHtml(d.ntype)}</span></div>`];
+  const n = sysLive.graph && (sysLive.graph.nodes || []).find((x) => x.id === id);
+  if (!box || !n) return;
+  const m = n.meta || {};
+  const type = { stage: "stage", agent: "agent", place: "where tools run", tool: "tool" }[n.type] || n.type;
+  const rows = [`<div class="gi-title">${escapeHtml(n.label)} <span class="gi-type">${escapeHtml(type)}</span></div>`];
+  if (m.kinds) rows.push(`<div><span class="gi-k">runs</span> ${m.kinds.map((k) => escapeHtml(SG_KIND[k] || k)).join(", ")}</div>`);
   if (m.category) rows.push(`<div><span class="gi-k">category</span> ${escapeHtml(m.category)}</div>`);
-  if (m.where) rows.push(`<div><span class="gi-k">where</span> <code>${escapeHtml(m.where)}</code></div>`);
-  if (typeof m.available === "boolean") rows.push(`<div><span class="gi-k">status</span> <span class="cap ${m.available ? "on" : "off"}">${m.available ? "available" : "unavailable"}</span></div>`);
+  if (m.place) {
+    const pl = (sysLive.graph.nodes || []).find((x) => x.id === m.place);
+    rows.push(`<div><span class="gi-k">runs on</span> ${escapeHtml(pl ? pl.label : m.runs_on)}</div>`);
+  }
+  if (m.where) rows.push(`<div><span class="gi-k">code</span> <code>${escapeHtml(m.where)}</code></div>`);
+  if (typeof m.available === "boolean") rows.push(`<div><span class="gi-k">here</span> <span class="cap ${m.available ? "on" : "off"}">${m.available ? "available" : "unavailable"}</span></div>`);
   if (m.reads_private_data) rows.push('<div><span class="tag-priv">reads private data</span></div>');
   if (m.requires && m.requires.length) rows.push(`<div><span class="gi-k">needs</span> ${m.requires.map(escapeHtml).join(", ")}</div>`);
   if (m.description) rows.push(`<div class="gi-desc">${escapeHtml(m.description)}</div>`);
+  if (m.roles && m.roles.length && typeof m.roles[0] === "object")
+    rows.push(`<div class="gi-list">${m.roles.map((r) => `<div><b>${escapeHtml(SG_ROLE[r.role] || r.role)}</b> — ${escapeHtml(r.does)}</div>`).join("")}</div>`);
+  if (m.specialists && m.specialists.length)
+    rows.push(`<div class="gi-list">${m.specialists.map((s) => `<div><b>${escapeHtml(s.name)}</b></div>`).join("")}</div>`);
+  if (m.pipelines && m.pipelines.length)
+    rows.push(`<div class="gi-list"><div class="gi-k">pipelines it can follow</div>${m.pipelines.map((p) => `<div>${escapeHtml(p.label)}</div>`).join("")}</div>`);
+  if (n.type === "place") {
+    const tools = (sysLive.graph.nodes || []).filter((x) => x.type === "tool" && (x.meta || {}).place === n.id);
+    rows.push(`<div class="gi-list">${tools.map((t) => `<div><code>${escapeHtml(t.label)}</code></div>`).join("")}</div>`);
+  }
+  const here = sysTaskTargets(sysLive.graph, sysLive.layout, sysLive.runs, sysLive.now).tokens.filter((k) => k.node === id);
+  if (here.length) rows.push(`<div class="gi-here"><div class="gi-k">here now</div>${here.map((k) =>
+    `<div><span class="sr-dot small" style="background:${k.color}">${k.run}</span> ${escapeHtml(k.title)}</div>`).join("")}</div>`);
   box.innerHTML = rows.join("");
+}
+
+function onSystemRunsClick(e) {
+  const card = e.target.closest("[data-run]");
+  if (!card) return;
+  sysLive.selected = sysLive.selected === card.dataset.run ? null : card.dataset.run;
+  paintSystemTasks();
+  document.querySelectorAll("#systemRuns .sr-card").forEach((c) => c.classList.toggle("selected", c.dataset.run === sysLive.selected));
 }
 
 // ---- Datasets view ----
@@ -5965,12 +6908,12 @@ async function loadDatasets() {
         : from.open ? ` · <button type="button" class="upload-chat" data-open-chat="${escapeHtml(String(x.conversation_id))}" title="Open the chat this upload was started from">${escapeHtml(from.text)}</button>`
         : ` · ${escapeHtml(from.text)}`;
       return `<div class="card"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
-      `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${metadataBadge(x.metadata)}</span></div>` +
+      `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${x.location === "hpc3" ? ` · <span title="Kept only on HPC3 so far: it is moved to the server when you connect">on HPC3</span>` : ""}${metadataBadge(x.metadata)}</span></div>` +
       `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
       `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
       `<a class="ghost small" href="/api/datasets/${x.id}/download" download data-dl-size="${Number(x.size_bytes) || 0}" data-name="${escapeHtml(x.name)}" title="${isFolderKind(x.kind) ? "Download the folder as one .zip" : "Download the file"}">Download</a>` +
       `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>` +
-      `<button class="ghost small danger" data-del="${x.id}" data-path="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`;
+      `<button class="ghost small danger" data-del="${x.id}" data-path="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}" data-location="${escapeHtml(x.location || "server")}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`;
     }).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
@@ -5997,7 +6940,9 @@ async function onDatasetsClick(e) {
     const fromServer = (d.dataset.kind || "").startsWith("server-");
     const ask = fromServer
       ? `Remove "${d.dataset.name}" from your datasets?\n\nThe data on the server is not touched. Your HPC3 copy of it is deleted (a later run copies it again).`
-      : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes the uploaded file and its history. This cannot be undone.`;
+      : d.dataset.location === "hpc3"
+      ? `Delete dataset "${d.dataset.name}" from your HPC3 storage?\n\nThis removes its files there and its history. This cannot be undone.`
+      : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes its files on the server (and this session's HPC3 copy) and its history. This cannot be undone.`;
     if (!confirm(ask)) return;
     try {
       const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
@@ -6399,7 +7344,9 @@ function resultHandoffHtml(runId, r) {
   const mb = (n) => `${(Number(n || 0) / 1e6).toFixed(0)} MB`;
   const kept = (x, label, what) => (x.saved_to
     ? `<span class="ok small" title="${escapeHtml(x.saved_to)}">Saved to my data</span>`
+    : x.saving ? `<span class="muted small">Copying from HPC3 to your data on the server…</span>`
     : `<span class="muted small">kept ${x.location === "hpc3" ? "on HPC3" : "on the server"} ${x.until_disconnect ? `until you disconnect (at most ${escapeHtml(String(x.kept_days ?? ""))} days)` : `for ${escapeHtml(String(x.kept_days ?? ""))} days`}</span>` +
+      (x.save_error ? `<span class="bad small" title="${escapeHtml(x.save_error)}">The last save failed</span>` : "") +
       `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${what}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
   let html = "";
   if (r.name) {
@@ -6417,8 +7364,21 @@ function resultHandoffHtml(runId, r) {
 }
 async function showResultHandoff(host, runId) {
   if (!host) return;
+  host.dataset.run = runId;
   const r = (await loadResultHandoffs())[runId];
   host.innerHTML = resultHandoffHtml(runId, r);
+}
+// A result kept on HPC3 is copied back to the server in the background; the server says when it is here.
+async function onResultSaved(msg) {
+  await loadResultHandoffs(true);
+  document.querySelectorAll(".result-handoff").forEach((host) => {
+    if (host.dataset.run === String(msg.run_id)) showResultHandoff(host, host.dataset.run);
+  });
+  if ($("view-runs") && $("view-runs").classList.contains("active")) loadRuns();
+  onDatasetsChanged();
+}
+function onDatasetsChanged() {
+  if ($("view-datasets") && $("view-datasets").classList.contains("active")) loadDatasets();
 }
 
 async function onSaveResultClick(e) {
@@ -6430,6 +7390,12 @@ async function onSaveResultClick(e) {
     const r = await fetch(`/api/result-datasets/${encodeURIComponent(runId)}/save?what=${encodeURIComponent(b.dataset.what || "dataset")}`, { method: "POST" });
     const j = await r.json();
     if (!r.ok) { toast(j.error || "Could not save it."); b.disabled = false; b.textContent = label; return; }
+    if (j.saving) {
+      b.textContent = "Copying to the server…";
+      toast("Copying it from HPC3 to your data on the server. It appears in Datasets when it is there.");
+      await loadResultHandoffs(true);
+      return;
+    }
     toast(`Saved to ${j.path} — it is in your Datasets now.`);
     await loadResultHandoffs(true);
     const inChat = b.closest(".result-handoff");
@@ -6609,24 +7575,68 @@ async function onUserTableClick(e) {
   }
 }
 
-// ---- Account view ----
+// ---- Account view: two tabs, API usage (the key, its usage, the budget) and Password ----
 function renderAccount(user) {
   const el = $("accountInfo");
-  if (!user) { el.innerHTML = '<p class="muted">Accounts are disabled on this server.</p>'; $("changePwForm").classList.add("hidden"); $("logoutBtn").classList.add("hidden"); return; }
-  $("changePwForm").classList.remove("hidden"); $("logoutBtn").classList.remove("hidden");
-  el.innerHTML = `<p><strong>${escapeHtml(user.username)}</strong> · role: ${escapeHtml(user.role)}</p>` +
-    `<p class="muted">Member since ${fmtDate(user.created_at)}</p>`;
+  const pwTab = $("accountTab-password");
+  if (!user) {
+    el.innerHTML = '<p class="muted">Accounts are disabled on this server.</p>';
+    $("logoutBtn").classList.add("hidden"); pwTab.classList.add("hidden"); switchAccountTab("usage");
+    return;
+  }
+  $("logoutBtn").classList.remove("hidden"); pwTab.classList.remove("hidden");
+  el.innerHTML = accountInfoHtml(user);
 }
+
+function accountInfoHtml(user) {
+  const since = user.created_at ? fmtDay(String(user.created_at).slice(0, 10), { year: true }) : "";
+  const bits = [user.email ? escapeHtml(user.email) : "", since ? `Member since ${escapeHtml(since)}` : ""].filter(Boolean);
+  return `<span class="account-avatar" aria-hidden="true">${escapeHtml((user.username || "?").slice(0, 1).toUpperCase())}</span>` +
+    `<div class="account-id"><div><strong>${escapeHtml(user.username)}</strong> <span class="role-chip">${escapeHtml(user.role)}</span></div>` +
+    (bits.length ? `<div class="muted">${bits.join(" · ")}</div>` : "") + `</div>`;
+}
+
+function switchAccountTab(tab) {
+  document.querySelectorAll(".account-tab").forEach((b) => {
+    const on = b.dataset.accountTab === tab;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.tabIndex = on ? 0 : -1;
+  });
+  document.querySelectorAll(".account-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "accountPane-" + tab));
+}
+
+// The chat counter, the budget notice and the key dialog all lead here, to the usage tab.
+function openAccount(tab = "usage") {
+  switchAccountTab(tab);
+  switchView("account");
+}
+
+// The new password is typed twice: a typo here would lock the account until an admin resets it.
+function passwordProblem(oldPw, newPw, again) {
+  if (!oldPw) return "Enter your current password.";
+  if (newPw.length < 6) return "The new password needs at least 6 characters.";
+  if (newPw !== again) return "The two new passwords are not the same.";
+  return "";
+}
+
 async function changePassword(e) {
   e.preventDefault();
+  const problem = passwordProblem($("cpOld").value, $("cpNew").value, $("cpNew2").value);
+  const box = $("cpProblem");
+  box.textContent = problem; box.classList.toggle("hidden", !problem);
+  if (problem) return;
   const payload = { old_password: $("cpOld").value, new_password: $("cpNew").value };
   const r = await fetch("/api/account/password", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) { toast(d.detail || "Change failed"); return; }
+  if (!r.ok) {
+    const why = typeof d.detail === "string" && d.detail ? d.detail[0].toUpperCase() + d.detail.slice(1) : "Change failed";
+    box.textContent = why; box.classList.remove("hidden"); toast(why); return;
+  }
   toast("Password updated"); $("changePwForm").reset();
 }
 
-// ---- LLM usage and estimated cost (Account › Usage, the chat counter, run details, budgets) ----
+// ---- LLM usage and estimated cost (Account › API usage, the chat counter, run details, budgets) ----
 // Every model call is recorded server-side with its token counts; the dollars are ESTIMATES from a
 // configurable price table (or the provider's own figure when it reports one). The Claude Console
 // stays the authoritative bill, and every view here says so.
@@ -6637,27 +7647,51 @@ function userTz() { try { return Intl.DateTimeFormat().resolvedOptions().timeZon
 function fmtUsd(x, { approx = true } = {}) {
   const v = Number(x || 0);
   const s = v === 0 ? "$0" : v < 0.01 ? "<$0.01" : v < 100 ? `$${v.toFixed(2)}` : `$${Math.round(v).toLocaleString()}`;
-  return (approx && v > 0 ? "~" : "") + s;
+  return (approx && v >= 0.01 ? "~" : "") + s;
 }
 
+// The chat counter's tooltip: what an API key paid for, then the cluster GPU's calls apart and free.
 function usageTitle(t) {
   if (!t) return "";
+  const api = apiPart(t), c = (t.cluster && t.cluster.calls) || 0;
+  const cluster = c ? `Cluster GPU: ${plural(c, "call")} · ${(t.cluster.total_tokens || 0).toLocaleString()} tokens · free. ${CLUSTER_FREE}` : "";
+  if (!api.calls) return `${cluster}\nClick for Account › API usage.`;
   const unpriced = t.unpriced_calls ? `\n${t.unpriced_calls} call(s) on a model the price table does not list are not in the dollar figure.` : "";
-  return `${(t.calls || 0).toLocaleString()} model calls · ${(t.total_tokens || 0).toLocaleString()} tokens · ${fmtUsd(t.spend_usd)} estimated.` +
-    unpriced + "\nAn estimate from AiScientist's own record; the Claude Console is the authoritative bill. Click for Account › Usage.";
+  return `${plural(api.calls, "API call")} · ${api.total_tokens.toLocaleString()} API tokens · ${fmtUsd(t.spend_usd)} estimated.` +
+    unpriced + (cluster ? `\n${cluster}` : "") +
+    "\nAn estimate from AiScientist's own record; the Claude Console is the authoritative bill. Click for Account › API usage.";
 }
 
-// The chat header counter: this chat's totals, plus the running total of its run while one is going.
+// "2026-10-18" -> "Oct 18" (or "Oct 18, 2026"). A calendar day, so it is read and written in UTC.
+function fmtDay(iso, { year = false } = {}) {
+  if (!iso) return "";
+  const d = new Date(String(iso).slice(0, 10) + "T00:00:00Z");
+  if (isNaN(d)) return String(iso);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC", ...(year ? { year: "numeric" } : {}) });
+}
+
+// The chat header counter: the API tokens and estimated cost of this chat, plus the running cost of
+// its run while one is going. Calls on the cluster GPU are in no token or dollar figure: they read
+// "cluster GPU free" beside an API figure, or carry the counter alone when the chat had no API call.
+//   "12K API tokens · ~$0.18"   "12K API tokens · ~$0.18 · cluster GPU free"   "9.9K tokens · free on the cluster GPU"
+function chatUsageText(u, running = false) {
+  if (!u || !u.chat || !u.chat.calls) return "";
+  const api = apiPart(u.chat), onCluster = (u.chat.cluster && u.chat.cluster.calls) || 0;
+  if (!api.calls) return `${fmtTokens((u.chat.cluster && u.chat.cluster.total_tokens) || 0)} tokens · free on the cluster GPU`;
+  let text = `${fmtTokens(api.total_tokens)} API tokens · ${fmtUsd(u.chat.spend_usd)}`;
+  if (onCluster) text += " · cluster GPU free";
+  if (running && u.run && apiPart(u.run).calls) text += ` · this run ${fmtUsd(u.run.spend_usd)}`;
+  return text;
+}
+
 function renderChatUsage() {
   const el = $("chatUsage");
   if (!el) return;
   const c = activeChat();
-  const u = c && c.usage;
-  if (!authed() || !u || !u.chat || !u.chat.calls) { el.classList.add("hidden"); return; }
-  let text = `${fmtTokens(u.chat.total_tokens || 0)} tokens · ${fmtUsd(u.chat.spend_usd)}`;
-  if (c.running && u.run && u.run.calls) text += ` · this run ${fmtUsd(u.run.spend_usd)}`;
+  const text = authed() && c ? chatUsageText(c.usage, c.running) : "";
+  if (!text) { el.classList.add("hidden"); return; }
   el.textContent = text;
-  el.title = usageTitle(u.chat);
+  el.title = usageTitle(c.usage.chat);
   el.classList.remove("hidden");
 }
 
@@ -6707,11 +7741,12 @@ async function checkBudgetNotices() {
   } catch { /* best-effort */ }
 }
 
-function usageCards(totals) {
-  const card = (label, t) => `<div class="usage-card"><span class="usage-card-label">${label}</span>` +
-    `<strong>${fmtUsd(t.spend_usd)}</strong><span class="muted">${fmtTokens(t.total_tokens || 0)} tokens · ${(t.calls || 0).toLocaleString()} calls` +
-    `${t.errors ? ` · <span class="bad">${t.errors} failed</span>` : ""}</span></div>`;
-  return `<div class="usage-cards">${card("Today", totals.today)}${card("Last 7 days", totals.last_7_days)}${card("This billing cycle", totals.cycle)}</div>`;
+function plural(n, word) { const v = n || 0; return `${v.toLocaleString()} ${word}${v === 1 ? "" : "s"}`; }
+
+// Today as the browser's own calendar day, "2026-10-18" (the server is told the same time zone).
+function localIsoDay(d = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 function nextDay(iso) {
@@ -6720,51 +7755,152 @@ function nextDay(iso) {
   return d.toISOString().slice(0, 10);
 }
 
-function budgetHtml(b) {
-  const bud = b.budget;
-  const cyc = b.cycle || {};
-  const range = `${escapeHtml(cyc.start || "")} – ${escapeHtml(cyc.end || "")}`;
-  if (!bud || !bud.monthly_credit_usd) {
-    return `<div class="usage-budget muted">Billing cycle ${range}. Set your monthly credit below to see your estimated spend against it.</div>`;
-  }
-  const pct = Math.min(100, b.percent || 0);
-  const tone = (b.percent || 0) >= 100 ? "over" : (b.percent || 0) >= 80 ? "warn" : "";
-  const proj = b.remaining_usd != null && b.remaining_usd <= 0
-    ? `The estimated spend is past the credit by ${fmtUsd(-b.remaining_usd)}. Check the Claude Console for what is actually left.`
-    : b.lasts_cycle === false && b.projected_exhaustion
-      ? `At the current rate the credit runs out around <strong>${escapeHtml(b.projected_exhaustion)}</strong>, before the cycle resets on ${escapeHtml(nextDay(cyc.end))}.`
-      : b.lasts_cycle ? `At the current rate the credit lasts until the cycle resets on ${escapeHtml(nextDay(cyc.end))}.` : "";
-  const marks = (bud.thresholds || []).filter((t) => t <= 100).map((t) => `<i class="usage-mark" style="left:${t}%" title="${t}%"></i>`).join("");
-  const hard = bud.hard_limit_usd != null
-    ? `<p class="muted small">Hard limit ${fmtUsd(bud.hard_limit_usd, { approx: false })} — ${bud.hard_limit_mode === "block" ? "new runs on your API key are blocked once it is reached" : "you are asked before each new run once it is reached"}${b.hard_limit_reached ? ' · <span class="bad">reached</span>' : ""}.</p>` : "";
-  return `<div class="usage-budget"><div class="usage-budget-head"><span>Estimated ${fmtUsd(b.spent_usd)} of ${fmtUsd(bud.monthly_credit_usd, { approx: false })} (${(b.percent || 0).toFixed(0)}%) · cycle ${range}</span></div>` +
-    `<div class="usage-bar ${tone}"><i style="width:${pct}%"></i>${marks}</div><p class="muted small">${proj}</p>${hard}</div>`;
+// "Oct 1 – Oct 31, 2026 · day 18 of 31 · resets Nov 1"
+function usageCycleText(cyc, today = localIsoDay()) {
+  if (!cyc || !cyc.start) return "";
+  const day = Math.round((Date.parse(today + "T00:00:00Z") - Date.parse(cyc.start + "T00:00:00Z")) / 86400000) + 1;
+  const of = cyc.days_total ? ` · day ${Math.min(Math.max(day, 1), cyc.days_total)} of ${cyc.days_total}` : "";
+  return `${fmtDay(cyc.start)} – ${fmtDay(cyc.end, { year: true })}${of} · resets ${fmtDay(nextDay(cyc.end))}`;
 }
 
-function usageChart(daily) {
+function usageTile(label, value, sub, cls = "") {
+  return `<div class="usage-tile${cls ? " " + cls : ""}"><div class="usage-tile-label">${label}</div>` +
+    `<div class="usage-tile-value">${value}</div><div class="usage-tile-sub">${sub}</div></div>`;
+}
+
+// The summary row: what this billing cycle has cost so far, in dollars and tokens, and where that
+// stands against the budget. The cycle does not follow the breakdown's period picker.
+function usageSummaryHtml(d) {
+  const t = d.totals || {};
+  const cyc = t.cycle || {}, today = t.today || {}, week = t.last_7_days || {};
+  const span = (d.budget && d.budget.cycle) || {};
+  // The cycle's spend at the rate so far, as the budget's projection reckons it.
+  const pace = cyc.spend_usd > 0 && span.days_elapsed >= 1 && span.days_total
+    ? `<div class="usage-tile-note">On pace for ${fmtUsd((cyc.spend_usd / span.days_elapsed) * span.days_total)} by ${escapeHtml(fmtDay(span.end))}</div>` : "";
+  const unpriced = cyc.unpriced_calls
+    ? `<div class="usage-tile-note" title="Calls on a model the price table does not list are not in the dollar figure.">+ ${plural(cyc.unpriced_calls, "call")} on an unpriced model</div>` : "";
+  const spend = usageTile("Estimated API spend", fmtUsd(cyc.spend_usd),
+    `Today ${fmtUsd(today.spend_usd)} · last 7 days ${fmtUsd(week.spend_usd)}${pace}${unpriced}`);
+  return `<div class="usage-tiles">${spend}${apiTokensTile(cyc)}${budgetTileHtml(d.budget || {})}</div>`;
+}
+
+// What an API key paid for: the whole minus ``cluster``, the calls on the cluster GPU, which HPC3
+// charges by GPU time and not by token, so they cost nothing here and count against no budget.
+function apiPart(x) {
+  const c = (x && x.cluster) || {};
+  const out = { calls: Math.max(0, (x.calls || 0) - (c.calls || 0)) };
+  ["input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens", "total_tokens"]
+    .forEach((k) => { out[k] = Math.max(0, (x[k] || 0) - (c[k] || 0)); });
+  return out;
+}
+
+const CLUSTER_FREE = "HPC3 charges the cluster GPU by the time it runs, not by token: these calls are in no dollar figure or budget.";
+
+function clusterNote(x) {
+  const c = x && x.cluster;
+  if (!c || !c.calls) return "";
+  return `<div class="usage-tile-note" title="${CLUSTER_FREE}">Cluster GPU: ${plural(c.calls, "call")} · ${fmtTokens(c.total_tokens || 0)} tokens · free</div>`;
+}
+
+function apiTokensTile(t) {
+  const api = apiPart(t);
+  const split = tokenSplit(api);
+  return usageTile("API tokens", fmtTokens(api.total_tokens),
+    plural(api.calls, "API call") + (t.errors ? ` · <span class="bad">${t.errors} failed</span>` : "") +
+    (split ? `<div class="usage-tile-note">${split}</div>` : "") + clusterNote(t));
+}
+
+// Where the cycle's estimated spend stands against the monthly credit: left / over, a bar with the
+// warning thresholds on it, the projection, and the hard limit.
+function budgetTileHtml(b) {
+  const bud = b.budget;
+  const resets = fmtDay(nextDay((b.cycle || {}).end));
+  if (!bud || !bud.monthly_credit_usd) {
+    return usageTile("Budget", "Not set",
+      `<a href="#budgetSection" data-budget-edit>Set your monthly credit</a> to see the spend against it.`, "usage-tile-budget unset");
+  }
+  const pct = b.percent || 0;
+  const over = b.remaining_usd != null && b.remaining_usd <= 0;
+  const early = b.lasts_cycle === false;
+  const tone = over ? "over" : pct >= 80 || early ? "warn" : "ok";
+  const chip = over ? "Credit used up" : early ? "Runs out early" : pct >= 80 ? `${pct.toFixed(0)}% used` : "On track";
+  const value = over ? `Over by ${fmtUsd(-b.remaining_usd)}` : `${fmtUsd(b.remaining_usd)} left`;
+  const marks = (bud.thresholds || []).filter((x) => x < 100).map((x) => `<i class="usage-mark" style="left:${x}%" title="Warns at ${x}%"></i>`).join("");
+  const bar = `<div class="usage-bar tone-${tone}" role="img" aria-label="${pct.toFixed(0)}% of the credit used"><i style="width:${Math.min(100, pct)}%"></i>${marks}</div>` +
+    `<div class="usage-bar-legend"><span>${fmtUsd(b.spent_usd)} of ${fmtUsd(bud.monthly_credit_usd, { approx: false })}</span><span>${pct.toFixed(0)}%</span></div>`;
+  const proj = over ? "Check the Claude Console for what is actually left."
+    : early && b.projected_exhaustion ? `At this rate it runs out around <strong>${escapeHtml(fmtDay(b.projected_exhaustion))}</strong>, before the reset on ${escapeHtml(resets)}.`
+      : b.lasts_cycle ? `At this rate it lasts until the reset on ${escapeHtml(resets)}.` : `Resets on ${escapeHtml(resets)}.`;
+  const hard = bud.hard_limit_usd != null
+    ? `<div class="usage-tile-note">Hard limit ${fmtUsd(bud.hard_limit_usd, { approx: false })} · ${bud.hard_limit_mode === "block" ? "then new runs on your key are blocked" : "then each new run asks first"}${b.hard_limit_reached ? ' · <span class="bad">reached</span>' : ""}</div>` : "";
+  const label = `Budget <span class="usage-chip tone-${tone}">${chip}</span><a href="#budgetSection" class="usage-tile-link" data-budget-edit>Edit</a>`;
+  return usageTile(label, value, bar + `<div>${proj}</div>` + hard, `usage-tile-budget tone-${tone}`);
+}
+
+// Daily bars. Dollars when anything was priced, otherwise tokens (only the cluster GPU was used).
+function usageChart(daily, { title = `Last ${(daily || []).length} days` } = {}) {
   if (!daily || !daily.length) return "";
-  const max = Math.max(...daily.map((d) => d.spend_usd || 0), 0);
+  const spendMax = Math.max(...daily.map((d) => d.spend_usd || 0), 0);
   const tokMax = Math.max(...daily.map((d) => d.total_tokens || 0), 0);
-  const useTokens = max === 0;           // only the cluster GPU was used: chart the tokens
+  const useTokens = spendMax === 0 && tokMax > 0;
+  const top = useTokens ? tokMax : spendMax;
+  const what = useTokens ? "tokens" : "estimated spend";
+  const peak = useTokens ? `${fmtTokens(tokMax)} tokens` : fmtUsd(spendMax);
+  const head = `<div class="usage-chart-head"><span><strong>${escapeHtml(title)}</strong> <span class="muted">· daily ${what}</span></span>` +
+    (top > 0 ? `<span class="muted">peak ${peak}</span>` : "") + "</div>";
+  if (top === 0) return `<div class="usage-card-box usage-chart-wrap">${head}<p class="usage-empty">No model calls in these ${daily.length} days.</p></div>`;
+  const last = daily.length - 1, today = localIsoDay();
   const bars = daily.map((d) => {
     const v = useTokens ? d.total_tokens || 0 : d.spend_usd || 0;
-    const top = useTokens ? tokMax : max;
-    const h = top > 0 ? Math.max(v > 0 ? 2 : 0, Math.round((v / top) * 100)) : 0;
-    return `<div class="usage-day" title="${escapeHtml(d.date)}: ${fmtUsd(d.spend_usd)} · ${(d.total_tokens || 0).toLocaleString()} tokens · ${d.calls} calls"><i style="height:${h}%"></i></div>`;
+    const h = v > 0 ? Math.max(3, Math.round((v / top) * 100)) : 0;
+    const tip = `${fmtDay(d.date)}: ${fmtUsd(d.spend_usd)} · ${(d.total_tokens || 0).toLocaleString()} tokens · ${plural(d.calls, "call")}`;
+    return `<div class="usage-day${d.date === today ? " today" : ""}${v ? "" : " zero"}" title="${escapeHtml(tip)}"><i style="height:${h}%"></i></div>`;
   }).join("");
-  const first = daily[0].date, last = daily[daily.length - 1].date;
-  return `<div class="usage-chart-wrap"><div class="usage-chart-head"><span>Daily ${useTokens ? "tokens" : "estimated spend"}</span>` +
-    `<span class="muted">peak ${useTokens ? fmtTokens(tokMax) + " tokens" : fmtUsd(max)}</span></div>` +
-    `<div class="usage-chart">${bars}</div><div class="usage-axis"><span>${escapeHtml(first)}</span><span>${escapeHtml(last)}</span></div></div>`;
+  const mid = Math.floor(last / 2);
+  const end = daily[last].date === today ? "Today" : fmtDay(daily[last].date);
+  return `<div class="usage-card-box usage-chart-wrap">${head}` +
+    `<div class="usage-chart" role="img" aria-label="Daily ${what} from ${escapeHtml(fmtDay(daily[0].date))} to ${escapeHtml(fmtDay(daily[last].date))}, peak ${peak}">${bars}</div>` +
+    `<div class="usage-axis"><span>${escapeHtml(fmtDay(daily[0].date))}</span><span>${escapeHtml(fmtDay(daily[mid].date))}</span><span>${escapeHtml(end)}</span></div></div>`;
 }
 
-function usageTable(rows, nameCol, nameOf) {
-  if (!rows || !rows.length) return '<p class="muted small">Nothing in this period.</p>';
-  return `<table class="user-table usage-table"><thead><tr><th>${nameCol}</th><th>Calls</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th><th>Est. cost</th></tr></thead><tbody>` +
-    rows.map((x) => `<tr><td>${nameOf(x)}</td><td>${x.calls}${x.errors ? ` <span class="bad small">(${x.errors} failed)</span>` : ""}</td>` +
-      `<td>${fmtTokens(x.input_tokens || 0)}</td><td>${fmtTokens(x.cache_write_tokens || 0)}</td><td>${fmtTokens(x.cache_read_tokens || 0)}</td>` +
-      `<td>${fmtTokens(x.output_tokens || 0)}</td><td>${fmtUsd(x.spend_usd)}${x.unpriced_calls ? ' <span class="muted small" title="Calls on a model the price table does not list">+?</span>' : ""}</td></tr>`).join("") +
-    "</tbody></table>";
+// "40K input · 30K cache write · 1.1M cache read · 52K output", leaving out the classes at zero.
+function tokenSplit(x) {
+  return [["input_tokens", "input"], ["cache_write_tokens", "cache write"], ["cache_read_tokens", "cache read"], ["output_tokens", "output"]]
+    .filter(([k]) => (x[k] || 0) > 0).map(([k, label]) => `${fmtTokens(x[k])} ${label}`).join(" · ");
+}
+
+function sharePct(part) {
+  const p = part * 100;
+  return p > 0 && p < 1 ? "<1%" : `${Math.round(p)}%`;
+}
+
+// One breakdown (by model, run, chat, step, account or day). Each row: its name, its calls and
+// tokens by class underneath, its estimated cost and share of the whole on the right, and a thin
+// bar for that share. Two columns, so it reads the same on a phone as on a laptop.
+function usageList(rows, nameCol, nameOf, { empty = "Nothing in this period.", capped = 0 } = {}) {
+  if (!rows || !rows.length) return `<p class="usage-empty">${empty}</p>`;
+  const spendSum = rows.reduce((a, x) => a + (x.spend_usd || 0), 0);
+  const tokSum = rows.reduce((a, x) => a + (x.total_tokens || 0), 0);
+  const byTokens = spendSum === 0;
+  const items = rows.map((x) => {
+    const part = byTokens ? (tokSum ? (x.total_tokens || 0) / tokSum : 0) : (x.spend_usd || 0) / spendSum;
+    const onCluster = (x.cluster && x.cluster.calls) || 0;
+    const free = onCluster > 0 && onCluster === x.calls;
+    const meta = [plural(x.calls, "call"), `${fmtTokens(x.total_tokens || 0)} tokens`];
+    if (onCluster && !free) meta.push(`<span title="${CLUSTER_FREE}">${onCluster} on the cluster GPU, free</span>`);
+    if (x.errors) meta.push(`<span class="bad">${x.errors} failed</span>`);
+    const split = tokenSplit(x);
+    const unpriced = x.unpriced_calls ? `<span class="usage-unpriced" title="${plural(x.unpriced_calls, "call")} on a model the price table does not list">+?</span>` : "";
+    const cost = free ? `<strong class="usage-free" title="${CLUSTER_FREE}">Free</strong><span>cluster GPU</span>`
+      : `<strong>${fmtUsd(x.spend_usd)}${unpriced}</strong><span>${sharePct(part)}</span>`;
+    return `<li class="usage-row${free ? " is-free" : ""}"><div class="usage-row-main"><div class="usage-row-name">${nameOf(x)}</div>` +
+      `<div class="usage-row-meta">${meta.join(" · ")}${split ? `<span class="usage-row-split">${split}</span>` : ""}</div></div>` +
+      `<div class="usage-row-cost">${cost}</div>` +
+      `<div class="usage-row-share" aria-hidden="true"><i style="width:${Math.min(100, part * 100).toFixed(1)}%"></i></div></li>`;
+  }).join("");
+  const more = capped && rows.length >= capped ? `<p class="usage-foot">The ${capped} largest are shown; Export CSV has every call.</p>` : "";
+  return `<div class="usage-list"><div class="usage-list-head"><span>${nameCol}</span><span>Est. cost · share${byTokens ? " of tokens" : ""}</span></div>` +
+    `<ul>${items}</ul></div>${more}`;
 }
 
 const ERROR_TEXT = {
@@ -6778,32 +7914,94 @@ const ERROR_TEXT = {
   refusal: "The model declined the request",
 };
 
+const PERIOD_LABEL = { today: "Today", "7d": "Last 7 days", cycle: "This billing cycle", "30d": "Last 30 days", all: "All time" };
+const PERIOD_IN = { today: "today", "7d": "in the last 7 days", cycle: "in this billing cycle", "30d": "in the last 30 days", all: "yet" };
+
+function usageErrorsHtml(errors) {
+  if (!errors || !errors.length) return "";
+  const n = errors.reduce((a, e) => a + (e.calls || 0), 0);
+  return `<div class="usage-errors" role="note"><span class="material-symbols-outlined msym" aria-hidden="true">error</span>` +
+    `<div><strong>${plural(n, "failed request")}</strong><ul>` +
+    errors.map((e) => `<li>${e.calls}× ${escapeHtml(ERROR_TEXT[e.error_type] || e.error_type)} <span class="muted">· last ${escapeHtml(fmtDate(e.last_at))}</span></li>`).join("") +
+    "</ul></div></div>";
+}
+
+// The breakdown of the picked period: failed requests first, then one list at a time, by model,
+// run or chat. A run and a chat open their conversation.
+const usageView = { by: "model", data: null };
+
+function usageBreakdownHtml(d, by = "model") {
+  const p = (d.totals && d.totals.period) || {};
+  if (!p.calls) {
+    const when = PERIOD_IN[d.period] || "in this period";
+    return `<p class="usage-empty"><strong>No model calls ${when}.</strong> ` +
+      "Every chat reply and run step that calls a model is listed here, with its tokens and estimated cost." +
+      (d.period !== "all" ? " Pick a longer period to see earlier ones." : "") + "</p>";
+  }
+  const views = [
+    ["model", "Models", d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`, ""],
+    ["run", "Runs", d.by_run, "Run", (x) => {
+      const q = escapeHtml(x.question || x.run_id);
+      const name = x.conversation_id ? `<a href="#" data-open-chat="${escapeHtml(String(x.conversation_id))}" title="Run ${escapeHtml(x.run_id)}: open its chat">${q}</a>` : `<span title="Run ${escapeHtml(x.run_id)}">${q}</span>`;
+      return name + (x.status ? ` <span class="usage-status ${escapeHtml(x.status)}">${escapeHtml(x.status)}</span>` : "");
+    }, "None of the calls in this period belonged to a run: they were chat replies."],
+    ["chat", "Chats", d.by_chat, "Chat", (x) => {
+      const t = x.title || chatTitle(x.conversation_id) || `chat ${x.conversation_id}`;
+      return `<a href="#" data-open-chat="${escapeHtml(String(x.conversation_id))}">${escapeHtml(t)}</a>`;
+    }, "None of the calls in this period belonged to a chat."],
+  ];
+  const cur = views.find((v) => v[0] === by) || views[0];
+  const seg = `<div class="usage-seg" role="group" aria-label="Break down by">` + views.map(([k, label, rows]) =>
+    `<button type="button" class="usage-seg-btn${k === cur[0] ? " active" : ""}" aria-pressed="${k === cur[0]}" data-usage-by="${k}">${label} <span class="usage-seg-n">${(rows || []).length}</span></button>`).join("") + "</div>";
+  return usageErrorsHtml(d.errors) + seg + usageList(cur[2], cur[3], cur[4], { empty: cur[5], capped: 50 });
+}
+
+function usagePeriodTotalHtml(d) {
+  const p = (d.totals && d.totals.period) || {};
+  return `${escapeHtml(PERIOD_LABEL[d.period] || "")}: ${usageTotalText(p)}`;
+}
+
+// "~$2.47 · 2.4M API tokens · 86 API calls · 1 call on the cluster GPU (free)"
+function usageTotalText(t) {
+  const api = apiPart(t), c = (t.cluster && t.cluster.calls) || 0;
+  return `${fmtUsd(t.spend_usd)} · ${fmtTokens(api.total_tokens)} API tokens · ${plural(api.calls, "API call")}` +
+    (c ? ` · ${plural(c, "call")} on the cluster GPU (free)` : "");
+}
+
+function usageNoteHtml(d) {
+  return `<span class="material-symbols-outlined msym" aria-hidden="true">info</span><span>${escapeHtml(d.note || "")} ` +
+    `<a href="${escapeHtml(d.console_url || "")}" target="_blank" rel="noopener">Open the Claude Console usage page</a>.` +
+    (d.pricing && d.pricing.as_of ? ` Prices as of ${escapeHtml(fmtDay(d.pricing.as_of, { year: true }))}.` : "") + "</span>";
+}
+
+function renderUsage(d) {
+  $("usageCycle").textContent = usageCycleText(d.budget && d.budget.cycle);
+  $("usageBody").innerHTML = usageSummaryHtml(d) + usageChart(d.daily);
+  $("usagePeriodTotal").innerHTML = usagePeriodTotalHtml(d);
+  $("usageBreakdown").innerHTML = usageBreakdownHtml(d, usageView.by);
+  $("usageNote").innerHTML = usageNoteHtml(d);
+}
+
+function usageFailedHtml(why) {
+  return `<div class="usage-empty">Could not load your usage (${escapeHtml(why)}). ` +
+    `<button type="button" class="secondary small" data-usage-retry>Try again</button></div>`;
+}
+
 async function loadUsage() {
   const body = $("usageBody");
   if (!body) return;
-  if (!authed()) { body.innerHTML = '<p class="muted">Usage tracking needs an account.</p>'; return; }
+  const clear = () => { ["usageCycle", "usagePeriodTotal", "usageBreakdown", "usageNote"].forEach((id) => { $(id).innerHTML = ""; }); };
+  if (!authed()) { clear(); body.innerHTML = '<p class="usage-empty">Usage tracking needs an account.</p>'; return; }
   const period = ($("usagePeriod") && $("usagePeriod").value) || "cycle";
   $("usageExport").href = `/api/usage/export.csv?period=${encodeURIComponent(period)}&tz=${encodeURIComponent(userTz())}`;
   try {
     const r = await fetch(`/api/usage?period=${encodeURIComponent(period)}&tz=${encodeURIComponent(userTz())}`);
-    if (!r.ok) { body.innerHTML = '<div class="empty-hint">Failed to load usage.</div>'; return; }
+    if (!r.ok) { clear(); body.innerHTML = usageFailedHtml(`HTTP ${r.status}`); return; }
     const d = await r.json();
-    $("usageNote").innerHTML = `${escapeHtml(d.note || "")} <a href="${escapeHtml(d.console_url || "")}" target="_blank" rel="noopener">Open the Claude Console usage page</a>.` +
-      (d.pricing && d.pricing.as_of ? ` <span class="muted">Prices as of ${escapeHtml(d.pricing.as_of)}.</span>` : "");
-    const errs = (d.errors || []).length
-      ? `<h4>Failed requests</h4><ul class="usage-errors">${d.errors.map((e) => `<li><strong>${e.calls}×</strong> ${escapeHtml(ERROR_TEXT[e.error_type] || e.error_type)} <span class="muted small">· last ${fmtDate(e.last_at)}</span></li>`).join("")}</ul>` : "";
-    const chatName = (x) => {
-      const t = x.title || chatTitle(x.conversation_id) || `chat ${x.conversation_id}`;
-      return `<a href="#" data-open-chat="${escapeHtml(String(x.conversation_id))}">${escapeHtml(t)}</a>`;
-    };
-    const runName = (x) => `<span title="${escapeHtml(x.run_id)}">${escapeHtml((x.question || x.run_id).slice(0, 70))}</span>` +
-      (x.status ? ` <span class="muted small">${escapeHtml(x.status)}</span>` : "");
-    body.innerHTML = usageCards(d.totals) + budgetHtml(d.budget) + usageChart(d.daily) + errs +
-      `<h4>By model</h4>${usageTable(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}` +
-      `<h4>By chat</h4>${usageTable(d.by_chat, "Chat", chatName)}` +
-      `<h4>By run</h4>${usageTable(d.by_run, "Run", runName)}`;
+    usageView.data = d;
+    renderUsage(d);
     fillBudgetForm(d.budget && d.budget.budget);
-  } catch (err) { body.innerHTML = `<div class="empty-hint">Failed to load usage: ${escapeHtml(err.message)}</div>`; }
+  } catch (err) { clear(); body.innerHTML = usageFailedHtml(err.message); }
 }
 
 function fillBudgetForm(b) {
@@ -6842,13 +8040,29 @@ async function toggleRunUsage(btn) {
   btn.textContent = "Hide usage";
   try {
     const d = await (await fetch(`/api/usage/run/${encodeURIComponent(btn.dataset.runUsage)}`)).json();
-    if (!d.calls) { box.innerHTML = '<span class="muted small">No model calls were recorded for this run (runs before usage tracking have none).</span>'; return; }
-    const errs = (d.errors || []).map((e) => `${e.calls}× ${escapeHtml(ERROR_TEXT[e.error_type] || e.error_type)}`).join("; ");
-    box.innerHTML = `<p class="small"><strong>${fmtUsd(d.spend_usd)}</strong> estimated · ${(d.total_tokens || 0).toLocaleString()} tokens · ${d.calls} calls` +
-      (errs ? ` · <span class="bad">${errs}</span>` : "") + `</p>` +
-      `<h4>By step</h4>${usageTable(d.by_step, "Step", (x) => escapeHtml(x.step))}` +
-      `<h4>By model</h4>${usageTable(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}`;
+    box.innerHTML = runUsageHtml(d);
   } catch (err) { box.innerHTML = `<span class="bad small">Could not load: ${escapeHtml(err.message)}</span>`; }
+}
+
+function runUsageHtml(d) {
+  if (!d.calls) return '<span class="muted small">No model calls were recorded for this run (runs before usage tracking have none).</span>';
+  return `<p class="run-usage-total"><strong>Estimated</strong> ${usageTotalText(d)}</p>` +
+    usageErrorsHtml(d.errors) +
+    `<h4>By step</h4>${usageList(d.by_step, "Step", (x) => escapeHtml(x.step))}` +
+    `<h4>By model</h4>${usageList(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}`;
+}
+
+function adminUsageHtml(d) {
+  const t = d.totals || {};
+  const since = fmtDay(String(d.since || "").slice(0, 10), { year: true });
+  const tiles = `<div class="usage-tiles">` +
+    usageTile("Estimated API spend", fmtUsd(t.spend_usd), `Since ${escapeHtml(since)}`) + apiTokensTile(t) +
+    usageTile("Accounts", String((d.by_user || []).length), "with at least one model call") + "</div>";
+  const daily = (d.by_day || []).map((x) => ({ date: x.date, spend_usd: x.spend_usd, total_tokens: x.total_tokens, calls: x.calls }));
+  return tiles + usageChart(daily) +
+    `<h4>By account</h4>${usageList(d.by_user, "Account", (x) => escapeHtml(x.username))}` +
+    `<h4>By model</h4>${usageList(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}` +
+    `<h4>By day</h4>${usageList([...(d.by_day || [])].filter((x) => x.calls).reverse(), "Day", (x) => escapeHtml(fmtDay(x.date, { year: true })))}`;
 }
 
 async function loadAdminUsage() {
@@ -6859,15 +8073,15 @@ async function loadAdminUsage() {
     const days = ($("adminUsageDays") && $("adminUsageDays").value) || 30;
     const r = await fetch(`/api/admin/usage?days=${encodeURIComponent(days)}&tz=${encodeURIComponent(userTz())}`);
     if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
-    const d = await r.json();
-    const t = d.totals || {};
-    el.innerHTML = `<p><strong>${fmtUsd(t.spend_usd)}</strong> estimated · ${(t.total_tokens || 0).toLocaleString()} tokens · ${(t.calls || 0).toLocaleString()} calls since ${escapeHtml(d.since)}` +
-      `${t.errors ? ` · <span class="bad">${t.errors} failed</span>` : ""}</p>` +
-      usageChart((d.by_day || []).map((x) => ({ date: x.date, spend_usd: x.spend_usd, total_tokens: x.total_tokens, calls: x.calls }))) +
-      `<h4>By account</h4>${usageTable(d.by_user, "Account", (x) => escapeHtml(x.username))}` +
-      `<h4>By model</h4>${usageTable(d.by_model, "Model", (x) => `<code>${escapeHtml(x.model)}</code>`)}` +
-      `<h4>By day</h4>${usageTable([...(d.by_day || [])].filter((x) => x.calls).reverse(), "Day", (x) => escapeHtml(x.date))}`;
+    el.innerHTML = adminUsageHtml(await r.json());
   } catch (err) { el.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(err.message)}</div>`; }
+}
+
+// Scroll to the budget form and put the cursor in its first field.
+function editBudget() {
+  const sec = $("budgetSection");
+  sec.scrollIntoView({ behavior: "smooth", block: "start" });
+  setTimeout(() => $("budgetCredit").focus({ preventScroll: true }), 300);
 }
 
 function wireUsage() {
@@ -6877,17 +8091,35 @@ function wireUsage() {
   $("usagePeriod").addEventListener("change", loadUsage);
   $("budgetForm").addEventListener("submit", saveBudget);
   $("budgetForm").addEventListener("input", () => { $("budgetForm").dataset.dirty = "1"; });
-  $("usageBody").addEventListener("click", (e) => {
-    const a = e.target.closest("[data-open-chat]");
-    if (a) { e.preventDefault(); openChat(a.dataset.openChat); }
+  $("changePwForm").addEventListener("input", () => $("cpProblem").classList.add("hidden"));
+  const tabs = [...document.querySelectorAll(".account-tab")];
+  tabs.forEach((b) => {
+    b.addEventListener("click", () => switchAccountTab(b.dataset.accountTab));
+    // Arrow keys move between the tabs, as in any tab list.
+    b.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+      const shown = tabs.filter((t) => !t.classList.contains("hidden"));
+      const next = shown[(shown.indexOf(b) + (e.key === "ArrowRight" ? 1 : shown.length - 1)) % shown.length];
+      switchAccountTab(next.dataset.accountTab); next.focus(); e.preventDefault();
+    });
   });
+  const onUsageClick = (e) => {
+    const a = e.target.closest("[data-open-chat]");
+    if (a) { e.preventDefault(); openChat(a.dataset.openChat); return; }
+    if (e.target.closest("[data-budget-edit]")) { e.preventDefault(); editBudget(); return; }
+    if (e.target.closest("[data-usage-retry]")) { loadUsage(); return; }
+    const by = e.target.closest("[data-usage-by]");
+    if (by && usageView.data) { usageView.by = by.dataset.usageBy; $("usageBreakdown").innerHTML = usageBreakdownHtml(usageView.data, usageView.by); }
+  };
+  $("usageBody").addEventListener("click", onUsageClick);
+  $("usageBreakdown").addEventListener("click", onUsageClick);
   $("adminUsageRefresh").addEventListener("click", loadAdminUsage);
   $("adminUsageDays").addEventListener("change", loadAdminUsage);
-  $("chatUsage").addEventListener("click", () => switchView("account"));
-  $("apiKeysUsageLink").addEventListener("click", (e) => { e.preventDefault(); $("apiKeysModal").classList.add("hidden"); switchView("account"); });
+  $("chatUsage").addEventListener("click", () => openAccount("usage"));
+  $("apiKeysUsageLink").addEventListener("click", (e) => { e.preventDefault(); $("apiKeysModal").classList.add("hidden"); openAccount("usage"); });
   $("budgetNotice").addEventListener("click", (e) => {
     if (e.target.closest("[data-dismiss]")) { $("budgetNotice").classList.add("hidden"); return; }
-    if (e.target.closest("[data-usage-open]")) { e.preventDefault(); switchView("account"); }
+    if (e.target.closest("[data-usage-open]")) { e.preventDefault(); openAccount("usage"); }
   });
 }
 

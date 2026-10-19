@@ -692,7 +692,7 @@ def make_inspect_dataset_tool() -> Any:
     when this session has a served model, describes it via ``ctx.tunnel_port`` (``think=False``,
     load-bearing — the served Qwen3.6 is a reasoning model and a bounded call with thinking ON can
     return empty content). Follows the ``make_hpo_mapping_tool`` template."""
-    from ..sdk import HarnessTool, session_chat_fn
+    from ..sdk import HarnessTool, confine_read, session_chat_fn
 
     def _exec(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         decisions = getattr(ctx, "decisions", None) or {}
@@ -700,10 +700,18 @@ def make_inspect_dataset_tool() -> Any:
         # runs HERE, on the gateway, so a model-typed path usually names the HPC3 copy (/dfs3b/...),
         # which does not exist on this host: honouring it first made the tool report the run's own
         # dataset "unreadable" (28 times in 12 prod runs). Use the model's path only when nothing is
-        # bound, or when it is a real file on this host that differs from the bound one.
+        # bound, or when it is a real file on this host that differs from the bound one — and only
+        # inside this run's files, its bound datasets or the owner's uploads (confine_read).
         bound = str(decisions.get("dataset_path") or "").strip()
         asked = str(args.get("path") or "").strip()
-        path = asked if (asked and (not bound or os.path.isfile(asked))) else bound
+        path = bound
+        if asked:
+            confined, why = confine_read(asked, ctx)
+            if confined is not None:
+                if confined.is_file() or not bound:
+                    path = str(confined)
+            elif not bound or os.path.lexists(asked):
+                return {"status": "error", "tool": "inspect_dataset", "error": why}
         if not path:
             return {"status": "error", "tool": "inspect_dataset",
                     "error": "inspect_dataset needs a file path — pass `path`, or bind a dataset to "
@@ -728,8 +736,9 @@ def make_inspect_dataset_tool() -> Any:
         "one_line_summary, confidence) — do not invent facts beyond what it reports.",
         {"type": "object", "properties": {
             "path": {"type": "string",
-                     "description": "server-side path of the file to skim. Omit to use the dataset "
-                                    "already bound to this run."}}},
+                     "description": "server-side path of the file to skim: a file of this run, a "
+                                    "dataset bound to it, or one of your uploads. Omit to use the "
+                                    "dataset already bound to this run."}}},
         _exec,
         reads_private_data=True, category="qc",
     )

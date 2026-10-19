@@ -81,3 +81,13 @@ def test_capability_log_records_scgpt_error_note(tmp_path):
 def test_capability_log_never_raises_on_bad_input(tmp_path):
     # A malformed conn (no .settings) must be swallowed — logging can never break a run.
     _write_capability_log(tmp_path, None, types.SimpleNamespace(), lambda *a: None)
+
+
+def test_capability_log_does_not_claim_a_vl_review_that_never_started(tmp_path):
+    # Run 6275df1213ab: a short report is never handed to the visual review, yet the log said
+    # "ENABLED and ran; pages read clean".
+    _write_capability_log(tmp_path, _result([{"tool": "run_cellqc", "status": "ok"}]),
+                          _conn(live=True, vl=True), lambda *a: None, vl_attempted=False)
+    txt = (tmp_path / "process" / "capabilities.log").read_text()
+    assert "VL render review: NOT RUN (no full report was rendered this run)." in txt
+    assert "read clean" not in txt

@@ -108,10 +108,16 @@ def _rows(user_id: int | None, since: _dt.datetime | None = None, *,
         return list(rows)
 
 
+def _tokens0() -> dict:
+    return dict.fromkeys(_TOKEN_KEYS, 0)
+
+
 def _empty() -> dict:
-    return {"calls": 0, "errors": 0, "input_tokens": 0, "cache_write_tokens": 0,
-            "cache_read_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-            "spend_usd": 0.0, "unpriced_calls": 0}
+    # ``cluster``: the part of the calls and tokens that no API key paid for (the cluster GPU, which
+    # HPC3 charges by GPU time, not by token). Every other figure counts all calls; the API-key share
+    # is the whole minus this.
+    return {"calls": 0, "errors": 0, **_tokens0(), "spend_usd": 0.0, "unpriced_calls": 0,
+            "cluster": {"calls": 0, **_tokens0()}}
 
 
 def _add(acc: dict, r) -> dict:
@@ -119,11 +125,15 @@ def _add(acc: dict, r) -> dict:
     if (r.status or "ok") == "error":
         acc["errors"] += 1
     cached = (r.cache_write_tokens or 0) + (r.cache_read_tokens or 0)
-    acc["input_tokens"] += r.input_tokens if r.input_tokens is not None else max(0, r.prompt_tokens - cached)
-    acc["cache_write_tokens"] += r.cache_write_tokens or 0
-    acc["cache_read_tokens"] += r.cache_read_tokens or 0
-    acc["output_tokens"] += r.completion_tokens or 0
-    acc["total_tokens"] += r.total_tokens or 0
+    tokens = {"input_tokens": r.input_tokens if r.input_tokens is not None else max(0, r.prompt_tokens - cached),
+              "cache_write_tokens": r.cache_write_tokens or 0, "cache_read_tokens": r.cache_read_tokens or 0,
+              "output_tokens": r.completion_tokens or 0, "total_tokens": r.total_tokens or 0}
+    for k, v in tokens.items():
+        acc[k] += v
+    if not r.remote:
+        acc["cluster"]["calls"] += 1
+        for k, v in tokens.items():
+            acc["cluster"][k] += v
     spend = r.spend_usd
     if spend is None:
         # A billed call the table has no price for. Calls on the cluster GPU are recorded at 0.
@@ -324,7 +334,8 @@ def typical_run_cost(user_id: int | None, model: str, *, limit: int = 20) -> dic
 
 def _sql_totals(user_id: int, *, conversation_id: str | None = None, run_id: str | None = None) -> dict:
     """Calls, tokens and spend of a chat or a run, summed in the database: this runs after every
-    model call of a live run, and a long chat has thousands of rows."""
+    model call of a live run, and a long chat has thousands of rows. ``cluster`` is the part on the
+    cluster GPU, as in ``_empty``."""
     from sqlalchemy import and_, case, func, or_, select
 
     from .db import session_scope
@@ -332,17 +343,22 @@ def _sql_totals(user_id: int, *, conversation_id: str | None = None, run_id: str
     spend = func.coalesce(LlmCall.cost_usd, LlmCall.est_cost_usd)
     unpriced = and_(LlmCall.remote.is_(True), LlmCall.cost_usd.is_(None), LlmCall.est_cost_usd.is_(None),
                     or_(LlmCall.status.is_(None), LlmCall.status != "error"))
+    on_cluster = or_(LlmCall.remote.is_(False), LlmCall.remote.is_(None))     # ``not r.remote`` in _add
     stmt = select(func.count(LlmCall.id), func.coalesce(func.sum(LlmCall.total_tokens), 0),
                   func.coalesce(func.sum(spend), 0.0),
-                  func.coalesce(func.sum(case((unpriced, 1), else_=0)), 0)).where(LlmCall.user_id == user_id)
+                  func.coalesce(func.sum(case((unpriced, 1), else_=0)), 0),
+                  func.coalesce(func.sum(case((on_cluster, 1), else_=0)), 0),
+                  func.coalesce(func.sum(case((on_cluster, LlmCall.total_tokens), else_=0)), 0)
+                  ).where(LlmCall.user_id == user_id)
     if conversation_id is not None:
         stmt = stmt.where(LlmCall.conversation_id == str(conversation_id))
     if run_id is not None:
         stmt = stmt.where(LlmCall.run_id == run_id)
     with session_scope() as s:
-        calls, tokens, usd, unpriced_n = s.execute(stmt).one()
+        calls, tokens, usd, unpriced_n, cluster_n, cluster_tokens = s.execute(stmt).one()
     return {"calls": int(calls), "total_tokens": int(tokens), "spend_usd": round(float(usd), 6),
-            "unpriced_calls": int(unpriced_n)}
+            "unpriced_calls": int(unpriced_n),
+            "cluster": {"calls": int(cluster_n), "total_tokens": int(cluster_tokens)}}
 
 
 def live_totals(user_id: int | None, conversation_id: str | None, run_id: str | None) -> dict:

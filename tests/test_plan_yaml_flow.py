@@ -82,11 +82,12 @@ def _complete(counts: dict):
     return complete
 
 
-def _lab(calls: list, counts: dict, *, plan_yaml: bool = True, scientist=None) -> ResearchLab:
+def _lab(calls: list, counts: dict, *, plan_yaml: bool = True, scientist=None,
+         planner: str = "linear") -> ResearchLab:
     scientist = scientist or ResearchHarness(catalog=_catalog(calls), chat_fn=_scientist_chat)
     return ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="m"),
                        LabConfig(plan_yaml=plan_yaml, plan_review=False, auto_select_skill=False,
-                                 mode="single", planner="linear"),
+                                 mode="single", planner=planner),
                        complete_fn=_complete(counts), scientist=scientist)
 
 
@@ -150,6 +151,32 @@ def test_an_edit_is_applied_by_code_and_the_approved_number_is_the_one_that_runs
     assert check["ok"] is True and check["as_planned"] == 2
     assert "resolution: 1.2" in lab.approved_plan_yaml
     assert result.agenda == seen[1]
+
+
+def test_on_the_dag_planner_the_approved_number_is_the_one_that_runs_too():
+    """The DAG planner (prod's default) hands the Scientist a node brief — the step's text plus
+    reuse hints and "Do ONLY this task" — and the approved settings were looked up by that brief, so
+    none was ever found: prod run caa188e8e672 called run_cellqc with species=auto against an approved
+    "mouse", and its own read-back said 0 of 1 steps ran as approved. Every test above ran linear."""
+    calls: list = []
+    counts: dict = {}
+
+    def decide(n, _payload, doc):
+        if n == 1:
+            return {"action": "edit", "plan_yaml": doc["yaml"].replace("resolution: 0.5", "resolution: 1.2")}
+        return {"action": "approve"}
+
+    lab = _lab(calls, counts, planner="dag")
+    _result, events, _seen = _run(lab, decide)
+
+    briefs = [e["step"] for e in _of(events, "scientist_start")]
+    assert briefs and all("Do ONLY this task" in b for b in briefs), "the DAG path ran, with node briefs"
+    assert ("run_clustering", {"resolution": 1.2, "n_pcs": 30}) in calls
+    assert ("run_scanpy_qc", {"min_genes": 200, "max_pct_mt": 10.0}) in calls
+    enforced = _of(events, "plan_setting_enforced")
+    assert enforced and enforced[0]["overrode"] == [{"param": "resolution", "approved": 1.2, "model": 0.5}]
+    check = _of(events, "plan_adherence")[0]
+    assert check["ok"] is True and check["as_planned"] == 2
 
 
 @pytest.mark.parametrize("bad, reason", [
@@ -346,3 +373,123 @@ def test_a_code_step_the_reviser_adds_carries_no_code_as_a_setting():
     added = _of(events, "plan_doc")[-1]["steps"][2]
     assert added["tool"] == "run_code" and not added.get("settings")
     assert _of(events, "plan_edited")[0]["by"] == "pi" and len(seen[1]) == 3
+
+
+# --- words after the researcher's own edit change the EDITED plan ----------------------------------------
+
+def _recording(lab: ResearchLab, prompts: list) -> ResearchLab:
+    """Keep every prompt the lab's models are given, by the system prompt's first words."""
+    inner = lab._complete_fn
+
+    def complete(messages):
+        prompts.append((messages[0]["content"][:60], "\n".join(m["content"] for m in messages[1:])))
+        return inner(messages)
+    lab._complete_fn = complete
+    return lab
+
+
+def _reviser_prompts(prompts):
+    return [p for s, p in prompts if s.startswith("You are changing an analysis plan")]
+
+
+def test_words_after_a_hand_edit_are_made_on_the_edited_plan():
+    calls: list = []
+    counts: dict = {}
+    prompts: list = []
+    reply = json.dumps({"ops": [{"op": "change", "step": "s1", "settings": {"min_genes": 300}}]})
+    lab = _recording(_revising_lab(calls, counts, reply), prompts)
+
+    def decide(n, _payload, doc):
+        if n == 1:
+            return {"action": "edit", "plan_yaml": doc["yaml"].replace("resolution: 0.5", "resolution: 1.2")}
+        if n == 2:
+            return {"action": "revise", "feedback": "keep cells with at least 300 genes"}
+        return {"action": "approve"}
+
+    _result, events, seen = _run(lab, decide)
+    shown = _reviser_prompts(prompts)
+    assert len(shown) == 1 and "resolution: 1.2" in shown[0] and "resolution: 0.5" not in shown[0], \
+        "the PI is shown the plan with the researcher's edit"
+    assert "resolution 1.2" in seen[2][1] and "300 genes" in seen[2][0], "both changes are in the plan"
+    assert ("run_clustering", {"resolution": 1.2, "n_pcs": 30}) in calls
+    assert ("run_scanpy_qc", {"min_genes": 300}) in calls
+
+
+def test_a_reply_sent_with_an_unapplied_edit_applies_the_edit_first():
+    """The researcher typed an edit in the document, did not apply it, and then asked for a change
+    in words: the edit is applied (by code) and the words change the edited plan."""
+    calls: list = []
+    counts: dict = {}
+    prompts: list = []
+    reply = json.dumps({"ops": [{"op": "change", "step": "s1", "settings": {"min_genes": 300}}]})
+    lab = _recording(_revising_lab(calls, counts, reply), prompts)
+
+    def decide(n, _payload, doc):
+        if n == 1:
+            return {"action": "revise", "feedback": "keep cells with at least 300 genes",
+                    "plan_yaml": doc["yaml"].replace("resolution: 0.5", "resolution: 1.2")}
+        return {"action": "approve"}
+
+    _result, events, seen = _run(lab, decide)
+    edits = _of(events, "plan_edited")
+    assert [e.get("by") for e in edits] == [None, "pi"], "the researcher's edit first, then the PI's"
+    assert [(c["kind"], c["param"], c["after"]) for c in edits[0]["changes"]] == [("setting", "resolution", 1.2)]
+    assert "resolution: 1.2" in _reviser_prompts(prompts)[0]
+    assert ("run_clustering", {"resolution": 1.2, "n_pcs": 30}) in calls
+    assert ("run_scanpy_qc", {"min_genes": 300}) in calls
+
+
+def test_an_unapplied_edit_that_cannot_be_applied_stops_the_reply_too():
+    calls: list = []
+    counts: dict = {}
+    reply = json.dumps({"ops": [{"op": "change", "step": "s1", "settings": {"min_genes": 300}}]})
+
+    def decide(n, _payload, doc):
+        if n == 1:
+            return {"action": "revise", "feedback": "keep cells with at least 300 genes",
+                    "plan_yaml": doc["yaml"].replace("resolution: 0.5", "resolution: fast")}
+        return {"action": "approve"}
+
+    _result, events, seen = _run(_revising_lab(calls, counts, reply), decide)
+    problems = " ".join(_of(events, "plan_edit_rejected")[0]["problems"])
+    assert "cannot take resolution" in problems and "message was not sent to the PI" in problems
+    assert "revise" not in counts and seen[1] == seen[0] and not _of(events, "plan_edited"), \
+        "nothing changed: not the edit, not the words"
+
+
+def test_an_unapplied_edit_that_changes_nothing_does_not_hold_the_reply():
+    calls: list = []
+    counts: dict = {}
+    reply = json.dumps({"ops": [{"op": "change", "step": "s1", "settings": {"min_genes": 300}}]})
+
+    def decide(n, _payload, doc):
+        if n == 1:
+            return {"action": "revise", "feedback": "keep cells with at least 300 genes",
+                    "plan_yaml": doc["yaml"] + "\n"}
+        return {"action": "approve"}
+
+    _result, events, _seen = _run(_revising_lab(calls, counts, reply), decide)
+    assert not _of(events, "plan_edit_rejected") and counts.get("revise") == 1
+    assert ("run_scanpy_qc", {"min_genes": 300}) in calls
+
+
+def test_a_redraft_after_a_hand_edit_is_told_to_keep_it():
+    """When the change asked for in words cannot be made on the document, the plan is patched or
+    redrafted from the feedback: the researcher's edit is part of that feedback, so a redraft
+    cannot quietly put the old value back."""
+    calls: list = []
+    counts: dict = {}
+    prompts: list = []
+    lab = _recording(_revising_lab(calls, counts, '{"ops": []}'), prompts)
+
+    def decide(n, _payload, doc):
+        if n == 1:
+            return {"action": "edit", "plan_yaml": doc["yaml"].replace("resolution: 0.5", "resolution: 1.2")}
+        if n == 2:
+            return {"action": "revise", "feedback": "make the clustering more thorough"}
+        return {"action": "approve"}
+
+    _run(lab, decide)
+    redraft = [p for s, p in prompts if "Principal Investigator" in s and "did not object to" in p][-1]
+    assert "edited the plan by hand; keep these changes: set resolution to 1.2 in step 2" in redraft
+    assert "make the clustering more thorough" in redraft

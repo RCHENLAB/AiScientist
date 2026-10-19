@@ -57,6 +57,10 @@ class PresetPipeline:
     # user-PINNED pipeline against the dataset-derived auto pick: when they name different modalities,
     # the dataset wins (a scanpy pipeline is never forced onto a VCF). See ``research_lab.run``.
     data_type: str = ""
+    # For people, from the pipeline's PROTOCOL.md when it has one: its heading ("Differential
+    # Expression") and its front-matter description, a line shorter than ``label``. Empty otherwise.
+    title: str = ""
+    summary: str = ""
 
     def missing_tools(self, available: "frozenset[str] | None") -> tuple[str, ...]:
         """Declared tools this deployment cannot actually run, in declaration order.
@@ -124,14 +128,29 @@ def _load_pipelines() -> dict[str, PresetPipeline]:
         if not key or not body:
             continue
         tools = tuple(t.strip() for t in meta.get("tools", "").split(",") if t.strip())
+        title, summary = _protocol_heading(skill_md.parent / "PROTOCOL.md")
         out[key] = PresetPipeline(
             key=key,
             label=meta.get("description", key),
             prompt=body,
             tools=tools,
             data_type=meta.get("data_type", "").strip().lower(),
+            title=title,
+            summary=summary,
         )
     return out
+
+
+def _protocol_heading(path: Path) -> tuple[str, str]:
+    """(title, summary) of a pipeline's PROTOCOL.md: its first ``# `` heading without a trailing
+    "Protocol", and its front-matter description. ``("", "")`` when there is no readable file."""
+    try:
+        meta, body = _parse_skill(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return "", ""
+    heading = next((ln[2:].strip() for ln in body.splitlines() if ln.startswith("# ")), "")
+    title = heading[:-len(" Protocol")] if heading.endswith(" Protocol") else heading
+    return title, meta.get("description", "")
 
 
 PIPELINES: dict[str, PresetPipeline] = _load_pipelines()
@@ -152,6 +171,8 @@ def list_pipelines() -> list[dict]:
             "prompt": p.prompt,
             "tools": list(p.tools),
             "data_type": p.data_type,
+            "title": p.title,
+            "summary": p.summary,
         }
         for p in PIPELINES.values()
     ]

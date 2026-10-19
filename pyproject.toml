@@ -69,7 +69,6 @@ literature = [
 # venv's python, so installing this extra into the app venv lets generated analysis
 # code `import scanpy/gseapy`. System tools (apt, not pip): `pandoc texlive-xetex`
 # for PDF rendering, `graphviz` for deterministic schematic figures (the `dot` binary).
-# Optional prettier SVG schematics: install d2 (curl -fsSL https://d2lang.com/install.sh | sh -s --).
 analysis = [
   "scanpy>=1.10",
   "pydeseq2>=0.4",           # pseudobulk DE: DESeq2's NB Wald test (run_pseudobulk_de)

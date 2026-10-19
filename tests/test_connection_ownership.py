@@ -244,12 +244,14 @@ def test_every_route_that_reads_a_connection_id_is_guarded():
     creates = {"/api/connect"}                 # makes connections; pinned in the connect tests below
     # finds the CALLER's own session by account, never one a request names; pinned below
     by_account = {"/api/session"}
+    # counts the open sessions and reads nothing of theirs; pinned in test_run_monitor.py
+    counts_only = {"/api/system/live"}
     unguarded = []
     for route in gw_app.app.routes:
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None or not getattr(route, "path", "").startswith(("/api/", "/ws/")):
             continue
-        if route.path in creates or route.path in by_account:
+        if route.path in creates or route.path in by_account or route.path in counts_only:
             continue
         src = inspect.getsource(endpoint)
         if "CONNECTIONS" in src or "connection_id" in src:

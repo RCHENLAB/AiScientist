@@ -57,10 +57,11 @@ def _write(tmp_path, name, data):
 class _Ctx:
     """Duck-typed HarnessContext (mirrors test_hpo_mapper's _Ctx)."""
 
-    def __init__(self, tunnel_port=None, decisions=None):
+    def __init__(self, tunnel_port=None, decisions=None, workspace=None):
         self.tunnel_port = tunnel_port
         self.model = "qwen3.6:35b-a3b"
         self.decisions = decisions or {}
+        self.workspace = workspace
 
 
 # --- peek: VCF ----------------------------------------------------------------
@@ -327,7 +328,7 @@ def test_tool_runs_without_a_served_model(tmp_path):
     description, not a crash and not an LLM call."""
     tool = make_inspect_dataset_tool()
     path = _write(tmp_path, "case.vcf", _VCF)
-    out = tool.executor({"path": path}, _Ctx(tunnel_port=None))
+    out = tool.executor({"path": path}, _Ctx(tunnel_port=None, workspace=tmp_path))
     assert out["status"] == "ok"
     assert out["description"]["source"] == "deterministic"
     assert out["peek"]["vcf"]["assembly"] == "GRCh37"

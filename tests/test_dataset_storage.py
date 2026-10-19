@@ -31,18 +31,22 @@ def storage(tmp_path, monkeypatch):
 def test_publish_uuid_layout_and_retry(storage):
     store, *_ = storage
     identity = str(uuid.uuid4())
-    stage = store.temp_dir(identity)
+    stage = store.temp_dir(identity, "owner")
     stage.mkdir(parents=True)
     (stage / "sample.txt").write_text("complete")
-    target = store.publish_dataset(stage, identity)
-    assert target == store.dataset_dir(identity) / "original"
+    target = store.publish_dataset(stage, identity, "owner")
+    assert target == store.dataset_dir(identity, "owner") / "original"
+    assert target == store.data_root() / "users" / "owner" / "datasets" / identity / "original"
     assert (target / "sample.txt").read_text() == "complete"
     assert (target.parent / "processed").is_dir()
-    assert store.publish_dataset(stage, identity) == target
+    assert store.publish_dataset(stage, identity, "owner") == target
     with pytest.raises(ValueError):
-        store.dataset_dir("../escape")
+        store.dataset_dir("../escape", "owner")
+    for bad in ("../other", "a/b", "", ".", "has space"):
+        with pytest.raises(ValueError):
+            store.dataset_dir(identity, bad)
     with pytest.raises(ValueError):
-        store.publish_dataset(target, str(uuid.uuid4()))
+        store.publish_dataset(target, str(uuid.uuid4()), "owner")
 
 
 def test_delete_failure_preserves_row_and_overlap_guard(storage, tmp_path):
@@ -66,20 +70,20 @@ def test_delete_only_uuid_tree(storage):
     store, routes, db, models, uid = storage
     identity, sibling = str(uuid.uuid4()), str(uuid.uuid4())
     for value in (identity, sibling):
-        folder = store.dataset_dir(value) / "original"
+        folder = store.dataset_dir(value, "owner") / "original"
         folder.mkdir(parents=True)
         (folder / "same.txt").write_text("contents")
-    dataset = routes.record_folder_dataset(uid, "same", str(store.dataset_dir(identity) / "original"), 8)
+    dataset = routes.record_folder_dataset(uid, "same", str(store.dataset_dir(identity, "owner") / "original"), 8)
     routes.delete_dataset_record(uid, dataset, delete_files=store.remove_managed_dataset)
-    assert not store.dataset_dir(identity).exists()
-    assert store.dataset_dir(sibling).exists()
+    assert not store.dataset_dir(identity, "owner").exists()
+    assert store.dataset_dir(sibling, "owner").exists()
     with db.session_scope() as session:
         assert session.get(models.Dataset, dataset) is None
 
 
 def test_reconcile_dry_run_owner_scope_and_cleanup(storage):
     store, routes, db, models, uid = storage
-    orphan = store.dataset_dir(str(uuid.uuid4()))
+    orphan = store.dataset_dir(str(uuid.uuid4()), "owner")
     orphan.mkdir(parents=True)
     missing = routes.record_dataset(uid, "missing", str(orphan.parent / str(uuid.uuid4())), 0, "other")
     assert store.reconcile(user_id=uid)["orphans"] == []
@@ -106,6 +110,7 @@ def test_legacy_migration_is_copy_and_preserves_uuid(storage, tmp_path):
     with db.session_scope() as session:
         row = session.get(models.Dataset, dataset)
         assert row.uuid == store.managed_uuid(row.path)
+        assert store.managed_owner(row.path) == "owner"
         assert row.public()["original_name"] == "original.txt"
         assert row.public()["status"] == "complete"
 
@@ -192,9 +197,9 @@ def test_reconcile_leaves_a_tree_published_a_moment_ago(storage, monkeypatch):
     import time
     store, *_ = storage
     monkeypatch.setattr(store, "_PUBLISH_GRACE_S", 3600)
-    fresh = store.dataset_dir(str(uuid.uuid4()))
+    fresh = store.dataset_dir(str(uuid.uuid4()), "owner")
     fresh.mkdir(parents=True)
-    old = store.dataset_dir(str(uuid.uuid4()))
+    old = store.dataset_dir(str(uuid.uuid4()), "other")
     old.mkdir(parents=True)
     hours_ago = time.time() - 2 * 3600
     os.utime(old, (hours_ago, hours_ago))
@@ -218,3 +223,46 @@ def test_reconcile_leaves_what_the_upload_queue_still_holds(storage, tmp_path):
     report = store.reconcile(cleanup=True)
     assert report["orphans"] == [str(root / "stray")]
     assert (root / "study").is_dir() and (root / "big.bam").exists() and not (root / "stray").exists()
+
+
+def test_layout_helpers_tell_accounts_apart(storage):
+    """Issue 6: one folder per account. A path names its account and its dataset; the flat layout
+    written before (``datasets/<uuid>``) is still recognised as managed, but belongs to no account."""
+    store, *_ = storage
+    identity = str(uuid.uuid4())
+    mine = store.dataset_dir(identity, "owner") / "original" / "x.h5ad"
+    assert store.managed_uuid(mine) == identity and store.managed_owner(mine) == "owner"
+    assert store.managed_tree(mine) == store.dataset_dir(identity, "owner")
+    assert store.is_owned(mine, "owner") and not store.is_owned(mine, "other")
+    flat = store.data_root() / "datasets" / identity / "original" / "x.h5ad"
+    assert store.managed_uuid(flat) == identity and store.managed_owner(flat) is None
+    assert not store.is_owned(flat, "owner")
+    # not a UUID folder, not inside the data root, or climbing out of it: not managed
+    assert store.managed_uuid(store.datasets_root("owner") / "not-a-uuid" / "f") is None
+    assert store.managed_uuid(store.data_root().parent / "users" / "owner" / "datasets" / identity) is None
+    assert store.managed_uuid(str(store.datasets_root("owner") / identity / ".." / ".." / ".." / "x")) is None
+    assert store.account_name("Bio Admin!") == "BioAdmin" and store.account_name("") == "guest"
+
+
+def test_location_of_tells_hpc3_from_this_host(storage, monkeypatch):
+    store, *_ = storage
+    from aiscientist.gateway import settings
+    assert store.location_of(f"{settings.LAB_STORAGE}/software/AiScientist/uploads/u/x.h5ad") == "hpc3"
+    assert store.location_of(f"{settings.LAB_STORAGE}/u/AiScientist_results/x.h5ad") == "hpc3"
+    assert store.location_of(str(store.dataset_dir(str(uuid.uuid4()), "owner") / "original")) == "server"
+    assert store.location_of("/data/Users/shared/lab/sample") == "server"
+
+
+def test_reconcile_finds_orphans_in_every_account_and_the_flat_layout(storage):
+    store, routes, db, models, uid = storage
+    kept = store.dataset_dir(str(uuid.uuid4()), "owner")
+    (kept / "original").mkdir(parents=True)
+    routes.record_folder_dataset(uid, "kept", str(kept / "original"), 0)
+    stray = store.dataset_dir(str(uuid.uuid4()), "someone")
+    stray.mkdir(parents=True)
+    flat = store.data_root() / "datasets" / str(uuid.uuid4())
+    flat.mkdir(parents=True)
+    report = store.reconcile()
+    assert sorted(report["orphans"]) == sorted([str(stray), str(flat)])
+    store.reconcile(cleanup=True)
+    assert kept.exists() and not stray.exists() and not flat.exists()

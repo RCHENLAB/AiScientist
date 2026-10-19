@@ -75,8 +75,8 @@ unchanged.
     `<sample>.h5ad` included. It is outside `artifacts/` for the reason the processed dataset is:
     everything under artifacts is copied to the gateway after each step. `data/cellqc_result.json`
     lists it. The console downloads it as one zip (`result/…`, read from HPC3 as it is sent) and
-    "Save to my data" moves it to the user's folder as a dataset; unsaved, it goes with the run's
-    process files.
+    "Save to my data" makes it one of the user's datasets (copied to the server for an HPC3 run);
+    unsaved, it goes with the run's process files.
 - `tables/cellqc_metrics.csv`; a per-library QC violin in `figures/`.
 - Result: per-library cells in → after filtering → after doublets, which threshold removed them
   (`removed_only_by`), median % mitochondrial before filtering (`median_pct_mt`, CellQC's) and

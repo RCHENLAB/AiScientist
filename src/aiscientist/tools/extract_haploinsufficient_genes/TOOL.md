@@ -5,6 +5,7 @@ category: literature
 runs_on: hpc:literature
 order: 415
 research: false
+served_model: true
 line: literature
 owner: literature
 cpus: 4
@@ -73,7 +74,7 @@ is listed only because a corpus paper says, in its own words, that one working c
 ## Where it runs
 
 <!-- generated:runs-on -->
-As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`, calling the session's served model. It is left out of the catalog when the session has no GPU allocation.
+As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`. Its job calls the session's served model, so it is offered only to a session with a GPU allocation.
 
 Slurm resources for its job: 4 CPUs, 16 GB, up to 04:00:00.
 

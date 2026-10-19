@@ -179,6 +179,7 @@ class ToolManifest:
     entry: str = "tool:make_tool"
     needs: tuple[str, ...] = ()
     chat: bool = False
+    served_model: bool = False    # the tool's HPC3 job calls the session's served model (needs a GPU allocation)
     research: bool = True         # in the Scientist's catalog; False = only its own console line runs it
     line: str = ""
     owner: str = ""
@@ -222,7 +223,7 @@ def load_manifest(folder: Path) -> ToolManifest:
         raise ManifestError(f"{path}: runs_on {fields['runs_on']!r} is not one of {RUNS_ON}")
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
-    known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "line", "owner",
+    known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "served_model", "line", "owner",
                               "image", "cpus", "mem_gb", "time_limit"}
     unknown = set(fields) - known
     if unknown:
@@ -245,7 +246,8 @@ def load_manifest(folder: Path) -> ToolManifest:
         runs_on=fields["runs_on"], order=int(fields["order"]), folder=folder,
         entry=str(fields.get("entry") or "tool:make_tool"),
         needs=tuple(str(n) for n in (needs if isinstance(needs, list) else [needs])),
-        chat=bool(fields.get("chat", False)), research=bool(fields.get("research", True)),
+        chat=bool(fields.get("chat", False)), served_model=bool(fields.get("served_model", False)),
+        research=bool(fields.get("research", True)),
         line=str(fields.get("line") or ""),
         owner=str(fields.get("owner") or ""), image=image,
         cpus=int(fields.get("cpus") or 0), mem_gb=int(fields.get("mem_gb") or 0),

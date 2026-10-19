@@ -157,8 +157,8 @@ def _importable(requirement: str) -> bool:
         return False
 
 
-def session_catalog(catalog: list["HarnessTool"],
-                    literature_executor: Any = None) -> list["HarnessTool"]:
+def session_catalog(catalog: list["HarnessTool"], literature_executor: Any = None,
+                    served_model: bool = True) -> list["HarnessTool"]:
     """The roster ONE SESSION is offered: ``catalog`` without the HPC3 literature tools it cannot run.
 
     ``deep_literature`` runs as a job in paperqa.sif on HPC3 and calls the session's served model
@@ -169,13 +169,23 @@ def session_catalog(catalog: list["HarnessTool"],
     key, so it had no GPU: the PI planned a ``deep_literature`` step, the plan review rewrote it
     around that tool's contract, and the call answered ``dependency_missing`` in under a second.
 
+    A literature executor can exist without a served model (a session on the user's own API key):
+    ``search_corpus`` runs there, because its job calls no model. The tools whose manifest says
+    ``served_model`` are offered only when ``served_model`` is true, so the rule is data, not a list
+    of names.
+
     Only the session's roster changes. ``build_scientist_catalog()`` keeps listing the tool, because
     the System page and the step classifier (``research_lab._known_tool_names``) read that catalog as
     the tools that exist, and ``diagnose_disease`` stays bound to the executor it was built with."""
-    if literature_executor is not None:
-        return catalog
-    return [t for t in catalog
-            if t.name not in _HPC_LITERATURE_TOOLS or all(_importable(r) for r in t.requires)]
+    def offered(t: "HarnessTool") -> bool:
+        if t.name not in _HPC_LITERATURE_TOOLS:
+            return True
+        if literature_executor is not None:
+            m = tool_catalog.manifest(t.name)
+            return served_model or not (m and m.served_model)
+        return all(_importable(r) for r in t.requires)
+
+    return [t for t in catalog if offered(t)]
 
 
 def _make_describe_environment_tool(hpc_shell: Any = None) -> "HarnessTool":
@@ -224,7 +234,7 @@ def _make_describe_environment_tool(hpc_shell: Any = None) -> "HarnessTool":
 #     ```mermaid fence and the browser renders it (Feature B). The two are complementary, and the
 #     schematic tool is untouched on the research path.
 # ``deep_literature`` is the one chat tool that runs on HPC3 (its index is on /dfs3b).
-def build_quickchat_catalog(literature_executor: Any = None) -> list["HarnessTool"]:
+def build_quickchat_catalog(literature_executor: Any = None, served_model: bool = True) -> list["HarnessTool"]:
     """The tools the answer-first chat loop may call: the ``chat: true`` manifests, built from the
     SAME factories as the research catalog (so a tool is never defined twice and cannot drift
     between paths).
@@ -235,6 +245,8 @@ def build_quickchat_catalog(literature_executor: Any = None) -> list["HarnessToo
     executors = {"hpc:literature": literature_executor}
 
     def wanted(m: Any) -> bool:
+        if m.served_model and not served_model:
+            return False
         return m.chat and (not m.runs_on.startswith("hpc:") or executors.get(m.runs_on) is not None)
 
     return tool_catalog.build_tools(where=wanted, route=_router(executors))

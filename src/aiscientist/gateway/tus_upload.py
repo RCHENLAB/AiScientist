@@ -572,6 +572,15 @@ def _log_finish_error(conn, upload_id: str, meta: dict, exc: Exception) -> None:
 async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
     gw = _gw()
     uploads = upload_storage.uploads(conn)
+    if meta["status"] == "finalizing" and gw._uploads_queued(conn):
+        # Finished before, and the request that did it died before it said so: the queue already
+        # holds the file (and may have published it into the dataset folder), so continue that job.
+        held = gw._staging_queue(conn).find_upload(path.stem)
+        if held is not None and held.state != "cancelled":
+            meta["job_id"] = held.id
+            meta["status"] = "staging"
+            _save(path, meta)
+            return
     if meta["status"] == "finalizing":
         rel = meta["rel_path"]
         dest = uploads / rel
@@ -595,23 +604,17 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
         meta["rel_path"] = rel
         meta["status"] = "finalizing"
         _save(path, meta)
-    if not part.exists() and not dest.exists() and meta.get("dataset_uuid") and not gw._uploads_on_hpc(conn):
-        from . import dataset_storage
-        dest = dataset_storage.dataset_dir(meta["dataset_uuid"]) / "original" / meta["name"]
     if not dest.resolve().is_relative_to(uploads.resolve()):
-        from . import dataset_storage
-        expected = (dataset_storage.dataset_dir(meta["dataset_uuid"]) / "original" / meta["name"]
-                    if meta.get("dataset_uuid") else None)
-        if expected is None or dest.resolve() != expected or dest.is_symlink():
-            raise ValueError("unsafe upload destination")
+        raise ValueError("unsafe upload destination")
     source = part if part.exists() else dest
     if not source.is_file():
         raise ValueError("completed upload bytes are missing")
     if source.stat().st_size != meta["length"]:
         raise ValueError("completed upload size mismatch")
-    # The HPC3 staging worker checks this digest before copying. Re-reading a 25 GiB file here
-    # would hold the final PATCH past the gateway proxy's 15-second response window.
-    if meta["client_sha256"] and not gw._uploads_on_hpc(conn):
+    # The staging worker checks this digest in the background (before a copy to HPC3, or before an
+    # upload kept here is published). Re-reading a 25 GiB file here would hold the final PATCH past
+    # the gateway proxy's 15-second response window.
+    if meta["client_sha256"] and not gw._uploads_queued(conn):
         def full_digest() -> str:
             digest = hashlib.sha256()
             with source.open("rb") as stream:
@@ -622,13 +625,6 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
             raise ValueError("whole-file SHA-256 mismatch")
     if part.exists():
         os.replace(part, dest)
-    if meta.get("dataset_uuid") and not gw._uploads_on_hpc(conn):
-        from . import dataset_storage
-        published = dataset_storage.dataset_dir(meta["dataset_uuid"]) / "original"
-        if dest.parent != published:
-            dataset_storage.publish_dataset(dest.parent, meta["dataset_uuid"])
-            dest = published / dest.name
-        meta["storage_path"] = str(dest)
     meta["status"] = "complete"
     meta["name"] = dest.name if not meta["folder"] else rel
     # Skim single files, matching /api/upload, and a folder's tables (their columns go into the
@@ -636,7 +632,7 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
     skim = not meta["folder"] or gw._is_table_name(rel)
     peek = await asyncio.to_thread(gw._peek_local_upload, dest) if skim else None
     meta["peek"] = peek
-    if gw._uploads_on_hpc(conn):
+    if gw._uploads_queued(conn):
         job = gw._submit_staging(conn, dest, rel, name=meta["name"],
                                  kind=gw._file_kind(meta["name"]), folder=meta["folder"],
                                  peek=peek, upload_id=path.stem,
@@ -659,7 +655,8 @@ async def _finish(conn, meta: dict, path: Path, part: Path) -> None:
                       size=meta["length"], seconds=seconds,
                       mb_s=meta["length"] / 1e6 / seconds if seconds >= 1 else None,
                       sha256="browser" if meta["client_sha256"] else "",
-                      next="copy to HPC3" if meta["job_id"] else "kept on the server",
+                      next=("kept on the server" if not meta["job_id"] or gw._uploads_kept_here(conn)
+                            else "copy to HPC3"),
                       job_id=meta["job_id"])
 
 

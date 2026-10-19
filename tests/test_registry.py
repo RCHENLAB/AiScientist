@@ -168,7 +168,8 @@ def test_session_roster_leaves_out_deep_literature_when_nothing_can_run_it(monke
     # Europe PMC needs neither HPC3 nor a served model, so the literature step still has a tool
     assert "literature_search" in names
     # only that tool goes: the order and the rest of the roster are untouched
-    assert names == [t.name for t in bare if t.name != "deep_literature"]
+    # (`search_corpus` goes with it: its job needs the HPC3 corpus, which only the executor reaches)
+    assert names == [t.name for t in bare if t.name not in ("deep_literature", "search_corpus")]
     # the bare catalog still lists it: the System page and the step classifier read that one as
     # "the tools that exist", and a step naming `deep_literature` must stay a literature step
     assert "deep_literature" in [t.name for t in bare]
@@ -190,3 +191,30 @@ def test_session_roster_keeps_deep_literature_where_it_can_run(monkeypatch):
     monkeypatch.setitem(sys.modules, "paperqa", fake)
     bare = build_scientist_catalog(literature_executor=None)
     assert "deep_literature" in [t.name for t in session_catalog(bare, literature_executor=None)]
+
+
+def test_session_without_a_served_model_gets_search_corpus_not_deep_literature():
+    class _Literature:
+        def run_tool(self, name, args, ctx):
+            return {"status": "ok"}
+
+    ex = _Literature()
+    catalog = build_scientist_catalog(literature_executor=ex)
+    no_gpu = [t.name for t in session_catalog(catalog, ex, served_model=False)]
+    assert "search_corpus" in no_gpu and "deep_literature" not in no_gpu
+    assert "literature_search" in no_gpu
+    gpu = [t.name for t in session_catalog(catalog, ex, served_model=True)]
+    assert "search_corpus" in gpu and "deep_literature" in gpu
+
+
+def test_quick_chat_without_a_served_model_gets_search_corpus():
+    from aiscientist.agents.registry import build_quickchat_catalog
+
+    class _Literature:
+        def run_tool(self, name, args, ctx):
+            return {"status": "ok"}
+
+    no_gpu = {t.name for t in build_quickchat_catalog(_Literature(), served_model=False)}
+    assert "search_corpus" in no_gpu and "deep_literature" not in no_gpu
+    gpu = {t.name for t in build_quickchat_catalog(_Literature(), served_model=True)}
+    assert {"search_corpus", "deep_literature"} <= gpu

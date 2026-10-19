@@ -25,13 +25,63 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .loop_utils import safe_json_loads
 
 # Tools that can do anything; a limit to named analyses does not include them unless it names them.
 GENERIC_TOOLS = frozenset({"run_code", "run_shell", "run_in_environment"})
-LITERATURE_TOOLS = frozenset({"deep_literature", "literature_search"})
+LITERATURE_TOOLS = frozenset({"deep_literature", "search_corpus", "literature_search"})
+QC_ONLY_TOOLS = frozenset({"run_scanpy_qc", "run_cellqc", "run_doublet_detection"})
+# Tools whose success does not make a run "more than QC": lookups, generic code, the closing call.
+NOT_AN_ANALYSIS = frozenset({
+    "finish", "inspect_dataset", "read_tool_source", "describe_environment", "search_skills",
+    "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text", "disk_usage",
+    "run_code", "run_shell", "run_in_environment"})
+
+
+def tools_that_ran(rounds: Any) -> "list[str]":
+    """Each tool with at least one successful call in ``rounds``, in first-use order. Reads both
+    round shapes: LabRound objects in a live run, dicts in run_state.json replays and tests."""
+    seen: list[str] = []
+    for rnd in rounds or []:
+        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
+              else getattr(rnd, "scientist_result", None))
+        for st in ((sr or {}).get("steps") or []):
+            if not isinstance(st, dict) or not st.get("tool") or st["tool"] in seen:
+                continue
+            r = st.get("result")
+            if st.get("ok") or (isinstance(r, dict) and r.get("status") == "ok"):
+                seen.append(str(st["tool"]))
+    return seen
+
+
+# A written report asked for in so many words. "brief report" and "不需要完整报告" still ask for one (a
+# short one); only a report ruled out altogether ("no report", "不需要报告") does not.
+_REPORT_WORD = re.compile(r"\breports?\b|\bwrite-?ups?\b|\bmanuscript\b|\b(?:pdf|docx)\b|报告|书面",
+                          re.IGNORECASE)
+_NO_REPORT = re.compile(
+    r"\b(?:no|without(?: a| any)?|skip(?: the)?|don'?t (?:need|want|write)(?: a| any)?|"
+    r"no need for(?: a| any)?)\s+(?:written\s+)?(?:report|write-?up)s?\b|"
+    r"(?:不需要|不要|不用|无需|不必|别)(?:写|出|生成|做)?(?:任何)?(?:书面)?报告", re.IGNORECASE)
+
+
+def wants_written_report(question: "str | None") -> bool:
+    """Does the request ask for a written report? A run that only did QC answers in the chat unless
+    it does (Yijun, 2026-10-18: no report asked for, the chat reply; a report asked for, the model
+    writes it)."""
+    q = question or ""
+    return bool(_REPORT_WORD.search(q)) and not _NO_REPORT.search(q)
+
+
+def qc_only(tools: "Iterable[str]") -> bool:
+    """Is quality control all a run did? At least one QC tool succeeded and no other analysis did.
+
+    Such a run is answered in the chat with the QC tool's own numbers — no research report, no
+    model-written synthesis (Yijun, 2026-10-16, on run 6275df1213ab: a one-step CellQC run needs a
+    short chat reply with the data, not a report)."""
+    analyses = [t for t in tools if t not in NOT_AN_ANALYSIS]
+    return bool(analyses) and all(t in QC_ONLY_TOOLS for t in analyses)
 
 _CLAUSE_SPLIT = re.compile(r"[,;.!?，；。！？\n]+|\bbut\b|\bthen\b|但是?|然后|另外")
 # A limit is an instruction about the WORK, so each cue is bound to a verb of doing or stands where

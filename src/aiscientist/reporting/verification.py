@@ -179,7 +179,7 @@ _MODEL_CODE_TOOLS = {"run_code", "run_in_environment", "run_shell", "shell"}
 # directory listings, a file re-read), and literature (a paper's numbers are not this run's).
 _NOT_EVIDENCE = {"finish", "read_tool_source", "describe_environment", "search_skills",
                  "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text",
-                 "disk_usage", "literature_search", "deep_literature"}
+                 "disk_usage", "literature_search", "deep_literature", "search_corpus"}
 _ID_COLUMN = re.compile(r"^(leiden|louvain|cluster|clusters|cl|rank|index|idx|id|row|sample|"
                         r"sampleid|group|groups|slug|round|step)$", re.IGNORECASE)
 
@@ -649,9 +649,11 @@ def _verb(n: int, plural: str, singular: str) -> str:
 def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | None" = None,
                        rounds: "list[Any] | None" = None, lit: "dict | None" = None,
                        corrections: "list[str] | None" = None,
-                       brief: bool = False) -> "tuple[str, dict]":
+                       brief: bool = False, qc_only: bool = False) -> "tuple[str, dict]":
     """``(markdown, summary)`` — the full statement for ``report/verification.md``. ``brief``: the
-    report is the short one, which has no Discussion."""
+    report is the short one, which has no Discussion. ``qc_only``: the run did quality control and
+    nothing else, so there are no labels to check and nothing to hold against the literature; the
+    statement does not list them as unchecked."""
     art = Path(art)
     rounds = list(rounds or [])
     claims = manuscript_numbers(report_md)
@@ -709,13 +711,17 @@ def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | N
     qc_lines, qc_sum = qc_section(rounds)
     step_lines, step_sum = steps_section(list(agenda or []), rounds)
     scope_lines, scope_sum = scope_section(art, lit, discussion=not brief)
-    out += ["", "## 2. Cell-type labels", "", *label_lines,
-            "", "## 3. Quality-control accounting", "", *qc_lines,
-            "", "## 4. Planned steps that did not finish as planned", "", *step_lines,
-            "", "## 5. What this analysis cannot show", "", *scope_lines]
-    if corrections:
-        out += ["", "## 6. Corrections made to the report automatically", ""]
-        out += [f"- {c}" for c in corrections]
+    if qc_only:
+        scope_lines = [ln for ln in scope_lines if "published literature" not in ln]
+        scope_sum = {**scope_sum, "literature_checked": None}
+    sections = [("Cell-type labels", label_lines) if not qc_only else None,
+                ("Quality-control accounting", qc_lines),
+                ("Planned steps that did not finish as planned", step_lines),
+                ("What this analysis cannot show", scope_lines) if scope_lines else None,
+                ("Corrections made to the report automatically", [f"- {c}" for c in corrections])
+                if corrections else None]
+    for n, (title, lines) in enumerate((x for x in sections if x), start=2):
+        out += ["", f"## {n}. {title}", "", *lines]
     summary = {"numbers_checked": len(claims), "numbers_exact": len(exact),
                "numbers_derived": len(derived), "numbers_printed": len(printed),
                "numbers_untraced": len(untraced), "numbers_inconsistent": len(wrong),

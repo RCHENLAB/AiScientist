@@ -76,12 +76,14 @@ AISCIENTIST_LIRICAL_DATA_DIR=/dfs3b/ruic20_lab/software/reference/lirical/data
 # genotype-aware (optional — omit both for phenotype-only):
 AISCIENTIST_LIRICAL_EXOMISER_HG19=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg19
 AISCIENTIST_LIRICAL_EXOMISER_HG38=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg38
-AISCIENTIST_UPLOADS_ON_HPC=1
 ```
 
-The VCF + the run's work/artifacts dirs must be reachable on the compute node (shared DFS — they are,
-via `uploads_on_hpc`). The AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` and
-bind-mounted in, so a tool edit needs a code deploy, NOT an image rebuild.
+The VCF + the run's work/artifacts dirs must be reachable on the compute node. They are on dfs3b: a
+VCF kept on the server (an upload under `AISCIENTIST_DATA_ROOT`) is copied to dfs3b when the run
+starts, into the session's own `Temp/<ucinetid>/server-data/` or the run's folder (a deployment
+without a data root uses `AISCIENTIST_UPLOADS_ON_HPC=1`, which puts uploads on dfs3b). The
+AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` and bind-mounted in, so a tool edit
+needs a code deploy, NOT an image rebuild.
 
 ## How it fits the two-track design
 

@@ -104,7 +104,7 @@ def test_more_experts_than_findings_still_assigns_everyone_a_role():
 def test_the_meeting_toolset_cannot_mutate_the_run():
     """A whitelist, not a blacklist. The analysis catalog is full of tools that rewrite the
     checkpoint chain, and a meeting must never be able to reach one."""
-    assert _MEETING_TOOLS == {"inspect_dataset", "literature_search", "deep_literature"}
+    assert _MEETING_TOOLS == {"inspect_dataset", "literature_search", "deep_literature", "search_corpus"}
     for banned in ("run_de", "run_code", "run_scanpy_qc", "run_clustering", "annotate_variants"):
         assert banned not in _MEETING_TOOLS
 

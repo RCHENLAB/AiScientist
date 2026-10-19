@@ -13,11 +13,12 @@ import threading
 import time
 import traceback
 import zipfile
+from collections.abc import Collection
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -27,6 +28,8 @@ from starlette.background import BackgroundTask
 from ..core.config import load_project_env
 from . import cluster_models, gpu, vllm_client
 from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
+from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
+from ..tools import sdk as _tools_sdk   # the tool contract (here: what a tool may read on this host)
 # The endpoint-locality test lives with the data-boundary guard it feeds (a privacy decision,
 # and testable without the web stack). Aliased so every call site reads the same as before.
 from ..integrations.safety import endpoint_is_off_host as _endpoint_is_off_host
@@ -35,6 +38,7 @@ from . import shared_llm                  # the lab's shared reasoning-model ser
 from . import staging                     # background copies of uploads to HPC3
 from . import upload_storage, dataset_storage
 from . import upload_log                  # what happened to each upload, per user
+from . import run_monitor                 # where each run is now (the System page's live graph)
 from .errors import GatewayError, VLLMNetworkError, error_detail
 from .executor import RemoteExecutor
 from .mock_host import MockExecutor
@@ -59,6 +63,28 @@ load_project_env(ROOT)
 CONSOLE_RUNS_DIR = Path(os.environ.get("AISCIENTIST_RESULTS_DIR") or (
     dataset_storage.data_root() / "analysis_results" if dataset_storage.configured()
     else ROOT / "runs" / "console")).resolve()
+
+
+def _private_host_paths() -> list[Path]:
+    """The files on this host that no tool may read, whatever a run's roots contain
+    (``tools.sdk.confine_read``): the API-key and SSH-key stores, the API-key master key, the
+    session secret, the accounts DB when it is a file, the deployment's ``.env``, and the whole
+    state dir when one is set."""
+    from . import auth, db, llm_credentials, ssh_credentials
+    paths = [*llm_credentials.private_paths(), *ssh_credentials.private_paths(), ROOT / ".env"]
+    secret = auth.secret_file()
+    if secret is not None:
+        paths.append(secret)
+    url = db.database_url()
+    if url.startswith("sqlite:///"):
+        paths.append(Path(url[len("sqlite:///"):]))
+    state = os.environ.get("AISCIENTIST_STATE_DIR", "").strip()
+    if state:
+        paths.append(Path(state))
+    return paths
+
+
+_tools_sdk.register_private_paths(_private_host_paths)
 
 
 def safe_name(value: str) -> str:
@@ -241,6 +267,9 @@ class RunState:
         # reads a file inside the EARLIER run's HPC3 folder for as long as it runs, so the session
         # cleanup must not remove that folder under it (see _session_cleanup_targets).
         self.continues: str | None = None
+        # Where this run is now, for the System page (gateway/run_monitor.py). Started with the run
+        # (``_watch_run``); None for a scope that never ran.
+        self.monitor: "run_monitor.RunMonitor | None" = None
 
     def tag(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Stamp a WS payload with this run's identity (without clobbering an explicit tag)."""
@@ -444,6 +473,8 @@ class Connection:
         if run is None:
             return
         run.running = False
+        if run.monitor is not None:
+            run.monitor.end()           # a no-op when the run already said how it ended
         if run in self.live_runs:
             self.live_runs.remove(run)
         if self._bare_run is run:
@@ -525,6 +556,8 @@ class Connection:
         run = run or self._tag_run()
         self._tag(payload, run)
         self._track_stream(payload, run)
+        if run is not None and run.monitor is not None:
+            run.monitor.observe_push(payload)
         self._publish(payload)
 
     # -- legacy per-run accessors (proxy to the active run) -----------------
@@ -939,6 +972,7 @@ def _ssh_connect_blocking(conn: Connection, req: ConnectRequest) -> None:
 
     _prepare_shared_storage(conn)
     _resume_staging(conn)
+    _start_dataset_homing(conn)
 
     emit("success", "ssh_connect",
          f"SSH session to {settings.host} is ready — allocating the GPU and starting the model next.")
@@ -2828,6 +2862,23 @@ def _scratch_dir(conn: Connection, kind: str, *, run_id: str | None = None) -> s
     return f"{base}/{safe_name(run_id)}" if run_id else base
 
 
+def _dataset_holds(rd: dict) -> str:
+    """What an exported dataset carries, read off its record: run 6275df1213ab's and caa188e8e672's
+    (QC only) were announced "with the clusters, cell types and embeddings" they did not have."""
+    cols = [str(c).lower() for c in (rd.get("obs_columns") or [])]
+    held = []
+    if any(re.match(r"^(?:leiden|louvain)|^clusters?$", c) for c in cols):
+        held.append("the clusters")
+    if any(re.search(r"cell_?type|label", c) for c in cols):
+        held.append("cell types")
+    if rd.get("obsm"):
+        held.append("embeddings")
+    if not held:
+        return "with each cell's QC metrics" if any(c.startswith(("n_genes", "total_counts", "pct_counts"))
+                                                    for c in cols) else "as QC left it"
+    return "with " + (", ".join(held[:-1]) + " and " + held[-1] if len(held) > 1 else held[0])
+
+
 def _keep_for(days: Any, until_disconnect: bool) -> str:
     """How long a run's handed-on files stay where the run left them, as the words after "kept":
     on HPC3 they go with the session (``session_cleanup``), and by age otherwise."""
@@ -2850,10 +2901,25 @@ def _hpc_uploads_dirs(conn: Connection) -> tuple[str, ...]:
     return (_hpc_uploads_dir(conn), f"{_storage_base(conn)}/uploads")
 
 
+def _uploads_kept_here(conn: Connection) -> bool:
+    """True when uploads stay on this host (RCHENLAB/AiScientist issue 6): the deployment has a data
+    root, so an upload goes into the owner's dataset folder (``dataset_storage.dataset_dir``) and HPC3
+    gets a copy only when a run needs it there, in the session's own area. The background queue still
+    checks every file and unpacks archives (``StagingJob.dest == "server"``)."""
+    return upload_storage.enabled(conn)
+
+
 def _uploads_on_hpc(conn: Connection) -> bool:
-    """True when uploads for this session should land on HPC3 dfs3b — the flag is on AND
-    there's an SSH executor to put_file with."""
-    return bool(conn.settings.uploads_on_hpc and conn.executor is not None)
+    """True when uploads for this session land on HPC3 dfs3b: the flag is on, there's an SSH executor
+    to put_file with, and the deployment has no data root (with one, uploads stay on this host)."""
+    return bool(conn.settings.uploads_on_hpc and conn.executor is not None
+                and not _uploads_kept_here(conn))
+
+
+def _uploads_queued(conn: Connection) -> bool:
+    """True when an upload goes through the background queue (copied to HPC3, or kept here and
+    checked there) rather than being recorded inside the request that delivered it."""
+    return _uploads_on_hpc(conn) or _uploads_kept_here(conn)
 
 
 def _is_remote_dataset(conn: Connection, path: str) -> bool:
@@ -2936,13 +3002,22 @@ def _paramiko_copy_lock(owner: str) -> threading.Lock:
 
 
 def _staging_queue(conn: Connection) -> "staging.StagingQueue":
+    return _owner_staging_queue(conn.owner, upload_storage.uploads(conn) / ".staging",
+                                conn.workspace / "uploads" / ".staging")
+
+
+def _owner_staging_queue(owner: str, store_dir: "Path | None" = None,
+                         legacy: "Path | None" = None) -> "staging.StagingQueue":
+    """The owner's queue. Without a connection (a check of a file kept on this host resumed after a
+    restart) the store is the managed one, ``<data root>/temp/<owner>/uploads/.staging``."""
     with _STAGING_LOCK:
-        q = _STAGING.get(conn.owner)
+        q = _STAGING.get(owner)
         if q is None:
-            owner = conn.owner
-            store_dir = upload_storage.uploads(conn) / ".staging"
-            legacy = conn.workspace / "uploads" / ".staging"
-            if store_dir != legacy and legacy.is_dir() and not store_dir.exists():
+            if store_dir is None:
+                store_dir = upload_storage.uploads(
+                    SimpleNamespace(owner=owner, managed_storage=True, workspace=CONSOLE_RUNS_DIR / owner)
+                ) / ".staging"
+            if legacy is not None and store_dir != legacy and legacy.is_dir() and not store_dir.exists():
                 # A data root configured since these copies were queued: the jobs (absolute paths)
                 # continue from the new place, so their copies are finished or retried at login.
                 shutil.copytree(legacy, store_dir)
@@ -2959,6 +3034,11 @@ def _staging_queue(conn: Connection) -> "staging.StagingQueue":
 
 
 def _push_staged(owner: str, job: "staging.StagingJob", progress) -> None:
+    if job.dest == "server":
+        # Kept on this host: nothing to copy. The file is published once it is checked
+        # (_verify_kept), after the queue has read it for its SHA-256.
+        progress(job.size, job.size)
+        return
     ex = _staging_executor(owner, job.hpc_user)
     put = getattr(ex, "put_file_resumable", None)
     if put is None:                       # simple executors (mock): one plain copy
@@ -3027,6 +3107,8 @@ def _unpack_result(stdout: str) -> dict | None:
 def _unpack_staged(owner: str, job: "staging.StagingJob") -> dict:
     """Unpack a verified archive on HPC3. Returns ``{"path", "files", "bytes", …}``; raises
     ``staging.Permanent`` when the archive itself is refused, anything else when the step failed."""
+    if job.dest == "server":
+        return _unpack_kept(owner, job)
     conn = _staging_conn(owner, job.hpc_user)
     if not job.unpack_dest:
         # A free folder name, chosen once and kept on the job: a retry must land in the SAME place,
@@ -3060,7 +3142,71 @@ def _unpack_staged(owner: str, job: "staging.StagingJob") -> dict:
 _VERIFY_MIN_BYTES = int(os.environ.get("AISCIENTIST_UPLOAD_VERIFY_MIN_BYTES", str(256 * 1024 ** 2)) or 0)
 
 
+def _unpack_kept(owner: str, job: "staging.StagingJob") -> dict:
+    """Unpack a checked archive kept on this host into its dataset's ``processed/<stem>``, with the
+    same script (and the same limits) the HPC3 step runs: standard library only, an archive is
+    untrusted input, so it never writes through a link or outside its destination, and stops a
+    decompression bomb. Runs as a subprocess of this host's Python, in isolated mode."""
+    import subprocess
+    import sys
+    archive = Path(job.remote_path)
+    if not job.unpack_dest:
+        stem = _archive_stem(job.name) or f"{job.name}.unpacked"
+        tree = dataset_storage.managed_tree(archive)
+        if tree is None or dataset_storage.managed_owner(archive) != owner:
+            raise staging.Permanent("The archive is not in your dataset folder.")
+        job.unpack_dest = str(tree / "processed" / safe_filename(stem))
+        _owner_staging_queue(owner).store.save(job)
+    script = Path(__file__).resolve().parents[1] / "hpc" / "unpack_archive.py"
+    argv = [sys.executable, "-I", str(script), "--archive", str(archive), "--dest", job.unpack_dest,
+            "--max-bytes", str(_env_int("AISCIENTIST_UNPACK_MAX_BYTES", 500 * 1024 ** 3)),
+            "--max-files", str(_env_int("AISCIENTIST_UNPACK_MAX_FILES", 200_000)),
+            "--max-ratio", str(_env_int("AISCIENTIST_UNPACK_MAX_RATIO", 200))]
+    if os.environ.get("AISCIENTIST_UNPACK_KEEP_ARCHIVE", "").strip().lower() in ("1", "true", "yes", "on"):
+        argv.append("--keep-archive")
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=6 * 3600, cwd="/")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Unpacking {job.name} took longer than 6 hours.") from exc
+    result = _unpack_result(res.stdout)
+    if result is None:
+        tail = " ".join(((res.stderr or "") + " " + (res.stdout or "")).split())[-300:]
+        raise RuntimeError(f"Unpacking {job.name} gave no result (exit {res.returncode}): {tail}")
+    if result.get("status") == "refused":
+        raise staging.Permanent(str(result.get("reason") or "the archive was refused"))
+    if result.get("status") != "ok":
+        raise RuntimeError(f"Unpacking {job.name} failed: {result.get('reason')}")
+    return {k: result.get(k) for k in ("path", "files", "bytes", "skipped_links", "skipped_junk",
+                                       "flattened", "archive_removed", "resumed") if k in result}
+
+
+def _verify_kept(owner: str, job: "staging.StagingJob") -> str:
+    """Check a file kept on this host and, for a single file, publish its UUID folder as the
+    dataset's folder (``users/<owner>/datasets/<uuid>/original``: one rename on the same disk). A
+    folder's file stays where it was sent until the whole folder is published
+    (:func:`_finish_staged_folder`). The browser's SHA-256, when it sent one, was compared before
+    this (staging.StagingQueue); here the size is."""
+    final = Path(job.remote_path)
+    local = Path(job.local_path)
+    here = local if local.is_file() else final if (not job.folder and final.is_file()) else None
+    if here is None:
+        raise staging.Permanent(f"{job.name} is no longer on the server. Upload it again.")
+    if here.stat().st_size != job.size:
+        raise staging.Permanent(f"{job.name} is {here.stat().st_size} bytes on the server, "
+                                f"expected {job.size}. Upload it again.")
+    if not job.folder and here != final:
+        identity = dataset_storage.managed_uuid(final)
+        if identity is None or dataset_storage.managed_owner(final) != owner:
+            raise staging.Permanent("The upload's destination is not in your dataset folder.")
+        dataset_storage.publish_dataset(local.parent, identity, owner)
+    if not job.folder:
+        job.local_path = str(final)
+    return "sha256" if job.client_sha256 else "size"
+
+
 def _verify_staged(owner: str, job: "staging.StagingJob") -> str:
+    if job.dest == "server":
+        return _verify_kept(owner, job)
     verified = _check_staged(owner, job)
     identity = upload_storage.remote_identity(job.remote_path)
     if identity and not job.folder:
@@ -3138,11 +3284,14 @@ def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
     payload = {"type": "upload_staging", "job": job.public()}
     for c in conns:
         c._publish(payload)               # untagged: an upload belongs to no conversation
+    kept = job.dest == "server"
+    where = "on the server" if kept else "on your HPC3 storage"
     if job.state == "done":
-        try:
-            Path(job.local_path).unlink()   # verified on HPC3: raw data must not linger here
-        except OSError:
-            pass
+        if not kept:
+            try:
+                Path(job.local_path).unlink()   # verified on HPC3: raw data must not linger here
+            except OSError:
+                pass
         if job.folder:
             _finish_staged_folder(owner, job.folder)
             return
@@ -3154,7 +3303,7 @@ def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
             note = f" {left_out} link(s) or device file(s) in it were left out." if left_out else ""
             for c in conns:
                 c.emit("success", "upload",
-                       f"Uploaded {job.name} ({how}) and unpacked it on your HPC3 storage to {folder}/ "
+                       f"Uploaded {job.name} ({how}) and unpacked it {where} to {folder}/ "
                        f"({int(out.get('files') or 0)} files, {int(out.get('bytes') or 0) / 1e6:.1f} MB).{note}")
             name, path, size, kind, sha = folder, str(out.get("path") or job.unpack_dest), \
                 int(out.get("bytes") or 0), "folder", None
@@ -3163,8 +3312,9 @@ def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
             peek = job.peek
             gist = (job.peek or {}).get("gist") or ""
             for c in conns:
-                c.emit("success", "upload", f"Uploaded {job.name} ({job.size / 1e6:.1f} MB) to your HPC3 "
-                       f"storage ({how})." + (f" Skim: {gist}" if gist else ""))
+                c.emit("success", "upload", f"Uploaded {job.name} ({job.size / 1e6:.1f} MB) "
+                       f"{'to the server' if kept else 'to your HPC3 storage'} ({how})."
+                       + (f" Skim: {gist}" if gist else ""))
                 if job.unpack_error:
                     c.emit("warning", "upload", f"{job.name} was not unpacked: {job.unpack_error}. "
                            "It is kept as a file.")
@@ -3179,15 +3329,19 @@ def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_dataset failed: {exc}")
     elif job.state == "failed":
-        kept = ("It is still on the server; retry it from the Uploads panel."
-                if os.path.exists(job.local_path) else "")
+        still = ("It is still on the server; retry it from the Uploads panel."
+                 if os.path.exists(job.local_path) else "")
+        what = f"Checking {job.name} on the server" if kept else f"Copying {job.name} to HPC3"
         for c in conns:
-            c.emit("error", "upload", f"Copying {job.name} to HPC3 failed: {job.error} {kept}".rstrip())
+            c.emit("error", "upload", f"{what} failed: {job.error} {still}".rstrip())
     elif job.state == "cancelled":
         try:
             Path(job.local_path).unlink()
         except OSError:
             pass
+        if kept:
+            _discard_kept(owner, job)
+            return
         try:   # and whatever reached HPC3 (a .part, or a copy cancelled while being verified)
             q = shlex.quote(job.remote_path)
             _staging_executor(owner, job.hpc_user).exec(f"rm -f {q} {shlex.quote(job.remote_path + '.part')}")
@@ -3202,10 +3356,43 @@ def _on_staging_change(owner: str, job: "staging.StagingJob") -> None:
 # and up to 20 GB on dfs3b). Only paths this job created are touched, and never one that a running
 # copy now uses: a later upload may have taken the same name.
 
+def _discard_kept(owner: str, job: "staging.StagingJob") -> None:
+    """What a cancelled or dismissed check of a file kept on this host leaves: the unpack work folder,
+    and a single file's UUID folder (in ``temp/`` before it was published, or its dataset folder
+    after, which no dataset row points at: a job records its row only once it is done)."""
+    if job.unpack_dest:
+        shutil.rmtree(f"{job.unpack_dest}.unpacking", ignore_errors=True)
+        if Path(job.unpack_dest).is_dir() and not job.unpacked:
+            shutil.rmtree(job.unpack_dest, ignore_errors=True)
+    if job.folder:
+        return
+    local = Path(job.local_path)
+    tree = dataset_storage.managed_tree(local)
+    if tree is not None:
+        if dataset_storage.managed_owner(local) != owner:
+            return
+        if _AUTH_ENABLED and job.user_id and auth_routes.dataset_path_recorded(job.user_id, job.remote_path):
+            return
+        shutil.rmtree(tree, ignore_errors=True)
+        return
+    try:
+        identity = str(UUID(local.parent.name))
+    except ValueError:
+        return
+    if identity == local.parent.name:
+        try:
+            local.parent.rmdir()          # only once empty: never a tree something else still uses
+        except OSError:
+            pass
+
+
 def _remove_unpack_leftover(owner: str, job: "staging.StagingJob") -> None:
     """Remove ``<unpack_dest>.unpacking`` if an unpack step died and left it. Looking is one ``test``
     on the login node; deleting a tree is work, so it runs as a Slurm step, in the background."""
     work = f"{job.unpack_dest}.unpacking"
+    if job.dest == "server":
+        shutil.rmtree(work, ignore_errors=True)
+        return
     try:
         conn = _staging_conn(owner, job.hpc_user)
         if conn.mock or work in {f"{d}.unpacking" for d in _staging_queue(conn).active_names()}:
@@ -3229,15 +3416,21 @@ def _discard_leftovers(owner: str, job: "staging.StagingJob") -> None:
     The local file goes. A copy that never completed loses its remote ``.part``. A copy that was
     verified (only the unpack kept failing) is a whole file on HPC3: it stays and is recorded as the
     file that was uploaded, as a refused archive is, because deleting 20 GB that arrived intact is
-    not what dismissing a card should do."""
-    try:
-        Path(job.local_path).unlink()
-    except OSError:
-        pass
+    not what dismissing a card should do. A file kept on this host is that only copy: once checked
+    it stays the same way, and otherwise its folder goes with it (:func:`_discard_kept`)."""
+    kept = job.dest == "server"
+    if not (kept and job.verified):
+        try:
+            Path(job.local_path).unlink()
+        except OSError:
+            pass
+    if kept and not job.verified:
+        _discard_kept(owner, job)
+        return
     if job.verified:
         for c in _owner_connections(owner):
             c.emit("warning", "upload", f"{job.name} was not unpacked ({job.error or 'the unpack step failed'}). "
-                                        "It is kept as a file on your HPC3 storage.")
+                                        f"It is kept as a file {'on the server' if kept else 'on your HPC3 storage'}.")
         if _AUTH_ENABLED and job.user_id:
             try:
                 auth_routes.record_dataset(job.user_id, job.name, job.remote_path, job.size, job.kind,
@@ -3245,6 +3438,9 @@ def _discard_leftovers(owner: str, job: "staging.StagingJob") -> None:
                                            conversation_id=job.conversation_id or None, peek=job.peek)
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_dataset failed: {exc}")
+        if kept:
+            _remove_unpack_leftover(owner, job)
+            return
     else:
         try:
             part = job.remote_path + ".part"
@@ -3312,6 +3508,7 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
         if len(jobs) + kept_count < int(meta.get("count") or 0):
             return None                  # registered early: some files have not been handed over yet
         conns = _owner_connections(owner)
+        kept = any(j.dest == "server" for j in jobs)
         bad = [j for j in jobs if j.state != "done"]
         if bad:
             if not meta.get("reported"):
@@ -3320,8 +3517,9 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
                                   count=len(jobs), failed=len(bad),
                                   error="; ".join(sorted({j.error for j in bad if j.error}))[:400])
                 for c in conns:
-                    c.emit("error", "upload", f"{len(bad)} of {len(jobs)} files of {folder}/ did not reach "
-                           "HPC3; retry them from the Uploads panel.")
+                    c.emit("error", "upload", f"{len(bad)} of {len(jobs)} files of {folder}/ "
+                           f"{'failed their check on the server' if kept else 'did not reach HPC3'}; "
+                           "retry them from the Uploads panel.")
             return None
         sent = {j.remote_path: j.size for j in jobs}     # a file handed over twice is one file
         size, count = kept_size + sum(sent.values()), kept_count + len(sent)
@@ -3335,7 +3533,13 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
         # What the metadata says about each file: its path inside the folder, size and checksum.
         file_facts = {j.remote_path: {"path": _rel(j.remote_path), "size": j.size, "sha256": j.sha256 or None,
                                       "peek": j.peek, "verified": "upload" if j.sha256 else ""} for j in jobs}
-        if conns and upload_storage.enabled(conns[0]):
+        if kept:
+            # Kept on this host: the session's manifest is checked and the folder renamed into the
+            # owner's dataset folder (upload_storage.publish), with or without a session open.
+            ns = SimpleNamespace(owner=owner, managed_storage=True, workspace=CONSOLE_RUNS_DIR / owner)
+            if (upload_storage.uploads(ns) / folder).is_dir():
+                upload_storage.publish(ns, folder, len(sent))
+        elif conns and upload_storage.enabled(conns[0]):
             manifest = upload_storage.session(conns[0], folder).get("files")
             if manifest is not None:
                 actual = {j.remote_path.split("/original/", 1)[-1]: j.size for j in jobs}
@@ -3346,12 +3550,14 @@ def _finish_staged_folder(owner: str, folder: str) -> dict | None:
         upload_log.record(_upload_workspace(owner), "folder_recorded", folder=folder, count=count,
                           size=size, added=len(sent) if kept_count else None,
                           remote_path=meta.get("remote_root"))
-    said = (f"Added {len(sent)} file(s) to {folder}/, which already held {kept_count}: it is now "
-            f"{count} files, {size / 1e6:.1f} MB on your HPC3 storage." if kept_count else
-            f"Uploaded folder {folder}/ ({count} files, {size / 1e6:.1f} MB) to your HPC3 storage.")
+    where = "the server" if kept else "your HPC3 storage"
+    shown = meta.get("original_name") or folder
+    said = (f"Added {len(sent)} file(s) to {shown}/, which already held {kept_count}: it is now "
+            f"{count} files, {size / 1e6:.1f} MB on {where}." if kept_count else
+            f"Uploaded folder {shown}/ ({count} files, {size / 1e6:.1f} MB) to {where}.")
     for c in conns:
         c.emit("success", "upload", said)
-    if conns:
+    if conns and not kept:
         shutil.rmtree(upload_storage.uploads(conns[0]) / folder, ignore_errors=True)
     user_id = meta.get("user_id")
     if _AUTH_ENABLED and user_id:
@@ -3371,12 +3577,14 @@ def _submit_staging(conn: Connection, local: Path, rel: str, *, name: str, kind:
                     client_sha256: str = "", unpack: bool = False,
                     conversation_id: str = "") -> "staging.StagingJob":
     """Hand a COMPLETE local upload to the background queue. This is the one seam between the upload
-    layer (browser -> gateway) and the transfer layer (gateway -> HPC3).
+    layer (browser -> gateway) and the transfer layer (gateway -> HPC3, or the owner's dataset folder
+    on this host when uploads are kept here: :func:`_uploads_kept_here`).
 
     The caller guarantees: ``local`` is complete and closed, lies under ``<workspace>/uploads/``, and
     its name is already free (:func:`_unique_upload_name`); ``rel`` is its path under ``uploads/``; a
     file of a folder upload carries ``folder`` (the top-level folder name). The queue then owns the
-    copy, its check, the dataset row, the local file's deletion and every event about it.
+    copy (or the publication), its check, the dataset row, the local file's deletion and every event
+    about it.
 
     ``upload_id`` is the upload layer's own id, so ``GET /api/upload/staging?upload_id=`` finds the
     job. ``client_sha256`` is the browser's SHA-256 of the file: a mismatch fails the job before
@@ -3393,18 +3601,20 @@ def _submit_staging(conn: Connection, local: Path, rel: str, *, name: str, kind:
     held = queue.find_upload(upload_id) if upload_id else None
     if held is not None and held.state in staging.ACTIVE and held.local_path == str(local):
         return held
-    remote_path = f"{_hpc_uploads_dir(conn)}/{rel}"
+    kept = _uploads_kept_here(conn)
     if upload_storage.enabled(conn):
-        identifier = folder or local.parent.name
-        from uuid import UUID
-        identifier = str(UUID(identifier))
+        identifier = str(UUID(folder or local.parent.name))
         nested = rel.split("/", 1)[1] if "/" in rel else local.name
-        remote_path = f"{_hpc_uploads_dir(conn)}/temp/{identifier}/original/{nested}"
+        remote_path = (str(dataset_storage.dataset_dir(identifier, conn.owner) / "original" / nested) if kept
+                       else f"{_hpc_uploads_dir(conn)}/temp/{identifier}/original/{nested}")
+    else:
+        remote_path = f"{_hpc_uploads_dir(conn)}/{rel}"
     job = staging.new_job(owner=conn.owner, local_path=str(local), remote_path=remote_path,
                           name=name, size=local.stat().st_size, kind=kind, folder=folder,
-                          user_id=conn.app_user_id, peek=peek, hpc_user=_hpc_user(conn),
+                          user_id=conn.app_user_id, peek=peek, hpc_user="" if kept else _hpc_user(conn),
                           upload_id=upload_id, client_sha256=(client_sha256 or "").strip().lower(),
-                          unpack=bool(unpack) and not folder, conversation_id=chat_ref(conversation_id))
+                          unpack=bool(unpack) and not folder, conversation_id=chat_ref(conversation_id),
+                          dest="server" if kept else "hpc3")
     queue.submit(job)
     return job
 
@@ -3634,7 +3844,7 @@ def _reserve_upload_folder(conn: Connection, raw: str, files: Any) -> dict:
 
 def _resume_staging(conn: Connection) -> None:
     """After a login: pick up this user's unfinished copies (a restart, or a closed tab)."""
-    if not _uploads_on_hpc(conn):
+    if not _uploads_queued(conn):
         return
     try:
         resumed = _staging_queue(conn).resume()
@@ -3642,7 +3852,8 @@ def _resume_staging(conn: Connection) -> None:
         conn.emit("warning", "upload", f"Could not resume unfinished uploads: {exc}")
         return
     if resumed:
-        conn.emit("info", "upload", f"Resuming {len(resumed)} unfinished upload copy(ies) to HPC3.")
+        conn.emit("info", "upload", f"Resuming {len(resumed)} unfinished upload "
+                  + ("check(s) on the server." if _uploads_kept_here(conn) else "copy(ies) to HPC3."))
     try:
         dropped = _expire_settled(conn)
     except Exception:  # noqa: BLE001 - housekeeping never fails a login
@@ -3651,6 +3862,125 @@ def _resume_staging(conn: Connection) -> None:
         days = _settled_keep_seconds() / 86400
         conn.emit("info", "upload", f"Removed {len(dropped)} failed upload(s) left for more than "
                                     f"{days:g} days: {', '.join(dropped[:5])}{'…' if len(dropped) > 5 else ''}.")
+
+
+# --- datasets kept only on HPC3, brought to this host (RCHENLAB/AiScientist issue 6) ------------
+# Before uploads stayed on this host, an upload (and a saved result) lived only on HPC3. When their
+# owner connects, each such dataset of theirs is copied into their dataset folder here, checked file
+# by file against the sizes HPC3 reports, and its row then points at the copy. The HPC3 original is
+# not deleted: ``source.json`` beside the copy names it, for the cleanup that removes it.
+
+_HOMING: "set[str]" = set()
+_HOMING_LOCK = threading.Lock()
+
+
+def _homing_enabled() -> bool:
+    """On with a data root, unless ``AISCIENTIST_MOVE_HPC_DATASETS=0``."""
+    return dataset_storage.configured() and os.environ.get(
+        "AISCIENTIST_MOVE_HPC_DATASETS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _start_dataset_homing(conn: Connection) -> bool:
+    """Bring this account's HPC3-only datasets to this host, in the background. One run per account
+    at a time; True when one was started."""
+    if not (_AUTH_ENABLED and conn.app_user_id and conn.executor is not None and not conn.mock
+            and _homing_enabled()):
+        return False
+    with _HOMING_LOCK:
+        if conn.owner in _HOMING:
+            return False
+        _HOMING.add(conn.owner)
+
+    def run() -> None:
+        try:
+            _home_datasets(conn)
+        except Exception as exc:  # noqa: BLE001 - the next login tries again
+            print(f"[homing] {conn.owner}: {type(exc).__name__}: {exc}")
+        finally:
+            with _HOMING_LOCK:
+                _HOMING.discard(conn.owner)
+
+    threading.Thread(target=run, name=f"homing-{conn.owner}", daemon=True).start()
+    return True
+
+
+def _homing_candidates(conn: Connection) -> "list[dict]":
+    """This account's rows whose data is only on HPC3, in a place its session may read: its uploads
+    there and its personal folder (saved results). Bound server folders are the lab's, never moved."""
+    return [r for r in auth_routes.list_dataset_records(conn.app_user_id)
+            if not str(r["kind"] or "").startswith("server-") and r.get("uuid")
+            and _is_remote_dataset(conn, str(r["path"] or ""))
+            and _remote_dataset_allowed(conn, str(r["path"] or ""))]
+
+
+def _home_datasets(conn: Connection) -> dict:
+    """Move every candidate (:func:`_homing_candidates`) to this host, one after the other. Returns
+    ``{"moved": [...], "missing": [...], "failed": [...]}``."""
+    out: dict[str, list] = {"moved": [], "missing": [], "failed": []}
+    rows = _homing_candidates(conn)
+    if not rows:
+        return out
+    total = sum(int(r.get("size_bytes") or 0) for r in rows)
+    conn.emit("info", "upload", f"Moving {len(rows)} dataset(s) kept only on HPC3 "
+                                f"({total / 1024 ** 3:.1f} GB) to your data on the server, in the "
+                                "background. Each stays usable from HPC3 until its copy is here.")
+    for row in rows:
+        if conn.executor is None or conn.id not in CONNECTIONS:
+            break                                   # disconnected: the next login continues
+        try:
+            moved = _home_dataset(conn, row)
+        except Exception as exc:  # noqa: BLE001 - one dataset never stops the others
+            out["failed"].append(row["name"])
+            conn.emit("warning", "upload", f"Could not move {row['name']} from HPC3 to the server yet "
+                                           f"({type(exc).__name__}: {exc}). The next login tries again.")
+            continue
+        if moved is None:
+            out["missing"].append(row["name"])
+            continue
+        out["moved"].append(row["name"])
+        conn.emit("success", "upload", f"{row['name']} is now kept on the server "
+                                       f"({moved / 1e6:.1f} MB copied from HPC3).")
+        conn._publish({"type": "datasets_changed"})
+    if out["missing"]:
+        conn.emit("info", "upload", f"{len(out['missing'])} dataset(s) are no longer on HPC3, so there "
+                                    f"was nothing to move: {', '.join(out['missing'][:5])}.")
+    return out
+
+
+def _home_dataset(conn: Connection, row: dict) -> "int | None":
+    """Copy one row's HPC3 data into ``users/<owner>/datasets/<uuid>/original`` (through
+    ``temp/<owner>/stage/<uuid>``, so an interrupted copy continues), then repoint the row. Returns the
+    bytes copied, or None when the data is no longer on HPC3."""
+    path = str(row["path"])
+    q = shlex.quote(path)
+    probe = conn.executor.exec(f"if test -d {q}; then echo dir; elif test -f {q}; then echo file; fi")
+    what = (probe.stdout or "").strip()
+    if what not in ("dir", "file"):
+        return None
+    identity, owner = str(row["uuid"]), conn.owner
+    name = safe_filename(path.rstrip("/").rsplit("/", 1)[-1])
+    tree = dataset_storage.dataset_dir(identity, owner)
+    published = tree / "original"
+    if not published.exists():
+        stage = dataset_storage.temp_dir(identity, owner)
+        stage.mkdir(parents=True, exist_ok=True)
+        _pull_from_hpc(conn.executor, path, stage if what == "dir" else stage / name, what == "dir")
+        if auth_routes.get_dataset_record(conn.app_user_id, int(row["id"])) is None:
+            shutil.rmtree(stage, ignore_errors=True)     # deleted meanwhile: nothing to keep
+            return None
+        dataset_storage.publish_dataset(stage, identity, owner)
+    dest = published if what == "dir" else published / name
+    if not dest.exists():
+        raise OSError(f"{dest} is not where the copy was published")
+    size = (sum(p.stat().st_size for p in dest.rglob("*") if p.is_file()) if dest.is_dir()
+            else dest.stat().st_size)
+    (tree / "source.json").write_text(json.dumps({
+        "hpc3_path": path, "hpc3_user": _hpc_user(conn), "bytes": size,
+        "copied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "note": "This dataset was kept only on HPC3; this folder holds its copy, and the HPC3 "
+                "original can be removed."}, indent=2), encoding="utf-8")
+    auth_routes.repoint_dataset(conn.app_user_id, int(row["id"]), path, str(dest), size)
+    return size
 
 
 # --- datasets already on the gateway host, bound by path (see server_data.py) -------------------
@@ -3667,6 +3997,29 @@ def _server_dataset_kind(is_dir: bool) -> str:
     return "server-folder" if is_dir else "server-file"
 
 
+def _kept_data_root(conn: Connection) -> "Path | None":
+    """This account's dataset folder on this host (``users/<owner>/datasets``), where its uploads and
+    saved results are kept when the deployment has a data root (issue 6), else None. A run binds a
+    dataset there the way it binds an allowlisted server folder: tools on this host read it in
+    place, and a run on HPC3 reads a copy in the session's own area, made when the run starts and
+    removed when the session disconnects."""
+    if not dataset_storage.configured():
+        return None
+    try:
+        return dataset_storage.datasets_root(conn.owner).resolve()
+    except (ValueError, OSError):
+        return None
+
+
+def _bindable_roots(conn: Connection) -> "tuple[Path, ...]":
+    """The folders a run of this session may bind a path from and copy to HPC3: the allowlisted
+    server folders and this account's own dataset folder."""
+    from . import server_data as sd
+    own = _kept_data_root(conn)
+    roots = sd.server_data_roots()
+    return roots + ((own,) if own is not None and own.is_dir() and own not in roots else ())
+
+
 def _sync_server_path(conn: Connection, path: Path, root: Path,
                       say: "Callable[[str], None]") -> "tuple[str, set[str]]":
     """Copy what an analysis needs from a bound server path to this SESSION's area on HPC3
@@ -3674,7 +4027,7 @@ def _sync_server_path(conn: Connection, path: Path, root: Path,
     Returns ``(mirror path, the relative paths now there)``. SSH-bound: call via a thread."""
     from . import server_data as sd
     from ..tools.api import describe_cellranger_layout
-    found = sd.scan(path, root, sd.server_data_roots(), describe_cellranger_layout)
+    found = sd.scan(path, root, _bindable_roots(conn), describe_cellranger_layout)
     if found.copy_bytes > sd.max_bytes():
         raise sd.ServerPathError(
             f"{path} needs {found.copy_bytes / 1024 ** 3:.0f} GB on HPC3, over the "
@@ -3700,18 +4053,36 @@ def _sync_server_path(conn: Connection, path: Path, root: Path,
     return remote, {rel for rel, _ in found.copy}
 
 
+def _tool_read_roots(conn: Connection) -> "tuple[Path, ...]":
+    """What a tool running on this host may read beyond the run's workspace and bound datasets when
+    the model names a file (``tools.sdk.confine_read``): the owner's uploads, and the owner's own
+    dataset folder when uploads are kept on this host."""
+    roots: list[Path] = []
+    try:
+        roots.append(upload_storage.uploads(conn))
+    except ValueError:
+        pass
+    own = _kept_data_root(conn)
+    if own is not None:
+        roots.append(own)
+    return tuple(roots)
+
+
 async def _admit_bound_paths(conn: Connection, bound: "list[dict]",
                              say_key: "Callable[..., None]",
                              emit: "Callable[..., None]") -> "tuple[list[dict], dict[str, tuple[str, set[str]]]]":
     """Check every bound path before the run reads it, and copy server paths to HPC3 when needed.
 
     A path is admitted when it is on dfs3b (an HPC3 upload), inside this user's own workspace on the
-    gateway host (a local upload), or inside an allowlisted server folder. Anything else is dropped
-    with a warning when accounts are on: the request comes from the browser, and one user must not
-    be able to point a run at another user's uploads or at the host's own files. Returns the
-    admitted entries and ``{server path: (mirror on HPC3, relative paths copied)}``."""
+    gateway host (a local upload), inside this user's own dataset folder (an upload kept on this
+    host), or inside an allowlisted server folder. The last two are copied to HPC3 when the run
+    computes there. Anything else is dropped with a warning when accounts are on: the request comes
+    from the browser, and one user must not be able to point a run at another user's uploads or at
+    the host's own files. Returns the admitted entries and ``{server path: (mirror on HPC3, relative
+    paths copied)}``."""
     from . import server_data as sd
-    roots = sd.server_data_roots()
+    roots = _bindable_roots(conn)
+    own_root = _kept_data_root(conn)
     try:
         own = conn.workspace.resolve()
     except OSError:
@@ -3739,7 +4110,7 @@ async def _admit_bound_paths(conn: Connection, bound: "list[dict]",
             admitted.append(entry)
             continue
         if _server_data_to_hpc(conn):
-            say_key(f"🔗 Server data: {path}")
+            say_key(f"📦 Your dataset: {entry['name']}" if root == own_root else f"🔗 Server data: {path}")
             try:
                 mirrors[path] = await asyncio.to_thread(
                     _sync_server_path, conn, Path(path).resolve(), root, say_key)
@@ -3760,14 +4131,15 @@ async def _restage_server_data(conn: Connection, decisions: dict[str, Any],
     the server that path is inside the copy made by the session that first ran it, which is removed
     when that session disconnects. The server still holds the data, so the copy is made again here
     (incremental: within the same session nothing moves) and the stored paths follow it. A dataset
-    the user uploaded is not a copy and is left as stored."""
+    kept in the user's dataset folder on this host is copied the same way; one uploaded to HPC3
+    before uploads stayed here is not a copy and is left as stored."""
     if not _server_data_to_hpc(conn):
         return
     from . import server_data as sd
     base = _session_mirror_base(conn)
     sessions_dir = base.rsplit("/", 1)[0]
     legacy_dir = f"{_hpc_uploads_dir(conn)}/{hpc_gc.SERVER_DATA_KIND}"
-    roots = sd.server_data_roots()
+    roots = _bindable_roots(conn)
     by_name = {sd.mirror_tag(root): root for root in roots}
     slots: list[tuple[dict, str]] = [(decisions, "hpc_dataset_root"), (decisions, "hpc_primary")]
     slots += [(rec, "hpc_primary") for rec in (decisions.get("datasets") or [])
@@ -4009,7 +4381,8 @@ def _describable_path(conn: Connection, path: str) -> "str | None":
     reach a file this user does not own: another user's uploads, the prod ``.env``, or the stored
     API and SSH keys under the state dir. Admitted, as for a run's bound paths
     (:func:`_admit_bound_paths`): a dfs3b path, read over this user's own HPC3 login; a file in this
-    user's own uploads on the gateway host; a file inside an allowlisted server folder. A local path
+    user's own uploads or dataset folder on the gateway host; a file inside an allowlisted server
+    folder. A local path
     is resolved first, so a symlink or ``..`` cannot lead out, and the resolved path is returned for
     the peek to read. Unlike a run, this holds with accounts off too: nothing else needs it."""
     from . import server_data as sd
@@ -4021,6 +4394,8 @@ def _describable_path(conn: Connection, path: str) -> "str | None":
         roots = [upload_storage.uploads(conn).resolve(), *_owner_upload_roots(conn.owner)]
     except (OSError, RuntimeError, ValueError):   # ValueError: a NUL byte in the path
         return None
+    if dataset_storage.is_owned(resolved, conn.owner):
+        return str(resolved)               # in this account's own dataset folder
     if not _AUTH_ENABLED and dataset_storage.managed_uuid(resolved):
         return str(resolved)               # one user, no accounts: every managed dataset is theirs
     if _AUTH_ENABLED and conn.app_user_id and dataset_storage.managed_uuid(resolved):
@@ -4424,6 +4799,28 @@ def _live_llm_args(conn: "Connection") -> dict[str, Any]:
     return {"llm_base_url": f"http://{alloc.node}:{alloc.port}/v1", "model": conn.selected_model}
 
 
+class _NoServedModelExecutor:
+    """The literature line of a session with no served model (the user's own API key). A tool whose
+    HPC3 job calls the served model (manifest ``served_model``) answers ``dependency_missing`` at once
+    instead of submitting a Slurm job that cannot reach a model. The roster already leaves those tools
+    out (``registry.session_catalog``); this covers a composite bound to one of them, such as
+    ``diagnose_disease``, which composes ``deep_literature`` and degrades to its LIRICAL track."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._needs_model = frozenset(m.name for m in _tools_catalog.manifests() if m.served_model)
+
+    def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        if tool in self._needs_model:
+            return {"status": "dependency_missing", "dependency": "served-model",
+                    "note": f"{tool} calls the model a session serves on an HPC3 GPU, and this session "
+                            "has no GPU allocation."}
+        return self._inner.run_tool(tool, args, ctx)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def _build_literature_executor(conn: "Connection", run_id: str | None = None) -> Any:
     """Offload the literature tools (deep_literature, extract_haploinsufficient_genes) to HPC3
     (paperqa.sif), or None to keep them disabled. With ``run_id`` the job gets that run's own
@@ -4440,10 +4837,13 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
     """
     st = conn.settings
     image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "")
-    # Opt-in guard: build the executor ONLY when the feature is enabled AND a live HPC3 GPU session
-    # exists — else return None so deep_literature is simply absent (no behaviour change).
+    # Opt-in guard: build the executor ONLY when the feature is enabled AND a live HPC3 session
+    # exists — else return None so the literature tools are simply absent. A session with no GPU
+    # allocation (the user's own API key) still gets the executor: ``search_corpus`` runs there
+    # without a model. The tools whose manifest says ``served_model`` are left out of that session's
+    # roster (``registry.session_catalog``), and the job gets no model endpoint.
     if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not image
-            or conn.executor is None or conn.mock or conn.alloc is None):
+            or conn.executor is None or conn.mock):
         return None
     retigene = os.environ.get("AISCIENTIST_PAPERQA_ROOT", "")
     index_dir = os.environ.get("AISCIENTIST_PAPERQA_INDEX_DIR", "")
@@ -4458,7 +4858,9 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
     if not pysrc:
         return None
     # vllm serves --host 0.0.0.0, so any HPC3 node reaches Qwen at the GPU node's own host:port.
-    llm_base_url = f"http://{conn.alloc.node}:{conn.alloc.port}/v1"
+    # Without an allocation nothing is injected: no job on HPC3 gets a model endpoint or an API key.
+    served = ({"model": conn.selected_model, "llm_base_url": f"http://{conn.alloc.node}:{conn.alloc.port}/v1"}
+              if conn.alloc is not None else {})
 
     def _lit_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
         return {"status": "dependency_missing", "dependency": "paperqa-hpc",
@@ -4483,7 +4885,7 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
     from .slurm_analysis import SlurmAnalysisExecutor
     ro_binds = tuple(dict.fromkeys(p for p in (
         retigene, papers, (os.path.dirname(manifest) if manifest else "")) if p))
-    return SlurmAnalysisExecutor(
+    executor = SlurmAnalysisExecutor(
         remote=conn.executor, container_image=image,
         remote_workspace=(f"{_temp_base(conn)}/corpus/{run_id}" if run_id else f"{_temp_base(conn)}/paperqa"),
         local_workspace=(conn.workspace / run_id if run_id else conn.workspace), source_dir=pysrc,
@@ -4498,7 +4900,7 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
         extra_rw_binds=(index_dir,) if index_dir else (),
         # Deploy config the model never sends — merged into the tool-call args before the job runs, so
         # paperqa_cli builds the ctx (Qwen endpoint) and points PaperQA at the pre-built /dfs3b index.
-        inject_args={"model": conn.selected_model, "llm_base_url": llm_base_url,
+        inject_args={**served,
                      "embedding": embedding, "papers": papers, "index_dir": index_dir,
                      "index_name": index_name, "manifest": manifest, **tuning},
         # The endpoint is re-read at every job: the serve job can be replaced mid-run on another
@@ -4510,6 +4912,7 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None) ->
         local_fallback=_lit_local_fallback,
         should_cancel=conn.chat_stop.is_set,
     )
+    return executor if conn.alloc is not None else _NoServedModelExecutor(executor)
 
 
 def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
@@ -4520,13 +4923,20 @@ def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
     allocation, so no served model for the PaperQA job to call."""
     from ..agents.registry import session_catalog
 
-    roster = session_catalog(catalog, literature_executor=literature_executor)
+    roster = session_catalog(catalog, literature_executor=literature_executor,
+                             served_model=conn.alloc is not None)
     if len(roster) < len(catalog) and os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
         no_gpu = conn.executor is not None and not conn.mock and conn.alloc is None
-        why = ("its HPC3 job calls the model a session serves on a GPU, and this session has no GPU "
-               "allocation" if no_gpu else "its HPC3 job line could not be set up")
-        emit("info", "lab", f"`deep_literature` (the indexed corpus) is not available in this run: "
-                            f"{why}. Literature steps use `literature_search` (Europe PMC).")
+        names = {t.name for t in roster}
+        if no_gpu and "search_corpus" in names:
+            emit("info", "lab", "`deep_literature` needs the model a session serves on a GPU, and this session "
+                                "has none: literature steps use `search_corpus` (the indexed corpus, "
+                                "retrieval only; the session's model writes the answer).")
+        else:
+            why = ("its HPC3 job calls the model a session serves on a GPU, and this session has no GPU "
+                   "allocation" if no_gpu else "its HPC3 job line could not be set up")
+            emit("info", "lab", f"`deep_literature` (the indexed corpus) is not available in this run: "
+                                f"{why}. Literature steps use `literature_search` (Europe PMC).")
     return roster
 
 
@@ -4998,7 +5408,8 @@ class PlanReviewRequest(BaseModel):
     run_id: str | None = None           # is live on the shared session); either identifier resolves it
     action: str = "approve"          # "approve" | "revise" | "edit" | "cancel"
     feedback: str = ""               # natural-language notes for the PI on a "revise"
-    plan_yaml: str = ""              # the edited plan document on an "edit" (agents/plan_doc.py)
+    plan_yaml: str = ""              # the edited plan document on an "edit" (agents/plan_doc.py), or
+                                     # on a "revise" the edit not applied yet, applied before the words
     # Back-compat: older clients sent {approved, agenda}. `approved=False` maps to cancel.
     approved: bool | None = None
     agenda: list[str] = []
@@ -5048,13 +5459,10 @@ async def upload_dataset(
     finally:
         await file.close()
     size = dest.stat().st_size
-    if upload_storage.enabled(conn) and not safe_rel and not _uploads_on_hpc(conn):
-        published = dataset_storage.publish_dataset(dest.parent, identifier)
-        dest = published / name
     recorded_path = str(dest)
     peek: "dict | None" = None
     if safe_rel:  # a folder file: copied to HPC3 too (preserving nesting); registered by register-folder
-        if _uploads_on_hpc(conn):
+        if _uploads_queued(conn):
             # a folder's table is skimmed for its columns (the folder's Croissant record sets)
             fpeek = await asyncio.to_thread(_peek_local_upload, dest) if _is_table_name(safe_rel) else None
             job = _submit_staging(conn, dest, safe_rel, name=safe_rel, folder=safe_rel.split("/")[0],
@@ -5065,7 +5473,7 @@ async def upload_dataset(
         # Skim the file CONTENT (deterministic, no GPU) while it is still local — before staging
         # to dfs3b deletes the local copy. The LLM description is deferred to /api/dataset/describe.
         peek = await asyncio.to_thread(_peek_local_upload, dest)
-        if _uploads_on_hpc(conn):
+        if _uploads_queued(conn):
             # The queue records the dataset and announces it once the copy is verified.
             job = _submit_staging(conn, dest, f"{identifier}/{name}" if upload_storage.enabled(conn) else name, name=name, kind=_file_kind(name), peek=peek, unpack=unpack)
             job = await _await_staging(conn, job) or job
@@ -5168,7 +5576,7 @@ def _reserve_managed_folder(conn: Connection, name: str, saved: str, files: Any)
     have = []
     for index, (rel, size) in enumerate(chosen or []):
         target = upload_storage.uploads(conn) / saved / rel
-        published = dataset_storage.dataset_dir(saved) / "original" / rel
+        published = dataset_storage.dataset_dir(saved, conn.owner) / "original" / rel
         if ((target.is_file() and target.stat().st_size == size)
                 or (published.is_file() and published.stat().st_size == size)
                 or remote_done.get(rel) == size):
@@ -5186,23 +5594,7 @@ async def register_folder(payload: dict, request: Request) -> JSONResponse:
     if not folder:
         return JSONResponse({"error": "bad folder name"}, status_code=400)
     chat = chat_ref(payload.get("conversation_id"))     # the chat the folder upload was started from
-    if upload_storage.enabled(conn) and not _uploads_on_hpc(conn):
-        try:
-            result = await asyncio.to_thread(upload_storage.publish, conn, folder, int(payload.get("count") or 0))
-            if _AUTH_ENABLED and conn.app_user_id:
-                def _record() -> None:
-                    # in a thread: recording drafts and validates the folder's metadata from its files
-                    root_dir = Path(result["path"])
-                    files = ([{"path": p.relative_to(root_dir).as_posix(), "size": p.stat().st_size}
-                              for p in root_dir.rglob("*") if p.is_file()] if root_dir.is_dir() else None)
-                    auth_routes.record_folder_dataset(conn.app_user_id, result["name"], result["path"],
-                                                      result["size"], conversation_id=chat,
-                                                      dataset_uuid=result["uuid"], files=files)
-                await asyncio.to_thread(_record)
-            return JSONResponse({"status": "registered", **result})
-        except (OSError, ValueError) as exc:
-            return JSONResponse({"error": str(exc)}, status_code=409)
-    if upload_storage.enabled(conn) and _uploads_on_hpc(conn):
+    if upload_storage.enabled(conn):
         recorded = _staging_queue(conn).store.folder(folder)
         if recorded.get("recorded"):
             return JSONResponse({"status": "registered", "name": recorded.get("original_name") or folder,
@@ -5221,12 +5613,16 @@ async def register_folder(payload: dict, request: Request) -> JSONResponse:
     except (TypeError, ValueError):
         expected = 0
     already = False
-    if _uploads_on_hpc(conn) and _staging_queue(conn).jobs(folder):
-        # Its files are being copied in the background: the folder becomes one dataset when the
-        # last copy is verified, whether that is now or later (see _finish_staged_folder).
+    if _uploads_queued(conn) and _staging_queue(conn).jobs(folder):
+        # Its files are being copied (or checked) in the background: the folder becomes one dataset
+        # when the last file is verified, whether that is now or later (see _finish_staged_folder).
         q = _staging_queue(conn)
-        remote_root = (f"{_hpc_uploads_dir(conn)}/datasets/{folder}/original" if upload_storage.enabled(conn)
-                       else f"{_hpc_uploads_dir(conn)}/{folder}")
+        if _uploads_kept_here(conn):
+            remote_root = str(dataset_storage.dataset_dir(folder, conn.owner) / "original")
+        elif upload_storage.enabled(conn):
+            remote_root = f"{_hpc_uploads_dir(conn)}/datasets/{folder}/original"
+        else:
+            remote_root = f"{_hpc_uploads_dir(conn)}/{folder}"
         original_name = upload_storage.session(conn, folder)["original_name"] if upload_storage.enabled(conn) else folder
         q.store.register_folder(folder, remote_root=remote_root, user_id=conn.app_user_id, count=expected,
                                 conversation_id=chat, original_name=original_name)
@@ -5500,12 +5896,10 @@ async def upload_chunk(
         safe = await asyncio.to_thread(_unique_upload_name, conn, uploads_dir, safe)
     dest = uploads_dir / safe
     part.replace(dest)
-    if upload_storage.enabled(conn) and not _uploads_on_hpc(conn):
-        dest = dataset_storage.publish_dataset(dest.parent, identifier) / safe
     size = dest.stat().st_size
     recorded_path = str(dest)
     peek = await asyncio.to_thread(_peek_local_upload, dest)   # skim locally before any staging
-    if _uploads_on_hpc(conn):
+    if _uploads_queued(conn):
         # The queue records the dataset and announces it once the copy is verified. The browser
         # gets an answer in seconds either way — never a request that outlives Envoy's 15 s.
         job = _submit_staging(conn, dest, safe, name=safe, kind=_file_kind(safe), peek=peek,
@@ -5532,7 +5926,8 @@ async def upload_chunk(
 @app.get("/api/upload/staging")
 async def upload_staging(connection_id: str, request: Request, job_id: str = "", upload_id: str = "",
                          folder: str = "", summary: int = 0) -> JSONResponse:
-    """Where this user's background copies to HPC3 stand: one job (by its id, or by the upload
+    """Where this user's background copies to HPC3 (or checks of uploads kept here) stand: one job
+    (by its id, or by the upload
     layer's ``upload_id``), one folder, or the whole list (unfinished and failed ones, plus copies
     that finished in the last 10 minutes). With ``summary=1`` the list holds single files only and
     every folder is one entry of ``folders``: a folder of 5,000 files is 5,000 jobs, and the page
@@ -5565,6 +5960,7 @@ def _staged_folder_summary(q: "staging.StagingQueue", name: str, jobs: list) -> 
     # files that were already on HPC3 when this upload started are part of the folder: counted as done
     kept_count, kept_size = int(meta.get("kept_count") or 0), int(meta.get("kept_size") or 0)
     return {**meta, "name": name, "count": kept_count + len(jobs),
+            "dest": "server" if any(j.dest == "server" for j in jobs) else "hpc3",
             "size": kept_size + sum(j.size for j in jobs),
             "sent": kept_size + sum(j.sent if j.state != "done" else j.size for j in jobs),
             "done": kept_count + sum(1 for j in jobs if j.state == "done"),
@@ -5587,7 +5983,7 @@ def _path_in_folder(remote_path: str, folder: str) -> str:
 async def upload_staging_retry(payload: dict, request: Request) -> JSONResponse:
     """Retry a failed copy — one job, or every failed file of a folder."""
     conn = _owned_conn(payload.get("connection_id"), request)
-    if not _uploads_on_hpc(conn):
+    if not _uploads_queued(conn):
         return JSONResponse({"error": "Uploads are not copied to HPC3 in this session."}, status_code=400)
     q = _staging_queue(conn)
     folder = safe_relpath(str(payload.get("folder") or "")).split("/")[0]
@@ -5785,6 +6181,23 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
                         print(f"[datasets] could not rm HPC3 copy {mirror}: {exc}")
             return
         target = Path(stored)
+        holder = dataset_storage.managed_owner(target)
+        if holder is not None:
+            # Kept on this host, in an account's dataset folder: only the caller's own. The session's
+            # HPC3 copy of it (made when a run read it there) goes too; a disconnect would remove it.
+            if holder != safe_name(user.username):
+                raise ValueError("Refusing to delete another account's dataset")
+            tree = dataset_storage.managed_tree(target)
+            if conn is not None and conn.executor is not None and tree is not None:
+                own = dataset_storage.datasets_root(holder).resolve()
+                mirror = sd.mirror_dir(_session_mirror_base(conn), own, tree)
+                if mirror.startswith(f"{_session_mirror_base(conn)}/"):
+                    try:
+                        conn.executor.exec(f"rm -rf -- {shlex.quote(mirror)}")
+                    except Exception as exc:  # noqa: BLE001 - a session copy; the disconnect cleans it too
+                        print(f"[datasets] could not rm HPC3 copy {mirror}: {exc}")
+            dataset_storage.remove_managed_dataset(target)
+            return
         managed = dataset_storage.data_root() / "datasets"
         if target.resolve().is_relative_to(managed.resolve()):
             dataset_storage.remove_managed_dataset(target)
@@ -5857,16 +6270,21 @@ def _owner_upload_roots(owner: str) -> "list[Path]":
     return list(dict.fromkeys((b / owner / "uploads").resolve() for b in bases))
 
 
-def _local_dataset_path(stored: str, owner_roots: "list[Path]") -> "Path | None":
+def _local_dataset_path(stored: str, owner_roots: "list[Path]", owner: str = "") -> "Path | None":
     """The stored path of one of the caller's OWN rows, resolved on this host, if it is one a dataset
-    may be read from here: inside the owner's uploads (saved results included), inside the managed
-    dataset tree (``DATA_ROOT/datasets/<uuid>``; the row is the caller's, checked before), or inside
-    an allowlisted server folder. Resolving first means a symlink or ``..`` cannot lead out."""
+    may be read from here: inside the owner's uploads (saved results included), inside the owner's
+    dataset folder (``users/<owner>/datasets/<uuid>``, where uploads are kept since issue 6), inside
+    the flat managed tree written before that (``DATA_ROOT/datasets/<uuid>``; the row is the
+    caller's, checked before), or inside an allowlisted server folder. Resolving first means a
+    symlink or ``..`` cannot lead out, and a dataset folder of another account is never read."""
     from . import server_data as sd
     try:
         resolved = Path(stored).resolve()
     except (OSError, RuntimeError, ValueError):
         return None
+    holder = dataset_storage.managed_owner(resolved)
+    if holder is not None:
+        return resolved if holder == owner else None
     if (any(resolved.is_relative_to(r) for r in owner_roots)
             or dataset_storage.managed_uuid(resolved) is not None
             or sd.root_of(resolved, sd.server_data_roots()) is not None):
@@ -5897,7 +6315,7 @@ def _dataset_source(request: Request, dataset_id: int) -> _DatasetSource:
     stored = str(row["path"] or "")
     base = dict(id=int(row["id"]), name=str(row["name"] or ""), kind=str(row["kind"] or ""),
                 size_bytes=int(row["size_bytes"] or 0))
-    local = _local_dataset_path(stored, _owner_upload_roots(safe_name(user.username)))
+    local = _local_dataset_path(stored, _owner_upload_roots(safe_name(user.username)), safe_name(user.username))
     if local is not None:
         if not local.exists():
             raise _refuse("This dataset is no longer on the server.", 410)
@@ -6237,7 +6655,9 @@ def _followup_target(conn: Connection, req: LabRequest) -> tuple[str, Path, dict
         return None
     art = conn.workspace / safe_name(run_id) / "artifacts"
     state_path = art / "process" / "run_state.json"
-    if not (art / "report" / "report.md").exists() or not state_path.exists():
+    # A finished run left its report, or — a run that only did QC, answered in the chat — its summary.
+    finished = (art / "report" / "report.md").exists() or (art / "report" / "summary.md").exists()
+    if not finished or not state_path.exists():
         return None
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -6630,6 +7050,53 @@ async def _adopt_handed_on_dataset(conn: Connection, run_id: str, decisions: dic
                        stage="lab")
 
 
+def _watch_run(conn: Connection, run: RunState, req: LabRequest) -> None:
+    """Start the System page's picture of this run (gateway/run_monitor.py). Never raises."""
+    try:
+        if run.monitor is not None:
+            run.monitor.end()           # this scope ran before (a continuation): that run is over
+        run.monitor = run_monitor.start(
+            kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,
+            conversation_id=run.conversation_id, run_id=run.run_id,
+            question=getattr(req, "question", "") or "", model=conn.selected_model or "")
+        if run.kind in ("chat", "corpus"):
+            run.monitor.enter(run.kind)
+    except Exception as exc:  # noqa: BLE001 - watching a run never breaks it
+        print(f"[run-monitor] not started: {exc}")
+
+
+def _watch_stage(run: RunState, stage: str) -> None:
+    if run.monitor is not None:
+        run.monitor.enter(stage)
+
+
+def _watch_llm(run: RunState, complete_fn: Callable[..., str],
+               scientist_chat: Callable[..., Any]) -> tuple[Callable[..., str], Callable[..., Any]]:
+    """The lab's two model entry points, telling the run's monitor which role is thinking (the
+    claim audit and the writer have no lab event of their own: their calls mark those stages)."""
+    def watched_complete(messages, *, role: str | None = None):
+        mon = run.monitor
+        if mon is not None:
+            mon.llm_begin(role)
+        try:
+            return complete_fn(messages, role=role)
+        finally:
+            if mon is not None:
+                mon.llm_end()
+
+    def watched_scientist(messages, tools):
+        mon = run.monitor
+        if mon is not None:
+            mon.llm_begin("scientist")
+        try:
+            return scientist_chat(messages, tools)
+        finally:
+            if mon is not None:
+                mon.llm_end()
+
+    return watched_complete, watched_scientist
+
+
 def _fast_path(req: LabRequest) -> bool:
     """True when this message should take the answer-first chat loop instead of the lab.
 
@@ -6668,6 +7135,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest) -> None:
     run.chat_stop.clear()
     run.hard_stop.clear()
     run.running = True
+    _watch_run(conn, run, req)
     conn.push({"type": "chat_start"})
     emit = conn.emit_fn()
 
@@ -6683,7 +7151,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest) -> None:
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_run_start failed: {exc}")
         executor = _build_literature_executor(conn, run_id=run_id)
-        if executor is None:
+        if executor is None or conn.alloc is None:
             raise GatewayError(
                 "The corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC, "
                 "paperqa.sif, and this session's served model). None of that is available on this "
@@ -6692,7 +7160,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest) -> None:
         from ..agents.research_harness import HarnessContext
         ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id,
                              model=conn.selected_model, tunnel_port=conn.tunnel_port,
-                             llm_is_remote=False)
+                             llm_is_remote=False, read_roots=_tool_read_roots(conn))
         emit("step", "corpus", f"Corpus scan: {CORPUS_TOOL} (model: {conn.selected_model}).")
         say("📚 Scanning the whole indexed corpus for explicitly reported haploinsufficient genes — "
             "one HPC3 job (text → candidate sentences → the model judges each one → verified "
@@ -6926,6 +7394,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     run.chat_stop.clear()
     run.hard_stop.clear()
     run.running = True
+    _watch_run(conn, run, req)
     conn.push({"type": "chat_start"})
     emit = conn.emit_fn()
     # NB run_quick_chat runs in a worker thread (urllib is blocking), and every push below happens
@@ -6965,7 +7434,8 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             native_anthropic = llm_providers.transport_for(cred.get("provider"), base_url) == "anthropic"
         emit("step", "chat", f"Fast chat turn (model: {model}).")
 
-        tools = build_quickchat_catalog(literature_executor=_build_literature_executor(conn))
+        tools = build_quickchat_catalog(
+            literature_executor=_build_literature_executor(conn), served_model=conn.alloc is not None)
         # The case note reaches map_phenotype_to_hpo the same way it does on the research path
         # (via ctx.decisions), so attaching a note and asking a question in chat still works.
         decisions: dict[str, Any] = {}
@@ -6974,11 +7444,14 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             decisions["case_note"] = note
         ctx = HarnessContext(decisions=decisions, workspace=conn.workspace,
                              model=model, tunnel_port=conn.tunnel_port,
-                             llm_is_remote=_endpoint_is_off_host(base_url))
+                             llm_is_remote=_endpoint_is_off_host(base_url),
+                             read_roots=_tool_read_roots(conn))
 
         # Tool chatter goes to the COLLAPSIBLE activity log (chat_thinking), never to the
         # always-visible feed — same split _lab_event_to_chat makes for the research path.
         def on_event(ev: dict[str, Any]) -> None:
+            if run.monitor is not None:
+                run.monitor.observe(ev)
             t = ev.get("type")
             if t == "content":
                 conn.push({"type": "chat_token", "token": ev.get("token", "")})
@@ -7280,16 +7753,20 @@ _PLAN_YAML_MAX_CHARS = 200_000
 @app.post("/api/lab/plan")
 async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONResponse:
     """Receive the user's decision on the PI's proposed plan and unblock the lab worker
-    waiting on ``conn.plan_event``. The user no longer text-edits the agenda; they
-    APPROVE it, CANCEL, or REVISE it with natural-language ``feedback`` that goes back to
-    the PI for a re-draft (also how a clarify question is answered)."""
+    waiting on ``conn.plan_event``. The user APPROVEs it, CANCELs, EDITs the plan document
+    (``plan_yaml``, applied by code), or REVISEs it with natural-language ``feedback`` that goes
+    back to the PI (also how a clarify question is answered); a revise carries ``plan_yaml`` when
+    an edit of the document was not applied yet, and the lab applies it before the words."""
     conn = _owned_conn(req.connection_id, request)
     action = (req.action or "approve").strip().lower()
     if req.approved is False:                       # back-compat: {approved:false} == cancel
         action = "cancel"
     if action not in ("approve", "revise", "edit", "cancel"):
         action = "cancel"
-    if action == "edit" and len(req.plan_yaml or "") > _PLAN_YAML_MAX_CHARS:
+    # The document comes with an edit, or with a reply in words while an edit of it was not applied:
+    # the lab applies that edit first and makes the reply on the edited plan.
+    carries_doc = action == "edit" or (action == "revise" and bool((req.plan_yaml or "").strip()))
+    if carries_doc and len(req.plan_yaml or "") > _PLAN_YAML_MAX_CHARS:
         return JSONResponse({"status": "error", "detail": "The plan document is too large."},
                             status_code=413)
     # Unblock only the run this decision is FOR (its own chat), not whatever run is live on the shared
@@ -7299,7 +7776,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     if target is None:
         return JSONResponse({"status": "stale", "action": "ignored"})
     target.plan_value = {"action": action, "feedback": (req.feedback or "").strip(),
-                         **({"plan_yaml": req.plan_yaml} if action == "edit" else {})}
+                         **({"plan_yaml": req.plan_yaml} if carries_doc else {})}
     target.pending_plan = None
     target.plan_event.set()
     conn.push({"type": "plan_done"}, run=target)
@@ -8484,7 +8961,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
             artifacts_dir=str(art),
             # Expose the WHOLE per-user uploads tree so run_code can reach every uploaded
             # file/folder — incl. folders added after the primary dataset was chosen.
-            uploads_dir=str(dataset_storage.data_root() / "datasets" if upload_storage.enabled(conn)
+            uploads_dir=str(dataset_storage.datasets_root(conn.owner) if upload_storage.enabled(conn)
                             else upload_storage.uploads(conn)),
             dataset_root=decisions.get("dataset_root"),
             # The other bound files (a reference atlas, a BED panel) by name and role.
@@ -8723,8 +9200,8 @@ async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dic
     labels and embeddings of the later ones, is written as ``<input>.processed.<time>.<run>.h5ad``
     next to the run's checkpoints (on HPC3 for an HPC3 run: it is not pulled back), and a pointer
     plus a per-cell table land in ``artifacts``. It stays as long as the run's process files do
-    (on HPC3: until the session disconnects, ``temp_ttl_days`` at most); "save to my data" moves
-    it to the user's personal folder.
+    (on HPC3: until the session disconnects, ``temp_ttl_days`` at most); "save to my data" makes
+    it one of the user's datasets (:func:`_save_run_result`).
     Best-effort: an export that fails costs the dataset, never the run."""
     from ..tools.api import EXPORT_RESULT_DATASET, export_result_dataset, result_dataset_name
     source = str(decisions.get("hpc_primary") or decisions.get("dataset_path") or "")
@@ -8759,10 +9236,11 @@ async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dic
         where = "on HPC3" if on_hpc else "on the server"
         emit("success", "lab",
              f"📦 Processed dataset ready: {name} — {rd.get('n_cells')} cells × {rd.get('n_genes')} "
-             f"genes, {int(rd.get('size_bytes') or 0) / 1e6:.0f} MB, with the clusters, cell types "
-             f"and embeddings. Kept {where} {_keep_for(kept_days, until_disconnect)}; Runs → "
-             "“Save to my data” moves it "
-             "to your personal folder as a dataset the next analysis can start from. A per-cell "
+             f"genes, {int(rd.get('size_bytes') or 0) / 1e6:.0f} MB, {_dataset_holds(rd)}. "
+             f"Kept {where} {_keep_for(kept_days, until_disconnect)}; Runs → "
+             "“Save to my data” keeps it "
+             + ("in your data on the server" if dataset_storage.configured() else "in your personal folder")
+             + " as a dataset the next analysis can start from. A per-cell "
              "table (tables/cells.csv) is in the bundle.")
         return rd
     if status == "skipped":
@@ -8827,43 +9305,81 @@ def _trim_work_keep_checkpoints(work_dir: Path) -> None:
         pass
 
 
-def _expire_old_checkpoints(runs_root: Path, ttl_days: int, *, now: float | None = None) -> int:
+def _expire_old_checkpoints(runs_root: Path, ttl_days: int, *, now: float | None = None,
+                            live: Collection[str] = ()) -> int:
     """Delete run analysis checkpoints — the ``<owner>/<run_id>/work/`` dirs A2 resume keeps — whose
     newest file is older than ``ttl_days``. This reclaims the large densified ``adata_*.h5ad``
     matrices while NEVER touching ``artifacts/`` (figures/tables/report/data — the deliverables), so
     the report keeps working; only step-level ``continue`` needs the run re-run once after expiry.
     Since :func:`_drop_process_files` releases ``work/`` the moment the report exists, this TTL
-    sweeper is now a backstop for runs that never reached that point. ``ttl_days <= 0`` disables. Returns how many ``work/`` dirs were
+    sweeper is now a backstop for runs that never reached that point. ``ttl_days <= 0`` disables. Returns how many dirs were
     removed. Best-effort and path-guarded to stay strictly under ``runs_root``.
 
     A local run's exported ``result/`` (the processed dataset, see :func:`_export_result_dataset`)
-    expires the same way unless the user saved it to their data, which MOVES it out of the run."""
+    expires the same way unless the user saved it to their data, which MOVES it out of the run.
+
+    So does ``staged/``, the copy of the input matrix pulled back from HPC3: a run that stalls or
+    fails never publishes, and its copy (a whole matrix, often over 1 GB) used to stay for good. A
+    copied file can carry its source's time, so ``staged/`` goes once nothing in the whole run has
+    changed for ``ttl_days``. Runs named in ``live`` (still in flight) are never touched."""
     if ttl_days <= 0 or not runs_root.exists():
         return 0
     import time as _time
     cutoff = (now if now is not None else _time.time()) - ttl_days * 86400
     root = runs_root.resolve()
     removed = 0
-    for work in [*root.glob("*/*/work"), *root.glob("*/*/result")]:
-        try:
-            if not work.is_dir() or root not in work.resolve().parents:
+    for kind in ("staged", "work", "result"):
+        for target in root.glob(f"*/*/{kind}"):
+            try:
+                if (not target.is_dir() or target.is_symlink() or target.parent.name in live
+                        or root not in target.resolve().parents):
+                    continue
+                if kind == "staged":
+                    # the run's files, plus staged/'s own directories (their times are the copy's)
+                    run = target.parent
+                    newest = max(p.lstat().st_mtime for p in run.rglob("*")
+                                 if p.is_file() or p.is_relative_to(target))
+                else:
+                    mtimes = [p.stat().st_mtime for p in target.rglob("*") if p.is_file()]
+                    newest = max(mtimes, default=target.stat().st_mtime)
+                if newest < cutoff:
+                    shutil.rmtree(target, ignore_errors=True)
+                    removed += 1
+            except OSError:
                 continue
-            mtimes = [p.stat().st_mtime for p in work.rglob("*") if p.is_file()]
-            newest = max(mtimes, default=work.stat().st_mtime)
-            if newest < cutoff:
-                shutil.rmtree(work, ignore_errors=True)
-                removed += 1
-        except OSError:
-            continue
     return removed
 
 
+def _resume_kept_uploads() -> int:
+    """Continue the checks a restart interrupted of uploads kept on this host, for every account,
+    connected or not: they need no HPC3 session. Returns how many were resumed."""
+    if not dataset_storage.configured():
+        return 0
+    resumed = 0
+    for store in sorted((dataset_storage.data_root() / "temp").glob("*/uploads/.staging")):
+        owner = store.parents[1].name
+        if store.is_symlink() or dataset_storage.account_name(owner) != owner:
+            continue
+        jobs = staging.StagingStore(store).load_all()
+        if not any(j.dest == "server" and j.state in staging.ACTIVE for j in jobs):
+            continue
+        try:
+            resumed += len(_owner_staging_queue(owner).resume())
+        except Exception as exc:  # noqa: BLE001 - the owner's next login resumes them too
+            print(f"[upload] resuming {owner}'s checks failed: {exc}")
+    return resumed
+
+
 async def _upload_gc_loop() -> None:
+    try:
+        await asyncio.to_thread(_resume_kept_uploads)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[upload] resume at start failed: {exc}")
     while True:
         try:
             await asyncio.to_thread(upload_storage.expire_all)
             for conn in list(CONNECTIONS.values()):
-                if _uploads_on_hpc(conn):
+                if _uploads_queued(conn):
                     await asyncio.to_thread(_expire_settled, conn)
         except Exception as exc:  # housekeeping retries next pass
             print(f"[gc] upload sweep failed: {exc}")
@@ -8877,9 +9393,10 @@ async def _checkpoint_gc_loop() -> None:
     while True:
         try:
             ttl = HPCSettings.from_env().checkpoint_ttl_days
-            n = await asyncio.to_thread(_expire_old_checkpoints, CONSOLE_RUNS_DIR, ttl)
+            live = {run.run_id for c in list(CONNECTIONS.values()) for run in list(c.live_runs)}
+            n = await asyncio.to_thread(_expire_old_checkpoints, CONSOLE_RUNS_DIR, ttl, live=live)
             if n:
-                print(f"[gc] expired {n} run checkpoint dir(s) older than {ttl}d")
+                print(f"[gc] expired {n} run process dir(s) older than {ttl}d")
         except Exception as exc:  # noqa: BLE001 - housekeeping must never crash the server
             print(f"[gc] checkpoint sweep failed: {type(exc).__name__}: {exc}")
         await asyncio.sleep(6 * 3600)
@@ -8956,6 +9473,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
     run.chat_stop.clear()
     run.hard_stop.clear()
     run.running = True
+    _watch_run(conn, run, req)
     conn.push({"type": "chat_start"})
     emit = conn.emit_fn()
 
@@ -8987,6 +9505,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
 
         # Load the dataset (path only — the raw matrix never enters a prompt) into the
         # derived dataset_result the QC/DE tools read.
+        _watch_stage(run, "data")
         decisions: dict[str, Any] = dict(resume_decisions or {})
         # The attached case note (see LabRequest.case_note): map_phenotype_to_hpo reads it from here
         # when the model doesn't pass `text` itself. A resume keeps the note it already had.
@@ -9170,8 +9689,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                     f"(primary {records[0]['name']} + {len(records) - 1} more).")
 
         _llm = _lab_llm(conn)
-        complete_fn, scientist_chat = _llm.complete_fn, _llm.scientist_chat
+        complete_fn, scientist_chat = _watch_llm(run, _llm.complete_fn, _llm.scientist_chat)
         model, llm_label, count_tokens = _llm.model, _llm.label, _llm.count_tokens
+        if run.monitor is not None:
+            run.monitor.model = model
         llm_remote = _llm.scientist_remote
         emit("step", "lab", f"Research lab starting (LLM: {llm_label}, model: {model}).")
         if resume is None and (llm_remote or _llm.lab_role_remote) and _AUTH_ENABLED:
@@ -9202,7 +9723,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 emit("warning", "lab", f"Run-start triage skipped: {type(exc).__name__}: {exc}")
 
         ctx = HarnessContext(decisions=decisions, workspace=conn.workspace / run_id, model=model,
-                             tunnel_port=conn.tunnel_port, llm_is_remote=llm_remote)
+                             tunnel_port=conn.tunnel_port, llm_is_remote=llm_remote,
+                             read_roots=_tool_read_roots(conn))
         # Scientist catalog = lightweight smoke tools + the REAL single-cell analysis
         # line (scanpy QC/cluster/DE + gseapy enrichment, emitting figures/tables) +
         # the CodeAct escape hatch. The analysis tools degrade gracefully if the
@@ -9865,6 +10387,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         def on_event(ev: dict[str, Any]) -> None:
             # Stream the run into the centre chat bubble (collapsible activity + key
             # progress), in addition to the full technical feed on the right.
+            if run.monitor is not None:
+                run.monitor.observe(ev)
             t_ev = ev.get("type")
             _note_usage_step(ev, run_flags)
             for payload in _lab_event_to_chat(ev):
@@ -10112,6 +10636,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # just because the last step (rendering) struggled. Re-affirmed after publish, below. Scoped
         # per-conversation so ONLY this chat's next message treats it as the run to amend.
         _remember_run(conn, run)
+        # A run that only did quality control is answered in the chat, unless its request asks for a
+        # written report: then the model writes one (Yijun, 2026-10-18). Either way the bundle is the
+        # complete folder.
+        from ..agents.scope import wants_written_report
+        qc_run = _qc_only_run(result) and not _code_wrote_outputs(result)
+        qc_report = qc_run and wants_written_report(req.question)
+        chat_only = qc_run and not qc_report
         # Always draw a deterministic methods/workflow schematic from the PI agenda
         # (zero AI — one box per step, holding its number and title, laid out by graphviz in a
         # shape that fits a page). Graceful: writes only the .dot source if graphviz isn't
@@ -10140,7 +10671,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # calls and two renders, it took 11 minutes, and the Stop button had just said "ending the
         # current run" — so the user watched a run they had stopped keep spending. Say what is
         # actually happening, and let a second Stop out of it.
-        if run.chat_stop.is_set():
+        if run.chat_stop.is_set() and not chat_only:
             say_key(f"🛑 Analysis stopped — writing up the {result.accepted_steps} step(s) that "
                     "completed. This takes a few minutes. Press Stop again to skip the write-up "
                     "and keep just the result files.", "warning")
@@ -10158,213 +10689,255 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             # before the report is written, so "The dataset" can say where the data ended up
             await _autosave_results(conn, run_id, emit)
 
-        brief = _wants_brief_report(getattr(lab_obj, "scope", None), result)
-        if abandoned():
-            report_md = ("# Research report (write-up skipped)\n\n"
-                         "You stopped this run a second time, so the model-written report, the "
-                         "self-review and the rendered PDF/DOCX were skipped. The figures and "
-                         "tables every completed step produced are in this bundle, and "
-                         "`process/run_state.json` can resume it.\n\n"
-                         f"{result.final_answer or ''}\n")
-        elif brief:
-            # Asked for ("a short report"), or all the run did was QC: a one-page summary built
-            # from what the tools returned — no manuscript, no model-written prose to check.
-            say_key("📝 Writing the short report…")
-            report_md = await asyncio.to_thread(
-                _build_brief_report, art, req.question, result, getattr(lab_obj, "scope", None))
-        else:
-            say_key("📝 Writing the research report…")
-            report_md = await asyncio.to_thread(
-                _build_report, result.final_answer or "", art, complete_fn, req.question, result)
-        # Literature module: fill the manuscript's reserved '## References' slot from citations
-        # actually produced by an accepted in-loop literature step. The research pipeline grounds
-        # literature via `deep_literature` (PaperQA over the lab's curated corpus); `literature_search`
-        # (Europe PMC) is the dev/no-HPC fallback. Reuse whichever ran — do NOT perform a hidden
-        # report-time search; if neither was accepted, the References section says so honestly.
-        from ..reporting.literature_references import (
-            append_design_background, degradation_note, empty_references, insert_references,
-            strip_intext_citation_markers)
-
-        if not brief:
-            say_key("📚 Collecting accepted literature citations…")
-        # Prefer deep_literature (the corpus tool the pipeline actually runs); fall back to an
-        # accepted Europe PMC literature_search step (dev / no-HPC runs).
-        lit = _references_from_accepted_deep_literature(result)
-        if lit is None:
-            lit = _references_from_accepted_literature_search(result)
-        if lit is None:
-            lit = empty_references("no accepted literature citations from this run")
-        # The report writer emits inline citation markers ("[3]", "[1, 2]") that are
-        # narrative artifacts: they map to nothing, since the References list below is rebuilt
-        # independently from the run's accepted citations. Strip them so the manuscript never
-        # shows a citation number that disagrees with the reference list; the real,
-        # corpus-backed list is kept.
-        report_md = strip_intext_citation_markers(report_md)
-        report_md = insert_references(report_md, lit)
-        # The expert team's design-phase reading, kept separate from References on purpose: those
-        # assert support for a finding and come only from accepted analysis steps, while these were
-        # never adjudicated. A run can spend a dozen real DOI-backed lookups shaping its plan, and
-        # showing none of them was the other way to be wrong about this.
-        design_background = list(getattr(result, "design_background", None) or [])
-        report_md = append_design_background(report_md, design_background)
-        if design_background:
-            emit("info", "lab",
-                 f"Design background: {len(design_background)} paper(s) the team consulted while "
-                 "planning (listed separately from References — not adjudicated as evidence).")
-        lit_note = degradation_note(lit)
-        try:
-            (art / "process" / "literature_references.json").write_text(
-                json.dumps(lit, indent=2, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
-        if lit["tier"] in ("lab_deep_literature", "lab_literature_search"):
-            _src = "indexed corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
-                else "literature-search step"
-            emit("success", "lab", f"References: reused {len(lit['citations'])} citation(s) from the accepted {_src}.")
-        elif not brief:
-            emit("warning", "lab", "References: no accepted literature citations in this run (none fabricated; no hidden fallback search).")
-        # Self-review the draft BEFORE rendering: strip leftover/placeholder content, fix
-        # numbering, validate figure refs, embed tables (best-effort; keeps draft on failure).
-        if not abandoned() and not brief:
-            say_key("🔍 Self-reviewing the draft…")
-            report_md = await asyncio.to_thread(
-                _review_and_finalize_report, report_md, art, complete_fn, req.question, lit)
-            emit("info", "lab", "Self-reviewed the report draft before rendering.")
-        # Checked on the FINAL text: the writer and the self-review both write prose of their own.
-        report_md = _correct_manuscript_markers(report_md, result)
-        # How we know it is right: every number traced to the run's outputs, what each label rests
-        # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
-        # statement is report/verification.md, the manuscript carries its summary.
-        verification_md, verification = await asyncio.to_thread(
-            _verification_statement, report_md, art, result, lit, brief)
-        if verification_md:
-            if not abandoned():
-                report_md = _insert_verification_note(report_md, verification)
-            emit("info", "lab", _verification_chat_line(verification))
-        if prior is not None:
-            # After the number check on purpose: this section restates another run's work.
-            report_md = _insert_before_backmatter(
-                report_md, _earlier_work_note(prior, continues_from_dataset))
-        say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
-                else "💾 Saving report.md — skipping the render.", "info")
-        report_md = _drop_strip_embeds(report_md, art, emit, "report")
-        # Title the document by CONTENT (the report's own H1 / main finding), not a generic
-        # constant — promotes the first heading to the pandoc title and drops it from the body.
-        report_title, report_md = _promote_doc_title(report_md, "AiScientist Research Report")
-        try:
-            if abandoned():
-                # Skip pandoc (and its Slurm job) but never the .md — the bundle must still carry a
-                # readable entry point to what ran. `made` stays empty, which also skips the
-                # post-render reviews below without needing a second guard for them.
-                (art / "report").mkdir(parents=True, exist_ok=True)
-                # Put the H1 back: _promote_doc_title lifted it out for pandoc's front matter, and
-                # nothing renders this file, so without it the .md opens mid-sentence.
-                (art / "report" / "report.md").write_text(
-                    f"# {report_title}\n\n{report_md}", encoding="utf-8")
-                rep = {"status": "markdown_only", "md_path": str(art / "report" / "report.md"),
-                       "pdf_path": None, "docx_path": None}
-            else:
-                rep = await asyncio.to_thread(
-                    build_pdf_report, report_md, art / "report",
-                    title=report_title, basename="report", assets_root=art, render_fn=report_render_fn)
-        except Exception as exc:  # noqa: BLE001 - the report is the LAST step and the analysis is
-            # already done + checkpointed; a render crash must NEVER discard the whole run. Degrade to
-            # an error result so the bundle (incl. report.md, written first inside build_pdf_report)
-            # still ships and the run finishes with its deliverables rather than losing them to a
-            # render crash. The renderer already returns instead of throwing (slurm_report), so this
-            # is defense-in-depth against any other render crash.
-            traceback.print_exc()
-            rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
-                   "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
-        made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
-        if made:
-            emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
-            if "pdf_path" not in made and rep.get("error"):
-                # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
-                emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
-        elif rep["status"] == "markdown_only":
-            emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
-        else:
-            # Persist the FULL render error (incl. the HPC3 Slurm-log tail with the real LaTeX
-            # cause) to the bundle — the chat emit is truncated, so without this the actual reason
-            # is lost. Best-effort; the .md always survives regardless.
-            full_err = str(rep.get("error", "") or "").strip()
-            if full_err:
-                try:
-                    err_dir = art / "process"
-                    err_dir.mkdir(parents=True, exist_ok=True)
-                    (err_dir / "report_render_error.log").write_text(full_err, encoding="utf-8")
-                except OSError:
-                    pass
-            emit("warning", "lab",
-                 f"Report render failed (full log: process/report_render_error.log): {full_err[:160]}")
-        # Post-render text review: read the rendered document back and flag any remaining
-        # issues (advisory — saved to process/report_review.md, never blocks the run).
-        visual_diag = ""
-        if made and not brief:
-            # Post-render reviews are ADVISORY and must NEVER throw past here: the analysis is done
-            # and checkpointed, and the bundle is published BELOW — a review that raises would skip
-            # the publish and the user would lose the ENTIRE run (analysis included) to a "Chat
-            # error", with no downloadable bundle. The VL review especially runs as an HPC3 vision-
-            # model job and can time out / drop the SSH channel. So wrap the whole review block.
+        vl_attempted = False   # did the post-render visual review get a document to read?
+        # The lab is done; what is left is the write-up (or, for QC only, the chat reply).
+        _watch_stage(run, "report" if chat_only else "writeup")
+        if chat_only:
+            # Quality control is all this run did: the answer is a short reply in the chat, written
+            # by code from the QC tool's own numbers. No report, no PDF/DOCX, no References and no
+            # verification statement — there is no model-written text to check (Yijun, 2026-10-16,
+            # on run 6275df1213ab: a one-step QC run needs the data in the chat, not a report).
+            reply = await asyncio.to_thread(_qc_chat_reply, art, result)
+            if reply:
+                result.final_answer = reply
             try:
-                review_note = await asyncio.to_thread(_postrender_text_check, rep, art, complete_fn)
-                if review_note:
-                    emit("warning", "lab",
-                         f"Post-render review flagged issues (see process/report_review.md): {review_note[:200]}")
-                else:
-                    emit("info", "lab", "Post-render review: report reads clean.")
-                # Post-render VISUAL review (opt-in): a vision model on HPC3 looks at the rendered
-                # pages for LAYOUT defects the text checks are blind to (overlap, clipping, broken
-                # tables) and RE-RENDERS with escalated format to fix them. Residual defects feed the
-                # technical report's Diagnostics only — the manuscript ships clean.
-                visual_diag = await asyncio.to_thread(
-                    _postrender_visual_check, rep, report_md, report_title, art, conn,
-                    report_render_fn)
-            except Exception as exc:  # noqa: BLE001 - advisory; degrade to a warning, keep the bundle
-                traceback.print_exc()
-                emit("warning", "lab", f"Post-render review skipped (non-fatal, bundle preserved): {exc}")
-
-        # Second deliverable: the internal TECHNICAL report — built from the FULL run log
-        # (every step incl. failures/substitutions), rendered alongside the manuscript as
-        # report/technical_report.{pdf,docx}. Best-effort; never blocks the manuscript.
-        try:
+                # The same lines in the folder, so a downloaded bundle says what QC did. It is also
+                # what marks the run finished for the next message in this chat to continue.
+                (art / "report").mkdir(parents=True, exist_ok=True)
+                (art / "report" / "summary.md").write_text(result.final_answer or "",
+                                                           encoding="utf-8")
+            except OSError:
+                pass
+            emit("info", "lab", "Quality control only — the summary is in the chat; no report was "
+                                "written.")
+        else:
+            brief = _wants_brief_report(getattr(lab_obj, "scope", None), result)
             if abandoned():
-                raise _WriteupAbandoned
-            if brief:
-                raise _BriefReportOnly
-            tech_md = await asyncio.to_thread(
-                _build_technical_report, result, art, complete_fn, req.question, lit_note,
-                "\n\n".join(d for d in (figure_diag, visual_diag) if d),
-                _llm_provenance_note(_llm))
-            tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
-            tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
-            if verification_md:
-                # The same statement, one heading level down, so the technical PDF carries it too.
-                tech_md = tech_md.rstrip() + "\n\n" + re.sub(
-                    r"(?m)^(#{1,5}) ", lambda m: "#" + m.group(1) + " ", verification_md)
-            tech_rep = await asyncio.to_thread(
-                build_pdf_report, tech_md, art / "report",
-                title=tech_title, basename="technical_report", assets_root=art, render_fn=report_render_fn)
-            tech_made = [f for f in ("pdf_path", "docx_path") if tech_rep.get(f)]
-            if tech_made:
-                emit("success", "lab",
-                     f"Rendered technical_report.{' + technical_report.'.join(f.split('_')[0] for f in tech_made)} (pandoc).")
-            elif tech_rep["status"] == "markdown_only":
-                emit("info", "lab", "technical_report.md written — install pandoc for PDF/DOCX.")
+                report_md = ("# Research report (write-up skipped)\n\n"
+                             "You stopped this run a second time, so the model-written report, the "
+                             "self-review and the rendered PDF/DOCX were skipped. The figures and "
+                             "tables every completed step produced are in this bundle, and "
+                             "`process/run_state.json` can resume it.\n\n"
+                             f"{result.final_answer or ''}\n")
+            elif qc_report:
+                # QC only, and a written report asked for: the writer's report (it chose the layout),
+                # then the files the run handed back.
+                say_key("📝 Writing the quality-control report…")
+                report_md = _qc_report_md(result.final_answer or "", art)
+            elif brief:
+                # Asked for ("a short report"): a one-page summary built from what the tools
+                # returned — no manuscript, no model-written prose to check.
+                say_key("📝 Writing the short report…")
+                report_md = await asyncio.to_thread(
+                    _build_brief_report, art, req.question, result, getattr(lab_obj, "scope", None))
             else:
-                emit("warning", "lab", f"Technical report render failed: {str(tech_rep.get('error', ''))[:160]}")
-        except _WriteupAbandoned:
-            emit("info", "lab", "Technical report skipped — you stopped the write-up.")
-        except _BriefReportOnly:
-            emit("info", "lab", "Short report only — no technical report was written. The run "
-                                "record is in process/, and report/verification.md lists every check.")
-        except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
-            emit("warning", "lab", f"Technical report step failed: {exc}")
+                say_key("📝 Writing the research report…")
+                report_md = await asyncio.to_thread(
+                    _build_report, result.final_answer or "", art, complete_fn, req.question, result)
+            # Literature module: fill the manuscript's reserved '## References' slot from citations
+            # actually produced by an accepted in-loop literature step. The research pipeline grounds
+            # literature via `deep_literature` (PaperQA over the lab's curated corpus); `literature_search`
+            # (Europe PMC) is the dev/no-HPC fallback. Reuse whichever ran — do NOT perform a hidden
+            # report-time search; if neither was accepted, the References section says so honestly.
+            from ..reporting.literature_references import (
+                append_design_background, degradation_note, empty_references, insert_references,
+                strip_intext_citation_markers)
 
-        say_key("✅ Report ready — see below and the Downloads panel." if not abandoned()
-                else "🛑 Write-up skipped — the run's figures, tables and report.md are in the "
-                     "Downloads panel.", "success" if not abandoned() else "warning")
+            if not brief:
+                say_key("📚 Collecting accepted literature citations…")
+            # Prefer deep_literature (the corpus tool the pipeline actually runs); fall back to an
+            # accepted Europe PMC literature_search step (dev / no-HPC runs).
+            lit = _references_from_accepted_deep_literature(result)
+            if lit is None:
+                lit = _references_from_accepted_literature_search(result)
+            if lit is None:
+                lit = empty_references("no accepted literature citations from this run")
+            # The report writer emits inline citation markers ("[3]", "[1, 2]") that are
+            # narrative artifacts: they map to nothing, since the References list below is rebuilt
+            # independently from the run's accepted citations. Strip them so the manuscript never
+            # shows a citation number that disagrees with the reference list; the real,
+            # corpus-backed list is kept.
+            report_md = strip_intext_citation_markers(report_md)
+            report_md = insert_references(report_md, lit)
+            # The expert team's design-phase reading, kept separate from References on purpose: those
+            # assert support for a finding and come only from accepted analysis steps, while these were
+            # never adjudicated. A run can spend a dozen real DOI-backed lookups shaping its plan, and
+            # showing none of them was the other way to be wrong about this.
+            design_background = list(getattr(result, "design_background", None) or [])
+            report_md = append_design_background(report_md, design_background)
+            if design_background:
+                emit("info", "lab",
+                     f"Design background: {len(design_background)} paper(s) the team consulted while "
+                     "planning (listed separately from References — not adjudicated as evidence).")
+            lit_note = degradation_note(lit)
+            try:
+                (art / "process" / "literature_references.json").write_text(
+                    json.dumps(lit, indent=2, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
+            if lit["tier"] in ("lab_deep_literature", "lab_literature_search"):
+                _src = "indexed corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
+                    else "literature-search step"
+                emit("success", "lab", f"References: reused {len(lit['citations'])} citation(s) from the accepted {_src}.")
+            elif not brief:
+                emit("warning", "lab", "References: no accepted literature citations in this run (none fabricated; no hidden fallback search).")
+            # Self-review the draft BEFORE rendering: strip leftover/placeholder content, fix
+            # numbering, validate figure refs, embed tables (best-effort; keeps draft on failure).
+            if not abandoned() and not brief:
+                say_key("🔍 Self-reviewing the draft…")
+                report_md = await asyncio.to_thread(
+                    _review_and_finalize_report, report_md, art, complete_fn, req.question, lit)
+                emit("info", "lab", "Self-reviewed the report draft before rendering.")
+            # Checked on the FINAL text: the writer and the self-review both write prose of their own.
+            report_md = _correct_manuscript_markers(report_md, result)
+            # How we know it is right: every number traced to the run's outputs, what each label rests
+            # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
+            # statement is report/verification.md, the manuscript carries its summary.
+            verification_md, verification = await asyncio.to_thread(
+                _verification_statement, report_md, art, result, lit, brief, qc_report)
+            if verification_md:
+                if not abandoned():
+                    report_md = _insert_verification_note(report_md, verification)
+                emit("info", "lab", _verification_chat_line(verification))
+            if prior is not None:
+                # After the number check on purpose: this section restates another run's work.
+                report_md = _insert_before_backmatter(
+                    report_md, _earlier_work_note(prior, continues_from_dataset))
+            _watch_stage(run, "report")
+            say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
+                    else "💾 Saving report.md — skipping the render.", "info")
+            report_md = _drop_strip_embeds(report_md, art, emit, "report")
+            # Title the document by CONTENT (the report's own H1 / main finding), not a generic
+            # constant — promotes the first heading to the pandoc title and drops it from the body.
+            report_title, report_md = _promote_doc_title(report_md, "AiScientist Research Report")
+            try:
+                if abandoned():
+                    # Skip pandoc (and its Slurm job) but never the .md — the bundle must still carry a
+                    # readable entry point to what ran. `made` stays empty, which also skips the
+                    # post-render reviews below without needing a second guard for them.
+                    (art / "report").mkdir(parents=True, exist_ok=True)
+                    # Put the H1 back: _promote_doc_title lifted it out for pandoc's front matter, and
+                    # nothing renders this file, so without it the .md opens mid-sentence.
+                    (art / "report" / "report.md").write_text(
+                        f"# {report_title}\n\n{report_md}", encoding="utf-8")
+                    rep = {"status": "markdown_only", "md_path": str(art / "report" / "report.md"),
+                           "pdf_path": None, "docx_path": None}
+                else:
+                    rep = await asyncio.to_thread(
+                        build_pdf_report, report_md, art / "report",
+                        title=report_title, basename="report", assets_root=art, render_fn=report_render_fn)
+            except Exception as exc:  # noqa: BLE001 - the report is the LAST step and the analysis is
+                # already done + checkpointed; a render crash must NEVER discard the whole run. Degrade to
+                # an error result so the bundle (incl. report.md, written first inside build_pdf_report)
+                # still ships and the run finishes with its deliverables rather than losing them to a
+                # render crash. The renderer already returns instead of throwing (slurm_report), so this
+                # is defense-in-depth against any other render crash.
+                traceback.print_exc()
+                rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
+                       "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
+            made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
+            if made:
+                emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
+                if "pdf_path" not in made and rep.get("error"):
+                    # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
+                    emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
+            elif rep["status"] == "markdown_only":
+                emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
+            else:
+                # Persist the FULL render error (incl. the HPC3 Slurm-log tail with the real LaTeX
+                # cause) to the bundle — the chat emit is truncated, so without this the actual reason
+                # is lost. Best-effort; the .md always survives regardless.
+                full_err = str(rep.get("error", "") or "").strip()
+                if full_err:
+                    try:
+                        err_dir = art / "process"
+                        err_dir.mkdir(parents=True, exist_ok=True)
+                        (err_dir / "report_render_error.log").write_text(full_err, encoding="utf-8")
+                    except OSError:
+                        pass
+                emit("warning", "lab",
+                     f"Report render failed (full log: process/report_render_error.log): {full_err[:160]}")
+            # Post-render text review: read the rendered document back and flag any remaining
+            # issues (advisory — saved to process/report_review.md, never blocks the run).
+            visual_diag = ""
+            if made and not brief:
+                # Post-render reviews are ADVISORY and must NEVER throw past here: the analysis is done
+                # and checkpointed, and the bundle is published BELOW — a review that raises would skip
+                # the publish and the user would lose the ENTIRE run (analysis included) to a "Chat
+                # error", with no downloadable bundle. The VL review especially runs as an HPC3 vision-
+                # model job and can time out / drop the SSH channel. So wrap the whole review block.
+                try:
+                    review_note = await asyncio.to_thread(_postrender_text_check, rep, art, complete_fn)
+                    if review_note:
+                        emit("warning", "lab",
+                             f"Post-render review flagged issues (see process/report_review.md): {review_note[:200]}")
+                    else:
+                        emit("info", "lab", "Post-render review: report reads clean.")
+                    # Post-render VISUAL review (opt-in): a vision model on HPC3 looks at the rendered
+                    # pages for LAYOUT defects the text checks are blind to (overlap, clipping, broken
+                    # tables) and RE-RENDERS with escalated format to fix them. Residual defects feed the
+                    # technical report's Diagnostics only — the manuscript ships clean.
+                    vl_attempted = True
+                    visual_diag = await asyncio.to_thread(
+                        _postrender_visual_check, rep, report_md, report_title, art, conn,
+                        report_render_fn)
+                except Exception as exc:  # noqa: BLE001 - advisory; degrade to a warning, keep the bundle
+                    traceback.print_exc()
+                    emit("warning", "lab", f"Post-render review skipped (non-fatal, bundle preserved): {exc}")
+
+            # Second deliverable: the internal TECHNICAL report — built from the FULL run log
+            # (every step incl. failures/substitutions), rendered alongside the manuscript as
+            # report/technical_report.{pdf,docx}. Best-effort; never blocks the manuscript.
+            try:
+                if abandoned():
+                    raise _WriteupAbandoned
+                if brief:
+                    raise _BriefReportOnly
+                tech_md = await asyncio.to_thread(
+                    _build_technical_report, result, art, complete_fn, req.question, lit_note,
+                    "\n\n".join(d for d in (figure_diag, visual_diag) if d),
+                    _llm_provenance_note(_llm))
+                tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
+                tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
+                if verification_md:
+                    # The same statement, one heading level down, so the technical PDF carries it too.
+                    tech_md = tech_md.rstrip() + "\n\n" + re.sub(
+                        r"(?m)^(#{1,5}) ", lambda m: "#" + m.group(1) + " ", verification_md)
+                tech_rep = await asyncio.to_thread(
+                    build_pdf_report, tech_md, art / "report",
+                    title=tech_title, basename="technical_report", assets_root=art, render_fn=report_render_fn)
+                tech_made = [f for f in ("pdf_path", "docx_path") if tech_rep.get(f)]
+                if tech_made:
+                    emit("success", "lab",
+                         f"Rendered technical_report.{' + technical_report.'.join(f.split('_')[0] for f in tech_made)} (pandoc).")
+                elif tech_rep["status"] == "markdown_only":
+                    emit("info", "lab", "technical_report.md written — install pandoc for PDF/DOCX.")
+                else:
+                    emit("warning", "lab", f"Technical report render failed: {str(tech_rep.get('error', ''))[:160]}")
+            except _WriteupAbandoned:
+                emit("info", "lab", "Technical report skipped — you stopped the write-up.")
+            except _BriefReportOnly:
+                emit("info", "lab", "Short report only — no technical report was written. The run "
+                                    "record is in process/, and report/verification.md lists every check.")
+            except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
+                emit("warning", "lab", f"Technical report step failed: {exc}")
+
+        if qc_report:
+            # The chat gets the numbers; the written report is in the folder.
+            reply = await asyncio.to_thread(_qc_chat_reply, art, result)
+            pdf = (art / "report" / "report.pdf").exists()
+            pointer = ("The written report is `report/report.pdf` (and `report/report.docx`) in the "
+                       "Downloads panel." if pdf else
+                       "The written report is `report/report.md` in the Downloads panel.")
+            if reply:
+                result.final_answer = reply.rstrip() + "\n\n" + pointer + "\n"
+        if chat_only:
+            say_key("✅ Done — the summary is below; the result files are in the Downloads panel.",
+                    "success")
+        else:
+            say_key("✅ Report ready — see below and the Downloads panel." if not abandoned()
+                    else "🛑 Write-up skipped — the run's figures, tables and report.md are in the "
+                         "Downloads panel.", "success" if not abandoned() else "warning")
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
         conn.push({"type": "chat_done"})
         if later_asks:
@@ -10387,7 +10960,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             freed = _drop_process_files(conn.workspace / run_id)
             if freed:
                 emit("info", "lab",
-                     f"Report written — released {freed / (1 << 20):.0f} MB of process files "
+                     f"{'Done' if chat_only else 'Report written'} — released "
+                     f"{freed / (1 << 20):.0f} MB of process files "
                      "(checkpoints + the staged input copy); artifacts kept.")
             if analysis_executor is not None:
                 # Packages installed for this run only (a tool's declared dependency) go now.
@@ -10409,7 +10983,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # BEFORE event_log.txt is written so the summary is captured in that diary too. Guarded so a
         # diagnostic write can't sink the bundle publish below.
         try:
-            _write_capability_log(art, result, conn, emit)
+            _write_capability_log(art, result, conn, emit, vl_attempted=vl_attempted)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 
@@ -11155,37 +11729,52 @@ _QC_TOOLS = ("run_scanpy_qc", "run_cellqc")
 _MATRIX_FORMS = {"h5": "`.h5`", "dir": "directory", "tar.gz": "`.tar.gz`"}
 
 
-# Tools whose success does not make a run "more than QC": lookups, generic code, the closing call.
-_NOT_AN_ANALYSIS = frozenset({
-    "finish", "inspect_dataset", "read_tool_source", "describe_environment", "search_skills",
-    "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text", "disk_usage",
-    "run_code", "run_shell", "run_in_environment"})
-_QC_ONLY_TOOLS = frozenset({"run_scanpy_qc", "run_cellqc", "run_doublet_detection"})
-
-
 def _tools_that_ran(result: Any) -> "list[str]":
     """Each tool with at least one successful call in the run, in first-use order."""
-    seen: list[str] = []
+    from ..agents.scope import tools_that_ran
+    return tools_that_ran(getattr(result, "rounds", None))
+
+
+def _qc_only_run(result: Any) -> bool:
+    """Quality control is all the run did: it gets a short chat reply and no report."""
+    from ..agents.scope import qc_only
+    return qc_only(_tools_that_ran(result))
+
+
+def _code_wrote_outputs(result: Any) -> bool:
+    """Did a successful generic-code step write a table, figure or file? Such a step is work the
+    chat reply (the QC tool's numbers) would leave out — run 1e887ed2bf8e added an "ambient rod-leak
+    audit" in run_code after CellQC — so that run keeps the short report, which lists it."""
+    from ..agents.scope import GENERIC_TOOLS
     for rnd in (getattr(result, "rounds", None) or []):
         sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
               else getattr(rnd, "scientist_result", None))
         for st in ((sr or {}).get("steps") or []):
-            if not isinstance(st, dict) or not st.get("tool") or st["tool"] in seen:
+            if not isinstance(st, dict) or st.get("tool") not in GENERIC_TOOLS or not st.get("ok"):
                 continue
-            r = st.get("result")
-            if st.get("ok") or (isinstance(r, dict) and r.get("status") == "ok"):
-                seen.append(str(st["tool"]))
-    return seen
+            res = st.get("result")
+            if isinstance(res, dict) and res.get("status") not in (None, "ok"):
+                continue
+            if isinstance(res, dict) and any(res.get(k) for k in ("tables", "figures", "artifacts")):
+                return True
+            if isinstance(res, dict) and res.get("execution_mode") == "hpc_slurm":
+                # An HPC3 run reports every file it wrote (slurm_sandbox.classify_written), so it
+                # reporting none is the answer. The code's look is only a guess: run 57c6b0c6ba0c's
+                # script READ tables/cellqc_metrics.csv through AISCIENTIST_ARTIFACTS, counted as a
+                # write, and the requested QC report went to the chat instead of the PDF.
+                continue
+            args = st.get("args") or {}
+            if _SCRIPT_WRITES.search(str(args.get("code") or args.get("command") or "")):
+                return True
+    return False
 
 
 def _wants_brief_report(scope: Any, result: Any) -> bool:
     """A short report instead of the manuscript: when the request asked for one, or when quality
     control is all the run did — an Abstract, a Discussion and a Methods section around one QC
-    table is padding (Yijun, 2026-10-11, testing CellQC alone)."""
-    if getattr(scope, "brief_report", False):
-        return True
-    analyses = [t for t in _tools_that_ran(result) if t not in _NOT_AN_ANALYSIS]
-    return bool(analyses) and all(t in _QC_ONLY_TOOLS for t in analyses)
+    table is padding (Yijun, 2026-10-11, testing CellQC alone). A QC-only run now gets no report
+    at all, only the chat reply (:func:`_qc_chat_reply`); this stays true for it."""
+    return bool(getattr(scope, "brief_report", False)) or _qc_only_run(result)
 
 
 # Below this agreement the two doublet callers are said to disagree, with the numbers: run_cellqc
@@ -11369,11 +11958,12 @@ def _brief_scope_line(scope: Any, ran: "list[str]", qc_only: bool) -> str:
     allows every QC tool — not what was asked for or what ran: run 6275df1213ab asked for CellQC,
     ran only run_cellqc, and its report said "As requested (only run_cellqc, run_scanpy_qc,
     run_doublet_detection)"."""
+    from ..agents.scope import NOT_AN_ANALYSIS, QC_ONLY_TOOLS
     keep = [str(t) for t in (getattr(scope, "keep", None) or ())]
     tools = ", ".join(f"`{t}`" for t in ran)
     if qc_only:
-        asked = (any(t in _QC_ONLY_TOOLS for t in keep)
-                 and all(t in _QC_ONLY_TOOLS or t in _NOT_AN_ANALYSIS for t in keep))
+        asked = (any(t in QC_ONLY_TOOLS for t in keep)
+                 and all(t in QC_ONLY_TOOLS or t in NOT_AN_ANALYSIS for t in keep))
         return ("**Scope.** " + ("As requested, this" if asked else "This")
                 + f" run did quality control only ({tools}); no clustering, annotation, differential "
                   "expression or pathway analysis was run.")
@@ -11418,8 +12008,9 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     The manuscript writer must produce an Abstract, Study question, Results, Discussion,
     Limitations, Conclusion and Methods, each "present and substantive". For a run that only did
     quality control that is several pages around one table."""
-    ran = [t for t in _tools_that_ran(result) if t not in _NOT_AN_ANALYSIS]
-    qc_only = bool(ran) and all(t in _QC_ONLY_TOOLS for t in ran)
+    from ..agents.scope import NOT_AN_ANALYSIS
+    ran = [t for t in _tools_that_ran(result) if t not in NOT_AN_ANALYSIS]
+    qc_only = _qc_only_run(result)
     try:
         dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -11440,11 +12031,17 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     pipeline = _pipeline_section(result)
     if pipeline:
         out += [pipeline.rstrip(), ""]
+    out += _files_lines(art, "see *The dataset* for where it is kept and how to save it") + [""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _files_lines(art: Path, dataset_note: str) -> "list[str]":
+    """The "## Files" section of a short or QC report: the processed dataset, the tables, CellQC's
+    result directory and the verification statement."""
     files = ["## Files", ""]
     rd = _result_dataset_pointer(art)
     if rd:
-        files.append(f"- `{rd['name']}` — the processed dataset (see *The dataset* for where it is "
-                     "kept and how to save it).")
+        files.append(f"- `{rd['name']}` — the processed dataset ({dataset_note}).")
     for rel, what in (("tables/cells.csv", _cells_table_what(art)),
                       ("tables/cellqc_metrics.csv", "CellQC's per-library metrics"),
                       ("result/report.html", "CellQC's own report; `result/` is CellQC's result "
@@ -11452,8 +12049,131 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
                       ("report/verification.md", "how each number here was checked")):
         if (art / rel).exists() or rel == "report/verification.md":
             files.append(f"- `{rel}` — {what}.")
-    out += files + [""]
+    return files
+
+
+def _qc_report_md(body: str, art: Path) -> str:
+    """A written report asked for on a run that only did QC: the writer's report as it wrote it —
+    its layout and length were its own choice — then the result dataset and the files, which code
+    knows and the writer was not told."""
+    out = [body.strip() or "# Quality-control report", ""]
+    rd = _result_dataset_line(art)
+    if rd:
+        out += [rd, ""]
+    out += _files_lines(art, "described above")
     return "\n".join(out).rstrip() + "\n"
+
+
+# What each QC threshold removes, in the words of the chat reply, given the threshold's value.
+_QC_REASONS = (("max_pct_mt", lambda v: f"mitochondrial RNA above {v:g}%", "too much mitochondrial RNA"),
+               ("min_features", lambda v: f"fewer than {v:g} genes", "too few genes"),
+               ("min_genes", lambda v: f"fewer than {v:g} genes", "too few genes"),
+               ("min_counts", lambda v: f"fewer than {v:g} counts", "too few counts"))
+
+
+def _qc_chat_reply(art: Path, result: Any) -> str:
+    """The whole answer to a run that only did quality control: a few lines for the chat, every
+    number from the QC tool's return value or CellQC's metrics table, none written by a model.
+    '' when no QC step reported its counts (the caller keeps the step's own answer then).
+
+    Run 6275df1213ab (CellQC on one library) answered with a model-written Summary, Methods,
+    Results, Limitations and Conclusion, plus a rendered PDF/DOCX. Yijun, 2026-10-16: a simple step
+    needs no report — a short reply in the chat with the necessary numbers."""
+    qc = _qc_step_result(result)
+    if qc is None:
+        return ""
+    tool, r = qc
+    th = r.get("thresholds") if isinstance(r.get("thresholds"), dict) else {}
+
+    def n(v: Any) -> str:
+        return f"{int(v):,}" if isinstance(v, (int, float)) else "—"
+
+    libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
+    warnings = [re.sub(r"\s*Report it\.?\s*$", "", str(w)).strip()
+                for w in (r.get("warnings") or []) if str(w).strip()]
+    before, after = r.get("cells_before"), r.get("cells_after")
+    genes = (f"; {int(r['genes_after']):,} genes" if isinstance(r.get("genes_after"), (int, float))
+             else "")
+    if libs:
+        names = ", ".join(str(lib.get("sample")) for lib in libs[:4]) + (" …" if len(libs) > 4 else "")
+        lines = [f"**Quality control done** — `{tool}` on {names}.", ""]
+    else:
+        lines = [f"**Quality control done** — `{tool}`.", ""]
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before:
+        lines.append(f"- **{int(after):,} of {int(before):,} cells kept "
+                     f"({100 * after / before:.1f}%)**{genes}.")
+    if len(libs) == 1:
+        lib = libs[0]
+        removed = lib.get("removed_only_by") or {}
+        why = sorted(((int(removed[key]), (words(th[key]) if isinstance(th.get(key), (int, float))
+                                            else plain))
+                      for key, words, plain in _QC_REASONS
+                      if isinstance(removed.get(key), (int, float)) and removed[key]),
+                     reverse=True)
+        cr, filt = lib.get("cells_cellranger"), lib.get("cells_after_filter")
+        if why or isinstance(removed.get("several_thresholds"), (int, float)):
+            several = removed.get("several_thresholds")
+            parts = [f"{k:,} only for {w}" for k, w in why]
+            if isinstance(several, (int, float)) and several:
+                parts.append(f"{int(several):,} for more than one")
+            gone = (f" {int(cr) - int(filt):,}" if isinstance(cr, (int, float))
+                    and isinstance(filt, (int, float)) else "")
+            lines.append(f"- Filters removed{gone}: " + ", ".join(parts) + ".")
+        row = _cellqc_metrics_rows(art).get(str(lib.get("sample")), {})
+        decider = str((r.get("doublets") or {}).get("decider") or "")
+        dbl = _brief_doublet_lines(lib, row, decider, _cells_columns(art))
+        if dbl:
+            lines.append("- " + " ".join(dbl))
+            # The doublet line already gives the callers' agreement with its counts.
+            if len(dbl) > 1:
+                warnings = [w for w in warnings if "doublet callers agree" not in w]
+        mito = lib.get("median_pct_mt_kept")
+        mito_words = "in the kept cells"
+        if not isinstance(mito, (int, float)):
+            mito, mito_words = lib.get("median_pct_mt"), "before filtering"
+        amb = lib.get("ambient_soupx_contamination_mean")
+        applied = str((r.get("ambient") or {}).get("applied") or "")
+        bits = []
+        if isinstance(mito, (int, float)):
+            bits.append(f"median mitochondrial RNA {mito_words} {mito:.2f}%")
+        if isinstance(amb, (int, float)):
+            bits.append(f"ambient RNA {100 * amb:.1f}% (SoupX"
+                        + (", already subtracted from the counts)" if applied == "soupx"
+                           else " estimate)"))
+        if bits:
+            text = "; ".join(bits)
+            lines.append("- " + text[:1].upper() + text[1:] + ".")
+    elif libs:
+        mito_kept = all(isinstance(lib.get("median_pct_mt_kept"), (int, float)) for lib in libs)
+        mkey = "median_pct_mt_kept" if mito_kept else "median_pct_mt"
+        lines += ["", "| Library | Cell Ranger cells | after filters | after doublets | kept | "
+                      + ("median % mito (kept)" if mito_kept else "median % mito (before filtering)")
+                      + " |", "|---|---:|---:|---:|---:|---:|"]
+        for lib in libs:
+            kept, mito = lib.get("frac_retained"), lib.get(mkey)
+            lines.append(f"| {lib.get('sample', '—')} | {n(lib.get('cells_cellranger'))} | "
+                         f"{n(lib.get('cells_after_filter'))} | {n(lib.get('cells_after_doublets'))} | "
+                         f"{f'{100 * kept:.1f}%' if isinstance(kept, (int, float)) else '—'} | "
+                         f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
+        lines.append("")
+    if th and len(libs) != 1:   # one library's filter line already names each threshold
+        lines.append("- Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".")
+    lines += [f"- ⚠️ {w}" for w in warnings]
+    rd = _result_dataset_pointer(art)
+    if rd:
+        layer = str(rd.get("counts_layer") or "").split(":")[0].strip()
+        where = (f"saved in your data (`{rd['saved_to']}`)" if rd.get("saved_to") else
+                 ("kept on HPC3" if rd.get("location") == "hpc3" else "kept on the server")
+                 + (f" {_keep_for(rd['kept_days'], bool(rd.get('until_disconnect')))}"
+                    if rd.get("kept_days") else "")
+                 + " — Runs → “Save to my data” keeps it")
+        lines += ["", f"**Result:** `{rd['name']}` — {n(rd.get('n_cells'))} cells × "
+                      f"{n(rd.get('n_genes'))} genes; `X` is log-normalised"
+                      + (f", `layers['counts']` holds {layer}" if layer else "") + f". It is {where}."]
+    if tool == "run_cellqc" and (art / "result" / "report.html").exists():
+        lines.append("CellQC's own report and per-library files are in `result/` "
+                     "(`result/report.html`).")
+    return "\n".join(lines).strip() + "\n"
 
 
 def _qc_step_result(result: Any) -> "tuple[str, dict] | None":
@@ -11704,7 +12424,7 @@ def _result_dataset_line(art: Path) -> str:
     kept = (f"It is saved in your data (`{rd['saved_to']}`) and listed in Datasets." if rd.get("saved_to")
             else f"It is {where}"
             + (f" {_keep_for(days, bool(rd.get('until_disconnect')))}" if days else "")
-            + " — Runs → “Save to my data” moves it to your personal folder.")
+            + " — Runs → “Save to my data” keeps it as one of your datasets.")
     return (f"**Result dataset.** `{rd['name']}` — {shape}; `X` is log-normalised expression; "
             f"`layers['counts']` holds {rd.get('counts_layer') or 'the integer counts kept by QC'}"
             + (f"; per-cell columns include {', '.join(f'`{c}`' for c in obs)}" if obs else "")
@@ -11942,17 +12662,19 @@ def _correct_manuscript_coverage(body: str, art: Path, result: Any) -> str:
 
 
 def _verification_statement(report_md: str, art: Path, result: Any,
-                            lit: "dict | None", brief: bool = False) -> "tuple[str, dict]":
+                            lit: "dict | None", brief: bool = False,
+                            qc_only: bool = False) -> "tuple[str, dict]":
     """``reporting/verification.py`` on the final manuscript (or the short report, ``brief``);
-    writes ``report/verification.md``. Never raises: a failed check costs the statement, not the
-    report."""
+    writes ``report/verification.md``. ``qc_only``: a QC report, whose statement does not list
+    labels or literature it had nothing to check against. Never raises: a failed check costs the
+    statement, not the report."""
     from ..reporting.verification import build_verification
     try:
         corrections = list(((getattr(result, "claim_audit", None) or {}).get("report_corrections"))
                            or [])
         md, summary = build_verification(art, report_md, list(getattr(result, "agenda", None) or []),
                                          list(getattr(result, "rounds", None) or []), lit,
-                                         corrections, brief=brief)
+                                         corrections, brief=brief, qc_only=qc_only)
         (art / "report").mkdir(parents=True, exist_ok=True)
         (art / "report" / "verification.md").write_text(md, encoding="utf-8")
         (art / "process").mkdir(parents=True, exist_ok=True)
@@ -12713,10 +13435,12 @@ def _references_from_accepted_deep_literature(
             continue
         scientist_result = _round_scientist_result(round_obj)
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "deep_literature" or not step.get("ok"):
+            if not isinstance(step, dict) or step.get("tool") not in ("deep_literature", "search_corpus") \
+                    or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
-            query = str((step.get("args") or {}).get("question") or "").strip()
+            step_args = step.get("args") or {}
+            query = str(step_args.get("question") or " | ".join(step_args.get("queries") or [])).strip()
             if query:
                 queries.append(query)
             if not answer_text:
@@ -12860,11 +13584,15 @@ def _scan_tool_invocation(result: Any, tool_name: str) -> "dict[str, Any] | None
 
 
 def _write_capability_log(art: Path, result: Any, conn: "Connection",
-                          emit: "Callable[..., None]") -> None:
+                          emit: "Callable[..., None]", *, vl_attempted: bool = True) -> None:
     """ALWAYS record the optional GPU capabilities' status for THIS run — invoked or not, and why not
     — into ``process/capabilities.log`` and the persisted event log. So a bundle can always answer
     "did scGPT / the VL review run this time?" instead of showing no trace at all. Best-effort:
-    logging must never break a run."""
+    logging must never break a run.
+
+    ``vl_attempted`` is False when no rendered report was handed to the visual review (a short
+    report, a chat-only QC run): run 6275df1213ab's log said "ENABLED and ran; pages read clean"
+    for a review that never started."""
     try:
         st = conn.settings
         live = getattr(conn, "executor", None) is not None and not getattr(conn, "mock", False)
@@ -12889,6 +13617,8 @@ def _write_capability_log(art: Path, result: Any, conn: "Connection",
             lines.append("- VL render review: DISABLED (AISCIENTIST_VLREVIEW_ENABLED not set).")
         elif not live:
             lines.append("- VL render review: ENABLED but SKIPPED (no live HPC3 session this run).")
+        elif not vl_attempted:
+            lines.append("- VL render review: NOT RUN (no full report was rendered this run).")
         else:
             # Detect DEGRADATION: the review's first pass reports model="bbox-only" when the vision
             # model never loaded (e.g. torch missing in the container) — a "clean" verdict from that
@@ -13060,9 +13790,10 @@ def _unlink_quietly(path: "str | Path") -> None:
 # --- the data a run hands on ---------------------------------------------------------------------
 # Two things, each with a pointer in the bundle's data/: the processed dataset (one .h5ad, see
 # _export_result_dataset) and, after run_cellqc, CellQC's complete result directory. Both stay beside
-# the run (on HPC3 for an HPC3 run) for as long as its process files do. "Save to my data" moves one
-# to the user's personal lab folder on HPC3 (never swept), in one subfolder, so a member finds it
-# outside AiScientist too, and lists it among their datasets; a local run's go to their uploads.
+# the run (on HPC3 for an HPC3 run) for as long as its process files do. "Save to my data" makes one
+# a dataset: with a data root it is copied (from HPC3) or moved into the user's dataset folder on this
+# host; without one it is moved to the user's personal lab folder on HPC3 (never swept), in one
+# subfolder, and a local run's go to their uploads.
 _RESULTS_FOLDER = "AiScientist_results"
 _RESULT_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.processed\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+\.h5ad")
 _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+")
@@ -13175,6 +13906,8 @@ def _cellqc_result_root(owner: str, run_id: str, rec: dict, conn: "Connection | 
         allowed = (f"{_storage_base(conn)}/{_RESULTS_FOLDER}/{name}" if saved
                    else f"{_temp_base(conn)}/analysis/{run_id}/result/cellqc")
         return root if root == allowed else None
+    if saved and dataset_storage.is_owned(root, safe_name(owner)):
+        return root                                  # saved into the owner's dataset folder (issue 6)
     owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
     allowed_p = (owner_dir / "uploads" / "processed" / name if saved
                  else owner_dir / run_id / "result" / "cellqc")
@@ -13214,9 +13947,15 @@ def md_result_uuid(run_id: str) -> str:
 
 def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                      conn: "Connection | None") -> "tuple[int, dict]":
-    """Move what a run handed on into the owner's personal folder and list it among their datasets:
-    the processed dataset (``what="dataset"``, an .h5ad) or CellQC's result directory (``"cellqc"``,
-    a folder). Returns ``(HTTP status, body)``. Talks to HPC3: call it in a thread."""
+    """Make what a run handed on one of the owner's datasets: the processed dataset
+    (``what="dataset"``, an .h5ad) or CellQC's result directory (``"cellqc"``, a folder). Returns
+    ``(HTTP status, body)``. Talks to HPC3: call it in a thread.
+
+    With a data root (issue 6) it goes into the owner's dataset folder on this host
+    (``users/<owner>/datasets/<uuid>/original``): a local run's is moved there, and one kept on HPC3 is
+    copied back in the background (202, ``saving``), checked by size, and listed when it is here;
+    the HPC3 copy goes with the run's other process files. Without one, it is moved to the owner's
+    personal HPC3 folder (``AiScientist_results``) or, for a local run, their ``uploads/processed``."""
     folder = what == "cellqc"
     pointer_path = _result_pointer_path(owner, run_id, what)
     rec = _read_pointer(pointer_path)
@@ -13226,15 +13965,30 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
     if rec.get("saved_to"):
         return 200, {"ok": True, "path": rec["saved_to"], "already": True}
     name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
+    if rec.get("saving"):
+        return 202, {"ok": True, "saving": True, "name": name}
     if not (_CELLQC_NAME_RE if folder else _RESULT_NAME_RE).fullmatch(name):
         return 400, {"error": "unexpected result name"}
     owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
+    kept = dataset_storage.configured()
     if rec.get("location") == "hpc3":
         if conn is None:
             return 409, {"error": "Connect to HPC3 first: the result is kept there."}
         expected = f"{_temp_base(conn)}/analysis/{run_id}/result/{'cellqc' if folder else name}"
         if src != expected:
             return 400, {"error": "unexpected source path"}
+        if kept:
+            with _SAVING_LOCK:
+                rec = _read_pointer(pointer_path) or rec
+                if rec.get("saving") or rec.get("saved_to"):
+                    return 202, {"ok": True, "saving": True, "name": name}
+                rec.pop("save_error", None)
+                rec["saving"] = {"started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+            threading.Thread(target=_bring_result_home,
+                             args=(owner, user_id, run_id, what, conn, src, pointer_path),
+                             name=f"save-result-{run_id}", daemon=True).start()
+            return 202, {"ok": True, "saving": True, "name": name}
         dest = f"{_storage_base(conn)}/{_RESULTS_FOLDER}/{name}"
         ok, detail = _move_on_hpc(conn, src, dest, directory=folder)
         if not ok:
@@ -13247,15 +14001,40 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
             found = src_p.parent == (owner_dir / run_id / "result").resolve() and src_p.is_file()
         if not found:
             return 409, {"error": "It is no longer on the server."}
-        dest_p = owner_dir / "uploads" / "processed" / name
-        if dest_p.exists():
-            return 409, {"error": "Something of that name is already saved."}
-        dest_p.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_p), str(dest_p))
         sidecar = src_p.with_name(src_p.name + ".json")
-        if not folder and sidecar.is_file():
-            shutil.move(str(sidecar), str(dest_p.with_name(dest_p.name + ".json")))
-        dest = str(dest_p)
+        if kept:
+            identity = str(uuid4())
+            stage = dataset_storage.temp_dir(identity, safe_name(owner))
+            stage.parent.mkdir(parents=True, exist_ok=True)
+            if folder:
+                shutil.move(str(src_p), str(stage))
+            else:
+                stage.mkdir()
+                shutil.move(str(src_p), str(stage / name))
+                if sidecar.is_file():
+                    shutil.move(str(sidecar), str(stage / sidecar.name))
+            published = dataset_storage.publish_dataset(stage, identity, safe_name(owner))
+            dest = str(published if folder else published / name)
+        else:
+            dest_p = owner_dir / "uploads" / "processed" / name
+            if dest_p.exists():
+                return 409, {"error": "Something of that name is already saved."}
+            dest_p.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src_p), str(dest_p))
+            if not folder and sidecar.is_file():
+                shutil.move(str(sidecar), str(dest_p.with_name(dest_p.name + ".json")))
+            dest = str(dest_p)
+    dataset_id = _record_saved_result(owner, user_id, run_id, folder, name, rec, pointer_path, dest)
+    return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name,
+                 "kind": "folder" if folder else "file"}
+
+
+_SAVING_LOCK = threading.Lock()
+
+
+def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder: bool, name: str,
+                         rec: dict, pointer_path: Path, dest: str, location: "str | None" = None) -> "int | None":
+    """List a saved result among the owner's datasets and point the run's record at it."""
     dataset_id = None
     try:
         if user_id and not auth_routes.dataset_path_recorded(user_id, dest):
@@ -13266,14 +14045,95 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                 derived_from={"uuid": md_result_uuid(run_id), "run_id": run_id})
     except Exception as exc:  # noqa: BLE001 - the data is moved; the history row is best-effort
         print(f"[result-dataset] record_dataset failed: {exc}")
-    rec.update(saved_to=dest, path=dest,
-               saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    rec = {**(_read_pointer(pointer_path) or rec)}
+    rec.pop("saving", None)
+    rec.pop("save_error", None)
+    rec.update(saved_to=dest, path=dest, saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               **({"location": location} if location else {}))
     try:
         pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
     except OSError as exc:
         print(f"[result-dataset] could not update {pointer_path}: {exc}")
-    return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name,
-                 "kind": "folder" if folder else "file"}
+    return dataset_id
+
+
+def _pull_from_hpc(ex: Any, src: str, target: Path, directory: bool) -> int:
+    """Copy a file, or a directory's files, from HPC3 to ``target`` on this host, over SFTP on the
+    transfer host. Each file goes through ``<file>.part`` (continued after an interruption) and must
+    arrive at the size HPC3 reports. Returns the bytes copied."""
+    from . import dataset_view as dv
+    if directory:
+        listing = ex.exec(f"find {shlex.quote(src.rstrip('/'))} -type f -printf '%P\\t%s\\n'",
+                          timeout=300.0)
+        if not listing.ok:
+            raise OSError(listing.stderr or f"{src} cannot be listed on HPC3")
+        entries = dv.parse_find_listing(listing.stdout or "", limit=10 ** 9)["entries"]
+        pairs = []
+        for entry in entries:
+            rel = dv.safe_relpath(entry["path"])
+            if rel is None:
+                raise OSError(f"unexpected file name in {src}: {entry['path']!r}")
+            pairs.append((f"{src.rstrip('/')}/{rel}", target / rel, int(entry["size"])))
+    else:
+        pairs = [(src, target, int(ex.remote_size(src)))]
+    total = 0
+    get = getattr(ex, "get_file_resumable", None)
+    for remote, local, size in pairs:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if local.is_file() and local.stat().st_size == size:
+            total += size                    # copied by an earlier attempt that stopped later on
+            continue
+        if get is not None:
+            get(remote, str(local))
+        else:
+            ex.get_file(remote, str(local))
+        if local.stat().st_size != size:
+            raise OSError(f"{local.name} arrived as {local.stat().st_size} bytes, expected {size}")
+        total += size
+    return total
+
+
+def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str,
+                       conn: "Connection", src: str, pointer_path: Path) -> None:
+    """The background half of saving a result kept on HPC3 (issue 6): copy it into a new dataset
+    folder of the owner's on this host, publish it, list it, and tell the owner's windows. The HPC3
+    copy stays where the run left it, and goes with the session's process files."""
+    folder = what == "cellqc"
+    rec = _read_pointer(pointer_path) or {}
+    name = str(rec.get("name") or "")
+    identity = str(uuid4())
+    stage = dataset_storage.temp_dir(identity, safe_name(owner))
+    started = time.monotonic()
+    try:
+        stage.mkdir(parents=True)
+        size = _pull_from_hpc(conn.executor, src, stage if folder else stage / name, folder)
+        if not folder:
+            sidecar = f"{src}.json"
+            if conn.executor.remote_size(sidecar):
+                _pull_from_hpc(conn.executor, sidecar, stage / f"{name}.json", False)
+        published = dataset_storage.publish_dataset(stage, identity, safe_name(owner))
+        dest = str(published if folder else published / name)
+        _record_saved_result(owner, user_id, run_id, folder, name, rec, pointer_path, dest,
+                             location="gateway")
+        for c in _owner_connections(safe_name(owner)):
+            c.emit("success", "lab", f"💾 {name} is saved to your data on the server "
+                                     f"({size / 1e6:.0f} MB copied from HPC3 in "
+                                     f"{time.monotonic() - started:.0f} s): it is in Datasets.")
+            c._publish({"type": "result_saved", "run_id": run_id, "what": what, "path": dest})
+    except Exception as exc:  # noqa: BLE001 - reported on the run's record and to the owner
+        shutil.rmtree(stage, ignore_errors=True)
+        with _SAVING_LOCK:
+            now = _read_pointer(pointer_path) or rec
+            now.pop("saving", None)
+            now["save_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            try:
+                pointer_path.write_text(json.dumps(now, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+        for c in _owner_connections(safe_name(owner)):
+            c.emit("error", "lab", f"Could not copy {name} from HPC3 to the server: {exc}. "
+                                   "It is still on HPC3; save it again from Runs.")
+            c._publish({"type": "result_saved", "run_id": run_id, "what": what, "error": str(exc)[:300]})
 
 
 async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[..., Any]) -> None:
@@ -13294,6 +14154,9 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
         if status == 200:
             emit("success", "lab", f"💾 {label} is saved to your data: {body['path']} — it is in "
                                    "Datasets, ready for the next analysis.")
+        elif status == 202:
+            emit("info", "lab", f"💾 {label} is being copied from HPC3 to your data on the server; it "
+                                "appears in Datasets when it is there.")
         else:
             emit("warning", "lab", f"{label} was not saved to your data automatically "
                                    f"({body.get('error', status)}); Runs → “Save to my data” still can.")
@@ -13317,7 +14180,8 @@ async def list_result_datasets(request: Request) -> JSONResponse:
             rows[p.parents[2].name] = {
                 "run_id": p.parents[2].name,
                 **{k: rec.get(k) for k in ("name", "size_bytes", "n_cells", "n_genes", "created_at",
-                                           "kept_days", "until_disconnect", "location", "saved_to", "saved_at")}}
+                                           "kept_days", "until_disconnect", "location", "saved_to", "saved_at",
+                                           "saving", "save_error")}}
     for p in home.glob(f"*/artifacts/data/{CELLQC_RESULT_POINTER}"):
         rec = _read_pointer(p)
         if rec is None or not rec.get("name"):
@@ -13326,7 +14190,7 @@ async def list_result_datasets(request: Request) -> JSONResponse:
         row = rows.setdefault(run_id, {"run_id": run_id, "created_at": rec.get("created_at")})
         row["cellqc"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "created_at", "kept_days",
                                                     "until_disconnect", "location", "saved_to",
-                                                    "saved_at")},
+                                                    "saved_at", "saving", "save_error")},
                          "n_files": len(rec.get("files") or []),
                          "n_matrices": len(rec.get("matrices") or []),
                          "download_url": f"/api/cellqc-result/{safe_name(user.username)}/{run_id}"}
@@ -13336,10 +14200,11 @@ async def list_result_datasets(request: Request) -> JSONResponse:
 
 @app.post("/api/result-datasets/{run_id}/save")
 async def save_result_dataset(run_id: str, request: Request, what: str = "dataset") -> JSONResponse:
-    """Move what a run handed on into the caller's personal folder — named with its input, what it
-    is, the time and the run — and list it among their datasets, so the next analysis can start
-    from it without anyone downloading it. ``what``: ``dataset`` (the processed .h5ad) or ``cellqc``
-    (CellQC's result directory, as a folder)."""
+    """Make what a run handed on one of the caller's datasets — named with its input, what it is, the
+    time and the run — so the next analysis can start from it without anyone downloading it.
+    ``what``: ``dataset`` (the processed .h5ad) or ``cellqc`` (CellQC's result directory, as a
+    folder). 202 with ``saving`` while one kept on HPC3 is being copied back (see
+    :func:`_save_run_result`)."""
     if not _AUTH_ENABLED:
         return JSONResponse({"error": "Saving a dataset requires accounts."}, status_code=400)
     user = _optional_user(request)
@@ -13489,6 +14354,20 @@ async def system_overview_endpoint() -> JSONResponse:
             db_ok = False
     data["capabilities"]["database"] = db_ok
     return JSONResponse(data)
+
+
+@app.get("/api/system/live")
+async def system_live_endpoint(request: Request) -> JSONResponse:
+    """Where every run is right now, for the System page's live graph (gateway/run_monitor.py).
+    Signed in only. Your own runs come in full; another account's only as a position on the graph
+    (its stage and the tool it is in, never its question or steps), except for an admin."""
+    user = _optional_user(request)
+    if _AUTH_ENABLED and user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    data = run_monitor.live_view(getattr(user, "id", None), admin=_is_admin(user),
+                                 accounts=_AUTH_ENABLED)
+    data["sessions"] = sum(1 for c in CONNECTIONS.values() if c.status in _LIVE_STATUSES)
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
 
 @app.websocket("/ws/{connection_id}")

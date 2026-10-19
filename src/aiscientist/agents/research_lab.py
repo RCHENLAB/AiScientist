@@ -60,9 +60,10 @@ from .plan_doc import (
     check_plan,
     parse_plan_ops,
     parse_plan_yaml,
+    split_step,
     sync_plan,
 )
-from .scope import RunScope, read_scope
+from .scope import RunScope, qc_only, read_scope, tools_that_ran, wants_written_report
 from .marker_claims import check_marker_claims
 from .preset_pipelines import (
     PresetPipeline,
@@ -366,6 +367,17 @@ _SYNTH_SYSTEM = (
     "Never state a PASS/non-PASS split, an allele-frequency cutoff, or a total the results do not show — "
     "do NOT write 'all PASS' or '0 non-PASS' unless the results report zero non-PASS. "
     "State limitations honestly and frame conclusions as hypotheses to validate."
+)
+
+# A run that only did quality control and whose request asks for a written report: what that report
+# is for. Its layout and length are the writer's to choose.
+_QC_REPORT_NOTE = (
+    "This run did quality control only, and the request asks for a written report. Write a "
+    "quality-control report for the person who asked: what was run on which data, the numbers the QC "
+    "step reported (cells in and kept, why cells were removed, doublets, ambient RNA, mitochondrial "
+    "content), the tool's warnings, and what was handed back. Use tables where they help. No "
+    "biological interpretation, no literature, no Discussion and no hypotheses: nothing beyond QC "
+    "was run. The layout and length are yours to choose.\n"
 )
 
 # Axis B — PI-autonomous skill selection. Researchers do not know which protocol they
@@ -973,7 +985,7 @@ def _route_specialist(step: str, roster: tuple[Specialist, ...]) -> Specialist:
 # scanpy state (it reads accepted findings in-memory + hits an external API), so its footprint is
 # empty and it CAN run alongside the analysis chain. This is the conservative default: anything not
 # clearly independent stays sequential.
-_READ_ONLY_TOOLS = frozenset({"literature_search", "deep_literature", "make_schematic"})
+_READ_ONLY_TOOLS = frozenset({"literature_search", "deep_literature", "search_corpus", "make_schematic"})
 # How many times a single hard-failed node may raise a "retry / skip / abort" fork before it just
 # force-advances — bounds the retry loop so a persistently-failing step can never hang the run.
 _MAX_FAILURE_FORKS = 2
@@ -1044,7 +1056,8 @@ _ANY_TOOL_CALL_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)\s*\(([^)]*)\)")
 #: once the guard could see tool names at all a genuine ``literature_search`` step would have been
 #: classified as NOT-literature. Kept together to make that pairing impossible to miss.
 _LITERATURE_TOOLS = frozenset({
-    "literature_search", "deep_literature", "run_literature", "run_paperqa", "run_paperqa_search",
+    "literature_search", "deep_literature", "search_corpus", "run_literature", "run_paperqa",
+    "run_paperqa_search",
 })
 
 
@@ -3020,7 +3033,7 @@ _MEETING_SYNTH_SYSTEM = (
 # mutate the run's state, and the analysis catalog is full of tools that rewrite the checkpoint
 # chain. These three only READ — the data file, and the published literature — which is exactly
 # what lets one expert hold evidence the others do not.
-_MEETING_TOOLS = frozenset({"inspect_dataset", "literature_search", "deep_literature"})
+_MEETING_TOOLS = frozenset({"inspect_dataset", "literature_search", "deep_literature", "search_corpus"})
 
 
 def _assign_evidence(experts: "tuple[Specialist, ...]",
@@ -3526,6 +3539,37 @@ _PLAN_FINDING_WORDS = {
     "unknown_setting": "step {step}: `{tool}` has no setting `{param}` (it takes: {detail})",
     "bad_value": "step {step}: `{tool}` cannot take {param} = {detail}",
 }
+
+
+def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
+    """The researcher's own edit of the plan, in words, for the revision history.
+
+    A later change asked for in words is made on the edited document. But when that cannot be done
+    the plan is patched or redrafted from the feedback so far, and a redraft that was never told
+    about the edit could put back a step the researcher removed or a value they changed."""
+    def title(text: str) -> str:
+        return split_step(text)[0] or text[:80]
+
+    said: list[str] = []
+    for c in changes:
+        kind, n = c.get("kind"), c.get("step")
+        if kind == "removed":
+            said.append(f'removed the step "{title(str(c.get("before") or ""))}"')
+        elif kind == "added":
+            said.append(f'added the step "{title(str(c.get("after") or ""))}" as step {n}')
+        elif kind == "title":
+            said.append(f'renamed step {n} from "{c.get("before")}" to "{c.get("after")}"')
+        elif kind == "setting":
+            said.append(f"removed the setting {c.get('param')} from step {n}" if c.get("after") is None
+                        else f"set {c.get('param')} to {json.dumps(c.get('after'))} in step {n}")
+        elif kind == "tool":
+            said.append(f"changed the tool of step {n} to {c.get('after') or 'none'}")
+        elif kind == "moved":
+            said.append(f"moved step {c.get('before')} to position {n}")
+        elif kind == "text":
+            said.append(f'rewrote step {n} as: {str(c.get("after") or "")[:300]}')
+    return ("The researcher edited the plan by hand; keep these changes: " + "; ".join(said) + "."
+            if said else "")
 
 
 _PLAN_REVISE_SYSTEM = (
@@ -4061,11 +4105,25 @@ class ResearchLab:
                 # model reads it, so a step they did not touch cannot change, and an edit that
                 # cannot be applied changes nothing and says why.
                 if action == "edit" and kind == "agenda":
-                    edited = self._apply_plan_edit(question, str(decision.get("plan_yaml") or ""), emit)
-                    if edited is not None:
-                        payload = edited
+                    applied = self._apply_plan_edit(question, str(decision.get("plan_yaml") or ""), emit)
+                    if applied is not None:
+                        payload, changes = applied
+                        feedback_log.append(_hand_edit_note(changes))
                     emit({"type": "pi_agenda", "agenda": payload})
                     continue
+                # A reply in words sent while the researcher's own edit of the document was not
+                # applied yet: the edit is applied first, by code, and the words then change THAT
+                # plan, never the one the edit was typed on. An edit that cannot be applied stops
+                # both, and the plan is re-presented as it was.
+                draft = str(decision.get("plan_yaml") or "") if action == "revise" and kind == "agenda" else ""
+                if draft.strip():
+                    applied = self._apply_plan_edit(question, draft, emit, with_reply=True)
+                    if applied is None:
+                        emit({"type": "pi_agenda", "agenda": payload})
+                        continue
+                    payload, changes = applied
+                    if changes:
+                        feedback_log.append(_hand_edit_note(changes))
                 if action in ("cancel", "timeout"):
                     # A review that EXPIRED and a review somebody CANCELLED end the same way, but
                     # they are not the same event and must not carry the same sentence. Both of the
@@ -5020,10 +5078,14 @@ class ResearchLab:
             step_notes = "\n".join(t for t in (
                 step_notes, "[Plan review — adjust how you run THIS step]: " + gate.amendment) if t)
         while True:   # revise the SAME node in place, then advance
+            # The brief is the node's goal plus reuse hints; the approved plan knows the step by its
+            # goal. Looked up by the brief, no step matched and no approved setting was ever pinned
+            # (prod run caa188e8e672: run_cellqc got species=auto against an approved "mouse").
             result = self._scientist(question, step_text, specialist, critique,
                                      prior_rounds + node_rounds, emit, should_cancel,
                                      user_notes=step_notes, memory=mem_block,
-                                     extra_steps=_budget_bonus(last_result, attempts))
+                                     extra_steps=_budget_bonus(last_result, attempts),
+                                     plan_step=node.goal)
             last_result = result
             executed += 1
             verdict = self._critic(question, node.goal, result, emit)
@@ -5494,7 +5556,11 @@ class ResearchLab:
         ``registry.session_catalog``) still has `literature_search`, and a PI told to reserve a step
         for a tool that is not in its list plans that tool anyway."""
         names = {t.name for t in getattr(self.scientist, "catalog", None) or ()}
-        if "deep_literature" in names or "literature_search" not in names:
+        if "deep_literature" in names:
+            return prompt
+        if "search_corpus" in names:
+            return prompt.replace("`deep_literature`", "`search_corpus`")
+        if "literature_search" not in names:
             return prompt
         return prompt.replace("`deep_literature`", "`literature_search`")
 
@@ -6174,20 +6240,31 @@ class ResearchLab:
             emit({"type": "plan_bind_dropped", "dropped": dropped})
         return PlanDoc(request=doc.request, steps=tuple(steps))
 
-    def _apply_plan_edit(self, question: str, text: str, emit: EventFn) -> "list[str] | None":
-        """Adopt the plan document the researcher edited; the new agenda, or ``None`` if refused.
+    def _apply_plan_edit(self, question: str, text: str, emit: EventFn, *,
+                         with_reply: bool = False) -> "tuple[list[str], list[dict[str, Any]]] | None":
+        """Adopt the plan document the researcher edited: ``(new agenda, changes)``, or ``None`` if
+        refused.
 
         Refused — with every reason, and the plan left exactly as it was — when the YAML does not
         parse, a step names a tool this deployment does not have, or a setting is not one the tool
-        takes. A value nobody can run is better stopped here than discovered as a failed job."""
+        takes. A value nobody can run is better stopped here than discovered as a failed job.
+
+        ``with_reply``: the edit came with a reply in words, which is made on the edited plan. A
+        refusal then also says the reply was not sent, and an edit that changes nothing is no
+        refusal (the reply goes ahead on the plan as it is)."""
+        def refuse(problems: "list[str]") -> None:
+            if with_reply:
+                problems = [*problems, "Your message was not sent to the PI either: fix or reset "
+                                       "this edit, then send it again."]
+            emit({"type": "plan_edit_rejected", "problems": problems})
+
         if not self.config.plan_yaml or self._plan_doc is None:
-            emit({"type": "plan_edit_rejected",
-                  "problems": ["Editing the plan as a document is not enabled on this server."]})
+            refuse(["Editing the plan as a document is not enabled on this server."])
             return None
         try:
             edited = parse_plan_yaml(text, request=question)
         except PlanError as exc:
-            emit({"type": "plan_edit_rejected", "problems": exc.problems})
+            refuse(list(exc.problems))
             return None
         # A step the researcher added without naming its tool still says which one in its text.
         known = {s.id for s in self._plan_doc.steps}
@@ -6198,17 +6275,18 @@ class ResearchLab:
             edited, _tool_schemas(list(getattr(self.scientist, "catalog", []))),
             is_known=lambda name: get_skill(name) is not None)
         if findings:
-            emit({"type": "plan_edit_rejected", "problems": [
-                _PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) + "." for f in findings]})
+            refuse([_PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) + "." for f in findings])
             return None
         doc, changes, notes = apply_edit(self._plan_doc, edited)
         if not changes:
-            emit({"type": "plan_edit_rejected", "problems": ["The edited plan is the same as the current one."]})
+            if with_reply:
+                return self._plan_doc.agenda(), []
+            refuse(["The edited plan is the same as the current one."])
             return None
         self._plan_doc = doc
         emit({"type": "plan_edited", "changes": changes, "notes": notes,
               "steps": sorted({c["step"] for c in changes if c["kind"] != "removed"})})
-        return doc.agenda()
+        return doc.agenda(), changes
 
     def _revise_plan_document(self, question: str, request: str, emit: EventFn) -> "list[str] | None":
         """Make the change the researcher asked for in words ON the plan document; the new agenda,
@@ -6894,17 +6972,135 @@ class ResearchLab:
             tool_calls, [{"tool": "deep_literature", "error": note or "no corpus answer"}],
         )
 
+    def _run_search_corpus_step(self, question: str, step: str, rounds: list[LabRound],
+                                corpus_tool: Any, specialist: Specialist,
+                                emit: EventFn, pinned: "dict[str, Any] | None" = None) -> HarnessResult:
+        """The literature-grounding step in a session with no served model (the user's own API key):
+        the session's model writes 2-5 requests, ONE ``search_corpus`` call returns the passages, the
+        model writes the answer from those passages, and :func:`corpus_answer.verify_answer` removes
+        every citation and quotation the passages do not support. An answer left with no citation is
+        no answer: the step is incomplete and the Europe PMC fallback runs.
+
+        ``pinned``: the ``search_corpus`` settings the researcher approved with the plan. They go to
+        the call as written, like every other tool's; approved ``queries`` replace the model's own."""
+        from . import corpus_answer as ca
+
+        emit({"type": "scientist_start", "step": step, "specialist": specialist.name})
+        pinned = dict(pinned or {})
+        approved = pinned.get("queries")
+        if isinstance(approved, str):
+            approved = [approved]
+        queries = [q.strip() for q in approved or [] if isinstance(q, str) and q.strip()][:ca.MAX_QUESTIONS]
+        if not queries:
+            try:
+                digest = _literature_findings_digest(rounds)
+            except Exception:  # noqa: BLE001
+                digest = ""
+            try:
+                raw = self._complete([
+                    {"role": "system", "content": ca.QUESTIONS_SYSTEM},
+                    {"role": "user", "content": (
+                        f"Research question: {question}\nLiterature step: {step}\n"
+                        + (f"Accepted findings:\n{digest}\n" if digest else "")
+                        + "\nWrite the JSON array now.")},
+                ])
+                queries = ca.parse_questions(raw)
+            except Exception:  # noqa: BLE001 - request writing must never break the run
+                queries = []
+        queries = queries or [self._deep_literature_question(question, step, rounds)]
+        args = {**pinned, "queries": queries}
+        emit({"type": "tool_start", "tool": "search_corpus", "args": args})
+        try:
+            output = corpus_tool.executor(args, self.ctx)
+        except Exception as exc:  # noqa: BLE001 - one literature failure never fails the whole run
+            error_text = f"{type(exc).__name__}: {exc}"
+            emit({"type": "tool_error", "tool": "search_corpus", "error": error_text})
+            return HarnessResult(
+                "incomplete", "search_corpus_error",
+                "The search_corpus (indexed corpus) step failed; state this limitation in the report "
+                "rather than inventing references.",
+                [{"tool": "search_corpus", "args": args, "ok": False, "error": error_text}],
+                [{"tool": "search_corpus", "error": error_text}])
+        ok = isinstance(output, dict) and output.get("status") == "ok"
+        contexts = [c for c in ((output.get("contexts") if isinstance(output, dict) else None) or [])
+                    if isinstance(c, dict)]
+        why = ""
+        if not ok and isinstance(output, dict):
+            why = " ".join(str(output.get(k) or "") for k in ("dependency", "error", "note")).strip()
+        emit({"type": "tool_result", "tool": "search_corpus",
+              "summary": f"{'ok' if ok else (output or {}).get('status', 'error') if isinstance(output, dict) else 'error'}"
+                         f": {len(contexts)} passage(s)" + (f" ({why[:240]})" if why else "")})
+        tool_calls = [{"tool": "search_corpus", "args": args, "ok": bool(ok),
+                       "summary": f"{len(contexts)} passage(s)", "result": output}]
+        incomplete = HarnessResult(
+            "incomplete", "no_literature_citations",
+            "The indexed corpus returned no grounded answer or citations for this step. State this "
+            "limitation in the report rather than inventing references.",
+            tool_calls, [{"tool": "search_corpus", "error": why or "no corpus answer"}])
+        if not ok or not contexts:
+            return incomplete
+        try:
+            written = self._complete([
+                {"role": "system", "content": ca.ANSWER_SYSTEM},
+                {"role": "user", "content": (
+                    f"Research question: {question}\nLiterature step: {step}\n\n"
+                    f"Passages:\n{ca.passages_block(contexts)}\n\nWrite the answer now.")},
+            ])
+        except Exception:  # noqa: BLE001
+            written = ""
+        verified = ca.verify_answer(str(written or ""), contexts)
+        if verified.removed:
+            emit({"type": "literature_check", "tool": "search_corpus", "removed": verified.removed})
+        if not verified.cited or _CANNOT_ANSWER.search(verified.text):
+            incomplete.errors = [{"tool": "search_corpus",
+                                  "error": "no answer cited a returned passage" if written
+                                  else "the answer could not be written"}]
+            return incomplete
+        # References come from the passages the checked answer cites, and only those.
+        used = [c for c in contexts if str(c.get("pmid")) in set(verified.cited)]
+        tool_calls[0]["result"] = {**output, "contexts": used, "answer": verified.text,
+                                   "removed_by_check": verified.removed}
+        cites = list(dict.fromkeys((c.get("citation") or "").strip() for c in used
+                                   if (c.get("citation") or "").strip()))
+        lines = [verified.text, "", "Citations from the indexed corpus (use ONLY these in the References "
+                                    "section — do NOT add any others):"]
+        lines += [f"{i}. {c}" for i, c in enumerate(cites[:12], 1)]
+        if verified.removed:
+            lines += ["", f"(Platform note: {len(verified.removed)} citation(s) or quotation(s) the "
+                          "passages did not support were removed from the answer.)"]
+        return HarnessResult("ok", "search_corpus_corpus", "\n".join(lines), tool_calls, [])
+
     def _scientist(self, question: str, step: str, specialist: Specialist, critique: str,
                    rounds: list[LabRound], emit: EventFn,
                    should_cancel: "Callable[[], bool] | None" = None,
                    user_notes: str = "", memory: str = "",
-                   extra_steps: int = 0) -> HarnessResult:
+                   extra_steps: int = 0, plan_step: "str | None" = None) -> HarnessResult:
+        """Run the Scientist on ``step``. ``plan_step``: the step's text in the approved plan, when
+        ``step`` is a brief built from it (a DAG node's), so the approved settings can be found."""
         # Literature grounding: prefer deep_literature (PaperQA over the lab's indexed corpus on
         # HPC3); fall back to literature_search (Europe PMC) ONLY when the corpus tool isn't wired
         # (dev / no-HPC), so behaviour never regresses where deep_literature can't run.
         if _is_literature_step(step):
             deep_tool = next((t for t in self.scientist.catalog if t.name == "deep_literature"), None)
             lit_tool = next((t for t in self.scientist.catalog if t.name == "literature_search"), None)
+            corpus_tool = next((t for t in self.scientist.catalog if t.name == "search_corpus"), None)
+            if deep_tool is None and corpus_tool is not None:
+                # No served model in this session: the corpus is searched without one and the
+                # session's model writes the answer. Same fallback as deep_literature below.
+                pinned = self._pinned_settings(plan_step if plan_step is not None else step)
+                result = self._run_search_corpus_step(question, step, rounds, corpus_tool, specialist, emit,
+                                                      pinned=pinned.get("search_corpus"))
+                if result.status == "ok" or lit_tool is None:
+                    return result
+                emit({"type": "literature_fallback", "from": "search_corpus",
+                      "to": "literature_search", "reason": getattr(result, "stop_reason", "")})
+                fallback = self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
+                fallback.final_answer = (
+                    "(Platform note: the indexed corpus, search_corpus, gave no answer that rested on its "
+                    "passages; the platform then searched Europe PMC with literature_search. Judge the "
+                    "citations below on their relevance to the step's question, not on which of the "
+                    "two tools found them.)\n\n" + (fallback.final_answer or ""))
+                return fallback
             if deep_tool is not None:
                 result = self._run_deep_literature_step(question, step, rounds, deep_tool, specialist, emit)
                 # deep_literature grounds against the curated corpus on HPC3. When it can't run
@@ -7003,7 +7199,7 @@ class ResearchLab:
                 f"if — THIS step needs analysis the tools above do not cover, {_fetch}. "
                 "`search_skills(query)` ranks them by keyword:\n" + skill_manifest()
             )
-        pinned = self._pinned_settings(step)
+        pinned = self._pinned_settings(plan_step if plan_step is not None else step)
         if pinned:
             parts.append(
                 "Settings the researcher approved with the plan: " + "; ".join(
@@ -7631,6 +7827,20 @@ class ResearchLab:
     def _synthesize(self, question: str, rounds: list[LabRound], emit: EventFn,
                     team_interpretation: str = "") -> str:
         accepted = [r for r in rounds if r.verdict.verdict == "accept"]
+        qc_report = False
+        if qc_only(tools_that_ran(rounds)):
+            # Quality control is all this run did. Unless the request asks for a written report, it
+            # is answered in the chat with the QC tool's own numbers, which the gateway builds from
+            # the run's files. Run 6275df1213ab (CellQC alone) had the writer produce Summary,
+            # Methods, Results, Limitations and Conclusion around one table, after a claim audit that
+            # asked of each QC count whether it claimed causation in a two-arm comparison.
+            if not wants_written_report(question):
+                emit({"type": "synthesize", "accepted": len(accepted), "qc_only": True})
+                return "\n\n".join(str(r.scientist_result.get("final_answer") or "").strip()
+                                   for r in (accepted or rounds[-1:])).strip()
+            # A report asked for: the writer writes it, as a QC report, with no claim audit (its
+            # checks are for findings about conditions; a QC run has none).
+            qc_report = True
 
         def _step_line(r: LabRound) -> str:
             answer = r.scientist_result.get("final_answer") or "(no textual answer)"
@@ -7672,7 +7882,7 @@ class ResearchLab:
         # asked one short question at a time: the model answers them correctly alone, but does not apply
         # them while writing (see agents/claim_audit.py). A failed audit never costs the report.
         audit_block = ""
-        if accepted and claim_audit.enabled():
+        if accepted and claim_audit.enabled() and not qc_report:
             try:
                 dataset_result = (self.ctx.decisions or {}).get("dataset_result")
                 self._claim_audit = claim_audit.audit(lambda m: self._complete(m, role="audit"),
@@ -7696,7 +7906,8 @@ class ResearchLab:
                 f"{ledger_block}"
                 f"{audit_prompt}"
                 f"{interp}\n"
-                "Write the final report now."
+                + (_QC_REPORT_NOTE if qc_report else "")
+                + "Write the final report now."
             )},
         ], role="writer")
         # Guarantee layer: deterministically CORRECT any fabricated assembly / non-PASS claim that slipped

@@ -1,6 +1,6 @@
 """Offline tests for deterministic schematic figures (tools/schematic).
 
-graphviz `dot` / mermaid `mmdc` are system binaries that need not be present here:
+graphviz `dot` is a system binary that need not be present here:
 these tests cover the pure DOT builder and the graceful "renderer absent" path, plus
 the simulated-success path (monkeypatching subprocess), and the harness tool shape.
 The tests marked ``needs_dot`` render with the real program and skip where it is absent.
@@ -236,22 +236,16 @@ def test_make_schematic_tool_renders_into_figure_gallery(tmp_path, monkeypatch):
     assert (tmp_path / "artifacts" / "figures").is_dir()
 
 
-def test_render_d2_graceful_when_binary_absent(tmp_path, monkeypatch):
-    monkeypatch.setattr(schematic.shutil, "which", lambda _n: None)
-    out = schematic.render_d2("a -> b", tmp_path, basename="wf")
-    assert out["status"] == "dependency_missing" and out["dependency"] == "d2"
-    assert (tmp_path / "wf.d2").read_text(encoding="utf-8") == "a -> b"   # source always kept
-
-
-def test_make_schematic_d2_engine_outputs_svg(tmp_path, monkeypatch):
-    monkeypatch.setattr(schematic.shutil, "which", lambda _n: "/usr/local/bin/d2")
-    monkeypatch.setattr(schematic.subprocess, "run",
-                        lambda cmd, **k: (open(cmd[-1], "w").write("<svg/>"),
-                                          types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
+def test_make_schematic_draws_dot_only(tmp_path):
+    """D2 and Mermaid were offered once, but neither binary was ever on the gateway: every such call
+    failed. The model is now offered DOT alone, and an old caller asking for another engine is told
+    to write DOT instead of getting a dependency error."""
     tool = schematic.make_schematic_tool()
-    out = tool.executor({"source": "QC -> DE", "engine": "d2", "basename": "wf"},
-                        types.SimpleNamespace(workspace=tmp_path))
-    assert out["status"] == "ok" and out["figure"].endswith(".svg")   # D2 → native SVG
+    assert "engine" not in tool.parameters["properties"]
+    for engine in ("d2", "mermaid"):
+        out = tool.executor({"source": "a -> b", "engine": engine}, types.SimpleNamespace(workspace=tmp_path))
+        assert out["status"] == "error" and "Graphviz DOT" in out["error"]
+    assert not (tmp_path / "artifacts").exists()                  # nothing was written
 
 
 def test_make_schematic_tool_rejects_empty_source(tmp_path):

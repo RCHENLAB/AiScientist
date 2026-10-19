@@ -34,6 +34,11 @@ def _root() -> Path:
     return Path(os.environ.get("AISCIENTIST_STATE_DIR", ".")) / "ssh_creds"
 
 
+def private_paths() -> list[Path]:
+    """The key store: files no tool may read (``tools.sdk.confine_read``)."""
+    return [_root()]
+
+
 def _safe_owner(owner: str) -> str:
     cleaned = "".join(c for c in (owner or "") if c.isalnum() or c in "-_")
     return cleaned or "guest"

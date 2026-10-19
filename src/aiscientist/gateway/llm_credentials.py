@@ -159,6 +159,11 @@ def _master_key_path() -> Path:
     return Path(os.environ.get("AISCIENTIST_STATE_DIR", ".")) / "llm_key.master"
 
 
+def private_paths() -> list[Path]:
+    """The key store and its master key: files no tool may read (``tools.sdk.confine_read``)."""
+    return [_root(), _master_key_path()]
+
+
 def _fernet():
     """The Fernet built from the master key, creating that key on first use.
 

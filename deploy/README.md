@@ -152,7 +152,8 @@ Never commit a credential. Documents and examples use placeholders such as `<pas
   failed calls included), priced when it is recorded from
   [`configs/llm_pricing.yaml`](../configs/llm_pricing.yaml). `AISCIENTIST_LLM_PRICING_FILE` points
   at a copy outside the app directory, so prices can change without a deploy. Users see their own
-  under Account › Usage; the cost is AiScientist's estimate, not the provider's bill.
+  under Account › API usage; the cost is AiScientist's estimate, not the provider's bill.
+  Calls on the cluster GPU are recorded at $0 and shown apart as free.
 
 So the service account can read the session secret and every user's HPC3 key and API key. Keep
 `state/` closed to other accounts, and keep the set of people who may run `sudo -u aiscientist`

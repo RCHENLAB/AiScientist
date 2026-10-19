@@ -56,6 +56,72 @@ def test_expire_no_root_is_noop(tmp_path):
     assert gw_app._expire_old_checkpoints(tmp_path / "nope", ttl_days=7) == 0
 
 
+def _seed_stalled(root: Path, run_id: str, *, copy_age_days: float, run_age_days: float) -> Path:
+    """A run that never published: a staged input copy, a loop log, a stall note, no report."""
+    run = root / "u" / run_id
+    (run / "staged").mkdir(parents=True)
+    matrix = run / "staged" / "input.h5ad"
+    matrix.write_bytes(b"x" * 64)
+    log = run / "loop.log"
+    log.write_text("step 1\n", encoding="utf-8")
+    note = run / "checkpoint_stalled.md"
+    note.write_text("stalled\n", encoding="utf-8")
+    # the copy keeps its source's time (as a transfer that preserves times would leave it)
+    source_time = time.time() - 400 * 86400
+    os.utime(matrix, (source_time, source_time))
+    copied = time.time() - copy_age_days * 86400
+    os.utime(run / "staged", (copied, copied))
+    last = time.time() - run_age_days * 86400
+    for p in (log, note):
+        os.utime(p, (last, last))
+    return run
+
+
+def test_a_stalled_runs_staged_copy_expires(tmp_path):
+    run = _seed_stalled(tmp_path, "stalled", copy_age_days=12, run_age_days=10)
+    assert gw_app._expire_old_checkpoints(tmp_path, ttl_days=7) == 1
+    assert not (run / "staged").exists()
+    assert (run / "loop.log").exists() and (run / "checkpoint_stalled.md").exists()
+
+
+def test_a_staged_copy_with_an_old_file_time_stays_while_its_run_is_recent(tmp_path):
+    # file time 400 days old (the source's), but the run wrote its log yesterday
+    active = _seed_stalled(tmp_path, "active", copy_age_days=12, run_age_days=1)
+    # and a copy that arrived an hour ago, in a run whose other files are old
+    fresh = _seed_stalled(tmp_path, "fresh", copy_age_days=0.04, run_age_days=30)
+    assert gw_app._expire_old_checkpoints(tmp_path, ttl_days=7) == 0
+    assert (active / "staged" / "input.h5ad").exists()
+    assert (fresh / "staged" / "input.h5ad").exists()
+
+
+def test_a_live_run_is_never_swept(tmp_path):
+    old = _seed_run(tmp_path, "u", "running", age_days=30)
+    _seed_stalled(tmp_path, "running2", copy_age_days=30, run_age_days=30)
+    assert gw_app._expire_old_checkpoints(tmp_path, ttl_days=7, live={"running", "running2"}) == 0
+    assert (old / "work").exists() and (tmp_path / "u" / "running2" / "staged").exists()
+
+
+def test_the_sweep_skips_live_runs_of_every_connection(tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(gw_app, "CONSOLE_RUNS_DIR", tmp_path)
+    monkeypatch.setattr(gw_app, "_expire_old_checkpoints",
+                        lambda root, ttl, *, live=(): seen.update(root=root, live=set(live)) or 0)
+    conn = gw_app.Connection(HPCSettings(), mock=True, loop=asyncio.new_event_loop(), username="u")
+    conn.live_runs.append(gw_app.RunState(conn, run_id="abc123"))
+    gw_app.CONNECTIONS[conn.id] = conn
+
+    async def once():
+        task = asyncio.create_task(gw_app._checkpoint_gc_loop())
+        for _ in range(50):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+
+    asyncio.run(once())
+    assert seen == {"root": tmp_path, "live": {"abc123"}}
+
+
 def test_ttl_reads_from_env(monkeypatch):
     monkeypatch.setenv("AISCIENTIST_CHECKPOINT_TTL_DAYS", "3")
     assert HPCSettings.from_env().checkpoint_ttl_days == 3

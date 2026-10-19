@@ -15,24 +15,38 @@ def managed(env, tmp_path, monkeypatch):  # noqa: F811 - the env fixture importe
     return env
 
 
+def _settled(client, gw, conn, url):
+    """The upload's background check, once it has settled."""
+    result = client.get(url).json()
+    assert result["job_id"], result
+    job = gw._staging_queue(conn).wait(result["job_id"], 5)
+    assert job is not None and job.state == "done", job and job.error
+    return job
+
+
 def test_single_file_uuid_layout_and_same_name(managed):
     client, conn, gw = managed
     from aiscientist.gateway import dataset_storage, upload_storage
     destinations = []
     for _ in range(2):
         url = _create(client, conn, 3).headers["location"]
-        assert not (dataset_storage.data_root() / "datasets").exists() or destinations
+        assert not (dataset_storage.data_root() / "users").exists() or destinations
         assert _patch(client, url, 0, b"abc").status_code == 204
-        result = client.get(url).json()
-        target = Path(result["path"])
+        job = _settled(client, gw, conn, url)
+        assert job.dest == "server"
+        target = Path(job.remote_path)
         assert target.name == "data.csv"
         UUID(target.parents[1].name)
         assert target.parent.name == "original"
+        # kept on this host, in the account's own dataset folder
+        assert target.parents[2] == dataset_storage.datasets_root("tester")
         assert (target.parents[1] / "processed").is_dir()
         assert target.read_bytes() == b"abc"
+        assert client.get(url).json()["path"] == str(target)
         destinations.append(target)
     assert destinations[0] != destinations[1]
     assert not list(upload_storage.uploads(conn).rglob("*.part"))
+    assert conn.executor.state.staged_files == []    # nothing was copied to HPC3
 
 
 def test_folder_manifest_prevents_partial_publication_and_cancel(managed):
@@ -44,15 +58,21 @@ def test_folder_manifest_prevents_partial_publication_and_cancel(managed):
     UUID(folder)
     url = _create(client, conn, 3, folder=folder, rel_path=f"{folder}/a.csv").headers["location"]
     assert _patch(client, url, 0, b"abc").status_code == 204
+    _settled(client, gw, conn, url)
     body = {"connection_id": conn.id, "folder": folder, "count": 2}
-    assert client.post("/api/upload/register-folder", json=body).status_code == 409
-    assert not dataset_storage.dataset_dir(folder).exists()
+    early = client.post("/api/upload/register-folder", json=body)
+    # registered before its last file arrived: it waits, and is not published half-way
+    assert early.status_code == 200 and early.json()["status"] == "staging", early.text
+    assert not dataset_storage.dataset_dir(folder, "tester").exists()
     url = _create(client, conn, 2, folder=folder, rel_path=f"{folder}/nested/b.csv").headers["location"]
     assert _patch(client, url, 0, b"xy").status_code == 204
+    _settled(client, gw, conn, url)
     response = client.post("/api/upload/register-folder", json=body)
     assert response.status_code == 200, response.text
-    assert response.json()["name"] == "study"
-    assert Path(response.json()["path"]).joinpath("nested/b.csv").read_bytes() == b"xy"
+    assert response.json()["status"] == "registered" and response.json()["name"] == "study"
+    published = dataset_storage.dataset_dir(folder, "tester") / "original"
+    assert Path(response.json()["path"]) == published
+    assert (published / "nested/b.csv").read_bytes() == b"xy"
     assert not (upload_storage.uploads(conn) / folder).exists()
     # Cancellation of another session never touches the completed dataset.
     other = client.post("/api/upload/reserve-folder", json={"connection_id": conn.id, "name": "study"}).json()["folder"]
@@ -63,7 +83,7 @@ def test_folder_manifest_prevents_partial_publication_and_cancel(managed):
                                                              "discard_upload": True})
     assert response.status_code == 200
     assert not (upload_storage.uploads(conn) / other).exists()
-    assert (dataset_storage.dataset_dir(folder) / "original/a.csv").read_bytes() == b"abc"
+    assert (published / "a.csv").read_bytes() == b"abc"
 
 
 def test_interrupted_upload_resumes_until_configured_expiry(managed, monkeypatch):
@@ -80,15 +100,19 @@ def test_interrupted_upload_resumes_until_configured_expiry(managed, monkeypatch
     assert not meta.exists() and not part.exists()
 
 
-def test_hpc_uuid_temp_then_publication(managed):
+def test_a_data_root_keeps_uploads_here_even_with_the_hpc3_flag(managed):
+    """Issue 6: with a data root nothing is written to HPC3 at upload time, whatever
+    AISCIENTIST_UPLOADS_ON_HPC says."""
     client, conn, gw = managed
+    from aiscientist.gateway import dataset_storage
     conn.settings.uploads_on_hpc = True
+    assert gw._uploads_on_hpc(conn) is False and gw._uploads_kept_here(conn) is True
     url = _create(client, conn, 3).headers["location"]
     assert _patch(client, url, 0, b"abc").status_code == 204
-    result = client.get(url).json()
-    job = gw._staging_queue(conn).wait(result["job_id"], 5)
-    assert job.state == "done", job.error
-    assert "/datasets/" in job.remote_path and "/original/data.csv" in job.remote_path
+    job = _settled(client, gw, conn, url)
+    assert job.dest == "server" and job.hpc_user == ""
+    assert Path(job.remote_path).is_relative_to(dataset_storage.datasets_root("tester"))
+    assert Path(job.remote_path).read_bytes() == b"abc"
 
 
 def test_folder_resume_checks_server_completed_files(managed):
@@ -132,7 +156,7 @@ def test_delete_endpoint_sync_failure_and_owner_isolation(managed, tmp_path, mon
     monkeypatch.setattr(gw, "_active_conn_for_user", lambda user: conn)
     targets = []
     for _ in range(2):
-        target = dataset_storage.dataset_dir(str(uuid4())) / "original"
+        target = dataset_storage.dataset_dir(str(uuid4()), "tester") / "original"
         target.mkdir(parents=True)
         (target / "x").write_bytes(b"x")
         targets.append(target)

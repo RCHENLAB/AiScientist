@@ -72,7 +72,7 @@ def session(conn, identifier: str) -> dict:
 def publish(conn, identifier: str, expected: int = 0) -> dict:
     meta = session(conn, identifier)
     root = uploads(conn) / identifier
-    dest = dataset_storage.dataset_dir(identifier) / "original"
+    dest = dataset_storage.dataset_dir(identifier, conn.owner) / "original"
     source = root if root.is_dir() else dest
     files = [p for p in source.rglob("*") if p.is_file()]
     if any(p.is_symlink() or not p.resolve().is_relative_to(source.resolve()) for p in source.rglob("*")):
@@ -86,7 +86,7 @@ def publish(conn, identifier: str, expected: int = 0) -> dict:
     elif len(files) != expected:
         raise ValueError("folder is incomplete")
     if root.is_dir():
-        dataset_storage.publish_dataset(root, identifier)
+        dataset_storage.publish_dataset(root, identifier, conn.owner)
     return {"name": meta["original_name"], "path": str(dest), "uuid": identifier,
             "size": sum(actual.values()), "count": len(files), "kind": "folder"}
 
@@ -133,8 +133,10 @@ def expire_sessions(conn) -> None:
                 if busy or running or any(job.updated_at >= cutoff for job in jobs):
                     continue
                 meta = session(conn, path.stem)
-                pending_remote = bool(jobs or meta.get("remote_cleanup_pending"))
-                hpc_user = jobs[0].hpc_user if jobs else meta.get("cleanup_hpc_user", "")
+                # Only a copy to HPC3 leaves anything there; a file kept on this host goes with cancel().
+                remote_jobs = [job for job in jobs if job.dest != "server"]
+                pending_remote = bool(remote_jobs or meta.get("remote_cleanup_pending"))
+                hpc_user = remote_jobs[0].hpc_user if remote_jobs else meta.get("cleanup_hpc_user", "")
                 live = next((c for c in app.CONNECTIONS.values()
                              if c.owner == conn.owner and c.executor is not None
                              and (not hpc_user or app._hpc_user(c) == hpc_user)), None)

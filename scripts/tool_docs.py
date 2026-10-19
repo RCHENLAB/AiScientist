@@ -43,8 +43,7 @@ RUNS_ON_TEXT = {
         "Without HPC3 it returns `not_installed` rather than a guess."),
     "hpc:literature": (
         "As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through "
-        "`python -m aiscientist.tools.paperqa_cli`, calling the session's served model. It is left out "
-        "of the catalog when the session has no GPU allocation."),
+        "`python -m aiscientist.tools.paperqa_cli`."),
     "gpu:scgpt": (
         "As a GPU Slurm job inside `scgpt.sif`, through the runner the gateway injects "
         "(`gateway/scgpt_runner.py`). Without a GPU session it stays listed but reports that it is "
@@ -118,6 +117,10 @@ def parameters_md(tool) -> str:
 
 def runs_on_md(m, tool) -> str:
     lines = [RUNS_ON_TEXT[m.runs_on]]
+    if m.runs_on == "hpc:literature":
+        lines[0] += (" Its job calls the session's served model, so it is offered only to a session "
+                     "with a GPU allocation." if m.served_model else
+                     " Its job runs no language model: it needs no GPU allocation.")
     if m.image:
         lines[0] = lines[0].replace(" inside `analysis.sif`", "")
         how = ("built on first use from conda-forge + bioconda (" + m.image.split(":", 1)[1] + ")"

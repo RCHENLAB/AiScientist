@@ -2,21 +2,17 @@
 LOCALLY from text, with **no generative AI drawing pixels**.
 
 The privacy/integrity story matches the data figures: a schematic is described as
-text (a Graphviz **DOT** string, or a Mermaid string) and a deterministic renderer
-turns that text — byte-for-byte — into a PNG/SVG. The LLM only ever writes the
-*structured description* (auditable text: nodes + edges), never paints the image, so
-there is no diffusion-model hallucination / tampering surface. (Qwen3-VL, the optional
-vision layer, is read-only QA on the rendered figure — it cannot generate one.)
+text (a Graphviz **DOT** string) and a deterministic renderer turns that text —
+byte-for-byte — into a PNG. The LLM only ever writes the *structured description*
+(auditable text: nodes + edges), never paints the image, so there is no
+diffusion-model hallucination / tampering surface. (Qwen3-VL, the optional vision
+layer, is read-only QA on the rendered figure — it cannot generate one.)
 
-Two renderers, graphviz preferred:
-
-* **Graphviz** (`dot`) — a single ``apt install graphviz``; the primary path.
-* **Mermaid** (`mmdc`) — optional; needs Node + headless Chromium, so it is a
-  best-effort fallback only.
-
-Both lazy/graceful: a renderer that isn't installed returns
-``{"status": "dependency_missing", ...}`` instead of crashing (same contract as
-``reporting/report.py`` for pandoc and ``tools/scrna_pack.py`` for scanpy).
+The renderer is Graphviz (`dot`, a single ``apt install graphviz``), the one the report's
+workflow figure uses too. Without it the tool returns ``{"status": "dependency_missing", ...}``
+instead of crashing (same contract as ``reporting/report.py`` for pandoc and
+``tools/scrna_pack.py`` for scanpy). Diagrams in the chat are not drawn here: the model writes a
+```mermaid fence there and the browser renders it.
 """
 
 from __future__ import annotations
@@ -34,14 +30,6 @@ from typing import Any
 
 def dot_available() -> bool:
     return shutil.which("dot") is not None
-
-
-def mermaid_available() -> bool:
-    return shutil.which("mmdc") is not None
-
-
-def d2_available() -> bool:
-    return shutil.which("d2") is not None
 
 
 # --- deterministic DOT builders (pure Python — no AI, no external process) ----
@@ -288,74 +276,6 @@ def render_workflow_schematic(
         k = k_next
 
 
-def render_mermaid(
-    mermaid_source: str,
-    out_dir: Path,
-    *,
-    basename: str = "schematic",
-    fmt: str = "png",
-    timeout_s: float = 90.0,
-) -> dict[str, Any]:
-    """Render a Mermaid string via ``mmdc`` (optional; needs Node + headless Chromium).
-    Best-effort fallback to graphviz."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    src_path = out_dir / f"{basename}.mmd"
-    src_path.write_text(mermaid_source, encoding="utf-8")
-    if not mermaid_available():
-        return {"status": "dependency_missing", "dependency": "mermaid-cli",
-                "src_path": str(src_path), "path": None,
-                "note": "mermaid `mmdc` not installed — prefer graphviz/DOT, or `npm i -g @mermaid-js/mermaid-cli`."}
-    out_path = out_dir / f"{basename}.{fmt}"
-    try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["mmdc", "-i", str(src_path), "-o", str(out_path)],
-            capture_output=True, text=True, timeout=timeout_s,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "src_path": str(src_path), "path": None,
-                "error": f"{type(exc).__name__}: {exc}"}
-    if proc.returncode != 0 or not out_path.exists():
-        return {"status": "error", "src_path": str(src_path), "path": None,
-                "error": (proc.stderr or proc.stdout or "")[-2000:]}
-    return {"status": "ok", "src_path": str(src_path), "path": str(out_path)}
-
-
-def render_d2(
-    d2_source: str,
-    out_dir: Path,
-    *,
-    basename: str = "schematic",
-    fmt: str = "svg",
-    theme: int = 0,
-    timeout_s: float = 60.0,
-) -> dict[str, Any]:
-    """Render a D2 string to a designer-grade **SVG** via the ``d2`` binary (a single
-    Go binary; ``curl -fsSL https://d2lang.com/install.sh | sh -s --``). SVG is D2's
-    NATIVE output — crisp + themeable + browser-renderable (great for the web preview).
-    PNG export needs a headless browser, so we default to SVG and keep graphviz PNG for
-    the PDF. Lazy/graceful when ``d2`` is absent (always keeps the ``.d2`` source)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    src_path = out_dir / f"{basename}.d2"
-    src_path.write_text(d2_source, encoding="utf-8")
-    if not d2_available():
-        return {"status": "dependency_missing", "dependency": "d2",
-                "src_path": str(src_path), "path": None,
-                "note": "d2 not installed — `curl -fsSL https://d2lang.com/install.sh | sh -s --` for pretty SVG schematics."}
-    out_path = out_dir / f"{basename}.{fmt}"
-    try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            ["d2", "--theme", str(theme), str(src_path), str(out_path)],
-            capture_output=True, text=True, timeout=timeout_s,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "src_path": str(src_path), "path": None,
-                "error": f"{type(exc).__name__}: {exc}"}
-    if proc.returncode != 0 or not out_path.exists():
-        return {"status": "error", "src_path": str(src_path), "path": None,
-                "error": (proc.stderr or proc.stdout or "")[-2000:]}
-    return {"status": "ok", "src_path": str(src_path), "path": str(out_path)}
-
-
 # --- harness tool -------------------------------------------------------------
 
 
@@ -372,18 +292,17 @@ def _exec_make_schematic(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     source = str(args.get("source", "")).strip()
     if not source:
         return {"status": "error", "error": "no diagram source provided"}
-    engine = str(args.get("engine", "dot")).lower()
+    engine = str(args.get("engine") or "dot").lower()
+    if engine != "dot":
+        # D2 and Mermaid were offered once; neither binary was ever installed on the gateway.
+        return {"status": "error",
+                "error": f"engine {engine!r} is not available: write the diagram in Graphviz DOT"}
     basename = str(args.get("basename", "schematic")).strip() or "schematic"
     # keep the filename safe + namespaced so it lands in the figure gallery
     basename = "schematic_" + "".join(c for c in basename if c.isalnum() or c in "-_")[:48]
     figs = _figdir(ctx)
     art = figs.parent
-    if engine == "d2":
-        out = render_d2(source, figs, basename=basename)          # native, pretty SVG
-    elif engine == "mermaid":
-        out = render_mermaid(source, figs, basename=basename)
-    else:
-        out = render_dot(source, figs, basename=basename)         # graphviz PNG (PDF-friendly)
+    out = render_dot(source, figs, basename=basename)             # graphviz PNG (PDF-friendly)
     # return a path relative to the artifacts root (the files-browser/report key)
     if out.get("path"):
         rel = Path(out["path"]).relative_to(art).as_posix()
@@ -392,8 +311,8 @@ def _exec_make_schematic(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
 
 def make_schematic_tool() -> Any:
-    """The schematic tool: the agent writes a Graphviz DOT (or Mermaid) description of a
-    workflow / pathway / mechanism, rendered deterministically into the figure gallery.
+    """The schematic tool: the agent writes a Graphviz DOT description of a workflow / pathway /
+    mechanism, rendered deterministically into the figure gallery.
 
     Imported lazily so ``tools.schematic`` has no import dependency on the agents pkg.
     """
@@ -403,13 +322,11 @@ def make_schematic_tool() -> Any:
         "make_schematic",
         "Draw a SCHEMATIC diagram (analysis workflow, signaling pathway, or mechanism) "
         "by writing its structure as text — a deterministic renderer turns it into a "
-        "figure in the gallery (NO AI draws pixels). Engines: `dot` (Graphviz, PNG, "
-        "best for the PDF; default), `d2` (designer-grade SVG, best for web preview), "
-        "`mermaid` (SVG/PNG). Use for conceptual figures, not data plots. Example DOT: "
+        "PNG figure in the gallery (NO AI draws pixels). Write it in Graphviz DOT. Use for "
+        "conceptual figures, not data plots. Example: "
         "'digraph { QC -> Clustering -> \"DE per cluster\" -> Enrichment }'.",
         {"type": "object", "properties": {
-            "source": {"type": "string", "description": "diagram text in the chosen engine's syntax"},
-            "engine": {"type": "string", "enum": ["dot", "d2", "mermaid"]},
+            "source": {"type": "string", "description": "the diagram in Graphviz DOT"},
             "basename": {"type": "string", "description": "short name for the figure file"}},
          "required": ["source"]},
         _exec_make_schematic,

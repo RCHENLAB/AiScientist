@@ -61,14 +61,16 @@ AISCIENTIST_VEP_CLINVAR_GRCH38=/dfs3b/ruic20_lab/software/reference/vep_annotati
 AISCIENTIST_VEP_CLINVAR_GRCH37=/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh37.vcf.gz
 AISCIENTIST_VEP_ASSEMBLY=GRCh38          # default; LLM can override per call
 AISCIENTIST_VEP_FORK=8
-AISCIENTIST_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
 ```
 
-The VCF + the run's work/artifacts dirs must be reachable on the compute node (shared DFS — they are,
-via `uploads_on_hpc`). The AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` by the
-gateway and bind-mounted in, so a tool edit needs a code deploy, NOT an image rebuild. If HPC is
-unreachable at run time, `annotate_variants` falls back to the REST path in-process (fine for small
-VCFs).
+The VCF + the run's work/artifacts dirs must be reachable on the compute node. They are on dfs3b:
+the run's dirs are under `Temp/<ucinetid>/variant/<run_id>/`, and a VCF kept on the server (an
+upload under `AISCIENTIST_DATA_ROOT`) is copied to dfs3b when the run starts, into the session's own
+`Temp/<ucinetid>/server-data/` or the run's folder (a deployment without a data root uses
+`AISCIENTIST_UPLOADS_ON_HPC=1`, which puts uploads on dfs3b). The AiScientist **tools** are synced
+to `<lab_storage>/<user>/pysrc` by the gateway and bind-mounted in, so a tool edit needs a code
+deploy, NOT an image rebuild. If HPC is unreachable at run time, `annotate_variants` falls back to
+the REST path in-process (fine for small VCFs).
 
 ## Keep in sync
 

@@ -243,3 +243,126 @@ def test_every_number_in_the_short_report_traces_and_the_statement_reads_right(t
     assert "Nothing in the report was checked against published literature." in note
     assert "1 are" not in note and "1 are" not in statement
     assert "- The one planned step completed and was accepted by the reviewer." in statement
+
+
+# --- A QC-only run is answered in the chat, with no report (Yijun, 2026-10-16, on 6275df1213ab) ---
+
+def _with_result_dataset(art: Path) -> Path:
+    (art / "data" / "result_dataset.json").write_text(json.dumps({
+        "name": "Sample2_Ddx41.processed.20261014-1204.6275df1213ab.h5ad", "n_cells": 14553,
+        "n_genes": 33696, "location": "hpc3", "kept_days": 3, "until_disconnect": True,
+        "counts_layer": "ambient-corrected integer UMI counts from CellQC (soupx), not the Cell "
+                        "Ranger matrix: ambient RNA has already been subtracted from every cell"}))
+    (art / "result").mkdir()
+    (art / "result" / "report.html").write_text("<html></html>")
+    return art
+
+
+def test_a_qc_only_run_gets_a_short_chat_reply_with_the_tools_numbers(tmp_path):
+    from aiscientist.gateway.app import _qc_chat_reply, _qc_only_run
+    art = _with_result_dataset(_ddx41_art(tmp_path))
+    applied = dict(_DDX41, ambient={"applied": "soupx", "compared": "decontx"})
+    result = _Result([dict(_DDX41_STEPS[0], result=applied)] + _DDX41_STEPS[1:])
+    assert _qc_only_run(result)
+    reply = _qc_chat_reply(art, result)
+    assert reply.startswith("**Quality control done** — `run_cellqc` on Sample2_Ddx41.")
+    assert "- **14,553 of 15,872 cells kept (91.7%)**; 33,696 genes." in reply
+    assert ("- Filters removed 390: 317 only for mitochondrial RNA above 10%, 28 only for fewer than "
+            "300 genes, 2 only for fewer than 500 counts, 43 for more than one.") in reply
+    assert ("Doublets removed: 929 of the 15,482 filtered cells (6.0%), called by DoubletFinder. "
+            "The two doublet callers agree poorly (kappa 0.14): scDblFinder agrees on 245") in reply
+    assert ("- Median mitochondrial RNA in the kept cells 0.69%; ambient RNA 1.6% (SoupX, already "
+            "subtracted from the counts).") in reply
+    assert ("**Result:** `Sample2_Ddx41.processed.20261014-1204.6275df1213ab.h5ad` — 14,553 cells × "
+            "33,696 genes") in reply
+    assert "kept on HPC3 until you disconnect (at most 3 days)" in reply
+    assert "`result/report.html`" in reply
+    # The kappa warning is not said twice, and no instruction to a model reaches the user.
+    assert reply.count("kappa") == 1 and "Report it" not in reply
+    # A reply, not a report: no sections, no literature, no "not run" list.
+    for word in ("## ", "Methods", "Limitations", "Conclusion", "literature", "differential"):
+        assert word not in reply, word
+    assert len(reply.strip().splitlines()) <= 10
+
+
+def test_more_than_qc_is_not_answered_in_the_chat_only():
+    from aiscientist.gateway.app import _code_wrote_outputs, _qc_only_run
+    # The run's own run_code only reloaded the checkpoint and printed it: a check, nothing written.
+    assert not _code_wrote_outputs(_Result(_DDX41_STEPS))
+    audit = _DDX41_STEPS + [{"tool": "run_code", "ok": True, "args": {"code": "x = 1"},
+                             "result": {"status": "ok", "tables": ["tables/rod_leak.csv"]}}]
+    assert _qc_only_run(_Result(audit)) and _code_wrote_outputs(_Result(audit))
+    saved = [{"tool": "run_code", "ok": True, "args": {"code": "plt.savefig('a.png')"},
+              "result": {"status": "ok"}}]
+    assert _code_wrote_outputs(_Result(saved))
+    # Run 57c6b0c6ba0c's script, verbatim in what matters: it READ the metrics table through
+    # AISCIENTIST_ARTIFACTS on HPC3, which reports every file a script writes and reported none.
+    read_only = [{"tool": "run_code", "ok": True, "args": {"code": (
+        "art=os.environ['AISCIENTIST_ARTIFACTS']\n"
+        "df=pd.read_csv(os.path.join(art, 'tables/cellqc_metrics.csv'))\nprint(df.head())\n")},
+        "result": {"status": "ok", "execution_mode": "hpc_slurm", "stdout": "..."}}]
+    assert not _code_wrote_outputs(_Result(_DDX41_STEPS + read_only))
+    hpc_wrote = [dict(read_only[0], result=dict(read_only[0]["result"], tables=["tables/x.csv"]))]
+    assert _code_wrote_outputs(_Result(hpc_wrote))
+    more = _DDX41_STEPS + [{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}]
+    assert not _qc_only_run(_Result(more))
+    assert not _qc_only_run(_Result([]))
+    failed_qc = [{"tool": "run_cellqc", "ok": False, "result": {"status": "error"}}]
+    assert not _qc_only_run(_Result(failed_qc))
+
+
+def test_the_chat_reply_for_several_libraries_and_for_scanpy_qc(tmp_path):
+    from aiscientist.gateway.app import _qc_chat_reply
+    two = dict(_DDX41, cells_before=34553, cells_after=31303,
+               libraries=[_QC["libraries"][0], _DDX41["libraries"][0]],
+               warnings=_QC["warnings"] + [w + " Report it." for w in _DDX41["warnings"]])
+    art = _ddx41_art(tmp_path / "two")
+    reply = _qc_chat_reply(art, _Result([{"tool": "run_cellqc", "ok": True, "result": two}]))
+    assert "- **31,303 of 34,553 cells kept (90.6%)**; 33,696 genes." in reply
+    assert "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | 91.7% |" in reply
+    assert "- Thresholds: `min_counts` = 500, `min_features` = 300, `max_pct_mt` = 10.0." in reply
+    assert reply.count("kappa 0.07") == 1 and reply.count("kappa 0.14") == 1   # each library's
+    assert "Report it" not in reply                                             # warning, once
+    assert "ambient RNA 1.6% (SoupX estimate)" not in reply   # per-library detail stays in the table
+    scanpy = {"status": "ok", "cells_before": 5000, "cells_after": 4600, "genes_before": 30000,
+              "genes_after": 18000, "warnings": [],
+              "thresholds": {"min_genes": 200, "min_cells": 3, "max_pct_mt": 20}}
+    reply = _qc_chat_reply(_art(tmp_path / "scanpy"),
+                           _Result([{"tool": "run_scanpy_qc", "ok": True, "result": scanpy}]))
+    assert reply.startswith("**Quality control done** — `run_scanpy_qc`.")
+    assert "- **4,600 of 5,000 cells kept (92.0%)**; 18,000 genes." in reply
+    assert "`min_genes` = 200" in reply and "result/report.html" not in reply
+
+
+def test_a_qc_reports_statement_lists_no_labels_or_literature(tmp_path):
+    """A QC report had no labels and nothing to check against the literature: run 6275df1213ab's
+    statement listed both as unchecked."""
+    from aiscientist.reporting.verification import build_verification, manuscript_note
+    art, md = _ddx41_report(tmp_path)
+    result = _Result(_DDX41_STEPS)
+    statement, summary = build_verification(art, md, result.agenda, result.rounds,
+                                            {"citations": [], "reason": "none"}, brief=True,
+                                            qc_only=True)
+    assert "literature" not in statement and "Cell-type labels" not in statement
+    assert "## 2. Quality-control accounting" in statement
+    assert "## 3. Planned steps that did not finish as planned" in statement
+    assert summary["literature_checked"] is None
+    assert "literature" not in manuscript_note(summary)
+    # Without the option the statement is unchanged.
+    statement, _ = build_verification(art, md, result.agenda, result.rounds,
+                                      {"citations": [], "reason": "none"}, brief=True)
+    assert "## 2. Cell-type labels" in statement and "published literature" in statement
+
+
+def test_the_dataset_ready_line_names_only_what_the_dataset_holds():
+    """Runs 6275df1213ab and caa188e8e672 (QC only) announced their dataset "with the clusters, cell
+    types and embeddings"; it had none of them."""
+    from aiscientist.gateway.app import _dataset_holds
+    qc = {"obs_columns": ["sampleid", "n_genes_by_counts", "total_counts", "pct_counts_mt",
+                          "doubletfinder_class"], "obsm": []}
+    assert _dataset_holds(qc) == "with each cell's QC metrics"
+    full = {"obs_columns": ["sampleid", "leiden", "cell_type"], "obsm": ["X_umap"]}
+    assert _dataset_holds(full) == "with the clusters, cell types and embeddings"
+    assert _dataset_holds({"obs_columns": ["leiden"], "obsm": ["X_umap"]}) == \
+        "with the clusters and embeddings"
+    assert _dataset_holds({}) == "as QC left it"

@@ -1,4 +1,8 @@
-"""Background staging of uploads onto HPC3 dfs3b.
+"""Background staging of uploads: their check, and their copy to HPC3 dfs3b where that is still done.
+
+With a data root configured an upload is kept on the gateway host (``StagingJob.dest == "server"``):
+the queue then checks the file and publishes it into the owner's dataset folder, and nothing goes to
+HPC3. Without one, and ``AISCIENTIST_UPLOADS_ON_HPC`` on, the queue copies it to HPC3 as below.
 
 An upload used to be copied to HPC3 inside the request that delivered its last byte. Envoy, the
 eyeserver ingress, ends a request that has not answered within 15 s, and at ~100 MB/s that is every
@@ -77,6 +81,10 @@ class StagingJob:
     unpack_dest: str = ""     # the folder it unpacks to, chosen once so a retry reuses it
     unpacked: dict | None = None   # what unpacking produced: {"path", "files", "bytes"}
     unpack_error: str = ""    # why the archive was left as a file instead (it was refused)
+    # Where the file is kept: "hpc3" (copied to the user's HPC3 uploads) or "server" (kept on the
+    # gateway host in the owner's dataset folder; the queue then only checks and publishes it, and
+    # ``remote_path`` is that local destination). Jobs written before this field are HPC3 copies.
+    dest: str = "hpc3"
     state: str = "queued"
     sent: int = 0
     sha256: str = ""          # of the local file, filled while the copy runs
@@ -268,7 +276,10 @@ class StagingQueue:
             fut = self._futures.get(job.id)
             if job.state not in ACTIVE or (fut is not None and not fut.done()):
                 continue
-            if not os.path.exists(job.local_path):
+            # A file kept on the server may already be at its destination (published just before
+            # the process died, before the job said so): its check finds it there.
+            published = job.dest == "server" and not job.folder and os.path.exists(job.remote_path)
+            if not os.path.exists(job.local_path) and not published:
                 self._finish(job, "failed", error="The copy of this upload on the server is gone. "
                                                   "Upload the file again.")
                 continue
@@ -385,10 +396,13 @@ class StagingQueue:
             if not job.verified:        # a retry after a verified copy has only the unpack left
                 self._set(job, "pushing", sent=0)
                 digest: dict[str, str] = {}
+                # A file kept on the server that was published before a restart is read where it is now.
+                source = (job.remote_path if job.dest == "server" and not os.path.exists(job.local_path)
+                          else job.local_path)
                 if job.client_sha256:
                     # The browser said what it sent: check BEFORE anything goes to HPC3. A mismatch
                     # means the file here is not the user's file; copying it again cannot fix that.
-                    digest["sha"] = sha256_file(job.local_path, cancel)
+                    digest["sha"] = sha256_file(source, cancel)
                     if cancel.is_set():
                         raise Cancelled()
                     if digest["sha"] != job.client_sha256.lower():
@@ -397,7 +411,7 @@ class StagingQueue:
                 else:
                     # Hash while the copy runs: both read the file, so the second read is from cache.
                     hasher = threading.Thread(
-                        target=lambda: digest.update(sha=sha256_file(job.local_path, cancel)),
+                        target=lambda: digest.update(sha=sha256_file(source, cancel)),
                         name=f"sha-{job_id}", daemon=True)
                     hasher.start()
                 self.push(job, progress)

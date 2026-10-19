@@ -139,3 +139,13 @@ different vector space and the index must be rebuilt.
 - **GPU:** PubMedBERT runs on CPU (slower than MiniLM but fine for this corpus). If you
   later want a GPU to speed it up, switch to a `gpu` partition with `--gres=gpu:1` and add
   `--account`/`--partition` accordingly; the model auto-uses CUDA if present.
+
+## Retrieval-only path (`search_corpus`)
+
+A session with no GPU allocation (the user's own API key) has no served model for `deep_literature`.
+`search_corpus` runs in the same `paperqa.sif` job line without one: it reads
+`<corpus-root>/mechanism_cache/{chunks.jsonl,chunk_vecs.npy}` and the offline `hf_cache` (PubMedBERT on
+CPU), and returns the matching passages. The job needs 2 CPUs and 8 GB, no GPU, and is given no model
+endpoint or API key; the session's model writes the queries and the answer, and the gateway removes any
+citation or quotation the passages do not support. The text cache is rebuilt by hand with
+`scripts/build_mechanism_cache.py` when papers are added.

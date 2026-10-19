@@ -55,8 +55,8 @@
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><rect x="1.5" y="2.5" width="15" height="13" rx="3" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="2.5" width="5.5" height="13" rx="3" fill="currentColor" opacity="0.5"/></svg>
         </button>
         <span class="logo">🧬</span>
-        <div>
-          <h1>AiScientist Console</h1>
+        <div class="brand-text">
+          <h1>AiScientist<span class="brand-suffix"> Console</span></h1>
           <p class="subtitle">SSH → UCI HPC3 · GPU · vLLM / Qwen3</p>
         </div>
       </div>
@@ -239,12 +239,12 @@
                 <small id="chatModel"></small>
                 <!-- What this chat's model calls cost so far (tokens, estimated $), and the running
                      total of its research run while one is going. Hidden with nothing to count. -->
-                <button id="chatUsage" type="button" class="chat-usage hidden" title="Tokens and estimated cost of this chat. Open Account › Usage for the details."></button>
+                <button id="chatUsage" type="button" class="chat-usage hidden" title="Tokens and estimated cost of this chat. Open Account › API usage for the details."></button>
               </div>
               <!-- Lightweight GPU cold-start status (shown only while provisioning; a
                    liveness cue so the user knows it isn't stuck). Auto-closes when live. -->
               <div id="bootStatus" class="boot-status hidden"></div>
-              <!-- A budget threshold reached (Account › Usage › Budget); shown once per cycle. -->
+              <!-- A budget threshold reached (Account › API usage › Budget); shown once per cycle. -->
               <div id="budgetNotice" class="budget-notice hidden" role="status"></div>
               <div id="chatStream" class="chat-stream">
                 <div class="empty-hint">Connect to HPC3, then ask a research question.</div>
@@ -418,78 +418,108 @@
 
         <!-- ===== ACCOUNT view ===== -->
         <section id="view-account" class="view">
-          <div class="page">
-            <div class="page-head"><h2>My account</h2></div>
+          <div class="page account-page">
+            <div class="page-head"><h2>My account</h2><button id="logoutBtn" type="button" class="secondary small">Sign out</button></div>
             <div id="accountInfo" class="account-info"></div>
 
-            <!-- Your own API key, and what it has been used for here. -->
-            <h3>Claude API key</h3>
-            <div class="account-info account-key">
-              <p>Bring your own Claude API key — for example one that uses your Claude Max or Team plan's monthly API credits. AiScientist stores it encrypted on this server and only ever shows its last 4 characters.</p>
-              <div class="btn-row">
-                <button id="accountKeysBtn" type="button" class="primary small">Manage API keys</button>
-                <a class="ghost small guide-link" target="_blank" rel="noopener" data-guide>Guide: use your Claude subscription</a>
-              </div>
+            <!-- Two tabs: what your API key spent here (and its budget), and your password. -->
+            <div id="accountTabs" class="account-tabs" role="tablist" aria-label="Account">
+              <button id="accountTab-usage" class="account-tab active" type="button" role="tab" aria-selected="true" aria-controls="accountPane-usage" data-account-tab="usage">API usage</button>
+              <button id="accountTab-password" class="account-tab" type="button" role="tab" aria-selected="false" aria-controls="accountPane-password" tabindex="-1" data-account-tab="password">Password</button>
             </div>
 
-            <section id="usageSection" class="usage-section">
-              <div class="page-head"><h3>Usage</h3>
-                <div class="usage-actions">
-                  <select id="usagePeriod" class="workflow-select" aria-label="Breakdown period">
-                    <option value="today">Today</option><option value="7d">Last 7 days</option>
-                    <option value="cycle" selected>This billing cycle</option><option value="30d">Last 30 days</option><option value="all">All time</option>
-                  </select>
-                  <a id="usageExport" class="ghost small" download>Export CSV</a>
-                  <button id="usageRefresh" type="button" class="ghost small">Refresh</button>
+            <div id="accountPane-usage" class="account-pane" role="tabpanel" aria-labelledby="accountTab-usage">
+              <!-- Your own API key. -->
+              <div class="account-key">
+                <span class="material-symbols-outlined msym account-key-ico" aria-hidden="true">key</span>
+                <div class="account-key-text">
+                  <strong>Claude API key</strong>
+                  <p>Bring your own Claude API key — for example one that uses your Claude Max or Team plan's monthly API credits. AiScientist stores it encrypted on this server and only ever shows its last 4 characters.</p>
+                </div>
+                <div class="account-key-actions">
+                  <button id="accountKeysBtn" type="button" class="primary small">Manage API keys</button>
+                  <a class="guide-link" target="_blank" rel="noopener" data-guide>Guide: use your Claude subscription</a>
                 </div>
               </div>
-              <p id="usageNote" class="usage-note"></p>
-              <div id="usageBody"><div class="empty-hint">Loading…</div></div>
 
-              <h3>Budget</h3>
-              <p class="page-sub">Your plan's monthly API credit and the day it resets. The usage page then compares the estimated spend with it, warns you at the thresholds, and can ask for confirmation — or refuse — before a new run on your API key once a hard limit is reached. Runs on the cluster GPU cost you nothing and are never limited.</p>
-              <form id="budgetForm" class="form budget-form">
-                <label>Monthly credit (USD) <span class="hint-inline">e.g. 100 for Max 5x; blank = none</span>
-                  <input id="budgetCredit" type="number" min="0" step="0.01" placeholder="100" />
-                </label>
-                <label>Billing cycle resets on day
-                  <input id="budgetResetDay" type="number" min="1" max="31" step="1" value="1" />
-                </label>
-                <label>Warn me at (% of the credit)
-                  <input id="budgetThresholds" type="text" value="50, 80, 100" autocomplete="off" />
-                </label>
-                <label>Hard limit (USD) <span class="hint-inline">optional</span>
-                  <input id="budgetHardLimit" type="number" min="0" step="0.01" placeholder="none" />
-                </label>
-                <label>When the hard limit is reached
-                  <select id="budgetHardMode">
-                    <option value="confirm">Ask me before each new run</option>
-                    <option value="block">Block new runs until the cycle resets</option>
-                  </select>
-                </label>
-                <button type="submit" class="primary small">Save budget</button>
-              </form>
-            </section>
+              <section id="usageSection" class="usage-section" aria-labelledby="usageCycleH">
+                <div class="usage-head">
+                  <div><h3 id="usageCycleH">This billing cycle</h3><p id="usageCycle" class="usage-sub"></p></div>
+                  <button id="usageRefresh" type="button" class="secondary quiet small">Refresh</button>
+                </div>
+                <div id="usageBody"><div class="empty-hint">Loading…</div></div>
 
-            <h3>Change my password</h3>
-            <form id="changePwForm" class="form narrow">
-              <label>Current password<input id="cpOld" type="password" autocomplete="current-password" /></label>
-              <label>New password (≥6)<input id="cpNew" type="password" autocomplete="new-password" /></label>
-              <button type="submit" class="primary">Update password</button>
-            </form>
-            <button id="logoutBtn" type="button" class="ghost">Sign out</button>
+                <div class="usage-head usage-head-breakdown">
+                  <div><h3>Breakdown</h3><p id="usagePeriodTotal" class="usage-sub"></p></div>
+                  <div class="usage-actions">
+                    <select id="usagePeriod" class="workflow-select" aria-label="Breakdown period">
+                      <option value="today">Today</option><option value="7d">Last 7 days</option>
+                      <option value="cycle" selected>This billing cycle</option><option value="30d">Last 30 days</option><option value="all">All time</option>
+                    </select>
+                    <a id="usageExport" class="usage-export" download><span class="material-symbols-outlined msym" aria-hidden="true">download</span>Export CSV</a>
+                  </div>
+                </div>
+                <div id="usageBreakdown"></div>
+                <p id="usageNote" class="usage-note"></p>
+              </section>
+
+              <section id="budgetSection" class="usage-card-box budget-box" aria-labelledby="budgetH">
+                <h3 id="budgetH">Budget</h3>
+                <p class="usage-sub">Your plan's monthly API credit and the day it resets. The page compares the estimated spend with it and warns you at the thresholds; past a hard limit, a new run on your API key asks first or is refused. Runs on the cluster GPU cost you nothing and are never limited.</p>
+                <form id="budgetForm" class="form budget-form">
+                  <div class="budget-row">
+                    <label>Monthly credit (USD) <span class="hint-inline">e.g. 100 for Max 5x; blank = none</span>
+                      <input id="budgetCredit" type="number" min="0" step="0.01" placeholder="100" />
+                    </label>
+                    <label>Billing cycle resets on day
+                      <input id="budgetResetDay" type="number" min="1" max="31" step="1" value="1" />
+                    </label>
+                    <label>Warn me at (% of the credit)
+                      <input id="budgetThresholds" type="text" value="50, 80, 100" autocomplete="off" />
+                    </label>
+                  </div>
+                  <div class="budget-row budget-row-limit">
+                    <label>Hard limit (USD) <span class="hint-inline">optional</span>
+                      <input id="budgetHardLimit" type="number" min="0" step="0.01" placeholder="none" />
+                    </label>
+                    <label>When the hard limit is reached
+                      <select id="budgetHardMode">
+                        <option value="confirm">Ask me before each new run</option>
+                        <option value="block">Block new runs until the cycle resets</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div><button type="submit" class="primary small">Save budget</button></div>
+                </form>
+              </section>
+            </div>
+
+            <div id="accountPane-password" class="account-pane hidden" role="tabpanel" aria-labelledby="accountTab-password">
+              <section class="usage-card-box password-box" aria-labelledby="changePwH">
+                <h3 id="changePwH">Change my password</h3>
+                <p class="usage-sub">The password you sign in to AiScientist with. Forgot it? An admin can reset it.</p>
+                <form id="changePwForm" class="form narrow">
+                  <label>Current password<input id="cpOld" type="password" autocomplete="current-password" /></label>
+                  <label>New password <span class="hint-inline">at least 6 characters</span><input id="cpNew" type="password" autocomplete="new-password" /></label>
+                  <label>Repeat the new password<input id="cpNew2" type="password" autocomplete="new-password" /></label>
+                  <p id="cpProblem" class="form-problem hidden" role="alert"></p>
+                  <div><button type="submit" class="primary">Update password</button></div>
+                </form>
+              </section>
+            </div>
           </div>
         </section>
 
-        <!-- ===== SYSTEM view (live: agents / tools / capabilities / roadmap) ===== -->
+        <!-- ===== SYSTEM view (the pipeline from the code, the running tasks on it, tools, capabilities) ===== -->
         <section id="view-system" class="view">
           <div class="page">
             <div class="page-head"><h2>System</h2><button id="systemRefresh" class="ghost small">Refresh</button></div>
-            <p class="page-sub">What this AiScientist defines and what this server can actually run — generated live from the code.</p>
-            <h3 class="sys-graph-h">Workflow graph <span class="muted">(live — reflects the current code)</span></h3>
+            <p class="page-sub">How a run goes through AiScientist and where every task is right now — the graph is built from the running code, and the tasks on it update every second or two.</p>
+            <h3 class="sys-graph-h">Workflow <span class="muted">· stages, agents and where each tool runs · a numbered dot is a running task</span></h3>
+            <div id="systemGraph" class="sys-graph"><div class="empty-hint">Loading…</div></div>
             <div class="sys-graph-wrap">
-              <div id="systemGraph" class="sys-graph"><div class="empty-hint">Loading…</div></div>
-              <div id="systemGraphInfo" class="sys-graph-info"><div class="empty-hint">Click a node to see its details.</div></div>
+              <div id="systemRuns" class="sys-runs"><div class="empty-hint">Loading…</div></div>
+              <div id="systemGraphInfo" class="sys-graph-info"><div class="empty-hint">Click a stage, an agent or a tool to see what it does and which tasks are there now.</div></div>
             </div>
             <div id="systemBody"><div class="empty-hint">Loading…</div></div>
           </div>
@@ -734,7 +764,6 @@
   </div>
 
   <div id="toast" class="toast"></div>
-  <script src="/static/cytoscape.min.js"></script>
   <script src="/static/tus.min.js"></script>
   <script src="/static/app.js"></script>
 </body>

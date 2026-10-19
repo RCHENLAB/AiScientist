@@ -51,6 +51,21 @@ def test_an_edit_reaches_the_waiting_run_with_its_document():
         loop.close()
 
 
+def test_a_reply_in_words_carries_the_edit_that_was_not_applied_and_only_then():
+    """Typed in the document but not applied, then a change asked for in words: the lab applies the
+    edit first and makes the change on the edited plan, so the edit has to reach it."""
+    for sent, expected in (("steps:\n  - does: a\n", {"plan_yaml": "steps:\n  - does: a\n"}), ("", {})):
+        conn, loop = _conn()
+        try:
+            r = _client().post("/api/lab/plan", json={
+                "connection_id": conn.id, "action": "revise", "feedback": "drop step 2", "plan_yaml": sent})
+            assert r.status_code == 200 and r.json()["action"] == "revise"
+            assert conn.plan_value == {"action": "revise", "feedback": "drop step 2", **expected}
+        finally:
+            gw_app.CONNECTIONS.pop(conn.id, None)
+            loop.close()
+
+
 def test_a_document_far_too_large_to_be_a_plan_is_refused_and_the_review_keeps_waiting():
     conn, loop = _conn()
     try:

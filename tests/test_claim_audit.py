@@ -159,3 +159,55 @@ def test_block_puts_the_tested_counts_beside_the_file_counts():
     assert "including which classes fell below a cell floor, MUST use these" in block
     assert "matches neither table is wrong" in block
     assert res["facts"]["cells_tested_by_label_and_arm"] == {"Endothelial": {"DDX41": 5, "WT": 22}}
+
+
+def test_a_qc_only_run_gets_no_writer_and_no_audit(monkeypatch):
+    """Run 6275df1213ab (CellQC alone): the writer produced Summary, Methods, Results, Limitations and
+    Conclusion around one table, after the audit asked of each QC count whether it claimed causation
+    in a two-arm comparison. A QC-only run is answered in the chat from the tool's numbers instead."""
+    monkeypatch.setenv("AISCIENTIST_CLAIM_AUDIT", "1")
+    calls: list = []
+
+    def complete(messages):
+        calls.append(messages)
+        return "REPORT"
+
+    lab = ResearchLab(HarnessContext(decisions={"dataset_result": DDX41}, tunnel_port=1, model="m"),
+                      LabConfig(), complete_fn=complete)
+    steps = [{"tool": "run_cellqc", "ok": True, "result": {"status": "ok", "cells_before": 10}},
+             {"tool": "run_code", "ok": True, "result": {"status": "ok"}},
+             {"tool": "finish", "ok": True, "result": {}}]
+    qc = LabRound(1, 1, "CellQC", "sci", {"final_answer": "14,553 of 15,872 cells kept.", "steps": steps},
+                  CriticVerdict("accept", 0.8, ""))
+    events: list = []
+    out = lab._synthesize("Do only cellqc", [qc], events.append)
+    assert out == "14,553 of 15,872 cells kept." and calls == []
+    assert not lab._claim_audit and not [e for e in events if e.get("type") == "claim_audit"]
+    assert {"type": "synthesize", "accepted": 1, "qc_only": True} in events
+    # One analysis beyond QC and the report is written as before.
+    de = LabRound(1, 2, "DE", "sci", {"final_answer": "x", "steps": [
+        {"tool": "run_de", "ok": True, "result": {"status": "ok"}}]}, CriticVerdict("accept", 0.9, ""))
+    assert lab._synthesize("q", [qc, de], lambda e: None).startswith("REPORT") and calls
+
+
+def test_a_qc_only_run_asked_for_a_report_gets_the_writer_and_no_audit(monkeypatch):
+    """Yijun, 2026-10-18: a written report asked for on a QC-only run is the model's to write."""
+    monkeypatch.setenv("AISCIENTIST_CLAIM_AUDIT", "1")
+    calls: list = []
+
+    def complete(messages):
+        calls.append(messages)
+        return "# QC report"
+
+    lab = ResearchLab(HarnessContext(decisions={"dataset_result": DDX41}, tunnel_port=1, model="m"),
+                      LabConfig(), complete_fn=complete)
+    steps = [{"tool": "run_cellqc", "ok": True, "result": {"status": "ok", "cells_before": 10}}]
+    qc = LabRound(1, 1, "CellQC", "sci", {"final_answer": "kept 9 of 10", "steps": steps},
+                  CriticVerdict("accept", 0.8, ""))
+    events: list = []
+    out = lab._synthesize("Only run CellQC and write me a report", [qc], events.append)
+    assert out.startswith("# QC report") and len(calls) == 1          # the writer, and nothing else
+    assert "Principal Investigator writing the final research report" in calls[0][0]["content"]
+    assert "This run did quality control only, and the request asks for a written report" in \
+        calls[0][1]["content"]
+    assert not [e for e in events if e.get("type") == "claim_audit"]
