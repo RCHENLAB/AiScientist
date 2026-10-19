@@ -44,6 +44,10 @@ def _settings(**kw) -> HPCSettings:
     return HPCSettings(**kw)
 
 
+# A line only the holder's batch script contains: finds it among the recorded commands.
+HOLDER = "AiScientist worker holding"
+
+
 # The directory the gateway gives the worker: <shared_root>/Temp/<user>/scratch/worker.
 SCRATCH = "/dfs/lab/Temp/alice/scratch/worker"
 # A directory given with a shell variable in it — what the worker had before the gateway named an
@@ -103,7 +107,7 @@ def test_a_fresh_worker_is_submitted_to_the_free_cpu_partition():
                                                worker_cpus=4, worker_mem_gb=16), scratch_dir=SCRATCH)
     assert (alloc.job_id, alloc.node, alloc.reused) == ("4242", "hpc3-20-01", False)
 
-    script = next(c for c in ex.cmds if "sleep infinity" in c)
+    script = next(c for c in ex.cmds if HOLDER in c)
     assert "--partition=standard" in script
     assert "--account=ruic20_lab" in script
     assert "--cpus-per-task=4" in script and "--mem=16G" in script
@@ -117,21 +121,29 @@ def test_the_holder_script_and_log_go_to_the_scratch_dir_not_the_home_directory(
                    (r"squeue -j", "R|n1", "", 0)])
     worker.ensure_worker(ex, _settings(), scratch_dir=SCRATCH)
     name = "aiscientist-worker-alice"
-    script = next(c for c in ex.cmds if "sleep infinity" in c)
+    script = next(c for c in ex.cmds if HOLDER in c)
     assert f"#SBATCH --output={SCRATCH}/{name}-%j.log" in script
     assert f"cat > {SCRATCH}/{name}.sbatch" in script
     assert ex.matching(r"^sbatch ") == [f"sbatch {SCRATCH}/{name}.sbatch"]
     assert not any("$HOME" in c or ".bioagent" in c for c in ex.cmds)
 
 
-def test_the_holder_sleeps_rather_than_computing_a_second_deadline():
-    """Slurm's --time is the one wall limit; a hand-computed sleep would just disagree with it."""
+def test_the_holder_ends_itself_when_nothing_uses_it():
+    """Issue 23: the holder was `sleep infinity`, so it kept 4 CPUs and 16 GB of the lab's
+    allocation for its whole 8-hour limit, idle or not, and outlived a gateway that restarted. It
+    now ends itself once its heartbeat goes stale; Slurm's --time is still the hard limit."""
     ex = FakeExec([(r"squeue.*--name=", "", "", 0), (r"sbatch", "Submitted batch job 1", "", 0),
                    (r"squeue -j", "R|n1", "", 0)])
-    worker.ensure_worker(ex, _settings(worker_time_limit="08:00:00"), scratch_dir=SCRATCH)
-    script = next(c for c in ex.cmds if "sleep infinity" in c)
+    st = _settings(worker_time_limit="08:00:00", worker_idle_timeout_s=900)
+    worker.ensure_worker(ex, st, scratch_dir=SCRATCH)
+    script = next(c for c in ex.cmds if HOLDER in c)
+
+    assert "sleep infinity" not in script
     assert "--time=08:00:00" in script
-    assert not re.search(r"sleep \d", script)
+    limit = worker.holder_idle_limit_s(st)
+    assert limit == 900 + worker.HOLDER_GRACE_S, "the gateway's idle release always acts first"
+    assert f"-gt {limit} ]" in script and "exit 0" in script
+    assert f'hb={SCRATCH}/aiscientist-worker-alice-"$SLURM_JOB_ID".alive' in script
 
 
 # What a fresh submission answers, with and without a shell that expands $HOME.
@@ -141,7 +153,7 @@ _HOME = (r"^echo \$HOME", "/data/homezvol0/alice/.bioagent\n", "", 0)
 
 
 def _directives(ex: FakeExec) -> list[str]:
-    script = next(c for c in ex.cmds if "sleep infinity" in c)
+    script = next(c for c in ex.cmds if HOLDER in c)
     return [line for line in script.splitlines() if line.startswith("#SBATCH")]
 
 
@@ -289,3 +301,155 @@ def test_a_command_runs_exactly_once():
                                timeout_s=60, cpus=4)
     assert "--ntasks=1" in line
     assert "--cpus-per-task=4" in line
+
+
+# --- held only while used: heartbeat, self-exit, leftover sweep (issue 23) ----
+
+
+def test_a_fresh_and_a_reused_worker_both_carry_their_heartbeat_file():
+    """Commands on a REUSED holder must refresh its heartbeat too, or it ends under them."""
+    fresh = FakeExec([(r"squeue.*--name=", "", "", 0), (r"sbatch", "Submitted batch job 4242", "", 0),
+                      (r"squeue -j", "R|n1", "", 0)])
+    alloc = worker.ensure_worker(fresh, _settings(), scratch_dir=SCRATCH)
+    assert alloc.heartbeat == f"{SCRATCH}/aiscientist-worker-alice-4242.alive"
+
+    reused = worker.ensure_worker(FakeExec([(r"squeue.*--name=", "998877|n2", "", 0)]),
+                                  _settings(), scratch_dir=SCRATCH)
+    assert reused.reused and reused.heartbeat == f"{SCRATCH}/aiscientist-worker-alice-998877.alive"
+
+
+def test_a_command_refreshes_the_heartbeat_and_stays_one_unit():
+    import shlex
+
+    hb = f"{SCRATCH}/aiscientist-worker-alice-7.alive"
+    payload = "grep -r 'needle; rm -rf /' /data"
+    line = worker.srun_command(worker.WorkerAllocation("7", "n", heartbeat=hb), payload, timeout_s=60)
+
+    argv = shlex.split(line)
+    assert argv[:2] == ["srun", "--jobid=7"] and argv[-3:-1] == ["bash", "-c"]
+    script = argv[-1]
+    assert script.startswith(f"touch {hb} ") and f"touch {hb} 2>/dev/null; exit $rc" in script
+    assert f"sleep {worker.HEARTBEAT_EVERY_S}; do touch {hb}" in script
+    assert "timeout 60s bash -lc " + shlex.quote(payload) in script
+
+
+def _timeout_shim(tmp_path):
+    """GNU `timeout` where the host has none (macOS): drop the duration and run the rest."""
+    import os
+    import shutil
+
+    if shutil.which("timeout"):
+        return os.environ["PATH"]
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    (shim / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+    (shim / "timeout").chmod(0o755)
+    return f"{shim}:{os.environ['PATH']}"
+
+
+def test_the_heartbeat_wrapper_keeps_the_commands_output_and_exit_status(tmp_path):
+    """Executed, not just read: the wrapper passes the command's output and exit status through,
+    leaves the heartbeat touched, and returns at once — its refresher does not hold the step's
+    stdout open for another minute."""
+    import shlex
+    import subprocess
+    import time
+
+    hb = tmp_path / "w-1.alive"
+    line = worker.srun_command(worker.WorkerAllocation("1", "n", heartbeat=str(hb)),
+                               "echo out; echo err >&2; exit 3", timeout_s=30)
+    script = shlex.split(line)[-1]
+    started = time.monotonic()
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                          env={"PATH": _timeout_shim(tmp_path), "HOME": str(tmp_path)})
+    assert time.monotonic() - started < 10, "the refresher kept the command from returning"
+    assert done.returncode == 3
+    assert "out" in done.stdout and "err" in done.stderr
+    assert hb.exists()
+
+
+def _gnu_tools() -> bool:
+    import subprocess
+
+    try:
+        return subprocess.run(["bash", "-c", "stat -c %Y / && date -d @0"], capture_output=True,
+                              timeout=10).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@pytest.mark.skipif(not _gnu_tools(), reason="the holder runs on Linux (GNU stat/date)")
+def test_the_holder_exits_once_idle_and_stays_while_touched(tmp_path):
+    """Executed with a 1-second check and a 3-second limit: touched, it keeps holding; left
+    alone, it removes its heartbeat and exits 0 (the job ends, the node goes back)."""
+    import os
+    import subprocess
+    import time
+
+    script = worker._holder_script(_settings(cpu_account=None), "aiscientist-worker-alice",
+                                   str(tmp_path), check_every_s=1, idle_limit_s=3)
+    path = tmp_path / "holder.sh"
+    path.write_text(script)
+    hb = tmp_path / "aiscientist-worker-alice-55.alive"
+    proc = subprocess.Popen(["bash", str(path)], stdout=subprocess.PIPE, text=True,
+                            env={**os.environ, "SLURM_JOB_ID": "55"})
+    try:
+        for _ in range(6):                     # 6 s of use: longer than the limit
+            time.sleep(1)
+            hb.touch()
+            assert proc.poll() is None, "a holder in use must not end itself"
+        assert proc.wait(timeout=15) == 0
+        assert not hb.exists()
+        assert "releasing" in proc.stdout.read()
+    finally:
+        proc.kill()
+
+
+SWEEP_BEAT = f"{SCRATCH}/aiscientist-worker-alice-{{}}.alive"
+
+
+def _sweep(ex: FakeExec, **kw) -> list[str]:
+    return worker.sweep_stale_workers(ex, log_dir=SCRATCH, stale_after_s=900, **kw)
+
+
+def test_the_sweep_cancels_only_holders_nothing_is_using():
+    now = 1_000_000
+    ex = FakeExec([
+        (r"^squeue --me --name=aiscientist-worker-alice --states=R",
+         "11|1:02:03\n22|40:00\n33|5:00\n44|0:30\n55|2:00:00\n", "", 0),
+        (r"^date \+%s; stat",
+         f"{now}\n{SWEEP_BEAT.format(11)}|{now - 60}\n{SWEEP_BEAT.format(22)}|{now - 3600}\n"
+         f"{SWEEP_BEAT.format(55)}|{now - 5000}\n", "", 1),
+    ])
+    gone = _sweep(ex, keep={"55"})
+    # 11 in use (fresh heartbeat); 22 idle an hour; 33 has no heartbeat and is 5 min old (a holder
+    # from before the fix); 44 has none but is 30 s old (still writing it); 55 a live session's.
+    assert gone == ["22", "33"]
+    assert ex.matching(r"^scancel ") == ["scancel 22 33"]
+
+
+def test_the_sweep_is_scoped_to_your_own_named_jobs():
+    ex = FakeExec()
+    assert _sweep(ex) == []
+    (cmd,) = ex.matching("squeue")
+    assert "--me" in cmd and "--name=aiscientist-worker-alice" in cmd
+    assert ex.matching("scancel") == [] and ex.matching(r"stat -c") == []
+
+
+def test_the_sweep_never_cancels_on_a_guess():
+    """No clock from the cluster: nothing to compare a heartbeat with, so nothing is cancelled."""
+    ex = FakeExec([(r"^squeue", "22|9:00:00", "", 0), (r"^date", "", "ssh hiccup", 255)])
+    assert _sweep(ex) == [] and ex.matching("scancel") == []
+
+
+@pytest.mark.parametrize("text,secs", [("0:30", 30), ("5:00", 300), ("1:02:03", 3723),
+                                       ("2-01:00:00", 176400), ("INVALID", None), ("", None)])
+def test_squeue_elapsed_time_is_read_in_seconds(text, secs):
+    assert worker._elapsed_s(text) == secs
+
+
+def test_release_says_why():
+    said = []
+    worker.release_worker(FakeExec(), worker.WorkerAllocation("4242", "n1"),
+                          lambda *a: said.append(a), reason=" because you logged out")
+    assert said == [("info", "worker", "Released worker node n1 (job 4242) because you logged out.")]

@@ -26,7 +26,8 @@ const state = {
   presetOrder: [],             // preset-pipeline keys in load order (for the Pipelines & skills picker)
   skills: {},                  // name -> {name, summary} from /api/skills (atomic skills)
   skillOrder: [],              // atomic-skill names in load order (for the Pipelines & skills picker)
-  datasets: [],                // uploaded files/folders this session: {name, path, kind}
+  datasets: [],                // uploaded files/folders this session: {name, path, kind}, newest first
+  dataSearch: null,            // the "＋ Data" popover's search of all uploads (null = the recent list)
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
   serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
@@ -5998,18 +5999,50 @@ function renderCaseNoteChip() {
     `<button type="button" class="dataset-chip-x" data-clear-note title="Remove the case note">×</button></span>`;
 }
 
-// The popover's "Recent uploads" list — all known uploads (this session + server history).
+// The popover's upload list: the RECENT_UPLOADS newest uploads (this session + server history,
+// newest first), or, while "Search in all uploaded datasets" is open, every upload that matches.
+const RECENT_UPLOADS = 5;
+
+// The uploads whose name holds every word of `query`, newest first (all of them when empty). Not the
+// path: a managed dataset's is users/<account>/datasets/<uuid>/…, which every upload shares.
+function matchDatasets(datasets, query) {
+  const words = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+  return datasets.filter((d) => {
+    const name = String(d.name || "").toLowerCase();
+    return words.every((w) => name.includes(w));
+  });
+}
+
 function renderDataMenuRecent() {
   const host = $("dataMenuRecent");
   if (!host) return;
-  if (!state.datasets.length) { host.innerHTML = '<div class="data-menu-empty">No uploads yet</div>'; return; }
-  host.innerHTML = state.datasets.map((d) => {
+  const all = state.datasets, searching = state.dataSearch !== null;
+  const list = searching ? matchDatasets(all, state.dataSearch) : all.slice(0, RECENT_UPLOADS);
+  $("dataMenuRecentLabel").textContent = !searching ? "Recent uploads (click to add/remove)"
+    : state.dataSearch.trim() ? `${list.length} of ${all.length} uploads match` : `All ${all.length} uploads`;
+  $("dataMenuSearchRow").classList.toggle("hidden", !searching);
+  $("dataMenuSearchBtn").classList.toggle("hidden", searching || !all.length);
+  $("dataMenuSearchCount").textContent = String(all.length);
+  if (!all.length) { host.innerHTML = '<div class="data-menu-empty">No uploads yet</div>'; return; }
+  if (!list.length) { host.innerHTML = '<div class="data-menu-empty">No upload matches that</div>'; return; }
+  host.innerHTML = list.map((d) => {
     const active = state.boundPaths.includes(d.path) ? " active" : "";   // in the bind-set → checked
     const ico = datasetIcon(d.kind);
+    // A search tells same-named uploads apart by when they came and how big they are.
+    const facts = searching ? [relTime(d.at), fmtSize(d.size)].filter(Boolean).join(" · ") : "";
+    const sub = facts ? `<span class="dmr-sub">${escapeHtml(facts)}</span>` : "";
     return `<button type="button" class="data-menu-recent-item${active}" data-path="${escapeHtml(d.path)}" title="${escapeHtml(d.path)} (click to add/remove)">` +
-      `<span class="material-symbols-outlined msym">${ico}</span><span class="dmr-name">${escapeHtml(d.name)}</span>` +
+      `<span class="material-symbols-outlined msym">${ico}</span><span class="dmr-text"><span class="dmr-name">${escapeHtml(d.name)}</span>${sub}</span>` +
       (active ? `<span class="material-symbols-outlined msym dmr-check">check</span>` : "") + `</button>`;
   }).join("");
+}
+
+// Open the search of all uploads (a string, "" to start) or go back to the recent list (null).
+function setDataSearch(query) {
+  state.dataSearch = query;
+  if (query !== null && $("dataMenuSearch").value !== query) $("dataMenuSearch").value = query;
+  renderDataMenuRecent();
+  if (query !== null) $("dataMenuSearch").focus();
 }
 
 // The composer's upload line belongs to the chat the upload was started from (issue 7). Each upload
@@ -6047,6 +6080,7 @@ function toggleDataMenu(force) {
   if (!m) return;
   const show = force !== undefined ? force : m.classList.contains("hidden");
   m.classList.toggle("hidden", !show);
+  if (!show) state.dataSearch = null;   // the popover opens on the recent list again
   if (show) renderDataMenuRecent();
 }
 
@@ -6057,7 +6091,9 @@ async function loadDatasetChips() {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
     for (const x of items) {
       const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
-      if (!state.datasets.some((d) => d.path === x.path)) state.datasets.push({ name, path: x.path, kind: x.kind });
+      if (!state.datasets.some((d) => d.path === x.path)) {
+        state.datasets.push({ name, path: x.path, kind: x.kind, at: x.uploaded_at, size: x.size_bytes });
+      }
     }
   } catch { /* datasets need accounts; the list just stays empty otherwise */ }
   // Do NOT auto-select the last dataset: a fresh chat starts with an EMPTY dataset box rather than
@@ -8229,6 +8265,7 @@ function init() {
       $("serverPathInput").focus();
       return;
     }
+    if (act && act.dataset.act === "search") { setDataSearch(""); return; }
     if (act) {
       const target = { file: "datasetFile", folder: "datasetDir", note: "caseNoteFile" }[act.dataset.act];
       if (target) $(target).click();
@@ -8239,7 +8276,17 @@ function init() {
     // Toggle the file in/out of the bind-set; keep the popover OPEN so several can be picked at once.
     if (rec) { toggleBound(rec.dataset.path); }
   });
-  document.addEventListener("click", (e) => { if (!e.target.closest(".data-menu-wrap")) toggleDataMenu(false); });
+  // "Search in all uploaded datasets": the list narrows as the user types; Escape or × goes back.
+  $("dataMenuSearch").addEventListener("input", (e) => setDataSearch(e.target.value));
+  $("dataMenuSearch").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setDataSearch(null); }
+  });
+  $("dataMenuSearchClose").addEventListener("click", () => setDataSearch(null));
+  // The path as dispatched, not e.target.closest: a click on a list item re-renders the list, so by
+  // now the clicked item is detached and closest() would take it for a click outside the popover.
+  document.addEventListener("click", (e) => {
+    if (!e.composedPath().some((n) => n.classList && n.classList.contains("data-menu-wrap"))) toggleDataMenu(false);
+  });
   $("downloads").addEventListener("click", (e) => {
     if (e.target.closest("[data-rerun]")) { primeComposer("rerun"); return; }
     const tab = e.target.closest("[data-rtab]");

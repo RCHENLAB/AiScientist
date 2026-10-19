@@ -162,6 +162,22 @@ def host_allowed(url: str, allowlist: tuple[str, ...]) -> bool:
     return any(host == a or host.endswith("." + a) for a in allowlist)
 
 
+# What ``srun`` prints when the job it was pointed at is no longer there to run a step on,
+# measured on HPC3: "Slurm job N has expired" for a job that ended minutes ago (completed or
+# cancelled), "Unable to confirm allocation for job N: Invalid job id specified" once Slurm has
+# forgotten it. It refuses before the step starts, so the command has not run and asking again is
+# safe. Matched as srun's own lines on stderr: a command that prints "has expired" is not re-run.
+_ALLOCATION_GONE = re.compile(r"^srun: error: (Slurm job \d+ has expired"
+                              r"|Unable to confirm allocation for job \d+)", re.MULTILINE)
+
+
+def _allocation_gone(result: Any) -> bool:
+    """Did ``srun`` refuse because the worker had already ended (released, idle, wall limit)?"""
+    if getattr(result, "ok", True):
+        return False
+    return bool(_ALLOCATION_GONE.search(getattr(result, "stderr", "") or ""))
+
+
 @dataclass
 class HpcShell:
     """Bound tool implementations for one session.
@@ -210,14 +226,22 @@ class HpcShell:
         return self.remote.exec(command, timeout=timeout)
 
     def _worker(self, command: str, timeout_s: int | None = None):
-        """Run on the session's held CPU node, allocating one on first use."""
+        """Run on the session's held CPU node, allocating one on first use.
+
+        The node is released while idle and ends itself when nothing uses it, so it can end
+        between the provider's liveness check and the ``srun``. ``srun`` then refuses before the
+        command starts; asking the provider again gets a new node and the command runs once."""
         if self.worker_provider is None or self.run_on_worker is None:
             raise HpcShellError(
                 "This action needs the session's CPU worker node, which is not enabled. "
                 "Ask an operator to set AISCIENTIST_WORKER_NODE=1, or use a tool that only reads "
                 "file metadata.")
-        alloc = self.worker_provider()
-        return self.run_on_worker(alloc, command, int(timeout_s or self.command_timeout_s))
+        limit = int(timeout_s or self.command_timeout_s)
+        res = self.run_on_worker(self.worker_provider(), command, limit)
+        if _allocation_gone(res):
+            self._say("info", "The worker node ended before the command started; requesting another.")
+            res = self.run_on_worker(self.worker_provider(), command, limit)
+        return res
 
     def _read_path(self, path: str) -> str:
         p = self.workspace.resolve(path, self.home)

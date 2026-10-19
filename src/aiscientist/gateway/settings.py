@@ -259,15 +259,19 @@ class HPCSettings:
     # anything that moves bytes or burns CPU belongs on a node you hold. Metadata (ls/stat/du)
     # stays on the login node, where it is cheap and allowed.
     #
-    # Unlike the GPU serve job this costs nothing scarce (free `standard` partition) and holds no
-    # accelerator, so it is safe to keep for the whole session. Off by default: enabling it
-    # changes what connect does, and the shell tools that need it are themselves opt-in.
+    # It holds no accelerator, but it is charged to the lab's account and its CPUs and memory are
+    # nobody else's while it runs, so it is held only while the agent uses it: released after
+    # `worker_idle_timeout_s` without a command, and on disconnect, logout and server stop (see
+    # gateway/worker.py). Off by default: the shell tools that need it are themselves opt-in.
     worker_enabled: bool = False
     worker_cpus: int = 4
     worker_mem_gb: int = 16
-    # Long enough to outlive a working session without pinning a node overnight. Slurm kills the
-    # allocation at this wall limit; the session re-acquires one on the next command.
+    # Slurm's hard limit on one holder. An idle holder is released long before it; a busy session
+    # that reaches it gets a new holder on its next command.
     worker_time_limit: str = "08:00:00"
+    # Released after this long without a command. The holder ends itself
+    # `worker.HOLDER_GRACE_S` later if the gateway could not release it (restart, crash).
+    worker_idle_timeout_s: int = 900
     worker_startup_timeout_s: int = 180      # a free-partition CPU node should come up fast
     # Per-command wall cap for `srun --overlap` work. Distinct from the ALLOCATION's time limit:
     # this bounds one agent command so a runaway `find /` cannot hold the session forever.
@@ -558,6 +562,8 @@ class HPCSettings:
             worker_cpus=_int("AISCIENTIST_WORKER_CPUS", cls.worker_cpus),
             worker_mem_gb=_int("AISCIENTIST_WORKER_MEM_GB", cls.worker_mem_gb),
             worker_time_limit=os.environ.get("AISCIENTIST_WORKER_TIME_LIMIT", cls.worker_time_limit),
+            worker_idle_timeout_s=max(60, _int("AISCIENTIST_WORKER_IDLE_TIMEOUT_S",
+                                               cls.worker_idle_timeout_s)),
             worker_startup_timeout_s=_int("AISCIENTIST_WORKER_STARTUP_TIMEOUT_S", cls.worker_startup_timeout_s),
             worker_command_timeout_s=_int("AISCIENTIST_WORKER_COMMAND_TIMEOUT_S", cls.worker_command_timeout_s),
             variant_on_hpc=(os.environ.get("AISCIENTIST_VARIANT_ON_HPC", "").strip().lower()

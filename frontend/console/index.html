@@ -292,8 +292,14 @@
                     <div class="data-menu-sep"></div>
                     <button type="button" class="data-menu-item" data-act="note" title="Attach the patient's clinical description (.txt/.md) — it is mapped to HPO terms for the phenotype step, and does NOT replace the dataset"><span class="material-symbols-outlined msym">clinical_notes</span> Attach a case note</button>
                     <div class="data-menu-sep"></div>
-                    <div class="data-menu-label">Recent uploads (click to add/remove)</div>
+                    <div id="dataMenuRecentLabel" class="data-menu-label">Recent uploads (click to add/remove)</div>
+                    <div id="dataMenuSearchRow" class="data-menu-search hidden">
+                      <span class="material-symbols-outlined msym">search</span>
+                      <input id="dataMenuSearch" type="text" spellcheck="false" autocomplete="off" placeholder="Dataset name…" aria-label="Search all uploaded datasets" />
+                      <button id="dataMenuSearchClose" type="button" class="data-menu-search-x" title="Back to recent uploads" aria-label="Back to recent uploads"><span class="material-symbols-outlined msym">close</span></button>
+                    </div>
                     <div id="dataMenuRecent" class="data-menu-recent"></div>
+                    <button type="button" id="dataMenuSearchBtn" class="data-menu-item hidden" data-act="search" title="Find any dataset you have uploaded, by name or path, and add it to this chat"><span class="material-symbols-outlined msym">search</span> <span class="dms-text">Search in all uploaded datasets</span><span id="dataMenuSearchCount" class="dms-count"></span></button>
                   </div>
                 </div>
                 <div id="uploadStatus" class="upload-status hidden"></div>

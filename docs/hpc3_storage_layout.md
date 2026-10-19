@@ -73,7 +73,7 @@ The session's CPU worker belongs to no run and writes to `scratch/worker/` itsel
 | LIRICAL phenotype | `scratch/phenotype/` |
 | PaperQA literature | `scratch/paperqa/` |
 | report rendering (pandoc / xelatex), including the staged `render_<n>.tgz` | `scratch/report/` |
-| the session's CPU worker (holder script + log) | `scratch/worker/` |
+| the session's CPU worker (holder script, log, heartbeat) | `scratch/worker/` |
 | scGPT annotation, render review | beside their output: `scgpt/<run_id>/out/`, `vlreview/<run_id>/pass<n>/out/` |
 
 The gateway takes each of these from one function (`app._scratch_dir`), and the job classes have
@@ -86,7 +86,7 @@ somewhere else. The paths are absolute on purpose. Slurm does not expand `$HOME`
 `deploy/hpc3/aiscientist_temp_gc.sh`, staged to `<root>/bin/<ucinetid>/temp_gc.sh`.
 
 It runs as a Slurm batch job, never on a login node. The gateway's login-node session runs one
-`sbatch --wrap`; the `find` and `rm` happen on a compute node in the free `standard` partition
+`sbatch --wrap`; the `find` and `rm` happen on a compute node in the `standard` partition
 (1 CPU, 2 G, 30 min cap).
 
 A **unit** is one `Temp/<user>/<kind>/<entry>` directory: a run directory such as
@@ -130,7 +130,7 @@ owner: what this session alone left on HPC3.
 | `uploads/<ucinetid>/server-data/` | copies of server data left by earlier versions of AiScientist; nothing reads them |
 
 `deploy/hpc3/aiscientist_session_clean.sh`, staged to `<root>/bin/<ucinetid>/session_clean.sh` at
-connect. `/api/disconnect` submits it as one `sbatch --wrap` on the free CPU partition (job
+connect. `/api/disconnect` submits it as one `sbatch --wrap` on the `standard` partition (job
 `aiscientist-sessionclean-<ucinetid>`, log `bin/<ucinetid>/session_clean.log`) and then closes the
 SSH session; the job needs neither. The gateway decides the targets (`app._session_cleanup_targets`)
 and the script removes exactly those: it never lists a directory to choose what to delete.
@@ -168,6 +168,26 @@ starts a new run from it and skips the steps already done.
 restart, or a dropped connection run no cleanup: the run may still be executing, and an
 interrupted run is resumed from these very files. Those sessions are left to the sweep, which runs
 only when that user connects again.
+
+## The session's CPU worker
+
+The agent's shell tools (`run_shell`, `fetch_url`, `install_package`) and the import check before a
+`run_code` snippet run as `srun` steps on one CPU job per HPC3 user, `aiscientist-worker-<ucinetid>`
+(4 CPU, 16 G, `standard`, charged to the lab's account; only with `AISCIENTIST_WORKER_NODE=1`). The
+analysis steps do not use it: each of them submits its own job, sized for that step. The worker is
+requested on the first shell command and held only while the agent uses it.
+
+| The worker ends when | Done by |
+|---|---|
+| 15 minutes pass without a command (`AISCIENTIST_WORKER_IDLE_TIMEOUT_S`, at least 60) | the gateway (`scancel`) |
+| the session disconnects, the user logs out, the server stops, or "Stop my GPU job" is pressed | the gateway (`scancel`) |
+| the user's next session starts and nothing is using it | the gateway (`scancel`) |
+| its heartbeat goes 5 minutes past the idle timeout without a touch (the gateway crashed or restarted) | the job itself |
+| 8 hours pass (`AISCIENTIST_WORKER_TIME_LIMIT`) | Slurm |
+
+The heartbeat is `scratch/worker/aiscientist-worker-<ucinetid>-<jobid>.alive`. A command refreshes
+it when it starts, every minute while it runs and when it ends, so a long command keeps its node.
+The next shell command after a release requests a new worker.
 
 ### What still touches a login node
 

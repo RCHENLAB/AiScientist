@@ -346,7 +346,7 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .data-menu-btn .msym { font-size: 17px; }
 .data-menu-btn .data-caret { font-size: 16px; opacity: 0.7; }
 .data-menu {
-  position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 100; width: 244px;
+  position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 100; width: 284px;
   background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
   box-shadow: var(--shadow-md); padding: 6px; display: flex; flex-direction: column; gap: 2px;
 }
@@ -373,6 +373,24 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .server-path-offer .spo-more { color: var(--text-tertiary); font-size: 12px; }
 .data-menu-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); font-weight: 600; padding: 2px 10px 4px; }
 .data-menu-recent { display: flex; flex-direction: column; gap: 2px; max-height: 190px; overflow-y: auto; }
+.data-menu-search {
+  display: flex; align-items: center; gap: 6px; margin: 0 4px 4px; padding: 0 4px 0 8px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+}
+.data-menu-search:focus-within { border-color: var(--accent); }
+.data-menu-search > .msym { font-size: 17px; color: var(--text-tertiary); flex: none; }
+.data-menu-search input {
+  flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; box-shadow: none;
+  padding: 7px 0; font-size: 12.5px; color: var(--text);
+}
+.data-menu-search-x {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 24px; height: 24px; padding: 0; border-radius: 6px; background: transparent; cursor: pointer;
+}
+.data-menu-search-x:hover { background: var(--surface-sunken); }
+.data-menu-search-x .msym { font-size: 16px; color: var(--text-tertiary); }
+.dms-text { flex: 1; white-space: nowrap; }
+.dms-count { font-size: 11px; color: var(--text-tertiary); background: var(--surface-sunken); border-radius: 999px; padding: 1px 7px; }
 .data-menu-empty { font-size: 12px; color: var(--text-tertiary); padding: 6px 10px 8px; }
 .data-menu-recent-item {
   display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
@@ -383,7 +401,9 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .data-menu-recent-item .msym { font-size: 17px; color: var(--text-tertiary); flex: none; }
 .data-menu-recent-item.active { color: var(--accent); font-weight: 500; }
 .data-menu-recent-item.active .msym { color: var(--accent); }
-.dmr-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmr-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.dmr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmr-sub { font-size: 11px; font-weight: 400; color: var(--text-tertiary); }
 .dmr-check { font-size: 16px !important; color: var(--accent) !important; }
 .upload-status { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
 

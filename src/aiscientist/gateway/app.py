@@ -304,8 +304,11 @@ class Connection:
         self.alloc: gpu.GPUAllocation | None = None
         # The session's held CPU node for the agent's shell (see gateway/worker.py). Allocated
         # LAZILY on the first command that needs a compute node, so a session that only inspects
-        # files never costs one, and released on disconnect.
+        # files never costs one, and released once idle (_release_idle_worker) or on disconnect.
         self.worker_alloc: Any = None
+        self.worker_lock = threading.Lock()  # acquiring and releasing the holder never overlap
+        self.worker_last_used = 0.0          # time.monotonic() of the last command on it
+        self.worker_busy = 0                 # commands running on it right now
         self.gpu_lock = threading.Lock()   # serializes GPU/vLLM work (mid-run heal vs the provisioning thread)
         self.hpc_pysrc: str | None = None  # dfs3b dir the live AiScientist source is synced to (bind for analysis jobs)
         # Two runs starting together would each find hpc_pysrc unset and rewrite the tree the
@@ -971,6 +974,7 @@ def _ssh_connect_blocking(conn: Connection, req: ConnectRequest) -> None:
         conn.push({"type": "duo_done"})
 
     _prepare_shared_storage(conn)
+    _sweep_leftover_workers(conn)
     _resume_staging(conn)
     _start_dataset_homing(conn)
 
@@ -1531,6 +1535,27 @@ def _start_shared_llm() -> None:
 def _stop_shared_llm() -> None:
     # Stops the keeper and its tunnel. The Slurm job stays: the next process picks it up by name.
     shared_llm.stop()
+
+
+@app.on_event("shutdown")
+def _release_session_workers() -> None:
+    """``scancel`` every session's CPU worker: the sessions end with this process, and a holder
+    nobody can reach any more would sit on the lab's allocation until it ends itself."""
+    from . import worker as worker_mod
+    for conn in list(CONNECTIONS.values()):
+        alloc = getattr(conn, "worker_alloc", None)
+        if alloc is None or conn.mock or conn.executor is None:
+            continue
+        worker_mod.release_worker(conn.executor, alloc, conn.emit_fn(),
+                                  reason=" because the AiScientist server is stopping")
+        conn.worker_alloc = None
+
+
+@app.on_event("startup")
+async def _start_worker_idle_release() -> None:
+    asyncio.create_task(_worker_idle_loop())
+    if _AUTH_ENABLED and _release_workers_of not in auth_routes.LOGOUT_HOOKS:
+        auth_routes.LOGOUT_HOOKS.append(_release_workers_of)
 
 
 @app.on_event("startup")
@@ -2650,7 +2675,7 @@ async def disconnect(payload: dict, request: Request) -> JSONResponse:
     if conn.worker_alloc is not None and conn.executor is not None and not conn.mock:
         from . import worker as worker_mod
         await asyncio.to_thread(worker_mod.release_worker, conn.executor, conn.worker_alloc,
-                                conn.emit_fn())
+                                conn.emit_fn(), reason=" because the session closed")
         conn.worker_alloc = None
     # The session is over: remove what it alone left on HPC3 (its runs' working folders and its
     # copies of server datasets). Submitted as a batch job before the SSH session it rides closes.
@@ -4761,33 +4786,124 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
 
 
 def _ensure_session_worker(conn: "Connection"):
-    """This session's held CPU node, acquired on first use and reacquired if Slurm reclaimed it.
+    """This session's held CPU node, acquired on first use and reacquired if it ended (released
+    while idle, ended by itself, or reclaimed by Slurm).
 
     Lazy because most runs never need it: the typed metadata tools answer from the login node,
-    and only byte-moving work requires a node. Serialized on the GPU lock so two concurrent tool
-    calls cannot each submit a holder job.
+    and only byte-moving work requires a node. Serialized on the session's worker lock so two
+    concurrent tool calls cannot each submit a holder job, and so the idle release never cancels
+    the holder between this answer and the command it is for: the use is stamped under the lock.
     """
     from . import worker as worker_mod
 
-    with conn.gpu_lock:
+    with conn.worker_lock:
         alloc = getattr(conn, "worker_alloc", None)
-        if alloc is not None and worker_mod.worker_is_alive(conn.executor, alloc):
-            return alloc
-        if alloc is not None:
-            conn.emit("info", "worker", "The worker node's allocation ended; requesting another.")
-        alloc = worker_mod.ensure_worker(conn.executor, conn.settings, conn.emit_fn(),
-                                         scratch_dir=_scratch_dir(conn, "worker"))
-        conn.worker_alloc = alloc
+        if alloc is None or not worker_mod.worker_is_alive(conn.executor, alloc):
+            if alloc is not None:
+                conn.emit("info", "worker", "The worker node's allocation ended; requesting another.")
+            alloc = worker_mod.ensure_worker(conn.executor, conn.settings, conn.emit_fn(),
+                                             scratch_dir=_scratch_dir(conn, "worker"))
+            conn.worker_alloc = alloc
+        conn.worker_last_used = time.monotonic()
         return alloc
 
 
+_WORKER_USE_LOCK = threading.Lock()   # guards Connection.worker_busy across every session
+
+
 def _run_on_session_worker(alloc, command: str, timeout_s: int):
-    """Bridge for :class:`HpcShell` — it holds the allocation, the gateway holds the executor."""
+    """Bridge for :class:`HpcShell` — it holds the allocation, the gateway holds the executor.
+
+    Counts the command as running while it runs, so the idle release never cancels the holder
+    under a long one, and stamps its end as the session's last use."""
     from . import worker as worker_mod
     for c in CONNECTIONS.values():
         if getattr(c, "worker_alloc", None) is alloc and c.executor is not None:
-            return worker_mod.run_on_worker(c.executor, alloc, command, timeout_s=timeout_s)
+            with _WORKER_USE_LOCK:
+                c.worker_busy += 1
+            try:
+                return worker_mod.run_on_worker(c.executor, alloc, command, timeout_s=timeout_s)
+            finally:
+                with _WORKER_USE_LOCK:
+                    c.worker_busy -= 1
+                c.worker_last_used = time.monotonic()
     raise GatewayError("The session that owns this worker node is gone.", stage="worker_exec")
+
+
+def _release_idle_worker(conn: "Connection", idle_s: float, *, reason: str = "") -> bool:
+    """``scancel`` the session's CPU worker once it has gone ``idle_s`` without a command.
+
+    The holder is charged to the lab's account and its CPUs and memory are nobody else's while it
+    runs; it used to be kept until disconnect or its 8-hour wall limit, and most sessions never
+    disconnect — the browser is just closed (RCHENLAB/AiScientist issue 23). Never while a command
+    is running on it, and never while the session is acquiring one (the lock is busy: skip, the
+    next pass decides). ``idle_s=0`` releases it now unless a command is running. Returns whether
+    it released one."""
+    alloc = getattr(conn, "worker_alloc", None)
+    if alloc is None or conn.mock or conn.executor is None:
+        return False
+    if not conn.worker_lock.acquire(blocking=False):
+        return False
+    try:
+        alloc = conn.worker_alloc
+        if alloc is None or conn.worker_busy > 0:
+            return False
+        idle = time.monotonic() - conn.worker_last_used
+        if idle < idle_s:
+            return False
+        from . import worker as worker_mod
+        worker_mod.release_worker(
+            conn.executor, alloc, conn.emit_fn(),
+            reason=reason or (f" after {int(idle // 60)} min without a command; the next shell "
+                              "command requests a new one"))
+        conn.worker_alloc = None
+        return True
+    finally:
+        conn.worker_lock.release()
+
+
+async def _worker_idle_loop() -> None:
+    """Every minute, release each session's CPU worker that has gone
+    ``AISCIENTIST_WORKER_IDLE_TIMEOUT_S`` (default 15 min) without a command."""
+    while True:
+        await asyncio.sleep(60)
+        for conn in list(CONNECTIONS.values()):
+            if getattr(conn, "worker_alloc", None) is None:
+                continue
+            try:
+                await asyncio.to_thread(_release_idle_worker, conn,
+                                        conn.settings.worker_idle_timeout_s)
+            except Exception as exc:  # noqa: BLE001 - housekeeping never crashes the server
+                print(f"[worker] idle release failed: {type(exc).__name__}: {exc}")
+
+
+def _release_workers_of(user: Any) -> None:
+    """Logout: release the account's CPU worker now, unless a command is running on it. The
+    session itself stays (a login joins it again); its next shell command requests a new node."""
+    uid = getattr(user, "id", None)
+    for conn in list(CONNECTIONS.values()):
+        if uid is not None and conn.app_user_id == uid:
+            _release_idle_worker(conn, 0.0, reason=" because you logged out")
+
+
+def _sweep_leftover_workers(conn: "Connection") -> None:
+    """Cancel this HPC3 user's CPU worker jobs that nothing is using, when a session starts.
+
+    A holder left by a gateway that restarted or crashed, or by the code before issue 23 (which
+    held its node until the 8-hour limit), would otherwise sit idle on the lab's allocation. The
+    holders of this process's live sessions are kept, and so is any whose heartbeat is fresh (in
+    use from another process). Best-effort: never fails a login."""
+    if conn.mock or conn.executor is None:
+        return
+    from . import worker as worker_mod
+    keep = {getattr(c.worker_alloc, "job_id", "") for c in list(CONNECTIONS.values())
+            if getattr(c, "worker_alloc", None) is not None}
+    try:
+        worker_mod.sweep_stale_workers(
+            conn.executor, log_dir=_scratch_dir(conn, "worker"), keep=keep,
+            stale_after_s=conn.settings.worker_idle_timeout_s, emit=conn.emit_fn())
+    except Exception as exc:  # noqa: BLE001 - housekeeping must never break the login
+        print(f"[worker] leftover sweep failed: {type(exc).__name__}: {exc}")
 
 
 def _live_llm_args(conn: "Connection") -> dict[str, Any]:

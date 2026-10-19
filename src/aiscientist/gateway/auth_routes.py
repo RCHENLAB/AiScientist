@@ -25,6 +25,10 @@ from .models import (Conversation, Dataset, LlmCall, Message, PendingRegistratio
 
 router = APIRouter(prefix="/api")
 
+# Called with the user who is logging out, before the cookie is cleared. The gateway registers
+# what a logout releases on HPC3 (the account's CPU worker); a failing hook never blocks a logout.
+LOGOUT_HOOKS: list = []
+
 
 # --- dependencies ------------------------------------------------------------
 
@@ -82,7 +86,15 @@ def login(req: LoginRequest, response: Response) -> dict:
 
 
 @router.post("/auth/logout")
-def logout(response: Response) -> dict:
+def logout(request: Request, response: Response) -> dict:
+    user = current_user(request) if LOGOUT_HOOKS else None
+    if user is not None:
+        for hook in list(LOGOUT_HOOKS):
+            try:
+                hook(user)
+            except Exception as exc:  # noqa: BLE001 - housekeeping never blocks a logout
+                print(f"[auth] logout hook {getattr(hook, '__name__', hook)} failed: "
+                      f"{type(exc).__name__}: {exc}")
     response.delete_cookie(auth.COOKIE_NAME, samesite="lax", secure=auth.secure_cookies())
     return {"status": "ok"}
 

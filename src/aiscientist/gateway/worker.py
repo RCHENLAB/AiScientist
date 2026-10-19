@@ -15,11 +15,23 @@ runs — instead of a guessed-at list of forbidden command names:
     GPU job      needs an accelerator     its own sbatch; the user waits on Slurm
     access-hpc3  bulk transfer            put_file / get_file (the DTN)
 
-Mechanics: one holder job per user (``sleep`` for its wall limit) in the free CPU partition, and
-``srun --jobid=<id> --overlap`` to run each command as a step on it. ``--overlap`` is required
-since Slurm 20.11 to share the allocation with the holder step. Cost per command is one ``srun``
-(~a second), not a queue wait — which is the entire point, because a queue wait per ``ls`` is what
-makes ``run_code`` unusable as a filesystem tool.
+Mechanics: one holder job per user in the CPU partition, and ``srun --jobid=<id> --overlap`` to
+run each command as a step on it. ``--overlap`` is required since Slurm 20.11 to share the
+allocation with the holder step. Cost per command is one ``srun`` (~a second), not a queue wait —
+which is the entire point, because a queue wait per ``ls`` is what makes ``run_code`` unusable as a
+filesystem tool.
+
+The holder is charged to the lab's account and keeps its CPUs and memory from everyone else for as
+long as it runs, so it is held only while the agent is using it (RCHENLAB/AiScientist issue 23):
+
+* the gateway releases it after ``worker_idle_timeout_s`` without a command (``app.py``), and when
+  the session disconnects, the user logs out or the server stops;
+* the holder ends itself once its heartbeat file has gone that long without a touch (every command
+  refreshes it, see ``srun_command``), so a gateway that crashed or restarted cannot strand it;
+* each new session cancels the user's leftover holders that nothing is using
+  (``sweep_stale_workers``).
+
+The next command after a release requests a new holder; on the CPU partition that is a short wait.
 
 Everything here goes through the ``RemoteExecutor`` protocol, so the whole flow is testable
 offline against a scripted fake — no Slurm, no SSH.
@@ -37,8 +49,13 @@ from .slurm_job import AcquireConfig, SlurmJobError, SlurmJobSpec, acquire_alloc
 
 JOB_NAME = "aiscientist-worker"
 
-# Slurm states that mean the allocation is gone and a command cannot run on it.
-_DEAD = {"CD", "CA", "F", "TO", "NF", "PR", "OOM", "ST"}
+# How often a running command refreshes the heartbeat, and how often the holder reads it.
+HEARTBEAT_EVERY_S = 60
+# How long the holder outlives the gateway's own idle release before it ends itself. The gateway
+# acts first; the holder's limit is only the backstop for a gateway that is gone.
+HOLDER_GRACE_S = 300
+# A holder younger than this may not have written its first heartbeat yet.
+_NEW_HOLDER_S = 120
 
 
 def job_name(username: str) -> str:
@@ -47,11 +64,18 @@ def job_name(username: str) -> str:
     return f"{JOB_NAME}-{safe}"
 
 
+def heartbeat_path(log_dir: str, name: str, job_id: str) -> str:
+    """The file a holder watches: every command on it refreshes the file's mtime."""
+    return f"{log_dir.rstrip('/')}/{name}-{job_id}.alive"
+
+
 @dataclass
 class WorkerAllocation:
     job_id: str
     node: str
     reused: bool = False
+    # The holder's heartbeat file (see ``heartbeat_path``); "" runs commands without touching one.
+    heartbeat: str = ""
 
     def as_dict(self) -> dict:
         return {"job_id": self.job_id, "node": self.node, "reused": self.reused}
@@ -84,17 +108,32 @@ def _resolved_dir(executor: RemoteExecutor, path: str) -> str:
     return _RESOLVED_DIRS[key]
 
 
-def _holder_script(settings: HPCSettings, name: str, log_dir: str) -> str:
-    """A batch script whose only job is to HOLD the allocation open.
+def holder_idle_limit_s(settings: HPCSettings) -> int:
+    """Seconds without a command after which the holder ends itself."""
+    return max(60, int(settings.worker_idle_timeout_s)) + HOLDER_GRACE_S
 
-    ``sleep infinity`` rather than a computed duration: Slurm enforces the wall limit itself, and
-    a hand-computed sleep that disagrees with ``--time`` just adds a second, wrong deadline. The
-    node is released by ``--time``, by ``scancel`` on disconnect, or by the job being preempted.
+
+def _holder_script(settings: HPCSettings, name: str, log_dir: str, *,
+                   check_every_s: int = HEARTBEAT_EVERY_S, idle_limit_s: int | None = None) -> str:
+    """A batch script that holds the allocation open while the agent uses it, then ends itself.
+
+    It was ``sleep infinity``, which held 4 CPUs and 16 GB of the lab's allocation for the whole
+    8-hour wall limit whether or not the agent ever ran another command, and outlived the gateway
+    that asked for it (issue 23). Now it watches a heartbeat file that every command refreshes
+    (``srun_command``) and exits once the file has gone ``holder_idle_limit_s`` without a touch. The
+    gateway normally releases an idle holder first; this limit is what still applies when the
+    gateway restarted, crashed or lost the session. ``--time`` remains Slurm's hard wall limit.
+
+    A heartbeat that cannot be read keeps the last value seen, so a deleted file or a slow stat
+    still ends an idle holder and never makes a busy one look idle for longer than a check.
 
     ``log_dir`` must already be absolute (see ``_resolved_dir``): Slurm takes ``--output`` as
     written, relative to the submit directory.
     """
     account = f"#SBATCH --account={settings.cpu_account}\n" if settings.cpu_account else ""
+    limit = int(idle_limit_s) if idle_limit_s is not None else holder_idle_limit_s(settings)
+    # Quoted prefix + the job id from the environment: the file name carries this job's id.
+    hb = shlex.quote(f"{log_dir.rstrip('/')}/{name}-") + '"$SLURM_JOB_ID".alive'
     return (
         "#!/bin/bash\n"
         f"#SBATCH --job-name={name}\n"
@@ -104,27 +143,110 @@ def _holder_script(settings: HPCSettings, name: str, log_dir: str) -> str:
         f"#SBATCH --mem={settings.worker_mem_gb}G\n"
         f"#SBATCH --time={settings.worker_time_limit}\n"
         f"#SBATCH --output={log_dir}/{name}-%j.log\n\n"
-        'echo "AiScientist worker holding $(hostname) from $(date)"\n'
-        "sleep infinity\n"
+        f"hb={hb}\n"
+        'touch "$hb"\n'
+        'echo "AiScientist worker holding $(hostname) from $(date);'
+        f' it ends itself after {limit}s without a command"\n'
+        "last=$(date +%s)\n"
+        f"while sleep {int(check_every_s)}; do\n"
+        '  m=$(stat -c %Y "$hb" 2>/dev/null) && last=$m\n'
+        f"  if [ $(( $(date +%s) - last )) -gt {limit} ]; then\n"
+        '    echo "AiScientist worker: no command since $(date -d @$last), releasing $(hostname) at $(date)"\n'
+        '    rm -f "$hb"\n'
+        "    exit 0\n"
+        "  fi\n"
+        "done\n"
     )
 
 
-def find_running_worker(executor: RemoteExecutor, username: str = "") -> WorkerAllocation | None:
+def find_running_worker(executor: RemoteExecutor, username: str = "", *,
+                        log_dir: str = "") -> WorkerAllocation | None:
     """This user's own running worker, if one is already up.
 
     Scoped with ``squeue --me`` and the per-user job name, so a reconnect reuses your own node and
-    can never see or adopt another member's allocation.
+    can never see or adopt another member's allocation. With ``log_dir`` the allocation carries its
+    heartbeat file, so the commands run on a reused holder keep it from ending itself.
     """
     user = username or getattr(executor, "username", "") or ""
+    name = job_name(user)
     result = executor.exec(
-        f"squeue --me --name={job_name(user)} --states=R --noheader --format='%i|%N'")
+        f"squeue --me --name={name} --states=R --noheader --format='%i|%N'")
     line = (result.out or "").splitlines()[0] if getattr(result, "out", "") else ""
     if not line or "|" not in line:
         return None
     job_id, _, node = line.partition("|")
     if not job_id.strip() or not node.strip():
         return None
-    return WorkerAllocation(job_id=job_id.strip(), node=node.strip(), reused=True)
+    return WorkerAllocation(job_id=job_id.strip(), node=node.strip(), reused=True,
+                            heartbeat=heartbeat_path(log_dir, name, job_id.strip()) if log_dir else "")
+
+
+def _elapsed_s(text: str) -> int | None:
+    """squeue's ``%M`` (``M:SS``, ``H:MM:SS`` or ``D-HH:MM:SS``) in seconds; None if unreadable."""
+    text = (text or "").strip()
+    days = 0
+    if "-" in text:
+        d, _, text = text.partition("-")
+        if not d.isdigit():
+            return None
+        days = int(d)
+    parts = text.split(":")
+    if not parts or len(parts) > 3 or not all(p.isdigit() for p in parts):
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return days * 86400 + secs
+
+
+def sweep_stale_workers(executor: RemoteExecutor, *, log_dir: str, keep=(), stale_after_s: int,
+                        username: str = "", emit=None) -> list[str]:
+    """``scancel`` this user's running holders that nothing is using; returns the cancelled ids.
+
+    Called when a session starts, so a holder left by a gateway that restarted or crashed (or by
+    the code before issue 23, whose ``sleep infinity`` never ended) does not wait out its 8-hour
+    limit. A holder is left alone when its job id is in ``keep`` (a live session of this process
+    holds it) or its heartbeat was touched within ``stale_after_s`` (another process is using it).
+    One with no heartbeat file is stale once it is older than a fresh holder needs to write one.
+
+    Login-node work only: one ``squeue``, one ``stat``, one ``scancel``.
+    """
+    emit = emit or (lambda *a, **k: None)
+    user = username or getattr(executor, "username", "") or ""
+    name = job_name(user)
+    res = executor.exec(f"squeue --me --name={name} --states=R --noheader --format='%i|%M'")
+    jobs: dict[str, int | None] = {}
+    for line in (getattr(res, "out", "") or "").splitlines():
+        jid, _, elapsed = line.strip().partition("|")
+        if jid.strip().isdigit() and jid.strip() not in keep:
+            jobs[jid.strip()] = _elapsed_s(elapsed)
+    if not jobs:
+        return []
+    beats = {heartbeat_path(log_dir, name, jid): jid for jid in jobs}
+    got = executor.exec("date +%s; stat -c '%n|%Y' "
+                        + " ".join(shlex.quote(p) for p in beats) + " 2>/dev/null")
+    lines = (getattr(got, "out", "") or "").splitlines()
+    if not lines or not lines[0].strip().isdigit():
+        return []                  # no clock to compare against: never cancel on a guess
+    now = int(lines[0].strip())
+    touched: dict[str, int] = {}
+    for line in lines[1:]:
+        path, _, mtime = line.strip().rpartition("|")
+        if path in beats and mtime.isdigit():
+            touched[beats[path]] = int(mtime)
+    stale = []
+    for jid, elapsed in sorted(jobs.items()):
+        if jid in touched:
+            if now - touched[jid] > stale_after_s:
+                stale.append(jid)
+        elif elapsed is not None and elapsed > _NEW_HOLDER_S:
+            stale.append(jid)
+    if not stale:
+        return []
+    executor.exec("scancel " + " ".join(stale))       # every id came from `squeue --me`
+    emit("info", "worker", "Cancelled your CPU worker job(s) " + ", ".join(stale)
+         + " on HPC3: no session was using them.")
+    return stale
 
 
 def ensure_worker(executor: RemoteExecutor, settings: HPCSettings, emit=None, *,
@@ -139,15 +261,16 @@ def ensure_worker(executor: RemoteExecutor, settings: HPCSettings, emit=None, *,
     allocations across browser reloads — the same reasoning as ``gpu.find_running_job``.
     """
     emit = emit or (lambda *a, **k: None)
-    existing = find_running_worker(executor, getattr(executor, "username", ""))
+    user = getattr(executor, "username", "") or "user"
+    name = job_name(user)
+    # Absolute before it reaches `#SBATCH --output`, the quoted `mkdir`, the submit directory and
+    # the heartbeat path a reused holder is given.
+    log_dir = _resolved_dir(executor, scratch_dir.rstrip("/"))
+    existing = find_running_worker(executor, getattr(executor, "username", ""), log_dir=log_dir)
     if existing is not None:
         emit("info", "worker", f"Reusing your running worker node {existing.node} (job {existing.job_id}).")
         return existing
 
-    user = getattr(executor, "username", "") or "user"
-    name = job_name(user)
-    # Absolute before it reaches `#SBATCH --output`, the quoted `mkdir` and the submit directory.
-    log_dir = _resolved_dir(executor, scratch_dir.rstrip("/"))
     executor.exec(f"mkdir -p {shlex.quote(log_dir)}")
     spec = SlurmJobSpec(job_name=name, script=_holder_script(settings, name, log_dir),
                         submit_dir=log_dir)
@@ -164,7 +287,8 @@ def ensure_worker(executor: RemoteExecutor, settings: HPCSettings, emit=None, *,
             f"Could not get a CPU worker node for the agent's shell: {exc}",
             stage="worker_alloc", detail=str(exc)) from exc
     emit("success", "worker", f"Agent shell is on worker node {node} (job {job_id}).")
-    return WorkerAllocation(job_id=job_id, node=node)
+    return WorkerAllocation(job_id=job_id, node=node,
+                            heartbeat=heartbeat_path(log_dir, name, job_id))
 
 
 def worker_is_alive(executor: RemoteExecutor, alloc: WorkerAllocation) -> bool:
@@ -190,13 +314,29 @@ def srun_command(alloc: WorkerAllocation, command: str, *, timeout_s: int,
     Two independent limits, deliberately: ``--time`` is Slurm's, and the shell ``timeout`` is
     ours. Slurm's applies to the step, but a step that never starts would otherwise hang the
     caller, so the outer bound is the one that guarantees the tool call returns.
+
+    With a heartbeat file the command refreshes it when it starts, every ``HEARTBEAT_EVERY_S``
+    while it runs and when it ends, so the holder never ends itself under a long command. The
+    refresher's output goes to /dev/null: it must not hold the step's stdout open after the
+    command is done.
     """
     inner = f"timeout {int(timeout_s)}s bash -lc {shlex.quote(command)}"
+    if alloc.heartbeat:
+        inner = "bash -c " + shlex.quote(_with_heartbeat(alloc.heartbeat, inner))
     parts = ["srun", f"--jobid={shlex.quote(alloc.job_id)}", "--overlap", "--ntasks=1",
              f"--cpus-per-task={int(cpus)}", "--quiet"]
     if chdir:
         parts.append(f"--chdir={shlex.quote(chdir)}")
     return " ".join(parts) + " " + inner
+
+
+def _with_heartbeat(heartbeat: str, inner: str) -> str:
+    """``inner`` wrapped so it keeps ``heartbeat`` fresh, and keeps ``inner``'s exit status."""
+    hb = shlex.quote(heartbeat)
+    return (f"touch {hb} 2>/dev/null; "
+            f"( while sleep {HEARTBEAT_EVERY_S}; do touch {hb} 2>/dev/null; done ) "
+            "</dev/null >/dev/null 2>&1 & beat=$!; "
+            f"{inner}; rc=$?; kill $beat 2>/dev/null; touch {hb} 2>/dev/null; exit $rc")
 
 
 def run_on_worker(executor: RemoteExecutor, alloc: WorkerAllocation, command: str, *,
@@ -211,14 +351,16 @@ def run_on_worker(executor: RemoteExecutor, alloc: WorkerAllocation, command: st
     return executor.exec(line, timeout=float(timeout_s) + 30.0)
 
 
-def release_worker(executor: RemoteExecutor, alloc: WorkerAllocation | None, emit=None) -> None:
-    """``scancel`` the holder job. Best-effort: a worker left running is released by its wall
-    limit anyway, so a failure here must never break disconnect."""
+def release_worker(executor: RemoteExecutor, alloc: WorkerAllocation | None, emit=None, *,
+                   reason: str = "") -> None:
+    """``scancel`` the holder job. Best-effort: a holder left running ends itself once its
+    heartbeat goes stale, so a failure here must never break disconnect, logout or shutdown.
+    ``reason`` completes the sentence "Released worker node N (job J)"."""
     if alloc is None:
         return
     emit = emit or (lambda *a, **k: None)
     try:
-        executor.exec(f"scancel {shlex.quote(alloc.job_id)}")
-        emit("info", "worker", f"Released worker node {alloc.node} (job {alloc.job_id}).")
+        executor.exec(f"scancel {shlex.quote(alloc.job_id)}", timeout=20.0)
+        emit("info", "worker", f"Released worker node {alloc.node} (job {alloc.job_id}){reason}.")
     except Exception as exc:  # noqa: BLE001 - disconnect must not fail over housekeeping
         emit("warning", "worker", f"Could not release worker job {alloc.job_id}: {exc}")
