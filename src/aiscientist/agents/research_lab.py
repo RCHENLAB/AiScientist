@@ -6090,9 +6090,25 @@ class ResearchLab:
         return "\n".join(lines)
 
     def _bound_files_context(self) -> str:
-        """The attached files (below) and what their Croissant metadata says (``_metadata_context``)."""
-        parts = [self._attached_files_context(), self._metadata_context()]
+        """The attached files (below), what their Croissant metadata says (``_metadata_context``),
+        and the attached datasets the run cannot use (``_unusable_inputs_context``)."""
+        parts = [self._attached_files_context(), self._metadata_context(),
+                 self._unusable_inputs_context()]
         return "\n".join(p for p in parts if p)
+
+    def _unusable_inputs_context(self) -> str:
+        """The attached datasets the run start could not use, each with the reason, or ``''``. Told
+        to the planner so the plan names them instead of quietly planning around them: a plan for
+        "these two samples" was scoped to one, with the second folder taken for a stray file
+        (RCHENLAB/AiScientist issue 22)."""
+        rows = [r for r in ((self.ctx.decisions or {}).get("unusable_inputs") or [])
+                if isinstance(r, dict) and r.get("name")]
+        if not rows:
+            return ""
+        lines = ["⚠ ATTACHED BUT NOT USABLE (say so in the plan, by name and with the reason; do not "
+                 "drop them silently or plan as if they were not attached):"]
+        lines += [f"  - {r['name']}: {r.get('reason') or 'not usable'}" for r in rows[:12]]
+        return "\n".join(lines)
 
     def _metadata_context(self) -> str:
         """What the bound datasets' Croissant metadata says (RCHENLAB/AiScientist issue 9): the
@@ -6129,11 +6145,19 @@ class ResearchLab:
                    if isinstance(r, dict) and r.get("name")]
         if len(records) <= 1:
             return ""
+        layout = (self.ctx.decisions or {}).get("cellranger_layout")
+        together = {str(d) for d in ((layout or {}).get("datasets") or [])} if isinstance(layout, dict) else set()
         lines = ["Attached files (the profile above describes the PRIMARY only; run_code reads the "
-                 "others through AISCIENTIST_INPUTS, and the other tools read only the primary):"]
+                 "others through AISCIENTIST_INPUTS, and the other tools read only the primary"
+                 + ("; `run_cellqc` reads the Cell Ranger libraries of every attached folder "
+                    "marked SAMPLE FOLDER, with the primary's" if len(together) > 1 else "") + "):"]
         for r in records:
             role = str(r.get("role") or "").strip()
-            label = "PRIMARY" if r.get("primary") else (role.upper() if role else "extra file")
+            name = str(r.get("name") or "").rstrip("/")
+            label = ("PRIMARY" if r.get("primary") else
+                     "SAMPLE FOLDER" if name in together else
+                     role.upper() if role else
+                     "extra folder" if r.get("kind") == "folder" else "extra file")
             desc = r.get("description") if isinstance(r.get("description"), dict) else {}
             gist = str(desc.get("one_line_summary") or desc.get("file_kind") or "").strip()
             lines.append(f"  - {r['name']} — {label}" + (f": {gist}" if gist else ""))

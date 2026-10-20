@@ -369,6 +369,25 @@ def test_grounding_keeps_the_passages_when_paperqa_could_not_answer():
     assert "has nothing" not in text
 
 
+def test_grounding_keeps_every_passage_of_a_paper_with_its_page():
+    """search_corpus returns up to three passages of one paper. Each stays under the paper's one
+    source number, with its page and whole (a raw passage is ~1500 characters); before, only the
+    first one was kept, cut to 500 characters."""
+    from aiscientist.agents.quick_chat import _format_grounding
+
+    long_tail = "x" * 700 + " PRPF31 haploinsufficiency causes adRP."
+    text = _format_grounding({"status": "ok", "contexts": [
+        {"citation": "Smith 2020", "page": 3, "summary": "A1 " + long_tail},
+        {"citation": "Smith 2020", "page": 7, "summary": "RPGR: loss of one copy."},
+        {"citation": "Jones 2019", "page": 2, "summary": "SNRNP200."}]}, "search_corpus")
+    assert "PRPF31 haploinsufficiency" in text and "(p. 7) RPGR: loss of one copy." in text
+    assert "1. Smith 2020" in text and "2. Jones 2019" in text and "3." not in text
+    assert "(p. 3) A1" in text
+    # deep_literature's summaries keep the 500-character cut
+    short = _format_grounding({"status": "ok", "contexts": [{"citation": "S", "summary": "A1 " + long_tail}]})
+    assert "PRPF31" not in short and "\u2026" in short
+
+
 def test_grounding_for_a_search_that_ran_out_of_time_does_not_claim_an_empty_corpus():
     from aiscientist.agents.quick_chat import _format_grounding
 

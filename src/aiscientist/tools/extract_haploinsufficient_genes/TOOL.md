@@ -1,42 +1,67 @@
 ---
 name: extract_haploinsufficient_genes
-summary: Scans the whole indexed corpus for genes a paper explicitly reports as haploinsufficient in retinal disease, and writes genes.csv + hits.csv with verbatim quotes.
+summary: Finds, by model-written search requests, the genes the corpus papers explicitly report as haploinsufficient in retinal disease, and writes genes.csv + hits.csv with verbatim quotes.
 category: literature
 runs_on: hpc:literature
 order: 415
 research: false
-served_model: true
+own_gpu: true
 line: literature
 owner: literature
-cpus: 4
-mem_gb: 16
-time_limit: "04:00:00"
+cpus: 8
+mem_gb: 48
+time_limit: "06:00:00"
 ---
 # extract_haploinsufficient_genes
 
-A corpus-wide extraction, not a question answered from the top-k passages. It reads every paper in
-the PaperQA corpus (the RetiGene PDFs on dfs3b), keeps the sentences that could state a disease
-mechanism, has the session's served model classify each one, verifies that every quote is a
-verbatim sentence of the paper, and writes two tables for human review: one row per gene and one
-row per supporting sentence. Nothing in the tables comes from the model's prior knowledge: a gene
-is listed only because a corpus paper says, in its own words, that one working copy is not enough.
+A list extraction over the PaperQA corpus (the RetiGene PDFs on dfs3b), done the way
+`search_corpus` answers a question, in two rounds:
+
+1. **Requests.** The model writes 16 search requests from the definition: full sentences, each from
+   another angle (the mechanism's wording, the allele types, the evidence, the phenotypes). It is
+   told to name no gene, so the genes come from the papers and not from the model.
+2. **Retrieve.** PubMedBERT embeds each request and takes its 50 nearest chunks of the corpus text
+   cache (at most 3 per paper).
+3. **Locate.** Each chunk is read back as its paper, page and numbered sentences.
+4. **Read.** The model reads each chunk once and returns, per gene whose disease mechanism a
+   sentence states, the mechanism class, whether it is explicit, negated and about a human retinal
+   disease, the phenotype as written, and that sentence verbatim with its number.
+5. **Verify.** Every quote must be a sentence of the paper; gene symbols are normalised through
+   HGNC; the results become two tables for human review, one row per gene and one row per
+   supporting sentence.
+
+Round two repeats steps 1-4 for each gene round one read as haploinsufficient whose symbol HGNC
+knows: the model writes one request about that gene, and only chunks that name the gene are searched (15 per gene), so the other
+papers that state the same gene's mechanism are read too. Nothing in the tables comes from the
+model's prior knowledge: a gene is listed only because a corpus paper says, in its own words, that
+one working copy is not enough.
 
 ## How it is run
 
 - From the console: pick **Corpus scan** in the composer and press Send. The gateway
-  (`_run_corpus_scan`) submits one HPC3 job with a workspace of its own and puts the two CSVs in
-  the run's downloads. One pick is one scan: the composer goes back to the engine the chat was
+  (`_run_corpus_scan`) submits one HPC3 job with a workspace of its own and puts the CSVs in the
+  run's downloads. One pick is one scan: the composer goes back to the engine the chat was
   using once the scan is sent.
+- The job brings its own model (`gateway/corpus_scan.py`): it gets one GPU on the lab's paid
+  `gpu` partition (the first free A30 or A100), starts vLLM there on the node's loopback, runs the scan
+  against it and exits, which frees the card. Any session can run it, whatever model it uses
+  itself, and the session's own model is never called. The scan's model is fixed
+  (`AISCIENTIST_CORPUS_SCAN_MODEL`, else the cluster sessions' model), so the tables do not
+  depend on who asked.
+- A finished scan is kept on the Eye Server (`<data root>/corpus_scans/<key>/`), keyed by the
+  corpus files, the scan's rules (`rules_digest()`) and the model. The next request for the same
+  corpus, from Corpus scan or from a chat message asking for the haploinsufficient genes, is
+  answered from it at once; adding papers changes the key, and the next request scans again.
 - No model can call it (`research: false`, no `chat`): the PI cannot plan it and the Scientist
-  cannot run it in a Research run. It takes about an hour of the session's served model (~15,000
-  sentences to judge), and a Research run's literature job has no workspace of its own, so the
-  tables would be written outside the run. To offer it to the agents, give the research line's
-  literature executor the run's workspace first, then drop `research: false`.
+  cannot run it in a Research run. It holds a GPU while it reads every retrieved passage, and a
+  Research run's literature job has no workspace of its own, so the tables would be written outside
+  the run. To offer it to the agents, give the research line's literature executor the run's
+  workspace first, then drop `research: false`.
 
 ## What it is not for
 
 - A focused question with a prose answer ("is PRPF31 haploinsufficient?"): that is
-  `deep_literature`, in Chat or Research.
+  `search_corpus` or `deep_literature`, in Chat or Research.
 - Anything outside the indexed corpus: it reads only the papers on dfs3b.
 
 ## Inputs
@@ -44,9 +69,12 @@ is listed only because a corpus paper says, in its own words, that one working c
 <!-- generated:parameters -->
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
+| `n_requests` | integer | `16` | how many search requests the model writes for the first round |
+| `k_per_request` | integer | `50` | passages (chunks) each first-round request retrieves |
+| `k_per_gene` | integer | `15` | passages each second-round gene request retrieves, among the chunks that name the gene |
 | `max_quotes_per_gene` | integer | `3` | how many papers (PMID + verbatim quote) genes.csv lists per gene |
-| `concurrency` | integer | `16` | parallel requests to the served model while judging sentences |
-| `max_candidates` | integer | `0` | judge only the first N candidate sentences (0 = all); for a smoke test |
+| `concurrency` | integer | `16` | parallel requests to the model while it reads the passages |
+| `max_passages` | integer | `0` | read only the first N retrieved passages (0 = all); for a smoke test |
 | `pmids` | array of string | — | restrict the scan to these PMIDs (empty = the whole corpus) |
 <!-- /generated:parameters -->
 
@@ -64,19 +92,25 @@ is listed only because a corpus paper says, in its own words, that one working c
   `not_mechanism`, `other`), with `pmid`, `page`, `gene` (the HGNC symbol where the table resolves
   it), `gene_as_written`, `gene_status`, `gene_in_quote`, `gene_in_context`, `mechanism_class`,
   `explicit`, `negated`, `human_retinal`, `phenotype`, `mechanism_statement`, `quote`,
-  `quote_verified`, `cite_like`, `dominance_marker`, `garbled`, `sentence_id`, `eligible`. The
-  eligible rows are the ones genes.csv is built from.
-- `work/haploinsufficiency/`: the candidate sentences and the model's raw judgments (resumable:
-  a re-run after a timeout continues where it stopped).
-- Result: counts at each stage (papers, sentences, candidates, judged, eligible hits, genes), the
-  genes with their paper counts and flags, the two file paths, and `warnings`.
+  `quote_verified`, `cite_like`, `dominance_marker`, `garbled`, `sentence_id`, `found_by` (the
+  requests that retrieved the passage: `R3` is round-one request 3, `G:PRPF31` the gene's own
+  request), `eligible`. The eligible rows are the ones genes.csv is built from.
+- `artifacts/haploinsufficiency/requests.csv`: every search request (`id`, `round`, `gene`,
+  `request`, `n_passages` it retrieved), so a curator can see what was searched for.
+- `work/haploinsufficiency/`: `requests.json` (the requests, reused by a rerun) and
+  `judgments.jsonl` (the model's whole reply for every passage). A rerun after a timeout reads only
+  the passages without a usable reply; a reply the parser rejected is parsed again from disk first,
+  so fixing the parser costs no model call.
+- Result: counts (papers, sentences, requests, gene requests, passages read, eligible hits, genes),
+  the round-one requests, the genes with their paper counts and flags, the file paths, and
+  `warnings`.
 
 ## Where it runs
 
 <!-- generated:runs-on -->
-As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`. Its job calls the session's served model, so it is offered only to a session with a GPU allocation.
+As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`. Its job gets a GPU of its own on the lab's paid partition and starts its own model there, so the session needs no GPU allocation.
 
-Slurm resources for its job: 4 CPUs, 16 GB, up to 04:00:00.
+Slurm resources for its job: 8 CPUs, 48 GB, up to 06:00:00.
 
 Needs: `paper-qa`.
 
@@ -87,10 +121,13 @@ In the research agents' catalog: no. No model can call it: it runs only from its
 
 ## Known limits
 
+- Recall is bounded by retrieval: a paper whose statement is in no request's nearest chunks, and
+  that names no gene round one found, is never read. `k_per_request` and `n_requests` widen round
+  one; `requests.csv` and `found_by` show which request found what.
 - The corpus cache (`mechanism_cache/` next to the papers: re-extracted page text, sentences, and
   PubMedBERT chunk vectors) is built once by `scripts/build_mechanism_cache.py`; without it the
-  tool rebuilds the text in the run's `work/` (slow: minutes for the PDFs, and no semantic
-  candidates unless sentence-transformers and the embedding model are available).
+  tool rebuilds the text in the run's `work/` (minutes for the PDFs). Without sentence-transformers
+  and the embedding model the scan cannot retrieve and fails with a message saying so.
 - A quote is kept only if it is a verbatim sentence of the paper (whitespace and hyphenation
   ignored); the model cannot invent evidence, but it can still misread a sentence. The flags mark
   the cases a curator should read first: a gene whose only quotes look like reference-list
@@ -100,21 +137,27 @@ In the research agents' catalog: no. No model can call it: it runs only from its
   (`flag_gene_alias_or_unknown`), and text damaged by two-column extraction (`flag_garbled`).
 - "Retinal disease" is read broadly (retinal dystrophies and the ocular syndromes the corpus
   covers); the `phenotype` column lets the curator narrow it.
-- The judging pass needs the session's served model for about an hour. If that model goes away
-  (its Slurm job preempted or expired) the tool stops after a short streak of refused connections
-  and returns `model_unreachable` with what it judged so far; the console's corpus line brings a
-  model back and resubmits, and the rerun resumes from the kept judgments.
+- If the model goes away mid-scan (out of memory, a lost node) the tool stops after a short streak
+  of refused connections and returns `model_unreachable` with what it read so far; the console's
+  corpus line submits the job again, and the rerun resumes from the kept requests and replies. A
+  model that never starts ends the job with a `failed` result naming its log.
+- A change to the code that decides which passages are retrieved, how replies are read or how rows
+  are built needs `RULES_REVISION` bumped, or a kept scan made under the old code is reused.
+- The requests are the model's, and temperature 0 is not bit-exact across cards and batch sizes, so
+  two scans of the same corpus can differ by a few genes. A kept scan is one such run; read the
+  flagged and the unexpected genes first.
 - Recessive genes can still appear when a paper discusses NMD or dosage in a heterozygous
   carrier; the model is told to class those as `recessive_lof`, and such rows stay in hits.csv
   for review.
 
 ## Code and tests
 
-- `tool.py`: text extraction (PyMuPDF blocks, column-aware), candidate selection (keyword +
-  semantic), the per-sentence judgment, quote verification, HGNC normalisation, aggregation.
+- `tool.py`: text extraction (PyMuPDF blocks, column-aware), the request writing, retrieval
+  (`nearest_chunks`, `chunks_naming`), the per-passage reading, quote verification, HGNC
+  normalisation, aggregation.
 - `scripts/build_mechanism_cache.py`: the one-off cache build on HPC3.
-- Tests: `tests/test_extract_haploinsufficient_genes.py` (a fake model and a three-paper corpus),
-  `tests/test_corpus_route.py` (the console line).
+- Tests: `tests/test_extract_haploinsufficient_genes.py` (a fake model, a toy embedder and a
+  four-paper corpus), `tests/test_corpus_route.py` (the console line).
 
 ## What the model is told
 
@@ -122,11 +165,13 @@ Nothing while `research: false`: this is the description a model would read once
 offered to the agents.
 
 <!-- generated:model-description -->
-> Scan EVERY paper of the indexed literature corpus for genes the papers explicitly report as
-> HAPLOINSUFFICIENT in retinal disease (a heterozygous loss-of-function allele causes disease
-> because one copy is not enough; not dominant-negative, not gain-of-function, not recessive).
-> Writes genes.csv (one row per gene: HGNC symbol, phenotype and mechanism in the paper's words,
-> up to 3 PMIDs with verbatim quotes, review flags) and hits.csv (every judged sentence). Use it
-> when the user wants the complete list with evidence as a table; for one focused question use
-> deep_literature. Slow (about an hour): call it once per run.
+> Search the indexed literature corpus for genes the papers explicitly report as HAPLOINSUFFICIENT
+> in retinal disease (a heterozygous loss-of-function allele causes disease because one copy is
+> not enough; not dominant-negative, not gain-of-function, not recessive). The model writes search
+> requests, PubMedBERT retrieves the passages, the model reads each passage, and every quote is
+> checked against the paper. Writes genes.csv (one row per gene: HGNC symbol, phenotype and
+> mechanism in the paper's words, up to 3 PMIDs with verbatim quotes, review flags), hits.csv
+> (every judged sentence) and requests.csv (the search requests). Use it when the user wants the
+> list with evidence as a table; for one focused question use search_corpus or deep_literature.
+> Slow: call it once per run.
 <!-- /generated:model-description -->

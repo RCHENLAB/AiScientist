@@ -432,3 +432,25 @@ class UsageBudget(Base):
             "thresholds": self.threshold_list(), "hard_limit_usd": self.hard_limit_usd,
             "hard_limit_mode": self.hard_limit_mode or "confirm",
         }
+
+
+class ComputeUsage(Base):
+    """Measured tool calls, including failed/cancelled calls; no dataset contents."""
+
+    __tablename__ = "compute_usage"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32), index=True)
+    skill: Mapped[str] = mapped_column(String(128), index=True)
+    units: Mapped[float] = mapped_column(Float)
+    seconds: Mapped[float] = mapped_column(Float)
+    cpu_hours: Mapped[float] = mapped_column(Float)
+    gpu_hours: Mapped[float] = mapped_column(Float)
+    cost: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))
+    success: Mapped[bool] = mapped_column(Boolean)
+
+
+class ComputeEstimate(Base):
+    __tablename__ = "compute_estimates"
+    run_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    payload: Mapped[str] = mapped_column(Text)

@@ -180,6 +180,7 @@ class ToolManifest:
     needs: tuple[str, ...] = ()
     chat: bool = False
     served_model: bool = False    # the tool's HPC3 job calls the session's served model (needs a GPU allocation)
+    own_gpu: bool = False         # the tool's HPC3 job gets a GPU of its own and starts its own model there
     research: bool = True         # in the Scientist's catalog; False = only its own console line runs it
     line: str = ""
     owner: str = ""
@@ -223,8 +224,8 @@ def load_manifest(folder: Path) -> ToolManifest:
         raise ManifestError(f"{path}: runs_on {fields['runs_on']!r} is not one of {RUNS_ON}")
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
-    known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "served_model", "line", "owner",
-                              "image", "cpus", "mem_gb", "time_limit"}
+    known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "served_model", "own_gpu", "line",
+                              "owner", "image", "cpus", "mem_gb", "time_limit"}
     unknown = set(fields) - known
     if unknown:
         raise ManifestError(f"{path}: unknown field(s) {sorted(unknown)}")
@@ -240,6 +241,8 @@ def load_manifest(folder: Path) -> ToolManifest:
             raise ManifestError(f"{path}: {key} must be a positive integer")
     if time_limit and not _TIME_RE.match(time_limit):
         raise ManifestError(f"{path}: time_limit {time_limit!r} must be [D-]HH:MM:SS")
+    if fields.get("own_gpu") and fields.get("served_model"):
+        raise ManifestError(f"{path}: own_gpu and served_model exclude each other (its own model, or the session's)")
     needs = fields.get("needs") or []
     return ToolManifest(
         name=fields["name"], summary=str(fields["summary"]), category=fields["category"],
@@ -247,6 +250,7 @@ def load_manifest(folder: Path) -> ToolManifest:
         entry=str(fields.get("entry") or "tool:make_tool"),
         needs=tuple(str(n) for n in (needs if isinstance(needs, list) else [needs])),
         chat=bool(fields.get("chat", False)), served_model=bool(fields.get("served_model", False)),
+        own_gpu=bool(fields.get("own_gpu", False)),
         research=bool(fields.get("research", True)),
         line=str(fields.get("line") or ""),
         owner=str(fields.get("owner") or ""), image=image,
@@ -326,3 +330,15 @@ def runs_on(where: str) -> list[ToolManifest]:
 
 def names(ms: Iterable[ToolManifest] | None = None) -> list[str]:
     return [m.name for m in (manifests() if ms is None else ms)]
+
+
+def resource_profile(name: str) -> dict[str, Any] | None:
+    """Optional per-tool resource_profile.json; unknown tools use the estimator fallback."""
+    import json
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        return None
+    try:
+        return json.loads((TOOLS_DIR / name / "resource_profile.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None

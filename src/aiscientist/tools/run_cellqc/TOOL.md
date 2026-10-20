@@ -22,10 +22,13 @@ unchanged.
 
 ## When the agent uses it
 
-- The bound dataset is a **folder of Cell Ranger outputs**: one or more libraries, each with a raw
+- The bound data are **folders of Cell Ranger outputs**: one or more libraries, each with a raw
   AND a filtered feature-barcode matrix (`.h5`, an unpacked directory, or a 10x Cloud `.tar.gz`).
   The gateway recognises this layout at run start and tells the planner (`⚠ INPUT is a 10x Cell
-  Ranger delivery …`).
+  Ranger delivery …`). Several attached folders are read together, in one step: a folder that is
+  one library takes its dataset's name as its sample id, and a folder that cannot be used is named
+  in the result's warnings. Libraries of different species are QC'd in the same step, one CellQC
+  run per species with that species' gene sets (CellQC applies one gene set per run).
 - Single-nucleus or single-cell data alike; set `max_pct_mt` for nuclei (5 in the CellQC reference
   run) versus whole cells (CellQC's default 10).
 
@@ -56,7 +59,7 @@ unchanged.
 | `seed` | integer | `42` | random seed for CellQC's stochastic steps, so a rerun reproduces |
 | `warn_ambient_frac` | number | `0.25` | flag a library whose mean SoupX contamination is above this. An ENGINEERING guard from the CellQC validation guide, not a literature threshold |
 | `warn_retained_below` | number | `0.5` | flag a library that keeps less than this fraction of its Cell Ranger cells. An ENGINEERING guard: losing half a library usually means a threshold, or the library, is the problem |
-| `samples` | array of string | — | only these libraries (by sample id = folder name); empty = all |
+| `samples` | array of string | — | only these libraries, by sample id as the data profile lists them (the dataset's name for a folder that is one library, else its subfolder's name); empty = all |
 <!-- /generated:parameters -->
 
 ## Outputs
@@ -65,12 +68,16 @@ unchanged.
   counts in `layers["counts"]` (not the Cell Ranger matrix; `uns["counts_layer"]` and the result's
   `counts_layer` say so), log-normalised `.X` and `.raw`, highly-variable genes (per library when there are several). The
   obs keep CellQC's columns: `pct_counts_mt`/`_ribo`/`_hb`, the uncorrected `raw_*` metrics, both
-  doublet callers' scores and classes, and `nuclear_fraction` when a BAM was present.
+  doublet callers' scores and classes, and `nuclear_fraction` when a BAM was present. With
+  libraries of several species it holds the first species' libraries (the primary folder's), each
+  other species' are in `work/adata_qc.<species>.h5ad`, and the result's `checkpoints` lists them.
 - CellQC's own `result/` directory, complete and under its own name:
   - `artifacts/result/` (in the results bundle and the files browser): every file except the
     per-library matrices — `report.html`, `report_slides.pdf` and `.tex`, `metrics.csv`,
     `qc_status.csv`, `manifest.tsv`, and per library `<sample>_obs.txt.gz`, `<sample>_var.txt.gz`,
-    `<sample>_doublet_summary.txt`, `<sample>_doublet_concordance.txt`.
+    `<sample>_doublet_summary.txt`, `<sample>_doublet_concordance.txt`. With several species the
+    directory is still one: the three tables join every run's rows (with a `species` column), and
+    the report and slides are one per species (`report_<species>.html`, …).
   - `<run>/result/cellqc/` (beside the run, on HPC3 for an HPC3 run): every file, the per-library
     `<sample>.h5ad` included. It is outside `artifacts/` for the reason the processed dataset is:
     everything under artifacts is copied to the gateway after each step. `data/cellqc_result.json`
@@ -126,10 +133,11 @@ On the fast chat path: no (research runs only).
 ## What the model is told
 
 <!-- generated:model-description -->
-> CellQC quality control for a FOLDER of 10x Cell Ranger outputs (one or more libraries with raw
-> AND filtered matrices): SoupX ambient-RNA correction, count/feature/mitochondrial filtering,
-> DoubletFinder doublet removal (scDblFinder as a second opinion), and the nuclear fraction from
-> the BAM. Merges the libraries (obs 'sampleid') and writes the normalized checkpoint the later
-> tools read. Use it INSTEAD of run_scanpy_qc when the data are Cell Ranger outputs; do not run
-> run_doublet_detection after it.
+> CellQC quality control for FOLDERS of 10x Cell Ranger outputs (one or more libraries with raw
+> AND filtered matrices, in every folder bound to the run): SoupX ambient-RNA correction,
+> count/feature/mitochondrial filtering, DoubletFinder doublet removal (scDblFinder as a second
+> opinion), and the nuclear fraction from the BAM. Merges the libraries of all the bound folders
+> in one call (obs 'sampleid') and writes the normalized checkpoint the later tools read. Use it
+> INSTEAD of run_scanpy_qc when the data are Cell Ranger outputs; do not run run_doublet_detection
+> after it.
 <!-- /generated:model-description -->

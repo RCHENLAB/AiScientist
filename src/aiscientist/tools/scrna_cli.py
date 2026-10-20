@@ -32,13 +32,17 @@ ADOPT_RESULT_DATASET = "_adopt_result_dataset"
 
 class _Ctx:
     """Minimal stand-in for the harness context the scrna tools read (``.workspace`` +
-    ``.decisions['dataset_path']``, and ``['dataset_root']`` for a folder dataset)."""
+    ``.decisions['dataset_path']``, ``['dataset_root']`` for a folder dataset, and
+    ``['input_folders']`` for every folder bound to the run)."""
 
-    def __init__(self, workspace: str, dataset_path: str | None, dataset_root: str | None = None) -> None:
+    def __init__(self, workspace: str, dataset_path: str | None, dataset_root: str | None = None,
+                 input_folders: "list[dict] | None" = None) -> None:
         self.workspace = Path(workspace)
         self.decisions: dict[str, Any] = {"dataset_path": dataset_path} if dataset_path else {}
         if dataset_root:
             self.decisions["dataset_root"] = dataset_root
+        if input_folders:
+            self.decisions["input_folders"] = input_folders
 
 
 def _analysis_tools(only: str | None = None) -> dict[str, Any]:
@@ -55,7 +59,8 @@ def _analysis_tools(only: str | None = None) -> dict[str, Any]:
 
 
 def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str, Any] | None,
-             dataset_root: str | None = None) -> dict[str, Any]:
+             dataset_root: str | None = None,
+             input_folders: "list[dict] | None" = None) -> dict[str, Any]:
     """Dispatch ONE step against the workspace. ``preflight`` is the dataset smoke analysis
     (different signature); the rest are the standard ``(args, ctx) -> dict`` scrna tools."""
     args = args or {}
@@ -85,7 +90,7 @@ def run_tool(tool: str, workspace: str, dataset_path: str | None, args: dict[str
     fn = _analysis_tools(only=tool).get(tool)
     if fn is None:
         return {"status": "error", "error": f"unknown analysis tool: {tool}"}
-    return fn(args, _Ctx(workspace, dataset_path, dataset_root))
+    return fn(args, _Ctx(workspace, dataset_path, dataset_root, input_folders))
 
 
 def _load_args(raw: str) -> dict[str, Any]:
@@ -102,15 +107,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", required=True)
     ap.add_argument("--dataset", default="")
     ap.add_argument("--dataset-root", default="")
+    # Every folder bound to the run, as JSON ``[{"name", "path"}]`` (inline, or a file like --args).
+    ap.add_argument("--input-folders", default="")
     ap.add_argument("--args", default="{}")
     ns = ap.parse_args(argv)
     try:
         args = _load_args(ns.args)
+        folders = _load_args(ns.input_folders) if ns.input_folders else None
     except (json.JSONDecodeError, OSError) as exc:
-        result: dict[str, Any] = {"status": "error", "error": f"bad --args: {exc}"}
+        result: dict[str, Any] = {"status": "error", "error": f"bad --args / --input-folders: {exc}"}
     else:
         result = run_tool(ns.tool, ns.workspace, ns.dataset or None, args,
-                          dataset_root=ns.dataset_root or None)
+                          dataset_root=ns.dataset_root or None,
+                          input_folders=folders if isinstance(folders, list) else None)
     print(RESULT_MARKER + json.dumps(result))
     return 0 if result.get("status") != "error" else 1
 

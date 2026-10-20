@@ -16,6 +16,7 @@ gateway = [
   # The plan as a YAML document (agents/plan_doc.py, AISCIENTIST_PLAN_YAML). Already present on
   # every gateway host through uvicorn[standard]; named here because the code now imports it.
   "pyyaml>=6.0",
+  "sqlalchemy>=2.0",  # durable plan estimates and compute usage, including auth-free deployments
 ]
 # LangGraph execution shell (agents/lab_graph.py, LabConfig.planner="langgraph").
 # DELIBERATELY NOT part of `gateway`: installing it pulls ~19 transitive packages

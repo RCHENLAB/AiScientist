@@ -131,5 +131,7 @@ if [ "$DRY" -eq 0 ]; then
 fi
 
 [ "$QUIET" -eq 1 ] || echo "aiscientist_session_clean: removed=${removed} missing=${missing} user=${ONLY_USER}"
-# Machine-readable last line.
+# Machine-readable last lines: the job (inside Slurm), so the gateway can tell this cleanup's result
+# from a later one's, then the result.
+[ -z "${SLURM_JOB_ID:-}" ] || echo "CLEAN_JOB ${SLURM_JOB_ID}"
 echo "CLEAN_RESULT removed=${removed} missing=${missing}"

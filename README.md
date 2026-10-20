@@ -28,10 +28,12 @@ Browser ──HTTPS──▶ Envoy ingress
 1. **Sign in and connect.** The gateway opens an SSH session to HPC3 as the user, with their
    password and Duo or with a saved SSH key.
 2. **Choose the model.** The model a session chooses answers all of its calls, the tool-calling
-   Scientist included: Qwen3.8-27B in a Slurm GPU job of the user's own (it waits for a free card),
-   the lab's shared model (DeepSeek-V4-Flash, one long-lived job on several HPC3 GPUs; no wait), or
-   the user's own LLM API key (no wait; [guide](docs/claude_api_guide.md)). The gateway reaches a
-   cluster model through an SSH tunnel. What a key spends is tracked under Account › API usage; the cluster models cost nothing per token.
+   Scientist included: the lab's shared model (DeepSeek-V4-Flash, one long-lived job on several
+   HPC3 GPUs; no wait, and the default where the server keeps one), the user's own LLM API key (no
+   wait; [guide](docs/claude_api_guide.md)), or Qwen3.8-27B in a Slurm GPU job of the user's own (it
+   waits for a free card; `AISCIENTIST_SESSION_GPU` can keep this to admins). The gateway reaches a
+   cluster model through an SSH tunnel. Account › API usage shows what a key spends and the tokens
+   each chat and run used on the shared model; the cluster models cost nothing per token.
 3. **Add data.** Upload it in the browser (resumable), or point to data already on the lab server.
 4. **Ask.** A quick question is answered in the chat. A research question becomes a plan, a
    dependency graph of steps, which the user approves, edits or cancels before anything runs.
@@ -56,7 +58,7 @@ The diagrams, the code layers and the tool routing are in
   numbers are checked against the tool results before and after it is written.
 - **Every dataset and result is described.** Each carries a Croissant 1.1 `croissant.json` (files,
   checksums, table columns, ontology terms, license, and for a result its inputs and run), which its
-  owner reviews on the Datasets page and MCP clients read at `/mcp`. See
+  owner reviews in Files → Datasets and MCP clients read at `/mcp`. See
   [`docs/development/metadata.md`](docs/development/metadata.md).
 
 ## Tools, skills and pipelines
@@ -86,6 +88,25 @@ python3 -m pytest        # the test suite: offline, no cluster, .env or network 
 - **Accounts:** `aiscientist-admin` manages users from the command line.
 - **Production:** a systemd unit on the lab server behind the Envoy ingress. The runbook is
   [`deploy/README.md`](deploy/README.md).
+
+## Plan resource estimates
+
+The plan panel shows time ranges, CPU/GPU hours and cost before approval, then compares
+estimated and actual tool compute after the run. Estimates with missing sizes or little
+history are marked rough. SLURM queue waits, model serving and report overhead are excluded;
+parallel steps may overlap.
+
+Set `AISCIENTIST_CPU_HOUR_RATE` and `AISCIENTIST_GPU_HOUR_RATE` in the gateway environment
+(USD per allocated hour; zero defaults mean unpriced). Tool calls, including failures, are
+recorded in the existing database; successful runs refine later estimates for the same tool.
+SLURM uses allocation accounting where available; other measurements use wall time and
+requested resources and remain rough. Run API records expose `compute_usage`.
+
+Tools may declare `resource_profile.json` beside `TOOL.md`: `unit` (`samples`, `cells`, `gb`),
+`baseline`, and `steps`, each with `name`, requested `cpus`, `gpus`, `mem_gb` and a two-value
+`minutes` range. See `src/aiscientist/tools/run_cellqc/resource_profile.json`. Dataset metadata
+supplies the sample count, cell count or GB for scaling; Cell Ranger library counts are inferred.
+Tools without profiles use rough defaults.
 
 ## Repository layout
 

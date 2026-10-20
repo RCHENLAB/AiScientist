@@ -24,7 +24,7 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from .._lib.cellranger import describe_cellranger_layout
+from .._lib.cellranger import describe_cellranger_layout, merge_cellranger_layouts
 from .._lib.result_dataset import CELLQC_POINTER as RESULT_POINTER
 from .._lib.scrna import _dirs, _import_scanpy, _p, _rel, _schema
 from ..sdk import HarnessTool
@@ -427,9 +427,11 @@ def _counts_layer_note(ambient: str) -> str:
             "matrix: ambient RNA has already been subtracted from every cell")
 
 
-def _merge_and_preprocess(sc: Any, h5ads: list[Path], n_top_genes: int, figs: Path) -> Any:
+def _merge_and_preprocess(sc: Any, h5ads: list[Path], n_top_genes: int, figs: Path,
+                          tag: str = "") -> Any:
     """CellQC's per-library results as ONE object, in the checkpoint shape the later tools read:
-    counts in ``layers['counts']``, log-normalised ``.X`` and ``.raw``, highly-variable genes."""
+    counts in ``layers['counts']``, log-normalised ``.X`` and ``.raw``, highly-variable genes.
+    ``tag`` (a species) goes into the figure's name when several species are QC'd apart."""
     import anndata as ad  # noqa: PLC0415
     parts = [sc.read_h5ad(p) for p in h5ads]
     adata = ad.concat(parts, join="inner", merge="same") if len(parts) > 1 else parts[0]
@@ -441,7 +443,8 @@ def _merge_and_preprocess(sc: Any, h5ads: list[Path], n_top_genes: int, figs: Pa
     keys = [k for k in ("n_genes_by_counts", "total_counts", "pct_counts_mt") if k in adata.obs]
     if keys:
         sc.pl.violin(adata, keys, groupby="sampleid" if "sampleid" in adata.obs else None,
-                     multi_panel=True, show=False, save="_cellqc_after_qc.png")
+                     multi_panel=True, show=False,
+                     save=f"_cellqc_after_qc{'_' + tag if tag else ''}.png")
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
     adata.raw = adata
@@ -467,11 +470,30 @@ def _add_kept_median_mt(adata: Any, libs: list[dict[str, Any]]) -> None:
         lib["median_pct_mt_kept"] = round(float(np.median(sel)), 4) if sel.size else None
 
 
+def _input_folders(ctx: Any) -> list[dict[str, str]]:
+    """The folders this step reads, as ``{"name", "path"}``: every folder bound to the run
+    (``decisions["input_folders"]``, named as the user sees them), else the one bound folder
+    (``dataset_root``) of a run that set nothing else."""
+    decisions = getattr(ctx, "decisions", None) or {}
+    folders = [{"name": str(f.get("name") or ""), "path": str(f["path"])}
+               for f in decisions.get("input_folders") or []
+               if isinstance(f, dict) and f.get("path")]
+    if folders:
+        return folders
+    root = str(decisions.get("dataset_root") or "")
+    return [{"name": "", "path": root}] if root else []
+
+
+def _folder_name(folder: dict[str, str]) -> str:
+    return (folder["name"] or Path(folder["path"]).name).rstrip("/") + "/"
+
+
 def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
-    """CellQC over the bound folder's Cell Ranger libraries -> ``work/adata_qc.h5ad`` + CellQC's
-    own report and tables, with its validation checklist turned into warnings."""
-    root = str((getattr(ctx, "decisions", None) or {}).get("dataset_root") or "")
-    if not root or not Path(root).is_dir():
+    """CellQC over the Cell Ranger libraries of every bound folder -> ``work/adata_qc.h5ad`` +
+    CellQC's own report and tables, with its validation checklist turned into warnings."""
+    folders = _input_folders(ctx)
+    readable = [f for f in folders if Path(f["path"]).is_dir()]
+    if not readable:
         return {"status": "error", "step": "qc",
                 "error": ("run_cellqc reads a FOLDER of Cell Ranger outputs (raw + filtered matrices "
                           "per library), and the bound dataset is not one. For a single matrix or "
@@ -482,12 +504,19 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "note": ("CellQC is not available where this step ran. run_cellqc runs as an HPC3 "
                          "job in its own image; without HPC3, use run_scanpy_qc instead and say "
                          "that ambient correction was not done.")}
-    layout = describe_cellranger_layout(_paths_under(Path(root)), root)
+    parts = [(f, describe_cellranger_layout(_paths_under(Path(f["path"])), f["path"]))
+             for f in readable]
+    layout = merge_cellranger_layouts([(f["name"], part) for f, part in parts])
     if not layout:
         return {"status": "error", "step": "qc",
-                "error": (f"No Cell Ranger library under {Path(root).name}/: a library is a "
-                          "directory holding both raw_feature_bc_matrix and "
+                "error": (f"No Cell Ranger library in {', '.join(_folder_name(f) for f in readable)}: "
+                          "a library is a directory holding both raw_feature_bc_matrix and "
                           "filtered_feature_bc_matrix (.h5, a directory, or .tar.gz).")}
+    # A bound folder this step cannot use is named, never dropped without a word.
+    skipped = [f"{_folder_name(f)} could not be read where this step ran, so it was not QC'd."
+               for f in folders if f not in readable]
+    skipped += [f"{_folder_name(f)} holds no Cell Ranger library (raw AND filtered matrices), so it "
+                "was not QC'd." for f, part in parts if not part]
     wanted = [str(s) for s in (args.get("samples") or []) if str(s).strip()]
     libs = [lib for lib in layout["libraries"] if not wanted or lib["sample"] in wanted]
     if not libs:
@@ -500,146 +529,144 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "error": f"two libraries share a sample id: {sample_ids}. Rename the folders."}
 
     work, art, figs, tables = _dirs(ctx)
-    qc = work / "cellqc"
-    out = qc / "out"
-    stage_root = qc / "lnfiles"
-    for d in (qc / "home", qc / "tmp", qc / "cache", stage_root):
-        d.mkdir(parents=True, exist_ok=True)
-    warnings: list[str] = []
+    base = work / "cellqc"
+    stage_root = base / "lnfiles"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    warnings: list[str] = list(skipped)
     staged = {lib["sample"]: _stage(lib, stage_root) for lib in libs}
 
     lib_species = [(_species_from_transcriptome(_web_summary_field(Path(lib["dir"]), "Transcriptome"))
                     or _species_from_genes(staged[lib["sample"]]),
                     _web_summary_field(Path(lib["dir"]), "Transcriptome") or "gene names")
                    for lib in libs]
-    # One gene set per run: unlike a chemistry mismatch (a doublet-rate guess), a species mismatch
-    # filters one species' cells with the other's mitochondrial genes, so it is refused, not averaged.
-    by_species: dict[str, list[str]] = {}
-    for lib, (sp, _src) in zip(libs, lib_species):
-        if sp:
-            by_species.setdefault(sp, []).append(lib["sample"])
-    if len(by_species) > 1:
-        groups = "; ".join(f"{sp}: {', '.join(names)}" for sp, names in sorted(by_species.items()))
-        return {"status": "error", "step": "qc", "species_by_library": by_species,
-                "error": (f"The libraries are from different species ({groups}). CellQC applies one "
-                          "mitochondrial and ribosomal gene set per run, so one species would be "
-                          "filtered with the other's genes. QC one species at a time: pass `samples` "
-                          "with one species' libraries, or bind each species' folders as a separate "
-                          "dataset.")}
-    species, species_src = _resolve(str(_p(_TOOL, "species", args)), lib_species, "human",
-                                    "species", warnings)
-    chemistry, chem_src = _resolve(
-        str(_p(_TOOL, "chemistry", args)),
-        [_chemistry(Path(lib["dir"])) for lib in libs], "next_gem", "10x chemistry", warnings)
+    groups = _species_groups(libs, lib_species, str(_p(_TOOL, "species", args)), warnings)
+    several = len(groups) > 1
     decider = str(_p(_TOOL, "doublet_decider", args))
-    callers = ["doubletfinder", "scdblfinder"]
     comparer = str(_p(_TOOL, "ambient_compare", args) or "").strip()
     ambient = str(_p(_TOOL, "ambient_method", args))
     nreaction = int(_p(_TOOL, "nreaction", args))
-    config = {
-        "seed": int(_p(_TOOL, "seed", args)),
-        "ambient": {"method": ambient,
-                    "compare": [comparer] if comparer and comparer != ambient else []},
-        "filterbycount": {"mincount": int(_p(_TOOL, "min_counts", args)),
-                          "minfeature": int(_p(_TOOL, "min_features", args)),
-                          "mito": float(_p(_TOOL, "max_pct_mt", args))},
-        "geneset": _GENESETS[species],
-        "doublet": {"run": callers, "decider": decider, "findpK": False, "pK": 0.01,
-                    "numthreads": 5, "rate": _DOUBLET_RATE[chemistry], "capacity": _CAPACITY,
-                    "nreaction": nreaction},
-    }
-    # CellQC reads YAML, and JSON is YAML: no YAML writer needed in any image.
-    (qc / "config.yaml").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    with (qc / "samples.txt").open("w", encoding="utf-8") as fh:
-        fh.write("sample\tcellranger\tnreaction\n")
-        for lib in libs:
-            fh.write(f"{lib['sample']}\t{staged[lib['sample']]}\t{nreaction}\n")
 
-    threads = int(os.environ.get("AISCIENTIST_JOB_CPUS") or os.cpu_count() or 4)
-    env = {**os.environ, "HOME": str(qc / "home"), "TMPDIR": str(qc / "tmp"),
-           "XDG_CACHE_HOME": str(qc / "cache"), "MPLBACKEND": "Agg"}
-    log = qc / "cellqc.log"
-    base_cmd = [cellqc, "-d", str(out), "-t", str(threads), "-c", str(qc / "config.yaml")]
-    if _run([*base_cmd, "-n", "--", str(qc / "samples.txt")], qc, env, log) != 0:
+    # One CellQC run per species (one gene set per run), each in its own directory when there are
+    # several; a single species keeps the one directory it always had.
+    runs: list[dict[str, Any]] = []
+    for species, species_src, members in groups:
+        qc = base / species if several else base
+        chemistry, chem_src = _resolve(
+            str(_p(_TOOL, "chemistry", args)),
+            [_chemistry(Path(lib["dir"])) for lib in members], "next_gem", "10x chemistry", warnings)
+        done = _run_cellqc_once(cellqc, members, staged, species, chemistry, qc, args)
+        done.update(species=species, species_src=species_src, chemistry=chemistry,
+                    chem_src=chem_src, libs=members)
+        if done.get("error") and not several:
+            return {"status": "error", "step": "qc", **{k: done[k] for k in ("error", "log") if k in done}}
+        if done.get("error"):
+            warnings.append(f"The {species} libraries ({', '.join(lib['sample'] for lib in members)}) "
+                            f"were not QC'd: {done['error'][:600]}")
+            continue
+        if done["rc"] != 0:
+            warnings.append(f"CellQC exited with status {done['rc']} although {len(done['h5ads'])} "
+                            f"librar{'y' if len(done['h5ads']) == 1 else 'ies'} reached result/ — most "
+                            "often the slide deck (a LaTeX step) failed. The QC'd matrices and metrics "
+                            f"are used; check cellqc/{species + '/' if several else ''}cellqc.log.")
+        done["summaries"] = [{**_library_summary(r, decider, comparer), "species": species}
+                             for r in done["metric_rows"]]
+        warnings.extend(_validate(done["summaries"], done["status_rows"], done["manifest_rows"], args))
+        runs.append(done)
+    if not runs:
         return {"status": "error", "step": "qc",
-                "error": "CellQC rejected the configuration (dry run failed): " + _tail(log, 1500)}
-    rc = _run([*base_cmd, "--", str(qc / "samples.txt")], qc, env, log)
-    if rc != 0 and "older modification time" in _tail(log, 20000):
-        # An intermittent CellQC publish bug (hard-linked outputs keep their source's timestamp),
-        # not a clock problem; the CellQC skill's remedy is a fresh output directory.
-        shutil.rmtree(out, ignore_errors=True)
-        rc = _run([*base_cmd, "--", str(qc / "samples.txt")], qc, env, log)
-
-    result_dir = out / "result"
-    manifest_rows = _read_csv(result_dir / "manifest.tsv", "\t")
-    status_rows = _read_csv(result_dir / "qc_status.csv")
-    metric_rows = _read_csv(result_dir / "metrics.csv")
-    included = [r["sample"] for r in manifest_rows
-                if str(r.get("included", "")).strip().lower() in ("true", "1", "yes")]
-    h5ads = [result_dir / f"{s}.h5ad" for s in included if (result_dir / f"{s}.h5ad").is_file()]
-    if not h5ads:
-        return {"status": "error", "step": "qc",
-                "error": f"CellQC produced no usable library (exit {rc}): " + _tail(log, 2000),
-                "log": str(log)}
-    if rc != 0:
-        warnings.append(f"CellQC exited with status {rc} although {len(h5ads)} librar"
-                        f"{'y' if len(h5ads) == 1 else 'ies'} reached result/ — most often the "
-                        "slide deck (a LaTeX step) failed. The QC'd matrices and metrics are used; "
-                        "check cellqc/cellqc.log.")
-
-    lib_summaries = [_library_summary(r, decider, comparer) for r in metric_rows]
-    warnings.extend(_validate(lib_summaries, status_rows, manifest_rows, args))
+                "error": "CellQC produced no usable library for any species: " + " ".join(warnings)[-2000:]}
 
     try:
         sc = _import_scanpy()
     except ImportError as exc:
         return {"status": "error", "step": "qc", "error": f"scanpy is missing: {exc}"}
-    adata = _merge_and_preprocess(sc, h5ads, int(_p(_TOOL, "n_top_genes", args)), figs)
-    _add_kept_median_mt(adata, lib_summaries)
-    adata.uns["cellqc"] = {"species": species, "chemistry": chemistry, "decider": decider,
-                           "ambient_method": ambient, "libraries": included}
     # What the counts layer IS. CellQC writes the AMBIENT-CORRECTED matrix, so these are not Cell
     # Ranger's counts: checked on run f3b8268c4fd4 (SoupX), every cell's total was lower and the
     # layer summed to 97.4% of the filtered matrix, yet its manuscript called the layer "pre-SoupX".
     counts_layer = _counts_layer_note(ambient)
-    adata.uns["counts_layer"] = counts_layer
-    _plain_strings(adata)                   # HVG / plotting may have added text columns
-    adata.write(work / "adata_qc.h5ad")
+    checkpoints: dict[str, dict[str, Any]] = {}
+    first = None
+    for i, done in enumerate(runs):
+        # Later steps read adata_qc.h5ad: the first species' (the primary folder's). Another species'
+        # libraries are not merged into it (their genes are other genes); each has its own file.
+        adata = _merge_and_preprocess(sc, done["h5ads"], int(_p(_TOOL, "n_top_genes", args)), figs,
+                                      tag=done["species"] if several else "")
+        _add_kept_median_mt(adata, done["summaries"])
+        adata.uns["cellqc"] = {"species": done["species"], "chemistry": done["chemistry"],
+                               "decider": decider, "ambient_method": ambient,
+                               "libraries": done["included"]}
+        adata.uns["counts_layer"] = counts_layer
+        _plain_strings(adata)                   # HVG / plotting may have added text columns
+        name = "adata_qc.h5ad" if i == 0 else f"adata_qc.{done['species']}.h5ad"
+        adata.write(work / name)
+        checkpoints[done["species"]] = {"checkpoint": name, "libraries": done["included"],
+                                        "cells": int(adata.n_obs), "genes": int(adata.n_vars),
+                                        "n_hvg": int(adata.var["highly_variable"].sum())
+                                        if "highly_variable" in adata.var else 0}
+        if first is None:
+            first = checkpoints[done["species"]]
+    if several:
+        names = {sp: c["checkpoint"] for sp, c in checkpoints.items()}
+        warnings.append(
+            "The libraries are from different species ("
+            + "; ".join(f"{d['species']}: {', '.join(lib['sample'] for lib in d['libs'])}" for d in runs)
+            + "). CellQC applies one mitochondrial, ribosomal and hemoglobin gene set per run, so each "
+            "species was QC'd in its own CellQC run with its own gene sets. Later steps read the "
+            f"{runs[0]['species']} libraries' checkpoint ({names[runs[0]['species']]}); "
+            + "; ".join(f"the {sp} libraries' QC'd data is work/{n}" for sp, n in names.items()
+                        if n != "adata_qc.h5ad")
+            + ". All their CellQC files are in result/.")
 
-    # CellQC's own result/ directory, complete: see _publish_result for what goes where.
+    # CellQC's own result/ directory, complete: see _publish_result for what goes where. Several
+    # species' runs are put in ONE flat directory (the download and "Save to my data" read it so).
+    result_dir = runs[0]["result_dir"] if not several else _combine_results(runs, base / "result")
+    included = [s for done in runs for s in done["included"]]
     copied, cellqc_result = _publish_result(result_dir, work.parent, art, included)
     if (result_dir / "metrics.csv").is_file():
         shutil.copy2(result_dir / "metrics.csv", tables / "cellqc_metrics.csv")
     figures = [_rel(art, p) for p in sorted(figs.glob("*cellqc_after_qc*.png"))]
 
+    lib_summaries = [lib for done in runs for lib in done["summaries"]]
     n_mt = [lib["n_mt_genes"] for lib in lib_summaries if lib["n_mt_genes"] is not None]
     cells_before = sum(lib["cells_cellranger"] or 0 for lib in lib_summaries)
-    return {
+    cells_after = sum(c["cells"] for c in checkpoints.values())
+    head = runs[0]
+    config = head["config"]
+    species_note = ("; ".join(f"{d['species']} for {', '.join(d['included'])} ({d['species_src']})"
+                    for d in runs) if several else head["species_src"])
+    chem_note = ("; ".join(f"{d['chemistry']} for the {d['species']} libraries ({d['chem_src']})"
+                 for d in runs) if several else head["chem_src"])
+    out = {
         "status": "ok",
         "step": "qc",
         "method": "CellQC 0.3.6 (SoupX ambient correction, count/feature/mito filtering, "
                   "DoubletFinder + scDblFinder, nuclear fraction)",
         "libraries": lib_summaries,
-        "n_libraries": len(h5ads),
+        "n_libraries": sum(len(d["h5ads"]) for d in runs),
         "excluded_libraries": [s for s in sample_ids if s not in included],
         "cells_before": cells_before,
-        "cells_after": int(adata.n_obs),
-        "genes_after": int(adata.n_vars),
-        "n_hvg": int(adata.var["highly_variable"].sum()) if "highly_variable" in adata.var else 0,
-        "pct_cells_removed": round(100.0 * (cells_before - adata.n_obs) / cells_before, 2)
+        "cells_after": cells_after,
+        "genes_after": first["genes"],
+        "n_hvg": first["n_hvg"],
+        "pct_cells_removed": round(100.0 * (cells_before - cells_after) / cells_before, 2)
         if cells_before else 0.0,
         "n_mt_genes": min(n_mt) if n_mt else 0,
         "mt_filter_effective": bool(n_mt) and min(n_mt) > 0,
         "thresholds": {"min_counts": config["filterbycount"]["mincount"],
                        "min_features": config["filterbycount"]["minfeature"],
                        "max_pct_mt": config["filterbycount"]["mito"]},
-        "assumptions": {"species": [species, species_src], "chemistry": [chemistry, chem_src],
-                        "doublet_rate": f"{_DOUBLET_RATE[chemistry]} at {_CAPACITY} cells per "
-                                        "reaction", "nreaction": [nreaction, "set by the caller"
-                                                                  if args.get("nreaction") else
-                                                                  "default 1 (not measured; confirm)"]},
+        "assumptions": {"species": [head["species"] if not several else
+                                    "+".join(d["species"] for d in runs), species_note],
+                        "chemistry": [head["chemistry"] if not several else
+                                      "+".join(d["chemistry"] for d in runs), chem_note],
+                        "doublet_rate": "; ".join(dict.fromkeys(
+                            f"{_DOUBLET_RATE[d['chemistry']]} at {_CAPACITY} cells per reaction"
+                            for d in runs)),
+                        "nreaction": [nreaction, "set by the caller" if args.get("nreaction") else
+                                      "default 1 (not measured; confirm)"]},
         "ambient": {"applied": ambient, "compared": comparer or "none"},
-        "doublets": {"decider": decider, "callers": callers, "removed_upstream": True},
+        "doublets": {"decider": decider, "callers": ["doubletfinder", "scdblfinder"],
+                     "removed_upstream": True},
         "warnings": warnings,
         "obs_sample_key": "sampleid",
         "layers": ["counts"],
@@ -656,24 +683,155 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                                    "per-library .h5ad included): downloadable as one zip, and "
                                    "saveable to the user's data as a dataset. The bundle's result/ "
                                    "holds every file except the matrices.")},
-        "read_from": f"the bound folder ({Path(root).name}/)",
+        "read_from": (f"the bound folder{'s' if len(readable) > 1 else ''} "
+                      f"({', '.join(_folder_name(f) for f, part in parts if part)})"),
         "raw_data_to_llm": False,
     }
+    if several:
+        out["checkpoints"] = checkpoints
+    return out
+
+
+def _species_groups(libs: list[dict[str, Any]], lib_species: "list[tuple[str, str]]", choice: str,
+                    warnings: list[str]) -> "list[tuple[str, str, list[dict[str, Any]]]]":
+    """The libraries as ``(species, how it was decided, libraries)`` groups, one CellQC run each.
+
+    CellQC applies one gene set per run, and a species mismatch filters one species' cells with the
+    other's mitochondrial genes (the 2026-10-02 test folder: human cells filtered on mouse "^mt-"),
+    so it is never averaged. Libraries of different species are QC'd in separate runs instead: the
+    two folders of RCHENLAB/AiScientist issue 22 were a human and a mouse library, and the run used
+    to refuse them. The species of the FIRST library (the primary folder's) comes first. A library
+    whose species cannot be read joins that first group, with a warning; a species set by the
+    caller applies to every library."""
+    if choice != "auto":
+        return [(choice, "set by the caller", list(libs))]
+    by_species: dict[str, list[dict[str, Any]]] = {}
+    source: dict[str, str] = {}
+    for lib, (sp, src) in zip(libs, lib_species):
+        if sp:
+            by_species.setdefault(sp, []).append(lib)
+            source.setdefault(sp, src)
+    if len(by_species) <= 1:
+        species, src = _resolve(choice, lib_species, "human", "species", warnings)
+        return [(species, src, list(libs))]
+    unknown = [lib for lib, (sp, _src) in zip(libs, lib_species) if not sp]
+    groups = [(sp, f"read from Cell Ranger output ({source[sp]})", members)
+              for sp, members in by_species.items()]
+    if unknown:
+        groups[0][2].extend(unknown)
+        warnings.append(f"Could not read the species of {', '.join(lib['sample'] for lib in unknown)}; "
+                        f"QC'd with the {groups[0][0]} libraries. State this assumption, or set "
+                        "`species` and pass `samples`.")
+    return groups
+
+
+def _run_cellqc_once(cellqc: str, libs: list[dict[str, Any]], staged: dict[str, Path], species: str,
+                     chemistry: str, qc: Path, args: dict[str, Any]) -> dict[str, Any]:
+    """Configure and run CellQC once, over ``libs`` (one species), in ``qc``: dry run, run, and what
+    it wrote. ``{"error", "log"}`` when nothing usable came out."""
+    for d in (qc / "home", qc / "tmp", qc / "cache"):
+        d.mkdir(parents=True, exist_ok=True)
+    out = qc / "out"
+    nreaction = int(_p(_TOOL, "nreaction", args))
+    comparer = str(_p(_TOOL, "ambient_compare", args) or "").strip()
+    ambient = str(_p(_TOOL, "ambient_method", args))
+    config = {
+        "seed": int(_p(_TOOL, "seed", args)),
+        "ambient": {"method": ambient,
+                    "compare": [comparer] if comparer and comparer != ambient else []},
+        "filterbycount": {"mincount": int(_p(_TOOL, "min_counts", args)),
+                          "minfeature": int(_p(_TOOL, "min_features", args)),
+                          "mito": float(_p(_TOOL, "max_pct_mt", args))},
+        "geneset": _GENESETS[species],
+        "doublet": {"run": ["doubletfinder", "scdblfinder"],
+                    "decider": str(_p(_TOOL, "doublet_decider", args)), "findpK": False, "pK": 0.01,
+                    "numthreads": 5, "rate": _DOUBLET_RATE[chemistry], "capacity": _CAPACITY,
+                    "nreaction": nreaction},
+    }
+    # CellQC reads YAML, and JSON is YAML: no YAML writer needed in any image.
+    (qc / "config.yaml").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    with (qc / "samples.txt").open("w", encoding="utf-8") as fh:
+        fh.write("sample\tcellranger\tnreaction\n")
+        for lib in libs:
+            fh.write(f"{lib['sample']}\t{staged[lib['sample']]}\t{nreaction}\n")
+
+    threads = int(os.environ.get("AISCIENTIST_JOB_CPUS") or os.cpu_count() or 4)
+    env = {**os.environ, "HOME": str(qc / "home"), "TMPDIR": str(qc / "tmp"),
+           "XDG_CACHE_HOME": str(qc / "cache"), "MPLBACKEND": "Agg"}
+    log = qc / "cellqc.log"
+    base_cmd = [cellqc, "-d", str(out), "-t", str(threads), "-c", str(qc / "config.yaml")]
+    if _run([*base_cmd, "-n", "--", str(qc / "samples.txt")], qc, env, log) != 0:
+        return {"error": "CellQC rejected the configuration (dry run failed): " + _tail(log, 1500)}
+    rc = _run([*base_cmd, "--", str(qc / "samples.txt")], qc, env, log)
+    if rc != 0 and "older modification time" in _tail(log, 20000):
+        # An intermittent CellQC publish bug (hard-linked outputs keep their source's timestamp),
+        # not a clock problem; the CellQC skill's remedy is a fresh output directory.
+        shutil.rmtree(out, ignore_errors=True)
+        rc = _run([*base_cmd, "--", str(qc / "samples.txt")], qc, env, log)
+
+    result_dir = out / "result"
+    manifest_rows = _read_csv(result_dir / "manifest.tsv", "\t")
+    included = [r["sample"] for r in manifest_rows
+                if str(r.get("included", "")).strip().lower() in ("true", "1", "yes")]
+    h5ads = [result_dir / f"{s}.h5ad" for s in included if (result_dir / f"{s}.h5ad").is_file()]
+    if not h5ads:
+        return {"error": f"CellQC produced no usable library (exit {rc}): " + _tail(log, 2000),
+                "log": str(log)}
+    return {"rc": rc, "log": log, "config": config, "result_dir": result_dir,
+            "manifest_rows": manifest_rows, "status_rows": _read_csv(result_dir / "qc_status.csv"),
+            "metric_rows": _read_csv(result_dir / "metrics.csv"), "included": included,
+            "h5ads": h5ads}
+
+
+# The tables every CellQC run writes once for all its libraries: several species' runs are joined
+# row by row, with the species named. Every other shared file (the report, its slides) keeps one
+# copy per species, named after it; a library's own files carry its sample id already.
+_COMBINED_TABLES = {"metrics.csv": ",", "manifest.tsv": "\t", "qc_status.csv": ","}
+
+
+def _combine_results(runs: list[dict[str, Any]], dest: Path) -> Path:
+    """Several species' CellQC ``result/`` directories as one flat directory in ``dest``."""
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    tables: dict[str, list[dict[str, str]]] = {name: [] for name in _COMBINED_TABLES}
+    for done in runs:
+        samples = done["included"] or [lib["sample"] for lib in done["libs"]]
+        for src in sorted(p for p in done["result_dir"].iterdir() if p.is_file()
+                          and not p.name.startswith(".")):
+            if src.name in _COMBINED_TABLES:
+                tables[src.name] += [{**row, "species": done["species"]}
+                                     for row in _read_csv(src, _COMBINED_TABLES[src.name])]
+            elif any(src.name.startswith(f"{s}.") or src.name.startswith(f"{s}_") for s in samples):
+                _link_or_copy(src, dest / src.name)
+            else:
+                _link_or_copy(src, dest / f"{src.stem}_{done['species']}{src.suffix}")
+    for name, rows in tables.items():
+        if not rows:
+            continue
+        fields = list(dict.fromkeys(k for row in rows for k in row))
+        with (dest / name).open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields, delimiter=_COMBINED_TABLES[name], restval="")
+            w.writeheader()
+            w.writerows(rows)
+    return dest
 
 
 def make_tool() -> HarnessTool:
     """The ``run_cellqc`` record for the Scientist's catalog (see ``TOOL.md``)."""
     return HarnessTool(
         _TOOL,
-        "CellQC quality control for a FOLDER of 10x Cell Ranger outputs (one or more libraries with "
-        "raw AND filtered matrices): SoupX ambient-RNA correction, count/feature/mitochondrial "
-        "filtering, DoubletFinder doublet removal (scDblFinder as a second opinion), and the "
-        "nuclear fraction from the BAM. Merges the libraries (obs 'sampleid') and writes the "
+        "CellQC quality control for FOLDERS of 10x Cell Ranger outputs (one or more libraries with "
+        "raw AND filtered matrices, in every folder bound to the run): SoupX ambient-RNA "
+        "correction, count/feature/mitochondrial filtering, DoubletFinder doublet removal "
+        "(scDblFinder as a second opinion), and the nuclear fraction from the BAM. Merges the "
+        "libraries of all the bound folders in one call (obs 'sampleid') and writes the "
         "normalized checkpoint the later tools read. Use it INSTEAD of run_scanpy_qc when the data "
         "are Cell Ranger outputs; do not run run_doublet_detection after it.",
         _schema(_TOOL, samples={
             "type": "array", "items": {"type": "string"},
-            "description": "only these libraries (by sample id = folder name); empty = all"}),
+            "description": ("only these libraries, by sample id as the data profile lists them "
+                            "(the dataset's name for a folder that is one library, else its "
+                            "subfolder's name); empty = all")}),
         run_cellqc,
         reads_private_data=True, category="qc", requires=("scanpy",),
     )

@@ -1,14 +1,20 @@
-"""extract_haploinsufficient_genes without HPC3: a fake model, a three-paper text corpus, and a PDF
-drawn with PyMuPDF for the extractor. What the tests pin down is the contract the curator relies
-on — a gene is listed only from an explicit, verified, heterozygous-context statement; the other
-mechanism classes stay in hits.csv; the review flags fire; a rerun resumes."""
+"""extract_haploinsufficient_genes without HPC3: a fake model, a toy embedder, a small text corpus,
+and a PDF drawn with PyMuPDF for the extractor. What the tests pin down is the contract the curator
+relies on — the passages come from the model's own search requests; a gene is listed only from an
+explicit, verified, heterozygous-context statement; the other mechanism classes stay in hits.csv;
+round two reads the other papers about a gene round one found; the review flags fire; a rerun
+resumes without asking the model twice."""
 from __future__ import annotations
 
 import csv
+import io
 import json
+import re
 import types
+import urllib.error
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from aiscientist.tools.extract_haploinsufficient_genes import tool as hi
@@ -22,21 +28,45 @@ ABCA4_SENT = ("Nonsense-mediated decay of the ABCA4 transcript was observed in t
 REF_TITLE = ("Haploinsufficiency of the splicing factor gene PRP31 underlies autosomal dominant retinitis "
              "pigmentosa on chromosome 19q13.4 (RP11)")
 REF_SENT = "Vithana EN, Abu-Safieh L, Allen MJ, Carey A, Papaioannou M. " + REF_TITLE + "."
+# A paper that never says "haploinsufficiency": only the gene's own request in round two finds it.
+DOSAGE_SENT = ("Fibroblasts from heterozygous PRPF31 carriers expressed half the normal amount of PRPF31 "
+               "protein, so one functional copy is not enough in adRP.")
+
+PAPERS = {
+    "11111111": ["Retinitis pigmentosa is a heterogeneous disease with many causal genes.", PRPF31_SENT,
+                 "Patients carried heterozygous deletions in PRPF31 and had typical adRP."],
+    "22222222": ["Rhodopsin mutations are the commonest cause of adRP in most populations.", RHO_SENT,
+                 "Transgenic mice confirm this finding in photoreceptors."],
+    "33333333": ["Stargardt disease is recessive in almost every reported family.", ABCA4_SENT,
+                 "Neuron 2001;29:125-132.", REF_SENT, "Nat Genet 1999;22:111-112."],
+}
+EXTRA = {"44444444": ["Splicing factor genes are expressed in every tissue of the eye.", DOSAGE_SENT,
+                      "The retina appears to be the tissue most sensitive to this reduction."]}
+
+REQUESTS = ["Heterozygous null alleles cause dominant retinitis pigmentosa through haploinsufficiency.",
+            "One functional copy of the gene is not enough, so haploinsufficiency causes the retinal disease.",
+            "Haploinsufficiency rather than a dominant-negative effect explains the dominant retinal dystrophy."]
+
+ANSWERS = {
+    PRPF31_SENT: {"gene": "PRPF31", "mechanism_class": "haploinsufficiency", "explicit": True, "negated": False,
+                  "human_retinal": True, "phenotype": "autosomal dominant retinitis pigmentosa"},
+    RHO_SENT: {"gene": "RHO", "mechanism_class": "dominant_negative", "explicit": True, "negated": True,
+               "human_retinal": True, "phenotype": "adRP"},
+    ABCA4_SENT: {"gene": "ABCA4", "mechanism_class": "recessive_lof", "explicit": True, "negated": False,
+                 "human_retinal": True, "phenotype": "Stargardt disease"},
+    REF_SENT: {"gene": "PRP31", "mechanism_class": "haploinsufficiency", "explicit": True, "negated": False,
+               "human_retinal": True, "phenotype": "adRP"},
+    DOSAGE_SENT: {"gene": "PRPF31", "mechanism_class": "haploinsufficiency", "explicit": True, "negated": False,
+                  "human_retinal": True, "phenotype": "adRP"},
+}
 
 
-def _corpus(tmp_path: Path) -> Path:
-    """A pre-built text cache: three papers, one chunk each."""
+def _corpus(tmp_path: Path, extra: bool = False) -> Path:
+    """A pre-built text cache: one chunk per paper."""
     root = tmp_path / "retigene"
     cache = root / "mechanism_cache"
     cache.mkdir(parents=True)
-    papers = {
-        "11111111": ["Retinitis pigmentosa is a heterogeneous disease with many causal genes.", PRPF31_SENT,
-                     "Patients carried heterozygous deletions in PRPF31 and had typical adRP."],
-        "22222222": ["Rhodopsin mutations are the commonest cause of adRP in most populations.", RHO_SENT,
-                     "Transgenic mice confirm this finding in photoreceptors."],
-        "33333333": ["Stargardt disease is recessive in almost every reported family.", ABCA4_SENT,
-                     "Neuron 2001;29:125-132.", REF_SENT, "Nat Genet 1999;22:111-112."],
-    }
+    papers = {**PAPERS, **(EXTRA if extra else {})}
     with (cache / "sentences.jsonl").open("w") as sf, (cache / "chunks.jsonl").open("w") as cf:
         for pmid, sents in papers.items():
             cf.write(json.dumps({"pmid": pmid, "chunk": 0, "page": 1, "text": " ".join(sents)}) + "\n")
@@ -51,6 +81,7 @@ def _corpus(tmp_path: Path) -> Path:
         w.writerow(["11111111.pdf", "PRPF31 haploinsufficiency in adRP families", "11111111"])
         w.writerow(["22222222.pdf", "Dominant-negative rhodopsin", "22222222"])
         w.writerow(["33333333.pdf", REF_TITLE, "33333333"])
+        w.writerow(["44444444.pdf", "PRPF31 protein levels in carrier fibroblasts", "44444444"])
     with (root / "hgnc_complete_set.txt").open("w") as fh:
         fh.write("hgnc_id\tsymbol\talias_symbol\tprev_symbol\n")
         fh.write("HGNC:1\tPRPF31\tPRP31\tRP11\n")
@@ -59,40 +90,51 @@ def _corpus(tmp_path: Path) -> Path:
     return root
 
 
-def _target(messages) -> str:
-    return messages[1]["content"].split("TARGET: ", 1)[1].split("\nCONTEXT AFTER:")[0]
+def _embed(texts):
+    """A toy PubMedBERT: one axis for the mechanism's word, one for PRPF31, a little of everything."""
+    return np.array([[1.0 if "haploinsufficiency" in t.lower() else 0.0, 1.0 if "PRPF31" in t else 0.0, 0.1]
+                     for t in texts], dtype="float32")
 
 
-def _fake_model(calls: list[str] | None = None):
-    """Answers like the served Qwen would for the four mechanism sentences; nothing for the rest."""
-    def judge(messages):
-        target = _target(messages)
+def _system(messages) -> str:
+    return messages[0]["content"]
+
+
+def _passage(messages) -> tuple[str, list[str]]:
+    """The PMID and the numbered sentences of a passage prompt."""
+    user = messages[1]["content"]
+    pmid = re.search(r"PMID (\d+)", user).group(1)
+    return pmid, [m.group(1) for m in re.finditer(r"^\[\d+\] (.*)$", user, re.M)]
+
+
+def _fake_model(calls: list[str] | None = None, written: list[str] | None = None):
+    """Writes the requests, and reads a passage like the served Qwen would: one item per mechanism
+    sentence it knows, nothing for the rest."""
+    def model(messages):
+        system = _system(messages)
+        if system == hi.GENE_REQUESTS_SYSTEM:
+            genes = [line.split(" — ")[0] for line in messages[1]["content"].splitlines()]
+            if written is not None:
+                written.extend(genes)
+            return json.dumps({"requests": {g: f"Heterozygous loss of {g} causes adRP through haploinsufficiency."
+                                            for g in genes}})
+        if system != hi.JUDGE_SYSTEM:
+            if written is not None:
+                written.append("round1")
+            return json.dumps({"requests": REQUESTS})
+        pmid, sents = _passage(messages)
         if calls is not None:
-            calls.append(target)
-        if target == PRPF31_SENT:
-            items = [{"gene": "PRPF31", "mechanism_class": "haploinsufficiency", "explicit": True,
-                      "negated": False, "human_retinal": True, "phenotype": "autosomal dominant retinitis pigmentosa",
-                      "quote": PRPF31_SENT}]
-        elif target == RHO_SENT:
-            items = [{"gene": "RHO", "mechanism_class": "dominant_negative", "explicit": True, "negated": True,
-                      "human_retinal": True, "phenotype": "adRP", "quote": RHO_SENT}]
-        elif target == ABCA4_SENT:
-            items = [{"gene": "ABCA4", "mechanism_class": "recessive_lof", "explicit": True, "negated": False,
-                      "human_retinal": True, "phenotype": "Stargardt disease", "quote": ABCA4_SENT}]
-        elif target == REF_SENT:
-            items = [{"gene": "PRP31", "mechanism_class": "haploinsufficiency", "explicit": True, "negated": False,
-                      "human_retinal": True, "phenotype": "adRP", "quote": REF_SENT}]
-        else:
-            items = []
+            calls.append(pmid)
+        items = [{**ANSWERS[s], "sentence": k + 1, "quote": s} for k, s in enumerate(sents) if s in ANSWERS]
         return json.dumps({"items": items})
-    return judge
+    return model
 
 
 def _ctx(tmp_path: Path, monkeypatch, root: Path):
     monkeypatch.setenv("AISCIENTIST_PAPERQA_PAPERS", str(root / "papers"))
     monkeypatch.setenv("AISCIENTIST_PAPERQA_MANIFEST", str(root / "paperqa_manifest.csv"))
     ws = tmp_path / "run"
-    ws.mkdir(exist_ok=True)
+    ws.mkdir(parents=True, exist_ok=True)
     return types.SimpleNamespace(model="qwen", llm_base_url="http://unused:1/v1", tunnel_port=None,
                                  workspace=ws, decisions={}, llm_is_remote=False)
 
@@ -102,10 +144,14 @@ def _read(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
+def _run(ctx, model, args=None):
+    return hi.run_extract(args or {}, ctx, judge_fn=model, embed_fn=_embed, log=lambda s: None)
+
+
 def test_only_explicit_verified_heterozygous_statements_make_genes_csv(tmp_path, monkeypatch):
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
-    res = hi.run_extract({}, ctx, judge_fn=_fake_model(), embed_fn=None, log=lambda s: None)
+    res = _run(ctx, _fake_model())
     assert res["status"] == "ok", res
     genes = _read(ctx.workspace / res["files"]["genes_csv"])
     hits = _read(ctx.workspace / res["files"]["hits_csv"])
@@ -126,77 +172,136 @@ def test_only_explicit_verified_heterozygous_statements_make_genes_csv(tmp_path,
     assert by_gene["RHO"]["mechanism_class"] == "dominant_negative" and by_gene["RHO"]["eligible"] == "False"
     assert by_gene["ABCA4"]["mechanism_class"] == "recessive_lof" and by_gene["ABCA4"]["eligible"] == "False"
     assert res["n_genes"] == 1 and res["genes"][0]["gene"] == "PRPF31"
-    assert any("keyword only" in w for w in res["warnings"])   # no embedder in the test
+    # Every hit says which request found its passage; the requests are a table of their own.
+    assert all(h["found_by"] for h in hits)
+    reqs = _read(ctx.workspace / res["files"]["requests_csv"])
+    assert [r["request"] for r in reqs if r["round"] == "1"] == REQUESTS
+    assert [r["gene"] for r in reqs if r["round"] == "2"] == ["PRPF31"]
+    assert res["n_requests"] == 3 and res["n_gene_requests"] == 1 and res["requests"] == REQUESTS
+    assert res["n_passages"] == 3 and res["n_judged"] == 3 and not res["warnings"]
+
+
+def test_each_passage_is_read_once_and_the_requests_name_no_gene(tmp_path, monkeypatch):
+    root = _corpus(tmp_path)
+    ctx = _ctx(tmp_path, monkeypatch, root)
+    calls: list[str] = []
+    res = _run(ctx, _fake_model(calls))
+    assert res["status"] == "ok"
+    assert sorted(calls) == ["11111111", "22222222", "33333333"]     # one call per passage, never per sentence
+    assert "Do NOT name any specific gene" in hi.REQUESTS_SYSTEM
+
+
+def test_round_two_reads_the_papers_round_one_missed(tmp_path, monkeypatch):
+    """Round one retrieves the passages that read like the mechanism; the paper that states PRPF31's
+    dosage without the word is found by PRPF31's own request, among the chunks naming PRPF31.
+    The vectors are cached next to the text."""
+    root = _corpus(tmp_path, extra=True)
+    ctx = _ctx(tmp_path, monkeypatch, root)
+    calls: list[str] = []
+    res = _run(ctx, _fake_model(calls), {"k_per_request": 3})
+    assert res["status"] == "ok", res
+    assert (root / "mechanism_cache" / "chunk_vecs.npy").exists()
+    assert calls[-1] == "44444444" and calls.count("44444444") == 1
+    genes = _read(ctx.workspace / res["files"]["genes_csv"])
+    assert genes[0]["gene"] == "PRPF31" and genes[0]["n_papers"] == "3"
+    dosage = [h for h in _read(ctx.workspace / res["files"]["hits_csv"]) if h["pmid"] == "44444444"][0]
+    assert dosage["found_by"] == "G:PRPF31" and dosage["eligible"] == "True"
+    # Without round two, the paper is never read.
+    ctx2 = _ctx(tmp_path / "b", monkeypatch, root)
+    res2 = _run(ctx2, _fake_model(), {"k_per_request": 3, "k_per_gene": 0})
+    assert res2["n_gene_requests"] == 0
+    assert _read(ctx2.workspace / res2["files"]["genes_csv"])[0]["n_papers"] == "2"
 
 
 def test_a_quote_the_paper_does_not_contain_is_rejected(tmp_path, monkeypatch):
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
+    base = _fake_model()
 
     def invented(messages):
-        if _target(messages) == PRPF31_SENT:
+        if _system(messages) == hi.JUDGE_SYSTEM and _passage(messages)[0] == "11111111":
             return json.dumps({"items": [{"gene": "PRPF31", "mechanism_class": "haploinsufficiency",
                                           "explicit": True, "negated": False, "human_retinal": True,
-                                          "phenotype": "adRP",
+                                          "phenotype": "adRP", "sentence": 2,
                                           "quote": "PRPF31 haploinsufficiency causes adRP in every family."}]})
-        return json.dumps({"items": []})
+        if _system(messages) == hi.JUDGE_SYSTEM:
+            return json.dumps({"items": []})
+        return base(messages)
 
-    res = hi.run_extract({}, ctx, judge_fn=invented, embed_fn=None, log=lambda s: None)
+    res = _run(ctx, invented)
     assert res["status"] == "ok" and res["n_genes"] == 0
     hits = _read(ctx.workspace / res["files"]["hits_csv"])
     assert hits and hits[0]["quote_verified"] == "False" and hits[0]["eligible"] == "False"
+    assert hits[0]["sentence_id"] == "11111111:0:1"          # filed under the sentence number it gave
 
 
-def test_rerun_resumes_and_retries_only_failed_calls(tmp_path, monkeypatch):
+def test_rerun_resumes_and_retries_only_failed_passages(tmp_path, monkeypatch):
     monkeypatch.setattr(hi.time, "sleep", lambda s: None)
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
     calls: list[str] = []
-    base = _fake_model(calls)
+    written: list[str] = []
+    base = _fake_model(calls, written)
 
     def flaky(messages):
-        if _target(messages) == PRPF31_SENT:
+        if _system(messages) == hi.JUDGE_SYSTEM and _passage(messages)[0] == "11111111":
             raise OSError("connection reset")
         return base(messages)
 
-    res1 = hi.run_extract({"concurrency": 2}, ctx, judge_fn=flaky, embed_fn=None, log=lambda s: None)
+    res1 = _run(ctx, flaky, {"concurrency": 2})
     assert res1["status"] == "ok"
-    assert any("could not be judged" in w for w in res1["warnings"])
+    assert any("could not be read" in w for w in res1["warnings"])
     # Without the body sentence, PRPF31 rests on the reference-list entry alone (and is flagged so).
     genes1 = _read(ctx.workspace / res1["files"]["genes_csv"])
     assert [(g["gene"], g["n_papers"], g["flag_only_cited_titles"]) for g in genes1] == [("PRPF31", "1", "True")]
-    n_first = len(calls)
     calls.clear()
-    res2 = hi.run_extract({"concurrency": 2}, ctx, judge_fn=base, embed_fn=None, log=lambda s: None)
+    written.clear()
+    res2 = _run(ctx, base, {"concurrency": 2})
     assert res2["status"] == "ok" and res2["n_genes"] == 1
-    assert calls == [PRPF31_SENT], "only the failed sentence is re-judged"
-    assert n_first > 1
+    assert calls == ["11111111"], "only the failed passage is read again"
+    assert written == [], "the kept requests are reused, not written again"
     genes2 = _read(ctx.workspace / res2["files"]["genes_csv"])
     assert genes2[0]["n_papers"] == "2" and genes2[0]["flag_only_cited_titles"] == "False"
 
 
-def test_semantic_candidates_use_the_chunk_vectors(tmp_path, monkeypatch):
-    """With an embedder, a chunk near a mechanism query brings in its soft-marker sentences even
-    without a keyword hit; the vectors are cached next to the text."""
-    import numpy as np
+def test_a_reply_the_parser_rejected_is_parsed_again_without_a_model_call(tmp_path, monkeypatch):
+    """The whole reply is kept: after a parser fix, the rerun reads it from disk instead of paying
+    for the passage again."""
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
+    monkeypatch.setattr(hi.time, "sleep", lambda s: None)
+    base = _fake_model()
+    real_parse = hi.parse_items
 
-    def embed(texts):
-        return np.array([[1.0, 0.0] if ("PRPF31" in t or "haploinsufficiency" in t) else [0.0, 1.0] for t in texts],
-                        dtype="float32")
+    def chatty(messages):
+        reply = base(messages)
+        return "Here is the JSON you asked for:\n" + reply if _system(messages) == hi.JUDGE_SYSTEM else reply
 
-    res = hi.run_extract({}, ctx, judge_fn=_fake_model(), embed_fn=embed, log=lambda s: None)
-    assert res["status"] == "ok"
-    assert (root / "mechanism_cache" / "chunk_vecs.npy").exists()
-    cands = {c["sid"]: c for c in map(json.loads, (ctx.workspace / "work" / "haploinsufficiency" / "candidates.jsonl").open())}
-    # "Patients carried heterozygous deletions ..." has no keyword tag but sits in the hot chunk.
-    assert cands["11111111:0:2"]["kw"] == [] and cands["11111111:0:2"]["sem"] is True
-    assert "11111111:0:0" not in cands                       # no soft marker: not a candidate
-    assert not any("keyword only" in w for w in res["warnings"])
+    def strict(text):                          # the old parser: bare JSON only
+        return None if not text.lstrip().startswith("{") else real_parse(text)
+
+    monkeypatch.setattr(hi, "parse_items", strict)
+    res1 = _run(ctx, chatty)
+    assert res1["status"] == "failed" and res1["n_judged"] == 0
+    monkeypatch.setattr(hi, "parse_items", real_parse)
+
+    def must_not_read(messages):
+        assert _system(messages) != hi.JUDGE_SYSTEM, "a kept reply was sent to the model again"
+        return base(messages)
+
+    res2 = _run(ctx, must_not_read)
+    assert res2["status"] == "ok" and res2["n_genes"] == 1
 
 
-def test_without_corpus_or_model_the_tool_says_so(tmp_path, monkeypatch):
+def test_max_passages_caps_a_smoke_test(tmp_path, monkeypatch):
+    root = _corpus(tmp_path)
+    ctx = _ctx(tmp_path, monkeypatch, root)
+    calls: list[str] = []
+    res = _run(ctx, _fake_model(calls), {"max_passages": 1})
+    assert res["status"] == "ok" and res["n_passages"] == 1 and len(calls) == 1
+
+
+def test_without_corpus_model_or_embedder_the_tool_says_so(tmp_path, monkeypatch):
     monkeypatch.delenv("AISCIENTIST_PAPERQA_PAPERS", raising=False)
     ctx = types.SimpleNamespace(model="qwen", llm_base_url="http://x/v1", tunnel_port=None,
                                 workspace=tmp_path, decisions={}, llm_is_remote=False)
@@ -205,6 +310,18 @@ def test_without_corpus_or_model_the_tool_says_so(tmp_path, monkeypatch):
     ctx = _ctx(tmp_path, monkeypatch, root)
     ctx.model = None
     assert hi.run_extract({}, ctx, log=lambda s: None)["status"] == "not_enabled"
+    ctx.model = "qwen"
+    monkeypatch.setattr(hi, "sentence_transformer_embed", lambda hf: None)
+    res = hi.run_extract({}, ctx, judge_fn=_fake_model(), log=lambda s: None)
+    assert res["status"] == "failed" and "PubMedBERT" in res["error"]
+
+
+def test_unusable_requests_fail_the_scan_plainly(tmp_path, monkeypatch):
+    monkeypatch.setattr(hi.time, "sleep", lambda s: None)
+    root = _corpus(tmp_path)
+    ctx = _ctx(tmp_path, monkeypatch, root)
+    res = _run(ctx, lambda messages: json.dumps({"requests": ["too short"]}))
+    assert res["status"] == "failed" and "search requests" in res["error"] and not res.get("model_unreachable")
 
 
 def test_pdf_extraction_reads_columns_in_order_and_stops_at_references(tmp_path):
@@ -236,14 +353,42 @@ def test_pdf_extraction_reads_columns_in_order_and_stops_at_references(tmp_path)
     assert hi.corpus_files(tmp_path, [{"file_location": "12345678.pdf", "doc_id": "99"}]) == [("99", pdf)]
 
 
-def test_judge_json_is_parsed_as_given():
+def test_replies_are_parsed_as_given():
     txt = '```json\n{"items":[{"gene":"CRX","mechanism_class":"haploinsufficiency","explicit":true,' \
           '"negated":false,"human_retinal":true,"phenotype":"LCA","quote":"q"},"junk"]}\n```'
     assert hi.parse_items(txt) == [{"gene": "CRX", "mechanism_class": "haploinsufficiency", "explicit": True,
                                     "negated": False, "human_retinal": True, "phenotype": "LCA", "quote": "q"}]
     assert hi.parse_items('{"items": []}') == []
+    assert hi.parse_items('Sure, here it is:\n{"items": []}') == []    # a line before the JSON
     assert hi.parse_items("not json") is None
     assert hi.parse_items('{"items": "x"}') is None
+    reqs = ["Heterozygous null alleles cause adRP.", "one copy is not enough here", "Dosage explains the disease."]
+    assert hi.parse_requests(json.dumps({"requests": reqs + [reqs[0], "short", 7]}), 16) == reqs
+    assert hi.parse_requests(json.dumps({"requests": reqs}), 2) == reqs[:2]
+    assert hi.parse_requests(json.dumps({"requests": reqs[:2]}), 16) is None
+    assert hi.parse_gene_requests('{"requests": {"prpf31": "PRPF31 loss causes adRP here.", "XYZ": "a b c d"}}',
+                                  ["PRPF31"]) == {"PRPF31": "PRPF31 loss causes adRP here."}
+    assert hi.parse_gene_requests('{"requests": {}}', ["PRPF31"]) is None
+
+
+def test_a_gene_the_writer_left_out_gets_the_template_and_a_warning(tmp_path, monkeypatch):
+    root = _corpus(tmp_path)
+    ctx = _ctx(tmp_path, monkeypatch, root)
+    base = _fake_model()
+
+    def forgetful(messages):
+        if _system(messages) == hi.GENE_REQUESTS_SYSTEM:
+            return json.dumps({"requests": {"RHO": "RHO is dominant-negative in adRP."}})
+        return base(messages)
+
+    monkeypatch.setattr(hi.time, "sleep", lambda s: None)
+    res = _run(ctx, forgetful)
+    assert res["status"] == "ok"
+    reqs = _read(ctx.workspace / res["files"]["requests_csv"])
+    # The phenotype is the first one read for the gene (the reference entry's, in retrieval order).
+    assert [r["request"] for r in reqs if r["gene"] == "PRPF31"] == [
+        hi.GENE_REQUEST_TEMPLATE.format(gene="PRPF31", phenotype="adRP")]
+    assert any("fixed template" in w for w in res["warnings"])
 
 
 def test_hgnc_normalisation_prefers_approved_symbols(tmp_path):
@@ -272,6 +417,27 @@ def test_reference_entries_are_recognised():
     assert not is_cite("Our data indicate that the mechanism is haploinsufficiency of PRPF31.")
 
 
+def test_round_two_searches_only_for_symbols_hgnc_knows(tmp_path):
+    hgnc = tmp_path / "hgnc.txt"
+    hgnc.write_text("hgnc_id\tsymbol\talias_symbol\tprev_symbol\nHGNC:1\tPRPF31\tPRP31\t\n")
+    items = [{"gene": g, "mechanism_class": "haploinsufficiency", "negated": False, "phenotype": "adRP"}
+             for g in ("PRP31", "the", "NOTAGENE")]
+    items.append({"gene": "PRPF31", "mechanism_class": "haploinsufficiency", "negated": True})
+    p = hi.Passage("1:0", "1", 0, 1, [])
+    got = hi.round_two_genes([p], {"1:0": hi.Judgment("1:0", items)}, hi.Hgnc(hgnc))
+    assert got == {"PRPF31": {"terms": {"PRPF31", "PRP31"}, "phenotypes": ["adRP"]}}
+
+
+def test_retrieval_keeps_a_few_chunks_per_paper_and_finds_genes_as_words():
+    chunks = [{"pmid": "1", "chunk": i, "text": t} for i, t in enumerate(["PRPF31 a", "b", "c", "d"])]
+    chunks.append({"pmid": "2", "chunk": 0, "text": "xPRPF31 and prpf31 and PRPF310"})
+    vecs = hi._l2(np.array([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.1, 0.9]], dtype="float32"))
+    q = hi._l2(np.array([1.0, 0.0], dtype="float32"))
+    assert hi.nearest_chunks(q, vecs, chunks, 4, max_per_paper=3) == [0, 1, 2, 4]
+    assert hi.nearest_chunks(q, vecs, chunks, 2, candidates=[3, 4]) == [3, 4]
+    assert hi.chunks_naming({"PRPF31": {"PRPF31"}}, chunks) == {"PRPF31": {0}}
+
+
 def test_paperqa_cli_dispatches_the_tool(tmp_path, monkeypatch):
     from aiscientist.tools import paperqa_cli
     root = _corpus(tmp_path)
@@ -288,71 +454,81 @@ def test_paperqa_cli_dispatches_the_tool(tmp_path, monkeypatch):
         monkeypatch.setenv(key, "")
     res = paperqa_cli.run_tool("extract_haploinsufficient_genes", str(tmp_path / "ws"),
                                {"model": "qwen", "llm_base_url": "http://gpu:1/v1", "papers": str(root / "papers"),
-                                "manifest": str(root / "paperqa_manifest.csv"), "max_candidates": 5})
+                                "manifest": str(root / "paperqa_manifest.csv"), "max_passages": 5})
     assert res["status"] == "ok"
-    assert seen["args"]["max_candidates"] == 5 and "model" not in seen["args"]
+    assert seen["args"]["max_passages"] == 5 and "model" not in seen["args"]
     assert seen["ctx"].llm_base_url == "http://gpu:1/v1" and seen["ctx"].workspace == str(tmp_path / "ws")
 
 
 def test_a_dead_endpoint_stops_the_pass_at_once(tmp_path, monkeypatch):
-    """Every call refused (the serve job was preempted): the pass gives up after a short streak,
+    """Every passage refused (the job's model died): the pass gives up after a short streak,
     reports model_unreachable instead of a hollow 'ok' with zero genes, writes no judgment lines
-    for the sentences it never reached, and a rerun with a live model judges them all."""
-    import urllib.error
+    for the passages it never reached, and a rerun with a live model reads them all."""
     monkeypatch.setattr(hi.time, "sleep", lambda s: None)
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
-    calls = []
+    base = _fake_model()
 
     def refused(messages):
-        calls.append(1)
-        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        if _system(messages) == hi.JUDGE_SYSTEM:
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        return base(messages)
 
     monkeypatch.setattr(hi, "_DEAD_AFTER", 3)
-    res = hi.run_extract({"concurrency": 2}, ctx, judge_fn=refused, embed_fn=None, log=lambda s: None,)
+    res = _run(ctx, refused, {"concurrency": 2})
     assert res["status"] == "failed" and res["model_unreachable"] is True
     assert "stopped answering" in res["error"] and res["n_judged"] == 0
     jl = ctx.workspace / "work" / "haploinsufficiency" / "judgments.jsonl"
     assert not jl.exists() or all(json.loads(line)["error"] != "model unreachable" for line in jl.open())
-    # Back with a live model: everything is judged, nothing was lost.
-    res2 = hi.run_extract({"concurrency": 2}, ctx, judge_fn=_fake_model(), embed_fn=None, log=lambda s: None)
-    assert res2["status"] == "ok" and res2["n_genes"] == 1 and not res2["warnings"][1:]
+    # Back with a live model: everything is read, nothing was lost.
+    res2 = _run(ctx, base, {"concurrency": 2})
+    assert res2["status"] == "ok" and res2["n_genes"] == 1 and not res2["warnings"]
+
+
+def test_a_model_gone_before_the_requests_is_unreachable_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(hi.time, "sleep", lambda s: None)
+    root = _corpus(tmp_path)
+    ctx = _ctx(tmp_path, monkeypatch, root)
+
+    def refused(messages):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    res = _run(ctx, refused)
+    assert res["status"] == "failed" and res["model_unreachable"] is True and res["n_judged"] == 0
 
 
 def test_an_http_error_is_not_a_dead_endpoint(tmp_path, monkeypatch):
     """A 4xx/5xx the server answered with is the server's problem with that request, not a dead
-    port: the pass continues, the sentence is recorded as failed and retried next run."""
-    import io
-    import urllib.error
+    port: the pass continues, the passage is recorded as failed and read again next run."""
     monkeypatch.setattr(hi.time, "sleep", lambda s: None)
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
     base = _fake_model()
 
     def bad_request(messages):
-        if _target(messages) == RHO_SENT:
+        if _system(messages) == hi.JUDGE_SYSTEM and _passage(messages)[0] == "22222222":
             raise urllib.error.HTTPError("http://x", 400, "Bad Request", {}, io.BytesIO(b""))
         return base(messages)
 
     monkeypatch.setattr(hi, "_DEAD_AFTER", 1)
-    res = hi.run_extract({"concurrency": 2}, ctx, judge_fn=bad_request, embed_fn=None, log=lambda s: None)
+    res = _run(ctx, bad_request, {"concurrency": 2})
     assert res["status"] == "ok" and res["n_genes"] == 1
-    assert any("1 of" in w and "could not be judged" in w for w in res["warnings"])
+    assert any("1 of" in w and "could not be read" in w for w in res["warnings"])
 
 
-def test_a_reply_that_is_not_a_completion_fails_its_sentence_only(tmp_path, monkeypatch):
+def test_a_reply_that_is_not_a_completion_fails_its_passage_only(tmp_path, monkeypatch):
     """A 200 with no choices (IndexError inside the client) used to escape the worker thread and
-    end the whole pass. It is one failed sentence: the rest are judged and the rerun retries it."""
+    end the whole pass. It is one failed passage: the rest are read and the rerun retries it."""
     monkeypatch.setattr(hi.time, "sleep", lambda s: None)
     root = _corpus(tmp_path)
     ctx = _ctx(tmp_path, monkeypatch, root)
     base = _fake_model()
 
     def no_choices(messages):
-        if _target(messages) == RHO_SENT:
+        if _system(messages) == hi.JUDGE_SYSTEM and _passage(messages)[0] == "22222222":
             return str({"choices": []}["choices"][0])
         return base(messages)
 
-    res = hi.run_extract({"concurrency": 2}, ctx, judge_fn=no_choices, embed_fn=None, log=lambda s: None)
+    res = _run(ctx, no_choices, {"concurrency": 2})
     assert res["status"] == "ok" and res["n_genes"] == 1
-    assert any("1 of" in w and "could not be judged" in w for w in res["warnings"])
+    assert any("1 of" in w and "could not be read" in w for w in res["warnings"])

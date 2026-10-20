@@ -296,6 +296,18 @@ def record_result(user_id: int, run_id: str, facts: dict, inputs: Iterable[dict]
         return None
 
 
+def delete_for_run(s, user_id: int, run_id: str) -> None:
+    """Remove a run's result metadata and the lineage edges into it, inside the caller's session, so
+    the run's row and its metadata go in one commit. A dataset saved from the result keeps its own
+    record; its lineage then says the result was deleted."""
+    for row in s.scalars(select(MetadataRecord).where(MetadataRecord.user_id == user_id,
+                                                      MetadataRecord.run_id == run_id,
+                                                      MetadataRecord.kind == "result")).all():
+        for link in s.scalars(select(MetadataLink).where(MetadataLink.child_uuid == row.uuid)).all():
+            s.delete(link)
+        s.delete(row)
+
+
 def _link(s, user_id: int, parent: str, child: str, relation: str) -> None:
     exists = s.scalars(select(MetadataLink.id).where(
         MetadataLink.user_id == user_id, MetadataLink.parent_uuid == parent,

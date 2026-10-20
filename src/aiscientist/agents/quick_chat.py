@@ -222,21 +222,28 @@ def _format_grounding(payload: dict, tool: str = "deep_literature") -> str:
         from ..reporting.literature_references import strip_intext_citation_markers
         ans = strip_intext_citation_markers(ans)
         parts.append(ans)
-    cites, seen = [], set()
+    # One source number per paper, with EVERY passage of it under that number: search_corpus returns
+    # up to three passages of a paper, and keeping only the first one (cut to 500 characters) hid
+    # most of the evidence it had found. Its passages are the papers' own text, ~1500 characters, so
+    # they are kept whole; deep_literature's summaries keep the 500-character cut.
+    max_chars = 1500 if tool == "search_corpus" else 500
+    sources: dict[str, tuple[str, list[str]]] = {}
     for c in contexts:
         if not isinstance(c, dict):
             continue
         cit = _clean_text(c.get("citation") or "")
-        key = cit.lower()
-        if cit and key not in seen:
-            seen.add(key)
-            snippet = _clean_text(c.get("summary") or "")
-            if len(snippet) > 500:
-                snippet = snippet[:497].rstrip() + "\u2026"
-            cites.append((cit, snippet))
-    if cites:
-        lines = [f"{i}. {cit}" + (f"\n   Evidence: {snip}" if snip else "")
-                 for i, (cit, snip) in enumerate(cites, 1)]
+        if not cit:
+            continue
+        evidence = sources.setdefault(cit.lower(), (cit, []))[1]
+        snippet = _clean_text(c.get("summary") or "")
+        if len(snippet) > max_chars:
+            snippet = snippet[:max_chars - 3].rstrip() + "\u2026"
+        if snippet:
+            page = c.get("page")
+            evidence.append(f"(p. {page}) {snippet}" if page not in (None, "") else snippet)
+    if sources:
+        lines = [f"{i}. {cit}" + "".join(f"\n   Evidence: {e}" for e in evidence)
+                 for i, (cit, evidence) in enumerate(sources.values(), 1)]
         parts.append(
             "Sources \u2014 cite ONLY these (one number each, no repeats). Attach a source to a "
             "gene's inheritance mode ONLY if that source's Evidence text actually states it; if no "

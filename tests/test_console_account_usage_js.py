@@ -97,6 +97,23 @@ out.counter = {
 };
 out.counterTitle = { api: api.usageTitle(apiOnly.chat), mixed: api.usageTitle(mixed.chat), cluster: api.usageTitle(onCluster.chat),
   unpriced: api.usageTitle({ ...apiOnly.chat, unpriced_calls: 2 }) };
+// The lab's shared model (issue 15): free like the cluster GPU, and counted on its own. ``shared`` is
+// a part of ``cluster``.
+const sharedChat = { chat: { ...chatTotals({ calls: 3, total_tokens: 12900 }, { calls: 3, total_tokens: 12900 }), shared: { calls: 3, total_tokens: 12900 } } };
+const both = { chat: { ...chatTotals({ calls: 7, total_tokens: 34800, spend_usd: 0.18 }, { calls: 3, total_tokens: 22800 }), shared: { calls: 1, total_tokens: 12900 } } };
+const sharedAgg = (n, t) => ({ calls: n, ...tok({ input_tokens: t - 300 * n, output_tokens: 300 * n, total_tokens: t }) });
+const cycleShared = { ...cycle, calls: 90, total_tokens: 2473800,
+  cluster: { calls: 4, ...tok({ input_tokens: 21000, output_tokens: 1800, total_tokens: 22800 }) }, shared: sharedAgg(3, 12900) };
+const totalsShared = { today: { ...agg(), shared: sharedAgg(1, 4300) }, last_7_days: { ...agg(), shared: sharedAgg(2, 8600) },
+  cycle: cycleShared, period: cycleShared };
+out.shared = {
+  counter: api.chatUsageText(sharedChat), counterBoth: api.chatUsageText(both), title: api.usageTitle(sharedChat.chat),
+  row: api.usageList([{ model: "deepseek-v4-flash", ...agg({ calls: 3, total_tokens: 12900,
+    cluster: { calls: 3, ...tok({ total_tokens: 12900 }) }, shared: { calls: 3, ...tok({ total_tokens: 12900 }) } }) }], "Model", (x) => x.model),
+  tile: api.usageSummaryHtml({ totals: totalsShared, budget: noBudget }),
+  tileKept: api.usageSummaryHtml({ totals, budget: noBudget, shared_model: true }),
+  periodTotal: api.usagePeriodTotalHtml({ period: "cycle", totals: totalsShared }),
+};
 console.log(JSON.stringify(out));
 """.replace("__ESCAPE__", ESCAPE)
 
@@ -266,3 +283,21 @@ def test_the_chat_counter_tooltip_separates_api_calls_from_the_free_cluster_gpu(
                             "runs, not by token: these calls are in no dollar figure or budget.\n"
                             "Click for Account › API usage.")
     assert "2 call(s) on a model the price table does not list" in t["unpriced"]
+
+
+def test_the_shared_model_is_free_and_counted_on_its_own(page):
+    sh = page["shared"]
+    assert sh["counter"] == "13K tokens · free on the shared model"
+    assert sh["counterBoth"] == "12K API tokens · ~$0.18 · lab GPUs free"    # shared + a session GPU
+    assert sh["title"].startswith("Shared model: 3 calls · 12,900 tokens · free. HPC3 charges the lab's GPUs")
+    assert sh["title"].endswith("Click for Account › API usage.")
+    assert "<strong class=\"usage-free\"" in sh["row"] and "<span>shared model</span>" in sh["row"]
+    assert "cluster GPU" not in sh["row"]
+    # The summary row: a tile of its own with the cycle, today and the last 7 days.
+    assert "Shared model tokens" in sh["tile"] and "13K" in sh["tile"]
+    assert "3 calls · today 4.3K · last 7 days 8.6K" in sh["tile"] and "12K input · 900 output" in sh["tile"]
+    # Under the API tokens, only a session GPU's free calls: the shared model has its own tile.
+    assert "Cluster GPU: 1 call · 9.9K tokens · free" in sh["tile"] and "Shared model: 3 calls" not in sh["tile"]
+    # Before any use, wherever the server keeps one; not at all where it keeps none.
+    assert "Shared model tokens" in sh["tileKept"] and "Shared model tokens" not in page["summary"]
+    assert "3 calls on the shared model (free) · 1 call on the cluster GPU (free)" in sh["periodTotal"]

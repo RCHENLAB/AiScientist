@@ -342,13 +342,16 @@ def _remote_sizes(executor: Any, remote_dir: str) -> "dict[str, int]":
 
 def sync_to_hpc(executor: Any, scan_result: Scan, remote: str,
                 progress: "Callable[[str], None] | None" = None,
-                should_cancel: "Callable[[], bool] | None" = None) -> dict:
+                should_cancel: "Callable[[], bool] | None" = None,
+                on_bytes: "Callable[[int, int, int, int], None] | None" = None) -> dict:
     """Copy ``scan_result.copy`` to ``remote`` (a directory for a folder, the file path for a file).
 
-    Returns ``{"remote", "copied", "copied_bytes", "kept", "kept_bytes", "seconds"}``. Raises
-    :class:`TransferCancelled` when ``should_cancel`` turns true, and the executor's error on a
-    failed transfer."""
+    ``progress`` gets lines for the run's log; ``on_bytes(bytes done, bytes to copy, files done,
+    files to copy)`` the numbers, as the copy goes. Returns ``{"remote", "copied", "copied_bytes",
+    "kept", "kept_bytes", "seconds"}``. Raises :class:`TransferCancelled` when ``should_cancel``
+    turns true, and the executor's error on a failed transfer."""
     say = progress or (lambda _msg: None)
+    count = on_bytes or (lambda *_a: None)
     start = time.monotonic()
     if scan_result.is_dir:
         have = _remote_sizes(executor, remote)
@@ -364,6 +367,7 @@ def sync_to_hpc(executor: Any, scan_result: Scan, remote: str,
     if todo:
         say(f"⤴ Copying {len(todo)} file(s), {total / _GB:.1f} GB, from the server to your HPC3 "
             f"storage" + (f" ({kept} already there)" if kept else "") + "…")
+    count(0, total, 0, len(todo))
     put_resumable = getattr(executor, "put_file_resumable", None)
     if put_resumable is not None and todo:
         # Every parent directory in one command, instead of one mkdir per file.
@@ -380,9 +384,10 @@ def sync_to_hpc(executor: Any, scan_result: Scan, remote: str,
         if put_resumable is not None:
             last = [time.monotonic()]
 
-            def _tick(sent: int, of: int, _rel: str = rel) -> None:
+            def _tick(sent: int, of: int, _rel: str = rel, _i: int = i) -> None:
                 if should_cancel and should_cancel():
                     raise TransferCancelled(f"stopped during {_rel}")
+                count(done_bytes + min(sent, of), total, _i - 1, len(todo))
                 now = time.monotonic()
                 if of >= _GB and now - last[0] >= 60:
                     last[0] = now
@@ -392,5 +397,6 @@ def sync_to_hpc(executor: Any, scan_result: Scan, remote: str,
         else:
             executor.put_file(src, dst)
         done_bytes += size
+        count(done_bytes, total, i, len(todo))
     return {"remote": remote, "copied": len(todo), "copied_bytes": done_bytes, "kept": kept,
             "kept_bytes": kept_bytes, "seconds": round(time.monotonic() - start, 1)}

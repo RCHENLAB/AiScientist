@@ -17,11 +17,14 @@ session's runs use it.
 │       │                                   tree), a result saved from a run, or a dataset that
 │       │                                   was kept on HPC3 and brought here
 │       ├── processed/                      what an uploaded archive unpacked to
-│       └── source.json                     only for a dataset brought from HPC3: where it was
+│       └── source.json                     only for a dataset brought from HPC3: where it was,
+│                                           its size, and whether that original was removed
 ├── temp/<account>/
 │   ├── uploads/                            uploads in progress: never shown as datasets
 │   └── stage/<uuid>/                       a dataset being assembled (copied back from HPC3)
 ├── analysis_results/                       the run store, unless AISCIENTIST_RESULTS_DIR says otherwise
+├── corpus_scans/<key>/                     finished corpus scans, one per corpus version, reused by
+│                                           every account (deploy/paperqa/README.md)
 └── exports/
 ```
 
@@ -60,7 +63,7 @@ connected. Nothing is written to HPC3 at upload time.
 ## When a run needs the data on HPC3
 
 HPC3's compute nodes cannot see the gateway host's disks. When a run's analysis or `run_code` runs on
-HPC3, each dataset it reads from the account's dataset folder (and each bound server folder) is
+HPC3, every dataset bound to it from the account's dataset folder (and each bound server folder) is
 copied, at the start of the run, into the session's own area,
 `<HPC3 shared root>/Temp/<ucinetid>/server-data/<session>/` (see
 [`hpc3_storage_layout.md`](hpc3_storage_layout.md)). The copy is incremental (a second run in the
@@ -68,6 +71,10 @@ same session copies nothing) and resumable, and goes through the transfer host, 
 Tools on the gateway host read the original in place. The session's copies are removed when it
 disconnects, and the 3-day `Temp/` sweep removes those a session left without disconnecting; a run
 continued in a later session copies its inputs again.
+
+Several bound folders are several samples: each is read as a folder (a Cell Ranger library in it is
+named after its dataset, not after `original/`), and `run_cellqc` reads the libraries of all of them
+in one step. A bound dataset the run cannot use is named to the planner with the reason.
 
 ## Results
 
@@ -77,7 +84,9 @@ beside the run, on HPC3 for an HPC3 run, until "Save to my data" makes one a dat
 
 - kept on HPC3: copied back in the background into a new `users/<account>/datasets/<uuid>/original/`,
   each file checked by size, and listed when it is all there. The request answers 202 at once, and
-  the console says when the dataset is in Datasets. The HPC3 copy goes with the run's other files;
+  the console shows the copy's progress and says when the dataset is in Files → Datasets. The HPC3
+  copy goes with the run's other files, except when the copy home is still running or failed: then
+  the run's folder is kept at disconnect, so a later session can save it, until the 3-day sweep;
 - kept on the gateway host: moved there.
 
 ## Moving existing datasets
@@ -87,8 +96,15 @@ place its session may read (its uploads there, or results saved to its personal 
 copied in the background into `users/<account>/datasets/<uuid>/original/`, file by file through
 `temp/<account>/stage/<uuid>/` so an interrupted copy continues at the next connection. Once every
 file has arrived at the size HPC3 reports, the dataset's row points at the copy, and `source.json`
-beside it names the HPC3 path. The HPC3 original is not deleted; it is safe to remove once the copy
-is backed up. A row whose data is gone from HPC3 is left as it is. Bound server folders are never
+beside it names the HPC3 path, its size and whether it is a file or a folder. A run that still
+names the HPC3 path (a chat attached it before the move) reads the copy here. The HPC3 original is
+not deleted then. Once the copy is backed up, the storage panel removes the originals in two Slurm
+jobs: a dry run that checks each one against its copy, then, on the user's confirmation, the
+removal; only originals in the account's own HPC3 uploads folder, and in its personal lab folder
+only where the deployment allows it (see
+[`hpc3_storage_layout.md`](hpc3_storage_layout.md#originals-of-datasets-kept-on-the-server)).
+A removed original is recorded in `source.json`, which still names it, so a run that names it reads
+the copy. A row whose data is gone from HPC3 is left as it is. Bound server folders are never
 moved. `AISCIENTIST_MOVE_HPC_DATASETS=0` turns this off.
 
 **On this host, in an older layout.** `POST /api/datasets/migrate` with
@@ -105,7 +121,7 @@ paths. Numeric ids stay valid.
 
 ## Removing data
 
-- **Delete a dataset** (Datasets page): its files are removed first, then its row. If the files
+- **Delete a dataset** (Files → Datasets): its files are removed first, then its row. If the files
   cannot be removed (no HPC3 session for a dataset still kept there, a permission error), the row
   stays and the page says why. What can be removed: the account's own `users/<account>/datasets/<uuid>`
   folder (and the session's HPC3 copy of it), the account's uploads folder (on this host or on HPC3,
@@ -113,6 +129,13 @@ paths. Numeric ids stay valid.
   (`<lab folder>/<user>/AiScientist_results/`). Never another account's folder, nothing else in the
   personal lab folder, no symlink, and no path another dataset row also covers. A bound server
   folder is the lab's: deleting it removes its row and this session's HPC3 copy, never the folder.
+- **Delete a run** (Runs): `POST /api/runs/delete` removes the run's folder on this host
+  (`<results>/<account>/<run_id>`: report, figures, tables, process record, and a processed dataset
+  kept beside it that was not saved), then its row and its result's metadata. Refused while the run
+  or a run continuing it is executing, while its result is being copied to the user's data, and
+  while a dataset row points inside the folder. Datasets saved from the run stay; its model calls stay
+  in the account's usage; its HPC3 working folder goes with the session's other runs when the
+  session ends.
 - **Cancel an upload**: its partial and temporary files go.
 - **An interrupted upload** stays resumable for `AISCIENTIST_UPLOAD_TTL_SECONDS` (default 86400,
   24 hours) after its last write, from this browser or another one of the account's. After that a

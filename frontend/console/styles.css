@@ -483,6 +483,18 @@ button.small { padding: 6px 12px; font-size: 12px; }
 }
 .plan-note .msym { font-size: 16px; }
 
+/* The plan's estimate of time, CPU/GPU hours and cost (RCHENLAB/AiScientist issue 25). */
+.plan-estimate { margin: 8px 20px 0; font-size: 12.5px; line-height: 1.45; color: var(--text-secondary); }
+.plan-estimate p { margin: 6px 0; }
+.plan-estimate table.md-table {
+  border-collapse: collapse; display: block; width: max-content; max-width: 100%; overflow-x: auto;
+  margin: 6px 0; font-variant-numeric: tabular-nums;
+}
+.plan-estimate table.md-table th, .plan-estimate table.md-table td {
+  border: 1px solid var(--border); padding: 4px 7px; text-align: left; white-space: nowrap; color: var(--text);
+}
+.plan-estimate table.md-table th { background: var(--surface-sunken); font-weight: 600; white-space: normal; vertical-align: bottom; }
+
 /* Steps: a numbered rail. The number sits on a line that runs to the next one, so the plan reads
    as one pipeline rather than as a list of paragraphs. */
 .plan-steps { list-style: none; margin: 0; padding: 6px 20px 4px; }
@@ -707,6 +719,7 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-panel .plan-head { padding: 13px 16px 12px; }
 .plan-panel .plan-note { margin: 11px 16px 0; }
 .plan-panel .plan-steps { padding: 6px 16px 4px; }
+.plan-panel .plan-estimate { margin: 8px 16px 0; }
 .plan-panel .plan-yaml { padding: 12px 16px 14px; }
 .plan-panel .plan-revise { padding: 12px 16px 13px; }
 .plan-panel .plan-actions-row { padding: 12px 16px 14px; }
@@ -961,10 +974,64 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .storage-item .si-size { font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .storage-item .si-del { padding: 5px 12px; border-radius: 980px; font-size: 12px; background: transparent; color: var(--red); border: 1px solid rgba(255, 59, 48, 0.35); }
 .storage-item .si-del:hover { background: rgba(255, 59, 48, 0.1); }
+.storage-item .si-deleting { font-size: 12px; color: var(--text-secondary); text-align: right; max-width: 40%; }
+.storage-deletes:not(:empty) { margin-top: 10px; }
+.storage-deletes .sd-head { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.sd-item .si-size { white-space: normal; text-align: right; max-width: 45%; }
+.sd-item.done .si-size { color: var(--green-text); }
+.sd-item .sess-failure { margin-top: 0; }
 .ghost.small.danger { color: var(--red); border-color: rgba(255, 59, 48, 0.35); }
 .ghost.small.danger:hover { background: rgba(255, 59, 48, 0.1); }
 .storage-note { font-size: 11.5px; color: var(--text-tertiary); margin: 14px 0 0; line-height: 1.5; }
 .storage-note code { background: var(--surface-sunken); padding: 1px 5px; border-radius: 4px; }
+.storage-h { margin: 18px 0 8px; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.modal-head + .storage-h { margin-top: 0; }
+
+/* ---- the compute session on HPC3 (issue 6): state, copies in flight, failures ---- */
+.sess-chip {
+  flex: none; border-radius: 980px; padding: 2px 9px; font: inherit; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border-strong); background: transparent; color: var(--text-secondary);
+  cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.sess-chip.staging-in, .sess-chip.staging-out { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.45); }
+.sess-chip.cleaning-up { color: var(--amber-text); border-color: var(--amber); }
+.sess-chip.failed { color: var(--red-text); border-color: rgba(224, 70, 59, 0.5); }
+.sess-chip .sc-short { display: none; }
+@media (max-width: 600px) {
+  /* the dot and the chip keep their width; the user chip (which cuts with an ellipsis) gives way */
+  .conn-indicator { flex-shrink: 0; gap: 6px; }
+  .sess-chip { padding: 2px 7px; font-size: 11.5px; }
+  .sess-chip .sc-long { display: none; }
+  .sess-chip .sc-short { display: inline; }
+}
+.conn-session { margin-top: 10px; font-size: 12px; line-height: 1.45; color: var(--text-secondary); }
+.sess-row { display: flex; align-items: flex-start; gap: 8px; }
+.sess-text { min-width: 0; overflow-wrap: anywhere; }
+.sess-pill {
+  flex: none; border-radius: 980px; padding: 1px 8px; font-size: 11px; font-weight: 600;
+  border: 1px solid var(--border-strong); color: var(--text-secondary); white-space: nowrap;
+}
+.sess-pill.staging-in, .sess-pill.staging-out, .sess-pill.running { color: var(--accent); border-color: rgba(var(--accent-rgb), 0.45); }
+.sess-pill.cleaning-up { color: var(--amber-text); border-color: var(--amber); }
+.sess-pill.closed { color: var(--green-text); border-color: var(--green); }
+.sess-pill.failed { color: var(--red-text); border-color: rgba(224, 70, 59, 0.5); }
+.sess-transfer { margin-top: 7px; }
+.sess-transfer-text { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.sess-transfer .meter { margin-top: 5px; height: 5px; }
+.sess-failure { margin-top: 6px; color: var(--red-text); overflow-wrap: anywhere; font-size: 12px; }
+.sess-item { align-items: flex-start; }
+.sess-item-main { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text-secondary); }
+.sess-when { margin-top: 5px; font-size: 11.5px; color: var(--text-tertiary); }
+.originals-box { display: flex; flex-direction: column; gap: 6px; }
+.originals-box .storage-note { margin-top: 0; }
+.orig-status { font-size: 12.5px; color: var(--text-secondary); }
+.orig-status.done { color: var(--green-text); }
+.orig-item.skip .si-size { color: var(--text-tertiary); }
+.orig-item.removed .si-size { color: var(--green-text); }
+.orig-item .si-size { white-space: normal; text-align: right; max-width: 45%; }
+.orig-kept > summary { cursor: pointer; font-size: 12px; color: var(--text-tertiary); margin: 4px 0; }
+.orig-kept .storage-item { margin-top: 6px; }
+.orig-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
 
 /* ---- bring-your-own LLM API key ---- */
 
@@ -1469,16 +1536,17 @@ button.full { width: 100%; margin-top: 6px; }
 .user-table th { color: var(--text-tertiary); font-weight: 600; font-size: 12px; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
-/* page tabs: Admin (Users | Skill review | Usage) and Account (API usage | Password) */
-.admin-tabs, .account-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
-.admin-tab, .account-tab {
+/* page tabs: Admin (Users | Skill review | Usage), Account (API usage | Password), Files (Datasets | Outputs) */
+.admin-tabs, .account-tabs, .files-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+.admin-tab, .account-tab, .files-tab {
   background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
   padding: 8px 14px; font: inherit; font-size: 14px; font-weight: 600; color: var(--text-tertiary); cursor: pointer;
 }
-.admin-tab:hover, .account-tab:hover { color: var(--text); }
-.admin-tab.active, .account-tab.active { color: var(--text); border-bottom-color: var(--accent); }
-.account-tab:not(:disabled):hover, .account-tab:not(:disabled):active { background: transparent; transform: none; }
-.account-tab:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.6); outline-offset: -2px; border-radius: 6px 6px 0 0; }
+.admin-tab:hover, .account-tab:hover, .files-tab:hover { color: var(--text); }
+.admin-tab.active, .account-tab.active, .files-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.account-tab:not(:disabled):hover, .account-tab:not(:disabled):active,
+.files-tab:not(:disabled):hover, .files-tab:not(:disabled):active { background: transparent; transform: none; }
+.account-tab:focus-visible, .files-tab:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.6); outline-offset: -2px; border-radius: 6px 6px 0 0; }
 .tab-badge {
   display: inline-block; min-width: 18px; padding: 0 6px; margin-left: 4px; border-radius: 980px;
   background: var(--amber); color: #fff; font-size: 11px; line-height: 18px; text-align: center;
@@ -1553,6 +1621,10 @@ button.full { width: 100%; margin-top: 6px; }
 .sys-catalog-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin: 30px 0 4px; }
 .page .sys-catalog-head h3 { margin: 0; flex: 1 1 auto; }
 .preset-search.sys-search { width: min(360px, 100%); border-radius: 10px; padding: 8px 12px; }
+/* the search over a page's list (Runs, Files → Datasets, Files → Outputs) */
+.list-search { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+.preset-search.list-search-box { width: min(360px, 100%); border-radius: 10px; padding: 8px 12px; }
+.list-search-n:empty { display: none; }
 .sys-list { margin-top: 16px; }
 .sys-list h4 { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; margin: 0 0 7px; font-size: 12px;
   font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); }
@@ -2162,6 +2234,13 @@ button.primary .msym, button.secondary .msym {
 
 .run-card { flex-wrap: wrap; }
 .run-card-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+/* a phone: the actions get their own line under the run and wrap there, never past the card */
+@media (max-width: 600px) {
+  .run-card-actions { flex: 1 1 100%; flex-wrap: wrap; }
+  /* a dataset's buttons too: under its name, wrapping */
+  #datasetsList .card { flex-wrap: wrap; justify-content: flex-start; gap: 4px 6px; }
+  #datasetsList .card .card-main { flex: 1 1 100%; }
+}
 .run-usage { flex-basis: 100%; border-top: 1px solid var(--border); padding-top: 8px; }
 .run-usage .small { font-size: 12px; }
 

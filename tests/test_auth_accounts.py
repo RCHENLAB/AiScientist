@@ -158,6 +158,10 @@ def test_datasets_and_runs_history_scoped_to_user(app_ctx):
     assert len(runs) == 1 and runs[0]["run_id"] == "run_abc123" and runs[0]["status"] == "done"
     assert runs[0]["plan_mode"] is True
 
+    # a run with no plan estimate and no measured tool call says so (issue 25)
+    assert runs[0]["compute_usage"]["estimate"] is None
+    assert runs[0]["compute_usage"]["actual"]["calls"] == 0
+
     # a different user sees an empty history (scoping)
     client.post("/api/admin/users", json={"username": "grace", "password": "gracepass"})
     client.post("/api/auth/logout")

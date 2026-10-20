@@ -10,6 +10,7 @@ With a data root configured (``AISCIENTIST_DATA_ROOT``) the layout is one folder
     ├── temp/<account>/                    uploads in progress (``uploads/``) and copies being
     │                                      assembled (``stage/<uuid>``); never a finished dataset
     ├── analysis_results/                  the run store when ``AISCIENTIST_RESULTS_DIR`` is unset
+    ├── corpus_scans/<key>/                finished corpus scans, shared by every account (corpus_scan.py)
     └── exports/
 
 ``<account>`` is the account's name as the gateway writes it everywhere else (letters, digits, ``-``

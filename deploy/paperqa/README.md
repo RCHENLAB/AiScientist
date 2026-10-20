@@ -149,3 +149,25 @@ CPU), and returns the matching passages. The job needs 2 CPUs and 8 GB, no GPU, 
 endpoint or API key; the session's model writes the queries and the answer, and the gateway removes any
 citation or quotation the passages do not support. The text cache is rebuilt by hand with
 `scripts/build_mechanism_cache.py` when papers are added.
+
+## Corpus scan (`extract_haploinsufficient_genes`)
+
+The console's Corpus scan has a language model write search requests and read every passage they
+retrieve, so its job brings its own: one Slurm job on the paid `gpu` partition (`AISCIENTIST_CORPUS_SCAN_PARTITION`,
+account `AISCIENTIST_CORPUS_SCAN_ACCOUNT`, default `ruic20_lab_gpu`) with `gpu:1` and the node
+feature `nvme`, so it takes the first free A30 or A100 and never a V100
+(`AISCIENTIST_CORPUS_SCAN_GRES`, `AISCIENTIST_CORPUS_SCAN_CONSTRAINT`). The partition bills every
+card the same; an A100 reads about twice as fast as an A30. The default model fits an A30 only with its image and video encoders
+off and at most 16 requests at once, the default of `AISCIENTIST_CORPUS_SCAN_VLLM_ARGS`. The job
+starts vLLM from
+`<root>/containers/vllm-0.28.0.sif` with the weights in `<root>/hf` on the node's `127.0.0.1`
+(model `AISCIENTIST_CORPUS_SCAN_MODEL`, default the cluster sessions' model; window
+`AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN`, default 16384), runs the scan in `paperqa.sif` against
+it, and exits, which frees the card. The session's own model is never called, so a session on the
+shared model or on an API key can run it.
+
+A finished scan is kept on the gateway host under `<AISCIENTIST_DATA_ROOT>/corpus_scans/<key>/`,
+where the key covers the corpus (the manifest's hash, the size and time of the text cache and the
+HGNC table), the scan's rules and the model. The next request for the same corpus is answered from
+it without a job; adding papers (a new manifest and text cache) changes the key. Deleting a key's
+folder makes the next request scan again.

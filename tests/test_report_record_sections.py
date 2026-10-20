@@ -232,6 +232,22 @@ def test_a_delivery_without_counts_gets_none_invented(tmp_path):
     assert "cells" not in input_line, "a sum over a library with no count is a floor, not the size"
 
 
+def test_two_kept_folders_are_named_after_their_datasets_in_the_input_line(tmp_path):
+    """Two folders kept on the server are both ``…/<uuid>/original``: the Input line used to name the
+    first one's directory, "`original/`", for a delivery of both (RCHENLAB/AiScientist issue 22)."""
+    lib = {"raw": ["h5"], "filtered": ["h5"], "bam": True, "clusters": True, "metrics": True,
+           "packed": False}
+    layout = {"root": "/data/aiscientist/data/users/u/datasets/aaa/original", "n_libraries": 2,
+              "datasets": ["Sample3_GSM5676874", "Sample1_WT"],
+              "libraries": [dict(lib, sample="Sample3_GSM5676874"), dict(lib, sample="Sample1_WT")]}
+    art = _bundle(tmp_path, {"dataset_kind": "single_cell_other", "cellranger_layout": layout})
+    input_line = next(ln for ln in _dataset_section(art, _result([])).splitlines()
+                      if ln.startswith("**Input.**"))
+    assert input_line.startswith("**Input.** `Sample3_GSM5676874/`, `Sample1_WT/` — a 10x Cell Ranger "
+                                 "delivery of 2 libraries (`Sample3_GSM5676874`, `Sample1_WT`)")
+    assert "original" not in input_line
+
+
 def test_a_single_10x_h5_takes_its_size_from_the_qc_step(tmp_path):
     art = _bundle(tmp_path, {"dataset_kind": "single_cell_other", "format": ".h5",
                              "dataset_path": "/staged/filtered_feature_bc_matrix.h5"})

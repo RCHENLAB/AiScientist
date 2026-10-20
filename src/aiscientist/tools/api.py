@@ -45,6 +45,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # literature
     "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
+    # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
+    "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),
     # the scRNA analysis line
     "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
     # curated marker references (run_marker_annotation), also read by the report's marker-claim check
@@ -52,6 +54,8 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "load_marker_reference": ("aiscientist.tools.run_marker_annotation.tool", "_load_reference"),
     # Cell Ranger deliveries in an uploaded folder: what they are, and the QC route they imply
     "describe_cellranger_layout": ("aiscientist.tools._lib.cellranger", "describe_cellranger_layout"),
+    "merge_cellranger_layouts": ("aiscientist.tools._lib.cellranger", "merge_cellranger_layouts"),
+    "cellranger_matrix_facts": ("aiscientist.tools._lib.cellranger", "matrix_facts"),
     "cellranger_layout_hint": ("aiscientist.tools._lib.cellranger", "cellranger_layout_hint"),
     "profile_cellranger_libraries": ("aiscientist.tools._lib.cellranger", "profile_cellranger_libraries"),
     "CELLRANGER_FIND_NAMES": ("aiscientist.tools._lib.cellranger", "FIND_NAMES"),

@@ -225,9 +225,37 @@ def test_the_chat_counter_sums_the_cluster_gpu_apart_and_its_live_push_agrees(ct
     # A chat entirely on the cluster GPU: every call and token is in the cluster share, at $0.
     only = client.get("/api/usage/chat/6").json()
     assert only == {"conversation_id": "6", "calls": 1, "total_tokens": 9100, "spend_usd": 0.0,
-                    "unpriced_calls": 0, "cluster": {"calls": 1, "total_tokens": 9100}}
+                    "unpriced_calls": 0, "cluster": {"calls": 1, "total_tokens": 9100},
+                    "shared": {"calls": 0, "total_tokens": 0}}
     assert usage.live_totals(ids["alice"], "6", None) == {"chat": {k: v for k, v in only.items()
                                                                    if k != "conversation_id"}}
+
+
+def test_the_shared_model_is_free_and_counted_per_chat_and_run_apart_from_a_session_gpu(ctx):
+    # The lab's shared model (RCHENLAB/AiScientist issue 15): free like a session's own cluster GPU,
+    # and counted on its own for the account, each chat and each run.
+    client, routes, usage, db, models, ids = ctx
+    shared = dict(remote=False, provider="shared", model="deepseek-v4-flash",
+                  endpoint="deepseek-v4-flash @ shared GPU",
+                  usage={"prompt_tokens": 4000, "completion_tokens": 300, "total_tokens": 4300})
+    _record(routes, ids["alice"], run_id="r7", conversation_id="7", **shared)
+    _record(routes, ids["alice"], run_id="r7", conversation_id="7", **shared)
+    _record(routes, ids["alice"], conversation_id="7", step="Chat", role="chat", **shared)
+    _record(routes, ids["alice"], run_id="r8", conversation_id="8", remote=False, provider="vllm",
+            model="qwen3.8", usage={"prompt_tokens": 9000, "completion_tokens": 100, "total_tokens": 9100})
+    _as(client, "alice", "alicepw1")
+    d = client.get("/api/usage?tz=UTC").json()
+    cyc = d["totals"]["cycle"]
+    assert cyc["shared"]["calls"] == 3 and cyc["shared"]["total_tokens"] == 12_900
+    assert cyc["shared"]["input_tokens"] == 12_000 and cyc["shared"]["output_tokens"] == 900
+    assert cyc["cluster"]["calls"] == 4 and cyc["spend_usd"] == 0, "the shared model is in the free share"
+    runs = {r["run_id"]: r for r in d["by_run"]}
+    assert runs["r7"]["shared"]["calls"] == 2 and runs["r8"]["shared"]["calls"] == 0
+    assert {c["conversation_id"]: c["shared"]["total_tokens"] for c in d["by_chat"]} == {"7": 12_900, "8": 0}
+    assert d["shared_model"] is False, "no shared model is kept by this test server"
+    chat = client.get("/api/usage/chat/7").json()
+    assert chat["shared"] == chat["cluster"] == {"calls": 3, "total_tokens": 12_900}
+    assert usage.live_totals(ids["alice"], "7", "r7")["run"]["shared"] == {"calls": 2, "total_tokens": 8600}
 
 
 def test_the_csv_export_has_one_line_per_call_of_the_user(ctx):

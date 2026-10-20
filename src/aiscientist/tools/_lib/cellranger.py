@@ -8,13 +8,16 @@ images; :func:`describe_10x_h5`, which reads a matrix file, imports h5py and num
 A LIBRARY is a directory holding both a raw and a filtered feature-barcode matrix, in any of the
 forms Cell Ranger and 10x Cloud deliver them: ``<m>.h5``, an unpacked ``<m>/`` directory, or a
 ``<m>.tar.gz`` archive of the bare files (10x Cloud). Its sample id is the directory's name, or its
-parent's when the directory is the usual ``outs/``.
+parent's when the directory is the usual ``outs/``. A run that binds several folders describes each
+and merges them (:func:`merge_cellranger_layouts`): a library that is its folder is then named after
+the dataset, not the directory.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 import io
 from collections import Counter
@@ -79,6 +82,57 @@ def describe_cellranger_layout(paths: Iterable[str], root: str) -> "dict[str, An
         return None
     return {
         "root": str(root_p),
+        "n_libraries": len(libraries),
+        "libraries": libraries,
+        "all_have_bam": all(lib["bam"] for lib in libraries),
+        "any_packed": any(lib["packed"] for lib in libraries),
+    }
+
+
+def sample_label(name: str) -> str:
+    """A sample id made from a dataset's name as the user sees it (``Sample1_WT/``): the characters a
+    file name and CellQC's sample sheet take, everything else as ``_``."""
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "").strip().rstrip("/")).strip("._-")
+    return label or "sample"
+
+
+def merge_cellranger_layouts(parts: "Iterable[tuple[str, dict[str, Any] | None]]") -> "dict[str, Any] | None":
+    """ONE layout for the Cell Ranger libraries of several bound folders.
+
+    ``parts`` pairs each folder's dataset name with that folder's own
+    :func:`describe_cellranger_layout` (None for a folder without a library). A library that IS its
+    folder, or that folder's ``outs/``, is named after the dataset: a dataset kept on the server
+    lives in ``…/datasets/<uuid>/original``, so the directory's name says nothing (both of two such
+    folders were "original"). A library in a subfolder keeps that subfolder's name, and a name two
+    libraries would share gets ``_2``, ``_3``. Each library records the ``dataset`` it came from, and
+    ``datasets`` lists the folders that hold one. The gateway and ``run_cellqc`` both build their
+    layout here, so the sample ids the planner reads are the ones CellQC runs under. A part without a
+    name keeps the directory's names, as a single folder always did. None when no folder holds a
+    library."""
+    libraries: list[dict[str, Any]] = []
+    roots: list[str] = []
+    datasets: list[str] = []
+    seen: set[str] = set()
+    for name, layout in parts:
+        if not layout:
+            continue
+        roots.append(layout["root"])
+        datasets.append(name)
+        for lib in layout["libraries"]:
+            own = lib["rel"] in (".", "outs")
+            base = sample_label(name) if (name and own) else lib["sample"]
+            label, k = base, 1
+            while label in seen:
+                k += 1
+                label = f"{base}_{k}"
+            seen.add(label)
+            libraries.append({**lib, "sample": label, "dataset": name})
+    if not libraries:
+        return None
+    return {
+        "root": roots[0],
+        "roots": roots,
+        "datasets": datasets,
         "n_libraries": len(libraries),
         "libraries": libraries,
         "all_have_bam": all(lib["bam"] for lib in libraries),
@@ -315,6 +369,16 @@ def is_count_matrix(matrix: "dict[str, Any]") -> bool:
     return str(matrix.get("dtype", "")).startswith(("int", "uint"))
 
 
+def species_by_library(libs: "list[dict[str, Any]]") -> "dict[str, list[str]]":
+    """``{species: [sample, ...]}`` from the genomes of the libraries' read matrices, in order."""
+    out: dict[str, list[str]] = {}
+    for lib in libs:
+        for sp in dict.fromkeys(genome_species(g) for g in (lib.get("matrix") or {}).get("genomes", {})):
+            if sp:
+                out.setdefault(sp, []).append(lib["sample"])
+    return out
+
+
 def _species(libs: "list[dict[str, Any]]") -> str:
     found = {genome_species(g) for lib in libs for g in (lib.get("matrix") or {}).get("genomes", {})}
     return found.pop() if len(found) == 1 and "" not in found else ""
@@ -389,6 +453,15 @@ def _provenance(libs: "list[dict[str, Any]]") -> str:
     if species:
         text += (f"The reference genome makes the species {species.upper()}: plan {species} gene "
                  f"symbols and {species} marker panels. ")
+    by_species = species_by_library(read)
+    if len(by_species) > 1:
+        first = next(iter(by_species))
+        text += ("The libraries are from DIFFERENT SPECIES ("
+                 + "; ".join(f"{sp}: {', '.join(names)}" for sp, names in by_species.items())
+                 + "). `run_cellqc` QCs each species in its own CellQC run, with its own gene sets, "
+                 f"in the same step. Later steps read the {first} libraries' checkpoint only (the "
+                 "others' QC'd data is kept beside it): plan them for one species, with that "
+                 "species' gene symbols, unless the user asks for a cross-species comparison. ")
     text += tissue_hint([g for lib in read for g in ((lib["matrix"].get("counts") or {})
                                                       .get("top_genes") or [])])
     return text + (
@@ -408,10 +481,14 @@ def cellranger_layout_hint(layout: "dict[str, Any] | None") -> str:
     names = ", ".join(lib["sample"] for lib in libs[:8]) + (" …" if len(libs) > 8 else "")
     bam = ("every library has its BAM" if layout["all_have_bam"] else
            "no BAM" if not any(lib["bam"] for lib in libs) else "some libraries have a BAM")
+    folders = len(layout.get("datasets") or ())
+    together = (f" in {folders} attached folders; `run_cellqc` reads them all in one step, so plan "
+                "ONE `run_cellqc` over every library (not one per folder, and none left out unless "
+                "the user asked)" if folders > 1 else "")
     return (
         f"INPUT is a 10x Cell Ranger delivery: {layout['n_libraries']} librar"
-        f"{'y' if layout['n_libraries'] == 1 else 'ies'} ({names}) with raw AND filtered matrices; "
-        f"{bam}. QC route: `run_cellqc` (CellQC: SoupX ambient-RNA correction from the raw matrix, "
+        f"{'y' if layout['n_libraries'] == 1 else 'ies'} ({names}){together} with raw AND filtered "
+        f"matrices; {bam}. QC route: `run_cellqc` (CellQC: SoupX ambient-RNA correction from the raw matrix, "
         "count/feature/mitochondrial filtering, DoubletFinder doublet removal with scDblFinder as a "
         "second opinion, and the nuclear fraction from the BAM), which also writes the normalized "
         "checkpoint every later tool reads. Do NOT plan `run_scanpy_qc` for this input: it reads one "

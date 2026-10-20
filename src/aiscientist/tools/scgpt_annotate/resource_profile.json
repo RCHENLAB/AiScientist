@@ -1,0 +1,16 @@
+{
+  "unit": "cells",
+  "baseline": 10000,
+  "steps": [
+    {
+      "name": "embedding and annotation",
+      "cpus": 8,
+      "gpus": 1,
+      "mem_gb": 32,
+      "minutes": [
+        5,
+        20
+      ]
+    }
+  ]
+}

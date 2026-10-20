@@ -536,19 +536,46 @@ def test_a_nonzero_exit_with_results_is_a_warning_not_a_failure(tmp_path, delive
     assert any("exited with status 1" in w for w in out["warnings"])
 
 
-def test_a_mixed_species_cohort_is_refused_and_one_species_runs(tmp_path, delivery, fake_cellqc):
+def test_a_mixed_species_cohort_is_qcd_one_species_per_cellqc_run(tmp_path, delivery, fake_cellqc):
     # The 2026-10-02 test folder held two mouse libraries and a human one: QC'd together, the human
-    # cells were filtered on mouse "^mt-" genes.
+    # cells were filtered on mouse "^mt-" genes. That was then refused, which also refused the two
+    # folders of RCHENLAB/AiScientist issue 22 (a human and a mouse library). Each species now gets a
+    # CellQC run of its own, with its own gene sets, and both are kept.
     pytest.importorskip("scanpy")
+    import csv
+    import anndata as ad
     from aiscientist.tools.run_cellqc.tool import run_cellqc
     (delivery / "S2" / "outs" / "web_summary.html").write_text(
         _web_summary("Single Cell 3' v3 (polyA)", "GRCh38-2024-A"))
-    out = run_cellqc({}, _ctx(tmp_path / "run", delivery))
-    assert out["status"] == "error" and "different species" in out["error"]
-    assert out["species_by_library"] == {"human": ["S2"], "mouse": ["S1"]}
-    assert "`samples`" in out["error"]
+    ws = tmp_path / "run"
+    out = run_cellqc({}, _ctx(ws, delivery))
+    assert out["status"] == "ok", out
+    qc = ws / "work" / "cellqc"
+    assert json.loads((qc / "mouse" / "config.yaml").read_text())["geneset"]["mt"]["patterns"] == ["^mt-"]
+    assert json.loads((qc / "human" / "config.yaml").read_text())["geneset"]["mt"]["patterns"] == ["^MT-"]
+    assert [ln.split("\t")[0] for ln in (qc / "human" / "samples.txt").read_text().splitlines()[1:]] == ["S2"]
+    # The primary's species is the checkpoint later steps read; the other has its own.
+    assert out["checkpoints"]["mouse"]["checkpoint"] == "adata_qc.h5ad"
+    assert out["checkpoints"]["human"]["checkpoint"] == "adata_qc.human.h5ad"
+    assert set(ad.read_h5ad(ws / "work" / "adata_qc.h5ad").obs["sampleid"]) == {"S1"}
+    assert set(ad.read_h5ad(ws / "work" / "adata_qc.human.h5ad").obs["sampleid"]) == {"S2"}
+    assert out["n_libraries"] == 2 and {lib["species"] for lib in out["libraries"]} == {"mouse", "human"}
+    assert out["cells_after"] == sum(lib["cells_after_doublets"] for lib in out["libraries"])
+    assert out["assumptions"]["species"][0] == "mouse+human"
+    assert any("different species (mouse: S1; human: S2)" in w for w in out["warnings"])
+    # ONE flat result directory: each library's files, the reports per species, the tables joined.
+    names = {p.name for p in (ws / "artifacts" / "result").iterdir()}
+    assert {"report_mouse.html", "report_human.html", "S1_obs.txt.gz", "S2_obs.txt.gz",
+            "metrics.csv", "manifest.tsv", "qc_status.csv"} <= names
+    rows = list(csv.DictReader((ws / "artifacts" / "result" / "metrics.csv").open()))
+    assert [(r["sampleid"], r["species"]) for r in rows] == [("S1", "mouse"), ("S2", "human")]
+    pointer = json.loads((ws / "artifacts" / "data" / "cellqc_result.json").read_text())
+    assert pointer["libraries"] == ["S1", "S2"] and set(pointer["matrices"]) == {"S1.h5ad", "S2.h5ad"}
+    assert len(out["figures"]) == 2                       # one QC violin per species
+    # Asking for one species' libraries is one run, as before.
     one = run_cellqc({"samples": ["S2"]}, _ctx(tmp_path / "run2", delivery))
     assert one["status"] == "ok" and one["assumptions"]["species"][0] == "human"
+    assert "checkpoints" not in one
 
 
 def test_without_a_folder_it_points_at_run_scanpy_qc(tmp_path, fake_cellqc):

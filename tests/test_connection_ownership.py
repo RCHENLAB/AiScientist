@@ -69,6 +69,7 @@ def _routes(cid: str) -> list[tuple[str, str, dict]]:
         ("post", "/api/stop-gpu", {"json": j}),
         ("get", f"/api/storage/{cid}", {}),
         ("post", "/api/storage/delete", {"json": {**j, "path": "/dfs3b/x/alice/y"}}),
+        ("get", f"/api/storage/{cid}/deletes", {}),
         ("post", "/api/model", {"json": {**j, "model": "m"}}),
         ("post", "/api/llm-endpoint", {"json": {**j, "credential_id": "abc"}}),
         ("post", "/api/chat/stop", {"json": j}),
@@ -100,6 +101,10 @@ def _routes(cid: str) -> list[tuple[str, str, dict]]:
         ("post", "/api/lab/continue", {"json": j}),
         ("post", "/api/lab/plan", {"json": {**j, "action": "approve"}}),
         ("post", "/api/confirm", {"json": {**j, "approved": True}}),
+        ("get", "/api/sessions", {"params": j}),
+        ("get", "/api/hpc-originals", {"params": j}),
+        ("post", "/api/hpc-originals/check", {"json": j}),
+        ("post", "/api/hpc-originals/remove", {"json": {**j, "plan_id": "aaaaaaaaaaaa"}}),
     ]
 
 

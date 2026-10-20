@@ -97,7 +97,9 @@ class SharedLLMSettings:
     time_limit: str = "3-00:00:00"
     exclude: str = ""
     # How it is kept.
-    renew_lead_s: int = 24 * 3600      # submit the next job this long before the limit
+    # Submit the next job this long before the limit. Four free cards on one node took up to 56 h
+    # to get (2026-08 to 10), so a day ahead was too late: the endpoint then had a gap.
+    renew_lead_s: int = 48 * 3600
     drain_s: int = 1800                # after moving to a newer job, let the old one finish calls
     poll_s: int = 60
     local_port: int = 0                # 0 = any free port; fixed = a stable URL on this host
@@ -134,7 +136,7 @@ class SharedLLMSettings:
             mem_gb=_int_env("AISCIENTIST_SHARED_LLM_MEM_GB", cls.mem_gb),
             time_limit=env("AISCIENTIST_SHARED_LLM_TIME_LIMIT", cls.time_limit).strip(),
             exclude=env("AISCIENTIST_SHARED_LLM_EXCLUDE", "").strip() or (hpc.exclude or ""),
-            renew_lead_s=_int_env("AISCIENTIST_SHARED_LLM_RENEW_LEAD_HOURS", 24) * 3600,
+            renew_lead_s=_int_env("AISCIENTIST_SHARED_LLM_RENEW_LEAD_HOURS", 48) * 3600,
             drain_s=_int_env("AISCIENTIST_SHARED_LLM_DRAIN_SECONDS", cls.drain_s),
             poll_s=max(15, _int_env("AISCIENTIST_SHARED_LLM_POLL_SECONDS", cls.poll_s)),
             local_port=_int_env("AISCIENTIST_SHARED_LLM_LOCAL_PORT", 0),

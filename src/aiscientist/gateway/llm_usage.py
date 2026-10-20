@@ -35,6 +35,8 @@ ESTIMATE_NOTE = ("These figures are estimates from AiScientist's own record of i
                  "left: it also counts this key used outside AiScientist, and other keys of the same "
                  "Console organization, which share one credit balance.")
 _TOKEN_KEYS = ("input_tokens", "cache_write_tokens", "cache_read_tokens", "output_tokens", "total_tokens")
+# ``llm_calls.provider`` of a call to the lab's shared model (``gateway/shared_llm.py``).
+SHARED_PROVIDER = "shared"
 
 
 # --- time -----------------------------------------------------------------------------------------
@@ -113,11 +115,12 @@ def _tokens0() -> dict:
 
 
 def _empty() -> dict:
-    # ``cluster``: the part of the calls and tokens that no API key paid for (the cluster GPU, which
-    # HPC3 charges by GPU time, not by token). Every other figure counts all calls; the API-key share
-    # is the whole minus this.
+    # ``cluster``: the part of the calls and tokens that no API key paid for (the lab's GPUs on HPC3,
+    # which HPC3 charges by GPU time, not by token). Every other figure counts all calls; the API-key
+    # share is the whole minus this. ``shared``: the part of ``cluster`` that went to the lab's shared
+    # model; the rest of ``cluster`` ran on a session's own GPU.
     return {"calls": 0, "errors": 0, **_tokens0(), "spend_usd": 0.0, "unpriced_calls": 0,
-            "cluster": {"calls": 0, **_tokens0()}}
+            "cluster": {"calls": 0, **_tokens0()}, "shared": {"calls": 0, **_tokens0()}}
 
 
 def _add(acc: dict, r) -> dict:
@@ -131,9 +134,11 @@ def _add(acc: dict, r) -> dict:
     for k, v in tokens.items():
         acc[k] += v
     if not r.remote:
-        acc["cluster"]["calls"] += 1
-        for k, v in tokens.items():
-            acc["cluster"][k] += v
+        parts = ("cluster", "shared") if r.provider == SHARED_PROVIDER else ("cluster",)
+        for part in parts:
+            acc[part]["calls"] += 1
+            for k, v in tokens.items():
+                acc[part][k] += v
     spend = r.spend_usd
     if spend is None:
         # A billed call the table has no price for. Calls on the cluster GPU are recorded at 0.
@@ -335,7 +340,7 @@ def typical_run_cost(user_id: int | None, model: str, *, limit: int = 20) -> dic
 def _sql_totals(user_id: int, *, conversation_id: str | None = None, run_id: str | None = None) -> dict:
     """Calls, tokens and spend of a chat or a run, summed in the database: this runs after every
     model call of a live run, and a long chat has thousands of rows. ``cluster`` is the part on the
-    cluster GPU, as in ``_empty``."""
+    lab's GPUs and ``shared`` the part of that on the shared model, as in ``_empty``."""
     from sqlalchemy import and_, case, func, or_, select
 
     from .db import session_scope
@@ -344,21 +349,26 @@ def _sql_totals(user_id: int, *, conversation_id: str | None = None, run_id: str
     unpriced = and_(LlmCall.remote.is_(True), LlmCall.cost_usd.is_(None), LlmCall.est_cost_usd.is_(None),
                     or_(LlmCall.status.is_(None), LlmCall.status != "error"))
     on_cluster = or_(LlmCall.remote.is_(False), LlmCall.remote.is_(None))     # ``not r.remote`` in _add
+    on_shared = and_(on_cluster, LlmCall.provider == SHARED_PROVIDER)
     stmt = select(func.count(LlmCall.id), func.coalesce(func.sum(LlmCall.total_tokens), 0),
                   func.coalesce(func.sum(spend), 0.0),
                   func.coalesce(func.sum(case((unpriced, 1), else_=0)), 0),
                   func.coalesce(func.sum(case((on_cluster, 1), else_=0)), 0),
-                  func.coalesce(func.sum(case((on_cluster, LlmCall.total_tokens), else_=0)), 0)
+                  func.coalesce(func.sum(case((on_cluster, LlmCall.total_tokens), else_=0)), 0),
+                  func.coalesce(func.sum(case((on_shared, 1), else_=0)), 0),
+                  func.coalesce(func.sum(case((on_shared, LlmCall.total_tokens), else_=0)), 0)
                   ).where(LlmCall.user_id == user_id)
     if conversation_id is not None:
         stmt = stmt.where(LlmCall.conversation_id == str(conversation_id))
     if run_id is not None:
         stmt = stmt.where(LlmCall.run_id == run_id)
     with session_scope() as s:
-        calls, tokens, usd, unpriced_n, cluster_n, cluster_tokens = s.execute(stmt).one()
+        calls, tokens, usd, unpriced_n, cluster_n, cluster_tokens, shared_n, shared_tokens = \
+            s.execute(stmt).one()
     return {"calls": int(calls), "total_tokens": int(tokens), "spend_usd": round(float(usd), 6),
             "unpriced_calls": int(unpriced_n),
-            "cluster": {"calls": int(cluster_n), "total_tokens": int(cluster_tokens)}}
+            "cluster": {"calls": int(cluster_n), "total_tokens": int(cluster_tokens)},
+            "shared": {"calls": int(shared_n), "total_tokens": int(shared_tokens)}}
 
 
 def live_totals(user_id: int | None, conversation_id: str | None, run_id: str | None) -> dict:
@@ -379,6 +389,11 @@ def live_totals(user_id: int | None, conversation_id: str | None, run_id: str | 
 def _user(request: Request):
     from . import auth_routes
     return auth_routes.require_user(request)
+
+
+def _shared_model_kept() -> bool:
+    from . import shared_llm
+    return bool(shared_llm.status().get("enabled"))
 
 
 def _pricing() -> dict:
@@ -468,6 +483,8 @@ def usage_page(request: Request, tz: str = "", period: str = "cycle", days: int 
         "pricing": _pricing(),
         "note": ESTIMATE_NOTE,
         "console_url": CONSOLE_USAGE_URL,
+        # The page shows the shared model's tokens wherever the server keeps one, before any use.
+        "shared_model": _shared_model_kept(),
     }
 
 

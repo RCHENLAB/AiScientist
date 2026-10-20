@@ -1,0 +1,16 @@
+{
+  "unit": "cells",
+  "baseline": 10000,
+  "steps": [
+    {
+      "name": "filtering and QC",
+      "cpus": 4,
+      "gpus": 0,
+      "mem_gb": 16,
+      "minutes": [
+        2,
+        8
+      ]
+    }
+  ]
+}

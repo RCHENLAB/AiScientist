@@ -10,7 +10,7 @@ credentials and no ``Mcp-Session-Id`` is issued. Implemented here, over the gate
 because the five tools and two resource kinds need nothing the protocol's SDK would add.
 
 Permissions are the web interface's: a request acts as ONE account, found from a personal access
-token (``Authorization: Bearer <token>``, made on the Datasets page) or the console's session
+token (``Authorization: Bearer <token>``, made in Files → Datasets) or the console's session
 cookie, and every lookup below is filtered on that account. A disabled account or a revoked token
 gets 401. A browser page of another origin is refused (403), against DNS rebinding.
 
@@ -372,7 +372,7 @@ async def mcp_post(request: Request) -> Response:
     user = await asyncio.to_thread(store.authenticate, request)
     if user is None:
         return _unauthorized("Sign in, or send 'Authorization: Bearer <token>' with a personal access "
-                             "token made on the Datasets page.")
+                             "token made in Files → Datasets.")
     try:
         payload = json.loads(await request.body() or b"null")
     except ValueError:

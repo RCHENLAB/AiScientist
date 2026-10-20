@@ -228,11 +228,11 @@ def test_a_job_still_loading_is_not_handed_out():
 
 def test_the_next_job_is_submitted_ahead_of_the_limit_and_only_once():
     cluster = FakeCluster()
-    cluster.add(left="1-01:00:00")
+    cluster.add(left="2-01:00:00")
     keeper = _keeper(cluster)
     keeper.step()
-    assert _sbatch_count(cluster) == 0             # 25 h left, lead is 24 h
-    next(iter(cluster.jobs.values()))["left"] = "23:00:00"
+    assert _sbatch_count(cluster) == 0             # 49 h left, lead is 48 h
+    next(iter(cluster.jobs.values()))["left"] = "1-23:00:00"
     keeper.step()
     assert _sbatch_count(cluster) == 1
     keeper.step()
@@ -261,7 +261,7 @@ def test_it_moves_to_the_newer_job_once_that_answers_and_cancels_the_old_one_aft
 
 def test_when_slurm_does_not_answer_nothing_is_submitted_or_cancelled():
     cluster = FakeCluster()
-    cluster.add(node="gpu-a", port=31000)
+    cluster.add(node="gpu-a", port=31000, left="2-12:00:00")
     keeper = _keeper(cluster)
     keeper.step()
     cluster.squeue_ok = False

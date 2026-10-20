@@ -60,3 +60,10 @@ def test_a_tool_is_offered_to_the_research_agents_unless_it_opts_out(tmp_path):
 def test_an_unknown_field_is_refused(tmp_path):
     with pytest.raises(ManifestError, match="unknown field"):
         load_manifest(_folder(tmp_path, "reserch: false\n"))
+
+
+def test_a_job_brings_its_own_gpu_or_calls_the_sessions_model_not_both(tmp_path):
+    m = load_manifest(_folder(tmp_path, "own_gpu: true\n"))
+    assert m.own_gpu is True and m.served_model is False
+    with pytest.raises(ManifestError, match="own_gpu and served_model"):
+        load_manifest(_folder(tmp_path / "b", "own_gpu: true\nserved_model: true\n"))

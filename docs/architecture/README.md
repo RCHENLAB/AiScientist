@@ -16,7 +16,7 @@ phenotypes). A user uploads data and asks a question. LLM roles form a virtual l
 plan, the user reviews it, the Scientist runs curated tools or its own code step by step (as Slurm
 jobs on UCI HPC3), the Critic reviews every step, and the run ends in a cited manuscript-style report
 (PDF / DOCX). A session runs on one LLM for all of its calls: Qwen3.8 in a GPU job of its own, the lab's shared model
-on HPC3 GPUs (DeepSeek-V4-Flash), both self-hosted with vLLM, or the user's own API key.
+on HPC3 GPUs (DeepSeek-V4-Flash; the default where the server keeps one), both self-hosted with vLLM, or the user's own API key.
 
 The code namespace is `aiscientist` (package, `AISCIENTIST_*` env vars). A `bioagent` import alias and
 the legacy `BIOAGENT_*` env names still work, and a few runtime identifiers outside the repository keep
@@ -44,6 +44,12 @@ The gateway orchestrates and never does the heavy compute. On each connect it sy
 `pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Apptainer images, so a
 tool change never needs an image rebuild. All gateway-to-HPC3 traffic goes over one SSH session per
 user. Deploys use `scripts/sync_deploy.sh` (rsync; the server never git-pulls).
+
+Users' data is kept on the gateway host ([dataset storage](../dataset_storage.md)); HPC3 holds a copy
+only while a session's runs need it. A session's data movement and housekeeping there go through a
+compute backend (`gateway/compute.py`: stage-in, submit, status, stage-out, clean-up), of which HPC3
+is the one implementation, and the console shows each session's state as it goes (staging in,
+running, staging out, cleaning up, closed, failed; `gateway/session_state.py`).
 
 Each chat has its own dialog and its own run: attachments, draft, plan review, Stop and mid-run notes
 belong to one chat. One session runs several chats at once, one run per chat, up to
@@ -107,7 +113,7 @@ flowchart TB
 
 | Package | What it owns |
 |---|---|
-| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, the HPC3 session (SSH, the held worker, the GPU serve job), LLM clients and bring-your-own keys, LLM usage and estimated cost (`llm_usage.py`, prices in `configs/llm_pricing.yaml`), the Slurm job executors (one per image), the environment manifest |
+| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, users' datasets (`dataset_storage.py`), the HPC3 session (SSH, the held worker, the GPU serve job; its compute backend and state, `compute.py`, `session_state.py`), LLM clients and bring-your-own keys, LLM usage and estimated cost (`llm_usage.py`, prices in `configs/llm_pricing.yaml`), the Slurm job executors (one per image), the environment manifest |
 | `src/aiscientist/agents/` | The orchestrator: the research lab, a step's tool loop, the catalog assembly, the DAG planner, the fast chat path, skills loading and induction, claim audit and step checks, agent memory |
 | `src/aiscientist/reporting/` | Turning a finished run into deliverables: pandoc render, result bundle, reference list, the vision-model render review |
 | `src/aiscientist/metadata/` | Croissant 1.1 metadata of datasets and results: built from what was measured plus the owner's review, validated (mlcroissant when installed), never hand-written. The gateway keeps it in the account database and serves it through the API and the MCP server at `/mcp` ([guideline](../development/metadata.md)) |

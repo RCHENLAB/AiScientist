@@ -1994,6 +1994,8 @@ function applyStatus(summary) {
     }
   }
   if (summary.gpu) renderGpu(summary);
+  if (showConnected && summary.session) renderSessionState(summary.session);
+  else if (isLogin) renderSessionState(null);
   if (isLogin || isReady) hideDuoPanel();
 
   // Cold-start status card in the chat area (replaces the removed log panel as a liveness
@@ -2099,6 +2101,11 @@ function sharedOptionHtml() {
   return `<option value="${SHARED_ENDPOINT}">${escapeHtml(s.label)} · ${escapeHtml(s.model)}${s.up ? "" : " (starting…)"}</option>`;
 }
 function isEndpointValue(v) { return v === SHARED_ENDPOINT ? !!apiKeys.shared : apiKeys.creds.some((c) => c.id === v); }
+// The lab's own choices, the shared model first: where the server keeps one it is everyone's default.
+function labOptionsHtml() { return sharedOptionHtml() + clusterOptionsHtml(); }
+// What a picker falls back to when the endpoint in use goes away (a deleted key): the cluster GPU
+// where sessions may still have one, else the shared model.
+function fallbackEndpoint() { return !clusterModels.sessionGpu && apiKeys.shared ? SHARED_ENDPOINT : ""; }
 
 // The "add one" affordance belongs INSIDE the picker, not only beside it. A first-time user opens
 // the endpoint dropdown looking for their own endpoint, finds a single "Cluster GPU" entry, and
@@ -2111,7 +2118,8 @@ const ADD_KEY_OPTION = "__add_key__";
 // previous Qwen3.6 AWQ, ...), each needing its own vLLM image and flags. The picker lists them as
 // "cluster:<id>" options; the 🖥 dialog shows which are on disk and lets an admin manage the list.
 const CLUSTER_PREFIX = "cluster:";
-const clusterModels = { models: [], unregistered: null, scanned: false, canManage: false, editing: null };
+const clusterModels = { models: [], unregistered: null, scanned: false, canManage: false, editing: null,
+                        sessionGpu: true };
 
 function clusterValue(id) {
   const m = clusterModels.models.find((x) => x.id === id && x.enabled)
@@ -2122,6 +2130,7 @@ function clusterValue(id) {
 function isClusterValue(v) { return !v || v.startsWith(CLUSTER_PREFIX); }
 
 function clusterOptionsHtml() {
+  if (!clusterModels.sessionGpu) return "";   // this server offers no session a GPU of its own
   const enabled = clusterModels.models.filter((m) => m.enabled);
   if (!enabled.length) return `<option value="${CLUSTER_PREFIX}">Cluster GPU (vLLM at UCI)</option>`;
   return enabled.map((m) => `<option value="${CLUSTER_PREFIX}${escapeHtml(m.id)}">Cluster GPU · ${escapeHtml(m.label)}${m.default ? " (default)" : ""}</option>`).join("");
@@ -2135,6 +2144,7 @@ async function loadClusterModels({ scan = false } = {}) {
     clusterModels.unregistered = d.unregistered;
     clusterModels.scanned = !!d.scanned;
     clusterModels.canManage = !!d.can_manage;
+    clusterModels.sessionGpu = d.session_gpu !== false;
   } catch { /* keep the last list; the picker still works with what it has */ }
   renderEndpointSelect();
   renderConnectEndpointSelect();
@@ -2182,7 +2192,7 @@ function renderEndpointSelect(summary) {
   // A refresh with no status attached (we just saved or deleted a key) must not silently move the
   // selection to "Cluster GPU" — the picker would then name an endpoint that isn't the one in use.
   const keep = summary ? activeId : (sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.activeId);
-  const opts = [clusterOptionsHtml(), sharedOptionHtml()];
+  const opts = [labOptionsHtml()];
   for (const c of apiKeys.creds) {
     const bad = c.last_error ? " ⚠" : "";
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}${bad}</option>`);
@@ -2192,7 +2202,10 @@ function renderEndpointSelect(summary) {
   if (summary) apiKeys.activeId = activeId;   // what to snap back to when "＋ Add" is picked
   if (keep && isEndpointValue(keep)) sel.value = keep;
   else if (keep && isClusterValue(keep) && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
-  else if (!known || (known.kind !== "credential" && known.kind !== "shared")) sel.value = clusterValue(known && known.cluster_model_id);
+  else if (!known || (known.kind !== "credential" && known.kind !== "shared")) {
+    const v = clusterValue(known && known.cluster_model_id);
+    sel.value = [...sel.options].some((o) => o.value === v) ? v : sel.options[0].value;
+  }
   if (current && onKey && !isEndpointValue(activeId)) {
     // The status names a credential we don't have in the list (another window added it, or the
     // list predates it). Reload rather than silently showing "Cluster GPU", which would misreport
@@ -2208,7 +2221,7 @@ function renderEndpointSelect(summary) {
 function snapEndpointSelect() {
   const sel = $("llmEndpointSelect");
   if (!sel) return;
-  sel.value = apiKeys.activeId || clusterValue();
+  sel.value = apiKeys.activeId || fallbackEndpoint() || clusterValue();
   syncEndpointActions();
 }
 
@@ -2254,7 +2267,7 @@ async function deleteEndpointById(credId) {
     toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message);
     return;
   }
-  if (wasActive) await selectLlmEndpoint("");
+  if (wasActive) await selectLlmEndpoint(fallbackEndpoint());
   if (apiKeys.editing === cred.id) resetApiKeyForm();
   if (apiKeys.connectChoice === cred.id) apiKeys.connectChoice = "";
   await loadApiCredentials();
@@ -2360,7 +2373,7 @@ function renderConnectEndpointSelect() {
   const sel = $("connectLlmSelect");
   if (!sel) return;
   const keep = sel.value && sel.value !== ADD_KEY_OPTION ? sel.value : apiKeys.connectChoice;
-  const opts = [clusterOptionsHtml(), sharedOptionHtml()];
+  const opts = [labOptionsHtml()];
   for (const c of apiKeys.creds) {
     opts.push(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} · ${escapeHtml(credRoles(c).pi || "no model")}</option>`);
   }
@@ -2381,9 +2394,13 @@ function renderConnectLlmHint() {
   const sel = $("connectLlmSelect");
   const chosen = sel && sel.value && sel.value !== ADD_KEY_OPTION && !isClusterValue(sel.value);
   if (chosen && sel.value === SHARED_ENDPOINT) {
-    el.textContent = "Every call of this session goes to the lab's shared model on HPC3 — no GPU queue, and nothing leaves UCI. Your HPC3 account still runs the analysis jobs.";
+    el.textContent = apiKeys.shared && apiKeys.shared.up === false
+      ? "The lab's shared model is starting or being renewed right now, so a session on it cannot start yet. Try again later, or use your own API key."
+      : "Every call of this session goes to the lab's shared model on HPC3: no GPU to wait for, nothing leaves UCI, and it costs you nothing. Your HPC3 account still runs the analysis jobs.";
   } else if (chosen) {
     el.textContent = "This session reasons on your own endpoint — no GPU queue. Your HPC3 account still runs the analysis jobs.";
+  } else if (!clusterModels.sessionGpu) {
+    el.textContent = "No API key saved yet. Add one here with 🔑 to use your own model; your HPC3 account still runs the analysis jobs.";
   } else if (apiKeys.shared) {
     el.textContent = "Cluster GPU runs Qwen on a card of your own for the whole session and waits for a free one, which can take hours. The shared model or your own API key start at once.";
   } else if (apiKeys.creds.length) {
@@ -3061,7 +3078,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "plan_expiring",
+  "plan_status", "plan_expiring", "run_usage",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -3089,6 +3106,7 @@ function handleWsMessage(msg) {
   }
   switch (msg.type) {
     case "status": applyStatus(msg.connection); break;
+    case "session_state": renderSessionState(msg.session); break;   // the session's copies and state on HPC3
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
     case "gpu_health": renderGpu({ gpu: { health: msg.health, job_id: state.lastJobId, node: state.lastNode, gres: state.lastGres } }); break;
     case "upload_staging": onStagingEvent(msg.job); break;       // a copy to HPC3 moved on
@@ -3124,6 +3142,13 @@ function handleRunEvent(c, msg) {
     case "run_status": streamStatus(c, msg.text); break;
     case "step_code": streamCode(c, msg.code); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
+    case "run_usage":
+      if (msg.actual) {
+        pushToSession(c.sid, { role: "assistant", content: runUsageMarkdown(msg),
+          streamId: `usage:${msg.run_id || msg.stream_id || c.lastStreamId}` });
+        if (chatVisible(c)) renderChat();
+      }
+      break;
     case "chat_done": finishAssistantStream(c); setChatRunning(c, false); renderChatUsage(); checkBudgetNotices(); break;
     case "chat_stopped":
       if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
@@ -3141,7 +3166,8 @@ function handleRunEvent(c, msg) {
     // The three prompts that wait for the user are held in the chat's record first and drawn from
     // there (holdPlanPrompt): only into their own chat, and again whenever that chat is rebuilt.
     case "plan_prompt":
-      holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [] }, msg);
+      holdPlanPrompt(c, "plan", { agenda: msg.agenda || [], doc: msg.plan || null, problems: msg.problems || [],
+                                    estimate: msg.estimate || null }, msg);
       break;
     case "plan_clarify": holdPlanPrompt(c, "clarify", { questions: msg.questions || [] }, msg); break;
     case "decision_prompt": holdPlanPrompt(c, "decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
@@ -3231,6 +3257,226 @@ async function doStopGpu() {
   }
 }
 
+// ---- the compute session on HPC3 (RCHENLAB/AiScientist issue 6) ------------------------------
+// What this session is doing with HPC3 (staging in, running, staging out, cleaning up, closed,
+// failed), each copy's progress and every failure, from the server's `session_state` pushes and the
+// status summary after a reload. The storage panel lists the account's recent sessions.
+const SESSION_STATE_LABEL = {
+  open: "Open", "staging-in": "Staging in", running: "Running", "staging-out": "Staging out",
+  "cleaning-up": "Cleaning up", closed: "Closed", failed: "Failed",
+};
+const SESSION_STATE_SHORT = { "staging-in": "In", "staging-out": "Out", "cleaning-up": "Cleanup", failed: "Failed" };
+
+// One copy, in words: what it copies and how far it is.
+function transferText(t) {
+  const total = t.bytes_total || 0;
+  if (t.status === "running") {
+    if (!total) return `${t.label}: starting…`;
+    const pct = t.percent != null ? t.percent : Math.round(100 * (t.bytes_done || 0) / total);
+    const files = t.files_total > 1
+      ? ` · file ${Math.min((t.files_done || 0) + 1, t.files_total)} of ${t.files_total}` : "";
+    return `${t.label}: ${fmtSize(t.bytes_done || 0)} of ${fmtSize(total)} (${pct}%)${files}`;
+  }
+  if (t.status === "failed") return `${t.label}: failed (${t.error || "unknown error"})`;
+  if (t.status === "cancelled") return `${t.label}: stopped`;
+  return `${t.label}: done` + (total ? ` (${fmtSize(total)})` : ", already there");
+}
+
+// How an ended session's HPC3 files went.
+function cleanupText(c, ttlDays) {
+  const days = ttlDays || 3;
+  if (!c) return "";
+  const kept = (c.kept_unsaved || []).length
+    ? ` Kept because a result was not saved: run ${c.kept_unsaved.join(", ")}.` : "";
+  switch (c.status) {
+    case "queued": return `Cleanup job ${c.job_id} queued on HPC3.` + kept;
+    case "done": return `Cleanup job ${c.job_id} finished` +
+      (c.removed != null ? `: ${c.removed} folder(s) removed.` : ".") + kept;
+    case "nothing": return "Nothing of it was left on HPC3." + kept;
+    case "failed": case "error": return `Cleanup: ${c.error || "failed"}. Its files go with the ${days}-day sweep.` + kept;
+    case "skipped":
+      if (c.reason === "mock") return "A mock session: nothing on HPC3.";
+      if (c.reason === "sweep") return `Ended without a disconnect: its HPC3 files go with the ${days}-day sweep.` + kept;
+      return `Its HPC3 files go with the ${days}-day sweep.` + kept;
+    default: return "";
+  }
+}
+
+// The one line under the state: what is happening, or how it ended.
+function sessionHeadline(s, ttlDays) {
+  const st = s.state || "open";
+  const unresolved = s.unresolved || [];
+  if (st === "failed" && unresolved.length) {
+    const t = unresolved[unresolved.length - 1];
+    return `${t.label} failed: ${String(t.error || "unknown error").replace(/\.+$/, "")}. It is still on HPC3` +
+      (s.closed_at ? `, kept for ${ttlDays || 3} days: connect and save it again from Runs.` : ": try again from Runs.");
+  }
+  if (s.closed_at) return cleanupText(s.cleanup, ttlDays);
+  return ({
+    open: "Connected; nothing is being copied.",
+    "staging-in": "Copying a run's inputs from the server to HPC3.",
+    running: "A run is executing on HPC3.",
+    "staging-out": "Copying from HPC3 to your data on the server.",
+    "cleaning-up": "Queuing the removal of this session's files on HPC3.",
+  })[st] || "";
+}
+
+function sessionDetailHtml(s, ttlDays) {
+  const st = s.state || "open";
+  const active = (s.active || []).map((t) => {
+    const pct = t.percent != null ? t.percent : 0;
+    return `<div class="sess-transfer"><div class="sess-transfer-text">${escapeHtml(transferText(t))}</div>` +
+      (t.bytes_total ? `<div class="meter"><div class="meter-fill" style="width:${Math.max(0, Math.min(100, pct))}%"></div></div>` : "") +
+      `</div>`;
+  }).join("");
+  const recentFails = (s.transfers || []).filter((t) => t.status === "failed" && t.kind === "stage-in").slice(-2)
+    .map((t) => `<div class="sess-failure">${escapeHtml(transferText(t))}</div>`).join("");
+  return `<div class="sess-row"><span class="sess-pill ${escapeHtml(st)}">${escapeHtml(SESSION_STATE_LABEL[st] || st)}</span>` +
+    `<span class="sess-text">${escapeHtml(sessionHeadline(s, ttlDays))}</span></div>` + active + recentFails;
+}
+
+function renderSessionState(s) {
+  state.session = s || null;
+  const box = $("connSession"), chip = $("sessChip");
+  if (!s) {
+    if (box) { box.classList.add("hidden"); box.innerHTML = ""; }
+    if (chip) chip.classList.add("hidden");
+    return;
+  }
+  const st = s.state || "open";
+  if (box) { box.innerHTML = sessionDetailHtml(s, state.ttlDays); box.classList.remove("hidden"); }
+  if (chip) {
+    // Idle and running are said elsewhere (the dot, the chat); the chip is for data on the move
+    // and for what went wrong.
+    const show = ["staging-in", "staging-out", "cleaning-up", "failed"].includes(st);
+    chip.classList.toggle("hidden", !show);
+    if (show) {
+      const t = (s.active || [])[0];
+      const pct = t && t.percent != null ? ` ${t.percent}%` : "";
+      chip.className = `sess-chip ${st}`;
+      // A phone shows the short word (styles.css), so the top bar still fits at 320 px.
+      chip.innerHTML = `<span class="sc-long">${escapeHtml(SESSION_STATE_LABEL[st])}</span>` +
+        `<span class="sc-short">${escapeHtml(SESSION_STATE_SHORT[st] || st)}</span>${escapeHtml(pct)}`;
+      chip.title = sessionHeadline(s, state.ttlDays);
+    }
+  }
+  if (!$("storageModal").classList.contains("hidden")) renderComputeSessions(null, s);
+}
+
+let _computeSessionRows = [];
+function renderComputeSessions(rows, live) {
+  if (rows) _computeSessionRows = rows;
+  if (live) _computeSessionRows = [live, ..._computeSessionRows.filter((r) => r.id !== live.id)];
+  const el = $("computeSessionList"); if (!el) return;
+  if (!_computeSessionRows.length) { el.innerHTML = '<div class="storage-empty">No sessions on HPC3 yet.</div>'; return; }
+  el.innerHTML = _computeSessionRows.slice(0, 8).map((r) => {
+    const when = r.closed_at ? `ended ${relTime(r.closed_at)}` : `opened ${relTime(r.opened_at)}`;
+    const now = r.connection_id === state.connectionId && !r.closed_at ? " · this session" : "";
+    return `<div class="storage-item sess-item"><div class="sess-item-main">${sessionDetailHtml(r, state.ttlDays)}` +
+      `<div class="sess-when">${escapeHtml(`${r.hpc_user || ""} · ${when}${now}`)}</div></div></div>`;
+  }).join("");
+}
+
+async function loadComputeSessions() {
+  const el = $("computeSessionList"); if (!el) return;
+  try {
+    const q = state.connectionId ? `?connection_id=${encodeURIComponent(state.connectionId)}` : "";
+    const res = await fetch(`/api/sessions${q}`);
+    const d = await res.json();
+    if (!res.ok) { el.innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read the sessions")}</div>`; return; }
+    if (d.ttl_days) state.ttlDays = d.ttl_days;
+    renderComputeSessions(d.sessions || []);
+  } catch (err) {
+    el.innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the local server." : escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ---- HPC3 originals of datasets now kept on the server (issue 6) ---------------------------------
+// Two explicit steps, each a Slurm job on HPC3: a dry run that checks every original against its
+// server copy, then, on the user's confirmation, the removal of what that check found.
+let _originalsPoll = null;
+
+function originalsPending(plan) {
+  return !!plan && [plan.check, plan.remove].some((j) => j && j.status === "queued");
+}
+
+function renderOriginals(d) {
+  const box = $("originalsBox"); if (!box) return;
+  clearTimeout(_originalsPoll); _originalsPoll = null;
+  if (d && d.unavailable) { box.innerHTML = `<div class="storage-empty">${escapeHtml(d.unavailable)}</div>`; return; }
+  const plan = d && d.plan;
+  const checkBtn = '<button type="button" class="ghost small" data-orig="check">Check what can be removed</button>';
+  if (!plan) {
+    box.innerHTML = `<p class="storage-note">When a dataset kept only on HPC3 is copied to the server, its HPC3 original is kept. ` +
+      `A check runs as a job on HPC3 and removes nothing; you confirm the removal after it.</p>${checkBtn}`;
+    return;
+  }
+  const parts = [];
+  const check = plan.check, remove = plan.remove;
+  if (!check && !(plan.candidates || []).length) {
+    parts.push('<div class="storage-empty">No HPC3 original can be removed now.</div>');
+  } else if (check && check.status === "queued") {
+    parts.push(`<div class="orig-status">Checking ${plan.candidates.length} original(s) on HPC3 (job ${escapeHtml(check.job_id)}` +
+      `${check.slurm_state ? `, ${escapeHtml(check.slurm_state.toLowerCase())}` : ", queued"}). Nothing is removed.</div>`);
+  } else if (check && check.status === "failed") {
+    parts.push(`<div class="sess-failure">The check did not finish: ${escapeHtml(check.error || "unknown error")}.</div>`);
+  }
+  const results = ((remove && remove.results) || (check && check.results) || []);
+  if (results.length) {
+    parts.push(results.map((r) => {
+      const verdict = { would_remove: "can be removed", removed: "removed", skip: `kept: ${r.reason}` }[r.verdict] || r.verdict;
+      return `<div class="storage-item orig-item ${escapeHtml(r.verdict)}"><span class="si-name">${escapeHtml(r.path)}</span>` +
+        `<span class="si-size">${r.bytes != null ? escapeHtml(fmtSize(r.bytes)) + " · " : ""}${escapeHtml(verdict)}</span></div>`;
+    }).join(""));
+  }
+  const kept = plan.kept || [];
+  if (kept.length) {
+    parts.push(`<details class="orig-kept"><summary>${kept.length} not considered</summary>` + kept.map((k) =>
+      `<div class="storage-item"><span class="si-name">${escapeHtml(k.path || k.name)}</span><span class="si-size">${escapeHtml(k.reason)}</span></div>`
+    ).join("") + "</details>");
+  }
+  if (remove && remove.status === "queued") {
+    parts.push(`<div class="orig-status">Removing ${remove.entries} original(s) on HPC3 (job ${escapeHtml(remove.job_id)}` +
+      `${remove.slurm_state ? `, ${escapeHtml(remove.slurm_state.toLowerCase())}` : ", queued"}).</div>`);
+  } else if (remove && remove.status === "done") {
+    parts.push(`<div class="orig-status done">Removed ${plan.removed} original(s), ${escapeHtml(fmtSize(plan.removed_bytes))}.</div>`);
+  } else if (remove && remove.status === "failed") {
+    parts.push(`<div class="sess-failure">The removal did not finish: ${escapeHtml(remove.error || "unknown error")}. Check again.</div>`);
+  }
+  const canRemove = check && check.status === "done" && !remove && plan.would_remove > 0;
+  const buttons = [checkBtn];
+  if (canRemove) buttons.unshift(`<button type="button" class="ghost small danger" data-orig="remove" data-plan="${escapeHtml(plan.id)}">` +
+    `Remove ${plan.would_remove} original(s), ${escapeHtml(fmtSize(plan.would_remove_bytes))}</button>`);
+  box.innerHTML = parts.join("") + `<div class="orig-actions">${buttons.join("")}</div>`;
+  if (originalsPending(plan)) _originalsPoll = setTimeout(() => loadOriginals(plan.id), 8000);
+}
+
+async function loadOriginals(planId) {
+  if (!state.connectionId) return;
+  const q = `connection_id=${encodeURIComponent(state.connectionId)}` + (planId ? `&plan_id=${encodeURIComponent(planId)}` : "");
+  try {
+    const res = await fetch(`/api/hpc-originals?${q}`);
+    const d = await res.json();
+    if (!res.ok) { renderOriginals({ unavailable: d.error || "Not available." }); return; }
+    if (!$("storageModal").classList.contains("hidden")) renderOriginals(d);
+  } catch (err) {
+    renderOriginals({ unavailable: isUnreachable(err) ? "Can't reach the local server." : err.message });
+  }
+}
+
+async function originalsAction(kind, planId) {
+  if (kind === "remove" && !confirm("Remove these HPC3 originals?\n\nEach one is checked again on HPC3 " +
+      "against its copy on the server before it is removed. This cannot be undone.")) return;
+  const url = kind === "remove" ? "/api/hpc-originals/remove" : "/api/hpc-originals/check";
+  try {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, plan_id: planId || "" }) });
+    const d = await res.json();
+    if (!res.ok) { toast(d.error || "Failed"); if (d.plan) renderOriginals(d); return; }
+    renderOriginals(d);
+  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : err.message); }
+}
+
 async function openStorage() {
   if (!state.connectionId) return;
   $("storageModal").classList.remove("hidden");
@@ -3238,6 +3484,13 @@ async function openStorage() {
   $("storageQuota").textContent = "";
   $("storageBase").textContent = "";
   $("storageUsed").textContent = "—";
+  loadComputeSessions();
+  loadOriginals();
+  loadStorageDeletes();
+  await loadStorageListing();
+}
+
+async function loadStorageListing() {
   try {
     const res = await fetch(`/api/storage/${state.connectionId}`);
     const d = await res.json();
@@ -3249,24 +3502,81 @@ async function openStorage() {
 }
 
 function renderStorage(d) {
+  _storageListing = d;
   $("storageBase").textContent = d.base || "";
   $("storageUsed").textContent = d.used || "?";
   $("storageQuota").textContent = d.quota_raw || "";
   const items = d.items || [];
   if (!items.length) { $("storageItems").innerHTML = '<div class="storage-empty">No items in your directory.</div>'; return; }
-  $("storageItems").innerHTML = items.map((i) =>
-    `<div class="storage-item"><span class="si-name">${escapeHtml(i.name)}</span><span class="si-size">${escapeHtml(i.size)}</span><button class="si-del" data-path="${escapeHtml(i.path)}">Delete</button></div>`
-  ).join("");
+  $("storageItems").innerHTML = items.map((i) => {
+    const deleting = i.deleting || _storageDeleting[i.path];
+    const action = deleting
+      ? `<span class="si-deleting">Deletion queued (job ${escapeHtml(deleting)})</span>`
+      : `<button class="si-del" data-path="${escapeHtml(i.path)}">Delete</button>`;
+    return `<div class="storage-item"><span class="si-name">${escapeHtml(i.name)}</span><span class="si-size">${escapeHtml(i.size)}</span>${action}</div>`;
+  }).join("");
+}
+
+// ---- the storage panel's Delete, a Slurm job on HPC3 --------------------------------------------
+// The server answers at once with the queued job; the panel asks for its state (one sacct) while
+// it is queued or running, and reads the folders again once it has ended.
+let _storageDeletesPoll = null;
+let _storageDeleting = {};        // path -> job id, for the deletions still queued or running
+let _storageListing = null;       // the folders as last read, to redraw a row as queued
+
+function storageDeleteLine(j) {
+  const where = `<span class="si-name">${escapeHtml(j.path)}</span>`;
+  if (j.status === "queued") {
+    return `<div class="storage-item sd-item queued">${where}<span class="si-size">deleting, job ${escapeHtml(j.job_id)}` +
+      `${j.slurm_state ? ` ${escapeHtml(j.slurm_state.toLowerCase())}` : " queued"}</span></div>`;
+  }
+  if (j.status === "done") {
+    return `<div class="storage-item sd-item done">${where}<span class="si-size">deleted` +
+      `${j.note ? ` (${escapeHtml(j.note)})` : ""}</span></div>`;
+  }
+  return `<div class="storage-item sd-item failed">${where}<span class="si-size sess-failure">not deleted: ` +
+    `${escapeHtml(j.error || "unknown error")}</span></div>`;
+}
+
+function renderStorageDeletes(deletes) {
+  const box = $("storageDeletes"); if (!box) return [];
+  clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null;
+  const shown = (deletes || []).filter((j) => j.job_id !== "mock").slice(-5).reverse();
+  box.innerHTML = shown.length ? `<div class="sd-head">Deletions on HPC3</div>` + shown.map(storageDeleteLine).join("") : "";
+  const before = _storageDeleting;
+  _storageDeleting = {};
+  for (const j of deletes || []) if (j.status === "queued") _storageDeleting[j.path] = j.job_id;
+  const ended = Object.keys(before).filter((path) => !(path in _storageDeleting));
+  if (Object.keys(_storageDeleting).length) _storageDeletesPoll = setTimeout(loadStorageDeletes, 8000);
+  return ended;
+}
+
+async function loadStorageDeletes() {
+  if (!state.connectionId) return;
+  try {
+    const res = await fetch(`/api/storage/${state.connectionId}/deletes`);
+    const d = await res.json();
+    if (!res.ok) {
+      if (Object.keys(_storageDeleting).length) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = setTimeout(loadStorageDeletes, 15000); }
+      return;
+    }
+    if ($("storageModal").classList.contains("hidden")) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null; return; }
+    const ended = renderStorageDeletes(d.deletes);
+    if (ended.length) loadStorageListing();          // a deletion ended: the folders changed
+  } catch (err) { /* the next open of the panel asks again */ }
 }
 
 async function deleteStorageItem(path) {
-  if (!confirm(`Delete on HPC3 (rm -rf):\n\n${path}\n\nThis cannot be undone. Continue?`)) return;
+  if (!confirm(`Delete on HPC3:\n\n${path}\n\nThe deletion runs as a job on HPC3, inside your own folders only. ` +
+      `This cannot be undone. Continue?`)) return;
   try {
     const res = await fetch("/api/storage/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, path }) });
     const d = await res.json();
     if (!res.ok) { toast(d.error || "Delete failed"); return; }
-    toast("Deleted.");
-    renderStorage(d);
+    if (d.status === "deleted") { toast("Deleted."); renderStorage(d); return; }
+    toast(`Deletion queued on HPC3 (job ${d.job.job_id}). The list updates when it has run.`);
+    renderStorageDeletes(d.deletes);
+    if (_storageListing) renderStorage(_storageListing);      // the row now says it is queued
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
 }
 
@@ -3293,7 +3603,13 @@ async function disconnect() {
     }
   }
   try {
-    await fetch("/api/disconnect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId }) });
+    const res = await fetch("/api/disconnect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId }) });
+    const d = await res.json().catch(() => ({}));
+    // How the session's HPC3 files went: its cleanup job, or why they are left to the sweep.
+    if (res.ok && d.session && d.session.closed_at) {
+      const said = sessionHeadline(d.session, state.ttlDays);
+      if (said) toast(`Session closed. ${said}`);
+    }
   } catch (err) {
     if (isUnreachable(err)) toast("Local server was already down — clearing the session. Check HPC3 with `squeue --me`.");
   }
@@ -3798,6 +4114,61 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + meta + `</div></li>`;
 }
 
+// One decimal from 1 up, two below it: an estimate is a range, and 2.667 hours claims more than it knows.
+function estimateNumber(value) {
+  return Number.isFinite(value)
+    ? value.toLocaleString(undefined, { maximumFractionDigits: Math.abs(value) >= 1 ? 1 : 2 }) : "—";
+}
+
+function estimateRange(values, time = false) {
+  if (!Array.isArray(values) || values.length !== 2 || !values.every(Number.isFinite)) return "—";
+  const divisor = time ? (values[1] >= 3600 ? 3600 : 60) : 1;
+  const [lo, hi] = values.map((v) => estimateNumber(v / divisor));
+  return `${time ? "~" : ""}${lo === hi ? lo : `${lo}–${hi}`}` + (time ? (divisor === 3600 ? " hr" : " min") : "");
+}
+
+function estimateCell(value) {
+  return String(value == null ? "" : value).replace(/[|\r\n]/g, " ");
+}
+
+function planEstimateMarkdown(estimate) {
+  if (!estimate || !Array.isArray(estimate.steps)) return "";
+  const currency = estimateCell(estimate.currency || "USD");
+  const row = (entry, label, skill) => `| ${estimateCell(label)}${entry.rough ? " (rough)" : ""} | ${estimateCell(skill)} | `
+    + `${estimateRange(entry.seconds, true)} | ${estimateRange(entry.cpu_hours)} | ${estimateRange(entry.gpu_hours)} | `
+    + `${estimate.rates_configured ? estimateRange(entry.cost) + " " + currency : "—"} |`;
+  return "\n\n**Estimated resources and cost**\n\n"
+    + "| Step | Skill | Time | CPU hours | GPU hours | Est. cost |\n| --- | --- | --- | --- | --- | --- |\n"
+    + estimate.steps.map((entry, i) => row(entry, entry.step || i + 1, entry.skill)).join("\n")
+    + (estimate.total ? "\n" + row(estimate.total, "Total", "") : "")
+    + "\n\nRough estimates have limited run history. "
+    + (estimate.rates_configured ? "" : "Rates not configured: no cost is shown. ")
+    + estimateCell(estimate.note || "HPC3 queue wait time is not included.") + "\n";
+}
+
+function runUsageMarkdown(msg) {
+  const actual = msg.actual;
+  const estimate = msg.estimate || {};
+  const total = estimate.total || {};
+  const cost = (value) => estimate.rates_configured
+    ? `${value} ${estimateCell(estimate.currency || "USD")}` : "—";
+  return "**Run resources and cost**\n\n| | Estimated | Actual |\n| --- | --- | --- |\n"
+    + `| Time | ${estimateRange(total.seconds, true)} | ${estimateNumber(actual.seconds / 60)} min |\n`
+    + `| CPU hours | ${estimateRange(total.cpu_hours)} | ${estimateNumber(actual.cpu_hours)} |\n`
+    + `| GPU hours | ${estimateRange(total.gpu_hours)} | ${estimateNumber(actual.gpu_hours)} |\n`
+    + `| Cost | ${cost(estimateRange(total.cost))} | ${cost(estimateNumber(actual.cost))} |\n\n`
+    + (total.rough ? "Estimate: rough. " : "") + (actual.rough ? "Actual resource accounting: rough. " : "")
+    + (estimate.rates_configured ? "" : "Rates not configured: no cost is shown. ")
+    + "Time is summed tool compute time; model/report overhead and HPC3 queue wait time are excluded.";
+}
+
+// The estimate on the plan card: the same table the approved plan keeps in the chat, in a block of
+// its own so a narrow side panel scrolls it sideways instead of widening.
+function planEstimateHtml(estimate) {
+  const md = planEstimateMarkdown(estimate);
+  return md ? `<div class="plan-estimate">${renderMarkdown(md)}</div>` : "";
+}
+
 // The line under a plan's title: how many steps, how many settings the plan fixes, and where the
 // steps run when that is the same for all of them (a step only carries its own line when the plan
 // mixes places).
@@ -3844,12 +4215,13 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
     + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace, edit)).join("")
     + `</ol>`;
   if (mode !== "review") {
-    return head + steps + planDocumentHtml(doc)
+    return head + steps + planEstimateHtml(o.estimate) + planDocumentHtml(doc)
       + `<div class="plan-actions-row"><span class="plan-actions-status">${escapeHtml(o.status || "")}</span></div>`;
   }
   const tip = edit ? `<div class="plan-edit-tip">${planIcon("edit")}<span>Click a title or a value to change it, `
     + `or remove a step. Applied as written, without the model; the other steps stay as they are.</span></div>` : "";
   return head + planRevisedNote(revised) + tip + steps
+    + planEstimateHtml(o.estimate)
     + planReviseHtml(o.words)
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
@@ -4304,6 +4676,7 @@ function chatPlanView(c = activeChat()) {
   if (state.planView) return { mode: "saved", ...state.planView };
   if (c && c.plan && c.plan.kind === "plan") {
     return { mode: "review", agenda: c.plan.agenda || [], doc: c.plan.doc || null, revised: c.plan.revised || [],
+             estimate: c.plan.estimate || null,
              expiry: c.plan.expiry ? planExpiryText("plan", c.plan.expiry.at) : "" };
   }
   if (c && c.answered) return { mode: "status", ...c.answered };
@@ -4325,7 +4698,7 @@ function renderPlanPanel() {
   }
   host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
     + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
-                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "",
+                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "", estimate: view.estimate || null,
                      words: (c && c.planWords) || "" })
     + `</div>`;
   wirePlanSteps(host, view.agenda || []);
@@ -4450,12 +4823,12 @@ function openPlanPanel() {
 // is given (the steps, and the document with the settings that ran); `plan` is what the entry and
 // the side panel are drawn from.
 function planSavedMessage(p) {
-  const docMd = (p.doc && p.doc.yaml)
+  const docMd = planEstimateMarkdown(p.estimate) + ((p.doc && p.doc.yaml)
     ? "\n\n**Approved plan document**\n\n```yaml\n" + p.doc.yaml.trim() + "\n```"
-    : "";
+    : "");
   return { role: "assistant", kind: "plan",
            content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd,
-           plan: { agenda: p.agenda, doc: p.doc || null, status: "Approved" } };
+           plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved" } };
 }
 
 function showClarify(questions) {
@@ -5901,6 +6274,18 @@ function unbindEverywhere(path) {
   syncDatasetSelection();
 }
 
+// A dataset whose path changed (moved from HPC3 to the server) stays attached wherever it was.
+function repointEverywhere(from, to) {
+  state.datasets = state.datasets.filter((d) => d.path !== from || d.path === to);
+  for (const s of state.sessions) {
+    const c = chatOf(s.id);
+    if (!c.bound.includes(from)) continue;
+    c.bound = [...new Set(c.bound.map((p) => (p === from ? to : p)))];
+    if (from in c.roles) { c.roles[to] = c.roles[from]; delete c.roles[from]; }
+    saveComposer(c);
+  }
+}
+
 // The chat an upload attaches to: the one it was started from. The server keeps it too, so a card
 // restored after a reload knows it; one from before the server kept it has none and attaches nothing.
 function uploadChat(id) {
@@ -6091,9 +6476,13 @@ async function loadDatasetChips() {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
     for (const x of items) {
       const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
-      if (!state.datasets.some((d) => d.path === x.path)) {
-        state.datasets.push({ name, path: x.path, kind: x.kind, at: x.uploaded_at, size: x.size_bytes });
-      }
+      // A dataset moved from HPC3 to the server keeps its id and changes its path: the chip and every
+      // chat it is attached to follow it, rather than keep sending the HPC3 original.
+      const moved = x.id != null && state.datasets.find((d) => d.id === x.id && d.path !== x.path);
+      if (moved) repointEverywhere(moved.path, x.path);
+      const known = state.datasets.find((d) => d.path === x.path);
+      if (known) { if (known.id == null) known.id = x.id; continue; }
+      state.datasets.push({ id: x.id, name, path: x.path, kind: x.kind, at: x.uploaded_at, size: x.size_bytes });
     }
   } catch { /* datasets need accounts; the list just stays empty otherwise */ }
   // Do NOT auto-select the last dataset: a fresh chat starts with an EMPTY dataset box rather than
@@ -6307,9 +6696,14 @@ async function doLogout() {
 
 function initShell() {
   document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
-  $("datasetsRefresh").addEventListener("click", loadDatasets);
+  $("datasetsRefresh").addEventListener("click", loadFiles);
   $("runsRefresh").addEventListener("click", loadRuns);
   $("runsList").addEventListener("click", onRunsClick);
+  $("outputsList").addEventListener("click", onOutputsClick);
+  document.querySelectorAll(".files-tab").forEach((b) => b.addEventListener("click", () => switchFilesTab(b.dataset.filesTab)));
+  wireListSearch("datasetsSearch", "datasetsList", "datasetsCount");
+  wireListSearch("outputsSearch", "outputsList", "outputsCount");
+  wireListSearch("runsSearch", "runsList", "runsCount");
   $("adminRefresh").addEventListener("click", loadAdminUsers);
   $("systemRefresh").addEventListener("click", loadSystem);
   $("systemRuns").addEventListener("click", onSystemRunsClick);
@@ -6351,7 +6745,7 @@ function initShell() {
 function switchView(name) {
   document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
-  if (name === "datasets") loadDatasets();
+  if (name === "datasets") loadFiles();
   else if (name === "runs") loadRuns();
   else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
   else if (name === "account") { renderAccount(state.user); loadUsage(); }
@@ -6943,7 +7337,9 @@ async function loadDatasets() {
       const fromHtml = !from ? ""
         : from.open ? ` · <button type="button" class="upload-chat" data-open-chat="${escapeHtml(String(x.conversation_id))}" title="Open the chat this upload was started from">${escapeHtml(from.text)}</button>`
         : ` · ${escapeHtml(from.text)}`;
-      return `<div class="card"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
+      const q = sysSearchText([x.name, x.kind, x.location === "hpc3" ? "on hpc3" : "on the server", from && from.text,
+                               fmtDate(x.uploaded_at), (x.uploaded_at || "").slice(0, 10)]);
+      return `<div class="card" data-q="${escapeHtml(q)}"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
       `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${x.location === "hpc3" ? ` · <span title="Kept only on HPC3 so far: it is moved to the server when you connect">on HPC3</span>` : ""}${metadataBadge(x.metadata)}</span></div>` +
       `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
       `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
@@ -6953,13 +7349,62 @@ async function loadDatasets() {
     }).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  filterCards("datasetsList", "datasetsCount", $("datasetsSearch").value);   // a reload keeps the search
   loadMcpTokens();
+}
+
+// ---- Files view: two tabs, Datasets (above) and Outputs (what the runs wrote, below) ----
+let filesTab = "datasets";
+function switchFilesTab(tab) {
+  filesTab = tab === "outputs" ? "outputs" : "datasets";
+  document.querySelectorAll(".files-tab").forEach((b) => {
+    const on = b.dataset.filesTab === filesTab;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  document.querySelectorAll(".files-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "filesPane-" + filesTab));
+  if (filesTab === "outputs") loadOutputs();
+}
+function loadFiles() {
+  loadDatasets();
+  if (filesTab === "outputs") loadOutputs();
+}
+
+// The search over a page's list: each card's data-q holds what it is found by (see sysSearchText), and
+// every term must match. Beside the box, "n of N" while a search is on.
+function filterCards(listId, countId, query) {
+  const list = $(listId);
+  if (!list) return;
+  const cards = [...list.children].filter((c) => c.dataset && c.dataset.q !== undefined);
+  let shown = 0;
+  for (const c of cards) {
+    const hit = sysMatch(query, c.dataset.q || "");
+    c.classList.toggle("hidden", !hit);
+    shown += hit;
+  }
+  const searching = !!String(query || "").trim() && cards.length > 0;
+  $(countId).textContent = searching ? `${shown} of ${cards.length}` : "";
+  let none = list.querySelector(":scope > .list-none");
+  if (!none) {
+    none = document.createElement("div");
+    none.className = "empty-hint list-none hidden";
+    none.textContent = "Nothing here matches.";
+    list.appendChild(none);
+  }
+  none.classList.toggle("hidden", !(searching && !shown));
+}
+function wireListSearch(boxId, listId, countId) {
+  const box = $(boxId);
+  box.addEventListener("input", () => filterCards(listId, countId, box.value));
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && box.value) { box.value = ""; filterCards(listId, countId, ""); }
+  });
 }
 async function onDatasetsClick(e) {
   const open = e.target.closest("[data-open-chat]");
   if (open) { openChat(open.dataset.openChat); return; }
   const pv = e.target.closest("[data-preview]");
-  if (pv) { openDatasetPreview(Number(pv.dataset.preview), pv.dataset.name || ""); return; }
+  if (pv) { openDatasetPreview(`/api/datasets/${Number(pv.dataset.preview)}`, pv.dataset.name || ""); return; }
   const dl = e.target.closest("[data-dl-size]");
   if (dl) { if (!confirmLargeDownload(Number(dl.dataset.dlSize), dl.dataset.name)) e.preventDefault(); return; }
   const meta = e.target.closest("[data-meta]");
@@ -7166,46 +7611,48 @@ async function onMcpTokensClick(e) {
 // ---- Dataset preview (RCHENLAB/AiScientist issue 10) ----
 // What a dataset holds, read on the server where it is kept: an .h5ad's cells, genes, metadata
 // columns and first rows; a table's first rows; a VCF's header and first records; a folder's files.
-// The server reads only a bounded part, so a 15 GB matrix opens as fast as a small one.
+// The server reads only a bounded part, so a 15 GB matrix opens as fast as a small one. The same viewer
+// opens a run's outputs (Files → Outputs): ``base`` is the API path of what is shown, /api/datasets/<id>
+// or /api/runs/<run id>, each answering /preview and /download.
 
 const LARGE_DOWNLOAD = 2 * 1024 ** 3;
-const dsPreview = { id: null, name: "", folder: null };
+const dsPreview = { base: null, name: "", folder: null };
 
 function confirmLargeDownload(size, name) {
   if (!size || size < LARGE_DOWNLOAD) return true;
   return confirm(`"${name}" is ${fmtSize(size)}. Download it anyway?\n\nLarge downloads take a while; keep this tab open until it finishes.`);
 }
 
-function dsDownloadUrl(id, file, inline) {
+function dsDownloadUrl(base, file, inline) {
   const q = new URLSearchParams();
   if (file) q.set("file", file);
   if (inline) q.set("inline", "1");
   const qs = q.toString();
-  return `/api/datasets/${id}/download${qs ? "?" + qs : ""}`;
+  return `${base}/download${qs ? "?" + qs : ""}`;
 }
 
-async function openDatasetPreview(id, name, file) {
+async function openDatasetPreview(base, name, file) {
   const modal = $("datasetPreviewModal"), body = $("dsPreviewBody");
-  if (dsPreview.id !== id) dsPreview.folder = null;
-  Object.assign(dsPreview, { id, name });
+  if (dsPreview.base !== base) dsPreview.folder = null;
+  Object.assign(dsPreview, { base, name });
   $("dsPreviewTitle").textContent = file ? file.split("/").pop() : name;
   $("dsPreviewMeta").textContent = "";
   const dl = $("dsPreviewDownload");
-  dl.href = dsDownloadUrl(id, file);
+  dl.href = dsDownloadUrl(base, file);
   dl.onclick = null;
   body.innerHTML = `<div class="ds-loading">${icon("hourglass_top")} Reading ${escapeHtml(file || name)}…</div>`;
   modal.classList.remove("hidden");
   let data;
   try {
     const q = file ? `?file=${encodeURIComponent(file)}` : "";
-    const res = await fetch(`/api/datasets/${id}/preview${q}`);
+    const res = await fetch(`${base}/preview${q}`);
     data = await res.json();
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   } catch (err) {
     body.innerHTML = `<div class="ds-error">${icon("error")} ${escapeHtml(isUnreachable(err) ? "Can't reach the server." : err.message)}</div>`;
     return;
   }
-  if (dsPreview.id !== id) return;                    // another preview was opened meanwhile
+  if (dsPreview.base !== base) return;                // another preview was opened meanwhile
   const ds = data.dataset || {};
   const where = ds.location === "hpc3" ? "kept on HPC3" : "kept on the server";
   if (data.folder) {
@@ -7213,7 +7660,7 @@ async function openDatasetPreview(id, name, file) {
     $("dsPreviewMeta").textContent = `Folder · ${data.folder.total_files} files · ${fmtSize(data.folder.total_bytes)} · ${where}`;
     dl.onclick = (e) => { if (!confirmLargeDownload(data.folder.total_bytes, name)) e.preventDefault(); };
     dl.textContent = "Download (.zip)";
-    body.innerHTML = dsFolderHtml(id, data.folder);
+    body.innerHTML = dsFolderHtml(base, data.folder);
     return;
   }
   const f = data.file || {};
@@ -7222,7 +7669,7 @@ async function openDatasetPreview(id, name, file) {
   $("dsPreviewMeta").textContent = [dsKindLabel(f.kind, data.preview), fmtSize(f.size_bytes), where].filter(Boolean).join(" · ");
   const back = file && ds.is_folder
     ? `<button type="button" class="ds-back ghost small" data-ds-back="1">${icon("arrow_back")} ${escapeHtml(name)}/</button>` : "";
-  body.innerHTML = back + dsPreviewHtml(id, file, data.preview || {});
+  body.innerHTML = back + dsPreviewHtml(base, file, data.preview || {});
 }
 
 function dsKindLabel(kind, p) {
@@ -7255,12 +7702,12 @@ function dsNames(list) {
     ? `<ul class="ds-names">${list.map((x) => `<li><code>${escapeHtml(x.name ?? x)}</code>${x.shape ? ` <span class="ds-dim">${escapeHtml(x.shape.join(" × "))}</span>` : ""}</li>`).join("")}</ul>` : "";
 }
 
-function dsFolderHtml(id, folder) {
+function dsFolderHtml(base, folder) {
   const rows = (folder.entries || []).map((e) => {
     const p = escapeHtml(e.path);
     return `<tr><td class="ds-path"><button type="button" class="linklike" data-ds-file="${p}">${p}</button></td>` +
       `<td class="ds-size">${fmtSize(e.size)}</td>` +
-      `<td class="ds-act"><a class="ghost small" href="${dsDownloadUrl(id, e.path)}" download>Download</a></td></tr>`;
+      `<td class="ds-act"><a class="ghost small" href="${dsDownloadUrl(base, e.path)}" download>Download</a></td></tr>`;
   }).join("");
   const more = folder.truncated ? `<p class="ds-note">Showing the first ${folder.entries.length} of ${folder.total_files} files. The .zip has all of them.</p>` : "";
   return rows
@@ -7276,7 +7723,7 @@ function dsXValues(x) {
   return `${range} in the first ${s.n} stored values, not all whole numbers: already normalized or transformed`;
 }
 
-function dsPreviewHtml(id, file, p) {
+function dsPreviewHtml(base, file, p) {
   switch (p.type) {
     case "h5ad": {
       if (p.note && !p.obs) return `<div class="ds-note">${escapeHtml(p.note)}</div>`;
@@ -7319,9 +7766,9 @@ function dsPreviewHtml(id, file, p) {
         dsSection("First records", dsTable(p.columns, p.rows), p.more_rows ? `Showing the first ${p.rows.length} records.` : "") +
         (p.header_complete ? "" : `<p class="ds-note">The header is longer than the part read for the preview.</p>`);
     case "image":
-      return `<div class="ds-media"><img src="${dsDownloadUrl(id, file, true)}" alt="${escapeHtml(file || dsPreview.name)}" /></div>`;
+      return `<div class="ds-media"><img src="${dsDownloadUrl(base, file, true)}" alt="${escapeHtml(file || dsPreview.name)}" /></div>`;
     case "pdf":
-      return `<iframe class="ds-pdf" src="${dsDownloadUrl(id, file, true)}" title="${escapeHtml(file || dsPreview.name)}"></iframe>`;
+      return `<iframe class="ds-pdf" src="${dsDownloadUrl(base, file, true)}" title="${escapeHtml(file || dsPreview.name)}"></iframe>`;
     case "text":
       return `<pre class="ds-text">${escapeHtml(p.text || "")}</pre>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
     default:
@@ -7331,14 +7778,14 @@ function dsPreviewHtml(id, file, p) {
 
 function onDatasetPreviewClick(e) {
   const f = e.target.closest("[data-ds-file]");
-  if (f) { openDatasetPreview(dsPreview.id, dsPreview.name, f.dataset.dsFile); return; }
-  if (e.target.closest("[data-ds-back]")) openDatasetPreview(dsPreview.id, dsPreview.name);
+  if (f) { openDatasetPreview(dsPreview.base, dsPreview.name, f.dataset.dsFile); return; }
+  if (e.target.closest("[data-ds-back]")) openDatasetPreview(dsPreview.base, dsPreview.name);
 }
 
 function closeDatasetPreview() {
   $("datasetPreviewModal").classList.add("hidden");
   $("dsPreviewBody").innerHTML = "";                   // stop a PDF or image that is still loading
-  dsPreview.id = null;
+  dsPreview.base = null;
 }
 
 // ---- Runs view ----
@@ -7351,16 +7798,76 @@ async function loadRuns() {
     const items = (await (await fetch("/api/runs")).json()).runs || [];
     const results = await loadResultHandoffs(true);
     el.innerHTML = items.length ? items.map((x) => {
-      const done = x.status === "done" || x.status === "incomplete";
+      const done = runHasOutputs(x);
       const zip = done
-        ? `<a class="ghost small" href="/api/results/${encodeURIComponent(x.run_id)}/croissant.json" target="_blank" rel="noopener" title="The result's Croissant metadata: its files, inputs and provenance">croissant.json</a>` +
+        ? `<button type="button" class="ghost small" data-run-files="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" title="Preview the report, figures and tables this run wrote">Files</button>` +
+          `<a class="ghost small" href="/api/results/${encodeURIComponent(x.run_id)}/croissant.json" target="_blank" rel="noopener" title="The result's Croissant metadata: its files, inputs and provenance">croissant.json</a>` +
           `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a>`
         : `<span class="muted small">${escapeHtml(x.status)}</span>`;
-      return `<div class="card run-card"><div class="card-main"><strong>${escapeHtml((x.question || "").slice(0, 90))}</strong>` +
+      return `<div class="card run-card" data-q="${escapeHtml(runSearchText(x))}"><div class="card-main"><strong>${escapeHtml(runTitle(x))}</strong>` +
         `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>` +
-        `<div class="run-card-actions"><button type="button" class="ghost small" data-run-usage="${escapeHtml(x.run_id)}" title="Tokens and estimated cost of this run, by pipeline step and model">Usage</button>${zip}</div></div>`;
+        `<div class="run-card-actions"><button type="button" class="ghost small" data-run-usage="${escapeHtml(x.run_id)}" title="Tokens and estimated cost of this run, by pipeline step and model">Usage</button>${zip}` +
+        `<button type="button" class="ghost small danger" data-run-del="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" data-kept="${keptBesideRun(results[x.run_id]) ? "1" : ""}" title="Delete this run and its files from the server">Delete</button></div></div>`;
     }).join("") : '<div class="empty-hint">No runs yet.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  filterCards("runsList", "runsCount", $("runsSearch").value);
+}
+
+// What a run handed on that is still kept beside it on this host (not saved to the user's data, not on
+// HPC3): deleting the run deletes it too.
+function keptBesideRun(r) {
+  const here = (x) => x && x.name && !x.saved_to && !x.saving && x.location !== "hpc3";
+  return !!r && (here(r) || here(r.cellqc));
+}
+function runHasOutputs(x) { return x.status === "done" || x.status === "incomplete"; }
+function runTitle(x) { return (x.question || "").slice(0, 90) || `Run ${x.run_id}`; }
+function runSearchText(x) {
+  const from = chatLabel(x.conversation_id);
+  return sysSearchText([x.question, x.status, x.plan_mode ? "planned" : "", x.run_id, from && from.text,
+                        fmtDate(x.created_at), (x.created_at || "").slice(0, 10)]);
+}
+
+// Files → Outputs: the runs that wrote something, each opening its artifacts in the dataset viewer.
+async function loadOutputs() {
+  const el = $("outputsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
+  const owner = state.user ? state.user.username : "";
+  try {
+    const items = ((await (await fetch("/api/runs")).json()).runs || []).filter(runHasOutputs);
+    const results = await loadResultHandoffs(true);
+    el.innerHTML = items.length ? items.map((x) =>
+      `<div class="card run-card" data-q="${escapeHtml(runSearchText(x))}"><div class="card-main"><strong>${icon("description")} ${escapeHtml(runTitle(x))}</strong>` +
+      `<span class="muted">${escapeHtml(x.status)} · ${fmtDate(x.created_at)} · run ${escapeHtml(x.run_id)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>` +
+      `<div class="run-card-actions"><button type="button" class="ghost small" data-run-files="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" title="Preview the report, figures and tables this run wrote">Preview</button>` +
+      `<a class="ghost small" href="/api/results/${encodeURIComponent(x.run_id)}/croissant.json" target="_blank" rel="noopener" title="The result's Croissant metadata: its files, inputs and provenance">croissant.json</a>` +
+      `<a class="ghost small" href="/api/bundle/${encodeURIComponent(owner)}/${encodeURIComponent(x.run_id)}" download>${icon("download")} Results (.zip)</a></div></div>`).join("")
+      : '<div class="empty-hint">No outputs yet: a finished run\'s report, figures and tables appear here.</div>';
+  } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+  filterCards("outputsList", "outputsCount", $("outputsSearch").value);
+}
+function onOutputsClick(e) {
+  const f = e.target.closest("[data-run-files]");
+  if (f) { openDatasetPreview(`/api/runs/${encodeURIComponent(f.dataset.runFiles)}`, f.dataset.name || ""); return; }
+  onSaveResultClick(e);
+}
+
+async function deleteRun(b) {
+  const what = b.dataset.kept ? ", and the processed data kept beside it (not saved to your data)" : "";
+  if (!confirm(`Delete the run "${b.dataset.name}"?\n\nThis removes from the server its report, figures, tables and run record${what}. ` +
+               `Datasets you saved from it stay in Files → Datasets, and what it cost stays in your usage. ` +
+               `Its working files on HPC3 go when your session ends. This cannot be undone.`)) return;
+  b.disabled = true;
+  try {
+    const res = await fetch("/api/runs/delete", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                  body: JSON.stringify({ run_id: b.dataset.runDel }) });
+    const j = await res.json();
+    if (!res.ok) { toast(j.error || "Delete failed"); b.disabled = false; return; }
+    toast("Run deleted.");
+    resultHandoffs = null;
+    loadRuns();
+  } catch (err) {
+    toast(isUnreachable(err) ? "Can't reach the server." : "Delete failed: " + err.message);
+    b.disabled = false;
+  }
 }
 
 // What a run hands on besides its bundle, neither of them in the zip: the processed dataset (an
@@ -7411,10 +7918,15 @@ async function onResultSaved(msg) {
     if (host.dataset.run === String(msg.run_id)) showResultHandoff(host, host.dataset.run);
   });
   if ($("view-runs") && $("view-runs").classList.contains("active")) loadRuns();
+  if (outputsShown()) loadOutputs();
   onDatasetsChanged();
+}
+function outputsShown() {
+  return filesTab === "outputs" && $("view-datasets") && $("view-datasets").classList.contains("active");
 }
 function onDatasetsChanged() {
   if ($("view-datasets") && $("view-datasets").classList.contains("active")) loadDatasets();
+  loadDatasetChips();   // a moved dataset's chips, and the chats it is attached to, take its new path
 }
 
 async function onSaveResultClick(e) {
@@ -7428,21 +7940,23 @@ async function onSaveResultClick(e) {
     if (!r.ok) { toast(j.error || "Could not save it."); b.disabled = false; b.textContent = label; return; }
     if (j.saving) {
       b.textContent = "Copying to the server…";
-      toast("Copying it from HPC3 to your data on the server. It appears in Datasets when it is there.");
+      toast("Copying it from HPC3 to your data on the server. It appears in Files → Datasets when it is there.");
       await loadResultHandoffs(true);
       return;
     }
-    toast(`Saved to ${j.path} — it is in your Datasets now.`);
+    toast(`Saved to ${j.path} — it is in Files → Datasets now.`);
     await loadResultHandoffs(true);
     const inChat = b.closest(".result-handoff");
-    if (inChat) showResultHandoff(inChat, runId); else loadRuns();
+    if (inChat) showResultHandoff(inChat, runId); else if (outputsShown()) loadOutputs(); else loadRuns();
     loadDatasets();
   } catch (err) { toast("Could not save it: " + err.message); b.disabled = false; b.textContent = label; }
 }
 function onRunsClick(e) {
   const u = e.target.closest("[data-run-usage]");
   if (u) { toggleRunUsage(u); return; }
-  onSaveResultClick(e);
+  const d = e.target.closest("[data-run-del]");
+  if (d) { deleteRun(d); return; }
+  onOutputsClick(e);
 }
 
 // ---- Admin view ----
@@ -7686,11 +8200,12 @@ function fmtUsd(x, { approx = true } = {}) {
   return (approx && v >= 0.01 ? "~" : "") + s;
 }
 
-// The chat counter's tooltip: what an API key paid for, then the cluster GPU's calls apart and free.
+// The chat counter's tooltip: what an API key paid for, then the lab GPUs' calls apart and free.
 function usageTitle(t) {
   if (!t) return "";
-  const api = apiPart(t), c = (t.cluster && t.cluster.calls) || 0;
-  const cluster = c ? `Cluster GPU: ${plural(c, "call")} · ${(t.cluster.total_tokens || 0).toLocaleString()} tokens · free. ${CLUSTER_FREE}` : "";
+  const api = apiPart(t);
+  const free = freeParts(t).map((f) => `${f.name}: ${plural(f.calls, "call")} · ${f.total_tokens.toLocaleString()} tokens · free.`);
+  const cluster = free.length ? `${free.join("\n")} ${freeNote(t)}` : "";
   if (!api.calls) return `${cluster}\nClick for Account › API usage.`;
   const unpriced = t.unpriced_calls ? `\n${t.unpriced_calls} call(s) on a model the price table does not list are not in the dollar figure.` : "";
   return `${plural(api.calls, "API call")} · ${api.total_tokens.toLocaleString()} API tokens · ${fmtUsd(t.spend_usd)} estimated.` +
@@ -7707,15 +8222,16 @@ function fmtDay(iso, { year = false } = {}) {
 }
 
 // The chat header counter: the API tokens and estimated cost of this chat, plus the running cost of
-// its run while one is going. Calls on the cluster GPU are in no token or dollar figure: they read
-// "cluster GPU free" beside an API figure, or carry the counter alone when the chat had no API call.
-//   "12K API tokens · ~$0.18"   "12K API tokens · ~$0.18 · cluster GPU free"   "9.9K tokens · free on the cluster GPU"
+// its run while one is going. Calls on the lab's GPUs (the shared model, a session's own cluster GPU)
+// are in no dollar figure: they read "shared model free" beside an API figure, or carry the counter
+// alone when the chat had no API call.
+//   "12K API tokens · ~$0.18"   "12K API tokens · ~$0.18 · cluster GPU free"   "9.9K tokens · free on the shared model"
 function chatUsageText(u, running = false) {
   if (!u || !u.chat || !u.chat.calls) return "";
   const api = apiPart(u.chat), onCluster = (u.chat.cluster && u.chat.cluster.calls) || 0;
-  if (!api.calls) return `${fmtTokens((u.chat.cluster && u.chat.cluster.total_tokens) || 0)} tokens · free on the cluster GPU`;
+  if (!api.calls) return `${fmtTokens((u.chat.cluster && u.chat.cluster.total_tokens) || 0)} tokens · free on the ${freeWhere(u.chat)}`;
   let text = `${fmtTokens(api.total_tokens)} API tokens · ${fmtUsd(u.chat.spend_usd)}`;
-  if (onCluster) text += " · cluster GPU free";
+  if (onCluster) text += ` · ${freeWhere(u.chat)} free`;
   if (running && u.run && apiPart(u.run).calls) text += ` · this run ${fmtUsd(u.run.spend_usd)}`;
   return text;
 }
@@ -7817,7 +8333,22 @@ function usageSummaryHtml(d) {
     ? `<div class="usage-tile-note" title="Calls on a model the price table does not list are not in the dollar figure.">+ ${plural(cyc.unpriced_calls, "call")} on an unpriced model</div>` : "";
   const spend = usageTile("Estimated API spend", fmtUsd(cyc.spend_usd),
     `Today ${fmtUsd(today.spend_usd)} · last 7 days ${fmtUsd(week.spend_usd)}${pace}${unpriced}`);
-  return `<div class="usage-tiles">${spend}${apiTokensTile(cyc)}${budgetTileHtml(d.budget || {})}</div>`;
+  const shared = sharedTokensTile(t, d.shared_model);
+  return `<div class="usage-tiles">${spend}${apiTokensTile(cyc, { sharedApart: !!shared })}${shared}${budgetTileHtml(d.budget || {})}</div>`;
+}
+
+// The lab's shared model, beside the API figures: its tokens this cycle, today and in the last 7
+// days. It is free (HPC3 charges the lab's GPUs by time), so it has tokens and no dollars. Shown once
+// the account has used it, or wherever the server keeps one (``kept``).
+function sharedTokensTile(t, kept = false) {
+  const sh = (x) => (x && x.shared) || {};
+  const cyc = sh(t.cycle);
+  if (!cyc.calls && !kept) return "";
+  const split = tokenSplit(cyc);
+  return usageTile("Shared model tokens", fmtTokens(cyc.total_tokens || 0),
+    `${plural(cyc.calls || 0, "call")} · today ${fmtTokens(sh(t.today).total_tokens || 0)} · last 7 days ${fmtTokens(sh(t.last_7_days).total_tokens || 0)}` +
+    (split ? `<div class="usage-tile-note">${split}</div>` : "") +
+    `<div class="usage-tile-note" title="${SHARED_FREE}">Free: the lab's GPUs on HPC3</div>`, "usage-tile-shared");
 }
 
 // What an API key paid for: the whole minus ``cluster``, the calls on the cluster GPU, which HPC3
@@ -7831,19 +8362,41 @@ function apiPart(x) {
 }
 
 const CLUSTER_FREE = "HPC3 charges the cluster GPU by the time it runs, not by token: these calls are in no dollar figure or budget.";
+const SHARED_FREE = "HPC3 charges the lab's GPUs by the time they run, not by token: calls on the shared model and on a session's own GPU are in no dollar figure or budget.";
 
-function clusterNote(x) {
-  const c = x && x.cluster;
-  if (!c || !c.calls) return "";
-  return `<div class="usage-tile-note" title="${CLUSTER_FREE}">Cluster GPU: ${plural(c.calls, "call")} · ${fmtTokens(c.total_tokens || 0)} tokens · free</div>`;
+// The tooltip of a free figure: the cluster GPU's wording, or the lab GPUs' once the shared model is in it.
+function freeNote(x) { return x && x.shared && x.shared.calls ? SHARED_FREE : CLUSTER_FREE; }
+
+// The calls no API key paid for, by where they ran: the lab's shared model (``shared``, a part of
+// ``cluster``) and the rest of ``cluster``, a session's own GPU. Only the parts with calls.
+function freeParts(x) {
+  const c = (x && x.cluster) || {}, sh = (x && x.shared) || {};
+  const parts = [];
+  if (sh.calls) parts.push({ name: "Shared model", calls: sh.calls, total_tokens: sh.total_tokens || 0 });
+  const own = (c.calls || 0) - (sh.calls || 0);
+  if (own > 0) parts.push({ name: "Cluster GPU", calls: own, total_tokens: Math.max(0, (c.total_tokens || 0) - (sh.total_tokens || 0)) });
+  return parts;
 }
 
-function apiTokensTile(t) {
+function lowerFirst(name) { return name.charAt(0).toLowerCase() + name.slice(1); }
+
+// "shared model", "cluster GPU", or "lab GPUs" when a figure holds calls on both.
+function freeWhere(x) {
+  const parts = freeParts(x);
+  return parts.length > 1 ? "lab GPUs" : parts.length ? lowerFirst(parts[0].name) : "cluster GPU";
+}
+
+// ``sharedApart``: the shared model has a tile of its own beside this one, so only a session GPU's part.
+function clusterNote(x, sharedApart = false) {
+  return freeParts(x).filter((f) => !sharedApart || f.name !== "Shared model").map((f) => `<div class="usage-tile-note" title="${freeNote(x)}">${f.name}: ${plural(f.calls, "call")} · ${fmtTokens(f.total_tokens)} tokens · free</div>`).join("");
+}
+
+function apiTokensTile(t, { sharedApart = false } = {}) {
   const api = apiPart(t);
   const split = tokenSplit(api);
   return usageTile("API tokens", fmtTokens(api.total_tokens),
     plural(api.calls, "API call") + (t.errors ? ` · <span class="bad">${t.errors} failed</span>` : "") +
-    (split ? `<div class="usage-tile-note">${split}</div>` : "") + clusterNote(t));
+    (split ? `<div class="usage-tile-note">${split}</div>` : "") + clusterNote(t, sharedApart));
 }
 
 // Where the cycle's estimated spend stands against the monthly credit: left / over, a bar with the
@@ -7923,11 +8476,11 @@ function usageList(rows, nameCol, nameOf, { empty = "Nothing in this period.", c
     const onCluster = (x.cluster && x.cluster.calls) || 0;
     const free = onCluster > 0 && onCluster === x.calls;
     const meta = [plural(x.calls, "call"), `${fmtTokens(x.total_tokens || 0)} tokens`];
-    if (onCluster && !free) meta.push(`<span title="${CLUSTER_FREE}">${onCluster} on the cluster GPU, free</span>`);
+    if (onCluster && !free) meta.push(`<span title="${freeNote(x)}">${onCluster} on the ${freeWhere(x)}, free</span>`);
     if (x.errors) meta.push(`<span class="bad">${x.errors} failed</span>`);
     const split = tokenSplit(x);
     const unpriced = x.unpriced_calls ? `<span class="usage-unpriced" title="${plural(x.unpriced_calls, "call")} on a model the price table does not list">+?</span>` : "";
-    const cost = free ? `<strong class="usage-free" title="${CLUSTER_FREE}">Free</strong><span>cluster GPU</span>`
+    const cost = free ? `<strong class="usage-free" title="${freeNote(x)}">Free</strong><span>${freeWhere(x)}</span>`
       : `<strong>${fmtUsd(x.spend_usd)}${unpriced}</strong><span>${sharePct(part)}</span>`;
     return `<li class="usage-row${free ? " is-free" : ""}"><div class="usage-row-main"><div class="usage-row-name">${nameOf(x)}</div>` +
       `<div class="usage-row-meta">${meta.join(" · ")}${split ? `<span class="usage-row-split">${split}</span>` : ""}</div></div>` +
@@ -7948,6 +8501,9 @@ const ERROR_TEXT = {
   network: "Could not reach the provider",
   endpoint: "The provider returned an error",
   refusal: "The model declined the request",
+  unavailable: "The shared model was not answering (its GPU job was being renewed)",
+  busy: "The shared model was busy: the request waited too long in its queue",
+  stopped: "Stopped while waiting for the shared model",
 };
 
 const PERIOD_LABEL = { today: "Today", "7d": "Last 7 days", cycle: "This billing cycle", "30d": "Last 30 days", all: "All time" };
@@ -7999,9 +8555,9 @@ function usagePeriodTotalHtml(d) {
 
 // "~$2.47 · 2.4M API tokens · 86 API calls · 1 call on the cluster GPU (free)"
 function usageTotalText(t) {
-  const api = apiPart(t), c = (t.cluster && t.cluster.calls) || 0;
-  return `${fmtUsd(t.spend_usd)} · ${fmtTokens(api.total_tokens)} API tokens · ${plural(api.calls, "API call")}` +
-    (c ? ` · ${plural(c, "call")} on the cluster GPU (free)` : "");
+  const api = apiPart(t);
+  const free = freeParts(t).map((f) => ` · ${plural(f.calls, "call")} on the ${lowerFirst(f.name)} (free)`);
+  return `${fmtUsd(t.spend_usd)} · ${fmtTokens(api.total_tokens)} API tokens · ${plural(api.calls, "API call")}` + free.join("");
 }
 
 function usageNoteHtml(d) {
@@ -8168,6 +8724,11 @@ function init() {
   $("stopGpuBtn").addEventListener("click", stopGpu);
   $("storageBtn").addEventListener("click", openStorage);
   $("storageClose").addEventListener("click", () => $("storageModal").classList.add("hidden"));
+  $("sessChip").addEventListener("click", openStorage);
+  $("originalsBox").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-orig]");
+    if (b) originalsAction(b.dataset.orig, b.dataset.plan);
+  });
   $("storageModal").addEventListener("click", (e) => { if (e.target.id === "storageModal") $("storageModal").classList.add("hidden"); });
   $("storageItems").addEventListener("click", (e) => { const b = e.target.closest("[data-path]"); if (b) deleteStorageItem(b.dataset.path); });
   $("modelSelect").addEventListener("change", (e) => selectModel(e.target.value));

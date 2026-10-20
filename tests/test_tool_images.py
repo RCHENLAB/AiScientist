@@ -219,3 +219,33 @@ def test_scrna_cli_hands_the_folder_root_to_the_tool(monkeypatch):
     out = scrna_cli.run_tool("run_cellqc", "/ws", "/up/S1/f.h5", {}, dataset_root="/up/S1")
     assert out["root"] == "/up/S1" and seen["only"] == "run_cellqc"
     assert json.dumps(out)
+
+
+def test_every_bound_folder_is_bound_and_handed_to_the_job():
+    """Two Cell Ranger folders bound to one run (RCHENLAB/AiScientist issue 22): the job sees both,
+    by name, and can read both inside its container."""
+    hpc = FakeHPC(present=True)
+    folders = ({"name": "Sample3_GSM5676874", "path": "/dfs/tmp/s/aaa/original"},
+               {"name": "Sample1_WT", "path": "/dfs/tmp/s/bbb/original"})
+    out = _executor(hpc, dataset_root="/dfs/tmp/s/aaa/original",
+                    input_folders=folders).run_tool("run_cellqc", {}, ctx=None)
+    assert out["status"] == "ok"
+    joined = _sbatch_scripts(hpc)
+    assert joined.count("-B /dfs/tmp/s/aaa/original:/dfs/tmp/s/aaa/original:ro") == 1   # bound once
+    assert "-B /dfs/tmp/s/bbb/original:/dfs/tmp/s/bbb/original:ro" in joined
+    assert "--input-folders" in joined and '"name": "Sample1_WT"' in joined
+
+
+def test_scrna_cli_hands_every_bound_folder_to_the_tool(monkeypatch, capsys):
+    from aiscientist.tools import scrna_cli
+
+    monkeypatch.setattr(scrna_cli, "_analysis_tools", lambda only=None: {
+        "run_cellqc": lambda args, ctx: {"status": "ok",
+                                         "folders": ctx.decisions.get("input_folders"),
+                                         "root": ctx.decisions.get("dataset_root")}})
+    folders = [{"name": "Sample3_GSM5676874", "path": "/up/a"}, {"name": "Sample1_WT", "path": "/up/b"}]
+    assert scrna_cli.main(["--tool", "run_cellqc", "--workspace", "/ws", "--dataset-root", "/up/a",
+                           "--input-folders", json.dumps(folders)]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(scrna_cli.RESULT_MARKER))
+    out = json.loads(line[len(scrna_cli.RESULT_MARKER):])
+    assert out["folders"] == folders and out["root"] == "/up/a"

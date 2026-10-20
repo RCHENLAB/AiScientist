@@ -120,6 +120,8 @@ def runs_on_md(m, tool) -> str:
     if m.runs_on == "hpc:literature":
         lines[0] += (" Its job calls the session's served model, so it is offered only to a session "
                      "with a GPU allocation." if m.served_model else
+                     " Its job gets a GPU of its own on the lab's paid partition and starts its own "
+                     "model there, so the session needs no GPU allocation." if m.own_gpu else
                      " Its job runs no language model: it needs no GPU allocation.")
     if m.image:
         lines[0] = lines[0].replace(" inside `analysis.sif`", "")

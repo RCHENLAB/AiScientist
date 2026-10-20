@@ -339,7 +339,10 @@ def my_runs(request: Request) -> dict:
     user = require_user(request)
     with session_scope() as s:
         rows = s.scalars(select(Run).where(Run.user_id == user.id).order_by(Run.id.desc())).all()
-        return {"runs": [r.public() for r in rows]}
+        # Each run's plan estimate and measured compute (issue 25), two queries for the whole list.
+        from .estimates import runs_usage
+        usage = runs_usage([r.run_id for r in rows])
+        return {"runs": [{**r.public(), "compute_usage": usage[r.run_id]} for r in rows]}
 
 
 # --- recording helpers (called by the gateway when a user is logged in) -------
@@ -494,6 +497,46 @@ def delete_dataset_record(user_id: int, dataset_id: int, delete_files=None) -> s
         s.delete(row)
         s.commit()
         return path
+
+
+def get_run_record(user_id: int, run_id: str) -> dict | None:
+    """One of this user's runs (:meth:`Run.public`); None when it is missing or another account's."""
+    with session_scope() as s:
+        row = s.scalars(select(Run).where(Run.run_id == run_id)).first()
+        if row is None or row.user_id != user_id:
+            return None
+        return row.public()
+
+
+def delete_run_record(user_id: int, run_id: str, run_dir=None, delete_files=None) -> dict | None:
+    """Remove one of this user's runs from their history: ``delete_files(run_dir)`` first (a failure
+    raises and keeps the row, so the delete can be retried), then the run's row and its result's
+    Croissant metadata, in one commit. Returns the run as it was, or ``None`` when it is missing or
+    another account's.
+
+    Refused (``ValueError``) while a dataset is kept inside ``run_dir``: deleting the run would take
+    that dataset's files with it. The run's model-call rows stay, so what the account spent is still
+    counted."""
+    with session_scope() as s:
+        row = s.scalars(select(Run).where(Run.run_id == run_id)).first()
+        if row is None or row.user_id != user_id:
+            return None
+        info = row.public()
+        if run_dir is not None:
+            from pathlib import Path
+            target = Path(run_dir).resolve()
+            for d in s.scalars(select(Dataset)):
+                if d.path and Path(d.path).resolve().is_relative_to(target):
+                    raise ValueError(f'The dataset "{d.name}" is kept inside this run\'s folder; '
+                                     "delete it in Files first.")
+            if delete_files is not None:
+                delete_files(target)
+        from . import metadata_store
+        metadata_store.delete_for_run(s, user_id, run_id)
+        s.flush()
+        s.delete(row)
+        s.commit()
+        return info
 
 
 def record_run_start(user_id: int, run_id: str, question: str, plan_mode: bool,

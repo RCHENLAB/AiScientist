@@ -561,7 +561,11 @@ def qc_section(rounds: "list[Any]") -> "tuple[list[str], dict]":
         s = sum(lib["cells_after_doublets"] for lib in libs)
         good = s == after
         ok &= good
-        lines.append(f"- The QC checkpoint holds {after:,} cells; the libraries' final counts sum to "
+        held = r.get("checkpoints") if isinstance(r.get("checkpoints"), dict) else {}
+        where = ("The QC checkpoints hold " + f"{after:,} cells (" + "; ".join(
+            f"{sp}: {int(c.get('cells') or 0):,} in {c.get('checkpoint')}" for sp, c in held.items()
+            if isinstance(c, dict)) + ")") if len(held) > 1 else f"The QC checkpoint holds {after:,} cells"
+        lines.append(f"- {where}; the libraries' final counts sum to "
                      f"{s:,} ({'consistent' if good else 'INCONSISTENT'}).")
     if isinstance(before, int) and isinstance(after, int) and not lines:
         lines.append(f"- {before:,} cells before QC, {after:,} after ({tool}); no per-stage counts "
