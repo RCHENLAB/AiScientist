@@ -224,7 +224,7 @@ def _capture(gw_app, monkeypatch) -> dict:
     captured: dict = {}
 
     def fake(c, req, *, resume=None, resume_run_id=None, resume_decisions=None):
-        captured.update(resume=resume, run_id=resume_run_id, decisions=resume_decisions)
+        captured.update(req=req, resume=resume, run_id=resume_run_id, decisions=resume_decisions)
 
         async def _noop():
             return None
@@ -253,6 +253,7 @@ def test_continue_resume_interrupted_runs_from_the_next_step(gw, tmp_path, monke
     assert cap["run_id"] == "78a707cd79e9"
     assert cap["resume"].redo_indices == frozenset({3, 5, 6})
     assert cap["decisions"]["dataset_path"] == "/data/sample3"
+    assert cap["req"].save_results is True        # a continued run saves its results like every run
 
 
 def test_continue_resume_interrupted_on_a_finished_run_is_refused(gw, tmp_path, monkeypatch):

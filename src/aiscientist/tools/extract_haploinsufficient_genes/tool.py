@@ -21,10 +21,13 @@ It is retrieval-augmented, in the same steps as ``search_corpus`` answering a qu
    look-alikes and garbled text are flagged, not silently dropped; one row per gene with up to
    three PMIDs and quotes, one row per judged sentence.
 
-Steps 1-4 run twice. Round one searches the whole corpus with the general requests. Round two
-takes every gene round one read as haploinsufficient, has the model write one request about that
-gene, and searches only the chunks that name the gene, so the other papers stating that gene's
-mechanism are read as well.
+Steps 1-4 run twice. Round one searches the whole corpus with the general requests, and also
+reads every chunk whose text states a dosage mechanism in words (``DOSAGE_WORDING``: the word
+haploinsufficiency, gene dosage, one functional copy, ...): the embedding of a 1,500-character
+chunk is dominated by its topic, so the requests alone found 50 of the corpus' 337 chunks that say
+"haploinsufficiency". Round two takes every gene round one read as haploinsufficient, has the model
+write one request about that gene, and searches only the chunks that name the gene, so the other
+papers stating that gene's mechanism are read as well.
 
 The model and the embedder are injectable (``judge_fn`` / ``embed_fn``) so the whole pipeline runs
 in the tests without HPC3, a GPU or network.
@@ -35,12 +38,15 @@ from __future__ import annotations
 import collections
 import csv
 import json
+import math
 import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,6 +138,14 @@ MECH = re.compile(r"haplo-?\s?insuffici\w*|gene dosage|dosage[- ]sensitiv\w*|dos
                   r"reduced (level|amount|dosage) of [^,.;]{0,30}", re.I)
 DOM = re.compile(r"heterozyg|monoallelic|dominant|haplo-?\s?insuffici|dosage|"
                  r"(one|single|a single) (functional|normal|wild[- ]type|intact|remaining) (copy|allele)|\bcarriers?\b", re.I)
+# Round one also reads every chunk whose (ligature-folded) text says this: a dosage mechanism in words.
+DOSAGE_WORDING = re.compile(
+    r"haplo-?\s?insuffici\w*|gene[- ]dosage|dosage[- ]sensitiv\w*|dosage effect|reduced (?:gene )?dosage|"
+    r"half[- ]dosage|(?:one|single|a single|the remaining) (?:functional|normal|wild[- ]type|intact|working) "
+    r"(?:copy|allele)|loss of (?:one|a single) (?:copy|allele)|half (?:the |of the )?(?:normal )?(?:amount|level|dose)",
+    re.I)
+KEYWORD_REQUEST = ("every passage that states a dosage mechanism in words: haploinsufficiency, gene dosage, "
+                   "dosage sensitivity, one functional copy or allele, loss of one copy, half the normal amount")
 
 
 @dataclass
@@ -173,6 +187,12 @@ REFHEAD = re.compile(r"^\s*(references|reference list|bibliography|literature ci
 ABBR = re.compile(r"\b(et al|Fig|Figs|Dr|vs|e\.g|i\.e|cf|approx|No|Ref|Refs|Suppl)\.$", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\(\[])")
 _CHUNK_CHARS = 1500
+
+
+def fold(t: str | None) -> str:
+    """NFKC: the PDF ligatures ("ﬁ" in "haploinsufﬁciency", in 62% of the corpus' sentences that use
+    the word) read as their letters; soft hyphens dropped."""
+    return unicodedata.normalize("NFKC", t or "").replace("­", "")
 
 
 def dehyph(t: str) -> str:
@@ -422,6 +442,13 @@ def nearest_chunks(q_vec: Any, vecs: Any, chunks: list[dict[str, Any]], k: int,
     return out
 
 
+def keyword_chunks(chunks: list[dict[str, Any]]) -> list[int]:
+    """The chunks whose text states a dosage mechanism in words (``DOSAGE_WORDING``, ligatures folded),
+    in corpus order. Jin's brief asks for genes the papers report EXPLICITLY, and a request's nearest
+    chunks miss most of them: a chunk's vector is its topic, and one word of 250 barely moves it."""
+    return [i for i, c in enumerate(chunks) if DOSAGE_WORDING.search(fold(c.get("text", "")))]
+
+
 def chunks_naming(terms: dict[str, set[str]], chunks: list[dict[str, Any]]) -> dict[str, set[int]]:
     """For each gene, the chunks that contain one of its symbols (``terms``) as a word. Case-sensitive:
     gene symbols are written in capitals, and a lower-case word is not the gene."""
@@ -493,10 +520,103 @@ def openai_judge_fn(base_url: str, model: str, timeout: float = 180.0, max_token
     return call
 
 
+# ---------------------------------------------------------------------------------------------
+# A model the gateway calls for the job (the user's own API key): the relay
+# ---------------------------------------------------------------------------------------------
+#
+# A key never leaves the Eye Server, so a scan on an API model cannot call it from HPC3. The job
+# writes each prompt as a file under ``<relay>/req/``; the gateway reads it, calls the model with
+# the user's key (recording the call and its cost against the user's budget) and writes the reply
+# to ``<relay>/resp/``. Both sides write a temporary name and rename it into place.
+
+RELAY_REQ, RELAY_RESP = "req", "resp"
+_RELAY_POLL_S = 0.5          # how often the job looks for a reply
+
+
+class ScanStopped(Exception):
+    """The gateway declined to call the model, and not because of a fault: the spending cap was
+    reached or the run was stopped. The pass ends at once; every passage read so far is kept."""
+
+
+@dataclass
+class Meter:
+    """The model calls the gateway made for this scan and what they cost (as the gateway priced
+    them). Empty on a model the job serves itself: that has no per-call price."""
+    calls: int = 0
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add(self, usage: dict[str, Any] | None, cost_usd: Any) -> None:
+        u = usage or {}
+        with self._lock:
+            self.calls += 1
+            self.input_tokens += int(u.get("prompt_tokens") or 0)
+            self.output_tokens += int(u.get("completion_tokens") or 0)
+            try:
+                self.cost_usd += float(cost_usd or 0)
+            except (TypeError, ValueError):
+                pass
+
+    def public(self) -> dict[str, Any]:
+        with self._lock:
+            return {"calls": self.calls, "input_tokens": self.input_tokens,
+                    "output_tokens": self.output_tokens, "cost_usd": round(self.cost_usd, 6)}
+
+
+def relay_judge_fn(relay_dir: Path, meter: Meter, *, max_tokens: int, timeout: float = 900.0,
+                   poll: float | None = None) -> Callable[[list[dict[str, str]]], str]:
+    """``messages -> text`` through the gateway (see the section comment). A reply that carries an
+    error raises what the passage loop expects: ``ScanStopped`` ends the pass, a transport error
+    counts toward the dead-endpoint streak, any other error is retried like an unparsable reply.
+    No reply within ``timeout`` (the gateway went away) is a transport error."""
+    req, resp = Path(relay_dir) / RELAY_REQ, Path(relay_dir) / RELAY_RESP
+    req.mkdir(parents=True, exist_ok=True)
+    resp.mkdir(parents=True, exist_ok=True)
+    poll = _RELAY_POLL_S if poll is None else poll
+
+    def call(messages: list[dict[str, str]]) -> str:
+        rid = uuid.uuid4().hex
+        tmp = req / f".{rid}.tmp"
+        tmp.write_text(json.dumps({"id": rid, "messages": messages, "max_tokens": max_tokens}),
+                       encoding="utf-8")
+        os.replace(tmp, req / f"{rid}.json")
+        answer = resp / f"{rid}.json"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if answer.is_file():
+                try:
+                    data = json.loads(answer.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    time.sleep(poll)          # seen before the rename landed everywhere: read again
+                    continue
+                answer.unlink(missing_ok=True)
+                if data.get("usage") or data.get("cost_usd"):
+                    meter.add(data.get("usage"), data.get("cost_usd"))
+                err = str(data.get("error") or "")
+                if not err:
+                    return str(data.get("text") or "")
+                kind = str(data.get("kind") or "")
+                if kind == "stop":
+                    raise ScanStopped(err)
+                if kind == "transport":
+                    raise urllib.error.URLError(err)
+                raise ValueError(err)
+            time.sleep(poll)
+        # Withdraw the prompt, so a gateway that comes back late does not pay for an unread answer.
+        (req / f"{rid}.json").unlink(missing_ok=True)
+        raise urllib.error.URLError(f"no answer from the gateway within {timeout:.0f} s")
+
+    return call
+
+
 # After this many passages IN A ROW fail to reach the model, the endpoint is taken as gone (the
 # job's model died) and the pass stops at once, instead of retrying every remaining passage
 # against a dead port.
 _DEAD_AFTER = 20
+# How a pass that the gateway stopped (``ScanStopped``) reports itself, as opposed to a model that died.
+STOPPED = "stopped: "
 # Everything one model call can raise that fails that call, not the pass. IndexError / TypeError /
 # AttributeError: a 200 whose body is not a completion (no choices, a null message).
 _CALL_ERRORS = (urllib.error.URLError, OSError, ValueError, KeyError, IndexError, TypeError, AttributeError)
@@ -521,6 +641,8 @@ def _ask(fn: Callable[[list[dict[str, str]]], str], messages: list[dict[str, str
             if got is not None:
                 return got, "", False
             err, transport = "not the JSON asked for", False
+        except ScanStopped as exc:
+            return None, f"{STOPPED}{exc}", True
         except _CALL_ERRORS as exc:
             err = f"{type(exc).__name__}: {str(exc)[:200]}"
             transport = transport and _connection_error(exc)
@@ -576,6 +698,12 @@ def judge_passages(passages: list[Passage], judge_fn: Callable[[list[dict[str, s
                 if items is not None:
                     return Judgment(p.sid, items, raw=raw)
                 err = "not the JSON asked for"
+            except ScanStopped as exc:
+                with lock:
+                    if not dead.is_set():
+                        dead_reason = f"{STOPPED}{exc}"
+                        dead.set()
+                return Judgment(p.sid, None, "stopped")
             except _CALL_ERRORS as exc:
                 err = f"{type(exc).__name__}: {str(exc)[:200]}"
                 if _connection_error(exc):
@@ -693,8 +821,15 @@ def is_garbled(text: str) -> bool:
 # 4. Verify, normalise, aggregate
 # ---------------------------------------------------------------------------------------------
 
+# Whitespace, hyphens and dashes of every kind, and control characters: a PDF can extract "60–80%"
+# as "60\x0180%", and the model types the dash back in.
+_NZ_DROP = re.compile("[\\s­\\-‐-―−\x00-\x1f\x7f]+")
+
+
 def nz(s: str | None) -> str:
-    return re.sub(r"[\s­-]+", "", (s or "").lower())
+    """Text for comparing quotes: ligatures folded, lower case, no whitespace, dashes or control
+    characters."""
+    return _NZ_DROP.sub("", fold(s).lower())
 
 
 class Hgnc:
@@ -789,7 +924,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
             q = str(it.get("quote") or "")
             gene, gstat = hgnc.norm(it.get("gene"))
             gw = str(it.get("gene") or "").strip()
-            m = MECH.search(q) or MECH.search(s.text)
+            m = MECH.search(fold(q)) or MECH.search(fold(s.text))
             h = {"pmid": s.pmid, "page": s.page, "gene": gene, "gene_as_written": gw, "gene_status": gstat,
                  "gene_in_quote": _word(gw, q), "gene_in_context": _word(gw, ctx),
                  "mechanism_class": it.get("mechanism_class"), "explicit": bool(it.get("explicit")),
@@ -797,7 +932,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
                  "phenotype": it.get("phenotype"), "mechanism_statement": m.group(0).strip() if m else "",
                  "quote": q, "quote_verified": bool(q) and nz(q) in nz(ctx),
                  "cite_like": bool(fl.get("cite_like")) or is_cite(q, s.prev, s.next) or is_cite(s.text, s.prev, s.next),
-                 "dominance_marker": bool(DOM.search(q + " " + ctx)), "garbled": bool(fl.get("garbled")),
+                 "dominance_marker": bool(DOM.search(fold(q + " " + ctx))), "garbled": bool(fl.get("garbled")),
                  "sentence_id": sid}
             h["eligible"] = eligible(h)
             hits.append(h)
@@ -819,7 +954,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
         # Quotes: body sentences before reference entries, clean before garbled, the gene in the
         # quote, the word "haploinsufficiency" itself, then the longer sentence.
         hs = sorted(hs, key=lambda h: (h["cite_like"], h["garbled"], not h["gene_in_quote"],
-                                       "haploinsuffic" not in h["quote"].lower(), -len(h["quote"])))
+                                       "haploinsuffic" not in fold(h["quote"]).lower(), -len(h["quote"])))
         picked: list[dict[str, Any]] = []
         seen: set[str] = set()
         for h in hs:
@@ -884,18 +1019,28 @@ def local_endpoint(ctx: Any) -> tuple[str, str] | None:
 PARAMS: dict[str, tuple[Any, str]] = {
     "n_requests": (16, "how many search requests the model writes for the first round"),
     "k_per_request": (50, "passages (chunks) each first-round request retrieves"),
+    "keyword_round": (1, "1 = round one also reads every passage that states a dosage mechanism in words "
+                         "(haploinsufficiency, gene dosage, one functional copy, ...); 0 = the requests alone"),
     "k_per_gene": (15, "passages each second-round gene request retrieves, among the chunks that name the gene"),
     "max_quotes_per_gene": (3, "how many papers (PMID + verbatim quote) genes.csv lists per gene"),
     "concurrency": (16, "parallel requests to the model while it reads the passages"),
     "max_passages": (0, "read only the first N retrieved passages (0 = all); for a smoke test"),
+    "pilot_fraction": (0.01, "share of round one's passages read first as a pilot (at least 5, at most 25): the "
+                             "scan stops before the rest when half of them fail, or when the cost they project "
+                             "is above max_cost_usd (0 = no pilot)"),
+    "max_cost_usd": (0.0, "stop before the full pass when the pilot projects a model cost above this, in USD "
+                          "(0 = no cap; only a model the gateway calls for the scan has a price)"),
 }
+# Pilot size bounds: 1% of 857 passages is 9; a small scan still gets 5, a huge one at most 25.
+_PILOT_MIN, _PILOT_MAX = 5, 25
 REQUEST_COLUMNS = ("id", "round", "gene", "request", "n_passages")
 
 
 def _schema() -> dict[str, Any]:
     props: dict[str, Any] = {}
     for name, (default, meaning) in PARAMS.items():
-        props[name] = {"type": "integer", "default": default, "description": meaning}
+        props[name] = {"type": "number" if isinstance(default, float) else "integer", "default": default,
+                       "description": meaning}
     props["pmids"] = {"type": "array", "items": {"type": "string"},
                       "description": "restrict the scan to these PMIDs (empty = the whole corpus)"}
     return {"type": "object", "properties": props}
@@ -904,6 +1049,16 @@ def _schema() -> dict[str, Any]:
 def _p(name: str, args: dict[str, Any]) -> Any:
     v = args.get(name)
     return PARAMS[name][0] if v is None else v
+
+
+def pilot_sample(passages: list[Passage], fraction: float) -> list[Passage]:
+    """About ``fraction`` of the passages (``_PILOT_MIN`` to ``_PILOT_MAX``), spread evenly over the
+    list, so the pilot sees passages of every request and of the keyword round."""
+    if not passages or fraction <= 0:
+        return []
+    n = min(len(passages), max(_PILOT_MIN, min(_PILOT_MAX, math.ceil(len(passages) * fraction))))
+    step = len(passages) / n
+    return [passages[int(i * step)] for i in range(n)]
 
 
 def _save_json(path: Path, data: Any) -> None:
@@ -931,7 +1086,14 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
                          "not available where this step ran. It runs as an HPC3 literature job.")}
     warnings = list(paths.notes)
     write_fn = judge_fn
-    if judge_fn is None:
+    meter = Meter()
+    relay = getattr(ctx, "llm_relay_dir", None)
+    if judge_fn is None and relay:
+        # The user's API model, called by the gateway with the user's key (see relay_judge_fn). It
+        # may think before it answers, so the reply gets room beyond the JSON.
+        judge_fn = write_fn = relay_judge_fn(Path(relay), meter, max_tokens=8000)
+        log(f"model {getattr(ctx, 'model', None) or '?'} through the gateway (relay {relay})")
+    elif judge_fn is None:
         ep = local_endpoint(ctx)
         if ep is None:
             return {"status": "not_enabled", "step": "literature",
@@ -1004,11 +1166,18 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         # The job's model went away (out of memory, a lost node). Keep what was read and say so:
         # the gateway submits the job again, and the rerun picks up where this one stopped.
         c = counts(passages, judgments)
+        if reason.startswith(STOPPED):
+            # The gateway declined (the spending cap, a stop): not a fault, and not to be retried.
+            return {"status": "failed", "step": "literature", "stopped": True,
+                    "error": (f"The scan was stopped: {reason[len(STOPPED):]}. {c['n_judged']} of "
+                              f"{len(passages)} retrieved passages are read and kept; a rerun reads only "
+                              "the rest."),
+                    **c, **({"api_usage": meter.public()} if meter.calls else {}), "warnings": warnings}
         return {"status": "failed", "step": "literature", "model_unreachable": True,
                 "error": (f"The model stopped answering ({reason}); {c['n_judged']} of {len(passages)} "
                           "retrieved passages are read. Rerun once the model is back: the requests and "
                           "every passage read are kept, and only the rest are read."),
-                **c, "warnings": warnings}
+                **c, **({"api_usage": meter.public()} if meter.calls else {}), "warnings": warnings}
 
     # Round one: the model writes the requests; each takes its nearest chunks of the whole corpus.
     requests = stored.get("round1")
@@ -1029,10 +1198,59 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         hits_per_request[f"R{r + 1}"] = len(got)
         for i in got:
             found.setdefault(i, []).append(f"R{r + 1}")
+    keyword_only = 0
+    if int(_p("keyword_round", args)):
+        worded = keyword_chunks(chunks)
+        hits_per_request["K"] = len(worded)
+        for i in worded:
+            keyword_only += i not in found
+            found.setdefault(i, []).append("K")
+        log(f"round one: {len(worded)} passages state a dosage mechanism in words, {keyword_only} of them "
+            "found by no request")
     passages = locate(found, chunks, sents_by_chunk)
     if max_p > 0:
         passages = passages[:max_p]
     log(f"round one: {len(passages)} passages in {len({p.pmid for p in passages})} papers")
+
+    # The pilot: about 1% of the passages first. A model that cannot do the job (an endpoint that
+    # answers with errors, a reply the parser cannot read) is found after a few calls, not after
+    # the whole corpus has been paid for; on a priced model its cost projects the scan's.
+    pilot = pilot_sample(passages, float(_p("pilot_fraction", args) or 0))
+    pilot_info: dict[str, Any] | None = None
+    if pilot:
+        before = meter.public()
+        judgments, unreachable = judge_passages(pilot, judge_fn, judgments_path, concurrency, log, should_stop)
+        if unreachable:
+            return gone(unreachable, passages, judgments)
+        bad = [p for p in pilot if not (judgments.get(p.sid) and judgments[p.sid].items is not None)]
+        after = meter.public()
+        calls, spent = after["calls"] - before["calls"], after["cost_usd"] - before["cost_usd"]
+        pilot_info = {"passages": len(pilot), "read": len(pilot) - len(bad), "calls": calls,
+                      "cost_usd": round(spent, 6)}
+        if calls and spent > 0:
+            # Round two reads about as many passages again (857 then 766 in the 2026-10-20 scan).
+            pilot_info["estimated_total_usd"] = round(spent / calls * 2 * len(passages), 4)
+        log(f"pilot: {pilot_info['read']} of {len(pilot)} passages read"
+            + (f", ${spent:.4f}; projected for the scan ${pilot_info['estimated_total_usd']:.2f}"
+               if "estimated_total_usd" in pilot_info else ""))
+        if 2 * len(bad) >= len(pilot):
+            first = next((judgments[p.sid].error for p in bad if judgments.get(p.sid) and judgments[p.sid].error),
+                         "no reply")
+            return {"status": "failed", "step": "literature", "pilot_failed": True,
+                    "error": (f"The pilot failed: {len(bad)} of its {len(pilot)} passages (about 1% of the "
+                              f"{len(passages)} retrieved) could not be read ({first}). The rest was not read, "
+                              "so nothing more was spent; fix the model or its endpoint and rerun."),
+                    **counts(passages, judgments), "pilot": pilot_info,
+                    **({"api_usage": meter.public()} if meter.calls else {}), "warnings": warnings}
+        cap = float(_p("max_cost_usd", args) or 0)
+        if cap > 0 and pilot_info.get("estimated_total_usd", 0) > cap:
+            return {"status": "failed", "step": "literature", "stopped": True, "over_budget": True,
+                    "error": (f"The pilot projects about ${pilot_info['estimated_total_usd']:.2f} for the scan, "
+                              f"above the ${cap:.2f} it may spend. Only the pilot's {len(pilot)} passages were "
+                              "read; raise the budget or the cap and rerun (they are kept)."),
+                    **counts(passages, judgments), "pilot": pilot_info,
+                    "api_usage": meter.public(), "warnings": warnings}
+
     judgments, unreachable = judge_passages(passages, judge_fn, judgments_path, concurrency, log, should_stop)
     if unreachable:
         return gone(unreachable, passages, judgments)
@@ -1109,6 +1327,9 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     write_csv(hits_csv, hits, HIT_COLUMNS)
     req_rows = [{"id": f"R{i + 1}", "round": 1, "gene": "", "request": q,
                  "n_passages": hits_per_request.get(f"R{i + 1}", 0)} for i, q in enumerate(requests)]
+    if "K" in hits_per_request:
+        req_rows.append({"id": "K", "round": 1, "gene": "", "request": KEYWORD_REQUEST,
+                         "n_passages": hits_per_request["K"]})
     req_rows += [{"id": f"G:{g}", "round": 2, "gene": g, "request": gene_requests[g],
                   "n_passages": hits_per_request.get(f"G:{g}", 0)} for g in genes2]
     write_csv(requests_csv, req_rows, REQUEST_COLUMNS)
@@ -1119,6 +1340,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     return {
         "status": "ok", "step": "literature", **c,
         "n_requests": len(requests), "n_gene_requests": len(genes2),
+        "n_keyword_passages": hits_per_request.get("K", 0), "n_keyword_only_passages": keyword_only,
         "n_hits_eligible": n_elig, "n_genes": len(genes),
         "genes": [{"gene": g["gene"], "n_papers": g["n_papers"], "phenotype": (g["phenotype"] or "")[:80],
                    "flags": [k[5:] for k in flag_keys if g[k]]} for g in genes],
@@ -1127,6 +1349,8 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         "files": {"genes_csv": str(genes_csv.relative_to(ws)), "hits_csv": str(hits_csv.relative_to(ws)),
                   "requests_csv": str(requests_csv.relative_to(ws))},
         "definition": DEFINITION,
+        "pilot": pilot_info,
+        **({"api_usage": meter.public()} if meter.calls else {}),
         "warnings": warnings,
         "raw_data_to_llm": False,
     }
@@ -1140,7 +1364,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
 # judgments become rows (``nearest_chunks``, ``chunks_naming``, ``round_two_genes``, ``parse_items``,
 # ``locate_items``, ``eligible``, ``aggregate``). The constants below are fingerprinted as they
 # are, so editing them needs no bump.
-RULES_REVISION = 2
+RULES_REVISION = 3
 
 
 def rules_digest() -> str:
@@ -1154,9 +1378,10 @@ def rules_digest() -> str:
         str(RULES_REVISION), JUDGE_SYSTEM, REQUESTS_SYSTEM, GENE_REQUESTS_SYSTEM, GENE_REQUEST_TEMPLATE,
         DEFINITION, ",".join(MECHANISM_CLASSES),
         passage_prompt(sample)[1]["content"], request_messages(1)[1]["content"],
-        *(rx.pattern for rx in (CIT, GARBLED_MARK, AUTH, CITN, MECH, DOM)),
+        *(rx.pattern for rx in (CIT, GARBLED_MARK, AUTH, CITN, MECH, DOM, DOSAGE_WORDING)), KEYWORD_REQUEST,
         f"max_per_paper={_MAX_PER_PAPER}", f"gene_batch={_GENE_BATCH}",
-        *(f"{k}={PARAMS[k][0]}" for k in ("n_requests", "k_per_request", "k_per_gene", "max_quotes_per_gene")),
+        *(f"{k}={PARAMS[k][0]}" for k in ("n_requests", "k_per_request", "keyword_round", "k_per_gene",
+                                          "max_quotes_per_gene")),
         ",".join(HIT_COLUMNS), ",".join(GENE_COLUMNS), ",".join(REQUEST_COLUMNS),
     ]
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]

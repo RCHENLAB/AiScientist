@@ -70,6 +70,18 @@ class SlurmJobError(RuntimeError):
         self.detail = detail
 
 
+class SlurmQueueTimeout(SlurmJobError):
+    """The job waited out every window in the queue and never started: the cluster queue was too
+    long, not a fault in the job. ``reason`` is Slurm's last pending reason (``Priority``,
+    ``Resources``, ...). A caller can submit the same job again later; nothing ran."""
+
+    def __init__(self, message: str, *, job_id: str | None = None, reason: str = "",
+                 waited_s: float = 0.0) -> None:
+        super().__init__(message, job_id=job_id)
+        self.reason = reason
+        self.waited_s = waited_s
+
+
 class JobCancelled(SlurmJobError):
     """The user asked to Stop mid-run, so the in-flight job was ``scancel``-led. Distinct from a
     real failure so callers can end the run cleanly instead of falling back to a LOCAL re-run
@@ -368,6 +380,7 @@ def acquire_allocation(
         windows_left -= 1
         deadline = time.monotonic() + config.startup_timeout_s
         died = False
+        announced = False               # one "pending" line per window, not one per poll
         while time.monotonic() < deadline:
             _check_cancel(executor, job_id, should_cancel, emit)   # Stop honoured while queued
             state, node = _queue_state(executor, job_id)
@@ -383,7 +396,8 @@ def acquire_allocation(
                 emit("warning", "slurm", f"Job {job_id} died on startup (state {state}); re-requesting ...")
                 died = True
                 break
-            if state == _PENDING:
+            if state == _PENDING and not announced:
+                announced = True
                 emit("info", "slurm", f"Job {job_id} pending in the queue ...")
             time.sleep(config.poll_interval_s)
         if died:
@@ -414,9 +428,10 @@ def acquire_allocation(
         executor.exec(f"scancel {job_id}")
     total_s = config.startup_timeout_s * (config.max_attempts + (1 if extended else 0))
     why = f"; Slurm's reason: {reason}" if reason else ""
-    raise SlurmJobError(
+    raise SlurmQueueTimeout(
         f"{spec.job_name} did not get a node within {total_s:.0f}s over {submissions} submission(s) "
         f"(the cluster queue is too long right now, not a fault in the job{why}).",
+        job_id=job_id or None, reason=reason, waited_s=float(total_s),
     )
 
 

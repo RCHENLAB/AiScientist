@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AiScientist · HPC3 Qwen3 Console</title>
+  <title>AiScientist Console</title>
   <!-- Material Symbols icon font is bundled LOCALLY (assets/material-symbols/) — no Google CDN, so
        the console renders its icons offline / under a strict CSP. Preloaded for a fast first paint. -->
   <link rel="preload" href="/static/assets/material-symbols/material-symbols-rounded.woff2" as="font" type="font/woff2" crossorigin />
@@ -57,7 +57,9 @@
         <span class="logo">🧬</span>
         <div class="brand-text">
           <h1>AiScientist<span class="brand-suffix"> Console</span></h1>
-          <p class="subtitle">SSH → UCI HPC3 · GPU · vLLM / Qwen3</p>
+          <!-- The model this session reasons with and where it runs, from its status (empty with no
+               session: the status on the right already says Disconnected). -->
+          <p id="headerModel" class="subtitle"></p>
         </div>
       </div>
       <div class="topbar-right">
@@ -65,7 +67,7 @@
           <span id="connDot" class="dot muted"></span>
           <span id="connLabel">Disconnected</span>
           <!-- What the session is doing with HPC3 when it is not idle (staging in, staging out,
-               cleaning up, failed); opens the storage panel with the session's details. -->
+               cleaning up, failed); opens My account → Storage with the session's details. -->
           <button id="sessChip" type="button" class="sess-chip hidden" title="This session on HPC3"></button>
         </div>
         <span id="userChip" class="user-chip" title="Signed in"></span>
@@ -186,15 +188,8 @@
                   <div class="conn-gpu" id="connGpu">GPU —</div>
                   <div class="conn-session hidden" id="connSession" aria-live="polite"></div>
                 </div>
-                <label class="model-row">Model
-                  <div class="model-row-controls">
-                    <select id="modelSelect"></select>
-                    <button id="pullModelBtn" type="button" class="icon-btn" title="Pull another model">+</button>
-                  </div>
-                </label>
-                <!-- WHICH LLM answers: the cluster's own vLLM, or one of your saved API keys.
-                     Separate from the Model row above, which only picks among what vLLM already
-                     loaded — an API endpoint serves whatever the provider offers. -->
+                <!-- WHICH LLM answers, and so which model: the lab's shared model, a cluster model on
+                     your own GPU, or one of your saved API keys. The only model picker. -->
                 <label class="model-row">LLM endpoint
                   <div class="model-row-controls">
                     <select id="llmEndpointSelect"></select>
@@ -207,7 +202,6 @@
                   </div>
                 </label>
                 <div id="llmEgressBanner" class="llm-egress hidden"></div>
-                <button id="storageBtn" type="button" class="ghost full">Manage HPC3 storage</button>
                 <button id="disconnectBtn" type="button" class="ghost full">Disconnect</button>
                 <button id="stopGpuBtn" type="button" class="danger-btn">Stop my GPU job (frees my SU)</button>
               </details>
@@ -250,60 +244,29 @@
               <div id="bootStatus" class="boot-status hidden"></div>
               <!-- A budget threshold reached (Account › API usage › Budget); shown once per cycle. -->
               <div id="budgetNotice" class="budget-notice hidden" role="status"></div>
+              <div id="dropHint" class="drop-hint hidden" aria-hidden="true">
+                <span class="material-symbols-outlined msym">upload</span>
+                <span>Drop files or folders to upload them to this chat</span>
+              </div>
               <div id="chatStream" class="chat-stream">
                 <div class="empty-hint">Connect to HPC3, then ask a research question.</div>
               </div>
               <div class="chat-controls">
-                <!-- Axis B: WHICH ENGINE answers. Explicit and user-visible on purpose — a
-                     classifier that silently sent a real study down the fast path would return a
-                     fluent answer with no analysis behind it. Research stays the default. -->
-                <select id="routeSelect" class="workflow-select" title="Chat = a fast, streaming answer that starts typing immediately and can look things up (literature, HPO). No plan, no analysis, no report. Research = the full lab: the PI plans, tools run on HPC3, and you get a report + downloadable results. Corpus scan = one HPC3 job reads EVERY paper of the indexed corpus and writes genes.csv + hits.csv (genes explicitly reported as haploinsufficient in retinal disease, with verbatim quotes). No plan, no report; about an hour. One pick is one scan: after Send the composer goes back to the engine this chat was using.">
-                  <option value="research" selected>🔬 Research (full pipeline)</option>
-                  <option value="chat">💬 Chat (fast answer)</option>
-                  <option value="corpus">📚 Corpus scan (haploinsufficient genes → CSV)</option>
-                </select>
-                <select id="modeSelect" class="workflow-select" title="How to run the research. Auto = the PI decides (a single scientist or a Virtual-Lab team). Single agent = one scientist. Virtual Lab = a team of expert agents that deliberate (Virtual-Lab style). The PI picks the analysis preset pipeline automatically — you don't.">
-                  <option value="auto" selected>✨ Auto (PI decides)</option>
-                  <option value="single">🧑‍🔬 Single agent</option>
-                  <option value="team">👥 Virtual Lab (multi-agent)</option>
-                </select>
-                <button id="methodsBtn" type="button" class="methods-btn" title="Preset pipelines and atomic skills. The PI picks the best-fit pipeline by itself — open this to see what each one does, or to require some for this chat.">
-                  <span class="material-symbols-outlined msym">tune</span> Pipelines &amp; skills
-                  <span id="methodsCount" class="methods-count hidden">0</span>
-                </button>
-                <label class="pipeline-toggle" title="The PI proposes a plan first; you refine it in chat (no manual editing) before any tool runs"><input id="planMode" type="checkbox" checked /> Plan first (PI proposes; refine in chat)</label>
-                <label class="pipeline-toggle" title="Bypass mode: run the whole research loop end-to-end with NO human gates — no plan review and no decision-point pauses (the agent decides at every fork). Stop and mid-run notes still work. Off = Manual (review gates on)."><input id="autonomousMode" type="checkbox" /> Bypass (run autonomously, no HITL)</label>
-                <label class="pipeline-toggle" title="When the run completes, save what it hands on to your data: the processed dataset (.h5ad) and, after CellQC, CellQC's whole result folder. They appear in Datasets, ready for the next analysis, with nothing to download or upload. Off = they are kept beside the run for a few days, and Runs → “Save to my data” saves them."><input id="saveResults" type="checkbox" /> Save results to my data</label>
-                <div id="datasetChips" class="dataset-chips" title="The data file(s) the next run will use — attach several (a VCF + a BED panel + a 2nd VCF); ★ marks the primary"></div>
-                <div id="caseNoteChips" class="dataset-chips" title="The patient's clinical description the next run will map to HPO terms"></div>
+                <!-- One flow for every request (RCHENLAB/AiScientist issue 21): the agent routes it (a
+                     literature search or an analysis) and proposes a plan; results are saved to
+                     Datasets. So the composer is the message box, + Data and Send, and the data of
+                     this chat. -->
+                <div id="datasetChips" class="dataset-chips" title="The data this chat's next run uses — attach several (a VCF + a BED panel + a 2nd VCF); ★ marks the primary"></div>
                 <input id="datasetInput" type="hidden" />
                 <input id="datasetFile" type="file" class="hidden" multiple accept=".h5ad,.h5,.loom,.csv,.tsv,.txt,.vcf,.vcf.gz,.bed,.bed.gz,.json,.zip,.tar,.tgz,.gz" />
                 <input id="datasetDir" type="file" class="hidden" webkitdirectory directory multiple />
-                <input id="caseNoteFile" type="file" class="hidden" accept=".txt,.md,.text" />
                 <div class="data-menu-wrap">
-                  <button id="dataMenuBtn" type="button" class="ghost small data-menu-btn" title="Add or choose data file(s) — a run can bind several">
+                  <button id="dataMenuBtn" type="button" class="ghost small data-menu-btn" title="Upload files or a folder for this chat. You can also drop several files and folders onto the chat.">
                     <span class="material-symbols-outlined msym">add</span> Data
-                    <span class="material-symbols-outlined msym data-caret">expand_more</span>
                   </button>
                   <div id="dataMenu" class="data-menu hidden">
-                    <button type="button" class="data-menu-item" data-act="file" title="Attach one or more data files — each joins the run's bind-set"><span class="material-symbols-outlined msym">upload_file</span> Upload file(s)</button>
-                    <button type="button" class="data-menu-item" data-act="folder"><span class="material-symbols-outlined msym">drive_folder_upload</span> Upload a folder</button>
-                    <button type="button" id="serverDataItem" class="data-menu-item hidden" data-act="server" title="Bind a dataset that is already on the server by its path: nothing is uploaded, and a run copies what it needs to HPC3"><span class="material-symbols-outlined msym">folder_shared</span> Use data on the server</button>
-                    <div id="serverPathRow" class="server-path-row hidden">
-                      <input id="serverPathInput" type="text" spellcheck="false" autocomplete="off" placeholder="/data/…" aria-label="Server path to bind" />
-                      <button id="serverPathBind" type="button" class="primary small">Bind</button>
-                    </div>
-                    <div class="data-menu-sep"></div>
-                    <button type="button" class="data-menu-item" data-act="note" title="Attach the patient's clinical description (.txt/.md) — it is mapped to HPO terms for the phenotype step, and does NOT replace the dataset"><span class="material-symbols-outlined msym">clinical_notes</span> Attach a case note</button>
-                    <div class="data-menu-sep"></div>
-                    <div id="dataMenuRecentLabel" class="data-menu-label">Recent uploads (click to add/remove)</div>
-                    <div id="dataMenuSearchRow" class="data-menu-search hidden">
-                      <span class="material-symbols-outlined msym">search</span>
-                      <input id="dataMenuSearch" type="text" spellcheck="false" autocomplete="off" placeholder="Dataset name…" aria-label="Search all uploaded datasets" />
-                      <button id="dataMenuSearchClose" type="button" class="data-menu-search-x" title="Back to recent uploads" aria-label="Back to recent uploads"><span class="material-symbols-outlined msym">close</span></button>
-                    </div>
-                    <div id="dataMenuRecent" class="data-menu-recent"></div>
-                    <button type="button" id="dataMenuSearchBtn" class="data-menu-item hidden" data-act="search" title="Find any dataset you have uploaded, by name or path, and add it to this chat"><span class="material-symbols-outlined msym">search</span> <span class="dms-text">Search in all uploaded datasets</span><span id="dataMenuSearchCount" class="dms-count"></span></button>
+                    <button type="button" class="data-menu-item" data-act="file" title="Upload one or more files — each joins this chat's data"><span class="material-symbols-outlined msym">upload_file</span> Files</button>
+                    <button type="button" class="data-menu-item" data-act="folder" title="Upload a folder, such as a Cell Ranger output folder. To add several folders at once, drop them onto the chat."><span class="material-symbols-outlined msym">drive_folder_upload</span> Folder</button>
                   </div>
                 </div>
                 <div id="uploadStatus" class="upload-status hidden"></div>
@@ -313,12 +276,9 @@
                      no box). Updated once per fast-chat turn. -->
                 <div id="ctxMeter" class="ctx-meter hidden"></div>
               </div>
-              <!-- What this chat REQUIRES (preset pipelines, atomic skills), as removable chips. Empty
-                   and hidden by default: the PI chooses. Picked in the "Pipelines & skills" sheet. -->
-              <div id="methodChips" class="method-chips hidden" aria-label="Required pipelines and skills"></div>
               <div id="serverPathOffer" class="server-path-offer hidden" role="status"></div>
               <form id="chatForm" class="chat-input">
-                <textarea id="chatInput" rows="2" placeholder="Ask AiScientist to plan or interpret an ocular bioinformatics analysis..."></textarea>
+                <textarea id="chatInput" rows="2" placeholder="Ask a question, or describe the analysis you want — the agent proposes a plan first…"></textarea>
                 <button id="chatSend" type="submit" class="primary">Send</button>
                 <button id="chatStop" type="button" class="danger-btn hidden" title="Stop the running analysis">■ Stop</button>
               </form>
@@ -454,9 +414,11 @@
             <div class="page-head"><h2>My account</h2><button id="logoutBtn" type="button" class="secondary small">Sign out</button></div>
             <div id="accountInfo" class="account-info"></div>
 
-            <!-- Two tabs: what your API key spent here (and its budget), and your password. -->
+            <!-- Three tabs: what your API key spent here (and its budget), where your files are kept
+                 (on the server and on HPC3), and your password. -->
             <div id="accountTabs" class="account-tabs" role="tablist" aria-label="Account">
               <button id="accountTab-usage" class="account-tab active" type="button" role="tab" aria-selected="true" aria-controls="accountPane-usage" data-account-tab="usage">API usage</button>
+              <button id="accountTab-storage" class="account-tab" type="button" role="tab" aria-selected="false" aria-controls="accountPane-storage" tabindex="-1" data-account-tab="storage">Storage</button>
               <button id="accountTab-password" class="account-tab" type="button" role="tab" aria-selected="false" aria-controls="accountPane-password" tabindex="-1" data-account-tab="password">Password</button>
             </div>
 
@@ -526,6 +488,54 @@
               </section>
             </div>
 
+            <!-- Where this account's files are (RCHENLAB/AiScientist issue 32). The server part needs no
+                 HPC3 session; the HPC3 part lists the account's own folders there while connected. -->
+            <div id="accountPane-storage" class="account-pane hidden" role="tabpanel" aria-labelledby="accountTab-storage">
+              <div class="usage-head">
+                <div><h3>Your storage</h3><p class="usage-sub">Where your files are kept, how much space they take, and what happens to them.</p></div>
+                <button id="storageRefresh" type="button" class="secondary quiet small">Refresh</button>
+              </div>
+
+              <section class="usage-card-box store-sec" aria-labelledby="storeServerH">
+                <div class="store-sec-head">
+                  <span class="material-symbols-outlined msym store-ico" aria-hidden="true">dns</span>
+                  <div class="store-sec-title">
+                    <h3 id="storeServerH">On the server</h3>
+                    <p class="usage-sub">Your datasets and what your runs wrote. Kept until you delete them.</p>
+                  </div>
+                  <strong id="storeServerTotal" class="store-total"></strong>
+                </div>
+                <div id="storeServerBody"><div class="storage-loading">Loading…</div></div>
+              </section>
+
+              <section class="usage-card-box store-sec" aria-labelledby="storeHpcH">
+                <div class="store-sec-head">
+                  <span class="material-symbols-outlined msym store-ico" aria-hidden="true">memory</span>
+                  <div class="store-sec-title">
+                    <h3 id="storeHpcH">On HPC3</h3>
+                    <p class="usage-sub">Where your runs compute. Their files there are temporary.</p>
+                  </div>
+                  <strong id="storeHpcTotal" class="store-total"></strong>
+                </div>
+                <div id="storeHpcBody"><div class="storage-loading">Loading…</div></div>
+                <!-- Each Delete is a Slurm job on HPC3 (never rm on a login node): queued here, then the
+                     list is read again once the job has ended. -->
+                <div id="storageDeletes" class="storage-items storage-deletes"></div>
+                <!-- Datasets that were kept only on HPC3 are copied to the server; their HPC3 originals
+                     stay until removed here: a dry-run job checks them first, then a second job removes them. -->
+                <div id="storeOriginals" class="store-sub hidden">
+                  <h4 class="store-sub-h">HPC3 originals of datasets now on the server</h4>
+                  <div id="originalsBox" class="originals-box"><div class="storage-loading">Loading…</div></div>
+                </div>
+                <!-- This session and the account's recent ones: state, copies with their progress,
+                     failures, and how each one's HPC3 cleanup went. -->
+                <details id="storeSessions" class="store-sub store-sessions store-fold">
+                  <summary class="store-sub-h">Recent sessions</summary>
+                  <div id="computeSessionList" class="storage-items"><div class="storage-loading">Loading…</div></div>
+                </details>
+              </section>
+            </div>
+
             <div id="accountPane-password" class="account-pane hidden" role="tabpanel" aria-labelledby="accountTab-password">
               <section class="usage-card-box password-box" aria-labelledby="changePwH">
                 <h3 id="changePwH">Change my password</h3>
@@ -557,59 +567,6 @@
           </div>
         </section>
       </div>
-    </div>
-  </div>
-
-  <!-- Pipelines & skills: every preset pipeline and atomic skill with its whole description, the
-       tools a pipeline composes and its protocol. Ticking one requires it for the active chat. -->
-  <div id="methodsModal" class="modal hidden">
-    <div class="modal-card methods-card" role="dialog" aria-modal="true" aria-labelledby="methodsTitle">
-      <div class="methods-head">
-        <div>
-          <h2 id="methodsTitle">Pipelines &amp; skills</h2>
-          <p class="methods-sub">The PI picks the best-fit pipeline for each request by itself. Tick anything here to <b>require</b> it in this chat.</p>
-        </div>
-        <button id="methodsClose" type="button" class="icon-btn" aria-label="Close">✕</button>
-      </div>
-      <div class="methods-tools">
-        <div class="methods-tabs" role="tablist">
-          <button type="button" role="tab" data-tab="pipelines" class="active">Preset pipelines <span class="methods-tab-n">0</span></button>
-          <button type="button" role="tab" data-tab="skills">Atomic skills <span class="methods-tab-n">0</span></button>
-        </div>
-        <input id="methodsSearch" type="search" class="preset-search" autocomplete="off" placeholder="Search by name, description or tool…" aria-label="Search pipelines and skills" />
-      </div>
-      <div id="methodsList" class="methods-list"></div>
-      <div class="methods-foot">
-        <span id="methodsSummary" class="methods-summary"></span>
-        <button id="methodsClear" type="button" class="secondary small">Clear all</button>
-        <button id="methodsDone" type="button" class="primary small">Done</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="storageModal" class="modal hidden">
-    <div class="modal-card">
-      <div class="modal-head">
-        <h2>HPC3 storage</h2>
-        <button id="storageClose" type="button" class="icon-btn" aria-label="Close">✕</button>
-      </div>
-      <!-- This session and the account's recent ones: state, copies with their progress, failures,
-           and how each one's HPC3 cleanup went. -->
-      <h3 class="storage-h">Sessions</h3>
-      <div id="computeSessionList" class="storage-items"><div class="storage-loading">Loading…</div></div>
-      <h3 class="storage-h">Your folders on HPC3</h3>
-      <div id="storageBase" class="storage-base"></div>
-      <div class="storage-used">Total used: <strong id="storageUsed">—</strong></div>
-      <pre id="storageQuota" class="storage-quota"></pre>
-      <div id="storageItems" class="storage-items"><div class="storage-loading">Loading…</div></div>
-      <!-- Each Delete is a Slurm job on HPC3 (never rm on a login node): queued here, then the list
-           is read again once the job has ended. -->
-      <div id="storageDeletes" class="storage-items storage-deletes"></div>
-      <p class="storage-note">A deletion runs as a job on HPC3, inside your own folders only, usually within a minute. This cannot be undone.</p>
-      <!-- Datasets that were kept only on HPC3 are copied to the server; their HPC3 originals stay
-           until removed here: a dry-run job checks them first, then a second job removes them. -->
-      <h3 class="storage-h">HPC3 originals of datasets now on the server</h3>
-      <div id="originalsBox" class="originals-box"><div class="storage-loading">Loading…</div></div>
     </div>
   </div>
 

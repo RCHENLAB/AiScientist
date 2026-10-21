@@ -70,7 +70,6 @@ def _routes(cid: str) -> list[tuple[str, str, dict]]:
         ("get", f"/api/storage/{cid}", {}),
         ("post", "/api/storage/delete", {"json": {**j, "path": "/dfs3b/x/alice/y"}}),
         ("get", f"/api/storage/{cid}/deletes", {}),
-        ("post", "/api/model", {"json": {**j, "model": "m"}}),
         ("post", "/api/llm-endpoint", {"json": {**j, "credential_id": "abc"}}),
         ("post", "/api/chat/stop", {"json": j}),
         ("post", "/api/chat/inject", {"json": {**j, "text": "use the other dataset"}}),

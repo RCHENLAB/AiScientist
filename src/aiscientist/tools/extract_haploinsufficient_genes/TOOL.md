@@ -21,7 +21,11 @@ A list extraction over the PaperQA corpus (the RetiGene PDFs on dfs3b), done the
    another angle (the mechanism's wording, the allele types, the evidence, the phenotypes). It is
    told to name no gene, so the genes come from the papers and not from the model.
 2. **Retrieve.** PubMedBERT embeds each request and takes its 50 nearest chunks of the corpus text
-   cache (at most 3 per paper).
+   cache (at most 3 per paper). Every chunk whose text states a dosage mechanism in words
+   (haploinsufficiency, gene dosage, dosage sensitivity, one functional copy or allele, loss of one
+   copy, half the normal amount; PDF ligatures such as "ﬁ" read as their letters) is read too: a
+   chunk's vector is mostly its topic, so the requests alone reached 50 of the corpus' 337 chunks
+   that say "haploinsufficiency".
 3. **Locate.** Each chunk is read back as its paper, page and numbered sentences.
 4. **Read.** The model reads each chunk once and returns, per gene whose disease mechanism a
    sentence states, the mechanism class, whether it is explicit, negated and about a human retinal
@@ -38,20 +42,29 @@ one working copy is not enough.
 
 ## How it is run
 
-- From the console: pick **Corpus scan** in the composer and press Send. The gateway
-  (`_run_corpus_scan`) submits one HPC3 job with a workspace of its own and puts the CSVs in the
-  run's downloads. One pick is one scan: the composer goes back to the engine the chat was
-  using once the scan is sent.
+- On request: a client sends `route: "corpus"` to `/api/lab` (the console has no control for it).
+  The gateway (`_run_corpus_scan`) submits one HPC3 job with a workspace of its own and puts the
+  CSVs in the run's downloads.
 - The job brings its own model (`gateway/corpus_scan.py`): it gets one GPU on the lab's paid
   `gpu` partition (the first free A30 or A100), starts vLLM there on the node's loopback, runs the scan
   against it and exits, which frees the card. Any session can run it, whatever model it uses
   itself, and the session's own model is never called. The scan's model is fixed
   (`AISCIENTIST_CORPUS_SCAN_MODEL`, else the cluster sessions' model), so the tables do not
   depend on who asked.
+- A session on the user's own API key (for example Claude Haiku) scans with that model instead,
+  on the user's bill: the job runs on a CPU node with no model of its own, and every prompt it
+  needs comes back to the Eye Server through files in `work/relay/` (`gateway/llm_relay.py`),
+  where the gateway calls the model with the key, records each call in the user's API usage and
+  stops at the scan's cap (`AISCIENTIST_CORPUS_SCAN_MAX_COST_USD`, default $20, lowered to what
+  is left of the user's budget). The key never leaves the Eye Server.
+- Before reading all of round one, the scan reads a pilot of about 1% of its passages (at least
+  5, at most 25, spread over the list). If half of them cannot be read, it stops there and says
+  why; on a priced model, if their cost projects past `max_cost_usd`, it stops as well. The pilot's
+  passages are kept, so the full pass does not read them again.
 - A finished scan is kept on the Eye Server (`<data root>/corpus_scans/<key>/`), keyed by the
   corpus files, the scan's rules (`rules_digest()`) and the model. The next request for the same
-  corpus, from Corpus scan or from a chat message asking for the haploinsufficient genes, is
-  answered from it at once; adding papers changes the key, and the next request scans again.
+  corpus, from a scan request or from a `route: "chat"` message asking for the haploinsufficient
+  genes, is answered from it at once; adding papers changes the key, and the next request scans again.
 - No model can call it (`research: false`, no `chat`): the PI cannot plan it and the Scientist
   cannot run it in a Research run. It holds a GPU while it reads every retrieved passage, and a
   Research run's literature job has no workspace of its own, so the tables would be written outside
@@ -71,10 +84,13 @@ one working copy is not enough.
 |---|---|---|---|
 | `n_requests` | integer | `16` | how many search requests the model writes for the first round |
 | `k_per_request` | integer | `50` | passages (chunks) each first-round request retrieves |
+| `keyword_round` | integer | `1` | 1 = round one also reads every passage that states a dosage mechanism in words (haploinsufficiency, gene dosage, one functional copy, ...); 0 = the requests alone |
 | `k_per_gene` | integer | `15` | passages each second-round gene request retrieves, among the chunks that name the gene |
 | `max_quotes_per_gene` | integer | `3` | how many papers (PMID + verbatim quote) genes.csv lists per gene |
 | `concurrency` | integer | `16` | parallel requests to the model while it reads the passages |
 | `max_passages` | integer | `0` | read only the first N retrieved passages (0 = all); for a smoke test |
+| `pilot_fraction` | number | `0.01` | share of round one's passages read first as a pilot (at least 5, at most 25): the scan stops before the rest when half of them fail, or when the cost they project is above max_cost_usd (0 = no pilot) |
+| `max_cost_usd` | number | `0.0` | stop before the full pass when the pilot projects a model cost above this, in USD (0 = no cap; only a model the gateway calls for the scan has a price) |
 | `pmids` | array of string | — | restrict the scan to these PMIDs (empty = the whole corpus) |
 <!-- /generated:parameters -->
 
@@ -93,7 +109,7 @@ one working copy is not enough.
   it), `gene_as_written`, `gene_status`, `gene_in_quote`, `gene_in_context`, `mechanism_class`,
   `explicit`, `negated`, `human_retinal`, `phenotype`, `mechanism_statement`, `quote`,
   `quote_verified`, `cite_like`, `dominance_marker`, `garbled`, `sentence_id`, `found_by` (the
-  requests that retrieved the passage: `R3` is round-one request 3, `G:PRPF31` the gene's own
+  requests that retrieved the passage: `R3` is round-one request 3, `K` the keyword round, `G:PRPF31` the gene's own
   request), `eligible`. The eligible rows are the ones genes.csv is built from.
 - `artifacts/haploinsufficiency/requests.csv`: every search request (`id`, `round`, `gene`,
   `request`, `n_passages` it retrieved), so a curator can see what was searched for.
@@ -121,9 +137,10 @@ In the research agents' catalog: no. No model can call it: it runs only from its
 
 ## Known limits
 
-- Recall is bounded by retrieval: a paper whose statement is in no request's nearest chunks, and
-  that names no gene round one found, is never read. `k_per_request` and `n_requests` widen round
-  one; `requests.csv` and `found_by` show which request found what.
+- Recall is bounded by retrieval: a paper that states the mechanism without any of the dosage
+  words, is in no request's nearest chunks, and names no gene round one found, is never read.
+  `k_per_request` and `n_requests` widen round one; `requests.csv` and `found_by` (`K` = the
+  keyword round) show which request found what.
 - The corpus cache (`mechanism_cache/` next to the papers: re-extracted page text, sentences, and
   PubMedBERT chunk vectors) is built once by `scripts/build_mechanism_cache.py`; without it the
   tool rebuilds the text in the run's `work/` (minutes for the PDFs). Without sentence-transformers

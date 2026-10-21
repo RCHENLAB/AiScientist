@@ -39,9 +39,7 @@ fixes ([`plan_doc.py`](../src/aiscientist/agents/plan_doc.py)). Two consequences
   `process/plan_adherence.md` ([`app.py:10574`](../src/aiscientist/gateway/app.py#L10574)).
 
 This is **on by default**: `AISCIENTIST_PLAN_YAML` has to be set to `0` to turn it off
-([`app.py:6926`](../src/aiscientist/gateway/app.py#L6926)). It also applies to a plan nobody
-reviewed — in bypass mode the plan is turned into a document and approved unreviewed, so its
-numbers still bind ([`research_lab.py:4313`](../src/aiscientist/agents/research_lab.py#L4313)).
+([`app.py:6926`](../src/aiscientist/gateway/app.py#L6926)).
 
 If your gateway has the flag off, the plan card is prose steps and none of the above applies. The
 probe detects which format a file is and says so on its first line; grade both captures the same

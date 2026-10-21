@@ -264,6 +264,15 @@ class HPCSettings:
                                   "--max-num-batched-tokens 4096")
     # The job's CPUs, memory and time come from the tool's TOOL.md, like every literature job's.
     corpus_scan_ready_timeout_s: int = 1500  # model load; ~400 s measured for the 27B INT4 on A100
+    # How long the job may wait in the paid queue for a card. 30 min (the analysis jobs' 3 x 600 s)
+    # was too short: on 2026-10-19 21:13 a scan queued behind 40 others (Slurm: Priority) and was
+    # cancelled at 21:43 without starting. A queued job keeps its place for the whole wait; the
+    # window is how often the chat hears where it stands.
+    corpus_scan_queue_wait_s: int = 7200
+    corpus_scan_queue_window_s: int = 1800
+    # After a wait that ends with no card, submit the job again this many times (a retry of that one
+    # step: the run is not failed while a retry is left). Nothing runs, so nothing is lost.
+    corpus_scan_queue_retries: int = 2
 
     # --- CodeAct (run_code) as a CPU Slurm batch job (opt-in) -------------------
     # By default run_code executes in the LOCAL CodeSandbox on the gateway host (uncapped
@@ -588,6 +597,10 @@ class HPCSettings:
             corpus_scan_vllm_args=os.environ.get("AISCIENTIST_CORPUS_SCAN_VLLM_ARGS", cls.corpus_scan_vllm_args),
             corpus_scan_ready_timeout_s=_int("AISCIENTIST_CORPUS_SCAN_READY_TIMEOUT_S",
                                              cls.corpus_scan_ready_timeout_s),
+            corpus_scan_queue_wait_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S", cls.corpus_scan_queue_wait_s),
+            corpus_scan_queue_window_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S",
+                                            cls.corpus_scan_queue_window_s),
+            corpus_scan_queue_retries=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES", cls.corpus_scan_queue_retries),
             run_code_on_hpc=(os.environ.get("AISCIENTIST_RUN_CODE_ON_HPC", "").strip().lower()
                              in ("1", "true", "yes", "on")),
             uploads_on_hpc=(os.environ.get("AISCIENTIST_UPLOADS_ON_HPC", "").strip().lower()

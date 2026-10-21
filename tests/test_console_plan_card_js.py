@@ -1,12 +1,13 @@
-"""The console's plan card and its "Pipelines & skills" picker, run under node.
+"""The console's plan card, run under node.
 
-Both are built by plain functions in ``frontend/console/app.js`` that return HTML. This runs those
+It is built by plain functions in ``frontend/console/app.js`` that return HTML. This runs those
 functions under node with the page's globals stubbed (like the upload cards' arithmetic in
 ``test_upload_pace_js.py``) and pins what a person depends on when reading them: a plan step is
 shown with its title and prose whatever shape it arrives in, only the step a revision touched is
-marked, an edit of the plan document that was refused comes back with what was typed, and a
-pipeline or a skill is shown whole — its description, every tool, its protocol — instead of in a
-clipped list. Skipped where node is not installed.
+marked, and an edit of the plan document that was refused comes back with what was typed. Also:
+a pipeline's hard-wrapped protocol text reads by paragraph on the System page, and the composer no
+longer carries the run options or the "Pipelines & skills" picker (issue 21). Skipped where node is
+not installed.
 """
 
 from __future__ import annotations
@@ -350,98 +351,35 @@ def test_a_change_on_the_cards_is_one_line_of_the_document_and_the_server_reads_
         "not_there is not where the plan document keeps it: change it in the YAML editor.", "A step needs a title."]
 
 
-# --- the pipelines & skills picker, run under node -----------------------------------------------------
+# --- a pipeline's protocol text, as the System page shows it ---------------------------------------
 
-PICKER_HARNESS = r"""
+UNWRAP_HARNESS = r"""
 const vm = require("vm");
 const src = require("fs").readFileSync(0, "utf8");
-const session = { presetKeys: ["differential_expression"], skillKeys: ["condition_by_celltype"] };
-const label = "Compare an experimental condition vs control (e.g. KO vs WT) per cell type, with pathway interpretation (v2 — pseudobulk when replicates exist, and honest about it when they don't)";
-const sandbox = { escapeHtml: __ESCAPE__, activeSession: () => session, state: {
-  presetOrder: ["celltype_annotation", "differential_expression", "variant_annotation"],
-  presets: {
-    celltype_annotation: { key: "celltype_annotation", label: "Single-cell **cell-type** annotation", data_type: "scrna", tools: ["run_scanpy_qc", "run_clustering"], prompt: "p" },
-    differential_expression: { key: "differential_expression", label, data_type: "scrna", prompt: "p",
-      tools: ["run_scanpy_qc", "run_cellqc", "run_clustering", "run_de", "run_pseudobulk_de", "run_depth_matched_de", "run_composition", "run_enrichment", "run_gsea_prerank", "deep_literature", "run_code"] },
-    variant_annotation: { key: "variant_annotation", label: "Interpret a VCF's variants", data_type: "variants", tools: ["annotate_variants"] },
-  },
-  skillOrder: ["condition_by_celltype", "crossvalidate_scgpt_vs_leiden"],
-  skills: {
-    condition_by_celltype: { name: "condition_by_celltype", summary: "Reference template — condition-vs-control differential expression, STRATIFIED BY CELL TYPE." },
-    crossvalidate_scgpt_vs_leiden: { name: "crossvalidate_scgpt_vs_leiden", summary: "Cross-validate scGPT labels <against> structure." },
-  } } };
-const api = vm.runInNewContext(src + "\n;({ methodEntries, methodRowsHtml, methodSummaryText, methodChipsHtml, methodPicks, methodUnwrap })", sandbox);
-const picks = api.methodPicks();
-const out = { label };
-out.pipelines = api.methodRowsHtml("pipelines", "", picks);
-out.skills = api.methodRowsHtml("skills", "", picks);
-out.by_tool = api.methodEntries("pipelines", "annotate_variants").map((e) => e.key);
-out.by_text = api.methodEntries("skills", "scgpt").map((e) => e.key);
-out.none = api.methodRowsHtml("pipelines", "zzzz", picks);
-out.summary = [api.methodSummaryText(picks), api.methodSummaryText({ presets: new Set(), skills: new Set() })];
-out.chips = api.methodChipsHtml(picks);
-out.no_chips = api.methodChipsHtml({ presets: new Set(), skills: new Set() });
+const api = vm.runInNewContext(src + "\n;({ methodUnwrap, METHOD_DATA_TYPES })", {});
+const out = { types: api.METHOD_DATA_TYPES };
 out.unwrap = api.methodUnwrap("One paragraph that the file\nwraps at ninety columns.\n\n1. first item that\n   continues here\n2. second\n\n| a | b |\n| c | d |\n```\nkeep\nthese\n```");
 console.log(JSON.stringify(out));
-""".replace("__ESCAPE__", ESCAPE)
-
-
-def _picker() -> dict:
-    return _node(PICKER_HARNESS, "const METHOD_DATA_TYPES", "// Paint everything that shows the active chat's picks")
-
-
-def test_a_pipeline_is_shown_whole_its_description_and_every_tool_it_composes():
-    """The list this replaces cut both off: a 176 px box of one-line labels."""
-    out = _picker()
-    rows = out["pipelines"]
-    assert out["label"] in rows, "the description is not shortened"
-    assert rows.count('class="method-tool"') == 2 + 11 + 1, "every tool of every pipeline"
-    assert "Single-cell cell-type annotation" in rows and "**" not in rows
-    assert '<span class="method-badge">scRNA-seq</span>' in rows and "Variants (VCF)" in rows
-
-
-def test_what_this_chat_requires_is_ticked_and_nothing_else():
-    out = _picker()
-    assert out["pipelines"].count('class="method-row checked"') == 1
-    assert 'class="method-row checked" data-kind="preset" data-key="differential_expression"' in out["pipelines"]
-    assert 'class="method-row checked" data-kind="skill" data-key="condition_by_celltype"' in out["skills"]
-
-
-def test_a_skill_shows_its_summary_not_only_its_name():
-    skills = _picker()["skills"]
-    assert "STRATIFIED BY CELL TYPE." in skills
-    assert "&lt;against&gt;" in skills and "<against>" not in skills
-
-
-def test_only_a_pipeline_with_a_protocol_offers_to_show_it():
-    assert _picker()["pipelines"].count("Read the protocol") == 2
-
-
-def test_the_search_reads_tools_and_descriptions():
-    out = _picker()
-    assert out["by_tool"] == ["variant_annotation"]
-    assert out["by_text"] == ["crossvalidate_scgpt_vs_leiden"]
-    assert "Nothing matches" in out["none"]
-
-
-def test_the_composer_names_what_is_required_and_is_empty_when_nothing_is():
-    out = _picker()
-    assert out["summary"][0] == "1 pipeline and 1 skill required in this chat."
-    assert out["summary"][1].startswith("Nothing required")
-    assert 'data-kind="preset" data-key="differential_expression"' in out["chips"]
-    assert 'data-kind="skill" data-key="condition_by_celltype"' in out["chips"]
-    assert out["no_chips"] == ""
+"""
 
 
 def test_a_hard_wrapped_protocol_is_rejoined_by_paragraph_and_list_item():
-    assert _picker()["unwrap"].split("\n") == [
+    out = _node(UNWRAP_HARNESS, "const METHOD_DATA_TYPES", "// The composer's placeholder, unless a plan is waiting")
+    assert out["types"] == {"scrna": "scRNA-seq", "variants": "Variants (VCF)"}
+    assert out["unwrap"].split("\n") == [
         "One paragraph that the file wraps at ninety columns.", "",
         "1. first item that continues here", "2. second", "",
         "| a | b |", "| c | d |", "```", "keep", "these", "```"]
 
 
-def test_the_page_no_longer_carries_the_inline_advanced_panel():
+def test_the_composer_has_no_run_options_and_no_pipelines_and_skills_picker():
+    """Every request runs with the same options (issue 21): nothing to choose, nothing to pick."""
     page = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
-    assert 'id="advancedPanel"' not in page and 'id="presetList"' not in page
-    for needed in ('id="methodsBtn"', 'id="methodChips"', 'id="methodsModal"', 'id="methodsList"'):
-        assert needed in page
+    for gone in ('id="modeSelect"', 'id="methodsBtn"', 'id="methodChips"', 'id="methodsModal"',
+                 'id="planMode"', 'id="autonomousMode"', 'id="saveResults"',
+                 'id="advancedPanel"', 'id="presetList"'):
+        assert gone not in page
+    source = APP_JS.read_text(encoding="utf-8")
+    for gone in ('$("modeSelect")', '$("planMode")', '$("autonomousMode")', '$("saveResults")', '$("methodsBtn")'):
+        assert gone not in source
+    assert "...FIXED_RUN_OPTIONS" in source, "the run is sent with the fixed options"

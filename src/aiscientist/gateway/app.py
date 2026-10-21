@@ -37,7 +37,7 @@ from ..integrations.safety import endpoint_is_off_host as _endpoint_is_off_host
 from . import hpc_gc                      # shared-root bootstrap + the HPC3 Temp sweeper
 from . import compute                     # where a session computes: HPC3 behind stage-in/submit/status/stage-out/clean-up
 from . import session_state               # what a session is doing with HPC3, shown in the console
-from . import storage_delete              # the storage panel's Delete, as a Slurm job
+from . import storage_delete              # the Storage tab's Delete, as a Slurm job
 from . import shared_llm                  # the lab's shared reasoning-model server and its keeper
 from . import staging                     # background copies of uploads to HPC3
 from . import upload_storage, dataset_storage
@@ -331,7 +331,7 @@ class Connection:
         # Set once the cleanup has been queued, so a repeated disconnect does not reach for an
         # SSH session that is already closed.
         self.session_cleaned = False
-        # The storage panel's deletions, each a Slurm job (see storage_delete.py), newest last, and
+        # The Storage tab's deletions, each a Slurm job (see storage_delete.py), newest last, and
         # where their script was staged on HPC3 (None = stage it at the first deletion).
         self.storage_deletes: list[dict] = []
         self.storage_delete_script: str | None = None
@@ -839,6 +839,8 @@ class Connection:
             m = cluster_models.get(cmid) if cmid else None
             return {"kind": "cluster", "cluster_model_id": cmid,
                     "label": f"vLLM · {m.label}" if m else "vLLM (UCI GPU node)",
+                    # The weight set's own name ("Qwen3.8-27B INT4"), for the console's header.
+                    "cluster_label": m.label if m else "",
                     "model": getattr(getattr(self, "settings", None), "vllm_model", None), "remote": False}
         if cred_id == shared_llm.ENDPOINT_ID:
             pub = shared_llm.endpoint_public()
@@ -2968,7 +2970,7 @@ def _hpc_user(conn: Connection) -> str:
 def _storage_base(conn: Connection) -> str:
     """The user's PERSONAL HPC3 lab dir. Legacy: everything AiScientist generates used to land
     here. Nothing new is written under it and the sweeper never touches it — it stays readable
-    (and browsable/deletable by hand from the storage panel) so old runs aren't lost."""
+    (and browsable/deletable by hand from the Storage tab) so old runs aren't lost."""
     return f"{conn.settings.lab_storage}/{_hpc_user(conn)}"
 
 
@@ -3028,7 +3030,7 @@ def _keep_for(days: Any, until_disconnect: bool) -> str:
 
 def _hpc_uploads_dir(conn: Connection) -> str:
     """The user's uploads area on HPC3 dfs3b — raw research data, deliberately OUTSIDE Temp so
-    the sweeper can never reach it (manual deletion only, from the storage panel)."""
+    the sweeper can never reach it (manual deletion only, from the Storage tab)."""
     return _shared_dir(conn, "uploads")
 
 
@@ -5244,7 +5246,7 @@ class _NoServedModelExecutor:
 
 
 def _build_literature_executor(conn: "Connection", run_id: str | None = None, *,
-                               own_gpu: bool = False) -> Any:
+                               own_gpu: bool = False, relay: "dict[str, Any] | None" = None) -> Any:
     """Offload the literature tools (deep_literature, extract_haploinsufficient_genes) to HPC3
     (paperqa.sif), or None to keep them disabled. With ``run_id`` the job gets that run's own
     workspace (``Temp/<user>/corpus/<run_id>`` on dfs3b, ``<workspace>/<run_id>`` locally), so its
@@ -5292,10 +5294,15 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None, *,
         # The job's own model, reached on the node's loopback (the URL is set inside the job, once
         # the port is known): no endpoint of the session goes in.
         served = {"model": corpus_scan.scan_model(st)}
+        window = max(60, int(st.corpus_scan_queue_window_s))
         gpu_job: dict[str, Any] = {
             "partition": st.corpus_scan_partition, "account": st.corpus_scan_account or "",
             "gres": st.corpus_scan_gres, "constraint": st.corpus_scan_constraint,
             "exclude": st.exclude or "", "network": True, "job_prefix": "bioagent_corpusscan",
+            # The paid queue can hold a card back for hours: wait in windows the chat hears about.
+            "startup_timeout_s": window,
+            "queue_windows": max(1, -(-int(st.corpus_scan_queue_wait_s) // window)),   # ceil
+            "queue_progress": True,
             "job_prelude": lambda name, scratch, res_f: corpus_scan.vllm_prelude(
                 st, name=name, scratch=scratch, res_f=res_f),
             "live_args": None,
@@ -5353,6 +5360,13 @@ def _build_literature_executor(conn: "Connection", run_id: str | None = None, *,
     )
     if own_gpu:
         return dataclasses.replace(executor, **gpu_job)
+    if relay is not None:
+        # The corpus scan on the user's own API model (``_corpus_scan_via_relay``): a CPU job whose
+        # model calls come back to this server (``gateway/llm_relay.py``), so neither an endpoint of
+        # the session nor a key goes in — only the model's name and the relay folder.
+        base = {k: v for k, v in executor.inject_args.items() if k not in ("model", "llm_base_url", "tunnel_port")}
+        return dataclasses.replace(executor, inject_args={**base, **relay}, live_args=None,
+                                   job_prefix="bioagent_corpusscan")
     return executor if conn.alloc is not None else _NoServedModelExecutor(executor)
 
 
@@ -5393,7 +5407,7 @@ def _active_conn_for_user(user) -> Connection | None:
 
 def _storage_areas(conn: Connection) -> list[tuple[str, str]]:
     """The HPC3 dirs this user owns, as ``(label, path)`` — every one of them browsable and
-    hand-deletable from the storage panel. ORDER = what a member most likely came here to clean.
+    hand-deletable from the Storage tab. ORDER = what a member most likely came here to clean.
 
     The legacy personal dir is listed LAST and only ever removed by an explicit click: the
     automatic sweeper is confined to ``Temp``, so anything a member put in their own lab folder
@@ -5406,56 +5420,161 @@ def _storage_areas(conn: Connection) -> list[tuple[str, str]]:
     ]
 
 
+def _storage_area_info(conn: Connection) -> list[dict]:
+    """The areas of :func:`_storage_areas` as the Storage tab shows them (RCHENLAB/AiScientist issue
+    32): a key, a name, and one line on what happens to the files there."""
+    ttl = conn.settings.temp_ttl_days
+    (_, temp), (_, uploads), (_, personal) = _storage_areas(conn)
+    kept = (f"Removed when your session ends, or {ttl} days after they were last used." if ttl > 0
+            else "Removed when your session ends.")
+    return [
+        {"key": "temp", "label": "Temporary run files", "path": temp, "note": kept},
+        {"key": "uploads", "label": "Uploads on HPC3", "path": uploads,
+         "note": ("Left from before uploads were kept on the server. Kept until you delete them."
+                  if _uploads_kept_here(conn) else "Your uploaded data. Kept until you delete it.")},
+        {"key": "personal", "label": "Your own lab folder", "path": personal,
+         "note": "Your personal folder in the lab's storage, with your own files too. AiScientist no "
+                 "longer writes here and never cleans it."},
+    ]
+
+
+def _du_entry(line: str, base: str) -> dict | None:
+    """One line of ``du -sk --time --time-style=+%s``: ``<KiB>\t<newest change, epoch>\t<path>``
+    (the time column may be missing). The name is the path below ``base``."""
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) == 3:
+        kib, changed, path = parts
+    elif len(parts) == 2:
+        (kib, path), changed = parts, ""
+    else:
+        return None
+    path = path.strip().rstrip("/")
+    if not path or not kib.strip().isdigit():
+        return None
+    entry = {"name": path[len(base) + 1:] if path.startswith(base.rstrip("/") + "/") else path.rsplit("/", 1)[-1],
+             "bytes": int(kib) * 1024, "path": path}
+    if changed.strip().isdigit():
+        entry["changed"] = int(changed)
+    return entry
+
+
+_DFS_POOL_RE = re.compile(r"^/(dfs[0-9a-z]+)/")
+_QUOTA_ROW_RE = re.compile(r"^(\S+)\s+\d+\s+group\s+(\S+)\s+([\d.]+)\s*([KMGTPE]?i?B)\s*/\s*([\d.]+)\s*([KMGTPE]?i?B)",
+                           re.MULTILINE)
+_UNIT_BYTES = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15,
+               "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40, "PiB": 2 ** 50, "EiB": 2 ** 60}
+
+
+def _parse_dfsquotas(text: str) -> dict | None:
+    """The group row of ``dfsquotas <UCInetID> <dfs>``, e.g.
+    ``ruic20_hpc  158908  group  dfs3b  574.58TiB/700.00TiB  53.94M/5.09G``: the lab's GROUP quota,
+    shared by every member (RCIC reports no per-user figure). None when there is no such row, as
+    when the command printed its usage text."""
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+    m = _QUOTA_ROW_RE.search(clean)
+    if not m:
+        return None
+    group, pool, used, used_unit, limit, limit_unit = m.groups()
+    used_b = float(used) * _UNIT_BYTES.get(used_unit, 0)
+    limit_b = float(limit) * _UNIT_BYTES.get(limit_unit, 0)
+    return {"group": group, "pool": pool, "used": f"{used} {used_unit}", "limit": f"{limit} {limit_unit}",
+            "percent": round(100 * used_b / limit_b, 1) if limit_b else None}
+
+
 def _list_storage(conn: Connection) -> dict:
-    areas = _storage_areas(conn)
-    base = areas[0][1]
-    if conn.mock:
-        deleted = getattr(conn, "mock_deleted", set())
-        items = [
-            {"name": "analysis/8f2c1d4a", "size": "11G", "path": f"{base}/analysis/8f2c1d4a",
-             "area": areas[0][0]},
-            {"name": "scratch/runcode", "size": "212M", "path": f"{base}/scratch/runcode",
-             "area": areas[0][0]},
-            {"name": "old_pbmc_run.h5ad", "size": "880M", "area": areas[2][0],
-             "path": f"{areas[2][1]}/old_pbmc_run.h5ad"},
-        ]
-        return {
-            "base": base,
-            "used": "28G",
-            "quota_raw": "MOCK dfsquotas: /dfs3b/ruic20_lab  used 612G / limit 1.0T (61%)",
-            "areas": [{"label": label, "path": path} for label, path in areas],
-            "ttl_days": conn.settings.temp_ttl_days,
-            "items": [i for i in items if i["path"] not in deleted],
-        }
-    items: list[dict] = []
-    used_parts: list[str] = []
-    for label, path in areas:
-        # Temp is listed one level deeper (Temp/<kind>/<entry>) because that IS the unit the
-        # sweeper works on — showing just "analysis" would hide which runs are actually costing
-        # space. The other areas stay at their top level.
-        depth = "*/*" if path == base else "*"
-        du = conn.executor.exec(
-            f"du -sh {shlex.quote(path)}/{depth} 2>/dev/null | sort -rh | head -60")
-        for line in du.stdout.splitlines():
-            parts = line.split("\t")
-            if len(parts) == 2 and parts[1].strip():
-                item_path = parts[1].strip()
-                items.append({"name": item_path[len(path) + 1:] or item_path.rsplit("/", 1)[-1],
-                              "size": parts[0].strip(), "path": item_path, "area": label})
-        total = conn.executor.exec(f"du -sh {shlex.quote(path)} 2>/dev/null")
-        if total.out:
-            size = total.out.split("\t")[0].strip()
-            used_parts.append(f"{size} {label}")
-    quota = conn.executor.exec("dfsquotas 2>/dev/null || echo 'run dfsquotas manually to see limits'")
+    """The user's own HPC3 folders for the Storage tab, area by area: what each area is, its size and
+    its entries, largest first. A Temp entry carries the day the sweep may remove it (its newest
+    change plus ``temp_ttl_days``: the sweep's own rule, see hpc_gc), and the lab's quota is read."""
+    areas = _storage_area_info(conn)
+    ttl = conn.settings.temp_ttl_days
     deleting = {j["path"]: j["job_id"] for j in conn.storage_deletes if j.get("status") == "queued"}
-    for item in items:
-        if item["path"] in deleting:
-            item["deleting"] = deleting[item["path"]]
-    return {"base": base, "used": " + ".join(used_parts) or "?",
-            "quota_raw": quota.out[:1500],
-            "areas": [{"label": label, "path": path} for label, path in areas],
-            "ttl_days": conn.settings.temp_ttl_days,
-            "items": items}
+    if conn.mock:
+        gone = getattr(conn, "mock_deleted", set())
+        now = int(time.time())
+        mock = {"temp": [("analysis/8f2c1d4a", 11 * 2 ** 30, now - 3600),
+                         ("scratch/runcode", 212 * 2 ** 20, now - 2 * 86400)],
+                "uploads": [], "personal": [("old_pbmc_run.h5ad", 880 * 2 ** 20, now - 90 * 86400)]}
+        for area in areas:
+            area["items"] = [{"name": n, "bytes": b, "path": f"{area['path']}/{n}", "changed": t}
+                             for n, b, t in mock[area["key"]] if f"{area['path']}/{n}" not in gone]
+        quota = {"group": "ruic20_hpc", "pool": "dfs3b", "used": "574.58 TiB", "limit": "700.00 TiB",
+                 "percent": 82.1}
+    else:
+        for area in areas:
+            path = area["path"]
+            # Temp is listed one level deeper (Temp/<kind>/<entry>) because that IS the unit the
+            # sweeper works on; the other areas stay at their top level.
+            depth = "*/*" if area["key"] == "temp" else "*"
+            du = conn.executor.exec(f"du -sk --time --time-style=+%s {shlex.quote(path)}/{depth} 2>/dev/null "
+                                    "| sort -rn | head -60")
+            area["items"] = [e for e in (_du_entry(line, path) for line in du.stdout.splitlines()) if e]
+        pool = _DFS_POOL_RE.match(conn.settings.lab_storage or "")
+        quota = None
+        if pool:
+            out = conn.executor.exec(f"dfsquotas {shlex.quote(_hpc_user(conn))} {pool.group(1)} 2>/dev/null")
+            quota = _parse_dfsquotas(out.stdout)
+    for area in areas:
+        for item in area["items"]:
+            item["area"] = area["key"]
+            if area["key"] == "temp" and ttl > 0 and item.get("changed"):
+                item["clean_after"] = item["changed"] + ttl * 86400
+            if item["path"] in deleting:
+                item["deleting"] = deleting[item["path"]]
+        area["bytes"] = sum(i["bytes"] for i in area["items"])
+    return {"areas": areas, "quota": quota, "ttl_days": ttl,
+            "items": [i for a in areas for i in a["items"]]}
+
+
+def _tree_bytes(root: Path) -> int:
+    """Bytes of the regular files under ``root``; symbolic links are not followed."""
+    total = 0
+    for folder, _dirs, files in os.walk(root):
+        for name in files:
+            path = os.path.join(folder, name)
+            try:
+                if not os.path.islink(path):
+                    total += os.lstat(path).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _server_storage(user_id: int, username: str) -> dict:
+    """What an account keeps on this server (issue 32): each dataset with its recorded size and each
+    run's folder (report, figures, tables, the processed data kept beside it) measured on disk,
+    largest first. A dataset that only points at a shared server folder takes none of the account's
+    space, and one still on HPC3 is counted there: both are counted apart, not listed."""
+    from .db import session_scope
+    from .dataset_storage import location_of
+    from .models import Dataset, Run
+    owner = safe_name(username)
+    with session_scope() as s:
+        datasets = [d.public() for d in s.query(Dataset).filter(Dataset.user_id == user_id)]
+        runs = [r.public() for r in s.query(Run).filter(Run.user_id == user_id)]
+    kept, linked, on_hpc3 = [], 0, 0
+    for d in datasets:
+        if str(d.get("kind") or "").startswith("server-"):
+            linked += 1
+        elif location_of(d.get("path") or "") == "hpc3":
+            on_hpc3 += 1
+        else:
+            kept.append({"id": d["id"], "name": d["name"], "kind": d["kind"], "bytes": int(d.get("size_bytes") or 0),
+                         "uploaded_at": d.get("uploaded_at"), "path": d.get("path"),
+                         "conversation_id": d.get("conversation_id")})
+    outputs = []
+    for r in runs:
+        folder = _run_folder(owner, r["run_id"])
+        if folder is None or not folder.is_dir() or folder.is_symlink():
+            continue
+        outputs.append({"run_id": r["run_id"], "question": r.get("question") or "", "status": r.get("status"),
+                        "created_at": r.get("created_at"), "bytes": _tree_bytes(folder),
+                        "running": _run_in_flight(r["run_id"])})
+    kept.sort(key=lambda d: -d["bytes"])
+    outputs.sort(key=lambda r: -r["bytes"])
+    datasets_bytes, outputs_bytes = sum(d["bytes"] for d in kept), sum(r["bytes"] for r in outputs)
+    return {"datasets": kept, "outputs": outputs, "datasets_bytes": datasets_bytes,
+            "outputs_bytes": outputs_bytes, "total_bytes": datasets_bytes + outputs_bytes,
+            "linked": linked, "on_hpc3": on_hpc3}
 
 
 @app.get("/api/sessions")
@@ -5463,11 +5582,28 @@ async def list_compute_sessions(request: Request, connection_id: str = "") -> JS
     """The recent compute sessions of the account that owns this connection, newest first (issue
     6): the live one as it is now (its state, the copies in flight with their progress, failures)
     and how each earlier one ended, its HPC3 cleanup included."""
-    owner = _owned_conn(connection_id, request, missing=("Not connected", 409)).owner
+    user = _optional_user(request) if not connection_id else None
+    # With accounts on, the account's own sessions can be read without an HPC3 session (the Storage
+    # tab, issue 32); otherwise they belong to the connection named.
+    owner = (safe_name(user.username) if user is not None
+             else _owned_conn(connection_id, request, missing=("Not connected", 409)).owner)
     live = {c.id: c.session.snapshot() for c in _owner_connections(owner)
             if c.status != "disconnected"}
     rows = await asyncio.to_thread(session_state.list_sessions, CONSOLE_RUNS_DIR / owner, live)
     return JSONResponse({"sessions": rows, "ttl_days": HPCSettings.from_env().temp_ttl_days})
+
+
+# Registered before /api/storage/{connection_id}, which would otherwise take "server" for an id.
+@app.get("/api/storage/server")
+async def get_server_storage(request: Request) -> JSONResponse:
+    """The caller's storage on this server, for the Storage tab of My account. Needs no HPC3 session."""
+    if not _AUTH_ENABLED:
+        return JSONResponse({"error": "Storage on the server is listed per account, and accounts are off."},
+                            status_code=400)
+    user = _optional_user(request)
+    if user is None:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    return JSONResponse(await asyncio.to_thread(_server_storage, user.id, user.username))
 
 
 @app.get("/api/storage/{connection_id}")
@@ -5558,7 +5694,7 @@ async def delete_storage(payload: dict, request: Request) -> JSONResponse:
 
 @app.get("/api/storage/{connection_id}/deletes")
 async def get_storage_deletes(connection_id: str, request: Request) -> JSONResponse:
-    """The session's deletions from the storage panel, the queued ones brought up to date."""
+    """The session's deletions from the Storage tab, the queued ones brought up to date."""
     conn = _owned_conn(connection_id, request, missing=("Not connected", 409))
     if not conn.executor:
         return JSONResponse({"error": "Not connected"}, status_code=409)
@@ -5691,31 +5827,6 @@ async def remove_hpc_originals(payload: dict, request: Request) -> JSONResponse:
                                     f"server (job {plan['remove']['job_id']}).")
     return JSONResponse({"plan": hpc_originals.public(plan),
                          "personal_allowed": hpc_originals.personal_allowed()})
-
-
-@app.post("/api/model")
-async def select_model(payload: dict, request: Request) -> JSONResponse:
-    conn = _owned_conn(payload.get("connection_id", ""), request)
-    model = str(payload.get("model", "")).strip()
-    if not model:
-        return JSONResponse({"error": "model is required"}, status_code=400)
-    leaf = model.rsplit("/", 1)[-1]
-    # vLLM loads ONE model into VRAM at serve-launch — it can't pull or hot-swap at
-    # runtime. So we can only select among what the server already serves; a
-    # different model means reconnecting (which submits a serve job for that model).
-    if any(leaf == t.rsplit("/", 1)[-1] for t in conn.available_models):
-        conn.selected_model = model
-        conn.emit("success", "llm_model", f"Active model switched to {model}.")
-        conn.broadcast_status()
-        return JSONResponse({"status": "selected", "model": model})
-    return JSONResponse(
-        {
-            "error": f"vLLM serves a single model ({conn.selected_model}) loaded at launch and cannot "
-                     f"hot-swap to '{model}'. Set AISCIENTIST_VLLM_MODEL and reconnect to serve a different model.",
-            "served": conn.available_models,
-        },
-        status_code=409,
-    )
 
 
 class LLMEndpointRequest(BaseModel):
@@ -5989,31 +6100,34 @@ class LabRequest(BaseModel):
     # data file — a second DATA file (a BED panel, say) now rides in ``datasets`` above (the bind-set),
     # while this stays a text-only clinical note.
     case_note: str | None = None
+    # The run options below are fixed for every request to /api/lab (_fixed_run_options: plan
+    # review on, no Bypass, mode "auto", nothing required by hand, results saved). The fields stay
+    # because the run code reads them and internal callers (a continued run) build requests too.
     plan_mode: bool = False          # if true, pause after the PI plans for user review/edit
     autonomous: bool = False         # BYPASS mode: run end-to-end with NO human gates (no plan
                                      # review, no decision-point pauses). Overrides plan_mode. Stop +
                                      # mid-run notes still work. Default (false) = Manual = gates on.
     preset: str | None = None        # legacy single pre-selected research path (key); see `presets`
-    presets: list[str] | None = None  # preset PIPELINE keys to inject for THIS run — the console's
-                                     # pipeline multi-select. Their prompts are composed into one
-                                     # guidance block; empty/absent = the PI auto-selects.
-    skills: list[str] | None = None  # atomic SKILL names (skills/*.py) to REQUIRE for THIS run — the
-                                     # console's skill multi-select. The plan must apply each.
+    presets: list[str] | None = None  # preset PIPELINE keys to inject for THIS run. Their prompts are
+                                     # composed into one guidance block; empty/absent = the PI
+                                     # auto-selects.
+    skills: list[str] | None = None  # atomic SKILL names (skills/*.py) to REQUIRE for THIS run. The
+                                     # plan must apply each.
     preset_prompt: str | None = None  # the (possibly user-edited) guidance text; overrides preset(s)
     mode: str = "single"             # Axis A: "single" | "team" (Virtual-Lab multi-agent) | "auto"
     planner: str | None = None       # "dag" (default, dependency-DAG + Coordinator) | "linear"
-    # Axis B — WHICH ENGINE answers, an axis orthogonal to `mode` (which is about one scientist vs a
-    # Virtual-Lab team, and applies only within the research engine):
-    #   "research" (default) — the full lab: PI agenda → multi-step execution → assembled report.
-    #   "chat"               — the answer-first streaming ReAct loop (agents/quick_chat.py). Tokens
-    #                          start immediately, tools are callable, NO plan / report / bundle.
-    # Routing is the USER's explicit choice from the composer, never a classifier: a study
-    # misrouted into a 4-turn chat loop would return a fluent answer with no analysis behind it,
-    # and nothing downstream would flag it. Unknown values fall back to "research" — the safe side.
+    # Which line answers. The console sends "auto" (RCHENLAB/AiScientist issue 21): the session's
+    # model routes the request (_route_request, agents/request_router.py) to a literature search
+    # (a general question, answered from PubMed with citations, after a one-step plan the user
+    # reviews) or to the lab (anything about data). "research" is routed the same way. Two values
+    # are kept for a client from before the change and for going back to v0.3.0's menu:
+    #   "chat"   — the answer-first streaming ReAct loop (agents/quick_chat.py): no plan, no report;
+    #   "corpus" — the corpus scan (extract_haploinsufficient_genes over the whole indexed corpus).
     route: str = "research"
     # Save what the run hands on (the processed dataset, CellQC's result directory) to the user's
     # data when it completes, as "Save to my data" would: the next analysis can start from it
     # without a click, a download or an upload. Off = it is kept beside the run for a few days.
+    # On for every run that /api/lab starts or /api/lab/continue redoes.
     save_results: bool = False
     # Prior turns of THIS conversation, [{"role": "user"|"assistant", "content": str}, ...].
     # Only the fast path reads it: a chat is a conversation, so "what about the other one?" has to
@@ -6027,6 +6141,21 @@ class LabRequest(BaseModel):
     tz: str | None = None
 
 
+def _fixed_run_options(req: LabRequest) -> LabRequest:
+    """Every research request follows one flow (RCHENLAB/AiScientist issue 21): the PI proposes a
+    plan the user reviews before anything runs, no run skips the review gates (Bypass), the PI
+    chooses one scientist or a team, no pipeline or skill is required by hand, and what the run
+    hands on is saved to the user's data. The console no longer offers these as choices; a client
+    that still sends other values (an older page, a script) gets these."""
+    req.plan_mode = True
+    req.autonomous = False
+    req.mode = "auto"
+    req.save_results = True
+    req.preset = None
+    req.presets = []
+    req.skills = []
+    req.preset_prompt = None
+    return req
 
 
 class ContinueRunRequest(BaseModel):
@@ -7365,7 +7494,12 @@ def _conversation_last_run(conn: Connection, conversation_id: str) -> str:
         return rid
     if _AUTH_ENABLED and conn.app_user_id:
         try:
-            rid = (auth_routes.latest_run_id_for_conversation(conn.app_user_id, conversation_id) or "").strip()
+            # A literature answer is a finished run too, but not a study a follow-up can continue:
+            # the run to find is the latest one with a run state.
+            rid = (auth_routes.latest_run_id_for_conversation(
+                conn.app_user_id, conversation_id,
+                accept=lambda r: (conn.workspace / safe_name(r) / "artifacts" / "process"
+                                  / "run_state.json").exists()) or "").strip()
         except Exception as exc:  # noqa: BLE001 - a lookup failure just means "no prior run known"
             print(f"[followup] DB last-run lookup failed: {exc}")
             rid = ""
@@ -7525,7 +7659,7 @@ def _starts_no_study(conn: Connection, req: LabRequest) -> bool:
     q = (req.question or "").strip()
     if not q:
         return True
-    if conn.alloc is not None:          # warm model — cheap to ask, and it reads intent, not keywords
+    if _model_ready(conn):              # warm model — cheap to ask, and it reads intent, not keywords
         try:
             complete_fn, *_ = _lab_llm(conn)
             verdict = _classify_new_study(complete_fn, q)
@@ -7538,6 +7672,38 @@ def _starts_no_study(conn: Connection, req: LabRequest) -> bool:
         if verdict and verdict["intent"] == "study":
             return False                # the model saw a request — believe it, never second-guess
     return _is_conversational_turn(q)   # cold, unparseable, or unsure → deterministic floor
+
+
+def _model_ready(conn: Connection) -> bool:
+    """Whether the session's model can be asked a short question now: its own GPU job is up, or it
+    runs on an endpoint (its API key, the lab's shared model), which is always there. A GPU session
+    whose job is not up yet is not asked: a classifier is not worth a cold start. (The screens below
+    asked only when ``conn.alloc`` was set, so on an endpoint they never asked the model: every
+    follow-up got the "what would you like me to do" card.)"""
+    return conn.alloc is not None or _session_credential(conn) is not None
+
+
+# --- which line a request goes to (RCHENLAB/AiScientist issue 21) ---------------------------------
+# The composer has no Research / Chat / Corpus scan menu: the model routes each request, either to a
+# literature search (a general question, answered from PubMed with citations) or to the lab
+# (anything about data). See agents/request_router.py for the rules and the guards.
+
+def _route_request(conn: Connection, req: LabRequest, prior_request: str = "") -> Any:
+    """Route one request with the session's model (role ``classify``); the router's rules when the
+    model cannot be asked. ``prior_request`` is the request of the chat's earlier analysis. Never
+    raises: a request that cannot be routed is an analysis."""
+    from ..agents import request_router
+    names = [str(d.get("name") or "") for d in _select_bound_datasets(req)]
+    complete = None
+    if _model_ready(conn):
+        try:
+            complete_fn = _lab_llm(conn).complete_fn
+            complete = lambda messages: complete_fn(messages, role="classify")  # noqa: E731
+        except Exception as exc:  # noqa: BLE001 - routing falls back to the rules
+            print(f"[route] the session's model is not available for routing: {exc}")
+    route = request_router.route_request(complete, req.question, data=names, prior_request=prior_request)
+    print(f"[route] {json.dumps(route.to_dict(), ensure_ascii=False)}")
+    return route
 
 
 async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
@@ -7555,8 +7721,12 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     finally:
         # The run functions end their own scope; this closes the ones that never started a run
         # (a reply that starts no study, a clarify left unanswered), which would otherwise stay in
-        # ``live_runs`` — and keep their chat looking busy — for the life of the session.
+        # ``live_runs`` — and keep their chat looking busy — for the life of the session. A literature
+        # plan the user turned into an analysis opened a second scope; it is closed too.
         conn.end_run(run)
+        current = conn.active_run
+        if current is not None and current is not run:
+            conn.end_run(current)
 
 
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
@@ -7583,24 +7753,38 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         await _run_corpus_scan(conn, req)
         return
     target = _followup_target(conn, req)
-    if target is None:
-        # Nothing to attach a follow-up to, so this message would mint a FRESH study. Refuse to do
-        # that for a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
-        if await asyncio.to_thread(_starts_no_study, conn, req):
-            conn.push({"type": "lab_progress",
-                       "text": "💬 That reads as a reply, not a study — nothing was started. "
-                               "There's no previous run in this chat to answer about (a cancelled "
-                               "or timed-out plan leaves none), so send the question you want "
-                               "analysed, or switch the composer to Chat to just talk.",
-                       "level": "info"})
-            conn.push({"type": "chat_stopped"})
+    # Nothing to attach a follow-up to, so this message would mint a FRESH run. Refuse to do that for
+    # a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
+    if target is None and await asyncio.to_thread(_starts_no_study, conn, req):
+        conn.push({"type": "lab_progress",
+                   "text": "💬 That reads as a reply, not a request — nothing was started. "
+                           "There's no previous run in this chat to answer about (a cancelled "
+                           "or timed-out plan leaves none), so send the question you want "
+                           "answered or the analysis you want run.",
+                   "level": "info"})
+        conn.push({"type": "chat_stopped"})
+        return
+    # Which line (issue 21): a general question is answered from the literature, everything else is
+    # the lab. The chat's earlier analysis is context: a question about it is an analysis.
+    prior_request = str(target[2].get("question") or "") if target else ""
+    route = await asyncio.to_thread(_route_request, conn, req, prior_request)
+    conn.emit("info", "route", f"Routed to {route.route} ({route.source}, confidence "
+                               f"{route.confidence:.2f}): {route.reason or '-'}")
+    if route.literature:
+        handoff = await _run_literature(conn, req, route)
+        if handoff is None:
             return
+        # The note on the literature plan asked for an analysis: the lab plans it, as a run of its own.
+        req = req.model_copy(update={"question": handoff})
+        conn.begin_run(req.conversation_id)
+        target = _followup_target(conn, req)
+    if target is None:
         await _run_lab(conn, req)
         return
     run_id, art, state = target
 
     intent = None
-    if conn.alloc is not None:          # model already warm — cheap to classify
+    if _model_ready(conn):              # model already warm — cheap to classify
         try:
             complete_fn, *_ = _lab_llm(conn)
             intent = await asyncio.to_thread(_classify_followup, complete_fn, state, req.question)
@@ -7855,11 +8039,9 @@ def _watch_llm(run: RunState, complete_fn: Callable[..., str],
 
 
 def _fast_path(req: LabRequest) -> bool:
-    """True when this message should take the answer-first chat loop instead of the lab.
-
-    ONE rule: the user picked it (``route == "chat"``). No keyword heuristics, no LLM classifier
-    — see ``LabRequest.route``. Anything unrecognised means research, so an older client that
-    doesn't send the field, or a typo'd value, keeps today's behaviour exactly."""
+    """True when this message should take the answer-first chat loop instead of the lab: only a
+    client that asks for it (``route == "chat"``, the v0.3.0 menu). The console no longer does; its
+    requests are routed by the model (``_route_request``). See ``LabRequest.route``."""
     return str(getattr(req, "route", "") or "").strip().lower() == "chat"
 
 
@@ -7871,6 +8053,7 @@ def _corpus_path(req: LabRequest) -> bool:
 
 CORPUS_TOOL = "extract_haploinsufficient_genes"
 CORPUS_MAX_ATTEMPTS = 3      # submissions of the job per run: the first plus two resumes after its model died
+# (A job that never left the queue is submitted again separately: settings.corpus_scan_queue_retries.)
 # One scan per corpus at a time: the key of each scan in progress (corpus_scan.scan_key) -> its run.
 _CORPUS_SCANS_RUNNING: dict[str, str] = {}
 
@@ -7888,8 +8071,30 @@ def _corpus_scan_identity(conn: Connection) -> "tuple[str, dict[str, Any]] | Non
     if fp is None:
         return None
     rules = _tools_api.corpus_scan_rules_digest()
-    model = corpus_scan.scan_model(conn.settings)
+    model = _corpus_scan_model(conn)
     return corpus_scan.scan_key(fp, rules, model), {"corpus": fp, "rules": rules, "model": model}
+
+
+def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
+    """The session's own API model when it runs on one (a saved key, not the cluster GPU and not the
+    lab's shared model): ``{"cred", "model", "base_url", "native_anthropic"}``, else None. The scan
+    then reads with that model, through ``_corpus_scan_via_relay``, on the user's bill."""
+    try:
+        cred = _session_credential(conn)
+    except Exception:  # noqa: BLE001 - the store unreadable: fall back to the GPU path
+        return None
+    if cred is None or cred.get("builtin") or not cred.get("model"):
+        return None
+    from . import llm_providers
+    base_url = cred.get("base_url") or None
+    return {"cred": cred, "model": str(cred["model"]), "base_url": base_url,
+            "native_anthropic": llm_providers.transport_for(cred.get("provider"), base_url) == "anthropic"}
+
+
+def _corpus_scan_model(conn: Connection) -> str:
+    """The model a scan by this session reads with: the session's API model, else the GPU job's."""
+    api = _corpus_scan_api(conn)
+    return api["model"] if api else corpus_scan.scan_model(conn.settings)
 
 
 def _stored_corpus_scan(conn: Connection) -> "corpus_scan.StoredScan | None":
@@ -7938,7 +8143,8 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
         conn.push({"type": "lab_progress", "text": text, "level": level})
 
     art = conn.workspace / run_id / "artifacts"
-    model = corpus_scan.scan_model(conn.settings)
+    api = _corpus_scan_api(conn)
+    model = api["model"] if api else corpus_scan.scan_model(conn.settings)
     try:
         if _AUTH_ENABLED and conn.app_user_id:
             try:
@@ -7957,7 +8163,8 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             await asyncio.to_thread(corpus_scan.copy_into, stored, art)
             result = stored.result
         else:
-            result = await _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit)
+            result = await (_corpus_scan_via_relay(conn, run, run_id, ident, say, emit, api) if api
+                            else _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit))
             if result is None:                   # stopped
                 return
         conn.push({"type": "chat_token", "token": _corpus_summary_md(
@@ -8028,32 +8235,60 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
         "corpus is answered at once.")
     if key:
         _CORPUS_SCANS_RUNNING[key] = run_id
+    wait = _duration_words(getattr(executor, "startup_timeout_s", 600) * getattr(executor, "queue_windows", 3))
+    queue_retries = max(0, int(st.corpus_scan_queue_retries))
     try:
-        # The job's model can still die mid-scan (out of memory, a lost node). The tool then returns
-        # model_unreachable with what it judged so far, and the job is submitted again: it resumes
-        # from the kept judgments in the run's work dir, so nothing is judged twice.
+        # Two ways the job is submitted again, each a retry of this one step, never a failed run
+        # while a retry is left:
+        # - it never got a card (the paid queue was full for the whole wait): nothing ran;
+        # - its model died mid-scan (out of memory, a lost node): the tool returns model_unreachable
+        #   with what it read so far, and the rerun resumes from the kept replies in the run's work
+        #   dir, so nothing is read twice.
         result: dict[str, Any] = {}
-        for attempt in range(1, CORPUS_MAX_ATTEMPTS + 1):
+        resumes = requeues = 0
+        while True:
             result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
             if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
                 conn.push({"type": "chat_stopped"})
                 return None
-            if not result.get("model_unreachable") or attempt == CORPUS_MAX_ATTEMPTS:
-                break
-            say(f"⚠ The scan's model went away mid-scan ({result.get('n_judged', 0)} of "
-                f"{result.get('n_passages', '?')} passages read so far). Submitting the job "
-                f"again; it resumes where it stopped — attempt {attempt + 1} of {CORPUS_MAX_ATTEMPTS}.",
-                "warning")
+            if result.get("queue_timeout") and requeues < queue_retries:
+                requeues += 1
+                why = f" (Slurm: {result.get('slurm_reason')})" if result.get("slurm_reason") else ""
+                say(f"⚠ No GPU card became free on the paid partition within {wait}{why}. The job never "
+                    f"started, so nothing ran. Submitting it again — retry {requeues} of {queue_retries}.",
+                    "warning")
+                continue
+            if result.get("model_unreachable") and resumes < CORPUS_MAX_ATTEMPTS - 1:
+                resumes += 1
+                say(f"⚠ The scan's model went away mid-scan ({result.get('n_judged', 0)} of "
+                    f"{result.get('n_passages', '?')} passages read so far). Submitting the job "
+                    f"again; it resumes where it stopped — attempt {resumes + 1} of {CORPUS_MAX_ATTEMPTS}.",
+                    "warning")
+                continue
+            break
     finally:
         if key:
             _CORPUS_SCANS_RUNNING.pop(key, None)
+    if result.get("queue_timeout"):
+        why = f"; Slurm's reason: {result.get('slurm_reason')}" if result.get("slurm_reason") else ""
+        raise GatewayError(
+            f"The corpus scan could not start: no GPU card became free on the paid partition in "
+            f"{requeues + 1} waits of {wait}{why}. The job never ran, so nothing was lost. Pick "
+            "Corpus scan again later to try once more.", stage="corpus",
+            detail=json.dumps(result, default=str)[:2000])
     if str(result.get("status") or "") != "ok":
         msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
         tail = await asyncio.to_thread(_vllm_log_tail, conn, str(result.get("vllm_log") or ""))
         raise GatewayError(f"The corpus scan did not finish: {msg}", stage="corpus",
                            detail=(tail or json.dumps(result, default=str))[:2000])
-    # Keep it, under the corpus as it is AFTER the job (a scan that had to build the text cache
-    # changed it).
+    await _keep_corpus_scan(conn, run_id, result, emit)
+    return result
+
+
+async def _keep_corpus_scan(conn: Connection, run_id: str, result: dict[str, Any],
+                            emit: Callable[..., None]) -> None:
+    """Keep a finished scan's tables, under the corpus as it is AFTER the job (a scan that had to
+    build the text cache changed it), so the next request for this corpus is answered from them."""
     after = await asyncio.to_thread(_corpus_scan_identity, conn)
     tables = conn.workspace / run_id / "artifacts" / corpus_scan.OUT_SUBDIR
     if after is not None and (tables / "genes.csv").is_file():
@@ -8066,7 +8301,171 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
         except OSError as exc:
             emit("warning", "corpus", f"The scan's tables could not be kept ({exc}); the next request "
                                       "scans again.")
+
+
+# The most one corpus scan on a user's own key may spend, whatever the budget left; the
+# remaining budget (Account › API usage) lowers it.
+CORPUS_SCAN_MAX_COST_USD = float(os.environ.get("AISCIENTIST_CORPUS_SCAN_MAX_COST_USD", "") or 20.0)
+
+
+def _corpus_scan_cost_cap(conn: Connection) -> tuple[float, str]:
+    """``(USD this scan may spend, why)``: the per-scan ceiling, lowered to what is left of the user's
+    monthly credit or hard limit. Raises ``GatewayError`` when nothing is left."""
+    cap, why = CORPUS_SCAN_MAX_COST_USD, f"the ${CORPUS_SCAN_MAX_COST_USD:.2f} per-scan ceiling"
+    user_id = getattr(conn, "app_user_id", None)
+    if not user_id:
+        return cap, why
+    from . import llm_usage
+    try:
+        st = llm_usage.budget_status(user_id, llm_usage._zone(None))
+    except Exception as exc:  # noqa: BLE001 - accounting never blocks: keep the ceiling
+        print(f"[corpus] budget check skipped: {exc}")
+        return cap, why
+    budget = st.get("budget") or {}
+    left = [(float(st["remaining_usd"]), "what is left of your monthly credit")] \
+        if st.get("remaining_usd") is not None else []
+    if budget.get("hard_limit_usd") is not None:
+        left.append((float(budget["hard_limit_usd"]) - float(st.get("spent_usd") or 0),
+                     "what is left under your hard limit"))
+    for amount, reason in left:
+        if amount < cap:
+            cap, why = amount, reason
+    if cap <= 0:
+        raise GatewayError(
+            f"Your API budget for this cycle is used up (${float(st.get('spent_usd') or 0):.2f} spent). "
+            "Raise it under Account › API usage, or switch the session to the cluster GPU, whose scan "
+            "costs no API credit.", stage="corpus")
+    return cap, why
+
+
+async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
+                                 ident: "tuple[str, dict[str, Any]] | None",
+                                 say: Callable[..., None], emit: Callable[..., None],
+                                 api: dict[str, Any]) -> "dict[str, Any] | None":
+    """The scan on the session's own API model. One CPU job on HPC3 retrieves the passages and
+    builds the tables; every model call it needs comes back here (``gateway/llm_relay.py``) and is
+    made with the user's key, recorded against the user's usage and capped by the budget left. The
+    job reads about 1% of the passages first (the tool's pilot) and stops if they fail or if their
+    cost projects past the cap. Returns the result (None when stopped); raises ``GatewayError``."""
+    key = ident[0] if ident else ""
+    if key and key in _CORPUS_SCANS_RUNNING:
+        raise GatewayError(
+            f"A scan of this corpus with this model is already running (run {_CORPUS_SCANS_RUNNING[key]}). "
+            "Its tables are kept when it finishes: ask again then.", stage="corpus")
+    cap, cap_why = _corpus_scan_cost_cap(conn)
+    from . import anthropic_client, auth_routes, llm_credentials, llm_pricing, llm_relay
+    cred, model, base_url, native = api["cred"], api["model"], api["base_url"], api["native_anthropic"]
+    api_key = llm_credentials.resolve_secret(conn.owner, cred["id"])
+    if not api_key:
+        raise GatewayError(
+            f"The API key for “{cred.get('label') or 'this endpoint'}” could not be read. Re-enter it "
+            "under API endpoints, or switch this session back to the cluster GPU.", stage="llm_credential")
+    remote_ws = f"{_temp_base(conn)}/corpus/{run_id}"
+    relay_dir = f"{remote_ws}/work/relay"
+    executor = _build_literature_executor(
+        conn, run_id=run_id, relay={"model": model, "llm_relay_dir": relay_dir, "max_cost_usd": round(cap, 4)})
+    if executor is None or not hasattr(conn.executor, "open_sftp"):
+        raise GatewayError(
+            "The corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
+            "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
+            "nothing was started.", stage="corpus")
+    executor.notify = lambda level, message: emit(level, "corpus", message)
+    provider = "anthropic" if native else "openai"
+    endpoint = "anthropic" if native else (base_url or "API")
+
+    def call(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str, dict[str, Any]]:
+        if native:
+            # Only the rules are shared between calls (the passages all differ): cache those alone.
+            return anthropic_client.complete_ex(model, messages, api_key=api_key, base_url=base_url,
+                                                max_tokens=max_tokens,
+                                                effort=anthropic_client.role_effort("corpus_scan"),
+                                                cache="system")
+        return vllm_client.complete_ex(0, model, messages, base_url=base_url, api_key=api_key,
+                                       max_tokens=max_tokens)
+
+    def price(usage: dict[str, Any]) -> "float | None":
+        if usage.get("cost") is not None:                      # the provider's own figure
+            try:
+                return float(usage["cost"])
+            except (TypeError, ValueError):
+                pass
+        read = int(usage.get("cache_read_input_tokens") or 0)
+        write = int(usage.get("cache_creation_input_tokens") or 0)
+        write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+        uncached = int(usage.get("input_tokens") if "input_tokens" in usage
+                       else max(0, int(usage.get("prompt_tokens") or 0) - read - write))
+        return llm_pricing.estimate(str(usage.get("model") or model), input_tokens=uncached,
+                                    output_tokens=int(usage.get("completion_tokens") or 0),
+                                    cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
+                                    cache_read_tokens=read)
+
+    pushed = {"n": 0}
+
+    def record(usage: "dict[str, Any] | None", duration_ms: int, error_type: "str | None") -> None:
+        try:
+            auth_routes.record_llm_call(run_id=run_id, user_id=getattr(conn, "app_user_id", None),
+                                        conversation_id=run.conversation_id, step="Corpus scan",
+                                        provider=provider, role="corpus_scan", model=model, endpoint=endpoint,
+                                        remote=True, usage=usage, max_tokens=None, duration_ms=duration_ms,
+                                        error_type=error_type)
+            pushed["n"] += 1
+            if pushed["n"] % 25 == 1:          # the chat header's counter, not on every call
+                _push_usage(conn, run, run.conversation_id, run_id)
+        except Exception as exc:  # noqa: BLE001 - accounting never breaks a scan
+            print(f"[corpus] call not recorded: {exc}")
+
+    relay = llm_relay.ModelRelay(
+        lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, call, price=price, record=record,
+        max_cost_usd=cap, concurrency=16, poll_s=1.0, should_stop=run.chat_stop.is_set,
+        log=lambda s: print(f"[corpus] {s}"))
+    from ..agents.research_harness import HarnessContext
+    ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
+                         llm_is_remote=True, read_roots=_tool_read_roots(conn))
+    emit("step", "corpus", f"Corpus scan: {CORPUS_TOOL} with your API model {model} (a CPU job on HPC3; "
+                           f"the model calls are made here, at most ${cap:.2f}: {cap_why}).")
+    say(f"📚 Scanning the whole indexed corpus for explicitly reported haploinsufficient genes with your "
+        f"API model **{model}**, on your key. One HPC3 job (CPU only) retrieves the passages; this server "
+        f"makes every model call and records it in your API usage. It reads about 1% of the passages "
+        f"first and stops there if they fail or if they project a cost above ${cap:.2f} ({cap_why}).")
+    if key:
+        _CORPUS_SCANS_RUNNING[key] = run_id
+    relay.start()
+    try:
+        result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
+        if (result.get("model_unreachable") and not run.chat_stop.is_set()
+                and not relay.stats.stopped):
+            say(f"⚠ The model stopped answering mid-scan ({result.get('n_judged', 0)} of "
+                f"{result.get('n_passages', '?')} passages read). Submitting the job once more; it "
+                "resumes where it stopped.", "warning")
+            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
+    finally:
+        stats = relay.stop()
+        if key:
+            _CORPUS_SCANS_RUNNING.pop(key, None)
+        _push_usage(conn, run, run.conversation_id, run_id)
+    usage = {"model": model, **stats.public()}
+    result["api_usage"] = usage
+    spent = f"${usage['cost_usd']:.4f} on your key ({usage['calls']} model calls)"
+    if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
+        say(f"Stopped. {spent} so far.")
+        conn.push({"type": "chat_stopped"})
+        return None
+    if str(result.get("status") or "") != "ok":
+        msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
+        raise GatewayError(f"The corpus scan did not finish: {msg} Spent: {spent}.", stage="corpus",
+                           detail=json.dumps(result, default=str)[:2000])
+    emit("info", "corpus", f"Corpus scan model cost: {spent}.")
+    await _keep_corpus_scan(conn, run_id, result, emit)
     return result
+
+
+def _duration_words(seconds: float) -> str:
+    """``7200`` -> "2 h", ``5400`` -> "1.5 h", ``1800`` -> "30 min": a wait as the chat says it."""
+    s = max(0, int(seconds))
+    if s < 3600:
+        return f"{max(1, round(s / 60))} min"
+    h = s / 3600
+    return f"{h:.0f} h" if abs(h - round(h)) < 0.05 else f"{h:.1f} h"
 
 
 def _md_cell(text: str) -> str:
@@ -8087,10 +8486,26 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
         title,
         "",
         f"- Corpus: **{result.get('n_papers')}** papers; search requests written by the model: "
-        f"{result.get('n_requests')}, plus one for each of {result.get('n_gene_requests')} genes found; "
-        f"passages read: **{result.get('n_passages')}**" + (f" (by {model})" if model else ""),
+        f"{result.get('n_requests')}, plus one for each of {result.get('n_gene_requests')} genes found"
+        + (f"; every passage that states a dosage mechanism in words: {result.get('n_keyword_passages')}"
+           if result.get("n_keyword_passages") else "")
+        + f"; passages read: **{result.get('n_passages')}**" + (f" (by {model})" if model else ""),
         f"- Verified mechanism statements: **{result.get('n_hits_eligible')}** → "
         f"genes: **{result.get('n_genes')}**",
+    ]
+    pilot = result.get("pilot") or {}
+    if pilot:
+        lines.append(f"- Pilot first: {pilot.get('read')} of {pilot.get('passages')} passages read"
+                     + (f", ${float(pilot.get('cost_usd') or 0):.4f}, projecting about "
+                        f"${float(pilot['estimated_total_usd']):.2f} for the scan" if pilot.get("estimated_total_usd")
+                        else ""))
+    api_usage = result.get("api_usage") or {}
+    if api_usage.get("calls"):
+        lines.append(f"- Model cost on your API key: **${float(api_usage.get('cost_usd') or 0):.2f}** "
+                     f"({api_usage['calls']} calls, {api_usage.get('input_tokens', 0):,} input / "
+                     f"{api_usage.get('output_tokens', 0):,} output tokens)"
+                     + (" — when this kept scan was made; answering from it costs nothing" if kept_since else ""))
+    lines += [
         "",
         "`genes.csv` (one row per gene: HGNC symbol, phenotype and mechanism as written, up to 3 PMIDs "
         "with verbatim quotes, review flags), `hits.csv` (every judged sentence, all mechanism "
@@ -8127,7 +8542,8 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
     for w in result.get("warnings") or []:
         lines.append(f"⚠ {w}")
     lines.append("")
-    lines.append(f"_Definition used: {result.get('definition', '')}_")
+    lines.append(f"**How a gene qualifies** (the definition the model read every passage against): "
+                 f"{result.get('definition', '')}")
     return "\n".join(lines)
 
 
@@ -8414,6 +8830,240 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
         conn.end_run(run)
 
 
+# --- the literature line (RCHENLAB/AiScientist issue 21) -------------------------------------------
+# A request the router sends to the literature line gets a one-step plan the user reviews on the
+# same plan card as an analysis; once approved, PubMed is searched and the model answers from the
+# abstracts (agents/literature_answer.py). No HPC3 job: Europe PMC is called from the gateway.
+
+_REVISE_LIT_SYSTEM = (
+    "Rewrite a researcher's literature question so that it includes the change they asked for. Keep "
+    "one self-contained question, in the language the researcher used, at most 60 words. Reply with "
+    "the question only."
+)
+
+
+def _revise_literature_question(conn: Connection, question: str, note: str) -> str:
+    """The literature question with the user's note on the plan folded in, written by the session's
+    model; the question with the note appended when the model gives nothing usable."""
+    fallback = f"{question} ({note})"
+    try:
+        raw = _lab_llm(conn).complete_fn(
+            [{"role": "system", "content": _REVISE_LIT_SYSTEM},
+             {"role": "user", "content": f"Question: {question}\nChange asked for: {note}\n\nThe question:"}],
+            role="classify")
+    except Exception as exc:  # noqa: BLE001 - the plain concatenation still carries the note
+        print(f"[literature] question rewrite failed: {exc}")
+        return fallback
+    text = " ".join(str(raw or "").split()).strip().strip('"“”').strip()
+    return text if 3 <= len(text.split()) <= 120 and not text.startswith(("{", "[")) else fallback
+
+
+def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: str) -> dict[str, Any]:
+    """Show the literature plan on the plan card and wait for the user's decision: the lab's plan
+    review (same card, same review window and expiry warning, answered through /api/lab/plan)."""
+    agenda = [step]
+    conn.plan_value = None
+    conn.plan_event.clear()
+    conn.pending_plan = {"kind": "plan", "payload": agenda}
+    conn.push({"type": "plan_prompt", "agenda": agenda, "revised": []})
+    emit("step", "literature", "Plan ready — Run it, or say in the chat what to change.")
+    warned_at = max(60.0, _PLAN_REVIEW_TIMEOUT * 0.75)
+    if not conn.plan_event.wait(timeout=warned_at):
+        pending = conn.pending_plan
+        if isinstance(pending, dict):
+            pending["expires_at"] = time.monotonic() + (_PLAN_REVIEW_TIMEOUT - warned_at)
+        conn.push({"type": "plan_expiring", "seconds_left": int(_PLAN_REVIEW_TIMEOUT - warned_at)})
+        if not conn.plan_event.wait(timeout=_PLAN_REVIEW_TIMEOUT - warned_at):
+            conn.pending_plan = None
+            return {"action": "timeout"}
+    conn.pending_plan = None
+    return conn.plan_value or {"action": "cancel"}
+
+
+def _literature_search_logged(conn: Connection, run: RunState, queries: list[str]) -> Any:
+    """Search PubMed for each query (abstracts included), telling the activity log and the run's
+    monitor about each call, and merge the papers (``literature_answer.collect_papers``)."""
+    from ..agents import literature_answer as lit
+
+    def search(query: str, limit: int) -> dict[str, Any]:
+        if run.monitor is not None:
+            run.monitor.observe({"type": "tool_start", "tool": lit.TOOL})
+        conn.push({"type": "run_status", "text": f"🔎 PubMed: {query}"})
+        conn.push({"type": "chat_thinking", "token": f"→ {lit.TOOL}({json.dumps({'query': query})})\n"})
+        out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
+        ok = isinstance(out, dict) and out.get("status") == "ok"
+        n = len(out.get("results") or []) if ok else 0
+        if run.monitor is not None:
+            run.monitor.observe({"type": "tool_result" if ok else "tool_error", "tool": lit.TOOL})
+        conn.push({"type": "chat_thinking", "token": (f"✓ {lit.TOOL}: {n} paper(s)\n" if ok else
+                                                      f"⚠ {lit.TOOL}: {(out or {}).get('error')}\n")})
+        return out
+
+    return lit.collect_papers(search, queries)
+
+
+def _save_literature_answer(art: Path, question: str, answer: str, collected: Any, cited: list) -> None:
+    """Keep the answer with the run: ``report/summary.md`` (the question, the answer with its
+    references, how it was made) and ``literature/papers.csv`` (every paper read)."""
+    from ..agents import literature_answer as lit
+    (art / "report").mkdir(parents=True, exist_ok=True)
+    (art / "literature").mkdir(parents=True, exist_ok=True)
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    md = (f"# Literature search\n\n**Question:** {question}\n\n{answer.strip()}\n\n"
+          f"## How this was answered\n\n{lit.method_md(collected, date)}\n")
+    (art / "report" / "summary.md").write_text(md, encoding="utf-8")
+    (art / "literature" / "papers.csv").write_text(
+        lit.papers_csv(collected.papers, {p.number for p in cited}), encoding="utf-8")
+
+
+async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) -> "str | None":
+    """A request routed to the literature line: a one-step plan the user reviews, then a PubMed
+    search and an answer that cites the papers found. Returns None when the run is over (answered,
+    cancelled, stopped or failed), or the request to plan as an ANALYSIS when the user's note on the
+    plan asked for one (the caller hands it to the lab).
+
+    Shares the run lifecycle of the other lines (``chat_start``, the plan card, ``chat_token`` →
+    ``chat_done``, per-run Stop, the ``artifacts`` event for the downloads), and keeps the answer
+    with the run (``_save_literature_answer``), listed under Runs. It writes no ``run_state.json``:
+    a later message cannot mistake it for a study to continue, and the chat's last analysis stays
+    the one a follow-up builds on."""
+    from ..agents import literature_answer as lit
+    run = conn.active_run or conn.begin_run(req.conversation_id)
+    if req.conversation_id and not run.conversation_id:
+        run.conversation_id = req.conversation_id
+    run.kind = "literature"
+    run_id = run.run_id or uuid4().hex[:12]
+    conn.bind_run_id(run, run_id)
+    run.chat_stop.clear()
+    run.hard_stop.clear()
+    run.running = True
+    _watch_run(conn, run, req)
+    conn.push({"type": "chat_start"})
+    emit = conn.emit_fn()
+
+    def say(text: str, level: str = "info") -> None:
+        conn.push({"type": "lab_progress", "text": text, "level": level})
+
+    def stopped() -> None:
+        _finish_run_record(conn, run_id, "cancelled", None, "Stopped by the user")
+        conn.push({"type": "chat_stopped"})
+
+    art = conn.workspace / run_id / "artifacts"
+    question = str(req.question or "").strip()
+    recorded = False
+    try:
+        say("📚 This reads as a question the published literature answers, so the plan is one "
+            "literature search in PubMed. Run it, or say in the chat what to change. If it needs your "
+            "data analysed, say so, and the PI plans an analysis instead.")
+        while True:
+            decision = await asyncio.to_thread(_literature_plan_review, conn, emit, lit.plan_step(question))
+            action = str(decision.get("action") or "cancel")
+            if action == "approve":
+                break
+            if action in ("cancel", "timeout"):
+                if run.chat_stop.is_set():
+                    conn.push({"type": "chat_stopped"})
+                    return None
+                say("Plan review expired — nothing was searched. (Nobody cancelled; the review window "
+                    "ran out.)" if action == "timeout" else "Plan cancelled — nothing was searched.",
+                    "warning")
+                if run.monitor is not None:
+                    run.monitor.end("cancelled")
+                conn.push({"type": "chat_done"})
+                return None
+            note = str(decision.get("feedback") or "").strip()
+            if not note:
+                continue                      # nothing said: show the plan again
+            combined = f"{question}\n\n{note}"
+            again = await asyncio.to_thread(_route_request, conn, req.model_copy(update={"question": combined}))
+            if not again.literature:
+                # The bubble's text, not a progress line: this run ends here, and a bubble with no
+                # text keeps none of its progress lines.
+                conn.push({"type": "chat_token",
+                           "token": "🧭 Your note asks for an analysis, so the PI plans one instead."})
+                if run.monitor is not None:
+                    run.monitor.end("ended")
+                conn.push({"type": "chat_done"})
+                return combined
+            question = await asyncio.to_thread(_revise_literature_question, conn, question, note)
+
+        if _AUTH_ENABLED and conn.app_user_id:
+            try:
+                auth_routes.record_run_start(conn.app_user_id, run_id, question, True,
+                                             conversation_id=run.conversation_id)
+                recorded = True
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_start failed: {exc}")
+        _watch_stage(run, "literature")
+        llm = _lab_llm(conn)
+        complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
+        emit("step", "literature", f"Literature search (model: {llm.model}).")
+        conn.push({"type": "run_status", "text": "🔎 Writing the PubMed queries…"})
+        queries = await asyncio.to_thread(
+            lit.plan_queries, lambda m: complete_fn(m, role="classify"), question,
+            fallback=_tools_api.focus_literature_query)
+        emit("info", "literature", "Queries: " + "; ".join(queries))
+        if run.chat_stop.is_set():
+            stopped()
+            return None
+        collected = await asyncio.to_thread(_literature_search_logged, conn, run, queries)
+        if run.chat_stop.is_set():
+            stopped()
+            return None
+        papers = collected.papers
+        if papers:
+            say(f"📄 {len(papers)} paper(s) from {len(queries)} PubMed search(es) — reading their "
+                "abstracts and writing the answer.")
+            conn.push({"type": "run_status", "text": "✍️ Writing the answer…"})
+            raw = await asyncio.to_thread(complete_fn, lit.answer_messages(question, papers), role="literature")
+            body, cited = lit.finish_answer(str(raw or ""), papers)
+            if not body:
+                raise GatewayError("The model returned an empty answer. Nothing was saved; send the "
+                                   "question again.", stage="literature")
+            answer = body + "\n\n" + lit.references_md(cited, papers)
+        else:
+            cited = []
+            answer = lit.no_papers_answer(question, collected)
+        if run.chat_stop.is_set():
+            stopped()
+            return None
+        conn.push({"type": "chat_token", "token": answer})
+        await asyncio.to_thread(_save_literature_answer, art, question, answer, collected, cited)
+        await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [llm.model])
+        items = [
+            {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
+             "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
+            for p in sorted(art.rglob("*")) if p.is_file()
+        ]
+        if items:
+            conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
+        summary = (f"Literature answer citing {len(cited)} of {len(papers)} PubMed papers" if papers
+                   else "Literature search: no papers found")
+        _finish_run_record(conn, run_id, "done", str(art), summary)
+        emit("success", "literature", f"{summary} ({len(queries)} queries).")
+        conn.push({"type": "chat_done"})
+        return None
+    except GatewayError as exc:
+        print(f"[literature] failed ({exc.stage or 'literature'}): {exc.message}")
+        traceback.print_exc()
+        conn.emit("error", exc.stage or "literature", exc.message, detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": exc.message})
+        if recorded:
+            _finish_run_record(conn, run_id, "failed", str(art), exc.message)
+        return None
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        print(f"[literature] failed (unhandled): {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        conn.emit("error", "literature", f"Literature search failed: {exc}", detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": str(exc)})
+        if recorded:
+            _finish_run_record(conn, run_id, "failed", str(art), str(exc))
+        return None
+    finally:
+        run.running = False
+        conn.end_run(run)
+
+
 def _default_rerun_index(state: dict) -> int:
     """A sensible step to re-run when the user picked 'rerun' but named no step: prefer a
     literature step (cheap, no checkpoint), else the last step."""
@@ -8442,7 +9092,7 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
         refused = _budget_refusal(conn, req.budget_ack, req.tz)
     if refused is not None:
         return refused
-    asyncio.create_task(_dispatch_lab(conn, req))
+    asyncio.create_task(_dispatch_lab(conn, _fixed_run_options(req)))
     return JSONResponse({"status": "running"})
 
 
@@ -8625,10 +9275,13 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
     for key in _STAGING_DECISIONS:
         if state.get(key):
             resume_decisions[key] = state[key]
+    # A step redone or an interrupted run picked up saves what it hands on, like every run
+    # (_fixed_run_options); its plan was reviewed when the run first started.
     cont_req = LabRequest(connection_id=connection_id, question=str(state.get("question", "")),
                           dataset_path=state.get("dataset_path"),
                           datasets=state.get("datasets"),
-                          case_note=state.get("case_note"))
+                          case_note=state.get("case_note"),
+                          save_results=True)
     return resume, resume_decisions, cont_req, idx
 
 
@@ -15193,11 +15846,10 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
 
 
 async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[..., Any]) -> None:
-    """The run asked for its results to be saved to the user's data when it completes: do what the
-    "Save to my data" buttons do, for whatever it handed on. Best-effort, like the export."""
+    """Save what a completed run handed on to the user's data: what the "Save to my data" buttons
+    do, for every run (_fixed_run_options). Best-effort, like the export."""
     if not (_AUTH_ENABLED and conn.app_user_id):
-        emit("info", "lab", "Results were not saved to your data automatically: that needs an account.")
-        return
+        return          # no account, no "my data": the results stay beside the run
     for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory")):
         if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
             continue

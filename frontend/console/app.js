@@ -8,7 +8,14 @@ const RUNOWNER_KEY = "bioagent_runowner_v1"; // {connId, sids}: the chats whose 
 const LASTRUN_KEY = "bioagent_lastrun_v1";   // last COMPLETED run_id — survives a refresh so we can still recognise this conn's own run
 const STREAMS_KEY = "aiscientist_streams_v1"; // stream ids of answers this browser already saved — a reconnect replay of one is dropped
 const PLANDRAFT_KEY = "aiscientist_plandraft_v1"; // {<chat id>: {run, base, text, open}}: each plan editor's unapplied text — survives a reload while that plan is still waiting
-const COMPOSER_KEY = "aiscientist_composer_v1";   // {<chat id>: {draft, bound, roles, planFirst, bypass, saveResults, mode, route}}: each chat's composer — survives a reload
+const COMPOSER_KEY = "aiscientist_composer_v1";   // {<chat id>: {draft, bound, roles}}: each chat's composer — survives a reload
+// Every request runs the same way (RCHENLAB/AiScientist issue 21): the agent routes it (a literature
+// search or an analysis: route "auto"), proposes a plan the user reviews before anything runs, no
+// review gate is skipped, the PI chooses one scientist or a team and the pipeline, and what the run
+// hands on is saved to the user's data. The server fixes the same values; they are sent too, so a
+// page served beside an older server still gets a plan to review.
+const FIXED_RUN_OPTIONS = Object.freeze({ plan_mode: true, autonomous: false, mode: "auto", save_results: true,
+                                          presets: [], skills: [], preset_prompt: null, route: "auto" });
 
 const state = {
   connectionId: null,
@@ -22,12 +29,7 @@ const state = {
   // Each chat's run and dialog live in its own record (see chatOf below), not here. What stays
   // here is the one visible chat's DOM: the live bubble of its run and its plan card.
   streamDom: null,      // {body, think, thinkBody, feed} DOM refs of the visible chat's live bubble
-  presets: {},                 // key -> {key, label, prompt, tools} from /api/presets (preset pipelines)
-  presetOrder: [],             // preset-pipeline keys in load order (for the Pipelines & skills picker)
-  skills: {},                  // name -> {name, summary} from /api/skills (atomic skills)
-  skillOrder: [],              // atomic-skill names in load order (for the Pipelines & skills picker)
   datasets: [],                // uploaded files/folders this session: {name, path, kind}, newest first
-  dataSearch: null,            // the "＋ Data" popover's search of all uploads (null = the recent list)
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
   serverBoundTyped: new Set(),       // pasted server paths already bound (as typed, before resolving)
@@ -85,12 +87,9 @@ function newChatRecord(sid) {
     roles: {},             // path -> role the user set on a bound file ("reference" = comparison
                            // data such as a cell-type atlas; never picked as the primary).
     primary: null,         // the PRIMARY of the bind-set (highest-ranked), posted as `dataset_path`
-    caseNote: null,        // the attached clinical description: {name, text} — held as TEXT, not
-                           // uploaded: its only consumer (map_phenotype_to_hpo) runs on the gateway.
+    caseNote: null,        // a clinical description attached as TEXT: {name, text}. The composer no
+                           // longer attaches one (issue 21: it goes in the message); nothing sets it.
     draft: "",             // what was typed in the composer and not sent yet
-    planFirst: true,       // "Plan first": the PI proposes a plan for review before any tool runs
-    bypass: false,         // "Bypass": this chat's runs have no review gates
-    saveResults: null,     // "Save results to my data"; null = the user's standing choice (savedResultsDefault)
     ctx: null,             // the last context-occupancy report of this chat's fast-chat turn
   };
 }
@@ -152,18 +151,11 @@ function writeComposers(all) {
 // Only what differs from a new chat is stored; a chat with nothing of its own has no entry.
 function saveComposer(c) {
   if (!c) return;
-  const s = state.sessions.find((x) => String(x.id) === c.sid);
-  const route = s && (s.route === "corpus" ? s.routeBeforeCorpus : s.route);   // a corpus scan is one action, not an engine
   const entry = {};
   if (c.draft) entry.draft = c.draft;
   if (c.bound.length) entry.bound = [...c.bound];
   const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
   if (roles.length) entry.roles = Object.fromEntries(roles);
-  if (!c.planFirst) entry.planFirst = false;
-  if (c.bypass) entry.bypass = true;
-  if (typeof c.saveResults === "boolean") entry.saveResults = c.saveResults;
-  if (s && s.mode && s.mode !== "auto") entry.mode = s.mode;
-  if (route && route !== "research") entry.route = route;
   const all = readComposers();
   if (Object.keys(entry).length) all[c.sid] = entry; else delete all[c.sid];
   writeComposers(all);
@@ -176,22 +168,9 @@ function restoreComposer(c) {
   for (const [p, role] of Object.entries((e.roles && typeof e.roles === "object") ? e.roles : {})) {
     if (c.bound.includes(p) && typeof role === "string") c.roles[p] = role;
   }
-  if (e.planFirst === false) c.planFirst = false;
-  if (e.bypass === true) c.bypass = true;
-  if (typeof e.saveResults === "boolean") c.saveResults = e.saveResults;
 }
-// A chat's mode and engine are kept on its session (onModeChange, onRouteChange): a reload brings
-// them back from here.
-const CHAT_MODES = ["auto", "single", "team"], CHAT_ROUTES = ["research", "chat"];
-function restoreChatModes(sessions) {
-  const all = readComposers();
-  for (const s of sessions) {
-    const e = all[String(s.id)];
-    if (!e) continue;
-    if (!s.mode && CHAT_MODES.includes(e.mode)) s.mode = e.mode;
-    if (!s.route && CHAT_ROUTES.includes(e.route)) s.route = e.route;
-  }
-}
+// What an older page stored beside a chat's composer (its engine, Plan first, Bypass, Save results,
+// mode) is no longer read, and the chat's next save drops it.
 function forgetComposer(sid) {
   const all = readComposers();
   delete all[String(sid)];
@@ -617,7 +596,6 @@ async function ensureMessages(s) {
     const data = await api("GET", `/api/conversations/${s.cid}`);
     s.messages = (data.messages || []).map(msgFromServer);
     s.title = data.conversation.title;
-    s.presetKeys = String(data.conversation.preset_key || "").split(",").map((x) => x.trim()).filter(Boolean);  // restore forced skills
   } catch { /* keep whatever we have */ }
   s.loaded = true;
 }
@@ -630,7 +608,6 @@ async function loadSessions() {
         id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false,
         createdAt: c.created_at, updatedAt: c.updated_at,
       }));
-      restoreChatModes(state.sessions);
       pruneComposers(state.sessions);
       if (!state.sessions.length) { await newSession(); }
       else { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
@@ -649,7 +626,6 @@ async function loadSessions() {
     const raw = JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]");
     state.sessions = Array.isArray(raw) ? raw : [];
   } catch { state.sessions = []; }
-  restoreChatModes(state.sessions);
   if (!state.sessions.length) newSession();
   else { state.activeId = state.sessions[0].id; showDialog(); }
 }
@@ -671,7 +647,6 @@ async function newSession() {
       state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
       createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
       state.activeId = String(c.id);
-      startComposer(activeChat());
       state.planView = null;
       renderSessionList();
       renderChat();
@@ -682,7 +657,6 @@ async function newSession() {
   const s = { id: rid(), title: "New chat", messages: [], loaded: true, createdAt: Date.now() };
   state.sessions.unshift(s);
   state.activeId = s.id;
-  startComposer(activeChat());
   state.planView = null;
   persistSessions();
   renderSessionList();
@@ -701,7 +675,7 @@ async function selectSession(id) {
 }
 
 // Keep what was typed in the chat being left; show the dialog of the chat being entered — its
-// attachments, case note, draft, run options, uploads and context meter, never the previous chat's.
+// attachments, case note, draft, uploads and context meter, never the previous chat's.
 function leaveDialog() {
   const c = activeChat(), input = $("chatInput");
   if (c && input) { c.draft = input.value; saveComposer(c); }
@@ -710,56 +684,15 @@ function showDialog() {
   const c = activeChat(), input = $("chatInput");
   if (input) input.value = (c && c.draft) || "";
   syncDatasetSelection();
-  syncRunOptions(c);
   renderUploadLine();
-  renderCaseNoteChip();
   // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
   // conversation's number would be worse than showing nothing.
   if (c && c.ctx) renderContextMeter(c.ctx); else hideContextMeter();
   updateComposerButton();
 }
 
-// ---- research path / methodology context ----------------------------------
-// A preset steers the PI's plan via an editable guidance prompt (it does not bypass
-// the PI). The prompt is conversation-level context: shown, editable, sent with the
-// run, and persisted with the chat (server-side) so it survives a reload.
-
-async function loadPresets() {
-  try {
-    const data = await (await fetch("/api/presets")).json();
-    state.presets = {};
-    state.presetOrder = [];
-    for (const p of (data.presets || [])) { state.presets[p.key] = p; state.presetOrder.push(p.key); }
-  } catch { /* presets are optional */ }
-  renderMethods();
-}
-
-async function loadSkills() {
-  try {
-    const data = await (await fetch("/api/skills")).json();
-    state.skills = {};
-    state.skillOrder = [];
-    for (const s of (data.skills || [])) { state.skills[s.name] = s; state.skillOrder.push(s.name); }
-  } catch { /* skills are optional */ }
-  renderMethods();
-}
-
-// ---- pipelines & skills picker ------------------------------------------------------------------
-// By default the PI picks the best-fit preset pipeline and the agent fetches skills on demand. This
-// picker REQUIRES some for the active chat: a ticked pipeline steers every plan in it, a ticked
-// skill must be applied. It opens as a sheet so each entry can say everything it is — the whole
-// description, the tools a pipeline composes, the protocol text — and what is ticked shows as chips
-// above the composer, so a chat's requirements are visible without opening anything. (It replaces
-// an inline "Advanced" disclosure whose two 176 px lists cut all of that off.)
+// ---- pipeline and skill text, as the System page shows it ----------------------------------------
 const METHOD_DATA_TYPES = { scrna: "scRNA-seq", variants: "Variants (VCF)" };
-
-function methodPlain(text) {
-  return String(text == null ? "" : text).replace(/\*\*/g, "").replace(/`/g, "").trim();
-}
-
-function methodName(key) {
-  return String(key || "").replace(/\.py$/, "").replace(/_/g, " ");
-}
 
 // A protocol file is hard-wrapped at about 90 columns. Shown as it is, in a box of another width,
 // every line breaks twice. So the lines of one paragraph or list item are joined, and only the
@@ -779,310 +712,10 @@ function methodUnwrap(text) {
   return out.join("\n");
 }
 
-function methodPicks() {
-  const s = activeSession();
-  return { presets: new Set((s && s.presetKeys) || []), skills: new Set((s && s.skillKeys) || []) };
-}
-
-// The entries of one tab that match the search, as plain records.
-function methodEntries(tab, needle) {
-  const q = String(needle || "").trim().toLowerCase();
-  const hit = (text) => !q || text.toLowerCase().includes(q);
-  if (tab === "skills") {
-    return (state.skillOrder || []).map((name) => state.skills[name] || { name })
-      .filter((sk) => hit(`${sk.name} ${methodName(sk.name)} ${sk.summary || ""} ${sk.category || ""}`))
-      .map((sk) => ({ kind: "skill", key: sk.name, title: methodName(sk.name), text: methodPlain(sk.summary),
-                      badge: sk.category || "", tools: [], protocol: false }));
-  }
-  return (state.presetOrder || []).map((k) => state.presets[k] || { key: k })
-    .filter((pp) => hit(`${pp.key} ${pp.label || ""} ${(pp.tools || []).join(" ")} ${pp.data_type || ""}`))
-    .map((pp) => ({ kind: "preset", key: pp.key, title: methodPlain(pp.label) || methodName(pp.key), text: "",
-                    badge: METHOD_DATA_TYPES[pp.data_type] || pp.data_type || "",
-                    tools: Array.isArray(pp.tools) ? pp.tools : [], protocol: !!pp.prompt }));
-}
-
-function methodRowsHtml(tab, needle, picks) {
-  const entries = methodEntries(tab, needle);
-  if (!entries.length) {
-    return `<div class="method-empty">${needle ? "Nothing matches that search." : "Nothing to show here yet."}</div>`;
-  }
-  const chosen = tab === "skills" ? picks.skills : picks.presets;
-  return entries.map((e) => {
-    const on = chosen.has(e.key);
-    return `<div class="method-row${on ? " checked" : ""}" data-kind="${e.kind}" data-key="${escapeHtml(e.key)}">`
-      + `<label class="method-pick"><input type="checkbox"${on ? " checked" : ""} />`
-      + `<span class="method-title">${escapeHtml(e.title)}</span></label>`
-      + (e.text ? `<div class="method-text">${escapeHtml(e.text)}</div>` : "")
-      + `<div class="method-meta"><code class="method-key">${escapeHtml(e.key)}</code>`
-      + (e.badge ? `<span class="method-badge">${escapeHtml(e.badge)}</span>` : "")
-      + e.tools.map((t) => `<span class="method-tool">${escapeHtml(t)}</span>`).join("")
-      + `</div>`
-      // Filled in when opened (renderMethods): a protocol is a few kB of text per pipeline.
-      + (e.protocol ? `<details class="method-protocol"><summary>Read the protocol</summary>`
-                      + `<div class="method-protocol-body"></div></details>` : "")
-      + `</div>`;
-  }).join("");
-}
-
-function methodSummaryText(picks) {
-  const p = picks.presets.size, k = picks.skills.size;
-  if (!p && !k) return "Nothing required — the PI chooses the pipeline, and skills are fetched on demand.";
-  const bits = [];
-  if (p) bits.push(`${p} pipeline${p === 1 ? "" : "s"}`);
-  if (k) bits.push(`${k} skill${k === 1 ? "" : "s"}`);
-  return `${bits.join(" and ")} required in this chat.`;
-}
-
-function methodChipsHtml(picks) {
-  const chip = (kind, key, icon, title) =>
-    `<span class="method-chip" title="${escapeHtml(title)}">`
-    + `<span class="material-symbols-outlined msym" aria-hidden="true">${icon}</span>`
-    + `<span class="method-chip-name">${escapeHtml(methodName(key))}</span>`
-    + `<button type="button" class="method-chip-x" data-kind="${kind}" data-key="${escapeHtml(key)}" `
-    + `aria-label="Stop requiring ${escapeHtml(methodName(key))}">×</button></span>`;
-  const out = [];
-  for (const k of picks.presets) out.push(chip("preset", k, "account_tree", methodPlain((state.presets[k] || {}).label) || k));
-  for (const k of picks.skills) out.push(chip("skill", k, "extension", methodPlain((state.skills[k] || {}).summary) || k));
-  return out.length ? `<span class="method-chips-label">Required</span>` + out.join("") : "";
-}
-
-// Paint everything that shows the active chat's picks: the button's count, the chips, and — when
-// the sheet is open — its list, tab counts and summary. A tick only re-marks the rows that are
-// there (`rebuild` false): rebuilding the list would close the protocol the person is reading.
-function renderMethods(rebuild = true) {
-  const picks = methodPicks();
-  const n = picks.presets.size + picks.skills.size;
-  const count = $("methodsCount");
-  if (count) { count.textContent = String(n); count.classList.toggle("hidden", !n); }
-  const chips = $("methodChips");
-  if (chips) { chips.innerHTML = methodChipsHtml(picks); chips.classList.toggle("hidden", !n); }
-  const modal = $("methodsModal");
-  if (!modal || modal.classList.contains("hidden")) return;
-  const tab = state.methodsTab || "pipelines";
-  for (const btn of modal.querySelectorAll(".methods-tabs [data-tab]")) {
-    const mine = btn.dataset.tab === tab;
-    btn.classList.toggle("active", mine);
-    btn.setAttribute("aria-selected", mine ? "true" : "false");
-    const total = btn.dataset.tab === "skills" ? (state.skillOrder || []).length : (state.presetOrder || []).length;
-    const picked = btn.dataset.tab === "skills" ? picks.skills.size : picks.presets.size;
-    btn.querySelector(".methods-tab-n").textContent = picked ? `${picked}/${total}` : String(total);
-  }
-  const list = $("methodsList");
-  if (rebuild) {
-    list.innerHTML = methodRowsHtml(tab, $("methodsSearch").value, picks);
-  } else {
-    for (const row of list.querySelectorAll(".method-row")) {
-      const on = (row.dataset.kind === "skill" ? picks.skills : picks.presets).has(row.dataset.key);
-      row.classList.toggle("checked", on);
-      row.querySelector('input[type="checkbox"]').checked = on;
-    }
-  }
-  $("methodsSummary").textContent = methodSummaryText(picks);
-  $("methodsClear").disabled = !n;
-}
-
-function openMethods(tab) {
-  if (tab) state.methodsTab = tab;
-  $("methodsModal").classList.remove("hidden");
-  $("methodsSearch").value = "";
-  renderMethods();
-  $("methodsSearch").focus();
-}
-
-function closeMethods() {
-  $("methodsModal").classList.add("hidden");
-}
-
-// Require (or stop requiring) one pipeline or skill for this chat. Persisted per chat like the
-// mode; the run sends the keys, and the plan must follow each pipeline and apply each skill.
-function setMethodPick(kind, key, checked) {
-  const s = activeSession();
-  if (!s) return;
-  const field = kind === "skill" ? "skillKeys" : "presetKeys";
-  const set = new Set(s[field] || []);
-  checked ? set.add(key) : set.delete(key);
-  s[field] = [...set];
-  if (kind !== "skill") saveSessionContext(s);   // pipelines are part of the stored conversation
-  persistSessions();
-  renderMethods(false);
-}
-
-function clearMethodPicks() {
-  const s = activeSession();
-  if (!s) return;
-  s.presetKeys = [];
-  s.skillKeys = [];
-  saveSessionContext(s);
-  persistSessions();
-  renderMethods(false);
-}
-
-function wireMethods() {
-  const modal = $("methodsModal");
-  if (!modal) return;
-  $("methodsBtn").addEventListener("click", () => openMethods());
-  $("methodsClose").addEventListener("click", closeMethods);
-  $("methodsDone").addEventListener("click", closeMethods);
-  $("methodsClear").addEventListener("click", clearMethodPicks);
-  modal.addEventListener("click", (e) => { if (e.target === modal) closeMethods(); });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.classList.contains("hidden")) closeMethods();
-  });
-  $("methodsSearch").addEventListener("input", () => renderMethods());
-  for (const btn of modal.querySelectorAll(".methods-tabs [data-tab]")) {
-    btn.addEventListener("click", () => { state.methodsTab = btn.dataset.tab; renderMethods(); });
-  }
-  const list = $("methodsList");
-  list.addEventListener("change", (e) => {
-    const row = e.target.closest(".method-row");
-    if (row && e.target.matches('input[type="checkbox"]')) setMethodPick(row.dataset.kind, row.dataset.key, e.target.checked);
-  });
-  // `toggle` does not bubble, hence the capture. The protocol is rendered the first time it opens.
-  list.addEventListener("toggle", (e) => {
-    const box = e.target;
-    if (!box.matches || !box.matches(".method-protocol") || !box.open) return;
-    const body = box.querySelector(".method-protocol-body");
-    const row = box.closest(".method-row");
-    if (body && !body.dataset.done && row) {
-      body.innerHTML = renderMarkdown(methodUnwrap((state.presets[row.dataset.key] || {}).prompt));
-      body.dataset.done = "1";
-    }
-  }, true);
-  $("methodChips").addEventListener("click", (e) => {
-    const x = e.target.closest(".method-chip-x");
-    if (x) setMethodPick(x.dataset.kind, x.dataset.key, false);
-  });
-}
-
-// Reflect the active chat's saved research path into the controls.
-function syncPresetUI() {
-  // Reflect the active chat's picks (preset pipelines + required skills) and run mode into the UI.
-  renderMethods();
-  const s = activeSession();
-  const modeSel = $("modeSelect");
-  if (modeSel) modeSel.value = (s && s.mode) || "auto";
-  const routeSel = $("routeSelect");
-  if (routeSel) routeSel.value = (s && s.route) || "research";
-  applyRouteUI();
-}
-
-// The user picks the MODE (single agent vs Virtual-Lab team); the PI still auto-selects
-// the skill. Saved per-chat so switching chats restores the choice.
-function onModeChange() {
-  const s = activeSession();
-  if (!s) return;
-  s.mode = $("modeSelect").value || "auto";
-  persistSessions();
-  saveComposer(activeChat());
-}
-
-// "Plan first", "Bypass" and "Save results to my data" are the chat's own. A new chat starts with
-// a plan to review and no bypass; "Save results" starts as the user last left it, a standing choice
-// (see applyUiPrefs), and from then on is this chat's.
-function savedResultsDefault() {
-  let prefs = {};
-  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
-  return prefs.saveResults === true;
-}
-function chatSavesResults(c) {
-  return c && typeof c.saveResults === "boolean" ? c.saveResults : savedResultsDefault();
-}
-function startComposer(c) {
-  if (!c) return;
-  c.saveResults = savedResultsDefault();
-  saveComposer(c);
-}
-function syncRunOptions(c = activeChat()) {
-  const plan = $("planMode"), bypass = $("autonomousMode"), save = $("saveResults");
-  if (plan) plan.checked = c ? c.planFirst : true;
-  if (bypass) bypass.checked = c ? c.bypass : false;
-  if (save) save.checked = chatSavesResults(c);
-}
-function onRunOptionChange() {
-  const c = activeChat();
-  if (!c) return;
-  c.planFirst = !!$("planMode").checked;
-  c.bypass = !!$("autonomousMode").checked;
-  c.saveResults = !!$("saveResults").checked;
-  saveComposer(c);
-}
-
-// ---- Axis B: chat (fast path) vs research (full lab) ----------------------
-// Which ENGINE answers, independent of Axis A (`mode`, one scientist vs a Virtual-Lab team,
-// which only applies inside the research engine). Saved per-chat like `mode`, so a chat used
-// for quick questions stays in chat mode when you switch back to it. "corpus" is the exception:
-// it is saved only until its scan is sent (leaveCorpusRoute).
-function activeRoute() {
-  const s = activeSession();
-  return (s && s.route) || ($("routeSelect") && $("routeSelect").value) || "research";
-}
-
-// The research-only controls (team mode, plan review, bypass) have no meaning on the fast path —
-// there is no plan to review and no team to convene. Disable rather than hide, so the user can see
-// what switching back to Research would give them.
-function applyRouteUI() {
-  const route = activeRoute();
-  const chat = route === "chat";
-  const corpus = route === "corpus";
-  // Neither the fast path nor the corpus scan has a plan to review or a team to convene.
-  const noLab = chat || corpus;
-  for (const id of ["modeSelect", "planMode", "autonomousMode", "saveResults", "methodsBtn"]) {
-    const el = $(id);
-    if (el) { el.disabled = noLab; if (el.closest("label")) el.closest("label").classList.toggle("dimmed", noLab); }
-  }
-  const sel = $("modeSelect");
-  if (sel) sel.classList.toggle("dimmed", noLab);
+// The composer's placeholder, unless a plan is waiting in this chat (then it asks what to change).
+function syncPlaceholder() {
   const input = $("chatInput");
-  if (input && !state.planPending) {
-    input.placeholder = chat
-      ? "Ask a quick question — answers start immediately (no analysis, no report)…"
-      : corpus
-        ? "Press Send to scan the whole corpus for haploinsufficient genes (the text here is only a label for the run)…"
-        : DEFAULT_PLACEHOLDER;
-  }
-}
-
-function onRouteChange() {
-  const s = activeSession();
-  if (!s) return;
-  const next = $("routeSelect").value || "research";
-  // The engine to come back to after a corpus scan — see leaveCorpusRoute.
-  if (next !== "corpus") delete s.routeBeforeCorpus;
-  else if (s.route !== "corpus") s.routeBeforeCorpus = s.route || "research";
-  s.route = next;
-  persistSessions();
-  saveComposer(activeChat());
-  applyRouteUI();
-}
-
-// A corpus scan is one ACTION, not an engine a chat stays on: once the scan is sent, the chat goes
-// back to the engine it was using. Left on "corpus", the next message — usually a question ABOUT
-// the tables — would start another hour-long scan with that question as its label.
-function leaveCorpusRoute(s) {
-  if (!s || s.route !== "corpus") return;
-  s.route = s.routeBeforeCorpus || "research";
-  delete s.routeBeforeCorpus;
-  persistSessions();
-  if (s !== activeSession()) return;       // the user switched chats while the request was out
-  const sel = $("routeSelect");
-  if (sel) sel.value = s.route;
-  applyRouteUI();
-}
-
-// Optional override: force specific research path(s) (the PI auto-selects by default). We persist
-// only the KEYS — each skill's guidance body is PI-internal and never shown/edited; to refine the
-// plan the user talks to the PI in chat (plan mode), not by editing text.
-// Persist the research-path context onto the server conversation (debounced), so it
-// survives a reload/device change — it's part of the chat's stored context.
-let _ctxSaveTimer = null;
-function saveSessionContext(s) {
-  if (!authed() || !s || !s.cid) return;
-  clearTimeout(_ctxSaveTimer);
-  _ctxSaveTimer = setTimeout(() => {
-    api("PATCH", `/api/conversations/${s.cid}`, {
-      preset_key: (s.presetKeys || []).join(","), context_prompt: "",
-    }).catch(() => {});
-  }, 500);
+  if (input && !state.planPending) input.placeholder = DEFAULT_PLACEHOLDER;
 }
 
 // Pull the (owner, run_id) of every finished run a chat owns, from the artifact
@@ -1227,7 +860,7 @@ function renderChat() {
   // empty-session case below, which used to early-return and leave the previous
   // session's downloads stranded in the panel.
   refreshDownloads();
-  syncPresetUI();   // reflect this chat's research-path context in the controls
+  syncPlaceholder();
   if (!s || (!s.messages.length && !ownerVisible() && !planPromptVisible())) {
     stream.innerHTML = '<div class="empty-hint">Connect to HPC3, then ask a research question.</div>';
     renderPlanPanel();
@@ -1909,9 +1542,25 @@ function reconcileRuns(summary) {
   }
 }
 
+// The header's second line: the model this session reasons with and where it runs (RCHENLAB/AiScientist
+// issue 32). Empty without a session, where the status on the right already says Disconnected.
+function sessionModelLine(summary) {
+  if (!summary || summary.status === "disconnected" || summary.status === "error") return "";
+  const ep = summary.llm_endpoint || {};
+  const name = (m) => String(m || "").replace(/\/+$/, "").split("/").pop();
+  let line;
+  if (ep.kind === "shared") line = `${name(ep.model) || "Shared model"} · lab's shared server`;
+  else if (ep.kind === "credential") line = `${name(ep.model) || ep.label || "API model"} · your API key`;
+  else if (ep.kind === "cluster") line = `${ep.cluster_label || name(summary.selected_model || ep.model) || "Cluster model"} · your GPU on HPC3`;
+  else if (ep.kind === "missing") line = ep.label || "";
+  else line = name(summary.selected_model || summary.model);
+  return line && summary.mock ? `${line} · mock` : line;
+}
+
 function applyStatus(summary) {
   const prevStatus = state.status;
   state.status = summary.status;
+  $("headerModel").textContent = sessionModelLine(summary);
   const dot = $("connDot");
   dot.className = "dot " + (summary.status === "ready" ? "ready" : summary.status === "error" ? "error" : summary.status === "disconnected" ? "muted" : "connecting");
   const labels = { connecting: "Connecting…", provisioning: "Provisioning…", ready: `Live · ${summary.model}`, error: "Error", disconnected: "Disconnected" };
@@ -1963,7 +1612,6 @@ function applyStatus(summary) {
       : "Bringing the GPU session up…";
   }
   if (isReady) {
-    renderModelOptions(summary);
     // Which LLM answers, and — when that is off-site — a banner that stays up for as long as it
     // is selected. Loaded once per session; after that the status stream keeps the picker honest.
     if (!apiKeys.creds.length && !state._apiKeysLoaded) { state._apiKeysLoaded = true; loadApiCredentials(); }
@@ -2061,30 +1709,10 @@ function updateBoot(ev) {
   if (label) showBoot(label, { sub: BOOT_SUB });
 }
 
-function renderModelOptions(summary) {
-  const select = $("modelSelect");
-  const models = summary.available_models || [];
-  const selected = summary.selected_model || summary.model;
-  select.innerHTML = models.map((m) => `<option value="${escapeHtml(m)}" ${m === selected || m.split(":")[0] === (selected || "").split(":")[0] ? "selected" : ""}>${escapeHtml(m)}</option>`).join("");
-  if (!models.length) select.innerHTML = `<option>${escapeHtml(selected || "qwen3")}</option>`;
-}
-
-async function selectModel(model) {
-  if (!state.connectionId || !model) return;
-  try {
-    const res = await fetch("/api/model", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connection_id: state.connectionId, model }) });
-    const d = await res.json();
-    if (!res.ok) { toast(d.error || "Model switch failed"); return; }
-    if (d.status === "pulling") toast(`Pulling ${model} … watch the log for progress.`);
-    else toast(`Model: ${model}`);
-  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Model switch failed: " + err.message); }
-}
-
 // ---- bring-your-own LLM API key -------------------------------------------
 //
-// Two axes that look similar but are not: the Model row picks among what vLLM already loaded
-// into VRAM at serve-launch, while this picks WHICH ENDPOINT answers at all. Switching endpoint
-// costs nothing and needs no reconnect — an API serves whatever the provider offers.
+// The endpoint IS the model choice: each entry names its model (the shared model, a cluster weight
+// set, a saved key's model). Switching to an API endpoint costs nothing and needs no reconnect.
 
 const apiKeys = { creds: [], providers: [], editing: null, pendingSelect: null,
                   activeId: "", connectChoice: "", models: [], storage: null,
@@ -3260,7 +2888,7 @@ async function doStopGpu() {
 // ---- the compute session on HPC3 (RCHENLAB/AiScientist issue 6) ------------------------------
 // What this session is doing with HPC3 (staging in, running, staging out, cleaning up, closed,
 // failed), each copy's progress and every failure, from the server's `session_state` pushes and the
-// status summary after a reload. The storage panel lists the account's recent sessions.
+// status summary after a reload. My account → Storage lists the account's recent sessions.
 const SESSION_STATE_LABEL = {
   open: "Open", "staging-in": "Staging in", running: "Running", "staging-out": "Staging out",
   "cleaning-up": "Cleaning up", closed: "Closed", failed: "Failed",
@@ -3360,7 +2988,7 @@ function renderSessionState(s) {
       chip.title = sessionHeadline(s, state.ttlDays);
     }
   }
-  if (!$("storageModal").classList.contains("hidden")) renderComputeSessions(null, s);
+  if (storageShown()) renderComputeSessions(null, s);
 }
 
 let _computeSessionRows = [];
@@ -3403,6 +3031,8 @@ function originalsPending(plan) {
 function renderOriginals(d) {
   const box = $("originalsBox"); if (!box) return;
   clearTimeout(_originalsPoll); _originalsPoll = null;
+  // Shown only where originals can be checked at all (accounts, a data root, a real HPC3 session).
+  const wrap = $("storeOriginals"); if (wrap) wrap.classList.toggle("hidden", !!(d && d.unavailable));
   if (d && d.unavailable) { box.innerHTML = `<div class="storage-empty">${escapeHtml(d.unavailable)}</div>`; return; }
   const plan = d && d.plan;
   const checkBtn = '<button type="button" class="ghost small" data-orig="check">Check what can be removed</button>';
@@ -3458,7 +3088,7 @@ async function loadOriginals(planId) {
     const res = await fetch(`/api/hpc-originals?${q}`);
     const d = await res.json();
     if (!res.ok) { renderOriginals({ unavailable: d.error || "Not available." }); return; }
-    if (!$("storageModal").classList.contains("hidden")) renderOriginals(d);
+    if (storageShown()) renderOriginals(d);
   } catch (err) {
     renderOriginals({ unavailable: isUnreachable(err) ? "Can't reach the local server." : err.message });
   }
@@ -3477,49 +3107,185 @@ async function originalsAction(kind, planId) {
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : err.message); }
 }
 
-async function openStorage() {
-  if (!state.connectionId) return;
-  $("storageModal").classList.remove("hidden");
-  $("storageItems").innerHTML = '<div class="storage-loading">Loading…</div>';
-  $("storageQuota").textContent = "";
-  $("storageBase").textContent = "";
-  $("storageUsed").textContent = "—";
+// ---- My account → Storage (RCHENLAB/AiScientist issue 32) ---------------------------------------
+// Where the account's files are. On the server: its datasets and its runs' folders, kept until
+// deleted; read without an HPC3 session. On HPC3: the account's own folders there, read over this
+// session's SSH, area by area, each saying what happens to the files in it.
+let _storeServer = null;                                   // the server listing as last read
+const _storeShowAll = { datasets: false, outputs: false };
+const STORE_ROWS = 6;                                      // rows a list shows before "Show all"
+
+// True while My account → Storage is on screen: polls and redraws stop when it is not.
+function storageShown() {
+  const view = $("view-account"), pane = $("accountPane-storage");
+  return !!view && view.classList.contains("active") && !!pane && !pane.classList.contains("hidden");
+}
+
+async function loadStorageTab() {
+  loadServerStorage();
   loadComputeSessions();
+  if (!state.connectionId) { renderStorage(null); return; }
+  $("storeHpcBody").innerHTML = '<div class="storage-loading">Loading…</div>';
   loadOriginals();
   loadStorageDeletes();
   await loadStorageListing();
+}
+
+// The session chip in the header: what the session is doing with HPC3, in detail.
+function openStorageSessions() {
+  openAccount("storage");
+  const d = $("storeSessions");
+  if (d) d.open = true;
+}
+
+function fmtEpochDay(t) {
+  try { return new Date(t * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return ""; }
+}
+
+// One row of either section: the name (and a line under it), its size, then its action.
+function storeRowHtml({ name, meta, bytes, title, action }) {
+  return `<div class="store-row"${title ? ` title="${escapeHtml(title)}"` : ""}><div class="store-row-main">` +
+    `<span class="store-name">${escapeHtml(name)}</span>${meta ? `<span class="store-meta">${escapeHtml(meta)}</span>` : ""}</div>` +
+    `<span class="store-size">${bytes == null ? "" : escapeHtml(fmtSize(bytes))}</span>${action || ""}</div>`;
+}
+
+// What share of the section each kind takes, as one bar and its legend.
+function storeBarHtml(parts) {
+  const total = parts.reduce((n, p) => n + (p.bytes || 0), 0);
+  const bar = total ? `<div class="store-bar" aria-hidden="true">` + parts.filter((p) => p.bytes > 0)
+    .map((p) => `<i class="${p.cls}" style="flex-grow:${p.bytes}"></i>`).join("") + `</div>` : "";
+  return bar + `<div class="store-legend">` + parts.map((p) =>
+    `<span><i class="store-dot ${p.cls}"></i>${escapeHtml(p.label)} <b>${escapeHtml(fmtSize(p.bytes || 0))}</b></span>`).join("") + `</div>`;
+}
+
+function storeListHtml(key, title, rows, empty) {
+  const all = _storeShowAll[key];
+  const more = rows.length > STORE_ROWS
+    ? `<button type="button" class="ghost small store-more" data-store-more="${key}">${all ? "Show fewer" : `Show all ${rows.length}`}</button>` : "";
+  return `<div class="store-group"><div class="store-group-head"><strong>${escapeHtml(title)}</strong>` +
+    `<span class="store-count">${rows.length}</span></div>` +
+    (rows.length ? (all ? rows : rows.slice(0, STORE_ROWS)).join("") + more : `<div class="storage-empty">${escapeHtml(empty)}</div>`) + `</div>`;
+}
+
+async function loadServerStorage() {
+  const body = $("storeServerBody");
+  try {
+    const res = await fetch("/api/storage/server");
+    const d = await res.json();
+    if (!res.ok) {
+      $("storeServerTotal").textContent = "";
+      body.innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read your storage on the server.")}</div>`;
+      return;
+    }
+    const results = await loadResultHandoffs(false).catch(() => ({}));
+    renderServerStorage(d, results || {});
+  } catch (err) {
+    body.innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the server." : escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderServerStorage(d, results) {
+  if (d) _storeServer = { d, results: results || {} };
+  if (!_storeServer) return;
+  ({ d, results } = _storeServer);
+  const datasets = d.datasets || [], outputs = d.outputs || [];
+  $("storeServerTotal").textContent = fmtSize(d.total_bytes || 0);
+  const dsRows = datasets.map((x) => storeRowHtml({
+    name: x.name, bytes: x.bytes, title: x.path || "",
+    meta: [x.kind, x.uploaded_at ? `added ${fmtDay(x.uploaded_at)}` : ""].filter(Boolean).join(" · "),
+    action: `<button type="button" class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}" ` +
+            `data-kind="${escapeHtml(x.kind || "")}" data-location="server" data-path="${escapeHtml(x.path || "")}">Delete</button>`,
+  }));
+  const runRows = outputs.map((r) => storeRowHtml({
+    name: runTitle(r), bytes: r.bytes, title: `Run ${r.run_id}`,
+    meta: [r.status, r.created_at ? fmtDay(r.created_at) : ""].filter(Boolean).join(" · "),
+    action: r.running ? '<span class="store-meta">running</span>'
+      : `<button type="button" class="ghost small danger" data-run-del="${escapeHtml(r.run_id)}" data-name="${escapeHtml(runTitle(r))}" ` +
+        `data-kept="${keptBesideRun(results[r.run_id]) ? "1" : ""}">Delete</button>`,
+  }));
+  const notes = [];
+  if (d.linked) notes.push(`${d.linked} of your datasets only point at a shared folder on the server and take none of your space.`);
+  if (d.on_hpc3) notes.push(`${d.on_hpc3} of your datasets are still kept on HPC3. They are copied to the server when you next connect.`);
+  $("storeServerBody").innerHTML =
+    storeBarHtml([{ label: "Datasets", bytes: d.datasets_bytes, cls: "k-datasets" },
+                  { label: "Run outputs", bytes: d.outputs_bytes, cls: "k-outputs" }]) +
+    storeListHtml("datasets", "Datasets", dsRows, "No datasets yet.") +
+    storeListHtml("outputs", "Run outputs", runRows, "No run has written anything yet.") +
+    notes.map((n) => `<p class="store-note">${escapeHtml(n)}</p>`).join("");
+}
+
+async function onServerStorageClick(e) {
+  const more = e.target.closest("[data-store-more]");
+  if (more) { _storeShowAll[more.dataset.storeMore] = !_storeShowAll[more.dataset.storeMore]; renderServerStorage(); return; }
+  const ds = e.target.closest("button[data-del]");
+  if (ds) { if (await deleteDatasetRow(ds)) loadServerStorage(); return; }
+  const run = e.target.closest("button[data-run-del]");
+  if (run && await deleteRun(run)) loadServerStorage();
 }
 
 async function loadStorageListing() {
   try {
     const res = await fetch(`/api/storage/${state.connectionId}`);
     const d = await res.json();
-    if (!res.ok) { $("storageItems").innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read storage")}</div>`; return; }
+    if (!res.ok) { $("storeHpcBody").innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read your folders on HPC3.")}</div>`; return; }
     renderStorage(d);
   } catch (err) {
-    $("storageItems").innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the local server." : escapeHtml(err.message)}</div>`;
+    $("storeHpcBody").innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the server." : escapeHtml(err.message)}</div>`;
   }
 }
 
-function renderStorage(d) {
-  _storageListing = d;
-  $("storageBase").textContent = d.base || "";
-  $("storageUsed").textContent = d.used || "?";
-  $("storageQuota").textContent = d.quota_raw || "";
-  const items = d.items || [];
-  if (!items.length) { $("storageItems").innerHTML = '<div class="storage-empty">No items in your directory.</div>'; return; }
-  $("storageItems").innerHTML = items.map((i) => {
-    const deleting = i.deleting || _storageDeleting[i.path];
-    const action = deleting
-      ? `<span class="si-deleting">Deletion queued (job ${escapeHtml(deleting)})</span>`
-      : `<button class="si-del" data-path="${escapeHtml(i.path)}">Delete</button>`;
-    return `<div class="storage-item"><span class="si-name">${escapeHtml(i.name)}</span><span class="si-size">${escapeHtml(i.size)}</span>${action}</div>`;
-  }).join("");
+// The lab's quota is a GROUP quota: RCIC reports no per-member figure.
+function quotaHtml(q) {
+  const pct = q.percent == null ? null : Math.min(100, Number(q.percent));
+  const tone = pct >= 95 ? " tone-over" : pct >= 85 ? " tone-warn" : "";
+  return `<div class="store-quota"><div class="usage-bar-legend"><span>Lab quota on ${escapeHtml(q.pool)}, shared by everyone in ${escapeHtml(q.group)}</span>` +
+    `<span>${escapeHtml(q.used)} of ${escapeHtml(q.limit)}${pct == null ? "" : ` · ${pct}%`}</span></div>` +
+    (pct == null ? "" : `<div class="usage-bar${tone}"><i style="width:${pct}%"></i></div>`) + `</div>`;
 }
 
-// ---- the storage panel's Delete, a Slurm job on HPC3 --------------------------------------------
-// The server answers at once with the queued job; the panel asks for its state (one sacct) while
-// it is queued or running, and reads the folders again once it has ended.
+function storageItemHtml(i) {
+  const deleting = i.deleting || _storageDeleting[i.path];
+  const meta = [];
+  if (i.changed) meta.push(`last used ${fmtEpochDay(i.changed)}`);
+  if (i.clean_after) meta.push(i.clean_after * 1000 <= Date.now() ? "removed at the next cleanup" : `removed after ${fmtEpochDay(i.clean_after)}`);
+  const action = deleting
+    ? `<span class="si-deleting">Deletion queued (job ${escapeHtml(deleting)})</span>`
+    : `<button type="button" class="ghost small danger" data-path="${escapeHtml(i.path)}">Delete</button>`;
+  return storeRowHtml({ name: i.name, meta: meta.join(" · "), bytes: i.bytes, title: i.path, action });
+}
+
+// ``d`` = GET /api/storage/<connection>; null = no HPC3 session to read the folders with.
+function renderStorage(d) {
+  _storageListing = d;
+  const body = $("storeHpcBody"); if (!body) return;
+  if (!d) {
+    $("storeHpcTotal").textContent = "";
+    $("storeOriginals").classList.add("hidden");
+    body.innerHTML = `<div class="storage-empty">Connect to HPC3 on the Research page to see your folders there. ` +
+      `Temporary run files are removed when a session ends${state.ttlDays ? `, or ${state.ttlDays} days after they were last used` : ""}.</div>`;
+    return;
+  }
+  const areas = d.areas || [];
+  $("storeHpcTotal").textContent = fmtSize(areas.reduce((n, a) => n + (a.bytes || 0), 0));
+  const parts = d.quota ? [quotaHtml(d.quota)] : [];
+  for (const a of areas) {
+    const items = a.items || [];
+    if (a.key !== "temp" && !items.length) continue;     // the older areas show only while they hold something
+    const rows = items.map(storageItemHtml).join("") || '<div class="storage-empty">Nothing here now.</div>';
+    const size = `<span class="store-size">${escapeHtml(fmtSize(a.bytes || 0))}</span>`;
+    const note = `<p class="store-note">${escapeHtml(a.note || "")}</p>`;
+    // The member's own lab folder holds their own files too: folded until they open it.
+    parts.push(a.key === "personal"
+      ? `<details class="store-group store-fold"><summary class="store-group-head"><strong>${escapeHtml(a.label)}</strong>` +
+        `<span class="store-count">${items.length}</span>${size}</summary>${note}${rows}</details>`
+      : `<div class="store-group"><div class="store-group-head"><strong>${escapeHtml(a.label)}</strong>${size}</div>${note}${rows}</div>`);
+  }
+  body.innerHTML = parts.join("");
+}
+
+// ---- a Delete on HPC3 is a Slurm job ------------------------------------------------------------
+// The server answers at once with the queued job; the Storage tab asks for its state (one sacct)
+// while it is queued or running, and reads the folders again once it has ended.
 let _storageDeletesPoll = null;
 let _storageDeleting = {};        // path -> job id, for the deletions still queued or running
 let _storageListing = null;       // the folders as last read, to redraw a row as queued
@@ -3560,7 +3326,7 @@ async function loadStorageDeletes() {
       if (Object.keys(_storageDeleting).length) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = setTimeout(loadStorageDeletes, 15000); }
       return;
     }
-    if ($("storageModal").classList.contains("hidden")) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null; return; }
+    if (!storageShown()) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null; return; }
     const ended = renderStorageDeletes(d.deletes);
     if (ended.length) loadStorageListing();          // a deletion ended: the folders changed
   } catch (err) { /* the next open of the panel asks again */ }
@@ -3582,7 +3348,7 @@ async function deleteStorageItem(path) {
 
 async function stopGpu() {
   if (!state.connectionId) return;
-  if (!confirm("Stop YOUR OWN Qwen3 GPU job (scancel)? Frees the GPU and stops your SU charge — only your own job, no one else is affected.")) return;
+  if (!confirm("Stop your own GPU job (scancel)? It frees the GPU and stops your SU charge. Only your own job is stopped; no one else is affected.")) return;
   await doStopGpu();
 }
 
@@ -3688,8 +3454,7 @@ async function injectPrompt(c, text) {
 async function sendChat(e) {
   e.preventDefault();
   const input = $("chatInput");
-  // The corpus scan takes no question: an empty composer sends a default label for the run.
-  const text = input.value.trim() || (activeRoute() === "corpus" ? "Corpus scan: haploinsufficient genes in retinal disease" : "");
+  const text = input.value.trim();
   if (!text) return;
   // Everything below is about THIS chat: its plan, its run, its attachments. A message typed in a
   // chat is never feedback on another chat's plan, never a note for another chat's run — a tester
@@ -3748,9 +3513,6 @@ async function sendChat(e) {
     const d = state.datasets.find((x) => x.path === p) || {};
     return { path: p, name: d.name || p.split("/").pop(), role: c.roles[p] || null };
   });
-  const autonomous = !!c.bypass;
-  // Bypass mode overrides plan review — don't also send plan_mode=true (avoids a stale plan card).
-  const plan_mode = !autonomous && !!c.planFirst;
   // DAG is the default execution model now (dependency-graph + Coordinator; no UI toggle). The
   // classic linear order is still reachable server-side via AISCIENTIST_PLANNER=linear.
   const planner = "dag";
@@ -3762,14 +3524,10 @@ async function sendChat(e) {
     saveComposer(c);
   };
   try {
-    // The research lab (PI→Scientist→Critic + real scanpy/gseapy tools) is the one execution path.
-    // Manual (default): plan review + DAG decision-point pauses. Bypass (autonomous): no gates.
-    // Axis B. `route: "chat"` takes the answer-first fast path (agents/quick_chat.py) — no plan, no
-    // report; `history` gives that loop the conversation it is continuing (the research path ignores
-    // it and scopes a study by question + dataset instead). An older client omitting `route` still
-    // gets today's research behaviour, because the server defaults it.
-    const route = activeRoute();
-    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, case_note: (c.caseNote && c.caseNote.text) || null, plan_mode, autonomous, save_results: chatSavesResults(c), planner, route, history, mode: ($("modeSelect") && $("modeSelect").value) || "auto", presets: (sess && sess.presetKeys) || [], skills: (sess && sess.skillKeys) || [], preset_prompt: null, tz: userTz() };
+    // One flow for every request, with the same run options (FIXED_RUN_OPTIONS): the server routes
+    // it to a literature search or to the lab, and either starts with a plan to review. `history` is
+    // the conversation so far, for a line that reads it.
+    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
     const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
     let res = await postLab();
     // The budget hard limit (Account › API usage): "confirm" asks once, then sends the same run again.
@@ -3796,8 +3554,6 @@ async function sendChat(e) {
       }
       giveBack();
       toast(d.error || "Run failed");
-    } else if (route === "corpus") {
-      leaveCorpusRoute(sess);     // accepted: one pick is one scan (a refused send keeps the pick)
     }
   } catch (err) {
     giveBack();
@@ -3810,7 +3566,7 @@ async function sendChat(e) {
 // Run / Cancel actions. The user refines it by typing in the composer (which re-plans);
 // an ambiguous request comes back as a clarify card with option chips. The live card is
 // ephemeral (buttons can't persist); on approval the plan is saved to history as text.
-const DEFAULT_PLACEHOLDER = "Ask AiScientist to plan or interpret an ocular bioinformatics analysis...";
+const DEFAULT_PLACEHOLDER = "Ask a question, or describe the analysis you want — the agent proposes a plan first…";
 
 // ---- the prompt that is waiting, kept apart from its card ---------------------------------------
 // A plan, a clarify question or a decision point waits for the user in ONE chat: the one that owns
@@ -6161,8 +5917,9 @@ function datasetIcon(kind) {
 }
 
 // ---- data already on the server, bound by path (no upload) ---------------------------------
-// The gateway allowlists folders (AISCIENTIST_SERVER_DATA_ROOTS). A path inside one can be bound from
-// the Data menu, or — when one is pasted into the chat — from the offer above the composer. Binding
+// The gateway allowlists folders (AISCIENTIST_SERVER_DATA_ROOTS). A path inside one, pasted into the
+// chat, is offered above the composer (the Data menu no longer has an item for it: users do not see
+// server paths, issue 21). Binding
 // is always the user's click: a path the model reads in a message is never bound on its own. A run
 // copies what it needs to HPC3 when it starts (only what changed since the last copy).
 const _SERVER_PATH_RE = /(?<![\w/])(\/[^\s'"`<>|;,()[\]{}]+)/g;
@@ -6172,10 +5929,6 @@ async function loadServerRoots() {
     const d = await (await fetch("/api/server-data/roots")).json();
     state.serverRoots = d.enabled ? (d.roots || []) : [];
   } catch { state.serverRoots = []; }
-  const item = $("serverDataItem");
-  if (item) item.classList.toggle("hidden", !state.serverRoots.length);
-  const inp = $("serverPathInput");
-  if (inp && state.serverRoots.length) inp.placeholder = state.serverRoots[0] + "/…";
   renderServerPathOffer();
 }
 
@@ -6258,7 +6011,7 @@ function addDataset(d, sid) {
   const c = chatOf(sid || state.activeId);
   if (c && !c.bound.includes(d.path)) c.bound.push(d.path);
   if (!c || chatVisible(c)) syncDatasetSelection();
-  else { saveComposer(c); renderDataMenuRecent(); }   // its chips appear when that chat is opened (showDialog)
+  else saveComposer(c);   // its chips appear when that chat is opened (showDialog)
 }
 
 // A deleted dataset leaves every chat it was attached to, the ones not opened since the reload too.
@@ -6326,7 +6079,6 @@ function syncDatasetSelection() {
   // than silently re-attaching the last one (see loadDatasetChips).
   saveComposer(activeChat());
   renderDatasetChips();
-  renderDataMenuRecent();
 }
 // Back-compat alias: some call sites still say selectDataset(path|null) — a single-file select is just
 // "replace the set with this one" (or clear it).
@@ -6353,81 +6105,6 @@ function renderDatasetChips() {
       `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + refBtn +
       `<button type="button" class="dataset-chip-x" data-clear-path="${escapeHtml(path)}" title="Remove this file">×</button></span>`;
   }).join("");
-}
-
-// ---- the case note: the SECOND attachment (clinical description → HPO) ---------------------
-// Read client-side and sent as TEXT with the run, so it never competes for the single dataset slot.
-const MAX_CASE_NOTE_CHARS = 64000;   // mirrors _MAX_CASE_NOTE_CHARS in the gateway
-
-async function attachCaseNote(file) {
-  if (!file) return;
-  try {
-    const text = (await file.text()).trim();
-    if (!text) { toast("That note is empty."); return; }
-    if (text.length > MAX_CASE_NOTE_CHARS) toast(`Note is long — only the first ${MAX_CASE_NOTE_CHARS / 1000}k characters will be used.`);
-    state.caseNote = { name: file.name, text: text.slice(0, MAX_CASE_NOTE_CHARS) };
-    renderCaseNoteChip();
-  } catch (err) {
-    toast("Couldn't read that note: " + err.message);
-  }
-}
-
-function renderCaseNoteChip() {
-  const host = $("caseNoteChips");
-  if (!host) return;
-  if (!state.caseNote) { host.innerHTML = ""; return; }   // absent by default — no empty-state noise
-  const n = state.caseNote;
-  const preview = n.text.slice(0, 160) + (n.text.length > 160 ? "…" : "");
-  host.innerHTML = `<span class="dataset-chip active" title="${escapeHtml(preview)}">` +
-    `<span class="material-symbols-outlined msym">clinical_notes</span>` +
-    `<span class="dataset-chip-name">${escapeHtml(n.name)} (${n.text.length} chars)</span>` +
-    `<button type="button" class="dataset-chip-x" data-clear-note title="Remove the case note">×</button></span>`;
-}
-
-// The popover's upload list: the RECENT_UPLOADS newest uploads (this session + server history,
-// newest first), or, while "Search in all uploaded datasets" is open, every upload that matches.
-const RECENT_UPLOADS = 5;
-
-// The uploads whose name holds every word of `query`, newest first (all of them when empty). Not the
-// path: a managed dataset's is users/<account>/datasets/<uuid>/…, which every upload shares.
-function matchDatasets(datasets, query) {
-  const words = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
-  return datasets.filter((d) => {
-    const name = String(d.name || "").toLowerCase();
-    return words.every((w) => name.includes(w));
-  });
-}
-
-function renderDataMenuRecent() {
-  const host = $("dataMenuRecent");
-  if (!host) return;
-  const all = state.datasets, searching = state.dataSearch !== null;
-  const list = searching ? matchDatasets(all, state.dataSearch) : all.slice(0, RECENT_UPLOADS);
-  $("dataMenuRecentLabel").textContent = !searching ? "Recent uploads (click to add/remove)"
-    : state.dataSearch.trim() ? `${list.length} of ${all.length} uploads match` : `All ${all.length} uploads`;
-  $("dataMenuSearchRow").classList.toggle("hidden", !searching);
-  $("dataMenuSearchBtn").classList.toggle("hidden", searching || !all.length);
-  $("dataMenuSearchCount").textContent = String(all.length);
-  if (!all.length) { host.innerHTML = '<div class="data-menu-empty">No uploads yet</div>'; return; }
-  if (!list.length) { host.innerHTML = '<div class="data-menu-empty">No upload matches that</div>'; return; }
-  host.innerHTML = list.map((d) => {
-    const active = state.boundPaths.includes(d.path) ? " active" : "";   // in the bind-set → checked
-    const ico = datasetIcon(d.kind);
-    // A search tells same-named uploads apart by when they came and how big they are.
-    const facts = searching ? [relTime(d.at), fmtSize(d.size)].filter(Boolean).join(" · ") : "";
-    const sub = facts ? `<span class="dmr-sub">${escapeHtml(facts)}</span>` : "";
-    return `<button type="button" class="data-menu-recent-item${active}" data-path="${escapeHtml(d.path)}" title="${escapeHtml(d.path)} (click to add/remove)">` +
-      `<span class="material-symbols-outlined msym">${ico}</span><span class="dmr-text"><span class="dmr-name">${escapeHtml(d.name)}</span>${sub}</span>` +
-      (active ? `<span class="material-symbols-outlined msym dmr-check">check</span>` : "") + `</button>`;
-  }).join("");
-}
-
-// Open the search of all uploads (a string, "" to start) or go back to the recent list (null).
-function setDataSearch(query) {
-  state.dataSearch = query;
-  if (query !== null && $("dataMenuSearch").value !== query) $("dataMenuSearch").value = query;
-  renderDataMenuRecent();
-  if (query !== null) $("dataMenuSearch").focus();
 }
 
 // The composer's upload line belongs to the chat the upload was started from (issue 7). Each upload
@@ -6460,17 +6137,89 @@ function renderUploadLine() {
   if (cb) cb.classList.toggle("hidden", !text || !chatUploads(here).length);
 }
 
+// "＋ Data" opens a two-item list, Files and Folder (issue 21): a browser's file dialog picks either
+// files or one folder, never both. Several files and folders at once are dropped onto the chat.
 function toggleDataMenu(force) {
   const m = $("dataMenu");
   if (!m) return;
   const show = force !== undefined ? force : m.classList.contains("hidden");
   m.classList.toggle("hidden", !show);
-  if (!show) state.dataSearch = null;   // the popover opens on the recent list again
-  if (show) renderDataMenuRecent();
 }
 
-// Populate the recent list from this user's server-side dataset history so earlier uploads
-// (incl. folders from a previous visit) are selectable — not just ones uploaded this session.
+// ---- dropping files and folders onto the chat ------------------------------------------------------
+// The drop's entries are read while the event is being handled (the browser empties the DataTransfer
+// after it); the folders are then walked. A file goes up as an upload of its own, a folder as one
+// folder upload, as if chosen in the dialogs. A dropped file has no webkitRelativePath, so each file
+// of a folder gets one: its path under the dropped folder, as the folder dialog gives it.
+function dropEntries(dt) {
+  const items = [...((dt && dt.items) || [])].filter((it) => it.kind === "file");
+  const entries = items.map((it) => (typeof it.webkitGetAsEntry === "function" ? it.webkitGetAsEntry() : null));
+  if (entries.length && entries.every(Boolean)) return { entries, files: [] };
+  return { entries: [], files: [...((dt && dt.files) || [])] };   // no entry API: plain files only
+}
+function entryFile(entry) { return new Promise((res, rej) => entry.file(res, rej)); }
+async function readDirAll(dir) {
+  const reader = dir.createReader(), out = [];
+  for (;;) {      // readEntries hands the entries over in batches until it returns an empty one
+    const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+    if (!batch.length) return out;
+    out.push(...batch);
+  }
+}
+async function folderFiles(dir) {
+  const files = [], todo = [dir];
+  while (todo.length) {
+    const d = todo.shift();
+    for (const e of await readDirAll(d)) {
+      if (e.isDirectory) { todo.push(e); continue; }
+      if (!e.isFile || e.name === ".DS_Store") continue;
+      const f = await entryFile(e);
+      const rel = String(e.fullPath || `${dir.name}/${e.name}`).replace(/^\/+/, "");
+      try { Object.defineProperty(f, "webkitRelativePath", { value: rel, configurable: true }); } catch { /* read-only here */ }
+      files.push(f);
+    }
+  }
+  return files;
+}
+// What a drop holds: the loose files, and each folder's files. Reading a folder that fails is skipped
+// with a note; the rest goes up.
+async function droppedUploads(found) {
+  const files = [...found.files], folders = [];
+  for (const e of found.entries) {
+    try {
+      if (e.isDirectory) { const fl = await folderFiles(e); if (fl.length) folders.push(fl); }
+      else if (e.isFile) files.push(await entryFile(e));
+    } catch (err) { toast(`Couldn't read ${e.name}: ${err.message || err}`); }
+  }
+  return { files, folders };
+}
+async function onDataDrop(found) {
+  if (!state.connectionId) { toast("Connect to HPC3 first."); return; }
+  const { files, folders } = await droppedUploads(found);
+  if (!files.length && !folders.length) { toast("Nothing to upload in what was dropped."); return; }
+  for (const f of files) uploadDataset(f);
+  for (const fl of folders) uploadFolder(fl);
+}
+function wireDataDrop() {
+  const panel = document.querySelector(".chat-panel"), hint = $("dropHint");
+  if (!panel) return;
+  let depth = 0;
+  const carriesFiles = (e) => [...((e.dataTransfer && e.dataTransfer.types) || [])].includes("Files");
+  const show = (on) => { if (hint) hint.classList.toggle("hidden", !on); panel.classList.toggle("drop-target", on); };
+  panel.addEventListener("dragenter", (e) => { if (!carriesFiles(e)) return; e.preventDefault(); depth += 1; show(true); });
+  panel.addEventListener("dragover", (e) => { if (!carriesFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+  panel.addEventListener("dragleave", (e) => { if (!carriesFiles(e)) return; depth = Math.max(0, depth - 1); if (!depth) show(false); });
+  panel.addEventListener("drop", (e) => {
+    if (!carriesFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    show(false);
+    onDataDrop(dropEntries(e.dataTransfer));
+  });
+}
+
+// Load this user's server-side dataset history so earlier uploads (incl. folders from a previous
+// visit) are known to the page: their chips, and Datasets → Use, which attaches one to the open chat.
 async function loadDatasetChips() {
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
@@ -6489,7 +6238,6 @@ async function loadDatasetChips() {
   // silently inheriting whatever was loaded last time (that surprised users and mis-attached data to
   // a new question). Prior uploads still appear as clickable chips; the user picks one explicitly.
   renderDatasetChips();
-  renderDataMenuRecent();
 }
 
 function hashStr(s) {
@@ -6540,18 +6288,6 @@ function applyUiPrefs() {
   try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
   setPanel("left", prefs.left !== false);
   setPanel("right", prefs.right === true);   // downloads/log panel collapsed by default
-  // "Save results to my data" is a standing choice, not a per-run one: a new chat starts as it was
-  // last left. Each chat keeps its own from then on (syncRunOptions).
-  const save = $("saveResults");
-  if (save) {
-    save.checked = prefs.saveResults === true;
-    save.addEventListener("change", () => {
-      let now = {};
-      try { now = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
-      now.saveResults = save.checked;
-      try { localStorage.setItem(UI_KEY, JSON.stringify(now)); } catch {}
-    });
-  }
 }
 
 function setPanel(side, open, remember = true) {
@@ -6748,7 +6484,7 @@ function switchView(name) {
   if (name === "datasets") loadFiles();
   else if (name === "runs") loadRuns();
   else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
-  else if (name === "account") { renderAccount(state.user); loadUsage(); }
+  else if (name === "account") { renderAccount(state.user); loadUsage(); if (state.accountTab === "storage") loadStorageTab(); }
   else if (name === "system") loadSystem();
   if (name !== "system") stopSystemLive();
 }
@@ -6918,11 +6654,11 @@ function wireSysCatalog() {
 // The graph is drawn once per /api/system load; the tasks move over it. Its stage nodes are the
 // stages the server moves runs through (gateway/run_monitor.py STAGES), its tool nodes the live
 // catalog grouped by where each tool runs, so the picture is the code's, not a drawing of it.
-const SG = { W: 1040, M: 12, NW: 104, NH: 46, LANE_Y: 74, SIDE_Y0: 150, SIDE_DY: 44, SW: 120, SH: 34,
+const SG = { W: 1040, M: 12, NW: 104, NH: 46, LANE_Y: 74, SIDE_Y0: 140, SIDE_DY: 38, SW: 120, SH: 34,
   AGENT_Y: 268, AW: 116, AH: 36, PLACE_Y: 330, COLW: 128, ROW_H: 22, HEAD: 30, PAD: 8, GAP: 10, BOTTOM: 14 };
 const SG_COLORS = ["#ad5a2b", "#1f7a8c", "#6b4fbb", "#2f8a4a", "#c0446b", "#b07d12"];
 const SG_ROLE = { plan: "PI", critic: "Critic", scientist: "Scientist", audit: "Claim auditor",
-  writer: "Writer", classify: "Router", chat: "Chat", reason: "Model" };
+  writer: "Writer", classify: "Router", literature: "Literature", chat: "Chat", reason: "Model" };
 
 // Positions for every node and a path for every edge. Pure: the same graph always lays out the same.
 function sysGraphLayout(graph) {
@@ -7091,10 +6827,11 @@ function sysTaskTargets(graph, layout, runs, now) {
           `${label} — ${r.outcome || "ended"}`);
       return;
     }
-    const lane = r.kind === "research" ? null : r.kind;           // chat / corpus
-    const home = lane && has(lane) ? lane : null;
+    const lane = r.kind === "research" ? null : r.kind;           // literature / chat / corpus
+    // A literature run waits for its plan's review on the main line first; its lane once approved.
+    const home = lane && has(lane) && (lane !== "literature" || r.stage === "literature") ? lane : null;
     const active = r.active || [];
-    if (active.length && ["execute", "chat", "corpus"].includes(r.stage)) {
+    if (active.length && ["execute", "literature", "chat", "corpus"].includes(r.stage)) {
       active.forEach((a, i) => {
         const key = i === 0 ? r.key : `${r.key}:${a.n || i}`;
         const stepTxt = a.step ? `Step ${a.n ? a.n + ": " : ""}${a.step}` : "";
@@ -7209,7 +6946,7 @@ function _sgAgo(sec) {
   return `${Math.floor(sec / 3600)}h ${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-const SG_KIND = { research: "Research", chat: "Chat", corpus: "Corpus scan" };
+const SG_KIND = { research: "Research", literature: "Literature", chat: "Chat", corpus: "Corpus scan" };
 const SG_OUTCOME = { finished: "Finished", stopped: "Stopped", cancelled: "Cancelled", failed: "Failed", ended: "Ended" };
 
 // One card in "Running now". ``now`` is the server's clock (seconds), so elapsed times are the
@@ -7417,23 +7154,28 @@ async function onDatasetsClick(e) {
     return;
   }
   const d = e.target.closest("[data-del]");
-  if (d) {
-    const fromServer = (d.dataset.kind || "").startsWith("server-");
-    const ask = fromServer
-      ? `Remove "${d.dataset.name}" from your datasets?\n\nThe data on the server is not touched. Your HPC3 copy of it is deleted (a later run copies it again).`
-      : d.dataset.location === "hpc3"
-      ? `Delete dataset "${d.dataset.name}" from your HPC3 storage?\n\nThis removes its files there and its history. This cannot be undone.`
-      : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes its files on the server (and this session's HPC3 copy) and its history. This cannot be undone.`;
-    if (!confirm(ask)) return;
-    try {
-      const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
-      const j = await res.json();
-      if (!res.ok) { toast(j.error || "Delete failed"); return; }
-      if (d.dataset.path) unbindEverywhere(d.dataset.path);
-      toast("Dataset deleted.");
-      loadDatasets();
-    } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
-  }
+  if (d && await deleteDatasetRow(d)) loadDatasets();
+}
+
+// Delete the dataset a button names (data-del, -name, -kind, -location, -path), after asking; true
+// when it is gone. Files → Datasets and My account → Storage both use it.
+async function deleteDatasetRow(d) {
+  const fromServer = (d.dataset.kind || "").startsWith("server-");
+  const ask = fromServer
+    ? `Remove "${d.dataset.name}" from your datasets?\n\nThe data on the server is not touched. Your HPC3 copy of it is deleted (a later run copies it again).`
+    : d.dataset.location === "hpc3"
+    ? `Delete dataset "${d.dataset.name}" from your HPC3 storage?\n\nThis removes its files there and its history. This cannot be undone.`
+    : `Delete dataset "${d.dataset.name}" from the server?\n\nThis removes its files on the server (and this session's HPC3 copy) and its history. This cannot be undone.`;
+  if (!confirm(ask)) return false;
+  try {
+    const res = await fetch("/api/datasets/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: Number(d.dataset.del) }) });
+    const j = await res.json();
+    if (!res.ok) { toast(j.error || "Delete failed"); return false; }
+    if (d.dataset.path) unbindEverywhere(d.dataset.path);
+    toast("Dataset deleted.");
+    return true;
+  } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Delete failed: " + err.message); }
+  return false;
 }
 
 // ---- Dataset metadata (Croissant; RCHENLAB/AiScientist issue 9) ----
@@ -7863,11 +7605,12 @@ async function deleteRun(b) {
     if (!res.ok) { toast(j.error || "Delete failed"); b.disabled = false; return; }
     toast("Run deleted.");
     resultHandoffs = null;
-    loadRuns();
+    return true;
   } catch (err) {
     toast(isUnreachable(err) ? "Can't reach the server." : "Delete failed: " + err.message);
     b.disabled = false;
   }
+  return false;
 }
 
 // What a run hands on besides its bundle, neither of them in the zip: the processed dataset (an
@@ -7955,7 +7698,7 @@ function onRunsClick(e) {
   const u = e.target.closest("[data-run-usage]");
   if (u) { toggleRunUsage(u); return; }
   const d = e.target.closest("[data-run-del]");
-  if (d) { deleteRun(d); return; }
+  if (d) { deleteRun(d).then((gone) => { if (gone) loadRuns(); }); return; }
   onOutputsClick(e);
 }
 
@@ -8146,7 +7889,8 @@ function accountInfoHtml(user) {
     (bits.length ? `<div class="muted">${bits.join(" · ")}</div>` : "") + `</div>`;
 }
 
-function switchAccountTab(tab) {
+function switchAccountTab(tab, { load = true } = {}) {
+  state.accountTab = tab;
   document.querySelectorAll(".account-tab").forEach((b) => {
     const on = b.dataset.accountTab === tab;
     b.classList.toggle("active", on);
@@ -8154,11 +7898,13 @@ function switchAccountTab(tab) {
     b.tabIndex = on ? 0 : -1;
   });
   document.querySelectorAll(".account-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "accountPane-" + tab));
+  if (load && tab === "storage" && storageShown()) loadStorageTab();
 }
 
-// The chat counter, the budget notice and the key dialog all lead here, to the usage tab.
+// The chat counter, the budget notice and the key dialog lead here, to the usage tab; the session
+// chip, to the storage tab. switchView reads the tab that is open.
 function openAccount(tab = "usage") {
-  switchAccountTab(tab);
+  switchAccountTab(tab, { load: false });
   switchView("account");
 }
 
@@ -8722,16 +8468,14 @@ function init() {
   $("reattachDismiss").addEventListener("click", () => $("reattachHint").classList.add("hidden"));
   $("disconnectBtn").addEventListener("click", disconnect);
   $("stopGpuBtn").addEventListener("click", stopGpu);
-  $("storageBtn").addEventListener("click", openStorage);
-  $("storageClose").addEventListener("click", () => $("storageModal").classList.add("hidden"));
-  $("sessChip").addEventListener("click", openStorage);
+  $("sessChip").addEventListener("click", openStorageSessions);
+  $("storageRefresh").addEventListener("click", loadStorageTab);
+  $("storeServerBody").addEventListener("click", onServerStorageClick);
   $("originalsBox").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-orig]");
     if (b) originalsAction(b.dataset.orig, b.dataset.plan);
   });
-  $("storageModal").addEventListener("click", (e) => { if (e.target.id === "storageModal") $("storageModal").classList.add("hidden"); });
-  $("storageItems").addEventListener("click", (e) => { const b = e.target.closest("[data-path]"); if (b) deleteStorageItem(b.dataset.path); });
-  $("modelSelect").addEventListener("change", (e) => selectModel(e.target.value));
+  $("storeHpcBody").addEventListener("click", (e) => { const b = e.target.closest("button[data-path]"); if (b) deleteStorageItem(b.dataset.path); });
 
   // --- LLM endpoint + API-key manager ---
   // "＋ Add your own API key…" is a menu ITEM, not an endpoint: it opens the manager and snaps the
@@ -8789,10 +8533,6 @@ function init() {
   $("egressCancel").addEventListener("click", () => closeEgressDialog(false));
   $("egressClose").addEventListener("click", () => closeEgressDialog(false));
   $("egressModal").addEventListener("click", (e) => { if (e.target.id === "egressModal") closeEgressDialog(false); });
-  $("pullModelBtn").addEventListener("click", () => {
-    const tag = prompt("Pull a model tag from Ollama (e.g. qwen3:32b, llama3.1:8b):");
-    if (tag && tag.trim()) selectModel(tag.trim());
-  });
   $("duoPushBtn").addEventListener("click", () => submitDuo("1"));
   $("duoSubmitBtn").addEventListener("click", () => submitDuo($("duoInput").value.trim() || "1"));
   $("duoInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitDuo($("duoInput").value.trim() || "1"); } });
@@ -8815,36 +8555,15 @@ function init() {
     const x = e.target.closest("[data-clear-path]");
     if (x) toggleBound(x.dataset.clearPath);
   });
-  $("caseNoteChips").addEventListener("click", (e) => { if (e.target.closest("[data-clear-note]")) { state.caseNote = null; renderCaseNoteChip(); } });   // this chat's note only
-  $("caseNoteFile").addEventListener("change", (e) => { const f = e.target.files[0]; if (f) attachCaseNote(f); e.target.value = ""; });
-  // "＋ Data" popover: upload a file/folder, or pick a recent upload.
+  // "＋ Data": Files or Folder, each straight to its dialog; or drop files and folders onto the chat.
   $("dataMenuBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleDataMenu(); });
   $("dataMenu").addEventListener("click", (e) => {
     const act = e.target.closest("[data-act]");
-    if (act && act.dataset.act === "server") {
-      $("serverPathRow").classList.remove("hidden");
-      $("serverPathInput").focus();
-      return;
-    }
-    if (act && act.dataset.act === "search") { setDataSearch(""); return; }
-    if (act) {
-      const target = { file: "datasetFile", folder: "datasetDir", note: "caseNoteFile" }[act.dataset.act];
-      if (target) $(target).click();
-      toggleDataMenu(false);
-      return;
-    }
-    const rec = e.target.closest("[data-path]");
-    // Toggle the file in/out of the bind-set; keep the popover OPEN so several can be picked at once.
-    if (rec) { toggleBound(rec.dataset.path); }
+    const target = act && { file: "datasetFile", folder: "datasetDir" }[act.dataset.act];
+    if (target) $(target).click();
+    if (act) toggleDataMenu(false);
   });
-  // "Search in all uploaded datasets": the list narrows as the user types; Escape or × goes back.
-  $("dataMenuSearch").addEventListener("input", (e) => setDataSearch(e.target.value));
-  $("dataMenuSearch").addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setDataSearch(null); }
-  });
-  $("dataMenuSearchClose").addEventListener("click", () => setDataSearch(null));
-  // The path as dispatched, not e.target.closest: a click on a list item re-renders the list, so by
-  // now the clicked item is detached and closest() would take it for a click outside the popover.
+  wireDataDrop();
   document.addEventListener("click", (e) => {
     if (!e.composedPath().some((n) => n.classList && n.classList.contains("data-menu-wrap"))) toggleDataMenu(false);
   });
@@ -8870,22 +8589,12 @@ function init() {
     if (c) { c.draft = $("chatInput").value; saveComposer(c); }
     updateComposerButton();
   });
-  for (const id of ["planMode", "autonomousMode", "saveResults"]) $(id).addEventListener("change", onRunOptionChange);
   $("serverPathOffer").addEventListener("click", (e) => {
     const b = e.target.closest("[data-spo-bind]");
     if (b) { bindServerPath(b.dataset.spoBind); return; }
     const x = e.target.closest("[data-spo-dismiss]");
     if (x) { state.serverOfferDismissed.add(x.dataset.spoDismiss); renderServerPathOffer(); }
   });
-  const bindTyped = async () => {
-    const inp = $("serverPathInput");
-    if (await bindServerPath(inp.value)) { inp.value = ""; $("serverPathRow").classList.add("hidden"); toggleDataMenu(false); }
-  };
-  $("serverPathBind").addEventListener("click", bindTyped);
-  $("serverPathInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); bindTyped(); } });
-  wireMethods();
-  $("modeSelect").addEventListener("change", onModeChange);
-  { const rs = $("routeSelect"); if (rs) rs.addEventListener("change", onRouteChange); }
   $("newSessionBtn").addEventListener("click", newSession);
   $("sessionList").addEventListener("click", (e) => {
     const del = e.target.closest("[data-del]");
@@ -8901,8 +8610,6 @@ function init() {
 
   syncAuthMethod();
   applyUiPrefs();
-  loadPresets();
-  loadSkills();
   loadSessions();
   renderSessionList();
   renderChat();

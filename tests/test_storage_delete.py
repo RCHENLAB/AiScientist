@@ -1,4 +1,4 @@
-"""The storage panel's Delete runs as a Slurm job on HPC3, never as ``rm`` on a login node.
+"""The Storage tab's Delete runs as a Slurm job on HPC3, never as ``rm`` on a login node.
 
 The panel lists the user's own HPC3 folders (``Temp/<user>``, ``uploads/<user>``, the personal lab
 folder) and deletes an entry on a click. This file pins down:
@@ -274,7 +274,7 @@ class _Hpc:
             out = f"Submitted batch job {self.next_job}"
         elif command.startswith("sacct"):
             out = "".join(f"{j}|{s}\n" for j, s in self.states.items())
-        elif command.startswith("du -sh "):
+        elif command.startswith("du -sk "):
             out = next((v for k, v in self.du.items() if k in command), "")
         return ExecResult(command=command, exit_status=0, stdout=out, stderr="")
 
@@ -337,7 +337,7 @@ def test_delete_queues_a_job_and_settles_it(flow):
     assert status == 409 and hpc.commands[n:] == []
 
     # The listing says it is being deleted.
-    hpc.du = {f"{UPLOADS}/*": f"1.2G\t{target}\n"}
+    hpc.du = {f"{UPLOADS}/*": f"1258291\t1792538330\t{target}\n"}
     listing = gw._list_storage(conn)
     assert next(i for i in listing["items"] if i["path"] == target)["deleting"] == "901"
 

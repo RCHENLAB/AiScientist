@@ -172,6 +172,22 @@ def test_a_job_that_never_starts_is_cancelled_once_and_the_error_names_the_queue
     assert fake.cancels == fake.submits                 # and not left behind in the queue
 
 
+def test_a_queue_timeout_says_so_and_names_slurms_reason(monkeypatch):
+    """A job that only waited in the queue raises SlurmQueueTimeout (still a SlurmJobError), with
+    Slurm's reason, so a caller can submit it again; the console hears one pending line a window,
+    not one a poll."""
+    from aiscientist.gateway.slurm_job import SlurmQueueTimeout
+    _virtual_clock(monkeypatch)
+    fake = FakeSlurm(plans=[["PD"]])                    # never starts
+    cfg = AcquireConfig(startup_timeout_s=30, max_attempts=2, poll_interval_s=10)
+    lines: list[str] = []
+    with pytest.raises(SlurmQueueTimeout) as exc:
+        acquire_allocation(fake, _spec(), config=cfg, emit=lambda lvl, stage, msg: lines.append(msg))
+    assert exc.value.reason == "Priority" and exc.value.job_id == fake.submits[0]
+    assert exc.value.waited_s == 60
+    assert sum("pending in the queue" in m for m in lines) == 2     # one per window
+
+
 def test_a_held_job_is_replaced_by_a_new_submission():
     # A hold is on the job itself: waiting never starts it, and a new submission does not carry it.
     fake = FakeSlurm(plans=[["PD"], ["R:node-3"]], pending=[("launch failed requeued held", "N/A")])

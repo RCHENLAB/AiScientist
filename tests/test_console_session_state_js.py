@@ -14,19 +14,21 @@ def _run(harness: str) -> None:
     if not node:
         pytest.skip("node is not installed")
     source = APP.read_text(encoding="utf-8")
-    block = source[source.index("// ---- the compute session on HPC3"):source.index("async function openStorage()")]
+    block = source[source.index("// ---- the compute session on HPC3"):source.index("// ---- My account → Storage")]
     size = source[source.index("function fmtSize(n)"):source.index("// Human label + sort order")]
     prelude = r'''
 const assert = require("assert");
 const els = {};
 const el = (id) => els[id] || (els[id] = { id, innerHTML: "", textContent: "", title: "", className: "",
-  _hidden: id === "storageModal", dataset: {},
+  _hidden: false, dataset: {},
   classList: { add(c) { if (c === "hidden") this._o._hidden = true; },
                remove(c) { if (c === "hidden") this._o._hidden = false; },
                toggle(c, on) { if (c === "hidden") this._o._hidden = !!on; },
                contains(c) { return c === "hidden" && this._o._hidden; } } });
 const $ = (id) => { const e = el(id); e.classList._o = e; return e; };
 const state = { connectionId: "c1" };
+let shown = false;                      // My account → Storage on screen
+const storageShown = () => shown;
 const escapeHtml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const relTime = () => "just now";
 const toast = (m) => { toasts.push(m); }, toasts = [];
@@ -84,7 +86,7 @@ assert.strictEqual(transferText({ label: "x", status: "cancelled" }), "x: stoppe
 
 def test_the_sessions_list_puts_the_live_one_first():
     _run(r'''
-$("storageModal")._hidden = false;
+shown = true;
 renderComputeSessions([{ id: "old", state: "closed", closed_at: "x", hpc_user: "u", cleanup: { status: "nothing" }, unresolved: [] }]);
 renderSessionState({ id: "new", connection_id: "c1", state: "running", hpc_user: "u", opened_at: "y", transfers: [], active: [], unresolved: [] });
 const html = $("computeSessionList").innerHTML;

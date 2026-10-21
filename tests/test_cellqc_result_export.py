@@ -291,9 +291,10 @@ def test_a_save_that_cannot_happen_is_a_warning_and_the_run_goes_on(tmp_path, gw
     (level, msg), = said
     assert level == "warning" and "Connect to HPC3" in msg and "still can" in msg
     said.clear()
+    # Without an account there is no "my data": every run would say so, so nothing is said.
     asyncio.run(gw._autosave_results(_run_conn(tmp_path, user_id=None), "run7",
                                      lambda level, stage, msg: said.append((level, msg))))
-    assert said[0][0] == "info" and "needs an account" in said[0][1]
+    assert said == []
 
 
 def test_cellqcs_directory_is_a_bundle_folder_not_a_stray(tmp_path, gw):

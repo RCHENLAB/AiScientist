@@ -488,6 +488,11 @@ class SSHExecutor:
             client = self._client
         return client.open_sftp()
 
+    def open_sftp(self) -> "paramiko.SFTPClient":
+        """An SFTP channel on the transfer host that the caller keeps open and closes: for a loop
+        of many small reads and writes (``gateway/llm_relay.py``, the model calls of a job)."""
+        return self._open_sftp()
+
     def put_file(self, local_path: str, remote_path: str) -> None:
         """Upload ``local_path`` to ``remote_path`` via SFTP, mkdir-ing the remote parent
         first (SFTP does not auto-create dirs). Used to stage a dataset onto shared DFS for

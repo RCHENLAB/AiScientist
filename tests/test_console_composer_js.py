@@ -2,9 +2,10 @@
 
 A tester started a folder upload in one chat, made a new chat, and the new chat showed the other
 chat's "Uploading Sample1_WT/ … Cancel upload". Every chat must keep its own upload line, draft,
-attached data and run options ("Plan first", "Bypass", "Save results to my data", mode, engine), a
-switch of chats must not stop an upload, and after a reload every chat shows its own state and no
-other's. This runs those parts of ``frontend/console/app.js`` with the page's globals stubbed, like
+attached data and engine, a switch of chats must not stop an upload, and after a reload every chat
+shows its own state and no other's. The run options are no longer the chat's: every request runs
+with the same ones (issue 21), and what an older page stored of them is dropped. This runs those
+parts of ``frontend/console/app.js`` with the page's globals stubbed, like
 ``test_console_chat_state_js.py``. Skipped where node is not installed.
 """
 
@@ -56,61 +57,55 @@ const localStorage = { getItem: (k) => (k in store ? store[k] : null), setItem: 
 """
 
 # --------------------------------------------------------------------------------------------------
-# The composer: draft, attached data and run options are the chat's own, and survive a reload.
+# The composer: draft and attached data are the chat's own, and survive a reload.
 
 COMPOSER = ELEMENTS + r"""
 const vm = require("vm");
 const src = require("fs").readFileSync(0, "utf8");
+// What an older page stored for chat C: its run options and its engine, beside a draft.
+store.composer = JSON.stringify({ C: { draft: "old words", planFirst: false, bypass: true, saveResults: true, mode: "team", route: "chat" } });
 const sandbox = { localStorage, JSON, String, Array, Object, Set,
   state: { activeId: "A", connectionId: "conn-1",
            sessions: [{ id: "A", title: "Retina" }, { id: "B", title: "" }, { id: "C", title: "" }, { id: "D", title: "" }] },
   RUNOWNER_KEY: "owners", STREAMS_KEY: "streams", COMPOSER_KEY: "composer", UI_KEY: "ui",
-  $: el, syncDatasetSelection() {}, renderUploadLine() {}, renderCaseNoteChip() {}, renderContextMeter() {},
+  $: el, syncDatasetSelection() {}, renderUploadLine() {}, renderContextMeter() {},
   hideContextMeter() {}, updateComposerButton() {} };
 const api = vm.runInNewContext(src + `
-;({ chats, chatOf, saveComposer, restoreChatModes, pruneComposers, forgetComposer, startComposer,
-    chatSavesResults, syncRunOptions, onRunOptionChange, leaveDialog, showDialog })`, sandbox);
+;({ chats, chatOf, saveComposer, pruneComposers, forgetComposer, leaveDialog, showDialog,
+    FIXED_RUN_OPTIONS })`, sandbox);
 const S = sandbox.state;
-const screen = () => ({ text: el("chatInput").value, planFirst: el("planMode").checked,
-                        bypass: el("autonomousMode").checked, save: el("saveResults").checked });
-const tick = (id, on) => { el(id).checked = on; api.onRunOptionChange(); };
 const out = {};
-// Chat A: a question half typed, a file attached as reference data, every option changed.
+out.fixed = api.FIXED_RUN_OPTIONS;
+// Chat A: a question half typed, a file attached as reference data.
 api.showDialog();
 el("chatInput").value = "Compare rods and cones";
 S.boundPaths.push("/data/retina.h5ad", "/data/atlas.h5ad");
 S.boundRoles["/data/atlas.h5ad"] = "reference";
 S.boundRoles["/data/gone.h5ad"] = "reference";            // a role left from a file no longer attached
 api.saveComposer(api.chatOf("A"));
-tick("planMode", false); tick("autonomousMode", true); tick("saveResults", true);
-out.onA = screen();
+out.onA = { text: el("chatInput").value };
 // "+" under CHATS: the new chat starts clean.
 api.leaveDialog(); S.activeId = "B"; api.showDialog();
-out.onB = { ...screen(), bound: [...S.boundPaths] };
+out.onB = { text: el("chatInput").value, bound: [...S.boundPaths] };
 el("chatInput").value = "Only B's words";
 api.leaveDialog(); S.activeId = "A"; api.showDialog();
-out.backOnA = { ...screen(), bound: [...S.boundPaths] };
-// "Save results" is a standing choice for a NEW chat; from then on each chat keeps its own.
-store.ui = JSON.stringify({ saveResults: true });
-api.startComposer(api.chatOf("C"));
-store.ui = JSON.stringify({ saveResults: false });
-out.saves = { C: api.chatSavesResults(api.chatOf("C")), D: api.chatSavesResults(api.chatOf("D")) };
-// Mode and engine are kept on the session; a corpus scan is one action, so its chat comes back on
-// the engine it was using.
-S.sessions[0].mode = "team"; S.sessions[0].route = "corpus"; S.sessions[0].routeBeforeCorpus = "chat";
+out.backOnA = { text: el("chatInput").value, bound: [...S.boundPaths] };
+// Chat C, from the older page: its draft comes back, its run options do not, and its next save drops them.
+api.leaveDialog(); S.activeId = "C"; api.showDialog();
+out.onC = { text: el("chatInput").value, keys: Object.keys(api.chatOf("C")).filter((k) => ["planFirst", "bypass", "saveResults"].includes(k)) };
+api.leaveDialog(); S.activeId = "A"; api.showDialog();
+// A session that still carries an engine from an older page: the composer stores none.
+S.sessions[0].mode = "team"; S.sessions[0].route = "chat";
 api.saveComposer(api.chatOf("A"));
 api.leaveDialog();
 out.stored = JSON.parse(store.composer);
 // A reload: the page's memory is gone, the browser's storage is not.
 api.chats.clear();
-const sessions = [{ id: "A" }, { id: "B" }, { id: "C" }, { id: "Z" }];
-store.composer = JSON.stringify({ ...JSON.parse(store.composer), Z: { route: "corpus", mode: "nonsense", draft: "z" } });
-api.restoreChatModes(sessions);
-out.modes = sessions.map((s) => [s.id, s.mode || null, s.route || null]);
+store.composer = JSON.stringify({ ...JSON.parse(store.composer), Z: { route: "corpus", mode: "team", draft: "z" } });
 S.activeId = "A"; api.showDialog();
-out.reloadA = { ...screen(), bound: [...S.boundPaths], roles: { ...S.boundRoles } };
+out.reloadA = { text: el("chatInput").value, bound: [...S.boundPaths], roles: { ...S.boundRoles } };
 S.activeId = "B"; api.showDialog();
-out.reloadB = { ...screen(), bound: [...S.boundPaths] };
+out.reloadB = { text: el("chatInput").value, bound: [...S.boundPaths] };
 // A chat with nothing of its own keeps no entry; deleted chats and other accounts' chats go.
 api.chatOf("B").draft = ""; api.saveComposer(api.chatOf("B"));
 api.pruneComposers([{ id: "A" }, { id: "B" }, { id: "C" }]);
@@ -124,44 +119,44 @@ console.log(JSON.stringify(out));
 @pytest.fixture(scope="module")
 def composer():
     source = APP_JS.read_text(encoding="utf-8")
-    code = source[source.index("const chats = new Map();"):source.index("function toast(")]
-    code += "".join(_function(source, name) for name in (
-        "savedResultsDefault", "chatSavesResults", "startComposer", "syncRunOptions", "onRunOptionChange",
-        "leaveDialog", "showDialog"))
+    start = source.index("const FIXED_RUN_OPTIONS")
+    code = source[start:source.index(");\n", start) + 3]
+    code += source[source.index("const chats = new Map();"):source.index("function toast(")]
+    code += "".join(_function(source, name) for name in ("leaveDialog", "showDialog"))
     return _run(COMPOSER, code)
 
 
-def test_a_new_chat_starts_with_an_empty_composer_and_default_options(composer):
-    assert composer["onA"] == {"text": "Compare rods and cones", "planFirst": False, "bypass": True, "save": True}
-    assert composer["onB"] == {"text": "", "planFirst": True, "bypass": False, "save": False, "bound": []}
+def test_every_request_is_sent_with_the_same_run_options(composer):
+    """Plan review, no Bypass, Auto, nothing required by hand, results saved (issue 21)."""
+    assert composer["fixed"] == {"plan_mode": True, "autonomous": False, "mode": "auto", "save_results": True,
+                                 "presets": [], "skills": [], "preset_prompt": None, "route": "auto"}
 
 
-def test_going_back_to_a_chat_gives_back_its_own_text_data_and_options(composer):
-    assert composer["backOnA"] == {"text": "Compare rods and cones", "planFirst": False, "bypass": True,
-                                   "save": True, "bound": ["/data/retina.h5ad", "/data/atlas.h5ad"]}
+def test_a_new_chat_starts_with_an_empty_composer(composer):
+    assert composer["onA"] == {"text": "Compare rods and cones"}
+    assert composer["onB"] == {"text": "", "bound": []}
 
 
-def test_save_results_starts_as_the_users_choice_and_then_is_the_chats(composer):
-    assert composer["saves"] == {"C": True, "D": False}     # C took the choice when made; D never had one
+def test_going_back_to_a_chat_gives_back_its_own_text_and_data(composer):
+    assert composer["backOnA"] == {"text": "Compare rods and cones", "bound": ["/data/retina.h5ad", "/data/atlas.h5ad"]}
+
+
+def test_run_options_and_engine_an_older_page_stored_are_not_read_and_are_dropped(composer):
+    assert composer["onC"] == {"text": "old words", "keys": []}
+    assert composer["stored"]["C"] == {"draft": "old words"}
 
 
 def test_what_is_stored_is_only_what_differs_from_a_new_chat(composer):
     stored = composer["stored"]
     assert stored["A"] == {"draft": "Compare rods and cones", "bound": ["/data/retina.h5ad", "/data/atlas.h5ad"],
-                           "roles": {"/data/atlas.h5ad": "reference"}, "planFirst": False, "bypass": True,
-                           "saveResults": True, "mode": "team", "route": "chat"}
+                           "roles": {"/data/atlas.h5ad": "reference"}}
     assert stored["B"] == {"draft": "Only B's words"}
-    assert stored["C"] == {"saveResults": True}
 
 
 def test_after_a_reload_every_chat_shows_its_own_state_and_no_others(composer):
-    assert composer["reloadA"] == {"text": "Compare rods and cones", "planFirst": False, "bypass": True, "save": True,
-                                   "bound": ["/data/retina.h5ad", "/data/atlas.h5ad"],
+    assert composer["reloadA"] == {"text": "Compare rods and cones", "bound": ["/data/retina.h5ad", "/data/atlas.h5ad"],
                                    "roles": {"/data/atlas.h5ad": "reference"}}
-    assert composer["reloadB"] == {"text": "Only B's words", "planFirst": True, "bypass": False, "save": False,
-                                   "bound": []}
-    # mode and engine come back on the session; a stored corpus scan or an unknown value does not
-    assert composer["modes"] == [["A", "team", "chat"], ["B", None, None], ["C", None, None], ["Z", None, None]]
+    assert composer["reloadB"] == {"text": "Only B's words", "bound": []}
 
 
 def test_entries_of_chats_that_are_gone_are_dropped(composer):

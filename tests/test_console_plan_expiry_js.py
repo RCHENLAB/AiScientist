@@ -134,7 +134,7 @@ const sandbox = {
   $: (id) => els[id] || (els[id] = makeEl("div")),
   escapeHtml, renderMarkdown: (s) => "<p>" + escapeHtml(s) + "</p>", absTime: () => "", relTime: () => "1m ago",
   toast: (t) => log.push("toast:" + t), updateComposerButton() {}, mountStream() {}, repaintWorking() {},
-  refreshDownloads() {}, syncPresetUI() {}, messageEl: () => makeEl("div"),
+  refreshDownloads() {}, syncPlaceholder() {}, messageEl: () => makeEl("div"),
   renderChatUsage() {}, refreshChatUsage() {}, checkBudgetNotices() {}, onUsageUpdate() {},   // usage counter: not under test here
   setPanel() {},   // the side panel opening for a plan; its tab and contents are drawn into $() elements
   getComputedStyle: () => ({ lineHeight: "" }),   // no layout here: every step keeps its chevron

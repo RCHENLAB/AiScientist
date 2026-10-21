@@ -17,9 +17,9 @@ informal it is ("夜盲、视野缩窄、ERG 熄灭型", "Stargardt", "RP with m
 
 **Where the description comes from — either is fine, you do not have to care which:**
 * the **research question** itself (the clinician pasted the note into the chat), or
-* an **attached case note** (the console's "Attach a case note" slot). It is a separate slot from the
-  dataset — the VCF keeps the dataset slot — and `map_phenotype_to_hpo` reads the attached note
-  automatically when you call it with no `text`.
+* an **attached case note** (sent with the request as a separate slot from the dataset — the VCF
+  keeps the dataset slot). `map_phenotype_to_hpo` reads the attached note automatically when you
+  call it with no `text`.
 
 So: if the question carries the description, pass it as `text` VERBATIM. If it does not, call
 `map_phenotype_to_hpo` with NO arguments — it will map the attached note. If neither exists, the tool

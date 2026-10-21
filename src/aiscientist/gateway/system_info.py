@@ -191,12 +191,14 @@ _NO_MANIFEST_PLACE = {"run_code": "sandbox", "run_in_environment": "sandbox"}
 
 # The model roles, as the Model node lists them (the ``role=`` of each model call).
 MODEL_ROLES: dict[str, str] = {
-    "classify": "routes a follow-up and reads a request's scope",
+    "classify": "routes a request (literature or analysis) and a follow-up, reads a request's scope, writes "
+                "literature queries",
     "plan": "drafts and revises the plan",
     "critic": "reviews the plan, then accepts or sends back each step",
     "scientist": "chooses each step's next tool call",
     "audit": "checks the claims one at a time",
     "writer": "writes the report from the accepted steps",
+    "literature": "answers a general question from the PubMed abstracts found",
     "chat": "answers on the Chat route",
 }
 
@@ -260,9 +262,8 @@ def workflow_graph() -> dict[str, Any]:
         chain = [st.id for st in run_monitor.STAGES if kind in st.kinds]
         for a, b in zip(chain, chain[1:]):
             edge(a, b, "", "flow")
-    # The shortcuts a research run really takes: without Plan first the plan runs as drafted, and a
-    # run that only did quality control is answered in the chat with no audit or write-up.
-    edge("plan", "execute", "no review", "skip")
+    # The shortcut a research run really takes: a run that only did quality control is answered in
+    # the chat with no audit or write-up. Every plan is reviewed (issue 21), so none skips "approve".
     edge("execute", "report", "QC only", "skip")
 
     node("scientist", "Scientist", "agent", where="agents/research_harness.py",

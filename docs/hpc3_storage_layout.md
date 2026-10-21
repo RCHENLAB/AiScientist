@@ -1,7 +1,7 @@
 # HPC3 storage layout and cleanup
 
 Where AiScientist keeps its files on HPC3, and what removes them: a sweep of `Temp/` after 3 days,
-a cleanup when a session disconnects, and, on the user's word, the storage panel's Delete and the
+a cleanup when a session disconnects, and, on the user's word, a Delete in the console's Storage tab and the
 removal of originals whose data is now kept on the server. The inventory of the shared assets (containers, model weights) is in
 [`hpc3_assets.md`](hpc3_assets.md).
 
@@ -38,7 +38,7 @@ With a data root on the server, users' datasets are kept there too
     ├── session_clean.sh                   the session cleanup (at each connect)
     ├── remove_originals.sh                the removal of originals (when one is checked)
     ├── originals/<plan>.{check,remove}.{tsv,log}   what each check and removal was given and said
-    ├── storage_delete.sh                  the storage panel's Delete (at the session's first one)
+    ├── storage_delete.sh                  the Storage tab's Delete (at the session's first one)
     └── deletes/<id>.log                   what each deletion said
 ```
 
@@ -50,7 +50,7 @@ Never deleted automatically:
 * `uploads/`: raw uploaded data of a deployment without a data root (with
   `AISCIENTIST_UPLOADS_ON_HPC`, a file uploaded through the browser is moved here and removed from
   the server, so this is its only copy), and data uploaded before a data root was configured. It is
-  deleted by hand only, from the storage panel or the dataset list. With a data root nothing new is
+  deleted by hand only, from the Storage tab or the dataset list. With a data root nothing new is
   written here, and each dataset kept only here is copied to the server when its owner connects;
   the original stays until the user removes it (see *Originals of datasets kept on the server*).
 * `pysrc/`: bind-mounted read-only by running jobs for their whole lifetime.
@@ -217,19 +217,28 @@ console as it changes:
 While several apply, the first in the order staging-out, staging-in, running, failed is shown.
 Every copy is listed with its files and bytes as it goes, and with the reason when it fails; a
 failed copy to HPC3 fails its run but leaves the session usable. The top bar shows the state while
-data moves or something failed; the connection card and the storage panel show the details.
+data moves or something failed; the connection card and the Storage tab show the details.
 
-The storage panel also lists the account's last 20 sessions and how each ended, kept in
+The Storage tab (**My account → Storage**) also lists the account's last 20 sessions and how each
+ended, kept in
 `<AISCIENTIST_RESULTS_DIR>/<owner>/.sessions.json`. A session that ended without a disconnect is
 listed as ended, its files left to the sweep. A queued cleanup is settled at the user's next
 connect: one `sacct` gives its job's end state, and the last cleanup log (`CLEAN_JOB` and
 `CLEAN_RESULT` lines) how many folders it removed.
 
-## The storage panel's Delete
+## The Storage tab and its Delete
 
-The storage panel lists the user's own folders: `Temp/<ucinetid>/` (one level deeper, by run),
-`uploads/<ucinetid>/` and the personal lab folder `/dfs3b/ruic20_lab/<ucinetid>/`, each entry
-with its `du -sh` size. Its Delete button removes one entry, as a Slurm job of
+**My account → Storage** has two parts. *On the server* lists the account's datasets (with their
+recorded size) and each run's folder (measured on disk), largest first, with the same Delete as
+**Files** and **Runs**; it needs no HPC3 session (`GET /api/storage/server`). *On HPC3* lists, while
+connected, the user's own folders area by area: `Temp/<ucinetid>/` (one level deeper, by run),
+`uploads/<ucinetid>/` and the personal lab folder `/dfs3b/ruic20_lab/<ucinetid>/` (folded, since
+it holds the member's own files too), the last two only while they hold something. Each entry has
+its size and newest change from `du -sk --time`; a `Temp/` entry also shows the day the sweep may
+remove it (that change plus `AISCIENTIST_TEMP_TTL_DAYS`). Above them is the lab's group quota from
+`dfsquotas <ucinetid> dfs3b`, which RCIC reports for the whole group only.
+
+A Delete removes one HPC3 entry, as a Slurm job of
 `deploy/hpc3/aiscientist_storage_delete.sh` on the `standard` partition
 (`aiscientist-delete-<ucinetid>`, 1 CPU, 2 G, 2 hours), never a command on a login node:
 
@@ -237,9 +246,9 @@ with its `du -sh` size. Its Delete button removes one entry, as a Slurm job of
    three folders: never a folder itself, never another member's, no `..`), stages the script to
    `bin/<ucinetid>/storage_delete.sh` at the session's first deletion, submits the job through the
    compute backend and answers at once with its id. A path already being deleted is refused.
-2. The panel shows the entry as queued and asks `GET /api/storage/{connection_id}/deletes` every
+2. The tab shows the entry as queued and asks `GET /api/storage/{connection_id}/deletes` every
    8 seconds while it is open: one `sacct` for the session's queued deletions, and the log of each
-   that ended (`bin/<ucinetid>/deletes/<id>.log`). When one has ended, the panel reads the folders
+   that ended (`bin/<ucinetid>/deletes/<id>.log`). When one has ended, the tab reads the folders
    again; the console says whether the entry was deleted or why not.
 
 The script checks the path again and refuses to run outside a Slurm job. It skips a path outside
@@ -251,7 +260,7 @@ runs the script against a real directory tree. A mock session deletes at once.
 ## Originals of datasets kept on the server
 
 When a dataset that lived only on HPC3 is copied to the server, its HPC3 original stays, and the
-server copy's `source.json` names it ([`dataset_storage.md`](dataset_storage.md)). The storage panel
+server copy's `source.json` names it ([`dataset_storage.md`](dataset_storage.md)). The Storage tab
 removes such originals in two explicit steps, each a Slurm job of
 `deploy/hpc3/aiscientist_remove_originals.sh` on the `standard` partition
 (`aiscientist-originals-<ucinetid>`, 1 CPU, 2 G, 1 hour), never a command on a login node:
@@ -280,12 +289,12 @@ against a real directory tree.
 
 ## What still touches a login node
 
-The sweep, the session cleanup, the storage panel's Delete and the removal of originals run no
+The sweep, the session cleanup, the Storage tab's Delete and the removal of originals run no
 `find`, no `rm` and no bulk transfer on a login node: each is a Slurm job, and their scripts are
 staged through `access-hpc3.rcic.uci.edu`. What they still run on a login node: `mkdir`, `chmod`
 and `test -d` (a job cannot be submitted before its directories exist), the `sbatch` itself,
-`sacct` for a job's end state, and the reading of a job's log. The storage panel's listing runs
-`du -sh` there.
+`sacct` for a job's end state, and the reading of a job's log. The Storage tab's listing runs
+`du -sk` and `dfsquotas` there.
 
 Other removals still run on a login node over the SSH session:
 
@@ -302,7 +311,7 @@ Other removals still run on a login node over the SSH session:
 | `AISCIENTIST_HPC_SHARED_ROOT` | `/dfs3b/ruic20_lab/software/AiScientist` | the shared root |
 | `AISCIENTIST_TEMP_TTL_DAYS` | `3` | age after which an untouched `Temp/` unit is removed; `0` disables the sweep |
 | `AISCIENTIST_SESSION_CLEANUP` | `1` | remove a session's own `Temp/` files when it disconnects; `0` leaves them to the sweep |
-| `AISCIENTIST_REMOVE_PERSONAL_ORIGINALS` | off | let the storage panel also remove originals in the personal lab folder |
+| `AISCIENTIST_REMOVE_PERSONAL_ORIGINALS` | off | let the Storage tab also remove originals in the personal lab folder |
 
 ## Permissions of the shared root
 

@@ -64,7 +64,9 @@ _ARG_TO_ENV = {
 # deployment config (corpus paths + the served model's endpoint).
 LITERATURE_TOOLS = ("deep_literature", "extract_haploinsufficient_genes", "search_corpus")
 # Injected by the executor, never a tool parameter: stripped before a tool sees its args.
-_DEPLOY_KEYS = frozenset({"model", "llm_base_url", "tunnel_port", *_ARG_TO_ENV})
+# ``llm_relay_dir``: the corpus scan on the user's own API model, whose calls the gateway makes and
+# answers through files in that dir (the key never leaves the Eye Server).
+_DEPLOY_KEYS = frozenset({"model", "llm_base_url", "tunnel_port", "llm_relay_dir", *_ARG_TO_ENV})
 
 
 def run_tool(tool: str, workspace: str, args: dict[str, Any] | None) -> dict[str, Any]:
@@ -125,6 +127,7 @@ def run_tool(tool: str, workspace: str, args: dict[str, Any] | None) -> dict[str
         model=args.get("model"),
         llm_base_url=args.get("llm_base_url"),
         tunnel_port=args.get("tunnel_port"),
+        llm_relay_dir=args.get("llm_relay_dir"),
         workspace=workspace,
     )
     if tool == "extract_haploinsufficient_genes":

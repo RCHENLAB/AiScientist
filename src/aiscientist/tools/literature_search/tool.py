@@ -12,6 +12,7 @@ allowed). Degrades gracefully (returns ``status="error"``) when offline.
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 
@@ -38,6 +39,7 @@ _BRIEF_FUNCTION_WORDS = {"against", "known", "using", "within", "between", "acro
                          "through", "under", "above", "below", "while", "where", "which",
                          "their", "these", "those", "there", "other", "every", "about"}
 _QUERY_MAX_CHARS = 180
+_ABSTRACT_MAX_CHARS = 2000
 #throw a series of garbage words
 _QUERY_STOPWORDS = {
     "a", "about", "above", "after", "an", "analysis", "analyze", "and", "annotations", "any",
@@ -91,8 +93,9 @@ _GENERIC_CITATION_PATTERNS = (
 
 #data clean
 def _clean(text: str) -> str:
-    """Europe PMC embeds HTML (e.g. <i>GENE</i>) in titles — strip tags for clean output."""
-    return _HTML_TAG.sub("", text or "").strip()
+    """Europe PMC embeds HTML (e.g. <i>GENE</i>) in titles and abstracts, sometimes escaped
+    (``&lt;i&gt;``) — unescape it, then strip the tags, for clean output."""
+    return _HTML_TAG.sub("", html.unescape(html.unescape(text or ""))).strip()
 
 
 def _format_citation(r: dict[str, Any]) -> str:
@@ -237,19 +240,26 @@ def _clean_results(citations: list[dict[str, Any]], query: str, limit: int) -> l
     return useful[:limit]
 
 #clear query-> request Europe PMC -> parse->filter->return
-def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0) -> dict[str, Any]:
+def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0, *,
+                     abstracts: bool = False, pubmed_only: bool = False) -> dict[str, Any]:
     """Search Europe PMC and return real, structured citations. Never raises — returns
-    ``{status: "error", error}`` on any failure so the agent loop can adapt or skip."""
+    ``{status: "error", error}`` on any failure so the agent loop can adapt or skip.
+
+    ``abstracts`` adds each paper's abstract (``abstract``, plain text, at most
+    ``_ABSTRACT_MAX_CHARS``), for a caller that answers from the papers rather than only citing
+    them. ``pubmed_only`` keeps PubMed records (Europe PMC source ``MED``): no preprints, patents
+    or theses."""
     query = focus_literature_query(query)
     if not query:
         return {"status": "error", "error": "empty query"}
     limit = max(1, min(int(limit or 8), 25))
+    sent = f"({query}) AND SRC:MED" if pubmed_only else query
     try:
         import httpx
 
         resp = httpx.get(
             _EUROPEPMC,
-            params={"query": query, "format": "json", "pageSize": limit, "resultType": "core"},
+            params={"query": sent, "format": "json", "pageSize": limit, "resultType": "core"},
             timeout=timeout_s,
             headers={"User-Agent": "AiScientist/literature_search"},
         )
@@ -279,6 +289,8 @@ def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0) -> dic
             "url": url,
         }
         item["citation"] = _format_citation(item)
+        if abstracts:
+            item["abstract"] = " ".join(_clean(r.get("abstractText") or "").split())[:_ABSTRACT_MAX_CHARS]
         results.append(item)
     results = _clean_results(results, query, limit)
     return {

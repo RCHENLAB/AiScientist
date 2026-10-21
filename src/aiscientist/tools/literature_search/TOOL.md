@@ -16,6 +16,7 @@ Searches Europe PMC (free, no key) with keyword queries built from a run's findi
 ## When the agent uses it
 
 - Before writing interpretation or discussion, with queries built from accepted findings (genes, pathways, disease, cell type).
+- In a literature plan (a general question the router sends to the literature line): the model's queries are searched in PubMed and the answer is written from the abstracts.
 - On the fast chat path, to answer a question with references.
 
 ## Inputs
@@ -48,7 +49,7 @@ On the fast chat path: yes.
 
 ## Code and tests
 
-- `tool.py`: the query focusing (`focus_literature_query`, also used by the planner through `tools/api.py`), the API client and the record.
+- `tool.py`: the query focusing (`focus_literature_query`, also used by the planner through `tools/api.py`), the API client and the record. The literature answer (`agents/literature_answer.py`) calls the same client through `tools/api.py` (`search_literature`) with `abstracts=True` (each paper's abstract, plain text) and `pubmed_only=True` (PubMed records only: no preprints, patents or theses).
 - Tests: `tests/test_literature_search.py`.
 
 ## What the model is told

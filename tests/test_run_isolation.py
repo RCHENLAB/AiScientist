@@ -281,10 +281,11 @@ def test_latest_run_id_is_scoped_to_the_user(_auth_db):
     assert auth_routes.latest_run_id_for_conversation(uid, "conv-1") is None   # not this user's run
 
 
-def test_conversation_last_run_prefers_memory_then_falls_back_to_db(_auth_db):
+def test_conversation_last_run_prefers_memory_then_falls_back_to_db(_auth_db, tmp_path):
     uid = _auth_db
     _finished_run(uid, "db_run", "conv-1", "done")
-    conn = _conn(app_user_id=uid)
+    conn = _conn(tmp_path, app_user_id=uid)
+    _seed_bundle(conn, "db_run")
     # In-memory hit wins (fast path, current session) — no DB read needed.
     conn.last_run_by_conversation["conv-1"] = "mem_run"
     assert gw_app._conversation_last_run(conn, "conv-1") == "mem_run"
@@ -292,6 +293,24 @@ def test_conversation_last_run_prefers_memory_then_falls_back_to_db(_auth_db):
     conn.last_run_by_conversation.clear()
     assert gw_app._conversation_last_run(conn, "conv-1") == "db_run"
     assert conn.last_run_by_conversation["conv-1"] == "db_run"
+
+
+def test_the_last_run_after_a_restart_is_the_last_study_not_a_later_literature_answer(_auth_db, tmp_path):
+    # A literature answer (issue 21) is a finished run with a summary but no run state: a follow-up
+    # cannot continue it, so the chat's last analysis must still be found behind it.
+    uid = _auth_db
+    conn = _conn(tmp_path, app_user_id=uid)
+    _finished_run(uid, "study", "conv-1", "done")
+    _seed_bundle(conn, "study")
+    _finished_run(uid, "literature", "conv-1", "done")
+    (conn.workspace / "literature" / "artifacts" / "report").mkdir(parents=True)
+    (conn.workspace / "literature" / "artifacts" / "report" / "summary.md").write_text("# Literature search\n")
+    from aiscientist.gateway import auth_routes
+    assert auth_routes.latest_run_id_for_conversation(uid, "conv-1") == "literature"     # unfiltered
+    assert gw_app._conversation_last_run(conn, "conv-1") == "study"
+    t = gw_app._followup_target(
+        conn, gw_app.LabRequest(connection_id=conn.id, question="now annotate them", conversation_id="conv-1"))
+    assert t is not None and t[0] == "study"
 
 
 def test_typed_followup_survives_restart_via_db(_auth_db, tmp_path):

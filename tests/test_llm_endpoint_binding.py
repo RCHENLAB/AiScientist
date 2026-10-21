@@ -223,7 +223,7 @@ def test_status_summary_reports_a_deleted_credential_rather_than_pretending(stor
 def test_status_summary_for_the_cluster_default(store):
     summary = gw_app.Connection._llm_endpoint_summary(_Conn())
     assert summary == {"kind": "cluster", "cluster_model_id": "", "label": "vLLM (UCI GPU node)",
-                       "model": None, "remote": False}
+                       "cluster_label": "", "model": None, "remote": False}
 
 
 # --- egress: consent is the control, the scanner is the backstop -------------

@@ -73,7 +73,7 @@ const sandbox = {
   $: el, escapeHtml: __ESCAPE__, planIcon: () => "", absTime: () => "", relTime: () => "1m ago",
   toast: (t) => log.push("toast:" + t),
   updateComposerButton: () => log.push("composer"),
-  refreshDownloads() {}, syncPresetUI() {}, repaintWorking() {},
+  refreshDownloads() {}, syncPlaceholder() {}, repaintWorking() {},
   renderChatUsage() {}, refreshChatUsage() {}, checkBudgetNotices() {}, onUsageUpdate() {},   // usage counter: not under test here
   mountStream: () => log.push("mount"),
   messageEl: (m) => ({ m }),
@@ -225,7 +225,7 @@ def test_nothing_is_drawn_again_once_the_prompt_is_answered_or_the_run_is_over()
     run_over = out["runOver"]
     assert {k: run_over[k] for k in gone} == gone
     assert run_over["draft"] == "" and run_over["stored"] is False
-    assert run_over["placeholder"].startswith("Ask AiScientist to plan"), "the composer is no longer the plan's reply box"
+    assert run_over["placeholder"].startswith("Ask a question, or describe"), "the composer is no longer the plan's reply box"
 
 
 def test_an_unapplied_edit_and_the_open_editor_survive_a_redraw_of_the_same_plan():

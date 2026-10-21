@@ -31,11 +31,9 @@ so the answer is supported by genotype **and** phenotype rather than by either o
 
 **You need two things: a VCF, and the patient's description in words.** Nothing has to be in HPO format.
 
-1. **Attach the VCF** — the console's dataset slot (`.vcf` / `.vcf.gz`).
-2. **Give the clinical description** — either way works, you do not have to choose:
-   * paste it straight into the chat question, **or**
-   * attach it with **"Attach a case note"** (a *separate* slot — the VCF keeps the dataset slot).
-3. **Ask for the diagnosis**, e.g. `complete the research with the VCF file and case note`.
+1. **Attach the VCF** with **+ Data** (`.vcf` / `.vcf.gz`).
+2. **Give the clinical description** in the chat message, as it is written.
+3. **Ask for the diagnosis**, e.g. `find the diagnosis from the VCF and this case: <the description>`.
 
 The note can be as informal as the clinician's own writing, in any language:
 

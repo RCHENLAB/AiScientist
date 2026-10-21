@@ -84,8 +84,16 @@ sequenceDiagram
     Gateway-->>Browser: report and bundle
 ```
 
-The fast chat path (`agents/quick_chat.py`) splits off before the plan: the same LLM, only the
-`chat: true` tools, a streamed answer and no run directory. Anti-fabrication layers: the Critic's
+Before the run, the session's model routes the request (`agents/request_router.py`): anything that
+needs data or computation goes to the lab as above; a general question that published papers answer
+gets a one-step literature plan instead (`agents/literature_answer.py`). Once approved, that step
+searches PubMed through Europe PMC in the gateway, has the model answer from the abstracts, and
+writes the reference list by code from the papers the answer cites; the answer is kept with the run.
+A note on either plan is routed again, so "analyse my data instead" turns a literature plan into an
+analysis. Every run saves its processed dataset and CellQC result folder to the user's Datasets. The
+fast chat path (`agents/quick_chat.py`: only the `chat: true` tools, a streamed answer, no run
+directory) and the corpus scan stay on the server for a client that asks for them by `route`; the
+console sends none. Anti-fabrication layers: the Critic's
 deterministic floors (`agents/step_numbers.py`), the claim audit before writing
 (`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing. The final
 manuscript loses any sentence that attributes a gene to a lineage the curated marker reference contradicts

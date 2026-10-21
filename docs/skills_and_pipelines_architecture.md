@@ -78,8 +78,6 @@ commands inside it with `run_in_environment(skill, command)`.
   So a skill's description must name its method.
 - **The Scientist is told which skill a step uses.** The brief of a step names the skills its text
   mentions, so the Scientist reads them instead of searching.
-- **The user can require skills.** In the console's *Pipelines & skills* sheet, a ticked skill is
-  required for that run: the PI's guidance says the plan must apply each of them.
 
 ### Skills learned from runs
 
@@ -125,10 +123,6 @@ How a run gets its pipeline:
   them from the question and the dataset profile; if the data type is unknown, the model picks
   from the whole library or answers that none fits, and the PI then plans from the tool and skill
   lists alone.
-- **By the user.** Pipelines ticked in the *Pipelines & skills* sheet are mandatory for that run,
-  and the automatic choice is added to them. A ticked pipeline for another data type than the
-  dataset's is dropped: a single-cell protocol is never applied to a VCF. If the user edits the
-  guidance text itself, the automatic choice is off.
 - **No automatic choice** when the request limits the run to named analyses ("only QC"): a
   protocol lays out a whole study, which the user has just declined.
 

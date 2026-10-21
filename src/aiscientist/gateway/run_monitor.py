@@ -1,6 +1,6 @@
 """Where every run is right now: the live half of the console's System page.
 
-Each run (a research study, a chat answer, a corpus scan) carries a :class:`RunMonitor`. It reads
+Each run (a research study, a literature answer, a chat answer, a corpus scan) carries a :class:`RunMonitor`. It reads
 what the run already produces — the lab's ``on_event`` dicts, the WebSocket payloads its connection
 pushes, and the start and end of each model call — and keeps one small picture of the run: the
 pipeline stage it is in, the steps that are running (several at once when the DAG scheduler runs
@@ -24,14 +24,15 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
-KINDS = ("research", "chat", "corpus")
+KINDS = ("research", "literature", "chat", "corpus")
 
 
 @dataclass(frozen=True)
 class Stage:
     """One stage of the pipeline. ``kinds`` are the run kinds that pass through it: ``research``
-    (the lab), ``chat`` (the answer-first loop), ``corpus`` (the corpus scan). ``roles`` are the
-    model roles that work in it (the ``role=`` of their model calls)."""
+    (the lab), ``literature`` (a general question answered from PubMed), ``chat`` (the answer-first
+    loop), ``corpus`` (the corpus scan). ``roles`` are the model roles that work in it (the
+    ``role=`` of their model calls)."""
 
     id: str
     label: str
@@ -43,8 +44,8 @@ class Stage:
 
 STAGES: tuple[Stage, ...] = (
     Stage("request", "Request", KINDS,
-          "The message arrives with its bound dataset. A follow-up is routed to the run it continues; "
-          "a new study gets its own folder and history row.",
+          "The message arrives with its bound dataset. The model routes it: a general question to a "
+          "literature search, anything about data to the lab; a follow-up goes to the run it continues.",
           "gateway/app.py", ("classify",)),
     Stage("data", "Data & compute", ("research",),
           "The dataset is staged to HPC3 and profiled, and the tools' executors are wired: HPC3 Slurm "
@@ -54,8 +55,8 @@ STAGES: tuple[Stage, ...] = (
           "The request's scope and the matching pipeline are read, the PI drafts the plan as a task "
           "graph, and the Critic reviews it before anyone sees it.",
           "agents/research_lab.py", ("plan", "critic")),
-    Stage("approve", "Your review", ("research",),
-          "Plan first: the run waits for you to run, edit or cancel the plan, or answer its question.",
+    Stage("approve", "Your review", ("research", "literature"),
+          "The run waits for you to run, edit or cancel the plan, or answer its question.",
           "gateway/app.py"),
     Stage("execute", "Run steps", ("research",),
           "The scheduler hands each ready step to the Scientist in the persona of the specialist it "
@@ -72,6 +73,10 @@ STAGES: tuple[Stage, ...] = (
           "The report is rendered to PDF / DOCX (on HPC3 when configured) and reviewed; a run that "
           "only did quality control answers in the chat instead. The files go to Downloads.",
           "reporting/"),
+    Stage("literature", "Literature answer", ("literature",),
+          "PubMed is searched through Europe PMC with the model's queries; the model answers from the "
+          "abstracts and code checks every citation against the papers found.",
+          "agents/literature_answer.py", ("literature",)),
     Stage("chat", "Chat answer", ("chat",),
           "The answer-first loop: the model answers directly and calls a tool only when it needs one.",
           "agents/quick_chat.py", ("chat",)),
@@ -197,7 +202,7 @@ class RunMonitor:
             self.stage_since = time.time()
             if stage != "approve":
                 self.waiting = ""
-            if stage not in ("execute", "chat", "corpus"):
+            if stage not in ("execute", "literature", "chat", "corpus"):
                 self._active.clear()
 
     def _finish(self, outcome: str) -> None:
@@ -283,7 +288,7 @@ class RunMonitor:
             self.tools_called += 1
             entry = self._active.get(tid)
             if entry is None and self.kind != "research":
-                # The chat and corpus lines have no steps: one implicit step holds the tool.
+                # The literature, chat and corpus lines have no steps: one implicit step holds the tool.
                 entry = self._active.setdefault(tid, {"step": "", "n": None, "node": "", "specialist": "",
                                                       "phase": "model", "tool": "", "since": now})
             if entry is not None:
@@ -320,7 +325,7 @@ class RunMonitor:
 
     def _observe_push(self, payload: dict[str, Any]) -> None:
         t = str(payload.get("type") or "")
-        if t in _WAITS_FOR_PLAN and self.kind == "research":
+        if t in _WAITS_FOR_PLAN and self.kind in ("research", "literature"):
             self._to("approve")
             self.waiting = "plan"
         elif t == "confirm_request":

@@ -32,8 +32,8 @@ from ..agents.sandbox import sandbox_network_enabled
 from ..tools.api import ANALYSIS_ENTRYPOINT
 from .executor import RemoteExecutor
 from .slurm_job import (
-    AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
-    run_batch_job, container_exec, slurm_time_to_seconds)
+    AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, SlurmQueueTimeout,
+    build_analysis_script, run_batch_job, container_exec, slurm_time_to_seconds)
 
 _ARGS_EOF = "AISCIENTIST_ANALYSIS_ARGS_EOF"
 _RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
@@ -123,6 +123,12 @@ class SlurmAnalysisExecutor:
     container_module: str = ""
     container_bin: str = "apptainer"
     startup_timeout_s: int = 600
+    # How many ``startup_timeout_s`` windows a job may wait in the queue before it is cancelled
+    # (a queued job keeps its place across them). The corpus scan's paid GPU queue can be hours.
+    queue_windows: int = 3
+    # Forward the queue's progress (submitted, still queued and why, running on which node) to
+    # ``notify``: for a job someone is watching wait for a scarce card.
+    queue_progress: bool = False
     # 0 = AUTO: derive the job-wait from the SBATCH --time (`time_limit`) + a margin, so the gateway
     # waits as long as Slurm allows and never scancels a healthy, still-progressing job early. The old
     # fixed 1800s (30 min) silently killed a WGS VEP job that legitimately runs ~30-60 min under a 2h
@@ -240,7 +246,11 @@ class SlurmAnalysisExecutor:
                     self.on_fallback(f"Slurm job failed (no local fallback): {exc}")
                 except Exception:  # noqa: BLE001
                     pass
-            return {"status": "error", "execution_mode": "hpc_slurm",
+            # A job that never left the queue says so: nothing ran, and the caller may submit it
+            # again (the corpus scan does, as a retry of that one step).
+            queued = ({"queue_timeout": True, "slurm_reason": exc.reason}
+                      if isinstance(exc, SlurmQueueTimeout) else {})
+            return {"status": "error", "execution_mode": "hpc_slurm", **queued,
                     "error": (f"HPC3 analysis job failed: {exc}. Not run on the gateway host "
                               "(local fallback is disabled). Fix the cause and call the tool again "
                               "— it will be resubmitted to HPC3.")}
@@ -544,8 +554,10 @@ class SlurmAnalysisExecutor:
         spec = SlurmJobSpec(script=script, job_name=name, submit_dir=scratch)
         result = run_batch_job(
             self.remote, spec,
-            acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s),
+            acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s,
+                                  max_attempts=max(1, self.queue_windows)),
             run=RunConfig(run_timeout_s=run_timeout),
+            emit=(lambda level, _stage, message: self._say(level, message)) if self.queue_progress else None,
             should_cancel=self.should_cancel)
 
         out = self._collect(res_f, log_f, result)

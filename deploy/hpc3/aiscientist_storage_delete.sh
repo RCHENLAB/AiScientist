@@ -1,7 +1,7 @@
 #!/bin/bash
-# AiScientist: delete what a user chose in the storage panel, as a Slurm job.
+# AiScientist: delete what a user chose in the console's Storage tab, as a Slurm job.
 #
-# The storage panel lists the user's own HPC3 folders, and its Delete button removes one entry. The
+# The Storage tab lists the user's own HPC3 folders, and its Delete button removes one entry. The
 # gateway submits this script with sbatch instead of running rm on a login node: removing data is
 # filesystem work, which RCIC keeps off the login nodes. It deletes each --path it is given when
 #   * the path is strictly inside one of the user's own folders: <root>/Temp/<user>/,

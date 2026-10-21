@@ -250,6 +250,88 @@ def test_corpus_scan_gives_up_after_the_last_attempt(tmp_path, monkeypatch):
     assert "stopped answering" in err["message"]
 
 
+_QUEUED = {"status": "error", "execution_mode": "hpc_slurm", "queue_timeout": True, "slurm_reason": "Priority",
+           "error": "HPC3 analysis job failed: bioagent_corpusscan_x did not get a node within 7200s"}
+
+
+def test_corpus_scan_submits_again_when_no_card_came_free(tmp_path, monkeypatch):
+    """Zian's 2026-10-19 21:13 scan waited out the paid queue (Slurm: Priority) and the whole run
+    failed. Now the job is submitted again, the run goes on, and the second job's result is shown."""
+    conn = _conn(tmp_path)
+    pushed: list[dict] = []
+    conn.push = pushed.append
+    ok = {"status": "ok", "n_papers": 3, "n_sentences": 30, "n_passages": 4, "n_hits_eligible": 1,
+          "n_genes": 1, "genes": [{"gene": "PRPF31", "n_papers": 1, "phenotype": "adRP", "flags": []}],
+          "genes_flagged_for_review": [], "definition": "d", "warnings": []}
+
+    class Busy(_FakeExecutor):
+        startup_timeout_s, queue_windows = 1800, 4
+
+        def __init__(self, ws):
+            super().__init__(ws, ok)
+            self.n = 0
+
+        def run_tool(self, tool, args, ctx):
+            self.n += 1
+            return dict(_QUEUED) if self.n == 1 else super().run_tool(tool, args, ctx)
+
+    built = {}
+    monkeypatch.setattr(gw_app, "_build_literature_executor",
+                        lambda c, run_id=None, own_gpu=False: built.setdefault("ex", Busy(c.workspace / run_id)))
+    req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
+    conn.begin_run(None)
+    asyncio.run(gw_app._run_corpus_scan(conn, req))
+    assert built["ex"].n == 2
+    retry = [p["text"] for p in pushed if p.get("type") == "lab_progress" and "No GPU card" in p.get("text", "")]
+    assert retry and "within 2 h (Slurm: Priority)" in retry[0] and "retry 1 of 2" in retry[0]
+    assert not any(p.get("type") == "chat_error" for p in pushed)
+    assert [p.get("type") for p in pushed][-1] == "chat_done"
+
+
+def test_corpus_scan_stops_retrying_a_full_queue_with_a_plain_message(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    pushed: list[dict] = []
+    conn.push = pushed.append
+
+    class Full:
+        notify = None
+        startup_timeout_s, queue_windows = 1800, 4
+        n = 0
+
+        def run_tool(self, tool, args, ctx):
+            self.n += 1
+            return dict(_QUEUED)
+
+    full = Full()
+    monkeypatch.setattr(gw_app, "_build_literature_executor", lambda c, run_id=None, own_gpu=False: full)
+    req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
+    conn.begin_run(None)
+    asyncio.run(gw_app._run_corpus_scan(conn, req))
+    assert full.n == 1 + conn.settings.corpus_scan_queue_retries
+    err = next(p for p in pushed if p.get("type") == "chat_error")["message"]
+    assert "could not start" in err and "3 waits of 2 h" in err and "never ran" in err
+
+
+def test_the_scan_executor_waits_hours_in_the_queue(tmp_path, monkeypatch):
+    conn = _conn(tmp_path, mock=False)
+    conn.alloc = type("A", (), {"node": "gpu-1", "port": 1234})()
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/x/paperqa.sif")
+    monkeypatch.setattr(gw_app, "_sync_aiscientist_source_to_hpc", lambda c: "/dfs/pysrc/tester")
+    monkeypatch.setattr(gw_app, "_temp_base", lambda c: "/dfs/Temp/tester")
+    ex = gw_app._build_literature_executor(conn, run_id="abc123", own_gpu=True)
+    st = conn.settings
+    assert ex.startup_timeout_s * ex.queue_windows >= st.corpus_scan_queue_wait_s >= 7200
+    assert ex.queue_progress is True
+    lit = gw_app._build_literature_executor(conn, run_id="abc123")
+    assert (lit.startup_timeout_s, lit.queue_windows, lit.queue_progress) == (600, 3, False)
+
+
+def test_waits_are_said_in_words():
+    assert [gw_app._duration_words(s) for s in (1800, 3600, 5400, 7200, 59)] == [
+        "30 min", "1 h", "1.5 h", "2 h", "1 min"]
+
+
 def test_the_corpus_tool_is_run_by_this_line_only():
     """The scan is an hour of the session's model and writes into a workspace the Research line's
     literature job does not have, so no model may call it: it is absent from the Scientist's

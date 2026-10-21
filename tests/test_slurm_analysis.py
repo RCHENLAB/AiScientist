@@ -130,6 +130,48 @@ def test_explicit_run_timeout_overrides_auto(monkeypatch):
     assert rt == 123   # a pinned positive value wins over the auto-derivation
 
 
+def test_queue_windows_and_progress_reach_the_job(monkeypatch):
+    import aiscientist.gateway.slurm_analysis as sa
+    from aiscientist.gateway.slurm_job import JobResult
+    seen = {}
+
+    def fake_run_batch_job(remote, spec, *, acquire, run, emit=None, **_):
+        seen.update(windows=acquire.max_attempts, window=acquire.startup_timeout_s, emit=emit)
+        if emit:
+            emit("info", "slurm", "Job 700 is still queued after 1800s (Priority).")
+        return JobResult("700", "n1", "COMPLETED", 1, completed=True)
+
+    monkeypatch.setattr(sa, "run_batch_job", fake_run_batch_job)
+    said: list[str] = []
+    ex = SlurmAnalysisExecutor(remote=FakeHPC({"status": "ok"}), container_image="/img.sif",
+                               remote_workspace="/ws", remote_dataset="/ds", scratch_dir=SCRATCH,
+                               startup_timeout_s=1800, queue_windows=4, queue_progress=True)
+    ex.notify = lambda level, message: said.append(message)
+    ex.run_tool("annotate_variants", {}, ctx=None)
+    assert (seen["windows"], seen["window"]) == (4, 1800) and said == ["Job 700 is still queued after 1800s (Priority)."]
+    # the default executor: three windows and no queue lines, as before
+    _ex(FakeHPC({"status": "ok"})).run_tool("annotate_variants", {}, ctx=None)
+    assert seen["windows"] == 3 and seen["emit"] is None
+
+
+def test_a_job_that_never_left_the_queue_is_flagged(monkeypatch):
+    from aiscientist.gateway.slurm_job import SlurmJobError, SlurmQueueTimeout
+    ex = _ex(FakeHPC({"status": "ok"}))
+
+    def queued(tool, args):
+        raise SlurmQueueTimeout("x did not get a node within 1800s over 1 submission(s)", reason="Priority")
+
+    monkeypatch.setattr(ex, "_run_on_slurm", queued)
+    out = ex.run_tool("run_clustering", {}, ctx=None)
+    assert out["status"] == "error" and out["queue_timeout"] is True and out["slurm_reason"] == "Priority"
+
+    def broken(tool, args):
+        raise SlurmJobError("job FAILED")
+
+    monkeypatch.setattr(ex, "_run_on_slurm", broken)
+    assert "queue_timeout" not in ex.run_tool("run_clustering", {}, ctx=None)
+
+
 def test_analysis_tool_runs_on_slurm_and_parses_result():
     hpc = FakeHPC({"status": "ok", "n_clusters": 8})
     out = _ex(hpc).run_tool("run_clustering", {"resolution": 1.0}, ctx=None)

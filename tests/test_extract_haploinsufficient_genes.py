@@ -175,9 +175,13 @@ def test_only_explicit_verified_heterozygous_statements_make_genes_csv(tmp_path,
     # Every hit says which request found its passage; the requests are a table of their own.
     assert all(h["found_by"] for h in hits)
     reqs = _read(ctx.workspace / res["files"]["requests_csv"])
-    assert [r["request"] for r in reqs if r["round"] == "1"] == REQUESTS
+    assert [r["request"] for r in reqs if r["round"] == "1" and r["id"] != "K"] == REQUESTS
+    # The keyword round is a row of its own: the three chunks that say "haploinsufficiency".
+    kw = [r for r in reqs if r["id"] == "K"][0]
+    assert kw["round"] == "1" and kw["request"] == hi.KEYWORD_REQUEST and kw["n_passages"] == "3"
     assert [r["gene"] for r in reqs if r["round"] == "2"] == ["PRPF31"]
     assert res["n_requests"] == 3 and res["n_gene_requests"] == 1 and res["requests"] == REQUESTS
+    assert res["n_keyword_passages"] == 3 and res["n_keyword_only_passages"] == 0
     assert res["n_passages"] == 3 and res["n_judged"] == 3 and not res["warnings"]
 
 
@@ -194,11 +198,12 @@ def test_each_passage_is_read_once_and_the_requests_name_no_gene(tmp_path, monke
 def test_round_two_reads_the_papers_round_one_missed(tmp_path, monkeypatch):
     """Round one retrieves the passages that read like the mechanism; the paper that states PRPF31's
     dosage without the word is found by PRPF31's own request, among the chunks naming PRPF31.
-    The vectors are cached next to the text."""
+    The vectors are cached next to the text. (The keyword round is off here: it would read that
+    paper in round one, for its "one functional copy".)"""
     root = _corpus(tmp_path, extra=True)
     ctx = _ctx(tmp_path, monkeypatch, root)
     calls: list[str] = []
-    res = _run(ctx, _fake_model(calls), {"k_per_request": 3})
+    res = _run(ctx, _fake_model(calls), {"k_per_request": 3, "keyword_round": 0})
     assert res["status"] == "ok", res
     assert (root / "mechanism_cache" / "chunk_vecs.npy").exists()
     assert calls[-1] == "44444444" and calls.count("44444444") == 1
@@ -208,9 +213,66 @@ def test_round_two_reads_the_papers_round_one_missed(tmp_path, monkeypatch):
     assert dosage["found_by"] == "G:PRPF31" and dosage["eligible"] == "True"
     # Without round two, the paper is never read.
     ctx2 = _ctx(tmp_path / "b", monkeypatch, root)
-    res2 = _run(ctx2, _fake_model(), {"k_per_request": 3, "k_per_gene": 0})
+    res2 = _run(ctx2, _fake_model(), {"k_per_request": 3, "k_per_gene": 0, "keyword_round": 0})
     assert res2["n_gene_requests"] == 0
     assert _read(ctx2.workspace / res2["files"]["genes_csv"])[0]["n_papers"] == "2"
+
+
+# A paper whose PDF writes the word with the "ﬁ" ligature (62% of the corpus' sentences that use
+# it do). The toy embedder, like PubMedBERT's tokens, does not see "haploinsufficiency" in it.
+LIGATURE_SENT = ("We conclude that haploinsufﬁciency of CRX causes the dominant cone-rod dystrophy in "
+                 "this family, as the heterozygous frameshift allele is degraded.")
+LIGATURE = {"55555555": ["Cone-rod dystrophy has dominant and recessive forms in the clinic.", LIGATURE_SENT,
+                         "The proband's mother carries the same allele and is mildly affected."]}
+
+
+def test_the_keyword_round_reads_the_worded_passages_no_request_found(tmp_path, monkeypatch):
+    root = _corpus(tmp_path)
+    cache = root / "mechanism_cache"
+    with (cache / "sentences.jsonl").open("a") as sf, (cache / "chunks.jsonl").open("a") as cf:
+        for pmid, sents in LIGATURE.items():
+            cf.write(json.dumps({"pmid": pmid, "chunk": 0, "page": 2, "text": " ".join(sents)}) + "\n")
+            for k, s in enumerate(sents):
+                sf.write(json.dumps({"sid": f"{pmid}:0:{k}", "pmid": pmid, "chunk": 0, "sent": k, "page": 2,
+                                     "text": s, "prev": sents[k - 1] if k else "",
+                                     "next": sents[k + 1] if k + 1 < len(sents) else ""}) + "\n")
+    with (root / "hgnc_complete_set.txt").open("a") as fh:
+        fh.write("HGNC:4\tCRX\tCORD2\t\n")
+    base = _fake_model()
+
+    def model(messages):
+        if _system(messages) == hi.JUDGE_SYSTEM and _passage(messages)[0] == "55555555":
+            # The model types the ligature out as "fi": the quote must still verify.
+            return json.dumps({"items": [{"gene": "CRX", "mechanism_class": "haploinsufficiency",
+                                          "explicit": True, "negated": False, "human_retinal": True,
+                                          "phenotype": "dominant cone-rod dystrophy", "sentence": 2,
+                                          "quote": LIGATURE_SENT.replace("ﬁ", "fi")}]})
+        return base(messages)
+
+    # The requests alone (k=3 of 4 chunks) never reach it.
+    ctx0 = _ctx(tmp_path / "a", monkeypatch, root)
+    res0 = _run(ctx0, model, {"k_per_request": 3, "keyword_round": 0, "k_per_gene": 0})
+    assert "CRX" not in {g["gene"] for g in res0["genes"]}
+    # The keyword round reads it, and only it is new.
+    ctx = _ctx(tmp_path / "b", monkeypatch, root)
+    res = _run(ctx, model, {"k_per_request": 3, "k_per_gene": 0})
+    assert res["status"] == "ok", res
+    assert res["n_keyword_passages"] == 4 and res["n_keyword_only_passages"] == 1
+    genes = {g["gene"]: g for g in _read(ctx.workspace / res["files"]["genes_csv"])}
+    assert genes["CRX"]["pmid_1"] == "55555555"
+    hit = [h for h in _read(ctx.workspace / res["files"]["hits_csv"]) if h["pmid"] == "55555555"][0]
+    assert hit["found_by"] == "K" and hit["quote_verified"] == "True" and hit["eligible"] == "True"
+
+
+def test_keyword_wording_folds_ligatures_and_skips_ordinary_dosage():
+    chunks = [{"text": "Haploinsufﬁciency of PAX6 causes aniridia."},
+              {"text": "One functional copy of the gene is not sufficient for normal vision."},
+              {"text": "The drug dosage was reduced after the first week."},
+              {"text": "Nonsense-mediated decay removed the mutant transcript in the recessive case."}]
+    assert hi.keyword_chunks(chunks) == [0, 1]
+    assert hi.nz("haploinsufﬁciency") == hi.nz("haploinsufficiency")
+    # A PDF that extracted the en dash as a control character still verifies the model's quote.
+    assert hi.nz("maintain 60\x0180% of the normal level") == hi.nz("maintain 60–80% of the normal level")
 
 
 def test_a_quote_the_paper_does_not_contain_is_rejected(tmp_path, monkeypatch):

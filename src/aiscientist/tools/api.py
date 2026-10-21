@@ -44,6 +44,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "render_workflow_schematic": ("aiscientist.tools.make_schematic.tool", "render_workflow_schematic"),
     # literature
     "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
+    "search_literature": ("aiscientist.tools.literature_search.tool", "search_europepmc"),
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
     # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
     "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),

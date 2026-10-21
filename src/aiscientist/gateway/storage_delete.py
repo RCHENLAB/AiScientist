@@ -1,11 +1,11 @@
-"""The storage panel's Delete, as a Slurm job on HPC3.
+"""The Storage tab's Delete (My account → Storage), as a Slurm job on HPC3.
 
-The storage panel lists the user's own HPC3 folders (``app._storage_areas``: ``Temp/<user>``,
+The Storage tab lists the user's own HPC3 folders (``app._storage_areas``: ``Temp/<user>``,
 ``uploads/<user>`` and the personal lab folder) and deletes an entry on the user's click. The
 deletion is filesystem work, which RCIC keeps off the login nodes, so it is never an ``rm`` over
 the SSH session: the gateway stages ``deploy/hpc3/aiscientist_storage_delete.sh`` and submits it as
 a one-CPU job on the CPU partition (``cpu_partition``) through the compute backend, then answers
-at once with the job id. The panel asks again while the job is queued or running; one ``sacct``
+at once with the job id. The tab asks again while the job is queued or running; one ``sacct``
 gives its state, and the job's log says what it deleted.
 
 The guard is applied twice: here (:func:`allowed`, before anything reaches HPC3) and by the script,

@@ -79,8 +79,10 @@ in one step. A bound dataset the run cannot use is named to the planner with the
 ## Results
 
 A run's deliverables (report, figures, tables) come back to `analysis_results/` (or
-`AISCIENTIST_RESULTS_DIR`) after each step. Its processed dataset and CellQC's result folder stay
-beside the run, on HPC3 for an HPC3 run, until "Save to my data" makes one a dataset:
+`AISCIENTIST_RESULTS_DIR`) after each step. Its processed dataset and CellQC's result folder are
+saved to the user's data when the run completes; until then they stay beside the run, on HPC3 for
+an HPC3 run. "Save to my data" on the Runs page does the same for a run whose save did not happen.
+Saving one makes it a dataset:
 
 - kept on HPC3: copied back in the background into a new `users/<account>/datasets/<uuid>/original/`,
   each file checked by size, and listed when it is all there. The request answers 202 at once, and
@@ -98,7 +100,7 @@ copied in the background into `users/<account>/datasets/<uuid>/original/`, file 
 file has arrived at the size HPC3 reports, the dataset's row points at the copy, and `source.json`
 beside it names the HPC3 path, its size and whether it is a file or a folder. A run that still
 names the HPC3 path (a chat attached it before the move) reads the copy here. The HPC3 original is
-not deleted then. Once the copy is backed up, the storage panel removes the originals in two Slurm
+not deleted then. Once the copy is backed up, the Storage tab removes the originals in two Slurm
 jobs: a dry run that checks each one against its copy, then, on the user's confirmation, the
 removal; only originals in the account's own HPC3 uploads folder, and in its personal lab folder
 only where the deployment allows it (see

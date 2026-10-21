@@ -273,6 +273,22 @@ def test_a_lab_completion_returns_text_and_openai_usage(fake):
     assert usage["prompt_tokens"] == 1050
 
 
+def test_one_off_calls_that_share_their_rules_cache_only_the_rules(fake):
+    """The corpus scan: 1,500 different passages under one system prompt. Caching the whole
+    prompt wrote each one to cache (1.25x) and read none back; only the rules are shared."""
+    client = fake(_final([{"type": "text", "text": "{}"}]), _final([{"type": "text", "text": "{}"}]))
+    msgs = [{"role": "system", "content": "RULES"}, {"role": "user", "content": "PASSAGE 1"}]
+    ac.complete_ex("claude-haiku-5-5", msgs, api_key="k", max_tokens=8000, cache="system")
+    kw = client.requests[0][1]
+    assert "cache_control" not in kw
+    assert kw["system"] == [{"type": "text", "text": "RULES", "cache_control": {"type": "ephemeral"}}]
+    assert kw["messages"][0]["content"][0] == {"type": "text", "text": "PASSAGE 1"}
+    # Every other call keeps whole-prompt auto-caching.
+    ac.complete_ex("claude-haiku-5-5", msgs, api_key="k", max_tokens=8000)
+    kw = client.requests[1][1]
+    assert kw["cache_control"] == {"type": "ephemeral"} and kw["system"] == [{"type": "text", "text": "RULES"}]
+
+
 def test_a_lab_completion_does_not_send_thinking(fake):
     client = fake(_final([{"type": "text", "text": "ok"}]))
     ac.complete_ex("claude-opus-5-5", [{"role": "user", "content": "q"}], api_key="k", max_tokens=1000)

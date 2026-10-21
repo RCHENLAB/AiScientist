@@ -12,6 +12,7 @@ import json as _json
 import os
 import re
 import secrets
+from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -645,20 +646,28 @@ def run_llm_cost(run_id: str) -> dict:
     }
 
 
-def latest_run_id_for_conversation(user_id: int, conversation_id: str) -> str | None:
+def latest_run_id_for_conversation(user_id: int, conversation_id: str,
+                                   accept: Callable[[str], bool] | None = None) -> str | None:
     """The most recent COMPLETED run this user produced in a conversation (``done``/``incomplete`` —
     i.e. one that reached the report stage, not a cancelled/errored/running one). Used by the
     follow-up router to recognise a prior run across a gateway restart, when the in-memory last-run
-    map is empty. None when the conversation has no such run."""
+    map is empty. ``accept`` keeps only the runs it returns True for (the gateway passes "has a run
+    state": a literature answer is finished but is no study to continue); the latest of the last 20
+    completed runs it accepts. None when the conversation has no such run."""
     if not conversation_id:
         return None
     with session_scope() as s:
-        return s.scalar(
+        rows = s.scalars(
             select(Run.run_id)
             .where(Run.user_id == user_id,
                    Run.conversation_id == conversation_id,
                    Run.status.in_(("done", "incomplete")))
-            .order_by(Run.created_at.desc(), Run.id.desc()))
+            .order_by(Run.created_at.desc(), Run.id.desc())
+            .limit(1 if accept is None else 20)).all()
+    for run_id in rows:
+        if accept is None or accept(run_id):
+            return run_id
+    return None
 
 
 def record_run_finish(run_id: str, status: str, artifacts_path: str | None = None,

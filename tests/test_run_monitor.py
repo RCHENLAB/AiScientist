@@ -314,7 +314,7 @@ def test_the_graph_stages_are_the_monitors_stages():
         assert all((a, b) in flow for a, b in zip(chain, chain[1:]))
     # Every stage the monitor can put a run in is drawn.
     reachable = set(run_monitor._STAGE_OF_EVENT.values()) | set(run_monitor._STAGE_OF_ROLE.values()) \
-        | {"request", "approve", "data", "report", "chat", "corpus", "done"}
+        | {"request", "approve", "data", "report", "literature", "chat", "corpus", "done"}
     assert reachable <= ids
     # Every role a stage names is explained on the Model node, and every agent's role is at work somewhere.
     stage_roles = {r for s in run_monitor.STAGES for r in s.roles}

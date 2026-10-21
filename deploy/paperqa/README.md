@@ -152,8 +152,9 @@ citation or quotation the passages do not support. The text cache is rebuilt by 
 
 ## Corpus scan (`extract_haploinsufficient_genes`)
 
-The console's Corpus scan has a language model write search requests and read every passage they
-retrieve, so its job brings its own: one Slurm job on the paid `gpu` partition (`AISCIENTIST_CORPUS_SCAN_PARTITION`,
+The corpus scan (asked for with `route: "corpus"` on `/api/lab`; the console has no control for it)
+has a language model write search requests and read every passage they retrieve, so its job brings
+its own: one Slurm job on the paid `gpu` partition (`AISCIENTIST_CORPUS_SCAN_PARTITION`,
 account `AISCIENTIST_CORPUS_SCAN_ACCOUNT`, default `ruic20_lab_gpu`) with `gpu:1` and the node
 feature `nvme`, so it takes the first free A30 or A100 and never a V100
 (`AISCIENTIST_CORPUS_SCAN_GRES`, `AISCIENTIST_CORPUS_SCAN_CONSTRAINT`). The partition bills every
@@ -165,6 +166,12 @@ starts vLLM from
 `AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN`, default 16384), runs the scan in `paperqa.sif` against
 it, and exits, which frees the card. The session's own model is never called, so a session on the
 shared model or on an API key can run it.
+
+The paid queue can hold a card back for hours. The job keeps its place in it for up to
+`AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S` (default 7200), and the chat hears where it stands (Slurm's
+reason and expected start) every `AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S` (default 1800). A job
+that never gets a card is submitted again, up to `AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES` times
+(default 2), before the run ends with a message that nothing ran.
 
 A finished scan is kept on the gateway host under `<AISCIENTIST_DATA_ROOT>/corpus_scans/<key>/`,
 where the key covers the corpus (the manifest's hash, the size and time of the text cache and the
