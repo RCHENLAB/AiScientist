@@ -173,6 +173,15 @@ def record_use(ctx, skill) -> None:
     if ctx is None:
         return
     ctx.decisions["active_registry_skill"] = skill if skill.registry_release else None
+    record_in_manifest(ctx, skill)
+
+
+def record_in_manifest(ctx, skill) -> None:
+    """Add ``skill`` (name, version, release) to the run's manifest.json, without making it the
+    active skill: a tool that runs a skill's method (``skill:`` in its TOOL.md) records it here, and
+    must not change how later run_code calls are sandboxed."""
+    if ctx is None:
+        return
     init_manifest(ctx)
     if ctx.workspace is None:
         return

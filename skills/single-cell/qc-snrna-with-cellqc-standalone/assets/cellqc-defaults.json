@@ -1,0 +1,39 @@
+{
+  "about": "Reference CellQC settings: gene sets per reference, expected doublet rate per 10x chemistry, and default count filters. The steps in SKILL.md use these values, and AiScientist's run_cellqc tool reads this file, so they are defined only here.",
+  "thresholds": {
+    "min_counts": 500,
+    "min_features": 300,
+    "max_pct_mt": 10.0
+  },
+  "doublet": {
+    "rate": {
+      "next_gem": 0.1,
+      "gem_x": 0.052
+    },
+    "capacity": 13000
+  },
+  "genesets": {
+    "mouse": {
+      "mt": {"label": "% mitochondrial", "patterns": ["^mt-"], "symbols": [], "exclude": []},
+      "ribo": {"label": "% ribosomal", "patterns": ["^Rp[sl]\\d", "^Rplp\\d", "^Rpsa$"],
+               "symbols": [], "exclude": ["^Rps6k", "^Rps19bp"]},
+      "hb": {"label": "% hemoglobin", "patterns": ["^Hb[ab]-"], "symbols": [], "exclude": []}
+    },
+    "human": {
+      "mt": {"label": "% mitochondrial", "patterns": ["^MT-"], "symbols": [], "exclude": []},
+      "ribo": {"label": "% ribosomal", "patterns": ["^RP[SL]\\d", "^RPLP\\d", "^RPSA$"],
+               "symbols": [], "exclude": ["^RPS6K", "^RPS19BP"]},
+      "hb": {"label": "% hemoglobin", "patterns": ["^HB[ABDEGMQZ]([0-9][AB]?)?$", "^HB[AB]-[A-Z0-9]+$"],
+             "symbols": [], "exclude": []}
+    },
+    "macaque": {
+      "mt": {"label": "% mitochondrial", "patterns": ["^MT-"], "exclude": [],
+             "symbols": ["ND1", "ND2", "ND3", "ND4", "ND4L", "ND5", "ND6", "COX1", "COX2", "COX3",
+                         "ATP6", "ATP8", "CYTB"]},
+      "ribo": {"label": "% ribosomal", "patterns": ["^RP[SL]\\d", "^RPLP\\d", "^RPSA$"],
+               "symbols": [], "exclude": ["^RPS6K", "^RPS19BP"]},
+      "hb": {"label": "% hemoglobin", "patterns": ["^HB[ABDEGMQZ]([0-9][AB]?)?$", "^HB[AB]-[A-Z0-9]+$"],
+             "symbols": [], "exclude": []}
+    }
+  }
+}

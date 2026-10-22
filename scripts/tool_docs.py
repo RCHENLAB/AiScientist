@@ -123,14 +123,23 @@ def runs_on_md(m, tool) -> str:
                      " Its job gets a GPU of its own on the lab's paid partition and starts its own "
                      "model there, so the session needs no GPU allocation." if m.own_gpu else
                      " Its job runs no language model: it needs no GPU allocation.")
-    if m.image:
+    from aiscientist.agents.tool_skills import ToolSkillError, job_environment
+    try:
+        env = job_environment(m)
+    except ToolSkillError as exc:
+        env = {"image": "", "cpus": 0, "mem_gb": 0, "time_limit": ""}
+        lines.append(f"The environment is defined by the skill `{m.skill}`, which is unavailable: {exc}.")
+    if m.skill:
+        lines.append(f"The container image, Slurm resources, and reference settings are defined by the "
+                     f"skill `{m.skill}` in the pinned aiscientist-skills release.")
+    if env["image"]:
         lines[0] = lines[0].replace(" inside `analysis.sif`", "")
-        how = ("built on first use from conda-forge + bioconda (" + m.image.split(":", 1)[1] + ")"
-               if m.image.startswith("bioconda:") else "pulled on first use")
-        lines.append(f"Its job runs in its OWN image instead of the line's: `{m.image}`, {how} into "
+        how = ("built on first use from conda-forge + bioconda (" + env["image"].split(":", 1)[1] + ")"
+               if env["image"].startswith("bioconda:") else "pulled on first use")
+        lines.append(f"Its job runs in its OWN image instead of the line's: `{env['image']}`, {how} into "
                      "the shared containers directory on HPC3 and reused by every later run.")
-    resources = [f"{m.cpus} CPUs" if m.cpus else "", f"{m.mem_gb} GB" if m.mem_gb else "",
-                 f"up to {m.time_limit}" if m.time_limit else ""]
+    resources = [f"{env['cpus']} CPUs" if env["cpus"] else "", f"{env['mem_gb']} GB" if env["mem_gb"] else "",
+                 f"up to {env['time_limit']}" if env["time_limit"] else ""]
     if any(resources):
         lines.append("Slurm resources for its job: " + ", ".join(r for r in resources if r) + ".")
     if tool.requires:

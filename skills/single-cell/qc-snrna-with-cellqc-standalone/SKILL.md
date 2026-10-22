@@ -1,6 +1,6 @@
 ---
 name: qc-snrna-with-cellqc-standalone
-description: Run the CellQC pipeline (ambient correction, count/feature/mitochondrial filtering, doublet calling, nuclear fraction) over a cohort of 10x Cell Ranger libraries by hand, with bash plus conda or a container, from installing cellqc to validating result/metrics.csv. Use when setting up a cellqc environment or container outside an AiScientist run, writing a cellqc config.yaml (including mitochondrial/ribosomal/hemoglobin gene sets for mouse or non-human references), or diagnosing a failed or inert QC run. Inside an AiScientist analysis, QC of Cell Ranger output is the run_cellqc tool, not this skill.
+description: Run the CellQC pipeline (ambient correction, count/feature/mitochondrial filtering, doublet calling, nuclear fraction) over a cohort of 10x Cell Ranger libraries by hand, with bash plus conda or a container, from installing cellqc to validating result/metrics.csv. Use when setting up a cellqc environment or container outside an AiScientist run, writing a cellqc config.yaml (including mitochondrial/ribosomal/hemoglobin gene sets for mouse or non-human references), or diagnosing a failed or inert QC run. Inside an AiScientist analysis, the run_cellqc tool runs this skill's pipeline; follow these steps there only for what run_cellqc does not expose.
 license: MIT
 compatibility: Requires bash, coreutils, tar, awk and conda or mamba; Slurm optional. Network access only to install packages.
 metadata:
@@ -260,6 +260,9 @@ metadata and print `$c["nreaction"]` instead of `1`.
 ## 4. Configure
 
 The config only needs the values that differ from the defaults (defaults merge in one level deep).
+The gene sets per reference, the expected doublet rate per chemistry with its capacity, and the
+default count filters are also in [`assets/cellqc-defaults.json`](assets/cellqc-defaults.json),
+which AiScientist's `run_cellqc` tool reads; change them there, not in a copy.
 This is the config the reference run used, for a **mouse GRCm39 (GENCODE)** reference and 3' v4
 nuclei:
 

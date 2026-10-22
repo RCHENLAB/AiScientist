@@ -226,9 +226,20 @@ class SlurmAnalysisExecutor:
     _deps_attempted: bool = field(default=False, repr=False)
 
     def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        args = args or {}
+        from ..agents.tool_skills import ToolSkillError, with_skill
+        from ..tools import catalog
+        m = catalog.manifest(tool)
+        if m is not None and m.skill:
+            # Usually attached by the router already; before the memo, so a cached result is reused
+            # only for the same skill version and settings.
+            try:
+                args = with_skill(m, args, ctx)
+            except ToolSkillError as exc:
+                return {"status": "error", "error": f"{exc}. Install or allow that skill, then run "
+                                                    f"{tool} again."}
         if self.remote is None or not self.remote_workspace:
             return self._fallback(tool, args, ctx, "no live HPC connection")
-        args = args or {}
         if self.memoize_result:                 # reuse this run's identical prior result, don't re-run
             hit = self._memo_load(tool, args)
             if hit is not None:
@@ -378,19 +389,25 @@ class SlurmAnalysisExecutor:
     # -- a tool's own container and resources (TOOL.md image / cpus / mem_gb / time_limit) --------
 
     def _job_settings(self, tool: str) -> dict[str, Any]:
-        """The image and Slurm resources ``tool``'s job runs with: what its TOOL.md declares, else
-        this line's defaults. A declared image is pulled on HPC3 first if it is not there yet."""
+        """The image and Slurm resources ``tool``'s job runs with: what its TOOL.md declares, or the
+        skill it names, else this line's defaults. A declared image is pulled on HPC3 first if it
+        is not there yet."""
+        from ..agents.tool_skills import ToolSkillError, job_environment
         from ..tools import catalog
         m = catalog.manifest(tool)
+        try:
+            env = job_environment(m) if m is not None else {}
+        except ToolSkillError as exc:
+            raise SlurmJobError(str(exc)) from exc
         image = self.container_image
-        if m is not None and m.image:
-            image = self._ensure_image(m.image)
+        if env.get("image"):
+            image = self._ensure_image(env["image"])
         return {
             "image": image,
-            "own_image": bool(m is not None and m.image),
-            "cpus": (m.cpus if m is not None and m.cpus else self.cpus),
-            "mem_gb": (m.mem_gb if m is not None and m.mem_gb else self.mem_gb),
-            "time_limit": (m.time_limit if m is not None and m.time_limit else self.time_limit),
+            "own_image": bool(env.get("image")),
+            "cpus": env.get("cpus") or self.cpus,
+            "mem_gb": env.get("mem_gb") or self.mem_gb,
+            "time_limit": env.get("time_limit") or self.time_limit,
         }
 
     def _ensure_image(self, ref: str) -> str:

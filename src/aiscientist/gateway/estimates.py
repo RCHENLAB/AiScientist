@@ -25,13 +25,21 @@ FIELDS = ("seconds", "cpu_hours", "gpu_hours", "cost")
 
 def profile(skill: str) -> dict:
     declared = catalog.resource_profile(skill)
-    if declared:
-        return declared
     manifest = catalog.manifest(skill)
+    from ..agents.tool_skills import ToolSkillError, job_environment
+    try:
+        env = job_environment(manifest) if manifest else {}
+    except ToolSkillError:
+        env = {}                          # an estimate is never a reason to fail a plan
+    if declared:
+        # A step may leave its CPUs and memory to the job's environment (TOOL.md, or the skill it
+        # names), so the resources are declared once and the profile only holds the timings.
+        return {**declared, "steps": [{"cpus": env.get("cpus") or 1, "mem_gb": env.get("mem_gb") or 8,
+                                       **step} for step in declared["steps"]]}
     return {"unit": "cells", "baseline": 10000, "rough": True, "steps": [
-        {"name": skill, "cpus": (manifest.cpus or 1) if manifest else 1,
+        {"name": skill, "cpus": env.get("cpus") or 1,
          "gpus": 1 if manifest and manifest.runs_on.startswith("gpu:") else 0,
-         "mem_gb": (manifest.mem_gb or 8) if manifest else 8, "minutes": [5, 30]}]}
+         "mem_gb": env.get("mem_gb") or 8, "minutes": [5, 30]}]}
 
 
 def input_units(p: dict, inputs: dict) -> tuple[float, bool]:

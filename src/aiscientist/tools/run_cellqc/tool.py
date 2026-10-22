@@ -2,8 +2,9 @@
 
 Runs CellQC (github.com/lijinbio/cellqc, a Snakemake + R pipeline by Jin Li) over the Cell Ranger
 libraries in a bound folder, then merges its per-library output into the checkpoint the rest of the
-single-cell line reads. The job runs in the image the TOOL.md declares, which carries CellQC, R and
-the Bioconductor stack; nothing here installs anything.
+single-cell line reads. The job runs in the image of the CellQC skill its TOOL.md names, which carries CellQC, R and the
+Bioconductor stack; nothing here installs anything. The skill also supplies CellQC's reference
+settings (gene sets, doublet rates, default filters): see :func:`_settings`.
 
 The steps follow the CellQC standalone skill (skills/single-cell/qc-snrna-with-cellqc-standalone):
 stage the deliveries without writing into them, write the sample file and config, dry-run, run, and
@@ -26,43 +27,54 @@ from typing import Any
 
 from .._lib.cellranger import describe_cellranger_layout, merge_cellranger_layouts
 from .._lib.result_dataset import CELLQC_POINTER as RESULT_POINTER
+from .. import catalog
 from .._lib.scrna import _dirs, _import_scanpy, _p, _rel, _schema
 from ..sdk import HarnessTool
 
 _TOOL = "run_cellqc"
 
-# Gene sets per reference, from the CellQC skill. Patterns are matched case-insensitively by CellQC;
-# a set given here REPLACES its default definition, so each is written out in full.
-_RIBO_EXCLUDE_HUMAN = ["^RPS6K", "^RPS19BP"]
-_GENESETS: dict[str, dict[str, dict[str, Any]]] = {
-    "mouse": {
-        "mt": {"label": "% mitochondrial", "patterns": ["^mt-"], "symbols": [], "exclude": []},
-        "ribo": {"label": "% ribosomal", "patterns": ["^Rp[sl]\\d", "^Rplp\\d", "^Rpsa$"],
-                 "symbols": [], "exclude": ["^Rps6k", "^Rps19bp"]},
-        "hb": {"label": "% hemoglobin", "patterns": ["^Hb[ab]-"], "symbols": [], "exclude": []},
-    },
-    "human": {
-        "mt": {"label": "% mitochondrial", "patterns": ["^MT-"], "symbols": [], "exclude": []},
-        "ribo": {"label": "% ribosomal", "patterns": ["^RP[SL]\\d", "^RPLP\\d", "^RPSA$"],
-                 "symbols": [], "exclude": _RIBO_EXCLUDE_HUMAN},
-        "hb": {"label": "% hemoglobin",
-               "patterns": ["^HB[ABDEGMQZ]([0-9][AB]?)?$", "^HB[AB]-[A-Z0-9]+$"],
-               "symbols": [], "exclude": []},
-    },
-}
-# Ensembl Mmul_10 names mtDNA genes bare (ND1, COX1, ...): the symbols are a fallback CellQC uses
-# only when no pattern matches, so on an MT- reference a bare COX1 (an old alias of PTGS1) never is.
-_GENESETS["macaque"] = {
-    **_GENESETS["human"],
-    "mt": {"label": "% mitochondrial", "patterns": ["^MT-"], "exclude": [],
-           "symbols": ["ND1", "ND2", "ND3", "ND4", "ND4L", "ND5", "ND6", "COX1", "COX2", "COX3",
-                       "ATP6", "ATP8", "CYTB"]},
-}
-# Expected doublet rate at `capacity` cells per reaction. GEM-X (3' v4) has about half the Next GEM
-# multiplet rate; 0.052 at 13000 encodes that (the CellQC skill's reference configuration).
-_DOUBLET_RATE = {"next_gem": 0.1, "gem_x": 0.052}
-_CAPACITY = 13000
+# CellQC's reference settings (gene sets per reference, the expected doublet rate per chemistry and
+# the reaction capacity, the default count filters) are the CellQC skill's: its
+# assets/cellqc-defaults.json, sent with the job by the gateway (see _settings). They are not copied
+# here, so updating the skill updates this tool.
+_SETTINGS_FILE = "assets/cellqc-defaults.json"
+_THRESHOLDS = ("min_counts", "min_features", "max_pct_mt")
 _KAPPA_LOW = 0.2
+
+
+class _SettingsError(ValueError):
+    """The CellQC skill's settings are missing or unusable."""
+
+
+def _settings(args: dict[str, Any]) -> dict[str, Any]:
+    """CellQC's reference settings from the CellQC skill: the gene sets per reference, the expected
+    doublet rate per chemistry and the reaction capacity, and the default count filters. The
+    platform attaches the skill to every call (``args[catalog.SKILL_ARG]``), on HPC3 and in-process
+    alike, and records its version in the run's manifest.json."""
+    sent = args.get(catalog.SKILL_ARG)
+    if not isinstance(sent, dict):
+        raise _SettingsError("the CellQC skill was not attached to this call (the platform's tool "
+                             "router attaches it; see TOOL.md)")
+    text = (sent.get("files") or {}).get(_SETTINGS_FILE)
+    where = f"skill {sent.get('name')!r} {sent.get('version') or ''}".strip()
+    if not text:
+        raise _SettingsError(f"{where} has no {_SETTINGS_FILE}, which holds CellQC's settings")
+    try:
+        settings = json.loads(text)
+        ok = (isinstance(settings["genesets"], dict) and isinstance(settings["doublet"]["rate"], dict)
+              and int(settings["doublet"]["capacity"]) > 0
+              and all(k in settings["thresholds"] for k in _THRESHOLDS))
+    except (ValueError, KeyError, TypeError):
+        ok = False
+    if not ok:
+        raise _SettingsError(f"{where}: {_SETTINGS_FILE} is not valid (it needs genesets, "
+                             f"doublet.rate, doublet.capacity and thresholds {list(_THRESHOLDS)})")
+    return settings
+
+
+def _threshold(name: str, args: dict[str, Any], settings: dict[str, Any]) -> Any:
+    """The caller's value for a count filter, else the CellQC skill's default."""
+    return args[name] if args.get(name) is not None else settings["thresholds"][name]
 
 
 def _paths_under(root: Path, maxdepth: int = 4) -> list[str]:
@@ -504,6 +516,10 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "note": ("CellQC is not available where this step ran. run_cellqc runs as an HPC3 "
                          "job in its own image; without HPC3, use run_scanpy_qc instead and say "
                          "that ambient correction was not done.")}
+    try:
+        settings = _settings(args)
+    except _SettingsError as exc:
+        return {"status": "error", "step": "qc", "error": f"run_cellqc cannot read CellQC's settings: {exc}"}
     parts = [(f, describe_cellranger_layout(_paths_under(Path(f["path"])), f["path"]))
              for f in readable]
     layout = merge_cellranger_layouts([(f["name"], part) for f, part in parts])
@@ -554,7 +570,14 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         chemistry, chem_src = _resolve(
             str(_p(_TOOL, "chemistry", args)),
             [_chemistry(Path(lib["dir"])) for lib in members], "next_gem", "10x chemistry", warnings)
-        done = _run_cellqc_once(cellqc, members, staged, species, chemistry, qc, args)
+        if species not in settings["genesets"] or chemistry not in settings["doublet"]["rate"]:
+            done = {"error": (f"the CellQC skill's settings have no "
+                              + (f"gene sets for {species}" if species not in settings["genesets"]
+                                 else f"doublet rate for the {chemistry} chemistry")
+                              + f" (it has {sorted(settings['genesets'])} and "
+                                f"{sorted(settings['doublet']['rate'])})")}
+        else:
+            done = _run_cellqc_once(cellqc, members, staged, species, chemistry, qc, args, settings)
         done.update(species=species, species_src=species_src, chemistry=chemistry,
                     chem_src=chem_src, libs=members)
         if done.get("error") and not several:
@@ -660,7 +683,8 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                         "chemistry": [head["chemistry"] if not several else
                                       "+".join(d["chemistry"] for d in runs), chem_note],
                         "doublet_rate": "; ".join(dict.fromkeys(
-                            f"{_DOUBLET_RATE[d['chemistry']]} at {_CAPACITY} cells per reaction"
+                            f"{settings['doublet']['rate'][d['chemistry']]} at "
+                            f"{settings['doublet']['capacity']} cells per reaction"
                             for d in runs)),
                         "nreaction": [nreaction, "set by the caller" if args.get("nreaction") else
                                       "default 1 (not measured; confirm)"]},
@@ -726,7 +750,8 @@ def _species_groups(libs: list[dict[str, Any]], lib_species: "list[tuple[str, st
 
 
 def _run_cellqc_once(cellqc: str, libs: list[dict[str, Any]], staged: dict[str, Path], species: str,
-                     chemistry: str, qc: Path, args: dict[str, Any]) -> dict[str, Any]:
+                     chemistry: str, qc: Path, args: dict[str, Any],
+                     settings: dict[str, Any]) -> dict[str, Any]:
     """Configure and run CellQC once, over ``libs`` (one species), in ``qc``: dry run, run, and what
     it wrote. ``{"error", "log"}`` when nothing usable came out."""
     for d in (qc / "home", qc / "tmp", qc / "cache"):
@@ -739,13 +764,14 @@ def _run_cellqc_once(cellqc: str, libs: list[dict[str, Any]], staged: dict[str, 
         "seed": int(_p(_TOOL, "seed", args)),
         "ambient": {"method": ambient,
                     "compare": [comparer] if comparer and comparer != ambient else []},
-        "filterbycount": {"mincount": int(_p(_TOOL, "min_counts", args)),
-                          "minfeature": int(_p(_TOOL, "min_features", args)),
-                          "mito": float(_p(_TOOL, "max_pct_mt", args))},
-        "geneset": _GENESETS[species],
+        "filterbycount": {"mincount": int(_threshold("min_counts", args, settings)),
+                          "minfeature": int(_threshold("min_features", args, settings)),
+                          "mito": float(_threshold("max_pct_mt", args, settings))},
+        "geneset": settings["genesets"][species],
         "doublet": {"run": ["doubletfinder", "scdblfinder"],
                     "decider": str(_p(_TOOL, "doublet_decider", args)), "findpK": False, "pK": 0.01,
-                    "numthreads": 5, "rate": _DOUBLET_RATE[chemistry], "capacity": _CAPACITY,
+                    "numthreads": 5, "rate": settings["doublet"]["rate"][chemistry],
+                    "capacity": int(settings["doublet"]["capacity"]),
                     "nreaction": nreaction},
     }
     # CellQC reads YAML, and JSON is YAML: no YAML writer needed in any image.

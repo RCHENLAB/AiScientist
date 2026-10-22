@@ -6,10 +6,7 @@ runs_on: hpc:analysis
 order: 205
 line: scrna
 owner: analysis
-image: "bioconda:cellqc=0.3.6 r-doubletfinder python=3.12"
-cpus: 16
-mem_gb: 80
-time_limit: "08:00:00"
+skill: qc-snrna-with-cellqc-standalone   # image, cpus, mem_gb, time_limit and CellQC settings come from it
 ---
 # run_cellqc
 
@@ -98,6 +95,8 @@ unchanged.
 
 <!-- generated:runs-on -->
 As a Slurm CPU job on HPC3, through the analysis line's job entry point `python -m aiscientist.tools.scrna_cli`, reading and writing the run's `work/` and `artifacts/` on dfs3b. When the session has no HPC3 executor it runs in the gateway process.
+
+The container image, Slurm resources, and reference settings are defined by the skill `qc-snrna-with-cellqc-standalone` in the pinned aiscientist-skills release.
 
 Its job runs in its OWN image instead of the line's: `bioconda:cellqc=0.3.6 r-doubletfinder python=3.12`, built on first use from conda-forge + bioconda (cellqc=0.3.6 r-doubletfinder python=3.12) into the shared containers directory on HPC3 and reused by every later run.
 

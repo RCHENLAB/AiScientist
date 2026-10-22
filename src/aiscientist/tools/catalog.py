@@ -20,6 +20,9 @@ the platform needs and whose body is the documentation people read::
     cpus: 16                     # optional Slurm resources for THIS tool's job (hpc:* only);
     mem_gb: 80                   #   unset = the line's executor defaults
     time_limit: "08:00:00"
+    skill: qc-snrna-with-cellqc-standalone   # optional, hpc:* only, INSTEAD of image/cpus/mem_gb/
+                                 #   time_limit: the registry skill whose environment and settings
+                                 #   the tool runs with (see SKILL_ARG)
     ---
     # run_de
     ...documentation...
@@ -35,6 +38,11 @@ directory, and runs the tool's job inside it. ``docker://...`` is pulled (a BioC
 exists for every bioconda package); ``bioconda:<pkg>=<version> ...`` is built from conda-forge +
 bioconda, for a combination or a pin no published image has. Versions must be pinned (never
 ``latest``), so a run can be traced to the exact software that made it.
+
+A tool that runs the method of a registry skill names it with ``skill:`` instead. The skill, from the
+pinned aiscientist-skills release, then declares the image and resources and any reference settings
+the tool reads, so they are defined in one place. The platform resolves the skill and passes it to
+the tool with each call (:data:`SKILL_ARG`); the tool itself never loads skills.
 """
 
 from __future__ import annotations
@@ -188,6 +196,7 @@ class ToolManifest:
     cpus: int = 0                 # Slurm resources for this tool's job (0 / "" = the line's defaults)
     mem_gb: int = 0
     time_limit: str = ""
+    skill: str = ""               # a registry skill whose image, resources and settings this tool runs with
     doc: str = field(default="", repr=False, compare=False)
 
     @property
@@ -225,15 +234,20 @@ def load_manifest(folder: Path) -> ToolManifest:
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
     known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "served_model", "own_gpu", "line",
-                              "owner", "image", "cpus", "mem_gb", "time_limit"}
+                              "owner", "image", "cpus", "mem_gb", "time_limit", "skill"}
     unknown = set(fields) - known
     if unknown:
         raise ManifestError(f"{path}: unknown field(s) {sorted(unknown)}")
     image = str(fields.get("image") or "")
     time_limit = str(fields.get("time_limit") or "")
+    skill = str(fields.get("skill") or "").strip()
     job_fields = [k for k in ("image", "cpus", "mem_gb", "time_limit") if fields.get(k)]
-    if job_fields and not fields["runs_on"].startswith("hpc:"):
-        raise ManifestError(f"{path}: {', '.join(job_fields)} only apply to an hpc:* tool")
+    if (job_fields or skill) and not fields["runs_on"].startswith("hpc:"):
+        raise ManifestError(f"{path}: {', '.join(job_fields or ['skill'])} only apply to an hpc:* tool")
+    if skill and job_fields:
+        # One source: the skill declares them, and a second copy here would drift from it.
+        raise ManifestError(f"{path}: {', '.join(job_fields)} come from skill {skill!r}; "
+                            "do not repeat them in TOOL.md")
     if image and _image_problem(image):
         raise ManifestError(f"{path}: image {image!r}: {_image_problem(image)}")
     for key in ("cpus", "mem_gb"):
@@ -255,7 +269,7 @@ def load_manifest(folder: Path) -> ToolManifest:
         line=str(fields.get("line") or ""),
         owner=str(fields.get("owner") or ""), image=image,
         cpus=int(fields.get("cpus") or 0), mem_gb=int(fields.get("mem_gb") or 0),
-        time_limit=time_limit, doc=body)
+        time_limit=time_limit, skill=skill, doc=body)
 
 
 @lru_cache(maxsize=1)
@@ -273,6 +287,12 @@ def manifests() -> tuple[ToolManifest, ...]:
 
 def manifest(name: str) -> ToolManifest | None:
     return next((m for m in manifests() if m.name == name), None)
+
+
+# The call argument that carries a tool's skill (``skill:`` in its TOOL.md) to wherever the tool runs:
+# ``{"name", "version", "registry_release", "files": {"assets/...": text}}``. The platform resolves
+# the skill and attaches it to every call (aiscientist/agents/tool_skills.py); a tool only reads it.
+SKILL_ARG = "_skill"
 
 
 def build(m: ToolManifest, deps: dict[str, Any] | None = None) -> HarnessTool:

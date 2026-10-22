@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..tools import catalog as tool_catalog
+from .tool_skills import attach_skill
 
 if TYPE_CHECKING:
     from .research_harness import HarnessTool
@@ -79,7 +80,10 @@ def _router(executors: dict[str, Any]) -> Callable[[Any, "HarnessTool"], "Harnes
     reports ``not_installed``), so an unwired line keeps the in-process behaviour."""
     def route(manifest: Any, tool: "HarnessTool") -> "HarnessTool":
         executor = executors.get(manifest.runs_on)
-        return _route_to_executor(tool, executor, (tool.name,)) if executor is not None else tool
+        routed = _route_to_executor(tool, executor, (tool.name,)) if executor is not None else tool
+        # A tool that runs a registry skill's method gets that skill with every call, on HPC3 or
+        # in-process alike (agents/tool_skills.py).
+        return attach_skill(manifest, routed)
     return route
 
 

@@ -401,6 +401,13 @@ def fake_cellqc(tmp_path, monkeypatch):
     log = tmp_path / "cellqc_argv.jsonl"
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("FAKE_CELLQC_LOG", str(log))
+    # The platform's router attaches the CellQC skill to every call (agents/tool_skills.py); a call
+    # made directly here gets the same.
+    from aiscientist.agents.tool_skills import with_skill
+    from aiscientist.tools import catalog
+    from aiscientist.tools.run_cellqc import tool
+    direct, m = tool.run_cellqc, catalog.manifest("run_cellqc")
+    monkeypatch.setattr(tool, "run_cellqc", lambda args, ctx: direct(with_skill(m, args, ctx), ctx))
     return log
 
 
@@ -656,3 +663,72 @@ def test_the_most_abundant_genes_hint_at_the_tissue(tmp_path):
     assert "most likely retina" in hint and "Rho (Rod photoreceptor)" in hint
     assert 'reference: "retina"' in hint
     assert tissue_hint(["Alb", "Apoa1", "Ttr", "Ptprc"]) == ""
+
+
+# -- CellQC's settings come from the CellQC skill (issue #42) -------------------------------------
+
+def _skill_settings() -> dict:
+    from aiscientist.agents.skills import get_skill, refresh_skills
+    refresh_skills()
+    return json.loads(get_skill("qc-snrna-with-cellqc-standalone").files["assets/cellqc-defaults.json"])
+
+
+def test_the_tool_keeps_no_copy_of_the_skills_settings():
+    from aiscientist.tools._lib.scrna import PARAMS
+    from aiscientist.tools.run_cellqc import tool
+    assert not any(hasattr(tool, n) for n in ("_GENESETS", "_DOUBLET_RATE", "_CAPACITY"))
+    settings = _skill_settings()
+    assert set(settings["genesets"]) == {"mouse", "human", "macaque"}
+    assert settings["doublet"]["rate"] == {"next_gem": 0.1, "gem_x": 0.052}
+    # The defaults the tool's schema shows the model must be the skill's.
+    assert {k: PARAMS["run_cellqc"][k][0] for k in settings["thresholds"]} == settings["thresholds"]
+
+
+def test_the_cellqc_config_is_built_from_the_skill_sent_with_the_job(tmp_path, delivery, fake_cellqc):
+    pytest.importorskip("scanpy")
+    from aiscientist.tools import catalog
+    from aiscientist.tools.run_cellqc.tool import run_cellqc
+    settings = _skill_settings()
+    settings["genesets"]["mouse"]["mt"]["patterns"] = ["^mt-", "^Mtx-"]
+    settings["doublet"]["capacity"] = 20000
+    settings["thresholds"]["min_counts"] = 777
+    skill = {"name": "qc-snrna-with-cellqc-standalone", "version": "9.9.9", "registry_release": "v9.9.9",
+             "files": {"assets/cellqc-defaults.json": json.dumps(settings)}}
+    ws = tmp_path / "run"
+    out = run_cellqc({catalog.SKILL_ARG: skill, "min_features": 250}, _ctx(ws, delivery))
+    assert out["status"] == "ok", out
+    config = json.loads((ws / "work" / "cellqc" / "config.yaml").read_text())
+    assert config["geneset"]["mt"]["patterns"] == ["^mt-", "^Mtx-"]
+    assert config["doublet"]["capacity"] == 20000
+    assert config["filterbycount"]["mincount"] == 777          # the skill's default
+    assert config["filterbycount"]["minfeature"] == 250        # the caller's value wins
+    assert "20000 cells per reaction" in out["assumptions"]["doublet_rate"]
+
+
+def test_the_router_attaches_the_installed_skill_and_records_it(tmp_path, delivery, fake_cellqc):
+    pytest.importorskip("scanpy")
+    from aiscientist.agents.registry import _router
+    from aiscientist.tools import catalog
+    m = catalog.manifest("run_cellqc")
+    tool = _router({})(m, catalog.build(m))          # no HPC3 executor: the in-process route
+    ws = tmp_path / "run"
+    out = tool.executor({}, _ctx(ws, delivery))
+    assert out["status"] == "ok", out
+    config = json.loads((ws / "work" / "cellqc" / "config.yaml").read_text())
+    assert config["geneset"] == _skill_settings()["genesets"]["mouse"]
+    doc = json.loads((ws / "manifest.json").read_text())
+    assert any(s["name"] == "qc-snrna-with-cellqc-standalone" for s in doc["skills"])
+
+
+def test_unusable_skill_settings_stop_the_run_with_a_clear_error(tmp_path, delivery, fake_cellqc):
+    from aiscientist.tools import catalog
+    from aiscientist.tools.run_cellqc.tool import run_cellqc
+    skill = {"name": "qc-snrna-with-cellqc-standalone", "version": "9.9.9", "files": {}}
+    out = run_cellqc({catalog.SKILL_ARG: skill}, _ctx(tmp_path / "run", delivery))
+    assert out["status"] == "error" and "assets/cellqc-defaults.json" in out["error"]
+
+
+def test_a_call_without_its_skill_is_refused_not_run_with_guessed_settings():
+    from aiscientist.tools.run_cellqc.tool import _settings
+    with pytest.raises(ValueError, match="not attached"):
+        _settings({})

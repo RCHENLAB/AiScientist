@@ -19,6 +19,7 @@ from aiscientist.gateway.tool_images import (
     provision_resources,
     pull_command,
 )
+from aiscientist.agents import tool_skills
 from aiscientist.tools import catalog
 from aiscientist.tools.catalog import ManifestError, load_manifest
 
@@ -161,18 +162,18 @@ def _sbatch_scripts(hpc) -> str:
 
 
 def test_a_tool_with_its_own_image_runs_in_it_with_its_resources():
-    m = catalog.manifest("run_cellqc")
+    m = tool_skills.job_environment(catalog.manifest("run_cellqc"))   # from the skill it names
     hpc = FakeHPC(present=True)
     out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {}, ctx=None)
     assert out["status"] == "ok"
     joined = _sbatch_scripts(hpc)
-    assert f"/dfs/c/{image_sif_name(m.image)}" in joined
-    assert f"--cpus-per-task={m.cpus}" in joined and f"--mem={m.mem_gb}G" in joined
-    assert f"--time={m.time_limit}" in joined
+    assert f"/dfs/c/{image_sif_name(m['image'])}" in joined
+    assert f"--cpus-per-task={m['cpus']}" in joined and f"--mem={m['mem_gb']}G" in joined
+    assert f"--time={m['time_limit']}" in joined
     assert "--dataset-root /dfs/up/cohort" in joined
     assert "-B /dfs/up/cohort:/dfs/up/cohort:ro" in joined
     assert "/dfs/pydeps" not in joined          # analysis.sif's extra deps stay out of its own image
-    assert f"AISCIENTIST_JOB_CPUS={m.cpus}" in joined
+    assert f"AISCIENTIST_JOB_CPUS={m['cpus']}" in joined
     assert not any("_image_" in c for c in hpc.cmds if c.startswith("sbatch"))   # already there
 
 
@@ -249,3 +250,80 @@ def test_scrna_cli_hands_every_bound_folder_to_the_tool(monkeypatch, capsys):
     line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(scrna_cli.RESULT_MARKER))
     out = json.loads(line[len(scrna_cli.RESULT_MARKER):])
     assert out["folders"] == folders and out["root"] == "/up/a"
+
+
+# -- a tool that runs a registry skill's method (TOOL.md ``skill:``, issue #42) -------------------
+
+_CELLQC_SKILL = "qc-snrna-with-cellqc-standalone"
+
+
+def _fake_skill(**kw):
+    from aiscientist.agents.skills import Skill
+    base = dict(name=_CELLQC_SKILL, summary="CellQC by hand.", image="bioconda:cellqc=0.3.6 python=3.12",
+                cpus=4, mem_gb=16, time_limit="00:30:00", version="9.9.9", registry_release="v9.9.9",
+                files={"assets/cellqc-defaults.json": '{"thresholds": {}}', "scripts/run.sh": "echo"})
+    return Skill(**{**base, **kw})
+
+
+def test_run_cellqc_names_its_skill_and_repeats_none_of_its_environment():
+    from aiscientist.agents.skills import get_skill, refresh_skills
+    m = catalog.manifest("run_cellqc")
+    assert m.skill == _CELLQC_SKILL
+    assert (m.image, m.cpus, m.mem_gb, m.time_limit) == ("", 0, 0, "")
+    refresh_skills()
+    s = get_skill(_CELLQC_SKILL)
+    assert tool_skills.job_environment(m) == {"image": s.image, "cpus": s.cpus, "mem_gb": s.mem_gb,
+                                          "time_limit": s.time_limit}
+
+
+def test_a_manifest_cannot_name_a_skill_and_also_declare_its_environment(tmp_path):
+    folder = tmp_path / "demo_tool"
+    folder.mkdir()
+    head = "---\nname: demo_tool\nsummary: A demo.\ncategory: qc\norder: 1\n"
+    (folder / "TOOL.md").write_text(head + f"runs_on: hpc:analysis\nskill: {_CELLQC_SKILL}\ncpus: 4\n---\n")
+    with pytest.raises(ManifestError, match="come from skill"):
+        load_manifest(folder)
+    (folder / "TOOL.md").write_text(head + f"runs_on: inprocess\nskill: {_CELLQC_SKILL}\n---\n")
+    with pytest.raises(ManifestError, match="only apply to an hpc"):
+        load_manifest(folder)
+
+
+def test_changing_the_skill_changes_the_job_without_editing_the_tool(tmp_path, monkeypatch):
+    from aiscientist.agents.research_harness import HarnessContext
+    monkeypatch.setattr(tool_skills, "tool_skill", lambda m: _fake_skill())
+    hpc = FakeHPC(present=True)
+    ctx = HarnessContext(decisions={}, workspace=tmp_path)
+    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {"min_counts": 700}, ctx=ctx)
+    assert out["status"] == "ok"
+    joined = _sbatch_scripts(hpc)
+    assert f"/dfs/c/{image_sif_name('bioconda:cellqc=0.3.6 python=3.12')}" in joined
+    assert "--cpus-per-task=4" in joined and "--mem=16G" in joined and "--time=00:30:00" in joined
+    # The skill's identity and its assets/ travel with the job; its scripts do not.
+    staged = next(c for c in hpc.cmds if ".args.json" in c and "cat >" in c)
+    args = json.loads(staged.split("\n", 1)[1].rsplit("\n", 1)[0])
+    assert args["min_counts"] == 700
+    assert args[catalog.SKILL_ARG]["version"] == "9.9.9"
+    assert args[catalog.SKILL_ARG]["registry_release"] == "v9.9.9"
+    assert list(args[catalog.SKILL_ARG]["files"]) == ["assets/cellqc-defaults.json"]
+    # Recorded in the run's manifest.json, without becoming the run's active skill.
+    doc = json.loads((tmp_path / "manifest.json").read_text())
+    assert {"name": _CELLQC_SKILL, "version": "9.9.9", "registry_release": "v9.9.9"} in doc["skills"]
+    assert ctx.decisions.get("active_registry_skill") is None
+
+
+def test_a_tool_whose_skill_cannot_be_used_is_an_error_and_submits_nothing(monkeypatch):
+    def missing(m):
+        raise tool_skills.ToolSkillError(f"{m.name} runs skill {m.skill!r}, which is not installed")
+    monkeypatch.setattr(tool_skills, "tool_skill", missing)
+    hpc = FakeHPC(present=True)
+    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {}, ctx=None)
+    assert out["status"] == "error" and "not installed" in out["error"]
+    assert not any(c.startswith("sbatch") for c in hpc.cmds)
+
+
+def test_plan_estimates_take_the_resources_from_the_skill(monkeypatch):
+    from aiscientist.gateway import estimates
+    monkeypatch.setattr(tool_skills, "tool_skill", lambda m: _fake_skill(cpus=12, mem_gb=48))
+    steps = estimates.profile("run_cellqc")["steps"]
+    assert steps and all(s["cpus"] == 12 and s["mem_gb"] == 48 for s in steps)
+    assert all("minutes" in s for s in steps)             # the timings stay in resource_profile.json

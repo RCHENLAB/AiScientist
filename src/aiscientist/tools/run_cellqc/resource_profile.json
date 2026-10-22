@@ -4,9 +4,7 @@
   "steps": [
     {
       "name": "ambient-RNA correction",
-      "cpus": 16,
       "gpus": 0,
-      "mem_gb": 80,
       "minutes": [
         15,
         25
@@ -14,9 +12,7 @@
     },
     {
       "name": "filtering",
-      "cpus": 16,
       "gpus": 0,
-      "mem_gb": 80,
       "minutes": [
         2,
         5
@@ -24,9 +20,7 @@
     },
     {
       "name": "doublet detection",
-      "cpus": 16,
       "gpus": 0,
-      "mem_gb": 80,
       "minutes": [
         8,
         10
