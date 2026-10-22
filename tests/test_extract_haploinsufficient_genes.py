@@ -107,6 +107,11 @@ def _passage(messages) -> tuple[str, list[str]]:
     return pmid, [m.group(1) for m in re.finditer(r"^\[\d+\] (.*)$", user, re.M)]
 
 
+# What the fake model writes as its search words: one in the corpus, one too common (in every chunk
+# of the fixture), one absent and a gene name.
+MODEL_TERMS = ["one copy is not enough", "retinitis", "zzzunusedword", "PRPF31"]
+
+
 def _fake_model(calls: list[str] | None = None, written: list[str] | None = None):
     """Writes the requests, and reads a passage like the served Qwen would: one item per mechanism
     sentence it knows, nothing for the rest."""
@@ -118,6 +123,10 @@ def _fake_model(calls: list[str] | None = None, written: list[str] | None = None
                 written.extend(genes)
             return json.dumps({"requests": {g: f"Heterozygous loss of {g} causes adRP through haploinsufficiency."
                                             for g in genes}})
+        if system.startswith(hi.TERMS_SYSTEM.split("{N}")[0][:80]):
+            if written is not None:
+                written.append("terms")
+            return json.dumps({"terms": MODEL_TERMS})
         if system != hi.JUDGE_SYSTEM:
             if written is not None:
                 written.append("round1")
@@ -175,7 +184,7 @@ def test_only_explicit_verified_heterozygous_statements_make_genes_csv(tmp_path,
     # Every hit says which request found its passage; the requests are a table of their own.
     assert all(h["found_by"] for h in hits)
     reqs = _read(ctx.workspace / res["files"]["requests_csv"])
-    assert [r["request"] for r in reqs if r["round"] == "1" and r["id"] != "K"] == REQUESTS
+    assert [r["request"] for r in reqs if r["round"] == "1" and r["id"] not in ("K", "T")] == REQUESTS
     # The keyword round is a row of its own: the three chunks that say "haploinsufficiency".
     kw = [r for r in reqs if r["id"] == "K"][0]
     assert kw["round"] == "1" and kw["request"] == hi.KEYWORD_REQUEST and kw["n_passages"] == "3"
@@ -594,3 +603,30 @@ def test_a_reply_that_is_not_a_completion_fails_its_passage_only(tmp_path, monke
     res = _run(ctx, no_choices, {"concurrency": 2})
     assert res["status"] == "ok" and res["n_genes"] == 1
     assert any("1 of" in w and "could not be read" in w for w in res["warnings"])
+
+
+def test_the_models_words_are_checked_against_the_corpus_before_any_passage_is_added():
+    chunks = ([{"pmid": str(i), "chunk": 0, "text": f"Retinal dystrophy family {i} with a heterozygous variant."}
+               for i in range(300)]
+              + [{"pmid": "a", "chunk": 0, "text": "Reduced dosage: one functional copy is not enough."},
+                 {"pmid": "b", "chunk": 0, "text": "PRPF31 haplo-insufficiency in adRP."}])
+    index = hi.TextIndex.of_chunks(chunks)
+    terms, added = hi.model_term_chunks(
+        ["one functional copy", "haploinsufficient", "heterozygous", "zzzabsent", "PRPF31"], index, cap=10)
+    use = {t.text: t.use for t in terms}
+    assert use == {"one functional copy": "filter", "haploinsufficient": "filter",   # hyphenated spelling too
+                   "heterozygous": "rank",          # in 300 of 302 chunks: too common to read every one
+                   "zzzabsent": "absent", "PRPF31": "rank"}                          # a gene selects no mechanism
+    assert added == {300, 301}
+    # The cap counts only chunks not read anyway: rarest words first, and a word that would pass it
+    # is left out.
+    capped, few = hi.model_term_chunks(["one functional copy", "haploinsufficient"], index, cap=1)
+    assert len(few) == 1 and sorted(t.use for t in capped) == ["filter", "over_cap"]
+    both, held = hi.model_term_chunks(["one functional copy", "haploinsufficient"], index, cap=1, already={301})
+    assert held == {300, 301} and [t.use for t in both] == ["filter", "filter"]
+
+
+def test_a_reply_with_words_is_parsed_and_a_bad_one_is_not():
+    assert hi.parse_model_terms(json.dumps({"terms": ["gene dosage", "a b c d e", 3, "one functional copy"]})) == [
+        "gene dosage", "one functional copy"]
+    assert hi.parse_model_terms("no json") is None

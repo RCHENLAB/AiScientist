@@ -43,7 +43,6 @@ import os
 import re
 import threading
 import time
-import unicodedata
 import urllib.error
 import urllib.request
 import uuid
@@ -54,6 +53,7 @@ from typing import Any, Callable, Iterable
 
 from .._lib.corpus import (  # noqa: F401 - re-exported: scripts/build_mechanism_cache.py imports them from here
     CorpusPaths, chunk_vectors, l2 as _l2, load_chunks, read_manifest, sentence_transformer_embed)
+from .._lib.corpus import FILTER_MAX_SHARE, Term, TextIndex, fold, nearest, parse_terms, term_report
 from .._lib.corpus import corpus_paths as _corpus_paths
 from ..sdk import HarnessTool
 
@@ -91,6 +91,34 @@ Return ONLY JSON: {"requests": ["...", "..."]}"""
 GENE_REQUESTS_SYSTEM = """You are writing search requests for an embedding index of full-text papers on inherited retinal disease. A first search found passages that state or suggest haploinsufficiency for the genes listed below, each with the phenotype the passages gave. For EACH gene write ONE full sentence that would find the other passages about that gene's disease mechanism: name the gene, its phenotype, and heterozygous loss of function / haploinsufficiency. Use only the gene symbols and phenotypes given; add no other gene.
 
 Return ONLY JSON: {"requests": {"GENE": "sentence", "...": "..."}}"""
+
+# Step 1, round one, exact words: the model writes the words a qualifying passage would contain;
+# the corpus counts each, and every passage holding a rare enough one is read too.
+TERMS_SYSTEM = """You are choosing exact search words for a full-text index of papers on inherited retinal disease. The goal is to find EVERY passage in which the authors state that a gene causes a retinal or ocular disease through haploinsufficiency.
+
+DEFINITION. "Haploinsufficiency" means: a heterozygous loss-of-function allele causes the disease because one functional copy is insufficient, i.e. a dominant loss-of-function / reduced-dosage mechanism. It is NOT dominant-negative, NOT gain-of-function, and NOT recessive loss of function.
+
+Write the words and short phrases (1-4 words) that such a passage would use to STATE THIS MECHANISM, with their usual variants (noun and adjective forms, hyphenated spellings, synonyms). Leave out words that also fill thousands of passages that do not state it: gene and disease names, variant types on their own (nonsense, frameshift, deletion, heterozygous), and the names of other mechanisms. Each word is counted in the corpus; one found in more than 1 passage of 100 is not used.
+
+Return ONLY JSON: {"terms": ["...", "..."]} with at most {N} terms."""
+_MAX_TERMS = 12
+
+
+def terms_messages() -> list[dict[str, str]]:
+    return [{"role": "system", "content": TERMS_SYSTEM.replace("{N}", str(_MAX_TERMS))},
+            {"role": "user", "content": "Write the search words."}]
+
+
+def parse_model_terms(text: str) -> list[str] | None:
+    """The model's search words: strings of at most 4 words, at most ``_MAX_TERMS``. None when the
+    reply is not the JSON asked for."""
+    data = _json_object(text)
+    raw = data.get("terms") if data else None
+    if not isinstance(raw, list):
+        return None
+    out = [" ".join(str(r).split()) for r in raw if isinstance(r, str) and 0 < len(str(r).split()) <= 4]
+    return out[:_MAX_TERMS]
+
 
 # Used for a gene the model's reply left out (counted in the result's warnings).
 GENE_REQUEST_TEMPLATE = ("Heterozygous loss of function of {gene} causes {phenotype} through haploinsufficiency, "
@@ -187,12 +215,6 @@ REFHEAD = re.compile(r"^\s*(references|reference list|bibliography|literature ci
 ABBR = re.compile(r"\b(et al|Fig|Figs|Dr|vs|e\.g|i\.e|cf|approx|No|Ref|Refs|Suppl)\.$", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\(\[])")
 _CHUNK_CHARS = 1500
-
-
-def fold(t: str | None) -> str:
-    """NFKC: the PDF ligatures ("ﬁ" in "haploinsufﬁciency", in 62% of the corpus' sentences that use
-    the word) read as their letters; soft hyphens dropped."""
-    return unicodedata.normalize("NFKC", t or "").replace("­", "")
 
 
 def dehyph(t: str) -> str:
@@ -417,51 +439,52 @@ def parse_gene_requests(text: str, genes: Iterable[str]) -> dict[str, str] | Non
 
 def nearest_chunks(q_vec: Any, vecs: Any, chunks: list[dict[str, Any]], k: int,
                    candidates: Iterable[int] | None = None, max_per_paper: int = _MAX_PER_PAPER) -> list[int]:
-    """The ``k`` chunks nearest one request (cosine: both sides are L2-normalised), at most
-    ``max_per_paper`` from one paper. ``candidates`` limits the search to those chunk indices."""
-    import numpy as np  # noqa: PLC0415
-    if candidates is None:
-        idx = None
-        scores = vecs @ q_vec
-    else:
-        idx = np.asarray(sorted(candidates), dtype=int)
-        if not len(idx):
-            return []
-        scores = vecs[idx] @ q_vec
-    out: list[int] = []
-    per_paper: dict[str, int] = {}
-    for o in np.argsort(-scores, kind="stable"):        # ties keep the corpus order
-        i = int(o) if idx is None else int(idx[o])
-        pmid = str(chunks[i]["pmid"])
-        if per_paper.get(pmid, 0) >= max_per_paper:
-            continue
-        per_paper[pmid] = per_paper.get(pmid, 0) + 1
-        out.append(i)
-        if len(out) >= k:
-            break
-    return out
+    """The ``k`` chunks nearest one request, at most ``max_per_paper`` from one paper (``_lib.corpus.nearest``)."""
+    return nearest(q_vec, vecs, chunks, k, candidates, max_per_paper)
 
 
-def keyword_chunks(chunks: list[dict[str, Any]]) -> list[int]:
+DOSAGE_TERM = Term("dosage wording", "pattern", DOSAGE_WORDING.pattern, source="tool")
+
+
+def keyword_chunks(chunks: list[dict[str, Any]], index: TextIndex | None = None) -> list[int]:
     """The chunks whose text states a dosage mechanism in words (``DOSAGE_WORDING``, ligatures folded),
     in corpus order. Jin's brief asks for genes the papers report EXPLICITLY, and a request's nearest
     chunks miss most of them: a chunk's vector is its topic, and one word of 250 barely moves it."""
-    return [i for i, c in enumerate(chunks) if DOSAGE_WORDING.search(fold(c.get("text", "")))]
+    index = index if index is not None else TextIndex.of_chunks(chunks)
+    return sorted(index.counts(DOSAGE_TERM))
 
 
-def chunks_naming(terms: dict[str, set[str]], chunks: list[dict[str, Any]]) -> dict[str, set[int]]:
+def model_term_chunks(raw_terms: list[str], index: TextIndex, cap: int,
+                      already: Iterable[int] = ()) -> tuple[list[Term], set[int]]:
+    """The model's words checked against the corpus, and the chunks the usable ones hold. A word is
+    used when it is in the corpus, names no gene and is in at most 1 chunk of 100 (``FILTER_MAX_SHARE``
+    / 2: a scan reads every chunk it is in); rarest first, while the chunks it adds beyond
+    ``already`` (those read anyway) stay within ``cap``."""
+    terms = index.check(parse_terms(raw_terms, "model"), FILTER_MAX_SHARE / 2)
+    seen = set(already)
+    chosen: set[int] = set()
+    added = 0
+    for t in sorted(terms, key=lambda t: t.n_passages):
+        if t.kind == "gene" and t.use == "filter":
+            t.use = "rank"                     # a gene name selects no mechanism
+        if t.use != "filter":
+            continue
+        hold = set(index.counts(t))
+        more = hold - chosen - seen
+        if added + len(more) > cap:
+            t.use = "over_cap"
+            continue
+        chosen |= hold
+        added += len(more)
+    return terms, chosen
+
+
+def chunks_naming(terms: dict[str, set[str]], chunks: list[dict[str, Any]],
+                  index: TextIndex | None = None) -> dict[str, set[int]]:
     """For each gene, the chunks that contain one of its symbols (``terms``) as a word. Case-sensitive:
     gene symbols are written in capitals, and a lower-case word is not the gene."""
-    owner = {t: g for g, ts in terms.items() for t in ts if t}
-    out: dict[str, set[int]] = {g: set() for g in terms}
-    if not owner:
-        return out
-    rx = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(re.escape(t) for t in sorted(owner, key=len, reverse=True))
-                    + r")(?![A-Za-z0-9])")
-    for i, c in enumerate(chunks):
-        for m in set(rx.findall(c.get("text", ""))):
-            out[owner[m]].add(i)
-    return out
+    index = index if index is not None else TextIndex.of_chunks(chunks)
+    return {g: index.matching(Term(t, "gene") for t in ts if t) for g, ts in terms.items()}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1021,6 +1044,10 @@ PARAMS: dict[str, tuple[Any, str]] = {
     "k_per_request": (50, "passages (chunks) each first-round request retrieves"),
     "keyword_round": (1, "1 = round one also reads every passage that states a dosage mechanism in words "
                          "(haploinsufficiency, gene dosage, one functional copy, ...); 0 = the requests alone"),
+    "term_round": (1, "1 = the model also writes the exact words a qualifying passage would use; each is "
+                      "counted in the corpus, and every passage holding one that is in at most 1% of the "
+                      "passages is read too; 0 = the built-in dosage wording only"),
+    "max_term_passages": (300, "at most this many passages the model's words add (rarest words first)"),
     "k_per_gene": (15, "passages each second-round gene request retrieves, among the chunks that name the gene"),
     "max_quotes_per_gene": (3, "how many papers (PMID + verbatim quote) genes.csv lists per gene"),
     "concurrency": (16, "parallel requests to the model while it reads the passages"),
@@ -1146,6 +1173,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     raw_vecs = (chunk_vectors(chunks, paths.cache, embed, paths.cache_writable, log) if not pmids
                 else _l2(embed([c["text"] for c in chunks])))
     vecs = np.asarray(raw_vecs, dtype="float32")
+    index = TextIndex.of_chunks(chunks)
     hgnc = Hgnc(paths.hgnc)
     manifest = read_manifest(paths.manifest)
     titles = [str(r.get("title") or "") for r in manifest]
@@ -1200,13 +1228,37 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
             found.setdefault(i, []).append(f"R{r + 1}")
     keyword_only = 0
     if int(_p("keyword_round", args)):
-        worded = keyword_chunks(chunks)
+        worded = keyword_chunks(chunks, index)
         hits_per_request["K"] = len(worded)
         for i in worded:
             keyword_only += i not in found
             found.setdefault(i, []).append("K")
         log(f"round one: {len(worded)} passages state a dosage mechanism in words, {keyword_only} of them "
             "found by no request")
+    # The model's own words, checked against the corpus: a safety net for wordings the built-in list
+    # does not have. Only the passages nothing else found are added.
+    term_rows: list[Term] = []
+    term_only = 0
+    if int(_p("term_round", args)):
+        raw_terms = stored.get("terms")
+        if not isinstance(raw_terms, list):
+            raw_terms, err, unreachable = _ask(write_fn, terms_messages(), parse_model_terms)
+            if raw_terms is None:
+                if unreachable:
+                    return gone(err, [], {})
+                warnings.append(f"The model did not write usable search words ({err}); the built-in dosage "
+                                "wording was used alone.")
+                raw_terms = []
+            stored["terms"] = raw_terms
+            _save_json(store_path, stored)
+        term_rows, by_terms = model_term_chunks(raw_terms, index, max(0, int(_p("max_term_passages", args))),
+                                                already=found)
+        hits_per_request["T"] = len(by_terms)
+        for i in sorted(by_terms):
+            term_only += i not in found
+            found.setdefault(i, []).append("T")
+        log(f"round one: the model's {len(raw_terms)} words, {sum(t.use == 'filter' for t in term_rows)} "
+            f"used, add {term_only} passages")
     passages = locate(found, chunks, sents_by_chunk)
     if max_p > 0:
         passages = passages[:max_p]
@@ -1285,7 +1337,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     found2: dict[int, list[str]] = {}
     round_one = {p.sid: p for p in passages}
     if genes2:
-        naming = chunks_naming({g: genes2[g]["terms"] for g in genes2}, chunks)
+        naming = chunks_naming({g: genes2[g]["terms"] for g in genes2}, chunks, index)
         for g, qv in zip(genes2, _l2(embed([gene_requests[g] for g in genes2]))):
             got = nearest_chunks(qv, vecs, chunks, k2, candidates=naming.get(g, set()))
             hits_per_request[f"G:{g}"] = len(got)
@@ -1330,6 +1382,10 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     if "K" in hits_per_request:
         req_rows.append({"id": "K", "round": 1, "gene": "", "request": KEYWORD_REQUEST,
                          "n_passages": hits_per_request["K"]})
+    if "T" in hits_per_request:
+        req_rows.append({"id": "T", "round": 1, "gene": "", "n_passages": hits_per_request["T"],
+                         "request": "the model's words: " + "; ".join(
+                             f"{t.text} ({t.n_passages}, {t.use})" for t in term_rows)})
     req_rows += [{"id": f"G:{g}", "round": 2, "gene": g, "request": gene_requests[g],
                   "n_passages": hits_per_request.get(f"G:{g}", 0)} for g in genes2]
     write_csv(requests_csv, req_rows, REQUEST_COLUMNS)
@@ -1341,6 +1397,8 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         "status": "ok", "step": "literature", **c,
         "n_requests": len(requests), "n_gene_requests": len(genes2),
         "n_keyword_passages": hits_per_request.get("K", 0), "n_keyword_only_passages": keyword_only,
+        "n_term_passages": hits_per_request.get("T", 0), "n_term_only_passages": term_only,
+        "terms": term_report(term_rows),
         "n_hits_eligible": n_elig, "n_genes": len(genes),
         "genes": [{"gene": g["gene"], "n_papers": g["n_papers"], "phenotype": (g["phenotype"] or "")[:80],
                    "flags": [k[5:] for k in flag_keys if g[k]]} for g in genes],
@@ -1364,7 +1422,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
 # judgments become rows (``nearest_chunks``, ``chunks_naming``, ``round_two_genes``, ``parse_items``,
 # ``locate_items``, ``eligible``, ``aggregate``). The constants below are fingerprinted as they
 # are, so editing them needs no bump.
-RULES_REVISION = 3
+RULES_REVISION = 4
 
 
 def rules_digest() -> str:
@@ -1376,12 +1434,13 @@ def rules_digest() -> str:
     sample = Passage("p:0", "p", 0, 1, [Sentence(sid="p:0:0", pmid="p", chunk=0, sent=0, page=1, text="TEXT")])
     parts = [
         str(RULES_REVISION), JUDGE_SYSTEM, REQUESTS_SYSTEM, GENE_REQUESTS_SYSTEM, GENE_REQUEST_TEMPLATE,
+        TERMS_SYSTEM, f"filter_max_share={FILTER_MAX_SHARE}",
         DEFINITION, ",".join(MECHANISM_CLASSES),
         passage_prompt(sample)[1]["content"], request_messages(1)[1]["content"],
         *(rx.pattern for rx in (CIT, GARBLED_MARK, AUTH, CITN, MECH, DOM, DOSAGE_WORDING)), KEYWORD_REQUEST,
         f"max_per_paper={_MAX_PER_PAPER}", f"gene_batch={_GENE_BATCH}",
-        *(f"{k}={PARAMS[k][0]}" for k in ("n_requests", "k_per_request", "keyword_round", "k_per_gene",
-                                          "max_quotes_per_gene")),
+        *(f"{k}={PARAMS[k][0]}" for k in ("n_requests", "k_per_request", "keyword_round", "term_round",
+                                          "max_term_passages", "k_per_gene", "max_quotes_per_gene")),
         ",".join(HIT_COLUMNS), ",".join(GENE_COLUMNS), ",".join(REQUEST_COLUMNS),
     ]
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]

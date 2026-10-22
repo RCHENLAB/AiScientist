@@ -40,6 +40,7 @@ from fastapi.responses import Response
 from starlette.requests import ClientDisconnect
 
 from . import upload_log, upload_storage
+from .errors import public_error
 
 router = APIRouter(prefix="/api/tus")
 _VERSION = "1.0.0"
@@ -544,7 +545,7 @@ async def head(upload_id: str, request: Request) -> Response:
                 if isinstance(exc, ValueError):
                     _fail_finalization(paths[0], paths[1], meta, exc)
                 return _answer(422 if isinstance(exc, ValueError) else 500,
-                               body={"error": f"upload finalization failed: {exc}"})
+                               body={"error": f"upload finalization failed: {public_error(exc)}"})
         if 0 < meta["offset"] < meta["length"]:
             upload_log.record(conn.workspace, "resume_asked", upload_id=upload_id,
                               name=meta.get("rel_path") or meta.get("name"), offset=meta["offset"],
@@ -739,7 +740,7 @@ async def patch(upload_id: str, request: Request) -> Response:
                         _fail_finalization(path, part, meta, exc)
                     return _answer(422 if isinstance(exc, ValueError) else 500,
                                    headers={"Upload-Offset": str(meta["offset"])},
-                                   body={"error": f"upload received but staging failed: {exc}"})
+                                   body={"error": f"upload received but staging failed: {public_error(exc)}"})
             headers = {"Upload-Offset": str(meta["offset"])}
             if meta.get("job_id"):
                 headers["Upload-Staging-Job"] = meta["job_id"]

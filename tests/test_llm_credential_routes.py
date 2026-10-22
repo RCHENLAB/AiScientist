@@ -8,6 +8,7 @@ the rotation ordering — rather than re-testing the provider layer.
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -478,16 +479,14 @@ def test_the_provider_preset_can_be_changed_by_an_edit(client, ok_endpoint):
 # --- where the key lives ------------------------------------------------------
 
 
-def test_the_list_says_where_keys_are_stored(client, ok_endpoint):
-    """"Where does my key go?" is answerable only here — the key itself never reaches the browser.
-
-    The path must be ABSOLUTE: AISCIENTIST_STATE_DIR is unset in production, so an unresolved store
-    reads "llm_creds/<user>", which the reader cannot locate and which therefore answers nothing.
-    """
+def test_the_list_says_how_keys_are_protected_but_not_where(client, ok_endpoint):
+    """The dialog states that the key is encrypted on the server; it never shows the key file's
+    path, owner or mode, which tell the user nothing and show the server's layout (issue 37)."""
     import os
 
+    _create(client)
     d = client.get("/api/llm-credentials?user=alice").json()
-    assert d["storage"]["owner"] == "alice"
-    assert d["storage"]["dir"].endswith("llm_creds/alice")
-    assert os.path.isabs(d["storage"]["dir"])
-    assert d["storage"]["encrypted"] is True
+    assert d["storage"] == {"encrypted": True}
+    state_dir = os.environ["AISCIENTIST_STATE_DIR"]
+    assert state_dir not in json.dumps(d), "no server path in the list"
+    assert "llm_creds" not in json.dumps(d)

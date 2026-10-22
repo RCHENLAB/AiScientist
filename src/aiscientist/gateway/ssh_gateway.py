@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterator
 
 import paramiko
 
-from .errors import GatewayError, error_detail
+from .errors import GatewayError, error_detail, public_error
 from .executor import ExecResult
 
 EmitFn = Callable[[str, str, str], None]  # (level, stage, message)
@@ -164,7 +164,8 @@ class SSHExecutor:
 
         if key_path:
             pkey = self._load_key(key_path, key_passphrase)
-            self._emit("step", "ssh_auth", f"Authenticating with SSH key {key_path} ...")
+            # Never the key file's path: it is a file in the server's key store (issue 37).
+            self._emit("step", "ssh_auth", "Authenticating with your SSH key ...")
             transport.auth_publickey(self.username, pkey)
             # Keep the LOADED key (not the path) so the data-transfer connection — and a reconnect
             # after a drop — can authenticate without re-reading the file or re-prompting for a
@@ -249,7 +250,8 @@ class SSHExecutor:
     def _load_key(key_path: str, passphrase: str | None) -> paramiko.PKey:
         path = Path(key_path).expanduser()
         if not path.exists():
-            raise GatewayError(f"SSH key not found at {path}", stage="ssh_auth")
+            raise GatewayError("The SSH key file was not found on the server. Add the key again.",
+                               stage="ssh_auth")
         last_error: Exception | None = None
         for key_cls in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
             try:
@@ -257,7 +259,7 @@ class SSHExecutor:
             except paramiko.SSHException as exc:
                 last_error = exc
         raise GatewayError(
-            f"Could not load SSH key {path}. Check the format and passphrase.",
+            "Could not load the SSH key. Check its format and passphrase.",
             stage="ssh_auth",
             detail=error_detail(last_error) if last_error else None,
         )
@@ -465,7 +467,7 @@ class SSHExecutor:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             client._transport = transport
         except Exception as exc:  # noqa: BLE001 - ANY failure here must degrade, never break a run
-            self._fall_back_to_login_node(f"{self.transfer_host} is not usable ({error_detail(exc)})")
+            self._fall_back_to_login_node(f"{self.transfer_host} is not usable ({public_error(exc)})")
             return None
 
         self._transfer_client = client

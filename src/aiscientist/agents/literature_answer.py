@@ -1,12 +1,16 @@
-"""The literature-search skill: a general question answered from PubMed, with citations.
+"""The literature-search skill: a general question answered from the lab's corpus and PubMed, with citations.
 
 What a request routed to ``literature`` (``agents/request_router.py``) runs once its one-step plan
-is approved. Everything happens in the gateway over Europe PMC's public REST API, with no HPC3 job:
+is approved:
 
-1. the model writes two to four keyword queries for the question (:func:`plan_queries`);
+1. the model writes two to four keyword queries for PubMed and the exact words a passage that
+   answers would contain (:func:`plan_search`);
 2. each query is searched in PubMed through Europe PMC, abstracts included (:func:`collect_papers`),
-   and the hits are merged and de-duplicated;
-3. the model answers from those abstracts only, citing them by number (:func:`answer_messages`);
+   and the hits are merged and de-duplicated; at the same time, when the session reaches HPC3, the
+   question and those words search the full text of the lab's RetiGene corpus (``search_corpus``,
+   the hybrid ranking) and its passages join the sources, merged by PMID (:func:`add_corpus`);
+3. the model answers from those passages and abstracts only, citing them by number
+   (:func:`answer_messages`);
 4. code writes the reference list from the numbers the answer cites (:func:`finish_answer`). A
    number that is not one of the papers is removed, so every reference is a paper the search
    returned and the model cannot add one.
@@ -24,7 +28,10 @@ from typing import Any, Callable
 from .loop_utils import safe_json_loads
 
 TOOL = "literature_search"
+CORPUS_TOOL = "search_corpus"
 MAX_QUERIES = 4
+MAX_TERMS = 12
+CORPUS_PASSAGES = 12
 PER_QUERY = 8
 MAX_PAPERS = 12
 ABSTRACT_CHARS = 1400
@@ -36,20 +43,24 @@ QUERY_SYSTEM = (
     "angle of the question (the disease, the tissue, the species, the mechanism); never write a "
     "query without the subject. Every term of a query must appear in a matching paper, so keep each query "
     "SHORT: 2 to 4 keywords, at most one gene symbol, no boolean operators, no quotes, no "
-    "instruction words. Translate a question in another language into English keywords. "
-    'Reply with ONLY a JSON array of strings, e.g. ["DDX41 retina", "DDX41 photoreceptor '
-    'degeneration", "DEAD-box helicase retinal disease"].'
+    "instruction words. Translate a question in another language into English keywords.\n"
+    "Also list up to 12 `terms`: the exact words or short phrases (1 to 4 words) a passage that "
+    "answers would contain, with their usual variants (gene symbols, disease names, technical "
+    "terms; noun and adjective forms). They search the full text of the lab's paper collection.\n"
+    'Reply with ONLY a JSON object, e.g. {"queries": ["DDX41 retina", "DDX41 photoreceptor '
+    'degeneration", "DEAD-box helicase retinal disease"], "terms": ["DDX41", "DEAD-box helicase", '
+    '"photoreceptor degeneration", "retina"]}.'
 )
 
 ANSWER_SYSTEM = (
     "You are AiScientist answering a researcher's question from the published literature. You are "
-    "given the question and numbered papers found in PubMed, each with its abstract. Answer in "
-    "English, from these abstracts only:\n"
+    "given the question and numbered papers: passages from the full text of papers in the lab's "
+    "corpus, and abstracts of papers found in PubMed. Answer in English, from these texts only:\n"
     "- Open with a direct answer in one or two sentences, then explain in a few short paragraphs "
     "(at most about 350 words in all).\n"
     "- After every statement drawn from a paper, cite it by its number in square brackets, e.g. "
     "[2] or [1, 4]. Cite only the numbers given; never invent a paper, an author or a number.\n"
-    "- Do not state findings the abstracts do not contain. Say plainly what they do not answer, "
+    "- Do not state findings the texts do not contain. Say plainly what they do not answer, "
     "and when the papers found do not address the question, say so instead of answering from "
     "memory.\n"
     "- No reference list, no title, no Methods/Results sections: the references are added below "
@@ -75,6 +86,8 @@ class Paper:
     citation: str = ""
     abstract: str = ""
     queries: list[str] = field(default_factory=list)
+    passages: list[str] = field(default_factory=list)   # full-text passages from the lab's corpus
+    sources: list[str] = field(default_factory=list)    # "corpus", "pubmed"
 
     def key(self) -> str:
         return (self.doi.lower() or self.pmid or self.title.lower()).strip()
@@ -89,17 +102,25 @@ class Paper:
 class Collected:
     papers: list[Paper]
     searched: list[dict[str, Any]]          # per query: query, count, error
+    corpus: "dict[str, Any] | None" = None  # the corpus search: status, passages, papers, terms, error
 
     @property
     def errors(self) -> list[str]:
         return [str(s["error"]) for s in self.searched if s.get("error")]
 
 
-def plan_step(question: str) -> str:
-    """The one step of a literature plan, as the plan card shows it."""
+def plan_step(question: str, corpus: bool = False) -> str:
+    """The one step of a literature plan, as the plan card shows it. ``corpus``: the session also
+    searches the lab's RetiGene corpus (a short HPC3 job)."""
     q = " ".join(str(question or "").split())
     if len(q) > 300:
         q = q[:297].rstrip() + "…"
+    if corpus:
+        return (f"**Literature search** — Search the full text of the lab's RetiGene corpus (`{CORPUS_TOOL}`, "
+                f"a short HPC3 job) and PubMed (through Europe PMC, `{TOOL}`) for what answers: “{q}”. Read "
+                f"the best corpus passages (up to {CORPUS_PASSAGES}) and the abstracts of the most relevant "
+                f"PubMed papers (up to {MAX_PAPERS}), and answer with numbered citations to them. It takes "
+                "one to a few minutes.")
     return (f"**Literature search** — Search PubMed (through Europe PMC) for papers that answer: “{q}”. "
             f"Read the abstracts of the most relevant papers (up to {MAX_PAPERS}) and answer with "
             f"numbered citations to them, using `{TOOL}`. It runs in the gateway in about a minute, "
@@ -115,29 +136,53 @@ def _clean_query(text: str) -> str:
 
 def plan_queries(complete: "Callable[[list[dict]], str] | None", question: str, *,
                  fallback: "Callable[[str], str] | None" = None) -> list[str]:
-    """Two to four keyword queries for ``question``. The model writes them; when it gives nothing
-    usable, ``fallback(question)`` (the literature tool's own query focusing) gives one."""
+    """Two to four keyword queries for ``question`` (:func:`plan_search` without the terms)."""
+    return plan_search(complete, question, fallback=fallback)[0]
+
+
+def _clean_term(text: str) -> str:
+    t = re.sub(r'["“”`]', " ", str(text or ""))
+    words = t.split()
+    return " ".join(words).strip() if 0 < len(words) <= 4 and len(t) <= 60 else ""
+
+
+def plan_search(complete: "Callable[[list[dict]], str] | None", question: str, *,
+                fallback: "Callable[[str], str] | None" = None) -> "tuple[list[str], list[str]]":
+    """Two to four keyword queries for ``question`` and up to ``MAX_TERMS`` exact words for the
+    corpus, from one model call. When the model gives no usable query, ``fallback(question)`` (the
+    literature tool's own query focusing) gives one; no terms is fine (the corpus search uses the
+    question's own words anyway)."""
     queries: list[str] = []
+    terms: list[str] = []
     if complete is not None:
         try:
             raw = str(complete([{"role": "system", "content": QUERY_SYSTEM},
-                                {"role": "user", "content": f"Question: {question}\n\nThe JSON array:"}]) or "")
+                                {"role": "user", "content": f"Question: {question}\n\nThe JSON:"}]) or "")
         except Exception:  # noqa: BLE001 - query writing must never fail the step
             raw = ""
         items: Any = None
         text = raw.strip()
         if text.startswith("```"):
             text = text.strip("`").removeprefix("json").strip()
-        m = re.search(r"\[.*\]", text, re.DOTALL)
-        if m:
-            try:
-                import json
-                items = json.loads(m.group(0))
-            except ValueError:
-                items = None
-        if items is None:
-            obj = safe_json_loads(text)
-            items = (obj or {}).get("queries") if isinstance(obj, dict) else None
+        obj = safe_json_loads(text)
+        if not isinstance(obj, dict) and "{" in text and "}" in text:
+            obj = safe_json_loads(text[text.find("{"):text.rfind("}") + 1])
+        if isinstance(obj, dict):
+            items = obj.get("queries")
+            for t in obj.get("terms") or []:
+                c = _clean_term(t if isinstance(t, str) else "")
+                if c and c.lower() not in {x.lower() for x in terms} and len(terms) < MAX_TERMS:
+                    terms.append(c)
+        else:
+            m = re.search(r"\[.*\]", text, re.DOTALL)
+            if m:
+                try:
+                    import json
+                    items = json.loads(m.group(0))
+                except ValueError:
+                    items = None
+        if not isinstance(items, list):
+            items = []
         for item in items or []:
             q = _clean_query(item if isinstance(item, str) else "")
             if q and q.lower() not in {x.lower() for x in queries}:
@@ -148,7 +193,7 @@ def plan_queries(complete: "Callable[[list[dict]], str] | None", question: str, 
         q = _clean_query(fallback(question) if fallback else question)
         if q:
             queries.append(q)
-    return queries
+    return queries, terms
 
 
 def collect_papers(search: "Callable[..., dict[str, Any]]", queries: list[str], *,
@@ -198,15 +243,77 @@ def collect_papers(search: "Callable[..., dict[str, Any]]", queries: list[str], 
     return Collected(papers, searched)
 
 
+_PMID_IN_CITATION = re.compile(r"\s*PMID:\s*\d+.*$")
+
+
+def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
+               max_passages: int = CORPUS_PASSAGES) -> Collected:
+    """``collected`` (the PubMed papers) with the corpus search's passages added: one source per
+    corpus paper, its passages in rank order, listed first; a PubMed paper with the same PMID is the
+    same source (passages and abstract together). Every source is numbered again, 1 to n.
+    ``result`` is ``search_corpus``'s result (``status``, ``contexts``, ``terms``), or None when the
+    session cannot reach the corpus."""
+    if result is None:
+        return collected
+    info: dict[str, Any] = {"status": str(result.get("status") or "error"),
+                            "terms": [t for t in (result.get("terms") or []) if isinstance(t, dict)]}
+    if result.get("status") != "ok":
+        info["error"] = str(result.get("error") or result.get("status") or "no result")
+    corpus: list[Paper] = []
+    by_pmid: dict[str, Paper] = {}
+    n_passages = 0
+    for c in result.get("contexts") or []:
+        if not isinstance(c, dict) or n_passages >= max_passages:
+            continue
+        pmid, text = str(c.get("pmid") or "").strip(), " ".join(str(c.get("text") or "").split())
+        if not pmid or not text:
+            continue
+        p = by_pmid.get(pmid)
+        if p is None:
+            cite = str(c.get("citation") or "").strip()
+            title = _PMID_IN_CITATION.sub("", cite).strip() or f"PMID {pmid}"
+            p = Paper(number=0, title=title, pmid=pmid, citation=cite or f"PMID {pmid}",
+                      url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/", sources=["corpus"])
+            by_pmid[pmid] = p
+            corpus.append(p)
+        page = c.get("page")
+        p.passages.append((f"(p. {page}) " if page not in (None, "") else "") + text)
+        n_passages += 1
+    info.update(passages=n_passages, papers=len(corpus))
+    merged = list(corpus)
+    for p in collected.papers:
+        same = by_pmid.get(p.pmid) if p.pmid else None
+        if same is not None:
+            same.abstract = same.abstract or p.abstract
+            same.title, same.authors, same.year, same.journal = p.title or same.title, p.authors, p.year, p.journal
+            same.doi, same.url = p.doi or same.doi, p.url or same.url
+            same.citation = p.citation or same.citation
+            same.queries = list(p.queries)
+            same.sources.append("pubmed")
+            continue
+        p.sources = p.sources or ["pubmed"]
+        merged.append(p)
+    for i, p in enumerate(merged, 1):
+        p.number = i
+    return Collected(merged, collected.searched, info)
+
+
 def answer_messages(question: str, papers: list[Paper]) -> list[dict]:
-    """The answer-writing call: the papers, numbered, each with its abstract."""
+    """The answer-writing call: the sources, numbered, each with its corpus passages and its
+    abstract."""
     blocks = []
     for p in papers:
         head = f"[{p.number}] {p.title}"
         meta = ", ".join(x for x in (p.authors.split(",")[0].strip() + (" et al." if "," in p.authors else ""),
                                      p.journal, p.year) if x)
-        blocks.append(f"{head}\n{meta}\nAbstract: {p.abstract or '(no abstract available)'}")
-    user = (f"Question: {question}\n\nPapers found in PubMed:\n\n" + "\n\n".join(blocks)
+        parts = [head] + ([meta] if meta else [])
+        if p.passages:
+            parts.append("Passages from the full text (lab's corpus):\n" + "\n".join(f"- {t}" for t in p.passages))
+        if p.abstract or not p.passages:
+            parts.append(f"Abstract: {p.abstract or '(no abstract available)'}")
+        blocks.append("\n".join(parts))
+    where = ("the lab's corpus and PubMed" if any(p.passages for p in papers) else "PubMed")
+    user = (f"Question: {question}\n\nPapers found in {where}:\n\n" + "\n\n".join(blocks)
             + "\n\nWrite the answer now.")
     return [{"role": "system", "content": ANSWER_SYSTEM}, {"role": "user", "content": user}]
 
@@ -265,19 +372,37 @@ def no_papers_answer(question: str, collected: Collected) -> str:
     """The reply when the search returned nothing to read."""
     tried = ", ".join(f"“{s['query']}”" for s in collected.searched) or "no query"
     why = (" The search itself failed: " + "; ".join(collected.errors[:2]) + ".") if collected.errors else ""
-    return (f"PubMed returned no papers to answer this from (searched {tried}).{why} Nothing was "
+    where = "PubMed returned no papers"
+    if collected.corpus is not None:
+        where = "Neither the lab's corpus nor PubMed returned a paper"
+        if collected.corpus.get("error"):
+            why += f" The corpus search failed: {collected.corpus['error']}."
+    return (f"{where} to answer this from (searched {tried}).{why} Nothing was "
             "answered from memory. Try naming the gene, disease or tissue more specifically, or ask for "
             "an analysis of your data instead.")
 
 
 def method_md(collected: Collected, date: str) -> str:
     """How the answer was made, for the saved summary."""
-    lines = [f"Searched PubMed through Europe PMC on {date} with {len(collected.searched)} "
-             f"quer{'y' if len(collected.searched) == 1 else 'ies'}:"]
+    lines: list[str] = []
+    c = collected.corpus
+    if c is not None:
+        if c.get("error") and not c.get("passages"):
+            lines.append(f"The lab's RetiGene corpus was searched on {date}, but the search failed "
+                         f"({c['error']}); the answer rests on PubMed alone.\n")
+        else:
+            used = [t for t in c.get("terms") or [] if t.get("use") in ("filter", "rank")]
+            lines.append(f"Searched the full text of the lab's RetiGene corpus on {date} with `{CORPUS_TOOL}` "
+                         "(the question's meaning and its exact words, merged by rank): "
+                         f"{c.get('passages', 0)} passage(s) from {c.get('papers', 0)} paper(s)."
+                         + (" Words used: " + ", ".join(f"{t['term']} ({t['n_passages']})" for t in used[:16]) + "."
+                            if used else "") + "\n")
+    lines.append(f"Searched PubMed through Europe PMC on {date} with {len(collected.searched)} "
+                 f"quer{'y' if len(collected.searched) == 1 else 'ies'}:")
     for s in collected.searched:
         lines.append(f"- “{s['query']}”: {s['count']} paper(s)" + (f" (error: {s['error']})" if s.get("error") else ""))
-    lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (title and abstract); the answer "
-                 "cites them by number, and each reference was checked against the search results.")
+    lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (corpus passages, titles and abstracts); "
+                 "the answer cites them by number, and each reference was checked against the search results.")
     return "\n".join(lines)
 
 
@@ -285,8 +410,20 @@ def papers_csv(papers: list[Paper], cited: "set[int] | None" = None) -> str:
     """Every paper read, one row each: what the reader can re-check or import."""
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["number", "cited", "title", "authors", "year", "journal", "doi", "pmid", "url", "queries"])
+    w.writerow(["number", "cited", "source", "title", "authors", "year", "journal", "doi", "pmid", "url",
+                "queries", "corpus_passages"])
     for p in papers:
-        w.writerow([p.number, "yes" if cited and p.number in cited else "no", p.title, p.authors, p.year,
-                    p.journal, p.doi, p.pmid, p.url, " | ".join(p.queries)])
+        w.writerow([p.number, "yes" if cited and p.number in cited else "no", "+".join(p.sources) or "pubmed",
+                    p.title, p.authors, p.year, p.journal, p.doi, p.pmid, p.url, " | ".join(p.queries),
+                    len(p.passages)])
     return buf.getvalue()
+
+
+def passages_md(papers: list[Paper]) -> str:
+    """Every corpus passage read, verbatim, under its source number: what a reader checks a cited
+    statement against."""
+    out = []
+    for p in papers:
+        if p.passages:
+            out.append(f"## [{p.number}] {p.citation or p.title}\n\n" + "\n\n".join(f"> {t}" for t in p.passages))
+    return ("# Corpus passages read\n\n" + "\n\n".join(out) + "\n") if out else ""

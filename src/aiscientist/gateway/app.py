@@ -44,7 +44,7 @@ from . import upload_storage, dataset_storage
 from . import upload_log                  # what happened to each upload, per user
 from . import run_monitor                 # where each run is now (the System page's live graph)
 from . import corpus_scan                 # the corpus scan's own GPU job + the scans kept on the Eye Server
-from .errors import GatewayError, VLLMNetworkError, error_detail
+from .errors import GatewayError, VLLMNetworkError, error_detail, public_error
 from .executor import RemoteExecutor
 from .mock_host import MockExecutor
 from .settings import HPCSettings
@@ -1935,7 +1935,7 @@ async def connect(req: ConnectRequest, request: Request) -> JSONResponse:
             conn.broadcast_status()
         except Exception as exc:  # noqa: BLE001
             conn.status = "error"
-            conn.emit("error", "provision", f"Unexpected failure: {exc}", detail=error_detail(exc))
+            conn.emit("error", "provision", f"Unexpected failure: {public_error(exc)}", detail=error_detail(exc))
             await asyncio.to_thread(_cancel_alloc, conn, "the connection failed")
             conn.broadcast_status()
 
@@ -2205,9 +2205,9 @@ async def list_llm_credentials(request: Request, user: str = "") -> JSONResponse
         "credentials": llm_credentials.list_credentials(owner),
         "shared": shared_llm.endpoint_public(),
         "encryption": llm_credentials.encryption_enabled(),
-        # Where the key file sits, so the dialog can answer "where is my key stored?" instead of
-        # leaving the user to guess (and re-paste it somewhere safer-looking).
-        "storage": llm_credentials.storage_info(owner),
+        # How the key is protected, so the dialog can say it in plain words. Never where the file
+        # is: a server path tells the user nothing and shows everyone the server's layout.
+        "storage": llm_credentials.storage_info(),
     })
 
 
@@ -4113,7 +4113,7 @@ def _home_dataset(conn: Connection, row: dict) -> "int | None":
                 on_bytes=lambda done, total, n, of: conn.session.progress(
                     tid, bytes_done=done, bytes_total=total, files_done=n, files_total=of))
         except Exception as exc:
-            conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {exc}")
+            conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {public_error(exc)}")
             raise
         conn.session.finish_transfer(tid)
         if auth_routes.get_dataset_record(conn.app_user_id, int(row["id"])) is None:
@@ -4205,7 +4205,7 @@ def _sync_server_path(conn: Connection, path: Path, root: Path,
         raise GatewayError("Stopped while copying the data to HPC3. The next run continues the "
                            "copy where it stopped.", stage="data", detail=str(exc)) from exc
     except Exception as exc:
-        conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {exc}")
+        conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {public_error(exc)}")
         raise
     conn.session.finish_transfer(tid)
     if res["copied"]:
@@ -5614,7 +5614,7 @@ async def get_storage(connection_id: str, request: Request) -> JSONResponse:
     try:
         data = await asyncio.to_thread(_list_storage, conn)
     except Exception as exc:  # noqa: BLE001
-        conn.emit("error", "storage", f"Could not read HPC3 storage: {exc}", detail=error_detail(exc))
+        conn.emit("error", "storage", f"Could not read HPC3 storage: {public_error(exc)}", detail=error_detail(exc))
         return JSONResponse({"error": str(exc)}, status_code=500)
     return JSONResponse(data)
 
@@ -6798,7 +6798,7 @@ async def upload_staging_cancel(payload: dict, request: Request) -> JSONResponse
             q.store.delete_folder(folder)
             return JSONResponse({"status": "cancelled", "job_ids": []})
         except (OSError, ValueError) as exc:
-            return JSONResponse({"error": str(exc)}, status_code=409)
+            return JSONResponse({"error": public_error(exc)}, status_code=409)
     ids = [str(payload.get("job_id") or "")] if not folder else \
         [j.id for j in q.jobs(folder) if j.state in staging.ACTIVE]
     stopped = [i for i in ids if i and q.cancel(i)]
@@ -7002,7 +7002,7 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
         stored = await asyncio.to_thread(auth_routes.delete_dataset_record, user.id, dataset_id,
                                         delete_files=remove)
     except (OSError, ValueError) as exc:
-        return JSONResponse({"error": f"Dataset deletion failed: {exc}"}, status_code=409)
+        return JSONResponse({"error": f"Dataset deletion failed: {public_error(exc)}"}, status_code=409)
     if stored is None:
         return JSONResponse({"error": "Dataset not found."}, status_code=404)
     return JSONResponse({"ok": True, "deleted": dataset_id})
@@ -7342,7 +7342,7 @@ async def delete_run(payload: dict, request: Request) -> JSONResponse:
         gone = await asyncio.to_thread(auth_routes.delete_run_record, user.id, run_id,
                                        run_dir=folder, delete_files=remove)
     except (OSError, ValueError) as exc:
-        return JSONResponse({"error": f"The run could not be deleted: {exc}"}, status_code=409)
+        return JSONResponse({"error": f"The run could not be deleted: {public_error(exc)}"}, status_code=409)
     if gone is None:
         return JSONResponse({"error": "Run not found."}, status_code=404)
     return JSONResponse({"ok": True, "deleted": run_id})
@@ -8195,8 +8195,8 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
     except Exception as exc:  # noqa: BLE001 - reported, never fatal
         print(f"[corpus] scan failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
-        conn.emit("error", "corpus", f"Corpus scan failed: {exc}", detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": str(exc)})
+        conn.emit("error", "corpus", f"Corpus scan failed: {public_error(exc)}", detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": public_error(exc)})
         _finish_run_record(conn, run_id, "failed", str(art), str(exc))
     finally:
         run.running = False
@@ -8823,8 +8823,8 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     except Exception as exc:  # noqa: BLE001 - a chat failure is reported, never fatal
         print(f"[chat] fast path failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
-        conn.emit("error", "chat", f"Chat failed: {exc}", detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": str(exc)})
+        conn.emit("error", "chat", f"Chat failed: {public_error(exc)}", detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": public_error(exc)})
     finally:
         run.running = False
         conn.end_run(run)
@@ -8833,7 +8833,13 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
 # --- the literature line (RCHENLAB/AiScientist issue 21) -------------------------------------------
 # A request the router sends to the literature line gets a one-step plan the user reviews on the
 # same plan card as an analysis; once approved, PubMed is searched and the model answers from the
-# abstracts (agents/literature_answer.py). No HPC3 job: Europe PMC is called from the gateway.
+# abstracts (agents/literature_answer.py); Europe PMC is called from the gateway. A session that
+# reaches HPC3 also searches the full text of the lab's RetiGene corpus (``search_corpus``, a short
+# CPU job, the same tool and executor the chat uses) with the question and the model's exact words.
+
+# How long the answer waits for the corpus search once PubMed is done: a queued or slow job is left
+# behind, and the answer rests on PubMed alone (said so in the reply and the saved method).
+_LIT_CORPUS_WAIT_S = 600
 
 _REVISE_LIT_SYSTEM = (
     "Rewrite a researcher's literature question so that it includes the change they asked for. Keep "
@@ -8880,6 +8886,63 @@ def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: s
     return conn.plan_value or {"action": "cancel"}
 
 
+def _literature_corpus_available(conn: Connection) -> bool:
+    """Whether this session can search the lab's corpus: the literature line is set up for HPC3 and
+    the session has a live HPC3 connection (what ``_build_literature_executor`` needs). Cheap: the
+    plan card says it before anything is built."""
+    return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
+                and conn.executor is not None and not conn.mock)
+
+
+def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
+    """The ``search_corpus`` tool, routed to HPC3 as in the chat (``build_quickchat_catalog``), and
+    the context to call it with; None when the corpus cannot be reached."""
+    from ..agents.registry import build_quickchat_catalog
+    from ..agents.research_harness import HarnessContext
+    from ..agents import literature_answer as lit
+    try:
+        executor = _build_literature_executor(conn)
+    except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
+        print(f"[literature] corpus executor failed: {type(exc).__name__}: {exc}")
+        return None
+    if executor is None:
+        return None
+    tools = build_quickchat_catalog(literature_executor=executor, served_model=conn.alloc is not None)
+    tool = next((t for t in tools if getattr(t, "name", "") == lit.CORPUS_TOOL), None)
+    if tool is None:
+        return None
+    ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
+                         tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
+    return tool, ctx
+
+
+def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[Any, Any]", question: str,
+                              terms: list[str]) -> dict[str, Any]:
+    """Search the corpus for the question with the model's words as ``terms``, telling the activity
+    log and the run's monitor about the call. A failure is returned as a result, never raised."""
+    from ..agents import literature_answer as lit
+    tool, ctx = corpus
+    args: dict[str, Any] = {"queries": [question], "top_k": lit.CORPUS_PASSAGES}
+    if terms:
+        args["terms"] = list(terms)
+    if run.monitor is not None:
+        run.monitor.observe({"type": "tool_start", "tool": lit.CORPUS_TOOL})
+    conn.push({"type": "run_status", "text": "📚 RetiGene corpus: searching the full text…"})
+    conn.push({"type": "chat_thinking", "token": f"→ {lit.CORPUS_TOOL}({json.dumps(args)[:200]})\n"})
+    try:
+        out = tool.executor(args, ctx)
+    except Exception as exc:  # noqa: BLE001 - the answer falls back to PubMed alone
+        out = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    out = out if isinstance(out, dict) else {"status": "error", "error": "no result"}
+    ok = out.get("status") == "ok"
+    if run.monitor is not None:
+        run.monitor.observe({"type": "tool_result" if ok else "tool_error", "tool": lit.CORPUS_TOOL})
+    n = len(out.get("contexts") or []) if ok else 0
+    conn.push({"type": "chat_thinking", "token": (f"✓ {lit.CORPUS_TOOL}: {n} passage(s)\n" if ok else
+                                                  f"⚠ {lit.CORPUS_TOOL}: {out.get('error')}\n")})
+    return out
+
+
 def _literature_search_logged(conn: Connection, run: RunState, queries: list[str]) -> Any:
     """Search PubMed for each query (abstracts included), telling the activity log and the run's
     monitor about each call, and merge the papers (``literature_answer.collect_papers``)."""
@@ -8904,7 +8967,8 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
 
 def _save_literature_answer(art: Path, question: str, answer: str, collected: Any, cited: list) -> None:
     """Keep the answer with the run: ``report/summary.md`` (the question, the answer with its
-    references, how it was made) and ``literature/papers.csv`` (every paper read)."""
+    references, how it was made), ``literature/papers.csv`` (every paper read) and, when the corpus
+    was searched, ``literature/corpus_passages.md`` (every corpus passage read, verbatim)."""
     from ..agents import literature_answer as lit
     (art / "report").mkdir(parents=True, exist_ok=True)
     (art / "literature").mkdir(parents=True, exist_ok=True)
@@ -8914,6 +8978,9 @@ def _save_literature_answer(art: Path, question: str, answer: str, collected: An
     (art / "report" / "summary.md").write_text(md, encoding="utf-8")
     (art / "literature" / "papers.csv").write_text(
         lit.papers_csv(collected.papers, {p.number for p in cited}), encoding="utf-8")
+    passages = lit.passages_md(collected.papers)
+    if passages:
+        (art / "literature" / "corpus_passages.md").write_text(passages, encoding="utf-8")
 
 
 async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) -> "str | None":
@@ -8951,12 +9018,16 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     art = conn.workspace / run_id / "artifacts"
     question = str(req.question or "").strip()
     recorded = False
+    with_corpus = _literature_corpus_available(conn)
     try:
         say("📚 This reads as a question the published literature answers, so the plan is one "
-            "literature search in PubMed. Run it, or say in the chat what to change. If it needs your "
-            "data analysed, say so, and the PI plans an analysis instead.")
+            + ("literature search in the lab's RetiGene corpus and PubMed. " if with_corpus else
+               "literature search in PubMed. ")
+            + "Run it, or say in the chat what to change. If it needs your data analysed, say so, and "
+            "the PI plans an analysis instead.")
         while True:
-            decision = await asyncio.to_thread(_literature_plan_review, conn, emit, lit.plan_step(question))
+            decision = await asyncio.to_thread(_literature_plan_review, conn, emit,
+                                               lit.plan_step(question, corpus=with_corpus))
             action = str(decision.get("action") or "cancel")
             if action == "approve":
                 break
@@ -8998,22 +9069,44 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         llm = _lab_llm(conn)
         complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
         emit("step", "literature", f"Literature search (model: {llm.model}).")
-        conn.push({"type": "run_status", "text": "🔎 Writing the PubMed queries…"})
-        queries = await asyncio.to_thread(
-            lit.plan_queries, lambda m: complete_fn(m, role="classify"), question,
+        conn.push({"type": "run_status", "text": "🔎 Writing the search queries…"})
+        queries, terms = await asyncio.to_thread(
+            lit.plan_search, lambda m: complete_fn(m, role="classify"), question,
             fallback=_tools_api.focus_literature_query)
-        emit("info", "literature", "Queries: " + "; ".join(queries))
+        emit("info", "literature", "Queries: " + "; ".join(queries)
+             + (f". Corpus words: {', '.join(terms)}" if with_corpus and terms else ""))
         if run.chat_stop.is_set():
             stopped()
             return None
+        corpus = await asyncio.to_thread(_literature_corpus_tool, conn) if with_corpus else None
+        corpus_job = (asyncio.ensure_future(asyncio.to_thread(
+            _literature_corpus_logged, conn, run, corpus, question, terms)) if corpus is not None else None)
         collected = await asyncio.to_thread(_literature_search_logged, conn, run, queries)
+        corpus_out: "dict[str, Any] | None" = None
+        if with_corpus and corpus is None:
+            corpus_out = {"status": "error", "error": "the corpus could not be reached from this session"}
+        if corpus_job is not None:
+            if not corpus_job.done():
+                conn.push({"type": "run_status", "text": "📚 Waiting for the RetiGene corpus search…"})
+            deadline = time.monotonic() + _LIT_CORPUS_WAIT_S
+            while not corpus_job.done() and time.monotonic() < deadline and not run.chat_stop.is_set():
+                await asyncio.wait({corpus_job}, timeout=2)
+            corpus_out = (corpus_job.result() if corpus_job.done() else
+                          {"status": "error", "error": f"no result within {_LIT_CORPUS_WAIT_S // 60} minutes"})
         if run.chat_stop.is_set():
             stopped()
             return None
+        collected = lit.add_corpus(collected, corpus_out)
+        if collected.corpus is not None and collected.corpus.get("error") and not collected.corpus.get("passages"):
+            say(f"⚠ The RetiGene corpus search gave nothing ({collected.corpus['error']}); the answer "
+                "rests on PubMed alone.", "warning")
         papers = collected.papers
         if papers:
-            say(f"📄 {len(papers)} paper(s) from {len(queries)} PubMed search(es) — reading their "
-                "abstracts and writing the answer.")
+            n_corpus = sum(1 for p in papers if p.passages)
+            where = (f"{n_corpus} from the RetiGene corpus ({collected.corpus.get('passages', 0)} passage(s)) "
+                     f"and {len(papers) - n_corpus} more from PubMed" if n_corpus else
+                     f"from {len(queries)} PubMed search(es)")
+            say(f"📄 {len(papers)} paper(s), {where} — reading them and writing the answer.")
             conn.push({"type": "run_status", "text": "✍️ Writing the answer…"})
             raw = await asyncio.to_thread(complete_fn, lit.answer_messages(question, papers), role="literature")
             body, cited = lit.finish_answer(str(raw or ""), papers)
@@ -9037,8 +9130,9 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         ]
         if items:
             conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
-        summary = (f"Literature answer citing {len(cited)} of {len(papers)} PubMed papers" if papers
-                   else "Literature search: no papers found")
+        summary = ((f"Literature answer citing {len(cited)} of {len(papers)} papers"
+                    + (" (RetiGene corpus and PubMed)" if any(p.passages for p in papers) else " (PubMed)"))
+                   if papers else "Literature search: no papers found")
         _finish_run_record(conn, run_id, "done", str(art), summary)
         emit("success", "literature", f"{summary} ({len(queries)} queries).")
         conn.push({"type": "chat_done"})
@@ -9054,8 +9148,8 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     except Exception as exc:  # noqa: BLE001 - reported, never fatal
         print(f"[literature] failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
-        conn.emit("error", "literature", f"Literature search failed: {exc}", detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": str(exc)})
+        conn.emit("error", "literature", f"Literature search failed: {public_error(exc)}", detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": public_error(exc)})
         if recorded:
             _finish_run_record(conn, run_id, "failed", str(art), str(exc))
         return None
@@ -9180,7 +9274,7 @@ async def lab_continue(req: ContinueRunRequest, request: Request) -> JSONRespons
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return JSONResponse({"error": f"run_state.json is unreadable: {exc}"}, status_code=422)
+        return JSONResponse({"error": f"run_state.json is unreadable: {public_error(exc)}"}, status_code=422)
     try:
         # In a thread: finding the checkpoints of a run that analysed on HPC3 is an SSH round trip.
         resume, resume_decisions, cont_req, idx = await asyncio.to_thread(
@@ -12759,8 +12853,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
     except Exception as exc:  # noqa: BLE001 - any lab failure is reported, never fatal
         print(f"[lab] run failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
-        conn.emit("error", "lab", f"Lab run failed: {exc}", detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": str(exc)})
+        conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
+        conn.push({"type": "chat_error", "message": public_error(exc)})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():
@@ -15830,19 +15924,19 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
             c._publish({"type": "result_saved", "run_id": run_id, "what": what, "path": dest})
     except Exception as exc:  # noqa: BLE001 - reported on the run's record and to the owner
         shutil.rmtree(stage, ignore_errors=True)
-        conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {exc}")
+        conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {public_error(exc)}")
         with _SAVING_LOCK:
             now = _read_pointer(pointer_path) or rec
             now.pop("saving", None)
-            now["save_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            now["save_error"] = f"{type(exc).__name__}: {public_error(exc)}"[:300]
             try:
                 pointer_path.write_text(json.dumps(now, indent=2), encoding="utf-8")
             except OSError:
                 pass
         for c in _owner_connections(safe_name(owner)):
-            c.emit("error", "lab", f"Could not copy {name} from HPC3 to the server: {exc}. "
+            c.emit("error", "lab", f"Could not copy {name} from HPC3 to the server: {public_error(exc)}. "
                                    "It is still on HPC3; save it again from Runs.")
-            c._publish({"type": "result_saved", "run_id": run_id, "what": what, "error": str(exc)[:300]})
+            c._publish({"type": "result_saved", "run_id": run_id, "what": what, "error": public_error(exc)[:300]})
 
 
 async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[..., Any]) -> None:

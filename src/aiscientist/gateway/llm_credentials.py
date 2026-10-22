@@ -431,23 +431,14 @@ def record_egress_consent(owner: str, cred_id: str) -> dict | None:
     return _public(row)
 
 
-def storage_info(owner: str) -> dict:
-    """Where this owner's keys actually live, in plain terms, for the UI to show.
+def storage_info() -> dict:
+    """How stored keys are protected, for the API endpoints dialog to state in plain words.
 
-    "Where is my key?" is a fair question and the honest answer is short: a 0600 file on THIS
-    server, under a directory named after the account, never in the browser and never back over
-    the wire. Users who cannot see that answer assume the worst (or paste the key somewhere
-    else "to be safe"), so the dialog states it rather than leaving it to the docs.
+    Only the protection, never the location: the file path, its owner and its mode tell a user
+    nothing they can act on and show everyone who opens the dialog how the server is laid out
+    (RCHENLAB/AiScientist issue 37). The store's layout is in this module's docstring.
     """
-    # Absolute, always. ``AISCIENTIST_STATE_DIR`` is unset in production, so the store resolves
-    # relative to the service's working directory and this read "llm_creds/<user>" — which
-    # answers "where is my key?" with a path the reader cannot locate, and so does not answer it.
-    return {
-        "owner": _safe_owner(owner),
-        "dir": str(_owner_dir(owner).resolve()),
-        "mode": "0600",
-        "encrypted": encryption_enabled(),
-    }
+    return {"encrypted": encryption_enabled()}
 
 
 def list_credentials(owner: str) -> list[dict]:

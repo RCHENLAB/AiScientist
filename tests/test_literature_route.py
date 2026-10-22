@@ -53,8 +53,8 @@ class _Model:
 
     def __init__(self, route='{"route": "literature", "confidence": 0.93, "reason": "general question"}',
                  answer="DDX41 is a DEAD-box helicase [1]; retinal data are scarce [2, 7].",
-                 reroute=None):
-        self.route, self.answer, self.reroute = route, answer, reroute
+                 reroute=None, queries='["DDX41 retina", "DDX41 photoreceptor"]'):
+        self.route, self.answer, self.reroute, self.queries = route, answer, reroute, queries
         self.calls: list[tuple[str, str | None]] = []
         self.routed: list[str] = []
 
@@ -68,7 +68,7 @@ class _Model:
             return self.route
         if system == lit.QUERY_SYSTEM:
             self.calls.append(("queries", role))
-            return '["DDX41 retina", "DDX41 photoreceptor"]'
+            return self.queries
         if system == lit.ANSWER_SYSTEM:
             self.calls.append(("answer", role))
             return self.answer
@@ -262,3 +262,63 @@ def test_the_literature_plan_waits_on_the_plan_card_like_the_labs(tmp_path):
     run.plan_event.set()
     t.join(5)
     assert got == {"action": "approve", "feedback": ""} and run.pending_plan is None
+
+
+# --- the lab's corpus next to PubMed -----------------------------------------------------------------
+
+def _corpus(monkeypatch, out=None, error=None):
+    """A session that reaches the corpus: ``search_corpus`` scripted, its calls recorded."""
+    calls: list = []
+
+    def executor(args, ctx):
+        calls.append(args)
+        if error is not None:
+            raise error
+        return out if out is not None else {"status": "ok", "n_contexts": 2, "terms": [
+            {"term": "DDX41", "kind": "gene", "source": "query", "n_passages": 9, "use": "filter"}], "contexts": [
+            {"pmid": "777", "chunk": 2, "page": 3, "text": "DDX41 is expressed in photoreceptors.",
+             "citation": "Smith J et al. DDX41 in the eye. Exp Eye Res (2024). PMID:777"},
+            {"pmid": "40002", "chunk": 0, "page": 1, "text": "DDX41 loss causes cone death.",
+             "citation": "Lee et al. DDX41 paper 2. PMID:40002"}]}
+
+    monkeypatch.setattr(gw_app, "_literature_corpus_available", lambda conn: True)
+    monkeypatch.setattr(gw_app, "_literature_corpus_tool",
+                        lambda conn: (SimpleNamespace(name="search_corpus", executor=executor), SimpleNamespace()))
+    return calls
+
+
+def test_a_session_on_hpc3_also_searches_the_corpus_and_answers_from_both(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41", "photoreceptor"]}',
+                   answer="DDX41 is in photoreceptors [1]; its loss kills cones [2]; also [3].")
+    w = _wire(monkeypatch, model, [{"action": "approve"}])
+    calls = _corpus(monkeypatch)
+    _dispatch(conn, "What is known about DDX41 in the retina?")
+
+    assert w.shown == [lit.plan_step("What is known about DDX41 in the retina?", corpus=True)]
+    assert calls == [{"queries": ["What is known about DDX41 in the retina?"], "top_k": lit.CORPUS_PASSAGES,
+                      "terms": ["DDX41", "photoreceptor"]}]
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina"]                 # PubMed still searched
+    answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
+    # [1] the corpus-only paper, [2] the corpus paper PubMed also found, [3] PubMed only
+    assert "- [1] Smith J et al. DDX41 in the eye. Exp Eye Res (2024). PMID:777 https://pubmed.ncbi.nlm.nih.gov/777/" in answer
+    assert "- [2] Lee et al. (2025) DDX41 paper 2." in answer and "- [3] Lee et al. (2025) DDX41 paper 1." in answer
+    (run_dir,) = list(conn.workspace.iterdir())
+    art = run_dir / "artifacts"
+    assert "> (p. 3) DDX41 is expressed in photoreceptors." in (art / "literature" / "corpus_passages.md").read_text()
+    summary = (art / "report" / "summary.md").read_text()
+    assert "2 passage(s) from 2 paper(s)" in summary and "Searched PubMed" in summary
+    progress = [p.get("text", "") for p in conn.pushed if p.get("type") == "lab_progress"]
+    assert any("from the RetiGene corpus" in t for t in progress)
+
+
+def test_a_corpus_search_that_fails_leaves_a_pubmed_answer_and_says_why(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, _Model(), [{"action": "approve"}])
+    _corpus(monkeypatch, error=RuntimeError("sbatch: queue full"))
+    _dispatch(conn, "What is known about DDX41 in the retina?")
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina", "DDX41 photoreceptor"]
+    warns = [p["text"] for p in conn.pushed if p.get("type") == "lab_progress" and p.get("level") == "warning"]
+    assert any("queue full" in t and "PubMed alone" in t for t in warns)
+    answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
+    assert "[1] Lee et al. (2025) DDX41 paper 1." in answer

@@ -25,7 +25,11 @@ A list extraction over the PaperQA corpus (the RetiGene PDFs on dfs3b), done the
    (haploinsufficiency, gene dosage, dosage sensitivity, one functional copy or allele, loss of one
    copy, half the normal amount; PDF ligatures such as "ﬁ" read as their letters) is read too: a
    chunk's vector is mostly its topic, so the requests alone reached 50 of the corpus' 337 chunks
-   that say "haploinsufficiency".
+   that say "haploinsufficiency". The model also writes the exact words such a passage would use;
+   each is counted in the corpus, and the chunks holding one that is in at most 1% of the chunks
+   are read as well (at most `max_term_passages` more): a safety net for wordings the built-in list
+   lacks. The word matching, the counting and the nearest-chunk search are the shared corpus layer
+   `search_corpus` uses (`../_lib/corpus.py`).
 3. **Locate.** Each chunk is read back as its paper, page and numbered sentences.
 4. **Read.** The model reads each chunk once and returns, per gene whose disease mechanism a
    sentence states, the mechanism class, whether it is explicit, negated and about a human retinal
@@ -85,6 +89,8 @@ one working copy is not enough.
 | `n_requests` | integer | `16` | how many search requests the model writes for the first round |
 | `k_per_request` | integer | `50` | passages (chunks) each first-round request retrieves |
 | `keyword_round` | integer | `1` | 1 = round one also reads every passage that states a dosage mechanism in words (haploinsufficiency, gene dosage, one functional copy, ...); 0 = the requests alone |
+| `term_round` | integer | `1` | 1 = the model also writes the exact words a qualifying passage would use; each is counted in the corpus, and every passage holding one that is in at most 1% of the passages is read too; 0 = the built-in dosage wording only |
+| `max_term_passages` | integer | `300` | at most this many passages the model's words add (rarest words first) |
 | `k_per_gene` | integer | `15` | passages each second-round gene request retrieves, among the chunks that name the gene |
 | `max_quotes_per_gene` | integer | `3` | how many papers (PMID + verbatim quote) genes.csv lists per gene |
 | `concurrency` | integer | `16` | parallel requests to the model while it reads the passages |
@@ -109,17 +115,19 @@ one working copy is not enough.
   it), `gene_as_written`, `gene_status`, `gene_in_quote`, `gene_in_context`, `mechanism_class`,
   `explicit`, `negated`, `human_retinal`, `phenotype`, `mechanism_statement`, `quote`,
   `quote_verified`, `cite_like`, `dominance_marker`, `garbled`, `sentence_id`, `found_by` (the
-  requests that retrieved the passage: `R3` is round-one request 3, `K` the keyword round, `G:PRPF31` the gene's own
-  request), `eligible`. The eligible rows are the ones genes.csv is built from.
+  requests that retrieved the passage: `R3` is round-one request 3, `K` the keyword round, `T` the
+  model's words, `G:PRPF31` the gene's own request), `eligible`. The eligible rows are the ones genes.csv is built from.
 - `artifacts/haploinsufficiency/requests.csv`: every search request (`id`, `round`, `gene`,
-  `request`, `n_passages` it retrieved), so a curator can see what was searched for.
+  `request`, `n_passages` it retrieved), so a curator can see what was searched for; row `T` lists
+  the model's words, each with its passage count and use (`filter` = read, `rank`/`absent`/`over_cap`
+  = not used).
 - `work/haploinsufficiency/`: `requests.json` (the requests, reused by a rerun) and
   `judgments.jsonl` (the model's whole reply for every passage). A rerun after a timeout reads only
   the passages without a usable reply; a reply the parser rejected is parsed again from disk first,
   so fixing the parser costs no model call.
-- Result: counts (papers, sentences, requests, gene requests, passages read, eligible hits, genes),
-  the round-one requests, the genes with their paper counts and flags, the file paths, and
-  `warnings`.
+- Result: counts (papers, sentences, requests, gene requests, passages read, eligible hits, genes,
+  keyword and model-word passages), the round-one requests, the model's words (`terms`), the genes
+  with their paper counts and flags, the file paths, and `warnings`.
 
 ## Where it runs
 
@@ -169,9 +177,10 @@ In the research agents' catalog: no. No model can call it: it runs only from its
 
 ## Code and tests
 
-- `tool.py`: text extraction (PyMuPDF blocks, column-aware), the request writing, retrieval
-  (`nearest_chunks`, `chunks_naming`), the per-passage reading, quote verification, HGNC
-  normalisation, aggregation.
+- `tool.py`: text extraction (PyMuPDF blocks, column-aware), the request and word writing,
+  retrieval (`nearest_chunks`, `keyword_chunks`, `model_term_chunks`, `chunks_naming`, on
+  `../_lib/corpus.py`'s `TextIndex` and `nearest`), the per-passage reading, quote verification,
+  HGNC normalisation, aggregation.
 - `scripts/build_mechanism_cache.py`: the one-off cache build on HPC3.
 - Tests: `tests/test_extract_haploinsufficient_genes.py` (a fake model, a toy embedder and a
   four-paper corpus), `tests/test_corpus_route.py` (the console line).

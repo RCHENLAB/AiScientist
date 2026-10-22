@@ -1205,7 +1205,8 @@ class MigrateDatasetRequest(BaseModel):
 def migrate_legacy_dataset(req: MigrateDatasetRequest, request: Request) -> dict:
     user = require_user(request)
     from .dataset_storage import migrate_dataset
+    from .errors import public_error
     try:
         return migrate_dataset(user.id, req.dataset_id, apply=req.apply)
     except (ValueError, OSError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=public_error(exc)) from exc

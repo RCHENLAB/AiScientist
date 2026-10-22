@@ -1,21 +1,21 @@
 """The ``search_corpus`` tool. Documentation: ``TOOL.md`` in this folder.
 
-Retrieval only, over the same corpus ``deep_literature`` answers from: embed the queries with
-PubMedBERT on CPU, take the nearest chunks of ``mechanism_cache/`` by one matrix product, return
-the verbatim passages with their PMID, page and citation. No language model runs here, so the job
-needs no GPU and holds no API key; the session's model writes the queries and the answer.
+Retrieval only, over the same corpus ``deep_literature`` answers from: each query ranks the chunks of
+``mechanism_cache/`` twice, by PubMedBERT similarity and by BM25 over its exact words (and the terms
+the model gives), and the two rankings are merged by reciprocal rank (``_lib.corpus.hybrid_rank``);
+the verbatim passages come back with their PMID, page and citation. No language model runs here, so
+the job needs no GPU and holds no API key; the session's model writes the queries and the answer.
 
 The embedder is injectable (``embed_fn``) so the tests run without sentence-transformers or HPC3.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any, Callable
 
 from .._lib.corpus import (
-    chunk_vectors, corpus_paths, gene_symbols, l2, load_chunks, manifest_citations, read_manifest,
-    sentence_transformer_embed)
+    TextIndex, Term, chunk_vectors, corpus_paths, hybrid_rank, known_gene_symbols, l2, load_chunks,
+    manifest_citations, parse_terms, query_terms, read_manifest, sentence_transformer_embed, term_report)
 from ..sdk import HarnessTool
 
 _TOOL = "search_corpus"
@@ -23,11 +23,9 @@ MAX_QUERIES = 6
 DEFAULT_TOP_K = 12
 MAX_TOP_K = 30
 DEFAULT_MAX_PER_PAPER = 3
-# Added to the cosine score of a chunk that contains a gene symbol written in the query as a word.
-# A semantic retriever is weak on bare identifiers (RPGR, PRPF31); the boost lifts a chunk that names
-# the gene over one that is merely about the same disease.
-GENE_BOOST = 0.05
-GENE_BOOST_MAX = 0.10
+MAX_TERMS = 12
+# How deep each of a query's two rankings goes before they are merged.
+RANK_DEPTH = 200
 
 
 def _schema() -> dict[str, Any]:
@@ -39,6 +37,12 @@ def _schema() -> dict[str, Any]:
                   "description": f"passages returned in total, at most {MAX_TOP_K}"},
         "max_per_paper": {"type": "integer", "default": DEFAULT_MAX_PER_PAPER,
                           "description": "at most this many passages from one paper"},
+        "terms": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_TERMS,
+                  "description": "optional: up to 12 exact words or short phrases a passage that answers "
+                                 "would contain, with their spelling variants (gene symbols, technical "
+                                 "terms, e.g. 'dominant negative', 'ellipsoid zone'). Each is counted in the "
+                                 "corpus and ranks the passages that contain it; the queries' own words "
+                                 "are used anyway"},
         "pmids": {"type": "array", "items": {"type": "string"},
                   "description": "restrict the search to these PMIDs (empty = the whole corpus)"},
     }, "required": ["queries"]}
@@ -56,37 +60,33 @@ def _failed(error: str, **extra: Any) -> dict[str, Any]:
 
 
 def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q_vecs: Any, *,
-                  top_k: int, max_per_paper: int, allowed: set[str] | None = None) -> list[dict[str, Any]]:
-    """The passages to return, as ``[{"idx", "score", "query"}]``.
+                  top_k: int, max_per_paper: int, allowed: set[str] | None = None,
+                  terms: list[Term] | None = None, index: TextIndex | None = None,
+                  known_genes: frozenset[str] | None = None) -> tuple[list[dict[str, Any]], list[Term]]:
+    """The passages to return, as ``[{"idx", "score", "cosine", "query"}]``, and the terms used.
 
-    Each query ranks every chunk by cosine similarity (plus the gene-symbol boost). The result takes
-    the best remaining chunk of each query in turn, so one broad query cannot crowd out the others,
-    skipping a chunk already taken and a paper that has its ``max_per_paper``."""
+    Each query ranks the chunks with ``hybrid_rank``: by embedding and by BM25 over its own words plus
+    ``terms``, merged by reciprocal rank; a query that names a gene the corpus has is answered from
+    the chunks that name it. The result takes the best remaining chunk of each query in turn, so one
+    broad query cannot crowd out the others, skipping a chunk already taken and a paper that has its
+    ``max_per_paper``."""
     import numpy as np  # noqa: PLC0415
 
-    sims = np.asarray(q_vecs, dtype="float32") @ np.asarray(vecs, dtype="float32").T
-    lowered: list[str] | None = None
-    ranked: list[list[tuple[float, int]]] = []
+    index = index if index is not None else TextIndex.of_chunks(chunks)
+    extra = list(terms or [])
+    allowed_idx = ({i for i, c in enumerate(chunks) if str(c.get("pmid")) in allowed}
+                   if allowed is not None else None)
+    q_vecs = np.asarray(q_vecs, dtype="float32")
+    ranked: list[list[tuple[int, float, float]]] = []
+    used: dict[tuple[str, str], Term] = {}
     for qi, query in enumerate(queries):
-        scores = sims[qi].copy()
-        symbols = gene_symbols(query)
-        if symbols:
-            if lowered is None:
-                lowered = [c["text"] for c in chunks]
-            for sym in symbols:
-                rx = re.compile(r"(?<![A-Za-z0-9])" + re.escape(sym) + r"(?![A-Za-z0-9])")
-                for i, text in enumerate(lowered):
-                    if rx.search(text):
-                        scores[i] += GENE_BOOST
-            scores = np.minimum(scores, sims[qi] + GENE_BOOST_MAX)
-        if allowed is not None:
-            scores = scores.copy()
-            for i, c in enumerate(chunks):
-                if str(c.get("pmid")) not in allowed:
-                    scores[i] = -np.inf
-        depth = min(len(scores), top_k * max_per_paper + top_k)
-        order = np.argsort(-scores)[:depth]
-        ranked.append([(float(scores[i]), int(i)) for i in order if np.isfinite(scores[i])])
+        q_terms = query_terms(query, known_genes)
+        have = {t.text.lower() for t in q_terms}
+        q_terms += [t for t in extra if t.text.lower() not in have]
+        index.check(q_terms)
+        for t in q_terms:
+            used.setdefault((t.kind, t.text.lower()), t)
+        ranked.append(hybrid_rank(q_vecs[qi], vecs, index, q_terms, depth=RANK_DEPTH, allowed=allowed_idx))
 
     taken: set[int] = set()
     per_paper: dict[str, int] = {}
@@ -97,20 +97,20 @@ def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q
         progressed = False
         for qi in range(len(queries)):
             while cursors[qi] < len(ranked[qi]):
-                score, i = ranked[qi][cursors[qi]]
+                i, score, cos = ranked[qi][cursors[qi]]
                 cursors[qi] += 1
                 pmid = str(chunks[i].get("pmid"))
                 if i in taken or per_paper.get(pmid, 0) >= max_per_paper:
                     continue
                 taken.add(i)
                 per_paper[pmid] = per_paper.get(pmid, 0) + 1
-                out.append({"idx": i, "score": score, "query": queries[qi]})
+                out.append({"idx": i, "score": score, "cosine": cos, "query": queries[qi]})
                 progressed = True
                 break
             if len(out) >= top_k:
                 break
     out.sort(key=lambda r: -r["score"])
-    return out
+    return out, list(used.values())
 
 
 def run_search(args: dict[str, Any], ctx: Any, *,
@@ -140,8 +140,11 @@ def run_search(args: dict[str, Any], ctx: Any, *,
     if not len(chunks):
         return _failed("the corpus cache holds no chunks", queries=queries)
 
-    picked = rank_passages(queries, chunks, vecs, l2(embed(queries)), top_k=top_k, max_per_paper=per_paper,
-                           allowed=allowed)
+    known = known_gene_symbols(paths.hgnc)
+    picked, used = rank_passages(queries, chunks, vecs, l2(embed(queries)), top_k=top_k,
+                                 max_per_paper=per_paper, allowed=allowed,
+                                 terms=parse_terms((args.get("terms") or [])[:MAX_TERMS], "model", known),
+                                 known_genes=known)
     cites = manifest_citations(read_manifest(paths.manifest))
     contexts = []
     for r in picked:
@@ -150,15 +153,16 @@ def run_search(args: dict[str, Any], ctx: Any, *,
         contexts.append({
             "citation": cites.get(pmid) or f"PMID {pmid}", "pmid": pmid, "page": c.get("page"),
             "chunk": c.get("chunk"), "text": c.get("text", ""), "score": round(r["score"], 4),
-            "query": r["query"]})
+            "cosine": round(r["cosine"], 4), "query": r["query"]})
     if not contexts:
         return _failed(
             "the indexed corpus returned 0 passages for these queries, so there is nothing to answer "
             "from. Either the PMIDs given are not in the corpus, or it does not cover the topic: "
             "use `literature_search` (live Europe PMC) and say in the write-up that the corpus "
-            "search returned nothing.", queries=queries, n_papers=0, contexts=[])
+            "search returned nothing.", queries=queries, n_papers=0, contexts=[], terms=term_report(used))
     return {"status": "ok", "queries": queries, "n_papers": len({c["pmid"] for c in contexts}),
-            "n_contexts": len(contexts), "contexts": contexts, "raw_data_to_llm": False}
+            "n_contexts": len(contexts), "contexts": contexts, "terms": term_report(used),
+            "raw_data_to_llm": False}
 
 
 def make_tool() -> HarnessTool:
@@ -169,7 +173,9 @@ def make_tool() -> HarnessTool:
         "with its PMID, page and citation. It does not write an answer: you read the passages and "
         "write it yourself. Give 1-6 focused questions or statements as full sentences (a bare list "
         "of gene symbols retrieves poorly), e.g. 'Does loss of one copy of PRPF31 cause autosomal "
-        "dominant retinitis pigmentosa?'. Cite ONLY a PMID that appears in the returned passages and "
+        "dominant retinitis pigmentosa?', and optionally `terms`: the exact words a passage that "
+        "answers would use (e.g. 'haploinsufficiency', 'one functional copy'); passages are ranked "
+        "by meaning and by these words together. Cite ONLY a PMID that appears in the returned passages and "
         "quote only sentences that appear in them; anything else is removed from your answer. "
         "Returns status failed when the corpus has nothing, then use literature_search.",
         _schema(), run_search,

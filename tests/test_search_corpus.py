@@ -8,7 +8,6 @@ import csv
 import json
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -89,16 +88,39 @@ def test_pmids_restrict_the_search_and_an_empty_result_is_failed(corpus):
     assert none["status"] == "failed" and none["contexts"] == [] and "literature_search" in none["error"]
 
 
-def test_gene_symbol_in_the_query_lifts_the_chunk_that_names_it(corpus):
+def test_a_query_that_names_a_gene_is_answered_first_from_the_passages_that_name_it(corpus):
     chunks = [{"pmid": "a", "text": "A general review of retinal splicing."},
               {"pmid": "b", "text": "RPGR is mutated in X-linked disease."}]
-    vecs = np.asarray([[1.0, 0.0], [0.97, 0.243]], dtype="float32")
+    vecs = np.asarray([[1.0, 0.0], [0.6, 0.8]], dtype="float32")
+    q = np.asarray([[1.0, 0.0]], dtype="float32")
+    order, _ = sc.rank_passages(["What does RPGR do?"], chunks, vecs, q, top_k=2, max_per_paper=2)
+    # the review is nearer by meaning, but the passage naming RPGR comes first; the other still follows
+    assert [chunks[r["idx"]]["pmid"] for r in order] == ["b", "a"]
+    plain, _ = sc.rank_passages(["What does the gene do?"], chunks, vecs, q, top_k=2, max_per_paper=2)
+    assert [chunks[r["idx"]]["pmid"] for r in plain] == ["a", "b"]
+
+
+def test_exact_words_find_a_passage_the_embedding_ranks_low(corpus):
+    """The 2026-10-20 failure: the passage that states the fact is about something else, so its
+    vector is far from the question; its words are not."""
+    chunks = [{"pmid": str(i), "text": f"Review {i} of retinal imaging and visual function."} for i in range(30)]
+    chunks.append({"pmid": "x", "text": "SIX6 is a candidate; BMP4 haploinsuf\ufb01ciency is known to cause microphthalmia."})
+    vecs = np.asarray([[1.0, 0.02 * i] for i in range(30)] + [[0.1, 1.0]], dtype="float32")
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
     q = np.asarray([[1.0, 0.0]], dtype="float32")
-    order = sc.rank_passages(["What does RPGR do?"], chunks, vecs, q, top_k=2, max_per_paper=2)
-    assert [chunks[r["idx"]]["pmid"] for r in order] == ["b", "a"]
-    plain = sc.rank_passages(["What does the gene do?"], chunks, vecs, q, top_k=2, max_per_paper=2)
-    assert [chunks[r["idx"]]["pmid"] for r in plain] == ["a", "b"]
+    order, used = sc.rank_passages(["Which genes cause microphthalmia through haploinsufficiency?"], chunks, vecs, q,
+                                   top_k=3, max_per_paper=1)
+    assert chunks[order[0]["idx"]]["pmid"] == "x"            # the ligature spelling matched too
+    assert {t.text: t.use for t in used}["haploinsufficiency"] == "filter"
+
+
+def test_model_terms_are_counted_and_reported(corpus):
+    out = run({"queries": ["Which splicing factor genes cause retinitis pigmentosa?"],
+               "terms": ["haploinsufficiency", "nonexistentword"], "top_k": 2})
+    rep = {t["term"]: t for t in out["terms"]}
+    assert rep["haploinsufficiency"]["n_passages"] == 1 and rep["haploinsufficiency"]["source"] == "model"
+    assert rep["nonexistentword"]["use"] == "absent"
+    assert out["contexts"][0]["pmid"] == "11111111"
 
 
 def test_missing_cache_and_bad_arguments_say_so(tmp_path, monkeypatch):

@@ -2221,17 +2221,17 @@ function renderApiKeyList() {
   }).join("");
 }
 
-// "Where is my key?" answered with the actual location. The key never reaches the browser and
-// never comes back over the wire, so the only place a user can learn this is here.
+// How the key is protected, in plain words. The key never reaches the browser and never comes back
+// over the wire, so this is the only place a user learns it. No server path, owner or file mode:
+// they tell the user nothing and show the server's layout to everyone (issue 37).
 function renderApiKeyStorage() {
   const el = $("apiKeyStorage");
   if (!el) return;
   const s = apiKeys.storage;
   if (!s) { el.textContent = ""; return; }
-  el.innerHTML = `Your key is stored on the AiScientist server — never in your browser — and is `
-    + `sent only to the endpoint you saved it for${s.encrypted ? ", encrypted at rest 🔒" : ""}.`
-    + `<br>Owner <code>${escapeHtml(s.owner)}</code> · <code>0600</code> file under `
-    + `<code>${escapeHtml(s.dir)}</code>`;
+  el.textContent = `Your key is stored ${s.encrypted ? "encrypted " : ""}on the AiScientist server, `
+    + `readable only by the service, never in your browser, and sent only to the endpoint you `
+    + `saved it for.`;
 }
 
 function renderProviderOptions() {

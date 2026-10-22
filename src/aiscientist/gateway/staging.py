@@ -36,6 +36,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable
 
+from .errors import public_error
+
 ACTIVE = ("queued", "pushing", "verifying", "unpacking")
 TERMINAL = ("done", "failed", "cancelled")
 
@@ -441,7 +443,7 @@ class StagingQueue:
             self._set(job, "queued", error=str(exc) or "Waiting for an HPC3 session.")
         except Exception as exc:  # noqa: BLE001 - every failure is recorded on the job
             self._stop(cancel, hasher)
-            msg = str(exc) or type(exc).__name__
+            msg = public_error(exc)
             if job.attempts <= len(RETRY_DELAYS):
                 delay = RETRY_DELAYS[job.attempts - 1]
                 self._set(job, "queued", error=f"{msg} — retrying in {delay:.0f} s.")

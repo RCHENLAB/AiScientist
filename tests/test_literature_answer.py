@@ -109,3 +109,65 @@ def test_what_is_saved_says_how_it_was_made_and_lists_every_paper():
     rows = list(csv.DictReader(io.StringIO(lit.papers_csv(got.papers, {2}))))
     assert [(r["number"], r["cited"], r["pmid"]) for r in rows] == [("1", "no", "1001"), ("2", "yes", "1002")]
     assert rows[0]["queries"] == "a | b"
+
+
+# --- the lab's corpus next to PubMed ------------------------------------------------------------------
+
+def _ctx(pmid, chunk, text, page=1):
+    return {"pmid": str(pmid), "chunk": chunk, "page": page, "text": text,
+            "citation": f"Nakamura M et al. RDH5 paper {pmid}. Am J Ophthalmol (2002). PMID:{pmid} DOI:10.1/x"}
+
+
+def test_one_model_call_gives_the_pubmed_queries_and_the_corpus_words():
+    raw = ('Sure: {"queries": ["RDH5 fundus albipunctatus", "RDH5 dark adaptation"], '
+           '"terms": ["RDH5", "fundus albipunctatus", "\\"dark adaptation\\"", "rdh5", "a b c d e", 7]}')
+    queries, terms = lit.plan_search(lambda m: raw, "q")
+    assert queries == ["RDH5 fundus albipunctatus", "RDH5 dark adaptation"]
+    assert terms == ["RDH5", "fundus albipunctatus", "dark adaptation"]      # deduplicated, at most 4 words
+    assert lit.plan_search(lambda m: '["DDX41 retina"]', "q") == (["DDX41 retina"], [])
+
+
+def test_corpus_passages_come_first_one_source_per_paper_and_a_pubmed_duplicate_joins_it():
+    pubmed = lit.collect_papers(lambda q, n: {"status": "ok", "results": [_hit(1), _hit(2)]}, ["a"])
+    result = {"status": "ok", "terms": [{"term": "RDH5", "n_passages": 116, "use": "filter"}],
+              "contexts": [_ctx(9001, 3, "The rod b-wave recovered after 3 h of dark adaptation."),
+                           _ctx(1002, 0, "Same paper as PubMed hit 2.", page=4),
+                           _ctx(9001, 5, "A second passage of the same paper.")]}
+    got = lit.add_corpus(pubmed, result)
+    assert [(p.number, p.pmid, p.sources) for p in got.papers] == [
+        (1, "9001", ["corpus"]), (2, "1002", ["corpus", "pubmed"]), (3, "1001", ["pubmed"])]
+    first, both = got.papers[0], got.papers[1]
+    assert first.passages == ["(p. 1) The rod b-wave recovered after 3 h of dark adaptation.",
+                              "(p. 1) A second passage of the same paper."]
+    assert first.title == "Nakamura M et al. RDH5 paper 9001. Am J Ophthalmol (2002)."
+    assert first.url == "https://pubmed.ncbi.nlm.nih.gov/9001/"
+    assert both.title == "Paper 2" and both.abstract == "Abstract text." and both.passages == ["(p. 4) Same paper as PubMed hit 2."]
+    assert got.corpus == {"status": "ok", "terms": result["terms"], "passages": 3, "papers": 2}
+    # the answer reads the passages and the abstracts; the saved method and tables say where each came from
+    user = lit.answer_messages("Q?", got.papers)[1]["content"]
+    assert "Papers found in the lab's corpus and PubMed" in user
+    assert "[1] Nakamura M et al. RDH5 paper 9001" in user and "- (p. 1) The rod b-wave recovered" in user
+    assert "[2] Paper 2" in user and "Abstract: Abstract text." in user
+    md = lit.method_md(got, "2026-10-21")
+    assert "3 passage(s) from 2 paper(s)" in md and "Words used: RDH5 (116)" in md
+    rows = list(csv.DictReader(io.StringIO(lit.papers_csv(got.papers, {1}))))
+    assert [(r["source"], r["corpus_passages"], r["cited"]) for r in rows] == [
+        ("corpus", "2", "yes"), ("corpus+pubmed", "1", "no"), ("pubmed", "0", "no")]
+    assert lit.passages_md(got.papers).startswith("# Corpus passages read\n\n## [1] Nakamura M")
+
+
+def test_a_failed_corpus_search_leaves_pubmed_alone_and_says_so():
+    pubmed = lit.collect_papers(lambda q, n: {"status": "ok", "results": [_hit(1)]}, ["a"])
+    got = lit.add_corpus(pubmed, {"status": "error", "error": "job timed out"})
+    assert [p.number for p in got.papers] == [1] and got.corpus["error"] == "job timed out"
+    assert "the search failed (job timed out); the answer rests on PubMed alone" in lit.method_md(got, "d")
+    assert lit.add_corpus(pubmed, None) is pubmed                       # no corpus: unchanged
+    none = lit.add_corpus(lit.collect_papers(lambda q, n: {"status": "ok", "results": []}, ["a"]),
+                          {"status": "failed", "error": "0 passages"})
+    assert lit.no_papers_answer("q", none).startswith("Neither the lab's corpus nor PubMed returned a paper")
+
+
+def test_the_plan_step_says_when_the_corpus_is_searched_too():
+    step = lit.plan_step("How does the rod ERG change?", corpus=True)
+    assert "RetiGene corpus" in step and "`search_corpus`" in step and "PubMed" in step
+    assert "no HPC3 job" not in step

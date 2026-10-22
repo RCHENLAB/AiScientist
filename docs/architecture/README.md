@@ -87,8 +87,10 @@ sequenceDiagram
 Before the run, the session's model routes the request (`agents/request_router.py`): anything that
 needs data or computation goes to the lab as above; a general question that published papers answer
 gets a one-step literature plan instead (`agents/literature_answer.py`). Once approved, that step
-searches PubMed through Europe PMC in the gateway, has the model answer from the abstracts, and
-writes the reference list by code from the papers the answer cites; the answer is kept with the run.
+searches PubMed through Europe PMC in the gateway and, in a session that reaches HPC3, the full text
+of the lab's RetiGene corpus (`search_corpus`: the question's meaning and the model's exact words,
+merged by rank) at the same time; the model answers from the corpus passages and the abstracts, and
+code writes the reference list from the papers the answer cites; the answer is kept with the run.
 A note on either plan is routed again, so "analyse my data instead" turns a literature plan into an
 analysis. Every run saves its processed dataset and CellQC result folder to the user's Datasets. The
 fast chat path (`agents/quick_chat.py`: only the `chat: true` tools, a streamed answer, no run

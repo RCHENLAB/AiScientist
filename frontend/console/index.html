@@ -658,10 +658,9 @@
         the analysis. Most providers show a new key only once — paste it here and AiScientist
         keeps it, so editing an endpoint later never asks you to find that key again.
       </p>
-      <!-- Filled from /api/llm-credentials. "Where does my key go?" deserves the actual path, not
-           a reassuring adjective — a user who cannot see the answer assumes the browser is
-           holding it, or that it travels with every request. -->
-      <p id="apiKeyStorage" class="storage-note storage-where"></p>
+      <!-- Filled from /api/llm-credentials: how the key is protected (encrypted, on the server,
+           sent only to its endpoint), never the server path of the key file. -->
+      <p id="apiKeyStorage" class="storage-note"></p>
       <p class="storage-note"><a class="guide-link" target="_blank" rel="noopener" data-guide>Guide: use your Claude subscription's monthly API credits, and keep your key safe</a> · <a href="#" id="apiKeysUsageLink" class="guide-link">See your usage</a></p>
       <div id="apiKeyList" class="storage-items"><div class="storage-loading">Loading…</div></div>
 

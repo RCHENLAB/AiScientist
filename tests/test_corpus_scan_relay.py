@@ -84,6 +84,8 @@ def _model(calls: list[str] | None = None, broken: bool = False):
         if system == hi.GENE_REQUESTS_SYSTEM:
             genes = [line.split(" — ")[0] for line in user.splitlines()]
             return json.dumps({"requests": {g: f"Heterozygous loss of {g} causes retinal dystrophy." for g in genes}})
+        if system.startswith("You are choosing exact search words"):
+            return json.dumps({"terms": ["haploinsufficiency", "one functional copy"]})
         if system != hi.JUDGE_SYSTEM:
             return json.dumps({"requests": REQUESTS})
         pmid = re.search(r"PMID (\d+)", user).group(1)
@@ -163,8 +165,9 @@ def test_the_relay_makes_the_calls_records_and_prices_them(tmp_path, monkeypatch
         stats = relay.stop()
     assert res["status"] == "ok", res
     assert res["n_genes"] == N_PAPERS
-    # requests (1) + passages (40) + round-two request batches (2 of 25 genes); round two finds nothing new.
-    assert stats.calls == res["api_usage"]["calls"] == 1 + N_PAPERS + 2
+    # requests (1) + search words (1) + passages (40) + round-two request batches (2 of 25 genes); round
+    # two finds nothing new.
+    assert stats.calls == res["api_usage"]["calls"] == 2 + N_PAPERS + 2
     assert res["api_usage"]["cost_usd"] == pytest.approx(stats.calls * 0.001)
     assert res["api_usage"]["input_tokens"] == 1000 * stats.calls
     assert len(records) == stats.calls and all(err is None for _, err in records)

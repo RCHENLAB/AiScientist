@@ -16,7 +16,7 @@ Searches Europe PMC (free, no key) with keyword queries built from a run's findi
 ## When the agent uses it
 
 - Before writing interpretation or discussion, with queries built from accepted findings (genes, pathways, disease, cell type).
-- In a literature plan (a general question the router sends to the literature line): the model's queries are searched in PubMed and the answer is written from the abstracts.
+- In a literature plan (a general question the router sends to the literature line): the model's queries are searched in PubMed and the answer is written from the abstracts, together with the passages `search_corpus` finds in the lab's corpus when the session reaches HPC3.
 - On the fast chat path, to answer a question with references.
 
 ## Inputs
