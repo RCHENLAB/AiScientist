@@ -1,6 +1,6 @@
 {
   "release_tag": "v0.1.0",
-  "allowed_tiers": ["core", "verified"],
+  "allowed_tiers": ["core", "verified", "community"],
   "releases_root": "skills/releases",
   "transitional_fallback": true
 }

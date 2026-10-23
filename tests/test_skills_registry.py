@@ -46,6 +46,7 @@ def checksums(root):
 
 
 def test_checksum_ok_catalog_metadata_and_tiers(release, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified")
     lib = registry.load(sk._load_from)
     assert set(lib) == {"skill-core", "skill-verified"}
     skill = lib["skill-core"]
@@ -277,6 +278,79 @@ def test_release_as_the_registry_publishes_it(tmp_path, monkeypatch):
     finally:
         monkeypatch.undo()
         sk.refresh_skills()
+
+
+CELLQC = "qc-snrna-with-cellqc-standalone"
+
+
+def bundle_release(tmp_path, monkeypatch, members: dict[str, str], rows: list[str]):
+    """A release as aiscientist_skills/package.py now builds it: aiscientist-skills-<version>.zip
+    with each skill folder at its catalog path, catalog.json, and SHA256SUMS over the two."""
+    root = tmp_path / "releases" / "0.1.0"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(root.parent))
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified,community")
+    with zipfile.ZipFile(root / "aiscientist-skills-0.1.0.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel, text in members.items():
+            info = zipfile.ZipInfo(rel, (1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, text)
+    (root / "catalog.json").write_text(json.dumps({
+        "schema_version": 1, "registry": "aiscientist-skills", "registry_version": "0.1.0",
+        "skills": [{"name": path.rsplit("/", 1)[1], "category": path.split("/")[1], "path": path,
+                    "version": "1.2.0", "status": status, "description": "catalog description",
+                    "tags": [], "requirements": {"compute": "16 CPUs, 80 GB", "network": "install"}}
+                   for path, status in (r.split("@") for r in rows)]}))
+    checksums(root)
+    return root
+
+
+def skill_md(name: str) -> str:
+    return f"---\nname: {name}\ndescription: d\n---\n# {name}\n"
+
+
+def test_release_bundle_as_the_registry_publishes_it(tmp_path, monkeypatch):
+    cellqc = f"skills/single-cell/{CELLQC}"
+    other = "skills/variants/normalize-vcf-with-bcftools"
+    root = bundle_release(tmp_path, monkeypatch, {
+        f"{cellqc}/SKILL.md": skill_md(CELLQC),
+        f"{cellqc}/assets/cellqc-defaults.json": '{"thresholds": {}}',
+        f"{other}/SKILL.md": skill_md("normalize-vcf-with-bcftools"),
+    }, [f"{cellqc}@core", f"{other}@community"])
+    assert sorted(p.name for p in root.iterdir()) == [
+        "SHA256SUMS", "aiscientist-skills-0.1.0.zip", "catalog.json"]
+    try:
+        lib = registry.load(sk._load_from)
+        assert set(lib) == {CELLQC, "normalize-vcf-with-bcftools"}
+        skill = lib[CELLQC]
+        assert skill.version == "1.2.0" and skill.registry_release == "v0.1.0"
+        assert skill.files["assets/cellqc-defaults.json"] == '{"thresholds": {}}'
+        assert lib["normalize-vcf-with-bcftools"].status == "community"
+    finally:
+        monkeypatch.undo()
+        sk.refresh_skills()
+
+
+def test_release_bundle_traversal_refused(tmp_path, monkeypatch):
+    cellqc = f"skills/single-cell/{CELLQC}"
+    bundle_release(tmp_path, monkeypatch, {f"{cellqc}/SKILL.md": skill_md(CELLQC),
+                                           "../outside": "bad"}, [f"{cellqc}@core"])
+    try:
+        with pytest.raises(ValueError, match="unsafe"):
+            registry.load(sk._load_from)
+    finally:
+        monkeypatch.undo()
+
+
+def test_release_bundle_missing_a_catalog_skill_is_refused(tmp_path, monkeypatch):
+    cellqc = f"skills/single-cell/{CELLQC}"
+    bundle_release(tmp_path, monkeypatch, {f"{cellqc}/SKILL.md": skill_md(CELLQC)},
+                   [f"{cellqc}@core", "skills/variants/qc-vcf-callset@community"])
+    try:
+        with pytest.raises(ValueError, match="missing verified bundle for skill qc-vcf-callset"):
+            registry.load(sk._load_from)
+    finally:
+        monkeypatch.undo()
 
 
 def test_bad_config_leaves_no_skills_and_no_crash(release, tmp_path, monkeypatch, caplog):

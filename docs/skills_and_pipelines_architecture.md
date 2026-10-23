@@ -85,15 +85,25 @@ commands inside it with `run_in_environment(skill, command)`.
 ### The pinned registry release
 
 `configs/skills_registry.json` pins a registry release tag, `v0.1.0`. A branch name such as `main`
-is refused. The config also lists the tiers to load (`core` and `verified` by default; `community`
-must be added), the releases root, and whether the fallback to `skills/` is allowed. Each key has
+is refused. The config also lists the tiers to load (`core`, `verified` and `community`; the skills
+migrated from `skills/` are `community` in `v0.1.0`, so without that tier an installed release
+would load only CellQC), the releases root, and whether the fallback to `skills/` is allowed.
+Each key has
 an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override. Updating skills means changing the tag and
 deploying the release.
 
-`agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's assets
-as published: `catalog.json`, `SHA256SUMS` and one `<name>-<version>.zip` per skill. The folder is
-installed on the server, outside git (`.gitignore`, and `scripts/sync_deploy.sh` never ships or
-deletes it). The loader checks `SHA256SUMS` against `catalog.json`, every skill zip and every
+`agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's three
+assets as published: `aiscientist-skills-<version>.zip` (every skill folder at its catalog `path`),
+`catalog.json` and `SHA256SUMS`. Releases with one `<name>-<version>.zip` per skill are still read.
+The folder is installed on the server, outside git (`.gitignore`, and `scripts/sync_deploy.sh`
+never ships or deletes it):
+
+```bash
+gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1.0
+(cd skills/releases/0.1.0 && sha256sum -c SHA256SUMS)   # leave the zip packed
+```
+
+The loader checks `SHA256SUMS` against `catalog.json`, the bundle or every skill zip, and every
 unpacked file, and refuses the release if any is missing or differs. A refused release gives no
 curated skills at all, logged as an error; it never falls back to `skills/`, and the rest of the
 platform keeps working. The skill list comes from the catalog: name, description, tags, version,

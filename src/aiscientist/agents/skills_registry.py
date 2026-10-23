@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import threading
 import zipfile
+from contextlib import ExitStack
 from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
@@ -86,6 +87,16 @@ def requirements(value: dict) -> dict:
     return req
 
 
+def _extract(archive: Path, dest: Path) -> None:
+    """Unpack a verified zip into ``dest``, refusing unsafe paths and symlinks."""
+    with zipfile.ZipFile(archive) as zf:
+        for info in zf.infolist():
+            safe_path(dest, info.filename)
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError("symlinks are not allowed in skill bundles")
+        zf.extractall(dest)
+
+
 def load(load_from) -> dict | None:
     cfg = config()
     root = release_dir(cfg)
@@ -101,50 +112,59 @@ def load(load_from) -> dict | None:
             or catalog.get("registry_version") != cfg["release_tag"][1:]):
         raise ValueError("skill catalog does not match pinned registry release")
     out = {}
-    for row in catalog["skills"]:
-        name = row["name"]
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in out:
-            raise ValueError("invalid or duplicate catalog skill name")
-        if row["status"] not in {"core", "verified", "community"}:
-            raise ValueError("invalid catalog skill status")
-        if row["status"] not in cfg["allowed_tiers"]:
-            continue
-        if not row.get("version"):
-            raise ValueError(f"missing skill version: {name}")
-        req = requirements(row["requirements"])
-        folder = safe_path(root, row["path"])
-        if folder.is_dir():
-            # Never load a file which was not covered by the release checksums.
-            for path in folder.rglob("*"):
-                if path.is_file() and path.relative_to(root).as_posix() not in checked:
-                    raise ValueError(f"unverified skill file: {path}")
-            loaded = load_from(folder)
-        else:
-            # The registry's release workflow names each bundle <name>-<version>.zip
-            # (aiscientist_skills/package.py); the other two names are accepted as well.
-            candidates = [f"{name}-{row['version']}.zip", f"{name}.zip", row["path"] + ".zip"]
-            archive = next((p for p in candidates if p in checked), None)
-            if archive is None:
-                raise ValueError(f"missing verified bundle for skill {name}")
-            # Extraction is temporary; text is read into Skill, so no writable cache can bypass hashes.
-            with tempfile.TemporaryDirectory(prefix="aiscientist-skill-") as temp:
-                dest = Path(temp)
-                with zipfile.ZipFile(safe_path(root, archive)) as zf:
-                    for info in zf.infolist():
-                        safe_path(dest, info.filename)
-                        if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                            raise ValueError("symlinks are not allowed in skill bundles")
-                    zf.extractall(dest)
-                loaded = load_from(dest)
-        if len(loaded) != 1:
-            raise ValueError(f"bundle must contain exactly one skill: {name}")
-        skill = next(iter(loaded.values()))
-        out[name] = replace(skill, name=name, summary=row["description"], category=row["category"],
-                            version=row["version"], status=row["status"], tags=tuple(row.get("tags", [])),
-                            requirements=req, registry_release=cfg["release_tag"], folder="",
-                            induced=False, review="",
-                            metadata={**skill.metadata, "compute": req["compute"]})
+    # The registry's release workflow publishes one aiscientist-skills-<version>.zip holding each
+    # skill folder at its catalog path (aiscientist_skills/package.py); per-skill zips are still read.
+    # Extraction is temporary; text is read into Skill, so no writable cache can bypass hashes.
+    bundle_name = f"aiscientist-skills-{cfg['release_tag'][1:]}.zip"
+    with ExitStack() as stack:
+        bundle = None
+        if bundle_name in checked:
+            bundle = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="aiscientist-skills-")))
+            _extract(safe_path(root, bundle_name), bundle)
+        for row in catalog["skills"]:
+            _load_row(row, cfg, root, checked, bundle, load_from, out)
     return out
+
+
+def _load_row(row: dict, cfg: dict, root: Path, checked: set[str], bundle: Path | None, load_from,
+              out: dict) -> None:
+    """Add one catalog row's skill to ``out`` if its tier is allowed."""
+    name = row["name"]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in out:
+        raise ValueError("invalid or duplicate catalog skill name")
+    if row["status"] not in {"core", "verified", "community"}:
+        raise ValueError("invalid catalog skill status")
+    if row["status"] not in cfg["allowed_tiers"]:
+        return
+    if not row.get("version"):
+        raise ValueError(f"missing skill version: {name}")
+    req = requirements(row["requirements"])
+    folder = safe_path(root, row["path"])
+    if folder.is_dir():
+        # Never load a file which was not covered by the release checksums.
+        for path in folder.rglob("*"):
+            if path.is_file() and path.relative_to(root).as_posix() not in checked:
+                raise ValueError(f"unverified skill file: {path}")
+        loaded = load_from(folder)
+    elif bundle is not None and safe_path(bundle, row["path"]).is_dir():
+        loaded = load_from(safe_path(bundle, row["path"]))
+    else:
+        # Older releases: one zip per skill, <name>-<version>.zip; two other names are accepted.
+        candidates = [f"{name}-{row['version']}.zip", f"{name}.zip", row["path"] + ".zip"]
+        archive = next((p for p in candidates if p in checked), None)
+        if archive is None:
+            raise ValueError(f"missing verified bundle for skill {name}")
+        with tempfile.TemporaryDirectory(prefix="aiscientist-skill-") as temp:
+            _extract(safe_path(root, archive), Path(temp))
+            loaded = load_from(Path(temp))
+    if len(loaded) != 1:
+        raise ValueError(f"bundle must contain exactly one skill: {name}")
+    skill = next(iter(loaded.values()))
+    out[name] = replace(skill, name=name, summary=row["description"], category=row["category"],
+                        version=row["version"], status=row["status"], tags=tuple(row.get("tags", [])),
+                        requirements=req, registry_release=cfg["release_tag"], folder="",
+                        induced=False, review="",
+                        metadata={**skill.metadata, "compute": req["compute"]})
 
 
 def init_manifest(ctx) -> None:
