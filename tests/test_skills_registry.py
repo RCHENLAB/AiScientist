@@ -206,7 +206,8 @@ def test_slurm_container_permissions_and_private_credentials(release, tmp_path, 
     script = scripts[0]
     assert "--containall" in script and "--cleanenv" in script
     assert ("--nv" in script) == gpu and ("--gres=gpu:1" in script) == gpu
-    assert ("--network none" in script) == (network != "runtime")
+    # `install` runs with network like `runtime`: the skill installs its own software.
+    assert ("--network none" in script) == (network == "none")
     assert "private-value" not in script
     assert remote.uploads[0][1] == "export TOKEN=private-value"
     assert remote.uploads[0][0] in remote.commands[-1] and "rm -f" in remote.commands[-1]
@@ -379,3 +380,64 @@ def test_counts_live_in_the_state_dir_and_skip_a_stop(release, tmp_path, monkeyp
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT success,error FROM skill_versions").fetchall() == [(2, 0)]
     assert not list((tmp_path / "runs").rglob("*.sqlite3"))
+
+
+@pytest.mark.parametrize("declared,platform,expected", [
+    ("none", True, False), ("install", True, True), ("runtime", True, True),
+    ("install", False, False), ("runtime", False, False)])
+def test_network_follows_the_declaration_and_the_platform_switch(declared, platform, expected):
+    assert registry.network_allowed(None, platform) is platform
+    assert registry.network_allowed({"network": declared}, platform) is expected
+
+
+def test_local_sandbox_gives_install_skills_network(release):
+    from aiscientist.agents.sandbox import CodeSandbox
+    skill = registry.load(sk._load_from)["skill-core"]
+    sandbox = CodeSandbox(container_image="test.sif", allow_network=True)
+    for declared, offline in (("install", False), ("none", True)):
+        token = registry.POLICY.set({**skill.requirements, "network": declared, "secret_values": {}})
+        try:
+            cmd, _ = sandbox._command("/tmp/code.py", "/tmp")
+        finally:
+            registry.POLICY.reset(token)
+        assert ("none" in cmd) == offline and "--cleanenv" in cmd
+
+
+def _registry_layout_skill(root):
+    folder = root / "single-cell" / "compare-two-groups"
+    (folder / "scripts").mkdir(parents=True)
+    (folder / "tests").mkdir()
+    (folder / "SKILL.md").write_text(
+        "---\nname: compare-two-groups\ndescription: Compare two groups of cells.\nlicense: MIT\n"
+        "metadata:\n  category: single-cell\n  version: \"1.0.0\"\n  status: verified\n"
+        "  tested-with: \"scanpy 1.10\"\n  aliases: \"pairwise_de, pairwise_de_v2\"\n---\n# Use\nRun it.\n")
+    (folder / "scripts" / "reference.py").write_text("print('de')\n")
+    (folder / "tests" / "test_reference.py").write_text("def test_x():\n    pass\n")
+    return sk._load_from(root)
+
+
+def test_migrated_skill_answers_to_its_old_names(tmp_path):
+    lib = _registry_layout_skill(tmp_path)
+    skill = lib["compare-two-groups"]
+    assert skill.aliases == ("compare_two_groups", "pairwise_de", "pairwise_de_v2")
+    for old in ("compare_two_groups", "pairwise_de", "pairwise_de_v2", "pairwise_de.py"):
+        assert sk.get_skill(old, lib) is skill
+    assert sk.skills_named_in("Step 3: adapt `pairwise_de` to condition", lib) == ["compare-two-groups"]
+    assert sk.skills_named_in("Step 3: adapt `pairwise_de_v3`", lib) == []
+    # An exact name always wins over an alias.
+    local = sk.Skill(name="pairwise_de", doc="local")
+    assert sk.get_skill("pairwise_de", {**lib, "pairwise_de": local}) is local
+
+
+def test_registry_layout_reads_scripts_reference_first(tmp_path):
+    lib = _registry_layout_skill(tmp_path)
+    assert sk.default_file(lib["compare-two-groups"].files) == "scripts/reference.py"
+    assert sk.default_file(["tests/test_reference.py", "references/notes.md"]) == "references/notes.md"
+    assert sk.default_file({}) is None
+    ctx = HarnessContext(workspace=tmp_path / "run")
+    out = sk.make_skill_reference_tool(lambda: lib).executor({"name": "pairwise_de"}, ctx)
+    assert out["name"] == "compare-two-groups" and "file='scripts/reference.py'" in out["next"]
+    assert "run_shell" in out["next"]        # a local skill may still use run_shell
+    registry_lib = {"compare-two-groups": replace(lib["compare-two-groups"], registry_release="v0.1.0")}
+    out = sk.make_skill_reference_tool(lambda: registry_lib).executor({"name": "pairwise_de"}, ctx)
+    assert "run_shell" not in out["next"]    # refused for registry skills

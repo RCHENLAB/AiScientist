@@ -13,6 +13,7 @@ Env conventions (see skills/README): AISCIENTIST_WORK for the dataset dir, AISCI
 
 from __future__ import annotations
 
+import gzip
 import os
 from pathlib import Path
 
@@ -26,10 +27,28 @@ DATASET_URI = str(WORK / "variant_db")           # a local dir (or an s3:// / az
 # Point this at YOUR indexed, single-sample VCFs (list them or glob a directory).
 SAMPLE_VCFS = sorted(str(p) for p in WORK.glob("*.vcf.gz"))
 
+
+def _vcf_samples(path: str) -> list[str]:
+    """Sample names on the #CHROM header line of a bgzipped VCF."""
+    with gzip.open(path, "rt") as fh:
+        for line in fh:
+            if line.startswith("#CHROM"):
+                return line.rstrip("\n").split("\t")[9:]
+    return []
+
+
 if not Path(DATASET_URI).exists():
     ds = tiledbvcf.Dataset(uri=DATASET_URI, mode="w",
                            cfg=tiledbvcf.ReadConfig(memory_budget_mb=1024))
     ds.create_dataset()                          # attributes default to the common INFO/FORMAT fields
+else:
+    # A re-run must not ingest a sample again: TileDB-VCF would store its records twice
+    # (resume=True does not prevent it). Ingest only the VCFs whose sample is new.
+    present = set(tiledbvcf.Dataset(uri=DATASET_URI, mode="r").samples())
+    new = [v for v in SAMPLE_VCFS if not set(_vcf_samples(v)) <= present]
+    if len(new) < len(SAMPLE_VCFS):
+        print(f"[tiledbvcf] {len(SAMPLE_VCFS) - len(new)} VCF(s) already ingested; skipped")
+    SAMPLE_VCFS = new
 if SAMPLE_VCFS:
     tiledbvcf.Dataset(uri=DATASET_URI, mode="w").ingest_samples(SAMPLE_VCFS)
     # Incremental: re-run ingest_samples([new.vcf.gz]) later to add samples WITHOUT re-merging.

@@ -337,9 +337,9 @@ class CodeSandbox:
 
     def _command(self, script: str, workdir: str):
         if self.container_image:
-            from .skills_registry import POLICY
+            from .skills_registry import POLICY, network_allowed
             policy = POLICY.get()
-            network = policy["network"] in {"required", "optional", "runtime"} if policy else self.allow_network
+            network = network_allowed(policy, self.allow_network)
             net = [] if network else ["--net", "--network", "none"]
             if policy:
                 net += ["--cleanenv"]

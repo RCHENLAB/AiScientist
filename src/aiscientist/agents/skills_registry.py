@@ -87,6 +87,17 @@ def requirements(value: dict) -> dict:
     return req
 
 
+def network_allowed(policy: dict | None, platform_allows: bool) -> bool:
+    """Whether the code of a call may reach the network. Without a registry skill, the platform's
+    switch decides (``AISCIENTIST_SANDBOX_NETWORK``). A registry skill that declares any network
+    use gets the same network as every other snippet: ``install`` included, because a skill's own
+    steps install its software (``mamba create`` in the registry template). ``none`` runs offline.
+    The platform switch, when off, wins over any declaration."""
+    if policy is None:
+        return platform_allows
+    return platform_allows and policy.get("network", "none") != "none"
+
+
 def _extract(archive: Path, dest: Path) -> None:
     """Unpack a verified zip into ``dest``, refusing unsafe paths and symlinks."""
     with zipfile.ZipFile(archive) as zf:

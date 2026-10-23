@@ -1,6 +1,6 @@
 ---
 name: normalize_vcf
-description: Reference template — normalize a VCF (atomize MNPs, split multiallelic, left-align indels) with bcftools norm before annotation or ClinVar/gnomAD matching.
+description: Reference template — normalize a VCF (split multiallelic, atomize MNPs, left-align indels) with bcftools norm before annotation or ClinVar/gnomAD matching.
 ---
 
 ## When to use
@@ -28,8 +28,10 @@ left-aligned) — normalizing twice is harmless but wasted time.
 
 Ported from operon's `variant-calling-variant-normalization` protocol. The pipeline order matters:
 
-1. `bcftools norm --atomize` — split MNPs into individual SNPs.
-2. `bcftools norm -m-any` — split multiallelic sites into biallelic records (so record count can rise).
+1. `bcftools norm -m-any` — split multiallelic sites into biallelic records (so record count can rise).
+2. `bcftools norm --atomize` — split MNPs into individual SNPs. Splitting comes first: atomizing a
+   multiallelic SNP (G>A,T) first makes bcftools 1.24 write `*` alleles, and the split then leaves
+   spurious G>* records with wrong genotypes.
 3. `bcftools norm -f REF` — left-align and trim indels against the reference FASTA.
 
 Downstream split requirement (operon): PLINK **yes**, ClinVar matching **yes**, VEP either, Hail no.

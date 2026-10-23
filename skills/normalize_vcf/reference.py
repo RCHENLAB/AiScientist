@@ -1,4 +1,4 @@
-"""Reference template — normalize a VCF (atomize MNPs, split multiallelic, left-align indels).
+"""Reference template — normalize a VCF (split multiallelic, atomize MNPs, left-align indels).
 
 Run this BEFORE annotation / ClinVar+gnomAD matching / caller comparison. dbSNP, ClinVar and gnomAD
 store variants in canonical **left-aligned, parsimonious** representation; a non-normalized indel or
@@ -6,8 +6,10 @@ multiallelic site fails to match its database record, so a real pathogenic varia
 reported as "not_in_clinvar". Ported from operon's variant-calling-variant-normalization protocol
 (bcftools norm), adapted to our AISCIENTIST_WORK/AISCIENTIST_ARTIFACTS conventions.
 
-Pipeline (order matters): (1) --atomize splits MNPs into SNPs, (2) -m-any splits multiallelic into
-biallelic records, (3) -f REF left-aligns + trims indels against the reference FASTA.
+Pipeline (order matters): (1) -m-any splits multiallelic into biallelic records, (2) --atomize
+splits MNPs into SNPs, (3) -f REF left-aligns + trims indels against the reference FASTA.
+Splitting comes first: atomizing a multiallelic SNP (G>A,T) first makes bcftools 1.24 write
+G>A,* and G>T,*, and the split then leaves spurious G>* records with wrong genotypes.
 
 ADAPT: INPUT_VCF and REF_FASTA (a reference genome matching the VCF's assembly — GRCh38 or GRCh37,
 with its .fai index). Needs bcftools on PATH (present in the analysis image, NOT the gateway env).
@@ -50,8 +52,8 @@ n_before = _count(INPUT_VCF)
 # The 3-stage norm as one shell pipeline (operon's canonical order). shell=True so the pipe is legible;
 # every argument here is a controlled path, not model/user free text.
 pipeline = (
-    f"bcftools norm --atomize {INPUT_VCF!r} 2>/dev/null "
-    f"| bcftools norm -m-any 2>/dev/null "
+    f"bcftools norm -m-any {INPUT_VCF!r} 2>/dev/null "
+    f"| bcftools norm --atomize 2>/dev/null "
     f"| bcftools norm -f {REF_FASTA!r} -Oz -o {OUTPUT_VCF!r}"
 )
 proc = subprocess.run(["bash", "-lc", pipeline], capture_output=True, text=True)
@@ -68,7 +70,7 @@ summary = {
     "normalized_vcf": OUTPUT_VCF,
     "records_before": n_before,
     "records_after": n_after,           # > before when multiallelic sites were split into biallelic
-    "note": "atomize MNPs -> split multiallelic -> left-align+trim against the reference; feed "
+    "note": "split multiallelic -> atomize MNPs -> left-align+trim against the reference; feed "
             "normalized.vcf.gz to annotate_variants / ClinVar matching.",
 }
 (ART / "data" / "normalization_summary.json").write_text(json.dumps(summary, indent=2))

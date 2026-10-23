@@ -99,6 +99,10 @@ class Skill:
     tags: tuple[str, ...] = ()
     requirements: dict[str, Any] = field(default_factory=dict)
     registry_release: str = ""
+    # Other names this skill answers to: the underscore form of a hyphenated name (the registry
+    # requires hyphens; plans, presets and older runs wrote ``pairwise_de``), plus any listed in
+    # ``metadata.aliases`` (comma-separated), e.g. the ``_v2`` name a skill was migrated from.
+    aliases: tuple[str, ...] = ()
 
 
 def _skills_dir() -> Path:
@@ -331,6 +335,32 @@ def _environment(meta: "dict[str, Any]", metadata: "dict[str, Any]") -> "tuple[d
     return ({}, problem) if problem else (env, "")
 
 
+def _aliases(name: str, metadata: "dict[str, Any]") -> "tuple[str, ...]":
+    """The other names a skill answers to (see :attr:`Skill.aliases`), never its own name."""
+    found = [name.replace("-", "_")]
+    found += [a.strip() for a in str(metadata.get("aliases") or "").split(",")]
+    out: list[str] = []
+    for alias in found:
+        if alias and alias != name and alias not in out:
+            out.append(alias)
+    return tuple(out)
+
+
+def default_file(files: "list[str] | dict[str, str]") -> "str | None":
+    """The bundled file to read first: ``reference.py`` (AiScientist layout), else the registry
+    layout's ``scripts/reference.py``, else the first file in ``scripts/``, else the first file that
+    is not a test. None when the skill has no files."""
+    names = sorted(files)
+    for wanted in ("reference.py", "scripts/reference.py"):
+        if wanted in names:
+            return wanted
+    scripts = [n for n in names if n.startswith("scripts/")]
+    if scripts:
+        return scripts[0]
+    rest = [n for n in names if not n.startswith("tests/")]
+    return rest[0] if rest else None
+
+
 def _load_from(root: Path) -> dict[str, Skill]:
     out: dict[str, Skill] = {}
     if not root.is_dir():
@@ -363,7 +393,7 @@ def _load_from(root: Path) -> dict[str, Skill]:
                               category=category, metadata=dict(metadata), folder=str(folder),
                               image=env.get("image", ""), cpus=env.get("cpus", 0),
                               mem_gb=env.get("mem_gb", 0), time_limit=env.get("time_limit", ""),
-                              env_problem=env_problem)
+                              env_problem=env_problem, aliases=_aliases(name, metadata))
     return out
 
 
@@ -531,10 +561,14 @@ def review_detail(name: str) -> "dict | None":
 
 def _resolve(lib: "dict[str, Skill]", name: str) -> "Skill | None":
     """Look up a skill tolerantly: exact name, else with a legacy ``.py`` suffix stripped (older
-    configs / preset prose refer to skills as ``<name>.py``)."""
+    configs / preset prose refer to skills as ``<name>.py``), else a skill that has the name as an
+    alias (a skill migrated to the registry under a hyphenated name). An exact name always wins."""
     hit = lib.get(name)
     if hit is None and name.endswith(".py"):
-        hit = lib.get(name[:-3])
+        name = name[:-3]
+        hit = lib.get(name)
+    if hit is None and name:
+        hit = next((s for s in list(lib.values()) if name in s.aliases), None)
     return hit
 
 
@@ -647,13 +681,16 @@ def plan_skill_lines(query: str, skills: "dict[str, Skill] | None" = None,
 
 
 def skills_named_in(text: str, skills: "dict[str, Skill] | None" = None) -> list[str]:
-    """Skill names that ``text`` (a plan step) mentions as whole names, in library order — so
-    ``annotate_clusters_by_markers_v2`` does not also count as ``annotate_clusters_by_markers``.
-    ``None`` → the loaded global library."""
+    """Skill names that ``text`` (a plan step) mentions as whole names or aliases, in library order —
+    so ``annotate_clusters_by_markers_v2`` does not also count as ``annotate_clusters_by_markers``.
+    A mention by alias returns the skill's own name. ``None`` → the loaded global library."""
     lib = SKILLS if skills is None else skills
     low = (text or "").lower()
-    return [name for name in list(lib)
-            if re.search(rf"(?<![\w-]){re.escape(name.lower())}(?![\w-])", low)]
+
+    def named(word: str) -> bool:
+        return re.search(rf"(?<![\w-]){re.escape(word.lower())}(?![\w-])", low) is not None
+
+    return [name for name, s in list(lib.items()) if named(name) or any(map(named, s.aliases))]
 
 
 def make_search_skills_tool(get_skills: "Callable[[], dict[str, Skill]] | None" = None) -> HarnessTool:
@@ -728,20 +765,23 @@ def make_skill_reference_tool(get_skills: "Callable[[], dict[str, Skill]] | None
             return {"name": hit.name, "file": requested, "code": code}
         # No file requested: return the SKILL.md body + the file list (fetch a file next for its code).
         files = sorted(hit.files)
-        default = "reference.py" if "reference.py" in files else (files[0] if files else None)
+        default = default_file(files)
         out = {"name": hit.name, "summary": hit.summary, "doc": hit.doc, "files": files}
         out.update(version=hit.version, status=hit.status, requirements=hit.requirements,
                    registry_release=hit.registry_release)
         if hit.metadata:
             out["metadata"] = hit.metadata   # e.g. compute, requires-gpu, requires-network, tested-with
+        # run_shell is refused once a registry skill is active (it cannot enforce the skill's policy).
+        shell = ("shell commands via subprocess inside run_code"
+                 + (", or run_in_environment for the skill's own environment" if hit.image else "")
+                 if hit.registry_release else
+                 "shell commands via run_shell, or via subprocess inside run_code")
         if default is not None:
             out["next"] = (f"call read_skill_reference(name={hit.name!r}, file={default!r}) to get the "
-                           "runnable file, then adapt it and run it (Python via run_code; shell "
-                           "commands via run_shell, or via subprocess inside run_code)")
+                           f"runnable file, then adapt it and run it (Python via run_code; {shell})")
         else:
             out["next"] = ("this skill has no bundled files: its code or commands are in `doc` above. "
-                           "Adapt them to this dataset, then run Python via run_code and shell "
-                           "commands via run_shell (or via subprocess inside run_code)")
+                           f"Adapt them to this dataset, then run Python via run_code and {shell}")
         return out
 
     return HarnessTool(

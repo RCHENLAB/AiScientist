@@ -110,9 +110,18 @@ platform keeps working. The skill list comes from the catalog: name, description
 tier and requirements. `requirements.compute` is also exposed as `metadata["compute"]` for plan
 estimates.
 
+Registry names use hyphens (`compare-two-groups`). A skill also answers to the underscore form of
+its name and to any names in `metadata.aliases`, so plans, preset pipelines and older runs that
+name a skill migrated from `skills/` (`pairwise_de`) still find it; an exact name always wins.
+In the registry layout the code sits in `scripts/`: `read_skill_reference` offers
+`reference.py`, else `scripts/reference.py`, else the first file in `scripts/`.
+
 A registry skill gets only what it declares. When it is read with `read_skill_reference`, or named
-in `run_code(skill=...)` or `run_in_environment`, the code runs in a container with network access,
-GPU, secrets and tools limited to its declaration. Its `scheduler` says whether the skill needs
+in `run_code(skill=...)` or `run_in_environment`, the code runs in a container with GPU, secrets and
+tools limited to its declaration. Network follows `requires-network`: `install` and `runtime` run
+with the network every other snippet has (a skill's own steps install its software, as the
+registry template's `mamba create` does), `none` runs offline and may only use an image that is
+already built. `AISCIENTIST_SANDBOX_NETWORK=0` turns the network off for all of them. Its `scheduler` says whether the skill needs
 Slurm: the platform runs every snippet as a contained Slurm job whatever it says, and code inside
 that container cannot submit jobs of its own, so no skill gets scheduler access. The local sandbox
 refuses a skill that requires a scheduler or a GPU. Uncontained local execution, the

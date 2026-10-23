@@ -45,7 +45,7 @@ ms = pt.tl.Mixscape()
 # Local perturbation signature: each cell minus its nearest control neighbours in PCA space.
 ms.perturbation_signature(adata, pert_key=PERT_KEY, control=CONTROL)
 # Classify KO/KD vs NP (escaped) vs NT; writes adata.obs["mixscape_class_global"].
-ms.mixscape(adata, control=CONTROL, labels=PERT_KEY)
+ms.mixscape(adata, PERT_KEY, CONTROL)  # positional: pertpy renamed labels to pert_key in 1.x
 
 CLASS_KEY = "mixscape_class_global"
 if CLASS_KEY not in adata.obs:

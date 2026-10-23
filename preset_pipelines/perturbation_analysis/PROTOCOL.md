@@ -181,9 +181,12 @@ large screens. Significance is a **label-permutation test**: pool P+C, reshuffle
 times, count how often the permuted E-distance ≥ observed (Davison–Hinkley `+1`), then **Benjamini–Hochberg**
 across perturbations. Not significant at the chosen FDR ⇒ **silent**.
 
-> **⚠️ Statistic definition.** With squared-Euclidean cost the statistic is **centroid-shift-based** — that
-> is the scPerturb definition and what pertpy's `Distance metric="edistance"` reports. A
-> distribution-shape-sensitive variant would need non-squared Euclidean + subsampled pairwise distances.
+> **⚠️ Statistic definition.** With squared-Euclidean cost the statistic is **centroid-shift-based**. It
+> equals scPerturb's `edist(dist="sqeuclidean", sample_correct=False)`; scPerturb's default
+> (`sample_correct=True`) is smaller by 2·Var/(n−1) per group, and pertpy's `Distance(metric="edistance")`
+> uses plain Euclidean distances, so neither reports the same numbers. With no effect the statistic is
+> about 2·V·(1/n_P + 1/n_C), so small silent groups rank higher: compare ranks with the group sizes in view.
+> A distribution-shape-sensitive variant would need non-squared Euclidean + subsampled pairwise distances.
 
 **✅ Verify this step:** E-distances **and** permutation / BH-adjusted p-values are reported (not just gene
 names) · perturbations are ranked by effect size · silent guides are listed **as a result**, not dropped

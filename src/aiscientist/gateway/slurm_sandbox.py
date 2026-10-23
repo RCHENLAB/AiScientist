@@ -386,11 +386,10 @@ class SlurmCodeExecutor:
                                      *self._input_binds())
                          if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
-        from ..agents.skills_registry import POLICY
+        from ..agents.skills_registry import POLICY, network_allowed
         policy = POLICY.get()
         gpu = bool(policy and policy["gpu"])
-        network = (policy["network"] in {"required", "optional", "runtime"}
-                   if policy else sandbox_network_enabled())
+        network = network_allowed(policy, sandbox_network_enabled())
         inner = container_exec(
             image, inner_payload,
             binds_ro=binds_ro, binds_rw=binds_rw, nv=gpu, network=network,

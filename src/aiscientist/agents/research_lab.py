@@ -866,12 +866,12 @@ def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
     def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
-        from .skills import SKILLS, refresh_skills
+        from .skills import SKILLS, get_skill, refresh_skills
         refresh_skills()
         wanted = str(args.get("skill") or "").strip()
         command = str(args.get("command") or "").strip()
         with_env = sorted(s.name for s in list(SKILLS.values()) if s.image)
-        skill = SKILLS.get(wanted) or next(
+        skill = get_skill(wanted) or next(
             (s for s in list(SKILLS.values()) if s.name.lower() == wanted.lower()), None)
         if skill is None:
             return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "

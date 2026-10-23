@@ -57,13 +57,14 @@ def _from_bcftools_stats() -> bool:
         elif line.startswith("TSTV\t"):
             metrics["ti_tv"] = round(float(f[4]), 3)                 # ts/tv column
         elif line.startswith("PSC\t"):
-            # PSC: id sample nRefHom nNonRefHom nHets ... nMissing (last)
-            hom += int(f[3]); het += int(f[4]); miss += int(f[-1])
+            # PSC: id sample nRefHom nNonRefHom nHets ... nMissing (last). Het/Hom is
+            # nHets / nNonRefHom (hom-ALT); hom-ref calls are called genotypes too.
+            hom += int(f[4]); het += int(f[5]); miss += int(f[-1])
     if hom:
         metrics["het_hom"] = round(het / hom, 3)
-    total_gt = het + hom + miss
+    total_gt = (metrics["n_records"] or 0) * (metrics["n_samples"] or 0)
     if total_gt:
-        metrics["call_rate"] = round((het + hom) / total_gt, 4)
+        metrics["call_rate"] = round(1 - miss / total_gt, 4)
     metrics["method"] = "bcftools stats"
     return True
 
@@ -74,7 +75,7 @@ def _from_cyvcf2() -> bool:
         from cyvcf2 import VCF
     except ImportError:
         return False
-    ts = tv = het = hom = miss = snps = indels = 0
+    ts = tv = het = hom = ref = miss = snps = indels = 0
     purines, pyrimidines = {"A", "G"}, {"C", "T"}
     vcf = VCF(INPUT_VCF)
     metrics["n_samples"] = len(vcf.samples)
@@ -92,13 +93,14 @@ def _from_cyvcf2() -> bool:
             het += int((v.gt_types == 1).sum())
             hom += int((v.gt_types == 3).sum())      # cyvcf2: 3 == HOM_ALT
             miss += int((v.gt_types == 2).sum())     # 2 == UNKNOWN/missing
+            ref += int((v.gt_types == 0).sum())      # 0 == HOM_REF, a called genotype
     metrics.update(n_snps=snps, n_indels=indels, n_records=snps + indels)
     if tv:
         metrics["ti_tv"] = round(ts / tv, 3)
     if hom:
         metrics["het_hom"] = round(het / hom, 3)
-    if het + hom + miss:
-        metrics["call_rate"] = round((het + hom) / (het + hom + miss), 4)
+    if het + hom + ref + miss:
+        metrics["call_rate"] = round((het + hom + ref) / (het + hom + ref + miss), 4)
     metrics["method"] = "cyvcf2"
     return True
 
