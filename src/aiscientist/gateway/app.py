@@ -7764,6 +7764,16 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
                    "level": "info"})
         conn.push({"type": "chat_stopped"})
         return
+    # A list question about the RetiGene papers is a curation of the whole corpus (issue 46): its own
+    # plan card, then the tables. A note on that plan that changes the request is routed below.
+    if _corpus_curation(conn, req.question):
+        conn.emit("info", "route", "Routed to the corpus curation: a list of genes from the RetiGene papers.")
+        handoff = await _run_corpus_scan(conn, req, review=True)
+        if handoff is None:
+            return
+        req = req.model_copy(update={"question": handoff})
+        conn.begin_run(req.conversation_id)
+        target = _followup_target(conn, req)
     # Which line (issue 21): a general question is answered from the literature, everything else is
     # the lab. The chat's earlier analysis is context: a question about it is an analysis.
     prior_request = str(target[2].get("question") or "") if target else ""
@@ -8113,19 +8123,152 @@ def _vllm_log_tail(conn: Connection, path: str) -> str:
         return ""
 
 
-async def _run_corpus_scan(conn: Connection, req: LabRequest,
-                           stored: "corpus_scan.StoredScan | None" = None) -> None:
-    """The third line next to Research and Chat: the haploinsufficient genes of the indexed corpus
-    as two CSVs. A scan of the corpus as it is now, if one is kept (``stored``, else looked up here),
-    answers at once; otherwise ``extract_haploinsufficient_genes`` runs as ONE HPC3 job with a GPU
-    and a model of its own (``gateway/corpus_scan.py``), and its tables are kept for the next request.
+def _corpus_curation(conn: Connection, question: str) -> bool:
+    """A list question about the RetiGene papers ("What are haploinsufficient genes in RetiGene
+    papers?"): the console's route sends it to the corpus curation, the whole corpus read for the
+    genes and their evidence, instead of the literature line's best passages (RCHENLAB/AiScientist
+    issue 46). Only a question that names the corpus, asks for the list and not about the user's
+    data, on a session that reaches the corpus. Haploinsufficiency is the one property curated."""
+    from ..agents import request_router
+    q = str(question or "")
+    return (request_router.names_corpus(q) and corpus_scan.asks_for_gene_list(q)
+            and not request_router.refers_to_data(q) and _literature_corpus_available(conn))
 
-    Shares the run lifecycle with the other two (``chat_running``, per-run ``chat_stop``, the
+
+# What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
+# 1,537 model calls, 9.7 min. Its tokens, with the shared rules cached as the relay caches them now
+# (1,262 rule tokens a call read from the cache): what the plan card prices another model at.
+_API_SCAN_TOKENS = {"input_tokens": 1_210_000, "cache_read_tokens": 1_940_000, "output_tokens": 1_380_000}
+
+
+def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | None",
+                         api: "dict[str, Any] | None") -> str:
+    """How long the curation takes on this session, and what it costs, as the plan card says it."""
+    if stored is not None:
+        day = str(stored.meta.get("stored_at") or "")[:10]
+        return (f"at once, from the scan of this corpus kept{' on ' + day if day else ''} (the corpus has "
+                "not changed since): no job and no model cost")
+    if api:
+        from . import llm_pricing
+        model = str(api["model"])
+        est = llm_pricing.estimate(model, **_API_SCAN_TOKENS)
+        try:
+            cap, why = _corpus_scan_cost_cap(conn)
+            limit = (f"; it stops at ${cap:.2f} ({why}), and reads about 1% of the passages first to check "
+                     "the cost")
+        except GatewayError as exc:
+            limit = f". {exc.message}"
+        return (f"with your API model {model}, on your key: it reads about 1,500 passages, which took Claude "
+                "Haiku about 10 minutes" + ("" if "haiku" in model.lower() else " (a larger model takes longer)")
+                + (f", for an estimated ${est:.2f}" if est is not None else "") + limit)
+    wait = _duration_words(conn.settings.corpus_scan_queue_wait_s)
+    return ("about 2 hours on a GPU of its own (an A100; about 4 hours on an A30) on the lab's paid partition, "
+            f"plus the wait for a free card (often minutes; after {wait} without one it is submitted again), "
+            "and no API cost. The tables are kept, so the next request for this corpus is answered at once")
+
+
+async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callable[..., None],
+                                  say: Callable[..., None], question: str,
+                                  stored: "corpus_scan.StoredScan | None",
+                                  api: "dict[str, Any] | None") -> "bool | str | None":
+    """The curation's plan card: True when the user runs it; None when the run is over (cancelled,
+    expired, stopped); the request with the user's note when the note changes it (to plan again)."""
+    when = await asyncio.to_thread(_curation_time_words, conn, stored, api)
+    say("🧬 This asks for the genes the RetiGene papers report, so the plan is a curation of the whole "
+        "corpus, not an answer from its best passages: every gene with its claim, the paper's own "
+        "sentence, the paper and the page, as a table. Run it, or say in the chat what to change.")
+    while True:
+        decision = await asyncio.to_thread(_literature_plan_review, conn, emit,
+                                           corpus_scan.curation_plan_step(question, when), "corpus")
+        action = str(decision.get("action") or "cancel")
+        if action == "approve":
+            return True
+        if action in ("cancel", "timeout"):
+            if run.chat_stop.is_set():
+                conn.push({"type": "chat_stopped"})
+                return None
+            say("Plan review expired — nothing was read. (Nobody cancelled; the review window ran out.)"
+                if action == "timeout" else "Plan cancelled — nothing was read.", "warning")
+            if run.monitor is not None:
+                run.monitor.end("cancelled")
+            conn.push({"type": "chat_done"})
+            return None
+        note = str(decision.get("feedback") or "").strip()
+        if not note:
+            continue                      # nothing said: show the plan again
+        conn.push({"type": "chat_token", "token": "🧭 Your note changes the request, so it is planned again."})
+        if run.monitor is not None:
+            run.monitor.end("ended")
+        conn.push({"type": "chat_done"})
+        return f"{question}\n\n{note}"
+
+
+# The corpus manifest is read whole for the papers' titles and DOIs; it is a few MB at most.
+_MANIFEST_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _corpus_papers(conn: Connection) -> dict[str, dict[str, str]]:
+    """Each corpus paper's title and DOI, from the corpus manifest on HPC3
+    (``corpus_scan.papers_from_manifest``); empty when it cannot be read, and the tables then name
+    the papers by PMID alone."""
+    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
+    if not manifest or conn.executor is None or conn.mock:
+        return {}
+    try:
+        raw = conn.executor.read_bytes(manifest, max_bytes=_MANIFEST_MAX_BYTES)
+    except Exception as exc:  # noqa: BLE001 - titles are a convenience: the PMIDs identify the papers
+        print(f"[corpus] the corpus manifest could not be read: {type(exc).__name__}: {exc}")
+        return {}
+    return corpus_scan.papers_from_manifest(raw.decode("utf-8", errors="replace"))
+
+
+def _curation_pointer_path(owner: str, run_id: str) -> Path:
+    """The record of a run's curation tables, for "Save tables to my data": in the run's folder,
+    outside ``artifacts/``, so it is neither a result file nor in the bundle."""
+    return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / corpus_scan.CURATION_POINTER
+
+
+def _point_at_curation_tables(conn: Connection, run_id: str, art: Path, curation: dict[str, Any]) -> None:
+    """Record the curation tables a run wrote, so the chat and Runs offer to save them."""
+    folder = art / corpus_scan.CURATION_SUBDIR
+    files = [{"name": n, "size": (folder / n).stat().st_size} for n in curation.get("files") or []
+             if (folder / n).is_file()]
+    if not files:
+        return
+    counts = curation.get("counts") or {}
+    rec = {"name": f"retigene_haploinsufficiency.curation.{datetime.now().strftime('%Y%m%d-%H%M')}.{run_id}",
+           "path": str(folder), "location": "gateway", "files": files,
+           "size_bytes": sum(f["size"] for f in files),
+           "n_genes": int(counts.get(corpus_scan.SUPPORTED, 0)) + int(counts.get(corpus_scan.CONTESTED, 0)),
+           "counts": counts, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    path = conn.workspace / run_id / corpus_scan.CURATION_POINTER
+    try:
+        path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[corpus] curation pointer not written: {exc}")
+
+
+async def _run_corpus_scan(conn: Connection, req: LabRequest,
+                           stored: "corpus_scan.StoredScan | None" = None,
+                           review: bool = False) -> "str | None":
+    """The haploinsufficient genes of the indexed corpus, curated: two tables (one row per gene with
+    its claim, one per sentence) and a chat answer written from them. A scan of the corpus as it is
+    now, if one is kept (``stored``, else looked up here), answers at once; otherwise
+    ``extract_haploinsufficient_genes`` runs as ONE HPC3 job with a GPU and a model of its own
+    (``gateway/corpus_scan.py``), or on the session's own API model, and its tables are kept for the
+    next request.
+
+    ``review``: the console's route for a list question about the RetiGene papers (issue 46,
+    ``_corpus_curation``). The plan card shows the curation and how long it takes, and nothing runs
+    until the user runs it. Returns the request to plan again when the user's note on that plan
+    changes it (the caller routes it), else None.
+
+    Shares the run lifecycle with the other lines (``chat_running``, per-run ``chat_stop``, the
     ``chat_start`` → ``chat_token`` → ``chat_done`` WS protocol, the ``artifacts`` event for the
     downloads panel) and touches neither engine: no planner, no Scientist/Critic, no report
     bundle, no ``run_state.json`` — so a later research message cannot mistake this run for a
     study to amend. The run does get an id and a ``<workspace>/<run_id>/artifacts`` dir, which is
-    what makes ``genes.csv`` / ``hits.csv`` downloadable."""
+    what makes the tables downloadable."""
     run = conn.active_run or conn.begin_run(req.conversation_id)
     if req.conversation_id and not run.conversation_id:
         run.conversation_id = req.conversation_id
@@ -8145,17 +8288,24 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
     art = conn.workspace / run_id / "artifacts"
     api = _corpus_scan_api(conn)
     model = api["model"] if api else corpus_scan.scan_model(conn.settings)
+    question = str(req.question or "").strip()
+    recorded = False
     try:
-        if _AUTH_ENABLED and conn.app_user_id:
-            try:
-                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
-                                             conversation_id=run.conversation_id)
-            except Exception as exc:  # noqa: BLE001 - history is best-effort
-                print(f"[auth] record_run_start failed: {exc}")
         ident = None
         if stored is None:
             ident = await asyncio.to_thread(_corpus_scan_identity, conn)
             stored = corpus_scan.load(ident[0]) if ident else None
+        if review:
+            go = await _review_corpus_curation(conn, run, emit, say, question, stored, api)
+            if go is not True:
+                return go
+        if _AUTH_ENABLED and conn.app_user_id:
+            try:
+                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
+                                             conversation_id=run.conversation_id)
+                recorded = True
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_start failed: {exc}")
         if stored is not None:
             model = str(stored.meta.get("model") or model)
             emit("step", "corpus", f"Corpus scan: kept scan {stored.key} of "
@@ -8166,11 +8316,17 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             result = await (_corpus_scan_via_relay(conn, run, run_id, ident, say, emit, api) if api
                             else _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit))
             if result is None:                   # stopped
-                return
+                return None
+        tables = art / corpus_scan.OUT_SUBDIR
+        papers = await asyncio.to_thread(_corpus_papers, conn)
+        curation = await asyncio.to_thread(corpus_scan.write_curation, tables,
+                                           art / corpus_scan.CURATION_SUBDIR, papers)
         conn.push({"type": "chat_token", "token": _corpus_summary_md(
-            result, corpus_scan.gene_rows(art / corpus_scan.OUT_SUBDIR), model=model,
+            result, curation=curation["rows"],
+            rows=None if curation["rows"] else corpus_scan.gene_rows(tables), model=model,
             kept_since=(str(stored.meta.get("stored_at") or "")[:10] if stored is not None else ""))})
         await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [model])
+        await asyncio.to_thread(_point_at_curation_tables, conn, run_id, art, curation)
         items = [
             {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
              "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
@@ -8180,24 +8336,34 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
         else:
             say("⚠ The job reported success but no files were synced back from HPC3.", "warning")
+        counts = curation["counts"]
+        n_genes = (counts[corpus_scan.SUPPORTED] + counts[corpus_scan.CONTESTED]) if curation["rows"] \
+            else result.get("n_genes")
         emit("success", "corpus",
-             f"Corpus scan done: {result.get('n_genes')} genes from {result.get('n_hits_eligible')} "
-             f"verified sentences ({result.get('n_passages')} passages read, {result.get('n_papers')} papers).")
-        _finish_run_record(conn, run_id, "done", str(art),
-                           f"{result.get('n_genes')} haploinsufficient genes (corpus scan)")
+             f"Corpus curation done: {n_genes} haploinsufficient genes"
+             + (f" ({counts[corpus_scan.CONTESTED]} contested), {counts[corpus_scan.AGAINST]} argued against, "
+                f"{counts[corpus_scan.SUGGESTED]} only suggested, from {curation['n_sentences']} verified sentences"
+                if curation["rows"] else f" from {result.get('n_hits_eligible')} verified sentences")
+             + f" ({result.get('n_passages')} passages read, {result.get('n_papers')} papers).")
+        _finish_run_record(conn, run_id, "done", str(art), f"{n_genes} haploinsufficient genes (corpus curation)")
         conn.push({"type": "chat_done"})
+        return None
     except GatewayError as exc:
         print(f"[corpus] scan failed ({exc.stage or 'corpus'}): {exc.message}")
         traceback.print_exc()
         conn.emit("error", exc.stage or "corpus", exc.message, detail=error_detail(exc))
         conn.push({"type": "chat_error", "message": exc.message})
-        _finish_run_record(conn, run_id, "failed", str(art), exc.message)
+        if recorded or not review:
+            _finish_run_record(conn, run_id, "failed", str(art), exc.message)
+        return None
     except Exception as exc:  # noqa: BLE001 - reported, never fatal
         print(f"[corpus] scan failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
         conn.emit("error", "corpus", f"Corpus scan failed: {public_error(exc)}", detail=error_detail(exc))
         conn.push({"type": "chat_error", "message": public_error(exc)})
-        _finish_run_record(conn, run_id, "failed", str(art), str(exc))
+        if recorded or not review:
+            _finish_run_record(conn, run_id, "failed", str(art), str(exc))
+        return None
     finally:
         run.running = False
         conn.end_run(run)
@@ -8472,16 +8638,100 @@ def _md_cell(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).replace("|", "\\|").strip()
 
 
+def _pmid_link(pmid: str, page: str = "") -> str:
+    pmid = str(pmid or "").strip()
+    if not pmid:
+        return "—"
+    return f"[PMID {pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)" + (f", p. {page}" if str(page or "").strip() else "")
+
+
+def _short_quote(text: str, limit: int = 240) -> str:
+    quote = _md_cell(text)
+    return quote if len(quote) <= limit else quote[:limit - 3].rstrip() + "…"
+
+
+def _curation_md(rows: list[dict[str, Any]]) -> list[str]:
+    """The chat's sections for the curation tables: the haploinsufficient genes, strongest evidence
+    first, then each other claim in a section of its own, so a gene the papers argue against is
+    never read as one of the list. Every row cites the paper and page of its sentence."""
+    by = {c: [r for r in rows if r.get("claim") == c] for c in corpus_scan.CLAIMS}
+    lines: list[str] = []
+
+    def more(r: dict[str, Any], key: str, cited: str) -> str:
+        rest = [p for p in str(r.get(key) or "").split("|") if p and p != cited]
+        return f" + {len(rest)} more" if rest else ""
+
+    sup = by[corpus_scan.SUPPORTED]
+    if sup:
+        lines += [f"**Haploinsufficient — {len(sup)} gene{'s' if len(sup) != 1 else ''}**, the most papers first:", "",
+                  "| gene | phenotype (as written) | evidence (the paper's words) | papers | citation | review flags |",
+                  "|---|---|---|---|---|---|"]
+        for r in sup:
+            flags = ", ".join(f for f in str(r.get("review_flags") or "").split("|") if f) or "—"
+            lines.append(f"| {_md_cell(r['gene'])} | {_md_cell(r.get('phenotype')) or '—'} | “{_short_quote(r.get('quote'))}” "
+                         f"| {r.get('papers_stating')} | {_pmid_link(r.get('pmid'), r.get('page'))}"
+                         f"{more(r, 'pmids_stating', str(r.get('pmid') or ''))} | {flags} |")
+        lines.append("")
+    con = by[corpus_scan.CONTESTED]
+    if con:
+        lines += [f"**Contested — {len(con)} gene{'s' if len(con) != 1 else ''}**: one paper states "
+                  "haploinsufficiency and another argues against it, in a human retinal disease or with an "
+                  "animal model or another disease. Every sentence on both sides is in the evidence table.", "",
+                  "| gene | stated (the paper's words) | argued against (the paper's words) | papers for / against |",
+                  "|---|---|---|---|"]
+        for r in con:
+            where = (" — in an animal model or another disease"
+                     if r.get("against_context") == "animal model or another disease" else "")
+            lines.append(f"| {_md_cell(r['gene'])} | “{_short_quote(r.get('quote'), 200)}” "
+                         f"({_pmid_link(r.get('pmid'), r.get('page'))}) "
+                         f"| “{_short_quote(r.get('quote_against'), 200)}” "
+                         f"({_pmid_link(r.get('pmid_against'), r.get('page_against'))}){where} "
+                         f"| {r.get('papers_stating')} / {r.get('papers_against')} |")
+        lines.append("")
+    against = by[corpus_scan.AGAINST]
+    if against:
+        lines += [f"**Argued against — {len(against)} gene{'s' if len(against) != 1 else ''}**, not in the list: "
+                  "the papers say haploinsufficiency is not, or is unlikely to be, the mechanism.", "",
+                  "| gene | the paper's words | citation |", "|---|---|---|"]
+        for r in against:
+            lines.append(f"| {_md_cell(r['gene'])} | “{_short_quote(r.get('quote'))}” | "
+                         f"{_pmid_link(r.get('pmid'), r.get('page'))}{more(r, 'pmids_against', str(r.get('pmid') or ''))} |")
+        lines.append("")
+    hedged = by[corpus_scan.SUGGESTED]
+    if hedged:
+        lines += [f"**Only suggested — {len(hedged)} gene{'s' if len(hedged) != 1 else ''}**, not in the list: the "
+                  "papers' statements are hedged (may, suggests, consistent with), none explicit.", ""]
+        for r in hedged:
+            lines.append(f"- **{_md_cell(r['gene'])}**: “{_short_quote(r.get('quote'), 200)}” "
+                         f"({_pmid_link(r.get('pmid'), r.get('page'))})")
+        lines.append("")
+    return lines
+
+
 def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | None" = None, *,
+                       curation: "list[dict[str, Any]] | None" = None,
                        model: str = "", kept_since: str = "") -> str:
-    """The chat bubble for a corpus scan: the counts, one row per gene with its evidence (the
-    paper's own sentence and page) and citations, the review flags and the warnings — written from
-    the tool's tables and result, nothing generated. ``kept_since``: the date of the kept scan this
-    answer comes from."""
-    title = ("**Haploinsufficient genes in the indexed corpus** — from the corpus scan of "
-             f"{kept_since}, kept because the corpus has not changed since."
-             if kept_since else
-             "**Corpus scan finished** — explicitly reported haploinsufficient genes in retinal disease.")
+    """The chat answer for a corpus curation, written from the tables and the scan's result, nothing
+    generated: how many genes, the strongest evidence first, the genes the papers argue against
+    apart, every row cited with its paper and page, then the flags and the warnings. ``curation``:
+    the gene rows of ``corpus_scan.write_curation``; ``rows``: the scan's genes.csv
+    (``corpus_scan.gene_rows``), shown when there is no curation. ``kept_since``: the date of the kept
+    scan this answer comes from."""
+    curation = list(curation or [])
+    counts = {c: sum(1 for r in curation if r.get("claim") == c) for c in corpus_scan.CLAIMS}
+    n_list = counts[corpus_scan.SUPPORTED] + counts[corpus_scan.CONTESTED]
+    if curation:
+        extra = [f"{counts[c]} {label}" for c, label in ((corpus_scan.CONTESTED, "of them contested"),
+                                                         (corpus_scan.AGAINST, "argued against"),
+                                                         (corpus_scan.SUGGESTED, "only suggested")) if counts[c]]
+        title = (f"**Haploinsufficient genes in the RetiGene corpus: {n_list}** — the genes its papers state "
+                 "are haploinsufficient in retinal disease, from a curation of the whole corpus"
+                 + (f" ({'; '.join(extra)})" if extra else "") + ".")
+    else:
+        title = ("**Haploinsufficient genes in the indexed corpus**" if kept_since else
+                 "**Corpus scan finished** — explicitly reported haploinsufficient genes in retinal disease.")
+    if kept_since:
+        title += f" From the corpus scan of {kept_since}, kept because the corpus has not changed since."
     lines = [
         title,
         "",
@@ -8505,36 +8755,48 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
                      f"({api_usage['calls']} calls, {api_usage.get('input_tokens', 0):,} input / "
                      f"{api_usage.get('output_tokens', 0):,} output tokens)"
                      + (" — when this kept scan was made; answering from it costs nothing" if kept_since else ""))
-    lines += [
-        "",
-        "`genes.csv` (one row per gene: HGNC symbol, phenotype and mechanism as written, up to 3 PMIDs "
-        "with verbatim quotes, review flags), `hits.csv` (every judged sentence, all mechanism "
-        "classes) and `requests.csv` (the search requests and the passages each found) are in the "
-        "downloads below.",
-        "",
-    ]
-    if rows:
-        lines.append("| gene | evidence (the paper's words) | citations | review flags |")
-        lines.append("|---|---|---|---|")
-        for r in rows:
-            quote = _md_cell(r.get("evidence"))
-            if len(quote) > 240:
-                quote = quote[:237].rstrip() + "…"
-            page = f" (p. {r['page']})" if r.get("page") else ""
-            cites = ", ".join(f"[PMID {p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in r.get("pmids") or [])
-            flags = ", ".join(r.get("flags") or []) or "—"
-            lines.append(f"| {_md_cell(r.get('gene'))} | “{quote}”{page} | {cites or '—'} | {flags} |")
-        lines.append("")
+    lines.append("")
+    if curation:
+        lines += [
+            f"Under Results, `{corpus_scan.CURATION_SUBDIR}/`: `{corpus_scan.CURATION_GENES}` (one row per gene: "
+            "its claim, explicit or hedged, negated or not, the phenotype as written, the strongest sentence "
+            f"verbatim, its paper's PMID, DOI and title, the page) and `{corpus_scan.CURATION_EVIDENCE}` (one row "
+            "per sentence). “Save tables to my data” keeps both in your Datasets. The scan's own tables "
+            f"(`{corpus_scan.OUT_SUBDIR}/`: genes.csv, hits.csv with every judged sentence, requests.csv with "
+            "the search requests) are beside them for audit.",
+            "",
+        ]
+        lines += _curation_md(curation)
     else:
-        genes = list(result.get("genes") or [])
-        if genes:
-            lines.append("| gene | papers | phenotype (as written) | review flags |")
+        lines += [
+            "`genes.csv` (one row per gene: HGNC symbol, phenotype and mechanism as written, up to 3 PMIDs "
+            "with verbatim quotes, review flags), `hits.csv` (every judged sentence, all mechanism "
+            "classes) and `requests.csv` (the search requests and the passages each found) are in the "
+            "downloads below.",
+            "",
+        ]
+        if rows:
+            lines.append("| gene | evidence (the paper's words) | citations | review flags |")
             lines.append("|---|---|---|---|")
-            for g in genes:
-                flags = ", ".join(g.get("flags") or []) or "—"
-                lines.append(f"| {g.get('gene')} | {g.get('n_papers')} | {g.get('phenotype') or ''} | {flags} |")
+            for r in rows:
+                page = f" (p. {r['page']})" if r.get("page") else ""
+                cites = ", ".join(f"[PMID {p}](https://pubmed.ncbi.nlm.nih.gov/{p}/)" for p in r.get("pmids") or [])
+                flags = ", ".join(r.get("flags") or []) or "—"
+                lines.append(f"| {_md_cell(r.get('gene'))} | “{_short_quote(r.get('evidence'))}”{page} | "
+                             f"{cites or '—'} | {flags} |")
             lines.append("")
-    flagged = list(result.get("genes_flagged_for_review") or [])
+        else:
+            genes = list(result.get("genes") or [])
+            if genes:
+                lines.append("| gene | papers | phenotype (as written) | review flags |")
+                lines.append("|---|---|---|---|")
+                for g in genes:
+                    flags = ", ".join(g.get("flags") or []) or "—"
+                    lines.append(f"| {g.get('gene')} | {g.get('n_papers')} | {g.get('phenotype') or ''} | {flags} |")
+                lines.append("")
+    flagged = ([r["gene"] for r in curation if r.get("claim") in (corpus_scan.SUPPORTED, corpus_scan.CONTESTED)
+                and str(r.get("review_flags") or "").strip("|")] if curation
+               else list(result.get("genes_flagged_for_review") or []))
     if flagged:
         lines.append(f"Read these first (a flag is a question for the curator, not an exclusion): "
                      f"{', '.join(flagged)}.")
@@ -8864,15 +9126,17 @@ def _revise_literature_question(conn: Connection, question: str, note: str) -> s
     return text if 3 <= len(text.split()) <= 120 and not text.startswith(("{", "[")) else fallback
 
 
-def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: str) -> dict[str, Any]:
-    """Show the literature plan on the plan card and wait for the user's decision: the lab's plan
-    review (same card, same review window and expiry warning, answered through /api/lab/plan)."""
+def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: str,
+                            stage: str = "literature") -> dict[str, Any]:
+    """Show a one-step plan (the literature search, or the corpus curation) on the plan card and
+    wait for the user's decision: the lab's plan review (same card, same review window and expiry
+    warning, answered through /api/lab/plan)."""
     agenda = [step]
     conn.plan_value = None
     conn.plan_event.clear()
     conn.pending_plan = {"kind": "plan", "payload": agenda}
     conn.push({"type": "plan_prompt", "agenda": agenda, "revised": []})
-    emit("step", "literature", "Plan ready — Run it, or say in the chat what to change.")
+    emit("step", stage, "Plan ready — Run it, or say in the chat what to change.")
     warned_at = max(60.0, _PLAN_REVIEW_TIMEOUT * 0.75)
     if not conn.plan_event.wait(timeout=warned_at):
         pending = conn.pending_plan
@@ -8996,6 +9260,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     a later message cannot mistake it for a study to continue, and the chat's last analysis stays
     the one a follow-up builds on."""
     from ..agents import literature_answer as lit
+    from ..agents import request_router
     run = conn.active_run or conn.begin_run(req.conversation_id)
     if req.conversation_id and not run.conversation_id:
         run.conversation_id = req.conversation_id
@@ -9020,15 +9285,32 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     question = str(req.question or "").strip()
     recorded = False
     with_corpus = _literature_corpus_available(conn)
+    # A question about the RetiGene papers is answered from them alone; PubMed only when it asks for
+    # it (RCHENLAB/AiScientist issue 46). Decided again after each note on the plan.
+    pubmed = not request_router.corpus_only(question)
     try:
+        if not pubmed and not with_corpus:
+            conn.push({"type": "chat_token", "token": (
+                "This question asks about the lab's RetiGene papers, but this session cannot reach the "
+                "RetiGene corpus (it is searched on HPC3), so nothing was searched. Connect a session "
+                "with HPC3, or say “search PubMed” to answer from the public literature instead.")})
+            if run.monitor is not None:
+                run.monitor.end("ended")
+            conn.push({"type": "chat_done"})
+            return None
         say("📚 This reads as a question the published literature answers, so the plan is one "
-            + ("literature search in the lab's RetiGene corpus and PubMed. " if with_corpus else
+            + ("search of the lab's RetiGene corpus, which the question asks about. " if not pubmed else
+               "literature search in the lab's RetiGene corpus and PubMed. " if with_corpus else
                "literature search in PubMed. ")
             + "Run it, or say in the chat what to change. If it needs your data analysed, say so, and "
             "the PI plans an analysis instead.")
+        if pubmed and with_corpus and corpus_scan.asks_for_gene_list(question):
+            say("ℹ For the complete list from the RetiGene papers, as a table of genes with their quotes, "
+                "ask about the RetiGene papers by name (for example “What are haploinsufficient genes in "
+                "RetiGene papers?”): that reads the whole corpus instead of its best passages.")
         while True:
             decision = await asyncio.to_thread(_literature_plan_review, conn, emit,
-                                               lit.plan_step(question, corpus=with_corpus))
+                                               lit.plan_step(question, corpus=with_corpus, pubmed=pubmed))
             action = str(decision.get("action") or "cancel")
             if action == "approve":
                 break
@@ -9058,6 +9340,10 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
                 conn.push({"type": "chat_done"})
                 return combined
             question = await asyncio.to_thread(_revise_literature_question, conn, question, note)
+            # "also search PubMed" on a corpus-only plan adds it; the revised question decides.
+            pubmed = not request_router.corpus_only(question) or request_router.asks_for_pubmed(note)
+            if not pubmed and not with_corpus:
+                pubmed = True                    # nothing else could answer it here
 
         if _AUTH_ENABLED and conn.app_user_id:
             try:
@@ -9069,20 +9355,24 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         _watch_stage(run, "literature")
         llm = _lab_llm(conn)
         complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
-        emit("step", "literature", f"Literature search (model: {llm.model}).")
+        emit("step", "literature", f"Literature search (model: {llm.model})."
+             + ("" if pubmed else " The RetiGene corpus only: PubMed is not searched."))
         conn.push({"type": "run_status", "text": "🔎 Writing the search queries…"})
         queries, terms = await asyncio.to_thread(
             lit.plan_search, lambda m: complete_fn(m, role="classify"), question,
             fallback=_tools_api.focus_literature_query)
-        emit("info", "literature", "Queries: " + "; ".join(queries)
-             + (f". Corpus words: {', '.join(terms)}" if with_corpus and terms else ""))
+        if not pubmed:
+            queries = []                          # the corpus is searched with the question and the words
+        emit("info", "literature", ("Queries: " + "; ".join(queries) + ". " if queries else "")
+             + (f"Corpus words: {', '.join(terms)}" if with_corpus and terms else ""))
         if run.chat_stop.is_set():
             stopped()
             return None
         corpus = await asyncio.to_thread(_literature_corpus_tool, conn) if with_corpus else None
         corpus_job = (asyncio.ensure_future(asyncio.to_thread(
             _literature_corpus_logged, conn, run, corpus, question, terms)) if corpus is not None else None)
-        collected = await asyncio.to_thread(_literature_search_logged, conn, run, queries)
+        collected = (await asyncio.to_thread(_literature_search_logged, conn, run, queries) if pubmed
+                     else lit.Collected([], []))
         corpus_out: "dict[str, Any] | None" = None
         if with_corpus and corpus is None:
             corpus_out = {"status": "error", "error": "the corpus could not be reached from this session"}
@@ -9098,15 +9388,16 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
             stopped()
             return None
         collected = lit.add_corpus(collected, corpus_out)
-        if collected.corpus is not None and collected.corpus.get("error") and not collected.corpus.get("passages"):
+        if (pubmed and collected.corpus is not None and collected.corpus.get("error")
+                and not collected.corpus.get("passages")):
             say(f"⚠ The RetiGene corpus search gave nothing ({collected.corpus['error']}); the answer "
                 "rests on PubMed alone.", "warning")
         papers = collected.papers
         if papers:
             n_corpus = sum(1 for p in papers if p.passages)
-            where = (f"{n_corpus} from the RetiGene corpus ({collected.corpus.get('passages', 0)} passage(s)) "
-                     f"and {len(papers) - n_corpus} more from PubMed" if n_corpus else
-                     f"from {len(queries)} PubMed search(es)")
+            where = ((f"{n_corpus} from the RetiGene corpus ({collected.corpus.get('passages', 0)} passage(s))"
+                      + (f" and {len(papers) - n_corpus} more from PubMed" if pubmed else ""))
+                     if n_corpus else f"from {len(queries)} PubMed search(es)")
             say(f"📄 {len(papers)} paper(s), {where} — reading them and writing the answer.")
             conn.push({"type": "run_status", "text": "✍️ Writing the answer…"})
             raw = await asyncio.to_thread(complete_fn, lit.answer_messages(question, papers), role="literature")
@@ -9132,10 +9423,11 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         if items:
             conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
         summary = ((f"Literature answer citing {len(cited)} of {len(papers)} papers"
-                    + (" (RetiGene corpus and PubMed)" if any(p.passages for p in papers) else " (PubMed)"))
+                    + (" (RetiGene corpus)" if not pubmed else
+                       " (RetiGene corpus and PubMed)" if any(p.passages for p in papers) else " (PubMed)"))
                    if papers else "Literature search: no papers found")
         _finish_run_record(conn, run_id, "done", str(art), summary)
-        emit("success", "literature", f"{summary} ({len(queries)} queries).")
+        emit("success", "literature", f"{summary}" + (f" ({len(queries)} queries)." if pubmed else "."))
         conn.push({"type": "chat_done"})
         return None
     except GatewayError as exc:
@@ -10176,12 +10468,35 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         # reactive recompaction so a stall reads as "recompacting", not "frozen".
         progress(f"  🗜 Context over the model window — recompacting and retrying "
                  f"(attempt {ev.get('attempt', 1)})…", "warning")
+    elif t == "plan_reformat":
+        activity("the PI's plan was not in the expected format; asking it to send the plan again")
+    elif t == "plan_reformat_failed":
+        activity(f"asking the PI to send the plan again failed ({ev.get('error')})")
     elif t == "plan_unparsed":
-        # Loud on purpose. The fallback agenda is the user's own question, so without this the card
-        # looks like a plan the PI meant to write.
-        progress("⚠️ The planner's reply could not be parsed — it was most likely cut off. "
-                 "The plan below is a FALLBACK built from your question, not the PI's agenda. "
-                 "Cancel and re-send rather than running it.", "warning")
+        # No plan comes after this: the run stops (see plan_failed), or a revision keeps the plan
+        # the researcher had (plan_revision_failed).
+        progress("⚠️ The PI's plan could not be read, even after it was asked to send it again "
+                 f"({ev.get('chars', 0):,} characters). Its replies are saved with the run in "
+                 "process/plan_replies/.", "warning")
+    elif t == "plan_failed":
+        progress("⛔ No plan, so nothing was run. Send the request again to plan it again.", "warning")
+    elif t == "plan_revision_failed":
+        progress("⚠️ The PI's revised plan could not be read, so the plan is unchanged. Ask for the "
+                 "change again.", "warning")
+    elif t == "plan_skill_matching":
+        status("🧩 Matching the plan's code steps to the skill library…")
+    elif t == "plan_skill_match_failed":
+        activity(f"could not match the plan's steps to skills ({ev.get('error')}); the plan stands "
+                 "without them")
+    elif t == "plan_skills":
+        progress("🧩 Skills in this plan: " + "; ".join(
+            f"step {a.get('step')} uses `{a.get('skill')}` {a.get('version')}"
+            + (f" ({a.get('release')})" if a.get("release") else " (local)")
+            for a in list(ev.get("assigned") or [])[:12]))
+    elif t == "step_skill":
+        activity(f"this step uses the skill `{ev.get('skill')}` {ev.get('version')}"
+                 + (f" from {ev.get('release')}" if ev.get("release") else " (local copy)")
+                 + "; its guidance and code are in the step's brief")
     elif t == "turn_budget_low":
         # The step is near its per-step tool-turn cap. Visible so a step that then wraps up
         # early reads as "out of budget", not as the model losing interest.
@@ -12605,7 +12920,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     _review_and_finalize_report, report_md, art, complete_fn, req.question, lit)
                 emit("info", "lab", "Self-reviewed the report draft before rendering.")
             # Checked on the FINAL text: the writer and the self-review both write prose of their own.
-            report_md = _correct_manuscript_markers(report_md, result)
+            report_md = _correct_manuscript_markers(report_md, result, decisions.get("dataset_result"))
+            # The plan's record of the choices the PI made itself, in every kind of report (the
+            # brief one is built by code and never saw the synthesis that carries it).
+            from ..agents import own_choices
+            report_md = own_choices.add_section(report_md, lab_obj.self_sourced,
+                                                insert=_insert_before_backmatter)
             # How we know it is right: every number traced to the run's outputs, what each label rests
             # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
             # statement is report/verification.md, the manuscript carries its summary.
@@ -13560,44 +13880,27 @@ def _tools_that_ran(result: Any) -> "list[str]":
 
 
 def _qc_only_run(result: Any) -> bool:
-    """Quality control is all the run did: it gets a short chat reply and no report."""
+    """Quality control is the only TOOL the run ran (generic code aside; see
+    :func:`_code_wrote_outputs` for whether that code did analysis)."""
     from ..agents.scope import qc_only
     return qc_only(_tools_that_ran(result))
 
 
 def _code_wrote_outputs(result: Any) -> bool:
-    """Did a successful generic-code step write a table, figure or file? Such a step is work the
-    chat reply (the QC tool's numbers) would leave out — run 1e887ed2bf8e added an "ambient rod-leak
-    audit" in run_code after CellQC — so that run keeps the short report, which lists it."""
-    from ..agents.scope import GENERIC_TOOLS
-    for rnd in (getattr(result, "rounds", None) or []):
-        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
-              else getattr(rnd, "scientist_result", None))
-        for st in ((sr or {}).get("steps") or []):
-            if not isinstance(st, dict) or st.get("tool") not in GENERIC_TOOLS or not st.get("ok"):
-                continue
-            res = st.get("result")
-            if isinstance(res, dict) and res.get("status") not in (None, "ok"):
-                continue
-            if isinstance(res, dict) and any(res.get(k) for k in ("tables", "figures", "artifacts")):
-                return True
-            if isinstance(res, dict) and res.get("execution_mode") == "hpc_slurm":
-                # An HPC3 run reports every file it wrote (slurm_sandbox.classify_written), so it
-                # reporting none is the answer. The code's look is only a guess: run 57c6b0c6ba0c's
-                # script READ tables/cellqc_metrics.csv through AISCIENTIST_ARTIFACTS, counted as a
-                # write, and the requested QC report went to the chat instead of the PDF.
-                continue
-            args = st.get("args") or {}
-            if _SCRIPT_WRITES.search(str(args.get("code") or args.get("command") or "")):
-                return True
-    return False
+    """Did a successful generic-code step write a table, figure or file
+    (:func:`agents.scope.code_wrote_outputs`)? Such a step is work the chat reply (the QC tool's
+    numbers) would leave out — run 1e887ed2bf8e added an "ambient rod-leak audit" in run_code after
+    CellQC — so that run keeps the short report, which carries it."""
+    from ..agents.scope import code_wrote_outputs
+    return code_wrote_outputs(getattr(result, "rounds", None))
 
 
 def _wants_brief_report(scope: Any, result: Any) -> bool:
     """A short report instead of the manuscript: when the request asked for one, or when quality
-    control is all the run did — an Abstract, a Discussion and a Methods section around one QC
-    table is padding (Yijun, 2026-10-11, testing CellQC alone). A QC-only run now gets no report
-    at all, only the chat reply (:func:`_qc_chat_reply`); this stays true for it."""
+    control is the only tool the run ran — an Abstract, a Discussion and a Methods section around
+    one QC table is padding (Yijun, 2026-10-11, testing CellQC alone). A QC-only run now gets no
+    report at all, only the chat reply (:func:`_qc_chat_reply`); this stays true for it, and for a
+    QC run whose added code wrote a table or figure, whose short report then carries that work."""
     return bool(getattr(scope, "brief_report", False)) or _qc_only_run(result)
 
 
@@ -13831,10 +14134,17 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
 
     The manuscript writer must produce an Abstract, Study question, Results, Discussion,
     Limitations, Conclusion and Methods, each "present and substantive". For a run that only did
-    quality control that is several pages around one table."""
+    quality control that is several pages around one table.
+
+    A run whose analysis was done in generic code gets :func:`_analysis_brief_md` instead: no tool
+    returned its results, so the run's written answer is the only text that says what they show."""
     from ..agents.scope import NOT_AN_ANALYSIS
+    answer = str(getattr(result, "final_answer", "") or "").strip()
+    by_code = _code_wrote_outputs(result)
+    if answer and by_code:
+        return _analysis_brief_md(answer, art, question, result)
     ran = [t for t in _tools_that_ran(result) if t not in NOT_AN_ANALYSIS]
-    qc_only = _qc_only_run(result)
+    qc_only = _qc_only_run(result) and not by_code
     try:
         dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -13856,6 +14166,74 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     if pipeline:
         out += [pipeline.rstrip(), ""]
     out += _files_lines(art, "see *The dataset* for where it is kept and how to save it") + [""]
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _code_step_outputs(result: Any) -> "list[tuple[int, str, str]]":
+    """``(step number, step title, relative path)`` of each table and figure a successful
+    generic-code step wrote in a step the Critic accepted, in run order. A rejected step's files stay
+    in the bundle but are not presented as results."""
+    from ..agents.scope import GENERIC_TOOLS
+    out: list[tuple[int, str, str]] = []
+    for rnd in (getattr(result, "rounds", None) or []):
+        get = (rnd.get if isinstance(rnd, dict) else lambda k, d=None, r=rnd: getattr(r, k, d))
+        verdict = get("verdict")
+        verdict = (verdict.get("verdict") if isinstance(verdict, dict)
+                   else getattr(verdict, "verdict", None))
+        if verdict not in (None, "accept"):
+            continue
+        title = re.sub(r"[*`]", "", str(get("step") or "").split(" — ")[0]).strip()[:90]
+        for st in ((get("scientist_result") or {}).get("steps") or []):
+            if not isinstance(st, dict) or st.get("tool") not in GENERIC_TOOLS or not st.get("ok"):
+                continue
+            res = st.get("result") if isinstance(st.get("result"), dict) else {}
+            for rel in [*(res.get("tables") or []), *(res.get("figures") or [])]:
+                rel = str(rel).strip().lstrip("./")
+                if rel.startswith(("tables/", "figures/")) and rel not in {p for _n, _t, p in out}:
+                    out.append((int(get("step_index") or 0), title, rel))
+    return out
+
+
+def _analysis_brief_md(answer: str, art: Path, question: str, result: Any) -> str:
+    """The short report of a run whose analysis was done in generic code — a skill applied with
+    ``run_code``, or a script of the model's own. No tool returned those results, so the run's written
+    answer is the report's text, as written; the verification statement then traces its numbers to
+    the tables. After it: the figures those steps made that the answer does not show, each table they
+    wrote that the answer does not name, with the step that wrote it, the result dataset and the files.
+
+    Run 74873590ca7b ("…compare the score between DDX41 and WT within each major cell class. Write a
+    short report.") scored and compared an ISG signature in three ``run_code`` steps after
+    ``run_scanpy_qc``; its short report was titled "Quality-control summary", said the run did
+    quality control only, and held none of the ISG results, which reached only the chat."""
+    lines = answer.strip().splitlines()
+    if not (lines and lines[0].startswith("# ")):
+        lines = ["# Analysis summary", ""] + lines
+    request = f"**Request.** {' '.join((question or '').split())[:500]}"
+    out = [lines[0], "", request, ""] + lines[1:] + [""]
+    outputs = [(n, t, p) for n, t, p in _code_step_outputs(result) if (art / p).is_file()]
+    # Embedded, not merely named: run 74873590ca7b's answer listed its figures by path and showed none.
+    shown = set(re.findall(r"!\[[^\]]*\]\((?:\./)?figures/([A-Za-z0-9._-]+)", answer))
+    embeddable = {f.name for f in _report_figures(art)}
+    figs = [(n, t, p) for n, t, p in outputs
+            if p.startswith("figures/") and Path(p).name in embeddable and Path(p).name not in shown]
+    if figs:
+        out += ["## Figures", ""]
+        for n, t, p in figs:
+            caption = Path(p).stem.replace("_", " ").strip().capitalize()
+            where = f" (step {n}: {t})" if n else ""
+            # No width attribute: the verification statement would read "85%" as a number to trace.
+            out += [f"![{caption}{where}]({p})", ""]
+    named = set(re.findall(r"tables/([A-Za-z0-9._-]+)", answer))
+    tables = [(n, t, p) for n, t, p in outputs if p.startswith("tables/") and Path(p).name not in named]
+    if tables:
+        out += ["## Result tables", ""]
+        out += [f"- `{p}` — " + (f"step {n}: {t}." if n else "written by the analysis code.")
+                for n, t, p in tables]
+        out.append("")
+    rd = _result_dataset_line(art)
+    if rd:
+        out += [rd, ""]
+    out += _files_lines(art, "described above")
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -14264,10 +14642,6 @@ def _result_dataset_line(art: Path) -> str:
 # packaged tool covers": run 6275df1213ab's only reloaded the QC checkpoint to print its shape and
 # layers. Anything that may write (a path under the artifacts, a save, a to_csv, a file opened for
 # writing) counts as writing, so a doubtful script keeps the generic description.
-_SCRIPT_WRITES = re.compile(
-    r"AISCIENTIST_ARTIFACTS|savefig|\bsave\s*=|\.to_(?:csv|tsv|excel|parquet|json|pickle|feather|"
-    r"hdf|zarr)\b|\.write\w*\s*\(|\bopen\s*\([^)]*['\"][wax]|\bnp\.save|\b(?:json|pickle)\.dump\b|"
-    r"\bshutil\.|\bos\.(?:rename|replace|remove|makedirs|mkdir)\b|\.mkdir\s*\(")
 _SCRIPT_CHECK = ("Ran a short purpose-written script that only read the run's data to check it; it "
                  "wrote no table, figure or file.")
 
@@ -14282,6 +14656,7 @@ def _pipeline_section(result: Any = None) -> str:
     Deterministic — the tools are read off the execution log, the descriptions off the tool
     library, and the parameter meanings off the declared-parameter table."""
     from ..agents.research_harness import nondefault_params
+    from ..agents.scope import SCRIPT_WRITES
     from ..tools.api import DECLARED_PARAMS as PARAMS, TOOL_SUMMARY
 
     seen: list[tuple[str, dict]] = []
@@ -14319,7 +14694,7 @@ def _pipeline_section(result: Any = None) -> str:
            "do; a value marked **chosen for this run** was not the tool's default.", ""]
     for i, (tool, args) in enumerate(seen, 1):
         summary = TOOL_SUMMARY[tool]
-        if tool == "run_code" and all(s and not _SCRIPT_WRITES.search(s) for s in scripts):
+        if tool == "run_code" and all(s and not SCRIPT_WRITES.search(s) for s in scripts):
             summary = _SCRIPT_CHECK
         out.append(f"**{i}. `{tool}`** — {summary}")
         decl = PARAMS.get(tool, {})
@@ -14562,21 +14937,30 @@ def _verification_chat_line(summary: dict) -> str:
             "statement: report/verification.md.")
 
 
-def _correct_manuscript_markers(body: str, result: Any) -> str:
-    """The manuscript's marker claims, checked against the curated reference the annotation used.
+def _correct_manuscript_markers(body: str, result: Any,
+                                dataset_result: "dict[str, Any] | None" = None) -> str:
+    """The manuscript's marker claims and class labels, checked on the text that gets rendered.
 
     Run c57071e7dc94's report said "RLBP1 is a canonical rod photoreceptor marker"; RLBP1 marks Muller
-    glia and RPE. The synthesis is checked in research_lab, but the manuscript is new prose, so the
-    sentence is removed here too (``agents/marker_claims.py``), on the text that gets rendered."""
+    glia and RPE. Run 74873590ca7b's answer called MG "Microglia-associated (MG)" where Microglia is
+    another class of the dataset. The synthesis is checked in research_lab, but the manuscript is new
+    prose, so both are checked here too (``agents/marker_claims.py``, ``agents/label_claims.py``):
+    the sentence is removed, the other class's name is taken off the label."""
     rounds = list(getattr(result, "rounds", None) or [])
     if not rounds or not body:
         return body
+    from ..agents.label_claims import check_label_conflation
     from ..agents.marker_claims import check_marker_claims
-    from ..agents.research_lab import _marker_reference
+    from ..agents.research_lab import _class_labels, _label_reference, _marker_reference
     try:
         fixed, issues = check_marker_claims(body, _marker_reference(rounds))
+        accepted = [r for r in rounds if r.verdict.verdict == "accept"]
+        column, labels = _class_labels(accepted, dataset_result)
+        fixed, label_issues = check_label_conflation(
+            fixed, labels, _label_reference(accepted, dataset_result), column)
+        issues += label_issues
     except Exception as exc:  # noqa: BLE001 - a check must never cost the manuscript
-        print(f"[report] marker-claim check skipped: {type(exc).__name__}: {exc}")
+        print(f"[report] marker/label check skipped: {type(exc).__name__}: {exc}")
         return body
     _record_report_corrections(result, issues)
     return fixed
@@ -15629,7 +16013,9 @@ _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za
 # folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
 # is a name; it is only ever joined to the directory for SFTP, never given to a shell.
 _CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
-_RESULT_KINDS = ("dataset", "cellqc")
+_RESULT_KINDS = ("dataset", "cellqc", "tables")
+# A corpus curation's tables (issue 46), saved as one folder: "<topic>.curation.<time>.<run>".
+_TABLES_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.curation\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+")
 # Already compressed: deflating them again costs CPU for the whole download and saves nothing.
 _ZIP_STORED_SUFFIXES = (".h5ad", ".h5", ".gz", ".pdf", ".png", ".zip")
 
@@ -15860,6 +16246,70 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                  "kind": "folder" if folder else "file"}
 
 
+def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tuple[int, dict]":
+    """Make a corpus curation's tables (``<run>/artifacts/curation/*.csv``, issue 46) one of the
+    owner's datasets: copied into a new dataset folder (``users/<owner>/datasets/<uuid>/original``
+    with a data root, else ``uploads/processed/<name>``), listed, and the run's record pointed at it.
+    A copy, not a move: the tables are small and stay in the run's results and its bundle. Returns
+    ``(HTTP status, body)``."""
+    pointer = _curation_pointer_path(owner, run_id)
+    rec = _read_pointer(pointer)
+    if rec is None:
+        return 404, {"error": "This run has no curation tables."}
+    if rec.get("saved_to"):
+        return 200, {"ok": True, "path": rec["saved_to"], "already": True}
+    name = str(rec.get("name") or "")
+    if not _TABLES_NAME_RE.fullmatch(name):
+        return 400, {"error": "unexpected result name"}
+    owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
+    src = owner_dir / run_id / "artifacts" / corpus_scan.CURATION_SUBDIR
+    # The record is a file in the run's folder: its path is checked, never followed.
+    try:
+        same = Path(str(rec.get("path") or "")).resolve() == src.resolve()
+    except OSError:
+        same = False
+    names = [str(f.get("name") or "") for f in rec.get("files") or [] if isinstance(f, dict)]
+    names = [n for n in names if _CELLQC_FILE_RE.fullmatch(n) and (src / n).is_file()]
+    if not same or not src.is_dir() or not names:
+        return 409, {"error": "The tables are no longer on the server."}
+    try:
+        if dataset_storage.configured():
+            identity = str(uuid4())
+            stage = dataset_storage.temp_dir(identity, safe_name(owner))
+            stage.mkdir(parents=True)
+            for n in names:
+                shutil.copy2(src / n, stage / n)
+            dest = str(dataset_storage.publish_dataset(stage, identity, safe_name(owner)))
+        else:
+            dest_p = owner_dir / "uploads" / "processed" / name
+            if dest_p.exists():
+                return 409, {"error": "Something of that name is already saved."}
+            dest_p.mkdir(parents=True)
+            for n in names:
+                shutil.copy2(src / n, dest_p / n)
+            dest = str(dest_p)
+    except (OSError, ValueError) as exc:
+        return 500, {"error": f"Could not save the tables: {public_error(exc)}"}
+    dataset_id = None
+    try:
+        if user_id and not auth_routes.dataset_path_recorded(user_id, dest):
+            from ..metadata.facts import sha256_file
+            files = [{"path": n, "size": (Path(dest) / n).stat().st_size, "sha256": sha256_file(Path(dest) / n),
+                      "verified": "computed"} for n in names]
+            dataset_id = auth_routes.record_dataset(
+                user_id, name, dest, sum(f["size"] for f in files), "folder", files=files, source="result",
+                derived_from={"uuid": md_result_uuid(run_id), "run_id": run_id})
+    except Exception as exc:  # noqa: BLE001 - the tables are saved; the history row is best-effort
+        print(f"[curation] record_dataset failed: {exc}")
+    rec.update(saved_to=dest, saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    rec.pop("save_error", None)
+    try:
+        pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"[curation] could not update {pointer}: {exc}")
+    return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name, "kind": "folder"}
+
+
 _SAVING_LOCK = threading.Lock()
 
 
@@ -15997,6 +16447,15 @@ async def list_result_datasets(request: Request) -> JSONResponse:
                          "n_files": len(rec.get("files") or []),
                          "n_matrices": len(rec.get("matrices") or []),
                          "download_url": f"/api/cellqc-result/{safe_name(user.username)}/{run_id}"}
+    for p in home.glob(f"*/{corpus_scan.CURATION_POINTER}"):
+        rec = _read_pointer(p)
+        if rec is None or not rec.get("name"):
+            continue
+        run_id = p.parent.name
+        row = rows.setdefault(run_id, {"run_id": run_id, "created_at": rec.get("created_at")})
+        row["tables"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "n_genes", "counts", "created_at",
+                                                    "saved_to", "saved_at", "save_error")},
+                         "files": [str(f.get("name") or "") for f in rec.get("files") or []]}
     ordered = sorted(rows.values(), key=lambda r: r.get("created_at") or "", reverse=True)
     return JSONResponse({"result_datasets": ordered})
 
@@ -16015,6 +16474,9 @@ async def save_result_dataset(run_id: str, request: Request, what: str = "datase
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     if not run_id.isalnum() or what not in _RESULT_KINDS:
         return JSONResponse({"error": "bad request"}, status_code=400)
+    if what == "tables":
+        status, body = await asyncio.to_thread(_save_curation_tables, user.username, user.id, run_id)
+        return JSONResponse(body, status_code=status)
     status, body = await asyncio.to_thread(_save_run_result, user.username, user.id, run_id, what,
                                            _active_conn_for_user(user))
     return JSONResponse(body, status_code=status)

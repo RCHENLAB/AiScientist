@@ -15,10 +15,18 @@ A scan's tables depend only on the corpus, the scan's rules and that model. They
 job, from any session and any model, and adding papers changes the key, so the next request scans
 again. Deleting a key's folder forces a new scan.
 
+What a researcher reviews is built here from the scan's sentences, after the job or from a kept
+scan (:func:`write_curation`, RCHENLAB/AiScientist issue 46): one row per gene with the claim its
+papers make (a gene they argue against is a row of its own claim, never one of the list) and one row
+per sentence, each with its paper and page.
+
     <data root>/corpus_scans/<key>/
     ├── meta.json                       the corpus fingerprint, rules digest, model, run, date
     ├── result.json                     the tool's result (counts, genes, warnings)
     └── haploinsufficiency/{genes,hits,requests}.csv
+
+    <run>/artifacts/curation/haploinsufficient_{genes,evidence}.csv   the curation tables
+    <run>/curation_tables.json                                        their record, for saving them
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ from __future__ import annotations
 import base64
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -293,3 +302,259 @@ def gene_rows(tables: Path) -> list[dict[str, Any]]:
             "flags": [k[5:] for k, v in g.items() if k.startswith("flag_") and str(v).strip().lower() in truthy],
         })
     return rows
+
+
+# ---------------------------------------------------------------------------------------------
+# The curation tables: the result a researcher reviews (RCHENLAB/AiScientist issue 46)
+# ---------------------------------------------------------------------------------------------
+# Built from the scan's hits.csv (every judged sentence), so a kept scan needs no new job and the
+# scan's rules, and with them its key, do not change. One row per gene with the claim its papers
+# make, and one row per sentence that bears on it. A gene the papers argue against is a row of its
+# own claim, never one of the haploinsufficient genes.
+
+CURATION_SUBDIR = "curation"           # under artifacts/, beside the scan's own tables
+CURATION_GENES = "haploinsufficient_genes.csv"
+CURATION_EVIDENCE = "haploinsufficient_evidence.csv"
+CURATION_POINTER = "curation_tables.json"   # in the run's folder, outside artifacts/
+
+# A gene's claim, strongest first. ``haploinsufficient``: a paper states it in so many words and none
+# argues against it; ``contested``: one states it and another argues against it (in a human retinal
+# disease, or with an animal model or another disease); ``suggested``: only hedged statements (may,
+# suggests, consistent with); ``argued against``: papers on a human retinal disease say it is not, or
+# unlikely to be, the mechanism, and none states it.
+SUPPORTED, CONTESTED, SUGGESTED, AGAINST = "haploinsufficient", "contested", "suggested", "argued against"
+CLAIMS = (SUPPORTED, CONTESTED, SUGGESTED, AGAINST)
+# One sentence's statement. ``argues against elsewhere``: about a gene the curation already holds, a
+# sentence against its haploinsufficiency from an animal model or another disease ("heterozygous
+# Tspan12 mice show normal vascularization"). It makes a stated gene contested, never a gene argued
+# against on its own: a heterozygous mouse without the human phenotype is common for dominant genes.
+STATES, HEDGES, DENIES, DENIES_ELSEWHERE = "states", "hedged", "argues against", "argues against elsewhere"
+AGAINST_ELSEWHERE_FLAG = "argued_against_in_animal_model_or_other_disease"
+
+GENE_TABLE_COLUMNS = (
+    "gene", "claim", "explicit", "negated", "phenotype", "quote", "pmid", "doi", "title", "page",
+    "papers_stating", "papers_hedged", "papers_against", "pmids_stating", "pmids_against",
+    "quote_against", "pmid_against", "page_against", "against_context",
+    "conflicting_mechanism", "review_flags", "gene_as_written")
+EVIDENCE_COLUMNS = (
+    "gene", "claim", "statement", "explicit", "negated", "phenotype", "quote", "pmid", "doi", "title",
+    "page", "sentence_id", "mechanism_statement", "gene_as_written", "review_flags", "found_by")
+
+_TRUE = frozenset({"1", "true", "yes"})
+
+
+def _yes(value: Any) -> bool:
+    return str(value or "").strip().lower() in _TRUE
+
+
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    try:
+        with path.open(newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+    except (OSError, csv.Error):
+        return []
+
+
+def papers_from_manifest(text: str) -> dict[str, dict[str, str]]:
+    """PMID -> ``{"title", "doi", "citation"}`` from the corpus manifest (a CSV). The PMID is read as
+    the corpus tools read it: ``doc_id``, else ``docname`` without "PMID", else the PDF's name."""
+    out: dict[str, dict[str, str]] = {}
+    try:
+        rows = list(csv.DictReader(io.StringIO(text or "")))
+    except csv.Error:
+        return out
+    for row in rows:
+        pmid = str(row.get("doc_id") or "").strip()
+        if not pmid and row.get("docname"):
+            pmid = str(row["docname"]).removeprefix("PMID").strip()
+        if not pmid and row.get("file_location"):
+            pmid = Path(str(row["file_location"])).stem
+        if not pmid:
+            continue
+        citation = " ".join(str(row.get("citation") or "").split())
+        doi = str(row.get("doi") or "").strip()
+        if not doi:
+            m = re.search(r"\bDOI:\s*(\S+)", citation, re.IGNORECASE)
+            doi = m.group(1).rstrip(".") if m else ""
+        out[pmid] = {"title": " ".join(str(row.get("title") or "").split()), "doi": doi, "citation": citation}
+    return out
+
+
+def _bears_on_claim(h: dict[str, str]) -> bool:
+    """A sentence that says something about the gene's haploinsufficiency in a human retinal disease,
+    whose quote is a sentence of the paper and whose gene is known: what the curation is made of.
+    (The scan's genes.csv is its explicit, not negated subset.)"""
+    return (str(h.get("mechanism_class") or "") == "haploinsufficiency" and bool(str(h.get("gene") or "").strip())
+            and str(h.get("gene_status") or "") != "missing"
+            and _yes(h.get("quote_verified")) and _yes(h.get("human_retinal")))
+
+
+def _argues_against_elsewhere(h: dict[str, str]) -> bool:
+    """A sentence against a gene's haploinsufficiency outside a human retinal disease (an animal
+    model, another disease), whose quote is a sentence of the paper and not a reference entry: counter
+    evidence for a gene the curation already holds, never a gene of its own."""
+    return (str(h.get("mechanism_class") or "") == "haploinsufficiency" and bool(str(h.get("gene") or "").strip())
+            and str(h.get("gene_status") or "") != "missing" and _yes(h.get("negated"))
+            and _yes(h.get("quote_verified")) and not _yes(h.get("human_retinal")) and not _yes(h.get("cite_like")))
+
+
+def _statement(h: dict[str, str]) -> str:
+    if _yes(h.get("negated")):
+        return DENIES if _yes(h.get("human_retinal")) else DENIES_ELSEWHERE
+    return STATES if _yes(h.get("explicit")) else HEDGES
+
+
+def _sentence_flags(h: dict[str, str]) -> list[str]:
+    """What a curator should check in a sentence (a question, not an exclusion)."""
+    flags = []
+    if _yes(h.get("cite_like")):
+        flags.append("looks_like_a_reference")
+    if "gene_in_quote" in h and not _yes(h.get("gene_in_quote")):
+        flags.append("gene_not_in_quote")
+    if str(h.get("gene_status") or "ok") not in ("ok", "unchecked"):
+        flags.append("gene_alias_or_unknown")
+    if _yes(h.get("garbled")):
+        flags.append("garbled")
+    if "dominance_marker" in h and not _yes(h.get("dominance_marker")):
+        flags.append("no_dominance_marker")
+    return flags
+
+
+def _best_first(h: dict[str, str]) -> tuple:
+    """The order a gene's quotes are shown in, as the scan picks them: body sentences before
+    reference entries, clean before garbled, the gene in the quote, the word itself, then longer."""
+    q = str(h.get("quote") or "")
+    return (_yes(h.get("cite_like")), _yes(h.get("garbled")),
+            "gene_in_quote" in h and not _yes(h.get("gene_in_quote")),
+            "haploinsuffic" not in q.lower(), -len(q))
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def curation_tables(tables: Path, papers: "dict[str, dict[str, str]] | None" = None,
+                    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(gene rows, sentence rows)`` from a scan's tables (``hits.csv``, and ``genes.csv`` for the
+    review flags it computed). ``papers`` (:func:`papers_from_manifest`) gives each paper's title and
+    DOI. Gene rows come strongest first: the claim (:data:`CLAIMS`), then how many papers make it."""
+    papers = papers or {}
+    flagged = {str(g.get("gene") or ""): g for g in _read_rows(tables / "genes.csv")}
+    by_gene: dict[str, list[dict[str, str]]] = {}
+    other: dict[str, set[str]] = {}
+    elsewhere: dict[str, list[dict[str, str]]] = {}
+    for h in _read_rows(tables / "hits.csv"):
+        gene = str(h.get("gene") or "").strip()
+        if (gene and str(h.get("mechanism_class") or "") in ("dominant_negative", "gain_of_function")
+                and _yes(h.get("explicit")) and not _yes(h.get("negated"))):
+            other.setdefault(gene, set()).add(str(h["mechanism_class"]))
+        if _bears_on_claim(h):
+            by_gene.setdefault(gene, []).append(h)
+        elif _argues_against_elsewhere(h):
+            elsewhere.setdefault(gene, []).append(h)
+    for gene, hs in elsewhere.items():       # counter evidence only for a gene the curation holds
+        if gene in by_gene:
+            by_gene[gene].extend(hs)
+
+    def paper(pmid: str) -> dict[str, str]:
+        return papers.get(pmid) or {}
+
+    rows: list[dict[str, Any]] = []
+    evidence: dict[str, list[dict[str, Any]]] = {}
+    for gene, hs in by_gene.items():
+        said = {s: sorted((h for h in hs if _statement(h) == s), key=_best_first)
+                for s in (STATES, HEDGES, DENIES, DENIES_ELSEWHERE)}
+        against = said[DENIES] + said[DENIES_ELSEWHERE]          # a human retinal disease first
+        pmids = {s: list(dict.fromkeys(str(h.get("pmid") or "") for h in said[s])) for s in said}
+        pmids_against = list(dict.fromkeys(str(h.get("pmid") or "") for h in against))
+        claim = (CONTESTED if said[STATES] and against else SUPPORTED if said[STATES]
+                 else AGAINST if said[DENIES] else SUGGESTED)
+        basis = said[STATES] if claim in (SUPPORTED, CONTESTED) else said[DENIES] if claim == AGAINST else said[HEDGES]
+        top = basis[0]
+        counter = against[0] if against else {}
+        phen = [str(h.get("phenotype") or "").strip() for h in basis if str(h.get("phenotype") or "").strip()]
+        g = flagged.get(gene)
+        flags = ([k[5:] for k, v in g.items() if k.startswith("flag_") and _yes(v)] if g is not None
+                 else _sentence_flags(top))
+        if said[DENIES_ELSEWHERE]:
+            flags.append(AGAINST_ELSEWHERE_FLAG)
+        conflicting = (str(g.get("conflicting_mechanism") or "") if g is not None
+                       else "|".join(sorted(other.get(gene, set()))))
+        pmid = str(top.get("pmid") or "")
+        rows.append({
+            "gene": gene, "claim": claim,
+            "explicit": "yes" if _yes(top.get("explicit")) else "no",
+            "negated": "yes" if _yes(top.get("negated")) else "no",
+            "phenotype": max(set(phen), key=phen.count) if phen else "",
+            "quote": str(top.get("quote") or ""), "pmid": pmid, "doi": paper(pmid).get("doi", ""),
+            "title": paper(pmid).get("title", ""), "page": str(top.get("page") or ""),
+            "papers_stating": len(pmids[STATES]), "papers_hedged": len(pmids[HEDGES]),
+            "papers_against": len([p for p in pmids_against if p]),
+            "pmids_stating": "|".join(p for p in pmids[STATES] if p),
+            "pmids_against": "|".join(p for p in pmids_against if p),
+            "quote_against": str(counter.get("quote") or ""), "pmid_against": str(counter.get("pmid") or ""),
+            "page_against": str(counter.get("page") or ""),
+            "against_context": ("" if not counter else "human retinal disease" if _yes(counter.get("human_retinal"))
+                                else "animal model or another disease"),
+            "conflicting_mechanism": conflicting, "review_flags": "|".join(flags),
+            "gene_as_written": str(top.get("gene_as_written") or ""),
+        })
+        evidence[gene] = [{
+            "gene": gene, "claim": claim, "statement": _statement(h),
+            "explicit": "yes" if _yes(h.get("explicit")) else "no",
+            "negated": "yes" if _yes(h.get("negated")) else "no",
+            "phenotype": str(h.get("phenotype") or ""), "quote": str(h.get("quote") or ""),
+            "pmid": str(h.get("pmid") or ""), "doi": paper(str(h.get("pmid") or "")).get("doi", ""),
+            "title": paper(str(h.get("pmid") or "")).get("title", ""), "page": str(h.get("page") or ""),
+            "sentence_id": str(h.get("sentence_id") or ""),
+            "mechanism_statement": str(h.get("mechanism_statement") or ""),
+            "gene_as_written": str(h.get("gene_as_written") or ""),
+            "review_flags": "|".join(_sentence_flags(h)), "found_by": str(h.get("found_by") or ""),
+        } for s in (STATES, HEDGES, DENIES, DENIES_ELSEWHERE) for h in said[s]]
+
+    def strength(r: dict[str, Any]) -> tuple:
+        made = r["papers_against"] if r["claim"] == AGAINST else (
+            r["papers_hedged"] if r["claim"] == SUGGESTED else r["papers_stating"])
+        return (CLAIMS.index(r["claim"]), -made, len([f for f in r["review_flags"].split("|") if f]), r["gene"])
+
+    rows.sort(key=strength)
+    return rows, [e for r in rows for e in evidence[r["gene"]]]
+
+
+def write_curation(tables: Path, out: Path, papers: "dict[str, dict[str, str]] | None" = None,
+                   ) -> dict[str, Any]:
+    """Write the two curation tables into ``out`` and return ``{"rows", "n_sentences", "counts",
+    "files"}`` (``counts``: genes per claim). Nothing is written when the scan found no sentence."""
+    rows, evidence = curation_tables(tables, papers)
+    counts = {c: sum(1 for r in rows if r["claim"] == c) for c in CLAIMS}
+    if not rows:
+        return {"rows": [], "n_sentences": 0, "counts": counts, "files": []}
+    out.mkdir(parents=True, exist_ok=True)
+    for name, data, columns in ((CURATION_GENES, rows, GENE_TABLE_COLUMNS),
+                                (CURATION_EVIDENCE, evidence, EVIDENCE_COLUMNS)):
+        with (out / name).open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(columns), extrasaction="ignore")
+            w.writeheader()
+            w.writerows(data)
+    return {"rows": rows, "n_sentences": len(evidence), "counts": counts,
+            "files": [CURATION_GENES, CURATION_EVIDENCE]}
+
+
+def curation_plan_step(question: str, when: str) -> str:
+    """The one step of a curation plan, as the plan card shows it. ``when``: how long it takes on
+    this session, and what it costs (the gateway's ``_curation_time_words``)."""
+    q = " ".join(str(question or "").split())
+    if len(q) > 300:
+        q = q[:297].rstrip() + "…"
+    return (f"**Corpus curation** — Read the whole RetiGene corpus for every gene its papers report as "
+            f"haploinsufficient in retinal disease, and every gene they argue against, to answer: “{q}”. "
+            "`extract_haploinsufficient_genes` has a model write search requests, reads every passage they "
+            "retrieve and every passage that states a dosage mechanism in words (not only the best "
+            "passages), and keeps each paper's own sentence; every quote is checked against its paper and "
+            f"every gene symbol against HGNC. The result is two tables: `{CURATION_GENES}` (one row per gene: "
+            "its claim, explicit or hedged, negated or not, the phenotype as written, the strongest sentence "
+            f"verbatim, its paper and page) and `{CURATION_EVIDENCE}` (one row per sentence), summarised in "
+            f"the chat. Only the RetiGene corpus is read; PubMed is not searched. Time: {when}.")

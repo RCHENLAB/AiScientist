@@ -3850,8 +3850,17 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + `<span class="plan-setting-v${editable ? " editable" : ""}"${editAttrs("setting", k)}>`
     + `${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
   const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
-  const meta = (chips || where)
-    ? `<div class="plan-step-meta">${chips}`
+  // The vetted skill the step uses: matched by AiScientist, handed to the agent with its guidance
+  // and code when the step runs. The researcher can take it off.
+  const skill = step && step.skill
+    ? `<span class="plan-step-skill" title="This step uses the vetted skill ${escapeHtml(step.skill)}: its guidance and code go to the agent">`
+      + `${planIcon("extension")}<span>${escapeHtml(step.skill)}</span>`
+      + (editable && edit.remove ? `<button type="button" class="plan-skill-remove" data-skill-remove `
+        + `aria-label="Run step ${n} without the skill" title="Run this step without the skill">${planIcon("close")}</button>` : "")
+      + `</span>`
+    : "";
+  const meta = (chips || where || skill)
+    ? `<div class="plan-step-meta">${skill}${chips}`
       + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
       + `</div>`
     : "";
@@ -4030,6 +4039,8 @@ function planEntryHtml(agenda, doc, opts) {
     + `<span class="plan-entry-num">${i + 1}</span>`
     + `<span class="plan-entry-title">${escapeHtml(planStepParts(s).title.replace(/[*`]/g, ""))}</span>`
     + (docSteps[i] && docSteps[i].tool ? `<code class="plan-step-tool">${escapeHtml(docSteps[i].tool)}</code>` : "")
+    + (docSteps[i] && docSteps[i].skill
+      ? `<span class="plan-step-skill" title="Uses the vetted skill ${escapeHtml(docSteps[i].skill)}">${planIcon("extension")}<span>${escapeHtml(docSteps[i].skill)}</span></span>` : "")
     + `</li>`).join("");
   const refused = (o.problems || []).length
     ? `<div class="plan-note bad">${planIcon("error")}<span>Your edit was not applied — the plan is unchanged. Open the plan to see why.</span></div>`
@@ -4172,7 +4183,7 @@ function planYamlValue(literal, typed) {
 }
 
 // The plan document with one change made to it. `change`: {id, title} | {id, setting, value} (the
-// value as typed) | {id, remove: true}. {yaml} or {error}: a value of the wrong kind, or a document
+// value as typed) | {id, remove: true} | {id, skill: null} (the step goes without its skill). {yaml} or {error}: a value of the wrong kind, or a document
 // edited by hand into a shape where the line is not where the server writes it.
 function planYamlEdit(yaml, change) {
   const lines = String(yaml == null ? "" : yaml).split("\n");
@@ -4190,6 +4201,15 @@ function planYamlEdit(yaml, change) {
   if (change.remove) {
     lines.splice(start, end - start);
     return { yaml: lines.join("\n") };
+  }
+  if (change.skill === null) {
+    for (let i = start + 1; i < end; i += 1) {
+      if (indent(lines[i]) === keyCol && /^\s*skill:/.test(lines[i])) {
+        lines.splice(i, 1);
+        return { yaml: lines.join("\n") };
+      }
+    }
+    return { error: "The skill is not where the plan document keeps it: delete it in the YAML editor." };
   }
   if (change.title !== undefined) {
     const title = String(change.title).replace(/\s+/g, " ").trim();
@@ -4309,6 +4329,13 @@ function wirePlanCardEdits(host, c, doc) {
         start();
       });
     });
+    const skillOff = li.querySelector("[data-skill-remove]");
+    if (skillOff) {
+      skillOff.addEventListener("click", () => {
+        const why = commitPlanChange(c, { id, skill: null });
+        if (why) planStepError(li, why);
+      });
+    }
     const remove = li.querySelector("[data-step-remove]");
     if (!remove) return;
     remove.addEventListener("click", () => {
@@ -7652,6 +7679,17 @@ function resultHandoffHtml(runId, r) {
     html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(q.name || "")}">🧪 CellQC result/ · ${q.n_files} files${matrices} · ${mb(q.size_bytes)}</span>` +
       `<a class="ghost small" href="${escapeHtml(q.download_url)}" download title="CellQC's complete result folder as one zip: reports, tables, slides and the per-library .h5ad, obs and var">${icon("download")} CellQC results (.zip)</a>` +
       kept(q, "Save folder to my data", "cellqc") + `</div>`;
+  }
+  // A corpus curation's two tables (issue 46): kept with the run's results; saving copies them into a dataset.
+  const t = r.tables;
+  if (t) {
+    const files = (t.files || []).join(", ");
+    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 Curation tables · ${escapeHtml(String(t.n_genes ?? 0))} haploinsufficient genes · ${escapeHtml(String((t.files || []).length))} CSV files</span>` +
+      (t.saved_to
+        ? `<span class="ok small" title="${escapeHtml(t.saved_to)}">Saved to my data</span>`
+        : (t.save_error ? `<span class="bad small" title="${escapeHtml(t.save_error)}">The last save failed</span>` : "") +
+          `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="tables" data-label="Save tables to my data">Save tables to my data</button>`) +
+      `</div>`;
   }
   return html;
 }

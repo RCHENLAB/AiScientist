@@ -193,7 +193,7 @@ A researcher can ask for something this protocol advises against — most often 
 its arguments directly ("run `run_de` with groupby=<condition>"). Do NOT silently pick one and
 proceed, and do NOT silently plan both and let them contradict each other in the same plan.
 
-Do this instead: **follow the request**, and in the same plan say — in the `SELF-SOURCED:` line —
+Do this instead: **follow the request**, and in the same plan say — in its `self_sourced` disclosure —
 that it departs from this protocol, which part, and what it costs ("this pools all cell types and
 tests across cells, so the p-values are pseudoreplicated and a composition shift is
 indistinguishable from a change in expression; reported as a ranking, not as DE"). If the valid
@@ -206,7 +206,7 @@ invalid while that earlier step's output is still reported as a result.
 These are the tools' declared defaults — the same values the code applies, checked by
 `tests/test_declared_params.py`, which fails if this table and `scrna_pack.PARAMS` disagree.
 Leave a parameter alone unless the dataset gives you a reason to change it; when you do change one,
-say so and say why in the plan's `SELF-SOURCED:` line, because a number chosen for one run reads
+say so and say why in the plan's `self_sourced` disclosure, because a number chosen for one run reads
 exactly like a protocol-mandated one once it reaches a Methods section.
 
 **`run_scanpy_qc`**

@@ -15,6 +15,11 @@ is approved:
    number that is not one of the papers is removed, so every reference is a paper the search
    returned and the model cannot add one.
 
+A question about the RetiGene papers themselves searches the corpus alone, and PubMed only when it
+asks for it (``plan_step(..., pubmed=False)``, ``request_router.corpus_only``; RCHENLAB/AiScientist
+issue 46). A list question about them is not this skill: it is the corpus curation
+(``gateway/corpus_scan.py``), which reads the whole corpus.
+
 The functions take their model and search callables as arguments, so the skill is tested offline.
 """
 from __future__ import annotations
@@ -109,12 +114,19 @@ class Collected:
         return [str(s["error"]) for s in self.searched if s.get("error")]
 
 
-def plan_step(question: str, corpus: bool = False) -> str:
+def plan_step(question: str, corpus: bool = False, pubmed: bool = True) -> str:
     """The one step of a literature plan, as the plan card shows it. ``corpus``: the session also
-    searches the lab's RetiGene corpus (a short HPC3 job)."""
+    searches the lab's RetiGene corpus (a short HPC3 job). ``pubmed=False``: the corpus alone, for a
+    question about the RetiGene papers (RCHENLAB/AiScientist issue 46)."""
     q = " ".join(str(question or "").split())
     if len(q) > 300:
         q = q[:297].rstrip() + "…"
+    if corpus and not pubmed:
+        return (f"**RetiGene corpus search** — Search the full text of the lab's RetiGene corpus only "
+                f"(`{CORPUS_TOOL}`, a short HPC3 job) for what answers: “{q}”. Read the best passages (up "
+                f"to {CORPUS_PASSAGES}) and answer with numbered citations to them. PubMed is not searched, "
+                "because the question asks about the RetiGene papers; say “also search PubMed” to add it. "
+                "It takes about a minute.")
     if corpus:
         return (f"**Literature search** — Search the full text of the lab's RetiGene corpus (`{CORPUS_TOOL}`, "
                 f"a short HPC3 job) and PubMed (through Europe PMC, `{TOOL}`) for what answers: “{q}”. Read "
@@ -347,7 +359,10 @@ def answer_messages(question: str, papers: list[Paper]) -> list[dict]:
         if p.abstract or not p.passages:
             parts.append(f"Abstract: {p.abstract or '(no abstract available)'}")
         blocks.append("\n".join(parts))
-    where = ("the lab's corpus and PubMed" if any(p.passages for p in papers) else "PubMed")
+    in_corpus = any(p.passages for p in papers)
+    in_pubmed = any("pubmed" in p.sources or not p.passages for p in papers)
+    where = ("the lab's corpus and PubMed" if in_corpus and in_pubmed else
+             "the lab's corpus" if in_corpus else "PubMed")
     user = (f"Question: {question}\n\nPapers found in {where}:\n\n" + "\n\n".join(blocks)
             + "\n\nWrite the answer now.")
     return [{"role": "system", "content": ANSWER_SYSTEM}, {"role": "user", "content": user}]
@@ -405,6 +420,13 @@ def references_md(cited: list[Paper], found: list[Paper]) -> str:
 
 def no_papers_answer(question: str, collected: Collected) -> str:
     """The reply when the search returned nothing to read."""
+    if collected.corpus is not None and not collected.searched:
+        # The corpus alone (a question about the RetiGene papers): PubMed was not searched.
+        why = f" The corpus search failed: {collected.corpus['error']}." if collected.corpus.get("error") else ""
+        return (f"The lab's RetiGene corpus returned no passage to answer this from.{why} Nothing was "
+                "answered from memory, and PubMed was not searched because the question asks about the "
+                "RetiGene papers. Name the gene, disease or tissue more specifically, or say “also search "
+                "PubMed”.")
     tried = ", ".join(f"“{s['query']}”" for s in collected.searched) or "no query"
     why = (" The search itself failed: " + "; ".join(collected.errors[:2]) + ".") if collected.errors else ""
     where = "PubMed returned no papers"
@@ -432,6 +454,11 @@ def method_md(collected: Collected, date: str) -> str:
                          f"{c.get('passages', 0)} passage(s) from {c.get('papers', 0)} paper(s)."
                          + (" Words used: " + ", ".join(f"{t['term']} ({t['n_passages']})" for t in used[:16]) + "."
                             if used else "") + "\n")
+    if c is not None and not collected.searched:
+        lines.append("PubMed was not searched: the question asks about the RetiGene papers.")
+        lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (corpus passages); the answer cites "
+                     "them by number, and each reference was checked against the search results.")
+        return "\n".join(lines)
     lines.append(f"Searched PubMed through Europe PMC on {date} with {len(collected.searched)} "
                  f"quer{'y' if len(collected.searched) == 1 else 'ies'}:")
     for s in collected.searched:

@@ -104,6 +104,43 @@ _ANALYSIS_ASK = re.compile(
     re.IGNORECASE)
 
 
+# The lab's own paper collection, named in a question (RCHENLAB/AiScientist issue 46): "RetiGene papers",
+# "the corpus", "the lab's corpus". A question about those papers is answered from them alone. Anatomy
+# that happens to be called a corpus (the corpus callosum) is not the collection.
+_NAMES_CORPUS = re.compile(
+    r"\bretigene\b"
+    r"|\b(?:the|this|our|lab'?s|indexed)\s+(?:(?:lab'?s|literature|paper|papers'?|text|retinal)\s+)?corpus\b"
+    r"(?!\s+(?:callosum|luteum|cavernosum|spongiosum|striatum|albicans))"
+    r"|\bcorpus\s+(?:papers?|scan|search|curation)\b"
+    r"|\bthe\s+lab'?s\s+(?:papers|paper\s+collection)\b"
+    r"|语料库",
+    re.IGNORECASE)
+# A question that asks for sources beyond the lab's papers as well: PubMed, the public literature.
+_ASKS_PUBMED = re.compile(
+    r"\bpubmed\b|\beurope\s*pmc\b|\bmedline\b"
+    r"|\b(?:public|published|wider|broader|general)\s+literature\b"
+    r"|\b(?:outside|beyond)\s+(?:the\s+)?(?:retigene|corpus)\b"
+    r"|\bother\s+(?:papers|publications|literature)\b"
+    r"|公开文献|其他文献",
+    re.IGNORECASE)
+
+
+def names_corpus(text: str) -> bool:
+    """Does the message name the lab's paper collection (the RetiGene corpus)?"""
+    return bool(_NAMES_CORPUS.search(text or ""))
+
+
+def asks_for_pubmed(text: str) -> bool:
+    """Does the message ask for PubMed or the public literature?"""
+    return bool(_ASKS_PUBMED.search(text or ""))
+
+
+def corpus_only(text: str) -> bool:
+    """A question about the RetiGene papers that does not also ask for PubMed: it is answered from
+    the corpus alone (issue 46). PubMed is added only when the message asks for it."""
+    return names_corpus(text) and not asks_for_pubmed(text)
+
+
 @dataclass(frozen=True)
 class Route:
     """Where a request goes, and why. ``source`` is ``model`` (the verdict was used as given),

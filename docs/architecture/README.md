@@ -91,11 +91,18 @@ searches PubMed through Europe PMC in the gateway and, in a session that reaches
 of the lab's RetiGene corpus (`search_corpus`: the question's meaning and the model's exact words,
 merged by rank) at the same time; the model answers from the corpus passages and the abstracts, and
 code writes the reference list from the papers the answer cites; the answer is kept with the run.
-A note on either plan is routed again, so "analyse my data instead" turns a literature plan into an
-analysis. Every run saves its processed dataset and CellQC result folder to the user's Datasets. The
-fast chat path (`agents/quick_chat.py`: only the `chat: true` tools, a streamed answer, no run
-directory) and the corpus scan stay on the server for a client that asks for them by `route`; the
-console sends none. Anti-fabrication layers: the Critic's
+A question that names the RetiGene papers searches the corpus alone, and PubMed only when it asks for
+it. A list question about them ("What are haploinsufficient genes in RetiGene papers?") gets a
+corpus curation plan instead, which says how long it takes on the session: `extract_haploinsufficient_genes`
+reads the whole corpus (a GPU job of its own, or the session's API model through the gateway, or a
+kept scan of the same corpus at once), and the gateway builds two tables from its sentences
+(`gateway/corpus_scan.py`: one row per gene with its claim, the genes the papers argue against
+apart, and one row per sentence, each with its paper and page) and answers from them; the user can
+save the tables to their Datasets. A note on any plan is routed again, so "analyse my data instead"
+turns a literature plan into an analysis. Every run saves its processed dataset and CellQC result
+folder to the user's Datasets. The fast chat path (`agents/quick_chat.py`: only the `chat: true`
+tools, a streamed answer, no run directory) and the bare corpus scan stay on the server for a client
+that asks for them by `route`; the console sends none. Anti-fabrication layers: the Critic's
 deterministic floors (`agents/step_numbers.py`), the claim audit before writing
 (`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing. The final
 manuscript loses any sentence that attributes a gene to a lineage the curated marker reference contradicts

@@ -338,3 +338,58 @@ def test_corpus_activity_logs_all_terms_without_the_question(tmp_path):
     logged = json.loads(line[line.index("(") + 1:line.rindex(")")])
     assert logged == {"terms": terms, "top_k": lit.CORPUS_PASSAGES}
     assert calls == [{"queries": [question], "terms": terms, "top_k": lit.CORPUS_PASSAGES}]
+
+
+# --- a question about the RetiGene papers: the corpus alone (issue 46) --------------------------------
+
+def test_a_question_about_the_retigene_papers_searches_the_corpus_and_not_pubmed(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    question = "What do the RetiGene papers say about DDX41 in the retina?"
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}',
+                   answer="DDX41 is in photoreceptors [1]; its loss kills cones [2].")
+    w = _wire(monkeypatch, model, [{"action": "approve"}])
+    calls = _corpus(monkeypatch)
+    _dispatch(conn, question)
+
+    assert w.shown == [lit.plan_step(question, corpus=True, pubmed=False)]
+    assert "RetiGene corpus only" in w.shown[0] and "PubMed is not searched" in w.shown[0]
+    assert w.searched == []                                            # no PubMed query at all
+    assert calls == [{"queries": [question], "top_k": lit.CORPUS_PASSAGES, "terms": ["DDX41"]}]
+    answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
+    assert "- [1] Smith J et al. DDX41 in the eye." in answer and "PubMed" not in answer
+    (run_dir,) = list(conn.workspace.iterdir())
+    summary = (run_dir / "artifacts" / "report" / "summary.md").read_text()
+    assert "PubMed was not searched: the question asks about the RetiGene papers." in summary
+    assert "Searched PubMed" not in summary
+    progress = [p.get("text", "") for p in conn.pushed if p.get("type") == "lab_progress"]
+    assert any("2 paper(s), 2 from the RetiGene corpus (2 passage(s)) —" in t for t in progress)
+
+
+def test_a_note_asking_for_pubmed_adds_it_to_a_corpus_only_plan(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    question = "What do RetiGene papers say about DDX41?"
+    w = _wire(monkeypatch, _Model(), [{"action": "feedback", "feedback": "also search PubMed"}, {"action": "cancel"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, question)
+    assert w.shown[0] == lit.plan_step(question, corpus=True, pubmed=False)
+    assert w.shown[1] == lit.plan_step("What is known about DDX41 in the mouse retina?", corpus=True, pubmed=True)
+
+
+def test_a_retigene_question_on_a_session_without_the_corpus_searches_nothing(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, _Model(), [])
+    _dispatch(conn, "What are haploinsufficient genes in RetiGene papers?")
+    assert w.shown == [] and w.searched == []                          # no plan, no PubMed fallback
+    answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
+    assert "cannot reach the RetiGene corpus" in answer
+    assert _types(conn)[-1] == "chat_done"
+
+
+def test_a_gene_list_question_that_names_no_corpus_says_how_to_get_the_whole_corpus(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, _Model(), [{"action": "cancel"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "Which genes are haploinsufficient in retinal disease?")
+    assert w.shown == [lit.plan_step("Which genes are haploinsufficient in retinal disease?", corpus=True)]
+    progress = [p.get("text", "") for p in conn.pushed if p.get("type") == "lab_progress"]
+    assert any("ask about the RetiGene papers by name" in t for t in progress)

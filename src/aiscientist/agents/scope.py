@@ -83,6 +83,51 @@ def qc_only(tools: "Iterable[str]") -> bool:
     analyses = [t for t in tools if t not in NOT_AN_ANALYSIS]
     return bool(analyses) and all(t in QC_ONLY_TOOLS for t in analyses)
 
+
+# What a generic-code script looks like when it writes a table, figure or file. Only consulted for a
+# step that ran outside HPC3: an HPC3 run reports every file it wrote, so its list is the answer.
+SCRIPT_WRITES = re.compile(
+    r"AISCIENTIST_ARTIFACTS|savefig|\bsave\s*=|\.to_(?:csv|tsv|excel|parquet|json|pickle|feather|"
+    r"hdf|zarr)\b|\.write\w*\s*\(|\bopen\s*\([^)]*['\"][wax]|\bnp\.save|\b(?:json|pickle)\.dump\b|"
+    r"\bshutil\.|\bos\.(?:rename|replace|remove|makedirs|mkdir)\b|\.mkdir\s*\(")
+
+
+def code_wrote_outputs(rounds: Any) -> bool:
+    """Did a successful generic-code step write a table, figure or file? Such a step did analysis
+    that no tool name shows: a skill applied with ``run_code`` (run 74873590ca7b scored every cell for
+    an ISG signature and compared the arms that way, after ``run_scanpy_qc``), or a script the model
+    added (run 1e887ed2bf8e's "ambient rod-leak audit" after CellQC). Reads both round shapes."""
+    for rnd in rounds or []:
+        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
+              else getattr(rnd, "scientist_result", None))
+        for st in ((sr or {}).get("steps") or []):
+            if not isinstance(st, dict) or st.get("tool") not in GENERIC_TOOLS or not st.get("ok"):
+                continue
+            res = st.get("result")
+            if isinstance(res, dict) and res.get("status") not in (None, "ok"):
+                continue
+            if isinstance(res, dict) and any(res.get(k) for k in ("tables", "figures", "artifacts")):
+                return True
+            if isinstance(res, dict) and res.get("execution_mode") == "hpc_slurm":
+                # An HPC3 run reports every file it wrote (slurm_sandbox.classify_written), so it
+                # reporting none is the answer. The code's look is only a guess: run 57c6b0c6ba0c's
+                # script READ tables/cellqc_metrics.csv through AISCIENTIST_ARTIFACTS, counted as a
+                # write, and the requested QC report went to the chat instead of the PDF.
+                continue
+            args = st.get("args") or {}
+            if SCRIPT_WRITES.search(str(args.get("code") or args.get("command") or "")):
+                return True
+    return False
+
+
+def qc_only_run(rounds: Any) -> bool:
+    """Is quality control ALL the run did? :func:`qc_only` over the tools that ran, and no
+    generic-code step wrote a table, figure or file. A run whose analysis was done in code is not a
+    QC run, whatever its tool list says: run 74873590ca7b ran ``run_scanpy_qc`` and three ``run_code``
+    steps that scored and compared an ISG signature, was written up as a QC report with no claim
+    audit, and its report said "This run did quality control only"."""
+    return qc_only(tools_that_ran(rounds)) and not code_wrote_outputs(rounds)
+
 _CLAUSE_SPLIT = re.compile(r"[,;.!?，；。！？\n]+|\bbut\b|\bthen\b|但是?|然后|另外")
 # A limit is an instruction about the WORK, so each cue is bound to a verb of doing or stands where
 # an instruction stands. "Which genes are expressed only in cluster 3?" and "genes with no

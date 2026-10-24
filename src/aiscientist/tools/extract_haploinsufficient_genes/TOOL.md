@@ -46,9 +46,12 @@ one working copy is not enough.
 
 ## How it is run
 
-- On request: a client sends `route: "corpus"` to `/api/lab` (the console has no control for it).
-  The gateway (`_run_corpus_scan`) submits one HPC3 job with a workspace of its own and puts the
-  CSVs in the run's downloads.
+- From the console: a list question about the RetiGene papers ("What are haploinsufficient genes
+  in RetiGene papers?": it names the corpus, asks for the genes and not about the user's data) is
+  routed to the corpus curation (`gateway/app._corpus_curation`). Its plan card says what is read
+  and how long it takes on the session; once the user runs it, the gateway (`_run_corpus_scan`)
+  submits one HPC3 job with a workspace of its own and puts the CSVs in the run's results. A
+  client can also send `route: "corpus"` to `/api/lab`, which runs it without a plan.
 - The job brings its own model (`gateway/corpus_scan.py`): it gets one GPU on the lab's paid
   `gpu` partition (the first free A30 or A100), starts vLLM there on the node's loopback, runs the scan
   against it and exits, which frees the card. Any session can run it, whatever model it uses
@@ -121,6 +124,21 @@ one working copy is not enough.
   `request`, `n_passages` it retrieved), so a curator can see what was searched for; row `T` lists
   the model's words, each with its passage count and use (`filter` = read, `rank`/`absent`/`over_cap`
   = not used).
+- `artifacts/curation/`, written by the gateway from `hits.csv` after the job (or from a kept
+  scan), so it needs no new scan (`gateway/corpus_scan.write_curation`): `haploinsufficient_genes.csv`,
+  one row per gene with its `claim` (`haploinsufficient`: a paper states it in so many words and
+  none argues against it; `contested`: one states it and another argues against it; `suggested`:
+  only hedged statements; `argued against`: papers on a human retinal disease say it is not, or
+  unlikely to be, the mechanism), `explicit`, `negated`, `phenotype`, the strongest sentence
+  verbatim with its `pmid`, `doi`, `title` (from the corpus manifest) and `page`, the strongest
+  sentence against it (`quote_against`, `pmid_against`, `page_against`, `against_context`), the
+  papers on each side and the review flags; `haploinsufficient_evidence.csv`, one row per sentence
+  that bears on a claim. A gene is curated from sentences about a human retinal or ocular disease
+  whose quote was found in the paper and whose gene is known. For such a gene, a sentence against
+  its haploinsufficiency from an animal model or another disease ("heterozygous Tspan12 mice
+  vascularize normally") is kept as `argues against elsewhere`: it makes a stated gene `contested`
+  and sets the flag `argued_against_in_animal_model_or_other_disease`, but never makes a gene
+  `argued against` on its own. "Save tables to my data" copies the folder into the user's Datasets.
 - `work/haploinsufficiency/`: `requests.json` (the requests, reused by a rerun) and
   `judgments.jsonl` (the model's whole reply for every passage). A rerun after a timeout reads only
   the passages without a usable reply; a reply the parser rejected is parsed again from disk first,
@@ -183,7 +201,8 @@ In the research agents' catalog: no. No model can call it: it runs only from its
   HGNC normalisation, aggregation.
 - `scripts/build_mechanism_cache.py`: the one-off cache build on HPC3.
 - Tests: `tests/test_extract_haploinsufficient_genes.py` (a fake model, a toy embedder and a
-  four-paper corpus), `tests/test_corpus_route.py` (the console line).
+  four-paper corpus), `tests/test_corpus_route.py` (the console line),
+  `tests/test_corpus_curation.py` (the route from a RetiGene list question, the curation tables, saving them).
 
 ## What the model is told
 

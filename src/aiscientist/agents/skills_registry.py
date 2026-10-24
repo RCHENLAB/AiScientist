@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -10,15 +11,26 @@ import sqlite3
 import tempfile
 import threading
 import zipfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[3]
 POLICY: ContextVar[dict | None] = ContextVar("skill_policy", default=None)
+# The registry skill the code of the CURRENT PLAN STEP runs under. A ContextVar, not
+# ``ctx.decisions``: a plan's independent steps run in parallel threads that share one ctx and each
+# copy the context, so one step's skill never reaches another step's code. Outside a step (the chat
+# path) it is unset and ``ctx.decisions`` keeps the last skill read, as before.
+_UNSET = object()
+ACTIVE: ContextVar = ContextVar("active_registry_skill", default=_UNSET)
+# What the code of the current plan step ran under each registry skill, counted once when the step
+# ends (``step_scope``). Unset outside a step, where each call is counted as it ends.
+_STEP_CALLS: ContextVar["dict | None"] = ContextVar("registry_skill_step_calls", default=None)
 LOG = logging.getLogger(__name__)
 _MANIFEST_LOCK = threading.RLock()
+_COUNT_LOCK = threading.Lock()
+_SCOPES = itertools.count()
 
 
 def config() -> dict:
@@ -200,10 +212,70 @@ def _write(path: Path, value: dict) -> None:
     os.replace(f.name, path)
 
 
+@contextmanager
+def step_scope(skill=None, step: str = ""):
+    """Run one plan step: ``skill`` (the one the plan assigned, if any) is the step's active registry
+    skill, a skill read during the step replaces it, and nothing outlives the step.
+
+    When the scope ends, each registry skill whose method the step's code ran is counted once
+    (``count_step``). ``step`` names the plan step, so that the attempts of one step (a revision the
+    Critic asked for) count as one use; without it each scope is a step of its own."""
+    token = ACTIVE.set(skill if skill is not None and skill.registry_release else None)
+    calls: dict = {}
+    calls_token = _STEP_CALLS.set(calls)
+    try:
+        yield
+    finally:
+        _STEP_CALLS.reset(calls_token)
+        ACTIVE.reset(token)
+        try:
+            count_step(step or f"\x00scope-{next(_SCOPES)}", calls)
+        except Exception as exc:  # noqa: BLE001 - the counter is advisory; it never fails a step
+            LOG.warning("could not count the skills of step %r: %s", step[:80], exc)
+
+
+def count_step(step: str, calls: dict) -> None:
+    """Count once, per registry skill, the step whose code ran under it.
+
+    ``calls`` is ``{(release, name, version): (skill, ctx, [(ok, code, tool), ...])}``, as
+    ``execute`` records it. A call runs the skill's method when it is a ``run_in_environment``
+    command (it runs only in a skill's own environment), when its code calls one of the skill's own
+    functions (``skill_code.skill_functions``), or when no such function can be found in the
+    skill's code. A step none of whose calls ran the method is not counted: it inspected files or
+    read another step's output, and said nothing about the version. The step is a success when one
+    of those calls succeeded, an error when none did. A later attempt of the same step that
+    succeeds turns that step's error into a success; nothing is counted twice."""
+    from .skill_code import calls_to, skill_functions
+    for skill, ctx, ran in calls.values():
+        functions = skill_functions(skill)
+        method = [ok for ok, code, tool in ran
+                  if tool != "run_code" or not functions or calls_to(code, functions)]
+        if method:
+            _count_once(ctx, step, skill, "success" if any(method) else "error")
+
+
+def _count_once(ctx, step: str, skill, state: str) -> None:
+    key = "\x1f".join((step, skill.registry_release, skill.name, skill.version))
+    with _COUNT_LOCK:
+        decisions = getattr(ctx, "decisions", None)
+        seen = decisions.setdefault("registry_skill_step_counts", {}) if isinstance(decisions, dict) else {}
+        before = seen.get(key)
+        if before == state or before == "success":
+            return
+        seen[key] = state
+    if before is None:
+        _count(skill, state, ctx)
+    else:                                   # the step's earlier attempt failed; this one ran it
+        _adjust(skill, ctx, success=1, error=-1)
+
+
 def record_use(ctx, skill) -> None:
     if ctx is None:
         return
-    ctx.decisions["active_registry_skill"] = skill if skill.registry_release else None
+    active = skill if skill.registry_release else None
+    ctx.decisions["active_registry_skill"] = active
+    if ACTIVE.get() is not _UNSET:
+        ACTIVE.set(active)
     record_in_manifest(ctx, skill)
 
 
@@ -234,11 +306,17 @@ def active_skill(ctx, name: str = ""):
         if skill is None:
             raise ValueError(f"unknown skill {name!r}")
         return skill
+    current = ACTIVE.get()
+    if current is not _UNSET:
+        return current
     return ctx.decisions.get("active_registry_skill") if ctx is not None else None
 
 
-def execute(skill, ctx, executor, call, tool: str):
-    """Apply immutable per-call policy; never mutate a shared executor or process environment."""
+def execute(skill, ctx, executor, call, tool: str, code: str = ""):
+    """Apply immutable per-call policy; never mutate a shared executor or process environment.
+
+    ``code`` is what the call runs (the snippet, the command). Inside a plan step the call is
+    recorded for the step's count (``count_step``); outside one it is counted as it ends."""
     if skill is None:
         return call()
     record_use(ctx, skill)
@@ -282,7 +360,13 @@ def execute(skill, ctx, executor, call, tool: str):
     result = redact(result)
     status = result.get("status") if isinstance(result, dict) else None
     if status != "cancelled":   # the user pressed Stop: not a verdict on the skill version
-        _count(skill, "success" if status in {"ok", "success"} else "error", ctx)
+        ok = status in {"ok", "success"}
+        step = _STEP_CALLS.get()
+        if step is None:
+            _count(skill, "success" if ok else "error", ctx)
+        else:
+            key = (skill.registry_release, skill.name, skill.version)
+            step.setdefault(key, (skill, ctx, []))[2].append((ok, str(code or ""), tool))
     return result
 
 
@@ -302,6 +386,10 @@ def stats_path(ctx=None) -> Path:
 
 
 def _count(skill, state: str, ctx) -> None:
+    _adjust(skill, ctx, **{state: 1})
+
+
+def _adjust(skill, ctx, success: int = 0, error: int = 0) -> None:
     path = stats_path(ctx)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,8 +400,9 @@ def _count(skill, state: str, ctx) -> None:
                            "success INTEGER DEFAULT 0, error INTEGER DEFAULT 0, PRIMARY KEY(release,name,version))")
                 db.execute("INSERT OR IGNORE INTO skill_versions(release,name,version) VALUES(?,?,?)",
                            (skill.registry_release, skill.name, skill.version))
-                db.execute(f"UPDATE skill_versions SET {state}={state}+1 WHERE release=? AND name=? AND version=?",
-                           (skill.registry_release, skill.name, skill.version))
+                db.execute("UPDATE skill_versions SET success=MAX(0, success+?), error=MAX(0, error+?) "
+                           "WHERE release=? AND name=? AND version=?",
+                           (success, error, skill.registry_release, skill.name, skill.version))
         finally:
             db.close()
     except (OSError, sqlite3.Error) as exc:

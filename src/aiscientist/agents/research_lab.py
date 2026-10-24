@@ -63,17 +63,21 @@ from .plan_doc import (
     split_step,
     sync_plan,
 )
-from .scope import RunScope, qc_only, read_scope, tools_that_ran, wants_written_report
+from .scope import RunScope, qc_only_run, read_scope, wants_written_report
 from .marker_claims import check_marker_claims
+from .label_claims import check_label_conflation, dataset_labels, label_glossary, labels_prompt
+from . import own_choices
 from .preset_pipelines import (
     PresetPipeline,
     compose_pipeline_prompts,
     drop_conflicting_pinned,
     select_pipeline,
 )
+from .skill_code import fit_scripts, skill_functions
 from .skills import (
     SKILLS as ATOMIC_SKILLS,
     Skill,
+    default_file,
     get_skill,
     make_search_skills_tool,
     make_skill_reference_tool,
@@ -81,6 +85,7 @@ from .skills import (
     refresh_skills,
     skill_manifest,
     skills_named_in,
+    superseded_names,
 )
 from .step_numbers import contrast_arms, describe_count_mismatches, find_count_mismatches
 from .tool_source import make_tool_source_tool
@@ -227,7 +232,7 @@ _PI_SYSTEM = (
     "first two steps, with `breadth` \"specific\" and `later` naming the marker and "
     "enrichment analyses in a sentence each. "
     'Reply with ONLY a JSON object {"breadth": "whole" | "specific", "agenda": [step '
-    'strings], "later": [one-sentence suggestions]}, e.g. '
+    'strings], "self_sourced": "<one disclosure string>", "later": [one-sentence suggestions]}, e.g. '
     '{"breadth": "whole", "agenda": ['
     '"**QC & normalization** — Measure each cell\'s quality with `run_scanpy_qc` and remove the ones that cannot support an '
     'analysis: cells detecting fewer than 200 genes (empty droplets and dying cells) and cells whose '
@@ -255,19 +260,20 @@ _PI_SYSTEM = (
     'would inflate every p-value. This turns gene lists into interpretable biology.", '
     '"**Literature grounding** — Search the published literature with `deep_literature` for the key genes and pathways found '
     'above and attach real, DOI-backed citations that support the biological interpretation."'
-    '], "later": []}. '
+    '], "self_sourced": "<every choice in this plan that came from your own judgement, or none — '
+    'every choice in this plan comes from the guidance and the dataset profile.>", "later": []}. '
     "DECLARE WHAT THE PROTOCOL DID NOT COVER. A research protocol cannot anticipate every dataset, "
     "so going beyond it is expected and often correct — but it must be VISIBLE, because a reader "
-    "otherwise cannot tell a protocol-mandated choice from one you made. After the analysis steps, "
-    "add ONE final step string that begins exactly with `SELF-SOURCED:` and lists, in plain "
-    "language, every decision in this plan that came from YOUR OWN judgement rather than from the "
-    "guidance or the dataset profile: a threshold you chose and why that value, a method the "
-    "guidance did not name, a step you added or dropped, and any place where the guidance did not "
-    "fit this dataset and you departed from it — say which and why. If the question itself asked "
-    "for something the guidance advises against, say THAT here explicitly: name the conflict, say "
-    "which you followed, and what it costs. Write `SELF-SOURCED: none — every choice in this plan "
-    "comes from the guidance and the dataset profile.` when that is genuinely true. This is a "
-    "DISCLOSURE, not an analysis step: it runs nothing, and it is the last item.\n"
+    "otherwise cannot tell a protocol-mandated choice from one you made. Write in `self_sourced` "
+    "ONE plain-language string that lists every decision in this plan that came from YOUR OWN "
+    "judgement rather than from the guidance or the dataset profile: a threshold you chose and why "
+    "that value, a method the guidance did not name, a step you added or dropped, and any place "
+    "where the guidance did not fit this dataset and you departed from it — say which and why. If "
+    "the question itself asked for something the guidance advises against, say THAT here "
+    "explicitly: name the conflict, say which you followed, and what it costs. Write `none — every "
+    "choice in this plan comes from the guidance and the dataset profile.` when that is genuinely "
+    "true. This is a DISCLOSURE, not an analysis step: it runs nothing, so it never goes in "
+    "`agenda`.\n"
     "CLARIFY (optional): if — and only if — the user prompt explicitly allows you to ask, AND the "
     "request is GENUINELY ambiguous in a way that would materially change the plan (not a trivial "
     "detail), you MAY instead return "
@@ -495,10 +501,30 @@ def _parse_agenda(raw: str, max_steps: int) -> list[str] | None:
 
 
 # The PI's disclosure of what it decided on its OWN knowledge rather than from the research-path
-# guidance or the dataset profile. Prefixed rather than returned as a separate JSON field because
-# the planning reply is a plain list of strings on every path (draft, patch, cycle), and one
-# recognisable prefix survives all of them.
+# guidance or the dataset profile. The draft prompt asks for it as the reply's `self_sourced` field
+# (`_parse_self_sourced`). It used to be the agenda's last string, prefixed `SELF-SOURCED:`; with
+# `later` after `agenda`, models wrote it after `later`, outside the array, and the reply was not
+# JSON (prod run 74873590ca7b on Haiku 5.5, and DSV4 on HPC3). The prefixed string is still split
+# off wherever it appears, for replies in the old form.
 _SELF_SOURCED_PREFIX = "SELF-SOURCED:"
+
+
+def _parse_self_sourced(raw: str) -> str:
+    """The ``self_sourced`` field of the PI's planning reply, ``''`` when it has none. A list of
+    strings is joined, and a ``SELF-SOURCED:`` prefix the model repeated inside it is dropped."""
+    obj = _parse_verdict(raw or "")
+    value = obj.get("self_sourced") if isinstance(obj, dict) else None
+    if isinstance(value, list):
+        value = " ".join(v for v in value if isinstance(v, str))
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    bare = text.lstrip("*-# ").strip()
+    if bare.upper().startswith(_SELF_SOURCED_PREFIX):
+        text = bare[len(_SELF_SOURCED_PREFIX):].lstrip("* ").strip()
+    if text.startswith("<") and text.endswith(">"):
+        return ""            # the prompt's placeholder, copied instead of filled in
+    return text
 
 
 # Telling a QUESTION about the plan from a REQUEST to change it. Plan mode had three actions —
@@ -800,7 +826,7 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
             skill = active_skill(ctx, str(args.get("skill") or ""))
         except ValueError as exc:
             return {"status": "error", "error": str(exc)}
-        result = execute(skill, ctx, executor, lambda: executor(to_run), "run_code")
+        result = execute(skill, ctx, executor, lambda: executor(to_run), "run_code", code=code)
         duration_ms = int((_prov.perf_now() - t0) * 1000)
         if isinstance(result, dict):
             try:
@@ -809,6 +835,13 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
                     result=result, started_at=started_at, duration_ms=duration_ms,
                 ).to_dict()
             except Exception:  # provenance must never break a run
+                pass
+            # A max/mean printed from the first N rows reads like the file's own (runs 74873590ca7b,
+            # 7f2955e8e834: ".raw max" of 300 nuclei). Say so on the result, before the answer is written.
+            try:
+                from .sampled_stats import annotate
+                annotate(result, code)
+            except Exception:  # a reading aid must never break a run
                 pass
         return result
 
@@ -902,7 +935,7 @@ def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
                                   mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=staged)
             return runner(command, skill.image, workdir=workdir, cpus=skill.cpus,
                           mem_gb=skill.mem_gb, time_limit=skill.time_limit, files=files)
-        result = execute(skill, ctx, executor, run, "run_in_environment")
+        result = execute(skill, ctx, executor, run, "run_in_environment", code=command)
         if isinstance(result, dict):
             result["skill"] = skill.name
             result["provenance"] = {
@@ -2032,14 +2065,9 @@ def _annotated_cell_types(rounds: "list[LabRound]") -> list[str]:
     return found
 
 
-def _grounding_vocab(rounds: "list[LabRound]") -> str:
-    """A CLOSED vocabulary the report writer must stay within — the exact cell-class labels and the
-    exact enriched pathway terms the tools actually produced. Injected into the synthesize prompt so
-    the model cannot invent pathways (e.g. an EMT/ECM term that never appeared in the enrichment
-    table) or expand a class label into a different cell type (e.g. 'MG' -> 'Müller/ganglion').
-    Empty string when there is nothing to pin (the system prompt still forbids invention)."""
+def _tool_classes(rounds: "list[LabRound]") -> "list[str]":
+    """The group labels the accepted steps' packaged tools reported results for."""
     classes: list[str] = []
-    terms: list[str] = []
     for r in rounds:
         if r.verdict.verdict != "accept":
             continue
@@ -2049,6 +2077,55 @@ def _grounding_vocab(rounds: "list[LabRound]") -> str:
                 for grp in (res.get(key) or {}):
                     if grp and str(grp) not in classes:
                         classes.append(str(grp))
+    return classes
+
+
+def _class_labels(rounds: "list[LabRound]",
+                  dataset_result: "dict[str, Any] | None") -> "tuple[str, list[str]]":
+    """``(label column, labels)``: the dataset profile's label column and its levels, then any other
+    group a packaged tool reported. A run whose steps are all ``run_code`` has no tool groups, and
+    run 74873590ca7b's writer was given no labels at all; its answer called MG "Microglia-associated"
+    in a dataset where Microglia is another class."""
+    column, labels = dataset_labels(dataset_result)
+    return column, list(dict.fromkeys([*labels, *_tool_classes(rounds)]))
+
+
+def _label_reference(rounds: "list[LabRound]",
+                     dataset_result: "dict[str, Any] | None") -> "dict[str, Any] | None":
+    """The curated reference that may spell a label out: the one an accepted ``run_marker_annotation``
+    step used, else the one the dataset profile's tissue hint names (``tissue_hint`` writes "markers
+    in the curated <name> reference"). None when neither applies: then no label is expanded."""
+    ref = _marker_reference(rounds)
+    if ref is not None:
+        return ref
+    hint = str((dataset_result or {}).get("tissue_hint") or "") if isinstance(dataset_result, dict) else ""
+    m = re.search(r"\bcurated (\S+) reference\b", hint)
+    if not m:
+        return None
+    from ..tools.api import available_references, load_marker_reference
+    try:
+        return load_marker_reference(m.group(1)) if m.group(1) in available_references() else None
+    except (OSError, ValueError):      # an unreadable reference expands nothing; it never costs the report
+        return None
+
+
+def _grounding_vocab(rounds: "list[LabRound]", dataset_result: "dict[str, Any] | None" = None,
+                     reference: "dict[str, Any] | None" = None) -> str:
+    """A CLOSED vocabulary the report writer must stay within — the exact cell-class labels and the
+    exact enriched pathway terms the tools actually produced. Injected into the synthesize prompt so
+    the model cannot invent pathways (e.g. an EMT/ECM term that never appeared in the enrichment
+    table) or expand a class label into a different cell type (e.g. 'MG' -> 'Müller/ganglion').
+    The labels include the dataset profile's label column (``dataset_result``), and a label may be
+    spelled out only as the curated ``reference`` spells it (``label_claims.labels_prompt``).
+    Empty string when there is nothing to pin (the system prompt still forbids invention)."""
+    column, profile_labels = dataset_labels(dataset_result)
+    classes = list(dict.fromkeys([*profile_labels, *_tool_classes(rounds)]))
+    terms: list[str] = []
+    for r in rounds:
+        if r.verdict.verdict != "accept":
+            continue
+        for s in r.scientist_result.get("steps", []):
+            res = s.get("result") if isinstance(s.get("result"), dict) else {}
             for lst in (res.get("top_terms_by_group") or {}).values():
                 for t in (lst or []):
                     if t and str(t) not in terms:
@@ -2061,6 +2138,8 @@ def _grounding_vocab(rounds: "list[LabRound]") -> str:
             "- Cell-class labels present in the data (use verbatim; do NOT rename, merge, split, or "
             "expand a single label into a different or additional cell type): " + ", ".join(classes) + "."
         )
+        lines += labels_prompt(column, classes, label_glossary(classes, reference),
+                               str((reference or {}).get("tissue") or ""))
     if terms:
         lines.append(
             "- Enriched pathway/term names ACTUALLY found (name enriched pathways ONLY from this list; "
@@ -2387,15 +2466,18 @@ def verify_report_facts(report_md: str, facts: "dict[str, Any]",
                         uncovered: "dict[str, str] | None" = None, *,
                         tested_counts: "dict[str, dict[str, int]] | None" = None,
                         pre_counts: "dict[str, dict[str, int]] | None" = None,
-                        marker_reference: "dict[str, Any] | None" = None) -> "tuple[str, list[str]]":
+                        marker_reference: "dict[str, Any] | None" = None,
+                        class_labels: "list[str] | None" = None, label_column: str = "",
+                        label_reference: "dict[str, Any] | None" = None) -> "tuple[str, list[str]]":
     """The GUARANTEE layer: a deterministic post-generation fact-check of the manuscript against the
     authoritative figures, so a fabrication that slipped past the grounding prompt is caught regardless of
     whether the LLM obeyed it. Corrects two UNAMBIGUOUS cases in place — a wrong genome assembly (the
     report named a build other than the one actually used), and a '0/no/zero non-PASS' claim when the QC
     reported non-PASS records — and returns ``(corrected_md, issues)``. It only swaps those tokens/numbers;
-    the one prose edit is removing a sentence that calls a gene a marker of a lineage the run's curated
-    ``marker_reference`` gives to another (``marker_claims``). ``issues`` are for the technical-report
-    Diagnostics."""
+    the prose edits are removing a sentence that calls a gene a marker of a lineage the run's curated
+    ``marker_reference`` gives to another (``marker_claims``), and removing another class's name from a
+    class label (``label_claims``: "Microglia-associated (MG)" -> "MG" when Microglia is one of
+    ``class_labels``). ``issues`` are for the technical-report Diagnostics."""
     import re
     md = report_md or ""
     issues: list[str] = []
@@ -2440,6 +2522,10 @@ def verify_report_facts(report_md: str, facts: "dict[str, Any]",
     # curated reference the annotation used lists RLBP1 under Muller glia: the sentence is removed.
     md, marker_issues = check_marker_claims(md, marker_reference)
     issues += marker_issues
+    # 6. Class labels — one class written under another class's name (run 74873590ca7b: "Microglia-
+    # associated (MG) nuclei" in a dataset whose `majorclass` has both MG and Microglia).
+    md, label_issues = check_label_conflation(md, class_labels or [], label_reference, label_column)
+    issues += label_issues
     return md, issues
 
 
@@ -3448,7 +3534,8 @@ class ResumeState:
     re-run). Which DOWNSTREAM steps also re-run is decided per-run: when ``redo_indices`` is None the
     lab EVALUATES which later steps actually depend on the change and re-runs only those (an
     independent literature step, say, is kept); pass an explicit set to force the choice.
-    ``modify_note`` steers the changed step; ``guidance`` restores the skill steering.
+    ``modify_note`` steers the changed step; ``guidance`` restores the skill steering;
+    ``self_sourced`` is the plan's own-judgement disclosure, which the write-up quotes.
     """
 
     agenda: list[str]
@@ -3457,6 +3544,7 @@ class ResumeState:
     modify_note: str = ""
     guidance: str | None = None
     redo_indices: "frozenset[int] | None" = None   # None = evaluate; else the exact 0-based set to re-run
+    self_sourced: str = ""
 
     @classmethod
     def from_run_state(cls, state: dict[str, Any], from_step_index: int, *, modify_note: str = "",
@@ -3469,7 +3557,8 @@ class ResumeState:
         kept = [r for r in rounds if r.verdict.verdict == "accept"]
         return cls(list(state.get("agenda", [])), kept, int(from_step_index),
                    modify_note=modify_note, guidance=guidance or state.get("guidance"),
-                   redo_indices=frozenset(redo_indices) if redo_indices is not None else None)
+                   redo_indices=frozenset(redo_indices) if redo_indices is not None else None,
+                   self_sourced=str(state.get("self_sourced") or ""))
 
     @classmethod
     def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
@@ -3484,7 +3573,7 @@ class ResumeState:
             raise ValueError("Every planned step of this run already has an accepted result — "
                              "there is nothing left to continue. Re-run a chosen step instead.")
         return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
-                   redo_indices=frozenset(todo))
+                   redo_indices=frozenset(todo), self_sourced=resume.self_sourced)
 
 
 # --- plan revision: patch ONE step instead of re-drafting the whole plan -----------------------
@@ -3559,7 +3648,53 @@ _PLAN_FINDING_WORDS = {
     "unknown_tool": "step {step} names `{tool}`, which is not a tool this deployment has",
     "unknown_setting": "step {step}: `{tool}` has no setting `{param}` (it takes: {detail})",
     "bad_value": "step {step}: `{tool}` cannot take {param} = {detail}",
+    "unknown_skill": "step {step} names the skill `{param}`, which is not in this deployment's skill library",
 }
+
+
+#: How much of an assigned skill's SKILL.md and code goes into a step's brief; the rest stays one
+#: ``read_skill_reference`` away, and the brief says where.
+_SKILL_DOC_CHARS = 12_000
+_SKILL_CODE_CHARS = 16_000
+
+
+def _clip_skill_text(text: str, limit: int, name: str, file: "str | None") -> str:
+    if len(text) <= limit:
+        return text
+    where = f"read_skill_reference(name={name!r}" + (f", file={file!r}" if file else "") + ")"
+    return text[:limit] + f"\n[... cut at {limit:,} characters; the rest is at {where}]"
+
+
+def _assigned_skill_block(skill: "Skill") -> str:
+    """The brief's part for a step the plan assigned ``skill`` to: what to do with it, then its
+    SKILL.md and its code, so the Scientist starts from the vetted method instead of rewriting it."""
+    where = (f"registry release {skill.registry_release}" if skill.registry_release
+             else "this deployment's skills/")
+    run = ("run its commands with run_in_environment" if skill.image
+           else "run the code with run_code")
+    out = [f"The approved plan assigns the skill `{skill.name}` (version {skill.version or 'local'}, "
+           f"{where}) to this step. Its guidance and code are below: carry out the step WITH this "
+           "skill. Adapt only what it marks for adaptation (this dataset's paths, columns, groups and "
+           f"thresholds) and {run}. Do not write the analysis from scratch. If part of the skill does "
+           "not fit this data, change only that part and say in your answer what you changed and why."]
+    doc = (skill.doc or "").strip()
+    if doc:
+        out.append(f"--- {skill.name}: SKILL.md ---\n" + _clip_skill_text(doc, _SKILL_DOC_CHARS, skill.name, None))
+    first = default_file(skill.files)
+    if first:
+        out.append(f"--- {skill.name}: {first} ---\n"
+                   + _clip_skill_text(skill.files.get(first) or "", _SKILL_CODE_CHARS, skill.name, first))
+        others = [f for f in sorted(skill.files) if f != first and not f.startswith("tests/")]
+        if others:
+            out.append("The skill's other files (read one with `read_skill_reference(name, file=...)`): "
+                       + ", ".join(others[:20]))
+    return "\n\n".join(out)
+
+
+def _skill_name(name: str) -> "str | None":
+    """The library's own name for ``name`` (an old name of a migrated skill resolves), or ``None``."""
+    found = get_skill(str(name or "").strip())
+    return found.name if found is not None else None
 
 
 def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
@@ -3585,6 +3720,9 @@ def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
                         else f"set {c.get('param')} to {json.dumps(c.get('after'))} in step {n}")
         elif kind == "tool":
             said.append(f"changed the tool of step {n} to {c.get('after') or 'none'}")
+        elif kind == "skill":
+            said.append(f"took the skill off step {n}" if not c.get("after")
+                        else f"set the skill of step {n} to {c.get('after')}")
         elif kind == "moved":
             said.append(f"moved step {c.get('before')} to position {n}")
         elif kind == "text":
@@ -3593,10 +3731,42 @@ def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
             if said else "")
 
 
+# Sent with the PI's own reply when that reply could not be read as a plan: the reply is in front of
+# the model, so it rewrites what it meant rather than planning again.
+_PLAN_REFORMAT = (
+    "Your reply above could not be read as the plan. The plan must be ONE JSON object and nothing "
+    "else. Send it again as ONLY the JSON object your instructions describe, "
+    '{"breadth": ..., "agenda": [...], "self_sourced": "...", "later": [...]} (or the clarify '
+    'object), with no prose, no '
+    "headings and no code fences. Keep the steps you meant, one string per step, and keep the whole "
+    "reply short enough to finish."
+)
+
+#: What a run says when the PI's plan cannot be read, even after it was asked again.
+_PLAN_FAILED_MESSAGE = (
+    "The PI's plan could not be read, even after it was asked to send it again, so nothing was "
+    "run. Send the request again to plan it again. The PI's replies are saved with this run in "
+    "process/plan_replies/.")
+
+_PLAN_SKILLS_SYSTEM = (
+    "You match the steps of an analysis plan to the lab's vetted SKILLS. A skill is tested code and "
+    "guidance for one kind of analysis; its description says what it does and when to use it. For "
+    "each numbered step, name the ONE skill whose description covers the analysis that step does, or "
+    "null when none does. Match on the analysis, not on shared words: a step that tests two "
+    "conditions for differential expression is not a signature-scoring skill because both mention "
+    "a condition, and a step a listed tool performs needs no skill. A skill the research path names "
+    "for this kind of study is the right one when its step is there. Give a skill to the step that "
+    "carries out its analysis: a later step that compares, tabulates or plots what that step "
+    "produced does not run the skill again and gets null, even when the skill's description "
+    "mentions the summaries or plots it makes. "
+    'Reply with ONLY a JSON array: [{"step": <number>, "skill": "<skill name>" | null}].'
+)
+
 _PLAN_REVISE_SYSTEM = (
     "You are changing an analysis plan for the researcher who asked for the change. The plan is a "
     "YAML document: each step has an `id`, a `title`, the `tool` it runs, `settings` (arguments "
-    "passed to that tool exactly as written) and `does` (what the step does, in prose). Make the "
+    "passed to that tool exactly as written), `does` (what the step does, in prose) and, for a step "
+    "that runs code, the `skill` whose vetted code it uses. Make the "
     "requested change with the FEWEST operations and leave every step the request does not concern "
     "exactly as it is: you return operations on the document, never the document. "
     'Reply with ONLY a JSON object {"ops": [...]}. An operation is one of:\n'
@@ -3606,6 +3776,8 @@ _PLAN_REVISE_SYSTEM = (
     '{"op": "change", "step": "<id>", "title": "...", "does": "..."} - reword a step: either field '
     'or both, and "tool" when the step should run another tool. Keep its style and level of '
     "detail, and name the tool in `does` in backticks.\n"
+    '{"op": "change", "step": "<id>", "skill": null} - the step goes without its skill, when the '
+    "researcher asks for that; a skill's name sets it.\n"
     '{"op": "remove", "step": "<id>"}\n'
     '{"op": "add", "after": "<id>", "title": "...", "does": "...", "tool": "<tool>", "settings": '
     '{...}} - a new step after that one ("after": "start" puts it first; leave "after" out to add '
@@ -3938,6 +4110,8 @@ class ResearchLab:
         if resume is not None:
             if resume.guidance is not None:
                 self._guidance = resume.guidance
+            if resume.self_sourced and not self._self_sourced:
+                self._self_sourced = resume.self_sourced     # the plan is not redrafted, so keep its record
             agenda = list(resume.agenda)
             k = max(0, min(resume.from_step_index, len(agenda) - 1))
             # Decide which downstream steps actually depend on the change and must be re-run; the
@@ -4086,6 +4260,9 @@ class ResearchLab:
         if (early := _cancelled_before_plan()) is not None:
             return early
         kind, payload = self._pi_plan(question, emit, allow_clarify=plan_review is not None)
+        if kind == "failed":
+            emit({"type": "plan_failed", "reason": payload})
+            return LabResult(question, [], [], False, 0, str(payload))
         # PI<->Critic review runs BEFORE the plan reaches the human, not instead of it. The old
         # condition skipped the review whenever a human was curating ("their decision wins") —
         # and "Plan first" is checked by default, so on the path almost every real run takes, the
@@ -4213,6 +4390,16 @@ class ResearchLab:
                     # The patch is judged against ONLY what the user just said; the accumulated log
                     # still drives a redraft, where the full history is the right context.
                     latest_feedback=fb)
+                if kind == "failed":
+                    if before_plan:
+                        # The revision could not be read. The plan the researcher had is still a
+                        # plan: keep it, say so, and let them ask again.
+                        emit({"type": "plan_revision_failed", "request": fb[:200]})
+                        kind, payload = "agenda", before_plan
+                        emit({"type": "pi_agenda", "agenda": payload})
+                        continue
+                    emit({"type": "plan_failed", "reason": payload})
+                    return LabResult(question, [], [], False, 0, str(payload))
                 # What the redraft did BESIDES what was asked. The single-step patch path cannot
                 # damage a step it did not name (this code applies the edit, so collateral is
                 # structurally impossible); the whole-plan redraft can, and did — so diff it and
@@ -6231,8 +6418,94 @@ class ResearchLab:
                                tool_of=_primary_tool, runs_on_of=_tool_runs_on)
         if fresh:
             doc = self._bind_plan_settings(doc, fresh, emit)
+            doc = self._assign_plan_skills(doc, fresh, emit)
         self._plan_doc = doc
         emit({"type": "plan_doc", "yaml": doc.to_yaml(), "steps": doc.to_public()})
+
+    def _assign_plan_skills(self, doc: PlanDoc, fresh: "list[int]", emit: EventFn) -> PlanDoc:
+        """Name the skill each new code step uses, so a vetted skill is used without the researcher
+        having to know it exists.
+
+        Only steps that write code are matched (no tool, or a code tool): a pipeline tool is the
+        step, and a literature step searches papers. A step whose text names a skill (an old name of
+        a migrated skill too) gets it as written; the rest go to one model call that reads the
+        skills' descriptions, with the skills the research path names for this study as hints. Every
+        name is resolved against the library and an unknown one is dropped. The model's match goes to
+        one step per skill, the first in plan order: a later step that uses what that step produced
+        does not run the skill again, unless its own text names it. No model, or a reply that
+        does not parse, leaves the steps as they are: the plan is never held up by this. The skill is
+        shown on the plan card and the researcher can take it off."""
+        refresh_skills()
+        hidden = superseded_names(ATOMIC_SKILLS)
+        lib = {n: s for n, s in list(ATOMIC_SKILLS.items()) if n not in hidden}
+        steps = list(doc.steps)
+        candidates = [i for i in fresh if 0 <= i < len(steps) and not steps[i].skill
+                      and (steps[i].tool is None or steps[i].tool in CODE_TOOLS)
+                      and not _is_literature_step(steps[i].text)]
+        if not lib or not candidates:
+            return doc
+        assigned: dict[int, str] = {}
+        for i in candidates:
+            named = skills_named_in(steps[i].text, lib)
+            if named:
+                assigned[i] = named[0]
+        named_in_text = set(assigned)
+        ask = [i for i in candidates if i not in assigned]
+        if ask and self._complete_fn is not None:
+            emit({"type": "plan_skill_matching", "steps": len(ask)})
+            hints = skills_named_in(self._guidance or "", lib)
+            listing = "\n\n".join(f"{i + 1}. {steps[i].text}" for i in ask)
+            catalog = "\n".join(
+                f"- {s.name}: " + " ".join((s.summary or "").split())[:600] for s in lib.values())
+            prompt = (f"Steps:\n\n{listing}\n\nSkills:\n{catalog}\n\n"
+                      + (f"The research path for this study names: {', '.join(hints)}.\n\n" if hints else "")
+                      + "Return the JSON array now.")
+            try:
+                raw = self._complete([{"role": "system", "content": _PLAN_SKILLS_SYSTEM},
+                                      {"role": "user", "content": prompt}], role="plan")
+                parsed = safe_json_loads(raw)
+                if not isinstance(parsed, list):
+                    m = re.search(r"\[.*\]", raw or "", re.DOTALL)
+                    parsed = json.loads(m.group(0)) if m else []
+                for item in parsed if isinstance(parsed, list) else []:
+                    if not isinstance(item, dict) or not item.get("skill"):
+                        continue
+                    try:
+                        idx = int(item.get("step", 0)) - 1
+                    except (TypeError, ValueError):
+                        continue
+                    hit = get_skill(str(item["skill"]).strip(), lib)
+                    if idx in ask and hit is not None:
+                        assigned[idx] = hit.name
+            except Exception as exc:  # noqa: BLE001 - skills are an addition; the plan stands without them
+                emit({"type": "plan_skill_match_failed", "error": f"{type(exc).__name__}: {exc}"[:200]})
+        # One step per skill. In run 74873590ca7b the model gave the scoring skill to the step that
+        # scored and to the two after it, which only compared and plotted the scores: each ran under
+        # the skill, and the figures step's Critic asked why it had not scored again. So a model's
+        # match is dropped when another step of the plan already has that skill (one matched earlier
+        # in plan order, or one the plan had before). A step whose own text names a skill keeps it.
+        held = {s.skill: j for j, s in enumerate(steps) if s.skill}
+        repeats: list[dict[str, Any]] = []
+        for i in sorted(assigned):
+            name = assigned[i]
+            if i not in named_in_text and name in held:
+                repeats.append({"step": i + 1, "skill": name, "kept_on": held[name] + 1})
+                del assigned[i]
+            else:
+                held.setdefault(name, i)
+        if repeats:
+            emit({"type": "plan_skill_repeats", "dropped": repeats})   # feed only: why a step has none
+        if not assigned:
+            return doc
+        for i, name in assigned.items():
+            s = steps[i]
+            steps[i] = PlanStep(id=s.id, text=s.text, tool=s.tool, settings=s.settings,
+                                runs_on=s.runs_on, skill=name)
+        emit({"type": "plan_skills", "assigned": [
+            {"step": i + 1, "id": steps[i].id, "skill": name,
+             "version": lib[name].version or "local", "release": lib[name].registry_release or ""}
+            for i, name in sorted(assigned.items())]})
+        return PlanDoc(request=doc.request, steps=tuple(steps))
 
     def _bind_plan_settings(self, doc: PlanDoc, fresh: "list[int]", emit: EventFn) -> PlanDoc:
         """Fill in ``settings`` for the steps at ``fresh``: the tool arguments their text states.
@@ -6244,7 +6517,11 @@ class ResearchLab:
         parse, leaves the call-syntax settings — the plan is never held up by this."""
         schemas = _tool_schemas(list(getattr(self.scientist, "catalog", [])))
         steps = list(doc.steps)
-        askable = [i for i in fresh if steps[i].tool and schemas.get(steps[i].tool)]
+        # A code step has no settings: the Scientist writes its code, and a plan that pinned an argument
+        # of run_code (a snippet, or the skill it uses — `skill:` says that) would hand the step a value
+        # nobody approved as one. The same rule as a revision (_revise_plan_document).
+        askable = [i for i in fresh if steps[i].tool and steps[i].tool not in CODE_TOOLS
+                   and schemas.get(steps[i].tool)]
         if not askable:
             return doc
         proposed: dict[int, dict[str, Any]] = {
@@ -6280,7 +6557,7 @@ class ResearchLab:
         for i in askable:
             settings, refused = bind_settings(steps[i].text, schemas[str(steps[i].tool)], proposed[i])
             steps[i] = PlanStep(id=steps[i].id, text=steps[i].text, tool=steps[i].tool,
-                                settings=settings, runs_on=steps[i].runs_on)
+                                settings=settings, runs_on=steps[i].runs_on, skill=steps[i].skill)
             dropped += [{"step": i + 1, "tool": steps[i].tool, **d} for d in refused]
         if dropped:
             # Feed only: what the binder proposed and the step's text did not support.
@@ -6316,11 +6593,11 @@ class ResearchLab:
         # A step the researcher added without naming its tool still says which one in its text.
         known = {s.id for s in self._plan_doc.steps}
         edited = PlanDoc(request=question, steps=tuple(
-            PlanStep(id=s.id, text=s.text, tool=_primary_tool(s.text), settings=s.settings)
+            PlanStep(id=s.id, text=s.text, tool=_primary_tool(s.text), settings=s.settings, skill=s.skill)
             if s.id not in known and not s.tool else s for s in edited.steps))
         edited, findings = check_plan(
             edited, _tool_schemas(list(getattr(self.scientist, "catalog", []))),
-            is_known=lambda name: get_skill(name) is not None)
+            is_known=lambda name: get_skill(name) is not None, skill_name=_skill_name)
         if findings:
             refuse([_PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) + "." for f in findings])
             return None
@@ -6410,9 +6687,11 @@ class ResearchLab:
                 settings = {k: v for k, v in settings.items()
                             if not (k in stated_before and k not in stated_now)}
             steps.append(step if (tool == step.tool and settings == step.settings) else PlanStep(
-                id=step.id, text=step.text, tool=tool, settings=settings, runs_on=step.runs_on))
+                id=step.id, text=step.text, tool=tool, settings=settings, runs_on=step.runs_on,
+                skill=step.skill))
         edited, findings = check_plan(PlanDoc(request=question, steps=tuple(steps)), schemas,
-                                      is_known=lambda name: get_skill(name) is not None)
+                                      is_known=lambda name: get_skill(name) is not None,
+                                      skill_name=_skill_name)
         if findings:
             emit({"type": "plan_revise_skipped", "why": "; ".join(
                 _PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) for f in findings)[:300]})
@@ -6438,7 +6717,7 @@ class ResearchLab:
                                         "before": was.get(key), "after": final.settings.get(key)})
         self._plan_doc = PlanDoc(request=doc.request, steps=tuple(
             s if not s.tool or s.runs_on else PlanStep(id=s.id, text=s.text, tool=s.tool, settings=s.settings,
-                                                       runs_on=_tool_runs_on(s.tool))
+                                                       runs_on=_tool_runs_on(s.tool), skill=s.skill)
             for s in doc.steps))
         emit({"type": "plan_edited", "by": "pi", "request": request[:300], "changes": changes, "notes": notes,
               "steps": sorted({c["step"] for c in changes if c["kind"] != "removed"})})
@@ -6451,6 +6730,15 @@ class ResearchLab:
         self._approved_plan = self._plan_doc
         emit({"type": "plan_approved", "yaml": self._approved_plan.to_yaml(), "reviewed": reviewed,
               "pinned": sum(len(s.settings) for s in self._approved_plan.steps)})
+
+    def _assigned_skill(self, step: str) -> "Skill | None":
+        """The skill the plan assigned to ``step`` (``skill:`` in the plan document), if it is still in
+        the library; ``None`` otherwise. The approved plan when there is one, else the draft."""
+        plan = self._approved_plan or self._plan_doc
+        found = plan.step_for(step) if plan is not None else None
+        if found is None or not found.skill:
+            return None
+        return get_skill(found.skill)
 
     def _pinned_settings(self, step: str) -> "dict[str, dict[str, Any]]":
         """``{tool: settings}`` the approved plan fixes for this step ({} when it fixes none)."""
@@ -6519,6 +6807,20 @@ class ResearchLab:
                       "before": old_value, "after": new_value, "steps": stale})
         return out
 
+    def _save_plan_reply(self, raw: "str | None") -> None:
+        """Keep the PI's planning reply with the run (``process/plan_replies/reply-NN.txt``), so a
+        plan that could not be read can be looked at afterwards. Never fails the planning."""
+        workspace = getattr(self.ctx, "workspace", None)
+        if not workspace:
+            return
+        try:
+            folder = Path(workspace) / "artifacts" / "process" / "plan_replies"
+            folder.mkdir(parents=True, exist_ok=True)
+            n = len(list(folder.glob("reply-*.txt"))) + 1
+            (folder / f"reply-{n:02d}.txt").write_text(raw or "", encoding="utf-8")
+        except OSError:
+            pass
+
     def _pi_plan(
         self,
         question: str,
@@ -6529,9 +6831,10 @@ class ResearchLab:
         allow_clarify: bool = False,
         latest_feedback: str = "",
     ) -> tuple[str, Any]:
-        """Draft (or re-draft) the plan. Returns ``("agenda", [steps])`` or, when
-        ``allow_clarify`` and the request is genuinely ambiguous, ``("clarify",
-        [{question, options}])``. ``feedback`` (the user's natural-language notes on the
+        """Draft (or re-draft) the plan. Returns ``("agenda", [steps])``; when ``allow_clarify``
+        and the request is genuinely ambiguous, ``("clarify", [{question, options}])``; and
+        ``("failed", message)`` when the PI's reply cannot be read as a plan even after it was asked
+        once more (the caller runs nothing). ``feedback`` (the user's natural-language notes on the
         previous draft) + ``prior_agenda`` drive a revision instead of a fresh plan.
 
         A revision tries a SINGLE-STEP PATCH first (``_patch_plan``) and only redrafts the whole
@@ -6597,21 +6900,37 @@ class ResearchLab:
         else:
             parts.append("Return the ordered agenda now.")
 
-        raw = self._complete([
+        messages = [
             {"role": "system", "content": self._name_literature_tool(_PI_SYSTEM)},
             {"role": "user", "content": "\n".join(parts)},
-        ], role="plan")
+        ]
+        raw = self._complete(messages, role="plan")
+        self._save_plan_reply(raw)
         parsed = _parse_plan(raw, self.config.max_steps, allow_clarify)
         if parsed is None:
-            # The PI's output did not parse — most often because the reply was CUT OFF at the
-            # role's output ceiling, which leaves the agenda JSON unterminated. The fallback puts
-            # the user's own question in as the only step, and until now said nothing: the reviewer
-            # got a plan card whose first step was their own question restated, with a literature
-            # step appended after it, and no sign that anything had failed. Say so. A degradation
-            # the reader cannot see is worse than the failure it is standing in for.
+            # The reply is not a plan: prose around it, a JSON object that does not parse, or a reply
+            # cut off at the role's output ceiling. Ask once more, with the reply in front of the PI,
+            # for the plan in its format. (Prod run 3ed7676de128: Haiku's 8,936-token reply, well
+            # under its ceiling, did not parse.)
+            emit({"type": "plan_reformat", "chars": len(raw or "")})
+            again = [*messages, *([{"role": "assistant", "content": raw}] if (raw or "").strip() else []),
+                     {"role": "user", "content": _PLAN_REFORMAT}]
+            try:
+                retry = self._complete(again, role="plan")
+            except Exception as exc:  # noqa: BLE001 - the failure below says the plan could not be read
+                emit({"type": "plan_reformat_failed", "error": f"{type(exc).__name__}: {exc}"[:200]})
+                retry = ""
+            self._save_plan_reply(retry)
+            parsed = _parse_plan(retry, self.config.max_steps, allow_clarify)
+            if parsed is not None:
+                raw = retry
+        if parsed is None:
+            # No plan. The question used to go in as the only step of a fallback plan, which the
+            # reviewer could run as if the PI had written it (run 3ed7676de128 did, and no skill or
+            # research path reached the step). A run with no plan runs nothing.
             emit({"type": "plan_unparsed", "chars": len(raw or ""),
                   "preview": " ".join((raw or "").split())[:200]})
-            parsed = ("agenda", [question])
+            return "failed", _PLAN_FAILED_MESSAGE
         kind, payload = parsed
         if kind == "clarify":
             emit({"type": "pi_clarify", "questions": payload})
@@ -6629,7 +6948,10 @@ class ResearchLab:
             # the plan the user reviews, plan.md and the technical report can all carry it, because
             # "which of these choices did the protocol actually specify" is otherwise unanswerable
             # once the numbers are in a Methods section.
-            payload, disclosure = _split_self_sourced(list(payload))
+            # The reply's `self_sourced` field; a reply in the old form carries it as a prefixed
+            # agenda string instead, which is split off either way so it never runs as a step.
+            payload, legacy = _split_self_sourced(list(payload))
+            disclosure = _parse_self_sourced(raw) or legacy
             if disclosure:
                 self._self_sourced = disclosure
                 emit({"type": "plan_self_sourced", "text": disclosure})
@@ -7233,10 +7555,15 @@ class ResearchLab:
                   "with `read_skill_reference(name, file=...)`. Adapt it to THIS dataset, then "
                   f"{_run} (read checkpoints from AISCIENTIST_WORK, write under "
                   "AISCIENTIST_ARTIFACTS). If a tool already covers the step, use the tool instead")
-        # A skill the plan wrote into this step is named outright, so the Scientist does not have to
-        # rediscover by search what the PI already chose.
+        # The skill the approved plan assigned to this step is HANDED OVER — its guidance and code are
+        # in the brief — so using it is not left to the model's choice. Run 3ed7676de128 wrote its own
+        # signature scoring while the vetted skill sat one read away; 4 of 47 prod runs had ever read
+        # a skill. Otherwise a skill the step's text names is pointed at, as before.
+        assigned = self._assigned_skill(plan_step if plan_step is not None else step)
         named = skills_named_in(step)
-        if named:
+        if assigned is not None:
+            parts.append(_assigned_skill_block(assigned))
+        elif named:
             parts.append(("The plan assigns skill " if len(named) == 1 else "The plan assigns skills ")
                          + ", ".join(f"`{n}`" for n in named) + f" to this step: {_fetch}.")
         if n_skills:
@@ -7266,35 +7593,46 @@ class ResearchLab:
         # Passed only when there is something to pin, so a scientist that predates the argument
         # (a test double, an older harness) is called exactly as before.
         pin_kwargs: dict[str, Any] = {"pinned_args": pinned} if pinned else {}
-        result = self.scientist.run(brief, self.ctx, on_event=emit, should_cancel=should_cancel,
-                                    untrusted_text=untrusted_text, extra_steps=extra_steps,
-                                    **pin_kwargs)
-        # Named-tool-not-called nudge. A step whose text names the tool that IS the step
-        # (`run_de`, `run_composition`) sometimes ends with the model writing final text after a
-        # round of reconnaissance — inspect, list_dir, read_tool_source — without ever calling it
-        # ("stop_reason: model_final_text", zero evidence). The Critic bounces that, correctly,
-        # but at the price of a whole extra round. One deterministic nudge, once, is cheaper: if
-        # the step names catalog tools, none of them ran, and the model stopped on its own, tell
-        # it exactly that and let it finish the step. ``done_early`` counts as stopping on its own
-        # when the named tool never ran: what "succeeded" was a side probe (run f3b8268c4fd4's ORA
-        # step: one exploratory run_code, two failed ones, run_enrichment never called). Never
-        # applied to a step that stopped for a cancel, an error budget or a step limit — those are
-        # not "forgot to call it".
-        named = {n for n in _BACKTICK_TOOL_RE.findall(step or "")}
-        catalog = {t.name for t in getattr(self.scientist, "catalog", [])}
-        named &= catalog
-        called = {str(st.get("tool")) for st in (result.steps or [])}
-        if (named and not (named & called)
-                and getattr(result, "stop_reason", "") in ("model_final_text", "done_early")
-                and not (should_cancel is not None and should_cancel())):
-            emit({"type": "tool_nudge", "step": step, "tools": sorted(named)})
-            nudge = ("\n\nNOTE: your last attempt ended without calling "
-                     + ", ".join(f"`{n}`" for n in sorted(named))
-                     + " — the tool this step is about. The reconnaissance is done; call it now with "
-                     "the settings the step specifies, then report what it returned.")
-            result = self.scientist.run(brief + nudge, self.ctx, on_event=emit,
-                                        should_cancel=should_cancel, untrusted_text=untrusted_text,
-                                        extra_steps=extra_steps, **pin_kwargs)
+        # The step runs inside its skill's scope: the run's manifest records the skill, and every
+        # run_code in this step carries it (its declared access) without the model having to name
+        # it. The skill's version is counted once for the step, by the code that ran its method, and
+        # a revision of the step is the same step. Nothing of it outlives the step, in sequence or
+        # in parallel.
+        from .skills_registry import record_use, step_scope
+        with step_scope(assigned, step=plan_step if plan_step is not None else step):
+            if assigned is not None:
+                record_use(self.ctx, assigned)
+                emit({"type": "step_skill", "step": step, "skill": assigned.name,
+                      "version": assigned.version or "local", "release": assigned.registry_release or ""})
+            result = self.scientist.run(brief, self.ctx, on_event=emit, should_cancel=should_cancel,
+                                        untrusted_text=untrusted_text, extra_steps=extra_steps,
+                                        **pin_kwargs)
+            # Named-tool-not-called nudge. A step whose text names the tool that IS the step
+            # (`run_de`, `run_composition`) sometimes ends with the model writing final text after a
+            # round of reconnaissance — inspect, list_dir, read_tool_source — without ever calling it
+            # ("stop_reason: model_final_text", zero evidence). The Critic bounces that, correctly,
+            # but at the price of a whole extra round. One deterministic nudge, once, is cheaper: if
+            # the step names catalog tools, none of them ran, and the model stopped on its own, tell
+            # it exactly that and let it finish the step. ``done_early`` counts as stopping on its own
+            # when the named tool never ran: what "succeeded" was a side probe (run f3b8268c4fd4's ORA
+            # step: one exploratory run_code, two failed ones, run_enrichment never called). Never
+            # applied to a step that stopped for a cancel, an error budget or a step limit — those are
+            # not "forgot to call it".
+            named = {n for n in _BACKTICK_TOOL_RE.findall(step or "")}
+            catalog = {t.name for t in getattr(self.scientist, "catalog", [])}
+            named &= catalog
+            called = {str(st.get("tool")) for st in (result.steps or [])}
+            if (named and not (named & called)
+                    and getattr(result, "stop_reason", "") in ("model_final_text", "done_early")
+                    and not (should_cancel is not None and should_cancel())):
+                emit({"type": "tool_nudge", "step": step, "tools": sorted(named)})
+                nudge = ("\n\nNOTE: your last attempt ended without calling "
+                         + ", ".join(f"`{n}`" for n in sorted(named))
+                         + " — the tool this step is about. The reconnaissance is done; call it now with "
+                         "the settings the step specifies, then report what it returned.")
+                result = self.scientist.run(brief + nudge, self.ctx, on_event=emit,
+                                            should_cancel=should_cancel, untrusted_text=untrusted_text,
+                                            extra_steps=extra_steps, **pin_kwargs)
         return result
 
     def _count_problems(self, step: str, result: HarnessResult) -> list[str]:
@@ -7408,6 +7746,36 @@ class ResearchLab:
                 "The tool claimed these artifacts but they are NOT on disk. Do NOT treat them as "
                 "backing for any statement; a claim whose only support is a missing file is "
                 "unsupported.")
+        # The skill the approved plan assigned. Its guidance and code were in the scientist's brief;
+        # whether the step used them is judged from the code it ran, which the results above omit.
+        # Every script in full up to a budget, and past it the lines that call the skill's own
+        # functions: run 74873590ca7b's scoring script was cut at a fixed 2,000 characters, 167
+        # before its `sc.tl.score_genes(` call, and the Critic could only ask whether it was there.
+        assigned = self._assigned_skill(step)
+        if assigned is not None:
+            functions = skill_functions(assigned)
+            scripts, not_shown = fit_scripts(result.steps, functions, succeeded=step_succeeded)
+            payload["ASSIGNED_SKILL"] = {
+                "name": assigned.name, "version": assigned.version or "local",
+                "what_it_does": " ".join((assigned.summary or "").split())[:800],
+                "skill_functions": list(functions[:30]),
+                "code_it_ran": scripts,
+                **({"scripts_not_shown": not_shown} if not_shown else {}),
+            }
+            payload["assigned_skill_note"] = (
+                "The approved plan assigned this skill to the step, and its guidance and code were in "
+                "the scientist's brief. `code_it_ran` is the code of the step's run_code and "
+                "run_in_environment calls (`tool_call` is its place in `tool_results`), in full "
+                "unless `shown` is \"excerpt\". An excerpt of a long script keeps the lines that call "
+                "the skill's own functions (`skill_functions`, found in the skill's code), the lines "
+                "around them and its first and last lines, and marks each gap "
+                "`# [... N lines left out ...]`; `calls_skill_functions` lists, found in code, the "
+                "ones each script calls (`skill_functions` is empty when the skill's method is not "
+                "a Python call). Check from this code that the step used the skill's method. A step "
+                "that wrote a method of its own instead, and does not say in its answer why the "
+                "skill did not fit this data, has not done what was approved: ask it to revise with "
+                "the skill. A step that only reads, compares or plots what an earlier step made with "
+                "the skill does not have to run the skill again.")
         raw = self._complete([
             {"role": "system", "content": _CRITIC_SYSTEM},
             {"role": "user", "content": json.dumps(payload)},
@@ -7875,8 +8243,10 @@ class ResearchLab:
                     team_interpretation: str = "") -> str:
         accepted = [r for r in rounds if r.verdict.verdict == "accept"]
         qc_report = False
-        if qc_only(tools_that_ran(rounds)):
-            # Quality control is all this run did. Unless the request asks for a written report, it
+        if qc_only_run(rounds):
+            # Quality control is all this run did (generic code that wrote a table or figure is
+            # analysis: run 74873590ca7b's ISG scoring ran in run_code after run_scanpy_qc, and was
+            # written up as a QC report with no claim audit). Unless the request asks for a written report, it
             # is answered in the chat with the QC tool's own numbers, which the gateway builds from
             # the run's files. Run 6275df1213ab (CellQC alone) had the writer produce Summary,
             # Methods, Results, Limitations and Conclusion around one table, after a claim audit that
@@ -7908,8 +8278,18 @@ class ResearchLab:
         # write-up reflects the multi-expert reading of the results, still grounded in the tools.
         interp = (f"\n\nTeam interpretation of the results (incorporate, but do not invent beyond "
                   f"the tool outputs):\n{team_interpretation}\n" if team_interpretation else "")
-        vocab = _grounding_vocab(accepted)
+        # The dataset's own class labels (its profile's label column, whichever tool the steps used)
+        # and the curated reference that may spell them out: run 74873590ca7b's writer, given none,
+        # turned MG into "Microglia-associated" in a dataset where Microglia is another class.
+        profile = (self.ctx.decisions or {}).get("dataset_result")
+        label_column, class_labels = _class_labels(accepted, profile)
+        label_reference = _label_reference(accepted, profile)
+        vocab = _grounding_vocab(accepted, profile, label_reference)
         vocab_block = f"\n{vocab}\n" if vocab else ""
+        # The plan's record of the choices the PI made itself (a gene set, a threshold). Run
+        # 74873590ca7b's answer presented the PI's own 14-gene set as "a frozen ISG set".
+        choices = own_choices.writer_note(self._self_sourced)
+        choices_block = f"\n{choices}" if choices else ""
         methods = _methods_performed(accepted)
         methods_block = f"\n{methods}\n" if methods else ""
         facts = _grounding_facts(accepted)          # pin the authoritative numbers/assembly (anti-fabrication)
@@ -7950,6 +8330,7 @@ class ResearchLab:
                 f"{methods_block}"
                 f"{facts_block}"
                 f"{vocab_block}"
+                f"{choices_block}"
                 f"{ledger_block}"
                 f"{audit_prompt}"
                 f"{interp}\n"
@@ -7962,11 +8343,13 @@ class ResearchLab:
         facts_dict, _dists = _collect_facts(accepted)
         report, fact_issues = verify_report_facts(
             report, facts_dict, _uncovered_groups(accepted), tested_counts=_tested_counts(accepted),
-            pre_counts=pre_qc_counts((self.ctx.decisions or {}).get("dataset_result")),
-            marker_reference=_marker_reference(accepted))
+            pre_counts=pre_qc_counts(profile),
+            marker_reference=_marker_reference(accepted),
+            class_labels=class_labels, label_column=label_column, label_reference=label_reference)
         if fact_issues:
             emit({"type": "report_fact_check", "issues": fact_issues})
-        return report
+        # The plan's own-judgement record, verbatim, whether or not the writer followed the note.
+        return own_choices.add_section(report, self._self_sourced)
 
     # -- internals ------------------------------------------------------------
 

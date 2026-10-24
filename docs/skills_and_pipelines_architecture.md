@@ -79,8 +79,39 @@ commands inside it with `run_in_environment(skill, command)`.
   a `run_code` step that names the skill in backticks. The prompt tells the PI to prefer a tool
   whenever one covers the step, and to describe a skill's method only as its description states it.
   So a skill's description must name its method.
-- **The Scientist is told which skill a step uses.** The brief of a step names the skills its text
-  mentions, so the Scientist reads them instead of searching.
+- **The plan says which skill each code step uses.** Once a plan is drafted, each new step that
+  writes code (no tool, or `run_code` / `run_shell` / `run_in_environment`; not a literature step)
+  is matched to a skill. A step whose text names a skill (an old name too) gets it as written; the
+  rest go to one model call that reads the skills' descriptions, with the skills the research path
+  names as hints. A name that is not in the library is dropped, and a failed call leaves the plan
+  as it is. The model's match goes to one step per skill, the first in plan order: a later step
+  that compares, tabulates or plots what that step produced gets no skill, unless its own text
+  names one. The match is the step's `skill:` in the plan document, shown on the plan card, where
+  the researcher can take it off (or set one in the YAML; an unknown name is refused).
+- **A step runs with its skill in hand.** The brief of a step the approved plan gave a skill holds
+  the skill's SKILL.md and its first script (cut at 12,000 and 16,000 characters, with where to
+  read the rest), and tells the Scientist to adapt it rather than write the analysis anew. The step
+  runs in that skill's scope: the run's `manifest.json` records it, and every `run_code` of the step
+  carries it (a registry skill's declared access) without the model naming it. The scope ends with
+  the step, so a skill never reaches another step, including steps running in parallel. The Critic
+  gets the skill, its own functions and the code of each `run_code` and `run_in_environment` call
+  of the step, and asks for a revision when the step replaced the skill's method without saying
+  why. A step with no assigned skill is pointed at the skills its text names.
+- **The Critic reads the code the step ran.** `agents/skill_code.py` finds a skill's own functions
+  in its scripts and the Python blocks of its SKILL.md: its calls into the libraries it imports
+  (`sc.tl.score_genes` is `scanpy.tl.score_genes`), apart from the standard library, reading and
+  writing files, and numpy, pandas, matplotlib, seaborn and anndata (which count only for a skill
+  that calls nothing else); the functions it defines; and the programs it runs through
+  `subprocess` (`bcftools`), apart from shells and interpreters. Each script of the step reaches
+  the Critic in full while the step's scripts fit in 24,000 characters. Past that, short scripts
+  stay whole and long ones share the rest equally: each keeps the lines that call the skill's
+  functions, then the lines around them and its first and last lines, and marks what it leaves
+  out. At most 12 scripts are shown, those that call the skill first. For each script the Critic
+  is told which of the skill's functions it calls.
+- **No plan, no run.** The PI's planning replies are kept in the run's
+  `process/plan_replies/`. A reply that is not a plan is sent back once with a request for the plan
+  in its format; if that fails too, the run stops with that message and runs nothing. A revision
+  that cannot be read keeps the plan the researcher had.
 
 ### The pinned registry release
 
@@ -132,8 +163,13 @@ private temporary file, and redacted from the output the model sees.
 Every run's `manifest.json` lists the skills it used, with name, version and release tag.
 Successes and errors are counted per release, skill and version in one file for the deployment,
 `<AISCIENTIST_STATE_DIR>/skill_versions.sqlite3` (`AISCIENTIST_SKILLS_REGISTRY_STATS` overrides
-it), so a broken version can be found and the pin rolled back. A run the user stops is not
-counted.
+it), so a broken version can be found and the pin rolled back. A registry skill is counted once
+per plan step whose code ran its method: a `run_code` call that calls one of the skill's own
+functions (every call, for a skill whose code has none to find), or a `run_in_environment`
+command. The step is a success when one of those calls succeeded and an error when none did. A
+step that only listed files or read what another step made is not counted. The attempts of one
+step are one use: a revision that succeeds turns the step's error into a success. Outside a plan
+step each call is counted as it ends. A call the user stops is not counted.
 
 ### Skills learned from runs
 

@@ -702,6 +702,20 @@ button.small { padding: 6px 12px; font-size: 12px; }
   background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border);
 }
 .plan-panel .plan-step-body code { font-size: 12px; color: var(--text); }
+/* The vetted skill a step uses: a chip beside its settings, removable while the plan waits. */
+.plan-step-skill {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 7px;
+  font-size: 11.5px; font-family: var(--font-mono, ui-monospace, monospace); color: var(--accent, var(--text));
+  background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border);
+}
+.plan-step-skill .msym { font-size: 14px; }
+.plan-entry-step .plan-step-skill { margin-left: 6px; }
+.plan-skill-remove {
+  display: inline-flex; align-items: center; border: 0; background: none; padding: 0; margin-left: 2px;
+  color: var(--text-secondary); cursor: pointer;
+}
+.plan-skill-remove .msym { font-size: 14px; }
+.plan-skill-remove:hover, .plan-skill-remove:focus-visible { color: var(--text); }
 .plan-yaml-read > summary { cursor: pointer; list-style: none; }
 .plan-yaml-read > summary::-webkit-details-marker { display: none; }
 .plan-yaml-read .plan-yaml-code { margin-top: 10px; }

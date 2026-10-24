@@ -86,9 +86,15 @@ def _named(dataset_path: str, run_id: str, when: "_dt.datetime | None", what: st
 
 
 def _checkpoints(work: Path) -> "list[Path]":
+    """The tools' checkpoints, plus any other ``work/adata_*.h5ad`` a step wrote: generic code names
+    its own (run 74873590ca7b's ISG scoring wrote ``adata_scored_isg.h5ad``, and the processed
+    dataset it handed on had no score). Each adds only the obs columns and embeddings the base lacks,
+    aligned by barcode, and one with no cell in common is skipped."""
     found = [work / n for n in CHECKPOINTS if (work / n).is_file()]
+    known = {p.name for p in found}
+    found += [p for p in sorted(work.glob("adata_*.h5ad")) if p.is_file() and p.name not in known]
     rank = {n: i for i, n in enumerate(CHECKPOINTS)}
-    return sorted(found, key=lambda p: (-p.stat().st_mtime, rank[p.name]))
+    return sorted(found, key=lambda p: (-p.stat().st_mtime, rank.get(p.name, len(CHECKPOINTS))))
 
 
 def _plain(value: Any) -> Any:

@@ -1,7 +1,7 @@
 # What AiScientist keeps on HPC3
 
 Most of what the product needs to run is not in the repository: container images, model weights
-and annotation databases, about 1 TiB in all. This file lists what exists, what reads it and how
+and annotation databases, about 580 G in all. This file lists what exists, what reads it and how
 to get it back. Whoever builds, downloads or stages something on HPC3 adds its row here in the
 same change.
 
@@ -87,17 +87,14 @@ configuration reads them. Together they are 60 G of the directory.
 | `pydeps/` | 128 M | Python packages the analysis image lacks, added to the analysis jobs' import path: `pydeseq2` and what it needs (`formulaic`, `formulaic_contrasts`, `interface_meta`, `wrapt`) | `AISCIENTIST_HPC_PYDEPS` | `pip install --no-deps --target <root>/pydeps <package>`, run inside `analysis.sif` so the wheels match its Python |
 | `pkgs/` | under 1 M | the shared cache of packages that `run_code` installs when a snippet needs one the image lacks (`gateway/package_cache.py`) | fixed: `<root>/pkgs` | fills itself |
 
-Nothing in the product's code or in the production configuration reads the following, 430 G
+Nothing in the product's code or in the production configuration reads the following, about 24 G
 together:
 
 | Path | Size | What |
 |---|---|---|
-| `hf-minimax-m27/` | 210 G | a second Hugging Face cache holding `MiniMaxAI/MiniMax-M2.7` |
-| `hf/hub/models--LibertAIDAI--GLM-5.3-Flash-NVFP4` | 178 G | weights from model-serving tests |
 | `ollama/` | 24 G | Ollama binaries and `qwen3.6` weights. Ollama is not a serving backend of the product. |
-| `.sing-cache/`, `.pip-cache/`, `.conda-pkgs/` | 16 G, 2.7 G, 657 M | download caches of earlier image and environment builds |
-| `pydeps/flashinfer-*`, `pydeps/fi-*` | part of `pydeps/` | packages left by the model-serving tests |
-| `qwen38_test/`, `sglang-sm120-build/`, `sglang-sm120-patch/`, `.smoketest/`, `.tmp/`, `.sing-tmp/`, two `vlreview-*.out` logs | under 20 M | benchmark scripts, job logs and patch sources |
+| `pydeps/flashinfer-*`, `pydeps/fi-*` | 125 M, part of `pydeps/` | packages left by the model-serving tests |
+| `_archive_2026-10-22/` | 16 M | benchmark scripts, patch sources and job logs set aside for deletion by a storage cleanup (RCHENLAB/AiScientist issue 28). `MANIFEST.txt` lists what came from where. |
 
 ## Literature: `<root>/retigene/` (7.5 G)
 
