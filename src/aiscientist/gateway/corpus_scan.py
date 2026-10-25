@@ -549,7 +549,7 @@ def curation_plan_step(question: str, when: str) -> str:
     q = " ".join(str(question or "").split())
     if len(q) > 300:
         q = q[:297].rstrip() + "…"
-    return (f"**Corpus curation** — Read the whole RetiGene corpus for every gene its papers report as "
+    return (f"**RetiGene curation** — Read the whole RetiGene corpus for every gene its papers report as "
             f"haploinsufficient in retinal disease, and every gene they argue against, to answer: “{q}”. "
             "`extract_haploinsufficient_genes` has a model write search requests, reads every passage they "
             "retrieve and every passage that states a dosage mechanism in words (not only the best "

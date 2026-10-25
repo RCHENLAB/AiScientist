@@ -383,7 +383,7 @@ def test_a_finished_scan_is_kept_and_the_next_request_needs_no_job(tmp_path, mon
     asyncio.run(gw_app._run_corpus_scan(conn, req))
     assert len(builds) == 1
     token = next(p for p in pushed if p.get("type") == "chat_token")["token"]
-    assert "kept because the corpus has not changed" in token and "PRPF31" in token
+    assert "kept because the RetiGene papers have not changed" in token and "PRPF31" in token
     arts = next(p for p in pushed if p.get("type") == "artifacts")
     assert {"genes.csv", "hits.csv"} <= {a["name"] for a in arts["items"]}
     assert [p.get("type") for p in pushed][-1] == "chat_done"
@@ -473,21 +473,18 @@ def test_a_chat_question_for_the_gene_list_is_answered_from_a_kept_scan(tmp_path
     assert seen["stored"] is stored
 
 
-def test_without_a_kept_scan_the_chat_answers_and_says_where_the_full_table_is(tmp_path, monkeypatch):
+def test_without_a_kept_scan_dispatches_to_the_gene_table(tmp_path, monkeypatch):
     conn = _conn(tmp_path)
-    pushed: list[dict] = []
-    conn.push = pushed.append
     ran = []
 
-    async def fake_chat(c, req):
+    async def table(c, req):
         ran.append(req.question)
 
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    monkeypatch.setattr(gw_app, "_literature_corpus_available", lambda c: True)
     monkeypatch.setattr(gw_app, "_stored_corpus_scan", lambda c: None)
-    monkeypatch.setattr(gw_app, "_run_quick_chat", fake_chat)
+    monkeypatch.setattr(gw_app, "_run_gene_table", table)
     _dispatch(conn, "What are haploinsufficient genes?", route="chat")
     assert ran == ["What are haploinsufficient genes?"]
-    assert any("Pick Corpus scan for the complete table" in p.get("text", "") for p in pushed)
 
 
 def test_a_question_about_one_gene_goes_to_the_chat_without_a_lookup(tmp_path, monkeypatch):
@@ -526,3 +523,38 @@ def test_the_scan_executor_has_its_own_gpu_and_never_the_sessions_model(tmp_path
     # the other literature jobs are unchanged: CPU, the session's model
     lit = gw_app._build_literature_executor(conn, run_id="abc123")
     assert lit.gres == "" and lit.job_prelude is None and lit.inject_args["llm_base_url"] == "http://gpu-1:1234/v1"
+
+
+@pytest.mark.parametrize("hpc_enabled", [False, True])
+def test_gene_list_without_reachable_corpus_uses_quick_chat(tmp_path, monkeypatch, hpc_enabled):
+    import threading
+
+    conn = _conn(tmp_path)
+    conn.push = lambda payload, **kw: pushed.append(payload)
+    pushed, ran, checks = [], [], []
+    loop_thread = threading.get_ident()
+    if hpc_enabled:
+        monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    else:
+        monkeypatch.delenv("AISCIENTIST_PAPERQA_ON_HPC", raising=False)
+    monkeypatch.setattr(gw_app, "_stored_corpus_scan", lambda c: None)
+
+    def available(c):
+        checks.append(threading.get_ident())
+        assert threading.get_ident() != loop_thread
+        return False
+
+    async def chat(c, req):
+        ran.append(req.question)
+
+    async def no_table(*args):
+        raise AssertionError("unreachable corpus used for a table")
+
+    monkeypatch.setattr(gw_app, "_literature_corpus_available", available)
+    monkeypatch.setattr(gw_app, "_run_quick_chat", chat)
+    monkeypatch.setattr(gw_app, "_run_gene_table", no_table)
+    _dispatch(conn, "What are haploinsufficient genes?", route="chat")
+    assert ran == ["What are haploinsufficient genes?"] and len(checks) == 1
+    notices = [p for p in pushed
+               if "Ask about the RetiGene papers by name for the complete table" in p.get("text", "")]
+    assert bool(notices) == hpc_enabled

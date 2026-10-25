@@ -21,10 +21,10 @@ scikit-learn>=1.3
 # on SQLite (stdlib), so this costs CI a few seconds and buys back the coverage.
 sqlalchemy>=2.0
 httpx>=0.27
-# pandas + matplotlib: skill templates (skills/*/reference.py) are CodeAct scripts the Scientist
-# runs through run_code, and their tests execute them end to end on tiny tables. Without these two
-# those tests can only skip, and a test module that imported pandas at the top did worse: it
-# aborted collection and CI ran nothing at all. numpy already arrives with scikit-learn.
+# pandas + matplotlib: tests run the tools' table and figure code end to end on tiny tables (DE
+# guards, the dataset preview, the report's figures). Without these two those tests can only skip,
+# and a test module that imported pandas at the top did worse: it aborted collection and CI ran
+# nothing at all. numpy already arrives with scikit-learn.
 pandas>=2.0
 matplotlib>=3.8
 # The reference Croissant validator (RCHENLAB/AiScientist issue 9): tests/test_croissant_metadata.py

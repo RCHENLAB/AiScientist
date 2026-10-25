@@ -1,13 +1,16 @@
 """Atomic skill library — small, model-rewritable code capabilities surfaced on demand.
 
-Curated skills come from the pinned, checksum-verified release configured in
-``configs/skills_registry.json``. The folder scanning described below is also used to read
-release bundles and for the explicitly configured transitional fallback and induced skills.
+The library has two sources:
 
-A *skill* is any folder holding a ``SKILL.md``, at ANY depth under ``skills/`` (repo root), in the
-Anthropic Agent-Skills shape — so ``skills/<name>/`` and a category layout such as
-``skills/single-cell/qc-snrna-with-cellqc-standalone/`` both work, and a skill written for another
-Agent-Skills catalog can be dropped in unchanged:
+- the CURATED skills: the pinned, checksum-verified release of the ``lijinbio/aiscientist-skills``
+  registry configured in ``configs/skills_registry.json`` (``agents/skills_registry.py``). Without
+  an installed release there are no curated skills, and the log says how to install it;
+- the INDUCED skills, written from runs into ``$AISCIENTIST_INDUCED_SKILLS_DIR`` (see
+  ``skill_induction.py``), which reach the models only once an admin approves them.
+
+A *skill* is any folder holding a ``SKILL.md``, at ANY depth, in the Anthropic Agent-Skills shape —
+so ``<name>/`` and a category layout such as ``single-cell/qc-snrna-with-cellqc-standalone/`` both
+work, and a skill written for another Agent-Skills catalog reads unchanged:
 
 - ``SKILL.md`` — the ONLY required file: frontmatter (``name`` + ``description``, plus optional
   Agent-Skills fields such as ``license``, ``compatibility`` and a nested ``metadata:`` block) and a
@@ -16,8 +19,9 @@ Agent-Skills catalog can be dropped in unchanged:
 - any other file in the folder or its subfolders (``reference.py``, ``scripts/stage.sh``, ...) — a
   bundled file the Scientist fetches on demand, adapts, and runs.
 
-A folder dropped in is picked up without a restart: :func:`refresh_skills` re-scans whenever the
-files on disk change, and the lab calls it before every step.
+A newly installed release, or an induced skill, is picked up without a restart:
+:func:`refresh_skills` re-scans whenever the files on disk change, and the lab calls it before every
+step.
 
 It sits between the two other layers (see ``docs/skills_and_pipelines_architecture.md``):
 
@@ -34,8 +38,6 @@ It sits between the two other layers (see ``docs/skills_and_pipelines_architectu
 3. ``read_skill_reference(name, file="reference.py")`` returns one bundled file on demand.
 
 ``search_skills(query)`` ranks the library by keyword for when the list is long.
-
-Override the location with ``$AISCIENTIST_SKILLS_DIR`` (repo-root ``skills/`` by default).
 
 **Induced skills are reviewed before any model sees them.** :data:`ALL_SKILLS` is everything on disk;
 :data:`SKILLS` — what the PI plans with and the Scientist lists, searches and reads — holds the
@@ -103,15 +105,6 @@ class Skill:
     # requires hyphens; plans, presets and older runs wrote ``pairwise_de``), plus any listed in
     # ``metadata.aliases`` (comma-separated), e.g. the ``_v2`` name a skill was migrated from.
     aliases: tuple[str, ...] = ()
-
-
-def _skills_dir() -> Path:
-    """The atomic-skill library: ``$AISCIENTIST_SKILLS_DIR`` or repo-root ``skills/``."""
-    env = os.environ.get("AISCIENTIST_SKILLS_DIR")
-    if env:
-        return Path(env)
-    # skills.py -> agents -> aiscientist -> src -> <repo root>
-    return Path(__file__).resolve().parents[3] / "skills"
 
 
 def _unquote(value: str) -> str:
@@ -195,34 +188,27 @@ def _first_line(text: str) -> str:
 def _induced_dir() -> "Path | None":
     """The INDUCED-skill root (``$AISCIENTIST_INDUCED_SKILLS_DIR``), or None when induction is not
     configured. Kept separate from the curated library on purpose — see ``skill_induction.py``:
-    machine-written templates live in the gateway workspace, never in the git-tracked ``skills/``."""
+    machine-written templates live in the gateway workspace, never in the pinned registry release."""
     env = os.environ.get("AISCIENTIST_INDUCED_SKILLS_DIR")
     return Path(env) if env else None
 
 
-def _roots() -> "list[Path]":
-    """Where skills are loaded from, curated first: ``skills/`` and, if configured, the induced root."""
-    induced = _induced_dir()
-    return [_skills_dir(), *([induced] if induced is not None else [])]
-
-
 def _load_skills() -> dict[str, Skill]:
-    """Load every ``SKILL.md`` under the skill roots, at any depth, into the library. The skill name
-    is its frontmatter ``name`` or, failing that, its folder name. Everything in the induced root is
-    induced — whatever its frontmatter says — and carries its review status (``pending`` until an
-    admin decides), so a folder dropped there cannot skip the review."""
+    """The curated skills of the pinned release, then every ``SKILL.md`` under the induced root, at
+    any depth. An induced skill's name is its frontmatter ``name`` or, failing that, its folder
+    name. Everything in the induced root is induced — whatever its frontmatter says — and carries
+    its review status (``pending`` until an admin decides), so a folder dropped there cannot skip
+    the review."""
     from .skills_registry import LOG, load
     try:
         out = load(_load_from)
     except Exception as exc:  # noqa: BLE001 - fail closed for skills, not for the whole service
         # A pinned release that is installed but corrupt, incomplete or misconfigured gives NO
-        # curated skills (never the repo fallback). This runs at import, so raising would stop the
-        # gateway, and every request that never touches a skill, from starting.
+        # curated skills. This runs at import, so raising would stop the gateway, and every request
+        # that never touches a skill, from starting.
         LOG.error("Pinned skills release refused, no curated skills are loaded: %s: %s",
                   type(exc).__name__, exc)
         out = {}
-    if out is None:
-        out = _load_from(_skills_dir())
     induced = _induced_dir()
     if induced is not None:
         reviews = _load_reviews()
@@ -275,8 +261,6 @@ def _skill_md_files(root: Path) -> "list[Path]":
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(_SKIP_PREFIXES))
-        if Path(dirpath) == root and root == _skills_dir():
-            dirnames[:] = [d for d in dirnames if d != "releases"]
         if "SKILL.md" in filenames:
             found.append(Path(dirpath) / "SKILL.md")
     return found
@@ -398,16 +382,18 @@ def _load_from(root: Path) -> dict[str, Skill]:
 
 
 def _signature() -> tuple:
-    """What the skill roots look like on disk: every file's path, size and mtime. Cheap — a stat per
-    file — and it changes whenever a skill folder is added, removed or edited."""
+    """What the pinned release and the induced root look like on disk: every file's path, size and
+    mtime. Cheap — a stat per file — and it changes whenever a release is installed or a skill
+    folder is added, removed or edited."""
     from .skills_registry import config, release_dir
     try:
         cfg = config()
         sig: list[tuple] = [(repr(cfg),)]
-        release = [release_dir(cfg)]
+        roots = [release_dir(cfg)]
     except Exception as exc:  # noqa: BLE001 - _load_skills reports a bad config; re-scan once it changes
-        sig, release = [("registry config error", repr(exc))], []
-    for root in [*_roots(), *release]:
+        sig, roots = [("registry config error", repr(exc))], []
+    induced = _induced_dir()
+    for root in [*roots, *([induced] if induced is not None else [])]:
         if not root.is_dir():
             sig.append((str(root), None))
             continue
@@ -433,10 +419,10 @@ _REGISTERED: dict[str, Skill] = {}
 
 
 def refresh_skills() -> bool:
-    """Bring :data:`SKILLS` up to date with the folders on disk, so a skill dropped into ``skills/``
-    (or edited, or removed) is seen by the next step without a restart. A no-op unless a file under
-    the skill roots changed since the last scan. Updates the dict IN PLACE, because other modules
-    hold a reference to it. Returns True when the library changed."""
+    """Bring :data:`SKILLS` up to date with the files on disk, so a newly installed release, or an
+    induced skill added, edited or removed, is seen by the next step without a restart. A no-op
+    unless a file of the release or the induced root changed since the last scan. Updates the dict
+    IN PLACE, because other modules hold a reference to it. Returns True when the library changed."""
     global _SIGNATURE
     sig = _signature()
     if sig == _SIGNATURE:

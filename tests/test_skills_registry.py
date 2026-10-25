@@ -59,7 +59,8 @@ def test_checksum_ok_catalog_metadata_and_tiers(release, monkeypatch):
 
 
 @pytest.mark.parametrize("missing", [False, True])
-def test_checksum_mismatch_or_missing_never_falls_back(release, missing, caplog):
+def test_a_checksum_mismatch_or_missing_file_gives_no_curated_skills(release, missing, caplog, monkeypatch):
+    monkeypatch.delenv("AISCIENTIST_INDUCED_SKILLS_DIR", raising=False)
     path = release / "skill-core-1.2.3.zip"
     if missing:
         path.unlink()
@@ -67,11 +68,9 @@ def test_checksum_mismatch_or_missing_never_falls_back(release, missing, caplog)
         path.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="checksum"):
         registry.load(sk._load_from)
-    # The library is empty, not the repository's skills/, and loading does not raise: it runs at
-    # import, so raising would keep the gateway from starting.
-    fallback = set(sk._load_from(sk._skills_dir()))
-    assert fallback
-    assert not set(sk._load_skills()) & fallback
+    # The library is empty, and loading does not raise: it runs at import, so raising would keep
+    # the gateway from starting.
+    assert sk._load_skills() == {}
     assert "Pinned skills release refused" in caplog.text and "checksum" in caplog.text
 
 
@@ -82,17 +81,20 @@ def test_tag_pinning(release, monkeypatch, tag):
         registry.config()
 
 
-def test_fallback_is_explicit_and_logged(tmp_path, monkeypatch, caplog):
+def test_an_absent_release_is_an_empty_library_and_says_how_to_install_it(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(tmp_path / "absent"))
+    monkeypatch.delenv("AISCIENTIST_INDUCED_SKILLS_DIR", raising=False)
+    # Neither a folder named by AISCIENTIST_SKILLS_DIR nor a fallback switch brings local skills back.
     monkeypatch.setenv("AISCIENTIST_SKILLS_DIR", str(tmp_path / "local"))
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_TRANSITIONAL_FALLBACK", "true")
     local = tmp_path / "local" / "example"
     local.mkdir(parents=True)
     (local / "SKILL.md").write_text("---\nname: example\n---\nLocal guidance")
-    assert "example" in sk._load_skills()
-    assert "transitional local skills fallback" in caplog.text
-    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_TRANSITIONAL_FALLBACK", "false")
-    assert "example" not in sk._load_skills()
-    assert "not installed" in caplog.text
+    assert registry.load(sk._load_from) == {}
+    assert sk._load_skills() == {}
+    assert "Pinned skills release v0.1.0 is not installed" in caplog.text
+    assert (f"gh release download v0.1.0 -R lijinbio/aiscientist-skills -D {tmp_path / 'absent' / '0.1.0'}"
+            in caplog.text)
 
 
 def test_unpacked_files_must_all_be_verified(release):
@@ -356,7 +358,8 @@ def test_release_bundle_missing_a_catalog_skill_is_refused(tmp_path, monkeypatch
 
 def test_bad_config_leaves_no_skills_and_no_crash(release, tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASE_TAG", "main")
-    assert not set(sk._load_skills()) & set(sk._load_from(sk._skills_dir()))
+    monkeypatch.delenv("AISCIENTIST_INDUCED_SKILLS_DIR", raising=False)
+    assert sk._load_skills() == {}
     assert "pinned" in caplog.text
     sk.refresh_skills()                     # the re-scan signature must not raise either
     ctx = HarnessContext(workspace=tmp_path / "run")

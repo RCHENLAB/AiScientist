@@ -1,8 +1,9 @@
-"""A skill is added by dropping its folder under ``skills/``: no code change, no restart, no required
-code file, any folder depth, and the Agent-Skills frontmatter other catalogs use (a nested
-``metadata:`` block, quoted values). These tests pin each of those."""
+"""A skill folder in the Agent-Skills shape loads as it is: no required code file, any folder depth,
+and the frontmatter other catalogs use (a nested ``metadata:`` block, quoted values). A release
+installed while the platform runs is used without a restart. These tests pin each of those."""
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -106,12 +107,12 @@ def test_two_folders_with_one_name_keep_the_first(tmp_path, capsys):
 
 
 @pytest.fixture
-def isolated_library(tmp_path, monkeypatch):
-    """The loader pointed at an empty temporary ``skills/``, with its own SKILLS dict and scan state,
-    all restored afterwards so nothing leaks into other tests."""
+def isolated_library(tmp_path, monkeypatch, skill_release):
+    """The loader pointed at an empty releases root, with its own SKILLS dict and scan state, all
+    restored afterwards so nothing leaks into other tests. Returns the folder a test writes skills
+    into, the library, and ``install`` (publish that folder as the pinned release)."""
     root = tmp_path / "skills"
     root.mkdir()
-    monkeypatch.setenv("AISCIENTIST_SKILLS_DIR", str(root))
     monkeypatch.delenv("AISCIENTIST_INDUCED_SKILLS_DIR", raising=False)
     lib: dict = {}
     monkeypatch.setattr(skills_mod, "SKILLS", lib)
@@ -119,35 +120,39 @@ def isolated_library(tmp_path, monkeypatch):
     monkeypatch.setattr(skills_mod, "_SIGNATURE", ())
     monkeypatch.setattr(skills_mod, "_REGISTERED", {})
     refresh_skills()
-    return root, lib
+    return root, lib, lambda: skill_release(root, refresh=False)
 
 
-def test_a_dropped_in_folder_is_seen_without_a_restart(isolated_library):
-    root, lib = isolated_library
+def test_an_installed_release_is_seen_without_a_restart(isolated_library):
+    root, lib, install = isolated_library
     assert lib == {}
     _write(root, "single-cell/qc-snrna-with-cellqc-standalone/SKILL.md", _AGENT_SKILL)
+    release = install()
     assert refresh_skills() is True
     assert "qc-snrna-with-cellqc-standalone" in lib
     assert refresh_skills() is False                              # nothing changed: no re-scan
 
     _write(root, "single-cell/qc-snrna-with-cellqc-standalone/SKILL.md",
            _AGENT_SKILL.replace("Run the CellQC pipeline", "Run CellQC, edited,"))
+    install()
     refresh_skills()
     assert lib["qc-snrna-with-cellqc-standalone"].summary.startswith("Run CellQC, edited,")
 
-    (root / "single-cell/qc-snrna-with-cellqc-standalone/SKILL.md").unlink()
+    shutil.rmtree(release)
     refresh_skills()
     assert "qc-snrna-with-cellqc-standalone" not in lib
 
 
 def test_an_induced_skill_survives_a_rescan_until_it_is_removed(isolated_library):
-    root, lib = isolated_library
+    root, lib, install = isolated_library
     assert register_skill(Skill("induced_one", summary="learned", files={"reference.py": "x"}))
     _write(root, "dropped/SKILL.md", _skill_md("dropped"))
+    install()
     refresh_skills()
     assert {"induced_one", "dropped"} <= set(lib)
     del lib["induced_one"]
     _write(root, "another/SKILL.md", _skill_md("another"))
+    install()
     refresh_skills()
     assert "induced_one" not in lib                               # a removal sticks
 

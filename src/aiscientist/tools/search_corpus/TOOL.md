@@ -50,6 +50,36 @@ Ranks the chunks of the corpus text cache (`mechanism_cache/chunks.jsonl`, vecto
 
 ## Where it runs
 
+The gateway first uses an Eye Server copy when the index and offline embedding model are available.
+It runs the same retrieval in a worker thread on CPU, with one lazily loaded embedder per process;
+it does not submit a Slurm job. Otherwise the HPC3 route below remains the fallback.
+Local retrieval can enable the literature line without `AISCIENTIST_PAPERQA_ON_HPC`; the GPU Corpus
+scan still requires its HPC3 configuration.
+
+On the Eye Server (with `rsync`, an SSH key for HPC3 and `sentence-transformers` installed), run:
+
+```sh
+PYTHONPATH=src python scripts/sync_corpus_index.py \
+  --source <user>@access-hpc3.rcic.uci.edu:/dfs3b/ruic20_lab/software/AiScientist/retigene \
+  --with-model --with-hgnc
+```
+
+The copy goes through RCIC's transfer node `access-hpc3.rcic.uci.edu`: RCIC allows no data
+transfer on the HPC3 login nodes, and the script refuses a login-node source.
+
+The default destination is `<AISCIENTIST_DATA_ROOT or DATA_ROOT>/literature`, following the
+gateway's data-root default when neither is set. Set `AISCIENTIST_LOCAL_CORPUS_ROOT` in the gateway
+and sync command to override it, or pass `--destination` to the script. The layout is
+`mechanism_cache/`, `manifest.csv`, optional `hf_cache/` and `hgnc_complete_set.txt`. The manifest
+source defaults to `paperqa_manifest.csv` (`--manifest` overrides its filename). The model can also
+be installed in the normal Hugging Face cache. Retrieval loads it offline and never downloads it.
+Repeat the command after rebuilding the HPC3 index: rsync compares checksums and transfers only
+changed files, retaining unrelated destination files. Run synchronization while retrieval is idle
+so a request cannot read chunks and vectors from different index revisions; a copy whose vectors do
+not match its chunks is not used (the request goes to HPC3), since searching it would embed the
+whole corpus again on the gateway's CPU. The index sync does
+not copy PDFs. `--with-model` and `--with-hgnc` require those optional source paths to exist.
+
 <!-- generated:runs-on -->
 As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`. Its job runs no language model: it needs no GPU allocation.
 
@@ -87,3 +117,21 @@ On the fast chat path: yes.
 > that appear in them; anything else is removed from your answer. Returns status failed when the
 > corpus has nothing, then use literature_search.
 <!-- /generated:model-description -->
+
+## Gene tables and saving results
+
+In the console, a list question that names the RetiGene papers ("What are haploinsufficient genes in
+RetiGene papers?") is a curation of the whole corpus on HPC3, with its own plan card and two tables
+(`gateway/corpus_scan.py`). This tool serves the other questions, through the literature line.
+
+A client that asks for the chat route (`route="chat"`, the API) gets, for a gene-list question, a
+kept full corpus scan when there is one. Otherwise the session model extracts a table from the
+passages this tool returns. Each kept row needs an exact verbatim evidence quote containing the gene
+and a source PMID and page. The answer labels this as a corpus search rather than a complete scan
+and keeps `literature/genes.csv` with the run. No verified rows means an empty table and an explicit
+explanation, never a gene list from model memory.
+
+**Save tables to my data** in Runs saves a run's tables as a dataset folder: a curation's two
+tables; otherwise these gene tables, a scan's `haploinsufficiency/genes.csv`, or a literature
+answer's `papers.csv`. The run's own downloads stay. Citation checks warn about uncited paragraphs;
+they do not attempt to infer which individual sentences state paper facts.

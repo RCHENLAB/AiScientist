@@ -392,7 +392,7 @@ def delivery(tmp_path):
 
 
 @pytest.fixture
-def fake_cellqc(tmp_path, monkeypatch):
+def fake_cellqc(tmp_path, monkeypatch, cellqc_release):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     exe = bindir / "cellqc"
@@ -673,15 +673,13 @@ def _skill_settings() -> dict:
     return json.loads(get_skill("qc-snrna-with-cellqc-standalone").files["assets/cellqc-defaults.json"])
 
 
-def test_the_tool_keeps_no_copy_of_the_skills_settings():
-    from aiscientist.tools._lib.scrna import PARAMS
+def test_the_tool_keeps_no_copy_of_the_skills_settings(cellqc_release):
     from aiscientist.tools.run_cellqc import tool
     assert not any(hasattr(tool, n) for n in ("_GENESETS", "_DOUBLET_RATE", "_CAPACITY"))
     settings = _skill_settings()
     assert set(settings["genesets"]) == {"mouse", "human", "macaque"}
     assert settings["doublet"]["rate"] == {"next_gem": 0.1, "gem_x": 0.052}
-    # The defaults the tool's schema shows the model must be the skill's.
-    assert {k: PARAMS["run_cellqc"][k][0] for k in settings["thresholds"]} == settings["thresholds"]
+    # That the tool's schema defaults are the pinned release's: tests/test_pinned_release.py.
 
 
 def test_the_cellqc_config_is_built_from_the_skill_sent_with_the_job(tmp_path, delivery, fake_cellqc):

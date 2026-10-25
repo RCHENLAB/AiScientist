@@ -60,11 +60,13 @@ QUERY_SYSTEM = (
 ANSWER_SYSTEM = (
     "You are AiScientist answering a researcher's question from the published literature. You are "
     "given the question and numbered papers: passages from the full text of papers in the lab's "
-    "corpus, and abstracts of papers found in PubMed. Answer in English, from these texts only:\n"
+    "RetiGene corpus, and abstracts of papers found in PubMed. Call that collection \"the RetiGene "
+    "papers\" or \"the RetiGene corpus\", never \"the corpus\" alone. Answer in English, from these texts only:\n"
     "- Open with a direct answer in one or two sentences, then explain in a few short paragraphs "
     "(at most about 350 words in all).\n"
     "- After every statement drawn from a paper, cite it by its number in square brackets, e.g. "
-    "[2] or [1, 4]. Cite only the numbers given; never invent a paper, an author or a number.\n"
+    "[2] or [1, 4]. Each factual sentence needs its own citation, including the opening answer. "
+    "Cite only the numbers given; never invent a paper, an author or a number.\n"
     "- Do not state findings the texts do not contain. Say plainly what they do not answer, "
     "and when the papers found do not address the question, say so instead of answering from "
     "memory.\n"
@@ -93,6 +95,7 @@ class Paper:
     queries: list[str] = field(default_factory=list)
     passages: list[str] = field(default_factory=list)   # full-text passages from the lab's corpus
     sources: list[str] = field(default_factory=list)    # "corpus", "pubmed"
+    pages: list[str] = field(default_factory=list)      # retrieved corpus pages, in rank order
 
     def key(self) -> str:
         return (self.doi.lower() or self.pmid or self.title.lower()).strip()
@@ -100,6 +103,8 @@ class Paper:
     def line(self) -> str:
         """The reference line: the citation, then a link to the paper."""
         text = self.citation or f"{self.title} ({self.year})"
+        if "corpus" in self.sources and self.pmid:
+            text += f" (PMID {self.pmid}, p. {', '.join(self.pages)})" if self.pages else f" (PMID {self.pmid})"
         return f"{text} {self.url}".strip() if self.url else text
 
 
@@ -130,7 +135,7 @@ def plan_step(question: str, corpus: bool = False, pubmed: bool = True) -> str:
     if corpus:
         return (f"**Literature search** — Search the full text of the lab's RetiGene corpus (`{CORPUS_TOOL}`, "
                 f"a short HPC3 job) and PubMed (through Europe PMC, `{TOOL}`) for what answers: “{q}”. Read "
-                f"the best corpus passages (up to {CORPUS_PASSAGES}) and the abstracts of the most relevant "
+                f"the best RetiGene passages (up to {CORPUS_PASSAGES}) and the abstracts of the most relevant "
                 f"PubMed papers (up to {MAX_PAPERS}), and answer with numbered citations to them. It takes "
                 "one to a few minutes.")
     return (f"**Literature search** — Search PubMed (through Europe PMC) for papers that answer: “{q}”. "
@@ -324,6 +329,8 @@ def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
             by_pmid[pmid] = p
             corpus.append(p)
         page = c.get("page")
+        if page not in (None, "") and str(page) not in p.pages:
+            p.pages.append(str(page))
         p.passages.append((f"(p. {page}) " if page not in (None, "") else "") + text)
         n_passages += 1
     info.update(passages=n_passages, papers=len(corpus))
@@ -355,14 +362,14 @@ def answer_messages(question: str, papers: list[Paper]) -> list[dict]:
                                      p.journal, p.year) if x)
         parts = [head] + ([meta] if meta else [])
         if p.passages:
-            parts.append("Passages from the full text (lab's corpus):\n" + "\n".join(f"- {t}" for t in p.passages))
+            parts.append("Passages from the full text (the lab's RetiGene corpus):\n" + "\n".join(f"- {t}" for t in p.passages))
         if p.abstract or not p.passages:
             parts.append(f"Abstract: {p.abstract or '(no abstract available)'}")
         blocks.append("\n".join(parts))
     in_corpus = any(p.passages for p in papers)
     in_pubmed = any("pubmed" in p.sources or not p.passages for p in papers)
-    where = ("the lab's corpus and PubMed" if in_corpus and in_pubmed else
-             "the lab's corpus" if in_corpus else "PubMed")
+    where = ("the lab's RetiGene corpus and PubMed" if in_corpus and in_pubmed else
+             "the lab's RetiGene corpus" if in_corpus else "PubMed")
     user = (f"Question: {question}\n\nPapers found in {where}:\n\n" + "\n\n".join(blocks)
             + "\n\nWrite the answer now.")
     return [{"role": "system", "content": ANSWER_SYSTEM}, {"role": "user", "content": user}]
@@ -384,6 +391,27 @@ def _numbers(group: str) -> list[int]:
     return out
 
 
+_ABSTENTION = re.compile(
+    r"\b(?:(?:papers?|abstracts?|passages?|texts?|studies)\s+(?:(?:found|retrieved)\s+)?(?:do(?:es)?\s+not|did\s+not|don['\u2019]t|doesn['\u2019]t|didn['\u2019]t)"
+    r"|no\s+(?:retrieved\s+)?papers?\b|not\s+(?:addressed|answered|reported|studied|covered|established)"
+    r"|unclear|unknown|insufficient\s+evidence|cannot\s+(?:answer|determine|conclude))\b", re.I)
+
+
+def _uncited_findings(paragraph: str) -> bool:
+    """Flag plausible prose claims, leaving clear abstentions and layout text alone."""
+    text = paragraph.strip()
+    if _CITE.search(text) or len(text.split()) <= 4:
+        return False
+    if (re.fullmatch(r"#{1,6}\s+[^\n]+", text)
+            or re.fullmatch(r"(?:\*\*|__)[^\n]+(?:\*\*|__):?", text)
+            or (len(text.split()) <= 12 and re.fullmatch(r"[^.?!\n]+:", text))):
+        return False
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return not all(_ABSTENTION.search(sentence)
+                   and not re.search(r"\b(?:but|however|although|yet)\b", sentence, re.I)
+                   for sentence in sentences)
+
+
 def finish_answer(text: str, papers: list[Paper]) -> "tuple[str, list[Paper]]":
     """The answer with its citations checked, and the papers it cites. A bracketed number that is
     not a paper is removed; the reference list is written here, from the papers cited."""
@@ -397,10 +425,15 @@ def finish_answer(text: str, papers: list[Paper]) -> "tuple[str, list[Paper]]":
                 cited.append(n)
         return f"[{', '.join(str(n) for n in dict.fromkeys(nums))}]" if nums else ""
 
-    body = _CITE.sub(fix, str(text or "")).strip()
     # A reference list the model wrote anyway is dropped: the one below is the checked one.
-    body = re.split(r"\n#{0,3}\s*\**(?:References|Reference list|Sources)\**:?\s*\n", body, maxsplit=1)[0].rstrip()
+    body = re.split(r"\n#{0,3}\s*\**(?:References|Reference list|Sources)\**:?\s*\n",
+                    str(text or ""), maxsplit=1)[0].rstrip()
+    body = _CITE.sub(fix, body).strip()
     body = re.sub(r"[ \t]+([.,;:])", r"\1", body)
+    paragraphs = [p for p in re.split(r"\n\s*\n", body) if p.strip()]
+    if any(_uncited_findings(p) for p in paragraphs):
+        body += ("\n\n**Citation warning:** One or more answer paragraphs may state paper findings without a valid citation. "
+                 "Treat any paper claims in those paragraphs as unverified.")
     used = [known[n] for n in sorted(cited)]
     return body, used
 
@@ -422,7 +455,7 @@ def no_papers_answer(question: str, collected: Collected) -> str:
     """The reply when the search returned nothing to read."""
     if collected.corpus is not None and not collected.searched:
         # The corpus alone (a question about the RetiGene papers): PubMed was not searched.
-        why = f" The corpus search failed: {collected.corpus['error']}." if collected.corpus.get("error") else ""
+        why = f" The RetiGene corpus search failed: {collected.corpus['error']}." if collected.corpus.get("error") else ""
         return (f"The lab's RetiGene corpus returned no passage to answer this from.{why} Nothing was "
                 "answered from memory, and PubMed was not searched because the question asks about the "
                 "RetiGene papers. Name the gene, disease or tissue more specifically, or say “also search "
@@ -431,9 +464,9 @@ def no_papers_answer(question: str, collected: Collected) -> str:
     why = (" The search itself failed: " + "; ".join(collected.errors[:2]) + ".") if collected.errors else ""
     where = "PubMed returned no papers"
     if collected.corpus is not None:
-        where = "Neither the lab's corpus nor PubMed returned a paper"
+        where = "Neither the lab's RetiGene corpus nor PubMed returned a paper"
         if collected.corpus.get("error"):
-            why += f" The corpus search failed: {collected.corpus['error']}."
+            why += f" The RetiGene corpus search failed: {collected.corpus['error']}."
     return (f"{where} to answer this from (searched {tried}).{why} Nothing was "
             "answered from memory. Try naming the gene, disease or tissue more specifically, or ask for "
             "an analysis of your data instead.")
@@ -456,14 +489,14 @@ def method_md(collected: Collected, date: str) -> str:
                             if used else "") + "\n")
     if c is not None and not collected.searched:
         lines.append("PubMed was not searched: the question asks about the RetiGene papers.")
-        lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (corpus passages); the answer cites "
+        lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (RetiGene passages); the answer cites "
                      "them by number, and each reference was checked against the search results.")
         return "\n".join(lines)
     lines.append(f"Searched PubMed through Europe PMC on {date} with {len(collected.searched)} "
                  f"quer{'y' if len(collected.searched) == 1 else 'ies'}:")
     for s in collected.searched:
         lines.append(f"- “{s['query']}”: {s['count']} paper(s)" + (f" (error: {s['error']})" if s.get("error") else ""))
-    lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (corpus passages, titles and abstracts); "
+    lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (RetiGene passages, titles and abstracts); "
                  "the answer cites them by number, and each reference was checked against the search results.")
     return "\n".join(lines)
 
@@ -488,4 +521,4 @@ def passages_md(papers: list[Paper]) -> str:
     for p in papers:
         if p.passages:
             out.append(f"## [{p.number}] {p.citation or p.title}\n\n" + "\n\n".join(f"> {t}" for t in p.passages))
-    return ("# Corpus passages read\n\n" + "\n\n".join(out) + "\n") if out else ""
+    return ("# RetiGene corpus passages read\n\n" + "\n\n".join(out) + "\n") if out else ""

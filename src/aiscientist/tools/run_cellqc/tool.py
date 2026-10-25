@@ -6,7 +6,7 @@ single-cell line reads. The job runs in the image of the CellQC skill its TOOL.m
 Bioconductor stack; nothing here installs anything. The skill also supplies CellQC's reference
 settings (gene sets, doublet rates, default filters): see :func:`_settings`.
 
-The steps follow the CellQC standalone skill (skills/single-cell/qc-snrna-with-cellqc-standalone):
+The steps follow the CellQC standalone skill (qc-snrna-with-cellqc-standalone):
 stage the deliveries without writing into them, write the sample file and config, dry-run, run, and
 validate ``result/`` before anything is used — keeping "the run completed" apart from "the result
 can be trusted".

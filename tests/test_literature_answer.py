@@ -145,13 +145,13 @@ def test_corpus_passages_come_first_one_source_per_paper_and_a_pubmed_duplicate_
         "RDH5 paper 9001", "Nakamura M et al.", "2002", "Am J Ophthalmol", "10.1/x")
     assert lit.references_md([first], got.papers) == (
         "**References**\n\n- [1] Nakamura M et al. RDH5 paper 9001. Am J Ophthalmol (2002). "
-        "PMID:9001 DOI:10.1/x https://pubmed.ncbi.nlm.nih.gov/9001/")
+        "PMID:9001 DOI:10.1/x (PMID 9001, p. 1) https://pubmed.ncbi.nlm.nih.gov/9001/")
     assert first.url == "https://pubmed.ncbi.nlm.nih.gov/9001/"
     assert both.title == "Paper 2" and both.abstract == "Abstract text." and both.passages == ["(p. 4) Same paper as PubMed hit 2."]
     assert got.corpus == {"status": "ok", "terms": result["terms"], "passages": 3, "papers": 2}
     # the answer reads the passages and the abstracts; the saved method and tables say where each came from
     user = lit.answer_messages("Q?", got.papers)[1]["content"]
-    assert "Papers found in the lab's corpus and PubMed" in user
+    assert "Papers found in the lab's RetiGene corpus and PubMed" in user
     assert "[1] RDH5 paper 9001" in user and "- (p. 1) The rod b-wave recovered" in user
     assert "[2] Paper 2" in user and "Abstract: Abstract text." in user
     md = lit.method_md(got, "2026-10-21")
@@ -165,7 +165,7 @@ def test_corpus_passages_come_first_one_source_per_paper_and_a_pubmed_duplicate_
     assert {k: rows[1][k] for k in ("title", "authors", "year", "journal", "doi")} == {
         "title": "Paper 2", "authors": "Author2 A, Other B", "year": "2024",
         "journal": "J Eye", "doi": "10.1/p2"}  # PubMed metadata takes precedence.
-    assert lit.passages_md(got.papers).startswith("# Corpus passages read\n\n## [1] Nakamura M")
+    assert lit.passages_md(got.papers).startswith("# RetiGene corpus passages read\n\n## [1] Nakamura M")
 
 
 def test_a_failed_corpus_search_leaves_pubmed_alone_and_says_so():
@@ -176,7 +176,7 @@ def test_a_failed_corpus_search_leaves_pubmed_alone_and_says_so():
     assert lit.add_corpus(pubmed, None) is pubmed                       # no corpus: unchanged
     none = lit.add_corpus(lit.collect_papers(lambda q, n: {"status": "ok", "results": []}, ["a"]),
                           {"status": "failed", "error": "0 passages"})
-    assert lit.no_papers_answer("q", none).startswith("Neither the lab's corpus nor PubMed returned a paper")
+    assert lit.no_papers_answer("q", none).startswith("Neither the lab's RetiGene corpus nor PubMed returned a paper")
 
 
 def test_the_plan_step_says_when_the_corpus_is_searched_too():
@@ -201,7 +201,7 @@ def test_legacy_corpus_citations_fill_csv_without_rewriting_references(citation,
         {"pmid": "9001", "text": "A passage.", "citation": citation}]})
     row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
     assert tuple(row[k] for k in ("title", "authors", "year", "journal", "doi")) == expected
-    assert got.papers[0].line() == citation + " https://pubmed.ncbi.nlm.nih.gov/9001/"
+    assert got.papers[0].line() == citation + " (PMID 9001) https://pubmed.ncbi.nlm.nih.gov/9001/"
 
 
 def test_structured_corpus_metadata_takes_precedence_over_the_citation():

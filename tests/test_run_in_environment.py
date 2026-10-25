@@ -33,7 +33,8 @@ def _skill(root: Path, name: str, front: str, body: str = "Run the pipeline.\n",
 
 
 @pytest.fixture
-def library(tmp_path, monkeypatch):
+def library(tmp_path, monkeypatch, skill_release):
+    """A release of five skills, from a full environment declaration to none."""
     root = tmp_path / "skills"
     _skill(root, "cellqc-standalone",
            "description: Run CellQC by hand.\nmetadata:\n  category: single-cell\n"
@@ -43,12 +44,9 @@ def library(tmp_path, monkeypatch):
     _skill(root, "floating-tag", 'description: Unpinned.\nimage: "docker://x/y:latest"\n')
     _skill(root, "resources-only", 'description: No image.\nmetadata:\n  cpus: "8"\n')
     _skill(root, "plain", "description: Just advice.\n")
-    monkeypatch.setenv("AISCIENTIST_SKILLS_DIR", str(root))
     monkeypatch.setenv("AISCIENTIST_INDUCED_SKILLS_DIR", str(tmp_path / "none"))
-    sk.refresh_skills()
-    yield root
-    monkeypatch.undo()
-    sk.refresh_skills()
+    skill_release(root)
+    return root
 
 
 def test_a_skill_declares_its_environment_in_metadata_or_at_the_top(library):
@@ -73,10 +71,15 @@ def test_the_manifest_says_which_skills_run_in_their_own_environment(library):
 # --- the tool --------------------------------------------------------------------------------
 
 class _Runner:
+    # A registry skill runs only on an executor that applies what the skill declares.
+    supports_skill_policy = True
+
     def __init__(self):
         self.calls: list[tuple] = []
 
     def run_in_image(self, command, image, **kw):
+        # The skill's files are staged for the call only: keep what they held.
+        kw["files"] = {rel: Path(path).read_text() for rel, path in (kw.get("files") or {}).items()}
         self.calls.append((command, image, kw))
         return {"status": "ok", "returncode": 0, "stdout": "done"}
 
@@ -104,7 +107,7 @@ def test_the_skill_s_declared_image_and_resources_are_what_runs(library):
     assert (command, image) == ("cellqc --version", CELLQC)
     assert (kw["cpus"], kw["mem_gb"], kw["time_limit"]) == (16, 80, "08:00:00")
     assert kw["workdir"] == "env/cellqc-standalone"
-    assert kw["files"] == {"scripts/stage.sh": str(library / "cellqc-standalone" / "scripts/stage.sh")}
+    assert kw["files"] == {"scripts/stage.sh": "echo stage\n"}
 
 
 def test_the_agent_cannot_run_a_skill_without_an_environment_or_an_unknown_one(library):

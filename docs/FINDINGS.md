@@ -9,7 +9,7 @@ unchanged, and a date marks any status that may have moved since.
 What the system is and how it is built: [README.md](../README.md) and
 [architecture/README.md](architecture/README.md). Deployment: [deploy/README.md](../deploy/README.md).
 The protocols and code templates the agents load: [preset_pipelines/](../preset_pipelines/) and
-[skills/](../skills/).
+the pinned release of [aiscientist-skills](https://github.com/lijinbio/aiscientist-skills).
 
 Last updated 2026-10-09.
 

@@ -17,6 +17,8 @@ from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[3]
+# Where the pinned releases are published (configs/skills_registry.json pins the tag).
+REGISTRY_REPO = "lijinbio/aiscientist-skills"
 POLICY: ContextVar[dict | None] = ContextVar("skill_policy", default=None)
 # The registry skill the code of the CURRENT PLAN STEP runs under. A ContextVar, not
 # ``ctx.decisions``: a plan's independent steps run in parallel threads that share one ctx and each
@@ -37,11 +39,10 @@ def config() -> dict:
     path = Path(os.environ.get("AISCIENTIST_SKILLS_REGISTRY_CONFIG",
                                ROOT / "configs/skills_registry.json"))
     cfg = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("release_tag", "releases_root", "allowed_tiers", "transitional_fallback"):
+    for key in ("release_tag", "releases_root", "allowed_tiers"):
         value = os.environ.get("AISCIENTIST_SKILLS_REGISTRY_" + key.upper())
         if value is not None:
-            cfg[key] = ([v.strip() for v in value.split(",") if v.strip()] if key == "allowed_tiers" else
-                        value.lower() in {"1", "true", "yes"} if key == "transitional_fallback"
+            cfg[key] = ([v.strip() for v in value.split(",") if v.strip()] if key == "allowed_tiers"
                         else value)
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", cfg["release_tag"]):
         raise ValueError("skills registry release_tag must be a pinned v<major>.<minor>.<patch> tag")
@@ -120,15 +121,20 @@ def _extract(archive: Path, dest: Path) -> None:
         zf.extractall(dest)
 
 
-def load(load_from) -> dict | None:
+def install_command(cfg: dict) -> str:
+    """The one line that installs the pinned release where the loader reads it."""
+    return f"gh release download {cfg['release_tag']} -R {REGISTRY_REPO} -D {release_dir(cfg)}"
+
+
+def load(load_from) -> dict:
+    """The curated skills of the pinned release. An absent release is an empty library, said in the
+    log with the command that installs it; an installed release that fails a check raises."""
     cfg = config()
     root = release_dir(cfg)
     if not root.exists():
-        if not cfg.get("transitional_fallback", False):
-            raise FileNotFoundError(f"pinned skills release is not installed: {root}")
-        LOG.warning("Pinned skills release %s not installed at %s; using transitional local skills fallback",
-                    cfg["release_tag"], root)
-        return None
+        LOG.warning("Pinned skills release %s is not installed at %s: no curated skills are loaded. "
+                    "Install it with: %s", cfg["release_tag"], root, install_command(cfg))
+        return {}
     checked = verify(root)
     catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
     if (catalog.get("schema_version") != 1 or catalog.get("registry") != "aiscientist-skills"

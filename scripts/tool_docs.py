@@ -123,15 +123,17 @@ def runs_on_md(m, tool) -> str:
                      " Its job gets a GPU of its own on the lab's paid partition and starts its own "
                      "model there, so the session needs no GPU allocation." if m.own_gpu else
                      " Its job runs no language model: it needs no GPU allocation.")
-    from aiscientist.agents.tool_skills import ToolSkillError, job_environment
-    try:
-        env = job_environment(m)
-    except ToolSkillError as exc:
-        env = {"image": "", "cpus": 0, "mem_gb": 0, "time_limit": ""}
-        lines.append(f"The environment is defined by the skill `{m.skill}`, which is unavailable: {exc}.")
     if m.skill:
+        # The skill declares them, and this page keeps no copy: it reads the same with or without
+        # the pinned release installed.
+        lines[0] = lines[0].replace(" inside `analysis.sif`", "")
         lines.append(f"The container image, Slurm resources, and reference settings are defined by the "
-                     f"skill `{m.skill}` in the pinned aiscientist-skills release.")
+                     f"skill `{m.skill}` in the pinned aiscientist-skills release (its `SKILL.md` "
+                     "metadata and `assets/`). Its job runs in that image instead of the line's, built "
+                     "on first use into the shared containers directory on HPC3 and reused by every "
+                     "later run.")
+    env = ({"image": "", "cpus": 0, "mem_gb": 0, "time_limit": ""} if m.skill else
+           {"image": m.image, "cpus": m.cpus, "mem_gb": m.mem_gb, "time_limit": m.time_limit})
     if env["image"]:
         lines[0] = lines[0].replace(" inside `analysis.sif`", "")
         how = ("built on first use from conda-forge + bioconda (" + env["image"].split(":", 1)[1] + ")"

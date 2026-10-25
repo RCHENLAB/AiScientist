@@ -66,15 +66,16 @@ The diagrams, the code layers and the tool routing are in
 | | What it is | Where |
 |---|---|---|
 | Tool | Fixed code the Scientist calls by name | [`src/aiscientist/tools/`](src/aiscientist/tools/README.md), one folder per tool |
-| Skill | A code template the Scientist adapts and runs | [`skills/`](skills/README.md) |
+| Skill | A code template the Scientist adapts and runs | the pinned release of [`lijinbio/aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills) ([`configs/skills_registry.json`](configs/skills_registry.json)) |
 | Pipeline | An end-to-end protocol the PI picks when planning | [`preset_pipelines/`](preset_pipelines/README.md) |
 
-Adding one of these is adding a folder. No platform code changes.
+Adding one of these is adding a folder (a skill's goes into the registry). No platform code changes.
 
 ## Run it
 
 ```bash
 ./deploy.sh              # create the virtual environment and install (safe to re-run)
+gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1.0   # the skills
 ./start.sh               # serve the console on 127.0.0.1:8800
 python3 -m pytest        # the test suite: offline, no cluster, .env or network needed
 ```
@@ -83,6 +84,8 @@ python3 -m pytest        # the test suite: offline, no cluster, .env or network 
   any OpenAI-compatible endpoint. Storage and compute still expect HPC3.
 - **Off campus:** the public site needs no VPN. A gateway run on your own computer does, because
   HPC3's SSH port answers only on the UCI campus network or the VPN.
+- **Skills:** the curated skills are the release `configs/skills_registry.json` pins, not files in
+  this repository. Without it installed the skill library is empty, and the log says so.
 - **Configuration:** every setting is described in
   [`configs/aiscientist.example.env`](configs/aiscientist.example.env).
 - **Accounts:** `aiscientist-admin` manages users from the command line.
@@ -119,7 +122,6 @@ src/aiscientist/
   metadata/      Croissant metadata for datasets and results
   hpc/           the HPC3 shell session and its tools
 frontend/console/  the browser UI
-skills/            code templates for the Scientist
 preset_pipelines/  protocols for the PI
 deploy/            the systemd unit, Kubernetes and Envoy config, HPC3 container definitions
 configs/           the configuration reference

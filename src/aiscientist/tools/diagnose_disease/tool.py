@@ -190,8 +190,8 @@ def adjudicate(result: DifferentialResult, *,
         elif status == "unsupported":
             agreement = "unsupported"
             score = prob * UNSUPPORTED_PENALTY
-            note = ("LIRICAL's call; the corpus returned related passages but none supporting this "
-                    "gene–disease link (the corpus is bounded — treat as weak, not as refutation)")
+            note = ("LIRICAL's call; the RetiGene corpus returned related passages but none supporting this "
+                    "gene–disease link (the RetiGene corpus is bounded — treat as weak, not as refutation)")
         elif "literature" in c.sources and strength > 0:
             agreement = "concordant"
             score = literature_weight * strength + lirical_weight * prob
@@ -199,7 +199,7 @@ def adjudicate(result: DifferentialResult, *,
         else:
             agreement = "lirical_only"
             score = prob
-            note = ("LIRICAL only — the literature track was not asked or the corpus returned "
+            note = ("LIRICAL only — the literature track was not asked or the RetiGene corpus returned "
                     "nothing (absence of data, not evidence of absence)")
 
         d = c.as_dict()

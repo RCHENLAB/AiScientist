@@ -40,7 +40,7 @@ def test_zero_context_corpus_answer_falls_back_to_europe_pmc():
     assert any(e.get("type") == "literature_fallback" for e in events)
     assert res.status in ("ok", "incomplete")
     # The Critic is told the switch was the platform's (run 7f2955e8e revised it as off-brief).
-    assert (res.final_answer or "").startswith("(Platform note: the indexed corpus")
+    assert (res.final_answer or "").startswith("(Platform note: the RetiGene corpus")
 
 
 def test_cited_corpus_answer_does_not_fall_back():
@@ -132,7 +132,7 @@ def test_a_step_naming_deep_literature_in_a_session_without_it_goes_to_europe_pm
     assert calls and res.status == "ok", "Europe PMC did not run"
     assert not any(e.get("tool") == "deep_literature" for e in events)
     assert (res.final_answer or "").startswith(
-        "(Platform note: `deep_literature`, the indexed corpus, is not available in this session")
+        "(Platform note: `deep_literature`, the RetiGene corpus, is not available in this session")
 
 
 def test_a_literature_search_step_gets_no_platform_note():

@@ -98,16 +98,18 @@ not: `AISCIENTIST_DEFAULT_GENE_PANEL` (a panel name, `ird`), `AISCIENTIST_DEFAUL
 
 ## Skills and pipelines on this line
 
-Skills in [`skills/`](../skills/README.md), which the Scientist adapts and runs with `run_code`:
+Skills of the pinned [aiscientist-skills](https://github.com/lijinbio/aiscientist-skills) release, which the Scientist adapts and runs
+with `run_code` (the pipelines name them by the second name, which resolves as an alias):
 
-- `normalize_vcf`: bcftools norm, as a separate step. Needs a reference FASTA.
-- `vcf_qc_stats`: Ti/Tv, het/hom, SNP, indel and multi-allelic counts, call rate (bcftools stats,
-  with cyvcf2 and a pure-Python fallback).
-- `clinical_variant_prioritization`: a research-triage tier per variant from ClinVar, gnomAD
-  frequency and the predictors. Not a clinical ACMG classification.
-- `variant_output_tables`: the standard result tables from an annotated TSV.
-- `build_variant_db_tiledbvcf`: a TileDB-VCF database for a cohort. It needs `tiledbvcf-py`, which
-  `analysis.sif` does not carry.
+- `normalize-vcf-with-bcftools` (`normalize_vcf`): bcftools norm, as a separate step. Needs a
+  reference FASTA.
+- `qc-vcf-callset` (`vcf_qc_stats`): Ti/Tv, het/hom, SNP, indel and multi-allelic counts, call rate
+  (bcftools stats, with cyvcf2 and a pure-Python fallback).
+- `prioritize-clinical-variants` (`clinical_variant_prioritization`): a research-triage tier per
+  variant from ClinVar, gnomAD frequency and the predictors. Not a clinical ACMG classification.
+- `write-variant-tables` (`variant_output_tables`): the standard result tables from an annotated TSV.
+- `build-variant-db-with-tiledbvcf` (`build_variant_db_tiledbvcf`): a TileDB-VCF database for a
+  cohort. It needs `tiledbvcf-py`, which `analysis.sif` does not carry.
 
 Pipelines in [`preset_pipelines/`](../preset_pipelines/README.md): `variant_annotation`, and
 `phenotype_variant_diagnosis`, which adds the patient's phenotype (`map_phenotype_to_hpo`,

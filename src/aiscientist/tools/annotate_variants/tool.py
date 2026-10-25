@@ -492,7 +492,7 @@ def _write_table(rows: "list[dict[str, Any]]", dest: "Path | str | None" = None)
 
 # The five standard deliverable tables `annotate_variants` writes DETERMINISTICALLY from a
 # summarize_annotations() result — so the orchestrator never hand-writes (and botches) this CSV /
-# summary-dict code. (The skills/variant_output_tables/ skill stays for CUSTOM thresholds/columns.)
+# summary-dict code. (The write-variant-tables skill stays for CUSTOM thresholds/columns.)
 STANDARD_TABLES = (
     "variant_consequence_distribution.csv", "variant_impact_distribution.csv",
     "variant_clinical_significance.csv", "clinvar_pathogenic_variants.csv",

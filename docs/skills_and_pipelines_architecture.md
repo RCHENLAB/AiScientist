@@ -6,10 +6,11 @@ much of the model's context they cost.
 | Layer | What it is | Can the model rewrite it? | Where |
 |---|---|---|---|
 | **Tool** | Fixed, tested code the Scientist calls by name. Most tools are Slurm jobs on HPC3. | No | [`src/aiscientist/tools/<name>/`](../src/aiscientist/tools/README.md) |
-| **Skill** | Guidance plus a code template that the Scientist reads, adapts to the dataset and runs. | Yes, that is its purpose | [`skills/`](../skills/README.md), and the induced-skill directory |
+| **Skill** | Guidance plus a code template that the Scientist reads, adapts to the dataset and runs. | Yes, that is its purpose | the pinned release of [`aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills), and the induced-skill directory |
 | **Pipeline** | A protocol for a whole study. It steers the PI's plan and names the tools it composes. | No | [`preset_pipelines/<name>/`](../preset_pipelines/README.md) |
 
-Adding any of the three is adding a folder. No platform code changes.
+Adding any of the three is adding a folder (a skill's goes into the registry, which publishes it in
+a release). No platform code changes.
 
 Which layer a new capability belongs in: code that carries infrastructure (a Slurm job, a
 checkpoint, a container, an external service) or that must behave the same in every run is a tool.
@@ -37,22 +38,24 @@ cost grows with the number of tools, which is why adaptable analysis code is kep
 
 A skill is any folder that holds a `SKILL.md`, at any depth, in the Agent-Skills layout. Only
 `SKILL.md` is required: its front matter gives `name` and `description`, and its body is the
-guidance. A longer skill bundles files beside it, usually a `reference.py` template. The format
-and the rules for writing one are in [`skills/README.md`](../skills/README.md).
+guidance. A longer skill bundles files beside it, usually a `scripts/reference.py` template. The
+format and the rules for writing one are the registry's:
+[CONTRIBUTING.md](https://github.com/lijinbio/aiscientist-skills/blob/main/CONTRIBUTING.md)
+and its `template/`. A skill is added by a pull request there and reaches AiScientist with the
+next release the platform pins.
 
-`agents/skills.py` loads skills from two roots:
+`agents/skills.py` loads skills from two places:
 
 - the curated library: the pinned release of the
   [`aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills) registry (see
-  [The pinned registry release](#the-pinned-registry-release)). While that release is not
-  installed, the library falls back to `skills/` in the repository (`AISCIENTIST_SKILLS_DIR`
-  overrides it) and logs a warning;
+  [The pinned registry release](#the-pinned-registry-release)). Without an installed release there
+  are no curated skills, and the log says so with the command that installs it;
 - the induced-skill directory (`AISCIENTIST_INDUCED_SKILLS_DIR`), outside the repository, where
   the platform writes the skills it learns from runs.
 
-The loader scans both again before every step, so a folder that is added, edited or removed takes
-effect at the next step of a running analysis, without a restart. A curated skill always wins
-over an induced skill of the same name.
+The loader reads both again before a step whenever their files changed, so a newly installed
+release, or an induced skill added, edited or removed, takes effect at the next step of a running
+analysis, without a restart. A curated skill always wins over an induced skill of the same name.
 
 ### How a skill reaches the model
 
@@ -68,9 +71,32 @@ The Scientist adapts the template and runs it with `run_code`, or runs its shell
 `run_shell`. `search_skills(query)` ranks the library by keyword overlap with the name, the
 description and the body.
 
-A skill whose steps are command-line programs that no tool runs declares an `image:` in its
-`SKILL.md`. The platform builds that image on HPC3 at first use, and the Scientist runs the skill's
-commands inside it with `run_in_environment(skill, command)`.
+### What a skill's code gets at run time
+
+A `reference.py` is a template to rewrite, not code to run as it is. In `run_code` it reads the
+run's checkpoints from `$AISCIENTIST_WORK` and writes deliverables under `$AISCIENTIST_ARTIFACTS`
+(`tables/`, `figures/`). Files the user attached beside the primary dataset (a reference atlas, a
+BED panel) arrive read-only as `$AISCIENTIST_INPUTS`, a JSON list of `{name, role, path}`; the one
+marked as reference is also `$AISCIENTIST_REFERENCE`.
+
+A skill whose steps are command-line programs that no tool runs (an R or Snakemake pipeline)
+declares the environment they need in its `SKILL.md` `metadata`, with the value a `TOOL.md` uses:
+`image` is `bioconda:<pkg>=<version> ...` (built from conda-forge and bioconda) or a pinned
+`docker://` image, and `cpus`, `mem_gb` and `time_limit` are optional. The skill list marks such a
+skill, and the Scientist runs its commands with `run_in_environment(skill, command)`: a CPU Slurm
+job on HPC3 inside that image, with the bound dataset read-only at `$AISCIENTIST_DATASET_ROOT`, the
+skill's bundled files in `$AISCIENTIST_SKILL_DIR`, and a working directory that persists across
+calls (`$AISCIENTIST_ENV_DIR`). The image is built once, at first use, for the whole lab:
+
+- every recipe is its own image, so two skills never share installed packages, and a changed
+  recipe is a new image;
+- an image is never re-solved: its lock file (the exact packages and URLs) sits beside it as
+  `<image>.sif.lock.txt`;
+- builds read the lab's shared conda download cache, so a package is downloaded once.
+
+An unpinned solve takes the newest version of everything, so a recipe pins what matters. A
+declaration that fails validation (a floating `:latest`, an unpinned first package) is ignored with
+the reason logged, and the skill still loads as guidance.
 
 ### How a plan uses a skill
 
@@ -116,18 +142,16 @@ commands inside it with `run_in_environment(skill, command)`.
 ### The pinned registry release
 
 `configs/skills_registry.json` pins a registry release tag, `v0.1.0`. A branch name such as `main`
-is refused. The config also lists the tiers to load (`core`, `verified` and `community`; the skills
-migrated from `skills/` are `community` in `v0.1.0`, so without that tier an installed release
-would load only CellQC), the releases root, and whether the fallback to `skills/` is allowed.
-Each key has
-an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override. Updating skills means changing the tag and
-deploying the release.
+is refused. The config also lists the tiers to load (`core`, `verified` and `community`; every
+skill but CellQC is `community` in `v0.1.0`, so without that tier an installed release would load
+only CellQC) and the releases root. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
+Updating skills means changing the tag and installing the release.
 
 `agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's three
 assets as published: `aiscientist-skills-<version>.zip` (every skill folder at its catalog `path`),
 `catalog.json` and `SHA256SUMS`. Releases with one `<name>-<version>.zip` per skill are still read.
-The folder is installed on the server, outside git (`.gitignore`, and `scripts/sync_deploy.sh`
-never ships or deletes it):
+The folder is installed on the server, and in a development checkout that needs skills, outside
+git (`.gitignore`, and `scripts/sync_deploy.sh` never ships or deletes it):
 
 ```bash
 gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1.0
@@ -136,14 +160,15 @@ gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1
 
 The loader checks `SHA256SUMS` against `catalog.json`, the bundle or every skill zip, and every
 unpacked file, and refuses the release if any is missing or differs. A refused release gives no
-curated skills at all, logged as an error; it never falls back to `skills/`, and the rest of the
-platform keeps working. The skill list comes from the catalog: name, description, tags, version,
+curated skills at all, logged as an error, and the rest of the platform keeps working; so does an
+absent one, logged as a warning that names the command above. The skill list comes from the
+catalog: name, description, tags, version,
 tier and requirements. `requirements.compute` is also exposed as `metadata["compute"]` for plan
 estimates.
 
 Registry names use hyphens (`compare-two-groups`). A skill also answers to the underscore form of
 its name and to any names in `metadata.aliases`, so plans, preset pipelines and older runs that
-name a skill migrated from `skills/` (`pairwise_de`) still find it; an exact name always wins.
+name a skill by an earlier name (`pairwise_de`) still find it; an exact name always wins.
 In the registry layout the code sits in `scripts/`: `read_skill_reference` offers
 `reference.py`, else `scripts/reference.py`, else the first file in `scripts/`.
 

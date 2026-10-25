@@ -1,17 +1,17 @@
 """Skill induction — turn a procedure a run actually executed into a reusable atomic skill.
 
 ``agents/skills.py`` has claimed since it was written that the library is "grown by induction", but
-nothing ever wrote a skill: every skill in ``skills/`` was hand-authored. This module is that
+nothing wrote a skill: every curated skill is hand-authored. This module is that
 missing half. When a step solved something with ``run_code`` that no curated tool covered, and the
 Critic accepted the result, the concrete snippet is generalized into a template
 (``SKILL.md`` + ``reference.py``) that later runs can find, read, adapt, and run.
 
-WHERE INDUCED SKILLS GO, AND WHY IT IS NOT ``skills/``
------------------------------------------------------
+WHERE INDUCED SKILLS GO, AND WHY IT IS NOT THE CURATED LIBRARY
+--------------------------------------------------------------
 Induced skills are written to a SEPARATE root (``AISCIENTIST_INDUCED_SKILLS_DIR``, in practice under
-the gateway workspace) — never into the repo's git-tracked ``skills/``. A model silently editing
-source that ships to every user is a different and much worse thing than a model leaving a template
-in its own workspace. A repo skill of the same name always wins, so an induced skill can never
+the gateway workspace) — never into the curated library, the pinned aiscientist-skills release. A
+model silently editing skills that ship to every user is a different and much worse thing than a
+model leaving a template in its own workspace. A curated skill of the same name always wins, so an induced skill can never
 shadow a curated one; the frontmatter carries ``induced: true`` and the originating step, so a
 human reading the library can always tell which is which and promote (or delete) it deliberately.
 

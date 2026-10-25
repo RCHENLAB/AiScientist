@@ -36,6 +36,7 @@ Browser ──HTTPS :443──▶ Envoy Gateway on the lab server's Kubernetes c
 | `/data/aiscientist/app/` | the code (the rsync target), `.env`, `.deployed_sha`, and under `runs/console/<UCInetID>/` each HPC3 user's run outputs and unfinished browser uploads (`uploads/.parts/`, removed 24 hours after their last write, `AISCIENTIST_UPLOAD_TTL_SECONDS`) |
 | `/data/aiscientist/env/` | the Python virtual environment; the app is an editable install |
 | `/data/aiscientist/state/` | `AISCIENTIST_STATE_DIR`, mode 0700: the session secret (`session_secret`), the users' saved SSH keys (`ssh_creds/`) and LLM API keys (`llm_creds/`) with the master key that encrypts them (`llm_key.master`), and the model list once an admin has saved it |
+| `/data/aiscientist/app/skills/releases/<version>/` | the curated skills: the aiscientist-skills release `configs/skills_registry.json` pins. Installed by hand; a deploy never ships or deletes it. Without it there are no curated skills |
 | `/data/aiscientist/induced_skills/` | `AISCIENTIST_INDUCED_SKILLS_DIR`: skills learned from runs, with their review file |
 | `/data/aiscientist/env-backups/` | copies of `.env` taken before an edit |
 | `/data/BioAgent` | a symlink to `/data/aiscientist`. Stored run paths may name it, so it stays. |
@@ -68,7 +69,7 @@ scripts/sync_deploy.sh               # copy, pip install -e, restart, health che
 |---|---|
 | `--no-install` | `pyproject.toml` and the requirements did not change |
 | `--no-restart` | the files should land now and the restart come later; `.deployed_sha` then says "NOT yet restarted" |
-| `--delete` | files removed from the repository should be removed on the server too. `.env`, the databases, the virtual environment, `runs/`, the credential stores and the gene-set libraries are never deleted. |
+| `--delete` | files removed from the repository should be removed on the server too. `.env`, the databases, the virtual environment, `runs/`, the credential stores, the gene-set libraries and the skills release are never deleted. |
 
 Before a deploy:
 
@@ -81,6 +82,11 @@ Before a deploy:
 4. **Gene sets.** `src/aiscientist/tools/genesets/*.gmt` are not in git
    (`scripts/fetch_genesets.py` downloads them). A checkout without them leaves the server's
    copies as they are.
+5. **Skills.** A commit that changes the tag in `configs/skills_registry.json` needs that release
+   installed first, in the app directory as the service account: download the three assets of the
+   GitHub release of `lijinbio/aiscientist-skills` into `skills/releases/<version>/`, then
+   `(cd skills/releases/<version> && sha256sum -c SHA256SUMS)`. The next step of a run reads it;
+   no restart.
 
 After a deploy:
 
@@ -202,12 +208,14 @@ Namespace `aiscientist`, applied from [`k8s/host-backend.yaml`](k8s/host-backend
    Claude key, which is refused when it is verified if the SDK is missing.
 3. `state/`, mode 0700, and `.env` in the app directory, readable by the service account only,
    with the settings above.
-4. The unit: copy [`systemd/aiscientist.service`](systemd/aiscientist.service) to
+4. The skills: the pinned release under `skills/releases/<version>/` in the app directory
+   (step 5 of "Before a deploy").
+5. The unit: copy [`systemd/aiscientist.service`](systemd/aiscientist.service) to
    `/etc/systemd/system/`, set `--host` to the address the ingress reaches,
    `sudo systemctl enable --now aiscientist.service`.
-5. The ingress: apply [`k8s/host-backend.yaml`](k8s/host-backend.yaml) with the host name and the
+6. The ingress: apply [`k8s/host-backend.yaml`](k8s/host-backend.yaml) with the host name and the
    node IP of that cluster, and create the TLS Secret.
-6. HPC3: the images, model weights and databases in
+7. HPC3: the images, model weights and databases in
    [`docs/hpc3_assets.md`](../docs/hpc3_assets.md).
 
 [`Dockerfile`](Dockerfile), [`k8s/aiscientist.yaml`](k8s/aiscientist.yaml) and

@@ -104,14 +104,24 @@ def test_pubmed_is_added_only_when_asked_for():
 
 def test_the_curation_route_takes_list_questions_about_the_corpus_only(monkeypatch):
     conn = types.SimpleNamespace()
-    monkeypatch.setattr(gw_app, "_literature_corpus_available", lambda c: True)
+    monkeypatch.setattr(gw_app, "_literature_corpus_on_hpc", lambda c: True)
     assert gw_app._corpus_curation(conn, QUESTION)
     assert gw_app._corpus_curation(conn, "Which RetiGene genes are haploinsufficient?")
     assert not gw_app._corpus_curation(conn, "Is PRPF31 haploinsufficient in RetiGene papers?")  # one gene
     assert not gw_app._corpus_curation(conn, "What are haploinsufficient genes?")                # no corpus named
     assert not gw_app._corpus_curation(conn, "Which haploinsufficient genes from RetiGene are in my data?")
-    monkeypatch.setattr(gw_app, "_literature_corpus_available", lambda c: False)
+    monkeypatch.setattr(gw_app, "_literature_corpus_on_hpc", lambda c: False)
     assert not gw_app._corpus_curation(conn, QUESTION)               # this session cannot reach the corpus
+
+
+def test_the_eye_server_copy_alone_makes_no_curation_and_is_not_loaded_to_decide(monkeypatch):
+    # The curation reads the corpus on HPC3; with only the Eye Server copy (local_corpus) the
+    # question goes to the literature line, and deciding that loads no embedding model.
+    from aiscientist.gateway import local_corpus
+    monkeypatch.setattr(local_corpus, "make_local_tool",
+                        lambda: (_ for _ in ()).throw(AssertionError("model loaded to route")))
+    monkeypatch.setattr(gw_app, "_literature_corpus_on_hpc", lambda c: False)
+    assert not gw_app._corpus_curation(types.SimpleNamespace(), QUESTION)
 
 
 # --- the tables ----------------------------------------------------------------------------------------
@@ -269,6 +279,7 @@ def _wire(monkeypatch, decisions, *, papers=PAPERS):
     monkeypatch.setattr(gw_app, "_lab_llm",
                         lambda conn: types.SimpleNamespace(complete_fn=model, scientist_chat=None, model="qwen"))
     monkeypatch.setattr(gw_app, "_literature_corpus_available", lambda c: True)
+    monkeypatch.setattr(gw_app, "_literature_corpus_on_hpc", lambda c: True)
     monkeypatch.setattr(gw_app, "_corpus_papers", lambda c: papers)
     jobs: list[_ScanJob] = []
 
@@ -303,7 +314,7 @@ def test_the_issue_question_gets_a_curation_plan_then_the_tables_and_an_answer_f
 
     # The plan: one curation step over the RetiGene corpus, no PubMed, with the time it takes.
     ((stage, step),) = w.shown
-    assert stage == "corpus" and step.startswith("**Corpus curation**")
+    assert stage == "corpus" and step.startswith("**RetiGene curation**")
     assert "PubMed is not searched" in step and "about 2 hours on a GPU of its own" in step
     assert corpus_scan.CURATION_GENES in step and w.model.asked == []          # the model routed nothing
     assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
@@ -331,7 +342,26 @@ def test_the_issue_question_gets_a_curation_plan_then_the_tables_and_an_answer_f
     assert pointer["n_genes"] == 3 and [f["name"] for f in pointer["files"]] == [
         corpus_scan.CURATION_GENES, corpus_scan.CURATION_EVIDENCE]
     assert gw_app._TABLES_NAME_RE.fullmatch(pointer["name"])
+    # The curation tables are the run's one "Save tables to my data", not also the scan's genes.csv.
+    assert not (run_dir / gw_app._LITERATURE_RESULT_POINTER).exists()
+    assert not (run_dir / "result" / "literature").exists()
     assert [p.get("type") for p in conn.pushed][-1] == "chat_done"
+
+
+def test_what_the_user_sees_names_retigene_never_the_corpus_alone(tmp_path, monkeypatch):
+    """Jin (issue 46): users do not know that "the corpus" is the RetiGene papers. The plan card, the
+    chat's messages, the feed and the answer say "RetiGene" wherever they say "corpus"."""
+    import re
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "approve"}])
+    _dispatch(conn)
+    seen = [step for _stage, step in w.shown]
+    seen += [str(p.get(k)) for p in conn.pushed for k in ("text", "token", "message") if p.get(k)]
+    seen += [str(e.get("message")) for e in conn.log if e.get("type") == "event"]
+    bare = [m.group(0) + " … " + text[max(0, m.start() - 60):m.end() + 20]
+            for text in seen for m in re.finditer(r"(?<!RetiGene )\bcorpus\b", text, re.IGNORECASE)]
+    assert bare == []
+    assert any("RetiGene" in text for text in seen)
 
 
 def test_a_cancelled_curation_plan_reads_nothing(tmp_path, monkeypatch):
@@ -369,10 +399,10 @@ def test_a_kept_scan_is_planned_as_instant_and_needs_no_job(tmp_path, monkeypatc
     w = _wire(monkeypatch, [{"action": "approve"}])
     _dispatch(conn)
     ((_, step),) = w.shown
-    assert f"at once, from the scan of this corpus kept on {stored.meta['stored_at'][:10]}" in step
+    assert f"at once, from the scan of the RetiGene papers kept on {stored.meta['stored_at'][:10]}" in step
     assert w.jobs == []
     answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
-    assert "kept because the corpus has not changed since" in answer and "| PRPF31 |" in answer
+    assert "kept because the RetiGene papers have not changed since" in answer and "| PRPF31 |" in answer
 
 
 def test_on_an_api_key_the_plan_says_the_model_the_time_and_the_cap(tmp_path, monkeypatch):

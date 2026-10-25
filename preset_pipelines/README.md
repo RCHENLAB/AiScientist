@@ -50,14 +50,14 @@ for people, so keep the two in step when one changes.
 Add the folder and restart the gateway: pipelines are loaded when it starts. No code changes.
 `AISCIENTIST_PIPELINES_DIR` points the loader at another directory.
 
-`tests/test_skills_library.py` checks that every folder has both files, that `name` equals the
+`tests/test_pipeline_library.py` checks that every folder has both files, that `name` equals the
 folder name, and that `tools` lists only tools that exist.
 
 ## Writing one
 
 - **Compose tools, do not reimplement them.** A step that a tool covers names the tool. A step
-  that no tool covers names a skill from [`skills/`](../skills/README.md), which the Scientist
-  adapts and runs with `run_code`.
+  that no tool covers names a skill of the pinned [aiscientist-skills](https://github.com/lijinbio/aiscientist-skills) release, which the
+  Scientist adapts and runs with `run_code`.
 - **State what the data must have** (a condition column with two groups, a VCF with a known genome
   build), so the plan can say when the protocol does not apply.
 - **A pipeline is text the planner reads.** It cannot change what the planner is shown about the

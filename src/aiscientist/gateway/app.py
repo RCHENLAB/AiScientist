@@ -264,6 +264,7 @@ class RunState:
         self.confirm_event = threading.Event()
         self.confirm_value: bool | None = None
         self.pending_confirm: Any = None     # buffered for a late WS subscriber
+        self.confirm_expires_at: float | None = None   # time.monotonic() when it counts as no
         # Which ENGINE this run is: "research" (the lab) or "chat" (the answer-first fast path).
         # Endpoints that only make sense against the lab (mid-run steering via /api/chat/inject)
         # check this — a note queued during a chat turn has nothing to consume it.
@@ -2913,6 +2914,7 @@ async def stop_gpu(payload: dict, request: Request) -> JSONResponse:
     if conn.chat_running and conn.live_runs:
         for run in list(conn.live_runs):
             run.chat_stop.set()
+            _decline_confirm(run)
             if run.pending_plan is not None:
                 run.plan_value = {"action": "cancel"}
                 run.pending_plan = None
@@ -4968,18 +4970,26 @@ def _hitl_confirm(conn: "Connection", run: "RunState | None"):
         return None
 
     def confirm(req) -> bool:
+        # Bounded wait: an unattended run must not hold a worker allocation forever waiting for a
+        # click that is never coming. The card says how long it has (``timeout_s``; a card sent
+        # again after a reconnect says what is left, ``seconds_left``).
+        timeout = float(os.environ.get("AISCIENTIST_CONFIRM_TIMEOUT_S", "600") or 600)
         payload = {"type": "confirm_request", "run_id": run.run_id,
-                   "conversation_id": run.conversation_id, **req.as_dict()}
+                   "conversation_id": run.conversation_id, **req.as_dict(),
+                   "timeout_s": int(timeout)}
         run.confirm_value = None
         run.confirm_event.clear()
+        run.confirm_expires_at = time.monotonic() + timeout
         run.pending_confirm = payload
-        conn.push(payload)
-        # Bounded wait: an unattended run must not hold a worker allocation forever waiting for a
-        # click that is never coming.
-        timeout = float(os.environ.get("AISCIENTIST_CONFIRM_TIMEOUT_S", "600") or 600)
+        conn.push(payload, run=run)
         answered = run.confirm_event.wait(timeout)
         run.pending_confirm = None
-        conn.push({"type": "confirm_done", "run_id": run.run_id})
+        run.confirm_expires_at = None
+        # What became of it, for every window that shows the card: answered here or in another
+        # window, not answered in time, or ended by Stop (which answers no, see _decline_confirm).
+        outcome = ("timeout" if not answered else "approved" if run.confirm_value
+                   else "stopped" if run.chat_stop.is_set() else "declined")
+        conn.push({"type": "confirm_done", "run_id": run.run_id, "outcome": outcome}, run=run)
         if not answered:
             conn.emit("warning", "hpc_shell",
                       f"No answer within {int(timeout)}s — declined: {req.summary}")
@@ -4987,6 +4997,16 @@ def _hitl_confirm(conn: "Connection", run: "RunState | None"):
         return bool(run.confirm_value)
 
     return confirm
+
+
+def _decline_confirm(run: "RunState") -> None:
+    """Answer a waiting confirmation with no, for Stop: the run's worker thread waits on
+    ``confirm_event``, not on ``chat_stop``, so without this a Stop clicked while the card is up
+    holds until the confirmation's timeout. ``_hitl_confirm`` then reports it as ``stopped``."""
+    if run.pending_confirm is not None and not run.confirm_event.is_set():
+        run.confirm_value = False
+        run.pending_confirm = None
+        run.confirm_event.set()
 
 
 def _hpc_home(conn: Connection) -> str:
@@ -5237,8 +5257,8 @@ class _NoServedModelExecutor:
                             "has no GPU allocation."}
         if tool in self._own_gpu:
             return {"status": "dependency_missing", "dependency": "own-gpu-job",
-                    "note": f"{tool} runs as a job with a GPU and a model of its own (the console's "
-                            "Corpus scan), not on this literature line."}
+                    "note": f"{tool} runs as a job with a GPU and a model of its own (the RetiGene "
+                            "corpus scan), not on this literature line."}
         return self._inner.run_tool(tool, args, ctx)
 
     def __getattr__(self, name: str) -> Any:
@@ -5380,19 +5400,30 @@ def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
 
     roster = session_catalog(catalog, literature_executor=literature_executor,
                              served_model=conn.alloc is not None)
+    from .local_corpus import has_local_index
+    if has_local_index():
+        corpus = _literature_corpus_tool(conn)
+        if corpus is not None:
+            roster = [t for t in roster if t.name != "search_corpus"] + [corpus[0]]
     if len(roster) < len(catalog) and os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
         no_gpu = conn.executor is not None and not conn.mock and conn.alloc is None
         names = {t.name for t in roster}
         if no_gpu and "search_corpus" in names:
             emit("info", "lab", "`deep_literature` needs the model a session serves on a GPU, and this session "
-                                "has none: literature steps use `search_corpus` (the indexed corpus, "
+                                "has none: literature steps use `search_corpus` (the RetiGene corpus, "
                                 "retrieval only; the session's model writes the answer).")
         else:
             why = ("its HPC3 job calls the model a session serves on a GPU, and this session has no GPU "
                    "allocation" if no_gpu else "its HPC3 job line could not be set up")
-            emit("info", "lab", f"`deep_literature` (the indexed corpus) is not available in this run: "
+            emit("info", "lab", f"`deep_literature` (the RetiGene corpus) is not available in this run: "
                                 f"{why}. Literature steps use `literature_search` (Europe PMC).")
     return roster
+
+
+async def _prepare_session_roster(conn: "Connection", catalog: list, literature_executor: Any,
+                                  emit: Callable[[str, str, str], None]) -> list:
+    """Prepare the local embedding model away from the run's event loop."""
+    return await asyncio.to_thread(_session_roster, conn, catalog, literature_executor, emit)
 
 
 def _active_conn_for_user(user) -> Connection | None:
@@ -5997,6 +6028,7 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
     target.chat_stop.set()
     if escalated:
         target.hard_stop.set()
+    _decline_confirm(target)
     # A run blocked at a plan-review or decision-point card is waiting on plan_event, NOT watching
     # chat_stop — so a Stop clicked while the card is up silently held until the 10-minute review
     # timeout. Resolve the pending wait as a cancel, exactly as /api/lab/plan would.
@@ -6039,7 +6071,7 @@ async def chat_inject(req: InjectRequest, request: Request) -> JSONResponse:
     # here would queue a note nothing consumes.
     if target.kind in ("chat", "corpus"):
         return JSONResponse(
-            {"error": "Chat answers and corpus scans can't be steered mid-run — wait for it to "
+            {"error": "Chat answers and RetiGene corpus scans can't be steered mid-run — wait for it to "
                       "finish, then ask a follow-up."}, status_code=409)
     conn.add_injection(text, run=target)
     conn.emit("step", "lab", f"Your note is queued for the next step: {text[:80]}", run=target)
@@ -6111,7 +6143,7 @@ class LabRequest(BaseModel):
     presets: list[str] | None = None  # preset PIPELINE keys to inject for THIS run. Their prompts are
                                      # composed into one guidance block; empty/absent = the PI
                                      # auto-selects.
-    skills: list[str] | None = None  # atomic SKILL names (skills/*.py) to REQUIRE for THIS run. The
+    skills: list[str] | None = None  # atomic SKILL names (the skill library) to REQUIRE for THIS run. The
                                      # plan must apply each.
     preset_prompt: str | None = None  # the (possibly user-edited) guidance text; overrides preset(s)
     mode: str = "single"             # Axis A: "single" | "team" (Virtual-Lab multi-agent) | "auto"
@@ -7742,11 +7774,14 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             if stored is not None:
                 await _run_corpus_scan(conn, req, stored=stored)
                 return
+            if await asyncio.to_thread(_literature_corpus_available, conn):
+                await _run_gene_table(conn, req)
+                return
             if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
                 conn.push({"type": "lab_progress", "level": "info", "text": (
-                    "ℹ No corpus scan of this corpus is kept yet, so this answer comes from a corpus "
-                    "search (the passages nearest to the question), not from every paper. Pick Corpus "
-                    "scan for the complete table: a few hours on a GPU of its own, once per corpus.")})
+                    "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
+                    "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
+                    "about the RetiGene papers by name for the complete table.")})
         await _run_quick_chat(conn, req)
         return
     if _corpus_path(req):
@@ -7767,7 +7802,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # A list question about the RetiGene papers is a curation of the whole corpus (issue 46): its own
     # plan card, then the tables. A note on that plan that changes the request is routed below.
     if _corpus_curation(conn, req.question):
-        conn.emit("info", "route", "Routed to the corpus curation: a list of genes from the RetiGene papers.")
+        conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence.")
         handoff = await _run_corpus_scan(conn, req, review=True)
         if handoff is None:
             return
@@ -8128,11 +8163,13 @@ def _corpus_curation(conn: Connection, question: str) -> bool:
     papers?"): the console's route sends it to the corpus curation, the whole corpus read for the
     genes and their evidence, instead of the literature line's best passages (RCHENLAB/AiScientist
     issue 46). Only a question that names the corpus, asks for the list and not about the user's
-    data, on a session that reaches the corpus. Haploinsufficiency is the one property curated."""
+    data, on a session that reaches the corpus on HPC3: the curation reads it there, so the Eye
+    Server copy alone (``local_corpus``) does not make one possible; the question then goes to the
+    literature line, which searches that copy. Haploinsufficiency is the one property curated."""
     from ..agents import request_router
     q = str(question or "")
     return (request_router.names_corpus(q) and corpus_scan.asks_for_gene_list(q)
-            and not request_router.refers_to_data(q) and _literature_corpus_available(conn))
+            and not request_router.refers_to_data(q) and _literature_corpus_on_hpc(conn))
 
 
 # What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
@@ -8146,7 +8183,7 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
     """How long the curation takes on this session, and what it costs, as the plan card says it."""
     if stored is not None:
         day = str(stored.meta.get("stored_at") or "")[:10]
-        return (f"at once, from the scan of this corpus kept{' on ' + day if day else ''} (the corpus has "
+        return (f"at once, from the scan of the RetiGene papers kept{' on ' + day if day else ''} (they have "
                 "not changed since): no job and no model cost")
     if api:
         from . import llm_pricing
@@ -8164,7 +8201,7 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
     wait = _duration_words(conn.settings.corpus_scan_queue_wait_s)
     return ("about 2 hours on a GPU of its own (an A100; about 4 hours on an A30) on the lab's paid partition, "
             f"plus the wait for a free card (often minutes; after {wait} without one it is submitted again), "
-            "and no API cost. The tables are kept, so the next request for this corpus is answered at once")
+            "and no API cost. The tables are kept, so the next request about the RetiGene papers is answered at once")
 
 
 async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callable[..., None],
@@ -8174,8 +8211,8 @@ async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callabl
     """The curation's plan card: True when the user runs it; None when the run is over (cancelled,
     expired, stopped); the request with the user's note when the note changes it (to plan again)."""
     when = await asyncio.to_thread(_curation_time_words, conn, stored, api)
-    say("🧬 This asks for the genes the RetiGene papers report, so the plan is a curation of the whole "
-        "corpus, not an answer from its best passages: every gene with its claim, the paper's own "
+    say("🧬 This asks for the genes the RetiGene papers report, so the plan is a curation of all the "
+        "RetiGene papers, not an answer from their best passages: every gene with its claim, the paper's own "
         "sentence, the paper and the page, as a table. Run it, or say in the chat what to change.")
     while True:
         decision = await asyncio.to_thread(_literature_plan_review, conn, emit,
@@ -8308,8 +8345,8 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
                 print(f"[auth] record_run_start failed: {exc}")
         if stored is not None:
             model = str(stored.meta.get("model") or model)
-            emit("step", "corpus", f"Corpus scan: kept scan {stored.key} of "
-                                   f"{str(stored.meta.get('stored_at') or '')[:10]} (the corpus has not changed).")
+            emit("step", "corpus", f"RetiGene corpus scan: kept scan {stored.key} of "
+                                   f"{str(stored.meta.get('stored_at') or '')[:10]} (the RetiGene papers have not changed).")
             await asyncio.to_thread(corpus_scan.copy_into, stored, art)
             result = stored.result
         else:
@@ -8327,6 +8364,10 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             kept_since=(str(stored.meta.get("stored_at") or "")[:10] if stored is not None else ""))})
         await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [model])
         await asyncio.to_thread(_point_at_curation_tables, conn, run_id, art, curation)
+        if not curation.get("files"):
+            # The curation tables are what "Save tables to my data" saves (issue 46); a scan that
+            # wrote none still offers its own genes.csv, once.
+            await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
         items = [
             {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
              "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
@@ -8340,12 +8381,12 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
         n_genes = (counts[corpus_scan.SUPPORTED] + counts[corpus_scan.CONTESTED]) if curation["rows"] \
             else result.get("n_genes")
         emit("success", "corpus",
-             f"Corpus curation done: {n_genes} haploinsufficient genes"
+             f"RetiGene curation done: {n_genes} haploinsufficient genes"
              + (f" ({counts[corpus_scan.CONTESTED]} contested), {counts[corpus_scan.AGAINST]} argued against, "
                 f"{counts[corpus_scan.SUGGESTED]} only suggested, from {curation['n_sentences']} verified sentences"
                 if curation["rows"] else f" from {result.get('n_hits_eligible')} verified sentences")
              + f" ({result.get('n_passages')} passages read, {result.get('n_papers')} papers).")
-        _finish_run_record(conn, run_id, "done", str(art), f"{n_genes} haploinsufficient genes (corpus curation)")
+        _finish_run_record(conn, run_id, "done", str(art), f"{n_genes} haploinsufficient genes (RetiGene curation)")
         conn.push({"type": "chat_done"})
         return None
     except GatewayError as exc:
@@ -8359,7 +8400,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
     except Exception as exc:  # noqa: BLE001 - reported, never fatal
         print(f"[corpus] scan failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
-        conn.emit("error", "corpus", f"Corpus scan failed: {public_error(exc)}", detail=error_detail(exc))
+        conn.emit("error", "corpus", f"RetiGene corpus scan failed: {public_error(exc)}", detail=error_detail(exc))
         conn.push({"type": "chat_error", "message": public_error(exc)})
         if recorded or not review:
             _finish_run_record(conn, run_id, "failed", str(art), str(exc))
@@ -8377,12 +8418,12 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
-            f"A scan of this corpus is already running (run {_CORPUS_SCANS_RUNNING[key]}). Its tables "
+            f"A scan of the RetiGene corpus is already running (run {_CORPUS_SCANS_RUNNING[key]}). Its tables "
             "are kept when it finishes: ask again then, and they are shown at once.", stage="corpus")
     executor = _build_literature_executor(conn, run_id=run_id, own_gpu=True)
     if executor is None:
         raise GatewayError(
-            "The corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
+            "The RetiGene corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
             "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
             "nothing was started.", stage="corpus")
     executor.notify = lambda level, message: emit(level, "corpus", message)
@@ -8391,14 +8432,14 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
     ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
                          llm_is_remote=False, read_roots=_tool_read_roots(conn))
     st = conn.settings
-    emit("step", "corpus", f"Corpus scan: {CORPUS_TOOL} on its own GPU ({st.corpus_scan_partition} "
+    emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} on its own GPU ({st.corpus_scan_partition} "
                            f"{st.corpus_scan_gres}, model {model}).")
-    say("📚 Scanning the whole indexed corpus for explicitly reported haploinsufficient genes — one "
+    say("📚 Scanning all the RetiGene papers for explicitly reported haploinsufficient genes — one "
         "HPC3 job with a GPU of its own (an A30 or A100 on the lab's paid partition): it starts the "
         "scan's model, which writes search requests, reads the passages they retrieve and quotes "
         "the papers; every quote is checked against its paper, then the card is freed. The paid queue "
-        "can add a wait before the job starts; the tables are kept, so the next request for this "
-        "corpus is answered at once.")
+        "can add a wait before the job starts; the tables are kept, so the next request about the "
+        "RetiGene papers is answered at once.")
     if key:
         _CORPUS_SCANS_RUNNING[key] = run_id
     wait = _duration_words(getattr(executor, "startup_timeout_s", 600) * getattr(executor, "queue_windows", 3))
@@ -8438,14 +8479,14 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
     if result.get("queue_timeout"):
         why = f"; Slurm's reason: {result.get('slurm_reason')}" if result.get("slurm_reason") else ""
         raise GatewayError(
-            f"The corpus scan could not start: no GPU card became free on the paid partition in "
-            f"{requeues + 1} waits of {wait}{why}. The job never ran, so nothing was lost. Pick "
-            "Corpus scan again later to try once more.", stage="corpus",
+            f"The RetiGene corpus scan could not start: no GPU card became free on the paid partition in "
+            f"{requeues + 1} waits of {wait}{why}. The job never ran, so nothing was lost. Ask "
+            "again later to try once more.", stage="corpus",
             detail=json.dumps(result, default=str)[:2000])
     if str(result.get("status") or "") != "ok":
         msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
         tail = await asyncio.to_thread(_vllm_log_tail, conn, str(result.get("vllm_log") or ""))
-        raise GatewayError(f"The corpus scan did not finish: {msg}", stage="corpus",
+        raise GatewayError(f"The RetiGene corpus scan did not finish: {msg}", stage="corpus",
                            detail=(tail or json.dumps(result, default=str))[:2000])
     await _keep_corpus_scan(conn, run_id, result, emit)
     return result
@@ -8462,8 +8503,8 @@ async def _keep_corpus_scan(conn: Connection, run_id: str, result: dict[str, Any
             kept = await asyncio.to_thread(corpus_scan.store, after[0], result, tables,
                                            {**after[1], "run_id": run_id, "owner": conn.owner,
                                             "slurm_state": result.get("slurm_state")})
-            emit("info", "corpus", f"Corpus scan kept as {kept.key}: the next request for this corpus "
-                                   "is answered from it.")
+            emit("info", "corpus", f"RetiGene corpus scan kept as {kept.key}: the next request about the "
+                                   "RetiGene papers is answered from it.")
         except OSError as exc:
             emit("warning", "corpus", f"The scan's tables could not be kept ({exc}); the next request "
                                       "scans again.")
@@ -8516,7 +8557,7 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
-            f"A scan of this corpus with this model is already running (run {_CORPUS_SCANS_RUNNING[key]}). "
+            f"A scan of the RetiGene corpus with this model is already running (run {_CORPUS_SCANS_RUNNING[key]}). "
             "Its tables are kept when it finishes: ask again then.", stage="corpus")
     cap, cap_why = _corpus_scan_cost_cap(conn)
     from . import anthropic_client, auth_routes, llm_credentials, llm_pricing, llm_relay
@@ -8532,7 +8573,7 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
         conn, run_id=run_id, relay={"model": model, "llm_relay_dir": relay_dir, "max_cost_usd": round(cap, 4)})
     if executor is None or not hasattr(conn.executor, "open_sftp"):
         raise GatewayError(
-            "The corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
+            "The RetiGene corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
             "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
             "nothing was started.", stage="corpus")
     executor.notify = lambda level, message: emit(level, "corpus", message)
@@ -8570,7 +8611,7 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
     def record(usage: "dict[str, Any] | None", duration_ms: int, error_type: "str | None") -> None:
         try:
             auth_routes.record_llm_call(run_id=run_id, user_id=getattr(conn, "app_user_id", None),
-                                        conversation_id=run.conversation_id, step="Corpus scan",
+                                        conversation_id=run.conversation_id, step="RetiGene corpus scan",
                                         provider=provider, role="corpus_scan", model=model, endpoint=endpoint,
                                         remote=True, usage=usage, max_tokens=None, duration_ms=duration_ms,
                                         error_type=error_type)
@@ -8587,9 +8628,9 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
     from ..agents.research_harness import HarnessContext
     ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
                          llm_is_remote=True, read_roots=_tool_read_roots(conn))
-    emit("step", "corpus", f"Corpus scan: {CORPUS_TOOL} with your API model {model} (a CPU job on HPC3; "
+    emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} with your API model {model} (a CPU job on HPC3; "
                            f"the model calls are made here, at most ${cap:.2f}: {cap_why}).")
-    say(f"📚 Scanning the whole indexed corpus for explicitly reported haploinsufficient genes with your "
+    say(f"📚 Scanning all the RetiGene papers for explicitly reported haploinsufficient genes with your "
         f"API model **{model}**, on your key. One HPC3 job (CPU only) retrieves the passages; this server "
         f"makes every model call and records it in your API usage. It reads about 1% of the passages "
         f"first and stops there if they fail or if they project a cost above ${cap:.2f} ({cap_why}).")
@@ -8618,9 +8659,9 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
         return None
     if str(result.get("status") or "") != "ok":
         msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
-        raise GatewayError(f"The corpus scan did not finish: {msg} Spent: {spent}.", stage="corpus",
+        raise GatewayError(f"The RetiGene corpus scan did not finish: {msg} Spent: {spent}.", stage="corpus",
                            detail=json.dumps(result, default=str)[:2000])
-    emit("info", "corpus", f"Corpus scan model cost: {spent}.")
+    emit("info", "corpus", f"RetiGene corpus scan model cost: {spent}.")
     await _keep_corpus_scan(conn, run_id, result, emit)
     return result
 
@@ -8725,17 +8766,17 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
                                                          (corpus_scan.AGAINST, "argued against"),
                                                          (corpus_scan.SUGGESTED, "only suggested")) if counts[c]]
         title = (f"**Haploinsufficient genes in the RetiGene corpus: {n_list}** — the genes its papers state "
-                 "are haploinsufficient in retinal disease, from a curation of the whole corpus"
+                 "are haploinsufficient in retinal disease, from a curation of all the RetiGene papers"
                  + (f" ({'; '.join(extra)})" if extra else "") + ".")
     else:
-        title = ("**Haploinsufficient genes in the indexed corpus**" if kept_since else
-                 "**Corpus scan finished** — explicitly reported haploinsufficient genes in retinal disease.")
+        title = ("**Haploinsufficient genes in the RetiGene corpus**" if kept_since else
+                 "**RetiGene corpus scan finished** — explicitly reported haploinsufficient genes in retinal disease.")
     if kept_since:
-        title += f" From the corpus scan of {kept_since}, kept because the corpus has not changed since."
+        title += f" From the RetiGene corpus scan of {kept_since}, kept because the RetiGene papers have not changed since."
     lines = [
         title,
         "",
-        f"- Corpus: **{result.get('n_papers')}** papers; search requests written by the model: "
+        f"- RetiGene corpus: **{result.get('n_papers')}** papers; search requests written by the model: "
         f"{result.get('n_requests')}, plus one for each of {result.get('n_gene_requests')} genes found"
         + (f"; every passage that states a dosage mechanism in words: {result.get('n_keyword_passages')}"
            if result.get("n_keyword_passages") else "")
@@ -8941,6 +8982,84 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
     return count_tokens, summarize
 
 
+async def _run_gene_table(conn: Connection, req: LabRequest) -> None:
+    """A passage-grounded table when no complete scan has been kept."""
+    import csv
+    from ..agents import corpus_answer
+
+    run = conn.active_run or conn.begin_run(req.conversation_id)
+    run.kind = "literature"
+    run_id = run.run_id or uuid4().hex[:12]
+    conn.bind_run_id(run, run_id)
+    run.running = True
+    run.chat_stop.clear()
+    run.hard_stop.clear()
+    _watch_run(conn, run, req)
+    conn.push({"type": "chat_start"})
+    art = conn.workspace / run_id / "artifacts"
+    notice = ("From a search of the RetiGene corpus (the passages nearest to the question), not from "
+              "every paper. Ask about the RetiGene papers by name for the complete table.")
+    conn.push({"type": "lab_progress", "level": "info", "text": notice})
+    status, summary = "cancelled", "Stopped by the user"
+    try:
+        if _AUTH_ENABLED and conn.app_user_id:
+            try:
+                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
+                                             conversation_id=run.conversation_id)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_start failed: {exc}")
+        corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
+        out = (await asyncio.to_thread(_literature_corpus_logged, conn, run, corpus, req.question, [])
+               if corpus is not None else {"status": "error", "error": "The RetiGene corpus cannot be searched from this session."})
+        contexts = out.get("contexts", []) if out.get("status") == "ok" else []
+        rows = []
+        if contexts and not run.chat_stop.is_set():
+            llm = await asyncio.to_thread(_lab_llm, conn)
+            raw = await asyncio.to_thread(llm.complete_fn,
+                                          corpus_answer.gene_table_messages(req.question, contexts),
+                                          role="literature")
+            rows = corpus_answer.verify_gene_table(str(raw or ""), contexts)
+        if run.chat_stop.is_set():
+            conn.push({"type": "chat_stopped"})
+            return
+        folder = art / "literature"
+        folder.mkdir(parents=True, exist_ok=True)
+        with (folder / "genes.csv").open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["gene", "evidence", "citation"])
+            writer.writeheader()
+            writer.writerows({key: row[key] for key in writer.fieldnames} for row in rows)
+        def cell(value: str) -> str:
+            return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+        answer = notice + "\n\n| gene | evidence (short verbatim quote) | citation |\n|---|---|---|\n"
+        answer += "\n".join("| " + " | ".join(cell(row[k]) for k in ("gene", "evidence", "citation"))
+                            + " |" for row in rows)
+        if not rows:
+            answer += ("\n\nThe RetiGene passages this search returned do not answer this with verified "
+                       "gene evidence.")
+            if out.get("error"):
+                answer += " " + str(out["error"])
+        (art / "report").mkdir(parents=True, exist_ok=True)
+        (art / "report" / "summary.md").write_text(answer, encoding="utf-8")
+        conn.push({"type": "chat_token", "token": answer})
+        await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [])
+        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
+        items = [{"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
+                  "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
+                 for p in sorted(art.rglob("*")) if p.is_file()]
+        conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
+        status, summary = "done", f"{len(rows)} genes (RetiGene corpus search)"
+        conn.push({"type": "chat_done"})
+    except Exception as exc:  # noqa: BLE001 - report the failed run to the chat
+        status, summary = ("cancelled", "Stopped by the user") if run.chat_stop.is_set() else ("failed", str(exc))
+        conn.push({"type": "chat_error", "message": public_error(exc)})
+    finally:
+        try:
+            _finish_run_record(conn, run_id, status, str(art) if status != "cancelled" else None, summary)
+        finally:
+            run.running = False
+            conn.end_run(run)
+
+
 async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     """The fast path: stream an answer-first ReAct turn straight into the chat bubble.
 
@@ -8997,6 +9116,11 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
 
         tools = build_quickchat_catalog(
             literature_executor=_build_literature_executor(conn), served_model=conn.alloc is not None)
+        from .local_corpus import has_local_index
+        if has_local_index():
+            corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
+            if corpus is not None:
+                tools = [t for t in tools if t.name != "search_corpus"] + [corpus[0]]
         # The case note reaches map_phenotype_to_hpo the same way it does on the research path
         # (via ctx.decisions), so attaching a note and asking a question in chat still works.
         decisions: dict[str, Any] = {}
@@ -9150,20 +9274,51 @@ def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: s
     return conn.plan_value or {"action": "cancel"}
 
 
-def _literature_corpus_available(conn: Connection) -> bool:
-    """Whether this session can search the lab's corpus: the literature line is set up for HPC3 and
-    the session has a live HPC3 connection (what ``_build_literature_executor`` needs). Cheap: the
-    plan card says it before anything is built."""
+def _literature_corpus_on_hpc(conn: Connection) -> bool:
+    """Whether this session reaches the corpus on HPC3: the literature line is set up for HPC3 and
+    the session has a live HPC3 connection (what ``_build_literature_executor`` and the corpus scan
+    need). Cheap, so the event loop may call it."""
     return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
                 and conn.executor is not None and not conn.mock)
 
 
+def _literature_corpus_available(conn: Connection) -> bool:
+    """Whether this session can search the corpus: the Eye Server copy (``local_corpus``, its model
+    loaded) or HPC3 (``_literature_corpus_on_hpc``).
+
+    Loading the model may take a while: callers on the event loop use a worker thread.
+    """
+    from .local_corpus import make_local_tool
+    if make_local_tool() is not None:
+        return True
+    return _literature_corpus_on_hpc(conn)
+
+
 def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
-    """The ``search_corpus`` tool, routed to HPC3 as in the chat (``build_quickchat_catalog``), and
-    the context to call it with; None when the corpus cannot be reached."""
+    """Local ``search_corpus`` with HPC3 fallback, and its context; None if neither is ready."""
     from ..agents.registry import build_quickchat_catalog
     from ..agents.research_harness import HarnessContext
     from ..agents import literature_answer as lit
+    from .local_corpus import make_local_tool
+    local = make_local_tool()
+    if local is not None:
+        local_run = local.executor
+
+        def retrieve(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+            out = local_run(args, ctx)
+            if out is not None:
+                return out
+            executor = _build_literature_executor(conn)
+            if executor is not None:
+                return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
+            return {"status": "error", "error": "The RetiGene corpus copy on this server could not be "
+                                                "searched, and HPC3 is not reachable from this session."}
+
+        from dataclasses import replace
+        local = replace(local, executor=retrieve)
+        ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
+                             tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
+        return local, ctx
     try:
         executor = _build_literature_executor(conn)
     except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
@@ -9284,7 +9439,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     art = conn.workspace / run_id / "artifacts"
     question = str(req.question or "").strip()
     recorded = False
-    with_corpus = _literature_corpus_available(conn)
+    with_corpus = await asyncio.to_thread(_literature_corpus_available, conn)
     # A question about the RetiGene papers is answered from them alone; PubMed only when it asks for
     # it (RCHENLAB/AiScientist issue 46). Decided again after each note on the plan.
     pubmed = not request_router.corpus_only(question)
@@ -9364,7 +9519,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         if not pubmed:
             queries = []                          # the corpus is searched with the question and the words
         emit("info", "literature", ("Queries: " + "; ".join(queries) + ". " if queries else "")
-             + (f"Corpus words: {', '.join(terms)}" if with_corpus and terms else ""))
+             + (f"RetiGene corpus words: {', '.join(terms)}" if with_corpus and terms else ""))
         if run.chat_stop.is_set():
             stopped()
             return None
@@ -9375,7 +9530,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
                      else lit.Collected([], []))
         corpus_out: "dict[str, Any] | None" = None
         if with_corpus and corpus is None:
-            corpus_out = {"status": "error", "error": "the corpus could not be reached from this session"}
+            corpus_out = {"status": "error", "error": "the RetiGene corpus could not be reached from this session"}
         if corpus_job is not None:
             if not corpus_job.done():
                 conn.push({"type": "run_status", "text": "📚 Waiting for the RetiGene corpus search…"})
@@ -9414,6 +9569,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
             return None
         conn.push({"type": "chat_token", "token": answer})
         await asyncio.to_thread(_save_literature_answer, art, question, answer, collected, cited)
+        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
         await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [llm.model])
         items = [
             {"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
@@ -12333,7 +12489,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         from .estimates import estimate_plan, instrument_catalog, run_usage, save_estimate
 
         scientist = ResearchHarness(
-            catalog=instrument_catalog(_session_roster(
+            catalog=instrument_catalog(await _prepare_session_roster(
                 conn,
                 build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
                                         analysis_executor=analysis_executor,
@@ -12409,7 +12565,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         except ValueError:
             max_cycles = 1
         # Skill INDUCTION: at the end of a run, generalize an accepted run_code procedure into a
-        # reusable skill. Written OUTSIDE the repo (never the git-tracked skills/). If the operator
+        # reusable skill. Written OUTSIDE the repo (never the curated release). If the operator
         # set AISCIENTIST_INDUCED_SKILLS_DIR, write there — that same path is what skills.py loads at
         # import, so induced skills survive a restart and are shared. Otherwise fall back to this
         # connection's workspace: still usable by later runs in THIS process (register_skill), but
@@ -12907,7 +13063,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             except OSError:
                 pass
             if lit["tier"] in ("lab_deep_literature", "lab_literature_search"):
-                _src = "indexed corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
+                _src = "RetiGene corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
                     else "literature-search step"
                 emit("success", "lab", f"References: reused {len(lit['citations'])} citation(s) from the accepted {_src}.")
             elif not brief:
@@ -16013,7 +16169,11 @@ _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za
 # folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
 # is a name; it is only ever joined to the directory for SFTP, never given to a shell.
 _CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
-_RESULT_KINDS = ("dataset", "cellqc", "tables")
+_RESULT_KINDS = ("dataset", "cellqc", "tables", "literature")
+# A literature run's tables (issue 20), saved as one folder. The record is in the run's folder, outside
+# ``artifacts/``, so it is neither a result file nor in the bundle (like the curation's, issue 46).
+_LITERATURE_RESULT_POINTER = "literature_result.json"
+_LITERATURE_NAME_RE = re.compile(r"literature\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+")
 # A corpus curation's tables (issue 46), saved as one folder: "<topic>.curation.<time>.<run>".
 _TABLES_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.curation\.[0-9]{8}-[0-9]{4}\.[A-Za-z0-9]+")
 # Already compressed: deflating them again costs CPU for the whole download and saves nothing.
@@ -16022,6 +16182,8 @@ _ZIP_STORED_SUFFIXES = (".h5ad", ".h5", ".gz", ".pdf", ".png", ".zip")
 
 def _result_pointer_path(owner: str, run_id: str, what: str = "dataset") -> Path:
     from ..tools.api import CELLQC_RESULT_POINTER, RESULT_DATASET_POINTER
+    if what == "literature":
+        return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / _LITERATURE_RESULT_POINTER
     name = CELLQC_RESULT_POINTER if what == "cellqc" else RESULT_DATASET_POINTER
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / name
 
@@ -16032,6 +16194,36 @@ def _read_pointer(path: Path) -> "dict | None":
     except (OSError, ValueError):
         return None
     return rec if isinstance(rec, dict) else None
+
+
+def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dict | None":
+    """Keep a saveable copy of literature tables; the run's downloads remain in artifacts. Both go
+    in the run's own folder (``art``'s parent): on the server that is where ``_result_pointer_path``
+    looks, since a session's workspace is ``CONSOLE_RUNS_DIR/<owner>``."""
+    from . import corpus_scan
+    pointer = art.parent / _LITERATURE_RESULT_POINTER
+    existing = _read_pointer(pointer)
+    if existing is not None:
+        return existing
+    sources = [art / "literature" / "papers.csv", art / "literature" / "genes.csv",
+               art / corpus_scan.OUT_SUBDIR / "genes.csv"]
+    sources = [p for p in sources if p.is_file()]
+    if not sources:
+        return None
+    root = art.parent / "result" / "literature"
+    root.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        shutil.copy2(source, root / source.name)
+    now = datetime.now(timezone.utc)
+    files = [{"name": p.name, "size": p.stat().st_size} for p in sorted(root.glob("*.csv"))]
+    rec = {"name": f"literature.{now:%Y%m%d-%H%M}.{run_id}", "path": str(root),
+           "kind": "literature", "owner": conn.owner, "run_id": run_id, "location": "gateway",
+           "created_at": now.isoformat(timespec="seconds"), "files": files,
+           "size_bytes": sum(f["size"] for f in files),
+           "kept_days": conn.settings.checkpoint_ttl_days, "until_disconnect": False}
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    return rec
 
 
 def _stamp_cellqc_result(conn: "Connection", run_id: str, decisions: dict, on_hpc: bool,
@@ -16150,7 +16342,11 @@ def _saved_result_files(owner: str, run_id: str, rec: dict, folder: bool) -> "tu
         fname = str(f.get("name") or "")
         if not _CELLQC_FILE_RE.fullmatch(fname):
             continue
-        copy = copies / fname
+        copy = (CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "literature" / fname
+                if rec.get("kind") == "literature" else copies / fname)
+        if rec.get("kind") == "literature" and not copy.is_file():
+            from . import corpus_scan
+            copy = CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / corpus_scan.OUT_SUBDIR / fname
         sha = sha256_file(copy) if copy.is_file() and copy.stat().st_size == int(f.get("size") or -1) else None
         files.append({"path": fname, "size": int(f.get("size") or 0), "sha256": sha,
                       "verified": "computed" if sha else ""})
@@ -16165,7 +16361,8 @@ def md_result_uuid(run_id: str) -> str:
 def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                      conn: "Connection | None") -> "tuple[int, dict]":
     """Make what a run handed on one of the owner's datasets: the processed dataset
-    (``what="dataset"``, an .h5ad) or CellQC's result directory (``"cellqc"``, a folder). Returns
+    (``what="dataset"``, an .h5ad), CellQC's result directory (``"cellqc"``), or literature
+    tables (``"literature"``), both folders. Returns
     ``(HTTP status, body)``. Talks to HPC3: call it in a thread.
 
     With a data root (issue 6) it goes into the owner's dataset folder on this host
@@ -16173,19 +16370,23 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
     copied back in the background (202, ``saving``), checked by size, and listed when it is here;
     the HPC3 copy goes with the run's other process files. Without one, it is moved to the owner's
     personal HPC3 folder (``AiScientist_results``) or, for a local run, their ``uploads/processed``."""
-    folder = what == "cellqc"
+    folder = what in ("cellqc", "literature")
     pointer_path = _result_pointer_path(owner, run_id, what)
     rec = _read_pointer(pointer_path)
     if rec is None:
-        return 404, {"error": "This run kept no CellQC result directory." if folder
+        return 404, {"error": "This run kept no literature tables." if what == "literature" else
+                     "This run kept no CellQC result directory." if folder
                      else "This run has no processed dataset."}
     if rec.get("saved_to"):
         return 200, {"ok": True, "path": rec["saved_to"], "already": True}
     name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
     if rec.get("saving"):
         return 202, {"ok": True, "saving": True, "name": name}
-    if not (_CELLQC_NAME_RE if folder else _RESULT_NAME_RE).fullmatch(name):
+    pattern = _LITERATURE_NAME_RE if what == "literature" else _CELLQC_NAME_RE if folder else _RESULT_NAME_RE
+    if not pattern.fullmatch(name):
         return 400, {"error": "unexpected result name"}
+    if what == "literature" and rec.get("location") != "gateway":
+        return 400, {"error": "unexpected literature location"}
     owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
     kept = dataset_storage.configured()
     if rec.get("location") == "hpc3":
@@ -16213,7 +16414,7 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
     else:
         src_p = Path(src).resolve()
         if folder:
-            found = src_p == (owner_dir / run_id / "result" / "cellqc").resolve() and src_p.is_dir()
+            found = src_p == (owner_dir / run_id / "result" / what).resolve() and src_p.is_dir()
         else:
             found = src_p.parent == (owner_dir / run_id / "result").resolve() and src_p.is_file()
         if not found:
@@ -16395,7 +16596,8 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
     do, for every run (_fixed_run_options). Best-effort, like the export."""
     if not (_AUTH_ENABLED and conn.app_user_id):
         return          # no account, no "my data": the results stay beside the run
-    for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory")):
+    for what, label in (("dataset", "The processed dataset"), ("cellqc", "CellQC's result directory"),
+                        ("literature", "The literature tables")):
         if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
             continue
         try:
@@ -16418,7 +16620,7 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
 @app.get("/api/result-datasets")
 async def list_result_datasets(request: Request) -> JSONResponse:
     """What the caller's runs handed on, newest first, with where each is now: the processed dataset
-    (the row's own fields) and, under ``cellqc``, CellQC's result directory."""
+    (the row's own fields), ``cellqc`` result directories and ``literature`` table folders."""
     if not _AUTH_ENABLED:
         return JSONResponse({"result_datasets": []})
     user = _optional_user(request)
@@ -16456,6 +16658,16 @@ async def list_result_datasets(request: Request) -> JSONResponse:
         row["tables"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "n_genes", "counts", "created_at",
                                                     "saved_to", "saved_at", "save_error")},
                          "files": [str(f.get("name") or "") for f in rec.get("files") or []]}
+    for p in home.glob(f"*/{_LITERATURE_RESULT_POINTER}"):
+        rec = _read_pointer(p)
+        if rec is None or not rec.get("name"):
+            continue
+        run_id = p.parent.name
+        row = rows.setdefault(run_id, {"run_id": run_id, "created_at": rec.get("created_at")})
+        row["literature"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "created_at", "kept_days",
+                                                       "until_disconnect", "location", "saved_to",
+                                                       "saved_at", "saving", "save_error")},
+                             "n_files": len(rec.get("files") or [])}
     ordered = sorted(rows.values(), key=lambda r: r.get("created_at") or "", reverse=True)
     return JSONResponse({"result_datasets": ordered})
 
@@ -16464,8 +16676,8 @@ async def list_result_datasets(request: Request) -> JSONResponse:
 async def save_result_dataset(run_id: str, request: Request, what: str = "dataset") -> JSONResponse:
     """Make what a run handed on one of the caller's datasets — named with its input, what it is, the
     time and the run — so the next analysis can start from it without anyone downloading it.
-    ``what``: ``dataset`` (the processed .h5ad) or ``cellqc`` (CellQC's result directory, as a
-    folder). 202 with ``saving`` while one kept on HPC3 is being copied back (see
+    ``what``: ``dataset`` (the processed .h5ad), ``cellqc`` (CellQC's result directory), or
+    ``literature`` (the literature CSV tables). 202 with ``saving`` while one kept on HPC3 is being copied back (see
     :func:`_save_run_result`)."""
     if not _AUTH_ENABLED:
         return JSONResponse({"error": "Saving a dataset requires accounts."}, status_code=400)
@@ -16683,6 +16895,14 @@ async def ws_endpoint(websocket: WebSocket, connection_id: str) -> None:
             if isinstance(_expires, (int, float)):
                 await websocket.send_json(_run.tag({"type": "plan_expiring",
                                                     "seconds_left": max(0, int(_expires - time.monotonic()))}))
+        # A confirmation the agent is waiting on, sent again with the time it has left.
+        for _run in list(conn.live_runs) + ([conn._bare_run] if conn._bare_run else []):
+            _pc = _run.pending_confirm
+            if not _pc or _run.confirm_event.is_set():
+                continue
+            _left = (max(0, int(_run.confirm_expires_at - time.monotonic()))
+                     if _run.confirm_expires_at is not None else None)
+            await websocket.send_json(_run.tag({**_pc, **({"seconds_left": _left} if _left is not None else {})}))
         # Rebuild the centre bubble for a client that refreshed / navigated back.
         #  • Run still in flight → replay so the live bubble keeps streaming to this queue.
         #  • Run already FINISHED → replay ONCE more, tagged `recover`, so a client that

@@ -301,7 +301,7 @@ def test_a_session_on_hpc3_also_searches_the_corpus_and_answers_from_both(tmp_pa
     assert [q for q, _, _ in w.searched] == ["DDX41 retina"]                 # PubMed still searched
     answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
     # [1] the corpus-only paper, [2] the corpus paper PubMed also found, [3] PubMed only
-    assert "- [1] Smith J et al. DDX41 in the eye. Exp Eye Res (2024). PMID:777 https://pubmed.ncbi.nlm.nih.gov/777/" in answer
+    assert "- [1] Smith J et al. DDX41 in the eye. Exp Eye Res (2024). PMID:777 (PMID 777, p. 3) https://pubmed.ncbi.nlm.nih.gov/777/" in answer
     assert "- [2] Lee et al. (2025) DDX41 paper 2." in answer and "- [3] Lee et al. (2025) DDX41 paper 1." in answer
     (run_dir,) = list(conn.workspace.iterdir())
     art = run_dir / "artifacts"

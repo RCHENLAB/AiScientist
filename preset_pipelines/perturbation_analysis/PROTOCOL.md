@@ -192,7 +192,7 @@ across perturbations. Not significant at the chosen FDR ⇒ **silent**.
 names) · perturbations are ranked by effect size · silent guides are listed **as a result**, not dropped
 silently and not forced into DE.
 
-<sub>Source: `skills/perturbation_edistance/reference.py` · `references/methods.md`</sub>
+<sub>Source: skill `rank-perturbations-by-edistance` (`scripts/reference.py`) · `references/methods.md`</sub>
 </details>
 
 <details>
@@ -218,7 +218,7 @@ versions).
 before DE · if skipped — the report SAYS the DE ran on all guide-assigned cells (conservative, diluting)
 and states pertpy was unavailable · the step never blocks the pipeline.
 
-<sub>Source: `skills/mixscape_escape_filter/reference.py` · `references/methods.md`</sub>
+<sub>Source: skill `filter-escapers-with-mixscape` (`scripts/reference.py`) · `references/methods.md`</sub>
 </details>
 
 <details>
@@ -253,7 +253,7 @@ one-vs-rest · each perturbation reports adjusted p-values + log fold-changes ·
 reported as a positive control and guides failing it are flagged · silent / low-cell perturbations are
 excluded.
 
-<sub>Source: `skills/perturbation_de_vs_control/reference.py` · `references/methods.md`</sub>
+<sub>Source: skill `compare-perturbations-to-control` (`scripts/reference.py`) · `references/methods.md`</sub>
 </details>
 
 <details>
@@ -291,7 +291,7 @@ perturbation×perturbation E-distance matrix.
 **✅ Verify this step:** modules are derived from correlated DE / small pairwise E-distance · they are
 framed as hypotheses, not established pathways.
 
-<sub>Source: `skills/perturbation_edistance/reference.py` · `preset_pipelines/perturbation_analysis/SKILL.md` (Ordered plan §8)</sub>
+<sub>Source: skill `rank-perturbations-by-edistance` (`scripts/reference.py`) · `preset_pipelines/perturbation_analysis/SKILL.md` (Ordered plan §8)</sub>
 </details>
 
 <details>

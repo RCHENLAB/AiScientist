@@ -34,8 +34,8 @@ Run this immediately after loading any single-cell RNA-seq .h5ad.
 
 
 @pytest.fixture
-def libs(tmp_path, monkeypatch):
-    """A curated root with one skill, an induced root with two, and module state of its own."""
+def libs(tmp_path, monkeypatch, skill_release):
+    """A pinned release with one skill, an induced root with two, and module state of its own."""
     curated, induced = tmp_path / "skills", tmp_path / "induced"
     (curated / "score_signature").mkdir(parents=True)
     (curated / "score_signature" / "SKILL.md").write_text(
@@ -44,7 +44,7 @@ def libs(tmp_path, monkeypatch):
         (induced / name).mkdir(parents=True)
         (induced / name / "SKILL.md").write_text(_INDUCED_MD.format(name=name))
         (induced / name / "reference.py").write_text("import scanpy as sc\nsc.read_h5ad(DATASET)\n")
-    monkeypatch.setenv("AISCIENTIST_SKILLS_DIR", str(curated))
+    skill_release(curated, refresh=False)
     monkeypatch.setenv("AISCIENTIST_INDUCED_SKILLS_DIR", str(induced))
     shown: dict = {}
     every: dict = {}

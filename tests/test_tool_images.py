@@ -161,7 +161,7 @@ def _sbatch_scripts(hpc) -> str:
     return "\n".join(hpc.cmds)
 
 
-def test_a_tool_with_its_own_image_runs_in_it_with_its_resources():
+def test_a_tool_with_its_own_image_runs_in_it_with_its_resources(cellqc_release):
     m = tool_skills.job_environment(catalog.manifest("run_cellqc"))   # from the skill it names
     hpc = FakeHPC(present=True)
     out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {}, ctx=None)
@@ -177,7 +177,7 @@ def test_a_tool_with_its_own_image_runs_in_it_with_its_resources():
     assert not any("_image_" in c for c in hpc.cmds if c.startswith("sbatch"))   # already there
 
 
-def test_the_image_is_provisioned_once_on_first_use():
+def test_the_image_is_provisioned_once_on_first_use(cellqc_release):
     hpc = FakeHPC(present=False)
     ex = _executor(hpc, dataset_root="/dfs/up/cohort")
     ex.run_tool("run_cellqc", {}, ctx=None)
@@ -187,7 +187,7 @@ def test_the_image_is_provisioned_once_on_first_use():
     assert any("build --sandbox" in c for c in hpc.cmds)   # run_cellqc's image is a bioconda: build
 
 
-def test_a_failed_provisioning_is_an_error_not_a_run_in_the_wrong_image():
+def test_a_failed_provisioning_is_an_error_not_a_run_in_the_wrong_image(cellqc_release):
     class NeverThere(FakeHPC):
         def exec(self, command, timeout=60.0):
             out = super().exec(command, timeout)
@@ -222,7 +222,7 @@ def test_scrna_cli_hands_the_folder_root_to_the_tool(monkeypatch):
     assert json.dumps(out)
 
 
-def test_every_bound_folder_is_bound_and_handed_to_the_job():
+def test_every_bound_folder_is_bound_and_handed_to_the_job(cellqc_release):
     """Two Cell Ranger folders bound to one run (RCHENLAB/AiScientist issue 22): the job sees both,
     by name, and can read both inside its container."""
     hpc = FakeHPC(present=True)
@@ -265,7 +265,7 @@ def _fake_skill(**kw):
     return Skill(**{**base, **kw})
 
 
-def test_run_cellqc_names_its_skill_and_repeats_none_of_its_environment():
+def test_run_cellqc_names_its_skill_and_repeats_none_of_its_environment(cellqc_release):
     from aiscientist.agents.skills import get_skill, refresh_skills
     m = catalog.manifest("run_cellqc")
     assert m.skill == _CELLQC_SKILL

@@ -20,7 +20,7 @@ its prose (``does``) and gains the structured facts beside it::
         does: >-
           Group the cells into transcriptionally distinct populations with `run_clustering` ...
 
-``skill`` names the vetted skill a code step uses (``skills/`` or the registry): matched by
+``skill`` names the vetted skill a code step uses (from the pinned registry release): matched by
 AiScientist when the plan is drafted, shown on the card, removable, and handed to the Scientist
 with its guidance and code when the step runs.
 

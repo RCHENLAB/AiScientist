@@ -272,7 +272,7 @@ def test_manifest_metadata_reaches_the_answer_csv_without_changing_the_citation(
     got = lit.add_corpus(lit.Collected([], []), out)
     row, = csv.DictReader(io.StringIO(lit.papers_csv(got.papers)))
     assert {k: row[k] for k in expected} == expected
-    assert got.papers[0].line() == "Smith J. PRPF31 in adRP. 2001. https://pubmed.ncbi.nlm.nih.gov/11111111/"
+    assert got.papers[0].line() == "Smith J. PRPF31 in adRP. 2001. (PMID 11111111, p. 1) https://pubmed.ncbi.nlm.nih.gov/11111111/"
 
 
 def test_the_retigene_manifest_column_names_reach_the_contexts(corpus):

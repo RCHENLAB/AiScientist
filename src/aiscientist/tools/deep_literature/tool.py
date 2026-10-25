@@ -446,10 +446,10 @@ def run_paperqa(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         # had run. Retrieving nothing is a failed lookup and has to say so — the caller can rephrase
         # or fall back, but it must not be able to mistake this for an answer.
         error = (
-            "the indexed corpus returned 0 passages for this question, so there is no "
+            "the RetiGene corpus returned 0 passages for this question, so there is no "
             "grounded answer. Two usual causes: (a) the question is a bag of identifiers "
             "(gene symbols, a pathway accession) rather than a sentence — this is a semantic "
-            "retriever, so ask it a question; (b) the corpus does not cover the topic, in "
+            "retriever, so ask it a question; (b) the RetiGene corpus does not cover the topic, in "
             "which case `literature_search` (live Europe PMC) is the right tool and the "
             "write-up must say the deep search returned nothing."
         )
@@ -459,7 +459,7 @@ def run_paperqa(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
             error = (
                 "PaperQA's time budget ran out (agent status 'truncated') and it ended with 0 "
                 "passages, so there is no grounded answer. Evidence gathering keeps nothing when "
-                "it is cut, so this does not show that the corpus lacks the topic: the model "
+                "it is cut, so this does not show that the RetiGene corpus lacks the topic: the model "
                 "endpoint was too slow. Retry later, or use `literature_search`."
             )
         return {

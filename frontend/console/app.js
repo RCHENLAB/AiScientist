@@ -77,6 +77,9 @@ function newChatRecord(sid) {
     planEditorOpen: false, // the plan editor is open on the waiting card
     planWords: "",         // a change to the plan typed in the side panel's box and not sent yet
     planShown: "",        // which version of the waiting plan has opened the side panel already
+    confirm: null,         // a confirmation the agent waits on (confirm_request): {run, kind, summary,
+                           // detail, reversible, deadline, answer}. Its card is drawn FROM it
+                           // (drawConfirmPrompt), like the plan's, and it is cleared by confirm_done.
     answered: null,        // the plan as it stood when it was answered and the PI took it back (a reply
                            // in words, an edit, a cancel, a review the server closed): {agenda, doc,
                            // revised, status}. Its entry and the side panel show it, read-only, until
@@ -836,6 +839,7 @@ function sessionBadge(sid) {
   const c = chats.get(String(sid));
   if (!c) return "";
   if (c.plan) return `<span class="session-waiting" title="This chat is waiting for your answer">${PLAN_WAITING_LABEL[c.plan.kind] || "Waiting for you"}</span>`;
+  if (c.confirm && !c.confirm.answer) return '<span class="session-waiting" title="The agent is waiting for your OK in this chat">Needs your OK</span>';
   if (c.running) return '<span class="session-running" title="A run is in progress in this chat">Running</span>';
   return "";
 }
@@ -861,7 +865,7 @@ function renderChat() {
   // session's downloads stranded in the panel.
   refreshDownloads();
   syncPlaceholder();
-  if (!s || (!s.messages.length && !ownerVisible() && !planPromptVisible())) {
+  if (!s || (!s.messages.length && !ownerVisible() && !planPromptVisible() && !confirmPromptVisible())) {
     stream.innerHTML = '<div class="empty-hint">Connect to HPC3, then ask a research question.</div>';
     renderPlanPanel();
     updateComposerButton();
@@ -875,6 +879,8 @@ function renderChat() {
   // Same for a plan, a question or a decision point that is waiting in this chat: its card with
   // its buttons comes back, instead of a composer that says a plan is pending and nothing to act on.
   drawPlanPrompt();
+  // …and a confirmation the agent is waiting on in this chat.
+  drawConfirmPrompt();
   // …and the side panel's Plan tab follows the chat on screen: its waiting plan, else its last one.
   renderPlanPanel();
   if (c && c.plan && c.plan.kind === "plan") selectSideTab("plan");
@@ -882,6 +888,146 @@ function renderChat() {
   // chat's, and both were last set for the chat that was left.
   updateComposerButton();
   stream.scrollTop = stream.scrollHeight;
+}
+
+// ---- confirmation cards ---------------------------------------------------
+// Before the agent acts at an edge of what it may do on HPC3 (install a package into the lab's
+// shared area, write outside the user's folders, download, delete or overwrite), the server asks:
+// `confirm_request`, answered with POST /api/confirm, closed by `confirm_done`. Like a plan, the
+// request is held in its own chat's record (c.confirm) and its card is drawn from there, so it comes
+// back when that chat is shown again and is never drawn into another chat; after a reconnect or a
+// reload the server sends it again. No answer before its deadline counts as no on the server.
+const CONFIRM_TITLES = {
+  install: "📦 Install software on HPC3?",
+  download: "⬇️ Download onto HPC3?",
+  write_outside: "✍️ Write outside your folders?",
+  destructive: "⚠️ Delete or overwrite on HPC3?",
+  quota: "💾 Use more storage on HPC3?",
+};
+const CONFIRM_OUTCOMES = {
+  approved: "✓ Approved — the agent continues.",
+  declined: "✗ Declined — the agent continues without it.",
+  timeout: "No answer in time — counted as no; the agent continues without it.",
+  stopped: "The run stopped — nothing was done.",
+};
+
+function confirmPromptVisible(c = activeChat()) {
+  return !!c && !!c.confirm && chatVisible(c);
+}
+
+// When the request counts as no: the time left (a request sent again after a reconnect) or its
+// whole window (a new one), from now. null when the server gave neither.
+function confirmDeadline(msg) {
+  const raw = msg.seconds_left ?? msg.timeout_s;
+  if (raw == null) return null;
+  const left = Number(raw);
+  return Number.isFinite(left) ? Date.now() + 1000 * left : null;
+}
+
+function holdConfirm(c, msg) {
+  const next = { run: msg.run_id || null, kind: String(msg.kind || ""), summary: String(msg.summary || ""),
+    detail: String(msg.detail || ""), reversible: msg.reversible !== false, deadline: confirmDeadline(msg), answer: null };
+  const held = c.confirm;
+  const same = !!held && held.run === next.run && held.kind === next.kind && held.summary === next.summary
+    && held.detail === next.detail;
+  // The same request sent again (a reconnect) after it was answered here: the answer stands.
+  if (same && held.answer) return;
+  c.confirm = next;
+  renderSessionList();
+  if (chatVisible(c)) {
+    if (same && state.confirmCardEl && state.confirmCardEl.isConnected) { state.confirmCardEl.innerHTML = confirmCardHtml(next); wireConfirmCard(c); return; }
+    drawConfirmPrompt(c);
+    return;
+  }
+  if (!same) toast(`“${chatTitle(c.sid).trim()}” needs your OK — open that chat to answer.`);
+}
+
+function confirmCardHtml(p, note = "") {
+  const when = p.deadline ? new Date(p.deadline).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const meta = [p.reversible ? "This can be undone." : "This cannot be undone.",
+    when ? `No answer by ${when} counts as no.` : "No answer in time counts as no."].join(" ");
+  const foot = note
+    ? `<div class="confirm-status">${escapeHtml(note)}</div>`
+    : p.answer
+      ? `<div class="confirm-status">${p.answer === "approve" ? "Approving…" : "Declining…"}</div>`
+      : `<div class="plan-actions-row"><button type="button" class="primary" data-confirm="approve">Approve</button>` +
+        `<button type="button" class="ghost" data-confirm="decline">Decline</button></div>`;
+  return `<h2>${escapeHtml(CONFIRM_TITLES[p.kind] || "🔐 The agent needs your OK")}</h2>` +
+    `<div class="clarify-question">${escapeHtml(p.summary)}</div>` +
+    (p.detail ? `<pre class="confirm-detail">${escapeHtml(p.detail)}</pre>` : "") +
+    (note ? "" : `<div class="confirm-meta">${escapeHtml(meta)}</div>`) + foot;
+}
+
+function removeConfirmCard() {
+  if (state.confirmCardEl) { state.confirmCardEl.remove(); state.confirmCardEl = null; }
+}
+
+function wireConfirmCard(c) {
+  const el = state.confirmCardEl;
+  if (!el) return;
+  el.querySelectorAll("[data-confirm]").forEach((b) =>
+    b.addEventListener("click", () => answerConfirm(c, b.dataset.confirm === "approve")));
+}
+
+function drawConfirmPrompt(c = activeChat()) {
+  if (!c || !chatVisible(c) || !c.confirm) return;
+  removeConfirmCard();
+  const stream = $("chatStream");
+  const hint = stream.querySelector(".empty-hint"); if (hint) hint.remove();
+  const el = document.createElement("div");
+  el.className = "msg assistant plan-card confirm-card";
+  el.dataset.prompt = "confirm";
+  el.innerHTML = confirmCardHtml(c.confirm);
+  stream.appendChild(el);
+  state.confirmCardEl = el;
+  wireConfirmCard(c);
+  stream.scrollTop = stream.scrollHeight;
+}
+
+// The request is no longer waiting: its card keeps a line saying what became of it.
+function closeConfirm(c, note) {
+  const p = c.confirm;
+  if (!p) return;
+  c.confirm = null;
+  renderSessionList();
+  if (chatVisible(c) && state.confirmCardEl && state.confirmCardEl.isConnected) {
+    state.confirmCardEl.innerHTML = confirmCardHtml(p, note);
+    state.confirmCardEl = null;
+  }
+}
+
+function releaseConfirm(c, msg) {
+  if (!c.confirm) return;
+  closeConfirm(c, CONFIRM_OUTCOMES[msg && msg.outcome] || "This request is no longer waiting.");
+}
+
+async function answerConfirm(c, approved) {
+  const p = c.confirm;
+  if (!p || p.answer || !state.connectionId) return;
+  p.answer = approved ? "approve" : "decline";
+  if (chatVisible(c) && state.confirmCardEl) state.confirmCardEl.innerHTML = confirmCardHtml(p);
+  renderSessionList();
+  let body = {};
+  try {
+    const r = await fetch("/api/confirm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection_id: state.connectionId, approved, run_id: p.run, conversation_id: c.sid }),
+    });
+    body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+  } catch (err) {
+    // Not sent: the buttons come back, so the person can try again before the deadline.
+    if (c.confirm === p) {
+      p.answer = null;
+      if (chatVisible(c) && state.confirmCardEl) { state.confirmCardEl.innerHTML = confirmCardHtml(p); wireConfirmCard(c); }
+      renderSessionList();
+    }
+    toast("Could not send your answer: " + err.message);
+    return;
+  }
+  // The server took it (confirm_done follows and closes the card) or no longer waits for it.
+  if (c.confirm === p && body.status === "stale") closeConfirm(c, "This request is no longer waiting.");
+  else if (c.confirm === p) closeConfirm(c, approved ? CONFIRM_OUTCOMES.approved : CONFIRM_OUTCOMES.declined);
 }
 
 function refreshDownloads() {
@@ -1218,6 +1364,7 @@ function finishAssistantStream(c) {
   // The run is over, so nothing of it can still be waiting for an answer. A plan review that
   // expired sends no plan_done: without this its card would be drawn again on every switch of chats.
   if (c.plan || c.planPending) { if (chatVisible(c)) removePlanCard(); hidePlanPanel(c); }
+  if (c.confirm) closeConfirm(c, "The run ended — this request is no longer waiting.");
   dropPlanDraft(c);
   if (!c.run) { saveRunOwners(); return; }
   const run = c.run;
@@ -2707,7 +2854,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "plan_expiring", "run_usage",
+  "plan_status", "plan_expiring", "run_usage", "confirm_request", "confirm_done",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -2803,6 +2950,8 @@ function handleRunEvent(c, msg) {
     case "plan_done": hidePlanPanel(c); break;
     case "plan_status": if (chatVisible(c)) setPlanStatus(msg.text); break;
     case "plan_expiring": notePlanExpiring(c, msg); break;
+    case "confirm_request": holdConfirm(c, msg); break;
+    case "confirm_done": releaseConfirm(c, msg); break;
   }
 }
 
@@ -6980,7 +7129,7 @@ function _sgAgo(sec) {
   return `${Math.floor(sec / 3600)}h ${String(Math.floor((sec % 3600) / 60)).padStart(2, "0")}m`;
 }
 
-const SG_KIND = { research: "Research", literature: "Literature", chat: "Chat", corpus: "Corpus scan" };
+const SG_KIND = { research: "Research", literature: "Literature", chat: "Chat", corpus: "RetiGene scan" };
 const SG_OUTCOME = { finished: "Finished", stopped: "Stopped", cancelled: "Cancelled", failed: "Failed", ended: "Ended" };
 
 // One card in "Running now". ``now`` is the server's clock (seconds), so elapsed times are the
@@ -7593,7 +7742,7 @@ async function loadRuns() {
 // HPC3): deleting the run deletes it too.
 function keptBesideRun(r) {
   const here = (x) => x && x.name && !x.saved_to && !x.saving && x.location !== "hpc3";
-  return !!r && (here(r) || here(r.cellqc));
+  return !!r && (here(r) || here(r.cellqc) || here(r.literature));
 }
 function runHasOutputs(x) { return x.status === "done" || x.status === "incomplete"; }
 function runTitle(x) { return (x.question || "").slice(0, 90) || `Run ${x.run_id}`; }
@@ -7684,12 +7833,17 @@ function resultHandoffHtml(runId, r) {
   const t = r.tables;
   if (t) {
     const files = (t.files || []).join(", ");
-    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 Curation tables · ${escapeHtml(String(t.n_genes ?? 0))} haploinsufficient genes · ${escapeHtml(String((t.files || []).length))} CSV files</span>` +
+    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 RetiGene curation tables · ${escapeHtml(String(t.n_genes ?? 0))} haploinsufficient genes · ${escapeHtml(String((t.files || []).length))} CSV files</span>` +
       (t.saved_to
         ? `<span class="ok small" title="${escapeHtml(t.saved_to)}">Saved to my data</span>`
         : (t.save_error ? `<span class="bad small" title="${escapeHtml(t.save_error)}">The last save failed</span>` : "") +
           `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="tables" data-label="Save tables to my data">Save tables to my data</button>`) +
       `</div>`;
+  }
+  const literature = r.literature;
+  if (literature) {
+    html += `<div class="run-dataset"><span class="muted small">Literature tables · ${literature.n_files} files · ${mb(literature.size_bytes)}</span>` +
+      kept(literature, "Save tables to my data", "literature") + `</div>`;
   }
   return html;
 }

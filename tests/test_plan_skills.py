@@ -70,8 +70,8 @@ ACCEPT = json.dumps({"verdict": "accept", "score": 0.9, "critique": "ok"})
 
 
 @pytest.fixture
-def library(tmp_path, monkeypatch):
-    """A skill library of two skills in the registry layout, loaded in place of the real one."""
+def library(tmp_path, monkeypatch, skill_release):
+    """A release of two skills in the registry layout, loaded in place of the real one."""
     root = tmp_path / "skills"
     for name, md, code in ((SIGNATURE, SIG_MD, SIG_CODE),
                            ("compare-two-groups-with-scanpy", DE_MD, "print('de')\n")):
@@ -79,8 +79,8 @@ def library(tmp_path, monkeypatch):
         (folder / "scripts").mkdir(parents=True)
         (folder / "SKILL.md").write_text(md, encoding="utf-8")
         (folder / "scripts" / "reference.py").write_text(code, encoding="utf-8")
-    monkeypatch.setenv("AISCIENTIST_SKILLS_DIR", str(root))
     monkeypatch.delenv("AISCIENTIST_INDUCED_SKILLS_DIR", raising=False)
+    skill_release(root)
     lib: dict = {}
     monkeypatch.setattr(skills_mod, "SKILLS", lib)
     monkeypatch.setattr(rl, "ATOMIC_SKILLS", lib)        # research_lab binds the dict at import
@@ -269,7 +269,7 @@ def test_a_code_step_gets_the_skill_that_fits_and_runs_with_it(tmp_path, library
 
     # The record: the run's manifest names the skill, and the Critic checks the code against it.
     manifest = json.loads((workspace / "manifest.json").read_text())
-    assert manifest["skills"] == [{"name": SIGNATURE, "version": "local", "registry_release": None}]
+    assert manifest["skills"] == [{"name": SIGNATURE, "version": "1.0.0", "registry_release": "v0.1.0"}]
     assigned = record["critic"][0]["ASSIGNED_SKILL"]
     assert assigned["name"] == SIGNATURE and assigned["skill_functions"] == ["scanpy.tl.score_genes"]
     assert assigned["code_it_ran"] == [{"tool_call": 1, "tool": "run_code", "ok": True, "chars": 8,
@@ -404,10 +404,7 @@ def test_a_skill_step_is_counted_once_by_the_code_that_ran_its_method(tmp_path, 
     three steps that had the skill, two of them only listing files. Here the step lists its files,
     then scores; the score fails, the Critic asks for a revision, and the second attempt scores. That
     is one use of the skill, and it worked."""
-    from dataclasses import replace
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_STATS", str(tmp_path / "counts.sqlite3"))
-    library[SIGNATURE] = replace(library[SIGNATURE], registry_release="v0.1.0", version="1.0.0",
-                                 requirements=registry.requirements({}))
     ran: list[str] = []
 
     class Sandbox:

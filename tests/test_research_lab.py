@@ -2229,17 +2229,14 @@ def test_no_skill_selected_means_free_planning():
     assert "research-path guidance" not in seen["pi_user"]
 
 
-def test_pipeline_loader_reads_tools_and_atomic_skill_library():
+def test_pipeline_loader_reads_tools():
     from aiscientist.agents.presets import PRESETS, get_preset
-    from aiscientist.agents.skills import SKILLS
 
     p = get_preset("scgpt_annotation")
     assert "scgpt_annotate" in p.tools                      # tools: frontmatter parsed
-    # the CodeAct templates that used to be bundled per-pipeline now live in the shared atomic library
-    # (each a folder skills/<name>/ with a SKILL.md + reference.py bundle)
-    assert "crossvalidate_scgpt_vs_leiden" in SKILLS and SKILLS["crossvalidate_scgpt_vs_leiden"].files
+    # The CodeAct templates a pipeline names are skills of the pinned release
+    # (tests/test_pinned_release.py checks that they resolve).
     assert "differential_expression" in PRESETS and "gene_signature_scoring" in PRESETS
-    assert "pairwise_de" in SKILLS                           # differential_expression's templates migrated
 
 
 def test_atomic_skills_reach_the_scientist_by_manifest(monkeypatch):
@@ -2310,9 +2307,14 @@ def test_read_skill_reference_fetches_guidance_then_code_on_demand():
     assert "error" in miss and "demo" in miss["available"]
 
 
-def test_required_skills_inject_a_mandatory_directive():
+def test_required_skills_inject_a_mandatory_directive(tmp_path, skill_release):
     # The console's skill multi-select: checked atomic skills are REQUIRED — the directive is added
-    # to the PI's planning guidance (validated against the real library; a real name is used here).
+    # to the PI's planning guidance (validated against the library, a release with that skill here).
+    folder = tmp_path / "skills" / "perturbation_edistance"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text("---\nname: perturbation_edistance\ndescription: Rank "
+                                     "perturbations by E-distance to control.\n---\n\nAdapt it.\n")
+    skill_release(tmp_path / "skills")
     def complete(messages):
         sys = messages[0]["content"]
         if "Principal Investigator of a bioinformatics lab" in sys:

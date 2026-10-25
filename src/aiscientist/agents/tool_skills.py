@@ -1,8 +1,7 @@
 """Tools that run the method of a registry skill (``skill:`` in their TOOL.md).
 
 Such a tool keeps no copy of what the skill defines. The skill, from the pinned aiscientist-skills
-release (or the transitional local copy), declares the container image and Slurm resources of the
-tool's job, and ships the reference settings the tool reads under ``assets/``. This module is the
+release, declares the container image and Slurm resources of the tool's job, and ships the reference settings the tool reads under ``assets/``. This module is the
 platform's side of that arrangement:
 
 - :func:`job_environment` gives the image and resources a tool's job runs with;

@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .._lib.corpus import (
-    TextIndex, Term, chunk_vectors, corpus_paths, hybrid_rank, known_gene_symbols, l2, load_chunks,
+    CorpusPaths, TextIndex, Term, chunk_vectors, corpus_paths, hybrid_rank, known_gene_symbols, l2, load_chunks,
     manifest_citations, parse_terms, query_terms, read_manifest, sentence_transformer_embed, term_report)
 from ..sdk import HarnessTool
 
@@ -114,7 +114,8 @@ def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q
 
 
 def run_search(args: dict[str, Any], ctx: Any, *,
-               embed_fn: Callable[[list[str]], Any] | None = None) -> dict[str, Any]:
+               embed_fn: Callable[[list[str]], Any] | None = None,
+               paths: CorpusPaths | None = None) -> dict[str, Any]:
     raw = args.get("queries")
     if isinstance(raw, str):
         raw = [raw]
@@ -125,11 +126,11 @@ def run_search(args: dict[str, Any], ctx: Any, *,
     per_paper = _int(args.get("max_per_paper"), DEFAULT_MAX_PER_PAPER, 1, MAX_TOP_K)
     allowed = {str(p).strip() for p in (args.get("pmids") or []) if str(p).strip()} or None
 
-    paths = corpus_paths(ctx)
+    paths = paths if paths is not None else corpus_paths(ctx)
     chunk_path = paths.cache / "chunks.jsonl" if paths else None
     if paths is None or not chunk_path.is_file():
         return {"status": "dependency_missing", "dependency": "corpus-cache",
-                "error": "the corpus text cache (mechanism_cache/chunks.jsonl) is not available here"}
+                "error": "the RetiGene corpus text cache (mechanism_cache/chunks.jsonl) is not available here"}
     chunks = load_chunks(chunk_path)
     embed = embed_fn if embed_fn is not None else sentence_transformer_embed(paths.hf_cache)
     if embed is None:
@@ -138,7 +139,7 @@ def run_search(args: dict[str, Any], ctx: Any, *,
     logs: list[str] = []
     vecs = chunk_vectors(chunks, paths.cache, embed, False, logs.append)
     if not len(chunks):
-        return _failed("the corpus cache holds no chunks", queries=queries)
+        return _failed("the RetiGene corpus cache holds no chunks", queries=queries)
 
     known = known_gene_symbols(paths.hgnc)
     picked, used = rank_passages(queries, chunks, vecs, l2(embed(queries)), top_k=top_k,
@@ -164,10 +165,10 @@ def run_search(args: dict[str, Any], ctx: Any, *,
             "cosine": round(r["cosine"], 4), "query": r["query"]})
     if not contexts:
         return _failed(
-            "the indexed corpus returned 0 passages for these queries, so there is nothing to answer "
-            "from. Either the PMIDs given are not in the corpus, or it does not cover the topic: "
-            "use `literature_search` (live Europe PMC) and say in the write-up that the corpus "
-            "search returned nothing.", queries=queries, n_papers=0, contexts=[], terms=term_report(used))
+            "the RetiGene corpus returned 0 passages for these queries, so there is nothing to answer "
+            "from. Either the PMIDs given are not in the RetiGene corpus, or it does not cover the topic: "
+            "use `literature_search` (live Europe PMC) and say in the write-up that the search of the "
+            "RetiGene papers returned nothing.", queries=queries, n_papers=0, contexts=[], terms=term_report(used))
     return {"status": "ok", "queries": queries, "n_papers": len({c["pmid"] for c in contexts}),
             "n_contexts": len(contexts), "contexts": contexts, "terms": term_report(used),
             "raw_data_to_llm": False}

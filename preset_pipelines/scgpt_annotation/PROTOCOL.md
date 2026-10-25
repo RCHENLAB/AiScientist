@@ -212,7 +212,7 @@ adata.obs["scgpt_conf"] = pred["confidence"].reindex(adata.obs_names)    # (or o
 column, if present, is compared **directly** (agreement %) — not ignored · low-confidence cells /
 populations are **flagged**.
 
-<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 5 + ⚑ callout) + `skills/crossvalidate_scgpt_vs_leiden/reference.py`</sub>
+<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 5 + ⚑ callout) + skill `crossvalidate-scgpt-vs-leiden` (`scripts/reference.py`)</sub>
 </details>
 
 <details>

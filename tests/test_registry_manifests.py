@@ -44,7 +44,7 @@ def test_a_tool_that_opts_out_of_research_reaches_no_model():
     assert hidden <= set(catalog.names())
 
 
-def test_hpc_routing_follows_runs_on():
+def test_hpc_routing_follows_runs_on(cellqc_release):     # run_cellqc runs the CellQC skill's method
     from aiscientist.agents.registry import build_scientist_catalog
 
     seen = []

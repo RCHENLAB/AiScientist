@@ -1,10 +1,11 @@
-"""The names the platform and the skills rely on, checked against the tools that exist.
+"""The names the platform and the pipelines rely on, checked against the tools that exist.
 
-After the split, the tools live in AiScientist-tools and the skills in AiScientist-skills, while this
-repository keeps the logic that keys on tool names (the planner's step heuristics, the report's
-"What was run" section, the follow-up router) and depends on both. A tool renamed over there would
-silently switch that logic off here, and a skill that names a tool that no longer exists teaches the
-agent to call nothing. These are the cross-repository contracts, so they are tested here.
+After the split, the tools live in AiScientist-tools, while this repository keeps the logic that
+keys on tool names (the planner's step heuristics, the report's "What was run" section, the
+follow-up router) and depends on them. A tool renamed over there would silently switch that logic
+off here, and a pipeline that names a tool that no longer exists teaches the agent to call nothing.
+These are the cross-repository contracts, so they are tested here. The skills of the pinned
+aiscientist-skills release are held to the same contract by tests/test_pinned_release.py.
 """
 from __future__ import annotations
 
@@ -73,19 +74,37 @@ _TOOLISH = re.compile(r"`((?:run|make|map|annotate|diagnose|inspect|deep|literat
                       r"_[a-z0-9_]+)(?:\(|`)")
 
 
-def test_skills_and_pipelines_name_only_tools_and_skills_that_exist():
-    from aiscientist.agents.skills import SKILLS
+# Skills this repository names: the preset pipelines' guidance, and the PI's example of planning a
+# skill (agents/research_lab.py). They are not tools, and the names are the skills' earlier ones:
+# each resolves to a skill of the pinned aiscientist-skills release by an alias, which
+# tests/test_pinned_release.py checks when that release is installed.
+NAMED_SKILLS = {
+    "annotate_clusters_by_markers_v2": "celltype_annotation",
+    "score_signature": "gene_signature_scoring",
+    "mixscape_escape_filter": "perturbation_analysis",
+    "perturbation_de_vs_control": "perturbation_analysis",
+    "perturbation_edistance": "perturbation_analysis",
+    "vcf_qc_stats": "phenotype_variant_diagnosis, variant_annotation",
+    "crossvalidate_scgpt_vs_leiden": "scgpt_annotation",
+    "build_variant_db_tiledbvcf": "variant_annotation",
+    "clinical_variant_prioritization": "variant_annotation",
+    "normalize_vcf": "variant_annotation",
+    "variant_output_tables": "variant_annotation",
+    "pairwise_de": "agents/research_lab.py: the PI's planning prompt",
+}
 
+
+def toolish_names(text: str) -> list[str]:
+    """The tool-like names (``run_x`` and the like) a document puts in backticks."""
+    return _TOOLISH.findall(text)
+
+
+def test_pipelines_name_only_tools_that_exist():
     from aiscientist.agents.preset_pipelines import PIPELINES, _pipelines_dir
 
     # A pipeline's own name is a legitimate thing for these documents to mention (`scgpt_annotation`
     # is a pipeline, not a misspelt `scgpt_annotate`).
-    known = set(catalog.names()) | PLATFORM_TOOLS | set(SKILLS) | set(PIPELINES)
-    bad = []
-    from aiscientist.agents.skills import _skills_dir
-
-    for path in [*_skills_dir().rglob("*.md"), *_pipelines_dir().rglob("*.md")]:
-        for name in _TOOLISH.findall(path.read_text(encoding="utf-8")):
-            if name not in known:
-                bad.append(f"{path}: `{name}`")
-    assert not bad, "skills/pipelines name tools that do not exist:\n" + "\n".join(sorted(set(bad)))
+    known = set(catalog.names()) | PLATFORM_TOOLS | set(PIPELINES) | set(NAMED_SKILLS)
+    bad = [f"{path}: `{name}`" for path in _pipelines_dir().rglob("*.md")
+           for name in toolish_names(path.read_text(encoding="utf-8")) if name not in known]
+    assert not bad, "pipelines name tools that do not exist:\n" + "\n".join(sorted(set(bad)))

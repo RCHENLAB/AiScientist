@@ -36,6 +36,57 @@ ANSWER_SYSTEM = (
     "or quotation that is not in the passages is deleted from your answer by a checker."
 )
 
+GENE_TABLE_SYSTEM = (
+    "Extract a gene evidence table answering the question using only the supplied corpus passages. "
+    "Return ONLY a JSON array of objects with gene (one gene symbol), evidence (a short verbatim "
+    "quote containing that symbol and supporting its inclusion), and passage (the 1-based passage "
+    "number). Copy evidence exactly, including case and punctuation, from that one passage. "
+    "Do not infer genes, combine quotes or add facts. Return [] if the passages do not answer this."
+)
+
+
+def gene_table_messages(question: str, contexts: list[dict[str, Any]]) -> list[dict]:
+    """Ask the session model for rows grounded in individually numbered search passages."""
+    return [{"role": "system", "content": GENE_TABLE_SYSTEM},
+            {"role": "user", "content": f"Question: {question}\n\n" + passages_block(contexts)}]
+
+
+def verify_gene_table(raw: str, contexts: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Keep only exact quotes with their gene symbol and source PMID/page; never trust model citations."""
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        rows = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    kept: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gene, quote, passage = row.get("gene"), row.get("evidence"), row.get("passage")
+        if (not isinstance(gene, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,39}", gene)
+                or not isinstance(quote, str) or not quote.strip()
+                or type(passage) is not int or not 1 <= passage <= len(contexts)):
+            continue
+        context = contexts[passage - 1]
+        pmid, page = str(context.get("pmid") or "").strip(), context.get("page")
+        if (not pmid or page in (None, "") or quote not in str(context.get("text") or "")
+                or not re.search(r"(?<![A-Za-z0-9])" + re.escape(gene) + r"(?![A-Za-z0-9])", quote)):
+            continue
+        key = (gene, quote, pmid, str(page))
+        if key in seen:
+            continue
+        seen.add(key)
+        citation = f"PMID {pmid}, p. {page}"
+        if context.get("citation"):
+            citation += "; " + str(context["citation"])
+        kept.append({"gene": gene, "evidence": quote, "citation": citation, "pmid": pmid, "page": str(page)})
+    return kept
+
 _PMID_TOKEN = re.compile(r"PMID\s*:?\s*(\d{4,9})", re.IGNORECASE)
 _QUOTE = re.compile(r"[\"“]([^\"“”]{8,}?)[\"”]")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\[\(\"“])")

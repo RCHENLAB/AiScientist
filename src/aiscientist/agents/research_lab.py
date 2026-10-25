@@ -889,8 +889,7 @@ def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
     session), so a local run's roster does not list a tool that cannot work.
 
     This is what lets a skill that needs its own software stack (an R/Snakemake pipeline such as
-    CellQC) work by being dropped into skills/: the platform builds its declared image once for the
-    lab, and the agent follows the skill's commands here. Only a skill's DECLARED image can be used —
+    CellQC) work with no wrapper tool: the platform builds its declared image once for the lab, and the agent follows the skill's commands here. Only a skill's DECLARED image can be used —
     the agent never names an image itself, so what runs is what the skill's author pinned."""
     runner = getattr(executor, "run_in_image", None)
     if not callable(runner):
@@ -3400,7 +3399,7 @@ class LabConfig:
     # User-PINNED preset pipelines (the console's pipeline multi-select): MANDATORY for this run.
     # auto_select_skill still runs and ADDS the PI's best-fit pipeline on top (pinned are must-have).
     pinned_skills: "tuple[PresetPipeline, ...]" = ()
-    # User-REQUIRED atomic skills (the console's skill multi-select): names from the ``skills/``
+    # User-REQUIRED atomic skills (the console's skill multi-select): names from the skill
     # library the run MUST apply. Unlike the global on-demand manifest, these are mandatory.
     required_skills: "tuple[str, ...]" = ()
 
@@ -3669,7 +3668,7 @@ def _assigned_skill_block(skill: "Skill") -> str:
     """The brief's part for a step the plan assigned ``skill`` to: what to do with it, then its
     SKILL.md and its code, so the Scientist starts from the vetted method instead of rewriting it."""
     where = (f"registry release {skill.registry_release}" if skill.registry_release
-             else "this deployment's skills/")
+             else "a skill learned by this deployment")
     run = ("run its commands with run_in_environment" if skill.image
            else "run the code with run_code")
     out = [f"The approved plan assigns the skill `{skill.name}` (version {skill.version or 'local'}, "
@@ -7465,7 +7464,7 @@ class ResearchLab:
                       "to": "literature_search", "reason": getattr(result, "stop_reason", "")})
                 fallback = self._run_literature_step(question, step, rounds, lit_tool, specialist, emit)
                 fallback.final_answer = (
-                    "(Platform note: the indexed corpus, search_corpus, gave no answer that rested on its "
+                    "(Platform note: the RetiGene corpus, search_corpus, gave no answer that rested on its "
                     "passages; the platform then searched Europe PMC with literature_search. Judge the "
                     "citations below on their relevance to the step's question, not on which of the "
                     "two tools found them.)\n\n" + (fallback.final_answer or ""))
@@ -7487,7 +7486,7 @@ class ResearchLab:
                 # references although Europe PMC had returned 11 papers. The switch is the
                 # platform's, not the Scientist's: say so where the Critic reads it.
                 fallback.final_answer = (
-                    "(Platform note: the indexed corpus, deep_literature, returned no usable answer "
+                    "(Platform note: the RetiGene corpus, deep_literature, returned no usable answer "
                     f"to \"{(result.steps[0].get('args') or {}).get('question', '') if result.steps else ''}\"; "
                     "the platform then searched Europe PMC with literature_search, as it always does in "
                     "that case. Judge the citations below on their relevance to the step's question, "
@@ -7500,7 +7499,7 @@ class ResearchLab:
                 # note as above, for the same reason: the tool was the platform's choice.
                 if "deep_literature" in _declared_tools(step):
                     result.final_answer = (
-                        "(Platform note: `deep_literature`, the indexed corpus, is not available in "
+                        "(Platform note: `deep_literature`, the RetiGene corpus, is not available in "
                         "this session, so the platform searched Europe PMC with literature_search. "
                         "Judge the citations below on their relevance to the step's question, not on "
                         "which of the two tools found them.)\n\n" + (result.final_answer or ""))

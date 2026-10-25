@@ -1,6 +1,6 @@
 {
  "tissue": "retina",
- "source": "Curated for AiScientist from skills/annotate_clusters_by_markers_v2 (canonical lineage markers of the vertebrate retina); mouse symbols are the MGI orthologues.",
+ "source": "Curated for AiScientist from the annotate-clusters-by-markers skill (canonical lineage markers of the vertebrate retina); mouse symbols are the MGI orthologues.",
  "expected": [
   "Muller glia"
  ],

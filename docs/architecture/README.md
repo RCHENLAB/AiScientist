@@ -93,7 +93,7 @@ merged by rank) at the same time; the model answers from the corpus passages and
 code writes the reference list from the papers the answer cites; the answer is kept with the run.
 A question that names the RetiGene papers searches the corpus alone, and PubMed only when it asks for
 it. A list question about them ("What are haploinsufficient genes in RetiGene papers?") gets a
-corpus curation plan instead, which says how long it takes on the session: `extract_haploinsufficient_genes`
+RetiGene curation plan instead, which says how long it takes on the session: `extract_haploinsufficient_genes`
 reads the whole corpus (a GPU job of its own, or the session's API model through the gateway, or a
 kept scan of the same corpus at once), and the gateway builds two tables from its sentences
 (`gateway/corpus_scan.py`: one row per gene with its claim, the genes the papers argue against
@@ -123,7 +123,7 @@ flowchart TB
     lab -->|"runs each step"| harness["agents/research_harness.py"]
     lab -->|"picks a protocol"| pipelines["preset_pipelines/"]
     harness -->|"calls, many as HPC3 jobs"| folders["tools/NAME/ (one folder per tool)"]
-    harness -->|"reads on demand"| skills["skills/"]
+    harness -->|"reads on demand"| skills["pinned aiscientist-skills release"]
     catalog -->|"loads"| folders
     folders -->|"implement"| sdk["tools/sdk.py"]
 ```
@@ -136,7 +136,7 @@ flowchart TB
 | `src/aiscientist/metadata/` | Croissant 1.1 metadata of datasets and results: built from what was measured plus the owner's review, validated (mlcroissant when installed), never hand-written. The gateway keeps it in the account database and serves it through the API and the MCP server at `/mcp` ([guideline](../development/metadata.md)) |
 | `src/aiscientist/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
 | `src/aiscientist/tools/` | Every model-callable domain tool, one folder each, plus the contract (`sdk.py`), discovery (`catalog.py`), the public surface (`api.py`), shared code (`_lib/`), reference data and the per-image job entry points |
-| `skills/`, `preset_pipelines/` | Plain files: atomic CodeAct templates the Scientist adapts, and end-to-end protocols the PI picks |
+| `preset_pipelines/` | Plain files: end-to-end protocols the PI picks. The atomic CodeAct templates the Scientist adapts are the skills of the pinned `lijinbio/aiscientist-skills` release (`configs/skills_registry.json`), installed outside git |
 | `frontend/console/` | The web UI |
 
 Two files are large enough to deserve a warning: `gateway/app.py` and
@@ -150,7 +150,7 @@ that look redundant fix a specific production incident, and the comment says whi
 | What it is | Fixed code called by name with JSON arguments | An adaptable code template with guidance | An end-to-end protocol with pinned settings |
 | Used by | The Scientist | The Scientist, adapted and run via `run_code` | The PI, when planning |
 | How it loads | `tools/catalog.py` reads every `TOOL.md` | Progressive disclosure: manifest, then SKILL.md, then reference.py | Matched by topic; SKILL.md + PROTOCOL.md enter the plan |
-| How to add one | A `tools/<name>/` folder | A `skills/<name>/` folder | A `preset_pipelines/<name>/` folder |
+| How to add one | A `tools/<name>/` folder | A folder in the aiscientist-skills registry, then a new pinned release | A `preset_pipelines/<name>/` folder |
 
 ## How a tool is discovered and routed
 
@@ -184,8 +184,9 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 | The platform reaches the tools only through `sdk`, `catalog`, `api`, and only public names | `tests/test_repo_boundaries.py` |
 | Every tool folder has a manifest that matches its code; the docs are current | `tests/test_tool_manifests.py` |
 | The catalog is the manifests plus the platform tools; routing follows `runs_on` | `tests/test_registry_manifests.py` |
-| Tool names the platform keys logic on, and the ones skills/pipelines name, all exist | `tests/test_tool_contract.py` |
-| Skills and pipelines are well-formed | `tests/test_skills_library.py` |
+| Tool names the platform keys logic on, and the ones pipelines name, all exist | `tests/test_tool_contract.py` |
+| The installed pinned release loads, and its skills name only tools that exist | `tests/test_pinned_release.py` (where the release is installed) |
+| Pipelines are well-formed | `tests/test_pipeline_library.py` |
 | Every generated `croissant.json` is valid Croissant 1.1 (mlcroissant), and holds no server path, sample id or credential | `tests/test_croissant_metadata.py` |
 | Metadata and MCP answer one account only, as `/api/datasets` does | `tests/test_metadata_gateway.py` |
 
@@ -197,6 +198,6 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 4. `agents/research_harness.py`: `ResearchHarness`, one step's tool loop.
 5. `agents/registry.py` and `tools/catalog.py`: how the catalog is assembled and routed.
 6. `tools/run_de/`: a typical tool (`TOOL.md`, then `tool.py`).
-7. `skills/README.md`, `preset_pipelines/README.md`.
+7. `docs/skills_and_pipelines_architecture.md`, `preset_pipelines/README.md`.
 8. `deploy/README.md`, `scripts/sync_deploy.sh`: deploys.
 9. `docs/FINDINGS.md`: what has been measured and decided, and why.

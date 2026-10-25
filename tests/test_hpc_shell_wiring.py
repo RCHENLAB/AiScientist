@@ -90,7 +90,7 @@ def test_a_confirmation_reaches_the_client_and_its_answer_unblocks_the_worker(tm
     run = c.begin_run("conv-1")
     c.bind_run_id(run, "run-1")
     pushed: list[dict] = []
-    monkeypatch.setattr(c, "push", pushed.append)
+    monkeypatch.setattr(c, "push", lambda payload, **_kw: pushed.append(payload))
 
     confirm = gw_app._hitl_confirm(c, run)
     answer: list[bool] = []
@@ -118,7 +118,7 @@ def test_no_answer_within_the_timeout_declines(tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_CONFIRM_TIMEOUT_S", "0.1")
     c = _conn(tmp_path, monkeypatch)
     run = c.begin_run("conv-1")
-    monkeypatch.setattr(c, "push", lambda *_a: None)
+    monkeypatch.setattr(c, "push", lambda *_a, **_kw: None)
 
     assert gw_app._hitl_confirm(c, run)(_Req()) is False
 

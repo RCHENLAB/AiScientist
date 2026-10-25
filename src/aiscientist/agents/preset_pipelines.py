@@ -3,8 +3,7 @@
 A *preset pipeline* is a folder ``preset_pipelines/<name>/`` (repo root): a ``SKILL.md``
 (frontmatter ``name`` + ``description`` + ``tools`` and a markdown body that is the default PI
 guidance) plus, for now, a ``scripts/`` folder of ``*.py`` CodeAct templates. Dropping a new folder
-adds a research path — no code change here. Override the location with ``$AISCIENTIST_PIPELINES_DIR``
-(``$AISCIENTIST_SKILLS_DIR`` is still honoured as a fallback for older configs).
+adds a research path — no code change here. Override the location with ``$AISCIENTIST_PIPELINES_DIR``.
 
 A preset pipeline *steers* the PI's planning toward a known workflow shape — it does NOT bypass the
 PI. The PI still drafts the agenda (adapting the guidance to the actual dataset/question), plan mode
@@ -15,8 +14,8 @@ each step. So a preset pipeline = "a good starting prompt the user can tweak".
 end-to-end workflow* that composes atomic capabilities. It is distinct from an atomic **skill**
 (``agents/skills.py`` — a rewritable code capability surfaced on demand, which now owns the
 ``read_skill_reference`` progressive-disclosure tool) and from the fixed **registry** tools
-(``agents/registry.py``). The reference ``scripts/*.py`` that used to be bundled per-pipeline have
-migrated to the shared atomic-skill library ``skills/``.
+(``agents/registry.py``). The CodeAct templates a pipeline relies on are atomic skills of the pinned
+aiscientist-skills release.
 
 **What this module owns:**
   - the data model — :class:`PresetPipeline`
@@ -44,8 +43,8 @@ from .research_harness import EventFn
 @dataclass(frozen=True)
 class PresetPipeline:
     """One preset pipeline: the PI-steering prompt plus the capability boundary it composes.
-    (The adaptable CodeAct templates a pipeline used to bundle now live in the shared atomic-skill
-    library ``skills/`` — see ``agents/skills.py`` — surfaced by progressive disclosure.)"""
+    (The adaptable CodeAct templates a pipeline relies on are atomic skills — see
+    ``agents/skills.py`` — surfaced by progressive disclosure.)"""
     key: str
     label: str
     prompt: str   # default guidance injected into the PI's planning (user-editable)
@@ -83,8 +82,7 @@ ResearchPreset = PresetPipeline
 # --- loading -----------------------------------------------------------------
 
 def _pipelines_dir() -> Path:
-    """The preset-pipeline library: ``$AISCIENTIST_PIPELINES_DIR`` or repo-root ``preset_pipelines/``.
-    (``$AISCIENTIST_SKILLS_DIR`` now points at the atomic-skill library — see ``agents/skills.py``.)"""
+    """The preset-pipeline library: ``$AISCIENTIST_PIPELINES_DIR`` or repo-root ``preset_pipelines/``."""
     env = os.environ.get("AISCIENTIST_PIPELINES_DIR")
     if env:
         return Path(env)
