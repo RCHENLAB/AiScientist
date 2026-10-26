@@ -8334,13 +8334,24 @@ async def get_bundle(owner: str, run_id: str) -> Response:
     )
 
 
+@app.get("/health")
+async def health_endpoint() -> JSONResponse:
+    """Liveness probe for the deploy script and systemd: cheap, unauthenticated, no secrets."""
+    from . import release_info
+
+    return JSONResponse({"status": "ok", "version": release_info.app_release()["tag"]})
+
+
 @app.get("/api/system")
 async def system_overview_endpoint() -> JSONResponse:
     """Live code-derived overview: agents, tools (with availability), server
     capabilities, and the roadmap. Powers the console's System page."""
     from . import system_info
 
+    from . import release_info
+
     data = system_info.system_overview()
+    data["release"] = release_info.release_info()
     data["capabilities"]["accounts"] = _AUTH_ENABLED
     db_ok = False
     if _AUTH_ENABLED:

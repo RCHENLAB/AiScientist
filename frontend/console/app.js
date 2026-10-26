@@ -3685,7 +3685,11 @@ async function loadSystem() {
     const specialists = (d.specialists || []).map((s) =>
       `<div class="card"><div class="card-main"><strong>${escapeHtml(s.name)}</strong>` +
       `<span class="sys-desc">${escapeHtml(s.persona)}</span></div></div>`).join("");
+    const rel = d.release || {};
+    const relRow = (label, r) => `<span class="cap ${r && r.tag ? "on" : "off"}">${escapeHtml(label)}: ` +
+      `${escapeHtml((r && r.tag) || "unknown")}${r && r.sha ? " (" + escapeHtml(String(r.sha).slice(0, 7)) + ")" : ""}</span>`;
     el.innerHTML =
+      `<h3>Running versions</h3><div class="cap-row">${relRow("app", rel.app)}${relRow("skills", rel.skills)}</div>` +
       `<h3>Capabilities (this server)</h3><div class="cap-row">${caps}</div>` +
       `<h3>Agents</h3><div class="card-list">${agents}</div>` +
       (specialists ? `<h3>Scientist specialists</h3><div class="card-list">${specialists}</div>` : "") +

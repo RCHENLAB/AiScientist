@@ -16,7 +16,7 @@
 #     sudo systemctl daemon-reload
 #     sudo systemctl enable --now bioagent
 #
-# Config/secrets are read from /data/BioAgent/app/.env by the app itself (load_project_env).
+# Config/secrets live in /data/BioAgent/shared/.env (linked into each release as .env) (load_project_env).
 # For the PUBLIC deploy that .env MUST set:  AISCIENTIST_SECRET_KEY=<strong-random>  and
 # AISCIENTIST_PUBLIC_HTTPS=1  (marks session cookies Secure). See deploy/README.md.
 
@@ -31,11 +31,15 @@ Type=simple
 # 2026-07-01) — chown /data/BioAgent to this user before enabling. See deploy/public-domain-tls.md.
 User=aiscientist
 Group=aiscientist
-WorkingDirectory=/data/BioAgent/app
+# Versioned layout (deploy/deploy_release.sh): app/current is a symlink to the active release and
+# each release carries its own venv, so a deploy or rollback is a symlink switch + restart.
+WorkingDirectory=/data/BioAgent/app/current
 # The app loads /data/BioAgent/app/.env on startup; EnvironmentFile is belt-and-suspenders
 # for anything read at import time. Comment out if you rely solely on the app's .env loader.
-EnvironmentFile=-/data/BioAgent/app/.env
-ExecStart=/data/BioAgent/env/bin/python -m aiscientist.gateway --host 127.0.0.1 --port 8800
+EnvironmentFile=-/data/BioAgent/shared/.env
+ExecStart=/data/BioAgent/app/current/.venv/bin/python -m aiscientist.gateway --host 127.0.0.1 --port 8800
+# Fail the start if the app does not answer /health, so a bad release is visible in systemctl.
+ExecStartPost=/usr/bin/curl --retry 30 --retry-delay 2 --retry-connrefused -fsS -o /dev/null http://127.0.0.1:8800/health
 Restart=always
 RestartSec=2
 # Give in-flight requests a moment to drain on restart.

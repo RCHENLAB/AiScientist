@@ -159,3 +159,18 @@ curl -I https://<PUBLIC_HOSTNAME>/         # 200, valid cert
 - [ ] Accounts enabled (Postgres + `.[auth]`); admin-created accounts only; admin password is strong.
 - [ ] HPC3 credentials are never stored (two-layer identity — only the bcrypt app-password hash).
 - [ ] HTTP→HTTPS redirect working; cert valid and auto-renewing (if Let's Encrypt).
+
+## Versioned releases (issue #29)
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which attaches `aiscientist-<tag>.tar.gz`
+and `SHA256SUMS` to a GitHub Release. On the Eye Server:
+
+```bash
+deploy/deploy_release.sh v0.4.0     # download, verify checksum, install, switch app/current, restart, health-check
+deploy/deploy_release.sh --rollback # back to app/previous
+deploy/deploy_release.sh --list
+```
+
+A failed `/health` check after a switch rolls back automatically. The running app and skills tags are
+shown on the console's System page (`/api/system` → `release`). Requires GNU coreutils (Linux).
+Not covered yet: the `aiscientist-skills` release repo and HPC3 images/models.
