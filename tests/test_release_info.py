@@ -12,8 +12,10 @@ def test_missing_version_file_degrades(tmp_path):
     assert release_info._read_version_file(tmp_path / "nope") == {}
 
 
-def test_skills_release_reads_skills_dir(tmp_path, monkeypatch):
-    (tmp_path / "VERSION").write_text("tag=skills-v1.2.0\nsha=def5678\n")
-    monkeypatch.setenv("AISCIENTIST_SKILLS_DIR", str(tmp_path))
-    assert release_info.skills_release()["tag"] == "skills-v1.2.0"
-    assert release_info.release_info()["skills"]["sha"] == "def5678"
+def test_skills_release_follows_pinned_registry(tmp_path, monkeypatch):
+    cfg = tmp_path / "reg.json"
+    cfg.write_text('{"release_tag": "v1.2.3", "allowed_tiers": ["core"], "releases_root": "%s"}' % tmp_path)
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_CONFIG", str(cfg))
+    assert release_info.skills_release() == {"tag": "v1.2.3", "installed": False}
+    (tmp_path / "1.2.3").mkdir()
+    assert release_info.skills_release()["installed"] is True

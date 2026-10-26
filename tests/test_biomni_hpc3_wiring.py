@@ -11,7 +11,7 @@ install and NO GPU — that:
   3. The execute path runs end-to-end through a ``MockBiomniRuntime`` behind the
      DataBoundaryGuard (the task reaches A1; raw tables are refused before any call).
 
-Run on the server with: ``/data/BioAgent/env/bin/python -m pytest tests/test_biomni_hpc3_wiring.py``
+Run on the server with: ``/data/aiscientist/env/bin/python -m pytest tests/test_biomni_hpc3_wiring.py``
 """
 
 from __future__ import annotations

@@ -126,7 +126,7 @@ def build_spliceai_cmd(input_vcf: str, output_vcf: str, *, bin_path: str, ref_fa
                        models_dir: str, annotation: str = "grch38", flank: int = 10000,
                        distance: int = 50, precision: int = 3, threads: int = 8,
                        home_dir: str = "") -> list[str]:
-    """An ``openspliceai variant`` argv, run directly from the conda env (NOT via singularity — VEP's
+    """An ``openspliceai variant`` argv, run directly from the conda env (NOT via apptainer — VEP's
     container has no torch). ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`` lets torch>=2.6 load the released
     full-model ``.pt`` files (trusted JHU CCB weights); ``OMP_NUM_THREADS`` bounds CPU inference.
     ``home_dir`` (a writable per-run dir) is pointed at by ``HOME``/``TORCH_HOME``/``XDG_CACHE_HOME`` so

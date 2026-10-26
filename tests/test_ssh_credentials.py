@@ -84,7 +84,8 @@ def test_deploy_failure_raises(sc):
 def test_a_saved_ssh_key_survives_the_store_moving(tmp_path, monkeypatch):
     """Same trap as the LLM store, with a worse blast radius: this key_path goes to paramiko, so a
     stale one costs every user their key login and drops them back to password + Duo."""
-    import importlib, shutil
+    import importlib
+    import shutil
     from aiscientist.gateway import ssh_credentials as sc
 
     old_root = tmp_path / "old"
@@ -104,3 +105,16 @@ def test_a_saved_ssh_key_survives_the_store_moving(tmp_path, monkeypatch):
     assert row is not None
     assert Path(row["key_path"]).is_file(), "the login path opens this exact path"
     importlib.reload(sc)
+
+
+def test_a_new_key_and_its_index_are_private_from_the_first_byte(sc, tmp_path):
+    import stat
+    (tmp_path / "ssh_creds" / "yijun").mkdir(parents=True)
+    os.chmod(tmp_path / "ssh_creds" / "yijun", 0o775)          # as production had them
+    sc.create_and_deploy("yijun", _FakeExec(), host="hpc3.rcic.uci.edu", hpc_user="testuser")
+    for d in (tmp_path / "ssh_creds", tmp_path / "ssh_creds" / "yijun"):
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700, d
+    files = list((tmp_path / "ssh_creds" / "yijun").iterdir())
+    assert {f.name.split(".")[-1] for f in files} == {"key", "json"}     # no .tmp left behind
+    for f in files:
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600, f

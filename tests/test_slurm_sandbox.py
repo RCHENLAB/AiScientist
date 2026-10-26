@@ -10,6 +10,9 @@ from __future__ import annotations
 from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 from aiscientist.gateway.executor import ExecResult
 
+# The directory the gateway gives this job line: <shared_root>/Temp/<user>/scratch/runcode.
+SCRATCH = "/dfs/lab/Temp/tester/scratch/runcode"
+
 
 class FakeHPC:
     """Fake HPC host: submits complete immediately (squeue empty -> sacct COMPLETED), and ``cat``
@@ -65,6 +68,7 @@ class FakeHPC:
 
 
 def _executor(hpc, **kw):
+    kw.setdefault("scratch_dir", SCRATCH)
     return SlurmCodeExecutor(
         remote=hpc, container_image="/dfs/lab/analysis.sif",
         dataset_path="/dfs/lab/ds.h5ad", work_dir="/dfs/lab/run/work",
@@ -106,12 +110,36 @@ def test_snippet_is_staged_and_data_env_exposed():
     assert "--mem=64G".replace("=", "=")  # sanity
 
 
+def test_a_bound_folder_is_mounted_whole_so_the_files_beside_the_primary_are_readable():
+    # 2026-10-03: a snippet checking a Cell Ranger delivery could open the filtered matrix (the
+    # primary, the only path bound) but not the raw matrix in the same folder.
+    class Recording(FakeHPC):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.commands: list[str] = []
+
+        def exec(self, command, timeout=60.0):
+            self.commands.append(command)
+            return super().exec(command, timeout)
+
+    hpc = Recording({".out": "", ".err": "", ".rc": "0\n"})
+    SlurmCodeExecutor(
+        remote=hpc, container_image="/dfs/lab/analysis.sif", scratch_dir=SCRATCH,
+        dataset_path="/dfs/up/lib/outs/filtered_feature_bc_matrix.h5", dataset_root="/dfs/up/lib",
+        work_dir="/dfs/lab/run/work", artifacts_dir="/dfs/lab/run/art",
+        startup_timeout_s=5, run_timeout_s=5)("print(1)")
+    script = "\n".join(hpc.commands)
+    assert "-B /dfs/up/lib:/dfs/up/lib:ro" in script
+    assert "filtered_feature_bc_matrix.h5:/dfs" not in script      # inside the root: not bound twice
+    assert "AISCIENTIST_DATASET_ROOT=/dfs/up/lib" in script
+
+
 def test_no_remote_uses_local_fallback():
     calls = {}
     def fake_local(code):
         calls["code"] = code
         return {"status": "ok", "stdout": "local", "returncode": 0}
-    ex = SlurmCodeExecutor(remote=None, container_image="/img.sif", local_fallback=fake_local)
+    ex = SlurmCodeExecutor(remote=None, container_image="/img.sif", scratch_dir=SCRATCH, local_fallback=fake_local)
     out = ex("print(1)")
     assert out["status"] == "ok" and out["stdout"] == "local"
     assert out["execution_mode"] == "local_fallback" and "no live HPC" in out["fallback_reason"]
@@ -128,7 +156,7 @@ def test_stop_cancels_the_runcode_job_without_fallback(monkeypatch):
     from aiscientist.gateway.slurm_job import JobCancelled
     called = {"fallback": False}
     ex = SlurmCodeExecutor(
-        remote=object(), container_image="/img.sif",
+        remote=object(), container_image="/img.sif", scratch_dir=SCRATCH,
         local_fallback=lambda code: called.__setitem__("fallback", True) or {"status": "ok"},
         should_cancel=lambda: True,
     )
@@ -186,7 +214,7 @@ def _executor_with_remote(listings):
             self.calls.append(cmd)
             return _Out(listings.pop(0) if listings else "")
 
-    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts")
     return ex
 
@@ -217,7 +245,7 @@ def test_a_broken_find_reports_no_evidence_rather_than_failing_the_snippet():
     class _Remote:
         def exec(self, cmd): raise OSError("ssh died")
 
-    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts")
     assert ex._artifact_snapshot() == {}
     assert ex._written_since({}) == []
@@ -255,7 +283,7 @@ def _sync_executor(tmp_path, remote_files, fetch_log):
             from pathlib import Path as _P
             _P(local).write_text("x")
 
-    return SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    return SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                              artifacts_dir="/dfs/run/artifacts",
                              local_artifacts=str(tmp_path))
 
@@ -304,6 +332,37 @@ def test_sync_is_a_no_op_without_a_local_target(tmp_path):
     class _Remote:
         def exec(self, cmd): raise AssertionError("must not touch the cluster")
 
-    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif",
+    ex = SlurmCodeExecutor(remote=_Remote(), container_image="x.sif", scratch_dir=SCRATCH,
                            artifacts_dir="/dfs/run/artifacts", local_artifacts=None)
     ex._sync_artifacts_back(changed=["tables/a.csv"])      # no raise
+
+
+class _ScriptHPC(FakeHPC):
+    """Also keeps the staged sbatch script, so its binds and exports can be checked."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.scripts: list[str] = []
+
+    def exec(self, command, timeout=60.0):
+        # main runs containers with apptainer since 2026-10-09; older settings still say singularity
+        if "apptainer" in command or "singularity" in command:
+            self.scripts.append(command)
+        return super().exec(command, timeout)
+
+
+def test_other_bound_files_are_bound_read_only_and_exported():
+    """--containall hides every unbound path: without an explicit bind a reference atlas on dfs3b
+    existed and no snippet could open it."""
+    hpc = _ScriptHPC({".out": "", ".err": "", ".rc": "0\n"})
+    ex = _executor(hpc, inputs=(
+        {"name": "atlas.h5ad", "role": "reference", "path": "/dfs/lab/uploads/u/atlas.h5ad"},
+        {"name": "panel.bed", "role": None, "path": "/dfs/lab/run/work/panel.bed"},
+    ))
+    out = ex("print(1)")
+    assert out["status"] == "ok"
+    script = "\n".join(hpc.scripts)
+    assert "/dfs/lab/uploads/u:/dfs/lab/uploads/u:ro" in script        # parent dir, read-only
+    assert "uploads/u/atlas.h5ad:/dfs" not in script                    # never the bare file
+    assert "/dfs/lab/run/work:/dfs/lab/run/work:ro" not in script       # already rw-bound
+    assert "AISCIENTIST_REFERENCE" in script and "AISCIENTIST_INPUTS" in script

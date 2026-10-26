@@ -8,7 +8,7 @@
 #
 # Idempotent: re-run any time to update deps after new code lands. Everything is
 # env-configurable so nothing is tied to one person or host:
-#     AISCIENTIST_ROOT    base dir              (default /data/BioAgent)
+#     AISCIENTIST_ROOT    base dir              (default /data/aiscientist)
 #     AISCIENTIST_APP     app/repo dir          (default $AISCIENTIST_ROOT/app)
 #     AISCIENTIST_ENV     venv dir              (default $AISCIENTIST_ROOT/env)
 #     AISCIENTIST_PYTHON  python to build venv  (default python3)
@@ -31,7 +31,7 @@ set -euo pipefail
 # Python side (aiscientist.core.config.apply_brand_env_aliases).
 for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
-ROOT="${AISCIENTIST_ROOT:-/data/BioAgent}"
+ROOT="${AISCIENTIST_ROOT:-/data/aiscientist}"
 APP="${AISCIENTIST_APP:-$ROOT/app}"
 ENV_DIR="${AISCIENTIST_ENV:-$ROOT/env}"
 PYTHON="${AISCIENTIST_PYTHON:-python3}"

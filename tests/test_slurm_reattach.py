@@ -86,7 +86,8 @@ def test_on_submit_hook_fires_with_job_id():
     fake = SlurmFake(squeue={"2000": ["R:node-1", ""]}, sacct={"2000": "COMPLETED"})
     captured: list[str] = []
     res = run_batch_job(
-        fake, SlurmJobSpec(script="#!/bin/bash\n", job_name="runcode_1"),
+        fake, SlurmJobSpec(script="#!/bin/bash\n", job_name="runcode_1",
+                           submit_dir="/dfs/lab/Temp/tester/scratch/runcode"),
         run=_FAST, on_submit=captured.append,
     )
     assert captured == ["2000"]            # recorded the instant sbatch accepted it

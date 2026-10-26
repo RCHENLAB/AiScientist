@@ -34,6 +34,11 @@ def _root() -> Path:
     return Path(os.environ.get("AISCIENTIST_STATE_DIR", ".")) / "ssh_creds"
 
 
+def private_paths() -> list[Path]:
+    """The key store: files no tool may read (``tools.sdk.confine_read``)."""
+    return [_root()]
+
+
 def _safe_owner(owner: str) -> str:
     cleaned = "".join(c for c in (owner or "") if c.isalnum() or c in "-_")
     return cleaned or "guest"
@@ -55,10 +60,38 @@ def _key_file(owner: str, row: dict) -> Path:
     return Path(row.get("key_path") or canonical)
 
 
-def _owner_dir(owner: str) -> Path:
-    d = _root() / _safe_owner(owner)
+def _private_dir(d: Path) -> Path:
+    """Create ``d`` and keep it 0700 — see ``llm_credentials._private_dir``: a folder made with
+    the default mode took the state dir's default ACL, readable by group and other."""
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        if stat.S_IMODE(d.stat().st_mode) != 0o700:
+            d.chmod(0o700)
+    except OSError:
+        pass
     return d
+
+
+def _owner_dir(owner: str) -> Path:
+    _private_dir(_root())
+    return _private_dir(_root() / _safe_owner(owner))
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically, created 0600 before a byte goes in. A private key
+    written with the default mode and chmod-ed afterwards was readable by more than its owner in
+    between."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
 
 
 def _index_path(owner: str) -> Path:
@@ -76,7 +109,7 @@ def _load_index(owner: str) -> list[dict]:
 
 
 def _save_index(owner: str, rows: list[dict]) -> None:
-    _index_path(owner).write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    _write_private(_index_path(owner), json.dumps(rows, indent=2).encode("utf-8"))
 
 
 def _public(row: dict) -> dict:
@@ -139,11 +172,7 @@ def create_and_deploy(owner: str, executor, *, host: str, hpc_user: str,
 
     cred_id = uuid4().hex[:12]
     key_path = _owner_dir(owner) / f"{cred_id}.key"
-    key_path.write_bytes(priv)
-    try:
-        key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)   # 0600
-    except OSError:
-        pass
+    _write_private(key_path, priv)                      # 0600 from the first byte
 
     row = {
         "id": cred_id, "host": host, "hpc_user": hpc_user, "key_path": str(key_path),
@@ -175,6 +204,25 @@ def get_credential(owner: str, cred_id: str) -> dict | None:
     return None
 
 
+def own_key_path(owner: str, key_path: str) -> str | None:
+    """``key_path`` resolved, if it is one of ``owner``'s own saved keys — under the current store or
+    where one of their rows recorded it — else None. A typed key path goes straight to paramiko, so on
+    a shared gateway it must never name another account's key."""
+    try:
+        want = Path(key_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not want.is_file():
+        return None
+    if want.is_relative_to(_owner_dir(owner).resolve()):
+        return str(want)
+    for r in _load_index(owner):
+        recorded = [_key_file(owner, r)] + ([Path(r["key_path"])] if r.get("key_path") else [])
+        if any(want == p.resolve() for p in recorded):
+            return str(want)
+    return None
+
+
 def delete_credential(owner: str, cred_id: str) -> bool:
     rows = _load_index(owner)
     keep = [r for r in rows if r["id"] != cred_id]
@@ -189,3 +237,16 @@ def delete_credential(owner: str, cred_id: str) -> bool:
         pass
     _save_index(owner, keep)
     return True
+
+
+def delete_owner(owner: str) -> int:
+    """Remove every saved key of ``owner`` when the account is deleted. The public halves stay in
+    HPC3's ``authorized_keys`` (they grant nothing without the private keys removed here).
+    Returns how many keys there were."""
+    d = _root() / _safe_owner(owner)
+    if not d.is_dir():
+        return 0
+    n = len(_load_index(owner))
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+    return n

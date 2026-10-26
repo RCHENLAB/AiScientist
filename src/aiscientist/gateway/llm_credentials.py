@@ -19,16 +19,18 @@ untouched. That ordering is what prevents the state users actually fear — old 
 discarded, new key not working, no way back. It is a parameter rather than a convention so a
 caller cannot skip it by forgetting.
 
-**At-rest encryption is optional** (``AISCIENTIST_LLM_KEY_ENCRYPTION=1``), and off by default, which
-matches how SSH private keys are already stored here. The reasoning: encryption protects against
-FILE-level exposure (a backup, a stray ``cat``, a misplaced tarball) but not against a compromised
-gateway process, which must be able to decrypt in order to use the key at all. Against that
-partial benefit it adds a real failure mode — lose the master key and every user re-enters their
-key. So it is a deployment choice. The ``encrypted`` flag is stored PER ROW, so switching it on
-later affects only newly written rows and existing plaintext rows keep working.
+**Keys are encrypted at rest** (Fernet), unless ``AISCIENTIST_LLM_KEY_ENCRYPTION=0`` turns it off.
+Encryption protects against FILE-level exposure — a backup, a stray ``cat``, a misplaced tarball of
+the key store — but not against root on the server or a compromised gateway process, which must be
+able to decrypt in order to use the key at all. The cost is a real failure mode: lose the master
+key and every user re-enters their key. The ``encrypted`` flag is stored PER ROW, and a plaintext
+row (written while encryption was off) is re-encrypted the next time it is read, and by
+:func:`encrypt_existing` at gateway start.
 
-The master key lives in its own 0600 file, never in ``.env``: the production ``.env`` on eyeserver
-is world-readable by design, so a secret placed there would be readable by every account on the box.
+The master key lives in its own 0600 file OUTSIDE the key store (``<state dir>/llm_key.master``, or
+``AISCIENTIST_LLM_KEY_MASTER_FILE``), so a copy of ``llm_creds/`` alone decrypts nothing; it is never
+in ``.env`` or in Git: the production ``.env`` on eyeserver is world-readable by design. A store
+created by an older version kept the master at ``llm_creds/.master``; it is still used if present.
 
 Nothing in this module opens a socket — verification lives in :mod:`llm_providers`.
 """
@@ -56,10 +58,22 @@ def _safe_owner(owner: str) -> str:
     return cleaned or "guest"
 
 
-def _owner_dir(owner: str) -> Path:
-    d = _root() / _safe_owner(owner)
+def _private_dir(d: Path) -> Path:
+    """Create ``d`` and keep it 0700. A folder made with the default mode took the state dir's
+    default ACL instead (group and other could list it, and read ``index.json``); the store was
+    then closed only by the state dir's own permissions — one chmod away from open."""
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        if stat.S_IMODE(d.stat().st_mode) != 0o700:
+            d.chmod(0o700)
+    except OSError:
+        pass
     return d
+
+
+def _owner_dir(owner: str) -> Path:
+    _private_dir(_root())
+    return _private_dir(_root() / _safe_owner(owner))
 
 
 def _index_path(owner: str) -> Path:
@@ -106,15 +120,48 @@ def _write_private(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-# --- optional at-rest encryption ---------------------------------------------
+# --- at-rest encryption --------------------------------------------------------
+
+_warned_no_crypto = False
+
+
+def _crypto_available() -> bool:
+    try:
+        import cryptography.fernet  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def encryption_enabled() -> bool:
-    return os.environ.get("AISCIENTIST_LLM_KEY_ENCRYPTION", "").strip().lower() in {"1", "true", "yes", "on"}
+    """On unless ``AISCIENTIST_LLM_KEY_ENCRYPTION`` says off. Without the ``cryptography`` package
+    (every gateway has it, through paramiko) keys are stored in plaintext, said once in the log and
+    shown in the key dialog — never silently."""
+    global _warned_no_crypto
+    if os.environ.get("AISCIENTIST_LLM_KEY_ENCRYPTION", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    if not _crypto_available():
+        if not _warned_no_crypto:
+            print("[llm-credentials] the cryptography package is missing: API keys are stored "
+                  "unencrypted (0600 files)")
+            _warned_no_crypto = True
+        return False
+    return True
 
 
 def _master_key_path() -> Path:
-    return _root() / ".master"
+    raw = os.environ.get("AISCIENTIST_LLM_KEY_MASTER_FILE", "").strip()
+    if raw:
+        return Path(raw)
+    legacy = _root() / ".master"
+    if legacy.is_file():
+        return legacy
+    return Path(os.environ.get("AISCIENTIST_STATE_DIR", ".")) / "llm_key.master"
+
+
+def private_paths() -> list[Path]:
+    """The key store and its master key: files no tool may read (``tools.sdk.confine_read``)."""
+    return [_root(), _master_key_path()]
 
 
 def _fernet():
@@ -161,11 +208,19 @@ def _decode_secret(raw: bytes, encrypted: bool) -> str:
 
 
 def _hint(secret: str) -> str:
-    """A recognizable but useless fragment, so a user with several keys can tell them apart
-    in the UI. Short keys degrade to a pure mask rather than leaking most of themselves."""
+    """The last 4 characters, so a user with several keys can tell them apart in the UI and match
+    one to the Console's key list. Short keys degrade to a pure mask rather than leaking most of
+    themselves."""
     if len(secret) <= 12:
         return "…" + secret[-2:] if len(secret) > 4 else "…"
-    return f"{secret[:6]}…{secret[-4:]}"
+    return f"…{secret[-4:]}"
+
+
+def _shown_hint(stored: str | None) -> str | None:
+    """Rows written before the hint was cut to the last 4 stored ``sk-ant…abcd``: show only the tail."""
+    if not stored:
+        return stored
+    return "…" + stored.rsplit("…", 1)[-1][-4:] if "…" in stored else stored
 
 
 def _fingerprint(secret: str) -> str:
@@ -184,7 +239,7 @@ def _public(row: dict) -> dict:
         "base_url": row.get("base_url"),
         "model": row.get("model"),
         "lab_model": row.get("lab_model"),
-        "key_hint": row.get("key_hint"),
+        "key_hint": _shown_hint(row.get("key_hint")),
         "key_fingerprint": row.get("key_fingerprint"),
         "encrypted": bool(row.get("encrypted")),
         "created_at": row.get("created_at"),
@@ -313,9 +368,9 @@ def rotate_key(owner: str, cred_id: str, api_key: str, *,
 def update(owner: str, cred_id: str, *, label: str | None = None, model: str | None = None,
            lab_model: str | None = None, base_url: str | None = None,
            provider: str | None = None) -> dict:
-    """Edit METADATA only — never the key. Changing ``model`` or ``base_url`` invalidates the
-    stored verification (the key was proven against the old pair, not this one), so the row is
-    marked unverified rather than carrying a stale green tick."""
+    """Edit METADATA only — never the key. Changing ``model``, ``lab_model`` or ``base_url``
+    invalidates the stored verification (the key was proven against the old endpoint and models,
+    not these), so the row is marked unverified rather than carrying a stale green tick."""
     rows = _load_index(owner)
     row = _find(rows, cred_id)
     if row is None:
@@ -332,8 +387,9 @@ def update(owner: str, cred_id: str, *, label: str | None = None, model: str | N
     if base_url is not None and base_url != row.get("base_url"):
         row["base_url"] = base_url
         endpoint_changed = True
-    if lab_model is not None:
+    if lab_model is not None and (lab_model or None) != row.get("lab_model"):
         row["lab_model"] = lab_model or None
+        endpoint_changed = True     # the PI/Critic model is tested at save too (see _verify_roles)
 
     if endpoint_changed:
         row["verified_at"] = None
@@ -375,23 +431,14 @@ def record_egress_consent(owner: str, cred_id: str) -> dict | None:
     return _public(row)
 
 
-def storage_info(owner: str) -> dict:
-    """Where this owner's keys actually live, in plain terms, for the UI to show.
+def storage_info() -> dict:
+    """How stored keys are protected, for the API endpoints dialog to state in plain words.
 
-    "Where is my key?" is a fair question and the honest answer is short: a 0600 file on THIS
-    server, under a directory named after the account, never in the browser and never back over
-    the wire. Users who cannot see that answer assume the worst (or paste the key somewhere
-    else "to be safe"), so the dialog states it rather than leaving it to the docs.
+    Only the protection, never the location: the file path, its owner and its mode tell a user
+    nothing they can act on and show everyone who opens the dialog how the server is laid out
+    (RCHENLAB/AiScientist issue 37). The store's layout is in this module's docstring.
     """
-    # Absolute, always. ``AISCIENTIST_STATE_DIR`` is unset in production, so the store resolves
-    # relative to the service's working directory and this read "llm_creds/<user>" — which
-    # answers "where is my key?" with a path the reader cannot locate, and so does not answer it.
-    return {
-        "owner": _safe_owner(owner),
-        "dir": str(_owner_dir(owner).resolve()),
-        "mode": "0600",
-        "encrypted": encryption_enabled(),
-    }
+    return {"encrypted": encryption_enabled()}
 
 
 def list_credentials(owner: str) -> list[dict]:
@@ -430,7 +477,61 @@ def resolve_secret(owner: str, cred_id: str) -> str | None:
         raw = path.read_bytes()
     except OSError:
         return None
-    return _decode_secret(raw, bool(row.get("encrypted")))
+    secret = _decode_secret(raw, bool(row.get("encrypted")))
+    if not row.get("encrypted") and secret and encryption_enabled():
+        _reencrypt(owner, cred_id, secret)
+    return secret
+
+
+def _reencrypt(owner: str, cred_id: str, secret: str) -> bool:
+    """Rewrite a plaintext key file encrypted (same id, same path). Best-effort: a failure leaves
+    the plaintext row working and is retried on the next read."""
+    try:
+        blob, encrypted = _encode_secret(secret)
+        if not encrypted:
+            return False
+        rows = _load_index(owner)
+        row = _find(rows, cred_id)
+        if row is None:
+            return False
+        _write_private(_key_path(owner, cred_id), blob)
+        row["encrypted"] = True
+        row["key_path"] = str(_key_path(owner, cred_id))
+        _save_index(owner, rows)
+        return True
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        print(f"[llm-credentials] could not encrypt credential {cred_id}: {exc}")
+        return False
+
+
+def encrypt_existing() -> int:
+    """Encrypt every plaintext key in the store (gateway start). Returns how many were rewritten."""
+    if not encryption_enabled() or not _root().is_dir():
+        return 0
+    done = 0
+    for d in sorted(p for p in _root().iterdir() if p.is_dir()):
+        for row in _load_index(d.name):
+            if row.get("encrypted"):
+                continue
+            try:
+                secret = resolve_secret(d.name, row["id"])   # re-encrypts as a side effect
+            except GatewayError:
+                continue
+            if secret and (get_credential(d.name, row["id"]) or {}).get("encrypted"):
+                done += 1
+    return done
+
+
+def delete_owner(owner: str) -> int:
+    """Remove every credential of ``owner`` — its key files and its index — when the account is
+    deleted. Returns how many credentials there were."""
+    d = _root() / _safe_owner(owner)
+    if not d.is_dir():
+        return 0
+    n = len(_load_index(owner))
+    import shutil
+    shutil.rmtree(d, ignore_errors=True)
+    return n
 
 
 def delete_credential(owner: str, cred_id: str) -> bool:

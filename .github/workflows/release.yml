@@ -25,7 +25,7 @@ jobs:
           NAME="aiscientist-${TAG}"
           mkdir -p "dist/${NAME}"
           # Runtime files only: no tests, docs, examples or dev tooling.
-          cp -r src frontend preset_pipelines skills configs deploy pyproject.toml LICENSE README.md \
+          cp -r src frontend preset_pipelines configs deploy pyproject.toml LICENSE README.md \
              requirements.txt requirements-gateway.txt start.sh "dist/${NAME}/"
           {
             echo "tag=${TAG}"

@@ -16,6 +16,9 @@ pytest.importorskip("fastapi")
 from aiscientist.gateway import app as gw_app          # noqa: E402
 from aiscientist.gateway.settings import HPCSettings   # noqa: E402
 
+# The directory the gateway gives this job line: <shared_root>/Temp/<user>/scratch/runcode.
+SCRATCH = "/dfs/lab/Temp/tester/scratch/runcode"
+
 
 def _conn(tmp_path, monkeypatch, **settings_kw):
     monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(tmp_path))
@@ -87,7 +90,7 @@ def test_a_confirmation_reaches_the_client_and_its_answer_unblocks_the_worker(tm
     run = c.begin_run("conv-1")
     c.bind_run_id(run, "run-1")
     pushed: list[dict] = []
-    monkeypatch.setattr(c, "push", pushed.append)
+    monkeypatch.setattr(c, "push", lambda payload, **_kw: pushed.append(payload))
 
     confirm = gw_app._hitl_confirm(c, run)
     answer: list[bool] = []
@@ -115,7 +118,7 @@ def test_no_answer_within_the_timeout_declines(tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_CONFIRM_TIMEOUT_S", "0.1")
     c = _conn(tmp_path, monkeypatch)
     run = c.begin_run("conv-1")
-    monkeypatch.setattr(c, "push", lambda *_a: None)
+    monkeypatch.setattr(c, "push", lambda *_a, **_kw: None)
 
     assert gw_app._hitl_confirm(c, run)(_Req()) is False
 
@@ -135,6 +138,7 @@ def test_the_confirm_route_resolves_to_the_owning_run(tmp_path, monkeypatch):
     c = _conn(tmp_path, monkeypatch)
     mine = c.begin_run("conv-mine")
     c.bind_run_id(mine, "run-mine")
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)   # accounts on: test_connection_ownership.py
     client = TestClient(gw_app.app)
 
     stale = client.post("/api/confirm", json={"connection_id": c.id, "approved": True,
@@ -156,7 +160,7 @@ def test_the_sandbox_binds_the_shared_cache_read_only():
     install_package, which prunes image collisions and publishes atomically."""
     from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
-    ex = SlurmCodeExecutor(remote=None, container_image="/x/analysis.sif",
+    ex = SlurmCodeExecutor(remote=None, container_image="/x/analysis.sif", scratch_dir=SCRATCH,
                            package_cache_root="/dfs3b/lab/AiScientist/pkgs")
     preamble, binds = ex._package_cache_preamble()
 
@@ -172,7 +176,7 @@ def test_an_unset_cache_root_changes_nothing():
     """The feature is additive: without a cache root the sandbox behaves exactly as before."""
     from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 
-    ex = SlurmCodeExecutor(remote=None, container_image="/x/analysis.sif")
+    ex = SlurmCodeExecutor(remote=None, container_image="/x/analysis.sif", scratch_dir=SCRATCH)
     assert ex._package_cache_preamble() == ("", ())
 
 
@@ -204,7 +208,7 @@ def test_bringing_your_own_key_skips_the_gpu_entirely(tmp_path, monkeypatch):
     from aiscientist.gateway import llm_credentials
     importlib.reload(llm_credentials)
     cred = llm_credentials.create("alice", provider="deepseek", base_url="https://api.deepseek.com/v1",
-                                  model="deepseek-chat", api_key="sk-000000000000", label="Mine")
+                                  model="deepseek-chat", api_key="sk-example-000000", label="Mine")
 
     c = _conn(tmp_path, monkeypatch)
     c.llm_choice = {"credential_id": cred["id"]}

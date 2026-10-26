@@ -21,8 +21,11 @@ def client_conn(tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_DATABASE_URL", f"sqlite:///{(tmp_path / 'u.db').as_posix()}")
     from fastapi.testclient import TestClient
 
+    from aiscientist.gateway import app as gw_app
     from aiscientist.gateway.app import CONNECTIONS, Connection, app
     from aiscientist.gateway.settings import HPCSettings
+
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)   # accounts on: test_connection_ownership.py
 
     loop = asyncio.new_event_loop()
     conn = Connection(HPCSettings(), mock=True, loop=loop, username="tester")

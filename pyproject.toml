@@ -13,6 +13,10 @@ gateway = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.29",
   "python-multipart>=0.0.9",
+  # The plan as a YAML document (agents/plan_doc.py, AISCIENTIST_PLAN_YAML). Already present on
+  # every gateway host through uvicorn[standard]; named here because the code now imports it.
+  "pyyaml>=6.0",
+  "sqlalchemy>=2.0",  # durable plan estimates and compute usage, including auth-free deployments
 ]
 # LangGraph execution shell (agents/lab_graph.py, LabConfig.planner="langgraph").
 # DELIBERATELY NOT part of `gateway`: installing it pulls ~19 transitive packages
@@ -22,6 +26,19 @@ gateway = [
 # deploy without this extra behaves exactly as before.
 langgraph = [
   "langgraph>=1.2",
+]
+# Native Anthropic transport for users' own Claude keys (gateway/anthropic_client.py). Imported
+# lazily: without it a Claude key is refused at verification with "SDK not installed" and every
+# other provider works as before. 1.13 is the version the transport was built and tested against.
+anthropic = [
+  "anthropic>=1.13,<2",
+]
+# Croissant metadata (aiscientist.metadata, issue 9): mlcroissant is the reference validator and reads
+# a record set's rows for the MCP preview. Optional at runtime: without it the gateway still writes and
+# checks every croissant.json with its own rules, and previews with the csv module. CI installs it
+# (requirements-dev.txt), so every generated document is validated by mlcroissant on each change.
+metadata = [
+  "mlcroissant>=1.1",
 ]
 # User accounts / login / admin (eye-server). SQLAlchemy 2.0 models + Alembic
 # migrations; bcrypt for password hashing; itsdangerous for signed session cookies;
@@ -53,7 +70,6 @@ literature = [
 # venv's python, so installing this extra into the app venv lets generated analysis
 # code `import scanpy/gseapy`. System tools (apt, not pip): `pandoc texlive-xetex`
 # for PDF rendering, `graphviz` for deterministic schematic figures (the `dot` binary).
-# Optional prettier SVG schematics: install d2 (curl -fsSL https://d2lang.com/install.sh | sh -s --).
 analysis = [
   "scanpy>=1.10",
   "pydeseq2>=0.4",           # pseudobulk DE: DESeq2's NB Wald test (run_pseudobulk_de)

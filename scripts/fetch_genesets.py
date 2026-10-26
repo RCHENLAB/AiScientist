@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Download gene-set libraries (GMT) for OFFLINE enrichment (run_enrichment).
 
-The analysis line runs pathway enrichment inside a network-OFF Slurm/Singularity container,
+The analysis line runs pathway enrichment inside a network-OFF Slurm/Apptainer container,
 so it CANNOT call the Enrichr web API. Instead it reads local ``.gmt`` files. Run this ONCE
 on a machine WITH internet (the eye server, or your laptop) and point it at the gene-set dir
 the container will read.

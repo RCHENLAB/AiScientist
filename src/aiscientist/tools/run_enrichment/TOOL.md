@@ -27,7 +27,7 @@ Asks which pathways and GO terms the genes from a DE step over-represent, with g
 | `gene_sets` | array of string | — | local gene-set libraries to test against |
 | `background` | integer | — | ORA background size; omit to use the tested universe |
 | `split_direction` | boolean | — | test up- and down-regulated genes separately |
-| `groupby` | string | — | which DE table column names the groups |
+| `groupby` | string | — | which DE table to read, by the key in its file name tables/de_<groupby>_all.csv: the column run_de grouped by (e.g. leiden, majorclass), not the `group` column inside the table; omit to find the table automatically |
 | `genes` | array of string | — | explicit gene list; omit so the DE tables are found instead |
 <!-- /generated:parameters -->
 
@@ -52,6 +52,7 @@ On the fast chat path: no (research runs only).
 
 - Only the libraries in `tools/genesets/` exist (`describe_environment` lists them). The `.gmt` files are not in git; deploys keep them in place.
 - A cut list throws away ranking information; `run_gsea_prerank` is the whole-ranking complement.
+- Marker tables from `run_de` are the top `n_genes` per group, so on large data every row passes the gate and the input is that top-N, not the significant set. The result then says so in `warnings` and `selection.upstream_table`, with the true counts from `de_<key>_significance.json` (or, for older runs, inferred from every row passing).
 - Without per-group DE tables it falls back to one pooled list and a fixed 20,000-gene background, which inflates p-values; the result warns when that happens.
 
 ## Code and tests

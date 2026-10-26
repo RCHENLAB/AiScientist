@@ -19,6 +19,7 @@ Endpoint differences vs Ollama's native API:
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -187,7 +188,7 @@ get_tags = get_models
 
 
 def ensure_installed(executor, settings: HPCSettings, emit) -> dict:
-    """vLLM runs from a prebuilt Singularity image — there is NO per-user binary to
+    """vLLM runs from a prebuilt Apptainer image — there is NO per-user binary to
     install (unlike Ollama). Just verify the ``.sif`` is present so a missing image
     is surfaced at provisioning, not mid-serve. Returns an info dict for the UI."""
     image = settings.vllm_image
@@ -197,7 +198,7 @@ def ensure_installed(executor, settings: HPCSettings, emit) -> dict:
         return {"installed": True, "engine": "vllm", "image": image, "version": None}
     raise GatewayError(
         f"vLLM container image not found at {image}. Pull it once on the cluster with: "
-        f"singularity pull {image} docker://vllm/vllm-openai:latest",
+        f"apptainer pull {image} docker://vllm/vllm-openai:latest",
         stage="vllm_image",
         detail={"image": image, "stderr": result.stderr},
     )
@@ -340,6 +341,8 @@ def chat_tools_stream(
         ``{"id", "type", "function": {"name", "arguments"}}`` with ``arguments`` as a
         JSON *string* — the same shape ``chat_tools`` returns, so callers parse it
         identically.
+      * ``("usage", {...})`` — ONCE, last, when the server reports the turn's token usage
+        (``stream_options.include_usage``), so the caller can record what the turn cost.
 
     ``think`` defaults to **False** here (the opposite of ``chat_stream``): the whole
     point of the fast path is that the first sentence appears immediately, and a Qwen3
@@ -347,7 +350,8 @@ def chat_tools_stream(
     only where the trace is wanted.
     """
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
-    payload: dict = {"model": model, "messages": messages, "stream": True}
+    payload: dict = {"model": model, "messages": _wire_messages(messages), "stream": True,
+                     "stream_options": {"include_usage": True}}
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -357,6 +361,7 @@ def chat_tools_stream(
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=_headers(api_key), method="POST")
     calls: dict[int, dict] = {}
+    usage: dict | None = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local tunnel
             for raw in resp:
@@ -372,6 +377,8 @@ def chat_tools_stream(
                     continue
                 if isinstance(event, dict) and event.get("error"):
                     raise GatewayError(f"vLLM chat error: {event['error']}", stage="vllm_chat", detail=event)
+                if isinstance(event.get("usage"), dict):
+                    usage = dict(event["usage"])
                 choices = event.get("choices") or []
                 if not choices:
                     continue
@@ -392,6 +399,8 @@ def chat_tools_stream(
                                stage="vllm_chat", detail=error_detail(exc)) from exc
     if calls:
         yield ("tool_calls", [calls[i] for i in sorted(calls)])
+    if usage:
+        yield ("usage", usage)
 
 
 def complete_ex(
@@ -405,11 +414,16 @@ def complete_ex(
     think: bool = True,
     reasoning_effort: str | None = None,
     idle_timeout: float | None = None,
+    think_kwargs: dict | None = None,
 ) -> tuple[str, dict]:
     """One ``/v1/chat/completions`` — the assistant text AND the provider's usage.
 
     ``reasoning_effort`` overrides ``AISCIENTIST_VLLM_REASONING_EFFORT`` for this call (the gateway sets
     it PER ROLE: planning and the write-up think harder than a routing classifier).
+
+    ``think_kwargs`` overrides ``AISCIENTIST_VLLM_THINK_ON_KWARGS`` for this call. That env var
+    describes the session's own served model; a call to a DIFFERENT local server (the shared
+    reasoning model, see ``shared_llm``) carries that server's dialect instead.
 
     ``idle_timeout`` (local path only) switches to STREAMING with no limit on total time: the call
     fails only when the server sends NOTHING for that many seconds. A reasoning model streams its
@@ -445,10 +459,10 @@ def complete_ex(
         # unchanged. The phenotype mapper uses the session tunnel, never base_url, so this vLLM-only
         # chat-template kwarg never reaches an OpenRouter endpoint that wouldn't understand it.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-    elif not base_url and _think_on_kwargs():
+    elif not base_url and (think_kwargs or _think_on_kwargs()):
         # Served models whose template does NOT think by default (DeepSeek-V4 under vLLM's
         # deepseek_v4 tokenizer mode) need the opt-IN spelled out; configured per deployment.
-        payload["chat_template_kwargs"] = _think_on_kwargs()
+        payload["chat_template_kwargs"] = think_kwargs or _think_on_kwargs()
     effort = (reasoning_effort or "").strip().lower() or _reasoning_effort()
     if think and not base_url and effort in REASONING_EFFORTS:
         # HOW HARD to think on the local path. chat_template_kwargs only toggles the trace on/off;
@@ -503,6 +517,7 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
     usage: dict = {}
     finish = ""
     served_model = ""
+    done = False
     try:
         with urllib.request.urlopen(req, timeout=idle_timeout) as resp:  # noqa: S310 - local tunnel
             for raw in resp:
@@ -511,6 +526,7 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    done = True
                     break
                 try:
                     chunk = json.loads(data)
@@ -532,9 +548,16 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise GatewayError(f"vLLM completion error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
-    except (urllib.error.URLError, OSError) as exc:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise VLLMNetworkError(f"vLLM sent nothing for {idle_timeout:.0f}s (or the connection dropped).",
                                stage="vllm_chat", detail=error_detail(exc)) from exc
+    if not done and not finish:
+        # The stream ended with neither [DONE] nor a finish_reason: the server stopped mid-reply.
+        # Returning what had arrived made a cut-off reply look like the answer — in run 78a707cd79e9
+        # the serve job hit its Slurm --time while the PI was writing the synthesis, and the run
+        # kept an EMPTY synthesis instead of healing the session and asking again.
+        raise VLLMNetworkError("vLLM stopped mid-reply (the stream ended before the reply finished).",
+                               stage="vllm_chat", detail={"chars_received": sum(map(len, parts))})
     usage.setdefault("model", served_model or model)
     usage.setdefault("finish_reason", finish)
     return "".join(parts), usage
@@ -553,6 +576,13 @@ def complete(
     """``complete_ex`` without the usage — the historical ``-> str`` contract, unchanged."""
     return complete_ex(local_port, model, messages, timeout=timeout, max_tokens=max_tokens,
                        base_url=base_url, api_key=api_key, think=think)[0]
+
+
+def _wire_messages(messages: list[dict]) -> list[dict]:
+    """The history as an OpenAI-compatible server should see it: without ``provider_blocks``,
+    which only the Anthropic adapter reads (a strict server rejects unknown message fields)."""
+    return [{k: v for k, v in m.items() if k != "provider_blocks"} if isinstance(m, dict)
+            and "provider_blocks" in m else m for m in messages]
 
 
 def chat_tools(
@@ -593,7 +623,7 @@ def chat_tools(
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
     payload: dict = {
         "model": model,
-        "messages": messages,
+        "messages": _wire_messages(messages),
         "tools": tools,
         "tool_choice": "auto",
         "stream": False,
@@ -633,8 +663,12 @@ def chat_tools(
         body = _post({k: v for k, v in payload.items() if k != "reasoning_effort"})
     choices = (body or {}).get("choices") or [{}]
     message = choices[0].get("message") or {}
-    return {"content": message.get("content") or "", "tool_calls": message.get("tool_calls") or [],
-            "finish_reason": str(choices[0].get("finish_reason") or "")}
+    out = {"content": message.get("content") or "", "tool_calls": message.get("tool_calls") or [],
+           "finish_reason": str(choices[0].get("finish_reason") or "")}
+    usage = (body or {}).get("usage")
+    if isinstance(usage, dict):        # what the turn cost, for the usage record
+        out["usage"] = {**usage, "model": str((body or {}).get("model") or model)}
+    return out
 
 
 def _tokenize_root(local_port: int, base_url: str | None) -> str | None:
@@ -657,7 +691,7 @@ def count_tokens(
 ) -> int | None:
     """EXACT prompt token count from vLLM's server-side ``/tokenize`` — the count is
     computed by the SAME tokenizer + chat template the server enforces ``--max-model-len``
-    with, INSIDE the Singularity container on the GPU node. The gateway only ships the
+    with, INSIDE the Apptainer container on the GPU node. The gateway only ships the
     messages over the tunnel and reads back an integer; no tokenizer/model files land on
     eye-server.
 
@@ -688,7 +722,7 @@ def count_tokens(
     # add_generation_prompt mirrors a real chat call; send tools when present so the
     # count includes the tool-schema injection. If this server build rejects `tools` on
     # /tokenize, retry without them (the caller adds the schema estimate separately).
-    base_payload = {"model": model, "messages": messages, "add_generation_prompt": True}
+    base_payload = {"model": model, "messages": _wire_messages(messages), "add_generation_prompt": True}
     if tools:
         got = _post({**base_payload, "tools": tools})
         if got is not None:

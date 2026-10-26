@@ -1,0 +1,108 @@
+# The Kubernetes objects in front of AiScientist on the lab server. This is what is applied there.
+#
+# AiScientist is not a pod. It runs on the host as a systemd unit (deploy/systemd/aiscientist.service)
+# and the cluster only routes to it: the Envoy Gateway ends TLS, an HTTPRoute sends the host name to
+# a Service that has no selector, and a hand-written Endpoints object points that Service at the
+# host process on the node's internal IP. `kubectl -n aiscientist get pods` is empty by design.
+#
+#     kubectl apply -f deploy/k8s/host-backend.yaml
+#
+# The namespace exists already. The TLS certificate is not in this file and never in git:
+#     kubectl -n aiscientist create secret tls aiscientist-cert --cert=<fullchain.pem> --key=<key.pem>
+#
+# The IP below is the single cluster node's internal address. The unit binds the same address
+# (`--host`), so the two change together. See deploy/README.md.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: aiscientist-gateway
+  namespace: aiscientist
+spec:
+  gatewayClassName: eg                      # the cluster's Envoy Gateway
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: aiscientist.eye.som.uci.edu
+      allowedRoutes:
+        namespaces: { from: Same }
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: aiscientist.eye.som.uci.edu
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - { kind: Secret, name: aiscientist-cert }
+      allowedRoutes:
+        namespaces: { from: Same }
+---
+# No selector: nothing in the cluster backs this Service. The Endpoints object below does.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiscientist-app
+  namespace: aiscientist
+spec:
+  ports:
+    - { name: http, port: 8800, protocol: TCP, targetPort: 8800 }
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: aiscientist-app                     # must equal the Service name
+  namespace: aiscientist
+subsets:
+  - addresses:
+      - ip: 128.200.71.197                  # the node's internal IP, where the unit listens
+    ports:
+      - { name: http, port: 8800, protocol: TCP }
+---
+# HTTPS: every path of the host name goes to the host process. No `timeouts` are set, so Envoy
+# Gateway's default applies: a request must be answered within 15 s of its body arriving.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: aiscientist
+  namespace: aiscientist
+spec:
+  hostnames: [aiscientist.eye.som.uci.edu]
+  parentRefs:
+    - { name: aiscientist-gateway, sectionName: https }
+  rules:
+    - backendRefs:
+        - { name: aiscientist-app, port: 8800 }
+---
+# HTTP: redirect to HTTPS.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: aiscientist-redirect
+  namespace: aiscientist
+spec:
+  hostnames: [aiscientist.eye.som.uci.edu]
+  parentRefs:
+    - { name: aiscientist-gateway, sectionName: http }
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect: { scheme: https, statusCode: 301 }
+---
+# HTTP/2 flow control on the HTTPS listener. Envoy Gateway's default window (64 KiB per stream)
+# limits one upload stream to one window per round trip, under 1 MiB/s from a home connection.
+# The proxy is shared with other sites on the cluster: this targets AiScientist's listener only.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: aiscientist-upload-window
+  namespace: aiscientist
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: aiscientist-gateway
+      sectionName: https
+  http2:
+    initialStreamWindowSize: 8Mi
+    initialConnectionWindowSize: 32Mi

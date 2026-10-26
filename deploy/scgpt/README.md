@@ -1,12 +1,12 @@
 # scGPT container — build & stage (route B: vendor the refactor)
 
-Deployment artifacts for the scGPT step-1+2 GPU batch job (a short-lived Singularity GPU batch job
+Deployment artifacts for the scGPT step-1+2 GPU batch job (a short-lived Apptainer GPU batch job
 per annotation). The orchestration engine that *runs* the image is
 already built + tested (`src/aiscientist/gateway/scgpt_job.py`, offline-tested via a
 `RemoteExecutor` mock — no GPU in CI). This folder is the **image build kit**.
 
-> ⚠️ There is **no maintained scGPT container to `singularity pull`** — this is a **build**,
-> and it must run **on HPC3** (or a Linux + Singularity host). **macOS cannot build a `.sif`.**
+> ⚠️ There is **no maintained scGPT container to `apptainer pull`** — this is a **build**,
+> and it must run **on HPC3** (or a Linux host with Apptainer). **macOS cannot build a `.sif`.**
 
 ## Approach: vendor, don't reimplement
 
@@ -19,16 +19,16 @@ gateway's Python env.
 
 ## Files
 - `run_infer.py` — in-container entrypoint (`--input/--model/--out` → `predictions.csv`).
-- `scgpt.def` — Singularity definition: torch-2.3.0 CUDA base, pip `scgpt` + the reference
+- `scgpt.def` — Apptainer definition: torch-2.3.0 CUDA base, pip `scgpt` + the reference
   deps, `%files`-copies your `scGPT_refactor` + `run_infer.py` into `/opt/scgpt`.
-- `build_and_stage.sh` — copy your harness into the build context, build the `.sif` (3
-  routes), verify weights, place the image at the dfs3b path the gateway reads.
+- `build_and_stage.sh` — copy your harness into the build context, build the `.sif` (an
+  Apptainer `--fakeroot` Slurm job), verify weights, place the image at the dfs3b path the gateway reads.
 
 ## Prerequisites (do these first)
 1. **CUDA / driver** — `nvidia-smi` on an HPC3 gpu node; confirm the driver supports the
    base image's CUDA (12.1). Bump the `From:` tag if not.
-2. **Build route** — confirm how you can build on/near HPC3: `--fakeroot` (if RCIC enables
-   it), `--remote`, or Docker-elsewhere → `singularity build docker://…` (no fakeroot).
+2. **Build route** — `apptainer build --fakeroot` on an HPC3 compute node (no /etc/subuid entry
+   needed; verified 2026-10-09), or Docker-elsewhere → `apptainer build docker://…`.
 3. **Reference model** — obtain `best_model.pt`, `vocab.json`, `id2type.json`,
    `dev_train_args.yml` and stage them under `AISCIENTIST_SCGPT_MODEL_DIR` on dfs3b (big; not
    in git). Bound **read-only** per run as `--model`.
@@ -39,15 +39,16 @@ gateway's Python env.
 
 ## Build + stage
 ```bash
-# copies your scGPT_refactor into the context and prints the build routes:
+# copies your scGPT_refactor into the context and prints the build command:
 ./deploy/scgpt/build_and_stage.sh
-# build with the route you picked (e.g. on HPC3):
-cd deploy/scgpt && singularity build --fakeroot scgpt.sif scgpt.def && cd -
+# build on an HPC3 compute node (RCIC forbids login-node builds):
+cd deploy/scgpt && sbatch -p standard -A ruic20_lab -c 8 --mem=32G -t 04:00:00 -J build-scgpt --wait \
+  --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=$TMPDIR/ac apptainer build --fakeroot scgpt.sif scgpt.def' && cd -
 # stage the image (weights must already be under AISCIENTIST_SCGPT_MODEL_DIR):
 BUILT=1 ./deploy/scgpt/build_and_stage.sh
 ```
 Then set `AISCIENTIST_SCGPT_IMAGE` / `AISCIENTIST_SCGPT_ENTRYPOINT` (printed by the script). The
-gateway's `run_scgpt_inference` submits a `gpu:1` job that `singularity exec --nv`s this
+gateway's `run_scgpt_inference` submits a `gpu:1` job that `apptainer exec --nv`s this
 image, waits to COMPLETED, and reads `predictions.csv` back.
 
 ## Not committed to git

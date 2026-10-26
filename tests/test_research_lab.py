@@ -296,6 +296,156 @@ def test_no_preset_means_no_guidance_line():
     assert "research-path guidance" not in seen["pi_user"]
 
 
+# --- the PI plans with the skill library in view ----------------------------------------
+
+def _skill_library():
+    from aiscientist.agents.skills import Skill
+    return {
+        "pairwise_de": Skill("pairwise_de", "Pairwise differential expression between two named groups."),
+        "score_signature": Skill("score_signature", "Score every cell for a gene signature."),
+        "old_markers": Skill("old_markers", "Label clusters from their markers."),
+        "new_markers": Skill("new_markers", "Label clusters from a marker panel.", supersedes="old_markers"),
+    }
+
+
+def _planning_prompt(question="Compare Ddx41 KO vs WT retina"):
+    seen = {}
+
+    def complete(messages):
+        if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+            seen["pi_user"] = messages[1]["content"]
+            return json.dumps(["Run QC"])
+        raise AssertionError("only planning should run")
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog()))
+    kind, _ = lab._pi_plan(question, lambda _event: None)
+    assert kind == "agenda"
+    return seen["pi_user"]
+
+
+def test_pi_plan_lists_the_skill_library_after_the_tools(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    monkeypatch.setattr(skills_mod, "SKILLS", _skill_library())
+    prompt = _planning_prompt()
+    assert "Skills the scientist can also use" in prompt
+    # a plan must not credit a skill with a method its description does not name (measured: one
+    # plan in seven said AUCell for a template that runs sc.tl.score_genes)
+    assert "Describe a skill's method only as its line below states it" in prompt
+    assert "- pairwise_de — Pairwise differential expression between two named groups." in prompt
+    assert "- score_signature — " in prompt
+    # the newest version of a superseded skill is listed, the old one is not
+    assert "- new_markers — " in prompt and "old_markers" not in prompt
+    assert prompt.index("these tools") < prompt.index("Skills the scientist can also use")
+
+
+def test_pi_plan_reads_the_library_as_it_is_at_planning_time(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    from aiscientist.agents.skills import Skill
+    lib = _skill_library()
+    monkeypatch.setattr(skills_mod, "SKILLS", lib)
+    assert "atlas_compare" not in _planning_prompt()
+    lib["atlas_compare"] = Skill("atlas_compare", "Compare a dataset against a precalculated atlas.")
+    assert "- atlas_compare — Compare a dataset against a precalculated atlas." in _planning_prompt()
+
+
+def test_an_empty_skill_library_adds_no_skill_section(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    monkeypatch.setattr(skills_mod, "SKILLS", {})
+    assert "Skills the scientist" not in _planning_prompt()
+
+
+def test_a_large_skill_library_lists_the_best_matches_first():
+    from aiscientist.agents.research_lab import plan_skills_block
+    from aiscientist.agents.skills import Skill
+    lib = {f"template_{i}": Skill(f"template_{i}", f"Unrelated template number {i}.") for i in range(5)}
+    lib["pairwise_de"] = Skill("pairwise_de", "Pairwise differential expression between two groups.")
+    block = plan_skills_block("differential expression of KO vs WT", skills=lib, limit=3)
+    lines = [line for line in block.splitlines() if line.startswith("- ")]
+    assert len(lines) == 3
+    assert lines[0].startswith("- pairwise_de — ")
+    assert "3 more skills exist" in block
+
+
+def test_only_an_overlong_skill_description_is_cut_in_the_planning_list():
+    # The cut is the Agent-Skills maximum (1024): a routing sentence at the END of a normal
+    # description ("... is the run_cellqc tool, not this skill") must reach the PI.
+    from aiscientist.agents.skills import Skill, plan_skill_lines
+    normal = "Run the pipeline by hand. " * 20 + "Inside an analysis, use the tool instead."
+    lines, left_out = plan_skill_lines("q", skills={"n": Skill("n", normal),
+                                                    "long": Skill("long", "word " * 400)})
+    assert left_out == 0 and lines[0].endswith("use the tool instead.")
+    assert lines[1].endswith(" …") and len(lines[1]) < 1050
+
+
+def test_the_planning_list_has_no_count_limit():
+    from aiscientist.agents.skills import Skill, plan_skill_lines
+    lib = {f"s{i}": Skill(f"s{i}", f"thing {i}") for i in range(120)}
+    lines, left_out = plan_skill_lines("q", skills=lib)
+    assert len(lines) == 120 and left_out == 0
+
+
+def test_skills_named_in_a_step_match_whole_names_only():
+    from aiscientist.agents.skills import Skill, skills_named_in
+    lib = {name: Skill(name) for name in (
+        "annotate_clusters_by_markers", "annotate_clusters_by_markers_v2", "literature-corpus-recovery")}
+    assert skills_named_in("apply skill `annotate_clusters_by_markers_v2` with `run_code`", lib) \
+        == ["annotate_clusters_by_markers_v2"]
+    assert skills_named_in("Label clusters with annotate_clusters_by_markers.", lib) \
+        == ["annotate_clusters_by_markers"]
+    assert skills_named_in("Fetch the PDFs with literature-corpus-recovery", lib) \
+        == ["literature-corpus-recovery"]
+    assert skills_named_in("Run QC with `run_qc`", lib) == []
+
+
+def test_the_scientist_is_pointed_at_the_skill_its_step_names(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    from aiscientist.agents.research_lab import Specialist
+    monkeypatch.setattr(skills_mod, "SKILLS", _skill_library())
+    briefs = []
+
+    def chat(messages, tools):
+        briefs.append(next(m["content"] for m in messages if m.get("role") == "user"))
+        return {"content": "", "tool_calls": [{"id": "f", "type": "function", "function": {
+            "name": "finish", "arguments": json.dumps({"answer": "done"})}}]}
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "x",
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=chat))
+    lab._scientist("q", "**KO vs WT** — apply skill `pairwise_de` with `run_code` to compare KO and WT.",
+                   Specialist("Sci", "persona"), "", [], lambda _event: None)
+    assert "The plan assigns skill `pairwise_de` to this step: call `read_skill_reference(name)`" \
+        in briefs[0]
+
+    briefs.clear()
+    lab._scientist("q", "**QC** — Filter cells with `run_qc` at the defaults.",
+                   Specialist("Sci", "persona"), "", [], lambda _event: None)
+    assert "The plan assigns" not in briefs[0]
+
+
+def test_the_next_cycle_plan_is_offered_the_skills(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    monkeypatch.setattr(skills_mod, "SKILLS", _skill_library())
+    seen = {}
+
+    def complete(messages):
+        seen["payload"] = json.loads(messages[1]["content"])
+        return json.dumps({"continue": False, "reason": "answered"})
+
+    lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=default_catalog()))
+    lab._plan_next_cycle("q", [], 2, lambda _event: None)
+    assert any(line.startswith("- pairwise_de — ") for line in seen["payload"]["skills_available"])
+
+
+def test_a_skill_named_like_a_tool_is_not_reported_as_an_unknown_tool(monkeypatch):
+    from aiscientist.agents import skills as skills_mod
+    from aiscientist.agents.research_lab import check_plan_tooling
+    from aiscientist.agents.skills import Skill
+    monkeypatch.setattr(skills_mod, "SKILLS", {"run_custom_qc": Skill("run_custom_qc", "Induced QC.")})
+    _, findings = check_plan_tooling(["Apply skill `run_custom_qc` with `run_code`."], default_catalog())
+    assert not any(f["tool"] == "run_custom_qc" for f in findings)
+
+
 # --- the PI planner sees the dataset's design (condition columns + existing labels) ----
 
 def _ctx_with_dataset(dataset_result):
@@ -421,6 +571,231 @@ def test_pi_plan_guard_collapses_duplicate_literature_steps():
     # longer overwrites the planner's wording with a string template.
     assert agenda == ["**Literature grounding** — Search the literature with `deep_literature` for "
                       "DDX41 in the retina and attach DOI-backed citations."]
+
+
+def test_pi_is_told_to_plan_the_literature_tool_the_session_has():
+    """The PI's instructions name `deep_literature` for the literature step. A session without that
+    tool (no HPC3 literature line, e.g. one that reasons on the user's own API key) must be told
+    `literature_search` instead, or the PI plans a tool the Scientist cannot call."""
+    from aiscientist.agents.research_lab import _PI_SYSTEM
+
+    def _tool(name):
+        return HarnessTool(name, f"{name}.", {"type": "object", "properties": {}},
+                           lambda _args, _ctx: {"status": "ok", "results": []}, category="literature")
+
+    def system_prompt(catalog):
+        seen = {}
+
+        def complete(messages):
+            if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+                seen["system"] = messages[0]["content"]
+            return json.dumps({"agenda": ["**Quality control** — Run `run_cellqc` on the library."]})
+
+        lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
+                          scientist=ResearchHarness(catalog=catalog))
+        lab._pi_plan("Run quality control on this library.", lambda _event: None)
+        return seen["system"]
+
+    without = system_prompt([_tool("literature_search")])
+    assert "deep_literature" not in without
+    assert "reserve one agenda step for `literature_search`" in without
+    # with the corpus tool wired, the instructions are the ones every GPU session has had
+    assert system_prompt([_tool("deep_literature"), _tool("literature_search")]) == _PI_SYSTEM
+
+
+# --- the literature guard follows what the user SAID about literature, not the words they used ---
+# Prod run 1e887ed2bf8e (2026-10-12). In plan review the user typed "only keep 1. cell QC quality
+# control ,discard all other step" and then "also discard the literature ,only first part.". The
+# PI's redraft dropped the literature step and said so; the guard put it back both times: first
+# because the protocol text says "reference" and "Literature", then because the note asking for
+# the removal contains the word "literature". The approved plan ran four literature searches.
+
+_QC_STEP = "**Cell QC** — Quality-control the delivery with `run_cellqc` and report what was removed."
+_CLUSTER_STEP = "**Clustering** — Cluster the cells with `run_clustering` and draw the UMAP."
+_LIT_STEP = ("**Mouse retina literature grounding** — Search the published literature with "
+             "`deep_literature` for mouse retina cell-type markers and attach DOI-backed citations.")
+# What the celltype_annotation protocol hands the PI in every run it matches: "reference" as
+# something to annotate against, and a literature stage.
+_PROTOCOL = ('5. Annotate with `run_marker_annotation`: for a curated reference pass '
+             '`reference: "retina"` and NO panel, or score against the reference panel.\n'
+             "6b. **Literature grounding** (`literature_search`): search on the cell types and "
+             "markers, and attach the references to the report.")
+_QC_REQUEST = "Run CellQC on the uploaded sample to generate quality control report."
+_LIT_REQUEST = "Annotate the mouse retina cell types and give me references for the markers."
+
+
+def _guard_lab(*drafts, **config):
+    """A lab that has the literature tools and whose PI answers each (re)draft with the next of
+    ``drafts`` (the last one repeats). A single-step patch is declined, as it is for any request
+    that removes a step; every other model call gets an empty reply."""
+    left = list(drafts)
+
+    def complete(messages):
+        system = messages[0]["content"]
+        if "revising ONE step" in system:
+            return '{"step": 0, "new_text": ""}'
+        if "Principal Investigator of a bioinformatics lab" in system:
+            return json.dumps({"agenda": left.pop(0) if len(left) > 1 else left[0]})
+        return "{}"
+
+    tools = [HarnessTool(name, f"{name} tool", {"type": "object", "properties": {}},
+                         lambda _args, _ctx: {"status": "ok"}, category="analysis")
+             for name in ("run_cellqc", "run_clustering", "deep_literature", "literature_search")]
+    return ResearchLab(_ctx(), LabConfig(**config), complete_fn=complete,
+                       scientist=ResearchHarness(catalog=tools))
+
+
+def _revise(lab, question, prior, *notes):
+    """The plan after the LAST of ``notes``, typed at ``prior``; the earlier notes are the log."""
+    kind, agenda = lab._pi_plan(question, lambda _event: None, feedback="\n".join(notes),
+                                prior_agenda=list(prior), latest_feedback=notes[-1])
+    assert kind == "agenda"
+    return agenda
+
+
+def test_a_review_note_that_removes_literature_does_not_put_it_back():
+    lab = _guard_lab([_QC_STEP, "SELF-SOURCED: The literature step was removed as requested."],
+                     preset_prompt=_PROTOCOL)
+    first = "only keep 1. cell QC quality control ,discard all other step"
+    second = "also discard the literature ,only first part."
+
+    assert _revise(lab, _QC_REQUEST, [_QC_STEP, _LIT_STEP], first) == [_QC_STEP]
+    assert _revise(lab, _QC_REQUEST, [_QC_STEP, _LIT_STEP], first, second) == [_QC_STEP]
+    # The plan and the PI's own note about it now say the same thing.
+    assert "literature step was removed" in lab._self_sourced
+
+
+def test_plan_review_shows_the_plan_the_note_asked_for():
+    """The same, through the review loop: the PI planned literature off the protocol, the user
+    took it out, and the next card is the one-step plan."""
+    lab = _guard_lab([_QC_STEP, _LIT_STEP], [_QC_STEP], preset_prompt=_PROTOCOL, mode="single")
+    shown: list[list[str]] = []
+    replies = [{"action": "revise", "feedback": "also discard the literature ,only first part."},
+               {"action": "cancel"}]
+
+    def review(kind, payload):
+        shown.append(list(payload))
+        return replies[len(shown) - 1]
+
+    events: list[dict] = []
+    lab.run(_QC_REQUEST, events.append, plan_review=review)
+
+    assert shown == [[_QC_STEP, _LIT_STEP], [_QC_STEP]]
+    # What went is in front of the reviewer, as with any step a redraft drops.
+    delta = [e for e in events if e.get("type") == "plan_redraft_delta"]
+    assert delta and delta[-1]["dropped"] == [_LIT_STEP]
+
+
+def test_a_request_for_literature_still_gets_the_step_the_pi_forgot():
+    from aiscientist.agents.research_lab import _is_literature_step
+
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP])
+    kind, agenda = lab._pi_plan(_LIT_REQUEST, lambda _event: None)
+    assert kind == "agenda" and agenda[:2] == [_QC_STEP, _CLUSTER_STEP]
+    assert len(agenda) == 3 and _is_literature_step(agenda[2])
+    # A redraft that loses the step while changing something else gets back the step the user
+    # reviewed, word for word, not a newly written one.
+    assert _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP, _LIT_STEP],
+                   "use resolution 0.8 for the clustering") == [_QC_STEP, _CLUSTER_STEP, _LIT_STEP]
+    # Asked for in review, on a plan that has none.
+    agenda = _revise(lab, _QC_REQUEST, [_QC_STEP, _CLUSTER_STEP],
+                     "add a literature step on the marker genes")
+    assert len(agenda) == 3 and _is_literature_step(agenda[2])
+
+
+@pytest.mark.parametrize("note", [
+    "drop the literature step",
+    "no references needed",
+    "the literature search is not needed",
+    "remove step 3",                                       # by its number: no literature word at all
+    "only keep step 1 and 2, discard all other steps",
+    "不要文献",
+    "去掉文献",
+    "文献步骤也去掉",
+    "把文献检索删掉",
+    "删掉第三步",
+    "只保留前两步",
+])
+def test_a_removal_in_review_wins_over_a_question_that_asked_for_literature(note):
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP])
+    assert _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP, _LIT_STEP], note) \
+        == [_QC_STEP, _CLUSTER_STEP]
+
+
+def test_a_removed_literature_step_stays_out_until_the_user_asks_for_it_again():
+    from aiscientist.agents.research_lab import _is_literature_step
+
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP])
+    removal, other = "去掉文献", "use resolution 0.8 for the clustering"
+    # The next note is about something else, typed at a plan that no longer has the step.
+    assert _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP], removal, other) \
+        == [_QC_STEP, _CLUSTER_STEP]
+    agenda = _revise(lab, _LIT_REQUEST, [_QC_STEP, _CLUSTER_STEP], removal, other,
+                     "add the literature step back")
+    assert len(agenda) == 3 and _is_literature_step(agenda[2])
+
+
+def test_a_protocol_naming_a_reference_panel_or_literature_forces_no_step():
+    lab = _guard_lab([_QC_STEP, _CLUSTER_STEP], preset_prompt=_PROTOCOL)
+    for question in (_QC_REQUEST,
+                     # ...and neither do the user's words, when the reference is what the
+                     # analysis is run against.
+                     "Annotate the clusters against the retina reference panel."):
+        assert lab._pi_plan(question, lambda _event: None) == ("agenda", [_QC_STEP, _CLUSTER_STEP])
+
+
+def test_what_a_sentence_says_about_literature():
+    from aiscientist.agents.research_lab import _literature_wish, _requests_literature
+
+    asks = ["Analyze DDX41 knockout mouse retina and include relevant literature context",
+            "Add citations for the top genes.",
+            "remove step 2 and add a literature step",
+            "discard the enrichment step and keep the literature step",
+            "skip clustering and search the literature for DDX41",
+            "make the literature step focus on rod photoreceptors",
+            "加上文献检索", "去掉富集保留文献", "分析这个数据并做文献检索"]
+    declines = ["also discard the literature ,only first part.",
+                "QC only, no clustering, no literature",
+                "don't add a literature step",
+                "I don't think we should add literature",
+                "no need to include references",
+                "we don't need the literature step",
+                "the literature step is not needed",
+                "discard the enrichment and literature steps",
+                "remove literature and add GSEA instead",
+                "不要文献", "去掉文献", "文献步骤也去掉", "把文献检索删掉", "文献不要了",
+                "不要保留文献", "去掉富集、文献", "不做聚类、注释、run_de、enrichment、GSEA 和文献检索"]
+    silent = [_QC_REQUEST, "only keep 1. cell QC quality control ,discard all other step",
+              "Align to the reference genome.", "Score the markers against the reference panel.",
+              "只保留第一步"]
+    for text in asks:
+        assert _literature_wish(text) is True and _requests_literature(text), text
+    for text in declines:
+        assert _literature_wish(text) is False and not _requests_literature(text), text
+    for text in silent:
+        assert _literature_wish(text) is None and not _requests_literature(text), text
+    # Read in order: the later sentence is the one that holds.
+    assert _literature_wish("Analyse it with literature context", "drop the literature step") is False
+    assert _literature_wish("No literature.", "add a literature step") is True
+    assert not _requests_literature(_PROTOCOL.splitlines()[0])       # "reference", "reference panel"
+
+
+def test_a_review_note_asking_for_literature_overrules_the_first_messages_limit():
+    """The scope is read from the first message only. A note typed at the plan is the newer
+    instruction, in both directions."""
+    from aiscientist.agents.research_lab import _is_literature_step
+    from aiscientist.agents.scope import read_scope
+
+    question = "Only run QC on this sample. No literature search."
+    lab = _guard_lab([_QC_STEP])
+    lab._scope = read_scope(question, {t.name: t.description for t in lab.scientist.catalog})
+    assert not lab._scope.allows_literature()
+    assert lab._pi_plan(question, lambda _event: None) == ("agenda", [_QC_STEP])
+
+    asked = "add a literature step on the marker genes"
+    agenda = _revise(lab, question, [_QC_STEP], asked)
+    assert len(agenda) == 2 and _is_literature_step(agenda[1])
+    assert _revise(lab, question, agenda, asked, "remove the literature step") == [_QC_STEP]
 
 
 def test_literature_context_step_is_deterministically_routed_to_literature_search():
@@ -766,8 +1141,6 @@ def test_dag_agent_memory_writes_reflects_and_reads_across_runs(tmp_path):
 
 
 def test_agent_memory_off_by_default_no_events(tmp_path):
-    briefs: list[str] = []
-
     def scientist_chat(messages, tools):
         if any(m.get("role") == "tool" for m in messages):
             return {"content": "", "tool_calls": [{"id": "f", "type": "function",
@@ -1293,6 +1666,36 @@ def test_no_contrast_detection_and_enrichment_step_classification():
     # a literature step that MENTIONS enriched pathways must NOT be misread as an enrichment step
     assert not _is_enrichment_step("Search the published literature for key marker genes and enriched pathways")
     assert not _is_enrichment_step("Synthesize the biological interpretation of the enriched pathways")
+
+
+def test_a_step_is_classified_by_the_tool_it_names_not_by_its_prose():
+    """2026-10-03, Sample3 e2e: the prose test called four steps of one plan "enrichment" and the
+    no-DE-producer guard dropped all four. The marker-DE step had said what its table feeds
+    ("pathway"); the annotation step had required a marker "enriched" in the cluster. The run lost
+    its markers and its cell-type labels. Abridged from that plan card, trigger words verbatim."""
+    from aiscientist.agents.research_lab import _is_de_producer_step, _is_enrichment_step
+    marker_de = ("**Marker genes per cluster** — Identify the genes that define each cluster with "
+                 "`run_de` in marker (default) mode: a Wilcoxon rank-sum test (`rank_genes_groups`) "
+                 "comparing every cell of one cluster against all remaining cells, writing a table "
+                 "per cluster (group, gene, log2fc, pval, pval_adj, score) that the pathway steps "
+                 "consume.")
+    ora = ("**ORA pathway context per cluster** — Put pathway context on each cluster with "
+           "`run_enrichment`: an offline over-representation test against the background of the "
+           "ACTUAL tested universe that `run_de` wrote, with the top enriched terms per cluster.")
+    gsea = ("**Preranked GSEA per cluster** — Complement the thresholded ORA with "
+            "`run_gsea_prerank`: a preranked GSEA that walks the COMPLETE ranked gene list per "
+            "cluster (every tested gene, ranked by Wilcoxon z, from `run_de`'s ranking files).")
+    annotation = ("**Marker-based cell-type annotation** — Assign a cell type to each cluster with "
+                  "`run_marker_annotation`, passing `reference: \"retina\"` and NO hand-built "
+                  "panel: a label is assigned only when that lineage's markers dominate the cluster "
+                  "AND at least one is enriched in it versus other lineages.")
+    assert _is_de_producer_step(marker_de) and not _is_enrichment_step(marker_de)
+    assert _is_enrichment_step(ora) and not _is_de_producer_step(ora)
+    assert _is_enrichment_step(gsea) and not _is_de_producer_step(gsea)
+    assert not _is_enrichment_step(annotation) and not _is_de_producer_step(annotation)
+    # A generic tool says nothing about what the step is, so its prose still decides.
+    assert _is_enrichment_step("**Pathways** — Run GO over-representation with `run_code` (gseapy)")
+    assert _is_de_producer_step("**Markers** — `run_code`: rank_genes_groups per cluster (Wilcoxon)")
 
 
 def test_run_prunes_enrichment_when_no_contrast(monkeypatch):
@@ -1826,17 +2229,14 @@ def test_no_skill_selected_means_free_planning():
     assert "research-path guidance" not in seen["pi_user"]
 
 
-def test_pipeline_loader_reads_tools_and_atomic_skill_library():
+def test_pipeline_loader_reads_tools():
     from aiscientist.agents.presets import PRESETS, get_preset
-    from aiscientist.agents.skills import SKILLS
 
     p = get_preset("scgpt_annotation")
     assert "scgpt_annotate" in p.tools                      # tools: frontmatter parsed
-    # the CodeAct templates that used to be bundled per-pipeline now live in the shared atomic library
-    # (each a folder skills/<name>/ with a SKILL.md + reference.py bundle)
-    assert "crossvalidate_scgpt_vs_leiden" in SKILLS and SKILLS["crossvalidate_scgpt_vs_leiden"].files
+    # The CodeAct templates a pipeline names are skills of the pinned release
+    # (tests/test_pinned_release.py checks that they resolve).
     assert "differential_expression" in PRESETS and "gene_signature_scoring" in PRESETS
-    assert "pairwise_de" in SKILLS                           # differential_expression's templates migrated
 
 
 def test_atomic_skills_reach_the_scientist_by_manifest(monkeypatch):
@@ -1907,9 +2307,14 @@ def test_read_skill_reference_fetches_guidance_then_code_on_demand():
     assert "error" in miss and "demo" in miss["available"]
 
 
-def test_required_skills_inject_a_mandatory_directive():
+def test_required_skills_inject_a_mandatory_directive(tmp_path, skill_release):
     # The console's skill multi-select: checked atomic skills are REQUIRED — the directive is added
-    # to the PI's planning guidance (validated against the real library; a real name is used here).
+    # to the PI's planning guidance (validated against the library, a release with that skill here).
+    folder = tmp_path / "skills" / "perturbation_edistance"
+    folder.mkdir(parents=True)
+    (folder / "SKILL.md").write_text("---\nname: perturbation_edistance\ndescription: Rank "
+                                     "perturbations by E-distance to control.\n---\n\nAdapt it.\n")
+    skill_release(tmp_path / "skills")
     def complete(messages):
         sys = messages[0]["content"]
         if "Principal Investigator of a bioinformatics lab" in sys:
@@ -1947,15 +2352,19 @@ def test_search_skills_ranks_by_relevance_and_reports_no_match():
     assert miss["results"] == [] and "hint" in miss and miss["available_count"] == 3
 
 
-def test_brief_switches_to_search_when_library_is_large(monkeypatch):
-    # Small library -> inline manifest (tested elsewhere). Large library (> threshold) -> the brief
-    # tells the agent to search_skills instead of listing all, so the manifest can't bloat context.
+def test_brief_lists_every_skill_however_large_the_library(monkeypatch):
+    # There is no manifest cap: the agent reads the WHOLE list (name + description, grouped by
+    # category) before it chooses. It used to stop listing above 12 skills and say "search", so with
+    # the 15 skills the repo already had, no run ever saw the list.
     import aiscientist.agents.research_lab as rl
+    from aiscientist.agents import skills as skills_mod
     from aiscientist.agents.skills import Skill
 
-    big = {f"skill_{i}": Skill(f"skill_{i}", summary=f"does thing {i}") for i in range(20)}
+    big = {f"skill_{i}": Skill(f"skill_{i}", summary=f"does thing {i}",
+                               category="single-cell" if i % 2 else "")
+           for i in range(40)}
+    monkeypatch.setattr(skills_mod, "SKILLS", big)
     monkeypatch.setattr(rl, "ATOMIC_SKILLS", big)
-    monkeypatch.setattr(rl, "SKILL_MANIFEST_MAX", 12)
     captured = {}
 
     def recording_chat(messages, tools):
@@ -1977,9 +2386,11 @@ def test_brief_switches_to_search_when_library_is_large(monkeypatch):
     scientist = ResearchHarness(catalog=default_catalog(), chat_fn=recording_chat)
     lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False), complete_fn=complete, scientist=scientist)
     lab.run("do the analysis")
-    assert "search_skills" in captured["brief"]           # large library -> search instruction
-    assert "20 atomic skills are available" in captured["brief"]
-    assert "skill_0" not in captured["brief"]             # the full manifest is NOT dumped
+    brief = captured["brief"]
+    assert "Atomic skills (40)" in brief
+    assert all(f"- skill_{i} — does thing {i}" in brief for i in range(40))   # every one listed
+    assert "[single-cell]" in brief                       # grouped by category
+    assert "search_skills" in brief                       # still offered for ranking
 
 
 def test_unknown_required_skill_is_dropped_not_injected():
@@ -2763,3 +3174,29 @@ def test_headless_never_consumes_the_ask_budget():
     for i in range(5):
         lab._failure_decision("q", TaskNode(id=f"s{i}", goal="Cluster"), "boom", [], None, lambda _e: None)
     assert lab._human_failure_asks == 0
+
+
+def test_dataset_profile_names_the_attached_reference():
+    """The profile describes the PRIMARY only; a second upload the user marked as reference must
+    reach the planner by name and role, or a plan cannot use it (and might analyse it as the study)."""
+    from aiscientist.agents.research_harness import HarnessContext
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
+
+    datasets = [
+        {"name": "query.h5ad", "primary": True},
+        {"name": "atlas.h5ad", "role": "reference", "primary": False,
+         "description": {"one_line_summary": "human retina cell-type atlas"}},
+        {"name": "panel.bed", "role": "gene_panel", "primary": False},
+    ]
+    ctx = HarnessContext(decisions={"dataset_result": {"cells": 10, "genes": 5},
+                                    "datasets": datasets}, tunnel_port=1, model="m")
+    prof = ResearchLab(ctx, LabConfig(), complete_fn=lambda m: "x")._dataset_context()
+    assert "query.h5ad — PRIMARY" in prof
+    assert "atlas.h5ad — REFERENCE: human retina cell-type atlas" in prof
+    assert "panel.bed — GENE_PANEL" in prof
+    assert "AISCIENTIST_REFERENCE" in prof and "never as the study's own data" in prof
+
+    single = HarnessContext(decisions={"dataset_result": {"cells": 10, "genes": 5},
+                                       "datasets": datasets[:1]}, tunnel_port=1, model="m")
+    assert "Attached files" not in ResearchLab(single, LabConfig(),
+                                               complete_fn=lambda m: "x")._dataset_context()

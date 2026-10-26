@@ -36,7 +36,7 @@ class BiomniRuntimeConfig:
       when a task needs lake-backed tools.
     """
 
-    data_path: str = "/data/BioAgent/biomni_data"
+    data_path: str = "/data/aiscientist/biomni_data"
     model: str = "qwen3.6:35b-a3b"
     source: str = "Custom"
     base_url: str = "http://127.0.0.1:11434/v1"

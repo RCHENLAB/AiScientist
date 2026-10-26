@@ -20,6 +20,7 @@ from .._lib.scrna import (
     _run_rel,
     _schema,
 )
+from .._lib.result_dataset import already_processed
 from ..sdk import HarnessTool
 
 
@@ -77,6 +78,9 @@ def run_scanpy_qc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     symbols_key = str(_p("run_scanpy_qc", "gene_symbols_key", args)).strip()
 
     adata = _read_anndata(sc, src)
+    done = already_processed(adata)
+    if done:
+        return {"status": "error", "step": "qc", "error": done}
     adata.var_names_make_unique()
     n_cells_0, n_genes_0 = int(adata.n_obs), int(adata.n_vars)
 
@@ -134,6 +138,8 @@ def run_scanpy_qc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     # aggregation (summing log values is meaningless), doublet detection, scVI. Cheap insurance
     # — the layer is the same sparse matrix that was about to be overwritten.
     adata.layers["counts"] = adata.X.copy()
+    adata.uns["counts_layer"] = ("UMI counts as read from the input, for the cells and genes that "
+                                 "passed QC (no ambient-RNA correction)")
 
     # Thresholds that empty the object must fail HERE, with the numbers that caused it. Left to
     # scanpy, HVG selection dies on the empty matrix with `ValueError: Cannot cut empty array` —
@@ -241,7 +247,8 @@ def make_tool() -> HarnessTool:
         "REAL scanpy QC on the uploaded single-cell dataset: per-cell metrics, "
         "cell/gene filtering, normalization, log1p, and HVG selection. Writes QC "
         "violin/scatter figures and a checkpoint. Returns pre/post cell-gene counts "
-        "and the thresholds used. Run this FIRST.",
+        "and the thresholds used. Run this FIRST on a single matrix; for a folder of 10x Cell "
+        "Ranger outputs (raw + filtered matrices) use run_cellqc instead.",
         _schema("run_scanpy_qc", input={
             **_INPUT_SPEC,
             "description": (

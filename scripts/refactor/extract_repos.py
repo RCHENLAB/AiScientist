@@ -8,8 +8,10 @@ are left alone, and nothing is pushed.
 
 Produces three repositories under ``--out``:
 
-* ``AiScientist-skills``: ``skills/`` and ``pipelines/`` (renamed from ``preset_pipelines/``), with
-  their history, plus a README commit.
+* ``AiScientist-skills``: ``pipelines/`` (renamed from ``preset_pipelines/``), with its history, plus
+  a README commit. The skills are not cut from here: they are the registry
+  ``lijinbio/aiscientist-skills``, whose pinned release the platform installs
+  (``configs/skills_registry.json``).
 * ``AiScientist-tools``: ``src/aiscientist/tools/``, the tests that import only ``aiscientist.tools``,
   ``tests/fixtures/`` and ``scripts/tool_docs.py``, with their history, plus a commit adding
   ``pyproject.toml`` (distribution ``aiscientist-tools``, import path still ``aiscientist.tools``) and
@@ -35,21 +37,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 SKILLS_README = """# AiScientist-skills
 
-What the AiScientist agent reads and adapts: plain files, no Python package.
+The protocols the AiScientist PI plans from: plain files, no Python package.
 
 ```
-skills/<name>/      SKILL.md (name, one-line description, When to use / Details / Run) + reference.py
 pipelines/<name>/   SKILL.md (name, description, tools, data_type) + PROTOCOL.md (+ references/)
 ```
 
-* A **skill** is an atomic CodeAct template. The Scientist sees only its name and description, reads
-  SKILL.md with `read_skill_reference`, then the template, adapts it and runs it with `run_code`.
-* A **pipeline** is an end-to-end protocol the PI picks when planning; its `tools:` must name tools
-  that exist in AiScientist-tools.
+A **pipeline** is an end-to-end protocol the PI picks when planning; its `tools:` must name tools
+that exist in AiScientist-tools. The atomic skills it names are those of the registry
+lijinbio/aiscientist-skills.
 
 The platform (RCHENLAB/AiScientist) reads this repository from a checkout of a pinned tag:
-`AISCIENTIST_SKILLS_DIR=<checkout>/skills`, `AISCIENTIST_PIPELINES_DIR=<checkout>/pipelines`. Its contract
-tests check that every tool a skill or pipeline names exists.
+`AISCIENTIST_PIPELINES_DIR=<checkout>/pipelines`. Its contract tests check that every tool a
+pipeline names exists.
 
 History: extracted from KrimsonSun/BioAgentPrototype with git filter-repo (`preset_pipelines/` was
 renamed to `pipelines/`).
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     # 1. AiScientist-skills
     skills = out / "AiScientist-skills"
     fresh_clone(skills, branch)
-    run("git", "filter-repo", "--force", "--path", "skills/", "--path", "preset_pipelines/",
+    run("git", "filter-repo", "--force", "--path", "preset_pipelines/",
         "--path-rename", "preset_pipelines/:pipelines/", cwd=skills)
     (skills / "README.md").write_text(SKILLS_README, encoding="utf-8")
     commit_all(skills, "docs: what this repository is and how the platform reads it")
@@ -175,10 +175,10 @@ def main(argv: list[str] | None = None) -> int:
     # 3. AiScientist (the platform keeps its history; one commit removes what moved)
     platform = out / "AiScientist"
     fresh_clone(platform, branch)
-    moved = ["skills", "preset_pipelines", "src/aiscientist/tools", "scripts/tool_docs.py",
+    moved = ["preset_pipelines", "src/aiscientist/tools", "scripts/tool_docs.py",
              "src/aiscientist/__init__.py", *tests]
     run("git", "rm", "-r", "-q", *moved, cwd=platform)
-    commit_all(platform, "split: the tools and the skills move to their own repositories\n\n"
+    commit_all(platform, "split: the tools and the pipelines move to their own repositories\n\n"
                "aiscientist becomes a namespace package: src/aiscientist/__init__.py is removed so that\n"
                "AiScientist-tools can provide aiscientist.tools.")
 
@@ -190,7 +190,7 @@ Test each the way the others consume it:
 
   cd {tools} && PYTHONPATH=src {py} -m pytest -q
   cd {platform} && PYTHONPATH=src:{tools}/src \\
-      AISCIENTIST_SKILLS_DIR={skills}/skills AISCIENTIST_PIPELINES_DIR={skills}/pipelines \\
+      AISCIENTIST_PIPELINES_DIR={skills}/pipelines \\
       {py} -m pytest -q
 """)
     return 0

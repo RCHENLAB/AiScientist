@@ -59,7 +59,7 @@ VCF ─▶ normalize ─▶ QC ─▶ annotate (VEP + ClinVar + gnomAD + predict
 - **QC**: Ti/Tv, Het/Hom, call rate — is the callset trustworthy before we interpret it?
 - **annotate → prioritize → report**: the core of the path.
 
-Everything runs offline on HPC3 (Singularity + Slurm) against locally-staged reference data.
+Everything runs offline on HPC3 (Apptainer + Slurm) against locally-staged reference data.
 **Why local rather than the online APIs:** a whole-genome VCF has ~5M variants; the Ensembl REST API
 is rate-limited and caps at a few hundred variants, so it cannot annotate at that scale — the local
 cache does the whole file in ~30–60 min. (HPC3 compute nodes *do* have internet — I verified this — so

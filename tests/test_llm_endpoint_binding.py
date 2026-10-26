@@ -209,7 +209,7 @@ def test_status_summary_names_the_endpoint_and_never_the_key(store):
     assert summary == {**summary, "model": "deepseek-chat", "lab_model": "deepseek-reasoner",
                        "remote": True, "label": "My DeepSeek"}
     assert "sk-user-own-example" not in repr(summary)
-    assert summary["key_hint"] == "sk-use…mple"   # first 6 + last 4 of the fixture key
+    assert summary["key_hint"] == "…mple"         # the last 4 of the fixture key, nothing more
 
 
 def test_status_summary_reports_a_deleted_credential_rather_than_pretending(store):
@@ -223,7 +223,7 @@ def test_status_summary_reports_a_deleted_credential_rather_than_pretending(stor
 def test_status_summary_for_the_cluster_default(store):
     summary = gw_app.Connection._llm_endpoint_summary(_Conn())
     assert summary == {"kind": "cluster", "cluster_model_id": "", "label": "vLLM (UCI GPU node)",
-                       "model": None, "remote": False}
+                       "cluster_label": "", "model": None, "remote": False}
 
 
 # --- egress: consent is the control, the scanner is the backstop -------------

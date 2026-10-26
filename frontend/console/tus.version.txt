@@ -1,0 +1,2 @@
+tus-js-client 4.3.1
+https://www.npmjs.com/package/tus-js-client

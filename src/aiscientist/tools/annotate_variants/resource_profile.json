@@ -1,0 +1,16 @@
+{
+  "unit": "gb",
+  "baseline": 1,
+  "steps": [
+    {
+      "name": "variant annotation",
+      "cpus": 4,
+      "gpus": 0,
+      "mem_gb": 32,
+      "minutes": [
+        20,
+        60
+      ]
+    }
+  ]
+}

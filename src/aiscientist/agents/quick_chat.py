@@ -60,7 +60,8 @@ QUICK_CHAT_SYSTEM = (
     "seconds of waiting. When you do call a tool, say what you already know first, then call it.\n"
     "\n"
     "For a gene-disease association, a variant/phenotype link, or what the literature/evidence "
-    "says, deep_literature (the indexed corpus) is the right tool — call it to ground the answer. "
+    "says, deep_literature (the indexed corpus; search_corpus where that is what you have) is the "
+    "right tool — call it to ground the answer. "
     "If an earlier turn in THIS conversation already got that answer from deep_literature, reuse "
     "it instead of calling again. HARD RULE: if you did NOT call deep_literature this turn, do NOT "
     "say you retrieved, searched, or used the corpus, and do NOT emit paper citations or a "
@@ -194,10 +195,10 @@ def _clean_text(s: str) -> str:
 
 
 #(1) make the paperqa drafts clean (2)pack every line to paper name and evidence(formatting the paper)
-def _format_grounding(payload: dict) -> str:
-    """Render deep_literature's REAL result as the evidence the model must answer from."""
+def _format_grounding(payload: dict, tool: str = "deep_literature") -> str:
+    """Render the literature tool's REAL result as the evidence the model must answer from."""
     if not isinstance(payload, dict):
-        return "deep_literature returned nothing usable."
+        return f"{tool} returned nothing usable."
     status = str(payload.get("status") or "")
     contexts = payload.get("contexts") or []
     answer = payload.get("formatted_answer") or payload.get("answer") or ""
@@ -205,9 +206,9 @@ def _format_grounding(payload: dict) -> str:
         note = payload.get("note") or payload.get("error") or status
         if payload.get("agent_status") == "truncated":
             # PaperQA ran out of time before it had evidence. That says nothing about the corpus.
-            return (f"deep_literature did NOT finish ({note}). Tell the user the corpus search did "
+            return (f"{tool} did NOT finish ({note}). Tell the user the corpus search did "
                     "not complete; do not say the corpus has nothing on this.")
-        return f"deep_literature returned NO relevant papers ({note}). The corpus has nothing on this."
+        return f"{tool} returned NO relevant papers ({note}). The corpus has nothing on this."
     parts = []
     if answer:
         # [1](#ref1) -> [1] (the bubble renders raw #ref anchors as noise) and strip the <i>/<b>
@@ -221,38 +222,45 @@ def _format_grounding(payload: dict) -> str:
         from ..reporting.literature_references import strip_intext_citation_markers
         ans = strip_intext_citation_markers(ans)
         parts.append(ans)
-    cites, seen = [], set()
+    # One source number per paper, with EVERY passage of it under that number: search_corpus returns
+    # up to three passages of a paper, and keeping only the first one (cut to 500 characters) hid
+    # most of the evidence it had found. Its passages are the papers' own text, ~1500 characters, so
+    # they are kept whole; deep_literature's summaries keep the 500-character cut.
+    max_chars = 1500 if tool == "search_corpus" else 500
+    sources: dict[str, tuple[str, list[str]]] = {}
     for c in contexts:
         if not isinstance(c, dict):
             continue
         cit = _clean_text(c.get("citation") or "")
-        key = cit.lower()
-        if cit and key not in seen:
-            seen.add(key)
-            snippet = _clean_text(c.get("summary") or "")
-            if len(snippet) > 500:
-                snippet = snippet[:497].rstrip() + "\u2026"
-            cites.append((cit, snippet))
-    if cites:
-        lines = [f"{i}. {cit}" + (f"\n   Evidence: {snip}" if snip else "")
-                 for i, (cit, snip) in enumerate(cites, 1)]
+        if not cit:
+            continue
+        evidence = sources.setdefault(cit.lower(), (cit, []))[1]
+        snippet = _clean_text(c.get("summary") or "")
+        if len(snippet) > max_chars:
+            snippet = snippet[:max_chars - 3].rstrip() + "\u2026"
+        if snippet:
+            page = c.get("page")
+            evidence.append(f"(p. {page}) {snippet}" if page not in (None, "") else snippet)
+    if sources:
+        lines = [f"{i}. {cit}" + "".join(f"\n   Evidence: {e}" for e in evidence)
+                 for i, (cit, evidence) in enumerate(sources.values(), 1)]
         parts.append(
             "Sources \u2014 cite ONLY these (one number each, no repeats). Attach a source to a "
             "gene's inheritance mode ONLY if that source's Evidence text actually states it; if no "
             "Evidence states a claim, do not make the claim:\n" + "\n".join(lines))
-    return "\n\n".join(parts) if parts else "deep_literature returned no relevant papers for this question."
+    return "\n\n".join(parts) if parts else f"{tool} returned no relevant papers for this question."
 
 #tell qwen how to write properly with the formatted answer
-def _grounding_note(payload: dict) -> str:
+def _grounding_note(payload: dict, tool: str = "deep_literature") -> str:
     return (
-        "deep_literature (the indexed corpus) was just run for the question above. Answer using ONLY "
+        f"{tool} (the indexed corpus) was just run for the question above. Answer using ONLY "
         "the evidence below. Cite inline as plain bracketed numbers — [1] or [1, 2] — with NO markdown "
         "links and NO #ref anchors, then end with a plain numbered \"References:\" list giving each "
         "unique source ONCE in full — never list the same paper under two numbers, and no HTML "
         "tags in titles. If the evidence says no relevant papers were found, tell the user the corpus "
         "has nothing on this rather than answering from memory. Keep it concise: a direct answer plus "
         "the references, not a formal report.\n\n"
-        "=== deep_literature result ===\n" + _format_grounding(payload)
+        f"=== {tool} result ===\n" + _format_grounding(payload, tool)
     )
 
 #this is the part of checker,which ask ai to see whether the chunks and the citations have noise
@@ -431,28 +439,37 @@ def run_quick_chat(
     # down -> executor is None -> tool not in the catalog), so chat still degrades to a plain answer.
     # deep_literature is dropped from the schemas afterwards so the model cannot fire the (minutes-
     # long) job a second time.
-    lit_tool = by_name.get("deep_literature")
+    # A session with no served model has ``search_corpus`` instead: the same corpus, passages only. The
+    # model (this loop) then writes the answer from them, which is what the note below tells it to do.
+    lit_name = next((n for n in ("deep_literature", "search_corpus") if n in by_name), None)
+    lit_tool = by_name.get(lit_name) if lit_name else None
     if lit_tool is not None and not cancelled() and _is_literature_question(question):
-        emit({"type": "tool_start", "tool": "deep_literature", "args": {"question": question}})
+        lit_args = ({"queries": [question]} if lit_name == "search_corpus" else {"question": question})
+        emit({"type": "tool_start", "tool": lit_name, "args": lit_args})
         try:
-            forced = lit_tool.executor({"question": question}, context)
+            forced = lit_tool.executor(lit_args, context)
             if not isinstance(forced, dict):
                 forced = {"status": "ok", "result": forced}
-            emit({"type": "tool_result", "tool": "deep_literature", "summary": _summarize(forced)})
+            if lit_name == "search_corpus":
+                # _format_grounding shows each source's `summary` as its evidence: here, the passage.
+                forced = {**forced, "contexts": [
+                    {**c, "summary": c.get("text", "")} for c in forced.get("contexts") or []
+                    if isinstance(c, dict)]}
+            emit({"type": "tool_result", "tool": lit_name, "summary": _summarize(forced)})
         except Exception as exc:  # noqa: BLE001 - a grounding failure is data for the model, not the
             forced = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}   # end of the turn
-            emit({"type": "tool_error", "tool": "deep_literature", "error": forced["error"]})
-        result.tool_calls.append({"tool": "deep_literature", "args": {"question": question}})
-        messages.append({"role": "user", "content": _grounding_note(forced)})
+            emit({"type": "tool_error", "tool": lit_name, "error": forced["error"]})
+        result.tool_calls.append({"tool": lit_name, "args": lit_args})
+        messages.append({"role": "user", "content": _grounding_note(forced, lit_name)})
         grounding_payload = forced
-        schemas = [sc for sc in schemas if _schema_name(sc) != "deep_literature"]
+        schemas = [sc for sc in schemas if _schema_name(sc) not in ("deep_literature", "search_corpus")]
 
     for turn in range(cfg.max_turns):
         if cancelled():
             result.stopped = True
             return result
         result.turns = turn + 1
-        turn_text, turn_thinking, calls = "", "", []
+        turn_text, turn_thinking, calls, provider_blocks = "", "", [], None
         for kind, chunk in stream_fn(messages, schemas):
             if cancelled():
                 result.stopped = True
@@ -467,6 +484,8 @@ def run_quick_chat(
                 emit({"type": "thinking", "token": chunk})
             elif kind == "tool_calls":
                 calls = list(chunk or [])
+            elif kind == "provider_blocks":
+                provider_blocks = chunk     # Claude's raw turn, replayed by its adapter next turn
 
         # Only the LAST turn's text is the answer the user keeps; earlier turns' prose is the
         # model narrating before a tool call ("PDE6B is a rod phosphodiesterase subunit — let me
@@ -475,6 +494,8 @@ def run_quick_chat(
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn_text}
         if calls:
             assistant_msg["tool_calls"] = calls
+        if provider_blocks:
+            assistant_msg["provider_blocks"] = provider_blocks
         messages.append(assistant_msg)
 
         if not calls:

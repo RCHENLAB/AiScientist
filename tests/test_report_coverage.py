@@ -151,7 +151,7 @@ def test_uncovered_is_optional_so_existing_callers_are_unaffected():
 # of nuclei, and run_de had tested and refused 5 / 22, 4 / 9, …, 57 / 21. The claim-audit block had
 # handed the writers the file's counts as the only authority.
 
-from aiscientist.agents.research_lab import _tested_counts, correct_coverage_counts, pre_qc_counts  # noqa: E402
+from aiscientist.agents.research_lab import _tested_counts, pre_qc_counts  # noqa: E402
 
 _PRE = {"Endothelial": {"DDX41": 7, "WT": 27}, "HC": {"DDX41": 5, "WT": 11},
         "Microglia": {"DDX41": 60, "WT": 24}, "Pericyte": {"DDX41": 4, "WT": 2},

@@ -63,9 +63,9 @@ def _seed_bundle(conn, run_id="run123", *, agenda=None, dataset_path="/data/a.h5
 
 
 def _fake_run_lab(cap):
-    def fake(c, req, *, resume=None, resume_run_id=None, resume_decisions=None):
+    def fake(c, req, *, resume=None, resume_run_id=None, resume_decisions=None, prior=None):
         cap.update(path="run_lab", question=req.question, resume=resume,
-                   run_id=resume_run_id, decisions=resume_decisions)
+                   run_id=resume_run_id, decisions=resume_decisions, prior=prior)
         async def _noop():
             return None
         return _noop()
@@ -133,9 +133,11 @@ def test_followup_target_eligibility(tmp_path):
     # plan-mode is CHECKED by default and does NOT disqualify — else every follow-up ("generate the
     # report") re-ran from scratch. The classifier decides intent; a new_study still honors plan_mode.
     assert gw_app._followup_target(conn, gw_app.LabRequest(connection_id=conn.id, question="x", plan_mode=True)) is not None
-    # a FORCED skill (preset/presets) or a DIFFERENT dataset DO mean "new study" -> not eligible
-    assert gw_app._followup_target(conn, gw_app.LabRequest(connection_id=conn.id, question="x", preset="scrna")) is None
-    assert gw_app._followup_target(conn, gw_app.LabRequest(connection_id=conn.id, question="x", presets=["scrna"])) is None
+    # A picked pipeline stays ticked for the whole chat, so it does NOT make a message a new study
+    # (it used to, which restarted every later message from the raw input).
+    assert gw_app._followup_target(conn, gw_app.LabRequest(connection_id=conn.id, question="x", preset="scrna")) is not None
+    assert gw_app._followup_target(conn, gw_app.LabRequest(connection_id=conn.id, question="x", presets=["scrna"])) is not None
+    # a DIFFERENT dataset does mean "new study" -> not eligible
     assert gw_app._followup_target(conn, gw_app.LabRequest(connection_id=conn.id, question="x",
                                                            dataset_path="/data/OTHER.h5ad")) is None
     # no prior run at all
@@ -178,10 +180,10 @@ def test_classify_rerun_step_continues_in_place(tmp_path, monkeypatch):
     assert cap["resume"].modify_note == "please search the literature again with better terms"
 
 
-def test_rerun_without_checkpoints_starts_a_fresh_study(tmp_path, monkeypatch):
-    # A mid-pipeline re-run needs the upstream checkpoints, and those are now deleted the moment
-    # the report is written. Report editing no longer exists as a fallback, so the honest outcome
-    # is to run the analysis again rather than quietly doing less.
+def test_rerun_without_checkpoints_redoes_the_step_from_the_processed_dataset(tmp_path, monkeypatch):
+    # A mid-pipeline re-run needs the upstream checkpoints, and those are deleted the moment the
+    # report is written. It used to fall back to the whole study from the raw input; what the run
+    # handed on is its processed dataset, so the step is redone from there.
     conn = _conn(tmp_path, last_run_id="run123")
     _seed_bundle(conn, with_checkpoint=False)
     cap: dict = {}
@@ -189,7 +191,70 @@ def test_rerun_without_checkpoints_starts_a_fresh_study(tmp_path, monkeypatch):
     _patch_llm(monkeypatch, {"intent": "rerun_step",
                              "step": "Differential expression per cluster", "confidence": 0.9})
     _dispatch(conn, "redo the differential expression")
-    assert cap["path"] == "run_lab"
+    assert cap["path"] == "run_lab" and cap["resume"] is None
+    assert cap["prior"]["run_id"] == "run123"
+
+
+def test_redoing_qc_without_checkpoints_starts_again_from_the_input(tmp_path, monkeypatch):
+    # The processed dataset holds only the cells the first QC kept, so QC cannot be redone from it.
+    conn = _conn(tmp_path, last_run_id="run123")
+    _seed_bundle(conn, with_checkpoint=False,
+                 agenda=["**Provenance** — Establish what the matrix is with `run_code`.",
+                         "**QC** — Filter cells with `run_scanpy_qc` at 10% mitochondrial.",
+                         "**Clustering** — Cluster with `run_clustering`."])
+    cap: dict = {}
+    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab(cap))
+    _patch_llm(monkeypatch, {"intent": "rerun_step", "confidence": 0.9,
+                             "step": "**QC** — Filter cells with `run_scanpy_qc` at 10% mitochondrial."})
+    _dispatch(conn, "redo the QC at 20% mitochondrial")
+    assert cap["path"] == "run_lab" and cap["prior"] is None and cap["resume"] is None
+
+
+def test_a_new_analysis_on_the_same_data_continues_from_the_results(tmp_path, monkeypatch):
+    conn = _conn(tmp_path, last_run_id="run123")
+    _seed_bundle(conn)
+    cap: dict = {}
+    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab(cap))
+    _patch_llm(monkeypatch, {"intent": "continue", "confidence": 0.9})
+    _dispatch(conn, "now annotate the cell types")
+    assert cap["resume"] is None and cap["run_id"] is None          # a NEW run, not a re-entry
+    assert cap["prior"]["run_id"] == "run123"
+    assert cap["prior"]["question"] == "characterize the DDX41 dataset"
+    assert [s["title"] for s in cap["prior"]["steps"]][:2] == ["Run QC and report the metrics",
+                                                              "Cluster the cells"]
+
+
+def test_a_picked_pipeline_continues_unless_the_message_starts_over(tmp_path, monkeypatch):
+    """The console keeps a picked pipeline ticked for the whole chat. With one ticked, a later
+    message plans that pipeline ON the earlier results; only "start over" goes back to the input."""
+    conn = _conn(tmp_path, last_run_id="run123")
+    _seed_bundle(conn)
+    cap: dict = {}
+    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab(cap))
+    _patch_llm(monkeypatch, {"intent": "rerun_step", "step": "Cluster the cells", "confidence": 0.9})
+    _dispatch(conn, "compare with the atlas", presets=["celltype_annotation"])
+    assert cap["prior"]["run_id"] == "run123" and cap["resume"] is None   # never a one-step re-run
+    cap.clear()
+    _patch_llm(monkeypatch, {"intent": "new_study", "confidence": 0.9})
+    _dispatch(conn, "start over from the raw data", presets=["celltype_annotation"])
+    assert cap["prior"] is None and cap["resume"] is None
+
+
+def test_the_bound_dataset_is_compared_as_it_was_bound(tmp_path):
+    """A bound FOLDER is staged as the matrix inside it, and a continuing run as the processed
+    dataset it started from: neither name matches what the browser keeps sending, so comparing
+    names called every later message a new study."""
+    conn = _conn(tmp_path, last_run_id="run123")
+    art = _seed_bundle(conn, dataset_path="/ws/run123/staged/filtered_feature_bc_matrix.h5")
+    state_path = art / "process" / "run_state.json"
+    state = json.loads(state_path.read_text())
+    req = gw_app.LabRequest(connection_id=conn.id, question="x", dataset_path="/data/shared/Sample1_WT")
+    assert gw_app._followup_target(conn, req) is None                # names differ, nothing recorded
+    state["bound_primary"] = "/data/shared/Sample1_WT"
+    state_path.write_text(json.dumps(state))
+    assert gw_app._followup_target(conn, req) is not None
+    other = gw_app.LabRequest(connection_id=conn.id, question="x", dataset_path="/data/shared/Sample2_KO")
+    assert gw_app._followup_target(conn, other) is None
 
 
 def test_low_confidence_asks_then_routes_to_choice(tmp_path, monkeypatch):
@@ -242,3 +307,30 @@ def test_ask_followup_clarify_maps_chip_answer(tmp_path):
     choice = asyncio.run(gw_app._ask_followup_clarify(conn))
     t.join()
     assert choice == "rerun_step"
+
+
+@pytest.mark.parametrize("answer,expected", [
+    ("Continue from these results with a new analysis", "continue"),
+    ("Start a brand-new analysis", "new_study"),
+])
+def test_the_clarify_card_offers_continuing_from_the_results(tmp_path, answer, expected):
+    conn = _conn(tmp_path)
+    pushed: list[dict] = []
+    conn.push = pushed.append
+
+    def reply():
+        for _ in range(400):
+            if conn.pending_plan is not None:
+                break
+            time.sleep(0.005)
+        conn.plan_value = {"action": "revise",
+                           "feedback": f"What would you like me to do with this message?: {answer}"}
+        conn.plan_event.set()
+
+    t = threading.Thread(target=reply)
+    t.start()
+    choice = asyncio.run(gw_app._ask_followup_clarify(conn))
+    t.join()
+    assert choice == expected
+    card = next(e for e in pushed if e.get("type") == "plan_clarify")
+    assert card["questions"][0]["options"][0].startswith("Continue from these results")

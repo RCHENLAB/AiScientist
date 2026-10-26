@@ -1,6 +1,6 @@
 """Housekeeping for AiScientist's own files on HPC3.
 
-Two jobs, both scoped to ``<shared_root>`` and nothing else:
+Three jobs, all scoped to ``<shared_root>`` and nothing else:
 
 * :func:`ensure_shared_dirs` — create the shared project skeleton
   (``Temp/<user>``, ``uploads/<user>``, ``pysrc/<user>``) at connect time.
@@ -8,6 +8,9 @@ Two jobs, both scoped to ``<shared_root>`` and nothing else:
   subtree has gone untouched for ``temp_ttl_days`` (default 3). Submitted as a Slurm batch job:
   walking trees and calling ``rm -rf`` is real filesystem work, and RCIC's login nodes are for
   logging in and SUBMITTING jobs, not for doing them. The login node runs one ``sbatch``.
+* :func:`clean_session` — when a session ends, delete what that session alone made: the folders
+  of the runs it started and its copies of server-side datasets. By owner, not by age, and only
+  the targets named to it (``deploy/hpc3/aiscientist_session_clean.sh``). Also a batch job.
 
 Why this module exists: every run's work/ + artifacts/ + Slurm scripts + job logs used to be
 written into each member's PERSONAL lab dir, and the product had no HPC3-side GC at all — the
@@ -33,6 +36,15 @@ from .executor import RemoteExecutor
 GC_SCRIPT_SRC = Path(__file__).resolve().parents[3] / "deploy" / "hpc3" / "aiscientist_temp_gc.sh"
 GC_SCRIPT_NAME = "temp_gc.sh"
 GC_LOG_NAME = "temp_gc.log"     # the batch job's --output; also how the LAST sweep reports
+
+# The session-end cleanup, staged beside the sweeper. Its own log file: the sweeper's is read back
+# for the previous sweep's GC_RESULT, and one job must not truncate the other's.
+CLEAN_SCRIPT_SRC = GC_SCRIPT_SRC.with_name("aiscientist_session_clean.sh")
+CLEAN_SCRIPT_NAME = "session_clean.sh"
+CLEAN_LOG_NAME = "session_clean.log"
+# Where a session's copies of server-side datasets go: Temp/<user>/server-data/<session>. Under
+# Temp, so a session that ends without a disconnect is still swept once the copies go cold.
+SERVER_DATA_KIND = "server-data"
 
 # Standard skeleton under <shared_root>. Every one of these is per-user; only ``Temp`` is swept.
 # ``bin`` is per-user too — several members' sessions stage the sweeper concurrently, and one
@@ -176,3 +188,76 @@ def sweep_temp(remote: RemoteExecutor, shared_root: str, user: str, ttl_days: in
     return {"status": "submitted", "job_id": res.out.split(";")[0].strip(),
             "removed": last.get("removed", 0), "kept": last.get("kept", 0),
             "ttl_days": ttl_days, "root": f"{root}/Temp/{user}", "submitted_at": time.time()}
+
+
+# --- session end --------------------------------------------------------------------------------
+
+def session_mirror_base(shared_root: str, user: str, session: str) -> str:
+    """Where ONE session keeps its copies of server-side datasets. Per session on purpose: nothing
+    is reused by the next session (it copies again from the server), and removing it when the
+    session ends cannot take a file another session is reading."""
+    return f"{shared_paths(shared_root, user)['temp']}/{SERVER_DATA_KIND}/{session}"
+
+
+def stage_clean_script(remote: RemoteExecutor, shared_root: str, user: str) -> str:
+    """Upload the session cleanup to ``<shared_root>/bin/<user>/session_clean.sh``; returns the
+    remote path. Staged at connect, so the disconnect itself is one ``sbatch``."""
+    remote_path = f"{shared_paths(shared_root, user)['bin']}/{CLEAN_SCRIPT_NAME}"
+    remote.put_file(str(CLEAN_SCRIPT_SRC), remote_path)
+    remote.exec(f"chmod 775 {shlex.quote(remote_path)}", timeout=30)
+    return remote_path
+
+
+def session_clean_command(script_path: str, shared_root: str, user: str, *,
+                          runs: "tuple[str, ...] | list[str]" = (), session: str = "",
+                          legacy_mirrors: "tuple[str, ...] | list[str]" = (),
+                          dry_run: bool = False) -> str:
+    """The cleanup invocation (the payload the batch job runs): explicit targets only. Split out so
+    a test can assert what a disconnect asks to be removed without needing a cluster."""
+    parts = [f"bash {shlex.quote(script_path)}", f"--root {shlex.quote(shared_root.rstrip('/'))}",
+             f"--user {shlex.quote(user)}"]
+    parts += [f"--run {shlex.quote(r)}" for r in runs]
+    if session:
+        parts.append(f"--session {shlex.quote(session)}")
+    parts += [f"--legacy-mirror {shlex.quote(t)}" for t in legacy_mirrors]
+    parts.append("--quiet")
+    if dry_run:
+        parts.append("--dry-run")
+    return " ".join(parts)
+
+
+def clean_session(remote: RemoteExecutor, shared_root: str, user: str, *,
+                  runs: "tuple[str, ...] | list[str]" = (), session: str = "",
+                  legacy_mirrors: "tuple[str, ...] | list[str]" = (),
+                  partition: str = "standard", account: str = "",
+                  script_path: str | None = None, dry_run: bool = False) -> dict:
+    """Remove an ended session's own files as a Slurm batch job, by name.
+
+    Submitted and not waited for: the caller is about to close the SSH session, and the job needs
+    none. Returns ``{"status": "submitted", "job_id", ...}``, ``{"status": "nothing"}`` when there
+    is nothing to remove, or ``{"status": "error", "error"}``. Never raises: a cleanup that cannot
+    be queued must not keep a session from closing (the Temp sweep still removes the files by age).
+    """
+    if not (runs or session or legacy_mirrors):
+        return {"status": "nothing", "runs": 0}
+    try:
+        path = script_path or stage_clean_script(remote, shared_root, user)
+        payload = session_clean_command(path, shared_root, user, runs=runs, session=session,
+                                        legacy_mirrors=legacy_mirrors, dry_run=dry_run)
+        log_path = f"{shared_paths(shared_root, user)['bin']}/{CLEAN_LOG_NAME}"
+        flags = [
+            f"--job-name=aiscientist-sessionclean-{user}",
+            f"--partition={partition}",
+            "--cpus-per-task=1", "--mem=2G", "--time=01:00:00",
+            f"--output={shlex.quote(log_path)}", "--open-mode=truncate", "--parsable",
+        ]
+        if account:
+            flags.insert(2, f"--account={account}")
+        # A short cap: the user is waiting on a disconnect, and the age sweep covers a miss.
+        res = remote.exec(f"sbatch {' '.join(flags)} --wrap {shlex.quote(payload)}", timeout=30)
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    if not res.ok:
+        return {"status": "error", "error": res.stderr.strip() or "sbatch failed"}
+    return {"status": "submitted", "job_id": res.out.split(";")[0].strip(), "runs": len(runs),
+            "session": session, "legacy_mirrors": len(legacy_mirrors)}

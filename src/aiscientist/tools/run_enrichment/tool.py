@@ -16,6 +16,8 @@ from .._lib.scrna import (
     _DEFAULT_GENE_SETS,
     _dirs,
     _genesets_dir,
+    gene_sets_note,
+    installed_gene_sets,
     _missing,
     _p,
     _rel,
@@ -90,20 +92,69 @@ def _enrichment_input_rows(rows: "list[dict[str, Any]]", lfc_min: float, padj_ma
     return out
 
 
+def _upstream_truncation(sidecar: Path, selected: "dict[str, int]",
+                         rows_read: "dict[str, int]") -> dict[str, Any]:
+    """Whether the input genes are the DE table's own top-N rather than the significant set.
+
+    Run f3b8268c4fd4's ORA step read run_de's marker tables, the top 50 genes per cluster by
+    score. All 50 cleared the gate in all 25 clusters, so the result said "50 selected by padj
+    and |log2FC|, no cap" while 2,300-9,644 genes per cluster were significant. Nothing reported
+    the cap, and the Critic accepted the step as an ORA of the significant set.
+
+    run_de's ``de_<key>_significance.json`` gives the true counts. Without it (a run before the
+    sidecar existed), the sign is that the gate kept every row it was given, in every group, at
+    one common table length."""
+    try:
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    sig = meta.get("significant_by_group")
+    out: dict[str, Any] = {"truncated": False,
+                           "upstream_table": str(meta.get("per_group_tables") or "not recorded")}
+    if meta.get("per_group_tables") == "complete":
+        return out                       # a contrast's per-group tables hold every tested gene
+    if isinstance(sig, dict) and str(meta.get("per_group_tables", "")).startswith("top_"):
+        true = {g: int(v.get("up", 0)) + int(v.get("down", 0))
+                for g, v in sig.items() if isinstance(v, dict) and g in selected}
+        cut = {g: n for g, n in true.items() if n > selected[g]}
+        if not cut:
+            return out
+        vals = sorted(cut.values())
+        out.update(truncated=True, significant_upstream_by_group=true)
+        out["warning"] = (
+            f"INPUT IS A TOP-N, NOT THE SIGNIFICANT SET: run_de wrote each group's table as its "
+            f"{meta['per_group_tables'].replace('_', ' ')} genes by score. In {len(cut)} of "
+            f"{len(selected)} groups more genes are significant than the table holds (median "
+            f"{vals[len(vals) // 2]}, range {vals[0]}-{vals[-1]}, at adjusted p < "
+            f"{meta.get('padj_max')} and |log2FC| >= {meta.get('abs_log2fc_min')}), so this ORA "
+            "tested each group's top-ranked markers. Report the terms as enrichment of the top-N "
+            "marker list, never as enrichment of the significant gene set.")
+        return out
+    lengths = set(rows_read.values())
+    if (len(selected) >= 2 and len(lengths) == 1 and min(lengths) >= 10
+            and all(selected[g] == rows_read[g] for g in selected)):
+        n = lengths.pop()
+        out.update(truncated=True, upstream_table=f"top_{n} (inferred)")
+        out["warning"] = (
+            f"INPUT IS PROBABLY A TOP-N, NOT THE SIGNIFICANT SET: every one of the {n} rows of "
+            f"each of the {len(selected)} groups' DE tables passed the gate, so the thresholds "
+            f"selected nothing and the input size is the table's length ({n}, run_de's n_genes "
+            "cap). This run predates run_de's de_<key>_significance.json, so the true significant "
+            "counts are not on disk. Report the terms as enrichment of the top-N marker list.")
+    return out
+
+
 def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Over-representation analysis (ORA) on the top DE genes per group — OFFLINE, against
     LOCAL ``.gmt`` gene-set files (``gseapy.enrich``), NOT the Enrichr web API.
 
-    The analysis runs in a network-OFF Slurm/Singularity container, so a web API (Enrichr)
+    The analysis runs in a network-OFF Slurm/Apptainer container, so a web API (Enrichr)
     can never reach out; and local GMTs are also more reproducible (pinned library versions,
     no rate limits). Download the libraries once with ``scripts/fetch_genesets.py`` into
     :func:`_genesets_dir`. Writes an enrichment table + bar plot per group; returns top terms.
     """
-    try:
-        import gseapy as gp
-    except ImportError as exc:
-        return _missing(getattr(exc, "name", None) or "gseapy")
-
     work, art, figs, tables = _dirs(ctx)
 
     gene_sets = args.get("gene_sets") or list(_DEFAULT_GENE_SETS)
@@ -149,8 +200,14 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 "error": (f"no USABLE local gene-set (.gmt) library found in {gdir} for {gene_sets}. "
                           + ("Present but degenerate: "
                              + "; ".join(degenerate_libs.values()) + " " if degenerate_libs else "")
-                          + "Offline enrichment needs local GMTs (the analysis container has no "
-                            "network) — run scripts/fetch_genesets.py to download them.")}
+                          + gene_sets_note(gene_sets))}
+
+    # gseapy only now: a library name the host lacks is the caller's to fix and needs no import, so
+    # it is reported, with the installed names, even where the analysis stack is absent.
+    try:
+        import gseapy as gp
+    except ImportError as exc:
+        return _missing(getattr(exc, "name", None) or "gseapy")
 
     # Prefer DE results computed this run — for ANY groupby (leiden, majorclass, cell_type, …),
     # so enrichment runs PER CLASS instead of collapsing to one pooled list. run_de writes
@@ -172,6 +229,8 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     selections: list[tuple[str, str, str, list[str]]] = []
     split_direction = bool(args.get("split_direction", True))
     n_input: dict[str, int] = {}
+    warnings: list[str] = []
+    upstream: dict[str, Any] = {"truncated": False}
     descriptive_de = ""      # the DE label, when run_de said its p-values are not inferential
     if de_all is not None and de_all.exists():
         key = de_all.name[len("de_"):-len("_all.csv")]
@@ -188,28 +247,45 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 descriptive_de = str(meta["inference"])
         except (OSError, ValueError, KeyError):
             descriptive_de = ""
+        if descriptive_de:
+            warnings.append(
+                "The differential expression this reads was labelled " + descriptive_de + " by "
+                "run_de, so its adjusted p-values are not a valid significance threshold and were "
+                "NOT used to choose the input genes; genes entered by |log2 fold-change| >= "
+                f"{lfc_min} instead. Report these terms as a DESCRIPTIVE over-representation of an "
+                "exploratory ranking. The enrichment's OWN adjusted p-values describe overlap with "
+                "the gene sets, conditional on a ranking that is itself unvalidated — they are not "
+                "evidence that the genes are differentially expressed.")
 
-        def _rows_for(group: str) -> list[tuple[str, float]]:
-            """Every gene of ``group`` clearing BOTH thresholds.
+        def _rows_for(group: str) -> tuple[list[tuple[str, float]], int]:
+            """Every gene of ``group`` clearing BOTH thresholds, and how many rows were read.
 
             Read from the PER-GROUP table, not the combined one. `de_<key>_all.csv` holds only what
             `run_de` kept after its own `n_genes` cap (50 per direction by default), so selecting
             from it meant ORA never saw more than 100 genes per group however many were significant
             — a truncation applied upstream, invisible here, and with no basis in how ORA is run.
-            The per-group file carries the full tested table for a contrast."""
+            The per-group file carries the full tested table for a contrast; for markers it is the
+            top n_genes too, which `_upstream_truncation` reports."""
             src = tables / f"de_{key}_{_slug(group)}.csv"
             fh_path = src if src.exists() else de_all
             with fh_path.open(encoding="utf-8") as fh:
                 rows = [r for r in csv.DictReader(fh)
                         if not (fh_path is de_all and r.get("group") != group)]
-            return _enrichment_input_rows(rows, lfc_min, padj_max, bool(descriptive_de))
+            return _enrichment_input_rows(rows, lfc_min, padj_max, bool(descriptive_de)), len(rows)
 
         groups: list[str] = []
         with de_all.open(encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
                 if row.get("group") and row["group"] not in groups:
                     groups.append(row["group"])
-        by_group = {g: _rows_for(g) for g in groups}
+        read = {g: _rows_for(g) for g in groups}
+        by_group = {g: items for g, (items, _) in read.items()}
+        upstream = _upstream_truncation(
+            tables / f"de_{key}_significance.json",
+            {g: len(items) for g, items in by_group.items()},
+            {g: n for g, (_, n) in read.items()})
+        if upstream["truncated"]:
+            warnings.append(upstream["warning"])
         for grp, items in by_group.items():
             up = [g for g, lfc in items if lfc > 0]
             down = [g for g, lfc in items if lfc < 0]
@@ -356,24 +432,26 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                       "abs_log2fc_min": lfc_min,
                       "cap_per_direction": top_n_genes or None,
                       "selected_by": "abs_log2fc" if descriptive_de else "padj_and_abs_log2fc",
-                      "genes_selected_by_group": n_input},
+                      "genes_selected_by_group": n_input,
+                      # The DE table's own cap, which the gate above cannot see past.
+                      "upstream_table": upstream.get("upstream_table", "not recorded"),
+                      **({"significant_upstream_by_group": upstream["significant_upstream_by_group"]}
+                         if upstream.get("significant_upstream_by_group") else {})},
         "tables": table_paths,
         "figures": figures,
         "errors": errors,
         "note": ("ORA and preranked GSEA (run_gsea_prerank) test different inputs under different "
                  "null hypotheses — they are NOT expected to agree, and disagreement is not a "
                  "failure of either."),
-        **({"warnings": [
-            "The differential expression this reads was labelled " + descriptive_de + " by run_de, "
-            "so its adjusted p-values are not a valid significance threshold and were NOT used to "
-            "choose the input genes; genes entered by |log2 fold-change| >= "
-            f"{lfc_min} instead. Report these terms as a DESCRIPTIVE over-representation of an "
-            "exploratory ranking. The enrichment's OWN adjusted p-values describe overlap with the "
-            "gene sets, conditional on a ranking that is itself unvalidated — they are not "
-            "evidence that the genes are differentially expressed."],
-            "input_inference": descriptive_de} if descriptive_de else {}),
+        **({"warnings": warnings} if warnings else {}),
+        **({"input_inference": descriptive_de} if descriptive_de else {}),
         "raw_data_to_llm": False,
     }
+
+
+def _installed_line() -> str:
+    have = installed_gene_sets()
+    return (f"Installed libraries: {', '.join(have)}; no other can be used." if have else "")
 
 
 def make_tool() -> HarnessTool:
@@ -393,7 +471,8 @@ def make_tool() -> HarnessTool:
         "separately, so a down-regulated programme cannot be cancelled out by an up-regulated "
         "one; `split_direction: false` disables that. "
         "`gene_sets` are library names resolved to local .gmt files "
-        "(default GO_Biological_Process_2023 / Reactome_2022 / MSigDB_Hallmark_2020).",
+        "(default GO_Biological_Process_2023 / Reactome_2022 / MSigDB_Hallmark_2020). "
+        + _installed_line(),
         _schema("run_enrichment",
                 gene_sets={"type": "array", "items": {"type": "string"},
                            "description": "local gene-set libraries to test against"},
@@ -401,7 +480,12 @@ def make_tool() -> HarnessTool:
                             "description": "ORA background size; omit to use the tested universe"},
                 split_direction={"type": "boolean",
                                  "description": "test up- and down-regulated genes separately"},
-                groupby={"type": "string", "description": "which DE table column names the groups"},
+                groupby={"type": "string",
+                         "description": ("which DE table to read, by the key in its file name "
+                                         "tables/de_<groupby>_all.csv: the column run_de grouped "
+                                         "by (e.g. leiden, majorclass), not the `group` column "
+                                         "inside the table; omit to find the table "
+                                         "automatically")},
                 genes={"type": "array", "items": {"type": "string"},
                        "description": "explicit gene list; omit so the DE tables are found instead"}),
         run_enrichment,

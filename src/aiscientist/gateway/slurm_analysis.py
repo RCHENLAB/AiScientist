@@ -32,13 +32,58 @@ from ..agents.sandbox import sandbox_network_enabled
 from ..tools.api import ANALYSIS_ENTRYPOINT
 from .executor import RemoteExecutor
 from .slurm_job import (
-    AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
-    run_batch_job, singularity_exec, slurm_time_to_seconds)
+    AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, SlurmQueueTimeout,
+    build_analysis_script, run_batch_job, container_exec, slurm_time_to_seconds)
 
 _ARGS_EOF = "AISCIENTIST_ANALYSIS_ARGS_EOF"
 _RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
 # The marker before the 2026-09-30 rename: a job submitted by the previous deploy prints this one.
 _LEGACY_RESULT_MARKER = "BIOAGENT_RESULT_JSON "
+
+
+def provision_image(remote: Any, ref: str, images_dir: str, *, scratch: str, job_name: str,
+                    partition: str, account: str = "", container_module: str = "",
+                    container_bin: str = "apptainer", startup_timeout_s: int = 600,
+                    should_cancel: "Callable[[], bool] | None" = None, pkgs_cache: str = "",
+                    say: "Callable[[str, str], None] | None" = None) -> str:
+    """The dfs3b path of image ``ref`` in ``images_dir``, provisioned first if it is not there.
+
+    One image per recipe, shared by every run and every lab member: a tool's TOOL.md or a skill's
+    SKILL.md names the image, and the first job that needs it pulls it (``docker://``) or builds it
+    (``bioconda:``) in a Slurm job on a compute node (RCIC bans downloads on login nodes). A changed
+    recipe is a new image, so two environments never share installed packages."""
+    from .tool_images import image_sif_name, is_build_ref, provision_command, provision_resources
+    notify = say or (lambda _level, _msg: None)
+    sif = f"{images_dir.rstrip('/')}/{image_sif_name(ref)}"
+    if remote.exec(f"test -s {shlex.quote(sif)}").ok:
+        return sif
+    verb = "building" if is_build_ref(ref) else "pulling"
+    notify("info", f"First use of {ref}: {verb} it into the shared containers directory on HPC3. "
+                   "This happens once; every later run reuses it.")
+    made = remote.exec(f"mkdir -p {scratch} {shlex.quote(images_dir)}")
+    if not made.ok:
+        raise SlurmJobError("could not create the image directories on HPC3", detail=made.stderr)
+    cpus, mem_gb, time_limit = provision_resources(ref)
+    script = build_analysis_script(
+        job_name, provision_command(ref, sif, container_bin, pkgs_cache=pkgs_cache),
+        partition=partition, cpus=cpus, mem_gb=mem_gb, time_limit=time_limit, account=account,
+        container_module=container_module, log_dir=scratch)
+    result = run_batch_job(
+        remote, SlurmJobSpec(script=script, job_name=job_name, submit_dir=scratch),
+        acquire=AcquireConfig(startup_timeout_s=startup_timeout_s),
+        run=RunConfig(run_timeout_s=slurm_time_to_seconds(time_limit) + 300),
+        should_cancel=should_cancel)
+    if not remote.exec(f"test -s {shlex.quote(sif)}").ok:
+        job_id = getattr(result, "job_id", "") or ""
+        log = f"{scratch}/{job_name}-{job_id}.log"
+        try:
+            tail = remote.read_bytes(log).decode("utf-8", errors="replace")[-1500:]
+        except Exception:  # noqa: BLE001 - the log is a diagnostic, not a requirement
+            tail = ""
+        raise SlurmJobError(f"could not provision {ref} on HPC3 (Slurm state {result.state})",
+                            job_id=job_id, detail=tail)
+    notify("success", f"{ref} is ready on HPC3.")
+    return sif
 
 
 @dataclass
@@ -65,7 +110,9 @@ class SlurmAnalysisExecutor:
     # Appended to PYTHONPATH after `source_dir` and bind-mounted read-only. None -> the tools'
     # own loud fallbacks cover the gap.
     deps_dir: str | None = None
-    scratch_dir: str = "$HOME/.bioagent/analysis"
+    # Where each job's script, args/result files and logs go. Required, with no default: the
+    # gateway passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    scratch_dir: str = field(kw_only=True)
     entrypoint: str = f"python -m {ANALYSIS_ENTRYPOINT}"
     job_prefix: str = "bioagent_analysis"   # squeue job-name prefix (variant line overrides it)
     mem_gb: int = 64
@@ -74,8 +121,14 @@ class SlurmAnalysisExecutor:
     account: str = ""
     time_limit: str = "01:00:00"
     container_module: str = ""
-    container_bin: str = "singularity"
+    container_bin: str = "apptainer"
     startup_timeout_s: int = 600
+    # How many ``startup_timeout_s`` windows a job may wait in the queue before it is cancelled
+    # (a queued job keeps its place across them). The corpus scan's paid GPU queue can be hours.
+    queue_windows: int = 3
+    # Forward the queue's progress (submitted, still queued and why, running on which node) to
+    # ``notify``: for a job someone is watching wait for a scarce card.
+    queue_progress: bool = False
     # 0 = AUTO: derive the job-wait from the SBATCH --time (`time_limit`) + a margin, so the gateway
     # waits as long as Slurm allows and never scancels a healthy, still-progressing job early. The old
     # fixed 1800s (30 min) silently killed a WGS VEP job that legitimately runs ~30-60 min under a 2h
@@ -137,6 +190,35 @@ class SlurmAnalysisExecutor:
     auto_install_deps: bool = False
     # Progress lines for the console, e.g. "installing scikit-image for this run": (level, message).
     notify: Callable[[str, str], None] | None = None
+    # Shared dfs3b dir for the container images tools declare in TOOL.md (``image:``): a tool's image
+    # is pulled here on its first use, by any run, and reused after (see gateway/tool_images.py).
+    # None -> a tool that declares an image cannot run on HPC3 and says so.
+    images_dir: str | None = None
+    # The lab's shared conda download cache on dfs3b: a ``bioconda:`` image build reads packages an
+    # earlier build already downloaded instead of fetching them again (see tool_images.build_command).
+    pkgs_cache_dir: str = ""
+    # A FOLDER dataset's root on dfs3b (e.g. a cohort of Cell Ranger libraries). Bound read-only and
+    # handed to the job as ``--dataset-root``, so a tool can read the whole tree, not only the one
+    # primary file ``remote_dataset`` names. None for a single-file dataset.
+    dataset_root: str | None = None
+    # EVERY folder bound to the run, as ``{"name", "path"}`` with its dfs3b path (the primary's
+    # folder included): each is bound read-only and handed to the job as ``--input-folders``, so a
+    # tool such as run_cellqc reads the libraries of all of them (RCHENLAB/AiScientist issue 22).
+    input_folders: tuple[dict[str, str], ...] = ()
+    # A GPU for the job (``gres``, ``constraint``, ``exclude``: as in ``build_analysis_script``). Empty
+    # for every line but the corpus scan, which brings its own model (gateway/corpus_scan.py).
+    gres: str = ""
+    constraint: str = ""
+    exclude: str = ""
+    # The tool container's network. None = ``sandbox_network_enabled()``; the corpus scan needs the
+    # host's network, because its model listens on the node's 127.0.0.1.
+    network: bool | None = None
+    # ``(job name, scratch dir, result file) -> (shell, payload env)``: shell the job runs on the node
+    # BEFORE the tool's container (the corpus scan starts its vLLM there), and exports put in front of
+    # the tool's command inside the container. The shell may write the result file and ``exit 0`` to
+    # end the job with a result of its own (the model never came up).
+    job_prelude: Callable[[str, str, str], tuple[str, str]] | None = None
+    _images: dict[str, str] = field(default_factory=dict, repr=False)
     _counter: int = field(default=0, repr=False)
     _scratch: str | None = field(default=None, repr=False)
     _run_deps: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
@@ -144,9 +226,20 @@ class SlurmAnalysisExecutor:
     _deps_attempted: bool = field(default=False, repr=False)
 
     def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        args = args or {}
+        from ..agents.tool_skills import ToolSkillError, with_skill
+        from ..tools import catalog
+        m = catalog.manifest(tool)
+        if m is not None and m.skill:
+            # Usually attached by the router already; before the memo, so a cached result is reused
+            # only for the same skill version and settings.
+            try:
+                args = with_skill(m, args, ctx)
+            except ToolSkillError as exc:
+                return {"status": "error", "error": f"{exc}. Install or allow that skill, then run "
+                                                    f"{tool} again."}
         if self.remote is None or not self.remote_workspace:
             return self._fallback(tool, args, ctx, "no live HPC connection")
-        args = args or {}
         if self.memoize_result:                 # reuse this run's identical prior result, don't re-run
             hit = self._memo_load(tool, args)
             if hit is not None:
@@ -164,7 +257,11 @@ class SlurmAnalysisExecutor:
                     self.on_fallback(f"Slurm job failed (no local fallback): {exc}")
                 except Exception:  # noqa: BLE001
                     pass
-            return {"status": "error", "execution_mode": "hpc_slurm",
+            # A job that never left the queue says so: nothing ran, and the caller may submit it
+            # again (the corpus scan does, as a retry of that one step).
+            queued = ({"queue_timeout": True, "slurm_reason": exc.reason}
+                      if isinstance(exc, SlurmQueueTimeout) else {})
+            return {"status": "error", "execution_mode": "hpc_slurm", **queued,
                     "error": (f"HPC3 analysis job failed: {exc}. Not run on the gateway host "
                               "(local fallback is disabled). Fix the cause and call the tool again "
                               "— it will be resubmitted to HPC3.")}
@@ -289,6 +386,48 @@ class SlurmAnalysisExecutor:
         except OSError:
             pass                                 # a cache write failure must never break the tool
 
+    # -- a tool's own container and resources (TOOL.md image / cpus / mem_gb / time_limit) --------
+
+    def _job_settings(self, tool: str) -> dict[str, Any]:
+        """The image and Slurm resources ``tool``'s job runs with: what its TOOL.md declares, or the
+        skill it names, else this line's defaults. A declared image is pulled on HPC3 first if it
+        is not there yet."""
+        from ..agents.tool_skills import ToolSkillError, job_environment
+        from ..tools import catalog
+        m = catalog.manifest(tool)
+        try:
+            env = job_environment(m) if m is not None else {}
+        except ToolSkillError as exc:
+            raise SlurmJobError(str(exc)) from exc
+        image = self.container_image
+        if env.get("image"):
+            image = self._ensure_image(env["image"])
+        return {
+            "image": image,
+            "own_image": bool(env.get("image")),
+            "cpus": env.get("cpus") or self.cpus,
+            "mem_gb": env.get("mem_gb") or self.mem_gb,
+            "time_limit": env.get("time_limit") or self.time_limit,
+        }
+
+    def _ensure_image(self, ref: str) -> str:
+        """The dfs3b path of image ``ref``, provisioned (pulled, or built from a ``bioconda:`` recipe)
+        in a Slurm job the first time any run needs it."""
+        if ref in self._images:
+            return self._images[ref]
+        if not self.images_dir:
+            raise SlurmJobError(f"this tool runs in {ref}, but no shared containers directory is "
+                                "configured for HPC3 images")
+        self._counter += 1
+        sif = provision_image(
+            self.remote, ref, self.images_dir, scratch=self._resolved_scratch(),
+            job_name=f"{self.job_prefix}_image_{self._counter}", partition=self.partition,
+            account=self.account, container_module=self.container_module,
+            container_bin=self.container_bin, startup_timeout_s=self.startup_timeout_s,
+            should_cancel=self.should_cancel, pkgs_cache=self.pkgs_cache_dir, say=self._say)
+        self._images[ref] = sif
+        return sif
+
     # -- internals ------------------------------------------------------------
 
     def _fallback(self, tool: str, args: dict, ctx: Any, reason: str) -> dict[str, Any]:
@@ -312,7 +451,7 @@ class SlurmAnalysisExecutor:
         The dir is referenced both **unquoted** in shell (``mkdir``/heredoc — ``$HOME`` expands)
         AND **shlex-quoted** as the CLI ``--args`` path. In the quoted form the single quotes stop
         the shell from expanding ``$HOME``, so the Python tool receives a literal ``$HOME/...`` and
-        fails with ``No such file or directory``. It also leaks into the ``singularity -B`` binds and
+        fails with ``No such file or directory``. It also leaks into the ``apptainer -B`` binds and
         ``#SBATCH --output`` (Slurm does not expand ``$HOME`` there either). Resolving to an absolute
         path up front keeps every use site correct and lets us quote paths safely everywhere. If the
         remote lookup can't fully expand it (offline/mock), we keep the literal so behaviour is
@@ -343,6 +482,7 @@ class SlurmAnalysisExecutor:
                 print(f"[{self.job_prefix}] forced {k}={v!r} over the model-supplied {caller[k]!r} "
                       f"(gateway-authoritative for the variant line — assembly is read from the VCF "
                       f"header; the offline path annotates the whole VCF).")
+        job = self._job_settings(tool)          # may pull the tool's image first (once, ever)
         self._counter += 1
         name = f"{self.job_prefix}_{tool}_{self._counter}"
         scratch = self._resolved_scratch()
@@ -352,7 +492,7 @@ class SlurmAnalysisExecutor:
 
         # Stage the args as a JSON file (quoted heredoc → no shell expansion of the payload).
         payload = json.dumps(args)
-        # Create the WORKSPACE too, not only scratch. Singularity refuses to bind-mount a source
+        # Create the WORKSPACE too, not only scratch. Apptainer refuses to bind-mount a source
         # that does not exist ("mount source … doesn't exist" → FATAL, exit 127), and the paperqa
         # executor's workspace (`Temp/<user>/paperqa`) was never created by anything: every
         # deep_literature job on HPC3 — 28 of 28 across two users since the feature shipped — died
@@ -366,42 +506,75 @@ class SlurmAnalysisExecutor:
 
         ws = self.remote_workspace
         ds = self.remote_dataset or ""
+        root = self.dataset_root or ""
         # Bind the live source read-only + put it on PYTHONPATH so `aiscientist.tools.scrna_cli` is the
-        # CURRENT code — no image rebuild on tool edits.
-        pypath = ":".join(p for p in (self.source_dir, self.deps_dir) if p)
+        # CURRENT code — no image rebuild on tool edits. ``deps_dir`` and the run's installed deps are
+        # built for analysis.sif's Python; a tool in its OWN image gets neither, or they could shadow
+        # that image's packages.
+        deps_dir = None if job["own_image"] else self.deps_dir
+        pypath = ":".join(p for p in (self.source_dir, deps_dir) if p)
         pysrc_env = f"export PYTHONPATH={shlex.quote(pypath)}:${{PYTHONPATH:-}}; " if pypath else ""
+        deps_env = "" if job["own_image"] else self._deps_env()
+        # The job's CPU count, for a tool that runs a multi-threaded pipeline of its own.
+        cpus_env = f"export AISCIENTIST_JOB_CPUS={int(job['cpus'])}; "
+        root_arg = f" --dataset-root {shlex.quote(root)}" if root else ""
+        folders = [{"name": str(f.get("name") or ""), "path": str(f["path"])}
+                   for f in self.input_folders if isinstance(f, dict) and f.get("path")]
+        folders_arg = (f" --input-folders {shlex.quote(json.dumps(folders, ensure_ascii=False))}"
+                       if folders else "")
+        prelude, prelude_env = (self.job_prelude(name, scratch, res_f) if callable(self.job_prelude)
+                                else ("", ""))
         inner_payload = (
-            f"{pysrc_env}{self._deps_env()}export MPLBACKEND=Agg; "
+            f"{pysrc_env}{deps_env}{cpus_env}{prelude_env}export MPLBACKEND=Agg; "
             f"{self.entrypoint} --tool {shlex.quote(tool)} --workspace {shlex.quote(ws)} "
-            f"--dataset {shlex.quote(ds)} --args {shlex.quote(args_f)} > {res_f} 2> {log_f}"
+            f"--dataset {shlex.quote(ds)}{root_arg}{folders_arg} --args {shlex.quote(args_f)} "
+            f"> {res_f} 2> {log_f}"
         )
         # Bind the dataset's PARENT DIRECTORY, never the bare file: a file bind FATALs with
         # "destination ... doesn't exist in container" when that path is absent from the image
         # (scgpt_job binds dirname() for the same reason). And when the dataset already lives
         # under the rw-bound workspace, skip the extra bind entirely - the workspace bind
         # already exposes it, and a duplicate ro/rw bind of the same tree can conflict.
-        ds_dir = str(Path(ds).parent) if ds else ""
-        if ds_dir and ws and (ds_dir.rstrip("/") + "/").startswith(ws.rstrip("/") + "/"):
-            ds_dir = ""
-        binds_ro = tuple(p for p in (ds_dir, self.source_dir, self.deps_dir,
+        def _outside_ws(path: str) -> str:
+            if path and ws and (path.rstrip("/") + "/").startswith(ws.rstrip("/") + "/"):
+                return ""
+            return path
+
+        ds_dir = _outside_ws(str(Path(ds).parent) if ds else "")
+        root_dir = _outside_ws(root)
+        if root_dir and ds_dir and (ds_dir.rstrip("/") + "/").startswith(root_dir.rstrip("/") + "/"):
+            ds_dir = ""                          # the folder bind already exposes the primary file
+        folder_dirs: list[str] = []
+        for f in folders:
+            d = _outside_ws(f["path"])
+            if d and d != root_dir and d not in folder_dirs:
+                folder_dirs.append(d)
+        binds_ro = tuple(p for p in (root_dir, ds_dir, *folder_dirs, self.source_dir, deps_dir,
                                      *self.extra_ro_binds) if p)
         binds_rw = tuple(p for p in (ws, scratch, *self.extra_rw_binds) if p)
-        inner = singularity_exec(
-            self.container_image, inner_payload,
-            binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=sandbox_network_enabled(),
+        network = sandbox_network_enabled() if self.network is None else self.network
+        inner = container_exec(
+            job["image"], inner_payload,
+            binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=network,
             container_bin=self.container_bin)
+        if prelude:
+            inner = f"{prelude}\n{inner}"
         script = build_analysis_script(
-            name, inner, partition=self.partition, cpus=self.cpus, mem_gb=self.mem_gb,
-            time_limit=self.time_limit, account=self.account, gres="",  # CPU-only
+            name, inner, partition=self.partition, cpus=job["cpus"], mem_gb=job["mem_gb"],
+            time_limit=job["time_limit"], account=self.account, gres=self.gres,
+            exclude=self.exclude, constraint=self.constraint,
             container_module=self.container_module, log_dir=scratch)
         # run_timeout_s == 0 → AUTO: wait as long as the SBATCH --time allows (+5 min margin), so a
         # healthy long job (e.g. WGS VEP) isn't scancelled early. Completion still returns immediately.
-        run_timeout = self.run_timeout_s if self.run_timeout_s > 0 else slurm_time_to_seconds(self.time_limit) + 300
+        run_timeout = (self.run_timeout_s if self.run_timeout_s > 0
+                       else slurm_time_to_seconds(job["time_limit"]) + 300)
         spec = SlurmJobSpec(script=script, job_name=name, submit_dir=scratch)
         result = run_batch_job(
             self.remote, spec,
-            acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s),
+            acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s,
+                                  max_attempts=max(1, self.queue_windows)),
             run=RunConfig(run_timeout_s=run_timeout),
+            emit=(lambda level, _stage, message: self._say(level, message)) if self.queue_progress else None,
             should_cancel=self.should_cancel)
 
         out = self._collect(res_f, log_f, result)
@@ -427,7 +600,7 @@ class SlurmAnalysisExecutor:
                     out["slurm_state"] = result.state
                     return out
         # No result marker → surface the REAL failure. The inner tool's stderr goes to log_f, but a
-        # container / module / sbatch failure BEFORE the tool ever runs (e.g. a singularity "FATAL:
+        # container / module / sbatch failure BEFORE the tool ever runs (e.g. an apptainer "FATAL:
         # container creation failed" bind-mount error) lands ONLY in the SBATCH --output log
         # ({name}-{jobid}.log — see build_analysis_script) which log_f is NOT. Read BOTH, else those
         # failures degrade to a useless "produced no result" and the model flails blind.

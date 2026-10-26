@@ -53,7 +53,7 @@ From: python:3.12-slim-bookworm
     PaperQA2 deep-literature RAG, contained for HPC3 (offloaded CPU job).
     Run via AiScientist (gateway offload) or directly (bind the AiScientist src + the retigene data,
     point HF_HOME at the embedding cache; the Qwen endpoint arrives in --args.llm_base_url):
-      singularity exec \
+      apptainer exec \
         -B <repo>/src:/opt/bioagent-src:ro \
         -B /dfs3b/ruic20_lab/<user>/retigene:/dfs3b/ruic20_lab/<user>/retigene:ro \
         --env PYTHONPATH=/opt/bioagent-src \

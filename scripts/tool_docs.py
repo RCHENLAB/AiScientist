@@ -43,8 +43,7 @@ RUNS_ON_TEXT = {
         "Without HPC3 it returns `not_installed` rather than a guess."),
     "hpc:literature": (
         "As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through "
-        "`python -m aiscientist.tools.paperqa_cli`, calling the session's served model. It is left out "
-        "of the catalog when the session has no GPU allocation."),
+        "`python -m aiscientist.tools.paperqa_cli`."),
     "gpu:scgpt": (
         "As a GPU Slurm job inside `scgpt.sif`, through the runner the gateway injects "
         "(`gateway/scgpt_runner.py`). Without a GPU session it stays listed but reports that it is "
@@ -118,11 +117,42 @@ def parameters_md(tool) -> str:
 
 def runs_on_md(m, tool) -> str:
     lines = [RUNS_ON_TEXT[m.runs_on]]
+    if m.runs_on == "hpc:literature":
+        lines[0] += (" Its job calls the session's served model, so it is offered only to a session "
+                     "with a GPU allocation." if m.served_model else
+                     " Its job gets a GPU of its own on the lab's paid partition and starts its own "
+                     "model there, so the session needs no GPU allocation." if m.own_gpu else
+                     " Its job runs no language model: it needs no GPU allocation.")
+    if m.skill:
+        # The skill declares them, and this page keeps no copy: it reads the same with or without
+        # the pinned release installed.
+        lines[0] = lines[0].replace(" inside `analysis.sif`", "")
+        lines.append(f"The container image, Slurm resources, and reference settings are defined by the "
+                     f"skill `{m.skill}` in the pinned aiscientist-skills release (its `SKILL.md` "
+                     "metadata and `assets/`). Its job runs in that image instead of the line's, built "
+                     "on first use into the shared containers directory on HPC3 and reused by every "
+                     "later run.")
+    env = ({"image": "", "cpus": 0, "mem_gb": 0, "time_limit": ""} if m.skill else
+           {"image": m.image, "cpus": m.cpus, "mem_gb": m.mem_gb, "time_limit": m.time_limit})
+    if env["image"]:
+        lines[0] = lines[0].replace(" inside `analysis.sif`", "")
+        how = ("built on first use from conda-forge + bioconda (" + env["image"].split(":", 1)[1] + ")"
+               if env["image"].startswith("bioconda:") else "pulled on first use")
+        lines.append(f"Its job runs in its OWN image instead of the line's: `{env['image']}`, {how} into "
+                     "the shared containers directory on HPC3 and reused by every later run.")
+    resources = [f"{env['cpus']} CPUs" if env["cpus"] else "", f"{env['mem_gb']} GB" if env["mem_gb"] else "",
+                 f"up to {env['time_limit']}" if env["time_limit"] else ""]
+    if any(resources):
+        lines.append("Slurm resources for its job: " + ", ".join(r for r in resources if r) + ".")
     if tool.requires:
         lines.append("Needs: " + ", ".join(f"`{r}`" for r in tool.requires) + ".")
     lines.append("Reads private data: " + ("yes; its results stay inside the run." if tool.reads_private_data
                                           else "no."))
-    lines.append("On the fast chat path: " + ("yes." if m.chat else "no (research runs only)."))
+    if m.research:
+        lines.append("On the fast chat path: " + ("yes." if m.chat else "no (research runs only)."))
+    else:
+        lines.append("In the research agents' catalog: no" + ("; the fast chat can call it." if m.chat else
+                     ". No model can call it: it runs only from its own console line."))
     return "\n\n".join(lines)
 
 

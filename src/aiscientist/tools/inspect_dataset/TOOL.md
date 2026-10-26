@@ -22,7 +22,7 @@ Reads the first part of any uploaded file and reports what it is: the format, an
 <!-- generated:parameters -->
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | — | server-side path of the file to skim. Omit to use the dataset already bound to this run. |
+| `path` | string | — | server-side path of the file to skim: a file of this run, a dataset bound to it, or one of your uploads. Omit to use the dataset already bound to this run. |
 <!-- /generated:parameters -->
 
 ## Outputs

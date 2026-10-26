@@ -7,7 +7,7 @@ Two properties this file exists to pin down, because getting either wrong is exp
    what makes an automatic sweep safe at all (there is nothing hand-curated in there to lose).
 2. **The sweeper's blast radius is exactly that dir.** Raw uploads, the synced source, another
    member's Temp, and every personal lab dir must stay out of reach — of the script's own
-   arguments AND of the storage panel's delete guard.
+   arguments AND of the Storage tab's delete guard.
 
 The sweep's *semantics* (a unit is deleted only when its whole subtree is cold) live in
 ``deploy/hpc3/aiscientist_temp_gc.sh`` and are exercised against a real tree here too, on the

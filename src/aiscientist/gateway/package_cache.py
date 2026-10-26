@@ -1,4 +1,4 @@
-"""A lab-SHARED, self-installing Python package cache for the Singularity sandboxes.
+"""A lab-SHARED, self-installing Python package cache for the Apptainer sandboxes.
 
 The problem: ``analysis.sif`` is read-only and fixed at build time, so the moment a snippet needs
 a library the image lacks, the step dies — and the model's usual recovery (reimplement it by
@@ -98,10 +98,10 @@ class SharedPackageCache:
 
     root: str
     image: str
-    singularity_bin: str = "singularity"
-    # The Lmod module that PUTS `singularity` on PATH. Not optional in practice on HPC3: the
+    container_bin: str = "apptainer"
+    # The Lmod module that PUTS `apptainer` on PATH. Not optional in practice on HPC3: the
     # cache's probes run through `HpcShell._worker`, i.e. a bare `srun ... bash -lc`, and a
-    # compute node has no `singularity` binary until the module is loaded. The run_code sbatch
+    # compute node has no `apptainer` binary until the module is loaded. The run_code sbatch
     # script loads it (build_analysis_script's `container_module`); this path did not, so every
     # probe exited 127 and the whole cache failed open and silent. Empty = do not load (mock
     # hosts, and any site where the binary is already on PATH).
@@ -109,7 +109,7 @@ class SharedPackageCache:
     max_mb: int = _MAX_PACKAGE_MB
     _key: str | None = field(default=None, repr=False)
     #: Modules this session has CONFIRMED the container can import. Each probe is an ``srun`` +
-    #: module load + ``singularity exec`` + interpreter start on a compute node, and nothing
+    #: module load + ``apptainer exec`` + interpreter start on a compute node, and nothing
     #: remembered the answer — so every ``run_code`` call re-probed the same handful of always-
     #: present packages, which is where a measured ten minutes per call went. Only a status-0
     #: probe is recorded: an image cannot LOSE a module mid-run, while a probe that merely failed
@@ -149,12 +149,12 @@ class SharedPackageCache:
 
     def _contained(self, command: str, *, binds_rw: tuple[str, ...] = (),
                    binds_ro: tuple[str, ...] = (), network: bool = False) -> str:
-        """A ``singularity exec`` line for one command inside the analysis image.
+        """An ``apptainer exec`` line for one command inside the analysis image.
 
         ``--containall`` for the same reason every other job here uses it: the install must see
         only the directories we name, so a package's setup script cannot reach the user's ``$HOME``.
         """
-        parts = [self.singularity_bin, "exec", "--containall", "--writable-tmpfs"]
+        parts = [self.container_bin, "exec", "--containall", "--writable-tmpfs"]
         if not network:
             parts += ["--net", "--network", "none"]
         for p in binds_ro:
@@ -165,7 +165,7 @@ class SharedPackageCache:
         line = " ".join(parts)
         if self.container_module:
             # Braces + `&&`, not a bare `;`: callers compose this into `mkdir -p X && <line>`,
-            # and a statement separator there would run singularity even when the mkdir failed.
+            # and a statement separator there would run the container even when the mkdir failed.
             # `|| true` inside, because a site with the binary already on PATH has no module to
             # load and must not be turned into a hard failure.
             line = (f"{{ module load {shlex.quote(self.container_module)} >/dev/null 2>&1 "
@@ -426,7 +426,7 @@ def missing_modules(shell, cache: "SharedPackageCache | None", modules: list[str
     present = _present_memo(cache)
     if all(m in present for m in modules):
         return []          # nothing to ask the cluster; skip the bind check too
-    # Bind the cache root only if it EXISTS. Singularity aborts the whole container with exit 255
+    # Bind the cache root only if it EXISTS. Apptainer aborts the whole container with exit 255
     # on a missing bind source — measured: on a first run, before any package had been published,
     # every probe failed that way and the caller offered to install `pandas`, which the image has.
     root = cache.root.rstrip("/")

@@ -200,7 +200,8 @@ def test_research_lab_runs_end_to_end_on_the_langgraph_planner(tmp_path):
         def run(self, *_a, **_k):
             return HarnessResult(
                 status="ok", stop_reason=None, final_answer="did it",
-                steps=[{"tool": "run_scanpy_qc", "args": {}, "ok": True, "summary": "ok",
+                # Not a QC tool: a run that only did QC is answered without the writer.
+                steps=[{"tool": "run_clustering", "args": {}, "ok": True, "summary": "ok",
                         "result": {"status": "ok", "figures": ["figures/a.png"]}}],
                 errors=[])
 

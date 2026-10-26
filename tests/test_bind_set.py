@@ -163,3 +163,103 @@ def test_cont_req_carries_the_bind_set_forward_on_resume():
     bound = gw_app._select_bound_datasets(req)
     assert bound[0]["path"] == "/ws/staged/case.vcf.gz"      # primary preserved
     assert [b["name"] for b in bound] == ["case.vcf.gz", "panel.bed"]
+
+
+# --- roles: a REFERENCE file (e.g. a cell-type atlas) never becomes the primary ----------------
+
+
+def test_a_reference_file_never_becomes_the_primary():
+    """Format ranking alone puts an .h5ad atlas ahead of a .csv query — the study would then be
+    profiled, QC'd and tested on the atlas. A file marked "reference" ranks after every other."""
+    req = gw_app.LabRequest(
+        connection_id="c", question="q",
+        datasets=[{"path": "/u/atlas.h5ad", "role": "reference"}, {"path": "/u/query.csv"}])
+    bound = gw_app._select_bound_datasets(req)
+    assert [b["name"] for b in bound] == ["query.csv", "atlas.h5ad"]
+    assert bound[1]["role"] == "reference"
+
+
+def test_an_explicit_primary_role_pins_the_primary():
+    req = gw_app.LabRequest(
+        connection_id="c", question="q",
+        datasets=[{"path": "/u/a.h5ad"}, {"path": "/u/b.h5ad", "role": "Primary"}])
+    assert gw_app._select_bound_datasets(req)[0]["path"] == "/u/b.h5ad"
+
+
+def test_only_references_still_yield_a_primary():
+    req = gw_app.LabRequest(connection_id="c", question="q",
+                            datasets=[{"path": "/u/x.csv", "role": "reference"},
+                                      {"path": "/u/y.h5ad", "role": "reference"}])
+    assert gw_app._select_bound_datasets(req)[0]["path"] == "/u/y.h5ad"
+
+
+# --- a dfs3b secondary is read in place when run_code runs on HPC3 -----------------------------
+
+
+def test_stage_secondary_remote_is_not_copied_back_when_read_in_place(tmp_path):
+    ex = _FakeExec()
+    conn = _FakeConn(executor=ex, lab_storage="/dfs/ruic20_lab")
+    remote = "/dfs/ruic20_lab/u/uploads/atlas.h5ad"
+    rec = gw_app._stage_secondary_dataset(conn, remote, "atlas.h5ad", "reference",
+                                          tmp_path / "staged", stage_local=False)
+    assert ex.gets == []                                  # no multi-GB pull to the gateway
+    assert rec == {"path": remote, "name": "atlas.h5ad", "role": "reference",
+                   "hpc_primary": remote, "remote": True, "primary": False}
+
+
+class _PutExec(_FakeExec):
+    def __init__(self):
+        super().__init__()
+        self.puts: list[tuple[str, str]] = []
+        self.cmds: list[str] = []
+
+    def exec(self, cmd: str, timeout: float = 60.0):
+        self.cmds.append(cmd)
+        return super().exec(cmd, timeout)
+
+    def put_file(self, local: str, remote: str) -> None:
+        self.puts.append((local, remote))
+
+
+def test_run_code_inputs_on_hpc_use_dfs3b_in_place_and_upload_local_files(tmp_path):
+    local = tmp_path / "panel.bed"
+    local.write_text("chr1\t1\t2\n")
+    decisions = {"datasets": [
+        {"path": "/dfs/u/q.h5ad", "name": "q.h5ad", "hpc_primary": "/dfs/u/q.h5ad", "primary": True},
+        {"path": "/dfs/u/atlas.h5ad", "name": "atlas.h5ad", "role": "reference",
+         "hpc_primary": "/dfs/u/atlas.h5ad", "remote": True, "primary": False},
+        {"path": str(local), "name": "panel.bed", "role": "gene_panel", "hpc_primary": None,
+         "remote": False, "primary": False},
+        {"path": "/gone/x.vcf", "name": "x.vcf", "primary": False, "error": "staging failed"},
+    ]}
+    ex = _PutExec()
+    inputs, warnings = gw_app._remote_inputs(_FakeConn(executor=ex), decisions, "/dfs/tmp/run1")
+    assert inputs == [
+        {"name": "atlas.h5ad", "role": "reference", "path": "/dfs/u/atlas.h5ad"},
+        {"name": "panel.bed", "role": "gene_panel", "path": "/dfs/tmp/run1/inputs/panel.bed"}]
+    assert ex.puts == [(str(local), "/dfs/tmp/run1/inputs/panel.bed")]
+    assert warnings == []
+
+
+def test_local_sandbox_inputs_are_only_files_readable_here(tmp_path):
+    here = tmp_path / "atlas.csv"
+    here.write_text("x")
+    decisions = {"datasets": [
+        {"path": str(tmp_path / "q.h5ad"), "name": "q.h5ad", "primary": True},
+        {"path": str(here), "name": "atlas.csv", "role": "reference", "primary": False},
+        {"path": "/dfs/u/other.h5ad", "name": "other.h5ad", "primary": False}]}
+    assert gw_app._local_inputs(decisions) == [
+        {"name": "atlas.csv", "role": "reference", "path": str(here)}]
+
+
+def test_one_failed_upload_is_a_warning_not_a_lost_executor(tmp_path):
+    local = tmp_path / "panel.bed"
+    local.write_text("x")
+
+    class _Broken(_PutExec):
+        def put_file(self, local, remote):
+            raise OSError("sftp closed")
+
+    decisions = {"datasets": [{"path": str(local), "name": "panel.bed", "primary": False}]}
+    inputs, warnings = gw_app._remote_inputs(_FakeConn(executor=_Broken()), decisions, "/dfs/tmp/r")
+    assert inputs == [] and "upload to HPC3 failed" in warnings[0]

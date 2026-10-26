@@ -5,7 +5,7 @@ working gateway that:
 
 - opens a real SSH session to UCI HPC3 (paramiko, password+Duo or SSH key),
 - ensures a GPU allocation through Slurm and monitors its health,
-- verifies the vLLM Singularity image is staged on shared DFS,
+- verifies the vLLM Apptainer image is staged on shared DFS,
 - tunnels to the vLLM /v1 endpoint and drives Qwen3 for research chat.
 
 Every failure is surfaced with its full cause and traceback (see ``errors``)

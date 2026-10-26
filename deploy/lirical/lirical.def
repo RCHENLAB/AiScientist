@@ -21,19 +21,21 @@ From: eclipse-temurin:17-jre-jammy
 # variant database (~20GB, needed ONLY for genotype-aware scoring) are NOT baked -- they are staged on
 # dfs3b by deploy/lirical/build_and_stage.sh and bind-mounted READ-ONLY at run time. The AiScientist tools
 # are likewise bind-mounted from dfs3b (pysrc) + put on PYTHONPATH by the executor, so a tool edit
-# needs only a code sync, never an image rebuild. Keeping the DATA out of the image also keeps
-# `--remote` builds working (no huge %files shipped to the Sylabs cloud builder).
+# needs only a code sync, never an image rebuild.
 #
 # IMPORTANT: LIRICAL_VERSION here MUST match the version deploy/lirical/build_and_stage.sh assumes for
 # the phenotype data layout, and the Exomiser data version must be one LIRICAL v2 supports (>= 2302 --
 # the lab's existing 1805_hg19 / exomiser-cli-10.1.0 data is the OLD Exomiser 10.x schema and is NOT
 # compatible with LIRICAL v2; see deploy/lirical/README.md).
 #
-# Build ON HPC3 or any Linux+singularity host (macOS cannot build .sif). See
+# Build ON an HPC3 compute node with `apptainer build --fakeroot` (macOS cannot build .sif). See
 # deploy/lirical/build_and_stage.sh and deploy/lirical/README.md.
 
 %post
     set -eux
+    # Apptainer --fakeroot on HPC3 maps only root (no /etc/subuid entry), so apt cannot drop to its
+    # _apt sandbox user ("setgroups ... Operation not permitted"): let it fetch as root.
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-aiscientist-fakeroot
     LIRICAL_VERSION=2.4.1
     # The base is Ubuntu (jammy); add python3 for the CLI entrypoint + unzip/curl for the LIRICAL dist.
     apt-get update
@@ -78,7 +80,7 @@ From: eclipse-temurin:17-jre-jammy
     LIRICAL data + the Exomiser variant DB are bind-mounted from dfs3b (NOT baked); the AiScientist tools
     are bound from dfs3b + put on PYTHONPATH.
 
-      singularity exec --containall \
+      apptainer exec --containall \
         -B <run_ws>:<run_ws> -B <vcf>:<vcf>:ro -B <pysrc>:<pysrc>:ro \
         -B <lirical_data>:<lirical_data>:ro -B <exomiser_dir>:<exomiser_dir>:ro \
         --env PYTHONPATH=<pysrc> \

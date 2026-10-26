@@ -11,7 +11,7 @@
 # build is live. Set AISCIENTIST_NO_KILL=1 to skip the stop step.
 #
 # Configurable via the same env vars as deploy.sh:
-#     AISCIENTIST_ROOT  base dir   (default /data/BioAgent)
+#     AISCIENTIST_ROOT  base dir   (default /data/aiscientist)
 #     AISCIENTIST_APP   app dir    (default $ROOT/app)
 #     AISCIENTIST_ENV   venv dir   (default $ROOT/env)
 #     AISCIENTIST_HOST  bind host  (default 127.0.0.1 — localhost only, SAFE)
@@ -26,29 +26,29 @@
 #     ssh -p <ADMIN_SSH_PORT> -L 8800:localhost:8800 <you>@<this-host>
 #     # then open http://localhost:8800/
 #
-# Production (always-on) instead of this script — /etc/systemd/system/bioagent.service:
+# Production (always-on) instead of this script — /etc/systemd/system/aiscientist.service:
 #     [Service]
 #     User=aiscientist
-#     WorkingDirectory=/data/BioAgent/app
-#     ExecStart=/data/BioAgent/env/bin/python -m aiscientist.gateway --host 127.0.0.1 --port 8800
+#     WorkingDirectory=/data/aiscientist/app
+#     ExecStart=/data/aiscientist/env/bin/python -m aiscientist.gateway --host 127.0.0.1 --port 8800
 #     # ^ bind localhost; put nginx (HTTPS + auth) in front and proxy_pass to it
 #     Restart=always
 #     [Install]
 #     WantedBy=multi-user.target
-#   then: sudo systemctl enable --now bioagent
+#   then: sudo systemctl enable --now aiscientist.service
 #
 set -euo pipefail
 # Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
 # Python side (aiscientist.core.config.apply_brand_env_aliases).
 for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGENT_}"; [ -n "${!_new+x}" ] || export "$_new=${!_old}"; done
 
-ROOT="${AISCIENTIST_ROOT:-/data/BioAgent}"
+ROOT="${AISCIENTIST_ROOT:-/data/aiscientist}"
 APP="${AISCIENTIST_APP:-$ROOT/app}"
 ENV_DIR="${AISCIENTIST_ENV:-$ROOT/env}"
 HOST="${AISCIENTIST_HOST:-127.0.0.1}"
 PORT="${AISCIENTIST_PORT:-8800}"
 # Dev hot-reload: AISCIENTIST_RELOAD=1 ./start.sh  → uvicorn auto-restarts the worker when
-# a backend .py changes (e.g. after ./scripts/push.sh). NOTE: a reload drops in-memory
+# a backend .py changes. NOTE: a reload drops in-memory
 # state — any live HPC3 connection/tunnel dies and must be reconnected, so use it for
 # dev iteration, NOT while a research run is in flight. (Frontend HTML/JS/CSS is always
 # hot — it's read from disk per request, so just refresh the browser.)
@@ -102,11 +102,11 @@ if [ -n "${holder// /}" ]; then
 fi
 
 # --- which build is this? print a fingerprint so a restart is verifiable ------
-# Works even though push.sh rsyncs source but NOT .git: the fingerprint is a hash
+# Works even though a deploy rsyncs the source but NOT .git: the fingerprint is a hash
 # of the deployed aiscientist/*.py, so it changes whenever new code lands. If a real
 # git checkout is present (local dev), show the commit too.
 gitline=""
-# Only trust the commit when the tree is CLEAN. On the server push.sh rsyncs source
+# Only trust the commit when the tree is CLEAN. On the server a deploy rsyncs the source
 # but not .git, so .git is a stale old checkout and rsync leaves it "dirty" — its HEAD
 # is NOT what we just deployed, so showing it would mislead. A clean tree (local dev)
 # means the commit really matches the files; the fingerprint is the truth either way.

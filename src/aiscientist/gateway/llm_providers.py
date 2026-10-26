@@ -7,9 +7,10 @@ never touches the filesystem, so each is testable on its own.
 Scope (locked with Yijun): **any OpenAI-compatible endpoint**, with presets as a
 convenience rather than a whitelist. Every preset below speaks ``POST /v1/chat/completions``
 with a ``Bearer`` token, which is exactly what :mod:`vllm_client` already sends — so the
-whole transport layer is reused unchanged and no per-provider adapter exists. Anthropic is
-deliberately NOT a preset: its native API is ``/v1/messages`` with ``x-api-key`` and a
-different tool-call schema, so Claude models are reached through OpenRouter for now.
+whole transport layer is reused unchanged. The one exception is **Anthropic** (added 2026-10-09):
+its native API is ``/v1/messages`` with ``x-api-key`` and a different message and tool schema, so a
+Claude key goes through :mod:`anthropic_client` (the official SDK) instead — :func:`transport_for`
+says which, and :func:`verify` / :func:`probe_models` dispatch on it.
 
 Model ids are deliberately NOT hard-coded. Providers rename and retire ids faster than we
 redeploy, and a stale built-in list is worse than none — it looks authoritative and sends
@@ -48,6 +49,8 @@ class Provider:
     key_url: str = ""
     # Free-text note rendered under the preset in the UI.
     note: str = ""
+    # Wire protocol: "openai" (POST /chat/completions, Bearer) or "anthropic" (POST /v1/messages).
+    transport: str = "openai"
 
 
 PROVIDERS: tuple[Provider, ...] = (
@@ -57,6 +60,16 @@ PROVIDERS: tuple[Provider, ...] = (
         base_url="https://openrouter.ai/api/v1",
         key_url="https://openrouter.ai/keys",
         note="One key reaches most vendors, including Anthropic and Google models.",
+    ),
+    Provider(
+        key="anthropic",
+        label="Anthropic (Claude)",
+        base_url="https://api.anthropic.com",
+        key_url="https://platform.claude.com/settings/keys",
+        note="Your own Anthropic API key, sent to Anthropic's native API. Claude then runs the whole "
+             "analysis (planning, the tool-calling Scientist, the write-up) without a cluster GPU; "
+             "it is billed to that Anthropic account.",
+        transport="anthropic",
     ),
     Provider(
         key="openai",
@@ -110,9 +123,22 @@ def public_presets() -> list[dict[str, Any]]:
     """Preset list for the UI. Pure data — no secrets, no network."""
     return [
         {"key": p.key, "label": p.label, "base_url": p.base_url,
-         "lists_models": p.lists_models, "key_url": p.key_url, "note": p.note}
+         "lists_models": p.lists_models, "key_url": p.key_url, "note": p.note,
+         "transport": p.transport}
         for p in PROVIDERS
     ]
+
+
+def transport_for(provider: str | None, base_url: str | None = None) -> str:
+    """Which wire protocol a credential speaks: "anthropic" for the Anthropic preset or any
+    credential pointing at Anthropic's own API host, else "openai". The host check covers calls
+    that only know the URL (the credential store's ``verify(base_url, key, model)`` callable, the
+    model probe of an endpoint still being typed)."""
+    from . import anthropic_client
+    preset = get_provider(provider or "")
+    if preset is not None and preset.transport == "anthropic":
+        return "anthropic"
+    return "anthropic" if anthropic_client.is_anthropic_endpoint(base_url) else "openai"
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -134,7 +160,7 @@ class VerifyResult:
     """Why a key did or didn't work. ``cause`` is what the UI keys its message on."""
 
     ok: bool
-    # 'ok' | 'auth' | 'credit' | 'model' | 'endpoint' | 'network'
+    # 'ok' | 'auth' | 'credit' | 'rate' | 'model' | 'endpoint' | 'network'
     cause: str
     message: str
     models: list[str] = field(default_factory=list)
@@ -179,16 +205,22 @@ class ModelsResult:
     URL" need three different things from the user and look identical as an empty list."""
 
     ok: bool
-    # 'ok' | 'auth' | 'credit' | 'model' | 'endpoint' | 'network' | 'unsupported'
+    # 'ok' | 'auth' | 'credit' | 'rate' | 'model' | 'endpoint' | 'network' | 'unsupported'
     cause: str
     message: str
     models: list[str] = field(default_factory=list)
 
 
-def probe_models(base_url: str, api_key: str, timeout: float = _TIMEOUT) -> ModelsResult:
+def probe_models(base_url: str, api_key: str, timeout: float = _TIMEOUT, *,
+                 provider: str | None = None) -> ModelsResult:
     """``GET /models`` with the reason attached. Used by the credential dialog so a user can see
     the model ids BEFORE saving anything — which is the only order that works, since a credential
     with no model id is refused at bind time and the ids live on the endpoint, not in our heads."""
+    if transport_for(provider, base_url) == "anthropic":
+        from . import anthropic_client
+        ok, cause, message, models = anthropic_client.probe_models(
+            api_key, base_url or None, timeout=max(timeout, 30.0))
+        return ModelsResult(ok, cause, message, models)
     base = normalize_base_url(base_url)
     if not base:
         return ModelsResult(False, "endpoint", "Enter the base URL first.")
@@ -219,10 +251,11 @@ def probe_models(base_url: str, api_key: str, timeout: float = _TIMEOUT) -> Mode
     return ModelsResult(True, "ok", f"{len(models)} models available.", models)
 
 
-def list_models(base_url: str, api_key: str, timeout: float = _TIMEOUT) -> list[str]:
+def list_models(base_url: str, api_key: str, timeout: float = _TIMEOUT, *,
+                provider: str | None = None) -> list[str]:
     """Live model ids from ``GET /models``, or ``[]`` when the endpoint doesn't serve one.
     Best-effort by design: a missing model list is a UI inconvenience, not a failure."""
-    return probe_models(base_url, api_key, timeout).models
+    return probe_models(base_url, api_key, timeout, provider=provider).models
 
 
 def _classify(status: int, body: str) -> tuple[str, str]:
@@ -243,12 +276,13 @@ def _classify(status: int, body: str) -> tuple[str, str]:
     if status == 404:
         return "endpoint", "No OpenAI-compatible API at that base URL (404)."
     if status == 429:
-        return "credit", "The endpoint is rate-limiting this key."
+        # A 429 that names credit or quota was caught above; this one is requests/tokens per minute.
+        return "rate", "The endpoint is rate-limiting this key (too many requests or tokens per minute)."
     return "endpoint", f"The endpoint answered HTTP {status}."
 
 
 def verify(base_url: str, api_key: str, model: str | None = None,
-           timeout: float = _TIMEOUT) -> VerifyResult:
+           timeout: float = _TIMEOUT, *, provider: str | None = None) -> VerifyResult:
     """Prove a (base_url, key, model) triple actually works, end to end.
 
     The chat ping — not the model list — is the real test: ``GET /models`` succeeds on keys
@@ -259,7 +293,14 @@ def verify(base_url: str, api_key: str, model: str | None = None,
     This is what makes rotation safe: :func:`llm_credentials.rotate_key` runs this against the
     NEW key before overwriting anything, so a failed rotation leaves the stored credential
     exactly as it was.
+
+    An Anthropic credential is verified the same way, through the SDK (:func:`anthropic_client.verify`).
     """
+    if transport_for(provider, base_url) == "anthropic":
+        from . import anthropic_client
+        ok, cause, message, models, verified = anthropic_client.verify(
+            api_key, model, base_url or None, timeout=max(timeout, 30.0))
+        return VerifyResult(ok, cause, message, models, verified_model=verified)
     base = normalize_base_url(base_url)
     if not base:
         return VerifyResult(False, "endpoint", "No base URL was given.")

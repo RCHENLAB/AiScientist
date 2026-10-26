@@ -369,6 +369,25 @@ def test_grounding_keeps_the_passages_when_paperqa_could_not_answer():
     assert "has nothing" not in text
 
 
+def test_grounding_keeps_every_passage_of_a_paper_with_its_page():
+    """search_corpus returns up to three passages of one paper. Each stays under the paper's one
+    source number, with its page and whole (a raw passage is ~1500 characters); before, only the
+    first one was kept, cut to 500 characters."""
+    from aiscientist.agents.quick_chat import _format_grounding
+
+    long_tail = "x" * 700 + " PRPF31 haploinsufficiency causes adRP."
+    text = _format_grounding({"status": "ok", "contexts": [
+        {"citation": "Smith 2020", "page": 3, "summary": "A1 " + long_tail},
+        {"citation": "Smith 2020", "page": 7, "summary": "RPGR: loss of one copy."},
+        {"citation": "Jones 2019", "page": 2, "summary": "SNRNP200."}]}, "search_corpus")
+    assert "PRPF31 haploinsufficiency" in text and "(p. 7) RPGR: loss of one copy." in text
+    assert "1. Smith 2020" in text and "2. Jones 2019" in text and "3." not in text
+    assert "(p. 3) A1" in text
+    # deep_literature's summaries keep the 500-character cut
+    short = _format_grounding({"status": "ok", "contexts": [{"citation": "S", "summary": "A1 " + long_tail}]})
+    assert "PRPF31" not in short and "\u2026" in short
+
+
 def test_grounding_for_a_search_that_ran_out_of_time_does_not_claim_an_empty_corpus():
     from aiscientist.agents.quick_chat import _format_grounding
 
@@ -380,3 +399,17 @@ def test_grounding_for_a_search_that_ran_out_of_time_does_not_claim_an_empty_cor
     empty = _format_grounding({"status": "failed", "n_contexts": 0, "agent_status": "success",
                                "error": "the indexed corpus returned 0 passages"})
     assert "The corpus has nothing on this." in empty
+
+
+def test_chat_tools_stream_asks_for_its_usage_and_reports_it_last(monkeypatch):
+    """A fast-chat turn costs tokens like any other call; without the usage it could not be
+    recorded, and chat answers were missing from the usage table."""
+    sent = []
+    stub_urlopen(monkeypatch, sent, sse(
+        {"choices": [{"delta": {"content": "ans"}}]},
+        {"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}},
+    ))
+    out = list(vllm_client.chat_tools_stream(1234, "m", [], []))
+    assert sent[0]["stream_options"] == {"include_usage": True}
+    assert out == [("content", "ans"),
+                   ("usage", {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15})]

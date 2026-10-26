@@ -82,6 +82,14 @@ def test_build_run_code_context_lists_paths_and_cwd_warning():
     assert "SIGKILL" in ctx                                             # memory caveat
 
 
+def test_a_10x_h5_dataset_comes_with_how_to_read_it():
+    from aiscientist.agents.sandbox import build_run_code_context
+
+    ctx = build_run_code_context(CodeSandbox(dataset_path="/up/S1/filtered_feature_bc_matrix.h5"))
+    assert "sc.read_10x_h5(path)" in ctx and "ONE COLUMN PER BARCODE" in ctx
+    assert "read_10x_h5" not in build_run_code_context(CodeSandbox(dataset_path="/up/a.h5ad"))
+
+
 def test_build_run_code_context_empty_without_executor():
     from aiscientist.agents.sandbox import build_run_code_context
 
@@ -109,7 +117,7 @@ def test_sandbox_network_enabled_defaults_on_and_env_toggles_off(monkeypatch):
 
 
 def test_container_command_network_follows_env(monkeypatch):
-    # With a container image, the singularity command isolates the network ONLY when disabled.
+    # With a container image, the apptainer command isolates the network ONLY when disabled.
     monkeypatch.delenv("AISCIENTIST_SANDBOX_NETWORK", raising=False)   # default ON
     cmd, _ = CodeSandbox(container_image="/img/analysis.sif")._command("/tmp/s.py", "/tmp/wd")
     assert "--network" not in cmd and "none" not in cmd            # network allowed → no isolation flags
@@ -117,3 +125,59 @@ def test_container_command_network_follows_env(monkeypatch):
     isolated = CodeSandbox(container_image="/img/analysis.sif", allow_network=False)
     cmd2, _ = isolated._command("/tmp/s.py", "/tmp/wd")
     assert "--net" in cmd2 and "--network" in cmd2 and "none" in cmd2   # explicit off → isolated
+
+
+def test_a_bound_folder_reaches_run_code_as_dataset_root():
+    from aiscientist.agents.sandbox import CodeSandbox, build_run_code_context
+    box = CodeSandbox(dataset_path="/srv/lib/outs/filtered_feature_bc_matrix.h5",
+                      dataset_root="/srv/lib")
+    assert box._env()["AISCIENTIST_DATASET_ROOT"] == "/srv/lib"
+    assert "AISCIENTIST_DATASET_ROOT = /srv/lib" in build_run_code_context(box)
+    assert "AISCIENTIST_DATASET_ROOT" not in CodeSandbox(dataset_path="/srv/a.h5ad")._env()
+
+
+def test_other_bound_files_reach_the_snippet_by_role(tmp_path):
+    """A second upload (a reference atlas) is readable by name and role, read-only, alongside the
+    primary dataset."""
+    import json
+
+    from aiscientist.agents.sandbox import build_run_code_context
+
+    atlas = tmp_path / "atlas.csv"
+    atlas.write_text("cell_type,gene,mean_expression\nrod,RHO,5\n", encoding="utf-8")
+    sb = CodeSandbox(work_dir=str(tmp_path / "work"),
+                     inputs=[{"name": "atlas.csv", "role": "reference", "path": str(atlas)}])
+    out = sb("import os, json\n"
+             "print(json.loads(os.environ['AISCIENTIST_INPUTS'])[0]['role'])\n"
+             "print(open(os.environ['AISCIENTIST_REFERENCE']).read().splitlines()[1])\n")
+    assert out["status"] == "ok", out
+    assert out["stdout"].split() == ["reference", "rod,RHO,5"]
+    ctx = build_run_code_context(sb)
+    assert "AISCIENTIST_INPUTS" in ctx and "atlas.csv (reference)" in ctx
+    assert f"AISCIENTIST_REFERENCE = {atlas}" in ctx and "never QC" in ctx
+    assert json.loads(sb._env()["AISCIENTIST_INPUTS"]) == [
+        {"name": "atlas.csv", "role": "reference", "path": str(atlas)}]
+
+
+def test_no_inputs_adds_no_env():
+    from aiscientist.agents.sandbox import input_env
+
+    assert input_env(None) == {} and input_env([{"name": "x"}]) == {}
+    env = input_env([{"name": "panel.bed", "role": "gene_panel", "path": "/p/panel.bed"}])
+    assert "AISCIENTIST_REFERENCE" not in env and "/p/panel.bed" in env["AISCIENTIST_INPUTS"]
+
+
+def test_container_binds_inputs_read_only(tmp_path):
+    atlas = tmp_path / "ref" / "atlas.h5ad"
+    atlas.parent.mkdir()
+    atlas.write_text("x")
+    sb = CodeSandbox(container_image="/img.sif", work_dir=str(tmp_path),
+                     inputs=[{"name": "atlas.h5ad", "role": "reference", "path": str(atlas)}])
+    (tmp_path / "w").mkdir()
+    cmd, _ = sb._command("s.py", str(tmp_path / "w"))
+    # Under work_dir already → covered by that bind, not bound twice.
+    assert f"{atlas}:{atlas}:ro" not in " ".join(cmd)
+    sb2 = CodeSandbox(container_image="/img.sif",
+                      inputs=[{"name": "atlas.h5ad", "role": "reference", "path": str(atlas)}])
+    cmd2, _ = sb2._command("s.py", str(tmp_path / "w"))
+    assert f"{atlas}:{atlas}:ro" in " ".join(cmd2)

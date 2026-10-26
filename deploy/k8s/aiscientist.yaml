@@ -1,6 +1,6 @@
-# Kubernetes manifests for AiScientist — EXAMPLE to adapt to the eyeserver cluster.
-# Replace every <placeholder>. The cluster already routes multiple subdomains on the shared
-# 443 via its ingress controller; this adds <PUBLIC_HOSTNAME> as one more rule.
+# Kubernetes manifests for running AiScientist IN A POD: an example for another cluster.
+# The lab server does not use this file. There the app is a host systemd unit and the cluster only
+# routes to it: see host-backend.yaml and deploy/README.md. Replace every <placeholder>.
 #
 # ▲▲▲ CRITICAL — this app is a STATEFUL SINGLETON ▲▲▲
 #   It holds a per-session SSH tunnel to HPC3 + in-memory connection state in ONE process.
@@ -19,6 +19,8 @@ type: Opaque
 stringData:
   # Signs session cookies — MUST be strong & unique (NOT a default). Generate with:
   #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+  # As an environment variable it makes the app warn at every start: mount this key as a file and
+  # set AISCIENTIST_SECRET_KEY_FILE to its path instead (configs/aiscientist.example.env, section 13).
   AISCIENTIST_SECRET_KEY: "<strong-random-secret>"
   AISCIENTIST_PUBLIC_HTTPS: "1"                 # marks session cookies Secure (HTTPS-only)
   # PostgreSQL is REQUIRED (NOT SQLite) — UCI-wide / multi-project use needs real concurrency.

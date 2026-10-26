@@ -1,243 +1,148 @@
 # AiScientist
 
-**A privacy-first, multi-agent bioinformatics research console for the UCI vision /
-ocular-biology lab.** A researcher logs in through the browser, points it at a dataset,
-and asks a scientific question in plain language. Behind the login, the console connects
-to **UCI HPC3** (SSH + Duo), serves an open-weights LLM (**Qwen3.8-27B**, INT4) on a GPU
-via Slurm + vLLM, and runs a role-based *research lab* — Principal Investigator →
-Scientist → Critic — that plans the work, executes real single-cell analysis and
-literature retrieval, and streams back a citable, publication-shaped report with
-downloadable figures, tables, and a PDF/DOCX manuscript.
+AiScientist is a web research agent for biomedical data: single-cell RNA-seq, VCFs and clinical
+phenotypes. A researcher adds a dataset and asks a question in plain language. LLM roles then work
+as a small lab: the PI drafts a plan, the researcher reviews it, the Scientist runs each step with
+curated tools or its own code, the Critic checks every step, and the run ends in a cited,
+manuscript-style report (PDF and DOCX) with its figures and tables.
 
-Public deployment: **<PUBLIC_HOSTNAME>** (UCI-network / VPN).
+It is built for the UCI vision research lab and runs at <https://AiScientist.eye.som.uci.edu>. The
+site is open on the public internet. An account is registered with a `@uci.edu` email or created
+by an admin, and a run needs the user's own UCI HPC3 account.
 
----
-
-## Why it exists
-
-Single-cell and spatial analyses are a long chain of judgement calls — QC thresholds,
-clustering resolution, differential expression, enrichment, marker interpretation,
-literature grounding — that a domain scientist normally does by hand across many tools.
-AiScientist runs that chain as a supervised agent team so a researcher gets a
-first-draft, reproducible analysis and manuscript from a question and a dataset, while
-**raw data and the model stay on UCI infrastructure**.
-
-Design posture:
-
-- **Privacy-first.** The LLM runs on UCI HPC3 and never leaves campus. Raw datasets stay
-  server-side; `DataBoundaryGuard` blocks raw rows and secrets from ever reaching a
-  prompt; external literature queries are sanitized (a bare filename and the question,
-  never data).
-- **Heavy compute stays on HPC3.** GPU inference, `run_code`, scanpy analysis, report
-  rendering, scGPT, and VL review all run as Singularity-contained Slurm jobs on the
-  cluster — never silently on the web server.
-- **Honest over impressive.** Tools report failures instead of faking success; a
-  deterministic guard refuses to let the Critic "accept" a step whose tool run errored
-  or returned nothing. Step degradations are recorded in a diagnostics report, and the
-  final manuscript renders clean.
-
----
-
-## What a run looks like
-
-1. **Log in & connect.** An AiScientist account gates the app: self-registration with a
-   verified `@uci.edu` email (a 6-digit code), or created by an admin. The console then
-   SSHes to `hpc3.rcic.uci.edu` with your UCInetID + interactive **Duo**. HPC3 credentials are never stored — only a bcrypt
-   hash of the *app* password lives in the DB.
-2. **Serve the model.** A per-user Slurm GPU job serves `RedHatAI/Qwen3.8-27B-INT4`
-   via **vLLM** (Singularity, OpenAI-compatible `/v1`) on a dynamic port; the console
-   SSH-tunnels to it. Jobs are per-user-isolated (`squeue --me`) and the model is warmed
-   on connect so the first query isn't stuck on the cold load from shared DFS.
-3. **Upload a dataset.** Resumable chunked upload; the file streams straight to your
-   HPC3 area (`/dfs3b/ruic20_lab/<user>/uploads/`) — the gateway keeps no copy.
-4. **Run the research lab.** The PI plans; the Scientist executes real tools; the Critic
-   judges each step; the loop converges. Progress streams per-role, token-by-token
-   (including the model's visible thinking), with a plan-mode pause for human
-   review/edit before anything runs.
-5. **Results.** Per-run artifacts in `runs/console/<ucinetid>/<run_id>/` — figures,
-   tables, a citable PDF/DOCX manuscript, and a downloadable bundle. Reports can be
-   regenerated without re-running the analysis.
-
----
-
-## Architecture — two tiers
+## How it works
 
 ```
-Browser ──HTTPS──▶ Envoy Gateway (<PUBLIC_HOSTNAME>)
+Browser ──HTTPS──▶ Envoy ingress
                         │
                         ▼
-        eyeserver: FastAPI + WebSocket console  ← accounts, chat history, uploads,
-        (systemd `bioagent.service`, Postgres)    orchestration, report assembly
-                        │  SSH + Duo, per-session tunnel
+        Gateway on the lab server (FastAPI + WebSocket, Postgres):
+        accounts, chats, run orchestration, report assembly
+                        │  one SSH session per user
                         ▼
-        UCI HPC3 (Slurm): vLLM GPU serve (Qwen3.8-27B) · run_code · scanpy analysis ·
-        pandoc/XeLaTeX report render · scGPT · VL review — all Singularity-contained
+        UCI HPC3 (Slurm + Apptainer): the LLM on a GPU, and every tool job
+        (single-cell analysis, variant annotation, phenotype ranking,
+        literature, report rendering)
 ```
 
-The web console (`src/aiscientist/gateway/`) is a deployable FastAPI + WebSocket app; the
-compute lives on HPC3 behind SSH. The two are decoupled by per-session SSH tunnels and
-Slurm job submission, so the eyeserver holds no GPU and no persistent dataset copy.
+1. **Sign in and connect.** The gateway opens an SSH session to HPC3 as the user, with their
+   password and Duo or with a saved SSH key.
+2. **Choose the model.** The model a session chooses answers all of its calls, the tool-calling
+   Scientist included: the lab's shared model (DeepSeek-V4-Flash, one long-lived job on several
+   HPC3 GPUs; no wait, and the default where the server keeps one), the user's own LLM API key (no
+   wait; [guide](docs/claude_api_guide.md)), or Qwen3.8-27B in a Slurm GPU job of the user's own (it
+   waits for a free card; `AISCIENTIST_SESSION_GPU` can keep this to admins). The gateway reaches a
+   cluster model through an SSH tunnel. Account › API usage shows what a key spends and the tokens
+   each chat and run used on the shared model; the cluster models cost nothing per token.
+3. **Add data.** Upload it in the browser (resumable), or point to data already on the lab server.
+4. **Ask.** A quick question is answered in the chat. A research question becomes a plan, a
+   dependency graph of steps, which the user approves, edits or cancels before anything runs.
+5. **Run.** For each step the Scientist calls tools, most of them Slurm jobs on HPC3, and the Critic
+   accepts the result or sends the step back.
+6. **Report.** The claims are audited against the tool results, the report is written and rendered,
+   and the figures, tables and a bundle of the run can be downloaded.
 
----
+The diagrams, the code layers and the tool routing are in
+[`docs/architecture/README.md`](docs/architecture/README.md).
 
-## The research lab (PI → Scientist → Critic)
+## Design rules
 
-The live agent system is a role-based loop in `src/aiscientist/agents/`:
+- **The data stays on UCI systems.** Datasets live on the lab server and on HPC3, and with the
+  default model the prompts stay there too. `DataBoundaryGuard` refuses a prompt that carries a raw
+  data table or a secret. Outside calls go to public reference services such as Europe PMC and
+  Ensembl, and to an LLM provider only when the user brings their own key.
+- **Heavy compute runs on HPC3 as Slurm jobs.** The gateway only orchestrates. HPC3 login nodes are
+  used to log in and submit jobs, and files are transferred through `access-hpc3.rcic.uci.edu`.
+- **Results are checked.** A tool reports a failure instead of faking success, the Critic
+  cannot accept a step whose tool call failed or returned nothing, and the report's claims and
+  numbers are checked against the tool results before and after it is written.
+- **Every dataset and result is described.** Each carries a Croissant 1.1 `croissant.json` (files,
+  checksums, table columns, ontology terms, license, and for a result its inputs and run), which its
+  owner reviews in Files → Datasets and MCP clients read at `/mcp`. See
+  [`docs/development/metadata.md`](docs/development/metadata.md).
 
-- **PI** turns the question into an ordered agenda of concrete steps (plan-mode pauses
-  here for human review/edit — the same human-in-the-loop gate as the Duo prompt).
-- **Scientist** (`ResearchHarness`) executes each step by **calling tools** on the loaded
-  dataset — one or more per turn, reading each result before continuing.
-- **Critic** judges each step `accept | revise` with a score and a specific critique; a
-  deterministic guard refuses to accept a step whose tool run errored or returned nothing
-  (the model-critic can't rubber-stamp a failure).
-- On convergence, a deterministic, **no-AI** report is assembled (pandoc → PDF/DOCX),
-  embedding the exact figures/tables the tools produced, with a formatted references
-  section built from accepted literature citations.
+## Tools, skills and pipelines
 
-### DAG planning & real multi-agent (0.2.0)
+| | What it is | Where |
+|---|---|---|
+| Tool | Fixed code the Scientist calls by name | [`src/aiscientist/tools/`](src/aiscientist/tools/README.md), one folder per tool |
+| Skill | A code template the Scientist adapts and runs | the pinned release of [`lijinbio/aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills) ([`configs/skills_registry.json`](configs/skills_registry.json)) |
+| Pipeline | An end-to-end protocol the PI picks when planning | [`preset_pipelines/`](preset_pipelines/README.md) |
 
-Beyond the linear pipeline, the lab can plan the work as a **dependency DAG** and run it
-with a team of specialists — all **feature-flagged and additive** (default off = the
-0.1.0 linear pipeline runs unchanged):
+Adding one of these is adding a folder (a skill's goes into the registry). No platform code changes.
 
-- **DAG planner** (`agents/dag.py`) — a structure pass turns the agenda into a
-  `LabPlan` of `TaskNode`s with explicit dependencies; a ready-set scheduler runs nodes
-  as their prerequisites complete. Scoped per-node briefs ("do ONLY this task; earlier
-  outputs already exist") structurally cure the double-QC / step-1-runs-everything
-  failure modes.
-- **Coordinator + expert claiming** — a Coordinator picks the next ready task; specialists
-  **claim** tasks by expertise fit (real multi-agent, not a fixed router).
-- **Safe concurrency** — independent branches (e.g. literature vs analysis) run in
-  parallel when their mutable footprints are disjoint; opt-in via
-  `AISCIENTIST_MAX_CONCURRENCY`.
-- **Per-agent evolving memory** (`agents/agent_memory.py`) — each specialist keeps a
-  private, disk-backed memory (`episodes.jsonl` + distilled `lessons.md`) that it recalls
-  into its brief and reflects on across runs (in-context learning on frozen weights).
-
-Flags (gateway env, all default off): `AISCIENTIST_PLANNER=dag`,
-`AISCIENTIST_MAX_CONCURRENCY=<n>`, `AISCIENTIST_AGENT_MEMORY=1`.
-
-### The Scientist's tool catalog (`agents/registry.py`)
-
-- **Single-cell analysis** (`tools/scrna_pack.py`) — real scanpy QC → clustering → DE →
-  gseapy Enrichr enrichment, emitting deterministic scanpy/matplotlib figures and tables;
-  runs as a Singularity Slurm job on HPC3.
-- **`run_code`** — a CodeAct sandbox that reads the run's dataset + checkpoints and writes
-  new artifacts, with a real per-snippet memory cap (runs on HPC3).
-- **Literature** — `literature_search` (Europe PMC keyword retrieval) and
-  `deep_literature` (`tools/paperqa_search.py`, PaperQA2 RAG grounded on the on-host Qwen
-  + local embeddings — nothing leaves campus); `reporting/literature_references.py` formats
-  the manuscript's references from accepted citations.
-- **`scgpt_annotate`** — per-cell type annotation via scGPT (separate short-lived GPU
-  batch job).
-- **`schematic`** — a deterministic graphviz workflow diagram. **`finish`** — return the
-  final answer.
-
-`DataBoundaryGuard` gates the brief before any model call. The whole loop runs offline in
-tests via an injected `chat_fn` with scripted tool calls.
-
----
-
-## HPC3 / RCIC login boundary
-
-- HPC3 host `hpc3.rcic.uci.edu`; interactive access over SSH. Password login requires
-  **Duo**, and users must be on the UCI campus network or VPN.
-- **Data transfer goes to `access-hpc3.rcic.uci.edu`, never a login node.** RCIC's 2026-08-06
-  notice reserves `login-i15/16/17` for logging in and submitting Slurm jobs — not compute, and
-  not `rsync`/`SFTP`/`rclone`/`wget` — and says offending processes may be killed. The gateway
-  honours this automatically: `put_file`/`get_file` open their own connection to
-  `AISCIENTIST_HPC_TRANSFER_HOST` while every `exec`, Slurm call and tunnel stays on the login node.
-  That host mounts the same `$HOME` and `/dfs3b`, and its shell is restricted to transfer
-  commands (`rsync`/`wget`/`curl`, not `bash`), so scripts still run on `hpc3.rcic.uci.edu`.
-- User SSH keys must have a non-empty passphrase and must not be shared.
-- High-compute GPU/CPU work runs on HPC3 through Slurm — never silently on the web
-  server. Heavy single-cell, spatial, and multi-omics work belongs on the cluster.
-
-References: `https://rcic.uci.edu/account/login.html`,
-`https://rcic.uci.edu/slurm/jobs.html`.
-
----
-
-## Deploy & run
-
-**Production (eyeserver).** The console runs as a host systemd unit (`bioagent.service`,
-user `aiscientist`, `/data/BioAgent/app`), bound to the node IP on `:8800`, fronted by
-the `aiscientist` Kubernetes Service → Envoy Gateway at `<PUBLIC_HOSTNAME>`.
-Config/secrets are read from `/data/BioAgent/app/.env` (see
-`configs/aiscientist.example.env` and [`deploy/`](deploy/)). Redeploy backend changes with
-`./deploy/redeploy.sh` (rsync + `systemctl restart` — drops live sessions; there is no
-zero-downtime backend path). Full deploy kit, TLS, and systemd notes:
-[`deploy/README.md`](deploy/README.md).
-
-**Local / dev.**
+## Run it
 
 ```bash
-./deploy.sh                       # create the venv + install (idempotent)
-./start.sh                        # bind 127.0.0.1:8800 — SSH-tunnel to view
-# or: aiscientist-console --port 8800     (tick "Mock mode" to demo without a cluster)
+./deploy.sh              # create the virtual environment and install (safe to re-run)
+gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1.0   # the skills
+./start.sh               # serve the console on 127.0.0.1:8800
+python3 -m pytest        # the test suite: offline, no cluster, .env or network needed
 ```
 
-Off-cluster testing can point the LLM at any OpenAI-compatible endpoint via
-`AISCIENTIST_LLM_BASE_URL` (e.g. OpenRouter) — a **test convenience**, not the product path
-(storage + compute still assume HPC3). Admin
-user management is `aiscientist-admin`.
+- **Without a cluster:** tick "Mock mode" in the console, or set `AISCIENTIST_LLM_BASE_URL` to
+  any OpenAI-compatible endpoint. Storage and compute still expect HPC3.
+- **Off campus:** the public site needs no VPN. A gateway run on your own computer does, because
+  HPC3's SSH port answers only on the UCI campus network or the VPN.
+- **Skills:** the curated skills are the release `configs/skills_registry.json` pins, not files in
+  this repository. Without it installed the skill library is empty, and the log says so.
+- **Configuration:** every setting is described in
+  [`configs/aiscientist.example.env`](configs/aiscientist.example.env).
+- **Accounts:** `aiscientist-admin` manages users from the command line.
+- **Production:** a systemd unit on the lab server behind the Envoy ingress. The runbook is
+  [`deploy/README.md`](deploy/README.md).
 
----
+## Plan resource estimates
 
-## Versions & rollback
+The plan panel shows time ranges, CPU/GPU hours and cost before approval, then compares
+estimated and actual tool compute after the run. Estimates with missing sizes or little
+history are marked rough. SLURM queue waits, model serving and report overhead are excluded;
+parallel steps may overlap.
 
-- **`v0.1.0` — "pipeline"** (git tag on `main`): the linear PI→Scientist→Critic pipeline.
-  This is the **frozen rollback snapshot** — a known-good, deployable state. Roll back
-  with `git checkout v0.1.0 && ./deploy/redeploy.sh`.
-- **`0.2.0` — "DAG"** (this line): adds the DAG planner, real multi-agent, per-agent
-  memory, and safe concurrency — all feature-flagged over 0.1.0. Merges to and is
-  maintained as the mainline.
+Set `AISCIENTIST_CPU_HOUR_RATE` and `AISCIENTIST_GPU_HOUR_RATE` in the gateway environment
+(USD per allocated hour; zero defaults mean unpriced). Tool calls, including failures, are
+recorded in the existing database; successful runs refine later estimates for the same tool.
+SLURM uses allocation accounting where available; other measurements use wall time and
+requested resources and remain rough. Run API records expose `compute_usage`.
 
+Tools may declare `resource_profile.json` beside `TOOL.md`: `unit` (`samples`, `cells`, `gb`),
+`baseline`, and `steps`, each with `name`, requested `cpus`, `gpus`, `mem_gb` and a two-value
+`minutes` range. See `src/aiscientist/tools/run_cellqc/resource_profile.json`. Dataset metadata
+supplies the sample count, cell count or GB for scaling; Cell Ranger library counts are inferred.
+Tools without profiles use rough defaults.
 
----
-
-## Test
-
-```bash
-python3 -m pytest        # offline; no cluster, .env, or network needed
-```
-
----
-
-## Package layout
+## Repository layout
 
 ```text
 src/aiscientist/
-  agents/        the research lab (PI/Scientist/Critic), DAG planner, agent memory,
-                 tool registry, CodeAct sandbox, provenance
-  gateway/       web console: SSH+Duo, Slurm vLLM serve + tunnel, accounts, chat history,
-                 uploads, report assembly, HPC3 offload (analysis/report/scGPT/VL review)
-  tools/         real analysis (scanpy/gseapy), literature (Europe PMC + PaperQA2),
-                 report (pandoc), scGPT annotation, visual review, schematic, datasets
-  lab/           research-lab support
-  providers/     OpenAI-compatible LLM client (+ fallback)
-  integrations/  DataBoundaryGuard safety (+ dormant adapters)
-  hpc/           Slurm boundaries
-  core/          shared config
-frontend/console/  the browser UI (served from disk per request)
-deploy/            systemd unit, k8s/Envoy, nginx, HPC3 container defs, redeploy kit
+  gateway/       the web app: accounts, the HPC3 session, LLM clients, Slurm job executors
+  agents/        the research lab (PI, Scientist, Critic), the planner, the fast chat path
+  tools/         every model-callable tool, one folder each
+  reporting/     report rendering, the result bundle, the reference list
+  metadata/      Croissant metadata for datasets and results
+  hpc/           the HPC3 shell session and its tools
+frontend/console/  the browser UI
+preset_pipelines/  protocols for the PI
+deploy/            the systemd unit, Kubernetes and Envoy config, HPC3 container definitions
+configs/           the configuration reference
+docs/              architecture, findings, HPC3 storage and assets
+tests/             the offline test suite
 ```
 
----
+## Documentation
 
-## Status
+- [`docs/architecture/README.md`](docs/architecture/README.md): how the system is built.
+- [`docs/FINDINGS.md`](docs/FINDINGS.md): what has been measured and decided, and why.
+- [`src/aiscientist/tools/README.md`](src/aiscientist/tools/README.md): the tool index.
+- [`docs/skills_and_pipelines_architecture.md`](docs/skills_and_pipelines_architecture.md): tools,
+  skills and pipelines in detail.
+- [`docs/hpc3_storage_layout.md`](docs/hpc3_storage_layout.md) and
+  [`docs/hpc3_assets.md`](docs/hpc3_assets.md): what lives where on HPC3, and what is cleaned up.
+- [`deploy/README.md`](deploy/README.md): deploying and updating the server.
+- [`docs/claude_api_guide.md`](docs/claude_api_guide.md): using your Claude subscription's API
+  credits with AiScientist, keeping the key safe, and watching what it spends.
+- [`docs/development/metadata.md`](docs/development/metadata.md): the metadata guideline, the
+  metadata API and the MCP server.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute.
 
-**Implemented + tested** (about 2,000 offline tests): the web console (accounts, SSH/Duo, Slurm
-vLLM serve + tunnel, GPU isolation, mid-run tunnel/serve auto-recovery), the linear
-PI→Scientist→Critic lab, the DAG planner + real multi-agent + per-agent evolving memory
-(feature-flagged), the real scanpy/gseapy analysis line, the `run_code` sandbox, the
-literature line (Europe PMC + PaperQA2) with manuscript references, deterministic pandoc
-PDF/DOCX reports with regenerate-without-rerun, HPC3 offload of uploads/analysis/report,
-and server-side chat history + resumable upload. What has been measured (validation results)
-and decided (and why) is summarised in [`docs/FINDINGS.md`](docs/FINDINGS.md); how the code is
-laid out is in [`docs/architecture/README.md`](docs/architecture/README.md).
-
-**Direction:**
-LangGraph + Postgres-checkpointer port of the loop, provenance stamping, and moving the tools
-and skills into their own repositories so they can be contributed to independently.
+Released under the [MIT License](LICENSE).

@@ -57,6 +57,11 @@ class PreflightingExecutor:
             self.emit(level, "preflight", message)
 
     def __call__(self, code: str) -> dict[str, Any]:
+        from ..agents.skills_registry import POLICY
+        if POLICY.get() is not None:
+            # The shared-cache probe/install path uses an uncontained worker shell. Registry
+            # skills must execute inside their declared policy, including on missing imports.
+            return self.inner(code)
         try:
             report = self._resolve(code)
         except Exception as exc:  # noqa: BLE001 - preflight is an optimisation, never a blocker

@@ -14,13 +14,15 @@ lifecycle in :mod:`aiscientist.gateway.slurm_job` (submit → wait for a node wi
 for completion → collect output). Everything goes through the ``RemoteExecutor`` protocol, so the
 whole flow runs offline against a scripted fake in tests — no real Slurm, no SSH.
 
-Isolation & data safety come from the same Singularity contract the scGPT job already uses: the
+Isolation & data safety come from the same Apptainer contract the scGPT job already uses: the
 dataset is bind-mounted **read-only**, only work/artifacts are writable, and ``--containall`` hides
 every other host path. Network access follows :func:`~aiscientist.agents.sandbox.sandbox_network_enabled`
 — ON by default (Jin Li 2026-07-08: prioritize effectiveness), toggled off with
-``AISCIENTIST_SANDBOX_NETWORK=0`` (which restores ``--net --network none``). If no live remote is wired,
-the executor falls back to a local ``CodeSandbox`` so a run never hard-fails just because HPC is
-unavailable.
+``AISCIENTIST_SANDBOX_NETWORK=0`` (which restores ``--net --network none``).
+
+Whether a snippet may ever run on the gateway host instead is the gateway's decision, not this
+class's: it passes ``local_fallback`` only on a console without accounts (``app._host_code_allowed``).
+Without one, a snippet that cannot run on HPC3 is not run at all: the call returns the reason.
 
 Example sbatch request this produces (CPU analysis job, real memory cap; network on by default) —
 also documented in the ``run`` skill::
@@ -34,8 +36,9 @@ also documented in the ``run`` skill::
     #SBATCH --time=01:00:00
     #SBATCH --output=<scratch>/bioagent_runcode_3-%j.log
 
-    singularity exec --containall --writable-tmpfs \\
-      -B <dataset>:<dataset>:ro -B <work>:<work> -B <artifacts>:<artifacts> \\
+    apptainer exec --containall --writable-tmpfs \\
+      -B <dataset>:<dataset>:ro -B <dir of each other bound file>:<same>:ro \\
+      -B <work>:<work> -B <artifacts>:<artifacts> \\
       <image> bash -lc 'python <scratch>/snippet_3.py > out 2> err; echo $? > rc'
 """
 
@@ -45,12 +48,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from ..agents.sandbox import sandbox_network_enabled
+from ..agents.sandbox import input_env, sandbox_network_enabled
 from .executor import RemoteExecutor
 from .job_store import JobRecord, JobStore
 from .slurm_job import (
     AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script,
-    run_batch_job, singularity_exec)
+    run_batch_job, container_exec, slurm_time_to_seconds)
 
 # A heredoc sentinel that will never collide with real Python source.
 _SNIPPET_EOF = "AISCIENTIST_SNIPPET_EOF_c0ffee"
@@ -65,36 +68,46 @@ class SlurmCodeExecutor:
     """A ``CodeExecutor`` that runs each snippet as a contained CPU batch job on HPC3.
 
     ``remote`` is the connected ``RemoteExecutor`` (SSH to HPC3). ``container_image`` is the same
-    Singularity image already used for the analysis stack. The dataset/work/artifacts paths are the
+    Apptainer image already used for the analysis stack. The dataset/work/artifacts paths are the
     **remote** (HPC3 DFS) locations the snippet reads/writes; they are exposed to the snippet as the
     usual ``AISCIENTIST_DATASET`` / ``AISCIENTIST_WORK`` / ``AISCIENTIST_ARTIFACTS`` env vars.
     """
 
     remote: RemoteExecutor | None
+    supports_skill_policy = True
     container_image: str
     # These three are BIND-MOUNTED into the container on the COMPUTE NODE, so they must be paths the
-    # HPC3 node can see — i.e. dfs3b, NOT the eyeserver-local /data/BioAgent run dir (binding a local
+    # HPC3 node can see — i.e. dfs3b, NOT the eyeserver-local /data/aiscientist run dir (binding a local
     # path there fails container creation with exit 127; see app.py's run_code wiring). Mirror the
     # analysis/VEP lines, which pass dfs3b paths via _storage_base(conn) / decisions['hpc_primary'].
     dataset_path: str | None = None
     work_dir: str | None = None
     artifacts_dir: str | None = None
+    # The dfs3b folder the primary dataset was picked from (a bound folder), bound read-only and
+    # exposed as AISCIENTIST_DATASET_ROOT. Binding only the primary FILE hid the rest of the
+    # delivery: a snippet could not open the raw matrix sitting next to the filtered one.
+    dataset_root: str | None = None
     # Eyeserver-local dir to mirror the job's artifacts back into (the report bundler is still on the
     # host). NOT bind-mounted — only a get_file target — so a local path here is correct. None → no sync.
     local_artifacts: str | None = None
-    scratch_dir: str = "$HOME/.bioagent/runcode"
+    # Where each job's script, output files and logs go. Required, with no default: the gateway
+    # passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    scratch_dir: str = field(kw_only=True)
     mem_gb: int = 64
     cpus: int = 8
     partition: str = "standard"
     account: str = ""
     time_limit: str = "01:00:00"
     container_module: str = ""
-    container_bin: str = "singularity"
+    container_bin: str = "apptainer"
     max_output: int = 20_000
     startup_timeout_s: int = 600     # HPC queues can be long; keep the whole run patient
     run_timeout_s: int = 1800
-    # Fallback used when no live remote is wired (offline/mock, or HPC not enabled). Kept as a
-    # plain callable so this module has no hard dependency on CodeSandbox's shape.
+    # Runs the snippet on the GATEWAY HOST when HPC3 cannot (no live remote, or a failed job and
+    # ``fallback_on_error``). None = never: the call returns the reason instead. The gateway passes
+    # one only on a console without accounts; with accounts on, the local sandbox is a subprocess
+    # of a service that holds every account's keys. Kept as a plain callable so this module has no
+    # hard dependency on CodeSandbox's shape.
     local_fallback: object | None = None
     fallback_on_error: bool = True
     # Optional durable registry: when set, each submitted job is recorded the instant its
@@ -110,7 +123,19 @@ class SlurmCodeExecutor:
     # import packages any lab member has installed — the point being that nobody installs the
     # same thing twice. Empty disables it entirely and the sandbox behaves exactly as before.
     package_cache_root: str = ""
+    # Images a SKILL declares (``image:`` in its SKILL.md) for ``run_in_image``: the shared dfs3b
+    # containers directory they are provisioned into on first use, and the lab's shared conda
+    # download cache those builds read from. Empty images_dir -> run_in_image says it is not enabled.
+    images_dir: str = ""
+    pkgs_cache_dir: str = ""
+    # Progress lines for the console, e.g. "building the image": (level, message).
+    notify: Callable[[str, str], None] | None = None
+    # The run's OTHER bound files ({name, role, path}, dfs3b paths), exposed read-only as
+    # AISCIENTIST_INPUTS / AISCIENTIST_REFERENCE. ``--containall`` hides every path not bound, so
+    # without this a second upload (a reference atlas) existed on dfs3b and no snippet could open it.
+    inputs: tuple[dict, ...] = ()
     _counter: int = field(default=0, repr=False)
+    _images: dict[str, str] = field(default_factory=dict, repr=False)
     _scratch: str | None = field(default=None, repr=False)
 
     @property
@@ -150,14 +175,89 @@ class SlurmCodeExecutor:
             return {"status": "cancelled", "error": "Run cancelled by the user.",
                     "returncode": None, "stdout": "", "stderr": ""}
         except SlurmJobError as exc:
-            if self.fallback_on_error:
+            if self.fallback_on_error and callable(self.local_fallback):
                 return self._fallback(code, f"Slurm job failed: {exc}")
-            return {"status": "error", "error": f"Slurm job failed: {exc}",
+            return {"status": "error", "execution_mode": "hpc_slurm",
+                    "error": (f"Slurm job failed: {exc}. The snippet was not run on the gateway "
+                              "host. Fix the cause and call run_code again: it is resubmitted to "
+                              "HPC3."),
                     "returncode": None, "stdout": "", "stderr": str(getattr(exc, "detail", "") or "")}
+
+    def run_in_image(self, command: str, image: str, *, workdir: str, cpus: int = 0,
+                     mem_gb: int = 0, time_limit: str = "",
+                     files: "dict[str, str] | None" = None) -> dict[str, object]:
+        """Run a SHELL ``command`` inside container ``image`` (a skill's declared environment) as a
+        Slurm job, with the same data contract as a snippet: the dataset read-only, work/artifacts
+        writable, the AISCIENTIST_* variables set.
+
+        ``workdir`` is the command's directory under the run's work dir (it persists across calls,
+        so a pipeline's intermediate output survives to the next step); ``files`` are the skill's
+        bundled files, ``{relative path: local path}``, staged into ``<workdir>/.skill``. Resources
+        default to this executor's. There is no local fallback: the command needs the image."""
+        command = (command or "").strip()
+        if not command:
+            return {"status": "error", "error": "no command provided"}
+        if self.remote is None:
+            return {"status": "not_enabled", "note": "needs a live HPC3 session"}
+        if not self.images_dir or not self.work_dir:
+            return {"status": "not_enabled",
+                    "note": "no shared containers directory / work dir is configured for HPC3"}
+        try:
+            sif = self._image(image)
+            wd = f"{str(self.work_dir).rstrip('/')}/{workdir.strip('/')}"
+            made = self.remote.exec(f"mkdir -p {shlex_quote(wd)}/.skill {shlex_quote(wd)}/.home "
+                                    f"{shlex_quote(wd)}/.tmp")
+            if not made.ok:
+                raise SlurmJobError("could not create the working directory on HPC3",
+                                    detail=made.stderr)
+            for rel, local in (files or {}).items():
+                self.remote.put_file(local, f"{wd}/.skill/{rel}")
+            cpus = int(cpus or self.cpus)
+            time_limit = time_limit or self.time_limit
+            exports = {"AISCIENTIST_ENV_DIR": wd, "AISCIENTIST_SKILL_DIR": f"{wd}/.skill",
+                       "AISCIENTIST_JOB_CPUS": str(cpus), "HOME": f"{wd}/.home",
+                       "TMPDIR": f"{wd}/.tmp"}
+            out = self._submit(command, kind="env", runner="bash", image=sif, cpus=cpus,
+                               mem_gb=int(mem_gb or self.mem_gb), time_limit=time_limit,
+                               cwd=wd, extra_exports=exports, package_cache=False,
+                               run_timeout_s=slurm_time_to_seconds(time_limit) + 600)
+        except JobCancelled:
+            return {"status": "cancelled", "error": "Run cancelled by the user.",
+                    "returncode": None, "stdout": "", "stderr": ""}
+        except SlurmJobError as exc:
+            return {"status": "error", "error": f"Slurm job failed: {exc}", "returncode": None,
+                    "stdout": "", "stderr": str(getattr(exc, "detail", "") or "")}
+        out["execution_mode"] = "hpc_slurm_image"
+        out["environment"] = {"image": image, "sif": sif, "workdir": wd}
+        return out
+
+    def _image(self, ref: str) -> str:
+        if ref not in self._images:
+            from ..agents.skills_registry import POLICY
+            policy = POLICY.get()
+            if policy and policy["network"] == "none":
+                from .tool_images import image_sif_name
+                sif = f"{self.images_dir.rstrip('/')}/{image_sif_name(ref)}"
+                if not self.remote.exec(f"test -s {shlex_quote(sif)}").ok:
+                    raise SlurmJobError("skill does not declare network access for image installation")
+                return sif
+            from .slurm_analysis import provision_image
+            self._counter += 1
+            self._images[ref] = provision_image(
+                self.remote, ref, self.images_dir, scratch=self._resolved_scratch(),
+                job_name=f"bioagent_image_{self._counter}", partition=self.partition,
+                account=self.account, container_module=self.container_module,
+                container_bin=self.container_bin, startup_timeout_s=self.startup_timeout_s,
+                should_cancel=self.should_cancel, pkgs_cache=self.pkgs_cache_dir,
+                say=self.notify)
+        return self._images[ref]
 
     # -- internals ------------------------------------------------------------
 
     def _fallback(self, code: str, reason: str) -> dict[str, object]:
+        from ..agents.skills_registry import POLICY
+        if POLICY.get() is not None:
+            return {"status": "error", "error": f"registry skill cannot use local fallback: {reason}"}
         if callable(self.local_fallback):
             out = self.local_fallback(code)
             if isinstance(out, dict):
@@ -165,13 +265,28 @@ class SlurmCodeExecutor:
                 out["fallback_reason"] = reason
                 return out
         return {"status": "not_enabled",
-                "note": f"CodeAct HPC execution unavailable ({reason}) and no local fallback is set."}
+                "note": f"run_code could not run on HPC3 ({reason}), and it is not run on the "
+                        "gateway host."}
+
+    def _input_binds(self) -> tuple[str, ...]:
+        """Read-only binds for the other bound files: each one's PARENT directory, never the bare
+        file — a file bind FATALs when that path is absent from the image (slurm_analysis binds
+        dirname() for the same reason). Skipped when already under the rw work/artifacts binds."""
+        rw = [p.rstrip("/") + "/" for p in (self.work_dir, self.artifacts_dir) if p]
+        out: list[str] = []
+        for i in self.inputs:
+            path = str(i.get("path") or "") if isinstance(i, dict) else ""
+            parent = str(Path(path).parent) if path else ""
+            if parent and parent != "/" and parent not in out and not any(
+                    (parent.rstrip("/") + "/").startswith(r) for r in rw):
+                out.append(parent)
+        return tuple(out)
 
     def _resolved_scratch(self) -> str:
         """Expand shell vars (e.g. ``$HOME``) in ``scratch_dir`` to a concrete remote path ONCE.
 
         ``scratch`` is used **unquoted** in the SSH shell (``mkdir``/heredoc — ``$HOME`` expands) but
-        also lands in the ``singularity -B`` binds and the ``#SBATCH --output`` directive, and **Slurm
+        also lands in the ``apptainer -B`` binds and the ``#SBATCH --output`` directive, and **Slurm
         does NOT expand ``$HOME`` in ``#SBATCH`` lines** — so an unresolved ``$HOME`` makes the job's
         log path a literal ``$HOME/.bioagent/runcode/...``. Resolve up front (mirrors
         ``SlurmAnalysisExecutor._resolved_scratch``). If the remote can't expand it (offline/mock), keep
@@ -188,51 +303,101 @@ class SlurmCodeExecutor:
         return scratch
 
     def _run_on_slurm(self, code: str) -> dict[str, object]:
-        self._counter += 1
-        name = f"bioagent_runcode_{self._counter}"
-        scratch = self._resolved_scratch()
-        snippet = f"{scratch}/snippet_{self._counter}.py"
-        out_f, err_f, rc_f = (f"{scratch}/{name}.{ext}" for ext in ("out", "err", "rc"))
+        return self._submit(code, kind="runcode", runner="python", image=self.container_image,
+                            cpus=self.cpus, mem_gb=self.mem_gb, time_limit=self.time_limit,
+                            extra_exports={"MPLBACKEND": "Agg"}, package_cache=True,
+                            run_timeout_s=self.run_timeout_s)
 
-        # Stage the snippet on the cluster (quoted heredoc → no shell/`$` expansion of the code).
+    def _submit(self, source: str, **kwargs) -> dict[str, object]:
+        # A registry skill's ``scheduler`` says whether the skill itself needs Slurm. It does not
+        # gate this job: the job is how the platform contains every snippet, and the code inside
+        # (--containall, no Slurm client or munge socket bound) cannot submit jobs of its own, so no
+        # skill is given scheduler access whatever it declares.
+        from ..agents.skills_registry import POLICY
+        import tempfile
+        import uuid
+        policy = POLICY.get()
+        secret_file = ""
+        try:
+            if policy and policy["secret_values"]:
+                secret_file = f"{self._resolved_scratch()}/.secrets-{uuid.uuid4().hex}"
+                made = self.remote.exec(f"umask 077; mkdir -p {shlex_quote(self._resolved_scratch())} "
+                                        f"&& : > {shlex_quote(secret_file)}")
+                if not made.ok:
+                    raise SlurmJobError("cannot create per-run credential directory")
+                with tempfile.TemporaryDirectory(prefix="aiscientist-credentials-") as temp:
+                    path = Path(temp) / "env"
+                    path.write_text("\n".join(f"export {k}={shlex_quote(v)}" for k, v in
+                                              policy["secret_values"].items()), encoding="utf-8")
+                    self.remote.put_file(str(path), secret_file)
+                if not self.remote.exec(f"chmod 600 {shlex_quote(secret_file)}").ok:
+                    raise SlurmJobError("cannot protect per-run credentials")
+            return self._submit_job(source, secret_file=secret_file, **kwargs)
+        finally:
+            if secret_file:
+                self.remote.exec(f"rm -f -- {shlex_quote(secret_file)}")
+
+    def _submit_job(self, source: str, *, kind: str, runner: str, image: str, cpus: int, mem_gb: int,
+                time_limit: str, run_timeout_s: int, cwd: str = "",
+                extra_exports: "dict[str, str] | None" = None,
+                package_cache: bool = False, secret_file: str = "") -> dict[str, object]:
+        """Stage ``source`` as a script, run it with ``runner`` inside ``image`` as a contained Slurm
+        job, and collect stdout/stderr/exit code plus the artifacts it wrote."""
+        self._counter += 1
+        name = f"bioagent_{kind}_{self._counter}"
+        scratch = self._resolved_scratch()
+        ext = "py" if runner == "python" else "sh"
+        snippet = f"{scratch}/snippet_{self._counter}.{ext}"
+        out_f, err_f, rc_f = (f"{scratch}/{name}.{ext_}" for ext_ in ("out", "err", "rc"))
+
+        # Stage the script on the cluster (quoted heredoc → no shell/`$` expansion of the code).
         write = self.remote.exec(
-            f"mkdir -p {scratch} && cat > {snippet} <<'{_SNIPPET_EOF}'\n{code}\n{_SNIPPET_EOF}"
+            f"mkdir -p {scratch} && cat > {snippet} <<'{_SNIPPET_EOF}'\n{source}\n{_SNIPPET_EOF}"
         )
         if not write.ok:
             raise SlurmJobError("failed to stage the snippet on the cluster", detail=write.stderr)
 
-        # Expose the run's data to the snippet exactly like CodeSandbox does, then run it contained,
+        # Expose the run's data to the script exactly like CodeSandbox does, then run it contained,
         # capturing stdout/stderr/exit-code to files (so a non-zero exit does not abort the sbatch
         # script — we want the traceback + returncode back, not a bare job failure).
-        exports = "; ".join(
-            f'export {var}={shlex_quote(val)}'
-            for var, val in (
-                ("AISCIENTIST_DATASET", self.dataset_path),
-                ("AISCIENTIST_WORK", self.work_dir),
-                ("AISCIENTIST_ARTIFACTS", self.artifacts_dir),
-                ("MPLBACKEND", "Agg"),
-            )
-            if val
-        )
-        # The lab-shared package cache. Resolved INSIDE the container (the key depends on the
-        # image's own Python version) and bound read-only, so a snippet can import a library some
-        # other member installed — without this image having to be rebuilt, and without the second
-        # user re-downloading it. Fails open: no cache, or an unreadable one, just means the
-        # image's own packages. See gateway/package_cache.py for why it appends to sys.path
-        # rather than going through PYTHONPATH.
-        preamble, cache_binds = self._package_cache_preamble()
-        inner_payload = (f"{preamble}{exports}; python {snippet} > {out_f} 2> {err_f}; "
+        variables = [("AISCIENTIST_DATASET", self.dataset_path),
+                     ("AISCIENTIST_DATASET_ROOT", self.dataset_root),
+                     ("AISCIENTIST_WORK", self.work_dir),
+                     ("AISCIENTIST_ARTIFACTS", self.artifacts_dir),
+                     *input_env(self.inputs).items(),
+                     *(extra_exports or {}).items()]
+        exports = "; ".join(f"export {var}={shlex_quote(val)}" for var, val in variables if val)
+        # The lab-shared package cache (run_code only). Resolved INSIDE the container (the key
+        # depends on the image's own Python version) and bound read-only, so a snippet can import a
+        # library some other member installed — without this image having to be rebuilt, and
+        # without the second user re-downloading it. Fails open: no cache, or an unreadable one,
+        # just means the image's own packages. See gateway/package_cache.py for why it appends to
+        # sys.path rather than going through PYTHONPATH.
+        preamble, cache_binds = self._package_cache_preamble() if package_cache else ("", ())
+        enter = f"cd {shlex_quote(cwd)}; " if cwd else ""
+        if secret_file:
+            enter = f". {shlex_quote(secret_file)}; " + enter
+        inner_payload = (f"{preamble}{exports}; {enter}{runner} {snippet} > {out_f} 2> {err_f}; "
                          f"echo $? > {rc_f}")
-        binds_ro = tuple(p for p in (self.dataset_path, *cache_binds) if p)
+        root = (self.dataset_root or "").rstrip("/")
+        inside_root = bool(root and self.dataset_path
+                           and str(self.dataset_path).startswith(root + "/"))
+        binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
+                                     *self._input_binds())
+                         if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
-        inner = singularity_exec(
-            self.container_image, inner_payload,
-            binds_ro=binds_ro, binds_rw=binds_rw, nv=False, network=sandbox_network_enabled(),
-            container_bin=self.container_bin,
+        from ..agents.skills_registry import POLICY, network_allowed
+        policy = POLICY.get()
+        gpu = bool(policy and policy["gpu"])
+        network = network_allowed(policy, sandbox_network_enabled())
+        inner = container_exec(
+            image, inner_payload,
+            binds_ro=binds_ro, binds_rw=binds_rw, nv=gpu, network=network,
+            container_bin=self.container_bin, cleanenv=bool(policy),
         )
         script = build_analysis_script(
-            name, inner, partition=self.partition, cpus=self.cpus, mem_gb=self.mem_gb,
-            time_limit=self.time_limit, account=self.account, gres="",  # CPU-only analysis job
+            name, inner, partition=self.partition, cpus=cpus, mem_gb=mem_gb,
+            time_limit=time_limit, account=self.account, gres="gpu:1" if gpu else "",
             container_module=self.container_module, log_dir=scratch,
         )
         spec = SlurmJobSpec(script=script, job_name=name, submit_dir=scratch)
@@ -240,12 +405,12 @@ class SlurmCodeExecutor:
         def _record(job_id: str) -> None:
             if self.job_store is not None:
                 self.job_store.record(JobRecord(
-                    job_id=job_id, job_name=name, kind="runcode",
+                    job_id=job_id, job_name=name, kind=kind,
                     owner=self.owner or getattr(self.remote, "username", ""),
                     submit_dir=scratch, state="SUBMITTED",
                 ))
 
-        # What the snippet WRITES is the step's evidence, and until now nothing reported it: the
+        # What the script WRITES is the step's evidence, and until now nothing reported it: the
         # result carried stdout and a return code, so ``evidence_pointers`` found only the input
         # dataset and every Critic verdict on a run_code step read "no backing artifact" — capping
         # the score in the 0.6-0.8 band and leaving the report unable to cite tables that existed
@@ -254,14 +419,14 @@ class SlurmCodeExecutor:
         result = run_batch_job(
             self.remote, spec,
             acquire=AcquireConfig(startup_timeout_s=self.startup_timeout_s),
-            run=RunConfig(run_timeout_s=self.run_timeout_s),
+            run=RunConfig(run_timeout_s=run_timeout_s),
             on_submit=_record if self.job_store is not None else None,
-            should_cancel=self.should_cancel,   # Stop scancels the in-flight run_code job
+            should_cancel=self.should_cancel,   # Stop scancels the in-flight job
         )
         if self.job_store is not None:
             self.job_store.mark(result.job_id, state=result.state, node=result.node,
                                 completed=result.completed)
-        out = self._collect(result, out_f, err_f, rc_f)
+        out = self._collect(result, out_f, err_f, rc_f, mem_gb=mem_gb)
         written = self._written_since(before_files)
         self._sync_artifacts_back(changed=written)
         out.update(classify_written(written))
@@ -334,7 +499,8 @@ class SlurmCodeExecutor:
             except OSError:
                 continue
 
-    def _collect(self, result, out_f: str, err_f: str, rc_f: str) -> dict[str, object]:
+    def _collect(self, result, out_f: str, err_f: str, rc_f: str,
+                 mem_gb: int = 0) -> dict[str, object]:
         # Read over SFTP, not `cat` on a login node — job output is file content, i.e. a transfer.
         def _text(path: str) -> str:
             return self.remote.read_bytes(path).decode("utf-8", errors="replace")
@@ -361,9 +527,24 @@ class SlurmCodeExecutor:
             hint = ""
             if returncode is None or (result.state or "").upper().startswith("OUT_OF_MEMORY"):
                 hint = (f" (Slurm state {result.state}; if OUT_OF_MEMORY, raise --mem above "
-                        f"{self.mem_gb}G or reduce the snippet's peak memory)")
+                        f"{mem_gb or self.mem_gb}G or reduce the snippet's peak memory)")
             out["error"] = (_tail(stderr, 2000).strip() or f"exited with code {returncode}{hint}")
         return out
+
+
+@dataclass
+class UnavailableCodeExecutor:
+    """A ``CodeExecutor`` that runs nothing and says why.
+
+    What the gateway hands the lab when a run's snippets have nowhere they are allowed to run: HPC3
+    is not available to it, and the gateway host is not an option (``app._host_code_allowed``).
+    Every call fails with ``reason``, so the model reads why instead of retrying blind."""
+
+    reason: str
+
+    def __call__(self, code: str) -> dict[str, object]:
+        return {"status": "not_enabled", "note": self.reason, "error": self.reason,
+                "returncode": None, "stdout": "", "stderr": ""}
 
 
 #: Artifact subdirectories that are step SCAFFOLDING, never a step's evidence — the job's own

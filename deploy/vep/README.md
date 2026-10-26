@@ -6,8 +6,8 @@ offline-tested (`src/aiscientist/tools/annotate_variants/offline.py` + `variant_
 `SlurmAnalysisExecutor` with an injected runner — no cluster, no VEP, no network in CI:
 `tests/test_vcf_offline.py`). This folder is the **image + cache build kit**.
 
-> ⚠️ macOS cannot build `.sif`. Build on **HPC3** (a **login node** — the cache download needs
-> internet; compute nodes don't) or any Linux host with `singularity`.
+> ⚠️ macOS cannot build `.sif`. Build on an **HPC3 compute node** (`standard` nodes have egress for the
+> cache download; RCIC bans builds and downloads on login nodes) or any Linux host with `apptainer`.
 
 ## Why this exists
 
@@ -24,13 +24,13 @@ A full WGS VCF forks through in ~30–60 min under `#SBATCH --mem` (a real cgrou
 ## Build & stage
 
 ```bash
-# on an HPC3 LOGIN node, from a checkout of this repo:
-module load singularity            # HPC3 has apptainer/1.4.5, singularity/3.11.3
+# on HPC3, from a checkout of this repo (builds + downloads go to a COMPUTE node: RCIC bans them on
+# the login nodes, and `standard` compute nodes have egress):
 cd deploy/vep
 
-# 1. build the image (deps-only: vep + bcftools + python3) — pick a route the script prints
-singularity build --fakeroot vep.sif vep.def       # if RCIC enables --fakeroot
-#   ...or `singularity build --remote vep.sif vep.def`
+# 1. build the image (deps-only: vep + bcftools + python3) — Apptainer --fakeroot, no /etc/subuid entry needed
+sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-vep --wait \
+  --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=$TMPDIR/ac apptainer build --fakeroot vep.sif vep.def'
 
 # 2. stage the .sif + download BOTH caches (GRCh38 + GRCh37) and the ClinVar VCFs to dfs3b
 BUILT=1 ./build_and_stage.sh
@@ -61,14 +61,16 @@ AISCIENTIST_VEP_CLINVAR_GRCH38=/dfs3b/ruic20_lab/software/reference/vep_annotati
 AISCIENTIST_VEP_CLINVAR_GRCH37=/dfs3b/ruic20_lab/software/reference/vep_annotation/clinvar_GRCh37.vcf.gz
 AISCIENTIST_VEP_ASSEMBLY=GRCh38          # default; LLM can override per call
 AISCIENTIST_VEP_FORK=8
-AISCIENTIST_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
 ```
 
-The VCF + the run's work/artifacts dirs must be reachable on the compute node (shared DFS — they are,
-via `uploads_on_hpc`). The AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` by the
-gateway and bind-mounted in, so a tool edit needs a code deploy, NOT an image rebuild. If HPC is
-unreachable at run time, `annotate_variants` falls back to the REST path in-process (fine for small
-VCFs).
+The VCF + the run's work/artifacts dirs must be reachable on the compute node. They are on dfs3b:
+the run's dirs are under `Temp/<ucinetid>/variant/<run_id>/`, and a VCF kept on the server (an
+upload under `AISCIENTIST_DATA_ROOT`) is copied to dfs3b when the run starts, into the session's own
+`Temp/<ucinetid>/server-data/` or the run's folder (a deployment without a data root uses
+`AISCIENTIST_UPLOADS_ON_HPC=1`, which puts uploads on dfs3b). The AiScientist **tools** are synced
+to `<lab_storage>/<user>/pysrc` by the gateway and bind-mounted in, so a tool edit needs a code
+deploy, NOT an image rebuild. If HPC is unreachable at run time, `annotate_variants` falls back to
+the REST path in-process (fine for small VCFs).
 
 ## Keep in sync
 

@@ -11,7 +11,7 @@ Same shape as `deploy/scgpt/` — a short-lived, on-demand `gpu:1` batch job, fu
 in a `.sif`, **not** co-located on Qwen's vLLM GPU and **not** a persistent second GPU.
 
 ## Files
-- `vlreview.def` — Singularity image (transformers + qwen-vl-utils + PyMuPDF). Weights are
+- `vlreview.def` — Apptainer image (transformers + qwen-vl-utils + PyMuPDF). Weights are
   **not** baked in — bind-mounted read-only at run time.
 - `run_review.py` — in-container CLI: rasterize pdf → deterministic bbox-overlap pre-check
   (no GPU) → Qwen2.5-VL page review → `review.json` (defects + fix directives).
@@ -35,8 +35,7 @@ rsync -av deploy/vlreview/ scripts/hpc3_vlreview_setup.sh <ucinetid>@access-hpc3
 ssh <ucinetid>@hpc3.rcic.uci.edu && newgrp ruic20_hpc
 srun -c 4 -p free --time=2:00:00 --pty /bin/bash -i
 cd ~/vlreview-build && bash hpc3_vlreview_setup.sh
-#   custom .def has no fakeroot on HPC3 (no /etc/subuid entry) -> it builds via --remote
-#   (Sylabs): `singularity remote login` once, then AISCIENTIST_VLREVIEW_BUILD_MODE=remote.
+#   builds the custom .def with `apptainer build --fakeroot` (no /etc/subuid entry needed on HPC3)
 ```
 Produces `…/containers/vlreview.sif` + `…/vlreview_model/` on dfs3b.
 

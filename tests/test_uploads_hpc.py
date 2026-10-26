@@ -36,7 +36,7 @@ def test_uploads_on_hpc_gate():
 def test_is_remote_dataset():
     conn = _conn()
     assert gw_app._is_remote_dataset(conn, f"{LAB_STORAGE}/tester/uploads/x.h5ad") is True
-    assert gw_app._is_remote_dataset(conn, "/data/BioAgent/tester/uploads/x.h5ad") is False
+    assert gw_app._is_remote_dataset(conn, "/data/aiscientist/tester/uploads/x.h5ad") is False
     assert gw_app._is_remote_dataset(conn, "") is False
 
 

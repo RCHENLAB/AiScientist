@@ -1,0 +1,52 @@
+# systemd unit for the AiScientist console.
+#
+# Replaces hand-running ./start.sh: keeps the app alive (Restart=always), starts it on
+# boot, and gives one-command restarts for the frequent-update workflow:
+#     sudo systemctl restart aiscientist.service   # picks up new backend code (frontend is hot)
+#     sudo systemctl status  aiscientist.service
+#     journalctl -u aiscientist -f                 # live logs (incl. the code-fingerprint line)
+#
+# Bind address: on the eyeserver the Envoy Gateway terminates TLS on :443 and routes to the host's
+# internal node IP, so the unit binds that IP (--host 128.200.71.197), not 127.0.0.1. On a bare
+# host behind nginx (deploy/nginx/) bind 127.0.0.1 instead.
+# Because the app is a stateful singleton (per-session SSH tunnels to HPC3), a restart drops
+# live sessions; users simply reconnect. There is no zero-downtime path for backend changes.
+#
+# Install (run as a user with sudo on eyeserver):
+#     sudo cp deploy/systemd/aiscientist.service /etc/systemd/system/aiscientist.service
+#     # edit User= / paths / --host below if your service account or layout differ
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now aiscientist.service
+#
+# Config/secrets are read from /data/aiscientist/app/.env by the app itself (load_project_env).
+# For the PUBLIC deploy that .env MUST set:  AISCIENTIST_STATE_DIR=/data/aiscientist/state  (the app
+# keeps the session secret there, 0600) and AISCIENTIST_PUBLIC_HTTPS=1  (marks session cookies
+# Secure). See deploy/README.md.
+
+[Unit]
+Description=AiScientist console (FastAPI/uvicorn)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Service account (no login shell).
+User=aiscientist
+Group=aiscientist
+# Versioned layout (deploy/deploy_release.sh): app/current is a symlink to the active release and
+# each release has its own venv, so a deploy or rollback is a symlink switch plus a restart.
+WorkingDirectory=/data/aiscientist/app/current
+# The app loads /data/aiscientist/app/.env on startup; EnvironmentFile is belt-and-suspenders
+# for anything read at import time. Comment out if you rely solely on the app's .env loader.
+EnvironmentFile=-/data/aiscientist/shared/.env
+ExecStart=/data/aiscientist/app/current/.venv/bin/python -m aiscientist.gateway --host 128.200.71.197 --port 8800
+# The start fails if the app does not answer /health, so a bad release shows in systemctl.
+ExecStartPost=/usr/bin/curl --retry 30 --retry-delay 2 --retry-connrefused -fsS -o /dev/null http://128.200.71.197:8800/health
+Restart=always
+RestartSec=2
+# Give in-flight requests a moment to drain on restart.
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

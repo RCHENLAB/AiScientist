@@ -1,147 +1,141 @@
-# VCF pipeline — tool & data inventory
+# The variant (VCF) line: tools and data
 
-The canonical list of every tool and reference dataset the variant (VCF) path uses: what it is (in
-plain terms), where it lives in our code, and its status. Companion to
-[`skills_and_pipelines_architecture.md`](skills_and_pipelines_architecture.md). Last updated 2026-07-08.
+Every program and reference dataset the variant path uses: what it is, where it is in the code,
+and which setting turns it on. The files on HPC3 and their sizes are in
+[`hpc3_assets.md`](hpc3_assets.md); how tools, skills and pipelines fit together is in
+[`skills_and_pipelines_architecture.md`](skills_and_pipelines_architecture.md).
 
-## The path in one line
+## The path
 
-A VCF is a diff: ~5M positions where one person's DNA differs from the reference. The path turns that
-raw diff into interpreted, prioritized variants:
-
-```
-VCF ── normalize ── QC ── annotate (VEP + ClinVar + gnomAD + predictors) ── prioritize ── report
-                                                                      └── (cohort) TileDB-VCF database
-```
-
-## Status legend
-
-- **live** — wired and running today.
-- **staging** — being downloaded / set up (this week).
-- **deferred** — planned, not started (reason noted).
-
-## Tools & data
-
-| Tool / data | What it is (plain) | Type | Where in our code | Status |
-|---|---|---|---|---|
-| **Ensembl VEP** | Variant Effect Predictor — for each variant: which gene, what change (consequence), severity (impact) | CLI + REST | `tools/vcf_offline.py` (offline), `tools/variant_annotation.py` (REST) | **live** |
-| VEP offline cache | Local copy of all gene/transcript annotations so VEP runs with no network, WGS-scale | reference data | `deploy/vep/` → HPC3 `vep_annotation/{GRCh38,GRCh37}` | **live** (GRCh38 25 GB, GRCh37 17 GB) |
-| **bcftools** | Swiss-army CLI for VCFs (filter, normalize, stats, query) | CLI | in `vep.sif`; used by `vcf_offline.py`, `normalize_vcf`, `vcf_qc_stats` | **live** |
-| tabix / htslib | Index + random-access for bgzipped VCF/TSV (fast region lookup) | CLI/lib | in `vep.sif`; indexes cache + plugin files | **live** |
-| **ClinVar** | NCBI database of variants clinically known to cause disease (with a review-status "star" rating) | reference data (VCF) | VEP `--custom`; `vep_annotation/clinvar_{GRCh38,GRCh37}.vcf.gz` | **live** (~180 MB each) |
-| **gnomAD** | Population allele frequencies — how common a variant is (common ⇒ likely harmless) | reference data (in cache) | VEP `--af_gnomade/--af_gnomadg` flags | **live** |
-| SIFT, PolyPhen | Built-in VEP predictors: does a missense change break the protein? | in VEP | `_VEP_ANNOT_FLAGS` (`--sift b --polyphen b`) | **live** |
-| **CADD** | Genome-wide deleteriousness score (incl. non-coding); cutoff ≥20 = damaging | VEP plugin + data | `vep_annotation/plugins/cadd/` (GRCh38 SNVs) | **staged + verified** (87 GB; BRAF V600E cadd_phred=29.8) |
-| **AlphaMissense** | DeepMind's missense pathogenicity score; >0.564 = likely pathogenic | VEP plugin + data | `vep_annotation/plugins/alphamissense/` (hg38) | **staged + verified** (643 MB; am_pathogenicity=0.9927) |
-| **REVEL** | Ensemble missense pathogenicity score; >0.5 = likely pathogenic | VEP plugin + data | `vep_annotation/plugins/revel/` | **staged + verified** (675 MB GRCh38-tabbed; BRAF V600E revel=0.931) |
-| **SpliceAI** (OpenSpliceAI) | Predicts whether a variant disrupts RNA splicing (the splice-prediction class VEP's protein predictors miss) — 4 delta scores (Acceptor/Donor × Gain/Loss); max ≥0.5 = likely splice-altering | PyTorch model (conda env) | `tools/vcf_offline.py` (`build_spliceai_cmd`/`parse_spliceai_vcf`, gated stage) | **installed + verified** — OpenSpliceAI 0.0.7 env + OSAI-MANE-10000nt models; BRAF/SAMD11 donor variants scored DS_DL 0.917/0.755 end-to-end INSIDE vep.sif |
-| MANE Select / HGVS | Pick the one clinically-standard transcript per gene; emit standard `c.`/`p.` variant names | VEP flags | `build_vep_cmd` (`--mane_select` with plugins; `--hgvs` with `AISCIENTIST_REF_FASTA`) | **code done** — activates when plugins / ref FASTA are staged |
-| **TileDB-VCF** | A database that stores many samples' variants in one compressed, indexed array for fast population queries + incremental sample addition | Python lib | `skills/build_variant_db_tiledbvcf/` | **live** (skill; heavy dep, analysis image) |
-| cyvcf2 | Fast Python VCF reader | Python lib | `skills/vcf_qc_stats/` fallback path | **live** (optional) |
-
-## Skills that use these tools
-
-Atomic skills (`skills/<name>/`, folder form — see the architecture doc). Each is a rewritable
-template the agent fetches and runs via `run_code`:
-
-- `normalize_vcf` — **bcftools norm** (atomize MNPs, split multiallelic, left-align indels). Must run
-  before annotation, or a non-canonical indel silently misses ClinVar/gnomAD. Needs a reference FASTA.
-- `vcf_qc_stats` — **bcftools stats** (or cyvcf2 / stdlib fallback): Ti/Tv, Het/Hom, counts, call rate.
-- `clinical_variant_prioritization` — pure stdlib; tiers variants from ClinVar + gnomAD AF + predictors.
-- `build_variant_db_tiledbvcf` — **TileDB-VCF** cohort database.
-
-The end-to-end workflow that composes them: `preset_pipelines/variant_annotation/SKILL.md`.
-
-## Rare-disease / known-gene workflow (Rui Chen's IRD protocol)
-
-For an inherited-disease study the causal variant is rare and usually in a known gene, so `annotate_variants`
-takes two reduction params (both default off → general runs unchanged):
-
-- `genes` — a known disease-gene panel (gene symbols); keeps only variants in those genes. Or
-  `regions_bed` (offline line) to restrict BEFORE VEP for a big compute saving on a WGS VCF.
-- `max_pop_af` — drop variants with gnomAD population AF above this (e.g. `0.01` removes everything
-  >1%); novel / no-frequency variants are kept.
-
-Strategy: known genes (exons + introns) first, common variants dropped; expand to the whole genome only
-if the known-gene search is negative. The result carries `variant_filters` (how many were dropped).
-**Open:** the known-IRD-gene list (from Meng) plugs into `genes` / a panel BED.
-
-## Staging the DBs (Jin Li's download-once pattern)
-
-`deploy/vep/stage_annotation_dbs.sh` — idempotent: checks which DB files already exist under the shared
-plugins dir and downloads only the missing ones (AlphaMissense, CADD, REVEL, reference FASTA), then
-prints the `AISCIENTIST_VEP_*` env lines to set. Bind-mount that dir read-only into `vep.sif`.
-
-## Reference-data footprint on HPC3
-
-Staged in the lab's SHARED reference dir `/dfs3b/ruic20_lab/software/reference/vep_annotation/` (Jin
-Li's convention — download once, mount read-only, reuse across projects; the `vep.sif` container stays
-under `.../AiScientist/containers/`). The lab's dfs3b quota is **600 TiB, ~97% used
-(~16 TiB free)**; Jin Li confirmed the lab keeps **>20 TB free (can grow past 50 TB)** for this, so
-the ~150 GB of predictor data is not a blocker — but download each DB ONCE and bind-mount it (see the
-staging script). Cohort variant databases are the real future consumer:
-
-| Component | Size |
-|---|---|
-| `containers/vep.sif` (VEP + bcftools + tabix) | 230 MB |
-| VEP cache GRCh38 / GRCh37 | 25 GB / 17 GB |
-| ClinVar (both assemblies) | ~360 MB |
-| CADD GRCh38 (staging) | 87 GB |
-| AlphaMissense hg38 (staging) | 643 MB |
-| OpenSpliceAI conda env (torch/cuda libs, `AiScientist/envs/openspliceai`) | ~7 GB |
-| OpenSpliceAI-MANE-10000nt models (5 × 2.8 MB, `reference/spliceai/`) | ~14 MB |
-| **Total (current + this week's plugins + SpliceAI)** | **~137 GB** |
-
-REVEL (+ optional dbNSFP bundle) and GRCh37 plugin copies would add more later; ~130 GB is ~0.8% of
-the ~16 TiB remaining headroom — fits, but not free (the lab is at 97% of its 600 TiB quota).
-
-## Env vars / paths
-
-The code for all of the below is wired (`tools/vcf_offline.py`) and **gated + graceful**: every extra
-is off/skipped unless its env var is set and the data exists, so the baseline SIFT/PolyPhen annotation
-runs unchanged until the deploy env is flipped.
+A VCF lists the positions where one person's DNA differs from the reference, about five million
+for a whole genome. The path turns that list into annotated, prioritized variants:
 
 ```
-AISCIENTIST_VARIANT_ON_HPC=1            # use the offline VEP line (default OFF → REST fallback, 500-cap)
-AISCIENTIST_VEP_IMAGE=.../containers/vep.sif
-AISCIENTIST_VEP_CACHE_DIR_GRCH38=.../vep_annotation/GRCh38
-AISCIENTIST_VEP_CACHE_DIR_GRCH37=.../vep_annotation/GRCh37
-AISCIENTIST_VEP_CLINVAR_GRCH38=.../vep_annotation/clinvar_GRCh38.vcf.gz
-
-# Predictor plugins — set once the data is staged (master switch defaults OFF):
-AISCIENTIST_VEP_PLUGINS=1              # turn on CADD/AlphaMissense/REVEL + MANE-Select
-AISCIENTIST_VEP_PLUGINS_DIR=.../vep_annotation/plugins/vep_plugins   # the .pm scripts (VEP --dir_plugins; no sif rebuild)
-AISCIENTIST_VEP_CADD_SNV=.../vep_annotation/plugins/cadd/whole_genome_SNVs.tsv.gz
-AISCIENTIST_VEP_CADD_INDELS=...       # optional
-AISCIENTIST_VEP_ALPHAMISSENSE=.../vep_annotation/plugins/alphamissense/AlphaMissense_hg38.tsv.gz
-AISCIENTIST_VEP_REVEL=.../vep_annotation/plugins/revel/new_tabbed_revel_grch38.tsv.gz
-
-# Normalization + HGVS names — needs the reference genome FASTA (+ .fai) for the assembly:
-AISCIENTIST_REF_FASTA=.../ref/GRCh38.primary_assembly.fa
-
-# SpliceAI (OpenSpliceAI) — splice-disruption scoring; separate conda env, run INSIDE vep.sif (its
-# conda-forge python runs under the container's glibc — validated). OFF by default; needs AISCIENTIST_REF_FASTA:
-AISCIENTIST_SPLICEAI=1                                              # master switch (default OFF)
-AISCIENTIST_SPLICEAI_BIN=.../AiScientist/envs/openspliceai/bin/openspliceai
-AISCIENTIST_SPLICEAI_MODELS=.../reference/spliceai/OSAI-MANE-10000nt   # 5-model ensemble (~14 MB)
-AISCIENTIST_SPLICEAI_MAX_VARIANTS=0       # 0 = NO cap (default); set >0 as an optional safety valve
-#                                        (~50 s/variant on CPU, so keep the panel/AF filter tight)
+VCF ── filter ── normalize ── annotate (VEP, ClinVar, gnomAD, predictors) ── reduce ── splice score ── tables
 ```
 
-**How SpliceAI runs.** OpenSpliceAI needs PyTorch, which is NOT in `vep.sif`, so it lives in its own
-conda env (`.../AiScientist/envs/openspliceai`, Python 3.10 + torch). The offline annotation runs inside
-`vep.sif`, and the SpliceAI stage execs the env's `openspliceai variant` binary as a subprocess — the
-conda-forge python runs cleanly under the container's glibc (verified on HPC3). The gateway bind-mounts
-the env dir + the model dir + the ref-FASTA dir (read-only; the `.fai` is present so pyfaidx never
-rebuilds) and points `HOME`/`TORCH_HOME` at a writable per-run dir. Because inference is ~50 s/variant
-on CPU, the stage is meant to run **on the variants left after the gene-panel / AF reduction** — there is
-NO hard cap by default (`AISCIENTIST_SPLICEAI_MAX_VARIANTS=0`), but a `>0` value is an optional safety valve
-that skips it (with a loud note) if the set is still huge, so a mis-configured whole-WGS run can't hang
-for days. Adds `spliceai_max_ds` + `spliceai_site` columns;
-a max delta ≥0.5 also counts as damaging in the high-priority shortlist.
+One tool does all of it: [`annotate_variants`](../src/aiscientist/tools/annotate_variants/TOOL.md).
+It has two ways to run:
 
-Each predictor is added to the VEP command only when its var is set AND the file exists; the
-`bcftools norm` (left-align) stage runs only when `AISCIENTIST_REF_FASTA` points at a real file.
-`annotate_variants` reports `normalized` + `predictors` so a run states its annotation depth honestly.
+- **Offline, on HPC3** (`AISCIENTIST_VARIANT_ON_HPC=1`): a Slurm job inside `vep.sif` that reads
+  the VCF in place and annotates it against a local VEP cache, with no network. This is the path
+  for a whole-genome or whole-exome VCF. Code: `annotate_variants/offline.py`, entered through
+  `tools/variant_cli.py`.
+- **REST** (the fallback, and the only path without HPC3): the Ensembl VEP REST API, called from
+  the gateway and capped at `max_variants` (500 by default). Code: `annotate_variants/tool.py`.
 
-Build/stage kit: `deploy/vep/` (`build_and_stage.sh`, `vep.def`, `README.md`, `PREDICTOR_STAGING.md`).
+The genome build is read from the VCF header; `AISCIENTIST_VEP_ASSEMBLY` (default `GRCh37`) is
+used only when the header does not say.
+
+## Stages of the offline path
+
+| Stage | Program | What it does | Runs when |
+|---|---|---|---|
+| Filter | bcftools | keeps `PASS` variants, and only the regions of `regions_bed` when one is given | `pass_only` (the default) or a `regions_bed` |
+| Normalize | bcftools norm | splits multi-allelic sites and left-aligns indels, so an indel matches its ClinVar and gnomAD record | a reference FASTA is set for the build |
+| Annotate | Ensembl VEP release 112, `--offline --cache` | gene, consequence, impact, SIFT, PolyPhen, gnomAD frequencies | always |
+| ClinVar | VEP `--custom` | clinical significance and review status | the ClinVar file for the build is set |
+| Predictors | VEP plugins | CADD, AlphaMissense and REVEL scores, and the MANE Select transcript | `AISCIENTIST_VEP_PLUGINS=1` and the file for the build exists |
+| HGVS names | VEP `--hgvs` | standard `c.` and `p.` names | a reference FASTA is set for the build |
+| Reduce | `apply_variant_filters` | drops variants more common than `max_pop_af` and outside the `genes` panel | the caller or the deployment sets them |
+| Splice score | OpenSpliceAI | the largest of the four splice delta scores per variant, and its site | `AISCIENTIST_SPLICEAI=1` and a reference FASTA |
+| IRD layers | `ird_annotate.py` | HGMD, retina exon, retina ATAC and dbscSNV lookups | `AISCIENTIST_IRD_ANNOTATE=1` |
+| Disease model | `ird_prioritize.py` | a per-gene inheritance model (dominant, recessive, X-linked) from how many rare alleles the gene carries; it ranks the shortlist and drops nothing | always |
+| Tables | `annotate_variants/tool.py` | `tables/variant_annotation.tsv` and the five deliverable tables | always |
+
+Each optional stage is skipped, not failed, when its data is missing, and the tool's result says
+which ran: `normalized`, `predictors` and `variant_filters`.
+
+A variant counts as damaging for the high-priority shortlist if any of these holds: VEP impact
+`HIGH`, SIFT deleterious, PolyPhen damaging, CADD ≥ 20, REVEL > 0.5, AlphaMissense > 0.564, or a
+SpliceAI delta ≥ 0.5.
+
+## Programs and data
+
+| Program or data | What it is | Where |
+|---|---|---|
+| Ensembl VEP | Variant Effect Predictor: for each variant, the gene, the change and its severity | `vep.sif` (release 112) |
+| VEP cache | the gene and transcript annotations VEP reads offline, one per build | `<reference>/vep_annotation/GRCh38`, `GRCh37` |
+| bcftools, tabix | filtering, normalizing and indexing VCFs | `vep.sif`; also in `analysis.sif` for skills run with `run_code` |
+| ClinVar | NCBI's database of variants with a clinical interpretation | `<reference>/vep_annotation/clinvar_GRCh38.vcf.gz`, `clinvar_GRCh37.vcf.gz` |
+| gnomAD | population allele frequencies | inside the VEP cache |
+| SIFT, PolyPhen | missense effect predictors built into VEP | inside the VEP cache |
+| CADD | a genome-wide deleteriousness score, coding and non-coding | `<reference>/vep_annotation/plugins/cadd/`, one file per build |
+| AlphaMissense | a missense pathogenicity score | `<reference>/vep_annotation/plugins/alphamissense/` (GRCh38 only) |
+| REVEL | an ensemble missense pathogenicity score | `<reference>/vep_annotation/plugins/revel/`, one file per build |
+| OpenSpliceAI | a splice-disruption predictor (PyTorch) | the conda environment `<root>/envs/openspliceai`, models in `<reference>/spliceai/OSAI-MANE-10000nt` |
+| Reference FASTA | the genome sequence, for normalization, HGVS names and SpliceAI | `<reference>/vep_annotation/ref/` |
+| IRD gene panel | the lab's curated RetNet list of inherited-retinal-disease genes | `src/aiscientist/tools/gene_panels/ird_retnet.txt` |
+
+`<root>` is `/dfs3b/ruic20_lab/software/AiScientist` and `<reference>` is
+`/dfs3b/ruic20_lab/software/reference`.
+
+**Predictor files are specific to a genome build.** The lookup is by coordinate, so a GRCh38 file
+on a GRCh37 run would return the score of a different variant. Each build has its own setting, and
+an empty one means that predictor is skipped for that build.
+
+**How OpenSpliceAI runs.** It needs PyTorch, which `vep.sif` does not have, so it lives in its own
+conda environment. The annotation job runs the environment's `openspliceai` binary as a subprocess
+inside `vep.sif`, with the environment, the models and the reference FASTA bound read-only.
+Inference takes about 50 seconds per variant on a CPU, so the stage runs after the reduction, on
+the variants that are left. `AISCIENTIST_SPLICEAI_MAX_VARIANTS` (0 = no cap) skips it, with a note
+in the result, when the set is still larger than the cap.
+
+## A rare-disease study
+
+The causal variant of an inherited disease is rare and usually in a known gene, so the reduction
+is known genes first, common variants dropped:
+
+- `genes`: keep only variants in a gene panel, after annotation.
+- `regions_bed`: restrict the VCF to a panel's regions before VEP. On a whole-genome VCF this cuts
+  the annotation from most of an hour to minutes; `genes` does not, because it filters afterwards.
+- `max_pop_af`: drop variants whose gnomAD frequency is above the cutoff. Variants with no
+  frequency are kept.
+
+The Scientist passes these as arguments. A deployment can set defaults that apply when it does
+not: `AISCIENTIST_DEFAULT_GENE_PANEL` (a panel name, `ird`), `AISCIENTIST_DEFAULT_REGIONS_BED` and
+`AISCIENTIST_DEFAULT_MAX_POP_AF`.
+
+## Skills and pipelines on this line
+
+Skills of the pinned [aiscientist-skills](https://github.com/lijinbio/aiscientist-skills) release, which the Scientist adapts and runs
+with `run_code` (the pipelines name them by the second name, which resolves as an alias):
+
+- `normalize-vcf-with-bcftools` (`normalize_vcf`): bcftools norm, as a separate step. Needs a
+  reference FASTA.
+- `qc-vcf-callset` (`vcf_qc_stats`): Ti/Tv, het/hom, SNP, indel and multi-allelic counts, call rate
+  (bcftools stats, with cyvcf2 and a pure-Python fallback).
+- `prioritize-clinical-variants` (`clinical_variant_prioritization`): a research-triage tier per
+  variant from ClinVar, gnomAD frequency and the predictors. Not a clinical ACMG classification.
+- `write-variant-tables` (`variant_output_tables`): the standard result tables from an annotated TSV.
+- `build-variant-db-with-tiledbvcf` (`build_variant_db_tiledbvcf`): a TileDB-VCF database for a
+  cohort. It needs `tiledbvcf-py`, which `analysis.sif` does not carry.
+
+Pipelines in [`preset_pipelines/`](../preset_pipelines/README.md): `variant_annotation`, and
+`phenotype_variant_diagnosis`, which adds the patient's phenotype (`map_phenotype_to_hpo`,
+`run_lirical`).
+
+## Settings
+
+Every path defaults to its location under `<reference>` or `<root>` (`gateway/settings.py`), so a
+deployment sets the switches and the GRCh37 files, which have no default. The full list is section
+9 of [`configs/aiscientist.example.env`](../configs/aiscientist.example.env).
+
+| Setting | Default | What it turns on |
+|---|---|---|
+| `AISCIENTIST_VARIANT_ON_HPC` | off | the offline path |
+| `AISCIENTIST_VEP_PLUGINS` | off | CADD, AlphaMissense, REVEL and MANE Select |
+| `AISCIENTIST_SPLICEAI` | off | OpenSpliceAI |
+| `AISCIENTIST_IRD_ANNOTATE` | off | the IRD layers; `AISCIENTIST_IRD_HGMD`, `_DBSCSNV`, `_RETINA_EXONS` and `_ATAC` name their files |
+| `AISCIENTIST_REF_FASTA_GRCH37`, `AISCIENTIST_VEP_REVEL_GRCH37` | empty | normalization, HGVS names and SpliceAI, and REVEL, on GRCh37. The files are staged: `ref/hg19.fa` and `plugins/revel/new_tabbed_revel_grch37.tsv.gz`. |
+| `AISCIENTIST_VEP_ALPHAMISSENSE_GRCH37` | empty | AlphaMissense on GRCh37. No file is staged for it. |
+| `AISCIENTIST_VEP_FORK`, `AISCIENTIST_VEP_TIME_LIMIT` | 8, 04:00:00 | the annotation job's CPUs and time limit |
+
+## Building and staging
+
+- `deploy/vep/build_and_stage.sh` builds `vep.sif` and downloads the VEP caches and ClinVar. The
+  VEP release in the image tag and the cache release must match; change both together.
+- `deploy/vep/stage_annotation_dbs.sh` downloads the predictor files and the reference FASTA that
+  are missing, creates the OpenSpliceAI environment, and prints the settings to add. It can be run
+  again safely. Details: `deploy/vep/README.md` and `deploy/vep/PREDICTOR_STAGING.md`.
+- Downloads run in a Slurm job or through `access-hpc3.rcic.uci.edu`, never on a login node.

@@ -2,7 +2,7 @@
 
 scGPT is a gene/expression transformer (NOT an LLM), so its reference-based, per-cell
 label transfer cannot be done by Qwen. We run it, but keep ``scgpt``/``torch`` entirely
-inside a Singularity ``.sif`` — never in the gateway's Python env — and provision the GPU
+inside an Apptainer ``.sif`` — never in the gateway's Python env — and provision the GPU
 as a **separate, on-demand, short-lived batch job** (Route C in
 ``docs/scgpt_workflow_integration.md``):
 
@@ -12,7 +12,7 @@ as a **separate, on-demand, short-lived batch job** (Route C in
 step-2 inference is one-shot: load ``best_model.pt`` -> infer the (vocab-aligned) query
 h5ad -> write ``predictions.csv`` -> exit, releasing the GPU. That is exactly the shape of
 the existing :mod:`aiscientist.gateway.slurm_job` batch engine, so this module is a thin,
-GPU-flavoured wrapper over it: build a ``gpu:1`` sbatch whose body is a ``singularity exec
+GPU-flavoured wrapper over it: build a ``gpu:1`` sbatch whose body is an ``apptainer exec
 --nv`` of the scGPT image, submit + supervise via :func:`run_batch_job`, then read the
 predictions path back. Everything goes through the ``RemoteExecutor`` protocol, so the
 whole lifecycle runs offline against a scripted fake in tests — no real Slurm, no GPU.
@@ -37,7 +37,7 @@ from .slurm_job import (
     SlurmJobSpec,
     build_analysis_script,
     run_batch_job,
-    singularity_exec,
+    container_exec,
 )
 
 PREDICTIONS_NAME = "predictions.csv"
@@ -138,12 +138,12 @@ def build_scgpt_script(
     model_dir: str,
     out_dir: str,
 ) -> str:
-    """Build the full ``gpu:1`` sbatch script: a ``singularity exec --nv`` of the scGPT
+    """Build the full ``gpu:1`` sbatch script: an ``apptainer exec --nv`` of the scGPT
     image with the dataset + model bound **read-only** and only ``out_dir`` writable."""
     import os.path
 
     inner = build_scgpt_command(settings, input_h5ad=input_h5ad, model_dir=model_dir, out_dir=out_dir)
-    contained = singularity_exec(
+    contained = container_exec(
         settings.scgpt_image,
         inner,
         # The query h5ad's directory + the reference model are read-only; the raw inputs
@@ -189,7 +189,8 @@ def run_scgpt_inference(
     script = build_scgpt_script(
         settings, job_name=name, input_h5ad=input_h5ad, model_dir=model_dir, out_dir=out_dir
     )
-    spec = SlurmJobSpec(script=script, job_name=name)
+    # The script goes beside the job's log, in the run's own output directory.
+    spec = SlurmJobSpec(script=script, job_name=name, submit_dir=out_dir.rstrip("/"))
     result = run_batch_job(executor, spec, acquire=acquire, run=run, emit=emit)
     if not result.completed:
         raise SlurmJobError(

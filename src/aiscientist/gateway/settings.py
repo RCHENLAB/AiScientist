@@ -31,6 +31,9 @@ class HPCSettings:
     The served model is the AWQ Qwen3.6 HF repo (``AISCIENTIST_VLLM_MODEL``).
     """
 
+    cpu_hour_rate: float = 0.0
+    gpu_hour_rate: float = 0.0
+
     host: str = "hpc3.rcic.uci.edu"
     ssh_port: int = 22
 
@@ -40,7 +43,7 @@ class HPCSettings:
     # kill. Our staging (`put_file`/`get_file`) moves GB-scale VCFs and h5ad matrices, so it gets its
     # OWN connection here instead of riding the login-node session that `exec` uses.
     # MEASURED 2026-08-06: this host runs a RESTRICTED shell (`ssh … echo hi` -> "Command 'echo' not
-    # allowed"), so ONLY the SFTP subsystem works — sbatch/squeue/module/singularity and the vLLM
+    # allowed"), so ONLY the SFTP subsystem works — sbatch/squeue/module/apptainer and the vLLM
     # tunnel must stay on `host`. It mounts the SAME $HOME and /dfs3b, so paths and authorized_keys
     # are identical and no extra setup is needed.
     # Set AISCIENTIST_HPC_TRANSFER_HOST="" to disable the split and stage over the login node again.
@@ -91,6 +94,12 @@ class HPCSettings:
     # the window, and the paid A100 only takes over when the free pool is genuinely busy. 0 = pure
     # first-come-first-served (the original behaviour). See AISCIENTIST_GPU_PREFER_SECONDS.
     gpu_prefer_seconds: int = 0
+    # How long a GPU request may queue before giving up: at connect (the user is watching and can
+    # retry), and when a RUN loses its serve job mid-way (the job hit its time limit) and needs a new
+    # one. The second is long on purpose: on 2026-10-05 a run with QC, integration and clustering done
+    # was thrown away because no GPU started within 300 s of its serve job expiring.
+    gpu_wait_seconds: int = 300
+    gpu_heal_wait_seconds: int = 1800
 
     # STRICT per-user isolation. The console only ever finds, reuses, or stops
     # the *current user's own* serve job (named bioagent-vllm-<ucinetid> and
@@ -117,7 +126,7 @@ class HPCSettings:
     #   <shared_root>/Temp/<user>/...     process files — SWEPT after temp_ttl_days (see hpc_gc.py)
     #   <shared_root>/uploads/<user>/...  raw uploaded data — NEVER swept
     #   <shared_root>/pysrc/<user>/...    the synced AiScientist source (rewritten in place each connect)
-    #   <shared_root>/bin/<user>/         the staged sweeper
+    #   <shared_root>/bin/<user>/         the staged sweeper and session cleanup
     #   <shared_root>/{containers,hf,envs,scgpt_model,vlreview_model,ollama}/   assets, NEVER swept
     # The sweeper is hard-guarded to `<root>/Temp` and cannot walk into the assets. Nothing outside
     # <shared_root> is ever deleted automatically: a member's personal <lab_storage>/<ucinetid>/ dir
@@ -126,15 +135,19 @@ class HPCSettings:
     # Age (days) after which a <shared_root>/Temp/<user>/<kind>/<run> dir whose whole subtree has
     # gone untouched is removed. 0 disables the sweep entirely.
     temp_ttl_days: int = 3
+    # On disconnect, remove what that session alone made under Temp: the folders of the runs it
+    # started and its copies of server-side datasets (hpc_gc.clean_session). Off leaves all of it
+    # to the age sweep above.
+    session_cleanup: bool = True
 
     # --- LLM serving backend ------------------------------------------------
-    # "vllm" (Singularity container, OpenAI-compatible /v1) — the default and only
+    # "vllm" (Apptainer container, OpenAI-compatible /v1) — the default and only
     # supported serving backend. "sglang" is reserved for a future engine swap that
     # reuses the SAME /v1 client (vllm_client) and only changes the serve command.
     # Everything downstream (Biomni, providers) is backend-agnostic (all OpenAI /v1).
     llm_backend: str = "vllm"
 
-    # vLLM (runs inside a Singularity container on the GPU node; serves /v1).
+    # vLLM (runs inside an Apptainer container on the GPU node; serves /v1).
     # Qwen3.8-27B (dense, hybrid attention, vision) as W4A16 INT4 (compressed-tensors, 16GB). It
     # needs a newer vLLM than the June vllm.sif, hence vllm-0.28.0.sif; the format is auto-detected,
     # so vllm_quantization is "". MEASURED 2026-09-25 on HPC3 (one card, 262144 ctx, same bench):
@@ -175,11 +188,16 @@ class HPCSettings:
     # a new job may use. Set per model from the cluster model list.
     vllm_gpu_cards: str = ""
 
-    # Container runtime for the GPU serve job + code sandbox. RCIC HPC3 provides
-    # SINGULARITY (module `singularity/<ver>`), NOT Apptainer — they share a CLI, but
-    # the binary/module on HPC3 is `singularity`. See rcic.uci.edu user-installed software.
-    container_bin: str = "singularity"
-    container_module: str = "singularity/3.11.3"
+    # Container runtime for every HPC3 container (vLLM serve, scGPT, VL review, run_code, the
+    # analysis/variant/phenotype/report/literature jobs, the package cache, image provisioning).
+    # Apptainer since 2026-10-09: HPC3 has both modules, and apptainer/1.4.5 runs every staged
+    # image and every command built here unchanged (measured on CPU and GPU nodes). It is installed
+    # WITHOUT setuid, so containers run in a user namespace with SIFs mounted by squashfuse_ll; its
+    # `--fakeroot` builds a .def on HPC3 itself, which Singularity never could (no /etc/subuid entry).
+    # Rollback, no code change: AISCIENTIST_CONTAINER_BIN=singularity +
+    # AISCIENTIST_CONTAINER_MODULE=singularity/3.11.3 in the .env.
+    container_bin: str = "apptainer"
+    container_module: str = "apptainer/1.4.5"
 
     # --- scGPT per-cell annotation (GPU batch job, NOT a persistent server) -----
     # scGPT is a gene/expression transformer (not an LLM); we run its one-shot
@@ -222,9 +240,45 @@ class HPCSettings:
     vlreview_dpi: int = 200                 # rasterization DPI (200 catches text overlap)
     vlreview_max_iters: int = 3             # render -> review -> re-render passes before giving up
 
+    # --- The corpus scan's own GPU (gateway/corpus_scan.py) ---------------------
+    # The scan has a model write search requests and read the passages they retrieve. It used to
+    # call the session's served model, so a session on the shared model or an API key could not run
+    # it at all, and a session with a GPU had that model busy for an hour. It now submits ONE job of
+    # its own: vLLM starts on the job's card, the scan runs against it on 127.0.0.1, the job exits
+    # and frees the card.
+    # Paid `gpu` partition, lab GPU account: 32 SU per GPU-hour whatever the card (2026-10). `gpu:1`
+    # + `nvme` takes the first free A30 or A100 (the V100 nodes lack the feature, and their 16 GB
+    # are too small). The 27B INT4 fits a 24 GB A30 only with the flags below: its image and video
+    # encoders off (the judge sends text) and at most 16 requests at once (the tool's concurrency).
+    # Measured 2026-10-19 on 400 sentences: an A100 judged them in 196 s, an A30 in 372 s.
+    corpus_scan_partition: str = "gpu"
+    corpus_scan_account: str | None = "ruic20_lab_gpu"
+    corpus_scan_gres: str = "gpu:1"
+    corpus_scan_constraint: str = "nvme"
+    corpus_scan_model: str = ""             # "" = vllm_model (the cluster sessions' model)
+    # The judge's prompts are a few thousand tokens: a short window costs less KV per request.
+    corpus_scan_max_model_len: int = 16384
+    # Extra `vllm serve` flags for this job only. The default suits the multimodal default model;
+    # a text-only `corpus_scan_model` takes "--max-num-seqs 16".
+    corpus_scan_vllm_args: str = ("--limit-mm-per-prompt '{\"image\":0,\"video\":0}' --max-num-seqs 16 "
+                                  "--max-num-batched-tokens 4096")
+    # The job's CPUs, memory and time come from the tool's TOOL.md, like every literature job's.
+    corpus_scan_ready_timeout_s: int = 1500  # model load; ~400 s measured for the 27B INT4 on A100
+    # How long the job may wait in the paid queue for a card. 30 min (the analysis jobs' 3 x 600 s)
+    # was too short: on 2026-10-19 21:13 a scan queued behind 40 others (Slurm: Priority) and was
+    # cancelled at 21:43 without starting. A queued job keeps its place for the whole wait; the
+    # window is how often the chat hears where it stands.
+    corpus_scan_queue_wait_s: int = 7200
+    corpus_scan_queue_window_s: int = 1800
+    # After a wait that ends with no card, submit the job again this many times (a retry of that one
+    # step: the run is not failed while a retry is left). Nothing runs, so nothing is lost.
+    corpus_scan_queue_retries: int = 2
+
     # --- CodeAct (run_code) as a CPU Slurm batch job (opt-in) -------------------
-    # By default run_code executes in the LOCAL CodeSandbox on the eyeserver (uncapped subprocess).
-    # Set AISCIENTIST_RUN_CODE_ON_HPC=1 to instead submit each snippet as a Singularity-contained CPU
+    # By default run_code executes in the LOCAL CodeSandbox on the gateway host (uncapped
+    # subprocess), which only a console WITHOUT accounts may do: with accounts on, run_code never
+    # runs on the gateway host (app._host_code_allowed), so it is unavailable until this is set.
+    # Set AISCIENTIST_RUN_CODE_ON_HPC=1 to instead submit each snippet as an Apptainer-contained CPU
     # batch job on HPC3, where `#SBATCH --mem` is a REAL, cgroup-enforced memory cap (the durable
     # fix for the OOM/-9 kills). Needs the dataset + run dirs on shared DFS and an analysis image.
     run_code_on_hpc: bool = False
@@ -242,15 +296,19 @@ class HPCSettings:
     # anything that moves bytes or burns CPU belongs on a node you hold. Metadata (ls/stat/du)
     # stays on the login node, where it is cheap and allowed.
     #
-    # Unlike the GPU serve job this costs nothing scarce (free `standard` partition) and holds no
-    # accelerator, so it is safe to keep for the whole session. Off by default: enabling it
-    # changes what connect does, and the shell tools that need it are themselves opt-in.
+    # It holds no accelerator, but it is charged to the lab's account and its CPUs and memory are
+    # nobody else's while it runs, so it is held only while the agent uses it: released after
+    # `worker_idle_timeout_s` without a command, and on disconnect, logout and server stop (see
+    # gateway/worker.py). Off by default: the shell tools that need it are themselves opt-in.
     worker_enabled: bool = False
     worker_cpus: int = 4
     worker_mem_gb: int = 16
-    # Long enough to outlive a working session without pinning a node overnight. Slurm kills the
-    # allocation at this wall limit; the session re-acquires one on the next command.
+    # Slurm's hard limit on one holder. An idle holder is released long before it; a busy session
+    # that reaches it gets a new holder on its next command.
     worker_time_limit: str = "08:00:00"
+    # Released after this long without a command. The holder ends itself
+    # `worker.HOLDER_GRACE_S` later if the gateway could not release it (restart, crash).
+    worker_idle_timeout_s: int = 900
     worker_startup_timeout_s: int = 180      # a free-partition CPU node should come up fast
     # Per-command wall cap for `srun --overlap` work. Distinct from the ALLOCATION's time limit:
     # this bounds one agent command so a runaway `find /` cannot hold the session forever.
@@ -258,16 +316,16 @@ class HPCSettings:
 
     # --- Uploads land on HPC3 dfs3b, not the eyeserver (opt-in) -----------------
     # Off: uploaded datasets are written to the eyeserver's per-user workspace. Set
-    # AISCIENTIST_UPLOADS_ON_HPC=1 to stream each upload straight to the user's HPC3 area
-    # (<lab_storage>/<user>/uploads) over the SSH session, so raw data never lives on the
-    # eyeserver. Needs a connected session (the SSH executor, which /api/connect brings up
-    # together with the GPU). Tools that still run locally stage the file back on demand;
-    # once analysis moves to HPC3 they read dfs3b in place with no round-trip.
+    # AISCIENTIST_UPLOADS_ON_HPC=1 to copy each upload to the user's HPC3 area
+    # (<shared_root>/uploads/<user>) through the transfer host, so raw data does not stay on the
+    # eyeserver. The copy runs in the background after the upload request answers (see
+    # gateway/staging.py); the local file is deleted once the copy is verified. Needs a connected
+    # session. Tools that still run locally stage the file back on demand.
     uploads_on_hpc: bool = False
 
     # --- scanpy analysis line runs as HPC3 CPU Slurm jobs (opt-in) --------------
     # Off: run_scanpy_qc/clustering/de/enrichment + the dataset preflight execute IN-PROCESS on
-    # the eyeserver. Set AISCIENTIST_ANALYSIS_ON_HPC=1 to submit each as a Singularity-contained CPU
+    # the eyeserver. Set AISCIENTIST_ANALYSIS_ON_HPC=1 to submit each as an Apptainer-contained CPU
     # batch job on HPC3 (SlurmAnalysisExecutor), reading the dataset on dfs3b in place — the real
     # memory cap is Slurm --mem, and the gateway host stays a thin I/O layer. Reuses analysis_image
     # + cpu_partition/cpu_account/run_code_mem_gb/run_code_cpus. Falls back in-process on failure.
@@ -276,8 +334,10 @@ class HPCSettings:
     # --- report render (pandoc/xelatex) runs as an HPC3 CPU Slurm job (opt-in) --
     # Off: build_pdf_report shells out to pandoc/xelatex on the eyeserver (a multi-GB texlive install
     # + minutes of CPU per report). Set AISCIENTIST_REPORT_ON_HPC=1 to render each report as a
-    # Singularity-contained CPU batch job on HPC3 (SlurmReportRenderer) using a deps-only
-    # pandoc/texlive image — no texlive on the eyeserver. Falls back to local pandoc on failure.
+    # Apptainer-contained CPU batch job on HPC3 (SlurmReportRenderer) using a deps-only
+    # pandoc/texlive image — no texlive on the eyeserver. On failure it falls back to local pandoc;
+    # with accounts on that fallback writes the DOCX only (TeX never runs on the gateway host for
+    # an account, so this flag is then what makes a PDF possible at all).
     report_on_hpc: bool = False
     report_image: str = f"{SHARED_ROOT}/containers/report.sif"
 
@@ -286,7 +346,7 @@ class HPCSettings:
     # VCF but it reads the whole file into memory, caps at 500 variants, and is rate-limited, so it
     # can't scale to a WGS-size VCF. Set AISCIENTIST_VARIANT_ON_HPC=1 to run the OFFLINE line
     # (bcftools PASS-filter -> `vep --offline --cache --fork` over a local cache -> stream-parse) as a
-    # Singularity-contained CPU batch job on HPC3, reading the VCF on dfs3b in place. No network is
+    # Apptainer-contained CPU batch job on HPC3, reading the VCF on dfs3b in place. No network is
     # needed at run time (the cache is bind-mounted) — the analysis container now allows network
     # on-demand (AISCIENTIST_SANDBOX_NETWORK, default on) but the offline line doesn't use it. Reuses
     # SlurmAnalysisExecutor + cpu_partition/cpu_account/run_code_mem_gb. Falls
@@ -459,7 +519,15 @@ class HPCSettings:
             except ValueError:
                 return default
 
+        def _rate(name: str) -> float:
+            import math
+
+            value = _float(name, 0.0)
+            return value if math.isfinite(value) and value >= 0 else 0.0
+
         return cls(
+            cpu_hour_rate=_rate("AISCIENTIST_CPU_HOUR_RATE"),
+            gpu_hour_rate=_rate("AISCIENTIST_GPU_HOUR_RATE"),
             host=os.environ.get("AISCIENTIST_HPC_HOST", cls.host),
             ssh_port=_int("AISCIENTIST_HPC_SSH_PORT", cls.ssh_port),
             # "" is a MEANINGFUL value here (= stage over the login node), so keep an explicitly
@@ -475,6 +543,8 @@ class HPCSettings:
             constraint=os.environ.get("AISCIENTIST_SLURM_CONSTRAINT") or None,
             gpu_candidates=os.environ.get("AISCIENTIST_GPU_CANDIDATES", cls.gpu_candidates),
             gpu_prefer_seconds=_int("AISCIENTIST_GPU_PREFER_SECONDS", cls.gpu_prefer_seconds),
+            gpu_wait_seconds=_int("AISCIENTIST_GPU_WAIT_SECONDS", cls.gpu_wait_seconds),
+            gpu_heal_wait_seconds=_int("AISCIENTIST_GPU_HEAL_WAIT_SECONDS", cls.gpu_heal_wait_seconds),
             # New names, with backward-compat fallback to the old AISCIENTIST_OLLAMA_* so a
             # deployed .env keeps working until it's updated.
             serve_port=_int("AISCIENTIST_VLLM_PORT", _int("AISCIENTIST_OLLAMA_PORT", cls.serve_port)),
@@ -489,6 +559,8 @@ class HPCSettings:
             lab_data_group=os.environ.get("AISCIENTIST_LAB_DATA_GROUP", cls.lab_data_group),
             shared_root=(os.environ.get("AISCIENTIST_HPC_SHARED_ROOT") or cls.shared_root).rstrip("/"),
             temp_ttl_days=_int("AISCIENTIST_TEMP_TTL_DAYS", cls.temp_ttl_days),
+            session_cleanup=(os.environ.get("AISCIENTIST_SESSION_CLEANUP", "1").strip().lower()
+                             not in ("0", "false", "no", "off")),
             llm_backend=os.environ.get("AISCIENTIST_LLM_BACKEND", cls.llm_backend).strip().lower(),
             vllm_model=os.environ.get("AISCIENTIST_VLLM_MODEL", cls.vllm_model),
             vllm_image=os.environ.get("AISCIENTIST_VLLM_IMAGE", cls.vllm_image),
@@ -515,6 +587,20 @@ class HPCSettings:
             vlreview_time_limit=os.environ.get("AISCIENTIST_VLREVIEW_TIME_LIMIT", cls.vlreview_time_limit),
             vlreview_dpi=_int("AISCIENTIST_VLREVIEW_DPI", cls.vlreview_dpi),
             vlreview_max_iters=_int("AISCIENTIST_VLREVIEW_MAX_ITERS", cls.vlreview_max_iters),
+            corpus_scan_partition=os.environ.get("AISCIENTIST_CORPUS_SCAN_PARTITION", cls.corpus_scan_partition),
+            corpus_scan_account=(os.environ.get("AISCIENTIST_CORPUS_SCAN_ACCOUNT", cls.corpus_scan_account or "")
+                                 or None),
+            corpus_scan_gres=os.environ.get("AISCIENTIST_CORPUS_SCAN_GRES", cls.corpus_scan_gres),
+            corpus_scan_constraint=os.environ.get("AISCIENTIST_CORPUS_SCAN_CONSTRAINT", cls.corpus_scan_constraint),
+            corpus_scan_model=os.environ.get("AISCIENTIST_CORPUS_SCAN_MODEL", cls.corpus_scan_model),
+            corpus_scan_max_model_len=_int("AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN", cls.corpus_scan_max_model_len),
+            corpus_scan_vllm_args=os.environ.get("AISCIENTIST_CORPUS_SCAN_VLLM_ARGS", cls.corpus_scan_vllm_args),
+            corpus_scan_ready_timeout_s=_int("AISCIENTIST_CORPUS_SCAN_READY_TIMEOUT_S",
+                                             cls.corpus_scan_ready_timeout_s),
+            corpus_scan_queue_wait_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S", cls.corpus_scan_queue_wait_s),
+            corpus_scan_queue_window_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S",
+                                            cls.corpus_scan_queue_window_s),
+            corpus_scan_queue_retries=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES", cls.corpus_scan_queue_retries),
             run_code_on_hpc=(os.environ.get("AISCIENTIST_RUN_CODE_ON_HPC", "").strip().lower()
                              in ("1", "true", "yes", "on")),
             uploads_on_hpc=(os.environ.get("AISCIENTIST_UPLOADS_ON_HPC", "").strip().lower()
@@ -535,6 +621,8 @@ class HPCSettings:
             worker_cpus=_int("AISCIENTIST_WORKER_CPUS", cls.worker_cpus),
             worker_mem_gb=_int("AISCIENTIST_WORKER_MEM_GB", cls.worker_mem_gb),
             worker_time_limit=os.environ.get("AISCIENTIST_WORKER_TIME_LIMIT", cls.worker_time_limit),
+            worker_idle_timeout_s=max(60, _int("AISCIENTIST_WORKER_IDLE_TIMEOUT_S",
+                                               cls.worker_idle_timeout_s)),
             worker_startup_timeout_s=_int("AISCIENTIST_WORKER_STARTUP_TIMEOUT_S", cls.worker_startup_timeout_s),
             worker_command_timeout_s=_int("AISCIENTIST_WORKER_COMMAND_TIMEOUT_S", cls.worker_command_timeout_s),
             variant_on_hpc=(os.environ.get("AISCIENTIST_VARIANT_ON_HPC", "").strip().lower()

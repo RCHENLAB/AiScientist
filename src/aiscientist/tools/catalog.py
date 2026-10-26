@@ -11,9 +11,18 @@ the platform needs and whose body is the documentation people read::
     entry: tool:make_tool        # <module in this folder>:<factory>   (this is the default)
     needs: []                    # factory arguments the platform injects: see build()
     chat: false                  # also offered on the fast chat path
+    research: true               # offered to the research agents (the default); false = the tool
+                                 #   runs only from its own console line, no model can call it
     order: 220                   # position in the Scientist's catalog (ascending)
     line: scrna                  # the analysis line it belongs to (optional)
     owner: analysis              # the team line that maintains it
+    image: "docker://quay.io/biocontainers/cellqc:0.3.6--pyhdfd78af_1"   # optional, hpc:* only
+    cpus: 16                     # optional Slurm resources for THIS tool's job (hpc:* only);
+    mem_gb: 80                   #   unset = the line's executor defaults
+    time_limit: "08:00:00"
+    skill: qc-snrna-with-cellqc-standalone   # optional, hpc:* only, INSTEAD of image/cpus/mem_gb/
+                                 #   time_limit: the registry skill whose environment and settings
+                                 #   the tool runs with (see SKILL_ARG)
     ---
     # run_de
     ...documentation...
@@ -21,6 +30,19 @@ the platform needs and whose body is the documentation people read::
 Adding a tool is adding a folder: the registry, the HPC3 routing, the fast-chat selection and the
 System page all read these manifests, so no platform file names a tool. The parser is standard
 library only, because the HPC3 job images import this module too.
+
+A tool that needs software the line's container lacks (R, Bioconductor, a pinned Python, any
+bioconda package) names a container ``image`` instead of asking anyone to install it: the platform
+provisions that image on HPC3 the first time the tool runs, keeps it in the shared containers
+directory, and runs the tool's job inside it. ``docker://...`` is pulled (a BioContainers image
+exists for every bioconda package); ``bioconda:<pkg>=<version> ...`` is built from conda-forge +
+bioconda, for a combination or a pin no published image has. Versions must be pinned (never
+``latest``), so a run can be traced to the exact software that made it.
+
+A tool that runs the method of a registry skill names it with ``skill:`` instead. The skill, from the
+pinned aiscientist-skills release, then declares the image and resources and any reference settings
+the tool reads, so they are defined in one place. The platform resolves the skill and passes it to
+the tool with each call (:data:`SKILL_ARG`); the tool itself never loads skills.
 """
 
 from __future__ import annotations
@@ -43,6 +65,43 @@ PACKAGE = __name__.rsplit(".", 1)[0]          # "aiscientist.tools"
 RUNS_ON = ("inprocess", "hpc:analysis", "hpc:variant", "hpc:phenotype", "hpc:literature", "gpu:scgpt")
 CATEGORIES = ("qc", "analysis", "annotation", "literature", "figure")
 _REQUIRED = ("name", "summary", "category", "runs_on", "order")
+# ``docker://<registry>/<repo>:<tag>`` or ``...@sha256:<digest>``; a floating tag is refused.
+_IMAGE_RE = re.compile(r"^docker://[\w.\-/]+(?::[\w.\-]+|@sha256:[0-9a-f]{64})$")
+# ``bioconda:<spec> <spec> ...`` — conda packages built into an image; the first spec is the tool's
+# own package and must be pinned to a version.
+_CONDA_SPEC_RE = re.compile(r"^[A-Za-z0-9_.\-]+(?:(?:==?|>=|<=|<|>|!=)[\w.*,<>=!\-]+)?$")
+
+
+def image_problem(image: str) -> str:
+    """Why ``image`` is not an acceptable ``image`` value (a TOOL.md's, or a SKILL.md's that declares
+    the environment its commands run in), or '' when it is."""
+    if image.startswith("bioconda:"):
+        specs = image[len("bioconda:"):].split()
+        if not specs or not all(_CONDA_SPEC_RE.match(s) for s in specs):
+            return "bioconda: must be followed by space-separated conda package specs"
+        if "=" not in specs[0]:
+            return f"the first package ({specs[0]}) must be pinned, e.g. {specs[0]}=1.2.3"
+        return ""
+    if not _IMAGE_RE.match(image):
+        return "must be docker://<repo>:<pinned tag> or @sha256, or bioconda:<pkg>=<version> ..."
+    if image.endswith(":latest"):
+        return "the tag 'latest' is not reproducible; pin a version"
+    return ""
+_image_problem = image_problem          # the old private name, kept for existing callers
+_TIME_RE = re.compile(r"^(?:\d+-)?\d{1,2}:\d{2}:\d{2}$")
+
+
+def resources_problem(cpus: Any, mem_gb: Any, time_limit: Any) -> str:
+    """Why these Slurm resources (each optional: 0, '' or None = the executor's default) are not
+    acceptable, or '' when they are. Shared by TOOL.md and SKILL.md."""
+    for key, value in (("cpus", cpus), ("mem_gb", mem_gb)):
+        if value in (None, "", 0):
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return f"{key} must be a positive integer"
+    if time_limit and not _TIME_RE.match(str(time_limit)):
+        return f"time_limit {time_limit!r} must be [D-]HH:MM:SS"
+    return ""
 
 
 class ManifestError(ValueError):
@@ -128,8 +187,16 @@ class ToolManifest:
     entry: str = "tool:make_tool"
     needs: tuple[str, ...] = ()
     chat: bool = False
+    served_model: bool = False    # the tool's HPC3 job calls the session's served model (needs a GPU allocation)
+    own_gpu: bool = False         # the tool's HPC3 job gets a GPU of its own and starts its own model there
+    research: bool = True         # in the Scientist's catalog; False = only its own console line runs it
     line: str = ""
     owner: str = ""
+    image: str = ""               # container the tool's HPC3 job runs in ("" = the line's image)
+    cpus: int = 0                 # Slurm resources for this tool's job (0 / "" = the line's defaults)
+    mem_gb: int = 0
+    time_limit: str = ""
+    skill: str = ""               # a registry skill whose image, resources and settings this tool runs with
     doc: str = field(default="", repr=False, compare=False)
 
     @property
@@ -166,18 +233,43 @@ def load_manifest(folder: Path) -> ToolManifest:
         raise ManifestError(f"{path}: runs_on {fields['runs_on']!r} is not one of {RUNS_ON}")
     if fields["category"] not in CATEGORIES:
         raise ManifestError(f"{path}: category {fields['category']!r} is not one of {CATEGORIES}")
-    known = set(_REQUIRED) | {"entry", "needs", "chat", "line", "owner"}
+    known = set(_REQUIRED) | {"entry", "needs", "chat", "research", "served_model", "own_gpu", "line",
+                              "owner", "image", "cpus", "mem_gb", "time_limit", "skill"}
     unknown = set(fields) - known
     if unknown:
         raise ManifestError(f"{path}: unknown field(s) {sorted(unknown)}")
+    image = str(fields.get("image") or "")
+    time_limit = str(fields.get("time_limit") or "")
+    skill = str(fields.get("skill") or "").strip()
+    job_fields = [k for k in ("image", "cpus", "mem_gb", "time_limit") if fields.get(k)]
+    if (job_fields or skill) and not fields["runs_on"].startswith("hpc:"):
+        raise ManifestError(f"{path}: {', '.join(job_fields or ['skill'])} only apply to an hpc:* tool")
+    if skill and job_fields:
+        # One source: the skill declares them, and a second copy here would drift from it.
+        raise ManifestError(f"{path}: {', '.join(job_fields)} come from skill {skill!r}; "
+                            "do not repeat them in TOOL.md")
+    if image and _image_problem(image):
+        raise ManifestError(f"{path}: image {image!r}: {_image_problem(image)}")
+    for key in ("cpus", "mem_gb"):
+        if key in fields and (not isinstance(fields[key], int) or fields[key] <= 0):
+            raise ManifestError(f"{path}: {key} must be a positive integer")
+    if time_limit and not _TIME_RE.match(time_limit):
+        raise ManifestError(f"{path}: time_limit {time_limit!r} must be [D-]HH:MM:SS")
+    if fields.get("own_gpu") and fields.get("served_model"):
+        raise ManifestError(f"{path}: own_gpu and served_model exclude each other (its own model, or the session's)")
     needs = fields.get("needs") or []
     return ToolManifest(
         name=fields["name"], summary=str(fields["summary"]), category=fields["category"],
         runs_on=fields["runs_on"], order=int(fields["order"]), folder=folder,
         entry=str(fields.get("entry") or "tool:make_tool"),
         needs=tuple(str(n) for n in (needs if isinstance(needs, list) else [needs])),
-        chat=bool(fields.get("chat", False)), line=str(fields.get("line") or ""),
-        owner=str(fields.get("owner") or ""), doc=body)
+        chat=bool(fields.get("chat", False)), served_model=bool(fields.get("served_model", False)),
+        own_gpu=bool(fields.get("own_gpu", False)),
+        research=bool(fields.get("research", True)),
+        line=str(fields.get("line") or ""),
+        owner=str(fields.get("owner") or ""), image=image,
+        cpus=int(fields.get("cpus") or 0), mem_gb=int(fields.get("mem_gb") or 0),
+        time_limit=time_limit, skill=skill, doc=body)
 
 
 @lru_cache(maxsize=1)
@@ -195,6 +287,12 @@ def manifests() -> tuple[ToolManifest, ...]:
 
 def manifest(name: str) -> ToolManifest | None:
     return next((m for m in manifests() if m.name == name), None)
+
+
+# The call argument that carries a tool's skill (``skill:`` in its TOOL.md) to wherever the tool runs:
+# ``{"name", "version", "registry_release", "files": {"assets/...": text}}``. The platform resolves
+# the skill and attaches it to every call (aiscientist/agents/tool_skills.py); a tool only reads it.
+SKILL_ARG = "_skill"
 
 
 def build(m: ToolManifest, deps: dict[str, Any] | None = None) -> HarnessTool:
@@ -252,3 +350,15 @@ def runs_on(where: str) -> list[ToolManifest]:
 
 def names(ms: Iterable[ToolManifest] | None = None) -> list[str]:
     return [m.name for m in (manifests() if ms is None else ms)]
+
+
+def resource_profile(name: str) -> dict[str, Any] | None:
+    """Optional per-tool resource_profile.json; unknown tools use the estimator fallback."""
+    import json
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        return None
+    try:
+        return json.loads((TOOLS_DIR / name / "resource_profile.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the PaperQA .sif and stage it on dfs3b, where the gateway's offload executor finds it.
-# Mirrors deploy/scgpt/build_and_stage.sh. PaperQA has NO ready-made image to `singularity pull`
+# Mirrors deploy/scgpt/build_and_stage.sh. PaperQA has NO ready-made image to `apptainer pull`
 # (paper-qa[local] is a pip install), so this is a BUILD, on HPC3 (macOS cannot build .sif).
 set -euo pipefail
 # Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
@@ -11,21 +11,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DFS_DIR="${AISCIENTIST_PAPERQA_CONTAINER_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
 SIF="${DFS_DIR}/paperqa.sif"
 
-echo "== 1. Build paperqa.sif — pick ONE route (then re-run with BUILT=1) =="
+echo "== 1. Build paperqa.sif with Apptainer (then re-run with BUILT=1) =="
 # The AiScientist source + the corpus/model are bind-mounted at RUN time (not baked in), so unlike the
 # scgpt image there is NO vendored code to stage into the build context first.
 cat <<ROUTES
-  (a) fakeroot build from the def (if RCIC enables --fakeroot):
-        cd ${HERE} && singularity build --fakeroot paperqa.sif paperqa.def
-  (b) remote builder (no local root needed):
-        cd ${HERE} && singularity build --remote paperqa.sif paperqa.def
-  (c) build a Docker image elsewhere -> registry -> convert on HPC3 (NO fakeroot):
-        # on a machine with Docker (translate paperqa.def to a Dockerfile: same base + the one
-        # pip install), then:
-        docker build -t <registry>/paperqa:cpu .
-        docker push <registry>/paperqa:cpu
-        # on HPC3:
-        singularity build paperqa.sif docker://<registry>/paperqa:cpu
+  # On an HPC3 COMPUTE node (RCIC: no builds on login nodes). Apptainer's --fakeroot needs no
+  # /etc/subuid entry on HPC3, and Sylabs --remote builds are gone (docs/hpc3_assets.md).
+  cd ${HERE} && sbatch -p standard -A ruic20_lab -c 8 --mem=32G -t 04:00:00 -J build-paperqa \\
+    --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=\$TMPDIR/ac apptainer build --fakeroot paperqa.sif paperqa.def'
+  # Alternative: build a Docker image elsewhere -> registry, then on HPC3:
+  #   apptainer build paperqa.sif docker://<registry>/paperqa:cpu
 ROUTES
 if [ "${BUILT:-0}" != "1" ]; then
     echo "(set BUILT=1 once ${HERE}/paperqa.sif exists to stage it)"; exit 0
@@ -49,7 +44,7 @@ The corpus INDEX + PubMedBERT model are bind-mounted read-only per run (NOT bake
 
 Smoke test (AiScientist src + retigene data bind-mounted; Qwen reachable at --args.llm_base_url).
 Write /tmp/pq_args.json with question/model/llm_base_url/embedding/index_dir/papers/manifest, then:
-  singularity exec \\
+  apptainer exec \\
     -B <repo>/src:/opt/bioagent-src:ro \\
     -B /dfs3b/ruic20_lab/<user>/retigene:/dfs3b/ruic20_lab/<user>/retigene:ro \\
     --env PYTHONPATH=/opt/bioagent-src \\

@@ -5,7 +5,7 @@ Qwen3.6 (the main LLM) is text-only: it can audit the numbers behind a chart, bu
 SEE render defects — text-over-text overlap, a caption printed on the figure, clipped cells,
 a table that overran its box. Those live only in the final rendered pdf, and only a vision
 model finds them. We run one, but keep ``transformers``/``torch``/the VL weights entirely
-inside a Singularity ``.sif`` — never in the gateway's Python env — and provision the GPU as
+inside an Apptainer ``.sif`` — never in the gateway's Python env — and provision the GPU as
 a **separate, on-demand, short-lived batch job** (Route C, exactly like scGPT):
 
 - NOT co-located on Qwen's vLLM GPU (that server claims most VRAM), and
@@ -41,7 +41,7 @@ from .slurm_job import (
     SlurmJobSpec,
     build_analysis_script,
     run_batch_job,
-    singularity_exec,
+    container_exec,
 )
 
 REVIEW_NAME = "review.json"
@@ -91,14 +91,14 @@ def build_vlreview_script(
     out_dir: str,
     source_dir: str | None = None,
 ) -> str:
-    """Build the ``gpu:1`` sbatch script: a ``singularity exec --nv`` of the vlreview image
+    """Build the ``gpu:1`` sbatch script: an ``apptainer exec --nv`` of the vlreview image
     with the rendered report + VL weights bound **read-only** and only ``out_dir`` writable.
     ``gres`` comes from ``settings.vlreview_gres`` so this pins a cheap 24GB card, not an A100."""
     import os.path
 
     inner = build_vlreview_command(settings, pdf=pdf, model_dir=model_dir, out_dir=out_dir,
                                    source_dir=source_dir)
-    contained = singularity_exec(
+    contained = container_exec(
         settings.vlreview_image,
         inner,
         # The rendered pdf's directory + the VL weights (+ the live source) are read-only; the
@@ -148,7 +148,8 @@ def run_vlreview(
     model = model_dir or settings.vlreview_model_dir
     script = build_vlreview_script(settings, job_name=name, pdf=pdf, model_dir=model, out_dir=out_dir,
                                    source_dir=source_dir)
-    spec = SlurmJobSpec(script=script, job_name=name)
+    # The script goes beside the job's log, in the run's own output directory.
+    spec = SlurmJobSpec(script=script, job_name=name, submit_dir=out_dir.rstrip("/"))
     result = run_batch_job(executor, spec, acquire=acquire, run=run, emit=emit)
     if not result.completed:
         raise SlurmJobError(

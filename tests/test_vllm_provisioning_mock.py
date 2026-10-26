@@ -12,8 +12,6 @@ BEFORE the full Ollama removal + app.py rewire.
 
 from __future__ import annotations
 
-import base64
-
 from aiscientist.gateway import gpu
 from aiscientist.gateway.mock_host import MockExecutor
 from aiscientist.gateway.settings import HPCSettings
@@ -45,14 +43,14 @@ def test_vllm_serve_job_allocates_and_reads_dynamic_port():
     assert reused is not None and reused.reused is True and reused.job_id == alloc.job_id
 
 
-def test_vllm_submitted_script_is_singularity_vllm():
+def test_vllm_submitted_script_is_apptainer_vllm():
     # What ensure_serve_job writes+submits for vLLM is the Apptainer/vLLM serve
     # script (group-wrapped because the image/HF live on lab DFS).
     settings = _vllm_settings()
     script = gpu._serve_script(settings, "testuser")
     assert "sg ruic20_hpc -c 'bash -s'" in script           # DFS group wrapper
     body = gpu.serve_body_from_script(script)
-    assert "singularity exec --nv" in body  # RCIC HPC3 uses Singularity
+    assert "apptainer exec --nv" in body  # HPC3 runtime since 2026-10-09
     assert "vllm serve QuantTrio/Qwen3.6-35B-A3B-AWQ" in body
     assert "--enable-auto-tool-choice --tool-call-parser qwen3_coder" in body
     assert "ollama serve" not in body                        # no Ollama on this path

@@ -1,0 +1,7 @@
+gene,cell_type,count,mean_expr,detected,date_measured
+RHO,rod,1520,12.75,true,2026-01-02
+GNAT1,rod,880,7.5,true,2026-01-02
+OPN1SW,cone,42,0.31,false,2026-01-03
+RLBP1,Mueller,310,2.0,true,2026-01-03
+VSX2,bipolar,95,0.88,true,2026-01-04
+POU4F2,ganglion,12,0.05,false,2026-01-04

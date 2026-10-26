@@ -51,8 +51,9 @@ def test_scientist_chat_heals_and_retries_once(monkeypatch):
         assert port == 5999, "retry must use the recovered tunnel port"
         return {"content": "ok", "tool_calls": []}
 
-    def fake_ensure(executor, settings, emit):
+    def fake_ensure(executor, settings, emit, wait_seconds=300):
         calls["ensure"] += 1
+        calls["wait"] = wait_seconds
         return types.SimpleNamespace(node="hpc3-gpu-1", port=12345)
 
     monkeypatch.setattr(gw.vllm_client, "chat_tools", fake_chat_tools)
@@ -67,6 +68,9 @@ def test_scientist_chat_heals_and_retries_once(monkeypatch):
     assert result == {"content": "ok", "tool_calls": []}
     assert calls["chat"] == 2, "must retry exactly once after healing"
     assert calls["ensure"] == 1, "must reattach/resubmit the serve job exactly once"
+    # A run is waiting: queue for a new GPU far longer than a connect does (2026-10-05: a run with
+    # three steps done died because no GPU started within 300 s of its serve job expiring).
+    assert calls["wait"] == 1800
     assert conn.tunnel_port == 5999, "conn.tunnel_port must be refreshed to the new local port"
     assert label == "vLLM"
 

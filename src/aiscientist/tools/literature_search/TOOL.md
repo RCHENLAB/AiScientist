@@ -16,6 +16,7 @@ Searches Europe PMC (free, no key) with keyword queries built from a run's findi
 ## When the agent uses it
 
 - Before writing interpretation or discussion, with queries built from accepted findings (genes, pathways, disease, cell type).
+- In a literature plan (a general question the router sends to the literature line): the model's queries are searched in PubMed and the answer is written from the abstracts, together with the passages `search_corpus` finds in the lab's corpus when the session reaches HPC3.
 - On the fast chat path, to answer a question with references.
 
 ## Inputs
@@ -44,11 +45,12 @@ On the fast chat path: yes.
 ## Known limits
 
 - It finds papers; it does not read them. For an answer with evidence, use `deep_literature`.
+- It reads the first 100 hits Europe PMC returns for a query, in Europe PMC's order (recent papers first), and ranks them itself by the query's words in the title and abstract, weighted by how rare each word is among those hits; a title match counts three times. Hits with none of the words are dropped. A relevant paper beyond the first 100 hits is not seen.
 - It calls the Europe PMC API from the gateway, so it needs the gateway's network.
 
 ## Code and tests
 
-- `tool.py`: the query focusing (`focus_literature_query`, also used by the planner through `tools/api.py`), the API client and the record.
+- `tool.py`: the query focusing (`focus_literature_query`, also used by the planner through `tools/api.py`), the API client, the ranking of the hits (`_clean_results`) and the record. The literature answer (`agents/literature_answer.py`) calls the same client through `tools/api.py` (`search_literature`) with `abstracts=True` (each paper's abstract, plain text) and `pubmed_only=True` (PubMed records only: no preprints, patents or theses).
 - Tests: `tests/test_literature_search.py`.
 
 ## What the model is told

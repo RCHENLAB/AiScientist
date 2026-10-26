@@ -402,7 +402,7 @@ def test_pips_scratch_never_reaches_the_published_tree():
 
 
 # --- probe results are remembered for the session -----------------------------
-# Each probe is an `srun` + module load + `singularity exec` + interpreter start on a compute node.
+# Each probe is an `srun` + module load + `apptainer exec` + interpreter start on a compute node.
 # Nothing remembered the answer, so every run_code call re-probed the same always-present packages.
 # Measured on a production run: ~605 seconds per call, seven calls per hour of "analysis".
 
@@ -453,7 +453,7 @@ def test_a_probe_that_could_not_run_is_never_cached_as_present():
 
     def broken(command, timeout_s=900):
         if "find_spec" in command and "scipy" in command:
-            return ExecResult(command, 127, "", "singularity: command not found")
+            return ExecResult(command, 127, "", "apptainer: command not found")
         return real_worker(command, timeout_s)
 
     shell._worker = broken

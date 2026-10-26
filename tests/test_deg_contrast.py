@@ -264,6 +264,9 @@ def test_enrichment_finds_the_contrast_table_and_splits_by_direction(ctx, tmp_pa
     # Background must be the tested universe run_de wrote, not the 20000 constant.
     assert out["background_source"] == "tested_universe"
     assert out["background_size"] == N_GENES
+    # A contrast's per-group tables are complete, so its input is the significant set.
+    assert out["selection"]["upstream_table"] == "complete"
+    assert not any("TOP-N" in w for w in out.get("warnings", []))
 
 
 def test_pseudobulk_writes_the_table_enrichment_discovers(tmp_path):
@@ -296,6 +299,55 @@ def test_pseudobulk_writes_the_table_enrichment_discovers(tmp_path):
     # Schema-compatible with run_de's table, so enrichment needs no special case.
     header = (tables / "de_celltype_all.csv").read_text(encoding="utf-8").splitlines()[0]
     assert header.split(",") == ["group", "gene", "log2fc", "pval", "pval_adj", "score"]
+
+
+def test_marker_de_reports_its_true_counts_and_enrichment_says_it_got_a_top_n(tmp_path,
+                                                                            monkeypatch):
+    """Run f3b8268c4fd4's hand-off: run_de's marker tables are the top n_genes per cluster, every
+    row cleared the gate, and the ORA step reported "50 selected by padj and |log2FC|" while
+    thousands per cluster were significant. Both tools must now say which it was."""
+    pytest.importorskip("gseapy")
+    rng = np.random.default_rng(1)
+    n_genes, block = 120, 40                   # cluster k is up in genes [40k, 40k + 40)
+    x = rng.poisson(2.0, (180, n_genes)).astype(np.float32)
+    clusters = np.repeat(["0", "1", "2"], 60)
+    for k in range(3):
+        x[clusters == str(k), k * block:(k + 1) * block] += rng.poisson(30.0, (60, block))
+    adata = ad.AnnData(x)
+    adata.var_names = [f"GENE_{i}" for i in range(n_genes)]
+    adata.obs_names = [f"cell_{i}" for i in range(adata.n_obs)]
+    adata.obs["leiden"] = clusters
+    adata.obs["leiden"] = adata.obs["leiden"].astype("category")
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    adata.raw = adata
+    (tmp_path / "work").mkdir()
+    adata.write(tmp_path / "work" / "adata_qc.h5ad")
+    ws = SimpleNamespace(workspace=tmp_path, decisions={})
+
+    de = run_de_tool.run_de({"groupby": "leiden", "n_genes": 10}, ws)
+
+    assert de["status"] == "ok" and all(n == 10 for n in de["de_rows_by_group"].values())
+    for g in ("0", "1", "2"):
+        sig = de["significant_by_group"][g]
+        assert sig["up"] >= block and sig["truncated"] and sig["shown"] == 10, sig
+    assert "top 10 per group" in de["table_truncation_note"]
+    tables = tmp_path / "artifacts" / "tables"
+    assert (tables / "de_leiden_significance.json").exists()
+
+    gdir = tmp_path / "genesets"
+    gdir.mkdir()
+    (gdir / "TestSets.gmt").write_text(
+        "BLOCK_0\tna\t" + "\t".join(f"GENE_{i}" for i in range(block)) + "\n", encoding="utf-8")
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(gdir))
+    out = run_enrichment_tool.run_enrichment({"gene_sets": ["TestSets"]}, ws)
+
+    assert out["status"] == "ok", out
+    assert out["genes_per_group"] == {"0": 10, "1": 10, "2": 10}
+    assert out["selection"]["upstream_table"] == "top_10"
+    assert out["selection"]["significant_upstream_by_group"] == {
+        g: v["up"] + v["down"] for g, v in de["significant_by_group"].items()}
+    assert any(w.startswith("INPUT IS A TOP-N") for w in out["warnings"])
 
 
 def test_enrichment_reports_no_significant_genes_instead_of_asking_for_a_gene_list(ctx,

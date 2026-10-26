@@ -2,8 +2,8 @@
 
 The guards are the point. Induction is the one feature here that WRITES EXECUTABLE CODE TO DISK,
 so most of these tests are about what it refuses: a bad name (it becomes a directory), code that
-does not compile, an oversized body, a collision with a curated skill, and any attempt to land in
-the repo's git-tracked ``skills/``.
+does not compile, an oversized body, a collision with a curated skill, and any attempt to land
+outside the induced-skill root.
 """
 
 from __future__ import annotations
@@ -191,30 +191,29 @@ def test_write_skill_refuses_a_traversing_name(tmp_path):
     assert not (tmp_path.parent.parent / "evil").exists()
 
 
-def test_a_curated_skill_always_wins_over_an_induced_one_of_the_same_name(tmp_path):
-    import os
+def test_a_curated_skill_always_wins_over_an_induced_one_of_the_same_name(tmp_path, monkeypatch,
+                                                                         skill_release):
     from aiscientist.agents import skills as skills_mod
     curated, induced_root = tmp_path / "curated", tmp_path / "induced"
     for root, desc in ((curated, "the curated one"), (induced_root, "the induced one")):
         (root / "shared_name").mkdir(parents=True)
         (root / "shared_name" / "SKILL.md").write_text(
             f"---\nname: shared_name\ndescription: {desc}\n---\n\nbody\n")
-    os.environ["AISCIENTIST_SKILLS_DIR"] = str(curated)
-    os.environ["AISCIENTIST_INDUCED_SKILLS_DIR"] = str(induced_root)
-    try:
-        lib = skills_mod._load_skills()
-    finally:
-        del os.environ["AISCIENTIST_SKILLS_DIR"], os.environ["AISCIENTIST_INDUCED_SKILLS_DIR"]
+    skill_release(curated, refresh=False)
+    monkeypatch.setenv("AISCIENTIST_INDUCED_SKILLS_DIR", str(induced_root))
+    lib = skills_mod._load_skills()
     assert lib["shared_name"].summary == "the curated one"
+    assert lib["shared_name"].registry_release == "v0.1.0" and not lib["shared_name"].induced
 
 
 def test_register_skill_is_additive_only():
     existing = Skill(name="already_here", summary="original")
     assert register_skill(existing) is True
     assert register_skill(Skill(name="already_here", summary="impostor")) is False
-    from aiscientist.agents.skills import SKILLS
+    from aiscientist.agents.skills import ALL_SKILLS, SKILLS
     assert SKILLS["already_here"].summary == "original"
     del SKILLS["already_here"]
+    ALL_SKILLS.pop("already_here", None)
 
 
 # --- wired into a run --------------------------------------------------------
@@ -261,16 +260,20 @@ def _run_lab(tmp_path, *, induction=True, seen=None):
 
 
 def test_a_run_induces_a_skill_at_the_end(tmp_path):
-    from aiscientist.agents.skills import SKILLS
+    from aiscientist.agents.skills import ALL_SKILLS, SKILLS
     try:
         events = _run_lab(tmp_path)
         induced = [e for e in events if e["type"] == "skill_induced"]
         assert induced and induced[0]["name"] == "summarize_group_sizes"
+        assert induced[0]["review"] == "pending"
         assert (tmp_path / "summarize_group_sizes" / "reference.py").exists()
-        # available in-process to the NEXT run, without a restart
-        assert "summarize_group_sizes" in SKILLS
+        # in the library in-process, without a restart — but no run is offered it until an admin
+        # approves it (tests/test_skill_review_gate.py)
+        assert ALL_SKILLS["summarize_group_sizes"].review == "pending"
+        assert "summarize_group_sizes" not in SKILLS
     finally:
         SKILLS.pop("summarize_group_sizes", None)
+        ALL_SKILLS.pop("summarize_group_sizes", None)
 
 
 def test_induction_off_by_default_never_asks_and_writes_nothing(tmp_path):

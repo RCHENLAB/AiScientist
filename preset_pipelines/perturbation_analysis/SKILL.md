@@ -1,7 +1,7 @@
 ---
 name: perturbation_analysis
 description: Analyze a pooled CRISPR / Perturb-seq screen — rank which perturbations change the transcriptome, then per-perturbation DE vs the non-targeting control
-tools: run_scanpy_qc, run_clustering, run_de, run_enrichment, run_code, literature_search
+tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, run_code, literature_search
 data_type: scrna
 ---
 
@@ -38,7 +38,7 @@ category values are given at planning time) and infer:
 
 ## Ordered plan
 
-1. **QC** (`run_scanpy_qc`): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
+1. **QC** (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor QC columns already in the data. Do NOT drop the control cells.
 2. **Embedding** (`run_clustering`): compute PCA/neighbors/UMAP. The PCA embedding is what the
    effect-size ranking (step 4) measures distances in; a UMAP colored by perturbation is a useful
@@ -69,7 +69,7 @@ category values are given at planning time) and infer:
    **Memory:** load the AnnData ONCE; inside the per-perturbation loop subset with a **view**
    (`adata[mask]`), never `.copy()` every group or hold all subsets at once — an over-budget loop is
    OOM-killed on the local sandbox (`returncode == -9`). Prefer `AISCIENTIST_RUN_CODE_ON_HPC=1`
-   (see `skills/README.md`) for a real `--mem` cap on large screens.
+   (see `deploy/analysis/README.md`) for a real `--mem` cap on large screens.
 7. **(Optional) Pathway enrichment per strong perturbation** (`run_enrichment`): on the up-/down-gene
    sets of each perturbation with a substantial DE result. Send gene SYMBOLS only.
 8. **(Optional) Group perturbations by transcriptional effect.** Perturbations with correlated DE

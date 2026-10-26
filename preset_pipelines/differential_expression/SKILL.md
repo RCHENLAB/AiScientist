@@ -2,7 +2,7 @@
 name: differential_expression
 version: 2
 description: Compare an experimental condition vs control (e.g. KO vs WT) per cell type, with pathway interpretation (v2 — pseudobulk when replicates exist, and honest about it when they don't)
-tools: run_scanpy_qc, run_clustering, run_de, run_pseudobulk_de, run_depth_matched_de, run_composition, run_enrichment, run_gsea_prerank, deep_literature, run_code
+tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_pseudobulk_de, run_depth_matched_de, run_composition, run_enrichment, run_gsea_prerank, deep_literature, run_code
 data_type: scrna
 ---
 
@@ -84,8 +84,12 @@ enrichment on the changed genes"** — plan that without waiting for the user to
 
 0. **Establish what the matrix IS, and the rules, before touching it** (`run_code`) — read-only,
    and BEFORE QC. Two outputs, written as tables the later steps read back:
-   * *Provenance.* Inspect `X`, `.raw`, `layers`, value ranges, sparsity and integer-ness, and
-     check whether matrix-derived totals reproduce any stored `nCount`/`nFeature` fields. A
+   * *Provenance.* **Not for a 10x Cell Ranger input whose data profile already rules on it**
+     (its `.h5` matrices were read at upload: integer UMI counts, checked against Cell Ranger's
+     `metrics_summary.csv`). Cite that ruling; do NOT plan a `run_code` step to re-derive it, and
+     write the decision rule below into the plan's first step instead. Otherwise: inspect `X`,
+     `.raw`, `layers`, value ranges, sparsity and integer-ness, and check whether matrix-derived
+     totals reproduce any stored `nCount`/`nFeature` fields. A
      published object often arrives already normalized and log1p'd: normalizing it again has NO
      symptom — every tool succeeds, every figure renders, and every number after it is wrong. So
      rule from the NUMBERS, and say which way you ruled:
@@ -109,7 +113,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
      relaxed until it passes. Most of these numbers already have defaults in the Parameters
      table below — this step is about COMMITTING to them (and to any change, with its reason)
      before the results can influence the choice.
-1. **QC** (`run_scanpy_qc`): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
+1. **QC** (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor any QC columns already in the data (e.g. `percent.mt`, doublet calls).
 2. **Define the comparison** from the profile (above): name the condition column, the two groups,
    the reference group, and the cell-type column you will stratify by. If labels already exist,
@@ -172,7 +176,8 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    must be `tested_universe`, not `constant_fallback`.
 5. **Cross-cell-type synthesis.** Find genes changed in the SAME direction across ≥2 cell types
    (a shared / pan-tissue signature) vs cell-type-specific changes.
-5b. **Literature grounding** (`deep_literature`): after the DE and pathway results exist, ground
+5b. **Literature grounding** (`deep_literature`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+   When it is planned: after the DE and pathway results exist, ground
    the surviving findings in published work. The query is built from what the analysis ACCEPTED —
    the actual genes, cell types and pathways — not from the user's original question, so this step
    is planned last among the analysis steps and never first. Ask focused questions ("is <gene> up
@@ -188,7 +193,7 @@ A researcher can ask for something this protocol advises against — most often 
 its arguments directly ("run `run_de` with groupby=<condition>"). Do NOT silently pick one and
 proceed, and do NOT silently plan both and let them contradict each other in the same plan.
 
-Do this instead: **follow the request**, and in the same plan say — in the `SELF-SOURCED:` line —
+Do this instead: **follow the request**, and in the same plan say — in its `self_sourced` disclosure —
 that it departs from this protocol, which part, and what it costs ("this pools all cell types and
 tests across cells, so the p-values are pseudoreplicated and a composition shift is
 indistinguishable from a change in expression; reported as a ranking, not as DE"). If the valid
@@ -201,7 +206,7 @@ invalid while that earlier step's output is still reported as a result.
 These are the tools' declared defaults — the same values the code applies, checked by
 `tests/test_declared_params.py`, which fails if this table and `scrna_pack.PARAMS` disagree.
 Leave a parameter alone unless the dataset gives you a reason to change it; when you do change one,
-say so and say why in the plan's `SELF-SOURCED:` line, because a number chosen for one run reads
+say so and say why in the plan's `self_sourced` disclosure, because a number chosen for one run reads
 exactly like a protocol-mandated one once it reaches a Methods section.
 
 **`run_scanpy_qc`**

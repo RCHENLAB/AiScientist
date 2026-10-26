@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import shlex
 
 from dataclasses import dataclass, field
 
@@ -24,6 +26,7 @@ class MockState:
     gpu_name: str = "NVIDIA L40S"
     tick: int = 0
     staged_files: list[tuple[str, str]] = field(default_factory=list)  # (local, remote) put_file calls
+    remote_sizes: dict[str, int] = field(default_factory=dict)          # what put_file "wrote"
 
 
 class MockExecutor:
@@ -105,6 +108,17 @@ class MockExecutor:
         if cmd.startswith("cat ") and "vllm.port" in cmd:
             return ok(str(st.serve_port)) if st.gpu_job_id else ok("")
 
+        # --- uploads: what put_file "wrote" is what is there ----------------
+        # (the gateway's check for a taken upload name, and its listing of an upload folder)
+        if cmd.startswith("test -e ") and cmd.endswith("&& echo taken"):
+            path = shlex.split(cmd)[2]
+            there = any(r == path or r.startswith(path + "/") for r in st.remote_sizes)
+            return ok("taken\n" if there else "")
+        if cmd.startswith("find ") and "-printf '%s\\t%P\\n'" in cmd:
+            root = shlex.split(cmd)[1].rstrip("/") + "/"
+            return ok("".join(f"{size}\t{r[len(root):]}\n" for r, size in sorted(st.remote_sizes.items())
+                              if r.startswith(root)))
+
         # --- basic shell (after tools, so heredoc bodies don't misfire) ---
         if cmd in ("hostname", "uname -n"):
             return ok("hpc3-login-1")
@@ -119,6 +133,10 @@ class MockExecutor:
     def put_file(self, local_path: str, remote_path: str) -> None:
         # No real remote FS in mock mode; record the staging request, do nothing.
         self.state.staged_files.append((local_path, remote_path))
+        try:
+            self.state.remote_sizes[remote_path] = os.path.getsize(local_path)
+        except OSError:
+            pass
 
     def get_file(self, remote_path: str, local_path: str) -> None:
         # No real remote FS in mock mode; nothing to fetch.
@@ -130,7 +148,8 @@ class MockExecutor:
         return b""
 
     def remote_size(self, remote_path: str) -> int:
-        return 0
+        # The size of what put_file was handed, so a staged upload's size check passes in mock mode.
+        return self.state.remote_sizes.get(remote_path, 0)
 
     def open_tunnel(self, remote_host: str, remote_port: int, local_port: int = 0) -> int:
         # No real socket in mock mode; echo a fixed local_port if pinned, else a

@@ -5,7 +5,7 @@ the CodeAct sandbox is injected as ``code_executor``. It closes over the live SS
 HPC settings and does the full remote round-trip for one annotation:
 
     stage the run's .h5ad onto shared DFS  (executor.put_file)
-        -> run_scgpt_inference: gpu:1 Singularity batch job (gateway/scgpt_job.py)
+        -> run_scgpt_inference: gpu:1 Apptainer batch job (gateway/scgpt_job.py)
         -> fetch predictions.csv back into the run artifacts  (executor.get_file)
         -> summarise the per-cell label distribution (no raw cells, no fabricated labels)
 

@@ -2,10 +2,10 @@
 (the report/PDF is produced on the eye server) and the REMOTE GPU that can actually *see* it.
 
 The eye server has no GPU, so each render is shipped to shared DFS and audited by a short-lived
-``gpu:1`` Singularity batch job on HPC3 (Route C — see :mod:`aiscientist.gateway.vlreview_job`):
+``gpu:1`` Apptainer batch job on HPC3 (Route C — see :mod:`aiscientist.gateway.vlreview_job`):
 
     stage the rendered PDF onto shared DFS  (executor.put_file)
-        -> run_vlreview: gpu:1 Singularity batch job (gateway/vlreview_job.py)
+        -> run_vlreview: gpu:1 Apptainer batch job (gateway/vlreview_job.py)
         -> read review.json back                 (returned parsed by run_vlreview)
 
 :func:`build_vlreview_review_fn` returns the ``review_fn(pdf_path) -> review dict`` callback the

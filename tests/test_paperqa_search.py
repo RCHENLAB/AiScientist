@@ -356,3 +356,70 @@ def test_gateway_forwards_every_cli_knob_from_its_env(monkeypatch, tmp_path):
     missing = {k: v for k, v in expected.items() if executor.inject_args.get(k) != v}
     assert not missing, f"CLI knobs the gateway does not forward: {sorted(missing)}"
     assert executor.inject_args["llm_base_url"] == "http://hpc3-gpu-m54-01:39124/v1"
+
+
+def test_a_session_on_the_users_api_key_gets_search_corpus_not_deep_literature(monkeypatch, tmp_path):
+    """Prod run BioAdmin/1e887ed2bf8e (2026-10-12), end to end on the gateway side. PaperQA on HPC3
+    is configured, but the session reasons on the user's own API key: no GPU allocation, so no served
+    model for the PaperQA job to call. The literature line is still built, because `search_corpus`
+    runs there without a model; the job is given no model endpoint and no API key. The roster leaves
+    `deep_literature` out, says why, and offers `search_corpus` in its place."""
+    import threading
+
+    from aiscientist.agents.registry import build_scientist_catalog
+    from aiscientist.gateway import app as gw
+    from aiscientist.gateway.settings import HPCSettings
+
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/shared/containers/paperqa.sif")
+    monkeypatch.setitem(sys.modules, "paperqa", None)      # the prod gateway venv has no paper-qa
+    conn = types.SimpleNamespace(
+        settings=HPCSettings(), executor=types.SimpleNamespace(username="tester"), mock=False,
+        alloc=None, owner="tester", workspace=tmp_path, selected_model="claude-haiku-5-5",
+        chat_stop=threading.Event(), hpc_pysrc="/shared/pysrc/tester")
+    executor = gw._build_literature_executor(conn)
+    assert executor is not None
+    assert "model" not in executor.inject_args and "llm_base_url" not in executor.inject_args
+    assert not any("key" in k.lower() for k in executor.inject_args)
+
+    said = []
+    roster = gw._session_roster(conn, build_scientist_catalog(literature_executor=executor),
+                                executor, lambda level, stage, message: said.append(message))
+    names = [t.name for t in roster]
+    assert "deep_literature" not in names
+    assert "search_corpus" in names and "literature_search" in names
+    assert len(said) == 1 and "deep_literature" in said[0] and "search_corpus" in said[0]
+    assert "GPU" in said[0]                                 # the reason, in the user's terms
+
+
+def test_without_a_served_model_no_deep_literature_job_is_submitted(monkeypatch, tmp_path):
+    """The roster drops `deep_literature`, but `diagnose_disease` composes its executor whatever the
+    roster says. In a session with no GPU allocation that call must answer `dependency_missing` at
+    once (so the differential falls to its LIRICAL track), not spend a Slurm job that has no model to
+    call; `search_corpus` still goes to HPC3."""
+    import threading
+
+    from aiscientist.gateway import app as gw
+    from aiscientist.gateway import slurm_analysis
+    from aiscientist.gateway.settings import HPCSettings
+
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/shared/containers/paperqa.sif")
+    submitted: list[str] = []
+    monkeypatch.setattr(slurm_analysis.SlurmAnalysisExecutor, "run_tool",
+                        lambda self, tool, args, ctx: submitted.append(tool) or {"status": "ok"})
+    conn = types.SimpleNamespace(
+        settings=HPCSettings(), executor=types.SimpleNamespace(username="tester"), mock=False,
+        alloc=None, owner="tester", workspace=tmp_path, selected_model="claude-haiku-5-5",
+        chat_stop=threading.Event(), hpc_pysrc="/shared/pysrc/tester")
+    executor = gw._build_literature_executor(conn)
+
+    out = executor.run_tool("deep_literature", {"question": "Is PRPF31 haploinsufficient?"}, None)
+    assert out["status"] == "dependency_missing" and out["dependency"] == "served-model"
+    assert executor.run_tool("extract_haploinsufficient_genes", {}, None)["status"] == "dependency_missing"
+    assert executor.run_tool("search_corpus", {"queries": ["PRPF31 haploinsufficiency"]}, None) == {"status": "ok"}
+    assert submitted == ["search_corpus"]
+
+    conn.alloc = types.SimpleNamespace(node="hpc3-gpu-m54-01", port=39124)
+    gw._build_literature_executor(conn).run_tool("deep_literature", {"question": "q"}, None)
+    assert submitted == ["search_corpus", "deep_literature"]   # a GPU session is unchanged

@@ -1,9 +1,10 @@
-# Container image for the AiScientist console (AiScientist) — for the eyeserver Kubernetes cluster.
+# Container image for the AiScientist console, for a deployment that runs the app in a pod.
+# The lab server does not use it (the app is a host systemd unit there: deploy/README.md).
 #
 # This is the FULL image: it bundles the analysis stack because the app's CodeAct sandbox runs
 # generated analysis code in-process on the same host (scanpy/gseapy/matplotlib), and the report
 # renderer shells out to pandoc + xelatex + graphviz. So the image is GB-scale (texlive + scanpy
-# are the bulk). If you later move tool execution to HPC3 (RemoteCodeSandbox + Singularity), the
+# are the bulk). If you later move tool execution to HPC3 (RemoteCodeSandbox + Apptainer), the
 # gateway image can drop the analysis stack and shrink dramatically.
 #
 # Build + push (run from repo root):
@@ -12,7 +13,7 @@
 #
 # The app holds per-session SSH tunnels to HPC3 + in-memory connection state → it is a STATEFUL
 # SINGLETON. Run exactly ONE replica (see deploy/k8s/aiscientist.yaml). No external MODEL API is
-# used; the only model is Qwen3.6 on HPC3, reached over SSH (paramiko, in-process).
+# needed; the default model is served on HPC3 and reached over SSH (paramiko, in-process).
 
 FROM python:3.13-slim
 

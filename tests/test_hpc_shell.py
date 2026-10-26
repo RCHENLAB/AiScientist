@@ -365,3 +365,50 @@ def test_the_shared_model_dirs_are_readable_but_never_writable(monkeypatch):
         assert asset not in write, f"{asset} must stay read-only — the lab account is shared"
     # The containers the models run inside were already readable; keep it that way.
     assert f"{st.shared_root.rstrip('/')}/containers" in read
+
+
+# --- a worker that ended between the liveness check and the command ----------
+
+
+# srun's refusals for a job that is gone, as printed on HPC3 (2026-10-19).
+GONE = ["srun: error: Slurm job 58247673 has expired",
+        "srun: error: Unable to confirm allocation for job 57546244: Invalid job id specified"]
+
+
+@pytest.mark.parametrize("refusal", GONE)
+def test_a_command_refused_because_the_worker_ended_runs_once_on_a_new_one(refusal):
+    """The worker is released while idle and ends itself when unused (issue 23), so it can end
+    between the provider's check and the srun. srun refuses BEFORE the step starts, so asking the
+    provider again is safe — and the command still runs exactly once."""
+    allocs = iter(["old", "new"])
+    seen: list[tuple[str, str]] = []
+
+    def run_on_worker(alloc, command, timeout_s):
+        seen.append((alloc, command))
+        if alloc == "old":
+            return ExecResult(command, 1, "", refusal + "\n")
+        return ExecResult(command, 0, "done", "")
+
+    sh = HpcShell(remote=FakeRemote(), workspace=HpcWorkspace(read_roots=(HOME,), write_roots=(HOME,)),
+                  home=HOME, worker_provider=lambda: next(allocs), run_on_worker=run_on_worker)
+    res = sh._worker("du -sh /x")
+    assert res.ok and seen == [("old", "du -sh /x"), ("new", "du -sh /x")]
+
+
+@pytest.mark.parametrize("err", [
+    "srun: error: hpc3-23-18: task 0: Exited with exit code 1",
+    "ERROR: cannot verify example.org's certificate: Issued certificate has expired.",
+    "wget: Slurm job 7 has expired",
+])
+def test_a_command_that_failed_on_its_own_is_not_run_again(err):
+    """Only srun's refusal to START is retried — never a command that ran and failed, even when
+    its own message happens to say "has expired"."""
+    calls: list[str] = []
+
+    def run_on_worker(alloc, command, timeout_s):
+        calls.append(command)
+        return ExecResult(command, 1, "", err)
+
+    sh = HpcShell(remote=FakeRemote(), workspace=HpcWorkspace(read_roots=(HOME,), write_roots=(HOME,)),
+                  home=HOME, worker_provider=object, run_on_worker=run_on_worker)
+    assert not sh._worker("false").ok and calls == ["false"]

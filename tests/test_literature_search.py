@@ -46,13 +46,14 @@ def test_search_parses_real_citations(monkeypatch):
     out = search_europepmc("DDX41 retina", limit=5)
 
     assert out["status"] == "ok" and out["count"] == 2
-    first = out["results"][0]
+    by_pmid = {r["pmid"]: r for r in out["results"]}
+    first = by_pmid["40000001"]
     assert first["doi"] == "10.1016/j.cell.2025.01.001"
     assert first["url"] == "https://doi.org/10.1016/j.cell.2025.01.001"
     assert "Li J et al. (2025)" in first["citation"] and "PMID" not in first["citation"]
     # a DOI-less paper falls back to a PubMed URL + PMID in the citation
-    assert out["results"][1]["url"] == "https://pubmed.ncbi.nlm.nih.gov/39999999/"
-    assert "PMID:39999999" in out["results"][1]["citation"]
+    assert by_pmid["39999999"]["url"] == "https://pubmed.ncbi.nlm.nih.gov/39999999/"
+    assert "PMID:39999999" in by_pmid["39999999"]["citation"]
     # the query is what we passed (only public keywords leave the host)
     assert seen["params"]["query"] == "DDX41 retina"
 
@@ -162,3 +163,79 @@ def test_search_filters_off_topic_hits(monkeypatch):
     assert out["filtered_count"] == 1
     assert "DDX41" in out["results"][0]["title"]
     assert "CAR T" not in "\n".join(c["citation"] for c in out["results"])
+
+
+@pytest.fixture
+def deep_response():
+    # Newest first: the useful paper is far beyond the previous eight-hit request.
+    hits = [{"title": "Unrelated cancer treatment", "pubYear": "2026", "pmid": str(i),
+             "authorString": "RHO A", "journalTitle": "Retina", "abstractText": "Tumour growth."}
+            for i in range(1, 101)]
+    hits[79] = {"title": "Inherited visual disease", "pubYear": "2003", "pmid": "12906118",
+                "abstractText": "<p>" + "Background. " * 250 + "RHO retina degeneration.</p>"}
+    return {"resultList": {"result": hits}}
+
+
+@pytest.mark.parametrize("abstracts", [False, True])
+def test_deep_abstract_match_outranks_newer_hits_in_one_request(monkeypatch, deep_response, abstracts):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(kwargs)
+        return _Resp(deep_response)
+
+    monkeypatch.setattr(httpx, "get", get)
+    out = search_europepmc("RHO retina degeneration", limit=8, abstracts=abstracts, pubmed_only=True)
+    assert len(calls) == 1
+    assert calls[0]["params"] == {"query": "(RHO retina degeneration) AND SRC:MED", "format": "json",
+                                  "pageSize": 100, "resultType": "core"}
+    assert calls[0]["timeout"] == 20.0
+    assert out["unfiltered_count"] == 100
+    assert [r["pmid"] for r in out["results"]] == ["12906118"]
+    assert ("abstract" in out["results"][0]) is abstracts
+    if abstracts:
+        assert len(out["results"][0]["abstract"]) <= 2000
+
+
+def test_zero_overlap_does_not_match_authors_journal_or_substrings(monkeypatch):
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp({"resultList": {"result": [
+        {"title": "Rhodopsin structure", "abstractText": "Protein folding.", "authorString": "RHO A",
+         "journalTitle": "RHO", "pmid": "1"}]}}))
+    out = search_europepmc("RHO", abstracts=True)
+    assert out["unfiltered_count"] == 1 and out["results"] == []
+
+
+def test_title_overlap_has_more_weight_than_abstract_overlap(monkeypatch):
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp({"resultList": {"result": [
+        {"title": "Protein structure", "abstractText": "RHO " * 200, "pmid": "1", "pubYear": "2026"},
+        {"title": "RHO structure", "pmid": "2", "pubYear": "2003"}]}}))
+    assert [r["pmid"] for r in search_europepmc("RHO")["results"]] == ["2", "1"]
+
+
+
+def test_deep_search_returns_ranked_candidates_but_answer_reads_only_twelve(monkeypatch):
+    from aiscientist.agents.literature_answer import collect_papers
+
+    calls = []
+    hits = [{"title": f"RHO retina study {i}", "abstractText": "RHO degeneration.",
+             "pmid": str(1000 + i), "pubYear": "2026"} for i in range(100)]
+
+    def get(url, **kwargs):
+        calls.append(kwargs)
+        return _Resp({"resultList": {"result": hits}})
+
+    monkeypatch.setattr(httpx, "get", get)
+    got = collect_papers(lambda q, n: search_europepmc(q, n, abstracts=True, pubmed_only=True), ["RHO retina"])
+    assert len(calls) == 1
+    assert calls[0]["params"]["pageSize"] == 100          # reads 100 hits ...
+    assert got.searched == [{"query": "RHO retina", "count": 12}]   # ... keeps the best 12
+    assert len(got.papers) == 12
+
+
+def test_a_large_limit_still_returns_at_most_twenty_five_papers(monkeypatch):
+    # The search reads 100 hits, but the tool's schema promises 1-25 results to the model.
+    hits = [{"title": f"RHO retina study {i}", "abstractText": "RHO degeneration.", "pmid": str(2000 + i)}
+            for i in range(100)]
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp({"resultList": {"result": hits}}))
+    out = search_europepmc("RHO retina", limit=100)
+    assert out["unfiltered_count"] == 100 and out["count"] == 25

@@ -99,7 +99,7 @@ Expected ranges it flags against:
 **✅ Verify this step:** Ti/Tv reported up front · any `qc_flags` surfaced · if flagged, downstream tables
 are framed as lower-confidence (not silently trusted).
 
-<sub>Source: `skills/vcf_qc_stats/reference.py`</sub>
+<sub>Source: skill `qc-vcf-callset` (`scripts/reference.py`)</sub>
 </details>
 
 <details>
@@ -292,7 +292,7 @@ if high-impact — note the frequency.
 · the ACMG-is-not-this caveat is present · compound-het candidates are marked "needs phasing" · no
 "uncertain"→"pathogenic" upgrades.
 
-<sub>Source: `ird_prioritize.annotate_disease_model` + `ird_annotate.inclusion_reason` + `skills/clinical_variant_prioritization/reference.py`</sub>
+<sub>Source: `ird_prioritize.annotate_disease_model` + `ird_annotate.inclusion_reason` + skill `prioritize-clinical-variants` (`scripts/reference.py`)</sub>
 </details>
 
 <details>

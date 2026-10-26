@@ -14,7 +14,7 @@ and labelled as such — it is a pipeline stress-test, not a real biological con
 Deps: h5py + numpy only (already in the app venv) — no scanpy/anndata needed.
 
 Usage (on the eye server, with the app venv):
-    /data/BioAgent/env/bin/python h5ad_to_csv.py INPUT.h5ad OUTPUT.csv \
+    /data/aiscientist/env/bin/python h5ad_to_csv.py INPUT.h5ad OUTPUT.csv \
         [--cells 400] [--genes 40] [--seed 0]
 """
 from __future__ import annotations

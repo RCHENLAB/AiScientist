@@ -12,7 +12,10 @@ allowed). Degrades gracefully (returns ``status="error"``) when offline.
 
 from __future__ import annotations
 
+import html
+import math
 import re
+from collections import Counter
 from typing import Any
 
 _EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -38,6 +41,11 @@ _BRIEF_FUNCTION_WORDS = {"against", "known", "using", "within", "between", "acro
                          "through", "under", "above", "below", "while", "where", "which",
                          "their", "these", "those", "there", "other", "every", "about"}
 _QUERY_MAX_CHARS = 180
+_ABSTRACT_MAX_CHARS = 2000
+SEARCH_DEPTH = 100
+MAX_RESULTS = 25    # papers returned: what the `limit` schema promises (1-25)
+_RANK_WORD = re.compile(r"[a-z][a-z0-9]*")
+_RANK_STOPWORDS = set("a an and are as at be by for from in is it not of on or that the this to was were with".split())
 #throw a series of garbage words
 _QUERY_STOPWORDS = {
     "a", "about", "above", "after", "an", "analysis", "analyze", "and", "annotations", "any",
@@ -91,8 +99,9 @@ _GENERIC_CITATION_PATTERNS = (
 
 #data clean
 def _clean(text: str) -> str:
-    """Europe PMC embeds HTML (e.g. <i>GENE</i>) in titles — strip tags for clean output."""
-    return _HTML_TAG.sub("", text or "").strip()
+    """Europe PMC embeds HTML (e.g. <i>GENE</i>) in titles and abstracts, sometimes escaped
+    (``&lt;i&gt;``) — unescape it, then strip the tags, for clean output."""
+    return _HTML_TAG.sub("", html.unescape(html.unescape(text or ""))).strip()
 
 
 def _format_citation(r: dict[str, Any]) -> str:
@@ -189,67 +198,51 @@ def _is_generic_citation(citation: dict[str, Any]) -> bool:
     return any(re.search(pattern, title) for pattern in _GENERIC_CITATION_PATTERNS)
 
 
-#score
-def _rank_key(citation: dict[str, Any], query_terms: set[str]) -> tuple[int, int]:
-    title = str(citation.get("title") or "").lower()
-    haystack = " ".join(str(citation.get(k) or "") for k in ("title", "journal", "authors")).lower()
-    score = 0
-    if citation.get("doi") or citation.get("pmid"):
-        score += 2
-    for term in query_terms:
-        if term in title:
-            score += 3
-        elif term in haystack:
-            score += 1
-    if "review" in title:
-        score += 2
-    if "germline" in title:
-        score += 2
-    if "ddx41" in title:
-        score += 4
-    if _is_generic_citation(citation):
-        score -= 100
-    try:
-        year_i = int(str(citation.get("year") or "")[:4])
-    except ValueError:
-        year_i = 0
-    return score, year_i
+def _rank_terms(text: str) -> set[str]:
+    return set(_RANK_WORD.findall(_clean(text).lower())) - _RANK_STOPWORDS
 
 
-def _matches_query_terms(citation: dict[str, Any], query_terms: set[str]) -> bool:
-    if not query_terms:
-        return True
-    haystack = " ".join(str(citation.get(k) or "") for k in ("title", "journal", "authors")).lower()
-    return any(term in haystack for term in query_terms)
-
-#get the filtered results
 def _clean_results(citations: list[dict[str, Any]], query: str, limit: int) -> list[dict[str, Any]]:
-    terms = {
-        t.lower()
-        for t in _WORD.findall(query)
-        if len(t) > 3 and t.lower() not in _QUERY_STOPWORDS
-    }
-    useful = [
-        c for c in citations
-        if not _is_generic_citation(c) and _matches_query_terms(c, terms)
-    ]
-    useful.sort(key=lambda c: _rank_key(c, terms), reverse=True)
-    return useful[:limit]
+    """IDF-weighted query overlap in title + abstract; title matches count three times.
+
+    Distinct terms prevent repeated words in long abstracts dominating. Exact tokens preserve
+    short gene symbols (RHO, RP1) without matching incidental substrings in authors or journals.
+    Ties retain the service's order; publication year and particular genes get no extra weight.
+    """
+    terms = _rank_terms(query)
+    docs = [(c, _rank_terms(str(c.get("title") or "")),
+             _rank_terms(str(c.get("abstract") or "")))
+            for c in citations if not _is_generic_citation(c)]
+    frequencies = Counter(term for _, title, abstract in docs for term in title | abstract)
+    weights = {t: math.log(1 + (len(docs) + 1) / (frequencies[t] + 1)) for t in terms}
+    scored = [(sum(weights[t] * (3 * (t in title) + (t in abstract)) for t in terms), c)
+              for c, title, abstract in docs]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [c for score, c in scored if score > 0][:limit]
+
 
 #clear query-> request Europe PMC -> parse->filter->return
-def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0) -> dict[str, Any]:
+def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0, *,
+                     abstracts: bool = False, pubmed_only: bool = False) -> dict[str, Any]:
     """Search Europe PMC and return real, structured citations. Never raises — returns
-    ``{status: "error", error}`` on any failure so the agent loop can adapt or skip."""
+    ``{status: "error", error}`` on any failure so the agent loop can adapt or skip.
+
+    ``abstracts`` adds each paper's abstract (``abstract``, plain text, at most
+    ``_ABSTRACT_MAX_CHARS``), for a caller that answers from the papers rather than only citing
+    them. ``pubmed_only`` keeps PubMed records (Europe PMC source ``MED``): no preprints, patents
+    or theses. One request reads up to 100 core records; title + full abstract determine local
+    relevance before the output limit and abstract truncation are applied."""
     query = focus_literature_query(query)
     if not query:
         return {"status": "error", "error": "empty query"}
-    limit = max(1, min(int(limit or 8), 25))
+    limit = max(1, min(int(limit or 8), MAX_RESULTS))
+    sent = f"({query}) AND SRC:MED" if pubmed_only else query
     try:
         import httpx
 
         resp = httpx.get(
             _EUROPEPMC,
-            params={"query": query, "format": "json", "pageSize": limit, "resultType": "core"},
+            params={"query": sent, "format": "json", "pageSize": SEARCH_DEPTH, "resultType": "core"},
             timeout=timeout_s,
             headers={"User-Agent": "AiScientist/literature_search"},
         )
@@ -258,9 +251,9 @@ def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0) -> dic
     except Exception as exc:  # noqa: BLE001 - network/parse failure is reported, never fatal
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}", "query": query}
 
-    raw_count = len(raw[:limit])
+    raw_count = len(raw[:SEARCH_DEPTH])
     results: list[dict[str, Any]] = []
-    for r in raw[:limit]:
+    for r in raw[:SEARCH_DEPTH]:
         doi = (r.get("doi") or "").strip()
         pmid = (r.get("pmid") or "").strip()
         if doi:
@@ -279,8 +272,14 @@ def search_europepmc(query: str, limit: int = 8, timeout_s: float = 20.0) -> dic
             "url": url,
         }
         item["citation"] = _format_citation(item)
+        item["abstract"] = " ".join(_clean(r.get("abstractText") or "").split())
         results.append(item)
     results = _clean_results(results, query, limit)
+    for item in results:
+        if abstracts:
+            item["abstract"] = item["abstract"][:_ABSTRACT_MAX_CHARS]
+        else:
+            item.pop("abstract")
     return {
         "status": "ok",
         "query": query,

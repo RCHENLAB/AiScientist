@@ -13,6 +13,8 @@ from .._lib.scrna import (
     _DEFAULT_GENE_SETS,
     _dirs,
     _genesets_dir,
+    gene_sets_note,
+    installed_gene_sets,
     _missing,
     _rel,
     _run_files,
@@ -36,11 +38,6 @@ def run_gsea_prerank(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     Ranks come from the ``rank_<groupby>_<group>.rnk`` files ``run_de`` writes (the Wilcoxon
     z-score, so a positive NES means "up in this group vs the rest").
     """
-    try:
-        import gseapy as gp
-    except ImportError as exc:
-        return _missing(getattr(exc, "name", None) or "gseapy")
-
     work, art, figs, tables = _dirs(ctx)
 
     gene_sets = args.get("gene_sets") or list(_DEFAULT_GENE_SETS)
@@ -60,7 +57,13 @@ def run_gsea_prerank(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         return {"status": "error", "step": "gsea_prerank", "genesets_dir": str(gdir),
                 "missing_libraries": missing_libs,
                 "error": (f"no local gene-set (.gmt) files found in {gdir} for {gene_sets}. "
-                          "Offline GSEA needs local GMTs — run scripts/fetch_genesets.py.")}
+                          + gene_sets_note(gene_sets))}
+
+    # gseapy only now, as in run_enrichment: an unknown library name needs no import to report.
+    try:
+        import gseapy as gp
+    except ImportError as exc:
+        return _missing(getattr(exc, "name", None) or "gseapy")
 
     labels: dict[str, str] = {}
     groupby = str(args.get("groupby", "")).strip()
@@ -207,7 +210,9 @@ def make_tool() -> HarnessTool:
         "COMPLEMENT to run_enrichment, not a replacement: ORA thresholds a top-N list, GSEA "
         "walks the whole ranking, and the two use different null hypotheses — do NOT treat "
         "disagreement between them as an error, and do NOT drop a group because nothing "
-        "passed FDR (report the null result).",
+        "passed FDR (report the null result)."
+        + (f" Installed libraries: {', '.join(installed_gene_sets())}; no other can be used."
+           if installed_gene_sets() else ""),
         {"type": "object", "properties": {
             "gene_sets": {"type": "array", "items": {"type": "string"}},
             "groupby": {"type": "string"}, "top_n_terms": {"type": "integer"},

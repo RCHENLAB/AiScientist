@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """In-container entrypoint for scGPT per-cell annotation (Route C GPU batch job).
 
-Runs INSIDE the scGPT Singularity image ONLY (scgpt + torch live here, never in the
+Runs INSIDE the scGPT Apptainer image ONLY (scgpt + torch live here, never in the
 gateway's Python env). Invoked by ``aiscientist.gateway.scgpt_job`` via:
 
     python /opt/scgpt/run_infer.py --input <query.h5ad> --model <model_dir> --out <out_dir>

@@ -30,9 +30,10 @@ to large screens. Significance is a **label-permutation test**: pool P+C, reshuf
 `N_PERM` times, count how often the permuted E-distance ≥ observed (Davison–Hinkley `+1`), then
 Benjamini–Hochberg across perturbations. Perturbations not significant at the chosen FDR are
 **silent** — reported as a result, not run through DE. (Note: with squared-Euclidean cost the
-statistic is centroid-shift-based; that is the scPerturb definition and what pertpy's `Distance
-metric="edistance"` reports. A distribution-shape-sensitive variant needs non-squared Euclidean +
-subsampled pairwise distances.)
+statistic is centroid-shift-based. It equals scPerturb's `edist(dist="sqeuclidean",
+sample_correct=False)`; scPerturb's default is smaller by 2·Var/(n−1) per group, and pertpy's
+`Distance(metric="edistance")` uses plain Euclidean distances, so neither reports the same numbers.
+A distribution-shape-sensitive variant needs non-squared Euclidean + subsampled pairwise distances.)
 
 ## Per-perturbation DE (`perturbation_de_vs_control.py`)
 

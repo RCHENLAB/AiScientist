@@ -45,13 +45,12 @@ SIF="${DFS_DIR}/lirical.sif"
 # Assembly tag is hg19 / hg38.
 EXOMISER_BASE="${EXOMISER_BASE:-https://data.monarchinitiative.org/exomiser/latest}"
 
-echo "== 1. Build lirical.sif -- pick ONE route (then re-run with BUILT=1) =="
+echo "== 1. Build lirical.sif with Apptainer (then re-run with BUILT=1) =="
 cat <<ROUTES
-  module load singularity        # or apptainer (HPC3 has apptainer/1.4.5, singularity/3.11.3)
-  (a) fakeroot build from the def (if RCIC enables --fakeroot):
-        cd ${HERE} && singularity build --fakeroot lirical.sif lirical.def
-  (b) remote builder (no local root; the def downloads LIRICAL in %post, no local %files, so this works):
-        cd ${HERE} && singularity build --remote lirical.sif lirical.def
+  # On an HPC3 COMPUTE node (RCIC: no builds on login nodes). Apptainer's --fakeroot needs no
+  # /etc/subuid entry on HPC3, and Sylabs --remote builds are gone (docs/hpc3_assets.md).
+  cd ${HERE} && sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-lirical \\
+    --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=\$TMPDIR/ac apptainer build --fakeroot lirical.sif lirical.def'
 ROUTES
 if [ "${BUILT:-0}" != "1" ]; then
     echo "(set BUILT=1 once ${HERE}/lirical.sif exists to stage it + download the data)"; exit 0
@@ -69,7 +68,7 @@ mkdir -p "${DATA_DIR}"
 if [ -s "${DATA_DIR}/hp.json" ] || [ -s "${DATA_DIR}/hpo.json" ]; then
     echo "  skip (LIRICAL data present): ${DATA_DIR}"
 else
-    singularity exec -B "${DATA_DIR}:${DATA_DIR}" "${SIF}" lirical download -d "${DATA_DIR}"
+    apptainer exec -B "${DATA_DIR}:${DATA_DIR}" "${SIF}" lirical download -d "${DATA_DIR}"
 fi
 ls -la "${DATA_DIR}" | head
 
@@ -98,7 +97,7 @@ cat <<EOF
   # LIRICAL v2.4 'prioritize' is CLI-ARGS mode: -p is the comma-separated OBSERVED HPO term IDs (NOT a
   # phenopacket file); -o outdir, -x prefix, -f format. Phenotype-only = omit --assembly/--vcf/-ed*.
   # (a) phenotype-only  (~1 min; expect retinal diseases near the top):
-  singularity exec -B /dfs3b:/dfs3b -B /tmp:/tmp ${SIF} \\
+  apptainer exec -B /dfs3b:/dfs3b -B /tmp:/tmp ${SIF} \\
     lirical prioritize -p HP:0000512,HP:0000662,HP:0000510 -d ${DATA_DIR} -o /tmp -x smoke_pheno -f tsv
   grep -v '^!' /tmp/smoke_pheno.tsv | head -12
 
@@ -107,13 +106,13 @@ cat <<EOF
     '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">' \\
     '#CHROM\\tPOS\\tID\\tREF\\tALT\\tQUAL\\tFILTER\\tINFO\\tFORMAT\\tsmoke-1' \\
     '1\\t94473807\\t.\\tC\\tT\\t100\\tPASS\\t.\\tGT\\t0/1' > /tmp/smoke.vcf
-  singularity exec -B /dfs3b:/dfs3b -B /tmp:/tmp ${SIF} \\
+  apptainer exec -B /dfs3b:/dfs3b -B /tmp:/tmp ${SIF} \\
     lirical prioritize -p HP:0000512,HP:0000662,HP:0000510 -d ${DATA_DIR} -o /tmp -x smoke_geno -f tsv \\
       --vcf /tmp/smoke.vcf --assembly hg19 -ed19 ${EXOMISER_DIR}/${EXOMISER_DATA_VERSION}_hg19 --sample-id smoke-1
   grep -v '^!' /tmp/smoke_geno.tsv | head -12   # expect ABCA4 diseases sharpened to the top
 
   # The exact flags are pinned to LIRICAL v${LIRICAL_VERSION}. If one is rejected, run
-  # \`singularity exec ${SIF} lirical prioritize --help\` and update tools/phenotype_dx.build_lirical_cmd
+  # \`apptainer exec ${SIF} lirical prioritize --help\` and update tools/phenotype_dx.build_lirical_cmd
   # (a runtime arg -- no image rebuild needed).
 EOF
 

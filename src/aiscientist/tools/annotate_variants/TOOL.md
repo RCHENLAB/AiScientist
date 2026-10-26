@@ -56,7 +56,7 @@ On the fast chat path: no (research runs only).
 ## Code and tests
 
 - `tool.py`: the REST path, the tables and the record; `offline.py`: the offline VEP command and parsing; `ird_annotate.py` and `ird_prioritize.py`: the IRD layers and gene-level tiering (the lab panel is in `../gene_panels/`). The job entry point is `../variant_cli.py`.
-- Tests: `tests/test_variant_annotation.py`, `tests/test_ird_annotate.py`, `tests/test_ird_prioritize.py`, `tests/test_variant_output_tables_skill.py`.
+- Tests: `tests/test_variant_annotation.py`, `tests/test_ird_annotate.py`, `tests/test_ird_prioritize.py`.
 
 ## What the model is told
 

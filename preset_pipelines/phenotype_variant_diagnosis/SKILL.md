@@ -17,9 +17,9 @@ informal it is ("夜盲、视野缩窄、ERG 熄灭型", "Stargardt", "RP with m
 
 **Where the description comes from — either is fine, you do not have to care which:**
 * the **research question** itself (the clinician pasted the note into the chat), or
-* an **attached case note** (the console's "Attach a case note" slot). It is a separate slot from the
-  dataset — the VCF keeps the dataset slot — and `map_phenotype_to_hpo` reads the attached note
-  automatically when you call it with no `text`.
+* an **attached case note** (sent with the request as a separate slot from the dataset — the VCF
+  keeps the dataset slot). `map_phenotype_to_hpo` reads the attached note automatically when you
+  call it with no `text`.
 
 So: if the question carries the description, pass it as `text` VERBATIM. If it does not, call
 `map_phenotype_to_hpo` with NO arguments — it will map the attached note. If neither exists, the tool
@@ -74,8 +74,9 @@ Put the two tracks side by side and say what they agree on:
 - **Variant-only hit** — a compelling variant in a gene LIRICAL did not rank. **This is expected and is
   NOT a contradiction.** LIRICAL scores against *curated* HPO/OMIM annotations, so a gene whose
   disease association is new, or a phenotype expansion of a known gene, CANNOT rank — by construction.
-  Treat a low LIRICAL rank as "not in the curated annotations", never as "not causal". Use
-  `literature_search` on that gene + the phenotype to check for recent evidence the curation lags.
+  Treat a low LIRICAL rank as "not in the curated annotations", never as "not causal". When the
+  user asks for literature, `literature_search` on that gene + the phenotype checks for recent
+  evidence the curation lags; otherwise say that this check is available as a follow-up.
 
 Report BOTH tracks even when they disagree — the disagreement is often the finding.
 

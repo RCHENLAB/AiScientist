@@ -15,20 +15,21 @@ AiScientist is a web research agent for biomedical data (single-cell RNA-seq, VC
 phenotypes). A user uploads data and asks a question. LLM roles form a virtual lab: the PI drafts a
 plan, the user reviews it, the Scientist runs curated tools or its own code step by step (as Slurm
 jobs on UCI HPC3), the Critic reviews every step, and the run ends in a cited manuscript-style report
-(PDF / DOCX). The LLM is Qwen3.8, self-hosted with vLLM on an HPC3 GPU, or the user's own API key.
+(PDF / DOCX). A session runs on one LLM for all of its calls: Qwen3.8 in a GPU job of its own, the lab's shared model
+on HPC3 GPUs (DeepSeek-V4-Flash; the default where the server keeps one), both self-hosted with vLLM, or the user's own API key.
 
 The code namespace is `aiscientist` (package, `AISCIENTIST_*` env vars). A `bioagent` import alias and
 the legacy `BIOAGENT_*` env names still work, and a few runtime identifiers outside the repository keep
-the old name (`/data/BioAgent`, the `bioagent` systemd unit, Slurm job names). See `CLAUDE.md`.
+the old name (Slurm job names, `~/.bioagent` on HPC3, the Postgres role and database).
 
 ## Where it runs
 
 ```mermaid
 flowchart LR
     browser["Browser: console UI"] <-->|"HTTPS + WebSocket"| envoy["Envoy ingress<br/>AiScientist.eye.som.uci.edu"]
-    envoy -->|"proxies"| gw["AiScientist gateway on eyeserver :8800<br/>systemd unit bioagent · FastAPI + WebSocket"]
+    envoy -->|"proxies"| gw["AiScientist gateway on eyeserver :8800<br/>systemd unit aiscientist · FastAPI + WebSocket"]
     gw -->|"accounts, runs, chats"| pg[("Postgres")]
-    gw -->|"run files, uploads, keys"| data[("/data/BioAgent")]
+    gw -->|"run files, uploads, keys"| data[("/data/aiscientist")]
     gw -->|"sync code, stage data"| dfs[("dfs3b shared root")]
     gw <-->|"LLM calls via SSH tunnel"| vllm["HPC3 GPU job: vLLM"]
     gw -->|"shell tools via SSH"| worker["HPC3 held CPU worker"]
@@ -40,9 +41,21 @@ flowchart LR
 ```
 
 The gateway orchestrates and never does the heavy compute. On each connect it syncs its own code to
-`pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Singularity images, so a
+`pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Apptainer images, so a
 tool change never needs an image rebuild. All gateway-to-HPC3 traffic goes over one SSH session per
 user. Deploys use `scripts/sync_deploy.sh` (rsync; the server never git-pulls).
+
+Users' data is kept on the gateway host ([dataset storage](../dataset_storage.md)); HPC3 holds a copy
+only while a session's runs need it. A session's data movement and housekeeping there go through a
+compute backend (`gateway/compute.py`: stage-in, submit, status, stage-out, clean-up), of which HPC3
+is the one implementation, and the console shows each session's state as it goes (staging in,
+running, staging out, cleaning up, closed, failed; `gateway/session_state.py`).
+
+Each chat has its own dialog and its own run: attachments, draft, plan review, Stop and mid-run notes
+belong to one chat. One session runs several chats at once, one run per chat, up to
+`AISCIENTIST_MAX_RUNS_PER_SESSION` (default 3); they share the session's served model, which batches
+their requests, and each run writes its job files in its own scratch folder. An account has one
+session: a second browser or tab joins the open one instead of logging in to HPC3 again.
 
 ## One research run
 
@@ -71,10 +84,29 @@ sequenceDiagram
     Gateway-->>Browser: report and bundle
 ```
 
-The fast chat path (`agents/quick_chat.py`) splits off before the plan: the same LLM, only the
-`chat: true` tools, a streamed answer and no run directory. Anti-fabrication layers: the Critic's
+Before the run, the session's model routes the request (`agents/request_router.py`): anything that
+needs data or computation goes to the lab as above; a general question that published papers answer
+gets a one-step literature plan instead (`agents/literature_answer.py`). Once approved, that step
+searches PubMed through Europe PMC in the gateway and, in a session that reaches HPC3, the full text
+of the lab's RetiGene corpus (`search_corpus`: the question's meaning and the model's exact words,
+merged by rank) at the same time; the model answers from the corpus passages and the abstracts, and
+code writes the reference list from the papers the answer cites; the answer is kept with the run.
+A question that names the RetiGene papers searches the corpus alone, and PubMed only when it asks for
+it. A list question about them ("What are haploinsufficient genes in RetiGene papers?") gets a
+RetiGene curation plan instead, which says how long it takes on the session: `extract_haploinsufficient_genes`
+reads the whole corpus (a GPU job of its own, or the session's API model through the gateway, or a
+kept scan of the same corpus at once), and the gateway builds two tables from its sentences
+(`gateway/corpus_scan.py`: one row per gene with its claim, the genes the papers argue against
+apart, and one row per sentence, each with its paper and page) and answers from them; the user can
+save the tables to their Datasets. A note on any plan is routed again, so "analyse my data instead"
+turns a literature plan into an analysis. Every run saves its processed dataset and CellQC result
+folder to the user's Datasets. The fast chat path (`agents/quick_chat.py`: only the `chat: true`
+tools, a streamed answer, no run directory) and the bare corpus scan stay on the server for a client
+that asks for them by `route`; the console sends none. Anti-fabrication layers: the Critic's
 deterministic floors (`agents/step_numbers.py`), the claim audit before writing
-(`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing.
+(`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing. The final
+manuscript loses any sentence that attributes a gene to a lineage the curated marker reference contradicts
+(`agents/marker_claims.py`, run just before rendering).
 
 ## How the code is layered
 
@@ -90,25 +122,26 @@ flowchart TB
     registry -->|"adds platform tools"| shell["hpc/shell.py"]
     lab -->|"runs each step"| harness["agents/research_harness.py"]
     lab -->|"picks a protocol"| pipelines["preset_pipelines/"]
-    harness -->|"calls, many as HPC3 jobs"| folders["tools/NAME/ (20 folders)"]
-    harness -->|"reads on demand"| skills["skills/"]
+    harness -->|"calls, many as HPC3 jobs"| folders["tools/NAME/ (one folder per tool)"]
+    harness -->|"reads on demand"| skills["pinned aiscientist-skills release"]
     catalog -->|"loads"| folders
     folders -->|"implement"| sdk["tools/sdk.py"]
 ```
 
 | Package | What it owns |
 |---|---|
-| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, the HPC3 session (SSH, the held worker, the GPU serve job), LLM clients and bring-your-own keys, the Slurm job executors (one per image), the environment manifest |
+| `src/aiscientist/gateway/` | The FastAPI app (`app.py`), accounts and the database, users' datasets (`dataset_storage.py`), the HPC3 session (SSH, the held worker, the GPU serve job; its compute backend and state, `compute.py`, `session_state.py`), LLM clients and bring-your-own keys, LLM usage and estimated cost (`llm_usage.py`, prices in `configs/llm_pricing.yaml`), the Slurm job executors (one per image), the environment manifest |
 | `src/aiscientist/agents/` | The orchestrator: the research lab, a step's tool loop, the catalog assembly, the DAG planner, the fast chat path, skills loading and induction, claim audit and step checks, agent memory |
 | `src/aiscientist/reporting/` | Turning a finished run into deliverables: pandoc render, result bundle, reference list, the vision-model render review |
+| `src/aiscientist/metadata/` | Croissant 1.1 metadata of datasets and results: built from what was measured plus the owner's review, validated (mlcroissant when installed), never hand-written. The gateway keeps it in the account database and serves it through the API and the MCP server at `/mcp` ([guideline](../development/metadata.md)) |
 | `src/aiscientist/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
 | `src/aiscientist/tools/` | Every model-callable domain tool, one folder each, plus the contract (`sdk.py`), discovery (`catalog.py`), the public surface (`api.py`), shared code (`_lib/`), reference data and the per-image job entry points |
-| `skills/`, `preset_pipelines/` | Plain files: atomic CodeAct templates the Scientist adapts, and end-to-end protocols the PI picks |
+| `preset_pipelines/` | Plain files: end-to-end protocols the PI picks. The atomic CodeAct templates the Scientist adapts are the skills of the pinned `lijinbio/aiscientist-skills` release (`configs/skills_registry.json`), installed outside git |
 | `frontend/console/` | The web UI |
 
-Two files are large enough to deserve a warning: `gateway/app.py` (8.4k lines) and
-`agents/research_lab.py` (6.5k). Read the matching notes in `handoff/yijun/HANDOFF.md` before
-changing either; many branches that look redundant fix a specific production incident.
+Two files are large enough to deserve a warning: `gateway/app.py` and
+`agents/research_lab.py`. Read the comments around a branch before changing it; many branches
+that look redundant fix a specific production incident, and the comment says which.
 
 ## Tools, skills and pipelines
 
@@ -117,7 +150,7 @@ changing either; many branches that look redundant fix a specific production inc
 | What it is | Fixed code called by name with JSON arguments | An adaptable code template with guidance | An end-to-end protocol with pinned settings |
 | Used by | The Scientist | The Scientist, adapted and run via `run_code` | The PI, when planning |
 | How it loads | `tools/catalog.py` reads every `TOOL.md` | Progressive disclosure: manifest, then SKILL.md, then reference.py | Matched by topic; SKILL.md + PROTOCOL.md enter the plan |
-| How to add one | A `tools/<name>/` folder | A `skills/<name>/` folder | A `preset_pipelines/<name>/` folder |
+| How to add one | A `tools/<name>/` folder | A folder in the aiscientist-skills registry, then a new pinned release | A `preset_pipelines/<name>/` folder |
 
 ## How a tool is discovered and routed
 
@@ -151,8 +184,11 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 | The platform reaches the tools only through `sdk`, `catalog`, `api`, and only public names | `tests/test_repo_boundaries.py` |
 | Every tool folder has a manifest that matches its code; the docs are current | `tests/test_tool_manifests.py` |
 | The catalog is the manifests plus the platform tools; routing follows `runs_on` | `tests/test_registry_manifests.py` |
-| Tool names the platform keys logic on, and the ones skills/pipelines name, all exist | `tests/test_tool_contract.py` |
-| Skills and pipelines are well-formed | `tests/test_skills_library.py` |
+| Tool names the platform keys logic on, and the ones pipelines name, all exist | `tests/test_tool_contract.py` |
+| The installed pinned release loads, and its skills name only tools that exist | `tests/test_pinned_release.py` (where the release is installed) |
+| Pipelines are well-formed | `tests/test_pipeline_library.py` |
+| Every generated `croissant.json` is valid Croissant 1.1 (mlcroissant), and holds no server path, sample id or credential | `tests/test_croissant_metadata.py` |
+| Metadata and MCP answer one account only, as `/api/datasets` does | `tests/test_metadata_gateway.py` |
 
 ## Where to start reading
 
@@ -162,6 +198,6 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 4. `agents/research_harness.py`: `ResearchHarness`, one step's tool loop.
 5. `agents/registry.py` and `tools/catalog.py`: how the catalog is assembled and routed.
 6. `tools/run_de/`: a typical tool (`TOOL.md`, then `tool.py`).
-7. `skills/README.md`, `preset_pipelines/README.md`.
+7. `docs/skills_and_pipelines_architecture.md`, `preset_pipelines/README.md`.
 8. `deploy/README.md`, `scripts/sync_deploy.sh`: deploys.
-9. `handoff/yijun/HANDOFF.md`: latest progress and known issues.
+9. `docs/FINDINGS.md`: what has been measured and decided, and why.

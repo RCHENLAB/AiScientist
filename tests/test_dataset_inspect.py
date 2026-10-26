@@ -57,10 +57,11 @@ def _write(tmp_path, name, data):
 class _Ctx:
     """Duck-typed HarnessContext (mirrors test_hpo_mapper's _Ctx)."""
 
-    def __init__(self, tunnel_port=None, decisions=None):
+    def __init__(self, tunnel_port=None, decisions=None, workspace=None):
         self.tunnel_port = tunnel_port
         self.model = "qwen3.6:35b-a3b"
         self.decisions = decisions or {}
+        self.workspace = workspace
 
 
 # --- peek: VCF ----------------------------------------------------------------
@@ -327,7 +328,7 @@ def test_tool_runs_without_a_served_model(tmp_path):
     description, not a crash and not an LLM call."""
     tool = make_inspect_dataset_tool()
     path = _write(tmp_path, "case.vcf", _VCF)
-    out = tool.executor({"path": path}, _Ctx(tunnel_port=None))
+    out = tool.executor({"path": path}, _Ctx(tunnel_port=None, workspace=tmp_path))
     assert out["status"] == "ok"
     assert out["description"]["source"] == "deterministic"
     assert out["peek"]["vcf"]["assembly"] == "GRCh37"
@@ -344,3 +345,15 @@ def test_tool_errors_without_any_path():
     out = make_inspect_dataset_tool().executor({}, _Ctx(tunnel_port=None))
     assert out["status"] == "error"
     assert "path" in out["error"]
+
+
+def test_hdf5_array_attributes_of_bytes_come_back_as_text():
+    # Cell Ranger's .h5 stores `library_ids` as an array of bytes; returned as-is it crashed the
+    # whole lab run when the result was serialised for the model (2026-10-02).
+    import json
+    import numpy as np
+    from aiscientist.tools.inspect_dataset.tool import _scalar
+    out = _scalar(np.array([b"GSE188280_GSM5676874_0715_Macula_Retina"]))
+    assert out == ["GSE188280_GSM5676874_0715_Macula_Retina"]
+    assert _scalar(np.array([[b"a", b"b"]])) == [["a", "b"]]
+    json.dumps(out)

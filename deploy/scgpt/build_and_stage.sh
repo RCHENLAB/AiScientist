@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the scGPT .sif (route B: vendor scGPT_refactor) and stage it on dfs3b.
-# scGPT has NO ready-made image to `singularity pull` — this is a BUILD, on HPC3 (or a
-# Linux+singularity host). macOS cannot build .sif.
+# scGPT has NO ready-made image to `apptainer pull` — this is a BUILD, on HPC3 (or any Linux host
+# with Apptainer). macOS cannot build .sif.
 set -euo pipefail
 # Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
 # Python side (aiscientist.core.config.apply_brand_env_aliases).
@@ -22,18 +22,14 @@ if [ ! -d "${HERE}/scGPT_refactor" ]; then
     echo "copied ${REFACTOR_SRC} -> ${HERE}/scGPT_refactor"
 fi
 
-echo "== 1. Build scgpt.sif — pick ONE route (then re-run with BUILT=1) =="
+echo "== 1. Build scgpt.sif with Apptainer (then re-run with BUILT=1) =="
 cat <<ROUTES
-  (a) fakeroot build from the def (if RCIC enables --fakeroot):
-        cd ${HERE} && singularity build --fakeroot scgpt.sif scgpt.def
-  (b) remote builder (no local root needed):
-        cd ${HERE} && singularity build --remote scgpt.sif scgpt.def
-  (c) build a Docker image elsewhere -> registry -> convert on HPC3 (NO fakeroot):
-        # on a machine with Docker (build context = ${HERE}):
-        docker build -t <registry>/scgpt:cu121 ${HERE}
-        docker push <registry>/scgpt:cu121
-        # on HPC3:
-        singularity build scgpt.sif docker://<registry>/scgpt:cu121
+  # On an HPC3 COMPUTE node (RCIC: no builds on login nodes). Apptainer's --fakeroot needs no
+  # /etc/subuid entry on HPC3, and Sylabs --remote builds are gone (docs/hpc3_assets.md).
+  cd ${HERE} && sbatch -p standard -A ruic20_lab -c 8 --mem=32G -t 04:00:00 -J build-scgpt \\
+    --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=\$TMPDIR/ac apptainer build --fakeroot scgpt.sif scgpt.def'
+  # Alternative: build a Docker image elsewhere -> registry, then on HPC3:
+  #   apptainer build scgpt.sif docker://<registry>/scgpt:cu121
 ROUTES
 if [ "${BUILT:-0}" != "1" ]; then
     echo "(set BUILT=1 once ${HERE}/scgpt.sif exists to stage it)"; exit 0
@@ -58,7 +54,7 @@ Done. Set these (in .env / HPCSettings) so the gateway finds the image:
   # model dir is passed per-run and bound read-only: ${MODEL_DIR}
 
 Smoke test on a gpu:1 job (after weights are staged):
-  singularity exec --nv \\
+  apptainer exec --nv \\
     -B ${MODEL_DIR}:${MODEL_DIR}:ro -B /tmp/scgpt_out:/tmp/scgpt_out \\
     ${SIF} python /opt/scgpt/run_infer.py \\
     --input <some_query.h5ad> --model ${MODEL_DIR} --out /tmp/scgpt_out

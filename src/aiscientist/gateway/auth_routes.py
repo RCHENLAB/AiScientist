@@ -12,17 +12,23 @@ import json as _json
 import os
 import re
 import secrets
+from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
 
 from . import auth, email_send
 from .db import session_scope
 from .models import (Conversation, Dataset, LlmCall, Message, PendingRegistration, Run,
-                     User)
+                     UsageBudget, User)
 
 router = APIRouter(prefix="/api")
+
+# Called with the user who is logging out, before the cookie is cleared. The gateway registers
+# what a logout releases on HPC3 (the account's CPU worker); a failing hook never blocks a logout.
+LOGOUT_HOOKS: list = []
 
 
 # --- dependencies ------------------------------------------------------------
@@ -81,7 +87,15 @@ def login(req: LoginRequest, response: Response) -> dict:
 
 
 @router.post("/auth/logout")
-def logout(response: Response) -> dict:
+def logout(request: Request, response: Response) -> dict:
+    user = current_user(request) if LOGOUT_HOOKS else None
+    if user is not None:
+        for hook in list(LOGOUT_HOOKS):
+            try:
+                hook(user)
+            except Exception as exc:  # noqa: BLE001 - housekeeping never blocks a logout
+                print(f"[auth] logout hook {getattr(hook, '__name__', hook)} failed: "
+                      f"{type(exc).__name__}: {exc}")
     response.delete_cookie(auth.COOKIE_NAME, samesite="lax", secure=auth.secure_cookies())
     return {"status": "ok"}
 
@@ -308,9 +322,17 @@ def change_my_password(req: ChangePasswordRequest, request: Request) -> dict:
 @router.get("/datasets")
 def my_datasets(request: Request) -> dict:
     user = require_user(request)
+    from .models import MetadataRecord
     with session_scope() as s:
         rows = s.scalars(select(Dataset).where(Dataset.user_id == user.id).order_by(Dataset.id.desc())).all()
-        return {"datasets": [d.public() for d in rows]}
+        # Each dataset's Croissant metadata: reviewed or still a draft, and whether it validated.
+        meta = {r.dataset_id: {"status": r.status, "valid": r.loads("validation").get("ok"),
+                               "needs_review": r.status != "reviewed"}
+                for r in s.scalars(select(MetadataRecord).where(MetadataRecord.user_id == user.id,
+                                                                MetadataRecord.kind == "dataset")).all()}
+        from .dataset_storage import location_of
+        return {"datasets": [{**d.public(), "metadata": meta.get(d.id), "location": location_of(d.path)}
+                             for d in rows]}
 
 
 @router.get("/runs")
@@ -318,21 +340,132 @@ def my_runs(request: Request) -> dict:
     user = require_user(request)
     with session_scope() as s:
         rows = s.scalars(select(Run).where(Run.user_id == user.id).order_by(Run.id.desc())).all()
-        return {"runs": [r.public() for r in rows]}
+        # Each run's plan estimate and measured compute (issue 25), two queries for the whole list.
+        from .estimates import runs_usage
+        usage = runs_usage([r.run_id for r in rows])
+        return {"runs": [{**r.public(), "compute_usage": usage[r.run_id]} for r in rows]}
 
 
 # --- recording helpers (called by the gateway when a user is logged in) -------
 
 
-def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: str) -> int | None:
+def record_dataset(user_id: int, name: str, path: str, size_bytes: int, kind: str,
+                   sha256: str | None = None, conversation_id: str | None = None,
+                   dataset_uuid: str | None = None, *, peek: dict | None = None,
+                   files: list[dict] | None = None, source: str = "upload",
+                   derived_from: dict | None = None) -> int | None:
+    """One dataset-history row. ``conversation_id`` is the chat the upload was started from;
+    ``dataset_uuid`` the dataset's managed-storage id (read off the path when it lies in a UUID
+    folder). A second record of the same UUID and path returns the first row.
+
+    The row's Croissant metadata is drafted in the same call (RCHENLAB/AiScientist issue 9) from what
+    the upload measured: ``sha256``, the content ``peek`` of a single file, the ``files`` of a folder
+    (``[{"path" relative to the folder, "size", "sha256", "peek"}]``). ``source`` says where the row
+    came from (``upload``, ``server`` for a bound server path, ``result`` for a saved result, with
+    ``derived_from`` = ``{"uuid", "run_id"}`` of that result). Drafting never fails the recording."""
     with session_scope() as s:
-        d = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind=kind)
+        from .dataset_storage import managed_uuid
+        metadata = {"uuid": dataset_uuid or managed_uuid(path)}
+        metadata = {k: v for k, v in metadata.items() if v is not None}
+        if metadata:
+            existing = s.scalars(select(Dataset).where(Dataset.uuid == metadata["uuid"])).first()
+            if existing is not None:
+                if existing.user_id != user_id or existing.path != path:
+                    raise ValueError("Dataset UUID already belongs to another storage reference")
+                return existing.id
+        d = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind=kind, sha256=sha256,
+                    conversation_id=conversation_id or None, **metadata)
         s.add(d)
         s.commit()
-        return d.id
+        dataset_id = d.id
+    _draft_metadata(dataset_id, peek=peek, files=files, source=source, derived_from=derived_from)
+    return dataset_id
 
 
-def delete_dataset_record(user_id: int, dataset_id: int) -> str | None:
+def _draft_metadata(dataset_id: int, **kw) -> None:
+    try:
+        from . import metadata_store
+        metadata_store.draft_dataset_record(dataset_id, **kw)
+    except Exception as exc:  # noqa: BLE001 - metadata is drafted again by the scheduled re-check
+        print(f"[metadata] draft for dataset {dataset_id} skipped: {type(exc).__name__}: {exc}")
+
+
+def record_folder_dataset(user_id: int, name: str, path: str, size_bytes: int,
+                          conversation_id: str | None = None,
+                          dataset_uuid: str | None = None, *, files: list[dict] | None = None,
+                          source: str = "upload") -> int | None:
+    """One row per uploaded folder: files added to a folder that is already a dataset update its
+    row's size instead of listing the folder a second time. The row keeps the chat that first
+    uploaded the folder. Its metadata is (re-)drafted from ``files`` (see :func:`record_dataset`);
+    files sent earlier keep the checksums recorded for them then."""
+    with session_scope() as s:
+        row = s.scalars(select(Dataset).where(Dataset.user_id == user_id, Dataset.path == path)
+                        .order_by(Dataset.id.desc()).limit(1)).first()
+        if row is None:
+            from .dataset_storage import managed_uuid
+            metadata = {"uuid": dataset_uuid or managed_uuid(path)}
+            metadata = {k: v for k, v in metadata.items() if v is not None}
+            row = Dataset(user_id=user_id, name=name, path=path, size_bytes=size_bytes, kind="folder",
+                          conversation_id=conversation_id or None, **metadata)
+            s.add(row)
+        else:
+            row.size_bytes = size_bytes
+            if conversation_id and not row.conversation_id:
+                row.conversation_id = conversation_id
+        s.commit()
+        dataset_id = row.id
+    try:
+        from . import metadata_store
+        files = metadata_store.merge_folder_files(dataset_id, files)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[metadata] folder file list for dataset {dataset_id} not merged: {exc}")
+    _draft_metadata(dataset_id, files=files, source=source)
+    return dataset_id
+
+
+def dataset_path_recorded(user_id: int, path: str) -> bool:
+    """True when this user already has a dataset row for ``path`` (binding a server folder twice
+    must not list it twice)."""
+    with session_scope() as s:
+        return s.scalars(select(Dataset.id).where(Dataset.user_id == user_id,
+                                                  Dataset.path == path).limit(1)).first() is not None
+
+
+def get_dataset_record(user_id: int, dataset_id: int) -> dict | None:
+    """One of this user's dataset rows as ``{id, name, path, kind, size_bytes}``; None when the row is
+    missing or belongs to another account (an id guessed from the URL reads nothing)."""
+    with session_scope() as s:
+        row = s.get(Dataset, dataset_id)
+        if row is None or row.user_id != user_id:
+            return None
+        return {"id": row.id, "name": row.name, "path": row.path, "kind": row.kind,
+                "size_bytes": row.size_bytes, "uuid": row.uuid, "status": row.status}
+
+
+def list_dataset_records(user_id: int) -> list[dict]:
+    """This user's dataset rows, oldest first, as :func:`get_dataset_record` gives one."""
+    with session_scope() as s:
+        rows = s.scalars(select(Dataset).where(Dataset.user_id == user_id).order_by(Dataset.id)).all()
+        return [{"id": r.id, "name": r.name, "path": r.path, "kind": r.kind, "size_bytes": r.size_bytes,
+                 "uuid": r.uuid, "status": r.status} for r in rows]
+
+
+def repoint_dataset(user_id: int, dataset_id: int, old_path: str, new_path: str,
+                    size_bytes: int | None = None) -> bool:
+    """Point one of this user's rows at the copy of its data in ``new_path`` (a dataset moved from
+    HPC3 to the gateway host), only while it still names ``old_path``. True when it was changed."""
+    with session_scope() as s:
+        row = s.get(Dataset, dataset_id)
+        if row is None or row.user_id != user_id or row.path != old_path:
+            return False
+        row.path = new_path
+        if size_bytes is not None:
+            row.size_bytes = size_bytes
+        s.commit()
+        return True
+
+
+def delete_dataset_record(user_id: int, dataset_id: int, delete_files=None) -> str | None:
     """Remove ONE dataset-history row, but only if it belongs to ``user_id`` (so a user
     can never delete another account's dataset by guessing an id). Returns the stored
     server-side ``path`` so the caller can unlink the physical file, or ``None`` when the
@@ -342,9 +475,69 @@ def delete_dataset_record(user_id: int, dataset_id: int) -> str | None:
         if row is None or row.user_id != user_id:
             return None
         path = row.path
+        from . import server_data as sd
+        if delete_files is not None and sd.root_of(path, sd.server_data_roots()) is not None:
+            delete_files(path)       # a bound server folder: only its session copy goes, see the caller
+        elif delete_files is not None:
+            from pathlib import Path
+            from .dataset_storage import managed_tree
+            target = managed_tree(path) or Path(path).resolve()
+            for other in s.scalars(select(Dataset).where(Dataset.id != dataset_id)):
+                if not other.path:            # "" resolves to the working directory: no overlap
+                    continue
+                other_path = Path(other.path).resolve()
+                if (target == other_path or target.is_relative_to(other_path)
+                        or other_path.is_relative_to(target)):
+                    raise ValueError("Dataset storage overlaps another registered dataset")
+            # A failed physical deletion leaves the registry entry available for retry.
+            delete_files(path)
+        # Its Croissant metadata goes in the same commit: no metadata outlives its dataset.
+        from . import metadata_store
+        metadata_store.delete_for_dataset(s, dataset_id)
+        s.flush()
         s.delete(row)
         s.commit()
         return path
+
+
+def get_run_record(user_id: int, run_id: str) -> dict | None:
+    """One of this user's runs (:meth:`Run.public`); None when it is missing or another account's."""
+    with session_scope() as s:
+        row = s.scalars(select(Run).where(Run.run_id == run_id)).first()
+        if row is None or row.user_id != user_id:
+            return None
+        return row.public()
+
+
+def delete_run_record(user_id: int, run_id: str, run_dir=None, delete_files=None) -> dict | None:
+    """Remove one of this user's runs from their history: ``delete_files(run_dir)`` first (a failure
+    raises and keeps the row, so the delete can be retried), then the run's row and its result's
+    Croissant metadata, in one commit. Returns the run as it was, or ``None`` when it is missing or
+    another account's.
+
+    Refused (``ValueError``) while a dataset is kept inside ``run_dir``: deleting the run would take
+    that dataset's files with it. The run's model-call rows stay, so what the account spent is still
+    counted."""
+    with session_scope() as s:
+        row = s.scalars(select(Run).where(Run.run_id == run_id)).first()
+        if row is None or row.user_id != user_id:
+            return None
+        info = row.public()
+        if run_dir is not None:
+            from pathlib import Path
+            target = Path(run_dir).resolve()
+            for d in s.scalars(select(Dataset)):
+                if d.path and Path(d.path).resolve().is_relative_to(target):
+                    raise ValueError(f'The dataset "{d.name}" is kept inside this run\'s folder; '
+                                     "delete it in Files first.")
+            if delete_files is not None:
+                delete_files(target)
+        from . import metadata_store
+        metadata_store.delete_for_run(s, user_id, run_id)
+        s.flush()
+        s.delete(row)
+        s.commit()
+        return info
 
 
 def record_run_start(user_id: int, run_id: str, question: str, plan_mode: bool,
@@ -355,31 +548,71 @@ def record_run_start(user_id: int, run_id: str, question: str, plan_mode: bool,
         s.commit()
 
 
+def _usage_split(usage: dict) -> tuple[int, int, int, int, int]:
+    """(uncached input, 5-minute cache writes, 1-hour cache writes, cache reads, output) from either
+    usage shape: Claude's (``input_tokens`` + ``cache_creation_input_tokens`` +
+    ``cache_read_input_tokens``, mapped by :func:`anthropic_client._usage`) or OpenAI's
+    (``prompt_tokens`` with ``prompt_tokens_details.cached_tokens`` inside it)."""
+    details = usage.get("prompt_tokens_details") or {}
+    prompt = int(usage.get("prompt_tokens") or 0)
+    reads = int(usage.get("cache_read_input_tokens") or details.get("cached_tokens") or 0)
+    writes = int(usage.get("cache_creation_input_tokens") or details.get("cache_write_tokens") or 0)
+    writes_1h = min(writes, int(usage.get("cache_creation_1h_input_tokens") or 0))
+    if usage.get("input_tokens") is not None:
+        uncached = int(usage.get("input_tokens") or 0)
+    else:
+        uncached = max(0, prompt - reads - writes)
+    return uncached, writes - writes_1h, writes_1h, reads, int(usage.get("completion_tokens") or 0)
+
+
 def record_llm_call(*, run_id: str | None, user_id: int | None, role: str, model: str,
                     endpoint: str, remote: bool, usage: dict | None,
-                    max_tokens: int | None, duration_ms: int) -> None:
-    """Persist what one completion cost. Best-effort, and deliberately so.
+                    max_tokens: int | None, duration_ms: int,
+                    conversation_id: str | None = None, step: str | None = None,
+                    provider: str | None = None, error_type: str | None = None) -> None:
+    """Persist what one model call cost, or why it failed. Best-effort, and deliberately so.
 
     Accounting must never be able to fail an analysis: a dropped row costs a line in a cost report,
     while a raised exception would kill a run mid-step. So every failure here is swallowed with a
-    log line. ``cost_usd`` is taken ONLY from what the provider reported — OpenRouter returns it in
-    ``usage`` — and left NULL otherwise, because a locally-computed price from a hard-coded table
-    goes stale silently and a wrong number is worse than a missing one.
+    log line.
+
+    Two money figures are kept apart: ``cost_usd`` is what the provider reported (OpenRouter returns
+    it in ``usage``); ``est_cost_usd`` is priced from the configurable table in
+    :mod:`llm_pricing` at the time of the call, and only for calls billed to an API key (``remote``).
+    A call on the cluster's own GPU costs the user nothing and is recorded at 0.
+
+    ``error_type`` marks a failed request (``status = "error"``): the cause the transport classified
+    (auth, credit, rate, …), so a user can see why a run stopped. No message text is stored.
     """
     try:
         usage = usage or {}
-        prompt = int(usage.get("prompt_tokens") or 0)
-        completion = int(usage.get("completion_tokens") or 0)
+        uncached, writes_5m, writes_1h, reads, completion = _usage_split(usage)
+        prompt = int(usage.get("prompt_tokens") or (uncached + writes_5m + writes_1h + reads))
         total = int(usage.get("total_tokens") or (prompt + completion))
         cost = usage.get("cost")
         if cost is None:
             cost = (usage.get("cost_details") or {}).get("upstream_inference_cost")
+        served = str(usage.get("model") or "") or model
+        if not remote:
+            estimate: float | None = 0.0
+        else:
+            from . import llm_pricing
+            estimate = llm_pricing.estimate(served, input_tokens=uncached, output_tokens=completion,
+                                            cache_write_tokens=writes_5m,
+                                            cache_write_1h_tokens=writes_1h, cache_read_tokens=reads)
         with session_scope() as s:
-            s.add(LlmCall(run_id=run_id, user_id=user_id, role=(role or "reason")[:24],
-                          model=(model or "")[:128], endpoint=(endpoint or "")[:128],
-                          remote=bool(remote), prompt_tokens=prompt,
-                          completion_tokens=completion, total_tokens=total,
+            s.add(LlmCall(run_id=run_id, conversation_id=(conversation_id or None) and str(conversation_id)[:64],
+                          step=(step or None) and str(step)[:160], user_id=user_id,
+                          role=(role or "reason")[:24], model=(model or "")[:128],
+                          endpoint=(endpoint or "")[:128], remote=bool(remote),
+                          provider=((provider or ("vllm" if not remote else "openai")))[:16],
+                          prompt_tokens=prompt, completion_tokens=completion, total_tokens=total,
+                          input_tokens=uncached, cache_write_tokens=writes_5m + writes_1h,
+                          cache_read_tokens=reads,
                           cost_usd=float(cost) if cost is not None else None,
+                          est_cost_usd=estimate,
+                          status="error" if error_type else "ok",
+                          error_type=(error_type or None) and str(error_type)[:32],
                           max_tokens=max_tokens, duration_ms=max(0, int(duration_ms))))
             s.commit()
     except Exception as exc:  # noqa: BLE001 - accounting never breaks a run
@@ -413,20 +646,28 @@ def run_llm_cost(run_id: str) -> dict:
     }
 
 
-def latest_run_id_for_conversation(user_id: int, conversation_id: str) -> str | None:
+def latest_run_id_for_conversation(user_id: int, conversation_id: str,
+                                   accept: Callable[[str], bool] | None = None) -> str | None:
     """The most recent COMPLETED run this user produced in a conversation (``done``/``incomplete`` —
     i.e. one that reached the report stage, not a cancelled/errored/running one). Used by the
     follow-up router to recognise a prior run across a gateway restart, when the in-memory last-run
-    map is empty. None when the conversation has no such run."""
+    map is empty. ``accept`` keeps only the runs it returns True for (the gateway passes "has a run
+    state": a literature answer is finished but is no study to continue); the latest of the last 20
+    completed runs it accepts. None when the conversation has no such run."""
     if not conversation_id:
         return None
     with session_scope() as s:
-        return s.scalar(
+        rows = s.scalars(
             select(Run.run_id)
             .where(Run.user_id == user_id,
                    Run.conversation_id == conversation_id,
                    Run.status.in_(("done", "incomplete")))
-            .order_by(Run.created_at.desc(), Run.id.desc()))
+            .order_by(Run.created_at.desc(), Run.id.desc())
+            .limit(1 if accept is None else 20)).all()
+    for run_id in rows:
+        if accept is None or accept(run_id):
+            return run_id
+    return None
 
 
 def record_run_finish(run_id: str, status: str, artifacts_path: str | None = None,
@@ -615,6 +856,20 @@ def add_message(cid: int, req: MessageCreate, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="role must be user|assistant|system")
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
+        # An answer is saved by every window that showed it: two windows of one account share a
+        # session, and a reconnect replays a finished answer to a window that may not have seen it.
+        # The answer's stream id makes the second save return the first instead of a duplicate.
+        stream_id = (req.meta or {}).get("stream_id") if isinstance(req.meta, dict) else None
+        if stream_id:
+            recent = s.scalars(select(Message).where(Message.conversation_id == cid)
+                               .order_by(Message.seq.desc()).limit(50)).all()
+            for m in recent:
+                try:
+                    if (m.kind == (req.kind or "text") and m.meta
+                            and _json.loads(m.meta).get("stream_id") == stream_id):
+                        return {"message": m.public(), "duplicate": True}
+                except (ValueError, AttributeError):
+                    continue
         next_seq = (s.scalar(select(func.max(Message.seq)).where(Message.conversation_id == cid)) or 0) + 1
         msg = Message(
             conversation_id=cid, role=req.role, content=req.content or "",
@@ -659,12 +914,18 @@ def list_users(q: str | None = None, _admin: User = Depends(require_admin)) -> d
         return {"users": [u.public() for u in users]}
 
 
+def _store_owner(username: str) -> str:
+    """The folder name the credential stores file an account under (``app.safe_name``)."""
+    return "".join(c for c in (username or "") if c.isalnum() or c in "-_") or "guest"
+
+
 @router.delete("/admin/users/{user_id}")
 def delete_user(user_id: int, admin: User = Depends(require_admin)) -> dict:
     """Hard-delete a user entry: the account row + all its history (datasets / runs /
-    conversations / messages cascade), plus a best-effort ``rm -rf`` of the user's own
-    results/uploads directory on disk. Guards: you can't delete your own account, and you
-    can't remove the last remaining admin."""
+    conversations / messages cascade; LLM usage rows and the budget explicitly), the account's
+    saved API keys and SSH keys, plus a best-effort ``rm -rf`` of the user's own results/uploads
+    directory on disk. Guards: you can't delete your own account, and you can't remove the last
+    remaining admin."""
     with session_scope() as s:
         user = s.get(User, user_id)
         if user is None:
@@ -676,8 +937,29 @@ def delete_user(user_id: int, admin: User = Depends(require_admin)) -> dict:
             if (admins or 0) <= 1:
                 raise HTTPException(status_code=400, detail="Can't delete the last admin.")
         username = user.username
+        # The key stores are keyed by the sanitized name, so "a.b" and "ab" share one. Another
+        # account on the same folder keeps it.
+        owner = _store_owner(username)
+        shared_store = any(_store_owner(u) == owner for u in
+                           s.scalars(select(User.username).where(User.id != user_id)).all())
+        # Not cascaded by the ORM (no relationship): without these the FK makes PostgreSQL refuse
+        # the delete for any account that ever made a model call.
+        s.execute(sa_delete(LlmCall).where(LlmCall.user_id == user_id))
+        s.execute(sa_delete(UsageBudget).where(UsageBudget.user_id == user_id))
         s.delete(user)   # cascades datasets/runs/conversations/messages
         s.commit()
+    # The account's saved keys go with it, at once: an API key left on disk after its owner is gone
+    # could still be read by anyone who later signs up under the same name.
+    from . import llm_credentials, ssh_credentials
+    for store in (llm_credentials, ssh_credentials):
+        if shared_store:
+            print(f"[admin] user {user_id} deleted; {store.__name__} folder {owner!r} is shared "
+                  "with another account and was kept")
+            continue
+        try:
+            store.delete_owner(owner)
+        except Exception as exc:  # noqa: BLE001 - reported; the account is already gone
+            print(f"[admin] user {user_id} deleted; {store.__name__} cleanup failed: {exc}")
     # Best-effort disk cleanup, strictly confined to this user's OWN results subtree.
     # Deferred import (app imports auth_routes at load; the reverse only at call time).
     try:
@@ -783,6 +1065,55 @@ def set_role(user_id: int, req: SetRoleRequest, admin: User = Depends(require_ad
         return {"status": "ok", "user": user.public()}
 
 
+# --- admin: induced-skill review ----------------------------------------------
+# An induced skill reaches the PI and the Scientist only once an admin approves it here
+# (agents/skills.py, "review gate"). Curated skills are not listed: they are always on.
+
+
+class SkillReviewRequest(BaseModel):
+    status: str                 # 'approved' | 'retired' | 'pending'
+    note: str = ""
+
+
+@router.get("/admin/skills")
+def list_skill_reviews(_admin: User = Depends(require_admin)) -> dict:
+    """Admin: every induced skill with its review status and provenance, newest first."""
+    from ..agents import skills as skills_mod
+    rows = skills_mod.review_listing()
+    counts = {st: sum(1 for r in rows if r["status"] == st) for st in skills_mod.REVIEW_STATUSES}
+    return {"skills": rows, "counts": counts,
+            "curated": sum(1 for s in list(skills_mod.ALL_SKILLS.values()) if not s.induced),
+            "induced_dir_configured": skills_mod._induced_dir() is not None}
+
+
+@router.get("/admin/skills/{name}")
+def skill_review_detail(name: str, _admin: User = Depends(require_admin)) -> dict:
+    """Admin: one induced skill in full — its SKILL.md and bundled files — to judge it by."""
+    from ..agents.skills import review_detail
+    detail = review_detail(name)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="no induced skill by that name")
+    return detail
+
+
+@router.post("/admin/skills/{name}/review")
+def review_skill(name: str, req: SkillReviewRequest, admin: User = Depends(require_admin)) -> dict:
+    """Admin: approve (the models may use it), retire (kept on disk, never offered) or reset to
+    pending. Applies to the next step of every run — no restart."""
+    from ..agents.skills import set_review
+    try:
+        rec = set_review(name, (req.status or "").strip().lower(), by=admin.username, note=req.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="no induced skill by that name") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not record the review: {exc}") from exc
+    return {"status": "ok", "name": name, "review": rec}
+
+
 # --- account helpers (shared by the admin CLI; no plaintext ever on disk) -----
 
 
@@ -849,3 +1180,33 @@ def ensure_bootstrap_admin() -> str | None:
               "(plaintext in .env). The bcrypt hash is now in the DB — DELETE that line from "
               ".env. Prefer `aiscientist-admin create-admin` (interactive) or AISCIENTIST_ADMIN_PASSWORD_HASH.")
     return username
+
+
+class ReconcileDatasetsRequest(BaseModel):
+    cleanup: bool = False
+    all_owners: bool = False
+
+
+@router.post("/datasets/reconcile")
+def reconcile_datasets(req: ReconcileDatasetsRequest, request: Request) -> dict:
+    user = require_user(request)
+    if req.all_owners and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    from .dataset_storage import reconcile
+    return reconcile(user_id=None if req.all_owners else user.id, cleanup=req.cleanup)
+
+
+class MigrateDatasetRequest(BaseModel):
+    dataset_id: int
+    apply: bool = False
+
+
+@router.post("/datasets/migrate")
+def migrate_legacy_dataset(req: MigrateDatasetRequest, request: Request) -> dict:
+    user = require_user(request)
+    from .dataset_storage import migrate_dataset
+    from .errors import public_error
+    try:
+        return migrate_dataset(user.id, req.dataset_id, apply=req.apply)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=public_error(exc)) from exc

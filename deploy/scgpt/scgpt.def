@@ -72,7 +72,7 @@ From: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 %help
     scGPT reference-based per-cell annotation, contained for HPC3 (vendored refactor).
     Run via AiScientist (gateway/scgpt_job.py) or directly:
-      singularity exec --nv \
+      apptainer exec --nv \
         -B <query_dir>:<query_dir>:ro -B <model_dir>:<model_dir>:ro -B <out_dir>:<out_dir> \
         scgpt.sif python /opt/scgpt/run_infer.py \
         --input <query.h5ad> --model <model_dir> --out <out_dir>

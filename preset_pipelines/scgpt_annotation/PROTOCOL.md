@@ -19,7 +19,7 @@ not ground truth**.
 |---|---|
 | **Input** | one AnnData `.h5ad` (scRNA-seq query), passed **as-is** — may already carry a `celltype` / `majorclass` label column |
 | **Output** | `data/scgpt_predictions.csv` (per-cell label + confidence, **one row per RAW-upload cell, indexed by barcode**) + an independent Leiden clustering + cross-validation tables + figures |
-| **Engine** | **scGPT** — a pretrained gene/expression transformer — run via `scgpt_annotate` as a **short-lived GPU Singularity batch job** (the scGPT `.sif` image); the scanpy structure/figure steps (`run_scanpy_qc` / `run_clustering` / `run_de` / `run_code`) run separately |
+| **Engine** | **scGPT** — a pretrained gene/expression transformer — run via `scgpt_annotate` as a **short-lived GPU Apptainer batch job** (the scGPT `.sif` image); the scanpy structure/figure steps (`run_scanpy_qc` / `run_clustering` / `run_de` / `run_code`) run separately |
 | **Not for** | marker-based cluster naming *without* a foundation model (use the `celltype_annotation` skill), or any non-`.h5ad` query |
 
 > **How to read the "parameters" in each step.** Two kinds of knob feed this pipeline, and this
@@ -95,7 +95,7 @@ scgpt_annotate( <the loaded .h5ad, passed as-is — no pre-norm / no HVG / no lo
 # → data/scgpt_predictions.csv   columns: index (ORIGINAL barcode), predictions, confidence
 #   one row per RAW-upload cell (BEFORE any QC filtering in Step 2)
 ```
-Inference runs as a **short-lived GPU Singularity batch job** (may queue). If scGPT is **not enabled**
+Inference runs as a **short-lived GPU Apptainer batch job** (may queue). If scGPT is **not enabled**
 (no GPU / image) or errors, the tool reports `not_enabled` / `error` — **say so and fall back to the
 marker-based path** (the `celltype_annotation` skill). Do **not** invent labels.
 
@@ -212,7 +212,7 @@ adata.obs["scgpt_conf"] = pred["confidence"].reindex(adata.obs_names)    # (or o
 column, if present, is compared **directly** (agreement %) — not ignored · low-confidence cells /
 populations are **flagged**.
 
-<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 5 + ⚑ callout) + `skills/crossvalidate_scgpt_vs_leiden/reference.py`</sub>
+<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 5 + ⚑ callout) + skill `crossvalidate-scgpt-vs-leiden` (`scripts/reference.py`)</sub>
 </details>
 
 <details>
@@ -257,7 +257,7 @@ assembled automatically — **do not plan a report-writing step.**
 
 ## Method provenance
 
-**scGPT** pretrained gene/expression transformer — Route C: a short-lived `gpu:1` **Singularity batch
+**scGPT** pretrained gene/expression transformer — Route C: a short-lived `gpu:1` **Apptainer batch
 job** on HPC3, orchestrated by `gateway/scgpt_job`, with `scgpt`/`torch` living only in the image ·
 **scanpy** QC / neighbors–Leiden–UMAP / DE for the independent, data-driven structure · **barcode-safe
 cross-validation** via the `crossvalidate_scgpt_vs_leiden` reference template. Deployment details:

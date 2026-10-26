@@ -72,6 +72,46 @@ def test_silence_is_what_ends_a_call(monkeypatch):
         vllm_client.complete_ex(port, "m", [{"role": "user", "content": "x"}], idle_timeout=0.8)
 
 
+def test_a_stream_cut_mid_reply_is_a_network_error_not_an_answer(monkeypatch):
+    """Run 78a707cd79e9: the serve job hit its Slurm --time while the PI was writing the synthesis.
+    The stream just ended — no [DONE], no finish_reason — and the empty text came back as the
+    report. It must raise, so the caller heals the session and asks again."""
+    monkeypatch.setattr(vllm_client, "_base", lambda port: f"http://127.0.0.1:{port}/v1", raising=False)
+    think = [{"model": "m", "choices": [{"delta": {"reasoning_content": "hmm "}}]} for _ in range(3)]
+
+    port, _ = _serve_cut(think)
+    with pytest.raises(VLLMNetworkError, match="mid-reply"):
+        vllm_client.complete_ex(port, "m", [{"role": "user", "content": "write"}], idle_timeout=2.0)
+
+
+def test_a_reply_that_finished_without_done_is_still_an_answer(monkeypatch):
+    """A finish_reason is enough: some servers close right after it without a [DONE] line."""
+    monkeypatch.setattr(vllm_client, "_base", lambda port: f"http://127.0.0.1:{port}/v1", raising=False)
+    port, _ = _serve_cut(_chunks(1))
+    text, usage = vllm_client.complete_ex(port, "m", [{"role": "user", "content": "x"}], idle_timeout=2.0)
+    assert text == "PLAN" and usage["finish_reason"] == "stop"
+
+
+def _serve_cut(chunks):
+    """Like ``_serve`` but the response ends after ``chunks`` with no ``[DONE]`` line."""
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # noqa: D401 - silence
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for c in chunks:
+                self.wfile.write(f"data: {json.dumps(c)}\n\n".encode())
+                self.wfile.flush()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1], []
+
+
 def test_role_effort_env(monkeypatch):
     from aiscientist.gateway import app as gw
     monkeypatch.setenv("AISCIENTIST_VLLM_REASONING_EFFORT_PLAN", "high")

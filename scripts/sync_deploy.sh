@@ -11,7 +11,7 @@
 #   2. rsync the repo -> $APP_DIR on the server (excludes .git, .env, the DB, venv, runs/,
 #      caches, large artifacts — so server-only state is never clobbered).
 #   3. reinstall the package into the server venv (idempotent; picks up new modules/deps).
-#   4. restart the console THROUGH systemd (`sudo systemctl restart bioagent`) — stopping the
+#   4. restart the console THROUGH systemd (`sudo systemctl restart aiscientist.service`) — stopping the
 #      old instance and killing any stray non-systemd orphan first, so exactly ONE instance
 #      owns the port. (The old path detached a start.sh orphan that fought the systemd unit
 #      for :8800 and wedged it in a 1000s-deep crash-restart loop — never do that again.)
@@ -54,8 +54,8 @@
 #                                      to an account that can `sudo -u aiscientist` when your
 #                                      normal login can't — here, eyeserver-admin (<admin-ucinetid>,
 #                                      passwordless sudo) vs eyeserver (<ucinetid>, no sudo).
-#   APP_DIR     [/data/BioAgent/app]   remote app dir (the git working tree)
-#   ROOT_DIR    [/data/BioAgent]       remote base (holds env/ and console.log)
+#   APP_DIR     [/data/aiscientist/app]   remote app dir (the git working tree)
+#   ROOT_DIR    [/data/aiscientist]       remote base (holds env/ and console.log)
 #   SVC_USER    [aiscientist]          service account that owns + runs the console
 #   PORT        [8800]                 console port for the health check
 #   SUDO        [sudo -u aiscientist]  how to act as the service account; set SUDO=""
@@ -118,16 +118,16 @@ DEPLOY_SSH="${DEPLOY_SSH:-eyeserver}"
 # does, passwordless). The bulk rsync still goes over DEPLOY_SSH (no sudo needed); only
 # the short mirror+install+restart uses ADMIN_SSH. Defaults to DEPLOY_SSH.
 ADMIN_SSH="${ADMIN_SSH:-$DEPLOY_SSH}"
-APP_DIR="${APP_DIR:-/data/BioAgent/app}"
-ROOT_DIR="${ROOT_DIR:-/data/BioAgent}"
+APP_DIR="${APP_DIR:-/data/aiscientist/app}"
+ROOT_DIR="${ROOT_DIR:-/data/aiscientist}"
 SVC_USER="${SVC_USER:-aiscientist}"
 PORT="${PORT:-8800}"
 SUDO="${SUDO-sudo -u ${SVC_USER}}"
-# The console runs under systemd (deploy/systemd/bioagent.service) as ${SVC_USER}. The
+# The console runs under systemd (deploy/systemd/aiscientist.service) as ${SVC_USER}. The
 # SUDO path restarts THROUGH systemd (sudo systemctl) — never a detached start.sh, which
 # would spawn an orphan that fights the systemd-managed instance for the port and wedge it
 # in a crash-restart loop. SERVICE names that unit.
-SERVICE="${AISCIENTIST_SERVICE:-bioagent}"
+SERVICE="${AISCIENTIST_SERVICE:-aiscientist}"
 DEPLOY_STAMP="$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
 STAGE_DIR="${STAGE_DIR:-/tmp/aiscientist-deploy-${USER:-$(id -un)}}"
 # Public-domain deploy: the console now binds a SPECIFIC internal node IP (the Envoy Gateway
@@ -207,6 +207,12 @@ EXCLUDE_PATTERNS=(
   # server, would have deleted every saved key on the box. Excluded here the same way .env and the
   # DB are: the wire never carries them, and --delete can never remove them.
   'ssh_creds/' 'llm_creds/'
+  # This script's own settings file (gitignored, sourced above). The server has no use for it, and a
+  # copy placed in a worktree to deploy from there was about to be shipped (2026-10-12).
+  '.deploy.env'
+  # The pinned aiscientist-skills release (configs/skills_registry.json) is installed on the server
+  # itself and is not in git: a --delete deploy must never remove it, nor ship a laptop's copy.
+  'skills/releases/'
 )
 RSYNC_EXCLUDES=()
 for _p in "${EXCLUDE_PATTERNS[@]}"; do RSYNC_EXCLUDES+=(--exclude "$_p"); done
@@ -258,7 +264,7 @@ if [ -z "$SUDO" ]; then
   fi
   if [ "$DO_RESTART" -eq 1 ]; then
     # WARNING: this path detaches a start.sh worker directly. Use it ONLY on a host with no
-    # systemd bioagent.service — on the prod host that unit is enabled, and a start.sh orphan
+    # systemd aiscientist.service — on the prod host that unit is enabled, and a start.sh orphan
     # will fight it for the port. On prod use the default (sudo) path, which restarts via systemd.
     say "restarting the console (start.sh — no-systemd/dev path) ..."
     ssh "$DEPLOY_SSH" \
@@ -348,7 +354,7 @@ else
   # word. Prompting once up front means every later sudo hits the cached timestamp instead.
   if [ "$DO_RESTART" -eq 1 ]; then
     # FULLY-QUALIFIED unit name. sudo matches a Cmnd_Alias on the exact argv, so a NOPASSWD grant
-    # written for `systemctl restart bioagent.service` does NOT match `… restart bioagent`; the
+    # written for `systemctl restart aiscientist.service` does NOT match `… restart aiscientist`; the
     # call silently falls through to the broad (ALL:ALL) rule and asks for a password. Always
     # send the same spelling the grant uses.
     _unit="${SERVICE%.service}.service"
@@ -357,7 +363,7 @@ else
     REMOTE_STEPS="${REMOTE_STEPS}; sudo systemctl stop ${_unit} || true"
     # Orphan sweep for the legacy detached-start path. Root, and deliberately NOT part of the
     # narrow service grant — so try it non-interactively and skip it rather than prompt.
-    REMOTE_STEPS="${REMOTE_STEPS}; sudo -n pkill -f '[b]ioagent[.]gateway' 2>/dev/null || true"
+    REMOTE_STEPS="${REMOTE_STEPS}; sudo -n pkill -f '([a]iscientist|[b]ioagent)[.]gateway' 2>/dev/null || true"
     REMOTE_STEPS="${REMOTE_STEPS}; sleep 1; sudo systemctl start ${_unit}; sleep 2; systemctl is-active ${_unit}"
   fi
 

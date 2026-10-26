@@ -1,0 +1,30 @@
+{
+  "unit": "samples",
+  "baseline": 1,
+  "steps": [
+    {
+      "name": "ambient-RNA correction",
+      "gpus": 0,
+      "minutes": [
+        15,
+        25
+      ]
+    },
+    {
+      "name": "filtering",
+      "gpus": 0,
+      "minutes": [
+        2,
+        5
+      ]
+    },
+    {
+      "name": "doublet detection",
+      "gpus": 0,
+      "minutes": [
+        8,
+        10
+      ]
+    }
+  ]
+}

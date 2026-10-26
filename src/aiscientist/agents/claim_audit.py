@@ -20,9 +20,10 @@ from __future__ import annotations
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
+
+from .loop_utils import ContextThreadPoolExecutor
 
 AskFn = Callable[[list[dict[str, Any]]], str]
 
@@ -237,7 +238,7 @@ def audit(ask: AskFn, summary: str, question: str, dataset_result: dict[str, Any
     claims = extract_claims(ask, summary, question)
     jobs = [(c, k) for c in claims for k in checks]
     if jobs:
-        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(jobs)))) as ex:
+        with ContextThreadPoolExecutor(max_workers=max(1, min(max_workers, len(jobs)))) as ex:
             results = list(ex.map(lambda ck: _run_check(ask, ck[0], ck[1], facts, _evidence_for(ck[0], summary)), jobs))
         for (c, k), r in zip(jobs, results):
             c.checks[k.name] = r

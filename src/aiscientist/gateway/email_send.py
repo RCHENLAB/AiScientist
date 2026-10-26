@@ -62,7 +62,7 @@ def send_email(to: str, subject: str, body: str) -> bool:
     msg.set_content(body)
 
     if not smtp_configured():
-        # Dev/log fallback: make the code trivially findable in `journalctl -u bioagent`.
+        # Dev/log fallback: make the code trivially findable in `journalctl -u aiscientist`.
         print(f"[email:dev] (SMTP not configured) would send to {to}\n"
               f"    Subject: {subject}\n"
               + "\n".join(f"    {line}" for line in body.splitlines()))

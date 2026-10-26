@@ -8,6 +8,7 @@ the rotation ordering — rather than re-testing the provider layer.
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -25,6 +26,9 @@ def client(tmp_path, monkeypatch):
 
     from fastapi.testclient import TestClient
     from aiscientist.gateway import app as gw_app
+    # Owners come from the `user` field here, i.e. accounts off; with accounts on the login is the
+    # owner and a logged-out caller is refused (tests/test_connection_ownership.py).
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)
     return TestClient(gw_app.app)
 
 
@@ -39,6 +43,8 @@ class _Endpoint:
     def __init__(self) -> None:
         self.seen: list[tuple] = []
         self.probed: list[tuple] = []
+        self.providers: list[str | None] = []   # the wire protocol each call was told to use
+        self.unknown_model: str | None = None   # a model id this endpoint does not serve
         self._fail: tuple[str, str] | None = None
 
     def fail(self, cause: str = "auth", message: str = "bad key") -> None:
@@ -47,16 +53,20 @@ class _Endpoint:
     def succeed(self) -> None:
         self._fail = None
 
-    def verify(self, base_url, api_key, model=None, timeout=15.0):
+    def verify(self, base_url, api_key, model=None, timeout=15.0, *, provider=None):
         from aiscientist.gateway import llm_providers
         self.seen.append((base_url, api_key, model))
+        self.providers.append(provider)
         if self._fail:
             return llm_providers.VerifyResult(False, self._fail[0], self._fail[1])
+        if model and model == self.unknown_model:
+            return llm_providers.VerifyResult(False, "model", "no such model here")
         return llm_providers.VerifyResult(True, "ok", "fine", ["m1", "m2"], verified_model=model)
 
-    def probe(self, base_url, api_key, timeout=15.0):
+    def probe(self, base_url, api_key, timeout=15.0, *, provider=None):
         from aiscientist.gateway import llm_providers
         self.probed.append((base_url, api_key))
+        self.providers.append(provider)
         if self._fail:
             return llm_providers.ModelsResult(False, self._fail[0], self._fail[1])
         return llm_providers.ModelsResult(True, "ok", "2 models available.", ["m1", "m2"])
@@ -68,7 +78,7 @@ def ok_endpoint(monkeypatch):
 
     ep = _Endpoint()
     monkeypatch.setattr(llm_providers, "verify", ep.verify)
-    monkeypatch.setattr(llm_providers, "list_models", lambda b, k, timeout=15.0: ["m1", "m2"])
+    monkeypatch.setattr(llm_providers, "list_models", lambda b, k, timeout=15.0, provider=None: ["m1", "m2"])
     monkeypatch.setattr(llm_providers, "probe_models", ep.probe)
     return ep
 
@@ -98,9 +108,27 @@ def test_create_verifies_then_returns_masked_metadata(client, ok_endpoint):
     cred = res.json()["credential"]
 
     assert "sk-original-000000000" not in res.text
-    assert cred["key_hint"] == "sk-ori…0000"
+    assert cred["key_hint"] == "…0000"          # the last 4 only (RCHENLAB/AiScientist issue 8)
     assert cred["verified_at"] is not None
     assert ok_endpoint.seen == [("https://api.deepseek.com/v1", "sk-original-000000000", "m1")]
+
+
+def test_an_anthropic_key_is_verified_through_the_native_api(client, ok_endpoint):
+    """Jin, 2026-10-09: there was no way to pick Anthropic. The preset fills the base URL, and the
+    provider reaches the verifier so the key is tested with /v1/messages, not /chat/completions."""
+    res = _create(client, provider="anthropic", base_url="", model="claude-opus-5-5",
+                  api_key="sk-ant-example-0000")
+    assert res.status_code == 200
+    assert ok_endpoint.seen == [("https://api.anthropic.com", "sk-ant-example-0000", "claude-opus-5-5")]
+    assert ok_endpoint.providers == ["anthropic"]
+    assert res.json()["credential"]["provider"] == "anthropic"
+
+
+def test_the_model_probe_passes_the_provider_through(client, ok_endpoint):
+    res = client.post("/api/llm-models", json={"base_url": "https://api.anthropic.com", "provider": "anthropic",
+                                               "api_key": "sk-ant-example-0000", "user": "alice"})
+    assert res.status_code == 200
+    assert ok_endpoint.providers == ["anthropic"]
 
 
 def test_create_normalises_a_pasted_full_endpoint(client, ok_endpoint):
@@ -180,11 +208,52 @@ def test_metadata_only_edit_needs_no_key(client, ok_endpoint):
     ok_endpoint.seen.clear()
 
     res = client.put(f"/api/llm-credentials/{cred_id}",
-                     json={"label": "cheap endpoint", "lab_model": "m2", "user": "alice"})
+                     json={"label": "cheap endpoint", "user": "alice"})
     assert res.status_code == 200
     assert res.json()["credential"]["label"] == "cheap endpoint"
+    assert ok_endpoint.seen == [], "a new label changes nothing an endpoint could refuse"
+
+
+def test_a_new_pi_critic_model_is_retested_with_the_key_already_on_file(client, ok_endpoint):
+    """The dialog asks for the PI/Critic model first. It used to be the one model nothing ever
+    tested: a mistyped id saved with a green tick and failed at the first planning call of a run."""
+    cred_id = _create(client).json()["credential"]["id"]
+    ok_endpoint.seen.clear()
+
+    res = client.put(f"/api/llm-credentials/{cred_id}", json={"lab_model": "m2", "user": "alice"})
+    assert res.status_code == 200
     assert res.json()["credential"]["lab_model"] == "m2"
-    assert ok_endpoint.seen == [], "no key was submitted, so nothing needed verifying"
+    # no key in the request: both roles are pinged with the stored one, the Scientist's first
+    assert [m for _, _, m in ok_endpoint.seen] == ["m1", "m2"]
+    assert {k for _, k, _ in ok_endpoint.seen} == {"sk-original-000000000"}
+    assert res.json()["credential"]["verified_at"] is not None
+
+
+def test_create_tests_the_pi_critic_model_too(client, ok_endpoint):
+    res = _create(client, model="m1", lab_model="m2")
+    assert res.status_code == 200
+    assert [m for _, _, m in ok_endpoint.seen] == ["m1", "m2"]
+
+
+def test_one_model_for_every_role_is_pinged_once(client, ok_endpoint):
+    assert _create(client, model="m1", lab_model="m1").status_code == 200
+    assert [m for _, _, m in ok_endpoint.seen] == ["m1"]
+
+
+def test_a_pi_critic_model_the_endpoint_refuses_stops_the_save_and_says_which(client, ok_endpoint):
+    ok_endpoint.unknown_model = "claude-opsu-5-5"
+    res = _create(client, model="m1", lab_model="claude-opsu-5-5")
+    assert res.status_code == 400
+    assert res.json()["cause"] == "model"
+    assert "PI/Critic model claude-opsu-5-5" in res.json()["error"]
+    assert client.get("/api/llm-credentials?user=alice").json()["credentials"] == [], "nothing was stored"
+
+
+def test_a_scientist_model_the_endpoint_refuses_is_named_as_such(client, ok_endpoint):
+    ok_endpoint.unknown_model = "m9"
+    res = _create(client, model="m9", lab_model="m2")
+    assert res.status_code == 400 and "Scientist model m9" in res.json()["error"]
+    assert [m for _, _, m in ok_endpoint.seen] == ["m9"], "the PI/Critic model is not pinged after a failure"
 
 
 def test_unknown_credential_is_404(client, ok_endpoint):
@@ -218,7 +287,7 @@ def test_list_never_leaks_a_key(client, ok_endpoint):
     _create(client)
     res = client.get("/api/llm-credentials?user=alice")
     assert "sk-original-000000000" not in res.text
-    assert res.json()["encryption"] is False
+    assert res.json()["encryption"] is True          # on by default (issue 8)
 
 
 def test_credentials_are_scoped_to_their_owner(client, ok_endpoint):
@@ -297,7 +366,7 @@ def test_consent_does_not_carry_across_credentials(client, ok_endpoint, conn):
     _select(client, conn, trusted)
 
     commercial = _create(client, provider="openrouter", base_url="https://openrouter.ai/api/v1",
-                         api_key="sk-or-second-key-00000").json()["credential"]["id"]
+                         api_key="sk-or-example-2").json()["credential"]["id"]
     assert _select(client, conn, commercial).status_code == 409
 
 
@@ -410,16 +479,14 @@ def test_the_provider_preset_can_be_changed_by_an_edit(client, ok_endpoint):
 # --- where the key lives ------------------------------------------------------
 
 
-def test_the_list_says_where_keys_are_stored(client, ok_endpoint):
-    """"Where does my key go?" is answerable only here — the key itself never reaches the browser.
-
-    The path must be ABSOLUTE: AISCIENTIST_STATE_DIR is unset in production, so an unresolved store
-    reads "llm_creds/<user>", which the reader cannot locate and which therefore answers nothing.
-    """
+def test_the_list_says_how_keys_are_protected_but_not_where(client, ok_endpoint):
+    """The dialog states that the key is encrypted on the server; it never shows the key file's
+    path, owner or mode, which tell the user nothing and show the server's layout (issue 37)."""
     import os
 
+    _create(client)
     d = client.get("/api/llm-credentials?user=alice").json()
-    assert d["storage"]["owner"] == "alice"
-    assert d["storage"]["dir"].endswith("llm_creds/alice")
-    assert os.path.isabs(d["storage"]["dir"])
-    assert d["storage"]["encrypted"] is False
+    assert d["storage"] == {"encrypted": True}
+    state_dir = os.environ["AISCIENTIST_STATE_DIR"]
+    assert state_dir not in json.dumps(d), "no server path in the list"
+    assert "llm_creds" not in json.dumps(d)

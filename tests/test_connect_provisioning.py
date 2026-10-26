@@ -17,8 +17,22 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+from starlette.requests import Request  # noqa: E402
+
 from aiscientist.gateway import app as gw_app  # noqa: E402
 from aiscientist.gateway.settings import HPCSettings  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _accounts_off(monkeypatch):
+    # The single-user console (accounts off): who may call these routes with accounts on is
+    # pinned in tests/test_connection_ownership.py.
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)
+
+
+def _http():
+    """The HTTP request a route is handed; nothing in it is read with accounts off."""
+    return Request({"type": "http", "method": "POST", "path": "/api/lab", "headers": []})
 
 
 def _conn():
@@ -26,7 +40,7 @@ def _conn():
 
 
 def _req():
-    return gw_app.ConnectRequest(ucinetid="tester", mock=True, campus_network_confirmed=True)
+    return gw_app.ConnectRequest(ucinetid="tester", mock=True)
 
 
 def test_ssh_phase_never_publishes_a_usable_half_connected_session():
@@ -83,7 +97,7 @@ def test_lab_endpoint_starts_a_run_on_a_ready_session(monkeypatch):
     req = gw_app.LabRequest(connection_id=conn.id, question="hello")
 
     async def call():
-        resp = await gw_app.lab(req)
+        resp = await gw_app.lab(req, _http())
         # Poll rather than a single tick: dispatch screens the message on a worker thread
         # (asyncio.to_thread) before it starts the run, so one event-loop turn is not enough.
         for _ in range(200):
@@ -109,7 +123,7 @@ def test_lab_endpoint_rejects_a_session_still_coming_up():
     gw_app.CONNECTIONS[conn.id] = conn
     req = gw_app.LabRequest(connection_id=conn.id, question="hello")
     try:
-        resp = asyncio.run(gw_app.lab(req))
+        resp = asyncio.run(gw_app.lab(req, _http()))
         assert resp.status_code == 409
     finally:
         gw_app.CONNECTIONS.pop(conn.id, None)
@@ -121,7 +135,7 @@ def test_lab_endpoint_rejects_session_without_ssh():
     gw_app.CONNECTIONS[conn.id] = conn
     req = gw_app.LabRequest(connection_id=conn.id, question="hello")
     try:
-        resp = asyncio.run(gw_app.lab(req))
+        resp = asyncio.run(gw_app.lab(req, _http()))
         assert resp.status_code == 409
     finally:
         gw_app.CONNECTIONS.pop(conn.id, None)

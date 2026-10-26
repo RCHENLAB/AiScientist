@@ -3,7 +3,7 @@
 scGPT is a gene/expression transformer (NOT an LLM), so this is a fundamentally different
 capability from the marker-based annotation the Scientist does by reasoning over DE genes:
 it transfers per-cell labels (+ data-calibrated confidence) from a pretrained reference
-atlas. Inference runs as a short-lived ``gpu:1`` Singularity batch job on HPC3 (Route C),
+atlas. Inference runs as a short-lived ``gpu:1`` Apptainer batch job on HPC3 (Route C),
 orchestrated by ``gateway/scgpt_job.run_scgpt_inference`` — ``scgpt``/``torch`` live only in
 the image, never here.
 
@@ -34,7 +34,7 @@ def make_scgpt_annotate_tool(runner: ScgptRunner | None) -> "HarnessTool":
             return {
                 "status": "not_enabled",
                 "note": (
-                    "scGPT annotation needs a live HPC3 session + the scGPT Singularity image "
+                    "scGPT annotation needs a live HPC3 session + the scGPT container image "
                     "(AISCIENTIST_SCGPT_IMAGE). Not configured for this run."
                 ),
             }

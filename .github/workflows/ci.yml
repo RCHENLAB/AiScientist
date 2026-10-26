@@ -58,5 +58,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[gateway]" -r requirements-dev.txt
 
+      # Named on its own so a metadata failure is visible at a glance. The documents are generated
+      # from tests/fixtures/croissant/ the way the gateway generates them, then validated by
+      # mlcroissant (docs/development/metadata.md). The full run below repeats them.
+      - name: Validate generated Croissant metadata (mlcroissant)
+        run: python -m pytest -q tests/test_croissant_metadata.py
+
       - name: Run unit tests
         run: python -m pytest

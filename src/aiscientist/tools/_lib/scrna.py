@@ -229,6 +229,42 @@ def _write_table(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) 
 #
 # Changing a number here changes it everywhere, including the protocol text the test checks.
 PARAMS: dict[str, dict[str, tuple[Any, str]]] = {
+    "run_cellqc": {
+        "species": ("auto", "the reference the libraries were aligned to; it decides the "
+                            "mitochondrial, ribosomal and hemoglobin gene sets. 'auto' reads it from "
+                            "Cell Ranger's web summary (Transcriptome), else from the gene names"),
+        "max_pct_mt": (10.0, "drop a barcode whose counts are more than this percent "
+                             "mitochondrial. CellQC's default 10 suits whole cells; single NUCLEI "
+                             "should carry almost no mitochondrial signal, and the CellQC reference "
+                             "snRNA-seq run used 5"),
+        "min_counts": (500, "drop a barcode with fewer total counts than this (counted after "
+                            "ambient correction)"),
+        "min_features": (300, "drop a barcode detecting fewer genes than this"),
+        "ambient_method": ("soupx", "ambient-RNA correction APPLIED to the counts: soupx "
+                                    "(estimated from Cell Ranger's clustering), decontx, or none"),
+        "ambient_compare": ("decontx", "a second ambient method that is estimated and reported "
+                                       "but NOT applied, to show where the methods disagree; '' "
+                                       "for none"),
+        "chemistry": ("auto", "the 10x chemistry, which sets the expected doublet rate: next_gem "
+                              "(3' v2/v3/v3.1, ~0.8% per 1,000 cells) or gem_x (3' v4, about half "
+                              "that). 'auto' reads it from Cell Ranger's web summary"),
+        "nreaction": (1, "10x reactions (GEM wells) pooled into each library. It only changes the "
+                         "expected doublet rate (rate x cells / (nreaction x capacity)), describes "
+                         "how the libraries were made and is NOT measured from the data: confirm "
+                         "it with whoever prepared them"),
+        "doublet_decider": ("doubletfinder", "the doublet caller whose calls REMOVE cells; the "
+                                             "other one only scores them, and the two are compared "
+                                             "with Cohen's kappa"),
+        "n_top_genes": (2000, "highly-variable genes kept for the embedding after the libraries "
+                              "are merged"),
+        "seed": (42, "random seed for CellQC's stochastic steps, so a rerun reproduces"),
+        "warn_ambient_frac": (0.25, "flag a library whose mean SoupX contamination is above this. "
+                                    "An ENGINEERING guard from the CellQC validation guide, not a "
+                                    "literature threshold"),
+        "warn_retained_below": (0.5, "flag a library that keeps less than this fraction of its "
+                                     "Cell Ranger cells. An ENGINEERING guard: losing half a library "
+                                     "usually means a threshold, or the library, is the problem"),
+    },
     "run_scanpy_qc": {
         "min_genes": (200, "drop a cell detecting fewer genes than this — an empty droplet or a "
                            "dying cell"),
@@ -368,6 +404,11 @@ PARAMS: dict[str, dict[str, tuple[Any, str]]] = {
 # paraphrase the model-facing text is how "we ran run_de" ends up in a manuscript with no
 # statement of what run_de is. Rendered verbatim into the report's pipeline section.
 TOOL_SUMMARY: dict[str, str] = {
+    "run_cellqc":
+        "Ran CellQC on each Cell Ranger library: removed ambient RNA from the counts (SoupX), "
+        "discarded barcodes below the count, gene and mitochondrial thresholds below, removed "
+        "doublets (DoubletFinder, with scDblFinder as a second opinion) and measured each "
+        "barcode's intronic read fraction; the libraries were then merged and normalised.",
     "run_scanpy_qc":
         "Measured each cell's quality (how many genes it detects, how much of its signal is "
         "mitochondrial), discarded the cells and genes that fall below the thresholds below, and "
@@ -429,6 +470,12 @@ TOOL_SUMMARY: dict[str, str] = {
 # DESeq2 IS available in this codebase, via `run_pseudobulk_de`; naming the alternative is the
 # useful half of the message.
 PARAM_CHOICES: dict[str, dict[str, tuple[str, ...]]] = {
+    "run_cellqc": {
+        "species": ("auto", "human", "mouse", "macaque"),
+        "ambient_method": ("soupx", "decontx", "none"),
+        "chemistry": ("auto", "next_gem", "gem_x"),
+        "doublet_decider": ("doubletfinder", "scdblfinder"),
+    },
     "run_de": {
         # scanpy's rank_genes_groups backends. DESeq2 is deliberately NOT here: a per-cell DESeq2
         # is not a thing scanpy does, and wanting it means wanting `run_pseudobulk_de`.
@@ -540,6 +587,58 @@ def _genesets_dir() -> Path:
     ``tools/_lib/``; the deploy keeps the .gmt files in ``tools/genesets/``.)"""
     d = os.environ.get("AISCIENTIST_GENESETS_DIR")
     return Path(d) if d else Path(__file__).resolve().parents[1] / "genesets"
+
+
+def counts_not_logged(adata: Any, use_raw: bool = True) -> "str | None":
+    """Why the expression a tool is about to read is unusable for it, or None.
+
+    Run 7f2955e8e (2026-10-08): the plan asked for log2 fold-changes "on per-cell integer UMI means",
+    so the Scientist saved an .h5ad whose X AND .raw held integer counts and passed it as run_de's
+    `input`. rank_genes_groups treats its input as log1p, so every log2FC it reported was wrong, and
+    run_marker_annotation, reading the checkpoint run_de then wrote, compared counts with thresholds in
+    log units: 52.9% of the cells, most rods and every cone, came out Unassigned. Checks the first 500
+    cells: integer values with a maximum above 50 are counts (log1p of 10k-normalised data stays near
+    10). None when it looks log-normalised or cannot be told."""
+    try:
+        import numpy as np
+        raw = use_raw and getattr(adata, "raw", None) is not None
+        X = adata.raw.X if raw else adata.X
+        sub = X[: min(500, X.shape[0])]
+        vals = np.asarray(sub.data if hasattr(sub, "toarray") else sub).ravel()
+        vals = vals[vals != 0]
+        if vals.size and float(vals.max()) > 50 and np.allclose(vals, np.round(vals)):
+            return (f"the expression in {'.raw' if raw else 'X'} is integer counts (max "
+                    f"{float(vals.max()):.0f}), not log-normalised expression. This tool works on "
+                    "log-normalised values: read the checkpoint the QC and clustering tools wrote "
+                    "(its .raw is log1p-normalised; the counts stay in layers['counts']), and do not "
+                    "pass an object whose X or .raw was replaced by counts.")
+    except Exception:  # noqa: BLE001 - a check that cannot run must not block the tool
+        return None
+    return None
+
+
+def installed_gene_sets() -> list[str]:
+    """The gene-set libraries actually present (``<name>.gmt`` in :func:`_genesets_dir`)."""
+    try:
+        return sorted(p.stem for p in _genesets_dir().glob("*.gmt"))
+    except OSError:
+        return []
+
+
+def gene_sets_note(requested: "list[str] | None" = None) -> str:
+    """What a model needs when it names a library that is not here: which ones ARE, and that no other
+    can be had during a run. Run 7f2955e8e (2026-10-08) planned MSigDB "M5"/"M6"; the error said only
+    "run scripts/fetch_genesets.py", and the Scientist spent three attempts hunting for the script and
+    for .gmt files instead of using the three libraries that were installed."""
+    have = installed_gene_sets()
+    if not have:
+        return ("No gene-set library is installed on this host; an administrator adds them with "
+                "scripts/fetch_genesets.py. Do not search for one during a run.")
+    asked = [g for g in (requested or []) if g not in have]
+    return ((f"Not installed: {', '.join(asked)}. " if asked else "")
+            + f"Installed (use these names exactly): {', '.join(have)}. No other library is "
+              "available offline and none can be downloaded during a run — do not search for one; "
+              "say in the report which library was used instead.")
 
 
 def scrna_analysis_summary(results: dict[str, Any]) -> str:

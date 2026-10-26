@@ -224,7 +224,7 @@ def grade_evidence(answer: str, contexts: "Iterable[dict[str, Any]]", *, gene: s
 
     # A plain "no evidence in the corpus" answer: passages came back but none support the link.
     if _NEGATION_RE.search(text):
-        notes.append("the answer reports no support for this association in the corpus")
+        notes.append("the answer reports no support for this association in the RetiGene corpus")
         return {"association": False, "clingen_tier": "NONE", "disease": disease, "gene": gene,
                 "evidence": evidence, "evidence_status": "unsupported", "notes": notes,
                 "stated_tier": stated}

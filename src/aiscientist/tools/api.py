@@ -41,11 +41,30 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # figures (make_schematic), also used for the report's workflow figure
     "render_dot": ("aiscientist.tools.make_schematic.tool", "render_dot"),
     "workflow_schematic_dot": ("aiscientist.tools.make_schematic.tool", "workflow_schematic_dot"),
+    "render_workflow_schematic": ("aiscientist.tools.make_schematic.tool", "render_workflow_schematic"),
     # literature
+    "CorpusPaths": ("aiscientist.tools._lib.corpus", "CorpusPaths"),
+    "CORPUS_DEFAULT_EMBEDDING": ("aiscientist.tools._lib.corpus", "DEFAULT_EMBEDDING"),
+    "make_search_corpus_tool": ("aiscientist.tools.search_corpus.tool", "make_tool"),
+    "run_search_corpus": ("aiscientist.tools.search_corpus.tool", "run_search"),
     "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
+    "search_literature": ("aiscientist.tools.literature_search.tool", "search_europepmc"),
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
+    # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
+    "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),
     # the scRNA analysis line
     "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
+    # curated marker references (run_marker_annotation), also read by the report's marker-claim check
+    "available_references": ("aiscientist.tools.run_marker_annotation.tool", "available_references"),
+    "load_marker_reference": ("aiscientist.tools.run_marker_annotation.tool", "_load_reference"),
+    # Cell Ranger deliveries in an uploaded folder: what they are, and the QC route they imply
+    "describe_cellranger_layout": ("aiscientist.tools._lib.cellranger", "describe_cellranger_layout"),
+    "merge_cellranger_layouts": ("aiscientist.tools._lib.cellranger", "merge_cellranger_layouts"),
+    "cellranger_matrix_facts": ("aiscientist.tools._lib.cellranger", "matrix_facts"),
+    "cellranger_layout_hint": ("aiscientist.tools._lib.cellranger", "cellranger_layout_hint"),
+    "profile_cellranger_libraries": ("aiscientist.tools._lib.cellranger", "profile_cellranger_libraries"),
+    "CELLRANGER_FIND_NAMES": ("aiscientist.tools._lib.cellranger", "FIND_NAMES"),
+    "CELLRANGER_FIND_MAXDEPTH": ("aiscientist.tools._lib.cellranger", "FIND_MAXDEPTH"),
     "genesets_dir": ("aiscientist.tools._lib.scrna", "_genesets_dir"),
     "looks_like_celltype_column": ("aiscientist.tools._lib.scrna", "_looks_like_celltype_column"),
     "looks_like_condition_column": ("aiscientist.tools._lib.scrna", "_looks_like_condition_column"),
@@ -54,6 +73,17 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # HPC3 job runtime
     "run_analysis_tool": ("aiscientist.tools.scrna_cli", "run_tool"),
     "INSTALL_DEPENDENCY": ("aiscientist.tools.scrna_cli", "INSTALL_DEPENDENCY"),
+    # the processed dataset a run hands on (built from its checkpoints at the end of the run)
+    "EXPORT_RESULT_DATASET": ("aiscientist.tools.scrna_cli", "EXPORT_RESULT_DATASET"),
+    "export_result_dataset": ("aiscientist.tools._lib.result_dataset", "export"),
+    "result_dataset_name": ("aiscientist.tools._lib.result_dataset", "result_name"),
+    "RESULT_DATASET_POINTER": ("aiscientist.tools._lib.result_dataset", "POINTER"),
+    # CellQC's complete result/ directory, kept with the run (run_cellqc writes the pointer)
+    "CELLQC_RESULT_POINTER": ("aiscientist.tools._lib.result_dataset", "CELLQC_POINTER"),
+    "cellqc_result_name": ("aiscientist.tools._lib.result_dataset", "cellqc_result_name"),
+    # ... and the next run of the conversation starts from (written back as its checkpoints)
+    "ADOPT_RESULT_DATASET": ("aiscientist.tools.scrna_cli", "ADOPT_RESULT_DATASET"),
+    "adopt_result_dataset": ("aiscientist.tools._lib.result_dataset", "adopt"),
     "resolve_run_dependency": ("aiscientist.tools.run_deps", "resolve"),
     "DEPS_DIRNAME": ("aiscientist.tools.run_deps", "DEPS_DIRNAME"),
     "SITECUSTOMIZE": ("aiscientist.tools.run_deps", "SITECUSTOMIZE"),

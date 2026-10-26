@@ -35,14 +35,12 @@ SIF="${DFS_DIR}/vep.sif"
 ENSEMBL="https://ftp.ensembl.org/pub/release-${VEP_RELEASE}/variation/indexed_vep_cache"
 CLINVAR="https://ftp.ncbi.nlm.nih.gov/pub/clinvar"
 
-echo "== 1. Build vep.sif — pick ONE route (then re-run with BUILT=1) =="
+echo "== 1. Build vep.sif with Apptainer (then re-run with BUILT=1) =="
 cat <<ROUTES
-  module load singularity        # or apptainer (HPC3 has apptainer/1.4.5, singularity/3.11.3)
-  (a) fakeroot build from the def (if RCIC enables --fakeroot):
-        cd ${HERE} && singularity build --fakeroot vep.sif vep.def
-  (b) remote builder (no local root; deps-only def, so this works):
-        cd ${HERE} && singularity build --remote vep.sif vep.def
-  (c) pull the base + add bcftools/python3 via the def's %post on any Linux+singularity host.
+  # On an HPC3 COMPUTE node (RCIC: no builds on login nodes). Apptainer's --fakeroot needs no
+  # /etc/subuid entry on HPC3, and Sylabs --remote builds are gone (docs/hpc3_assets.md).
+  cd ${HERE} && sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-vep \\
+    --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=\$TMPDIR/ac apptainer build --fakeroot vep.sif vep.def'
 ROUTES
 if [ "${BUILT:-0}" != "1" ]; then
     echo "(set BUILT=1 once ${HERE}/vep.sif exists to stage it + download the caches)"; exit 0
@@ -96,7 +94,7 @@ cat <<EOF
     '#CHROM\\tPOS\\tID\\tREF\\tALT\\tQUAL\\tFILTER\\tINFO' \\
     '17\\t7676154\\t.\\tG\\tA\\t.\\tPASS\\t.' > /tmp/smoke.vcf
 
-  singularity exec --containall --net --network none \\
+  apptainer exec --containall --net --network none \\
     -B ${CACHE_ROOT}/GRCh38:${CACHE_ROOT}/GRCh38:ro \\
     -B ${CACHE_ROOT}/clinvar_GRCh38.vcf.gz:${CACHE_ROOT}/clinvar_GRCh38.vcf.gz:ro \\
     -B ${CACHE_ROOT}/clinvar_GRCh38.vcf.gz.tbi:${CACHE_ROOT}/clinvar_GRCh38.vcf.gz.tbi:ro \\

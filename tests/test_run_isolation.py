@@ -23,7 +23,10 @@ from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _clean_conns():
+def _clean_conns(monkeypatch):
+    # The single-user console (accounts off): who may call these routes with accounts on is
+    # pinned in tests/test_connection_ownership.py.
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", False)
     yield
     gw_app.CONNECTIONS.clear()
 
@@ -100,17 +103,22 @@ def test_stream_replay_carries_conversation_id():
 
 def test_each_run_has_independent_cancel_and_plan_events():
     c = _conn()
-    a = c.begin_run("conv-A"); c.bind_run_id(a, "runA")
-    b = c.begin_run("conv-B"); c.bind_run_id(b, "runB")
+    a = c.begin_run("conv-A")
+    c.bind_run_id(a, "runA")
+    b = c.begin_run("conv-B")
+    c.bind_run_id(b, "runB")
     assert a.chat_stop is not b.chat_stop and a.plan_event is not b.plan_event
     a.chat_stop.set()
     assert a.chat_stop.is_set() and not b.chat_stop.is_set()   # cancelling A never touches B
 
 
-def test_resolve_run_only_matches_the_active_run():
+def test_resolve_run_only_matches_a_live_run():
     c = _conn()
-    a = c.begin_run("conv-A"); c.bind_run_id(a, "runA")
-    b = c.begin_run("conv-B"); c.bind_run_id(b, "runB")        # B is now active
+    a = c.begin_run("conv-A")
+    c.bind_run_id(a, "runA")
+    c.end_run(a)                                               # A finished
+    b = c.begin_run("conv-B")
+    c.bind_run_id(b, "runB")                                   # B is now active
     assert c.resolve_run(run_id="runB") is b
     assert c.resolve_run(conversation_id="conv-B") is b
     assert c.resolve_run() is b                                # no ids -> active (back-compat)
@@ -170,7 +178,8 @@ def test_summary_exposes_active_run_identity():
     # that drifted across a WS reconnect) and the in-flight job runs on to its Slurm --time.
     c = _conn(alloc=None)                                      # summary() reads alloc.job_id
     assert c.summary()["active_run"] is None                   # no run yet
-    run = c.begin_run("conv-A"); c.bind_run_id(run, "runA")
+    run = c.begin_run("conv-A")
+    c.bind_run_id(run, "runA")
     assert c.summary()["active_run"] == {"run_id": "runA", "conversation_id": "conv-A"}
     c.end_run(run)
     assert c.summary()["active_run"] is None                   # cleared once the run ends
@@ -233,7 +242,9 @@ def _auth_db(tmp_path, monkeypatch):
     from aiscientist.gateway.models import User
     with session_scope() as s:
         u = User(username="tester", password_hash="x")
-        s.add(u); s.commit(); uid = u.id
+        s.add(u)
+        s.commit()
+        uid = u.id
     yield uid
     db.reset()   # drop the cached engine so a later test doesn't reuse this temp DB
 
@@ -262,15 +273,19 @@ def test_latest_run_id_is_scoped_to_the_user(_auth_db):
     from aiscientist.gateway.models import User
     uid = _auth_db
     with session_scope() as s:
-        other = User(username="other", password_hash="x"); s.add(other); s.commit(); other_id = other.id
+        other = User(username="other", password_hash="x")
+        s.add(other)
+        s.commit()
+        other_id = other.id
     _finished_run(other_id, "theirs", "conv-1", "done")
     assert auth_routes.latest_run_id_for_conversation(uid, "conv-1") is None   # not this user's run
 
 
-def test_conversation_last_run_prefers_memory_then_falls_back_to_db(_auth_db):
+def test_conversation_last_run_prefers_memory_then_falls_back_to_db(_auth_db, tmp_path):
     uid = _auth_db
     _finished_run(uid, "db_run", "conv-1", "done")
-    conn = _conn(app_user_id=uid)
+    conn = _conn(tmp_path, app_user_id=uid)
+    _seed_bundle(conn, "db_run")
     # In-memory hit wins (fast path, current session) — no DB read needed.
     conn.last_run_by_conversation["conv-1"] = "mem_run"
     assert gw_app._conversation_last_run(conn, "conv-1") == "mem_run"
@@ -278,6 +293,24 @@ def test_conversation_last_run_prefers_memory_then_falls_back_to_db(_auth_db):
     conn.last_run_by_conversation.clear()
     assert gw_app._conversation_last_run(conn, "conv-1") == "db_run"
     assert conn.last_run_by_conversation["conv-1"] == "db_run"
+
+
+def test_the_last_run_after_a_restart_is_the_last_study_not_a_later_literature_answer(_auth_db, tmp_path):
+    # A literature answer (issue 21) is a finished run with a summary but no run state: a follow-up
+    # cannot continue it, so the chat's last analysis must still be found behind it.
+    uid = _auth_db
+    conn = _conn(tmp_path, app_user_id=uid)
+    _finished_run(uid, "study", "conv-1", "done")
+    _seed_bundle(conn, "study")
+    _finished_run(uid, "literature", "conv-1", "done")
+    (conn.workspace / "literature" / "artifacts" / "report").mkdir(parents=True)
+    (conn.workspace / "literature" / "artifacts" / "report" / "summary.md").write_text("# Literature search\n")
+    from aiscientist.gateway import auth_routes
+    assert auth_routes.latest_run_id_for_conversation(uid, "conv-1") == "literature"     # unfiltered
+    assert gw_app._conversation_last_run(conn, "conv-1") == "study"
+    t = gw_app._followup_target(
+        conn, gw_app.LabRequest(connection_id=conn.id, question="now annotate them", conversation_id="conv-1"))
+    assert t is not None and t[0] == "study"
 
 
 def test_typed_followup_survives_restart_via_db(_auth_db, tmp_path):

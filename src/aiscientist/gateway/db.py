@@ -72,6 +72,25 @@ def init_db() -> None:
     # idempotent ADD COLUMN (skipped when the column already exists), which SQLite and
     # PostgreSQL both support for a nullable column with no default. Keep these forward-only.
     _ensure_columns(engine, "runs", {"conversation_id": "VARCHAR(64)"})
+    _ensure_columns(engine, "datasets", {
+        "conversation_id": "VARCHAR(64)",
+        "uuid": "VARCHAR(36)", "status": "VARCHAR(24)", "updated_at": "TIMESTAMP",
+    })
+    _ensure_columns(engine, "llm_calls", {
+        "conversation_id": "VARCHAR(64)", "step": "VARCHAR(160)", "provider": "VARCHAR(16)",
+        "input_tokens": "INTEGER", "cache_write_tokens": "INTEGER", "cache_read_tokens": "INTEGER",
+        "est_cost_usd": "FLOAT", "status": "VARCHAR(16)", "error_type": "VARCHAR(32)"})
+    # Backfill the dataset identity columns (issue 5) on rows written before them. Metadata only:
+    # existing paths and files stay where they are.
+    import uuid
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        for row in conn.execute(text("SELECT id FROM datasets WHERE uuid IS NULL")).all():
+            conn.execute(text("UPDATE datasets SET uuid=:uuid WHERE id=:id"),
+                         {"uuid": str(uuid.uuid4()), "id": row[0]})
+        conn.execute(text("UPDATE datasets SET status='complete' WHERE status IS NULL"))
+        conn.execute(text("UPDATE datasets SET updated_at=uploaded_at WHERE updated_at IS NULL"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_datasets_uuid ON datasets (uuid)"))
 
 
 def _ensure_columns(engine: Engine, table: str, columns: dict[str, str]) -> None:

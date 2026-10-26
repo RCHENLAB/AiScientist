@@ -5,8 +5,6 @@ sbatch) so it can't silently break.
 
 from __future__ import annotations
 
-import base64
-
 from aiscientist.gateway import gpu
 from aiscientist.gateway.settings import HPCSettings
 from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
@@ -29,7 +27,7 @@ def test_serve_script_keeps_dynamic_port_and_jobname():
 
 # --- vLLM path ---------------------------------------------------------------
 
-def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
+def test_vllm_backend_runs_apptainer_vllm_with_tool_calling():
     s = _script(
         llm_backend="vllm",
         vllm_image=f"{LAB_STORAGE}/software/AiScientist/containers/vllm.sif",
@@ -41,7 +39,8 @@ def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
     assert "sg ruic20_hpc -c 'bash -s'" in s
     # the real serve command lives inside the base64 blob — decode and assert on it
     body = gpu.serve_body_from_script(s)
-    assert "singularity exec --nv" in body  # RCIC HPC3 uses Singularity, not Apptainer
+    assert "apptainer exec --nv" in body  # HPC3 runtime since 2026-10-09 (HPCSettings.container_bin)
+    assert "module load apptainer/1.4.5" in body
     assert "vllm serve QuantTrio/Qwen3.6-35B-A3B-AWQ" in body
     assert "--enable-auto-tool-choice --tool-call-parser qwen3_coder" in body
     assert "--quantization awq_marlin" in body
@@ -49,6 +48,15 @@ def test_vllm_backend_runs_singularity_vllm_with_tool_calling():
     assert f'--port "$(cat {gpu.PORT_FILE_JOB})"' in body      # binds the dynamic per-job port
     assert "export HF_HOME=\"/dfs3b/ruic20_lab/software/AiScientist/hf\"" in body
     assert "HF_HUB_OFFLINE=1" in body                          # weights pre-staged, no hub call
+
+
+def test_container_runtime_rolls_back_to_singularity_from_env(monkeypatch):
+    # The documented rollback is two .env lines and no code change.
+    monkeypatch.setenv("AISCIENTIST_CONTAINER_BIN", "singularity")
+    monkeypatch.setenv("AISCIENTIST_CONTAINER_MODULE", "singularity/3.11.3")
+    body = gpu.serve_body_from_script(gpu._serve_script(HPCSettings.from_env(), "testuser"))
+    assert "module load singularity/3.11.3" in body
+    assert "singularity exec --nv" in body and "apptainer" not in body
 
 
 def test_vllm_optional_flags_omitted_when_unset():

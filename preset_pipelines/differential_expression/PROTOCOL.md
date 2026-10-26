@@ -28,7 +28,7 @@ that).
 >   marked *(agent-chosen per study)*.
 > - **⚙️ Fixed (infra)** — the harness supplies these; they don't change the science: the `run_code`
 >   sandbox image, and the `AISCIENTIST_RUN_CODE_ON_HPC=1` switch that gives the per-cell-type loop a real
->   `--mem` cap on large datasets (see `skills/README.md`). Shown once (Step 3) so you can see the method,
+>   `--mem` cap on large datasets (see `deploy/analysis/README.md`). Shown once (Step 3) so you can see the method,
 >   not re-audited per run.
 
 ---
@@ -153,7 +153,7 @@ express — a paired/covariate-adjusted comparison, or a custom shared-signature
 **keep the template's `de_<cell-type column>_all.csv` + `_universe.txt` writes**: Step 4 discovers DE
 results by those exact names. **⚙️ Memory discipline** for that loop: load the AnnData **ONCE** and subset
 with a **view** (`adata[mask]`), never `.copy()` per cell type. On the local sandbox an over-budget loop is
-**OOM-killed** (`returncode == -9`); prefer `AISCIENTIST_RUN_CODE_ON_HPC=1` (see `skills/README.md`) for a real
+**OOM-killed** (`returncode == -9`); prefer `AISCIENTIST_RUN_CODE_ON_HPC=1` (see `deploy/analysis/README.md`) for a real
 `--mem` cap on large datasets.
 
 **✅ Verify this step:** the result's `comparison` field names the condition, the **reference**, and the
@@ -161,7 +161,7 @@ stratification column · `reference` is NOT `"rest"` · `significant_by_group` r
 counts · `skipped_groups` (if any) is carried into the report as cell types the contrast did not cover ·
 results carry **logFC + adjusted p-values**.
 
-<sub>Source: SKILL.md "Ordered plan" §3 · `run_de` · template `skills/condition_by_celltype/reference.py`</sub>
+<sub>Source: SKILL.md "Ordered plan" §3 · `run_de` · template skill `compare-conditions-by-celltype` (`scripts/reference.py`)</sub>
 </details>
 
 <details>
@@ -242,9 +242,9 @@ as **hypotheses to validate**, not established fact.
 
 scanpy `rank_genes_groups` (per-cell-type condition-vs-reference), driven by `run_scanpy_qc` / `run_de`
 (`reference=` + `stratify_by=`) / `run_enrichment`; `run_clustering` only for unlabeled data. Designs the
-tool cannot express fall back to `run_code` adapting `skills/condition_by_celltype/reference.py`, and on
+tool cannot express fall back to `run_code` adapting skill `compare-conditions-by-celltype` (`scripts/reference.py`), and on
 large datasets that loop runs with a real `--mem` cap under `AISCIENTIST_RUN_CODE_ON_HPC=1` (see
-`skills/README.md`).
+`deploy/analysis/README.md`).
 
 <sub>This protocol renders `preset_pipelines/differential_expression/SKILL.md` — regenerate to keep it in
 step with the skill.</sub>

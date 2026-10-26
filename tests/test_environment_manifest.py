@@ -42,6 +42,22 @@ def test_every_tool_resolves_to_a_real_source_location():
         assert int(line) > 0
 
 
+
+def test_an_hpc_routed_tool_is_located_at_its_own_tool_py():
+    """A tool routed to HPC3 is registered with the registry's dispatcher as its executor; its
+    location must still be the tool's own folder, not agents/registry.py."""
+    from aiscientist.agents.registry import _HPC_ANALYSIS_TOOLS, build_scientist_catalog
+
+    class _Line:
+        def run_tool(self, name, args, ctx):
+            return {}
+
+    tools = {t["name"]: t for t in tool_index(build_scientist_catalog(analysis_executor=_Line()))}
+    assert tools["run_enrichment"]["source"].startswith("src/aiscientist/tools/run_enrichment/tool.py:")
+    wrong = {n: tools[n]["source"] for n in _HPC_ANALYSIS_TOOLS
+             if n in tools and not tools[n]["source"].startswith(f"src/aiscientist/tools/{n}/")}
+    assert not wrong, wrong
+
 def test_the_gene_sets_that_caused_the_failure_are_in_the_inventory():
     items = {a["label"]: a for a in asset_inventory()}
     gmt = next(a for k, a in items.items() if "Gene-set" in k)

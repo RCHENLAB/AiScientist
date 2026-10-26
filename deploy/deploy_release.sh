@@ -6,25 +6,27 @@
 #   deploy/deploy_release.sh --rollback   # switch back to the previous release and restart
 #   deploy/deploy_release.sh --list       # show installed releases and which one is current
 #
-# Layout (under $AISCIENTIST_ROOT, default /data/BioAgent):
+# Layout (under $AISCIENTIST_ROOT, default /data/aiscientist):
 #   app/releases/<tag>/   one directory per release (code + VERSION)
 #   app/current           symlink to the active release (what systemd runs)
 #   app/previous          symlink to the release that was active before the last switch
 #   env/<tag>/            one venv per release, so rollback needs no reinstall
-#   shared/.env           secrets/config, linked into each release; never in Git
+#   shared/               .env, runs/ and skills/releases/ (curated skills, installed by hand per
+#                         deploy/README.md) are linked into each release; never in Git or in a package
+#   state/                AISCIENTIST_STATE_DIR already lives outside the app directory
 #
 # If the health check fails after a switch, the script switches back to the previous release by
 # itself. Releases beyond the newest $AISCIENTIST_KEEP (default 5) are pruned.
 #
-# Other env: AISCIENTIST_REPO (default RCHENLAB/AiScientist), AISCIENTIST_SERVICE (default bioagent),
+# Other env: AISCIENTIST_REPO (default RCHENLAB/AiScientist), AISCIENTIST_SERVICE (default aiscientist.service),
 # AISCIENTIST_PORT (8800), AISCIENTIST_EXTRAS (pip extras, default gateway), AISCIENTIST_PYTHON,
 # AISCIENTIST_HEALTH_TIMEOUT (seconds, default 60), AISCIENTIST_PACKAGE_DIR (use a local
 # aiscientist-<tag>.tar.gz + SHA256SUMS instead of downloading, for air-gapped hosts and tests).
 set -euo pipefail
 
-ROOT="${AISCIENTIST_ROOT:-/data/BioAgent}"
+ROOT="${AISCIENTIST_ROOT:-/data/aiscientist}"
 REPO="${AISCIENTIST_REPO:-RCHENLAB/AiScientist}"
-SERVICE="${AISCIENTIST_SERVICE:-bioagent}"
+SERVICE="${AISCIENTIST_SERVICE:-aiscientist.service}"
 PORT="${AISCIENTIST_PORT:-8800}"
 EXTRAS="${AISCIENTIST_EXTRAS:-gateway}"
 PYTHON="${AISCIENTIST_PYTHON:-python3}"
@@ -51,7 +53,7 @@ switch_to() {
 
 health_check() {
   local deadline=$((SECONDS + HEALTH_TIMEOUT))
-  until curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
+  until curl -fsS "http://${AISCIENTIST_HOST:-127.0.0.1}:$PORT/health" >/dev/null 2>&1; do
     [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 2
   done
@@ -120,16 +122,19 @@ install_release() {
     mv "$tmp/aiscientist-$tag" "$dest"
   fi
 
+  mkdir -p "$SHARED/runs" "$SHARED/skills/releases"
   [ -f "$SHARED/.env" ] && ln -sfn "$SHARED/.env" "$dest/.env" \
     || echo "WARNING: $SHARED/.env not found; the console needs its config there" >&2
+  ln -sfn "$SHARED/runs" "$dest/runs"
+  mkdir -p "$dest/skills" && ln -sfn "$SHARED/skills/releases" "$dest/skills/releases"
 
   if [ ! -x "$venv/bin/python" ]; then
     echo "==> creating venv $venv"
     "$PYTHON" -m venv "$venv"
   fi
-  echo "==> pip install $dest[$EXTRAS]"
+  echo "==> pip install -e $dest[$EXTRAS]"
   "$venv/bin/pip" install -q -U pip
-  "$venv/bin/pip" install -q "$dest[$EXTRAS]"
+  "$venv/bin/pip" install -q -e "$dest[$EXTRAS]"
 
   echo "==> initializing database schema"
   (cd "$dest" && set -a && { [ ! -f .env ] || . ./.env; } && set +a \

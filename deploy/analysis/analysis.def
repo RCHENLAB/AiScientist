@@ -15,18 +15,20 @@ From: python:3.11-slim
 # self-install at run time (read-only .sif, non-root, no conda), so baking them stops a snippet from
 # hard-stalling on a missing standard tool. Version-pinned annotation (VEP + predictors) stays in vep.sif.
 #
-# Build ON HPC3 or any Linux+singularity host (macOS cannot build .sif). See
+# Build ON an HPC3 compute node with `apptainer build --fakeroot` (macOS cannot build .sif). See
 # deploy/analysis/build_and_stage.sh and deploy/analysis/README.md.
 #
 # Phase 4 of the HPC3 offload ALSO runs the scanpy analysis line here via
 # `python -m aiscientist.tools.scrna_cli` (gateway/slurm_analysis.py::SlurmAnalysisExecutor). The
 # AiScientist tools are NOT baked in — they are bind-mounted from dfs3b at run time and put on
 # PYTHONPATH by the executor, so editing a tool needs only a code sync, never an image rebuild.
-# This image therefore carries ONLY the heavy deps below — which also keeps `--remote` builds
-# working (a %files copy of local source can't reach the Sylabs cloud builder).
+# This image therefore carries ONLY the heavy deps below.
 
 %post
     set -eux
+    # Apptainer --fakeroot on HPC3 maps only root (no /etc/subuid entry), so apt cannot drop to its
+    # _apt sandbox user ("setgroups ... Operation not permitted"): let it fetch as root.
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-aiscientist-fakeroot
     # build-essential: build tools only if a wheel is missing (most of the stack ships manylinux wheels).
     # Core bioinformatics CLI toolkit (bcftools/samtools/htslib-tabix/bedtools): these are COMPILED
     # binaries that a run_code snippet CANNOT self-install at run time (the .sif root fs is read-only,
@@ -87,11 +89,11 @@ print('analysis stack OK — scanpy', scanpy.__version__, 'pandas', pandas.__ver
 %help
     CPU scanpy/pandas/gseapy analysis image for AiScientist on HPC3. Two uses:
       1) CodeAct run_code snippets (gateway/slurm_sandbox.py):
-           singularity exec --containall --writable-tmpfs --net --network none \
+           apptainer exec --containall --writable-tmpfs --net --network none \
              -B <dataset>:<dataset>:ro -B <work>:<work> -B <artifacts>:<artifacts> \
              analysis.sif python <snippet>.py
       2) The scanpy analysis line (gateway/slurm_analysis.py), tools BOUND from dfs3b (not baked):
-           singularity exec --containall --net --network none \
+           apptainer exec --containall --net --network none \
              -B <dataset>:<dataset>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
              --env PYTHONPATH=<pysrc> \
              analysis.sif python -m aiscientist.tools.scrna_cli \

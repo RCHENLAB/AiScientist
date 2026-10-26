@@ -8,7 +8,6 @@ not exist, and scGPT annotating a mouse dataset on 17 genes.
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,12 +59,13 @@ def test_bound_dataset_wins_over_a_model_typed_hpc3_path(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(dataset_inspect, "inspect_dataset", lambda path, chat_fn=None: seen.append(path) or {})
     tool = next(t for t in [dataset_inspect.make_inspect_dataset_tool()] if t.name == "inspect_dataset")
-    ctx = SimpleNamespace(decisions={"dataset_path": str(bound)}, tunnel_port=None, model="m")
+    ctx = SimpleNamespace(decisions={"dataset_path": str(bound)}, workspace=tmp_path, tunnel_port=None,
+                          model="m")
     tool.executor({"path": "/dfs3b/ruic20_lab/software/AiScientist/uploads/u/Ddx41.h5ad"}, ctx)
     other = tmp_path / "other.h5ad"
     other.write_bytes(b"y")
-    tool.executor({"path": str(other)}, ctx)                 # a real local file the model points at
-    assert seen == [str(bound), str(other)]
+    tool.executor({"path": str(other)}, ctx)                 # a real local file of this run
+    assert seen == [str(bound), str(other.resolve())]
 
 
 # --- 3. literature routing reads the step's headline -------------------------------------------

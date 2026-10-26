@@ -15,17 +15,19 @@ From: ensemblorg/ensembl-vep:release_112.0
 # The VEP CACHE and the ClinVar VCF are NOT baked in — they are ~20GB each and are staged on dfs3b by
 # deploy/vep/build_and_stage.sh, then bind-mounted READ-ONLY at run time (offline). The AiScientist tools
 # are likewise bind-mounted from dfs3b (pysrc) + put on PYTHONPATH by the executor, so a tool edit
-# needs only a code sync, never an image rebuild. Keeping the image deps-only also keeps `--remote`
-# builds working (no local %files to ship to the Sylabs cloud builder).
+# needs only a code sync, never an image rebuild.
 #
 # IMPORTANT: the release in the image tag (release_112.0) MUST match the cache release the stage
 # script downloads (release-112 -> `homo_sapiens/112_GRCh38`). Bump both together.
 #
-# Build ON HPC3 or any Linux+singularity host (macOS cannot build .sif). See
+# Build ON an HPC3 compute node with `apptainer build --fakeroot` (macOS cannot build .sif). See
 # deploy/vep/build_and_stage.sh and deploy/vep/README.md.
 
 %post
     set -eux
+    # Apptainer --fakeroot on HPC3 maps only root (no /etc/subuid entry), so apt cannot drop to its
+    # _apt sandbox user ("setgroups ... Operation not permitted"): let it fetch as root.
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/99-aiscientist-fakeroot
     # The base is Ubuntu; add bcftools for the pre-filter and python3 for the CLI entrypoint.
     apt-get update
     apt-get install -y --no-install-recommends bcftools python3
@@ -38,7 +40,7 @@ From: ensemblorg/ensembl-vep:release_112.0
     python3 --version
 
 %environment
-    # VEP lives here in the base image; make sure it + its Perl libs are on PATH under `singularity
+    # VEP lives here in the base image; make sure it + its Perl libs are on PATH under `apptainer
     # exec` (the base sets these for its ENTRYPOINT, which exec bypasses).
     export PATH=/opt/vep/src/ensembl-vep:$PATH
     export PERL5LIB=/opt/vep/src/ensembl-vep:${PERL5LIB:-}
@@ -55,7 +57,7 @@ From: ensemblorg/ensembl-vep:release_112.0
     Offline Ensembl VEP + bcftools image for AiScientist's variant line on HPC3. The cache + ClinVar are
     bind-mounted from dfs3b (NOT baked); the AiScientist tools are bound from dfs3b + put on PYTHONPATH.
 
-      singularity exec --containall --net --network none \
+      apptainer exec --containall --net --network none \
         -B <vcf>:<vcf>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
         -B <cache>:<cache>:ro -B <clinvar.vcf.gz>:<clinvar.vcf.gz>:ro \
         --env PYTHONPATH=<pysrc> \

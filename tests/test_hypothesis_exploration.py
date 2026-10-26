@@ -75,8 +75,13 @@ def _router(agenda, *, explore=None, seen=None, synth=None):
     return complete
 
 
+# The growth MECHANICS below (caps, dedup, DAG dependencies) are tested with the operator's standing
+# approval, as an unattended campaign runs. The default — ask the user first — is tested at the end.
+_AUTO = {"hypothesis_driven": True, "new_steps_need_approval": False}
+
+
 def _lab(agenda, *, config=None, **router_kw):
-    return ResearchLab(_ctx(), config or LabConfig(hypothesis_driven=True),
+    return ResearchLab(_ctx(), config or LabConfig(**_AUTO),
                        complete_fn=_router(agenda, **router_kw),
                        scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
 
@@ -234,21 +239,23 @@ def test_a_later_step_can_refute_an_open_hypothesis_and_the_report_says_so():
 
 def test_orphan_step_without_a_hypothesis_is_refused():
     agenda = ["Run QC on the dataset", "Identify marker genes"]
-    explore = lambda _u: {"surprise": "s", "hypotheses": [],
-                          "new_steps": [{"step": "Do some more analysis of the rods",
-                                         "hypothesis": "nothing we hold"}]}
+    def explore(_u):
+        return {"surprise": "s", "hypotheses": [],
+                "new_steps": [{"step": "Do some more analysis of the rods",
+                               "hypothesis": "nothing we hold"}]}
     result = _lab(agenda, explore=explore).run("Characterize the dataset")
     assert result.agenda == agenda and result.hypotheses == []
 
 
 def test_unfalsifiable_hypothesis_is_refused_so_its_step_has_nothing_to_stand_on():
     agenda = ["Run QC on the dataset", "Identify marker genes"]
-    explore = lambda _u: {
-        "surprise": "s",
-        # no prediction and no test -> "investigate X further" dressed up as a hypothesis
-        "hypotheses": [{"statement": "Rods are interesting", "prediction": "", "test": "", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
-        "new_steps": [{"step": "Characterise the rods in more detail",
-                       "hypothesis": "Rods are interesting"}]}
+    def explore(_u):
+        return {
+            "surprise": "s",
+            # no prediction and no test -> "investigate X further" dressed up as a hypothesis
+            "hypotheses": [{"statement": "Rods are interesting", "prediction": "", "test": "", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
+            "new_steps": [{"step": "Characterise the rods in more detail",
+                           "hypothesis": "Rods are interesting"}]}
     result = _lab(agenda, explore=explore).run("Characterize the dataset")
     assert result.hypotheses == [] and result.agenda == agenda
 
@@ -282,7 +289,7 @@ def test_max_new_steps_caps_a_model_that_finds_everything_surprising():
                 "new_steps": [{"step": f"Run the discriminating comparison number {n}",
                                "hypothesis": f"Claim number {n}"}]}
 
-    cfg = LabConfig(hypothesis_driven=True, max_new_steps=2)
+    cfg = LabConfig(**_AUTO, max_new_steps=2)
     lab = ResearchLab(_ctx(), cfg, complete_fn=_router(agenda, explore=explore),
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
@@ -300,7 +307,7 @@ def test_max_steps_caps_total_plan_length():
                 "hypotheses": [{"statement": f"Claim {n}", "prediction": "p", "test": "t", "rival": "ambient RNA from lysed photoreceptors", "discriminator": "a cell-type-specific pattern favours the hypothesis; a uniform one favours the rival"}],
                 "new_steps": [{"step": f"Run comparison {n}", "hypothesis": f"Claim {n}"}]}
 
-    cfg = LabConfig(hypothesis_driven=True, max_new_steps=99, max_steps=3)
+    cfg = LabConfig(**_AUTO, max_new_steps=99, max_steps=3)
     lab = ResearchLab(_ctx(), cfg, complete_fn=_router(agenda, explore=explore),
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
@@ -320,7 +327,7 @@ def test_malformed_exploration_reply_degrades_to_no_growth():
             return json.dumps(agenda)
         return "FINAL REPORT"
 
-    lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True), complete_fn=complete,
+    lab = ResearchLab(_ctx(), LabConfig(**_AUTO), complete_fn=complete,
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.agenda == agenda and result.accepted_steps == 2
@@ -353,7 +360,7 @@ def test_dag_planner_adds_a_node_that_depends_on_the_step_that_provoked_it():
         return "FINAL REPORT"
 
     events: list[dict] = []
-    lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True, planner="dag"),
+    lab = ResearchLab(_ctx(), LabConfig(**_AUTO, planner="dag"),
                       complete_fn=complete,
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset", on_event=events.append)
@@ -369,7 +376,8 @@ def test_dag_planner_adds_a_node_that_depends_on_the_step_that_provoked_it():
 # time. The lever is not issuing calls that can only come back empty. These tests use a stub that
 # proposes NOTHING, so the count reflects only how many turns were issued.
 
-_QUIET = lambda _u: {"surprise": "nothing", "hypotheses": [], "new_steps": []}
+def _QUIET(_u):
+    return {"surprise": "nothing", "hypotheses": [], "new_steps": []}
 
 
 def _explore_calls(seen):
@@ -393,7 +401,7 @@ def test_no_exploration_call_when_the_step_produced_nothing_to_be_surprised_by()
 
     seen: list[str] = []
     agenda = ["Run QC on the dataset"]
-    lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True),
+    lab = ResearchLab(_ctx(), LabConfig(**_AUTO),
                       complete_fn=_router(agenda, explore=_QUIET, seen=seen),
                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=chat))
     lab.run("Characterize the dataset")
@@ -550,3 +558,98 @@ def test_a_discriminator_the_design_cannot_answer_is_refused(discriminator):
 
 def test_the_same_discriminators_are_fine_once_the_design_has_replicates():
     assert _admit("pseudobulk between the arms decides it", replicates=3)[0] is not None
+
+
+# --- a step the plan did not contain needs the user's yes -----------------------------------
+#
+# Prod run 1e887ed2bf8e ("Run CellQC … to generate quality control report"): after CellQC the
+# exploration turn added an "Ambient rod-leak audit" nobody had asked for, without asking, and the
+# run spent three failed attempts on it.
+
+def _asking_lab(answers, **config):
+    """A lab whose decision card is answered from ``answers`` (dicts, in order); records each ask."""
+    asked: list = []
+
+    def decision_review(node):
+        asked.append(node)
+        return answers[len(asked) - 1] if len(asked) <= len(answers) else {"action": "proceed"}
+
+    agenda = ["Run QC on the dataset", "Cluster the cells"]
+    lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True, planner="linear", **config),
+                      complete_fn=_router(agenda, explore=_proposal()),
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+    return lab, asked, decision_review
+
+
+def test_a_proposed_step_is_added_only_when_the_user_approves_it():
+    lab, asked, review = _asking_lab([{"action": "proceed", "choice": "Add this step"}])
+    events: list[dict] = []
+    result = lab.run("Q", events.append, decision_review=review)
+    proposals = [n for n in asked if getattr(n, "kind", "") == "add_step"]
+    assert len(proposals) == 1
+    card = proposals[0]
+    assert card.options == ("Add this step", "Do not add it") and card.timeout_s == 300
+    assert "NOT in your plan" in card.goal and "Compare the stress-response genes" in card.goal
+    assert "Rod cells in this sample carry a stress signature" in card.goal       # the reason why
+    assert len(result.agenda) == 3 and lab.proposed_steps == []
+    assert any(e.get("type") == "step_approved" for e in events)
+
+
+@pytest.mark.parametrize("answer,decision", [
+    ({"action": "proceed", "choice": "Do not add it"}, "declined"),
+    ({"action": "proceed", "choice": "why would I want this?"}, "declined"),   # not a yes
+    ({"action": "cancel"}, "declined"),
+    ({"action": "proceed", "timed_out": True}, "unanswered"),
+])
+def test_without_an_explicit_yes_the_step_is_left_out_and_recorded(answer, decision):
+    lab, _asked, review = _asking_lab([answer])
+    events: list[dict] = []
+    result = lab.run("Q", events.append, decision_review=review)
+    assert len(result.agenda) == 2                                   # the plan the user approved
+    assert [p["decision"] for p in lab.proposed_steps] == [decision]
+    assert lab.proposed_steps[0]["step"].startswith("Compare the stress-response genes")
+    assert lab.proposed_steps[0]["why"].startswith("Rod cells in this sample")
+    assert not any(e.get("type") in ("step_added", "agenda_extended") for e in events)
+    assert any(e.get("type") == "step_proposed" and e.get("decision") == decision for e in events)
+
+
+def test_after_one_unanswered_proposal_the_run_stops_asking():
+    seq = iter(["Rods carry a technical stress signature", "Cones carry a second, unrelated artefact"])
+    steps = iter(["Compare rod stress genes against the ambient profile to separate biology from soup",
+                  "Contrast cone opsin dropout with capture efficiency to test the second artefact"])
+
+    def explore(_u):
+        statement, step = next(seq), next(steps)
+        return {"surprise": "unexpected", "hypotheses": [
+                    {"statement": statement, "prediction": "p", "test": "t", "rival": "the other one",
+                     "discriminator": "a specific pattern favours it; a uniform one the rival"}],
+                "new_steps": [{"step": step, "hypothesis": statement}], "resolve": []}
+
+    asked: list = []
+
+    def review(node):
+        asked.append(node)
+        return {"action": "proceed", "timed_out": True}
+
+    lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True, planner="linear"),
+                      complete_fn=_router(["Run QC on the dataset", "Cluster the cells"], explore=explore),
+                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+    result = lab.run("Q", lambda _e: None, decision_review=review)
+    assert len([n for n in asked if getattr(n, "kind", "") == "add_step"]) == 1   # asked once only
+    assert [p["decision"] for p in lab.proposed_steps] == ["unanswered", "not_asked"]
+    assert len(result.agenda) == 2
+
+
+def test_with_nobody_to_ask_nothing_is_added():
+    """Bypass mode and a resumed run pass no decision card: a proposal is recorded, never run."""
+    lab, _asked, _review = _asking_lab([])
+    result = lab.run("Q", lambda _e: None)                           # no decision_review
+    assert len(result.agenda) == 2
+    assert [p["decision"] for p in lab.proposed_steps] == ["not_asked"]
+
+
+def test_the_operator_can_approve_new_steps_once_for_unattended_runs():
+    lab, asked, review = _asking_lab([], new_steps_need_approval=False)
+    result = lab.run("Q", lambda _e: None, decision_review=review)
+    assert len(result.agenda) == 3 and lab.proposed_steps == []
+    assert not [n for n in asked if getattr(n, "kind", "") == "add_step"]

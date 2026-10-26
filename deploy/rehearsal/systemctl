@@ -1,0 +1,24 @@
+#!/bin/bash
+# Stand-in for systemctl inside the rehearsal container (no systemd there): runs a unit's
+# ExecStart as its User in its WorkingDirectory, and answers the few verbs the script uses.
+echo "$*" >> /var/log/systemctl-shim.log
+cmd="$1"; shift
+D=/etc/systemd/system
+case "$cmd" in
+  daemon-reload) exit 0 ;;
+  enable)  [ -f "$D/$1" ] || { echo "Failed to enable unit: Unit $1 does not exist" >&2; exit 1; }; touch "/run/enabled.$1"; exit 0 ;;
+  disable) rm -f "/run/enabled.$1"; exit 0 ;;
+  stop)    u="$1"; if [ -f "/run/$u.pid" ]; then pkill -INT -P "$(cat "/run/$u.pid")" 2>/dev/null; kill "$(cat "/run/$u.pid")" 2>/dev/null; fi
+           rm -f "/run/$u.pid"; sleep 2; exit 0 ;;
+  start)   u="$1"; f="$D/$u"; [ -f "$f" ] || { echo "Failed to start $u: Unit $u not found." >&2; exit 5; }
+           user="$(sed -n 's/^User=//p' "$f")"; wd="$(sed -n 's/^WorkingDirectory=//p' "$f")"
+           ex="$(sed -n 's/^ExecStart=//p' "$f")"
+           cd "$wd" || { echo "Failed at step CHDIR spawning: $wd" >&2; exit 200; }
+           nohup sudo -u "$user" $ex > "/var/log/$u.log" 2>&1 &
+           echo $! > "/run/$u.pid"; exit 0 ;;
+  is-active) [ "$1" = "--quiet" ] && shift; u="$1"
+           if [ -f "/run/$u.pid" ] && kill -0 "$(cat "/run/$u.pid")" 2>/dev/null; then echo active; exit 0; fi
+           echo inactive; exit 3 ;;
+  show)    u="${@: -1}"; cat "/run/$u.pid" 2>/dev/null || echo 0; exit 0 ;;
+  *) echo "systemctl shim: unsupported: $cmd $*" >&2; exit 1 ;;
+esac

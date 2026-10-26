@@ -8,7 +8,8 @@ Two independent detectors, cheapest first, so we never rely on the VL model alon
   1. Deterministic bbox-overlap pre-check (NO GPU, always runs). PyMuPDF gives every word's
      bounding box on the rendered page; two boxes that significantly intersect ARE stacked
      text. This catches the big, unambiguous class of "文字压文字 / table crushed" for free
-     and is fully reproducible.
+     and is fully reproducible. The same pass reads the box each image is placed in and
+     reports one printed as a strip.
 
   2. Qwen2.5-VL page review (the GPU model). Catches what bbox math can't: text sitting on
      top of IMAGE content, axis/legend labels overlapping data, clipped-at-the-margin text,
@@ -120,6 +121,34 @@ def _unrendered_markup_defects(page, page_no: int) -> list[dict]:
     return [{
         "page": page_no, "source": "text", "type": "unrendered_markup", "severity": "medium",
         "note": f"literal markup on the page: {', '.join(repr(h) for h in hits[:4])}",
+        "fix": None,
+    }]
+
+
+# One side over this many times the other and an image is a strip on the page. The gateway applies
+# the same limit to a figure's pixel size before a report is written (reporting/figure_checks.py);
+# here it is measured on the page, so it also holds for an image that reached the PDF another way.
+_MAX_IMAGE_ASPECT = 8.0
+
+
+def _strip_image_defects(page, page_no: int) -> list[dict]:
+    """An image placed as a strip. A workflow diagram of 14,312 x 342 px was printed 6.5 in wide
+    and under 4 mm tall, and the vision model called the page clean: at page scale a strip looks
+    like a rule. The box every image is placed in is in the PDF, so its shape is decided here.
+    Re-rendering cannot fix it (the figure itself has to be drawn again), so no fix directive."""
+    strips = []
+    for info in page.get_image_info():
+        x0, y0, x1, y1 = info["bbox"]
+        long_side, short_side = max(x1 - x0, y1 - y0), min(x1 - x0, y1 - y0)
+        # Under an inch long it is an inline mark, not a figure.
+        if short_side > 0 and long_side >= 72 and long_side / short_side > _MAX_IMAGE_ASPECT:
+            strips.append((x1 - x0, y1 - y0))
+    if not strips:
+        return []
+    width, height = strips[0]
+    return [{
+        "page": page_no, "source": "bbox", "type": "figure_strip", "severity": "high",
+        "note": f"{len(strips)} image(s) placed as a strip (e.g. {width / 72:.1f} x {height / 72:.2f} in)",
         "fix": None,
     }]
 
@@ -250,6 +279,7 @@ def main() -> int:
         defects.extend(_bbox_overlap_defects(page, i + 1))
         defects.extend(_clipping_defects(page, i + 1))
         defects.extend(_unrendered_markup_defects(page, i + 1))
+        defects.extend(_strip_image_defects(page, i + 1))
         png = pages_dir / f"page_{i + 1:03d}.png"
         page.get_pixmap(matrix=matrix).save(png)
         png_paths.append((i + 1, png))

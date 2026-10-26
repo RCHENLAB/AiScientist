@@ -24,6 +24,10 @@ from .._lib.scrna import (
 )
 from ..sdk import HarnessTool
 
+# obs columns that mean doublets were called before this step: CellQC's two callers (run_cellqc)
+# and this tool's own call from an earlier run.
+_UPSTREAM_DOUBLET_COLS = ("doubletfinder_class", "scdblfinder_class", "predicted_doublet")
+
 
 def run_doublet_detection(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     """Scrublet doublet scoring on the raw counts, BEFORE clustering.
@@ -54,6 +58,19 @@ def run_doublet_detection(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     expected_rate = float(_p("run_doublet_detection", "expected_doublet_rate", args))
 
     adata = sc.read_h5ad(ckpt)
+    # Doublets already called upstream (CellQC writes DoubletFinder's and scDblFinder's calls and
+    # has removed the decider's doublets). A second caller on the survivors removes a further set by
+    # a different model, and the report would then describe one doublet step while two ran.
+    upstream = [c for c in _UPSTREAM_DOUBLET_COLS if c in adata.obs.columns]
+    if upstream and not args.get("force"):
+        return {"status": "ok", "step": "doublets", "skipped": True,
+                "cells_before": int(adata.n_obs), "cells_after": int(adata.n_obs),
+                "doublets_called_upstream": upstream,
+                "note": (f"Doublets were already called upstream ({', '.join(upstream)} in obs; "
+                         "run_cellqc removes its decider's doublets), so Scrublet was NOT run and no "
+                         "cell was removed here. Report the upstream calls, not a Scrublet rate. "
+                         "Pass force=true only to score these cells a second time, on purpose."),
+                "read_from": _run_rel(ctx, ckpt), "raw_data_to_llm": False}
     counts = _counts_matrix(adata)
     if counts is None:
         return {"status": "error", "step": "doublets", "error": _NO_COUNTS}
@@ -147,6 +164,9 @@ def make_tool() -> HarnessTool:
                            "description": "obs column to simulate doublets within, per batch"},
                 threshold={"type": "number",
                            "description": "explicit score cutoff; omit to let scrublet choose one"},
+                force={"type": "boolean",
+                       "description": ("score again even though obs already holds doublet calls "
+                                       "(from run_cellqc or an earlier run); off by default")},
                 input={**_INPUT_SPEC, "description": (
                     _INPUT_SPEC["description"] + " Doublets are scored and filtered IN PLACE, "
                     "in that file.")}),

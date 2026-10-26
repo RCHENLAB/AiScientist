@@ -49,3 +49,19 @@ def test_delete_dataset_record_enforces_ownership(db_ctx):
     path = auth_routes.delete_dataset_record(alice, ds_id)
     assert path == "/data/alice/uploads/pbmc.h5ad"
     assert auth_routes.delete_dataset_record(alice, ds_id) is None   # already deleted
+
+
+def test_a_folder_that_gains_files_stays_one_dataset_row(db_ctx):
+    """Files added to a folder that is already uploaded (the same folder chosen again) update its
+    row: the Datasets list must not show the folder twice."""
+    auth_routes, db, models = db_ctx
+    alice = _mk_user(db, models, "alice")
+    bob = _mk_user(db, models, "bob")
+    path = "/dfs3b/lab/uploads/alice/run1"
+    first = auth_routes.record_folder_dataset(alice, "run1", path, 100)
+    assert auth_routes.record_folder_dataset(alice, "run1", path, 250) == first
+    other = auth_routes.record_folder_dataset(bob, "run1", path, 7)          # another account's row is its own
+    assert other != first
+    with db.session_scope() as s:
+        rows = s.query(models.Dataset).order_by(models.Dataset.id).all()
+        assert [(r.user_id, r.size_bytes, r.kind) for r in rows] == [(alice, 250, "folder"), (bob, 7, "folder")]

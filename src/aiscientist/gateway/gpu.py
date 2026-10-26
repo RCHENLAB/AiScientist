@@ -72,7 +72,7 @@ class GPUHealth:
 
 
 def _vllm_serve_body(settings: HPCSettings) -> str:
-    """Run vLLM inside the Singularity container, serving the OpenAI-compatible /v1
+    """Run vLLM inside the Apptainer container, serving the OpenAI-compatible /v1
     API on the dynamic port. The model is loaded at launch (no pull). HF cache lives
     on shared DFS (bind-mounted, offline) so it never touches the home quota."""
     hf = settings.hf_home
@@ -98,7 +98,7 @@ def _vllm_serve_body(settings: HPCSettings) -> str:
         # mid-serve (HPC3 compute nodes DO have egress — verified 2026-07-08 — but we don't rely on it).
         "export HF_HUB_OFFLINE=1\n"
         "source /etc/profile.d/lmod.sh 2>/dev/null || true\n"
-        # RCIC HPC3 provides Singularity via a module (NOT apptainer).
+        # The runtime comes from an Lmod module (HPCSettings.container_module, apptainer/1.4.5).
         f"module load {settings.container_module} 2>/dev/null || true\n"
         'echo "AiScientist vLLM serve starting on $(hostname) at $(date)"\n'
         f"{settings.container_bin} exec --nv -B {hf}:{hf} --env HF_HOME={hf} --env HF_HUB_OFFLINE=1 "

@@ -15,6 +15,12 @@ Runs Scrublet on the raw counts after QC and before clustering. Two cells in one
 
 - After `run_scanpy_qc`, before `run_clustering`.
 
+## When the agent does NOT use it
+
+- After `run_cellqc`: DoubletFinder and scDblFinder have already called the doublets and the decider's
+  were removed. If obs already holds doublet calls (`doubletfinder_class`, `scdblfinder_class`,
+  `predicted_doublet`) the tool returns `skipped` without running Scrublet, unless `force: true`.
+
 ## Inputs
 
 <!-- generated:parameters -->
@@ -25,6 +31,7 @@ Runs Scrublet on the raw counts after QC and before clustering. Two cells in one
 | `filter` | boolean | — | remove the predicted doublets (default) or only annotate them |
 | `batch_key` | string | — | obs column to simulate doublets within, per batch |
 | `threshold` | number | — | explicit score cutoff; omit to let scrublet choose one |
+| `force` | boolean | — | score again even though obs already holds doublet calls (from run_cellqc or an earlier run); off by default |
 | `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote — e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here — never overwrite a tool's checkpoint. Doublets are scored and filtered IN PLACE, in that file. |
 <!-- /generated:parameters -->
 

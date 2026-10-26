@@ -145,3 +145,22 @@ def test_bad_role_rejected(app_ctx):
     cid = client.post("/api/conversations", json={}).json()["conversation"]["id"]
     assert client.post(f"/api/conversations/{cid}/messages",
                        json={"role": "robot", "content": "x"}).status_code == 400
+
+
+def test_an_answer_saved_by_two_windows_is_stored_once(app_ctx):
+    """Two windows of one account share a session, and a reconnect replays a finished answer, so
+    the same answer may be saved twice; its stream id keeps one copy."""
+    client = app_ctx
+    _login(client, "root", "rootpass1")
+    cid = client.post("/api/conversations", json={"title": "t"}).json()["conversation"]["id"]
+    answer = {"role": "assistant", "content": "10 clusters", "kind": "text", "meta": {"stream_id": "s1"}}
+    first = client.post(f"/api/conversations/{cid}/messages", json=answer).json()
+    second = client.post(f"/api/conversations/{cid}/messages", json=answer).json()
+    assert second.get("duplicate") is True and second["message"]["id"] == first["message"]["id"]
+    files = {"role": "assistant", "kind": "artifacts", "meta": {"stream_id": "s1", "items": []}}
+    client.post(f"/api/conversations/{cid}/messages", json=files)     # the same run's files: kept
+    client.post(f"/api/conversations/{cid}/messages", json=files)
+    client.post(f"/api/conversations/{cid}/messages", json={**answer, "meta": {"stream_id": "s2"}})
+    msgs = client.get(f"/api/conversations/{cid}").json()["messages"]
+    assert [(m["kind"], (m.get("meta") or {}).get("stream_id")) for m in msgs] == [
+        ("text", "s1"), ("artifacts", "s1"), ("text", "s2")]

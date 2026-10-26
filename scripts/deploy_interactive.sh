@@ -26,7 +26,7 @@
 # ENV: reads the SAME gitignored ./.deploy.env as scripts/sync_deploy.sh (so BIND_HOST etc. are
 #      set once, in one place); anything below can also be overridden inline. Defaults:
 # ENV (defaults): HOST=<GATEWAY_HOST>  PORT=<ADMIN_SSH_PORT>  ADMIN_USER=<localuser>-admin
-#                 APP_DIR=/data/BioAgent/app  ROOT_DIR=/data/BioAgent
+#                 APP_DIR=/data/aiscientist/app  ROOT_DIR=/data/aiscientist
 #                 SVC_USER=aiscientist  CONSOLE_PORT=8800
 #                 BIND_HOST=<empty>   internal node IP the console must bind so the cluster
 #                     ingress reaches it — set <GATEWAY_BIND_IP> for the PUBLIC prod (else start.sh
@@ -44,8 +44,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 HOST="${HOST:-<GATEWAY_HOST>}"
 PORT="${PORT:-}"
-APP_DIR="${APP_DIR:-/data/BioAgent/app}"
-ROOT_DIR="${ROOT_DIR:-/data/BioAgent}"
+APP_DIR="${APP_DIR:-/data/aiscientist/app}"
+ROOT_DIR="${ROOT_DIR:-/data/aiscientist}"
 # Service account migrated bioagent -> aiscientist when the public domain went live (2026-07-01).
 SVC_USER="${SVC_USER:-aiscientist}"
 CONSOLE_PORT="${CONSOLE_PORT:-8800}"

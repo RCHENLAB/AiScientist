@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the CPU analysis .sif for AiScientist CodeAct (run_code on HPC3) and stage it on dfs3b.
-# scanpy/pandas/gseapy — NO GPU. Build on HPC3 or any Linux+singularity host (macOS cannot
+# scanpy/pandas/gseapy — NO GPU. Build on an HPC3 compute node with Apptainer (macOS cannot
 # build .sif). This is the image SlurmCodeExecutor runs each run_code snippet inside.
 set -euo pipefail
 # Legacy BIOAGENT_* names still work (AISCIENTIST_* wins when both are set) — same rule as the
@@ -13,19 +13,16 @@ SIF="${DFS_DIR}/analysis.sif"
 
 # The AiScientist TOOLS are NOT in this image — they are synced to dfs3b + bind-mounted at run time
 # (see gateway/slurm_analysis.py / app._sync_aiscientist_source_to_hpc). So the image is DEPS-ONLY
-# and only needs rebuilding when the Python deps change — a tool edit needs no rebuild. It also
-# means `--remote` works (no local-file %files to ship to the cloud builder).
+# and only needs rebuilding when the Python deps change — a tool edit needs no rebuild.
 
-echo "== 1. Build analysis.sif — pick ONE route (then re-run with BUILT=1) =="
+echo "== 1. Build analysis.sif with Apptainer (then re-run with BUILT=1) =="
 cat <<ROUTES
-  (a) fakeroot build from the def (if RCIC enables --fakeroot):
-        cd ${HERE} && singularity build --fakeroot analysis.sif analysis.def
-  (b) remote builder (no local root needed — DEPS-only def, so this works):
-        cd ${HERE} && singularity build --remote analysis.sif analysis.def
-  (c) Docker elsewhere -> registry -> convert on HPC3 (NO fakeroot):
-        docker build -t <registry>/bioagent-analysis:cpu ${HERE}   # add a Dockerfile FROM the same base
-        docker push <registry>/bioagent-analysis:cpu
-        singularity build analysis.sif docker://<registry>/bioagent-analysis:cpu
+  # On an HPC3 COMPUTE node (RCIC: no builds on login nodes). Apptainer's --fakeroot needs no
+  # /etc/subuid entry on HPC3, and Sylabs --remote builds are gone (docs/hpc3_assets.md).
+  cd ${HERE} && sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-analysis \\
+    --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=\$TMPDIR/ac apptainer build --fakeroot analysis.sif analysis.def'
+  # Alternative: build a Docker image elsewhere -> registry, then on HPC3:
+  #   apptainer build analysis.sif docker://<registry>/bioagent-analysis:cpu
 ROUTES
 if [ "${BUILT:-0}" != "1" ]; then
     echo "(set BUILT=1 once ${HERE}/analysis.sif exists to stage it)"; exit 0
@@ -38,7 +35,7 @@ cp -v "${HERE}/analysis.sif" "${SIF}"
 echo "== 3. Smoke-test the image on a CPU node (no GPU needed) =="
 cat <<EOF
   # analysis stack (deps only — the AiScientist tools are bound at run time, not in the image):
-  singularity exec --containall --writable-tmpfs --net --network none \\
+  apptainer exec --containall --writable-tmpfs --net --network none \\
     ${SIF} python -c "import scanpy, gseapy, pandas, h5py; print('ok', scanpy.__version__)"
 
 Then enable the HPC paths (in .env / HPCSettings):

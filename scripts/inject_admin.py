@@ -3,13 +3,13 @@
 
 Use this when `aiscientist-admin create-admin` is unavailable or the CLI env isn't
 loading correctly on the server.  Needs only bcrypt + sqlalchemy (both in the
-server venv at /data/BioAgent/env).
+server venv at /data/aiscientist/env).
 
 USAGE (run on the server as the aiscientist user or with sudo):
 
-  sudo -u aiscientist /data/BioAgent/env/bin/python3 /tmp/inject_admin.py
-  sudo -u aiscientist /data/BioAgent/env/bin/python3 /tmp/inject_admin.py BioAdmin
-  sudo -u aiscientist /data/BioAgent/env/bin/python3 /tmp/inject_admin.py BioAdmin --db /data/BioAgent/bioagent.db
+  sudo -u aiscientist /data/aiscientist/env/bin/python3 /tmp/inject_admin.py
+  sudo -u aiscientist /data/aiscientist/env/bin/python3 /tmp/inject_admin.py BioAdmin
+  sudo -u aiscientist /data/aiscientist/env/bin/python3 /tmp/inject_admin.py BioAdmin --db /data/aiscientist/bioagent.db
 
   # Non-interactive (password via env, useful for automation):
   AISCIENTIST_ADMIN_PASSWORD=<pw> ... python3 /tmp/inject_admin.py BioAdmin
@@ -18,14 +18,14 @@ Username defaults to 'BioAdmin'. The script creates the user if it doesn't exist
 or resets the password + ensures role=admin + is_active=1 if it does.
 
 DB resolution order: --db override > $AISCIENTIST_DATABASE_URL > AISCIENTIST_DATABASE_URL
-parsed from the app's .env (/data/BioAgent/app/.env) > a SQLite fallback guess. The
+parsed from the app's .env (/data/aiscientist/app/.env) > a SQLite fallback guess. The
 .env step is what makes a bare `sudo -u aiscientist ... inject_admin.py` hit the SAME
 Postgres the console uses, instead of silently writing to a stray SQLite file.
 
 PREFERRED ALTERNATIVE — if the app CLI is installed and AISCIENTIST_DATABASE_URL is
 set in the server .env, use the canonical tool instead:
 
-  sudo -u aiscientist /data/BioAgent/env/bin/aiscientist-admin create-admin BioAdmin
+  sudo -u aiscientist /data/aiscientist/env/bin/aiscientist-admin create-admin BioAdmin
 """
 from __future__ import annotations
 
@@ -37,9 +37,9 @@ from pathlib import Path
 
 
 SERVER_DB_CANDIDATES = [
-    "/data/BioAgent/bioagent.db",
-    "/data/BioAgent/app/bioagent.db",
-    "/data/BioAgent/state/bioagent.db",
+    "/data/aiscientist/bioagent.db",
+    "/data/aiscientist/app/bioagent.db",
+    "/data/aiscientist/state/bioagent.db",
     "./bioagent.db",
 ]
 
@@ -49,8 +49,8 @@ SERVER_DB_CANDIDATES = [
 # `sudo -u aiscientist python3 inject_admin.py` silently fell back to a stray SQLite file
 # while the app was actually on Postgres.
 ENV_CANDIDATES = [
-    "/data/BioAgent/app/.env",
-    "/data/BioAgent/.env",
+    "/data/aiscientist/app/.env",
+    "/data/aiscientist/.env",
     "./.env",
 ]
 
@@ -112,7 +112,7 @@ def resolve_db_url(override: str | None) -> str:
         "ERROR: cannot locate a database.\n"
         "  No AISCIENTIST_DATABASE_URL in the environment or any .env, and no bioagent.db found.\n"
         "  Set AISCIENTIST_DATABASE_URL=postgresql+psycopg://bioagent:<pw>@127.0.0.1/bioagent\n"
-        "  (or sqlite:////data/BioAgent/bioagent.db), or pass --db /path/or/url.",
+        "  (or sqlite:////data/aiscientist/bioagent.db), or pass --db /path/or/url.",
         file=sys.stderr,
     )
     sys.exit(1)

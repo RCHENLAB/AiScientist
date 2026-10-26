@@ -1,15 +1,31 @@
 """Small loop-agnostic helpers used by the research harness/lab: a tolerant JSON
-parser and a heartbeat checkpoint writer (start/stop/log + a stall marker). Extracted
-from the retired eval autonomous-loop so the live agents don't depend on legacy code.
+parser, a thread pool that keeps the caller's context, and a heartbeat checkpoint writer
+(start/stop/log + a stall marker). Extracted from the retired eval autonomous-loop so the
+live agents don't depend on legacy code.
 """
 
 from __future__ import annotations
 
+import contextvars
 import json
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+
+class ContextThreadPoolExecutor(ThreadPoolExecutor):
+    """A ``ThreadPoolExecutor`` whose tasks run in a copy of the submitting thread's context.
+
+    A plain pool starts its workers with an empty context, so whatever the caller's context says
+    is lost inside them — on the gateway, WHICH RUN the work is for, when several chats each have
+    a run in flight on one session. Parallel steps and expert calls then emitted events and
+    recorded model usage under another chat's run. ``map`` goes through ``submit``, so it is
+    covered too."""
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future:
+        return super().submit(contextvars.copy_context().run, fn, *args, **kwargs)
 
 
 def safe_json_loads(text: str) -> dict[str, Any] | None:

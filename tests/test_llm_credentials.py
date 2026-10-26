@@ -14,7 +14,6 @@ import importlib
 import json
 import os
 import stat
-from pathlib import Path
 
 import pytest
 
@@ -30,7 +29,7 @@ def lc(tmp_path, monkeypatch):
     return llm_credentials
 
 
-def _make(lc, owner="alice", key="sk-test-abcdefghijklmnop", **kw):
+def _make(lc, owner="alice", key="sk-test-abcdefgmnop", **kw):
     return lc.create(owner, provider="deepseek", base_url="https://api.deepseek.com/v1",
                      model="deepseek-chat", api_key=key, **kw)
 
@@ -41,9 +40,9 @@ def _make(lc, owner="alice", key="sk-test-abcdefghijklmnop", **kw):
 def test_public_metadata_never_carries_the_key(lc):
     pub = _make(lc)
     blob = json.dumps(pub)
-    assert "sk-test-abcdefghijklmnop" not in blob
+    assert "sk-test-abcdefgmnop" not in blob
     assert "key_path" not in pub
-    assert pub["key_hint"] == "sk-tes…mnop"
+    assert pub["key_hint"] == "…mnop"            # the last 4 characters, nothing else
     assert pub["key_fingerprint"].startswith("sha256:")
 
 
@@ -51,13 +50,13 @@ def test_key_file_is_0600_and_secret_round_trips(lc, tmp_path):
     pub = _make(lc)
     key_file = tmp_path / "llm_creds" / "alice" / f"{pub['id']}.key"
     assert stat.S_IMODE(key_file.stat().st_mode) == 0o600
-    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefghijklmnop"
+    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefgmnop"
 
 
 def test_index_json_holds_no_secret(lc, tmp_path):
     _make(lc)
     index = (tmp_path / "llm_creds" / "alice" / "index.json").read_text(encoding="utf-8")
-    assert "sk-test-abcdefghijklmnop" not in index
+    assert "sk-test-abcdefgmnop" not in index
 
 
 def test_create_requires_key_and_base_url(lc):
@@ -81,12 +80,12 @@ def test_failed_verification_stores_nothing(lc):
 
 def test_rotation_keeps_the_id_and_swaps_the_secret(lc):
     pub = _make(lc)
-    rotated = lc.rotate_key("alice", pub["id"], "sk-brand-new-qrstuvwxyz")
+    rotated = lc.rotate_key("alice", pub["id"], "sk-brand-new-uvwxyz")
 
     assert rotated["id"] == pub["id"], "the id must survive so every reference to it stays valid"
     assert rotated["key_fingerprint"] != pub["key_fingerprint"]
     assert rotated["rotated_at"] is not None
-    assert lc.resolve_secret("alice", pub["id"]) == "sk-brand-new-qrstuvwxyz"
+    assert lc.resolve_secret("alice", pub["id"]) == "sk-brand-new-uvwxyz"
     assert len(lc.list_credentials("alice")) == 1, "rotation updates in place, it does not add a row"
 
 
@@ -103,7 +102,7 @@ def test_failed_rotation_leaves_the_old_key_working(lc):
         lc.rotate_key("alice", pub["id"], "sk-bad-key-000000000", verify=reject)
 
     assert seen["key"] == "sk-bad-key-000000000", "verification must see the NEW key, not the stored one"
-    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefghijklmnop"
+    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefgmnop"
     after = lc.list_credentials("alice")[0]
     assert after["key_fingerprint"] == pub["key_fingerprint"]
     assert after["rotated_at"] is None
@@ -147,6 +146,14 @@ def test_lab_model_round_trips(lc):
     assert lc.update("alice", pub["id"], lab_model="")["lab_model"] is None
 
 
+def test_a_changed_lab_model_drops_the_stored_verification(lc):
+    """The key was proven against the old PI/Critic model, not the new one."""
+    pub = _make(lc, lab_model="deepseek-reasoner")
+    assert lc.mark_verified("alice", pub["id"], model="deepseek-chat")["verified_at"] is not None
+    assert lc.update("alice", pub["id"], lab_model="deepseek-reasoner")["verified_at"] is not None  # unchanged
+    assert lc.update("alice", pub["id"], lab_model="other-model")["verified_at"] is None
+
+
 # --- optional encryption -----------------------------------------------------
 
 
@@ -154,14 +161,16 @@ def test_encrypted_at_rest_when_enabled(lc, tmp_path, monkeypatch):
     pytest.importorskip("cryptography")
     monkeypatch.setenv("AISCIENTIST_LLM_KEY_ENCRYPTION", "1")
 
-    pub = _make(lc, key="sk-secret-value-1234567")
+    pub = _make(lc, key="sk-secret-val-1234567")
     raw = (tmp_path / "llm_creds" / "alice" / f"{pub['id']}.key").read_bytes()
-    assert b"sk-secret-value-1234567" not in raw
+    assert b"sk-secret-val-1234567" not in raw
     assert pub["encrypted"] is True
-    assert lc.resolve_secret("alice", pub["id"]) == "sk-secret-value-1234567"
+    assert lc.resolve_secret("alice", pub["id"]) == "sk-secret-val-1234567"
 
-    master = tmp_path / "llm_creds" / ".master"
+    # The master lives OUTSIDE the key store, so a copy of llm_creds/ alone decrypts nothing.
+    master = tmp_path / "llm_key.master"
     assert stat.S_IMODE(master.stat().st_mode) == 0o600
+    assert not (tmp_path / "llm_creds" / ".master").exists()
 
 
 def test_enabling_encryption_later_keeps_old_plaintext_rows_readable(lc, monkeypatch):
@@ -220,7 +229,7 @@ def test_key_path_outside_the_owner_store_is_ignored(lc, tmp_path):
     _point_key_path_at(tmp_path, outside)
 
     assert lc.resolve_secret("alice", pub["id"]) != "root:x:0:0"
-    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefghijklmnop"
+    assert lc.resolve_secret("alice", pub["id"]) == "sk-test-abcdefgmnop"
 
 
 def test_a_tampered_key_path_is_refused_when_there_is_no_canonical_file(lc, tmp_path):
@@ -237,7 +246,7 @@ def test_a_tampered_key_path_is_refused_when_there_is_no_canonical_file(lc, tmp_
 
 
 def test_owner_names_are_sanitised_into_one_directory(lc, tmp_path):
-    lc.create("../../etc", provider="p", base_url="https://a/v1", model="m", api_key="sk-000000000000")
+    lc.create("../../etc", provider="p", base_url="https://a/v1", model="m", api_key="sk-example-0000")
     assert not (tmp_path / "llm_creds" / ".." / ".." / "etc").exists()
     assert (tmp_path / "llm_creds" / "etc").is_dir()
 
@@ -274,7 +283,7 @@ def test_the_key_survives_the_store_moving(tmp_path, monkeypatch):
     directory the deploy rsyncs into) left every row naming a file that was no longer there: the
     key sat intact on disk while every use of it failed with "outside the owner's store".
     """
-    import importlib, json, os, shutil
+    import shutil
     from aiscientist.gateway import llm_credentials as lc
 
     old_root = tmp_path / "old"
@@ -283,14 +292,55 @@ def test_the_key_survives_the_store_moving(tmp_path, monkeypatch):
     monkeypatch.delenv("AISCIENTIST_STATE_DIR", raising=False)   # the unset-in-prod case
     importlib.reload(lc)
     cred = lc.create("alice", provider="custom", base_url="https://a/v1", model="m1",
-                     api_key="sk-lives-through-a-move")
+                     api_key="sk-example-lives-on")
     assert not os.path.isabs(json.loads((old_root / "llm_creds/alice/index.json").read_text())[0]["key_path"])
 
     new_root = tmp_path / "new"
     shutil.copytree(old_root / "llm_creds", new_root / "llm_creds")
+    # Keys are encrypted by default, and the master sits beside the store, not in it: moving the
+    # state dir means moving both.
+    shutil.copy2(old_root / "llm_key.master", new_root / "llm_key.master")
     monkeypatch.setenv("AISCIENTIST_STATE_DIR", str(new_root))
     monkeypatch.chdir(tmp_path)                               # the old relative path now resolves nowhere
     importlib.reload(lc)
 
-    assert lc.resolve_secret("alice", cred["id"]) == "sk-lives-through-a-move"
+    assert lc.resolve_secret("alice", cred["id"]) == "sk-example-lives-on"
     importlib.reload(lc)
+
+
+def test_a_plaintext_key_is_encrypted_on_its_next_read_and_at_start(lc, tmp_path, monkeypatch):
+    """Keys saved while encryption was off (the default until RCHENLAB/AiScientist issue 8) are
+    rewritten encrypted, under the same id, without the user re-entering anything."""
+    pytest.importorskip("cryptography")
+    monkeypatch.setenv("AISCIENTIST_LLM_KEY_ENCRYPTION", "0")
+    a = _make(lc, key="sk-plain-aaaaaaaaaa")
+    b = _make(lc, key="sk-plain-bbbbbbbbbb")
+    path_a = tmp_path / "llm_creds" / "alice" / f"{a['id']}.key"
+    assert path_a.read_bytes() == b"sk-plain-aaaaaaaaaa"
+
+    monkeypatch.delenv("AISCIENTIST_LLM_KEY_ENCRYPTION")          # back to the default: on
+    assert lc.resolve_secret("alice", a["id"]) == "sk-plain-aaaaaaaaaa"
+    assert b"sk-plain-" not in path_a.read_bytes()
+    assert lc.get_public("alice", a["id"])["encrypted"] is True
+
+    assert lc.encrypt_existing() == 1                              # b, at gateway start
+    assert lc.get_public("alice", b["id"])["encrypted"] is True
+    assert lc.resolve_secret("alice", b["id"]) == "sk-plain-bbbbbbbbbb"
+    assert lc.encrypt_existing() == 0
+
+
+def test_an_old_long_hint_is_shown_as_its_last_four(lc, tmp_path):
+    pub = _make(lc, key="sk-test-abcdefgmnop")
+    idx = tmp_path / "llm_creds" / "alice" / "index.json"
+    rows = json.loads(idx.read_text())
+    rows[0]["key_hint"] = "sk-tes…mnop"                          # how older rows stored it
+    idx.write_text(json.dumps(rows))
+    assert lc.get_public("alice", pub["id"])["key_hint"] == "…mnop"
+
+
+def test_delete_owner_removes_every_key_of_the_account(lc, tmp_path):
+    _make(lc, key="sk-one-000000000000")
+    _make(lc, key="sk-two-000000000000")
+    assert lc.delete_owner("alice") == 2
+    assert not (tmp_path / "llm_creds" / "alice").exists()
+    assert lc.delete_owner("alice") == 0

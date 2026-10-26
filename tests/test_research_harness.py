@@ -144,13 +144,16 @@ def test_missing_required_arg_is_a_validation_error() -> None:
         lambda _args, _ctx: {"status": "ok"},
     )
     harness = ResearchHarness(catalog=[need_arg, *default_catalog()], chat_fn=_scripted([
-        _tool_call("need_arg", {}),  # missing required "x"
+        _tool_call("need_arg", {}),            # no arguments at all: a reply cut off at the limit
+        _tool_call("need_arg", {"y": "1"}),    # a wrong parameter name
         _tool_call("finish", {"answer": "ok"}),
     ]))
 
     result = harness.run("analyze", _ctx())
 
-    assert any("missing required args for 'need_arg'" in err["error"] for err in result.errors)
+    errors = [err["error"] for err in result.errors]
+    assert any("arrived with NO arguments" in e and "SHORTER" in e for e in errors)
+    assert any("missing required args for 'need_arg'" in e and "got ['y']" in e for e in errors)
     assert result.final_answer == "ok"
 
 
@@ -253,6 +256,43 @@ def test_redundant_repeats_after_success_stop_early() -> None:
     assert result.stop_reason == "done_early"
     assert calls["n"] == 1                   # the identical repeats were NOT re-executed
     assert [s["tool"] for s in result.steps] == ["run_thing"]   # one real successful step
+
+
+def _probe_then_two_errors(first: str) -> ResearchHarness:
+    """``first`` succeeds, two DIFFERENT run_code errors follow, then the step's tool and finish:
+    the shape of run f3b8268c4fd4's first ORA attempt."""
+    errors = iter(["AttributeError: 'AnnData' object has no attribute 'close'",
+                   "AttributeError: 'numpy.ndarray' object has no attribute 'keys'"])
+
+    def _raise(_a: dict, _c: HarnessContext) -> dict:
+        raise RuntimeError(next(errors))
+
+    def _ok(_a: dict, _c: HarnessContext) -> dict:
+        return {"status": "ok"}
+
+    empty = {"type": "object", "properties": {}}
+    catalog = [HarnessTool(first, "succeeds", empty, _ok),
+               HarnessTool("run_code", "fails", empty, _raise),
+               HarnessTool("run_enrichment", "the step's tool", empty, _ok),
+               *[t for t in default_catalog() if t.name == "finish"]]
+    return ResearchHarness(catalog=catalog, chat_fn=_scripted([
+        _tool_call(first, {}), _tool_call("run_code", {}), _tool_call("run_code", {}),
+        _tool_call("run_enrichment", {}), _tool_call("finish", {"answer": "enriched"})]))
+
+
+def test_a_lookup_is_not_a_result_so_errors_after_it_do_not_stop_the_step() -> None:
+    result = _probe_then_two_errors("read_tool_source").run("ORA", _ctx())
+
+    assert result.stop_reason == "finished"
+    assert [s["tool"] for s in result.steps] == [
+        "read_tool_source", "run_code", "run_code", "run_enrichment", "finish"]
+
+
+def test_errors_after_a_real_result_still_stop_the_step_early() -> None:
+    result = _probe_then_two_errors("run_clustering").run("ORA", _ctx())
+
+    assert result.stop_reason == "done_early"
+    assert "run_enrichment" not in [s["tool"] for s in result.steps]
 
 
 def test_guard_blocks_raw_table_brief_before_any_model_call() -> None:
@@ -656,3 +696,15 @@ def test_extra_steps_raises_the_ceiling_for_one_attempt() -> None:
     calls.clear()
     harness.run("Analyze.", _ctx(), on_event=lambda _e: None)
     assert len(calls) == 2                        # the next step is back to the default
+
+
+def test_a_tool_result_with_bytes_or_numpy_reaches_the_model_instead_of_ending_the_run():
+    import json
+    import numpy as np
+    from aiscientist.agents.research_harness import ResearchHarness
+    messages: list = []
+    ResearchHarness._feed_result(messages, True, "c1", {
+        "status": "ok", "attr": b"library", "n": np.int64(3), "arr": np.array([1.5, 2.5]),
+        "keys": {"b", "a"}})
+    fed = json.loads(messages[0]["content"])
+    assert fed == {"status": "ok", "attr": "library", "n": 3, "arr": [1.5, 2.5], "keys": ["a", "b"]}

@@ -6,7 +6,7 @@ forces a multi-GB texlive install on the eyeserver). This renderer implements th
 ``(cmd, cwd, out_path, timeout_s) -> (ok, err)`` contract as ``report._run_pandoc``, so
 ``build_pdf_report(render_fn=...)`` uses it transparently: it tars the render bundle (markdown +
 figures/tables + the header/lua helpers) to dfs3b, runs the exact pandoc command inside a texlive
-Singularity image as a batch job, and pulls the produced PDF/DOCX back.
+Apptainer image as a batch job, and pulls the produced PDF/DOCX back.
 
 No AiScientist code runs in the image — pandoc is a self-contained binary — so this needs only a
 deps-only texlive/pandoc image (deploy/report/report.def). Reuses the slurm_job lifecycle and the
@@ -22,7 +22,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from .executor import RemoteExecutor
 from .slurm_job import (
@@ -40,14 +40,16 @@ class SlurmReportRenderer:
     remote: RemoteExecutor | None
     container_image: str
     remote_base: str
-    scratch_dir: str = "$HOME/.bioagent/report"
+    # Where the render bundle, the job's script and its log go. Required, with no default: the
+    # gateway passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    scratch_dir: str = field(kw_only=True)
     mem_gb: int = 8
     cpus: int = 2
     partition: str = "standard"
     account: str = ""
     time_limit: str = "00:30:00"
     container_module: str = ""
-    container_bin: str = "singularity"
+    container_bin: str = "apptainer"
     startup_timeout_s: int = 600
     run_timeout_s: int = 1800
     local_fallback: Callable[[list, Path, Path, float], tuple] | None = None
@@ -85,7 +87,7 @@ class SlurmReportRenderer:
     def _resolved_scratch(self) -> str:
         """Expand ``$HOME`` in ``scratch_dir`` to a concrete absolute remote path ONCE (cached).
 
-        The scratch dir leaks into the ``singularity -B`` bind AND ``#SBATCH --output``. Slurm does
+        The scratch dir leaks into the ``apptainer -B`` bind AND ``#SBATCH --output``. Slurm does
         NOT expand ``$HOME`` in ``--output``, and shlex-quoting the bind freezes ``$HOME`` as a
         literal — so a raw ``$HOME/.bioagent/report`` made the render Slurm job die instantly (exit
         127: no writable log, unbindable mount), which is why NO report ever rendered on HPC3.
@@ -151,7 +153,7 @@ class SlurmReportRenderer:
         rcmd = [a.replace(base, remote_root) for a in cmd]
         remote_out = str(out_path).replace(base, remote_root)
 
-        # Build the singularity line DIRECTLY (not via singularity_exec, which wraps the command in
+        # Build the container line DIRECTLY (not via container_exec, which wraps the command in
         # `bash -lc` — the deps-only pandoc image has no bash). pandoc runs as the container command;
         # TeX's font/format cache goes under a writable HOME on the tmpfs via --env (no shell needed).
         sing = [
@@ -206,7 +208,7 @@ class SlurmReportRenderer:
     def _fetch_log_tail(self, job_name: str, job_id: str, lines: int = 60) -> str:
         """Best-effort tail of the job's Slurm log (where pandoc/xelatex writes its real error).
 
-        Fetched ONLY on failure, so a black-box "no output" turns into the actual LaTeX/singularity
+        Fetched ONLY on failure, so a black-box "no output" turns into the actual LaTeX/container
         error. The path mirrors ``build_analysis_script``'s ``--output`` (``{log_dir}/{name}-%j``),
         using the resolved absolute scratch (``_resolved_scratch``) so it matches where Slurm actually
         wrote the log. Any failure here is swallowed — a diagnostic that itself errors must not mask

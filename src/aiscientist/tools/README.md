@@ -7,6 +7,7 @@ Every model-callable domain tool lives in its own folder here. This file is gene
 |---|---|---|---|---|
 | [`inspect_dataset`](inspect_dataset/TOOL.md) | Identifies what an uploaded file is (format, genome build, samples, matrix layout) from a bounded read of its head. | qc | `inprocess` | data |
 | [`run_scanpy_qc`](run_scanpy_qc/TOOL.md) | Filters cells and genes by quality, normalises and log-transforms the counts, and selects highly variable genes. | analysis | `hpc:analysis` | scrna |
+| [`run_cellqc`](run_cellqc/TOOL.md) | CellQC on a folder of 10x Cell Ranger libraries — ambient correction, filtering, doublets — then the merged, normalised checkpoint. | qc | `hpc:analysis` | scrna |
 | [`run_clustering`](run_clustering/TOOL.md) | PCA, a neighbourhood graph, Leiden clustering and a UMAP layout; can choose the resolution by bootstrap stability. | analysis | `hpc:analysis` | scrna |
 | [`run_de`](run_de/TOOL.md) | Differential expression with a Wilcoxon test over cells: each group against the rest, or condition against control, optionally within each cell type. | analysis | `hpc:analysis` | scrna |
 | [`run_enrichment`](run_enrichment/TOOL.md) | Over-representation analysis of DE genes against local gene-set libraries, with the genes actually tested as the background. | analysis | `hpc:analysis` | scrna |
@@ -19,11 +20,13 @@ Every model-callable domain tool lives in its own folder here. This file is gene
 | [`run_marker_annotation`](run_marker_annotation/TOOL.md) | Names clusters from a curated marker panel, with optional lineage-specific discriminators. | analysis | `hpc:analysis` | scrna |
 | [`literature_search`](literature_search/TOOL.md) | Finds real papers in Europe PMC for keyword queries and returns ready-to-cite references. | literature | `inprocess` | literature |
 | [`deep_literature`](deep_literature/TOOL.md) | Answers a scientific question from the literature with PaperQA2 and returns a cited answer with its evidence. | literature | `hpc:literature` | literature |
+| [`search_corpus`](search_corpus/TOOL.md) | Retrieval over the literature corpus without a language model: returns the matching passages, verbatim, with PMID, page and citation, for the session's model to answer from. | literature | `hpc:literature` | literature |
+| [`extract_haploinsufficient_genes`](extract_haploinsufficient_genes/TOOL.md) | Finds, by model-written search requests, the genes the corpus papers explicitly report as haploinsufficient in retinal disease, and writes genes.csv + hits.csv with verbatim quotes. | literature | `hpc:literature` | literature |
 | [`annotate_variants`](annotate_variants/TOOL.md) | Annotates VCF variants with consequence, gene, impact, population frequency and ClinVar significance, and writes the standard deliverable tables. | annotation | `hpc:variant` | variant |
 | [`map_phenotype_to_hpo`](map_phenotype_to_hpo/TOOL.md) | Turns free-text clinical notes into validated HPO term IDs, observed and excluded, each traced to its source phrase. | annotation | `inprocess` | phenotype |
 | [`run_lirical`](run_lirical/TOOL.md) | Ranks candidate diseases by LIRICAL's post-test probability from HPO terms, genotype-aware when a VCF is loaded. | annotation | `hpc:phenotype` | phenotype |
 | [`diagnose_disease`](diagnose_disease/TOOL.md) | Combines LIRICAL's probabilities with literature evidence into one adjudicated ranking of candidate diseases. | annotation | `inprocess` | phenotype |
-| [`make_schematic`](make_schematic/TOOL.md) | Renders a workflow, pathway or mechanism diagram from text (Graphviz, D2 or Mermaid) into the run's figures. | figure | `inprocess` | figure |
+| [`make_schematic`](make_schematic/TOOL.md) | Renders a workflow, pathway or mechanism diagram written in Graphviz DOT into the run's figures. | figure | `inprocess` | figure |
 | [`scgpt_annotate`](scgpt_annotate/TOOL.md) | Per-cell cell-type labels with a confidence, transferred from a reference atlas by scGPT on a GPU. | annotation | `gpu:scgpt` | scgpt |
 
 ## Anatomy of a tool folder

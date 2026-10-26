@@ -18,6 +18,9 @@ runs/
 # Raw datasets (never commit; provided per-run)
 *.h5ad
 
+# The pinned aiscientist-skills release, installed on the server (configs/skills_registry.json)
+skills/releases/
+
 # Local databases (dev SQLite created by running the gateway; prod uses PostgreSQL)
 *.db
 *.sqlite
@@ -54,3 +57,6 @@ output/
 ssh_creds/
 llm_creds/
 src/aiscientist/gateway/_app_prefix_9d72d43.py
+
+# scripts/inspect_run.py output: a run's question and chat messages, never committed
+run_inspect/

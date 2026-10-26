@@ -112,7 +112,8 @@ trustworthy and focused; skipping those is how a variant study silently ships wr
    → VUS_FAVOR_PATH → … → BENIGN) from ClinVar + gnomAD AF (disease-model thresholds) + the predictors. It
    is a **research-triage** ordering, NOT a clinical ACMG diagnosis — carry that caveat; never upgrade a
    ClinVar "uncertain" call.
-7. **Literature context** (`literature_search`): for the prioritised pathogenic genes/variants, pull real
+7. **Literature context** (`literature_search`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+   When it is planned: for the prioritised pathogenic genes/variants, pull real
    citations (gene + disease/phenotype) to ground the interpretation. Cite only what the tool returns.
 
 **(Optional) Cohort variant database** (`run_code`): for MANY samples, adapt the reference template

@@ -138,6 +138,23 @@ def test_a_stratified_contrast_runs_but_is_labelled_exploratory(tmp_path):
     assert "exploratory ranking" in joined and "not as differential expression" in joined
 
 
+def test_the_label_beside_the_tables_is_rewritten_on_every_run(tmp_path):
+    """A marker run reusing a stratified contrast's key must not inherit its label: run_enrichment
+    would treat the markers as descriptive, and nothing else on disk tells markers from a contrast
+    (the columns are identical)."""
+    import json
+
+    ctx = _qc(tmp_path, _retina_like(tmp_path))
+    sidecar = tmp_path / "artifacts" / "tables" / "de_majorclass_inference.json"
+    run_de_tool.run_de({"groupby": "sampleid", "reference": "WT", "stratify_by": "majorclass"}, ctx)
+    meta = json.loads(sidecar.read_text())
+    assert (meta["mode"], meta["inference"], meta["reference"]) == ("contrast", "exploratory_ranking", "WT")
+
+    assert run_de_tool.run_de({"groupby": "majorclass"}, ctx)["status"] == "ok"
+    meta = json.loads(sidecar.read_text())
+    assert (meta["mode"], meta["inference"], meta["reference"]) == ("markers", None, "rest")
+
+
 def test_force_runs_the_pooled_test_and_says_what_it_just_did(tmp_path):
     """`force` is a deliberate override, not a way to make the problem go away: the result carries
     the label so a downstream writer cannot present it as ordinary DE."""
@@ -202,7 +219,6 @@ def test_composition_runs_off_qc_when_the_labels_already_exist(tmp_path):
     `run_clustering` — the step the protocol explicitly forbids on a labelled dataset — so the
     analysis a two-arm annotated study needs FIRST refused to run on exactly those studies."""
     from aiscientist.tools.run_composition import tool as run_composition_tool
-    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))
     out = run_composition_tool.run_composition(
@@ -219,7 +235,6 @@ def test_composition_reports_per_arm_proportions_even_with_one_library(tmp_path)
     that makes a pooled DE result unreadable as expression change.
     """
     from aiscientist.tools.run_composition import tool as run_composition_tool
-    from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))          # `orig.ident` holds ONE value
     out = run_composition_tool.run_composition(
@@ -238,7 +253,6 @@ def test_pseudobulk_names_the_finding_instead_of_blaming_the_metadata(tmp_path):
     """Refusing is correct; the diagnosis was not. A one-library study got 'check the metadata',
     sending the reader after a bug that does not exist — the metadata is fine, the STUDY has no
     replicates, and that is the thing to report."""
-    from aiscientist.tools.run_composition import tool as run_composition_tool
     from aiscientist.tools.run_pseudobulk_de import tool as run_pseudobulk_de_tool
 
     ctx = _qc(tmp_path, _retina_like(tmp_path))

@@ -17,7 +17,7 @@ from aiscientist.agents.research_harness import (
     HarnessConfig, HarnessContext, ResearchHarness, default_catalog,
 )
 from aiscientist.agents.research_lab import (
-    CriticVerdict, LabConfig, LabRound, ResearchLab, make_run_code_tool,
+    LabConfig, ResearchLab, make_run_code_tool,
 )
 
 _COMPACT_MARK = "HANDOVER SUMMARY"

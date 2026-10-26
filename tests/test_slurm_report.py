@@ -14,6 +14,9 @@ from aiscientist.gateway.executor import ExecResult
 from aiscientist.gateway.slurm_report import SlurmReportRenderer
 from aiscientist.reporting import report
 
+# The directory the gateway gives this job line: <shared_root>/Temp/<user>/scratch/report.
+SCRATCH = "/dfs/lab/Temp/tester/scratch/report"
+
 
 class FakeHPC:
     def __init__(self, sacct: str = "COMPLETED"):
@@ -33,7 +36,8 @@ class FakeHPC:
         cmd = command.strip()
         self.all_cmds.append(cmd)
         if cmd.startswith("sbatch"):
-            jid = str(self._next); self._next += 1
+            jid = str(self._next)
+            self._next += 1
             self.submits.append(jid)
             return self._ok(f"Submitted batch job {jid}")
         if cmd.startswith("squeue"):
@@ -67,7 +71,7 @@ def test_report_render_on_slurm_stages_remaps_and_pulls_back(tmp_path):
     cmd = ["pandoc", str(md), "-o", str(out), "--resource-path", str(bundle), "--pdf-engine=xelatex"]
 
     hpc = FakeHPC()
-    r = SlurmReportRenderer(remote=hpc, container_image="/dfs/report.sif",
+    r = SlurmReportRenderer(remote=hpc, container_image="/dfs/report.sif", scratch_dir=SCRATCH,
                             remote_base="/dfs/lab/tester/reports", startup_timeout_s=5, run_timeout_s=5)
     ok, err = r(cmd, bundle, out, 60.0)
 
@@ -96,8 +100,8 @@ def test_report_render_missing_output_is_diagnosable_and_never_throws(tmp_path):
     cmd = ["pandoc", "in.md", "-o", str(out), "--pdf-engine=xelatex"]
 
     hpc = FakeHPCNoOutput()
-    r = SlurmReportRenderer(remote=hpc, container_image="/img", remote_base="/dfs/lab/tester/reports",
-                            startup_timeout_s=5, run_timeout_s=5)
+    r = SlurmReportRenderer(remote=hpc, container_image="/img", scratch_dir=SCRATCH,
+                            remote_base="/dfs/lab/tester/reports", startup_timeout_s=5, run_timeout_s=5)
     ok, err = r(cmd, bundle, out, 60.0)   # must return, not raise
 
     assert ok is False and not out.exists()
@@ -118,7 +122,7 @@ def test_report_render_missing_output_falls_back_to_local(tmp_path):
         return (True, "")
 
     hpc = FakeHPCNoOutput()
-    r = SlurmReportRenderer(remote=hpc, container_image="/img", remote_base="/x",
+    r = SlurmReportRenderer(remote=hpc, container_image="/img", scratch_dir=SCRATCH, remote_base="/x",
                             startup_timeout_s=5, run_timeout_s=5, local_fallback=local)
     ok, err = r(["pandoc", "-o", str(out)], bundle, out, 60.0)
 
@@ -144,7 +148,7 @@ def test_report_render_mkdir_timeout_never_throws(tmp_path):
     bundle = tmp_path / "run" / "artifacts"
     (bundle / "report").mkdir(parents=True)
     out = bundle / "report" / "report.pdf"
-    r = SlurmReportRenderer(remote=FakeHPCMkdirTimeout(), container_image="/img",
+    r = SlurmReportRenderer(remote=FakeHPCMkdirTimeout(), container_image="/img", scratch_dir=SCRATCH,
                             remote_base="/dfs/lab/tester/reports", startup_timeout_s=5, run_timeout_s=5)
     ok, err = r(["pandoc", "-o", str(out)], bundle, out, 60.0)   # must return, not raise
     assert ok is False and "timed out" in err and not out.exists()
@@ -161,7 +165,7 @@ def test_report_render_mkdir_timeout_falls_back_to_local(tmp_path):
         Path(out_path).write_bytes(b"%PDF local\n")
         return (True, "")
 
-    r = SlurmReportRenderer(remote=FakeHPCMkdirTimeout(), container_image="/img", remote_base="/x",
+    r = SlurmReportRenderer(remote=FakeHPCMkdirTimeout(), container_image="/img", scratch_dir=SCRATCH, remote_base="/x",
                             startup_timeout_s=5, run_timeout_s=5, local_fallback=local)
     ok, err = r(["pandoc", "-o", str(out)], bundle, out, 60.0)
     assert ok is True and err == "" and out.exists()
@@ -177,19 +181,21 @@ class FakeHPCEcho(FakeHPC):
 
 
 def test_report_render_resolves_home_no_literal_in_job(tmp_path):
-    # Regression: the render Slurm job put a raw $HOME/.bioagent/report in `#SBATCH --output` AND the
-    # `singularity -B` bind. Slurm doesn't expand $HOME in --output, and the quoted bind froze it, so
+    # Regression, from when the scratch default was "$HOME/.bioagent/report" (a scratch_dir with a
+    # shell variable in it must still resolve): the render job put that raw path in `#SBATCH --output` AND the
+    # `apptainer -B` bind. Slurm doesn't expand $HOME in --output, and the quoted bind froze it, so
     # every HPC render died instantly (exit 127) — no report ever rendered. With a shell that resolves
     # $HOME, the ABSOLUTE path must be baked into the submitted job, with no literal "$HOME" anywhere.
     bundle = tmp_path / "run" / "artifacts"
     (bundle / "report").mkdir(parents=True)
-    md = bundle / "report" / "report.md"; md.write_text("# hi")
+    md = bundle / "report" / "report.md"
+    md.write_text("# hi")
     out = bundle / "report" / "report.pdf"
     cmd = ["pandoc", str(md), "-o", str(out), "--pdf-engine=xelatex"]
 
     hpc = FakeHPCEcho()
-    r = SlurmReportRenderer(remote=hpc, container_image="/img", remote_base="/dfs/lab/tester/reports",
-                            startup_timeout_s=5, run_timeout_s=5)
+    r = SlurmReportRenderer(remote=hpc, container_image="/img", scratch_dir="$HOME/.bioagent/report",
+                            remote_base="/dfs/lab/tester/reports", startup_timeout_s=5, run_timeout_s=5)
     ok, err = r(cmd, bundle, out, 60.0)
 
     assert ok and err == "" and out.exists()
@@ -205,7 +211,7 @@ def test_report_render_no_remote_falls_back(tmp_path):
         calls["cmd"] = cmd
         return (True, "")
 
-    r = SlurmReportRenderer(remote=None, container_image="/img", remote_base="/x",
+    r = SlurmReportRenderer(remote=None, container_image="/img", scratch_dir=SCRATCH, remote_base="/x",
                             local_fallback=fake_local)
     ok, _err = r(["pandoc"], tmp_path, tmp_path / "o.pdf", 10.0)
     assert ok and calls["cmd"] == ["pandoc"]

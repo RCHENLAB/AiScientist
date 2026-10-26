@@ -110,7 +110,10 @@ class _Shell:
 
 def _exec(missing=(), outcome="installed", ran=None):
     cache = _Cache(missing, outcome)
-    inner = lambda code: (ran.append(code) if ran is not None else None) or {"status": "ok"}
+    def inner(code):
+        if ran is not None:
+            ran.append(code)
+        return {"status": "ok"}
     return PreflightingExecutor(inner=inner, shell=_Shell(cache), cache=cache), cache
 
 

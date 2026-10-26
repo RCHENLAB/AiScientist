@@ -139,3 +139,42 @@ different vector space and the index must be rebuilt.
 - **GPU:** PubMedBERT runs on CPU (slower than MiniLM but fine for this corpus). If you
   later want a GPU to speed it up, switch to a `gpu` partition with `--gres=gpu:1` and add
   `--account`/`--partition` accordingly; the model auto-uses CUDA if present.
+
+## Retrieval-only path (`search_corpus`)
+
+A session with no GPU allocation (the user's own API key) has no served model for `deep_literature`.
+`search_corpus` runs in the same `paperqa.sif` job line without one: it reads
+`<corpus-root>/mechanism_cache/{chunks.jsonl,chunk_vecs.npy}` and the offline `hf_cache` (PubMedBERT on
+CPU), and returns the matching passages. The job needs 2 CPUs and 8 GB, no GPU, and is given no model
+endpoint or API key; the session's model writes the queries and the answer, and the gateway removes any
+citation or quotation the passages do not support. The text cache is rebuilt by hand with
+`scripts/build_mechanism_cache.py` when papers are added.
+
+## Corpus scan (`extract_haploinsufficient_genes`)
+
+The corpus scan (asked for with `route: "corpus"` on `/api/lab`; the console has no control for it)
+has a language model write search requests and read every passage they retrieve, so its job brings
+its own: one Slurm job on the paid `gpu` partition (`AISCIENTIST_CORPUS_SCAN_PARTITION`,
+account `AISCIENTIST_CORPUS_SCAN_ACCOUNT`, default `ruic20_lab_gpu`) with `gpu:1` and the node
+feature `nvme`, so it takes the first free A30 or A100 and never a V100
+(`AISCIENTIST_CORPUS_SCAN_GRES`, `AISCIENTIST_CORPUS_SCAN_CONSTRAINT`). The partition bills every
+card the same; an A100 reads about twice as fast as an A30. The default model fits an A30 only with its image and video encoders
+off and at most 16 requests at once, the default of `AISCIENTIST_CORPUS_SCAN_VLLM_ARGS`. The job
+starts vLLM from
+`<root>/containers/vllm-0.28.0.sif` with the weights in `<root>/hf` on the node's `127.0.0.1`
+(model `AISCIENTIST_CORPUS_SCAN_MODEL`, default the cluster sessions' model; window
+`AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN`, default 16384), runs the scan in `paperqa.sif` against
+it, and exits, which frees the card. The session's own model is never called, so a session on the
+shared model or on an API key can run it.
+
+The paid queue can hold a card back for hours. The job keeps its place in it for up to
+`AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S` (default 7200), and the chat hears where it stands (Slurm's
+reason and expected start) every `AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S` (default 1800). A job
+that never gets a card is submitted again, up to `AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES` times
+(default 2), before the run ends with a message that nothing ran.
+
+A finished scan is kept on the gateway host under `<AISCIENTIST_DATA_ROOT>/corpus_scans/<key>/`,
+where the key covers the corpus (the manifest's hash, the size and time of the text cache and the
+HGNC table), the scan's rules and the model. The next request for the same corpus is answered from
+it without a job; adding papers (a new manifest and text cache) changes the key. Deleting a key's
+folder makes the next request scan again.

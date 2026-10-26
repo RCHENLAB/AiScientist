@@ -6,6 +6,7 @@ hashed before they touch the database; nothing plaintext is ever written to disk
     aiscientist-admin reset-password <username>   # reset any user's password (prompts pw)
     aiscientist-admin list-users                  # list accounts (no hashes)
     aiscientist-admin hash-password               # print a bcrypt hash for AISCIENTIST_ADMIN_PASSWORD_HASH
+    aiscientist-admin metadata-check              # draft missing Croissant metadata, re-validate all of it
 
 Run after the `auth` extra is installed and AISCIENTIST_DATABASE_URL points at the DB.
 """
@@ -37,6 +38,8 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("username")
     sub.add_parser("list-users", help="list accounts")
     sub.add_parser("hash-password", help="print a bcrypt hash (for AISCIENTIST_ADMIN_PASSWORD_HASH)")
+    sub.add_parser("metadata-check", help="draft missing Croissant metadata and re-validate every stored "
+                                          "croissant.json now (the gateway also does this weekly)")
     args = parser.parse_args(argv)
 
     # Load the project .env (AISCIENTIST_DATABASE_URL / SECRET_KEY / ...) the same way the
@@ -70,6 +73,14 @@ def main(argv: list[str] | None = None) -> int:
         ok = auth_routes.set_user_password(args.username, _prompt_password())
         print(f"Password reset for {args.username}" if ok else f"User not found: {args.username}")
         return 0 if ok else 1
+
+    if args.cmd == "metadata-check":
+        from . import metadata_store
+        from ..metadata import mlcroissant_version
+        summary = metadata_store.recheck_all()
+        print(f"validator: aiscientist + {('mlcroissant ' + mlcroissant_version()) if mlcroissant_version() else 'no mlcroissant (own rules only)'}")
+        print(f"drafted {summary['drafted']}, checked {summary['checked']}, invalid {summary['invalid']}")
+        return 1 if summary["invalid"] else 0
 
     if args.cmd == "list-users":
         for u in auth_routes.all_users():

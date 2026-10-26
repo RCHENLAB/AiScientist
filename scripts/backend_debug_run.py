@@ -25,7 +25,7 @@ forgotten or crashed run never leaves a GPU allocation burning.
 Usage (on the eye server, after `pip install -e <biomni> scanpy anndata`):
     PYTHONPATH=src python scripts/backend_debug_run.py \
         --ollama-port 37219 --model qwen3.6:35b-a3b \
-        --dataset /data/BioAgent/uploads/pbmc3k.h5ad \
+        --dataset /data/aiscientist/uploads/pbmc3k.h5ad \
         --slurm-job-id 1234567 --hpc3-ssh hpc3
 
 Skip the manual pause (endpoint already up):  add --no-pause

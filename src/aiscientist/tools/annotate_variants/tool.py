@@ -492,7 +492,7 @@ def _write_table(rows: "list[dict[str, Any]]", dest: "Path | str | None" = None)
 
 # The five standard deliverable tables `annotate_variants` writes DETERMINISTICALLY from a
 # summarize_annotations() result — so the orchestrator never hand-writes (and botches) this CSV /
-# summary-dict code. (The skills/variant_output_tables/ skill stays for CUSTOM thresholds/columns.)
+# summary-dict code. (The write-variant-tables skill stays for CUSTOM thresholds/columns.)
 STANDARD_TABLES = (
     "variant_consequence_distribution.csv", "variant_impact_distribution.csv",
     "variant_clinical_significance.csv", "clinvar_pathogenic_variants.csv",
@@ -583,12 +583,22 @@ def annotate_variants_rest(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     offline stack; for WGS-scale VCFs use the offline line (:mod:`aiscientist.tools.vcf_offline`), which
     this also serves as the in-process fallback when the HPC3 job can't run. Caps at ``max_variants``
     (default 500) because the public REST API is rate-limited — the offline path removes that cap."""
-    src = str(args.get("vcf_path")
-              or (ctx.decisions.get("dataset_path") if ctx and getattr(ctx, "decisions", None) else "")
-              or "").strip()
+    from ..sdk import confine_read
+
+    asked = str(args.get("vcf_path") or "").strip()
+    src = (asked
+           or str((ctx.decisions.get("dataset_path") if ctx and getattr(ctx, "decisions", None) else "")
+                  or "").strip())
     if not src:
         return {"status": "error", "error": "no VCF given (pass vcf_path or load a .vcf dataset)"}
     looks_like_text = ("\n" in src) or src.lstrip().startswith("#")
+    if asked and not looks_like_text:
+        # A model-named file is read HERE, on the gateway: only this run's files, its bound
+        # datasets and the owner's uploads.
+        confined, why = confine_read(asked, ctx)
+        if confined is None:
+            return {"status": "error", "error": why}
+        src = str(confined)
     if not looks_like_text and _existing_path(src) is None:
         return {"status": "error", "error": f"VCF not found: {src}"}
     cap = int(args.get("max_variants", 500) or 500)

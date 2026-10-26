@@ -1,11 +1,11 @@
 # Analysis container — build & stage (CPU CodeAct image)
 
-Build kit for `analysis.sif` — the CPU Singularity image that AiScientist runs each `run_code`
+Build kit for `analysis.sif` — the CPU Apptainer image that AiScientist runs each `run_code`
 (CodeAct) snippet inside **when `AISCIENTIST_RUN_CODE_ON_HPC=1`**. The orchestration engine that
 *runs* the image is already built + offline-tested (`src/aiscientist/gateway/slurm_sandbox.py`,
 driven by a `RemoteExecutor` mock — no cluster in CI). This folder is the **image build kit**.
 
-> ⚠️ macOS cannot build `.sif`. Build on **HPC3** or any Linux host with `singularity`.
+> ⚠️ macOS cannot build `.sif`. Build on an **HPC3 compute node** (or any Linux host) with `apptainer`.
 
 ## Why this exists
 
@@ -17,19 +17,19 @@ image. It is CPU-only (scanpy/pandas/gseapy) — **no GPU/torch** (that's `scgpt
 ## Build & stage (3 steps)
 
 ```bash
-# on HPC3 (or a Linux+singularity host), from a checkout of this repo:
+# on HPC3, from a checkout of this repo (builds go to a compute node — never the login node):
 cd deploy/analysis
 
-# 1. build the image — pick a route the script prints (fakeroot / --remote / docker→convert)
-singularity build --fakeroot analysis.sif analysis.def      # if RCIC enables --fakeroot
-#   ...or `singularity build --remote analysis.sif analysis.def`
+# 1. build the image (Apptainer --fakeroot works on HPC3 without an /etc/subuid entry)
+sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-analysis --wait \
+  --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=$TMPDIR/ac apptainer build --fakeroot analysis.sif analysis.def'
 
 # 2. stage it onto shared DFS where the gateway looks for it
 BUILT=1 ./build_and_stage.sh
 #   -> copies analysis.sif to /dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif
 
-# 3. smoke-test on a CPU node
-singularity exec --containall --writable-tmpfs --net --network none \
+# 3. smoke-test on a CPU node (after `module load apptainer/1.4.5`)
+apptainer exec --containall --writable-tmpfs --net --network none \
   /dfs3b/ruic20_lab/software/AiScientist/containers/analysis.sif \
   python -c "import scanpy, gseapy, pandas; print('ok', scanpy.__version__)"
 ```
@@ -37,7 +37,8 @@ singularity exec --containall --writable-tmpfs --net --network none \
 ## Enable it
 
 Set these in the gateway env (`.env` / `HPCSettings`) — until `AISCIENTIST_RUN_CODE_ON_HPC=1`,
-`run_code` stays on the local sandbox and this image is unused:
+`run_code` stays on the local sandbox and this image is unused. A deployment with accounts **must**
+set it: there `run_code` never runs on the gateway host, so without it the tool is unavailable:
 
 ```
 AISCIENTIST_RUN_CODE_ON_HPC=1

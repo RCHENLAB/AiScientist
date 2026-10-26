@@ -24,6 +24,7 @@ from .._lib.scrna import (
     _schema,
     _slug,
     _step_input,
+    counts_not_logged,
     _write_table,
 )
 from ..sdk import HarnessTool
@@ -198,6 +199,12 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     contrast = reference != "rest"
 
     adata = sc.read_h5ad(ckpt)
+    problem = counts_not_logged(adata, use_raw=True)
+    if problem:
+        return {"status": "error", "step": "de", "read_from": _run_rel(ctx, ckpt),
+                "error": (f"{problem} rank_genes_groups computes its log2 fold-changes from "
+                          "log-normalised means; on counts they are wrong. Report the tool's "
+                          "log2FC as computed from normalised expression.")}
     obs_cols = list(adata.obs.columns)
     if groupby not in adata.obs:
         return {"status": "error", "error": f"groupby '{groupby}' not in obs; available: {obs_cols}"}
@@ -304,6 +311,14 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         else:
             combined.extend(rows_file)
             top_by_group[label] = [r["gene"] for r in rows_file[:10]]
+            # The TRUE count, as for a contrast. A marker table is the top n_genes by score, so
+            # "50 markers" read as "50 significant genes" hid that 2,300-9,644 per cluster cleared
+            # the gate in run f3b8268c4fd4, and its ORA step was asked for the complete set.
+            _, _, totals = _significant_both_directions(rows_full, padj_max, lfc_min, 0)
+            shown = sum(1 for r in rows_file
+                        if r["pval_adj"] < padj_max and abs(r["log2fc"]) >= lfc_min)
+            sig_by_group[label] = {"up": totals["up"], "down": totals["down"], "shown": shown,
+                                   "truncated": totals["up"] + totals["down"] > shown}
         universe.update(r["gene"] for r in rows_full)
         rnk = tables / f"rank_{key}_{_slug(label)}.rnk"
         rnk.write_text("".join(f"{r['gene']}\t{r['score']:.6g}\n" for r in rows_full),
@@ -422,7 +437,10 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if rank_fig.exists():
             figures.append(_rel(art, rank_fig))
         if not contrast:
-            marker_genes = {g: top_by_group[g][:min(5, n_genes)] for g in top_by_group}
+            # At most ~60 columns: run f3b8268c4fd4's 25 clusters x 5 genes drew a 125-gene dot plot
+            # 3,746 px wide that no page could show legibly.
+            per = max(2, min(5, n_genes, 60 // max(1, len(top_by_group))))
+            marker_genes = {g: top_by_group[g][:per] for g in top_by_group}
             try:
                 sc.pl.dotplot(adata, marker_genes, groupby=groupby, show=False, save="_markers.png")
             except Exception:  # noqa: BLE001 - dotplot can fail on degenerate inputs
@@ -566,6 +584,17 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                 f"({', '.join(one_sided[:6])}). Check this is biology and not a normalisation or "
                 "composition artefact before interpreting it as a coherent programme.")
     else:
+        out["significant_by_group"] = sig_by_group          # {group: {up, down, shown, truncated}}
+        out["significance"] = {"padj_max": padj_max, "abs_log2fc_min": lfc_min}
+        out["n_genes_cap_per_group"] = int(n_genes)
+        if any(v["truncated"] for v in sig_by_group.values()):
+            totals = sorted(v["up"] + v["down"] for v in sig_by_group.values())
+            out["table_truncation_note"] = (
+                f"significant_by_group gives the TRUE counts (median {totals[len(totals) // 2]} "
+                f"of {len(universe)} tested genes per group clear adjusted p < {padj_max} and "
+                f"|log2FC| >= {lfc_min}); the written tables and the gene lists passed downstream "
+                f"are the top {n_genes} per group by score. Report a marker list as a top-N, not "
+                "as the significant set.")
         # Markers from a handful of cells are unstable, and nothing in the marker path had a
         # cell-count floor at all — the contrast path's min_cells does not apply here.
         try:
@@ -600,14 +629,28 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
     # how a plan could declare p-values non-inferential in one step and then gate the enrichment
     # input on padj<0.05 in the next, laundering a pseudoreplicated p-value into "significantly
     # shifted genes". A sidecar makes the label travel with the data.
-    if out.get("inference"):
-        try:
-            (tables / f"de_{key}_inference.json").write_text(
-                json.dumps({"inference": out["inference"], "groupby": groupby,
-                            "reference": reference, "stratify_by": stratify_by or None}),
-                encoding="utf-8")
-        except OSError:
-            pass    # a sidecar we could not write must never fail the DE step itself
+    # Written on EVERY run, not only when there is a label: a marker run reusing a contrast's key
+    # would otherwise leave the contrast's stale label on its tables, and `mode` is the only thing
+    # on disk that tells a one-vs-rest marker table from a contrast — the columns are identical.
+    try:
+        (tables / f"de_{key}_inference.json").write_text(
+            json.dumps({"tool": "run_de", "mode": "contrast" if contrast else "markers",
+                        "inference": out.get("inference"), "groupby": groupby,
+                        "reference": reference, "stratify_by": stratify_by or None}),
+            encoding="utf-8")
+    except OSError:
+        pass    # a sidecar we could not write must never fail the DE step itself
+    # The same reason for the true significant counts: run_enrichment selects its input from the
+    # per-group tables, and only this says whether such a table is the complete test (a
+    # contrast) or a top-n_genes view of it (markers).
+    try:
+        (tables / f"de_{key}_significance.json").write_text(
+            json.dumps({"per_group_tables": "complete" if contrast else f"top_{n_genes}",
+                        "padj_max": padj_max, "abs_log2fc_min": lfc_min,
+                        "significant_by_group": sig_by_group}),
+            encoding="utf-8")
+    except OSError:
+        pass
     return out
 
 
