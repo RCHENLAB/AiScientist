@@ -8471,29 +8471,59 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         return
     # A list question about the RetiGene papers is a curation of the whole corpus (issue 46): its own
     # plan card, then the tables. So is one that names no papers (issue 20), in a chat with no data
-    # and no analysis. A note on that plan that changes the request is routed below.
-    if _corpus_curation(conn, req.question,
-                        with_context=target is not None or bool(_select_bound_datasets(req))):
+    # and no analysis. A note on that plan that changes the request is routed below. The chat's
+    # context is read once, here: a note on the literature plan is held to the same rule.
+    with_context = target is not None or bool(_select_bound_datasets(req))
+    curation_offered = False
+    if _corpus_curation(conn, req.question, with_context=with_context):
         from ..agents import request_router
         conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence"
                   + ("." if request_router.names_corpus(req.question) else " (the question names no papers)."))
         handoff = await _run_corpus_scan(conn, req, review=True)
         if handoff is None:
             return
+        curation_offered = True
         req = req.model_copy(update={"question": handoff})
         _note_budget_choice(conn.begin_run(req.conversation_id), req)
         target = _followup_target(conn, req)
     # Which line (issue 21): a general question is answered from the literature, everything else is
-    # the lab. The chat's earlier analysis is context: a question about it is an analysis.
-    prior_request = str(target[2].get("question") or "") if target else ""
-    route = await asyncio.to_thread(_route_request, conn, req, prior_request)
-    conn.emit("info", "route", f"Routed to {route.route} ({route.source}, confidence "
-                               f"{route.confidence:.2f}): {route.reason or '-'}")
-    if route.literature:
-        handoff = await _run_literature(conn, req, route)
+    # the lab. The chat's earlier analysis is context: a question about it is an analysis. At most
+    # twice: once more when a note on the literature plan led to the curation and a note on THAT plan
+    # changed the request again.
+    while True:
+        prior_request = str(target[2].get("question") or "") if target else ""
+        route = await asyncio.to_thread(_route_request, conn, req, prior_request)
+        conn.emit("info", "route", f"Routed to {route.route} ({route.source}, confidence "
+                                   f"{route.confidence:.2f}): {route.reason or '-'}")
+        if not route.literature:
+            break
+        handoff = await _run_literature(conn, req, route, curation=not curation_offered,
+                                        with_context=with_context)
         if handoff is None:
             return
-        # The note on the literature plan asked for an analysis: the lab plans it, as a run of its own.
+        # The note on the literature plan asked for something this line does not do: the lab plans an
+        # analysis, or — when the note turned the question INTO a list question about the RetiGene
+        # papers — the curation reads them all. Either in a run scope of its own: the literature run
+        # has ended, and ``conn.active_run`` is now the session's newest live run, which can be
+        # another chat's run waiting at its plan card.
+        req = req.model_copy(update={"question": handoff})
+        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        target = _followup_target(conn, req)
+        # The curation was considered once, for the message that opened this run. A note can make the
+        # question qualify for it that did not ("...in the RetiGene papers, without limiting it to 12
+        # papers"), and the literature line has no way to grant it: it answered a request for the
+        # whole corpus with its best twelve passages instead (RCHENLAB/AiScientist issue 60, run
+        # 73f1758c07de). So consider it again here — once, so a note cannot bounce a request between
+        # the two lines. The literature line hands a request back for it only on the same test.
+        if curation_offered or not _corpus_curation(conn, req.question, with_context=with_context):
+            break
+        curation_offered = True
+        conn.emit("info", "route", "Routed to a curation of the RetiGene papers: the note asks for "
+                                   "every gene with its evidence.")
+        handoff = await _run_corpus_scan(conn, req, review=True)
+        if handoff is None:
+            return
+        # A note on that plan is routed again, as on the opening message's curation.
         req = req.model_copy(update={"question": handoff})
         _note_budget_choice(conn.begin_run(req.conversation_id), req)
         target = _followup_target(conn, req)
@@ -8928,6 +8958,17 @@ async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callabl
         note = str(decision.get("feedback") or "").strip()
         if not note:
             continue                      # nothing said: show the plan again
+        # A note that asks for MORE of the corpus asks for what the curation already does: it reads
+        # every RetiGene paper, not a number of passages. Keep the plan instead of handing the
+        # request back to the router, which would re-plan it as a bounded search and so answer a
+        # request for more coverage with less (RCHENLAB/AiScientist issue 59, and the 12 passages of
+        # issue 60). A note that asks for other sources, or for the user's data, still re-plans.
+        from ..agents import request_router as _rr
+        if (_rr.asks_for_more_coverage(note) and not _rr.asks_for_pubmed(note)
+                and not _rr.refers_to_data(note)):
+            say("ℹ The curation already reads every RetiGene paper, not a fixed number of them, so "
+                "your note is already covered and the plan is unchanged.")
+            continue
         conn.push({"type": "chat_token", "token": "🧭 Your note changes the request, so it is planned again."})
         if run.monitor is not None:
             run.monitor.end("ended")
@@ -10056,18 +10097,25 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
 
 
 def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[Any, Any]", question: str,
-                              terms: list[str]) -> dict[str, Any]:
+                              terms: list[str], top_k: "int | None" = None) -> dict[str, Any]:
     """Search the corpus for the question with the model's words as ``terms``, telling the activity
     log and the run's monitor about the call. A failure is returned as a result, never raised."""
     from ..agents import literature_answer as lit
     tool, ctx = corpus
-    args: dict[str, Any] = {"queries": [question], "top_k": lit.CORPUS_PASSAGES}
+    from ..agents import request_router
+    # A "don't limit me to 12 papers" clause is a budget, not something a paper contains: searching
+    # for it ranked passages on "without" and "limiting" (issue 60, run 73f1758c07de).
+    args: dict[str, Any] = {"queries": [request_router.strip_coverage_request(question)],
+                            "top_k": int(top_k or lit.CORPUS_PASSAGES),
+                            "max_per_paper": lit.CORPUS_MAX_PER_PAPER}
     if terms:
         args["terms"] = list(terms)
     if run.monitor is not None:
         run.monitor.observe({"type": "tool_start", "tool": lit.CORPUS_TOOL})
     conn.push({"type": "run_status", "text": "📚 RetiGene corpus: searching the full text…"})
-    log_args = {"terms": list(terms), "top_k": args["top_k"]}
+    # The arguments the search really ran with, in the activity log: a report that says "12
+    # passages" can then be read against the budget that produced it (issue 60).
+    log_args = {"terms": list(terms), "top_k": args["top_k"], "max_per_paper": args["max_per_paper"]}
     conn.push({"type": "chat_thinking", "token": f"→ {lit.CORPUS_TOOL}({json.dumps(log_args, ensure_ascii=False)})\n"})
     try:
         out = tool.executor(args, ctx)
@@ -10083,7 +10131,8 @@ def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[An
     return out
 
 
-def _literature_search_logged(conn: Connection, run: RunState, queries: list[str]) -> Any:
+def _literature_search_logged(conn: Connection, run: RunState, queries: list[str],
+                              max_papers: "int | None" = None, per_query: "int | None" = None) -> Any:
     """Search PubMed for each query (abstracts included), telling the activity log and the run's
     monitor about each call, and merge the papers (``literature_answer.collect_papers``)."""
     from ..agents import literature_answer as lit
@@ -10102,7 +10151,8 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
                                                       f"⚠ {lit.TOOL}: {(out or {}).get('error')}\n")})
         return out
 
-    return lit.collect_papers(search, queries)
+    return lit.collect_papers(search, queries, max_papers=int(max_papers or lit.MAX_PAPERS),
+                              per_query=int(per_query or lit.PER_QUERY))
 
 
 def _save_literature_answer(art: Path, question: str, answer: str, collected: Any, cited: list) -> None:
@@ -10123,11 +10173,18 @@ def _save_literature_answer(art: Path, question: str, answer: str, collected: An
         (art / "literature" / "corpus_passages.md").write_text(passages, encoding="utf-8")
 
 
-async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) -> "str | None":
+async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, *,
+                          curation: bool = True, with_context: bool = False) -> "str | None":
     """A request routed to the literature line: a one-step plan the user reviews, then a PubMed
     search and an answer that cites the papers found. Returns None when the run is over (answered,
-    cancelled, stopped or failed), or the request to plan as an ANALYSIS when the user's note on the
-    plan asked for one (the caller hands it to the lab).
+    cancelled, stopped or failed), or the request to plan again when the user's note on the plan
+    asked for something this line does not do: an analysis, which the caller hands to the lab, or a
+    curation of the RetiGene papers, which it hands to the corpus scan (issue 60).
+
+    ``curation``: whether a note may still lead to the curation. False once the curation was offered
+    for this message, so a note cannot bounce the request back to it. ``with_context``: the chat has
+    data attached or an earlier analysis, as ``_corpus_curation`` reads it; the caller's test of the
+    handed-back request uses the same value, so the two never disagree.
 
     Shares the run lifecycle of the other lines (``chat_start``, the plan card, ``chat_token`` →
     ``chat_done``, per-run Stop, the ``artifacts`` event for the downloads), and keeps the answer
@@ -10161,8 +10218,31 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
     recorded = False
     with_corpus = await asyncio.to_thread(_literature_corpus_available, conn)
     # A question about the RetiGene papers is answered from them alone; PubMed only when it asks for
-    # it (RCHENLAB/AiScientist issue 46). Decided again after each note on the plan.
+    # it (RCHENLAB/AiScientist issue 46). The sources are then a SETTING of this plan: they are read
+    # from the question ONCE, and afterwards only a note that asks for a source changes them. They
+    # are never re-derived from the question the model rewrote for a note, whose wording is the
+    # model's and can drop the words the sources were read from (issue 59).
     pubmed = not request_router.corpus_only(question)
+    # How much is read is a setting too: the usual budget, or the wider one when the user asked for
+    # more than it (issue 60). Carried through the plan card, the search and the saved method.
+    wide = request_router.asks_for_more_coverage(question)
+    passages, max_papers, per_query = ((lit.CORPUS_PASSAGES_WIDE, lit.MAX_PAPERS_WIDE, lit.PER_QUERY_WIDE)
+                                       if wide else (lit.CORPUS_PASSAGES, lit.MAX_PAPERS, lit.PER_QUERY))
+
+    def coverage_words() -> str:
+        """What this plan will read, as the chat says it."""
+        return " and ".join(([f"up to {passages} RetiGene passage(s)"] if with_corpus else [])
+                            + ([f"up to {max_papers} PubMed paper(s)"] if pubmed else []))
+
+    def say_wider(lead: str) -> None:
+        """The wider budget, and — for a request for the COMPLETE list that only the curation can
+        answer — what this session cannot do, said whenever the plan becomes wide."""
+        say(f"🔎 {lead}: {coverage_words()}. It is still a bounded search.")
+        if corpus_scan.asks_for_gene_list(question) and not _literature_corpus_on_hpc(conn):
+            say("ℹ The complete list, every RetiGene paper read for every gene, is a curation of the "
+                "RetiGene papers; it runs on HPC3 and this session does not reach it, so this search "
+                "reads the best passages instead. Ask again from a session with HPC3 for the full "
+                "table.", "warning")
     try:
         if not pubmed and not with_corpus:
             conn.push({"type": "chat_token", "token": (
@@ -10179,13 +10259,22 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
                "literature search in PubMed. ")
             + "Run it, or say in the chat what to change. If it needs your data analysed, say so, and "
             "the PI plans an analysis instead.")
+        if wide:
+            say_wider(f"You asked for more than the usual {lit.CORPUS_PASSAGES} sources, so this plan reads")
         if pubmed and with_corpus and corpus_scan.asks_for_gene_list(question):
+            # The curation runs on HPC3. Where this session cannot reach it, the hint still says how
+            # to ask for the complete list, but not that asking here would produce it (issue 60).
             say("ℹ For the complete list from the RetiGene papers, as a table of genes with their quotes, "
                 "ask about the RetiGene papers by name (for example “What are haploinsufficient genes in "
-                "RetiGene papers?”): that reads the whole corpus instead of its best passages.")
+                "RetiGene papers?”): that reads the whole corpus instead of its best passages."
+                + ("" if _literature_corpus_on_hpc(conn) else
+                   " That curation runs on HPC3, which this session does not reach, so ask it from a "
+                   "session that does."))
         while True:
-            decision = await asyncio.to_thread(_literature_plan_review, conn, emit,
-                                               lit.plan_step(question, corpus=with_corpus, pubmed=pubmed))
+            decision = await asyncio.to_thread(
+                _literature_plan_review, conn, emit,
+                lit.plan_step(question, corpus=with_corpus, pubmed=pubmed,
+                              passages=passages, max_papers=max_papers))
             action = str(decision.get("action") or "cancel")
             if action == "approve":
                 break
@@ -10202,6 +10291,18 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
             if not note:
                 continue                      # nothing said: show the plan again
             combined = f"{question}\n\n{note}"
+            # A note that turns this into a list question about the RetiGene papers asks for the
+            # curation, which reads every paper: this line cannot do that, so it hands the request
+            # back (issue 60). Decided on the note as the user wrote it, before the model rewrites
+            # the question, so it does not depend on the rewrite's wording (issue 59).
+            if curation and _corpus_curation(conn, combined, with_context=with_context):
+                conn.push({"type": "chat_token", "token": (
+                    "🧬 Your note asks for the genes the RetiGene papers report, so this becomes a "
+                    "curation of all of them instead of a search of their best passages.")})
+                if run.monitor is not None:
+                    run.monitor.end("ended")
+                conn.push({"type": "chat_done"})
+                return combined
             again = await asyncio.to_thread(_route_request, conn, req.model_copy(update={"question": combined}))
             if not again.literature:
                 # The bubble's text, not a progress line: this run ends here, and a bubble with no
@@ -10213,10 +10314,28 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
                 conn.push({"type": "chat_done"})
                 return combined
             question = await asyncio.to_thread(_revise_literature_question, conn, question, note)
-            # "also search PubMed" on a corpus-only plan adds it; the revised question decides.
-            pubmed = not request_router.corpus_only(question) or request_router.asks_for_pubmed(note)
+            # The NOTE decides the sources, not the rewritten question (issue 59): "also search
+            # PubMed" adds PubMed, naming the RetiGene papers alone drops it, and a note about
+            # anything else — a rewording, more coverage, a narrower topic — leaves them as the user
+            # approved them.
+            was = pubmed
+            if request_router.asks_for_pubmed(note):
+                pubmed = True
+            elif request_router.asks_corpus_only(note):
+                pubmed = False
             if not pubmed and not with_corpus:
                 pubmed = True                    # nothing else could answer it here
+            if pubmed != was:
+                say("🔁 The sources change: " + ("PubMed is searched as well."
+                                                 if pubmed else "the RetiGene papers only."))
+            emit("info", "literature",
+                 f"Source scope: {'RetiGene corpus + PubMed' if pubmed else 'RetiGene corpus only'}"
+                 f" ({'changed by' if pubmed != was else 'unchanged by'} the note on the plan).")
+            if request_router.asks_for_more_coverage(note) and not wide:
+                wide = True
+                passages, max_papers, per_query = (lit.CORPUS_PASSAGES_WIDE, lit.MAX_PAPERS_WIDE,
+                                                   lit.PER_QUERY_WIDE)
+                say_wider("More sources, as the note asks")
 
         if _AUTH_ENABLED and conn.app_user_id:
             try:
@@ -10229,7 +10348,8 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         llm = _lab_llm(conn)
         complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
         emit("step", "literature", f"Literature search (model: {llm.model})."
-             + ("" if pubmed else " The RetiGene corpus only: PubMed is not searched."))
+             + ("" if pubmed else " The RetiGene corpus only: PubMed is not searched.")
+             + f" Coverage: {coverage_words()}.")
         conn.push({"type": "run_status", "text": "🔎 Writing the search queries…"})
         queries, terms = await asyncio.to_thread(
             lit.plan_search, lambda m: complete_fn(m, role="classify"), question,
@@ -10243,9 +10363,11 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
             return None
         corpus = await asyncio.to_thread(_literature_corpus_tool, conn) if with_corpus else None
         corpus_job = (asyncio.ensure_future(asyncio.to_thread(
-            _literature_corpus_logged, conn, run, corpus, question, terms)) if corpus is not None else None)
-        collected = (await asyncio.to_thread(_literature_search_logged, conn, run, queries) if pubmed
-                     else lit.Collected([], []))
+            _literature_corpus_logged, conn, run, corpus, question, terms, passages))
+            if corpus is not None else None)
+        collected = (await asyncio.to_thread(_literature_search_logged, conn, run, queries,
+                                             max_papers, per_query)
+                     if pubmed else lit.Collected([], []))
         corpus_out: "dict[str, Any] | None" = None
         if with_corpus and corpus is None:
             corpus_out = {"status": "error", "error": "the RetiGene corpus could not be reached from this session"}
@@ -10260,7 +10382,9 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None) 
         if run.chat_stop.is_set():
             stopped()
             return None
-        collected = lit.add_corpus(collected, corpus_out)
+        # The same budget the search ran with: nothing is trimmed to twelve on the way back in
+        # (``add_corpus``'s own default), which is how a wider search still reported 12 (issue 60).
+        collected = lit.add_corpus(collected, corpus_out, max_passages=passages)
         if (pubmed and collected.corpus is not None and collected.corpus.get("error")
                 and not collected.corpus.get("passages")):
             say(f"⚠ The RetiGene corpus search gave nothing ({collected.corpus['error']}); the answer "

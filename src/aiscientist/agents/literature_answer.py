@@ -37,8 +37,26 @@ CORPUS_TOOL = "search_corpus"
 MAX_QUERIES = 4
 MAX_TERMS = 12
 CORPUS_PASSAGES = 12
+# What a request for more than the usual budget gets (issue 60): ``search_corpus``'s own ceiling
+# (``MAX_TOP_K``) for the passages, twice the papers for PubMed. Bounded on purpose: "no limit" is
+# not a promise to fit the whole corpus into one prompt — the curation of the RetiGene papers is.
+CORPUS_PASSAGES_WIDE = 30
+# Passages from any ONE paper, so a passage budget spreads over distinct papers instead of being
+# spent on the same one: the two budgets are not the same thing (issue 60).
+CORPUS_MAX_PER_PAPER = 3
 PER_QUERY = 12      # kept per query; each search reads 100 hits and ranks them itself
+# Per query under the wide budget: the merge cannot reach MAX_PAPERS_WIDE if each query only offers
+# twelve and the queries overlap (issue 60).
+PER_QUERY_WIDE = 24
 MAX_PAPERS = 12
+MAX_PAPERS_WIDE = 24
+# Words that belong to a request for MORE SOURCES, never to a paper's text. The model sometimes
+# lifts them out of the question into its ranking terms, where they match thousands of passages
+# (issue 60): "without (2714), limiting (1645), answer (46)" in run 73f1758c07de.
+COVERAGE_TERMS = frozenset({
+    "without", "limit", "limits", "limiting", "limited", "unlimited", "cap", "capped", "maximum",
+    "restrict", "restricted", "restricting", "truncate", "truncated", "exhaustive", "answer",
+    "answers", "no limit", "not limited", "不限", "限制", "答案"})
 ABSTRACT_CHARS = 1400
 
 QUERY_SYSTEM = (
@@ -113,35 +131,42 @@ class Collected:
     papers: list[Paper]
     searched: list[dict[str, Any]]          # per query: query, count, error
     corpus: "dict[str, Any] | None" = None  # the corpus search: status, passages, papers, terms, error
+    pubmed_budget: int = MAX_PAPERS         # papers the PubMed merge was allowed to keep (issue 60)
 
     @property
     def errors(self) -> list[str]:
         return [str(s["error"]) for s in self.searched if s.get("error")]
 
 
-def plan_step(question: str, corpus: bool = False, pubmed: bool = True) -> str:
+def plan_step(question: str, corpus: bool = False, pubmed: bool = True, *,
+              passages: int = CORPUS_PASSAGES, max_papers: int = MAX_PAPERS) -> str:
     """The one step of a literature plan, as the plan card shows it. ``corpus``: the session also
     searches the lab's RetiGene corpus (a short HPC3 job). ``pubmed=False``: the corpus alone, for a
-    question about the RetiGene papers (RCHENLAB/AiScientist issue 46)."""
+    question about the RetiGene papers (RCHENLAB/AiScientist issue 46). ``passages``/``max_papers``:
+    the budgets this plan will use, wider than the usual ones when the user asked for more coverage
+    (issue 60); the card states them, so approval is approval of a coverage the user can read."""
     q = " ".join(str(question or "").split())
     if len(q) > 300:
         q = q[:297].rstrip() + "…"
+    wider = (" More than the usual coverage was asked for, so this reads more sources; it is still a "
+             "bounded search, not every paper." if passages > CORPUS_PASSAGES or max_papers > MAX_PAPERS
+             else "")
     if corpus and not pubmed:
         return (f"**RetiGene corpus search** — Search the full text of the lab's RetiGene corpus only "
                 f"(`{CORPUS_TOOL}`, a short HPC3 job) for what answers: “{q}”. Read the best passages (up "
-                f"to {CORPUS_PASSAGES}) and answer with numbered citations to them. PubMed is not searched, "
-                "because the question asks about the RetiGene papers; say “also search PubMed” to add it. "
-                "It takes about a minute.")
+                f"to {passages}, at most {CORPUS_MAX_PER_PAPER} from one paper) and answer with numbered "
+                "citations to them. PubMed is not searched, because the question asks about the RetiGene "
+                "papers; say “also search PubMed” to add it." + wider + " It takes about a minute.")
     if corpus:
         return (f"**Literature search** — Search the full text of the lab's RetiGene corpus (`{CORPUS_TOOL}`, "
                 f"a short HPC3 job) and PubMed (through Europe PMC, `{TOOL}`) for what answers: “{q}”. Read "
-                f"the best RetiGene passages (up to {CORPUS_PASSAGES}) and the abstracts of the most relevant "
-                f"PubMed papers (up to {MAX_PAPERS}), and answer with numbered citations to them. It takes "
-                "one to a few minutes.")
+                f"the best RetiGene passages (up to {passages}, at most {CORPUS_MAX_PER_PAPER} from one "
+                f"paper) and the abstracts of the most relevant PubMed papers (up to {max_papers}), and "
+                "answer with numbered citations to them." + wider + " It takes one to a few minutes.")
     return (f"**Literature search** — Search PubMed (through Europe PMC) for papers that answer: “{q}”. "
-            f"Read the abstracts of the most relevant papers (up to {MAX_PAPERS}) and answer with "
+            f"Read the abstracts of the most relevant papers (up to {max_papers}) and answer with "
             f"numbered citations to them, using `{TOOL}`. It runs in the gateway in about a minute, "
-            "with no HPC3 job.")
+            "with no HPC3 job." + wider)
 
 
 def _clean_query(text: str) -> str:
@@ -188,6 +213,8 @@ def plan_search(complete: "Callable[[list[dict]], str] | None", question: str, *
             items = obj.get("queries")
             for t in obj.get("terms") or []:
                 c = _clean_term(t if isinstance(t, str) else "")
+                if c.lower() in COVERAGE_TERMS:
+                    continue            # a budget, not something a paper says (issue 60)
                 if c and c.lower() not in {x.lower() for x in terms} and len(terms) < MAX_TERMS:
                     terms.append(c)
         else:
@@ -257,7 +284,7 @@ def collect_papers(search: "Callable[..., dict[str, Any]]", queries: list[str], 
             p.number = len(papers) + 1
             by_key[k] = p
             papers.append(p)
-    return Collected(papers, searched)
+    return Collected(papers, searched, None, max_papers)
 
 
 def _corpus_metadata(context: dict[str, Any], citation: str) -> dict[str, str]:
@@ -313,6 +340,7 @@ def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
     corpus: list[Paper] = []
     by_pmid: dict[str, Paper] = {}
     n_passages = 0
+    n_returned = sum(1 for c in result.get("contexts") or [] if isinstance(c, dict))
     for c in result.get("contexts") or []:
         if not isinstance(c, dict) or n_passages >= max_passages:
             continue
@@ -333,7 +361,10 @@ def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
             p.pages.append(str(page))
         p.passages.append((f"(p. {page}) " if page not in (None, "") else "") + text)
         n_passages += 1
-    info.update(passages=n_passages, papers=len(corpus))
+    # The budget this kept to, and what the search gave it: a later report can say whether the
+    # answer was cut to the budget, instead of showing a bare twelve (issue 60).
+    info.update(passages=n_passages, papers=len(corpus), max_passages=int(max_passages),
+                returned=n_returned)
     merged = list(corpus)
     for p in collected.papers:
         same = by_pmid.get(p.pmid) if p.pmid else None
@@ -349,7 +380,7 @@ def add_corpus(collected: Collected, result: "dict[str, Any] | None", *,
         merged.append(p)
     for i, p in enumerate(merged, 1):
         p.number = i
-    return Collected(merged, collected.searched, info)
+    return Collected(merged, collected.searched, info, collected.pubmed_budget)
 
 
 def answer_messages(question: str, papers: list[Paper]) -> list[dict]:
@@ -478,22 +509,34 @@ def method_md(collected: Collected, date: str) -> str:
     c = collected.corpus
     if c is not None:
         if c.get("error") and not c.get("passages"):
+            # On a corpus-only plan there is no PubMed to fall back on, and saying there is
+            # contradicts the "PubMed was not searched" line below (issue 59).
             lines.append(f"The lab's RetiGene corpus was searched on {date}, but the search failed "
-                         f"({c['error']}); the answer rests on PubMed alone.\n")
+                         f"({c['error']}); "
+                         + ("the answer rests on PubMed alone.\n" if collected.searched else
+                            "and PubMed was not searched, because the question asks about the "
+                            "RetiGene papers, so no source could be read.\n"))
         else:
             used = [t for t in c.get("terms") or [] if t.get("use") in ("filter", "rank")]
+            budget = int(c.get("max_passages") or CORPUS_PASSAGES)
+            kept, returned = int(c.get("passages", 0)), int(c.get("returned", 0))
             lines.append(f"Searched the full text of the lab's RetiGene corpus on {date} with `{CORPUS_TOOL}` "
                          "(the question's meaning and its exact words, merged by rank): "
-                         f"{c.get('passages', 0)} passage(s) from {c.get('papers', 0)} paper(s)."
+                         f"{kept} passage(s) from {c.get('papers', 0)} paper(s), "
+                         f"of up to {budget} this search was allowed to read"
+                         + (f" ({returned} came back and {returned - kept} were dropped to that budget)"
+                            if returned > kept else "") + "."
                          + (" Words used: " + ", ".join(f"{t['term']} ({t['n_passages']})" for t in used[:16]) + "."
                             if used else "") + "\n")
     if c is not None and not collected.searched:
-        lines.append("PubMed was not searched: the question asks about the RetiGene papers.")
+        if not (c.get("error") and not c.get("passages")):      # already said, with its reason
+            lines.append("PubMed was not searched: the question asks about the RetiGene papers.")
         lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (RetiGene passages); the answer cites "
                      "them by number, and each reference was checked against the search results.")
         return "\n".join(lines)
     lines.append(f"Searched PubMed through Europe PMC on {date} with {len(collected.searched)} "
-                 f"quer{'y' if len(collected.searched) == 1 else 'ies'}:")
+                 f"quer{'y' if len(collected.searched) == 1 else 'ies'}, keeping up to "
+                 f"{collected.pubmed_budget} paper(s) in all:")
     for s in collected.searched:
         lines.append(f"- “{s['query']}”: {s['count']} paper(s)" + (f" (error: {s['error']})" if s.get("error") else ""))
     lines.append(f"\n{len(collected.papers)} distinct paper(s) were read (RetiGene passages, titles and abstracts); "

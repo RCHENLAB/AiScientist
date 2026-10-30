@@ -460,7 +460,7 @@ def _to_literature(monkeypatch):
         seen.append(f"routed: {req.question}")
         return rr.Route(rr.LITERATURE, 0.9, "papers", "model")
 
-    async def literature(c, req, r=None):
+    async def literature(c, req, r=None, **kw):
         seen.append(f"literature: {req.question}")
 
     monkeypatch.setattr(gw_app, "_route_request", route)
@@ -544,7 +544,7 @@ def test_a_note_on_the_curation_plan_is_planned_again_by_the_router(tmp_path, mo
         routed.append(req.question)
         return rr.Route(rr.LITERATURE, 0.9, "papers", "model")
 
-    async def literature(c, req, r=None):
+    async def literature(c, req, r=None, **kw):
         routed.append("literature")
 
     monkeypatch.setattr(gw_app, "_route_request", route)
@@ -552,6 +552,199 @@ def test_a_note_on_the_curation_plan_is_planned_again_by_the_router(tmp_path, mo
     _dispatch(conn)
     assert w.jobs == []
     assert routed == [f"{QUESTION}\n\nalso search PubMed", "literature"]
+
+
+def test_a_note_asking_for_more_than_a_fixed_number_keeps_the_curation(tmp_path, monkeypatch):
+    """The curation reads every RetiGene paper, so a note asking not to be limited to a number of
+    papers asks for what it already does. Re-planning it through the router answered a request for
+    MORE coverage with a bounded 12-passage search (RCHENLAB/AiScientist issues 59 and 60)."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "without limiting the answer to 12 papers"},
+                            {"action": "approve"}])
+
+    def never(*a, **k):
+        raise AssertionError("re-planned by the router")
+
+    monkeypatch.setattr(gw_app, "_route_request", never)
+    _dispatch(conn)
+    assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
+    assert [stage for stage, _ in w.shown] == ["corpus", "corpus"]
+    assert any("already reads every RetiGene paper" in str(p.get("text")) for p in conn.pushed)
+
+
+def test_a_note_lifting_the_limit_to_the_retigene_papers_is_planned_again(tmp_path, monkeypatch):
+    """"Don't limit it to RetiGene" asks for other sources, not for more of the RetiGene papers: the
+    curation must not keep its RetiGene-only plan and call the note covered."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "Don't limit it to RetiGene"}])
+    routed: list[str] = []
+
+    def route(c, req, prior=""):
+        routed.append(req.question)
+        return rr.Route(rr.LITERATURE, 0.9, "papers", "model")
+
+    async def literature(c, req, r=None, **kw):
+        routed.append("literature")
+
+    monkeypatch.setattr(gw_app, "_route_request", route)
+    monkeypatch.setattr(gw_app, "_run_literature", literature)
+    _dispatch(conn)
+    assert w.jobs == [] and routed == [f"{QUESTION}\n\nDon't limit it to RetiGene", "literature"]
+    assert not rr.corpus_only(routed[0])                         # the literature line searches PubMed
+    assert not any("already reads every RetiGene paper" in str(p.get("text")) for p in conn.pushed)
+
+
+class _RoutesToLiterature:
+    """The session's model for a question that does NOT name the RetiGene papers: it routes to the
+    literature line, and is asked nothing else because the note hands the request on before the
+    plan is approved."""
+
+    def __call__(self, messages, *, role=None):
+        system = messages[0]["content"]
+        if system == gw_app._NEW_STUDY_ROUTER_SYS:
+            return '{"intent": "study", "confidence": 0.95}'
+        if system == rr.ROUTER_SYSTEM:
+            return '{"route": "literature", "confidence": 0.9, "reason": "published evidence"}'
+        raise AssertionError(f"unexpected model call: {system[:80]}")
+
+
+def test_a_note_that_turns_a_literature_question_into_a_list_question_gets_the_curation(tmp_path, monkeypatch):
+    """Run 73f1758c07de (RCHENLAB/AiScientist issue 60). The question that opened the run did not
+    name the RetiGene papers, so it was routed to the literature line — correctly. A note then made
+    it "according to the RetiGene papers, without limiting the answer to 12 papers", which is exactly
+    what the curation is for; but the curation was only ever considered for the opening message, so
+    the request stayed in the literature line and the user got 12 passages from 12 papers. The note
+    must reach the curation. The opening question names the published literature, as the run's did
+    ("gene evidence in published retinal disease literature"): a bare gene-list question would get
+    the curation on the opening message already (issue 20)."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback",
+                             "feedback": "I mean according to the RetiGene papers, and do not limit "
+                                         "the answer to 12 papers"},
+                            {"action": "approve"}])
+    monkeypatch.setattr(gw_app, "_lab_llm",
+                        lambda conn: types.SimpleNamespace(complete_fn=_RoutesToLiterature(),
+                                                           scientist_chat=None, model="qwen"))
+    opening = "What are haploinsufficient genes in the published retinal disease literature?"
+    assert not gw_app._corpus_curation(conn, opening)
+    _dispatch(conn, opening)
+
+    # the literature plan first, then the curation's own plan card, then the whole corpus is read
+    assert [stage for stage, _ in w.shown] == ["literature", "corpus"]
+    assert w.shown[1][1].startswith("**RetiGene curation**")
+    assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
+    assert any("becomes a curation of all of them" in str(p.get("token")) for p in conn.pushed)
+    answer = [p for p in conn.pushed if p.get("type") == "chat_token"][-1]["token"]
+    assert answer.startswith("**Haploinsufficient genes in the RetiGene corpus: 3**")
+
+
+def test_a_request_cannot_bounce_between_the_curation_and_the_literature_line(tmp_path, monkeypatch):
+    """The curation is reconsidered once per message. A note that sends a curation request to the
+    literature line must not be sent straight back, however the question then reads."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "also search PubMed"}])
+    lab: list[str] = []
+
+    def route(c, req, prior=""):
+        return rr.Route(rr.LITERATURE, 0.9, "papers", "model")
+
+    async def literature(c, req, r=None, **kw):
+        return QUESTION                       # qualifies for the curation all over again
+
+    async def fake_lab(c, req, **kw):
+        lab.append(req.question)
+
+    monkeypatch.setattr(gw_app, "_route_request", route)
+    monkeypatch.setattr(gw_app, "_run_literature", literature)
+    monkeypatch.setattr(gw_app, "_run_lab", fake_lab)
+    _dispatch(conn)
+    assert w.jobs == []                       # the curation did not run a second time
+    assert lab == [QUESTION]
+
+
+# --- the real literature line between the two (review of PR #135 after #137) ------------------------
+
+PUBLISHED = "What are haploinsufficient genes in the published retinal disease literature?"
+
+
+def _real_literature_line(monkeypatch):
+    """The session's model routes to the literature line, its rewrite of the question keeps the
+    words, and the lab is recorded: the literature line itself is NOT replaced."""
+    monkeypatch.setattr(gw_app, "_lab_llm",
+                        lambda conn: types.SimpleNamespace(complete_fn=_RoutesToLiterature(),
+                                                           scientist_chat=None, model="qwen"))
+    monkeypatch.setattr(gw_app, "_revise_literature_question", lambda conn, q, note: f"{q} {note}")
+    lab: list[str] = []
+
+    async def fake_lab(c, req, **kw):
+        lab.append(req.question)
+
+    monkeypatch.setattr(gw_app, "_run_lab", fake_lab)
+    return lab
+
+
+def test_a_note_on_the_literature_plan_after_the_curation_was_turned_down_stays_there(tmp_path, monkeypatch):
+    """The curation is offered once per message. After the user turned it down ("also search
+    PubMed"), the literature line's question still names the RetiGene papers and asks for the
+    genes, so ANY later note made it qualify again: the line said "this becomes a curation" and
+    handed the request back, and the dispatcher, which had already offered the curation, gave it to
+    the lab as an analysis."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "also search PubMed"},
+                            {"action": "feedback", "feedback": "focus on mouse studies"},
+                            {"action": "cancel"}])
+    lab = _real_literature_line(monkeypatch)
+    _dispatch(conn, QUESTION)
+    assert [stage for stage, _ in w.shown] == ["corpus", "literature", "literature"]
+    assert w.jobs == [] and lab == []
+    assert not any("becomes a curation" in str(p.get("token")) for p in conn.pushed)
+    assert "PubMed is not searched" not in w.shown[2][1]          # the sources the user asked for
+
+
+def test_a_note_on_the_literature_plan_keeps_the_rule_for_a_chat_with_data(tmp_path, monkeypatch):
+    """Issue 20: the bare question goes to the literature line in a chat with data attached, where
+    "which genes" may mean the user's own. A note on that plan must not take it to the curation
+    after all: the note loop asked ``_corpus_curation`` without the chat's context."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "list every one of them"},
+                            {"action": "cancel"}])
+    lab = _real_literature_line(monkeypatch)
+    req = gw_app.LabRequest(connection_id=conn.id, conversation_id="conv-1", question=BARE, route="auto",
+                            dataset_path="/data/retina.h5ad")
+    asyncio.run(gw_app._dispatch_lab(conn, gw_app._fixed_run_options(req)))
+    assert [stage for stage, _ in w.shown] == ["literature", "literature"]
+    assert w.jobs == [] and lab == []
+    assert not any("becomes a curation" in str(p.get("token")) for p in conn.pushed)
+
+
+def test_a_note_on_a_curation_reached_from_the_literature_plan_is_routed_again(tmp_path, monkeypatch):
+    """Literature plan → a note that names the RetiGene papers → the curation's card → "also search
+    PubMed". On the opening message's curation that note is routed; here it went straight to the
+    lab, which planned an analysis of a literature question."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "I mean according to the RetiGene papers"},
+                            {"action": "feedback", "feedback": "also search PubMed"},
+                            {"action": "cancel"}])
+    lab = _real_literature_line(monkeypatch)
+    _dispatch(conn, PUBLISHED)
+    assert [stage for stage, _ in w.shown] == ["literature", "corpus", "literature"]
+    assert w.jobs == [] and lab == []
+    assert "PubMed is not searched" not in w.shown[2][1]
+
+
+def test_the_curation_a_literature_note_leads_to_does_not_take_another_chats_run(tmp_path, monkeypatch):
+    """The literature line ends its run before it hands the request back. The curation then took
+    ``conn.active_run``, which is by then the newest live run of the session: another chat's run
+    waiting at its plan card, which it re-bound, ran in and ended."""
+    conn = _conn(tmp_path)
+    other = gw_app.RunState(conn, conversation_id="conv-other")
+    conn.live_runs.append(other)                      # another chat, waiting at its plan card
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "I mean according to the RetiGene papers"},
+                            {"action": "approve"}])
+    _real_literature_line(monkeypatch)
+    _dispatch(conn, PUBLISHED)
+    assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
+    assert other in conn.live_runs and other.run_id is None and other.kind == "research"
 
 
 def test_a_kept_scan_is_planned_as_instant_and_needs_no_job(tmp_path, monkeypatch):

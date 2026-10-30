@@ -297,7 +297,7 @@ def test_a_session_on_hpc3_also_searches_the_corpus_and_answers_from_both(tmp_pa
 
     assert w.shown == [lit.plan_step("What is known about DDX41 in the retina?", corpus=True)]
     assert calls == [{"queries": ["What is known about DDX41 in the retina?"], "top_k": lit.CORPUS_PASSAGES,
-                      "terms": ["DDX41", "photoreceptor"]}]
+                      "max_per_paper": lit.CORPUS_MAX_PER_PAPER, "terms": ["DDX41", "photoreceptor"]}]
     assert [q for q, _, _ in w.searched] == ["DDX41 retina"]                 # PubMed still searched
     answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
     # [1] the corpus-only paper, [2] the corpus paper PubMed also found, [3] PubMed only
@@ -336,8 +336,10 @@ def test_corpus_activity_logs_all_terms_without_the_question(tmp_path):
     assert all(term in line for term in terms)
     assert question not in line and "This question" not in line and "queries" not in line
     logged = json.loads(line[line.index("(") + 1:line.rindex(")")])
-    assert logged == {"terms": terms, "top_k": lit.CORPUS_PASSAGES}
-    assert calls == [{"queries": [question], "terms": terms, "top_k": lit.CORPUS_PASSAGES}]
+    assert logged == {"terms": terms, "top_k": lit.CORPUS_PASSAGES,
+                      "max_per_paper": lit.CORPUS_MAX_PER_PAPER}
+    assert calls == [{"queries": [question.strip()], "terms": terms, "top_k": lit.CORPUS_PASSAGES,
+                      "max_per_paper": lit.CORPUS_MAX_PER_PAPER}]
 
 
 # --- a question about the RetiGene papers: the corpus alone (issue 46) --------------------------------
@@ -354,7 +356,8 @@ def test_a_question_about_the_retigene_papers_searches_the_corpus_and_not_pubmed
     assert w.shown == [lit.plan_step(question, corpus=True, pubmed=False)]
     assert "RetiGene corpus only" in w.shown[0] and "PubMed is not searched" in w.shown[0]
     assert w.searched == []                                            # no PubMed query at all
-    assert calls == [{"queries": [question], "top_k": lit.CORPUS_PASSAGES, "terms": ["DDX41"]}]
+    assert calls == [{"queries": [question], "top_k": lit.CORPUS_PASSAGES,
+                      "max_per_paper": lit.CORPUS_MAX_PER_PAPER, "terms": ["DDX41"]}]
     answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
     assert "- [1] Smith J et al. DDX41 in the eye." in answer and "PubMed" not in answer
     (run_dir,) = list(conn.workspace.iterdir())
@@ -393,3 +396,277 @@ def test_a_gene_list_question_that_names_no_corpus_says_how_to_get_the_whole_cor
     assert w.shown == [lit.plan_step("Which genes are haploinsufficient in retinal disease?", corpus=True)]
     progress = [p.get("text", "") for p in conn.pushed if p.get("type") == "lab_progress"]
     assert any("ask about the RetiGene papers by name" in t for t in progress)
+
+
+# --- the sources are the plan's setting, not the rewritten question's wording (issue 59) -------------
+
+def test_a_note_that_only_rewords_the_question_keeps_the_approved_sources(tmp_path, monkeypatch):
+    """A note that is not about sources ("focus on mouse studies") goes through the model, which
+    rewrites the question in its own words — here without "RetiGene". The scope the user approved
+    (the RetiGene papers alone) must survive that rewrite: before issue 59 it was read back out of
+    the rewritten text, and PubMed came back on its own."""
+    conn = _conn(tmp_path)
+    question = "What do the RetiGene papers say about DDX41 in the retina?"
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}',
+                   answer="DDX41 is in photoreceptors [1]; its loss kills cones [2].")
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "focus on mouse studies"},
+                                   {"action": "approve"}])
+    calls = _corpus(monkeypatch)
+    _dispatch(conn, question)
+
+    assert ("revise", "classify") in model.calls          # the question WAS rewritten
+    assert "RetiGene" not in calls[0]["queries"][0]        # and the rewrite dropped the corpus's name
+    assert w.searched == []                                # yet PubMed is still not searched
+    assert "PubMed is not searched" in w.shown[1] and "RetiGene corpus only" in w.shown[1]
+    summary = (next(iter(conn.workspace.iterdir())) / "artifacts" / "report" / "summary.md").read_text()
+    assert "PubMed was not searched: the question asks about the RetiGene papers." in summary
+
+
+def test_a_note_that_asks_for_pubmed_still_adds_it(tmp_path, monkeypatch):
+    """The other half of issue 59: an explicit request DOES change the sources."""
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}')
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "also search PubMed"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What do the RetiGene papers say about DDX41 in the retina?")
+
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina"]
+    assert "PubMed is not searched" not in w.shown[1]
+    assert any("The sources change" in str(p.get("text")) for p in conn.pushed)
+
+
+# --- a coverage request is carried to the search instead of being capped at twelve (issue 60) --------
+
+def _many_contexts(n):
+    return {"status": "ok", "terms": [], "contexts": [
+        {"pmid": str(90000 + i), "chunk": 0, "page": i, "text": f"DDX41 passage {i}.",
+         "citation": f"Author {i} et al. Paper {i}. IOVS (2025). PMID:{90000 + i}"} for i in range(n)]}
+
+
+def test_a_question_that_asks_past_twelve_reads_more_and_nothing_trims_it_back(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    question = ("What are haploinsufficient genes according to the RetiGene papers, without limiting "
+                "the answer to 12 papers?")
+    model = _Model(queries='{"queries": ["haploinsufficiency retina"], "terms": ["haploinsufficiency"]}',
+                   answer="Genes are reported [1] and others [2].")
+    w = _wire(monkeypatch, model, [{"action": "approve"}])
+    calls = _corpus(monkeypatch, out=_many_contexts(20))
+    _dispatch(conn, question)
+
+    # the search runs with the wider budget, and the log says which budget it ran with
+    assert calls[0]["top_k"] == lit.CORPUS_PASSAGES_WIDE == 30
+    assert calls[0]["max_per_paper"] == lit.CORPUS_MAX_PER_PAPER
+    assert f"up to {lit.CORPUS_PASSAGES_WIDE}" in w.shown[0]
+    # and what came back is kept: ``add_corpus`` no longer trims it to its own twelve
+    summary = (next(iter(conn.workspace.iterdir())) / "artifacts" / "report" / "summary.md").read_text()
+    assert "20 passage(s) from 20 paper(s)" in summary
+    assert f"of up to {lit.CORPUS_PASSAGES_WIDE} this search was allowed to read" in summary
+    papers = (next(iter(conn.workspace.iterdir())) / "artifacts" / "literature" / "papers.csv").read_text()
+    assert len([ln for ln in papers.splitlines() if ln.strip()]) == 21   # header + 20 papers, not 12
+
+
+def test_a_note_that_asks_past_twelve_raises_the_budget_without_touching_the_sources(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}',
+                   answer="DDX41 is in photoreceptors [1]; its loss kills cones [2].")
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "do not limit it to 12 papers"},
+                                   {"action": "approve"}])
+    calls = _corpus(monkeypatch, out=_many_contexts(20))
+    _dispatch(conn, "What do the RetiGene papers say about DDX41 in the retina?")
+
+    assert calls[0]["top_k"] == lit.CORPUS_PASSAGES_WIDE
+    assert w.searched == []                                   # a coverage note is not a source note
+    assert f"up to {lit.CORPUS_PASSAGES_WIDE}" in w.shown[1] and "PubMed is not searched" in w.shown[1]
+    assert any("More sources, as the note asks" in str(p.get("text")) for p in conn.pushed)
+
+
+def test_the_usual_budget_is_unchanged_when_nothing_asks_for_more(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}')
+    _wire(monkeypatch, model, [{"action": "approve"}])
+    calls = _corpus(monkeypatch, out=_many_contexts(20))
+    _dispatch(conn, "What do the RetiGene papers say about DDX41 in the retina?")
+
+    assert calls[0]["top_k"] == lit.CORPUS_PASSAGES == 12
+    summary = (next(iter(conn.workspace.iterdir())) / "artifacts" / "report" / "summary.md").read_text()
+    assert "12 passage(s) from 12 paper(s)" in summary and "8 were dropped to that budget" in summary
+
+
+# --- the note decides the sources, and a refusal is not a request (review of issues 59, 60) ---------
+
+def _hits(n):
+    return [{"title": f"DDX41 paper {i}", "authors": "Lee A", "year": "2025", "journal": "IOVS",
+             "doi": f"10.1/d{i}", "pmid": str(41000 + i), "url": f"https://doi.org/10.1/d{i}",
+             "citation": f"Lee et al. (2025) DDX41 paper {i}. IOVS.", "abstract": "An abstract."}
+            for i in range(1, n + 1)]
+
+
+def test_a_note_refusing_pubmed_never_turns_it_on(tmp_path, monkeypatch):
+    """"don't search PubMed" names PubMed, so it used to read as a request FOR it (issue 59)."""
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}',
+                   answer="DDX41 is in photoreceptors [1]; its loss kills cones [2].")
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "don't search PubMed"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What is known about DDX41 in the retina?")
+    assert w.searched == []
+    assert "PubMed is not searched" in w.shown[1]
+
+
+def test_a_note_in_chinese_adds_pubmed(tmp_path, monkeypatch):
+    """"\u4e5f\u641c\u7d22PubMed": no word boundary between a CJK character and "P", so \\bpubmed\\b missed it."""
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}')
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "\u4e5f\u641c\u7d22PubMed"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What do the RetiGene papers say about DDX41 in the retina?")
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina"]
+
+
+def test_a_narrowing_note_that_names_retigene_keeps_pubmed(tmp_path, monkeypatch):
+    """Naming the corpus is not asking for it alone: this note narrows the topic (issue 59)."""
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}')
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "focus on RetiGene mouse studies"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What is known about DDX41 in the retina?")
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina"]
+    assert "PubMed is not searched" not in w.shown[1]
+
+
+def test_the_coverage_request_is_a_budget_not_a_search_term(tmp_path, monkeypatch):
+    """"without", "limiting" and "answer" matched 2714, 1645 and 46 passages in run 73f1758c07de,
+    because the whole request was searched for and the model lifted its words into the terms."""
+    conn = _conn(tmp_path)
+    question = ("What are haploinsufficient genes according to the RetiGene papers, without limiting "
+                "the answer to 12 papers?")
+    model = _Model(queries='{"queries": ["haploinsufficiency"], "terms": ["haploinsufficiency", "without", "limiting"]}',
+                   answer="Genes are reported [1].")
+    _wire(monkeypatch, model, [{"action": "approve"}])
+    calls = _corpus(monkeypatch)
+    _dispatch(conn, question)
+
+    searched_for = calls[0]["queries"][0]
+    assert "without" not in searched_for.lower() and "limiting" not in searched_for.lower()
+    assert "haploinsufficient genes" in searched_for and "RetiGene papers" in searched_for
+    assert [t.lower() for t in calls[0]["terms"]] == ["haploinsufficiency"]
+
+
+def test_the_wide_budget_reaches_the_pubmed_merge(tmp_path, monkeypatch):
+    """A wider paper budget the per-query depth never fills is not a wider search (issue 60)."""
+    conn = _conn(tmp_path)
+    model = _Model(queries='["DDX41 retina", "DDX41 photoreceptor"]',
+                   answer="DDX41 matters [1] and [2].")
+    w = _wire(monkeypatch, model, [{"action": "approve"}], hits=_hits(20))
+    _dispatch(conn, "What is known about DDX41, without limiting the answer to 12 papers?")
+
+    assert [n for _, n, _ in w.searched] == [lit.PER_QUERY_WIDE, lit.PER_QUERY_WIDE]
+    papers = (next(iter(conn.workspace.iterdir())) / "artifacts" / "literature" / "papers.csv").read_text()
+    assert len([ln for ln in papers.splitlines() if ln.strip()]) == 21   # header + 20 papers, not 12
+    summary = (next(iter(conn.workspace.iterdir())) / "artifacts" / "report" / "summary.md").read_text()
+    assert f"keeping up to {lit.MAX_PAPERS_WIDE} paper(s) in all" in summary
+
+
+def test_a_note_that_widens_a_gene_list_question_says_the_curation_is_out_of_reach(tmp_path, monkeypatch):
+    """The warning was only given when the OPENING question was wide. On 2026-10-28 it was a note
+    that widened it, so the user was told "still a bounded search" and nothing else (issue 60)."""
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["haploinsufficiency"], "terms": ["haploinsufficiency"]}',
+                   answer="Genes are reported [1].")
+    monkeypatch.setattr(gw_app, "_revise_literature_question", lambda conn, q, note: f"{q} {note}")
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "do not limit it to 12 papers"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What are haploinsufficient genes in retinal disease?")
+
+    assert any("is a curation of the RetiGene papers" in str(p.get("text")) for p in conn.pushed)
+    assert f"up to {lit.CORPUS_PASSAGES_WIDE}" in w.shown[1]
+
+
+# --- a note that lifts a LIMIT to the RetiGene papers is not a refusal of PubMed (review of #135) ----
+
+@pytest.mark.parametrize("note", [
+    "Not just RetiGene — also PubMed",
+    "not just the RetiGene papers, search PubMed too",
+    "Don't limit it to RetiGene, search PubMed as well",
+    "Don't only use RetiGene; search PubMed too",
+    "not limited to PubMed",
+    "也搜索PubMed",                                       # also search PubMed
+    "不要只看RetiGene，也搜PubMed",       # don't only read RetiGene, also PubMed
+])
+def test_a_note_that_widens_past_retigene_asks_for_pubmed(note):
+    """The negation in these governs "only", "just" or "limit", not PubMed: they ask for MORE
+    sources. Read as refusals, they dropped PubMed from the plan instead of adding it."""
+    assert rr.asks_for_pubmed(note) and not rr.asks_to_drop_pubmed(note)
+
+
+@pytest.mark.parametrize("note", [
+    "not only the corpus", "Don't limit it to RetiGene", "do not restrict it to the RetiGene papers",
+    "不要只看RetiGene",                              # don't only read RetiGene
+    "不仅是语料库",                          # not only the corpus
+])
+def test_a_note_that_lifts_the_retigene_limit_is_not_corpus_only(note):
+    """...and it asks for the other source, as "beyond the RetiGene papers" does."""
+    assert not rr.asks_corpus_only(note) and rr.asks_for_pubmed(note)
+    assert not rr.corpus_only(f"What do the RetiGene papers say about DDX41? {note}")
+
+
+@pytest.mark.parametrize("text", [
+    "What do the RetiGene papers say about DDX41?", "RetiGene only", "focus on RetiGene mouse studies",
+    "Is PRPF31 just one of the RetiGene genes?", "without limiting the answer to 12 papers",
+])
+def test_naming_or_narrowing_to_retigene_does_not_ask_for_pubmed(text):
+    assert not rr.asks_for_pubmed(text)
+
+
+@pytest.mark.parametrize("note", [
+    "don't search PubMed", "don’t search PubMed", "no PubMed please", "without PubMed",
+    "do not search in PubMed", "skip PubMed", "never PubMed",
+    "不要搜 PubMed",                                     # don't search PubMed
+    "不用查PubMed了",                                # no need to check PubMed
+])
+def test_a_refusal_of_pubmed_is_still_read_as_one(note):
+    assert rr.asks_to_drop_pubmed(note) and not rr.asks_for_pubmed(note) and rr.asks_corpus_only(note)
+
+
+@pytest.mark.parametrize("note", [
+    "RetiGene only", "only the RetiGene papers",
+    "只看RetiGene",                                          # only read RetiGene
+    "仅限语料库",                                # the corpus only
+])
+def test_asking_for_the_retigene_papers_alone_is_still_corpus_only(note):
+    assert rr.asks_corpus_only(note)
+
+
+@pytest.mark.parametrize("text", [
+    "don’t limit it to 12 papers", "beyond 12 papers", "over 20 papers", "at least 20 papers",
+])
+def test_more_ways_to_ask_past_twelve(text):
+    assert rr.asks_for_more_coverage(text)
+
+
+def test_a_note_lifting_the_retigene_limit_adds_pubmed_to_a_corpus_only_plan(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}')
+    w = _wire(monkeypatch, model, [{"action": "feedback",
+                                    "feedback": "not just the RetiGene papers, search PubMed too"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What do the RetiGene papers say about DDX41 in the retina?")
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina"]
+    assert "PubMed is not searched" not in w.shown[1]
+
+
+def test_a_note_lifting_the_retigene_limit_keeps_pubmed(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    model = _Model(queries='{"queries": ["DDX41 retina"], "terms": ["DDX41"]}')
+    w = _wire(monkeypatch, model, [{"action": "feedback", "feedback": "don't limit it to RetiGene"},
+                                   {"action": "approve"}])
+    _corpus(monkeypatch)
+    _dispatch(conn, "What is known about DDX41 in the retina?")
+    assert [q for q, _, _ in w.searched] == ["DDX41 retina"]
+    assert "PubMed is not searched" not in w.shown[1]

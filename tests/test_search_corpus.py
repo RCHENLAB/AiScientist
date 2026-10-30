@@ -209,6 +209,29 @@ def test_step_is_incomplete_when_the_corpus_has_nothing():
     assert res.status == "incomplete" and res.stop_reason == "no_literature_citations"
 
 
+def test_every_citation_the_answer_makes_is_listed_not_the_first_twelve():
+    """A plan may pin a larger ``search_corpus`` top_k; the citation list was cut to twelve anyway,
+    dropping references the checked answer had already made (review of issue 60)."""
+    from aiscientist.agents.research_lab import ResearchLab
+
+    pmids = [str(10000000 + i) for i in range(20)]
+    out = {"status": "ok", "contexts": [
+        {"pmid": m, "citation": f"Author {m}. Paper {m}. 2025.",
+         "text": "PRPF31 haploinsufficiency causes adRP."} for m in pmids]}
+    answer = "PRPF31 haploinsufficiency causes adRP " + " ".join(f"[PMID:{m}]" for m in pmids) + "."
+    lab = types.SimpleNamespace(_complete=lambda _m: answer, ctx=None,
+                                _deep_literature_question=lambda *_a: "unused")
+    tool = types.SimpleNamespace(executor=lambda args, ctx: out)
+    res = ResearchLab._run_search_corpus_step(lab, "q", "step", [], tool,
+                                              types.SimpleNamespace(name="G"), lambda _e: None,
+                                              pinned={"queries": ["Is PRPF31 haploinsufficient?"],
+                                                      "top_k": 20})
+    assert res.status == "ok"
+    listed = res.final_answer.split("Citations from the indexed corpus")[1]
+    assert all(m in listed for m in pmids)
+    assert listed.count("\n20. ") == 1
+
+
 def test_approved_queries_go_to_the_call_as_written():
     """Prod run BioAdmin/0dd83b85d736 (2026-10-18, OpenRouter): the plan pinned four queries, the
     step had the model write five others, and the plan check reported "0 of 1 approved steps ran as

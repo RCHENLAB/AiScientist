@@ -148,7 +148,8 @@ def test_corpus_passages_come_first_one_source_per_paper_and_a_pubmed_duplicate_
         "PMID:9001 DOI:10.1/x (PMID 9001, p. 1) https://pubmed.ncbi.nlm.nih.gov/9001/")
     assert first.url == "https://pubmed.ncbi.nlm.nih.gov/9001/"
     assert both.title == "Paper 2" and both.abstract == "Abstract text." and both.passages == ["(p. 4) Same paper as PubMed hit 2."]
-    assert got.corpus == {"status": "ok", "terms": result["terms"], "passages": 3, "papers": 2}
+    assert got.corpus == {"status": "ok", "terms": result["terms"], "passages": 3, "papers": 2,
+                          "max_passages": lit.CORPUS_PASSAGES, "returned": 3}
     # the answer reads the passages and the abstracts; the saved method and tables say where each came from
     user = lit.answer_messages("Q?", got.papers)[1]["content"]
     assert "Papers found in the lab's RetiGene corpus and PubMed" in user
@@ -239,3 +240,13 @@ def test_deeper_queries_still_read_only_twelve_papers():
     assert len(got.papers) == lit.MAX_PAPERS == 12
     assert [p.number for p in got.papers] == list(range(1, 13))
     assert all(p.queries == ["RHO retina", "RHO degeneration"] for p in got.papers)
+
+
+def test_a_failed_corpus_search_on_a_corpus_only_plan_does_not_claim_pubmed():
+    """The method said both "the answer rests on PubMed alone" and "PubMed was not searched"
+    (review of issue 59)."""
+    collected = lit.add_corpus(lit.Collected([], []), {"status": "error", "error": "no corpus here"})
+    method = lit.method_md(collected, "2026-10-30")
+    assert "rests on PubMed alone" not in method
+    assert "PubMed was not searched" in method and "no source could be read" in method
+    assert method.count("PubMed was not searched") == 1

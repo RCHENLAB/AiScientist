@@ -115,13 +115,52 @@ _NAMES_CORPUS = re.compile(
     r"|\bthe\s+lab'?s\s+(?:papers|paper\s+collection)\b"
     r"|语料库",
     re.IGNORECASE)
+# The public sources, named. ``\b`` is not usable at the edge of a Latin name here: a CJK character
+# is a word character too, so "\bpubmed\b" does not match in "也搜索PubMed". These names are bounded
+# against Latin letters instead, which leaves them free to follow or precede Chinese text.
+_PUBMED_NAME = (r"(?<![A-Za-z])(?:pubmed|medline|europe\s*pmc)(?![A-Za-z])"
+                r"|\b(?:public|published|wider|broader|general)\s+literature\b"
+                r"|\b(?:outside|beyond)\s+(?:the\s+)?(?:retigene|corpus)\b"
+                r"|\bother\s+(?:papers|publications|literature)\b"
+                r"|公开文献|其他文献")
 # A question that asks for sources beyond the lab's papers as well: PubMed, the public literature.
-_ASKS_PUBMED = re.compile(
-    r"\bpubmed\b|\beurope\s*pmc\b|\bmedline\b"
-    r"|\b(?:public|published|wider|broader|general)\s+literature\b"
-    r"|\b(?:outside|beyond)\s+(?:the\s+)?(?:retigene|corpus)\b"
-    r"|\bother\s+(?:papers|publications|literature)\b"
-    r"|公开文献|其他文献",
+_ASKS_PUBMED = re.compile(_PUBMED_NAME, re.IGNORECASE)
+# ...and the same names under a refusal: "don't search PubMed", "no PubMed", "without PubMed",
+# "不要搜 PubMed". Naming a source is not asking for it (RCHENLAB/AiScientist issue 59): a note that
+# asks for PubMed to be LEFT OUT used to read as a note asking for it, and turned it on.
+# The refusal must govern the name: at most two words between them, none of them a word that makes
+# the negation lift a LIMIT instead ("not just RetiGene — also PubMed", "don't limit it to RetiGene,
+# search PubMed too", "not limited to PubMed"), and no punctuation, which starts another clause.
+_NEGATION = (r"\b(?:no|not|without|never|skip|exclude|omit|drop|avoid|stop|leave\s+out"
+             r"|do\s+not|don['’]?t|doesn['’]?t)\b")
+_NEGATION_GAP = (r"(?:\s+(?!(?:only|just|merely|solely|exclusively|limit\w*|restrict\w*|confin\w*"
+                 r"|retigene|corpus)\b)[A-Za-z'’-]+){0,2}?\s+")
+_NEGATION_ZH = r"(?:不要|不用|别|无需|不需要|去掉|排除|不再)(?:(?![只仅限])[^。.!?\n，,；;：:]){0,6}?"
+_DROP_PUBMED = re.compile(
+    r"(?:" + _NEGATION + _NEGATION_GAP + r"|" + _NEGATION_ZH + r")(?:" + _PUBMED_NAME + r")",
+    re.IGNORECASE)
+# A message that asks for the lab's papers ALONE, rather than one that merely names them: naming
+# them in a narrowing note ("focus on RetiGene mouse studies") must not drop PubMed from a plan the
+# user already approved with it (issue 59). "only"/"just"/"limit to" under a negation lifts the
+# limit instead ("not only the corpus", "don't limit it to RetiGene", "不要只看 RetiGene").
+_NOT_BEFORE = r"(?<!\bnot\s)(?<!\bno\s)(?<!n't\s)(?<!n’t\s)"
+_ONLY_CORPUS = re.compile(
+    r"(?:" + _NOT_BEFORE + r"(?:\bonly\b|\bjust\b|\balone\b|\bsolely\b|\bexclusively\b|\bnothing\s+but\b"
+    r"|\brestrict(?:\s+\w+){0,2}\s+to\b|\blimit(?:\s+\w+){0,2}\s+to\b|\bstick\s+to\b))"
+    r"[^。.!?\n]{0,40}?(?:\bretigene\b|\bcorpus\b|语料库)"
+    r"|(?:\bretigene\b|\bcorpus\b|语料库)[^。.!?\n]{0,20}?(?:\bonly\b|\balone\b)"
+    r"|(?<!不)(?<!不要)(?<!别)只(?:搜索?|看|用|读)?[^。.!?\n]{0,10}?(?:retigene|语料库)"
+    r"|(?<!不)仅(?:限)?[^。.!?\n]{0,10}?(?:retigene|语料库)",
+    re.IGNORECASE)
+# A message that LIFTS a limit to the lab's papers: "not just the RetiGene papers", "don't limit it
+# to RetiGene", "not only the corpus", "不要只看 RetiGene". It asks for sources beyond them, as
+# "beyond the RetiGene papers" does, and the one other source a literature plan has is PubMed. Read
+# as a coverage request instead, it kept a RetiGene-only plan as it was.
+_LIFTS_CORPUS_LIMIT = re.compile(
+    r"\b(?:not|no|never|do\s+not|don['’]?t|doesn['’]?t)\s+(?:\w+\s+)?"
+    r"(?:only|just|merely|solely|exclusively|limit\w*|restrict\w*|confin\w*|stick)\b"
+    r"[^。.!?\n]{0,30}?(?:\bretigene\b|\bcorpus\b)"
+    r"|(?:不要|不用|别|不)(?:只|仅)[^。.!?\n]{0,10}?(?:retigene|语料库)",
     re.IGNORECASE)
 # Any other source a question can name: papers or the literature in general, a gene database, the
 # web. A question that names one is about that source, not about the RetiGene papers.
@@ -144,8 +183,72 @@ def names_corpus(text: str) -> bool:
 
 
 def asks_for_pubmed(text: str) -> bool:
-    """Does the message ask for PubMed or the public literature?"""
-    return bool(_ASKS_PUBMED.search(text or ""))
+    """Does the message ask FOR PubMed or the public literature? A message that names it in order to
+    refuse it ("don't search PubMed") does not (issue 59); one that lifts a limit to the RetiGene
+    papers ("not just the RetiGene papers") does, as "beyond the RetiGene papers" does."""
+    t = text or ""
+    return (bool(_ASKS_PUBMED.search(t)) and not _DROP_PUBMED.search(t)) or bool(_LIFTS_CORPUS_LIMIT.search(t))
+
+
+def asks_to_drop_pubmed(text: str) -> bool:
+    """Does the message ask for PubMed to be left out? ("don't search PubMed", "不要搜 PubMed")"""
+    return bool(_DROP_PUBMED.search(text or ""))
+
+
+def asks_corpus_only(text: str) -> bool:
+    """Does the message ask for the RetiGene papers ALONE? Naming them is not the same as asking for
+    them alone: a note that narrows the topic ("focus on RetiGene mouse studies") leaves the sources
+    the user approved (issue 59). Refusing PubMed asks for the corpus alone too."""
+    t = text or ""
+    return bool(_ONLY_CORPUS.search(t)) or (asks_to_drop_pubmed(t) and not _ASKS_PUBMED.search(
+        _DROP_PUBMED.sub("", t)))
+
+
+# A message that asks for more sources than a search's usual budget: "without limiting the answer to
+# 12 papers", "every relevant paper", "the complete list" (RCHENLAB/AiScientist issue 60). It asks for
+# COVERAGE, never for a different source, so it never changes the sources the plan has (issue 59).
+_ASKS_MORE_COVERAGE = re.compile(
+    r"\b(?:no|not|without|don['’]?t|do\s+not)\s+(?:\w+\s+){0,2}?"
+    r"(?:limit\w*|cap(?:ped|ping)?|restrict\w*|truncat\w*|maximum)\b"
+    r"|\b(?:unlimited|exhaustive(?:ly)?)\b"
+    r"|\b(?:all|every|each)\s+(?:(?:the|relevant|available|indexed)\s+){0,2}"
+    r"(?:papers?|articles?|passages?|publications?|sources?|studies)\b"
+    r"|\b(?:more\s+than|beyond|over|at\s+least)\s+\d{1,4}\s*(?:papers?|passages?|articles?|sources?)\b"
+    r"|\b(?:whole|entire|full)\s+(?:retigene\s+)?(?:corpus|collection)\b"
+    r"|\bcomplete\s+(?:list|table|set)\b"
+    r"|不限|不要限制|不局限|全部(?:文献|论文|文章)|所有(?:文献|论文|文章)|完整(?:列表|清单)|穷尽"
+    r"|增加(?:覆盖面?|范围)|扩大(?:覆盖面?|范围|检索)|多(?:读|搜|找)(?:一些|点|些)|更多(?:文献|论文|文章|篇)",
+    re.IGNORECASE)
+
+
+# The clause a coverage request is written as, whole: "(and) without limiting the answer to 12
+# papers". Removed from the text that is SEARCHED, so that "without", "limiting" and "answer" do not
+# rank passages of their own (RCHENLAB/AiScientist issue 60: they matched 2714, 1645 and 46 passages
+# in run 73f1758c07de). Only a refusal of a limit is stripped; "all the papers on X" is left alone,
+# because there the words are the question's own subject.
+_COVERAGE_CLAUSE = re.compile(
+    r"[,，;；]?\s*(?:and\s+|but\s+)?"
+    r"(?:(?:no|not|without|don['’]?t|do\s+not)\s+(?:\w+\s+){0,2}?"
+    r"(?:limit\w*|cap(?:ped|ping)?|restrict\w*|truncat\w*|maximum)"
+    r"|\bunlimited\b|\bexhaustive(?:ly)?\b"
+    r"|不限(?:制)?|不要限制|不局限)"
+    r"[^,，.。;；?？!！\n]*",
+    re.IGNORECASE)
+
+
+def strip_coverage_request(text: str) -> str:
+    """``text`` with a "do not limit me to N papers" clause removed: what the search should look for.
+    The request is a budget, not something a paper can contain (issue 60)."""
+    out = _COVERAGE_CLAUSE.sub(" ", text or "")
+    out = re.sub(r"\s+([,，.。;；?？!！])", r"\1", " ".join(out.split()))
+    return out.strip(" ,;，；") or " ".join((text or "").split())
+
+
+def asks_for_more_coverage(text: str) -> bool:
+    """Does the message ask for more sources than the search's usual budget? "without limiting the
+    answer to 12 papers", "every relevant paper", "the complete list" (issue 60). A coverage request
+    is not a source request: it leaves the sources the plan already has alone (issue 59)."""
+    return bool(_ASKS_MORE_COVERAGE.search(text or ""))
 
 
 def corpus_only(text: str) -> bool:

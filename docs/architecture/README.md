@@ -102,7 +102,11 @@ kept scan of the same corpus at once), and the gateway builds two tables from it
 (`gateway/corpus_scan.py`: one row per gene with its claim, the genes the papers argue against
 apart, and one row per sentence, each with its paper and page) and answers from them; the user can
 save the tables to their Datasets. A note on any plan is routed again, so "analyse my data instead"
-turns a literature plan into an analysis. Every run saves its processed dataset and CellQC result
+turns a literature plan into an analysis, and a note that makes it a list question about the RetiGene
+papers turns it into the curation, once per message. The literature plan's sources are read from the
+question once; after that only a note that asks for a source changes them. A request for more than
+the usual 12 sources widens the search to 30 corpus passages (3 per paper at most) and 24 PubMed
+papers, and the plan card and the saved method state the budget. Every run saves its processed dataset and CellQC result
 folder to the user's Datasets. The fast chat path (`agents/quick_chat.py`: only the `chat: true`
 tools, a streamed answer, no run directory) and the bare corpus scan stay on the server for a client
 that asks for them by `route`; the console sends none. Anti-fabrication layers: the Critic's

@@ -2065,6 +2065,12 @@ _DEEP_LIT_QUESTION_SYSTEM = (
     "and species and the cell types, marker genes or pathways the findings are about. No tool names, "
     "file names, statistics jargon or instructions. Reply with the question only."
 )
+# Citations listed under a corpus-grounded answer. These are the papers the CHECKED answer already
+# cites, so cutting them drops references the answer makes: a step whose plan pinned a larger
+# ``search_corpus`` top_k read more than twelve passages and still listed twelve
+# (RCHENLAB/AiScientist issue 60, review of PR #135). The ceiling is ``search_corpus``'s own.
+MAX_LISTED_CITATIONS = 30
+
 # PaperQA's own refusal, at the start of its answer ("I cannot answer.", "I cannot answer this
 # question due to having no papers").
 _CANNOT_ANSWER = re.compile(r"^\s*(?:I\s+)?(?:cannot|can't|am unable to) answer\b", re.IGNORECASE)
@@ -7663,7 +7669,7 @@ class ResearchLab:
             if cites:
                 lines += ["", "Citations from the indexed corpus (use ONLY these in the References "
                               "section — do NOT add any others):"]
-                lines += [f"{i}. {c}" for i, c in enumerate(cites[:12], 1)]
+                lines += [f"{i}. {c}" for i, c in enumerate(cites[:MAX_LISTED_CITATIONS], 1)]
             return HarnessResult("ok", "deep_literature_corpus", "\n".join(lines), tool_calls, [])
         note = (output.get("error") or output.get("note")) if isinstance(output, dict) else None
         return HarnessResult(
@@ -7765,7 +7771,7 @@ class ResearchLab:
                                    if (c.get("citation") or "").strip()))
         lines = [verified.text, "", "Citations from the indexed corpus (use ONLY these in the References "
                                     "section — do NOT add any others):"]
-        lines += [f"{i}. {c}" for i, c in enumerate(cites[:12], 1)]
+        lines += [f"{i}. {c}" for i, c in enumerate(cites[:MAX_LISTED_CITATIONS], 1)]
         if verified.removed:
             lines += ["", f"(Platform note: {len(verified.removed)} citation(s) or quotation(s) the "
                           "passages did not support were removed from the answer.)"]
