@@ -17,6 +17,12 @@
 # WHY rsync (not git pull): the server can't fetch the PRIVATE repo (no creds on the box),
 # so we push your local state directly.
 #
+# ONLY for a server on the rsync layout (the code in app/, the venv in env/). A server on the
+# release layout (deploy/deploy_release.sh: app/releases/, app/current) is deployed from tags, and
+# an rsync with --delete into it would remove the running release. The script refuses one before
+# any rsync when it can see the app folder, and the step that copies into the app folder checks
+# again as the service account; its excludes keep releases/, current, previous and held anyway.
+#
 # USAGE:
 #   scripts/deploy_interactive.sh [--no-delete] [--allow-dirty]
 #     --no-delete    keep server files that aren't in your local tree (default: --delete,
@@ -60,7 +66,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --no-delete) DELETE="" ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
   esac; shift
 done
@@ -81,7 +87,7 @@ if [ "$ALLOW_DIRTY" -eq 0 ] && [ -n "$(git status --porcelain 2>/dev/null)" ]; t
 fi
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
-STAGE="/tmp/aiscientist-deploy-${ADMIN_USER}"
+STAGE="${STAGE:-/tmp/aiscientist-deploy-${ADMIN_USER}}"
 say "deploy ${BRANCH}@${SHA}  ->  ${TARGET}:${APP_DIR}  (as ${SVC_USER}; delete=${DELETE:-off})"
 
 # --- shared excludes (protect server-only state from --delete) --------------
@@ -91,6 +97,8 @@ PATTERNS=(
   '.git/' '.env' '*.db' '*.sqlite*' '.venv/' 'venv/' 'env/' '__pycache__/' '*.pyc'
   'runs/' '.adaptive_kg/' 'node_modules/' '*.sif' 'console.log' '*.egg-info/'
   '.claude/settings.local.json'
+  # The release layout's own entries at the top of the app folder: --delete must never reach them.
+  '/releases/' '/current' '/previous' '/held'
 )
 EXC=(); for p in "${PATTERNS[@]}"; do EXC+=(--exclude "$p"); done   # local rsync (array)
 EXC_STR=""; for p in "${PATTERNS[@]}"; do EXC_STR+=" --exclude '$p'"; done   # remote rsync (quoted)
@@ -106,6 +114,22 @@ ssh -o ControlMaster=yes -o ControlPath="$CTL" -o ControlPersist=600 \
 
 SSHM=(ssh -o ControlPath="$CTL" -p "$PORT")
 
+# --- the layout: a server on releases is deployed from tags only -------------
+# Checked before any rsync: as this account when it can see the app folder, else as ${SVC_USER}
+# through `sudo -n` (no prompt). When neither can tell (the server's root is closed to other
+# accounts and sudo needs the password), the privileged step checks before it copies anything.
+REFUSE_RELEASES="${APP_DIR} holds app releases (deploy/deploy_release.sh): this server is deployed from tags, not with rsync (deploy/README.md)."
+LAYOUT_PROBE="if [ -e ${APP_DIR}/releases ] || [ -L ${APP_DIR}/current ]; then echo releases; elif [ -r ${APP_DIR} ] && [ -x ${APP_DIR} ]; then echo rsync; else echo unknown; fi"
+layout="$("${SSHM[@]}" "$TARGET" "$LAYOUT_PROBE" 2>/dev/null)" || layout=unknown
+if [ "$layout" != releases ] && [ "$layout" != rsync ]; then
+  layout="$("${SSHM[@]}" "$TARGET" "sudo -n -u ${SVC_USER} sh -c '${LAYOUT_PROBE}'" 2>/dev/null)" || layout=unknown
+fi
+case "$layout" in
+  releases) die "$REFUSE_RELEASES" ;;
+  rsync)    say "the server is on the rsync layout" ;;
+  *)        say "cannot see ${APP_DIR} as ${ADMIN_USER}: the layout is checked as ${SVC_USER} before anything is copied into it" ;;
+esac
+
 # --- 2. rsync local -> staging you own (no sudo) ----------------------------
 say "syncing your local tree -> ${STAGE} (staging) ..."
 rsync -az --delete "${EXC[@]}" -e "ssh -o ControlPath=$CTL -p $PORT" \
@@ -117,6 +141,10 @@ rsync -az --delete "${EXC[@]}" -e "ssh -o ControlPath=$CTL -p $PORT" \
 # survive --delete), reinstalls, and restarts the console.
 REMOTE_STEP="$(cat <<REMOTE
 set -euo pipefail
+if [ -e "${APP_DIR}/releases" ] || [ -L "${APP_DIR}/current" ]; then
+  echo "[deploy] ERROR: ${REFUSE_RELEASES}" >&2
+  exit 3
+fi
 rsync -a ${DELETE} ${EXC_STR} "${STAGE}/" "${APP_DIR}/"
 cd "${APP_DIR}"
 "${ROOT_DIR}/env/bin/pip" install -e . -q || echo "[deploy] pip install warned (continuing)"

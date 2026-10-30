@@ -16,8 +16,11 @@ Safe by construction: DRY-RUN by default (prints what it WOULD do); pass ``--com
 ever fills rows where ``conversation_id IS NULL`` (never overwrites), and skips a run_id that is
 referenced from MORE THAN ONE conversation (an ambiguous historical leak) rather than guess.
 
-Run it on the server as the ``aiscientist`` service account (same env as the gateway, so it points at the
-prod DB):  ``python -m scripts.backfill_run_conversation_id --commit``
+Run it on the server as the ``aiscientist`` service account, from the running release. It reads the
+``.env`` beside ``scripts/`` (in a release, the link to ``config/.env``), so it points at the prod DB::
+
+    R=/data/aiscientist/app/current
+    sudo -u aiscientist $R/.venv/bin/python $R/scripts/backfill_run_conversation_id.py --commit
 """
 
 from __future__ import annotations
@@ -27,6 +30,10 @@ import json
 import re
 import sys
 from collections import defaultdict
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
 
 # /api/bundle/<owner>/<run_id>  |  /api/artifacts/<owner>/<run_id>/...  |  /api/file/<owner>/<run_id>/...
 _RUN_URL = re.compile(r"/api/(?:bundle|artifacts|file)/[^/]+/([^/?#\"]+)")
@@ -78,6 +85,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Backfill runs.conversation_id from chat history.")
     ap.add_argument("--commit", action="store_true", help="write changes (default: dry-run)")
     args = ap.parse_args(argv)
+
+    # The app's settings, as the gateway reads them: without them the database URL would fall back
+    # to a local SQLite file, and init_db() would create it.
+    from aiscientist.core.config import load_project_env
+    load_project_env(REPO)
 
     from aiscientist.gateway.db import init_db, session_scope
     from aiscientist.gateway.models import Run

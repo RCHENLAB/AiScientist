@@ -183,8 +183,8 @@ Updating skills means changing the tag and installing the release.
 `agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's three
 assets as published: `aiscientist-skills-<version>.zip` (every skill folder at its catalog `path`),
 `catalog.json` and `SHA256SUMS`. Releases with one `<name>-<version>.zip` per skill are still read.
-The folder is installed on the server, and in a development checkout that needs skills, outside
-git (`.gitignore`, and `scripts/sync_deploy.sh` never ships or deletes it):
+The folder is outside git (`.gitignore`), and an app release never ships or deletes it. On the
+server `deploy/deploy_skills.sh` installs it; a development checkout that needs skills downloads it:
 
 ```bash
 gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1.0

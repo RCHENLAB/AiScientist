@@ -1,8 +1,9 @@
 """Update the Eye Server's copy of the RetiGene corpus index, and rebuild the index on HPC3 first when
-papers were added. One command, run on the Eye Server as the service account:
+papers were added. One command, run on the Eye Server as the service account, from the running
+release:
 
-    sudo -u aiscientist /data/aiscientist/env/bin/python \\
-        /data/aiscientist/app/scripts/update_corpus_index.py [--rebuild] [--check]
+    sudo -u aiscientist /data/aiscientist/app/current/.venv/bin/python \\
+        /data/aiscientist/app/current/scripts/update_corpus_index.py [--rebuild] [--check]
 
 1. ``--rebuild``: one CPU Slurm job on HPC3, inside ``paperqa.sif``, extracts and embeds the papers
    added to the corpus since the last build (``build_mechanism_cache.py --replace``) and puts the new
@@ -16,9 +17,10 @@ papers were added. One command, run on the Eye Server as the service account:
 ``--check`` runs step 3 alone: exit status 0 when the copy is the HPC3 index, 1 when it is stale or
 missing. ``--rollback`` makes the previous version of the copy current again.
 
-Settings come from the deployment's ``.env``: the corpus (``AISCIENTIST_PAPERQA_PAPERS``, ``_MANIFEST``,
-``_IMAGE``), HPC3 (host, transfer host, CPU partition and account, Apptainer module) and the copy's
-root (``AISCIENTIST_LOCAL_CORPUS_ROOT``, default ``<data root>/reference/retigene``). The HPC3 login
+Settings come from the ``.env`` beside ``scripts/``, in a release the link to ``config/.env``: the
+corpus (``AISCIENTIST_PAPERQA_PAPERS``, ``_MANIFEST``, ``_IMAGE``), HPC3 (host, transfer host, CPU
+partition and account, Apptainer module) and the copy's root (``AISCIENTIST_LOCAL_CORPUS_ROOT``,
+default ``<data root>/reference/retigene``). The HPC3 login
 is ``--hpc-user`` with ``--ssh-key``, by default the shared model server's (the saved key of
 ``AISCIENTIST_SHARED_LLM_OWNER``, or ``AISCIENTIST_SHARED_LLM_HPC_USER`` + ``_KEY_PATH``): a key
 without a passphrase, since nobody is there to type one or answer Duo.

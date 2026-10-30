@@ -12,6 +12,11 @@ for, where it runs and whether it changes anything.
 *gateway* = the eyeserver host that runs `aiscientist.service`; *HPC3* = a compute node, never a
 login node. **Changes:** *read-only*, or what it writes.
 
+Every app release ships this folder. On the gateway, run a script from the running release, as the
+service account: `sudo -u aiscientist /data/aiscientist/app/current/.venv/bin/python
+/data/aiscientist/app/current/scripts/<name>.py`. A script that needs the app's settings reads the
+release's `.env`, a link to `config/.env`.
+
 Settings shared by the deploy and monitoring scripts (`DEPLOY_SSH`, `ADMIN_SSH`, `BIND_HOST`, …) can be
 kept in a `.deploy.env` at the repository root. It is git-ignored and must never be committed.
 
@@ -19,9 +24,9 @@ kept in a `.deploy.env` at the repository root. It is git-ignored and must never
 
 | Script | What it is for | Runs on | Changes |
 |---|---|---|---|
-| `sync_deploy.sh` | Deploy: rsync the local working tree to the gateway host, reinstall the package into the server venv, restart `aiscientist.service`, health-check. The normal way to ship. | laptop | the gateway's app dir, the service |
-| `deploy_interactive.sh` | The same deploy for a coworker without NOPASSWD sudo: one SSH master connection and one sudo prompt. Its header still names the old `bioagent` unit; prefer `sync_deploy.sh`. | laptop | as above |
-| `migrate_prod_root.sh` | One-off move of the deployment root (`/data/BioAgent` → `/data/aiscientist`) and rename of the systemd unit, with preflight, `--apply`, `--rollback` and `--harden`. Done on 2026-10-09. | gateway (root) | the deployment root, the unit |
+| `sync_deploy.sh` | Deploy a server on the rsync layout, such as a new server before its first release: rsync the local working tree to the gateway host, reinstall the package into the server venv, restart `aiscientist.service`, health-check. It refuses a server on the release layout, which is deployed from tags (`deploy/README.md`). | laptop | the gateway's app dir, the service |
+| `deploy_interactive.sh` | The same deploy for a coworker without NOPASSWD sudo: one SSH master connection and one sudo prompt. It refuses a server on the release layout too: before any rsync when your account can see the app folder, else as the service account before it copies anything into it. Its header still names the old `bioagent` unit; prefer `sync_deploy.sh`. | laptop | as above |
+| `migrate_prod_root.sh` | One-off move of the deployment root (`/data/BioAgent` → `/data/aiscientist`) and rename of the systemd unit, with preflight, `--apply`, `--rollback` and `--harden`. | gateway (root) | the deployment root, the unit |
 | `install_frameworks.sh` | Install the Biomni runtime under `/data`. Kept for reference; Biomni is no longer the research backend. | gateway (service account) | `/data` |
 | `inject_admin.py` | Re-seed an admin account directly in the database when `aiscientist-admin` cannot run. | gateway | the `users` table |
 | `backfill_run_conversation_id.py` | Fill `runs.conversation_id` for runs that finished before the column existed. Dry run unless `--commit`. | gateway | the `runs` table (with `--commit`) |

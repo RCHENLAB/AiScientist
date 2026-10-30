@@ -18,7 +18,10 @@
 #     sudo systemctl daemon-reload
 #     sudo systemctl enable --now aiscientist.service
 #
-# Config/secrets are read from /data/aiscientist/app/.env by the app itself (load_project_env).
+# This file is the rsync layout: the code and .env in /data/aiscientist/app, the venv in env/. On the
+# release layout (the Eye Server) the drop-in aiscientist.service.d/release-layout.conf runs
+# app/current/.venv/bin/python in app/current and reads /data/aiscientist/config/.env instead.
+# Config/secrets are read from that .env by the app itself (load_project_env).
 # For the PUBLIC deploy that .env MUST set:  AISCIENTIST_STATE_DIR=/data/aiscientist/state  (the app
 # keeps the session secret there, 0600) and AISCIENTIST_PUBLIC_HTTPS=1  (marks session cookies
 # Secure). See deploy/README.md.

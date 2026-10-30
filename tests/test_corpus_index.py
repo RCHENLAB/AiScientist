@@ -322,6 +322,36 @@ def test_the_corpus_settings_come_from_the_deployment(monkeypatch):
         "/dfs3b/me/test", "/dfs3b/me/test/papers", "/dfs3b/me/test/paperqa_manifest.csv")
 
 
+def test_run_from_a_release_it_reads_config_env_through_the_release_s_link(tmp_path, source, monkeypatch, capsys):
+    """On the release layout the command is app/current/scripts/update_corpus_index.py: the release
+    links .env to config/.env (deploy_release.sh), and that is where the copy's root is read."""
+    copy = tmp_path / "data" / "reference" / "retigene"
+    clock = iter([1_000_000_000.0 + 60 * i for i in range(10)])
+    first = ci.sync(str(source), copy, run=fake_rsync([]), clock=lambda: next(clock))
+    write_index(source, 5)
+    ci.sync(str(source), copy, run=fake_rsync([]), clock=lambda: next(clock))
+
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / ".env").write_text(f"AISCIENTIST_LOCAL_CORPUS_ROOT={copy}\n")
+    release = tmp_path / "app" / "releases" / "v1.0.0"
+    (release / "scripts").mkdir(parents=True)
+    shutil.copy(REPO / "scripts" / "update_corpus_index.py", release / "scripts")
+    (release / ".env").symlink_to(tmp_path / "config" / ".env")
+    (tmp_path / "app" / "current").symlink_to(release)
+    for var in ("AISCIENTIST_LOCAL_CORPUS_ROOT", "BIOAGENT_LOCAL_CORPUS_ROOT"):
+        monkeypatch.setenv(var, "unset by the test")      # restored (removed) when the test ends
+        monkeypatch.delenv(var)
+
+    spec = importlib.util.spec_from_file_location(
+        "update_from_release", tmp_path / "app" / "current" / "scripts" / "update_corpus_index.py")
+    update = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(update)
+    assert update.REPO == release.resolve()
+    assert update.main(["--rollback"]) == 0
+    assert ci.current(copy) == first.version
+    assert first.version.name in capsys.readouterr().out
+
+
 def test_the_build_job_ships_the_build_script_and_the_package(tmp_path):
     import tarfile
 

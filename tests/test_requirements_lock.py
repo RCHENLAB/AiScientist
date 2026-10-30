@@ -84,6 +84,7 @@ def test_the_package_holds_the_commit_s_runtime_files_only(tmp_path):
     for rel in ("src/aiscientist/__init__.py", "frontend/index.html", "preset_pipelines/p.yaml",
                 "configs/skills_registry.json", "deploy/deploy_release.sh", "pyproject.toml", "LICENSE",
                 "README.md", "requirements.txt", "requirements-gateway.txt", "start.sh",
+                "scripts/update_corpus_index.py", "scripts/build_mechanism_cache.py",
                 "tests/test_x.py", "docs/x.md", "handoff/h.md"):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text(rel)
@@ -112,6 +113,9 @@ def test_the_package_holds_the_commit_s_runtime_files_only(tmp_path):
     sha = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     assert f"tag=v1.0.0\nsha={sha}\n" in version
     assert "aiscientist-v1.0.0/requirements.lock" in names
+    # The operator scripts that run on the server, from the release (scripts/README.md).
+    assert {"aiscientist-v1.0.0/scripts/update_corpus_index.py",
+            "aiscientist-v1.0.0/scripts/build_mechanism_cache.py"} <= names
     assert "aiscientist-v1.0.0/src/aiscientist/untracked.py" not in names
     assert not [n for n in names if "/._" in n]                 # no AppleDouble files from a Mac build
     with tarfile.open(tmp_path / "out" / "aiscientist-v1.0.0.tar.gz") as tf:

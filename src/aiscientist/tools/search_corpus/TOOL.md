@@ -64,13 +64,15 @@ The copy lives in `<data root>/reference/retigene/` (`AISCIENTIST_LOCAL_CORPUS_R
 `current` names the version searches read, `versions/<time>/` holds `mechanism_cache/`,
 `manifest.csv`, `hgnc_complete_set.txt` and `SOURCE.json` (what was copied, from where, when), and
 `hf_cache/` the embedding model. The gateway's environment needs the `corpus` extra
-(`sentence-transformers`, with torch from the CPU index).
+(`sentence-transformers`, with torch from the CPU index); on the Eye Server, `AISCIENTIST_EXTRAS` in
+`config/deploy.env` adds it to every release.
 
 To add papers, put the PDFs and their manifest rows in the corpus on HPC3, then on the Eye Server,
-as the service account:
+as the service account, with the running release:
 
 ```sh
-python scripts/update_corpus_index.py --rebuild
+sudo -u aiscientist /data/aiscientist/app/current/.venv/bin/python \
+    /data/aiscientist/app/current/scripts/update_corpus_index.py --rebuild
 ```
 
 It rebuilds the index on HPC3 in one CPU Slurm job inside `paperqa.sif` (only the new papers are

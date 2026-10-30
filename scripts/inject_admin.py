@@ -2,30 +2,32 @@
 """inject_admin.py — re-seed a BioAdmin account directly in the gateway database.
 
 Use this when `aiscientist-admin create-admin` is unavailable or the CLI env isn't
-loading correctly on the server.  Needs only bcrypt + sqlalchemy (both in the
-server venv at /data/aiscientist/env).
+loading correctly on the server.  Needs only bcrypt + sqlalchemy (both in each
+release's venv, /data/aiscientist/app/current/.venv).
 
-USAGE (run on the server as the aiscientist user or with sudo):
+USAGE (run on the server as the aiscientist user, from the running release):
 
-  sudo -u aiscientist /data/aiscientist/env/bin/python3 /tmp/inject_admin.py
-  sudo -u aiscientist /data/aiscientist/env/bin/python3 /tmp/inject_admin.py BioAdmin
-  sudo -u aiscientist /data/aiscientist/env/bin/python3 /tmp/inject_admin.py BioAdmin --db /data/aiscientist/bioagent.db
+  R=/data/aiscientist/app/current
+  sudo -u aiscientist $R/.venv/bin/python $R/scripts/inject_admin.py
+  sudo -u aiscientist $R/.venv/bin/python $R/scripts/inject_admin.py BioAdmin
+  sudo -u aiscientist $R/.venv/bin/python $R/scripts/inject_admin.py BioAdmin --db /data/aiscientist/bioagent.db
 
   # Non-interactive (password via env, useful for automation):
-  AISCIENTIST_ADMIN_PASSWORD=<pw> ... python3 /tmp/inject_admin.py BioAdmin
+  AISCIENTIST_ADMIN_PASSWORD=<pw> ... python3 .../inject_admin.py BioAdmin
 
 Username defaults to 'BioAdmin'. The script creates the user if it doesn't exist,
 or resets the password + ensures role=admin + is_active=1 if it does.
 
 DB resolution order: --db override > $AISCIENTIST_DATABASE_URL > AISCIENTIST_DATABASE_URL
-parsed from the app's .env (/data/aiscientist/app/.env) > a SQLite fallback guess. The
-.env step is what makes a bare `sudo -u aiscientist ... inject_admin.py` hit the SAME
-Postgres the console uses, instead of silently writing to a stray SQLite file.
+parsed from the app's .env (the one beside scripts/, which in a release links to
+/data/aiscientist/config/.env) > a SQLite fallback guess. The .env step is what makes a
+bare `sudo -u aiscientist ... inject_admin.py` hit the SAME Postgres the console uses,
+instead of silently writing to a stray SQLite file.
 
 PREFERRED ALTERNATIVE — if the app CLI is installed and AISCIENTIST_DATABASE_URL is
 set in the server .env, use the canonical tool instead:
 
-  sudo -u aiscientist /data/aiscientist/env/bin/aiscientist-admin create-admin BioAdmin
+  sudo -u aiscientist /data/aiscientist/app/current/.venv/bin/aiscientist-admin create-admin BioAdmin
 """
 from __future__ import annotations
 
@@ -49,7 +51,9 @@ SERVER_DB_CANDIDATES = [
 # `sudo -u aiscientist python3 inject_admin.py` silently fell back to a stray SQLite file
 # while the app was actually on Postgres.
 ENV_CANDIDATES = [
-    "/data/aiscientist/app/.env",
+    str(Path(__file__).resolve().parents[1] / ".env"),   # the release's (or checkout's) own .env
+    "/data/aiscientist/config/.env",                     # the release layout
+    "/data/aiscientist/app/.env",                        # the rsync layout
     "/data/aiscientist/.env",
     "./.env",
 ]
