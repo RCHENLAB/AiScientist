@@ -275,7 +275,7 @@ def test_a_qc_only_run_gets_a_short_chat_reply_with_the_tools_numbers(tmp_path):
             "subtracted from the counts).") in reply
     assert ("**Result:** `Sample2_Ddx41.processed.20261014-1204.6275df1213ab.h5ad` — 14,553 cells × "
             "33,696 genes") in reply
-    assert "kept on HPC3 until you disconnect (at most 3 days)" in reply
+    assert "kept on HPC3 until the session ends, then with the run on the server" in reply
     assert "`result/report.html`" in reply
     # The kappa warning is not said twice, and no instruction to a model reaches the user.
     assert reply.count("kappa") == 1 and "Report it" not in reply

@@ -321,11 +321,12 @@ def test_delete_queues_a_job_and_settles_it(flow):
     assert status == 200, body
     assert body["status"] == "queued" and body["job"]["job_id"] == "901" and body["job"]["path"] == target
     assert "log" not in body["job"]
-    assert hpc.files[f"{ROOT}/bin/tester/storage_delete.sh"] == SCRIPT.read_bytes()
+    here = f"{ROOT}/sessions/{conn.id}"
+    assert hpc.files[f"{here}/scripts/storage_delete.sh"] == SCRIPT.read_bytes()
     sbatch = next(c for c in hpc.commands if "cat >" in c)
     assert "#SBATCH --job-name=aiscientist-delete-tester" in sbatch
     assert "#SBATCH --partition=standard" in sbatch and "#SBATCH --account=ruic20_lab" in sbatch
-    assert (f"bash {ROOT}/bin/tester/storage_delete.sh --root {ROOT} --user tester "
+    assert (f"bash {here}/scripts/storage_delete.sh --root {ROOT} --user tester "
             f"--path '{target}'") in sbatch
     assert "--personal" not in sbatch                                  # not a personal-folder path
     assert not any(c.lstrip().startswith("rm ") for c in hpc.commands)  # nothing on a login node
@@ -347,7 +348,7 @@ def test_delete_queues_a_job_and_settles_it(flow):
     assert body["deletes"][0]["status"] == "queued" and body["deletes"][0]["slurm_state"] == "RUNNING"
     assert sum(c.startswith("sacct") for c in hpc.commands) == 1
 
-    log = f"{ROOT}/bin/tester/deletes/{conn.storage_deletes[0]['id']}.log"
+    log = f"{here}/logs/deletes/{conn.storage_deletes[0]['id']}.log"
     hpc.states["901"] = "COMPLETED"
     hpc.files[log] = f"DELETED\t{target}\nDELETE_RESULT deleted=1 skipped=0 job=901\n".encode()
     status, body = _call(gw.get_storage_deletes(conn.id, None))
@@ -368,7 +369,7 @@ def test_a_personal_folder_entry_names_that_folder_and_the_script_is_staged_once
     scripts = [c for c in hpc.commands if "cat >" in c]
     assert f"--personal {PERSONAL} --path {PERSONAL}/old_pbmc_run.h5ad" in scripts[0]
     assert "--personal" not in scripts[1]
-    assert sum(c.startswith("mkdir -p") and c.endswith("/deletes") for c in hpc.commands) == 1
+    assert sum(c.startswith("mkdir -p") and "cat >" not in c and "/logs/deletes" in c for c in hpc.commands) == 1
     assert [j["job_id"] for j in conn.storage_deletes] == ["901", "902"]
 
 

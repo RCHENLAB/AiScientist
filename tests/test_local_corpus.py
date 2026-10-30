@@ -1,5 +1,4 @@
 """Eye Server retrieval and index synchronisation, without network or a GPU."""
-import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -13,7 +12,7 @@ from aiscientist.gateway import local_corpus as lc
 @pytest.fixture
 def index(tmp_path, monkeypatch):
     np = pytest.importorskip("numpy")
-    root = tmp_path / "literature"
+    root = tmp_path / "reference" / "retigene"     # the default under the data root
     cache = root / "mechanism_cache"
     cache.mkdir(parents=True)
     (cache / "chunks.jsonl").write_text(json.dumps({
@@ -71,24 +70,6 @@ def test_explicit_local_root_and_broken_index_fall_back(index, monkeypatch):
     assert lc.run_local_search({"queries": ["PRPF31"]}) is None
 
 
-def test_sync_uses_checksum_incremental_transfer_and_includes_manifest(tmp_path, monkeypatch):
-    path = Path(__file__).resolve().parents[1] / "scripts" / "sync_corpus_index.py"
-    spec = importlib.util.spec_from_file_location("sync_corpus_index", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    calls = []
-    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)))
-    module.sync("me@access-hpc3.rcic.uci.edu:/corpus", tmp_path, with_model=True, with_hgnc=True)
-    assert len(calls) == 4
-    dtn = "me@access-hpc3.rcic.uci.edu:/corpus"
-    assert [call[0][-2] for call in calls] == [
-        f"{dtn}/mechanism_cache/", f"{dtn}/paperqa_manifest.csv",
-        f"{dtn}/hf_cache/", f"{dtn}/hgnc_complete_set.txt"]
-    assert calls[1][0][-1] == str(tmp_path / "manifest.csv")
-    assert all("-rltc" in argv and "--delay-updates" in argv and kw["check"] for argv, kw in calls)
-    assert all("--delete" not in argv for argv, _ in calls)
-
-
 def test_failed_model_load_is_cached_until_retry_window(index, monkeypatch):
     attempts = []
     now = [100.0]
@@ -108,35 +89,109 @@ def test_failed_model_load_is_cached_until_retry_window(index, monkeypatch):
     assert len(attempts) == 2
 
 
-def _sync_module():
-    path = Path(__file__).resolve().parents[1] / "scripts" / "sync_corpus_index.py"
-    spec = importlib.util.spec_from_file_location("sync_corpus_index", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.mark.parametrize("source", ["hpc3:/corpus", "me@hpc3.rcic.uci.edu:/corpus",
-                                    "login-i15.rcic.uci.edu:/corpus", "HPC3:/corpus"])
-def test_sync_refuses_an_hpc3_login_node(tmp_path, monkeypatch, source):
-    # RCIC allows no data transfer on the login nodes: the copy goes through access-hpc3.
-    module = _sync_module()
-    monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: pytest.fail("rsync started"))
-    with pytest.raises(ValueError, match="access-hpc3.rcic.uci.edu"):
-        module.sync(source, tmp_path)
-
-
-def test_a_local_source_path_is_not_a_host(tmp_path, monkeypatch):
-    module = _sync_module()
-    calls = []
-    monkeypatch.setattr(module.subprocess, "run", lambda argv, **kw: calls.append(argv))
-    module.sync(str(tmp_path / "hpc3:copy"), tmp_path / "out")
-    assert len(calls) == 2
-
-
 def test_vectors_for_another_index_are_not_searched_and_never_re_embedded(index, monkeypatch):
     np = pytest.importorskip("numpy")
     np.save(index / "mechanism_cache" / "chunk_vecs.npy", np.zeros((3, 2), dtype="float32"))
     monkeypatch.setattr(lc, "_embedder",
                         lambda root: lambda texts: pytest.fail(f"embedded {len(texts)} texts"))
     assert lc.run_local_search({"queries": ["PRPF31"]}) is None    # the HPC3 fallback answers
+
+
+def _fingerprint(index, **override):
+    """What corpus_scan.corpus_fingerprint reports for an HPC3 index identical to ``index``."""
+    import hashlib
+
+    fp = {"root": "/dfs3b/corpus"}
+    for name in ("mechanism_cache/chunks.jsonl", "mechanism_cache/chunk_vecs.npy"):
+        st = (index / name).stat()
+        fp[name] = f"{st.st_size} {int(st.st_mtime)}"
+    fp["manifest_sha256"] = hashlib.sha256((index / "manifest.csv").read_bytes()).hexdigest()
+    fp.update(override)
+    return fp
+
+
+def test_a_copy_is_compared_with_the_hpc3_index_file_by_file(index):
+    assert lc.differences(_fingerprint(index), index) == []
+    assert lc.differences(_fingerprint(index, **{"mechanism_cache/chunks.jsonl": "1 2"}), index) == [
+        "mechanism_cache/chunks.jsonl"]
+    assert lc.differences(_fingerprint(index, manifest_sha256="0" * 64), index) == ["manifest.csv"]
+    # HPC3 lists an HGNC table and sentences: the copy has no HGNC table (the search runs without
+    # one), so only the missing sentences count.
+    fp = _fingerprint(index, **{"hgnc_complete_set.txt": "10 20", "mechanism_cache/sentences.jsonl": "3 4"})
+    assert lc.differences(fp, index) == ["mechanism_cache/sentences.jsonl"]
+
+
+def test_the_copy_in_current_is_the_one_searched(tmp_path, monkeypatch):
+    root = tmp_path / "copy"
+    version = root / "versions" / "20261029T000000Z"
+    (version / "mechanism_cache").mkdir(parents=True)
+    for name in ("chunks.jsonl", "chunk_vecs.npy"):
+        (version / "mechanism_cache" / name).write_text("x")
+    (root / "current").symlink_to(Path("versions") / version.name)
+    monkeypatch.setenv("AISCIENTIST_LOCAL_CORPUS_ROOT", str(root))
+    assert lc.index_dir() == version.resolve()
+    assert lc.has_local_index()
+    (root / "current").unlink()
+    assert lc.index_dir() == root and not lc.has_local_index()
+
+
+def test_staleness_is_read_from_hpc3_at_most_once_per_interval(index, monkeypatch):
+    from aiscientist.gateway import corpus_scan
+
+    monkeypatch.setenv("AISCIENTIST_PAPERQA_PAPERS", "/dfs3b/corpus/papers")
+    monkeypatch.setattr(lc, "_FINGERPRINTS", {})
+    now = [1000.0]
+    monkeypatch.setattr(lc.time, "monotonic", lambda: now[0])
+    reads = []
+    answer = {"fp": _fingerprint(index)}
+
+    def fingerprint(executor, papers, manifest=""):
+        reads.append(papers)
+        return answer["fp"]
+
+    monkeypatch.setattr(corpus_scan, "corpus_fingerprint", fingerprint)
+    assert lc.stale(object()) == []
+    answer["fp"] = _fingerprint(index, **{"mechanism_cache/chunk_vecs.npy": "9 9"})   # papers added on HPC3
+    assert lc.stale(object()) == [] and len(reads) == 1                             # still trusted
+    now[0] += lc.FINGERPRINT_TTL_S + 1
+    assert lc.stale(object()) == ["mechanism_cache/chunk_vecs.npy"] and len(reads) == 2
+    # No session on HPC3, or HPC3 cannot say: the copy is searched as it is.
+    assert lc.stale(None) == []
+    answer["fp"] = None
+    now[0] += lc.FINGERPRINT_TTL_S + 1
+    assert lc.stale(object()) == []
+
+
+def test_the_copy_text_is_built_once_per_version(index, monkeypatch):
+    from aiscientist.tools.search_corpus import tool as search_tool
+
+    monkeypatch.setattr(lc, "_TEXT", {})
+    monkeypatch.setattr(lc, "_embedder", lambda root: lambda texts: [[1., 0.] for _ in texts])
+    built = []
+    real = search_tool.preload
+
+    def preload(paths):
+        built.append(paths.cache)
+        return real(paths)
+
+    monkeypatch.setattr(lc, "preload_search_corpus", preload)
+    first = lc.run_local_search({"queries": ["PRPF31 disease"]})
+    second = lc.run_local_search({"queries": ["What does PRPF31 cause?"]})
+    assert first["status"] == second["status"] == "ok" and len(built) == 1
+    assert second["contexts"][0]["text"] == "PRPF31 causes disease."
+    # A new version of the copy (here: the same folder rewritten) is loaded again.
+    (index / "mechanism_cache" / "chunks.jsonl").write_text(json.dumps({
+        "pmid": "123", "page": 7, "chunk": 0, "text": "PRPF31 haploinsufficiency."}) + "\n")
+    third = lc.run_local_search({"queries": ["PRPF31"]})
+    assert len(built) == 2 and third["contexts"][0]["page"] == 7
+
+
+def test_the_word_index_memo_stays_bounded(monkeypatch):
+    from aiscientist.tools._lib.corpus import TextIndex, parse_terms
+
+    idx = TextIndex(["alpha beta", "beta gamma"])
+    monkeypatch.setattr(TextIndex, "MEMO_MAX", 3)
+    for word in ("alpha", "beta", "gamma", "delta", "alpha"):
+        idx.counts(parse_terms([word])[0])
+        assert len(idx._counts) <= 3
+    assert idx.counts(parse_terms(["beta"])[0]) == {0: 1, 1: 1}

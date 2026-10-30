@@ -180,6 +180,14 @@ SHA="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"      # short, for hu
 FULL_SHA="$(git rev-parse HEAD 2>/dev/null || echo "$SHA")"       # full, for the .deployed_sha marker (provenance git_sha)
 say "deploying ${BRANCH}@${SHA}  ->  ${SVC_USER}@${DEPLOY_SSH}:${APP_DIR}"
 
+# A server on the release layout (deploy/deploy_release.sh) is deployed from tags only. An rsync
+# with --delete would remove ${APP_DIR}/releases/, the running release included.
+if [ -n "$SUDO" ]; then _layout_probe=(ssh "$ADMIN_SSH" "sudo -n -u ${SVC_USER} test -e ${APP_DIR}/releases -o -L ${APP_DIR}/current")
+else _layout_probe=(ssh "$DEPLOY_SSH" "test -e ${APP_DIR}/releases -o -L ${APP_DIR}/current"); fi
+if "${_layout_probe[@]}" 2>/dev/null; then
+  die "${APP_DIR} holds app releases (deploy/deploy_release.sh): this server is deployed from tags, not with rsync (deploy/README.md)."
+fi
+
 # --- 2. rsync code (never the server's .env / DB / venv / runs) -------------
 # Excludes keep server-only state intact — honored both on the wire AND, with --delete, as
 # deletion protection so .env/DB/venv/runs on the server are never removed.
@@ -212,7 +220,17 @@ EXCLUDE_PATTERNS=(
   '.deploy.env'
   # The pinned aiscientist-skills release (configs/skills_registry.json) is installed on the server
   # itself and is not in git: a --delete deploy must never remove it, nor ship a laptop's copy.
+  # (Prod reads it from /data/aiscientist/skills/releases through AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT.)
   'skills/releases/'
+  # Repository files the running app never reads: a release holds runtime files only
+  # (RCHENLAB/AiScientist issue 28). Anchored with '/' so only the top-level entries match:
+  # preset_pipelines/variant_annotation/examples/ is read at runtime and must still ship. Never add
+  # deploy/, configs/, preset_pipelines/ or frontend/: the gateway reads them, and it stages
+  # deploy/hpc3/*.sh onto HPC3. An excluded path already on the server stays there even with
+  # --delete; remove it there by hand once.
+  '/tests/' '/docs/' '/experiments/' '/handoff/' '/examples/' '/.github/' '/.claude/'
+  '/CLAUDE*.md' '/CONTRIBUTING.md' '/requirements-dev.txt' '/.mcp.json' '/.publicexclude'
+  '.pytest_cache/' '.ruff_cache/'
 )
 RSYNC_EXCLUDES=()
 for _p in "${EXCLUDE_PATTERNS[@]}"; do RSYNC_EXCLUDES+=(--exclude "$_p"); done

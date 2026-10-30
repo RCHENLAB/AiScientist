@@ -152,20 +152,21 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
                 "endothelial cell 'Microglia', at confidence >= 0.94 — confidence is not accuracy."),
         _remote("model", "Vision model for the post-render report review", settings.vlreview_model_dir),
         _remote("cache", "Shared Python package cache (preflight installs land here)",
-                f"{settings.shared_root.rstrip('/')}/pkgs",
+                f"{settings.shared_root.rstrip('/')}/envs/run-code-pkgs",
                 "Immutable and content-keyed; appended to sys.path inside the container by a "
                 "generated sitecustomize."),
         _remote("reference", "Lab reference data (VEP caches, LIRICAL data, SpliceAI models)",
                 f"{settings.lab_storage.rstrip('/')}/software/reference"),
         _remote("gene_sets", "Gene-set libraries (.gmt), the copy HPC3 jobs can read",
-                f"{settings.shared_root.rstrip('/')}/pysrc/<user>/bioagent/tools/genesets",
+                f"{settings.shared_root.rstrip('/')}/sessions/<session>/app/aiscientist/tools/genesets",
                 "The same files as the gateway copy, synced with the live source for analysis jobs. "
                 "They list human (upper-case) symbols: run_enrichment / run_gsea_prerank matched "
                 "mouse genes in past runs, but code that reads a .gmt directly must upper-case "
                 "mouse symbols first."),
-        _remote("workspace", "Per-user process files (swept on a TTL)",
-                f"{settings.shared_root.rstrip('/')}/Temp/<user>"),
-        _remote("workspace", "Per-user uploads (never swept)",
+        _remote("workspace", "This session's folder (removed when the session ends, after its "
+                             "results are copied to the server)",
+                f"{settings.shared_root.rstrip('/')}/sessions/<session>"),
+        _remote("workspace", "Uploads of the retired per-user layout (never swept)",
                 f"{settings.shared_root.rstrip('/')}/uploads/<user>"),
     ]
     return items

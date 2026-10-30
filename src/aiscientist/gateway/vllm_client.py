@@ -25,8 +25,31 @@ import urllib.error
 import urllib.request
 from typing import Any, Iterator
 
-from .errors import GatewayError, VLLMNetworkError, error_detail
+from .errors import GatewayError, VLLMNetworkError, error_detail, scrub_secrets
 from .settings import HPCSettings
+
+
+def _provider_error(what: str, body: Any, api_key: str | None, *, cut: int = 300) -> GatewayError:
+    """A ``GatewayError`` for an error the endpoint answered with, its text scrubbed of the key.
+
+    The body is the provider's own words, and a provider may copy the ``Authorization`` header, a
+    masked key or its first characters into it. Both the message and the ``detail`` (which reaches
+    the run's log and the browser) are scrubbed before they leave this module (issue 16)."""
+    if not isinstance(body, str):
+        try:
+            body = json.dumps(body, default=str)
+        except (TypeError, ValueError):
+            body = str(body)
+    clean = scrub_secrets(body, api_key)
+    return GatewayError(f"vLLM {what} error: {clean[:cut]}", stage="vllm_chat", detail=clean[:4000])
+
+
+def _http_error(what: str, exc: urllib.error.HTTPError, api_key: str | None) -> GatewayError:
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except OSError:
+        body = f"HTTP {exc.code}"
+    return _provider_error(what, body or f"HTTP {exc.code}", api_key)
 
 
 # --- Served-model dialect knobs (env-gated; empty = today's Qwen behaviour, byte-for-byte) ----------
@@ -275,7 +298,7 @@ def chat_stream(
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict) and event.get("error"):
-                    raise GatewayError(f"vLLM chat error: {event['error']}", stage="vllm_chat", detail=event)
+                    raise _provider_error("chat", event["error"], None)
                 choices = event.get("choices") or []
                 if not choices:
                     continue
@@ -287,8 +310,7 @@ def chat_stream(
                 if content:
                     yield ("content", content)
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GatewayError(f"vLLM chat error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+        raise _http_error("chat", exc, None) from exc
     except (urllib.error.URLError, OSError) as exc:
         raise VLLMNetworkError("Network error during vLLM chat.", stage="vllm_chat", detail=error_detail(exc)) from exc
 
@@ -376,7 +398,7 @@ def chat_tools_stream(
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict) and event.get("error"):
-                    raise GatewayError(f"vLLM chat error: {event['error']}", stage="vllm_chat", detail=event)
+                    raise _provider_error("chat", event["error"], api_key)
                 if isinstance(event.get("usage"), dict):
                     usage = dict(event["usage"])
                 choices = event.get("choices") or []
@@ -392,8 +414,7 @@ def chat_tools_stream(
                 if delta.get("tool_calls"):
                     _accumulate_tool_deltas(calls, delta["tool_calls"])
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GatewayError(f"vLLM tool-stream error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+        raise _http_error("tool-stream", exc, api_key) from exc
     except (urllib.error.URLError, OSError) as exc:
         raise VLLMNetworkError("Network error during vLLM tool-stream.",
                                stage="vllm_chat", detail=error_detail(exc)) from exc
@@ -484,8 +505,7 @@ def complete_ex(
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local tunnel
             body = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GatewayError(f"vLLM completion error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+        raise _http_error("completion", exc, api_key) from exc
     except (urllib.error.URLError, OSError) as exc:
         raise VLLMNetworkError("Network error during vLLM completion.", stage="vllm_chat", detail=error_detail(exc)) from exc
     choices = (body or {}).get("choices") or [{}]
@@ -535,7 +555,7 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
                 if chunk.get("error"):
                     err = chunk["error"]
                     msg = err.get("message") if isinstance(err, dict) else str(err)
-                    raise GatewayError(f"vLLM completion error: {str(msg)[:300]}", stage="vllm_chat", detail=err)
+                    raise _provider_error("completion", msg, api_key)
                 served_model = chunk.get("model") or served_model
                 if isinstance(chunk.get("usage"), dict):
                     usage = dict(chunk["usage"])
@@ -546,8 +566,7 @@ def _complete_streaming(url: str, payload: dict, model: str, api_key: str | None
                     if ch.get("finish_reason"):
                         finish = ch["finish_reason"]
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise GatewayError(f"vLLM completion error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+        raise _http_error("completion", exc, api_key) from exc
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         raise VLLMNetworkError(f"vLLM sent nothing for {idle_timeout:.0f}s (or the connection dropped).",
                                stage="vllm_chat", detail=error_detail(exc)) from exc
@@ -647,12 +666,11 @@ def chat_tools(
             with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local tunnel
                 body = json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise GatewayError(f"vLLM tool-chat error: {detail[:300]}", stage="vllm_chat", detail=detail) from exc
+            raise _http_error("tool-chat", exc, api_key) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise VLLMNetworkError("Network error during vLLM tool-chat.", stage="vllm_chat", detail=error_detail(exc)) from exc
         if isinstance(body, dict) and body.get("error"):
-            raise GatewayError(f"vLLM tool-chat error: {body['error']}", stage="vllm_chat", detail=body)
+            raise _provider_error("tool-chat", body["error"], api_key)
         return body
 
     try:

@@ -79,40 +79,50 @@ def _conn(gw, executor, *, mock=False, ttl=3):
 
 
 def test_the_hpc3_folders_are_listed_area_by_area_with_cleanup_days_and_the_quota(gw):
+    conn = _conn(gw, None)
+    here = f"{ROOT}/sessions/{conn.id}"
     hpc = _Hpc({
-        f"{TEMP}/*/*": f"5592404\t1792538330\t{TEMP}/analysis/run1\n"
-                       f"2048\t1792362245\t{TEMP}/reports/run0\n",
+        f"{here}/runs/*": f"5592404\t1792538330\t{here}/runs/run1\n2048\t1792362245\t{here}/inputs\n",
+        "[ -O": f"100\t1792000000\t{ROOT}/sessions/old-session\n",
+        f"{TEMP}/*/*": f"64\t1792000000\t{TEMP}/analysis/run0\n",
         f"{UPLOADS}/*": f"16000000\t1700000000\t{UPLOADS}/Sample2_Ddx41\n",
         f"{PERSONAL}/*": "",
         "dfsquotas tester dfs3b": DFSQUOTAS,
     })
-    conn = _conn(gw, hpc)
+    conn.executor = hpc
     conn.storage_deletes = [{"path": f"{UPLOADS}/Sample2_Ddx41", "job_id": "901", "status": "queued"}]
     d = gw._list_storage(conn)
 
-    assert [a["key"] for a in d["areas"]] == ["temp", "uploads", "personal"]
-    temp, uploads, personal = d["areas"]
-    assert temp["label"] == "Temporary run files" and "3 days after they were last used" in temp["note"]
-    assert temp["bytes"] == (5592404 + 2048) * 1024
+    assert [a["key"] for a in d["areas"]] == ["temp", "sessions", "legacy", "uploads", "personal"]
+    temp, sessions, legacy, uploads, personal = d["areas"]
+    assert temp["label"] == "This session's files" and "results are copied to the server" in temp["note"]
+    assert temp["path"] == here and temp["bytes"] == (5592404 + 2048) * 1024
     run1 = temp["items"][0]
-    assert run1["name"] == "analysis/run1" and run1["area"] == "temp"
-    assert run1["clean_after"] == 1792538330 + 3 * 86400            # the sweep's rule: newest change + ttl
+    assert run1["name"] == "runs/run1" and run1["area"] == "temp"
+    assert "clean_after" not in run1                                  # it goes with this session
+    old = sessions["items"][0]
+    assert old["name"] == "old-session" and old["clean_after"] == 1792000000 + 3 * 86400
+    assert legacy["items"][0]["clean_after"] == 1792000000 + 3 * 86400
     up = uploads["items"][0]
-    assert "clean_after" not in up and up["deleting"] == "901"       # only Temp is swept
+    assert "clean_after" not in up and up["deleting"] == "901"       # uploads are never swept
     assert personal["items"] == [] and personal["bytes"] == 0
     assert d["quota"]["used"] == "574.58 TiB" and d["quota"]["percent"] == 82.1
-    assert len(d["items"]) == 3
+    assert len(d["items"]) == 5
     # The quota is asked for this account on the lab storage's own file system, never bare.
     assert "dfsquotas tester dfs3b 2>/dev/null" in hpc.commands
     assert not any(c.startswith("dfsquotas 2>") for c in hpc.commands)
-    assert any(c.startswith(f"du -sk --time --time-style=+%s {TEMP}/*/*") for c in hpc.commands)
+    assert any(c.startswith(f"du -sk --time --time-style=+%s {here}/[!r]* {here}/runs/*") for c in hpc.commands)
+    # Earlier sessions: only the folders this account owns, never this session's own.
+    (listing,) = [c for c in hpc.commands if "[ -O" in c]
+    assert f'[ "$d" != {here} ]' in listing and "xargs -0 -r du" in listing
 
 
 def test_without_a_ttl_nothing_carries_a_cleanup_day_and_an_unknown_quota_is_none(gw):
     hpc = _Hpc({f"{TEMP}/*/*": f"8\t1792538330\t{TEMP}/analysis/run1\n", "dfsquotas": USAGE})
     d = gw._list_storage(_conn(gw, hpc, ttl=0))
-    assert "clean_after" not in d["areas"][0]["items"][0]
-    assert d["areas"][0]["note"] == "Removed when your session ends."
+    assert "clean_after" not in d["areas"][2]["items"][0]
+    assert d["areas"][0]["note"] == ("Removed when your session ends, once each run's results are "
+                                     "copied to the server.")
     assert d["quota"] is None
 
 
@@ -120,11 +130,11 @@ def test_the_mock_lists_every_area_and_forgets_what_was_deleted(gw):
     conn = _conn(gw, _Hpc({}), mock=True)
     d = gw._list_storage(conn)
     names = {a["key"]: [i["name"] for i in a["items"]] for a in d["areas"]}
-    assert names == {"temp": ["analysis/8f2c1d4a", "scratch/runcode"], "uploads": [],
+    assert names == {"temp": ["runs/8f2c1d4a", "inputs"], "sessions": [], "legacy": [], "uploads": [],
                      "personal": ["old_pbmc_run.h5ad"]}
-    assert all("clean_after" in i for i in d["areas"][0]["items"]) and d["quota"]["pool"] == "dfs3b"
+    assert d["quota"]["pool"] == "dfs3b"
     conn.mock_deleted = {f"{PERSONAL}/old_pbmc_run.h5ad"}
-    assert gw._list_storage(conn)["areas"][2]["items"] == []
+    assert gw._list_storage(conn)["areas"][4]["items"] == []
 
 
 # --- the server side, per account --------------------------------------------------------------------

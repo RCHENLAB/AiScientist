@@ -305,9 +305,10 @@ def test_changing_the_skill_changes_the_job_without_editing_the_tool(tmp_path, m
     assert args[catalog.SKILL_ARG]["version"] == "9.9.9"
     assert args[catalog.SKILL_ARG]["registry_release"] == "v9.9.9"
     assert list(args[catalog.SKILL_ARG]["files"]) == ["assets/cellqc-defaults.json"]
-    # Recorded in the run's manifest.json, without becoming the run's active skill.
+    # Recorded in the run's manifest.json, with the image it pins, without becoming the run's active skill.
     doc = json.loads((tmp_path / "manifest.json").read_text())
-    assert {"name": _CELLQC_SKILL, "version": "9.9.9", "registry_release": "v9.9.9"} in doc["skills"]
+    assert {"name": _CELLQC_SKILL, "version": "9.9.9", "registry_release": "v9.9.9",
+            "image": "bioconda:cellqc=0.3.6 python=3.12"} in doc["skills"]
     assert ctx.decisions.get("active_registry_skill") is None
 
 

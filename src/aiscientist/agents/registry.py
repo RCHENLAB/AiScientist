@@ -124,7 +124,9 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     catalog: list[HarnessTool] = list(default_catalog())                  # finish + smoke QC/DE
     catalog += tool_catalog.build_tools({"scgpt_runner": scgpt_runner}, where=lambda m: m.research,
                                         route=_router(executors))
-    catalog.append(make_run_code_tool(code_executor))                      # CodeAct (needs the sandbox)
+    # A failed snippet that lacked a program gets the HPC3 module that provides it (hpc/modules.py).
+    note = ((lambda text: hpc_shell.missing_software_note(text, "run_code")) if hpc_shell is not None else None)
+    catalog.append(make_run_code_tool(code_executor, software_note=note))   # CodeAct (needs the sandbox)
     # A skill's declared environment (SKILL.md ``image:``) — only when the executor can run images
     # on HPC3, so a local run's roster stays honest.
     env_tool = make_run_in_environment_tool(code_executor)

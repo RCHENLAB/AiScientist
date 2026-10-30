@@ -190,9 +190,8 @@ def _client(api_key: str, base_url: str | None, timeout: float):
 
 
 def _scrub(text: str, api_key: str | None) -> str:
-    if api_key and len(api_key) >= 8:
-        text = text.replace(api_key, "<key>")
-    return text
+    from .errors import scrub_secrets
+    return scrub_secrets(text, api_key)
 
 
 def classify_error(exc: BaseException) -> tuple[str, str]:

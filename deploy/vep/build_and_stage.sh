@@ -119,7 +119,7 @@ cat <<EOF
   AISCIENTIST_VARIANT_ON_HPC=1             # route annotate_variants to the offline HPC3 line
   AISCIENTIST_UPLOADS_ON_HPC=1             # so the VCF lands on dfs3b and is annotated in place
 
-The AiScientist TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway and bind-mounted in — a
+The AiScientist TOOLS are synced to <shared_root>/sessions/<session>/app by the gateway and bind-mounted in — a
 tool edit needs only a code deploy, NOT an image rebuild. If HPC is unreachable (or the tool sync
 fails), annotate_variants falls back to the REST path in-process (fine for small VCFs).
 EOF

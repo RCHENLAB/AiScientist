@@ -113,9 +113,19 @@ def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q
     return out, list(used.values())
 
 
+def preload(paths: CorpusPaths) -> tuple[list[dict[str, Any]], TextIndex, frozenset[str] | None]:
+    """The corpus text a search reads, ready to search: its chunks, their word index and the known
+    gene symbols. Building the word index takes seconds for the 39,563 RetiGene chunks, so a process
+    that searches many times (the gateway's copy) builds it once and passes it as ``preloaded``."""
+    chunks = load_chunks(paths.cache / "chunks.jsonl")
+    return chunks, TextIndex.of_chunks(chunks), known_gene_symbols(paths.hgnc)
+
+
 def run_search(args: dict[str, Any], ctx: Any, *,
                embed_fn: Callable[[list[str]], Any] | None = None,
-               paths: CorpusPaths | None = None) -> dict[str, Any]:
+               paths: CorpusPaths | None = None,
+               preloaded: tuple[list[dict[str, Any]], TextIndex, frozenset[str] | None] | None = None,
+               ) -> dict[str, Any]:
     raw = args.get("queries")
     if isinstance(raw, str):
         raw = [raw]
@@ -131,7 +141,7 @@ def run_search(args: dict[str, Any], ctx: Any, *,
     if paths is None or not chunk_path.is_file():
         return {"status": "dependency_missing", "dependency": "corpus-cache",
                 "error": "the RetiGene corpus text cache (mechanism_cache/chunks.jsonl) is not available here"}
-    chunks = load_chunks(chunk_path)
+    chunks, index, known = preloaded if preloaded is not None else (load_chunks(chunk_path), None, None)
     embed = embed_fn if embed_fn is not None else sentence_transformer_embed(paths.hf_cache)
     if embed is None:
         return {"status": "dependency_missing", "dependency": "sentence-transformers",
@@ -141,9 +151,10 @@ def run_search(args: dict[str, Any], ctx: Any, *,
     if not len(chunks):
         return _failed("the RetiGene corpus cache holds no chunks", queries=queries)
 
-    known = known_gene_symbols(paths.hgnc)
+    if preloaded is None:
+        known = known_gene_symbols(paths.hgnc)
     picked, used = rank_passages(queries, chunks, vecs, l2(embed(queries)), top_k=top_k,
-                                 max_per_paper=per_paper, allowed=allowed,
+                                 max_per_paper=per_paper, allowed=allowed, index=index,
                                  terms=parse_terms((args.get("terms") or [])[:MAX_TERMS], "model", known),
                                  known_genes=known)
     rows = read_manifest(paths.manifest)
@@ -192,4 +203,4 @@ def make_tool() -> HarnessTool:
     )
 
 
-__all__ = ["make_tool", "run_search", "rank_passages"]
+__all__ = ["make_tool", "run_search", "rank_passages", "preload"]

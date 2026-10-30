@@ -38,6 +38,7 @@ import inspect
 import json
 import re
 import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from dataclasses import asdict, dataclass, field
@@ -73,6 +74,7 @@ from .preset_pipelines import (
     drop_conflicting_pinned,
     select_pipeline,
 )
+from . import skill_outputs
 from .skill_code import fit_scripts, skill_functions
 from .skills import (
     SKILLS as ATOMIC_SKILLS,
@@ -798,11 +800,16 @@ def _close_unterminated_json(raw: str) -> "dict[str, Any] | None":
     return parsed if isinstance(parsed, dict) else None
 
 
-def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
+def make_run_code_tool(executor: CodeExecutor | None,
+                       software_note: "Callable[[str], list[dict]] | None" = None) -> HarnessTool:
     """The hybrid CodeAct tool: the Scientist can write-and-run Python when the
     curated tools don't cover a step. Execution is delegated to ``executor`` (a
     sandboxed runtime on the server); without one it returns a clear 'not enabled'
-    rather than running arbitrary code in-process."""
+    rather than running arbitrary code in-process.
+
+    ``software_note(output)``: for a failed snippet, the programs or R packages it lacked and the
+    HPC3 module that provides each (``HpcShell.missing_software_note``), so the model runs the
+    module with run_shell instead of rewriting the method (docs/environments/README.md §4)."""
 
     def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
         code = str(args.get("code", "")).strip()
@@ -843,6 +850,14 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
                 annotate(result, code)
             except Exception:  # a reading aid must never break a run
                 pass
+            if software_note is not None and str(result.get("status") or "") not in ("ok", "success"):
+                try:
+                    text = "\n".join(str(result.get(k) or "") for k in ("error", "stderr", "stdout"))
+                    note = software_note(text)
+                    if note:
+                        result["missing_software"] = note
+                except Exception:  # a reading aid must never break a run
+                    pass
         return result
 
     from .sandbox import build_run_code_context
@@ -861,6 +876,9 @@ def make_run_code_tool(executor: CodeExecutor | None) -> HarnessTool:
         "anything missing is offered to the user for a one-time install into the lab-shared "
         "package area. Do NOT pip-install from inside the snippet (it does not persist and can "
         "silently half-work), and do NOT hand-write a replacement for a library you were denied. "
+        "A program this Python image lacks (an R script, a command-line tool such as bedtools or STAR) "
+        "may be one of HPC3's software modules: call find_software('<name>') and run it with run_shell "
+        "(`module load ...`), on files you write to AISCIENTIST_WORK. "
         "STRICT: use this ONLY for analysis (compute figures into figures/, tables into tables/). Do "
         "NOT write or render a report or document (no .docx/.pdf/.html, no python-docx/reportlab/"
         "pandoc), and do NOT zip/package/export the outputs: the final PDF+DOCX report and the "
@@ -3410,11 +3428,16 @@ class CriticVerdict:
     score: float
     critique: str
     reviewed: bool = True
+    # The check of the step's declared outputs (skill_outputs.py), when it had any: what was
+    # expected, from which skill or pipeline, and what was found. The report's Diagnostics read it.
+    outputs: "dict[str, Any] | None" = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CriticVerdict":
+        outputs = d.get("outputs")
         return cls(str(d.get("verdict", "revise")), float(d.get("score", 0.0)),
-                   str(d.get("critique", "")), bool(d.get("reviewed", True)))
+                   str(d.get("critique", "")), bool(d.get("reviewed", True)),
+                   outputs if isinstance(outputs, dict) else None)
 
 
 @dataclass(frozen=True)
@@ -3676,6 +3699,13 @@ _PLAN_FINDING_WORDS = {
 #: How much of an assigned skill's SKILL.md and code goes into a step's brief; the rest stays one
 #: ``read_skill_reference`` away, and the brief says where.
 _SKILL_DOC_CHARS = 12_000
+# The most of a DATASET.md the planner reads; the whole file is in the run's data/ folder.
+_DATASET_MD_CHARS = 8_000
+
+
+def _dt_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 _SKILL_CODE_CHARS = 16_000
 
 
@@ -3709,6 +3739,11 @@ def _assigned_skill_block(skill: "Skill") -> str:
         if others:
             out.append("The skill's other files (read one with `read_skill_reference(name, file=...)`): "
                        + ", ".join(others[:20]))
+    if skill.outputs:
+        out.append("The skill declares the outputs this step must leave under $AISCIENTIST_ARTIFACTS "
+                   "(a * stands for this dataset's names). After the step the platform checks that "
+                   "every required one exists, is not empty and, for a figure, is not blank; a step "
+                   "without them is not accepted:\n" + skill_outputs.brief_lines(skill.outputs))
     return "\n\n".join(out)
 
 
@@ -3935,6 +3970,9 @@ class ResearchLab:
         # Steps the researcher said yes to DURING the run (``_approve_new_step``). They are not in
         # the approved document, and the read-back must not report them as unapproved work.
         self._approved_additions: list[str] = []
+        # When each step's first attempt began, by its plan text: the check of its declared outputs
+        # counts only files written since then as the step's own (skill_outputs.check).
+        self._step_started: dict[str, float] = {}
         # What the user limited this run to ("only QC", "no DE"): read once in _run_inner, enforced
         # wherever a step can enter the plan (agents/scope.py).
         self._scope: RunScope = RunScope()
@@ -4182,6 +4220,10 @@ class ResearchLab:
         # the pinned set (never replaces it), deduped by key. A user-EDITED free-text override
         # (``self._guidance`` from ``preset_prompt``) turns auto OFF — "I'm taking over the guidance";
         # pinned skills do NOT (they leave ``self._guidance`` None), so they still get the auto pick.
+        # The dataset's description (DATASET.md): read when it is kept, written by the PI the first
+        # time a run reads the dataset. Before the protocol is chosen and the plan drafted, so both
+        # read it (RCHENLAB/AiScientist issue 10, part 3).
+        self._describe_dataset(emit)
         # The limit the request itself sets ("only QC", "no DE, no enrichment", "a short report"),
         # read before anything that could widen the plan.
         self._scope = read_scope(
@@ -6372,10 +6414,88 @@ class ResearchLab:
 
     def _bound_files_context(self) -> str:
         """The attached files (below), what their Croissant metadata says (``_metadata_context``),
-        and the attached datasets the run cannot use (``_unusable_inputs_context``)."""
+        the primary's DATASET.md (``_description_context``), and the attached datasets the run
+        cannot use (``_unusable_inputs_context``)."""
         parts = [self._attached_files_context(), self._metadata_context(),
-                 self._unusable_inputs_context()]
+                 self._description_context(), self._unusable_inputs_context()]
         return "\n".join(p for p in parts if p)
+
+    def _description_context(self) -> str:
+        """The primary dataset's DATASET.md for the planner, '' when it has none. Its statements
+        read from the data are settled, so a plan need not spend a step finding them out again."""
+        dd = (self.ctx.decisions or {}).get("dataset_description")
+        if not isinstance(dd, dict) or not dd.get("markdown"):
+            return ""
+        whose = ("written by the PI and edited by its owner (the owner's text wins over your own "
+                 "reading, unless the data contradicts it: then say so in the plan)"
+                 if dd.get("state") == "owner" else
+                 "written by the PI the first time a run read this dataset")
+        text = str(dd["markdown"])
+        if len(text) > _DATASET_MD_CHARS:
+            text = text[:_DATASET_MD_CHARS] + "\n[... cut; the full description is in data/DATASET.md]"
+        return (f"DATASET DESCRIPTION (DATASET.md, {whose}). What it marks as read from the data is "
+                "established: do not plan a step whose only purpose is to find it out again (the "
+                "shape, the columns and their levels, the species, the files). What it marks as "
+                "inferred is a reading to confirm where it matters.\n" + text)
+
+    def _describe_dataset(self, emit: EventFn) -> None:
+        """Read the primary dataset's DATASET.md, or write it the first time a run reads the dataset.
+
+        The gateway puts the dataset's kept description, or the facts to write one from, in
+        ``decisions["dataset_description"]`` (only for one of the account's datasets). A kept
+        description that still matches the data is read as it is: the PI does not describe the
+        dataset again, and an owner's edit is never overwritten. Otherwise the PI makes one model
+        call over the run-start profile; every number in the result is read from the data
+        (``metadata/description.py``), and the gateway keeps it with the dataset
+        (``dataset_described``). The description goes into the run's bundle as data/DATASET.md.
+        Never raises: the plan does not depend on it."""
+        from ..metadata import description as dmd
+        decisions = self.ctx.decisions if self.ctx.decisions is not None else {}
+        dd = decisions.get("dataset_description")
+        if not isinstance(dd, dict) or not dd.get("uuid"):
+            return
+        name = str(dd.get("name") or "dataset")
+        try:
+            kept = dd.get("state") in ("pi", "owner") and dd.get("markdown")
+            if kept and (dd.get("state") == "owner" or not dd.get("stale")):
+                emit({"type": "dataset_description_used", "uuid": dd["uuid"], "name": name,
+                      "state": dd.get("state")})
+                self._write_dataset_md(str(dd["markdown"]))
+                return
+            dr = decisions.get("dataset_result")
+            if not isinstance(dr, dict) or self._complete_fn is None:
+                return
+            facts = dd.get("facts") if isinstance(dd.get("facts"), dict) else {}
+            user_fields = dd.get("user_fields") if isinstance(dd.get("user_fields"), dict) else {}
+            profile = dmd.profile_snapshot(dr)
+            emit({"type": "dataset_describing", "name": name})
+            raw = self._complete(dmd.describe_messages(name, profile, facts, user_fields), role="plan")
+            inferred = dmd.parse_inferred(raw or "")
+            written_at = _dt_now_iso()
+            run_id = str(dd.get("run_id") or "")
+            model = str(getattr(self.ctx, "model", "") or "")
+            desc = dmd.build(name=name, profile=profile, facts=facts, user_fields=user_fields,
+                             inferred=inferred, model=model, written_at=written_at, run_id=run_id)
+            markdown = dmd.render(desc)
+            emit({"type": "dataset_described", "uuid": dd["uuid"], "name": name, "profile": profile,
+                  "inferred": inferred, "model": model, "written_at": written_at, "run_id": run_id,
+                  "dropped": len(desc.get("dropped") or []), "markdown": markdown})
+            if dd.get("state") != "owner":                 # the owner's edit stays what is read
+                dd.update(state="pi", markdown=markdown, stale=False)
+            self._write_dataset_md(str(dd.get("markdown") or markdown))
+        except Exception as exc:  # noqa: BLE001 - the description is an extra; the run goes on
+            emit({"type": "dataset_describe_failed", "error": f"{type(exc).__name__}: {exc}"[:200]})
+
+    def _write_dataset_md(self, markdown: str) -> None:
+        """The description the run read, in its bundle (data/DATASET.md), for the report to cite."""
+        if self.ctx.workspace is None or not markdown:
+            return
+        try:
+            data = Path(self.ctx.workspace) / "artifacts" / "data"
+            data.mkdir(parents=True, exist_ok=True)
+            (data / "DATASET.md").write_text(markdown, encoding="utf-8")
+        except OSError:
+            pass
 
     def _unusable_inputs_context(self) -> str:
         """The attached datasets the run start could not use, each with the reason, or ``''``. Told
@@ -6491,7 +6611,39 @@ class ResearchLab:
             doc = self._bind_plan_settings(doc, fresh, emit)
             doc = self._assign_plan_skills(doc, fresh, emit)
         self._plan_doc = doc
-        emit({"type": "plan_doc", "yaml": doc.to_yaml(), "steps": doc.to_public()})
+        emit({"type": "plan_doc", "yaml": doc.to_yaml(), "steps": self._public_plan_steps(doc)})
+
+    def _expected_outputs(self, step: str) -> "tuple[list[skill_outputs.DeclaredOutput], list[str]]":
+        """What ``step`` should leave under the artifacts directory, and where that comes from: the
+        outputs its assigned skill declares, and those an active pipeline declares for the tool the
+        step runs. ``([], [])`` for a step with neither, which is then not checked."""
+        plan = self._approved_plan or self._plan_doc
+        found = plan.step_for(step) if plan is not None else None
+        expected: list[skill_outputs.DeclaredOutput] = []
+        sources: list[str] = []
+        skill = get_skill(found.skill) if found is not None and found.skill else None
+        if skill is not None and skill.outputs:
+            expected.extend(skill.outputs)
+            sources.append(f"skill {skill.name} {skill.version or 'local'}".strip())
+        tool = found.tool if found is not None else _primary_tool(step)
+        for pipeline in self._skills:
+            mine = [o for o in skill_outputs.for_tool(pipeline.outputs, tool)
+                    if all(o.path != e.path for e in expected)]
+            if mine:
+                expected.extend(mine)
+                sources.append(f"pipeline {pipeline.key}")
+        return expected, sources
+
+    def _public_plan_steps(self, doc: PlanDoc) -> "list[dict[str, Any]]":
+        """The plan document's steps for the console, each with the outputs it is expected to leave
+        (its skill's, and its tool's under an active pipeline), so the researcher sees what a step
+        will give them before approving the plan."""
+        steps = doc.to_public()
+        for public, step in zip(steps, doc.steps):
+            expected, _ = self._expected_outputs(step.text)
+            if expected:
+                public["outputs"] = [o.to_public() for o in expected]
+        return steps
 
     def _assign_plan_skills(self, doc: PlanDoc, fresh: "list[int]", emit: EventFn) -> PlanDoc:
         """Name the skill each new code step uses, so a vetted skill is used without the researcher
@@ -7518,6 +7670,9 @@ class ResearchLab:
                    extra_steps: int = 0, plan_step: "str | None" = None) -> HarnessResult:
         """Run the Scientist on ``step``. ``plan_step``: the step's text in the approved plan, when
         ``step`` is a brief built from it (a DAG node's), so the approved settings can be found."""
+        started = getattr(self, "_step_started", None)    # a test may call this on a stand-in
+        if started is not None:
+            started.setdefault(plan_step if plan_step is not None else step, time.time())
         # Literature grounding: prefer deep_literature (PaperQA over the lab's indexed corpus on
         # HPC3); fall back to literature_search (Europe PMC) ONLY when the corpus tool isn't wired
         # (dev / no-HPC), so behaviour never regresses where deep_literature can't run.
@@ -7766,6 +7921,11 @@ class ResearchLab:
         present, missing = resolve_evidence(all_evidence, self.ctx.workspace)
         if missing:
             emit({"type": "evidence_missing", "step": step, "paths": missing})
+        # The outputs the step's skill (or its tool, under an active pipeline) DECLARES, checked on
+        # disk: present, written by this step, not empty, a figure not blank. Unlike the evidence
+        # above this is judged: a required output that is not there keeps the step from being
+        # accepted (the floor below), because the declaration is what the researcher approved.
+        outputs_record, out_missing = self._check_step_outputs(step, emit)
         # Tool SELF-DIAGNOSIS. A tool knows what its own unhealthy output looks like far better than
         # a reviewer re-deriving it from raw counts — e.g. run_scanpy_qc knows that zero matched
         # mitochondrial genes means its max_pct_mt filter was a no-op, which no count in the result
@@ -7804,6 +7964,13 @@ class ResearchLab:
         payload = {
             "research_question": question,
             "step": step,
+            **({"REQUIRED_OUTPUTS_MISSING": out_missing,
+                "outputs_note": (
+                    "Checked on disk, not by a model: the skill or pipeline this step follows "
+                    "declares these outputs as required, and the step did not leave them (not "
+                    "written by this step, empty, or a blank image). The step is not complete "
+                    "without them; name them in the critique.")} if out_missing else {}),
+            **({"DECLARED_OUTPUTS": outputs_record["checked"]} if outputs_record else {}),
             **({"ANSWER_CONTRADICTS_TOOL_RESULTS": count_problems,
                 "contradiction_note": (
                     "Checked in code, not by a model: each line is a count the scientist's final "
@@ -7883,10 +8050,11 @@ class ResearchLab:
         else:
             # Advance with the existing result; a failed reviewer has supplied no reason to rerun.
             # The floors below still hold: an empty step or contradicted counts are never kept.
-            if any(step_succeeded(s) for s in result.steps) and not count_problems:
+            if any(step_succeeded(s) for s in result.steps) and not count_problems and not out_missing:
                 v = CriticVerdict("accept", 0.0,
                                   "Step not reviewed: the Critic returned no usable review twice; "
-                                  "the existing result was kept without rerunning the step.", False)
+                                  "the existing result was kept without rerunning the step.", False,
+                                  outputs_record)
                 emit({"type": "step_not_reviewed", "step": step, "reason": v.critique})
                 emit({"type": "critic", "step": step, "verdict": v.verdict, "score": v.score,
                       "critique": v.critique, "reviewed": False})
@@ -7920,11 +8088,46 @@ class ResearchLab:
                         "exactly as given here; do not re-derive, re-type or swap them.]").strip()
             verdict = "revise"
             score = min(score, 0.5)
+        # Third floor: a required declared output is not there. Never accepted, whatever the model
+        # said; after the revision budget the step ends unaccepted and the report's Diagnostics
+        # name the missing files.
+        if out_missing:
+            critique = (critique + " [auto-guard: required outputs missing — " + " ".join(out_missing)
+                        + " Write each at its declared path under $AISCIENTIST_ARTIFACTS. If this "
+                        "data cannot give one, say so in the answer: the step then ends without "
+                        "being accepted, and the report says why.]").strip()
+            verdict = "revise"
+            score = min(score, 0.5)
 
-        v = CriticVerdict(verdict, max(0.0, min(1.0, score)), critique)
+        v = CriticVerdict(verdict, max(0.0, min(1.0, score)), critique, outputs=outputs_record)
         emit({"type": "critic", "step": step, "verdict": v.verdict, "score": v.score,
               "critique": v.critique})
         return v
+
+    def _check_step_outputs(self, step: str, emit: EventFn
+                            ) -> "tuple[dict[str, Any] | None, list[str]]":
+        """Check the outputs ``step`` declares (``_expected_outputs``) under the run's artifacts, record
+        the result for the Results panel, and announce it (``step_outputs``). Returns the record for
+        the verdict and one line per required output that is not there; ``(None, [])`` when the step
+        declares none or the run has no workspace."""
+        if _is_literature_step(step) or self.ctx.workspace is None:
+            return None, []
+        expected, sources = self._expected_outputs(step)
+        if not expected:
+            return None, []
+        art = Path(self.ctx.workspace) / "artifacts"
+        results = skill_outputs.check(expected, art, since=self._step_started.get(step))
+        missing = skill_outputs.problem_lines(results)
+        record = {"sources": sources, "checked": [r.to_public() for r in results],
+                  "missing_required": missing}
+        plan = self._approved_plan or self._plan_doc
+        index = next((i for i, s in enumerate(plan.steps) if s.text == step), None) if plan else None
+        title = plan.steps[index].title if plan is not None and index is not None else split_step(step)[0]
+        skill_outputs.record_step(art, step=step, title=title, index=index,
+                                  source=", ".join(sources), results=results)
+        emit({"type": "step_outputs", "step": step, "sources": sources,
+              "outputs": record["checked"], "missing_required": missing})
+        return record, missing
 
     def _plan_state(self, question: str, agenda: list[str], step_idx: int, rounds: list[LabRound],
                     *, pruned: "frozenset[int] | set[int]" = frozenset()) -> dict[str, Any]:

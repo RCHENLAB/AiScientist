@@ -80,25 +80,26 @@ def test_shared_root_and_ttl_come_from_env(monkeypatch):
 
 # --------------------------------------------------------------------------- layout
 
-def test_process_files_go_to_shared_temp_never_a_personal_dir():
+def test_process_files_go_to_the_sessions_folder_never_a_personal_dir():
     # gateway.app pulls in fastapi, which CI deliberately does not install (see
     # requirements-dev.txt) — skip like every other app-level test rather than erroring.
     pytest.importorskip("fastapi")
     from aiscientist.gateway import app as gw_app
 
     conn = types.SimpleNamespace(
+        id="0f1e2d3c-aaaa-bbbb-cccc-123456789abc",
         executor=types.SimpleNamespace(username="tester"), owner="tester",
         settings=HPCSettings())
 
     temp = gw_app._temp_base(conn)
-    assert temp == f"{SHARED_ROOT}/Temp/tester"
-    # The legacy personal dir is still addressable (for browsing) but is not a prefix of Temp.
+    assert temp == f"{SHARED_ROOT}/sessions/0f1e2d3c-aaaa-bbbb-cccc-123456789abc"
+    # Ids only in the name: no account name, no UCInetID (issue 28).
+    assert "tester" not in temp
+    # The legacy personal dir is still addressable (for browsing) but is not a prefix of it.
     assert not temp.startswith(gw_app._storage_base(conn) + "/")
-
-    # Raw data and the synced source are deliberately OUTSIDE Temp — the sweeper must never
-    # be able to walk into either.
+    # Raw data of the retired layout is OUTSIDE the session folder.
     assert not gw_app._hpc_uploads_dir(conn).startswith(temp)
-    assert gw_app._shared_dir(conn, "pysrc") == f"{SHARED_ROOT}/pysrc/tester"
+    assert gw_app._shared_dir(conn, "pysrc") == f"{SHARED_ROOT}/pysrc/tester"   # retired, read only
 
 
 def test_shared_paths_are_per_user():
@@ -116,7 +117,7 @@ def test_shared_paths_are_per_user():
 
 def test_missing_shared_root_is_reported_with_the_exact_fix():
     remote = _FakeRemote(root_exists=False)
-    ok, message = hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester")
+    ok, message = hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester", "s1")
     assert ok is False
     # /dfs3b/ruic20_lab is drwxr-s--- ruic20, so this one mkdir is a human prerequisite. The
     # message has to carry it, or every offloaded job later dies on an unexplained mkdir.
@@ -125,15 +126,34 @@ def test_missing_shared_root_is_reported_with_the_exact_fix():
     assert not any(c.startswith("umask") for c in remote.commands)   # nothing attempted
 
 
-def test_bootstrap_creates_only_this_users_dirs_group_writable():
+def test_bootstrap_creates_the_sessions_folder_private_and_nothing_of_the_retired_layout():
     remote = _FakeRemote()
-    ok, _ = hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester")
-    assert ok is True
+    ok, where = hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester", "s1",
+                                          manifest={"session_id": "s1"})
+    assert ok is True and where == f"{SHARED_ROOT}/sessions/s1"
     mkdir = next(c for c in remote.commands if "mkdir -p" in c)
-    for expected in ("/AiScientist/Temp/tester", "/AiScientist/uploads/tester",
-                     "/AiScientist/pysrc/tester", "/AiScientist/bin/tester"):
-        assert expected in mkdir
-    assert "umask 002" in mkdir and hpc_gc.DIR_MODE in mkdir
+    # sessions/ is shared (setgid + sticky, group-writable); the session's own folder is 0700.
+    assert f"mkdir -p {SHARED_ROOT}/sessions &&" in mkdir and "chmod 3775" in mkdir
+    assert f"{SHARED_ROOT}/sessions/s1/scripts" in mkdir and f"{SHARED_ROOT}/sessions/s1/logs" in mkdir
+    assert "umask 077" in mkdir and f"chmod 0700 {SHARED_ROOT}/sessions/s1" in mkdir
+    for retired in ("/Temp/", "/uploads/", "/pysrc/", "/bin/"):
+        assert retired not in mkdir
+    assert remote.staged and remote.staged[0][1] == f"{SHARED_ROOT}/sessions/s1/manifest.json"
+
+
+def test_a_deployment_without_a_data_root_still_gets_its_uploads_folder():
+    remote = _FakeRemote()
+    hpc_gc.ensure_shared_dirs(remote, f"{SHARED_ROOT}", "tester", "s1", uploads=True)
+    mkdir = next(c for c in remote.commands if "mkdir -p" in c)
+    assert f"{SHARED_ROOT}/uploads/tester" in mkdir and hpc_gc.DIR_MODE in mkdir
+
+
+def test_the_manifest_names_ids_versions_and_when_it_goes():
+    doc = hpc_gc.manifest_doc(session_id="s1", record_id="abc", owner="BioAdmin", hpc_user="tester",
+                              version="0.2.0", git_sha="deadbeef", ttl_days=3, created_at=0)
+    assert doc["session_id"] == "s1" and doc["account"] == "BioAdmin" and doc["hpc_user"] == "tester"
+    assert doc["app_version"] == "0.2.0" and doc["created_at"] == "1970-01-01T00:00:00Z"
+    assert "3 days" in doc["cleanup"]
 
 
 # --------------------------------------------------------------------------- sweep call
@@ -156,17 +176,20 @@ def test_the_sweep_runs_on_a_compute_node_not_the_login_node():
     """RCIC's rule: login nodes are for logging in and SUBMITTING jobs. The sweep walks trees and
     calls rm -rf, so the only thing the login node may run is the sbatch."""
     remote = _FakeRemote()
-    out = hpc_gc.sweep_temp(remote, f"{SHARED_ROOT}", "tester", 3,
+    out = hpc_gc.sweep_temp(remote, f"{SHARED_ROOT}", "tester", 3, session_id="s1",
+                            keep_sessions=["s2"], retire_legacy=True,
                             partition="standard", account="ruic20_lab")
     assert out["status"] == "submitted" and out["job_id"] == "7654321"
     # the previous run's numbers, read back from its log
     assert out["removed"] == 4 and out["kept"] == 1
-    assert out["root"] == f"{SHARED_ROOT}/Temp/tester"
-    assert remote.staged and remote.staged[0][1].endswith("/AiScientist/bin/tester/temp_gc.sh")
+    assert out["root"] == f"{SHARED_ROOT}/sessions"
+    assert remote.staged and remote.staged[0][1] == f"{SHARED_ROOT}/sessions/s1/scripts/temp_gc.sh"
 
     submit = next(c for c in remote.commands if c.startswith("sbatch"))
     assert "--partition=standard" in submit and "--account=ruic20_lab" in submit
-    assert "--parsable" in submit and "temp_gc.log" in submit
+    assert "--parsable" in submit and f"--output={SHARED_ROOT}/sessions/s1/logs/sweep.log" in submit
+    # The live sessions (this one and the account's other one) are named, never swept.
+    assert "--keep-session s1 --keep-session s2" in submit and "--retire-legacy" in submit
     # the destructive part is INSIDE --wrap (i.e. inside the job), never run directly
     assert "--wrap" in submit and "temp_gc.sh" in submit
     assert not any(c.startswith("bash ") for c in remote.commands)
@@ -179,13 +202,13 @@ def test_submit_command_omits_the_account_flag_when_there_is_none():
 
 def test_ttl_zero_disables_the_sweep_entirely():
     remote = _FakeRemote()
-    assert hpc_gc.sweep_temp(remote, "/r", "tester", 0)["status"] == "disabled"
+    assert hpc_gc.sweep_temp(remote, "/r", "tester", 0, session_id="s1")["status"] == "disabled"
     assert remote.commands == [] and remote.staged == []
 
 
 def test_a_failed_sweep_is_reported_not_raised():
     remote = _FakeRemote(fail="sbatch")
-    out = hpc_gc.sweep_temp(remote, "/r", "tester", 3)
+    out = hpc_gc.sweep_temp(remote, "/r", "tester", 3, session_id="s1")
     assert out["status"] == "error" and "boom" in out["error"]
 
 
@@ -196,7 +219,7 @@ def test_storage_delete_guard_covers_the_new_roots_but_not_another_member():
     from aiscientist.gateway import app as gw_app
 
     conn = types.SimpleNamespace(
-        executor=types.SimpleNamespace(username="tester"), owner="tester",
+        id="s1", executor=types.SimpleNamespace(username="tester"), owner="tester",
         settings=HPCSettings())
     allowed = [p for _label, p in gw_app._storage_areas(conn)]
 
@@ -204,6 +227,9 @@ def test_storage_delete_guard_covers_the_new_roots_but_not_another_member():
         return ".." not in path and any(path.startswith(a + "/") for a in allowed)
 
     assert permitted(f"{SHARED_ROOT}/Temp/tester/analysis/abc")
+    assert permitted(f"{SHARED_ROOT}/sessions/s1/runs/abc")
+    # Another session folder passes here; the script removes it only if this user owns it.
+    assert permitted(f"{SHARED_ROOT}/sessions/s0")
     assert permitted(f"{SHARED_ROOT}/uploads/tester/case.vcf.gz")
     assert permitted(f"{LAB_STORAGE}/tester/old_run")            # legacy personal dir, by hand
     # Sharing one project root must NOT let a member reach anyone else's files.

@@ -85,7 +85,7 @@ def _hpc_conn(gw_app, monkeypatch, executor):
     conn = types.SimpleNamespace(
         owner="yijus12", app_user_id=5, executor=executor,
         settings=types.SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7, session_cleanup=True,
-                                       cpu_partition="standard",
+                                       shared_root="/dfs3b/proj/AiScientist", cpu_partition="standard",
                                        cpu_account="ruic20_lab"))
     monkeypatch.setattr(gw_app, "_owner_connections", lambda owner: [conn] if owner == "yijus12" else [])
     monkeypatch.setattr(gw_app, "_active_conn_for_user", lambda user: conn)
@@ -256,7 +256,7 @@ def test_the_gateway_names_the_directory_and_says_how_long_it_is_kept(tmp_path, 
     assert json.loads(p.read_text())["name"] == out["name"]
     (level, msg), = said
     assert level == "success" and "11 files" in msg and "1 per-library .h5ad" in msg
-    assert "until you disconnect (at most 3 days)" in msg
+    assert "until the session ends, then with the run on the server" in msg
     # a run without CellQC says nothing
     assert gw._stamp_cellqc_result(_run_conn(tmp_path), "other", {}, True, lambda *a: said.append(a)) is None
     assert len(said) == 1

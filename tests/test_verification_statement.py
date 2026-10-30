@@ -92,6 +92,21 @@ def test_labels_qc_steps_and_scope_are_stated(tmp_path):
     assert "Rod photoreceptor make up 80.7%" in md
 
 
+def test_a_step_kept_without_review_is_named_not_counted_as_reviewed(tmp_path):
+    # Two unusable Critic replies keep a successful step with score 0.0 and reviewed: False: not a
+    # step "accepted with reservations (0.00)", and not one "accepted by the reviewer".
+    unreviewed = {"verdict": "accept", "score": 0.0, "reviewed": False,
+                  "critique": "Step not reviewed: the Critic returned no usable review twice; ..."}
+    rounds = [{**_ROUNDS[0], "verdict": unreviewed}]
+    md, s = build_verification(_art(tmp_path), "Nothing numeric.\n", _AGENDA[:1], rounds,
+                               {"citations": [], "reason": "none"})
+    assert ("- Step 1, QC: kept without review (the Critic returned no usable review twice)."
+            in md)
+    assert "accepted with reservations" not in md and "accepted by the reviewer" not in md
+    assert s["steps_unreviewed"] == 1 and s["steps_reserved"] == 0 and s["steps_incomplete"] == 0
+    assert "1 step(s) were kept without a review" in manuscript_note(s)
+
+
 def test_identifiers_years_and_references_are_not_checked(tmp_path):
     body = ("Cldn2 and GRCm39 and GO:0007601 in 2023, with 10x v4 chemistry; see `work/adata_1234.h5ad`.\n"
             "## References\n1. Smith 2020, 12,345 cells.\n")

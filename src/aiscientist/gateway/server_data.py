@@ -7,7 +7,7 @@ through the browser would copy it out of the server and back in. Instead a user 
    ``AISCIENTIST_SERVER_DATA_ROOTS``: the allowlist is checked here, in code, never by a model;
 2. :func:`scan` lists it once (metadata only) and decides what an analysis needs from it;
 3. when analysis runs on HPC3, whose nodes cannot see the server's disks, :func:`sync_to_hpc`
-   copies those files to the session's own area under the user's dfs3b ``Temp`` at run start. The
+   copies those files to the session's own ``inputs/`` on dfs3b at run start. The
    copy is incremental (a file already there at the same size is skipped, so a second run in the
    session copies nothing) and resumable (a large file is written as ``.part`` and continued where
    an interrupted copy stopped). It is a temporary copy: removed when the session disconnects, and

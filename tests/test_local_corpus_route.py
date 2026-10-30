@@ -63,3 +63,34 @@ def test_research_roster_loads_model_off_the_event_loop(tmp_path, monkeypatch):
     roster = asyncio.run(gw._prepare_session_roster(connection(tmp_path), [], None, lambda *a: None))
     assert [t.name for t in roster] == ["search_corpus"]
     assert len(loaded) == 1
+
+
+def test_a_stale_copy_is_skipped_and_hpc3_answers(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(lc, "make_local_tool", lambda: replace(
+        make_tool(), executor=lambda a, c: pytest.fail("the stale copy was searched")))
+    asked = []
+    monkeypatch.setattr(lc, "stale", lambda executor: asked.append(executor) or ["mechanism_cache/chunks.jsonl"])
+    monkeypatch.setattr(gw, "_tool_read_roots", lambda conn: [])
+    calls = []
+    monkeypatch.setattr(gw, "_build_literature_executor", lambda c: SimpleNamespace(
+        run_tool=lambda name, args, ctx: calls.append(name) or {"status": "ok", "contexts": []}))
+    hpc3 = object()
+    conn = SimpleNamespace(workspace=tmp_path, selected_model="test", tunnel_port=0,
+                           alloc=None, executor=hpc3, mock=False)
+    tool, ctx = gw._literature_corpus_tool(conn)
+    assert tool.executor({"queries": ["question"]}, ctx)["status"] == "ok"
+    assert calls == ["search_corpus"] and asked == [hpc3]
+
+
+def test_a_fresh_copy_is_searched_here(tmp_path, monkeypatch):
+    result = {"status": "ok", "contexts": [{"pmid": "1"}]}
+    monkeypatch.setattr(lc, "make_local_tool", lambda: replace(make_tool(), executor=lambda a, c: result))
+    monkeypatch.setattr(lc, "stale", lambda executor: [])
+    monkeypatch.setattr(gw, "_tool_read_roots", lambda conn: [])
+    monkeypatch.setattr(gw, "_build_literature_executor", lambda c: (_ for _ in ()).throw(AssertionError("HPC used")))
+    conn = SimpleNamespace(workspace=tmp_path, selected_model="test", tunnel_port=0,
+                           alloc=None, executor=object(), mock=False)
+    tool, ctx = gw._literature_corpus_tool(conn)
+    assert tool.executor({"queries": ["question"]}, ctx) == result

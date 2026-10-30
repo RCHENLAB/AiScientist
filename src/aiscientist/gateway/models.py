@@ -22,7 +22,7 @@ import datetime as _dt
 import json as _json
 import uuid as _uuid
 
-from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String,
+from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String,
                         Text, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -238,6 +238,8 @@ class LlmCall(Base):
     """
 
     __tablename__ = "llm_calls"
+    # The spike check reads one key's last hour (key_guard); revision 0002 adds it to a migrated database.
+    __table_args__ = (Index("ix_llm_calls_key_fp_created", "key_fp", "created_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
@@ -277,6 +279,9 @@ class LlmCall(Base):
     #: bill can be read against the ceiling that was in force, not the one currently configured.
     max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    #: The fingerprint of the API key that paid (``llm_credentials._fingerprint``: a hash prefix,
+    #: never the key), so a spike can be seen per KEY (``key_guard``). NULL off a user's key.
+    key_fp: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     @property
@@ -333,6 +338,11 @@ class MetadataRecord(Base):
     #: labels and ontology IDs, for the search filters and the dataset list.
     facets: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(16), default="draft")    # 'draft' | 'reviewed'
+    #: The dataset's DATASET.md (issue 10), as the record it is built from: the run-start profile the
+    #: PI read, its statements, who wrote them and when, and the owner's edit of the Markdown, which
+    #: a later run never overwrites. NULL until a run has read the dataset. Both DATASET.md and the
+    #: croissant.json are built from it (:mod:`aiscientist.metadata.description`).
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: The last validation: {"ok", "errors", "warnings", "validator", "checked_at"}.
     validation: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

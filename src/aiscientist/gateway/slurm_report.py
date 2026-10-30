@@ -41,7 +41,7 @@ class SlurmReportRenderer:
     container_image: str
     remote_base: str
     # Where the render bundle, the job's script and its log go. Required, with no default: the
-    # gateway passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    # gateway passes a directory in the session's folder (<shared_root>/sessions/<id>/...), never the user's home.
     scratch_dir: str = field(kw_only=True)
     mem_gb: int = 8
     cpus: int = 2

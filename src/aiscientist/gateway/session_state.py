@@ -24,7 +24,7 @@ gateway pushes the state to the console as it changes (``session_state`` message
 most once a second), and keeps a record of the account's recent sessions in
 ``<workspace>/.sessions.json`` so a session that has ended is still shown with how it ended,
 including one that ended without a disconnect (the gateway restarted, or the connection was lost):
-its HPC3 files are left to the Temp sweep.
+what it left on HPC3 is brought home and removed at the account's next connect, or by the sweep.
 
 This module knows nothing of SSH or HTTP: the gateway calls it, and the tests drive it directly.
 """
@@ -399,12 +399,27 @@ def queued_cleanups(store_dir: Path, hpc_user: str) -> list[str]:
             and (not hpc_user or r.get("hpc_user") in ("", hpc_user))]
 
 
+def queued_cleanup_logs(store_dir: Path, hpc_user: str) -> "dict[str, str]":
+    """``{job id: its log on HPC3}`` of this HPC3 account's cleanups still recorded as queued (the
+    log is '' for a record from before session folders, whose log was one per user)."""
+    return {str((r.get("cleanup") or {}).get("job_id")): str((r.get("cleanup") or {}).get("log") or "")
+            for r in load_records(store_dir)
+            if (r.get("cleanup") or {}).get("status") == "queued"
+            and (r.get("cleanup") or {}).get("job_id")
+            and (not hpc_user or r.get("hpc_user") in ("", hpc_user))}
+
+
 def confirm_cleanups(store_dir: Path, states: "dict[str, str]",
-                     last_result: "dict | None" = None) -> int:
+                     last_result: "dict | None" = None, *,
+                     results_by_job: "dict[str, dict] | None" = None) -> int:
     """Settle the queued cleanups whose job has ended. ``states`` maps a job id to its Slurm state
-    (``sacct``); ``last_result`` is the ``CLEAN_RESULT`` of the newest cleanup log, with its
-    ``job``, which gives that job's counts. A job still queued or running, or one Slurm has no
-    record of, is left as it is. Returns how many records changed."""
+    (``sacct``); ``results_by_job`` maps a job id to the ``CLEAN_RESULT`` of its log (each session
+    folder keeps its own), and ``last_result`` is the one result of a single shared log, with its
+    ``job``. A job still queued or running, or one Slurm has no record of, is left as it is. Returns
+    how many records changed."""
+    results = dict(results_by_job or {})
+    if last_result and last_result.get("job"):
+        results.setdefault(str(last_result["job"]), last_result)
 
     def change(r: dict) -> bool:
         cleanup = r.get("cleanup") or {}
@@ -412,15 +427,23 @@ def confirm_cleanups(store_dir: Path, states: "dict[str, str]",
         if cleanup.get("status") != "queued" or job not in states:
             return False
         state = (states[job] or "").split()[0].upper() if states[job] else ""
+        last_result = results.get(job)
+        mine = bool(last_result)
+        if mine:
+            for k in ("removed", "missing", "kept"):
+                if k in last_result:
+                    cleanup[k] = last_result[k]
         if state.startswith(_COMPLETED):
             cleanup["status"] = "done"
-            if last_result and str(last_result.get("job")) == job:
-                for k in ("removed", "missing"):
-                    if k in last_result:
-                        cleanup[k] = last_result[k]
         elif state.startswith(_ENDED_BADLY):
             cleanup["status"] = "failed"
-            cleanup["error"] = f"the cleanup job ended {state}; the files are left to the Temp sweep"
+            if mine and int(last_result.get("kept") or 0):
+                n = int(last_result["kept"])
+                cleanup["error"] = (f"{n} run folder{'' if n == 1 else 's'} kept on HPC3: a result there "
+                                    "did not match its copy on the server; it is copied again at the "
+                                    "next connect")
+            else:
+                cleanup["error"] = f"the cleanup job ended {state}; the files are left to the sweep"
         else:
             return False
         cleanup["confirmed_at"] = _now()
@@ -433,7 +456,7 @@ def confirm_cleanups(store_dir: Path, states: "dict[str, str]",
 
 def parse_clean_log(text: str) -> "dict | None":
     """The last ``CLEAN_JOB`` / ``CLEAN_RESULT`` pair of a session cleanup log, as
-    ``{"job", "removed", "missing"}``; None when the log has no result line."""
+    ``{"job", "removed", "missing", "kept"}``; None when the log has no result line."""
     job, result = "", None
     for line in (text or "").splitlines():
         if line.startswith("CLEAN_JOB "):

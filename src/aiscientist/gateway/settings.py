@@ -122,22 +122,23 @@ class HPCSettings:
     # simply has no `w`). `software/` IS group-writable (2775), which is where the lab actually puts
     # shared things.
     #
-    # Split by lifetime — per-user throughout, so one member can never reach another's files:
-    #   <shared_root>/Temp/<user>/...     process files — SWEPT after temp_ttl_days (see hpc_gc.py)
-    #   <shared_root>/uploads/<user>/...  raw uploaded data — NEVER swept
-    #   <shared_root>/pysrc/<user>/...    the synced AiScientist source (rewritten in place each connect)
-    #   <shared_root>/bin/<user>/         the staged sweeper and session cleanup
-    #   <shared_root>/{containers,hf,envs,scgpt_model,vlreview_model,ollama}/   assets, NEVER swept
-    # The sweeper is hard-guarded to `<root>/Temp` and cannot walk into the assets. Nothing outside
-    # <shared_root> is ever deleted automatically: a member's personal <lab_storage>/<ucinetid>/ dir
-    # is read/browsed but left strictly alone.
+    # Four folders (RCHENLAB/AiScientist issue 28, gateway/hpc_layout.py):
+    #   <shared_root>/envs/        environments (openspliceai, analysis-pydeps, run-code-pkgs, conda-pkgs)
+    #   <shared_root>/containers/  images
+    #   <shared_root>/models/      model weights (hf/, scgpt/, vlreview/)
+    #   <shared_root>/sessions/<session-uuid>/   one session: its app/, inputs/, runs/, logs ...;
+    #                              removed when it ends, after its results are on the server
+    # The sweeper touches only session folders the user owns (and what is left of the retired
+    # Temp/<user>), never the assets. Nothing outside <shared_root> is ever deleted automatically:
+    # a member's personal <lab_storage>/<ucinetid>/ dir is read/browsed but left strictly alone.
     shared_root: str = SHARED_ROOT
-    # Age (days) after which a <shared_root>/Temp/<user>/<kind>/<run> dir whose whole subtree has
-    # gone untouched is removed. 0 disables the sweep entirely.
+    # Age (days) after which a session folder (or a Temp/<user>/<kind>/<run> dir of the retired
+    # layout) whose whole subtree has gone untouched is removed, all but each run's result/.
+    # 0 disables the sweep entirely.
     temp_ttl_days: int = 3
-    # On disconnect, remove what that session alone made under Temp: the folders of the runs it
-    # started and its copies of server-side datasets (hpc_gc.clean_session). Off leaves all of it
-    # to the age sweep above.
+    # On disconnect, bring the session's results home and remove its folder and its runs' folders
+    # (stage_out, hpc_gc.clean_session); at the next connect, the same for earlier sessions. Off
+    # leaves all of it to the age sweep above.
     session_cleanup: bool = True
 
     # --- LLM serving backend ------------------------------------------------
@@ -164,7 +165,7 @@ class HPCSettings:
     # AISCIENTIST_VLLM_QUANTIZATION=awq_marlin (those weights and that image are kept).
     vllm_model: str = "RedHatAI/Qwen3.8-27B-INT4"
     vllm_image: str = f"{SHARED_ROOT}/containers/vllm-0.28.0.sif"
-    hf_home: str = f"{SHARED_ROOT}/hf"  # HF cache on shared DFS, NOT $HOME
+    hf_home: str = f"{SHARED_ROOT}/models/hf"  # HF cache on shared DFS, NOT $HOME
     # The model's NATIVE window (config.json max_position_embeddings = 262144) — no YaRN, no
     # rope scaling. The old 32768 default was justified by "A100-40G leaves ~16GB KV", and both
     # halves of that were wrong. MEASURED on HPC3 2026-08-02 by booting this exact image+model
@@ -213,7 +214,7 @@ class HPCSettings:
     scgpt_entrypoint: str = "python /opt/scgpt/run_infer.py"
     # Reference model dir on shared DFS (best_model.pt, vocab.json, id2type.json,
     # dev_train_args.yml), bound read-only into the job. Staged by deploy/scgpt/build_and_stage.sh.
-    scgpt_model_dir: str = f"{SHARED_ROOT}/scgpt_model"
+    scgpt_model_dir: str = f"{SHARED_ROOT}/models/scgpt"
     # scGPT inference is a short annotation job that runs fine on ANY card — keep it on gpu:1 so it
     # is NOT pinned to the (scarcer) A100 the LLM reserves. Decoupled from the main `gres`.
     scgpt_gres: str = "gpu:1"
@@ -227,7 +228,7 @@ class HPCSettings:
     vlreview_image: str = f"{SHARED_ROOT}/containers/vlreview.sif"
     vlreview_entrypoint: str = "python /opt/vlreview/run_review.py"
     # VL weights on shared DFS, bound read-only. Staged by deploy/vlreview/build_and_stage.sh.
-    vlreview_model_dir: str = f"{SHARED_ROOT}/vlreview_model"
+    vlreview_model_dir: str = f"{SHARED_ROOT}/models/vlreview"
     # Use the lab's paid GPU partition ("gpu") — the lab GPU account buys scheduling PRIORITY,
     # and the free/preemptible partitions (free-gpu/free-gpu32) queue too slowly, delaying the
     # report. Cost is bounded anyway: a cheap A30 for one short (~30 min) job. Set empty to fall

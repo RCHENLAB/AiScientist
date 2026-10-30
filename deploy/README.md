@@ -33,13 +33,14 @@ Browser ──HTTPS :443──▶ Envoy Gateway on the lab server's Kubernetes c
 
 | Path | What |
 |---|---|
-| `/data/aiscientist/app/` | the code (the rsync target), `.env`, `.deployed_sha`, and under `runs/console/<UCInetID>/` each HPC3 user's run outputs and unfinished browser uploads (`uploads/.parts/`, removed 24 hours after their last write, `AISCIENTIST_UPLOAD_TTL_SECONDS`) |
+| `/data/aiscientist/app/` | the code (the rsync target, runtime files only: `scripts/sync_deploy.sh` does not ship tests, docs, experiments or handoffs), `.env`, `.deployed_sha` |
 | `/data/aiscientist/env/` | the Python virtual environment; the app is an editable install |
-| `/data/aiscientist/state/` | `AISCIENTIST_STATE_DIR`, mode 0700: the session secret (`session_secret`), the users' saved SSH keys (`ssh_creds/`) and LLM API keys (`llm_creds/`) with the master key that encrypts them (`llm_key.master`), and the model list once an admin has saved it |
-| `/data/aiscientist/app/skills/releases/<version>/` | the curated skills: the aiscientist-skills release `configs/skills_registry.json` pins. Installed by hand; a deploy never ships or deletes it. Without it there are no curated skills |
-| `/data/aiscientist/induced_skills/` | `AISCIENTIST_INDUCED_SKILLS_DIR`: skills learned from runs, with their review file |
-| `/data/aiscientist/env-backups/` | copies of `.env` taken before an edit |
-| `/data/BioAgent` | a symlink to `/data/aiscientist`. Stored run paths may name it, so it stays. |
+| `/data/aiscientist/data/` | `AISCIENTIST_DATA_ROOT`, the users' data ([`docs/dataset_storage.md`](../docs/dataset_storage.md)): `users/<account>/datasets/<uuid>/`, uploads in progress under `temp/<account>/` (an unfinished browser upload is removed 24 hours after its last write, `AISCIENTIST_UPLOAD_TTL_SECONDS`), each run's outputs under `analysis_results/<UCInetID>/<run_id>/` (`AISCIENTIST_RESULTS_DIR`), `corpus_scans/`, `exports/`, and `reference/retigene/`: the copy of the RetiGene index that literature searches read, written by `scripts/update_corpus_index.py` (see the `search_corpus` tool's documentation) |
+| `/data/aiscientist/state/` | `AISCIENTIST_STATE_DIR`, mode 0700: the session secret (`session_secret`), the users' saved SSH keys (`ssh_creds/`) and LLM API keys (`llm_creds/`) with the master key that encrypts them (`llm_key.master`), the model list once an admin has saved it, and `induced_skills/` (`AISCIENTIST_INDUCED_SKILLS_DIR`: skills learned from runs, with their review file) |
+| `/data/aiscientist/skills/releases/<version>/` | the curated skills: releases of aiscientist-skills, installed and checked by [`deploy_skills.sh`](deploy_skills.sh), read-only. `skills/current` names the one the app reads; without it, the tag `configs/skills_registry.json` pins (found through `AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT`). A deploy of the app never ships or deletes them. Without one there are no curated skills |
+| `/data/aiscientist/config/` | mode 0700: configuration and secrets kept outside the code folder (the encrypted backups of the credential stores) |
+| `/data/aiscientist/logs/` | for service logs; the unit writes to the journal |
+| `/data/aiscientist/backups/` | `env/` (mode 0700): copies of `.env` taken before an edit; copies taken before a migration; `_archive_<date>/`: items set aside for 30 days before deletion, each with a `MANIFEST.txt` |
 | `/etc/systemd/system/aiscientist.service` | the unit, installed from [`systemd/aiscientist.service`](systemd/aiscientist.service) |
 
 Everything under `/data/aiscientist` belongs to the service account `aiscientist`, which has no
@@ -52,8 +53,10 @@ database are both named `bioagent`.
 
 ## Updating the server
 
-The server cannot fetch the repository. Code is copied with rsync from a checkout on your machine
-by [`scripts/sync_deploy.sh`](../scripts/sync_deploy.sh), which then installs the package,
+The server runs the rsync layout described here until it moves to releases from tags
+([below](#releases-from-tags)); after the move `scripts/sync_deploy.sh` refuses to run against it.
+The server cannot fetch the private repository. Code is copied with rsync from a checkout on your
+machine by [`scripts/sync_deploy.sh`](../scripts/sync_deploy.sh), which then installs the package,
 restarts the unit through systemd and checks that it answers.
 
 ```bash
@@ -83,10 +86,8 @@ Before a deploy:
    (`scripts/fetch_genesets.py` downloads them). A checkout without them leaves the server's
    copies as they are.
 5. **Skills.** A commit that changes the tag in `configs/skills_registry.json` needs that release
-   installed first, in the app directory as the service account: download the three assets of the
-   GitHub release of `lijinbio/aiscientist-skills` into `skills/releases/<version>/`, then
-   `(cd skills/releases/<version> && sha256sum -c SHA256SUMS)`. The next step of a run reads it;
-   no restart.
+   installed first: `deploy/deploy_skills.sh <tag>` as the service account
+   ([Skills releases](#skills-releases)).
 
 After a deploy:
 
@@ -97,8 +98,14 @@ curl -s https://AiScientist.eye.som.uci.edu/api/auth/config  # answers through t
 sudo journalctl -u aiscientist.service -n 50                 # the service log
 ```
 
-The app creates the schema at start, and adds a new nullable column to an existing table
-(`_ensure_columns` in `gateway/db.py`). Any other change to an existing table is a manual migration.
+**Database schema.** It is versioned by Alembic: one revision per change in
+[`src/aiscientist/gateway/migrations/versions/`](../src/aiscientist/gateway/migrations/versions/).
+`aiscientist-admin migrate` applies the missing ones; a release deploy runs it before the switch,
+and the app runs it at start. A database from before migrations is recorded as revision `0001`
+the first time. A change to a model in `gateway/models.py` needs a revision
+(`tests/test_db_migrations.py` fails until it has one), written to only add: a new nullable column, a
+new table. The release before it then still works on the migrated database, so a rollback needs no
+downgrade.
 
 Other scripts:
 
@@ -132,8 +139,8 @@ directory the built-in development secret is used, which the app reports loudly 
 
 `.env` holds the database and SMTP passwords, so only the service account may read it
 (`chown aiscientist:aiscientist .env && chmod 640 .env`, and `getfacl .env` shows no entry for
-another group). To change a setting: copy the file to `env-backups/` first
-(`sudo -u aiscientist cp -p .env ../env-backups/.env.bak-<date>-<why>`), edit it as the service
+another group). To change a setting: copy the file to `backups/env/` first
+(`sudo -u aiscientist cp -p .env ../backups/env/.env.bak-<date>-<why>`), edit it as the service
 account, restart the unit. `/api/auth/config` shows the registration settings the running process
 uses.
 
@@ -163,7 +170,56 @@ Never commit a credential. Documents and examples use placeholders such as `<pas
 
 So the service account can read the session secret and every user's HPC3 key and API key. Keep
 `state/` closed to other accounts, and keep the set of people who may run `sudo -u aiscientist`
-small.
+small. The key service below takes the API keys out of that account's reach.
+
+### The key service (API keys under their own account)
+
+With the key service, the API keys are held by a second process, `aiscientist-keys.service`, which
+runs as its own system account `aiscientist-keys`. The web server's account cannot read them,
+whatever code runs in it (the agents' tools included).
+- **Saving a key.** The web server hands a new or rotated key to the service once and keeps only
+  its label, hint and fingerprint.
+- **Model calls.** Every model call on a user's key goes through the service's proxy on
+  `127.0.0.1:8899`. The service puts the key in the request and sends it only to the address the
+  key was saved for.
+- **The token.** The web server authenticates with a token (`/etc/aiscientist-keys/token`, 0640
+  `aiscientist-keys:aiscientist`). The token lets the web server spend keys, never read them.
+
+Set it up once, as root:
+
+```
+sudo bash deploy/keys/install_key_service.sh
+```
+
+The script:
+- creates the account;
+- copies the saved keys and the master key into `/var/lib/aiscientist-keys` (0700);
+- installs and starts the unit;
+- checks that the service can read as many keys as the web server lists.
+
+It changes nothing the web server uses. Then switch the web server over:
+
+1. Add to its `.env`:
+   ```
+   AISCIENTIST_KEY_SERVICE=http://127.0.0.1:8899
+   AISCIENTIST_KEY_SERVICE_TOKEN_FILE=/etc/aiscientist-keys/token
+   ```
+2. Restart it when no run is running.
+3. Check that the service holds and can read every saved key:
+   ```
+   sudo -u aiscientist <python> -m aiscientist.gateway.admin_cli key-service-check
+   ```
+4. Delete the web server's own copies, `state/llm_creds/*/*.key` and `state/llm_key.master`.
+
+From then on:
+- **Deploys.** A deploy that changes the service's code restarts both units:
+  `sudo systemctl restart aiscientist-keys.service` (the script grants the admin account this, as
+  it has for `aiscientist.service`).
+- **Back-ups.** Back up `/var/lib/aiscientist-keys/llm_key.master`. It is the only copy, and
+  without it every saved key has to be entered again.
+- **Revoking every key.** `aiscientist-admin purge-llm-keys` asks the service to delete every key.
+- **Undo.** `sudo bash deploy/keys/install_key_service.sh --copy-back` puts the keys back into
+  `state/`. Then remove the two `.env` lines and restart.
 
 ## The Kubernetes side
 
@@ -208,8 +264,7 @@ Namespace `aiscientist`, applied from [`k8s/host-backend.yaml`](k8s/host-backend
    Claude key, which is refused when it is verified if the SDK is missing.
 3. `state/`, mode 0700, and `.env` in the app directory, readable by the service account only,
    with the settings above.
-4. The skills: the pinned release under `skills/releases/<version>/` in the app directory
-   (step 5 of "Before a deploy").
+4. The skills: `deploy/deploy_skills.sh <tag>` as the service account.
 5. The unit: copy [`systemd/aiscientist.service`](systemd/aiscientist.service) to
    `/etc/systemd/system/`, set `--host` to the address the ingress reaches,
    `sudo systemctl enable --now aiscientist.service`.
@@ -237,19 +292,113 @@ behind nginx on a bare host. The lab server uses neither, and no test exercises 
 - [ ] The admin password is strong, and no account was created with a default password.
 - [ ] `run_code` runs on HPC3 (`AISCIENTIST_RUN_CODE_ON_HPC=1`).
 
-## Versioned releases (alternative to the rsync deploy)
+## Releases from tags
 
-Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which attaches `aiscientist-<tag>.tar.gz`
-and `SHA256SUMS` to a GitHub Release. On the server:
+An app release is a Git tag `vX.Y.Z` on RCHENLAB/AiScientist. Pushing it runs
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds the tagged
+commit's runtime files with [`build_package.sh`](build_package.sh) (no tests, docs or experiments)
+and attaches `aiscientist-<tag>.tar.gz` and `SHA256SUMS` to the tag's GitHub Release. The package's
+`VERSION` names the tag and the commit.
+
+**How a tag reaches the server.** GitHub cannot reach the server inside the university network,
+but the server can reach GitHub. `aiscientist-deploy.timer` starts
+[`deploy_release.sh --auto`](deploy_release.sh) every 10 minutes, as the service account. It asks
+GitHub for the latest release; when that release has a package, is newer than the running one and
+is not held, it installs it and switches to it once no run is in progress (a restart interrupts
+runs; it tries again at the next start). Then it brings the skills to the pinned release. So a
+release is deployed by publishing it, and stopped by not publishing it; nothing is copied to the
+server by hand.
 
 ```bash
-AISCIENTIST_HOST=128.200.71.197 deploy/deploy_release.sh v0.4.0   # download, verify checksum, install, switch app/current, restart, check /health
-deploy/deploy_release.sh --rollback                                # back to app/previous
-deploy/deploy_release.sh --list
+# as the service account, from the running release: app/current/deploy/...
+deploy_release.sh v0.4.0            # install that tag now (download, verify, install, migrate, switch, restart, check)
+deploy_release.sh --prepare v0.4.0  # everything up to the switch; the site keeps running
+deploy_release.sh --rollback        # back to app/previous; the release rolled back from is held
+deploy_release.sh --list            # installed releases, current, previous, held
+deploy_release.sh --auto            # what the timer runs
 ```
 
-Each release lives in `app/releases/<tag>/` with its own venv; `.env`, `runs/` and
-`skills/releases/` are shared links into `/data/aiscientist/shared/`. A failed `/health` check after
-a switch rolls back by itself. `deploy/systemd/aiscientist.service` runs from `app/current`. The
-running app tag and the pinned skills tag appear on the console's System page (`/api/system` →
-`release`). Needs GNU coreutils. The skills release is still installed by hand (see above).
+| Path | What |
+|---|---|
+| `app/releases/<tag>/` | one release: the package, its own venv in `.venv/`, links to `config/.env` and `skills/`, the gene sets copied from `data/reference/genesets/`. Read-only once installed |
+| `app/current`, `app/previous` | the running release and the one before it. The unit runs `app/current/.venv/bin/python` in `app/current` |
+| `app/held` | tags `--auto` never installs: one rolled back from, or one whose health check failed. Deploying a tag by name takes it off |
+| `config/.env` | the app's settings and secrets (mode 640); it must set `AISCIENTIST_RESULTS_DIR` |
+| `config/deploy.env` | the deploy's own settings: `AISCIENTIST_APP_TAG` holds the app at one release instead of following the latest, `AISCIENTIST_SKILLS_TAG` pins the skills release |
+| `logs/deploy.log` | one line per install, switch, rollback, refusal and prune |
+
+A deploy checks each step before the next: the package against `SHA256SUMS`; the Python packages
+installed from the release's `requirements.lock` with `pip install --require-hashes` (exact
+versions and hashes, made for the server's Python by
+[`scripts/lock_requirements.sh`](../scripts/lock_requirements.sh)); the database migrated; then the
+switch, a restart, and `/health`, which must name the new tag with accounts on. Otherwise it
+switches back and holds the tag. The newest 5 releases are kept. With the key service installed
+([below](#the-key-service-api-keys-under-their-own-account)), every switch restarts
+`aiscientist-keys.service` first: it runs the release's code from `app/current`, and the app makes its
+API-key calls through it. Keys a user gave for one session only are dropped by that restart.
+
+A new Python dependency is a change to `pyproject.toml` and to `requirements.lock`
+(`scripts/lock_requirements.sh`, after `pip install uv`), then a release. A large one weighs on every
+release's venv: `sentence-transformers` for a local embedding model brings PyTorch, about 2 GB more
+per release.
+
+### Skills releases
+
+A skills release is a tag of [`lijinbio/aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills)
+whose GitHub Release holds `catalog.json`, the skills zip and `SHA256SUMS`.
+[`deploy_skills.sh`](deploy_skills.sh) installs one, as the service account:
+
+```bash
+deploy_skills.sh v0.2.0       # download, check, install into skills/releases/0.2.0/, switch skills/current
+deploy_skills.sh --rollback   # back to skills/previous; the release rolled back from is held
+deploy_skills.sh --list
+```
+
+A release is installed only when every file `SHA256SUMS` lists matches and `catalog.json` is the
+catalog of that tag, the same check the app makes before it reads a skill. The app reads the
+library again when `skills/current` changes, without a restart, and the script waits until
+`/health` reports the new release, or switches back. The deploy timer installs the release
+`config/deploy.env` pins (`AISCIENTIST_SKILLS_TAG`), else the one the running app release pins in
+`configs/skills_registry.json`. A skills release needs no app release.
+
+### Moving the server to releases
+
+The server runs the rsync layout above. [`migrate_release_layout.sh`](migrate_release_layout.sh)
+moves it once, run as root from the package of the release it moves to:
+
+```bash
+cd /tmp
+curl -fsSLO https://github.com/RCHENLAB/AiScientist/releases/download/<tag>/aiscientist-<tag>.tar.gz
+curl -fsSLO https://github.com/RCHENLAB/AiScientist/releases/download/<tag>/SHA256SUMS
+sha256sum -c SHA256SUMS && tar xzf aiscientist-<tag>.tar.gz
+sudo bash aiscientist-<tag>/deploy/migrate_release_layout.sh --tag <tag>             # checks; changes nothing
+sudo bash aiscientist-<tag>/deploy/migrate_release_layout.sh --tag <tag> --prepare   # the site keeps running
+sudo bash aiscientist-<tag>/deploy/migrate_release_layout.sh --tag <tag> --apply     # about a minute down
+sudo bash aiscientist-<tag>/deploy/migrate_release_layout.sh --tag <tag> --apply --timer   # the same, and deploy from tags from then on
+sudo bash aiscientist-<tag>/deploy/migrate_release_layout.sh --rollback              # back to the rsync layout
+```
+
+- The check: the rsync layout, `.env` with the results and state directories outside `app/`, the
+  unit, the gene sets, the installed skills release, the server's Python against the lock's,
+  access to GitHub and PyPI, free disk, and how many runs are in progress. It changes nothing.
+- `--prepare`: `config/.env` (a copy of `app/.env`), `config/deploy.env`, the gene sets in
+  `data/reference/genesets/`, `skills/current`, and the release installed in `app/releases/<tag>/` with
+  its venv. The database is migrated: recorded as revision `0001`, then the newer revisions; they only
+  add, so the running site does not mind.
+  Between `--prepare` and `--apply`, do not run `scripts/sync_deploy.sh`.
+- `--apply`: waits for no run in progress, stops the unit, moves the rsync tree (all of `app/` but
+  `releases/`) and the venv `env/` into `backups/release-layout-<stamp>/`, links `app/current`,
+  installs the unit drop-in [`release-layout.conf`](systemd/aiscientist.service.d/release-layout.conf)
+  (the bind address taken from the installed unit), the rule that lets the service account run
+  `sudo systemctl restart aiscientist.service` without a password
+  (`/etc/sudoers.d/aiscientist-restart`, which also covers `aiscientist-keys.service`) and the timer
+  units, starts the unit and checks `/health`. If the check fails it rolls back on its own. A key
+  service installed before the move with `env/bin/python` is pointed at `app/current/.venv` and
+  restarted first.
+- `--rollback`: the reverse, from the newest backup set. `config/`, `data/reference/genesets/`,
+  `skills/current` and the database's revision table stay; the rsync layout does not read them.
+
+[`rehearsal/release_layout.sh`](rehearsal/release_layout.sh) runs every mode against a scratch copy
+of the server (the code prod runs, its own venv, a database with rows, the skills release), with a
+stand-in for systemd and no root, then deploys an update, rolls it back, switches the skills, and
+checks each step.

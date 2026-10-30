@@ -75,7 +75,7 @@ def test_sync_aiscientist_source_to_hpc_tars_and_caches():
     conn.executor = MockExecutor(username="tester")
 
     pysrc = gw_app._sync_aiscientist_source_to_hpc(conn)
-    assert pysrc == f"{SHARED_ROOT}/pysrc/tester"
+    assert pysrc == f"{SHARED_ROOT}/sessions/{conn.id}/app"          # the session's own copy
     assert conn.hpc_pysrc == pysrc
     staged = conn.executor.state.staged_files
     assert any(remote == f"{pysrc}/aiscientist-src.tgz" for _l, remote in staged)   # tarball pushed

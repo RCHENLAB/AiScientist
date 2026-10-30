@@ -136,8 +136,9 @@ def test_manifest_and_version_counters_and_secrets(release, tmp_path, monkeypatc
     assert registry.execute(skill, ctx, Executor(), run, "run_code")["status"] == "error"
     assert registry.POLICY.get() is None
     manifest = json.loads((ctx.workspace / "manifest.json").read_text())
-    assert manifest == {"registry_release": "v0.1.0", "skills": [{"name": skill.name,
-        "version": "1.2.3", "registry_release": "v0.1.0"}]}
+    assert manifest["app"].keys() == {"tag", "sha"}                 # the app release that ran it
+    assert {k: v for k, v in manifest.items() if k != "app"} == {"registry_release": "v0.1.0",
+        "skills": [{"name": skill.name, "version": "1.2.3", "registry_release": "v0.1.0"}]}
     assert "private-value" not in json.dumps(manifest)
     with sqlite3.connect(tmp_path / "counts.sqlite3") as db:
         assert db.execute("SELECT success,error FROM skill_versions").fetchone() == (1, 1)
@@ -364,8 +365,8 @@ def test_bad_config_leaves_no_skills_and_no_crash(release, tmp_path, monkeypatch
     sk.refresh_skills()                     # the re-scan signature must not raise either
     ctx = HarnessContext(workspace=tmp_path / "run")
     registry.init_manifest(ctx)            # a run still gets its manifest
-    assert json.loads((ctx.workspace / "manifest.json").read_text()) == {
-        "registry_release": None, "skills": []}
+    manifest = json.loads((ctx.workspace / "manifest.json").read_text())
+    assert {k: v for k, v in manifest.items() if k != "app"} == {"registry_release": None, "skills": []}
 
 
 def test_counts_live_in_the_state_dir_and_skip_a_stop(release, tmp_path, monkeypatch):

@@ -91,7 +91,7 @@ class SlurmCodeExecutor:
     # host). NOT bind-mounted — only a get_file target — so a local path here is correct. None → no sync.
     local_artifacts: str | None = None
     # Where each job's script, output files and logs go. Required, with no default: the gateway
-    # passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    # passes a directory in the session's folder (<shared_root>/sessions/<id>/...), never the user's home.
     scratch_dir: str = field(kw_only=True)
     mem_gb: int = 64
     cpus: int = 8
@@ -119,7 +119,7 @@ class SlurmCodeExecutor:
     # call ends at once (no local fallback — that would re-run the snippet and defeat Stop). Set to
     # conn.chat_stop.is_set. Without it, a Stop can't cancel a run_code job (the old bug).
     should_cancel: Callable[[], bool] | None = None
-    # Root of the lab-SHARED package cache (``<shared_root>/pkgs``). When set, each snippet can
+    # Root of the lab-SHARED package cache (``<shared_root>/envs/run-code-pkgs``). When set, each snippet can
     # import packages any lab member has installed — the point being that nobody installs the
     # same thing twice. Empty disables it entirely and the sandbox behaves exactly as before.
     package_cache_root: str = ""

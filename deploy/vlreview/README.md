@@ -37,7 +37,7 @@ srun -c 4 -p free --time=2:00:00 --pty /bin/bash -i
 cd ~/vlreview-build && bash hpc3_vlreview_setup.sh
 #   builds the custom .def with `apptainer build --fakeroot` (no /etc/subuid entry needed on HPC3)
 ```
-Produces `…/containers/vlreview.sif` + `…/vlreview_model/` on dfs3b.
+Produces `…/containers/vlreview.sif` + `…/models/vlreview/` on dfs3b.
 
 ## Enable (opt-in)
 Defaults already match the RUIC20 cluster (paid `gpu` partition, `gpu:A30:1`, image/model at

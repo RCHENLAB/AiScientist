@@ -27,14 +27,16 @@ Asks which pathways and GO terms the genes from a DE step over-represent, with g
 | `gene_sets` | array of string | — | local gene-set libraries to test against |
 | `background` | integer | — | ORA background size; omit to use the tested universe |
 | `split_direction` | boolean | — | test up- and down-regulated genes separately |
-| `groupby` | string | — | which DE table to read, by the key in its file name tables/de_<groupby>_all.csv: the column run_de grouped by (e.g. leiden, majorclass), not the `group` column inside the table; omit to find the table automatically |
+| `groupby` | string | — | which DE table to read, by the key in its file name tables/de_<groupby>_all.csv: the column run_de grouped by (e.g. leiden, majorclass), or the `de_key` run_pseudobulk_de returned (pseudobulk_<group_key>), not the `group` column inside the table; omit to find the table automatically, a replicated pseudobulk test first |
 | `genes` | array of string | — | explicit gene list; omit so the DE tables are found instead |
 <!-- /generated:parameters -->
 
 ## Outputs
 
 - `tables/enrichment_<key>.csv` per group and bar plots in `figures/enrichment_<key>.png`.
-- Result: the top terms per group, `background_size`, `background_source`, `warnings`, and the DE step's `inference` label.
+- Result: the top terms per group, `background_size`, `background_source`, `warnings`, the DE step's `inference` label, and `de_table_read`, the DE table the input came from.
+
+With no `groupby` the DE table is chosen in this order: a `run_pseudobulk_de` result (`de_pseudobulk_<key>_all.csv`, a replicated test), then an annotated grouping, then `leiden`. Each group's genes come from its own complete table (`de_<key>_<group>.csv`; a group named `all` is `de_<key>_all_group.csv`).
 
 ## Where it runs
 

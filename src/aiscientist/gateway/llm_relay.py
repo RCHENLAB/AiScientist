@@ -28,8 +28,10 @@ from typing import Any, Callable, Protocol
 
 REQ, RESP = "req", "resp"
 
-# Causes (``anthropic_client.classify_error``) after which no further call can succeed.
-_FATAL = {"auth", "credit", "model"}
+# Causes (``anthropic_client.classify_error``) after which no further call can succeed. "refused":
+# the gateway's own key guard stopped the call (the key is paused or revoked, or the budget is
+# reached), so nothing was sent and nothing is recorded.
+_FATAL = {"auth", "credit", "model", "refused"}
 # Causes worth waiting out here before the job hears about them.
 _RETRYABLE = {"rate", "endpoint", "network"}
 _RETRY_WAITS = (5.0, 15.0, 30.0)
@@ -130,6 +132,9 @@ def cause_of(exc: BaseException) -> str:
     """The cause of a failed call: ``GatewayError.stage`` ``anthropic_<cause>`` / ``llm_<cause>``,
     else ``anthropic_client.classify_error``."""
     stage = str(getattr(exc, "stage", "") or "")
+    from .key_guard import REFUSALS
+    if stage in REFUSALS:
+        return "refused"
     if "_" in stage:
         return stage.split("_", 1)[1]
     try:
@@ -264,7 +269,7 @@ class ModelRelay:
                 text, usage = self._call(messages, max_tokens)
             except Exception as exc:  # noqa: BLE001 - classified below
                 cause, err = cause_of(exc), str(getattr(exc, "message", "") or exc)[:300]
-                if self._record is not None:
+                if self._record is not None and cause != "refused":
                     self._record(None, int((time.time() - t0) * 1000), cause)
                 if cause in _RETRYABLE and attempt < len(_RETRY_WAITS) and not self._halt.is_set():
                     self._sleep(_RETRY_WAITS[attempt])

@@ -5,7 +5,12 @@ and annotation databases, about 580 G in all. This file lists what exists, what 
 to get it back. Whoever builds, downloads or stages something on HPC3 adds its row here in the
 same change.
 
-The per-user working directories (`Temp/`, `uploads/`, `pysrc/`, `bin/`) and their cleanup are in
+[`configs/hpc3_assets.yaml`](../configs/hpc3_assets.yaml) pins the images and model weights the code
+uses: each image's source and SHA-256, each model's revision and the SHA-256 of its weight files. A
+run's `manifest.json` records the entries it used. `scripts/hpc3_assets_check.py` compares the list
+with HPC3.
+
+The session folders (`sessions/<session-uuid>/`) and their cleanup are in
 [`hpc3_storage_layout.md`](hpc3_storage_layout.md). Sizes are as `du -sh` reports them.
 
 ## Where it lives
@@ -33,6 +38,7 @@ code change.
 | `scgpt.sif` | 3.9 G | scGPT per-cell annotation, on a GPU | `AISCIENTIST_SCGPT_IMAGE` | `deploy/scgpt/build_and_stage.sh` |
 | `vlreview.sif` | 3.6 G | the vision model that reviews the rendered report | `AISCIENTIST_VLREVIEW_IMAGE` | `scripts/hpc3_vlreview_setup.sh` with `deploy/vlreview/` |
 | `cellqc-0.3.6_4509649d69.sif` | 1.0 G | `run_cellqc` and the standalone CellQC skill: CellQC 0.3.6, Python 3.12, R with DoubletFinder | `image:` in `run_cellqc/TOOL.md` | automatic, see below |
+| `rockylinux_9.7.20251123.sif` | 83 M | the agent's `run_shell` sandbox: the compute nodes' OS (Rocky Linux 9.7), with RCIC's modules and the host's `/usr` mounted read-only | `SHELL_IMAGE_REF` in `hpc/shell.py` | automatic: pulled on the session's CPU worker on first use (`docker://rockylinux/rockylinux:9.7.20251123`) |
 
 The PaperQA image is with the literature files, under `<root>/retigene/`.
 
@@ -55,7 +61,7 @@ job of any lab member reuses the file. A `docker://` reference is pulled. A
 a micromamba base and packed into a SIF named after the recipe.
 
 A build writes the exact package list beside the image as `<image>.sif.lock.txt`, and it reads and
-extends the lab's conda download cache, `<root>/conda-pkgs/`, which the first build creates. To
+extends the lab's conda download cache, `<root>/envs/conda-pkgs/`, which the first build creates. To
 rebuild such an image, delete the file: the next job that needs it builds it again.
 `cellqc-0.3.6_4509649d69.sif` has no lock file beside it; its package list is inside the image at
 `/opt/conda/aiscientist-packages.txt`.
@@ -78,14 +84,14 @@ configuration reads them. Together they are 60 G of the directory.
 
 | Path | Size | What | Read through | Get it again |
 |---|---|---|---|---|
-| `hf/hub/models--RedHatAI--Qwen3.8-27B-INT4` | 18 G | the default model of a session | `AISCIENTIST_VLLM_MODEL`, `AISCIENTIST_HF_HOME` | `scripts/hpc3_vllm_setup.sh` (`hf download` into `<root>/hf`) |
-| `hf/hub/models--QuantTrio--Qwen3.6-35B-A3B-AWQ` | 24 G | the second model of the model list | the model list | the same script with `AISCIENTIST_VLLM_MODEL` set to it |
-| `hf/hub/models--MJPansa--DeepSeek-V4-Flash-0731-NVFP4` | 160 G | the model of the shared reasoning-model server | `AISCIENTIST_SHARED_LLM_MODEL` (`configs/aiscientist.example.env`, section 6b) | `hf download` into `<root>/hf` on a compute node |
-| `vlreview_model/` | 16 G | `Qwen/Qwen2.5-VL-7B-Instruct`, for the report review | `AISCIENTIST_VLREVIEW_MODEL_DIR` | `scripts/hpc3_vlreview_setup.sh` |
-| `scgpt_model/` | 198 M | the scGPT reference checkpoint: `best_model.pt`, `vocab.json`, `id2type.json`, `dev_train_args.yml` | `AISCIENTIST_SCGPT_MODEL_DIR` | not downloadable: a copy of the lab's trained reference model (`deploy/scgpt/README.md`) |
+| `models/hf/hub/models--RedHatAI--Qwen3.8-27B-INT4` | 18 G | the default model of a session | `AISCIENTIST_VLLM_MODEL`, `AISCIENTIST_HF_HOME` | `scripts/hpc3_vllm_setup.sh` (`hf download` into `<root>/models/hf`) |
+| `models/hf/hub/models--QuantTrio--Qwen3.6-35B-A3B-AWQ` | 24 G | the second model of the model list | the model list | the same script with `AISCIENTIST_VLLM_MODEL` set to it |
+| `models/hf/hub/models--MJPansa--DeepSeek-V4-Flash-0731-NVFP4` | 160 G | the model of the shared reasoning-model server | `AISCIENTIST_SHARED_LLM_MODEL` (`configs/aiscientist.example.env`, section 6b) | `hf download` into `<root>/models/hf` on a compute node |
+| `models/vlreview/` | 16 G | `Qwen/Qwen2.5-VL-7B-Instruct`, for the report review | `AISCIENTIST_VLREVIEW_MODEL_DIR` | `scripts/hpc3_vlreview_setup.sh` |
+| `models/scgpt/` | 198 M | the scGPT reference checkpoint: `best_model.pt`, `vocab.json`, `id2type.json`, `dev_train_args.yml` | `AISCIENTIST_SCGPT_MODEL_DIR` | not downloadable: a copy of the lab's trained reference model (`deploy/scgpt/README.md`) |
 | `envs/openspliceai/` | 5.1 G | a conda environment with OpenSpliceAI and PyTorch | `AISCIENTIST_SPLICEAI_BIN` | `deploy/vep/stage_annotation_dbs.sh` |
-| `pydeps/` | 128 M | Python packages the analysis image lacks, added to the analysis jobs' import path: `pydeseq2` and what it needs (`formulaic`, `formulaic_contrasts`, `interface_meta`, `wrapt`) | `AISCIENTIST_HPC_PYDEPS` | `pip install --no-deps --target <root>/pydeps <package>`, run inside `analysis.sif` so the wheels match its Python |
-| `pkgs/` | under 1 M | the shared cache of packages that `run_code` installs when a snippet needs one the image lacks (`gateway/package_cache.py`) | fixed: `<root>/pkgs` | fills itself |
+| `envs/analysis-pydeps/` | 128 M | Python packages the analysis image lacks, added to the analysis jobs' import path: `pydeseq2` and what it needs (`formulaic`, `formulaic_contrasts`, `interface_meta`, `wrapt`) | `AISCIENTIST_HPC_PYDEPS` | `pip install --no-deps --target <root>/envs/analysis-pydeps <package>`, run inside `analysis.sif` so the wheels match its Python |
+| `envs/run-code-pkgs/` | under 1 M | the shared cache of packages that `run_code` installs when a snippet needs one the image lacks (`gateway/package_cache.py`) | fixed: `<root>/envs/run-code-pkgs` | fills itself |
 
 Nothing in the product's code or in the production configuration reads the following, about 24 G
 together:
@@ -93,7 +99,7 @@ together:
 | Path | Size | What |
 |---|---|---|
 | `ollama/` | 24 G | Ollama binaries and `qwen3.6` weights. Ollama is not a serving backend of the product. |
-| `pydeps/flashinfer-*`, `pydeps/fi-*` | 125 M, part of `pydeps/` | packages left by the model-serving tests |
+| `envs/analysis-pydeps/flashinfer-*`, `envs/analysis-pydeps/fi-*` | 125 M, part of `analysis-pydeps/` | packages left by the model-serving tests |
 | `_archive_2026-10-22/` | 16 M | benchmark scripts, patch sources and job logs set aside for deletion by a storage cleanup (RCHENLAB/AiScientist issue 28). `MANIFEST.txt` lists what came from where. |
 
 ## Literature: `<root>/retigene/` (7.5 G)

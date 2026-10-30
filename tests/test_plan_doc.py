@@ -241,6 +241,21 @@ def test_a_multi_library_step_can_bind_the_complete_sample_list():
                          {"samples": samples}) == ({"samples": samples}, [])
 
 
+@pytest.mark.parametrize("proposed", [["Sample3"], ["Sample3_GSM5676874", "Sample3"],
+                                      ["Sample1", "Sample2", "Sample3"]])
+def test_a_sample_list_that_misses_a_named_library_is_refused_even_with_other_items(proposed):
+    # "Sample3" is in the text (inside "Sample3_GSM5676874"), so it passes the stated check; it is no
+    # subset of the full names either. run_cellqc matches sample ids exactly and would refuse it.
+    from aiscientist.tools.run_cellqc.tool import make_tool
+
+    text = ("Run run_cellqc on Sample1_WT and Sample2_Ddx41 (mouse) and Sample3_GSM5676874 "
+            "(human).")
+    settings, dropped = bind_settings(text, make_tool().parameters["properties"],
+                                      {"samples": proposed})
+    assert settings == {}
+    assert [d["why"] for d in dropped] == ["incomplete_list"]
+
+
 def test_arguments_written_as_a_call_are_read_from_the_step():
     step = 'Contrast the arms with `run_de(groupby="sampleid", reference="WT", padj=0.05)`.'
     assert call_settings(step, "run_de") == {"groupby": "sampleid", "reference": "WT", "padj": "0.05"}

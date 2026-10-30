@@ -120,6 +120,31 @@ def test_a_job_is_copied_hashed_verified_and_persisted(h):
     assert on_disk.state == "done" and on_disk.sha256 == done.sha256
 
 
+def test_queued_is_announced_before_the_copy_can_move_the_job_on(tmp_path):
+    """CI 2026-10-28: the worker started before submit() announced "queued" and moved the shared job
+    to "pushing", so the upload log's first copy line was copy_pushing. A slow first listener makes
+    that window wide: the job must still read "queued" when its announcement ends."""
+    seen: list[str] = []
+
+    def on_change(job: st.StagingJob) -> None:
+        if not seen:
+            time.sleep(0.2)
+        seen.append(job.state)
+
+    harness = Harness(tmp_path)
+    q = st.StagingQueue(harness.store, push=harness.push, verify=harness.verify, on_change=on_change)
+    try:
+        job = harness.job()
+        q.submit(job)
+        _settle(q, job.id)
+        assert seen[0] == "queued" and harness.pushes == 1
+        assert [s for i, s in enumerate(seen) if i == 0 or seen[i - 1] != s] == [
+            "queued", "pushing", "verifying", "done"]
+    finally:
+        q.shutdown()
+        harness.q.shutdown()
+
+
 def test_wait_returns_none_while_running_and_the_job_once_settled(h):
     h.push_gate = threading.Event()
     job = h.job()

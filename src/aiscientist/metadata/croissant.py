@@ -104,6 +104,8 @@ SOURCE_REGISTRY = "registry"      # the registry row only (a dataset older than 
 SOURCE_CONTENT = "file-content"   # read from the file's head: header, columns, genome build
 SOURCE_NAME = "file-name"         # guessed from a file or folder name
 SOURCE_DEFAULT = "default"        # a placeholder until the owner decides (license, version)
+SOURCE_PROFILE = "dataset-profile"  # read off the data by a run's profile of it (DATASET.md)
+SOURCE_PI = "pi-description"      # the PI's reading of the dataset: the summary of its DATASET.md
 
 UNSURE_BELOW = 0.7
 DRAFT_NOTE = "Drafted automatically; not yet reviewed by its owner."
@@ -267,6 +269,14 @@ def _distribution(files: list[dict], ids: _Ids, ledger: _Ledger, *, size_source:
         desc = _content_description(fmt, content)
         if fmt.label != "File":
             desc = (f"{fmt.label}. " + desc).strip()
+        declared = f.get("declared") if isinstance(f.get("declared"), dict) else {}
+        if declared.get("description"):
+            # What the skill or pipeline that made the file declares it holds (issue 10).
+            said = str(declared["description"]).strip()
+            desc = (said + ("" if said.endswith(".") else ".") + " " + desc).strip()
+            ledger.add(entry["@id"], f"distribution[{i}].description", said, SOURCE_RUN, 0.9,
+                       "Declared in the outputs of " + (str(declared.get("source") or "")
+                                                        or "the skill that wrote it"))
         if f.get("size") is not None and entry["@type"] == "cr:FileSet":
             desc = (desc + f" Size: {human_size(f['size'])}.").strip()
         if desc:
@@ -417,9 +427,15 @@ def _facets(about_terms: dict[str, list[tuple["vocab.Term | None", str]]], acces
     return facets
 
 
-def build_dataset(uuid: str, facts: dict, user_fields: "dict | None" = None, *, base_url: str = "") -> Built:
-    """The ``croissant.json`` of one dataset, from its facts and its owner's review."""
+def build_dataset(uuid: str, facts: dict, user_fields: "dict | None" = None, *, base_url: str = "",
+                  description: "dict | None" = None) -> Built:
+    """The ``croissant.json`` of one dataset, from its facts and its owner's review, and from the
+    record of its ``DATASET.md`` when a run has written one (``description``: the profile the PI
+    read, its statements and the owner's edit; RCHENLAB/AiScientist issue 10). The organism and
+    tissue the profile establishes, and the description's summary, are the same in both documents."""
+    from . import description as dataset_md
     uf = dict(user_fields or {})
+    rec = description if isinstance(description, dict) else {}
     ledger = _Ledger()
     did = f"urn:uuid:{uuid}"
     ids = _Ids()
@@ -431,6 +447,10 @@ def build_dataset(uuid: str, facts: dict, user_fields: "dict | None" = None, *, 
 
     # the subject: organism, tissue, cell type, assay
     drafted = suggestions(facts)
+    for kind, found in dataset_md.profile_terms(rec.get("profile") or {}).items():
+        for term, why in found:
+            if all(t.id != term.id for t, *_ in drafted[kind]):
+                drafted[kind].insert(0, (term, SOURCE_PROFILE, 0.8 if kind == "organism" else 0.6, why))
     about_terms: dict[str, list[tuple["vocab.Term | None", str]]] = {}
     about: list[dict] = []
     techniques: list[dict] = []
@@ -455,9 +475,20 @@ def build_dataset(uuid: str, facts: dict, user_fields: "dict | None" = None, *, 
     fmts = [formats.refine(formats.for_name(f["path"]), f.get("content")) for f in files]
 
     # description
+    owner_md = dataset_md.owner_summary(str((rec.get("owner") or {}).get("markdown") or ""))
+    pi_summary = (dataset_md.summary_text(dataset_md.from_record(rec, facts, uf, name=name))
+                  if rec.get("written_at") else "")
     if uf.get("description"):
         description = str(uf["description"])
         ledger.add(did, "description", "(the owner's text)", SOURCE_OWNER, 1.0)
+    elif owner_md:
+        description = owner_md
+        ledger.add(did, "description", "(the summary of DATASET.md as its owner edited it)", SOURCE_OWNER, 1.0)
+    elif pi_summary:
+        description = pi_summary
+        ledger.add(did, "description", "(the summary of DATASET.md)", SOURCE_PI, 0.6,
+                   "Written by the PI the first time a run read this dataset: the counts are read "
+                   "from the data, the rest is its reading of them.")
     else:
         description = _draft_description(facts, fmts)
         ledger.add(did, "description", description, SOURCE_CONTENT if files else SOURCE_REGISTRY, 0.5,
@@ -627,7 +658,9 @@ def build_result(uuid: str, facts: dict, *, base_url: str = "") -> Built:
                                         for i in inputs) + "."
     handed = facts.get("handed_on") or []
     if handed:
-        desc += " Kept beside the run (not in this bundle): " + "; ".join(
+        where = ("Kept with the run on the server" if all(h.get("location") == "server" for h in handed)
+                 else "Kept beside the run")
+        desc += f" {where} (not in this bundle): " + "; ".join(
             f"{h.get('what')}: {h.get('name')} ({human_size(h.get('size_bytes'))})" for h in handed) + "."
     sw_label = f"{software.get('name') or 'AiScientist'} {software.get('version') or ''}".strip()
     if software.get("git_sha"):

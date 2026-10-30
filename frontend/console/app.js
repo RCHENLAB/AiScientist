@@ -69,7 +69,7 @@ function newChatRecord(sid) {
     deadRunTimer: null,    // grace timer that stops a "running" chat whose backend run died silently
     planPending: false,    // a PI plan / clarify / decision is waiting for the user
     plan: null,            // that prompt: {kind: "plan"|"clarify"|"decision", sid, run, agenda, doc,
-                           // revised, problems, questions, goal, options, expiry}. Its card is drawn
+                           // revised, problems, questions, goal, options}. Its card is drawn
                            // FROM it (drawPlanPrompt), so it survives a rebuild of the chat stream.
     planDraftYaml: "",     // what is typed in the plan editor and not applied (or an edit just sent)
     planDraftBase: "",     // the plan document (its YAML) that text and the open editor belong to
@@ -843,6 +843,7 @@ function sessionBadge(sid) {
   if (!c) return "";
   if (c.plan) return `<span class="session-waiting" title="This chat is waiting for your answer">${PLAN_WAITING_LABEL[c.plan.kind] || "Waiting for you"}</span>`;
   if (c.confirm && !c.confirm.answer) return '<span class="session-waiting" title="The agent is waiting for your OK in this chat">Needs your OK</span>';
+  if (c.bindConfirm) return '<span class="session-waiting" title="A Bind of server data is waiting for your OK in this chat">Needs your OK</span>';
   if (c.running) return '<span class="session-running" title="A run is in progress in this chat">Running</span>';
   return "";
 }
@@ -906,6 +907,13 @@ const CONFIRM_TITLES = {
   write_outside: "✍️ Write outside your folders?",
   destructive: "⚠️ Delete or overwrite on HPC3?",
   quota: "💾 Use more storage on HPC3?",
+  budget: "💳 Over your API budget — continue?",
+};
+// A budget question stops the run on no, unlike the agent's other requests (key_guard, issue 16).
+const BUDGET_OUTCOMES = {
+  approved: "✓ Continuing past your limit for this run.",
+  declined: "✗ Declined — the run stopped before its next model call.",
+  timeout: "No answer in time — counted as no; the run stopped before its next model call.",
 };
 const CONFIRM_OUTCOMES = {
   approved: "✓ Approved — the agent continues.",
@@ -947,7 +955,7 @@ function holdConfirm(c, msg) {
 
 function confirmCardHtml(p, note = "") {
   const when = p.deadline ? new Date(p.deadline).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-  const meta = [p.reversible ? "This can be undone." : "This cannot be undone.",
+  const meta = [p.kind === "budget" ? "No stops the run; its files are kept." : p.reversible ? "This can be undone." : "This cannot be undone.",
     when ? `No answer by ${when} counts as no.` : "No answer in time counts as no."].join(" ");
   const foot = note
     ? `<div class="confirm-status">${escapeHtml(note)}</div>`
@@ -1004,15 +1012,23 @@ function confirmServerBind(c, message) {
       resolve: (approved) => {
         if (c.bindConfirm !== p) return;
         c.bindConfirm = null;
+        renderSessionList();
         if (chatVisible(c) && state.bindConfirmCardEl) {
           state.bindConfirmCardEl.remove(); state.bindConfirmCardEl = null;
         }
         resolve(approved);
       } };
     c.bindConfirm = p;
+    // The chat list marks the chat as waiting, like an agent request (sessionBadge).
+    renderSessionList();
     if (chatVisible(c)) drawConfirmPrompt(c);
-    else toast("Open the original chat to confirm binding server data.");
+    else toast(`“${chatTitle(c.sid).trim()}” needs your OK to bind server data — open that chat to answer.`);
   });
+}
+
+// One large-copy Bind waits for an answer at a time in a chat.
+function bindWaiting(c) {
+  return !!(c && c.bindConfirm);
 }
 
 // The request is no longer waiting: its card keeps a line saying what became of it.
@@ -1029,7 +1045,8 @@ function closeConfirm(c, note) {
 
 function releaseConfirm(c, msg) {
   if (!c.confirm) return;
-  closeConfirm(c, CONFIRM_OUTCOMES[msg && msg.outcome] || "This request is no longer waiting.");
+  const outcomes = c.confirm.kind === "budget" ? { ...CONFIRM_OUTCOMES, ...BUDGET_OUTCOMES } : CONFIRM_OUTCOMES;
+  closeConfirm(c, outcomes[msg && msg.outcome] || "This request is no longer waiting.");
 }
 
 async function answerConfirm(c, approved) {
@@ -1392,8 +1409,8 @@ function renderContextMeter(msg) {
 function hideContextMeter() { const el = $("ctxMeter"); if (el) el.classList.add("hidden"); }
 
 function finishAssistantStream(c) {
-  // The run is over, so nothing of it can still be waiting for an answer. A plan review that
-  // expired sends no plan_done: without this its card would be drawn again on every switch of chats.
+  // The run is over, so nothing of it can still be waiting for an answer. A run that ended while its
+  // card waited may send no plan_done: without this its card would be drawn again on every switch of chats.
   if (c.plan || c.planPending) { if (chatVisible(c)) removePlanCard(); hidePlanPanel(c); }
   if (c.confirm) closeConfirm(c, "The run ended — this request is no longer waiting.");
   dropPlanDraft(c);
@@ -1572,12 +1589,24 @@ async function loadResults(owner, runId) {
           .map((f) =>
             `<button class="file-row" data-url="${f.url}" data-kind="${f.kind}" data-name="${escapeHtml(f.name)}" title="${escapeHtml(f.path)}">` +
             `<span class="file-row-icon">${fileIcon(f.kind)}</span>` +
-            `<span class="file-row-name">${escapeHtml(f.name)}</span>` +
+            `<span class="file-row-text"><span class="file-row-name">${escapeHtml(f.name)}</span>${declaredCaption(f.declared)}</span>` +
             `<span class="file-row-size">${fmtSize(f.size)}</span></button>`
           ).join("");
         return `<details class="file-folder" open><summary>${meta(k).label} <span class="file-folder-count">${groups[k].length}</span></summary>${rows}</details>`;
       }).join("");
   } catch { /* preview is best-effort */ }
+}
+
+// The description a skill or pipeline declared for a produced file, and the step that made it
+// (process/declared_outputs.json, via /api/files). Nothing for a file no declaration matched.
+function declaredCaption(d) {
+  if (!d || !d.description) return "";
+  const bad = { empty: "empty", blank: "blank image", invalid: "unreadable" }[d.status];
+  return `<span class="file-row-desc">`
+    + (d.step ? `<span class="file-row-step">Step ${escapeHtml(String(d.step))}</span>` : "")
+    + escapeHtml(d.description)
+    + (bad ? ` <span class="file-row-bad">${icon("warning")}${escapeHtml(bad)}</span>` : "")
+    + `</span>`;
 }
 
 async function openFilePreview(url, kind, name) {
@@ -1978,6 +2007,7 @@ async function loadApiCredentials() {
     apiKeys.creds = d.credentials || [];
     apiKeys.shared = d.shared || null;
     apiKeys.storage = d.storage || null;
+    apiKeys.sessionHours = d.session_idle_hours || 12;
   } catch { apiKeys.creds = []; }
   renderEndpointSelect();
   renderConnectEndpointSelect();
@@ -2384,14 +2414,27 @@ function renderApiKeyList() {
       : c.verified_at ? '<span class="api-key-ok">✓ verified</span>' : "<span>not tested</span>";
     const roles = c.model ? credRolesLabel(c)
       : '<span class="api-key-bad">no model — pick one before this endpoint can be used</span>';
+    // Paused: no model call uses the key (the next call of a running run included) until resumed.
+    // An administrator's pause can be lifted only by an administrator.
+    const pausedBy = { owner: "you", admin: "an administrator", auto: "AiScientist (unusual usage)" }[c.paused_by] || "";
+    const paused = c.paused_at
+      ? `<small class="api-key-bad">⏸ Paused by ${escapeHtml(pausedBy)}${c.pause_reason && c.paused_by !== "owner" ? ` — ${escapeHtml(c.pause_reason)}` : ""}</small>` : "";
+    const where = c.session_only
+      ? ` · <span title="Held in the server's memory for this browser session only; never written to disk">this session only</span>`
+      : (c.encrypted ? " 🔒" : "");
+    const pauseBtn = c.paused_at
+      ? (c.paused_by === "admin" ? "" : '<button type="button" class="ghost small" data-act="resume">Resume</button>')
+      : '<button type="button" class="ghost small" data-act="pause" title="Stop every use of this key now, running runs included">Pause</button>';
     return `<div class="api-key-row${apiKeys.editing === c.id ? " editing" : ""}" data-id="${escapeHtml(c.id)}">
       <div class="api-key-main">
         <strong>${escapeHtml(c.label)}</strong>
         <small>${roles}</small>
-        <small><code>${escapeHtml(c.base_url || "")}</code> · key ${escapeHtml(c.key_hint || "")}${c.encrypted ? " 🔒" : ""}</small>
+        <small><code>${escapeHtml(c.base_url || "")}</code> · key ${escapeHtml(c.key_hint || "")}${where}</small>
         <small>${state_}</small>
+        ${paused}
       </div>
       <div class="api-key-actions">
+        ${pauseBtn}
         <button type="button" class="ghost small" data-act="test">Test</button>
         <button type="button" class="ghost small" data-act="edit">Edit / rotate key</button>
         <button type="button" class="ghost small" data-act="del">Delete</button>
@@ -2408,9 +2451,13 @@ function renderApiKeyStorage() {
   if (!el) return;
   const s = apiKeys.storage;
   if (!s) { el.textContent = ""; return; }
-  el.textContent = `Your key is stored ${s.encrypted ? "encrypted " : ""}on the AiScientist server, `
-    + `readable only by the service, never in your browser, and sent only to the endpoint you `
-    + `saved it for.`;
+  el.textContent = s.separate_service
+    ? `Your key is stored encrypted on the AiScientist server by a separate key service, which alone `
+      + `can read it: the web server and the agents never see it. It is never in your browser and is `
+      + `sent only to the endpoint you saved it for. To use a key without saving it, tick "this browser session only".`
+    : `Your key is stored ${s.encrypted ? "encrypted " : ""}on the AiScientist server, `
+      + `readable only by the service, never in your browser, and sent only to the endpoint you `
+      + `saved it for. To use a key without saving it, tick "this browser session only".`;
 }
 
 function renderProviderOptions() {
@@ -2568,6 +2615,9 @@ function resetApiKeyForm() {
   $("apiKeySave").textContent = "Verify & save";
   $("apiKeyCancel").classList.add("hidden");
   for (const id of ["apiKeyBaseUrl", "apiKeyValue", "apiKeyModel", "apiKeyLabModel", "apiKeyLabel"]) $(id).value = "";
+  $("apiKeySessionOnly").checked = false;
+  $("apiKeySessionRow").classList.remove("hidden");
+  $("apiKeySessionHint").textContent = `kept in the server's memory until you log out or leave it unused for ${apiKeys.sessionHours || 12} hours`;
   apiKeys.fetchedFor = "";
   renderModelChoices([]);
   for (const [inputId, menuId] of MODEL_COMBOS) closeModelMenu(inputId, menuId);
@@ -2586,6 +2636,7 @@ function editApiKey(cred) {
     `keeping the saved key ${cred.key_hint || ""} — paste one only to replace it`;
   $("apiKeySave").textContent = "Save changes";
   $("apiKeyCancel").classList.remove("hidden");
+  $("apiKeySessionRow").classList.add("hidden");     // saved or session-only is chosen when adding
   $("apiKeyProvider").value = cred.provider || "custom";
   $("apiKeyBaseUrl").value = cred.base_url || "";
   $("apiKeyValue").value = "";
@@ -2636,6 +2687,7 @@ async function submitApiKey(ev) {
     user: apiKeyOwner(),
   };
   const editing = apiKeys.editing;
+  if (!editing && $("apiKeySessionOnly").checked) body.session_only = true;
   if (!editing && !body.api_key) { apiKeyError("Paste an API key to save this endpoint."); return; }
   // A credential with no model id is refused at bind time ("Set a model on this credential"),
   // so saving one produces an endpoint that appears in the picker and then cannot be used.
@@ -2682,7 +2734,7 @@ async function submitApiKey(ev) {
       }
     }
     if (reverify && !reverify.ok) toast(`Saved, but ${reverify.message}`);
-    else toast(editing ? "Endpoint updated" : "Endpoint saved");
+    else toast(editing ? "Endpoint updated" : body.session_only ? "Key ready for this session (not saved)" : "Endpoint saved");
   } catch (err) {
     apiKeyError(isUnreachable(err) ? "Can't reach the local server." : err.message);
   } finally {
@@ -2752,6 +2804,19 @@ async function fetchEndpointModels({ silent = false } = {}) {
   } finally { btn.disabled = false; }
 }
 
+// One of the user's API keys was paused (an administrator, or the spike check) or its usage spiked
+// (key_guard). Said once as a toast, and the key list redrawn so the row shows why.
+function onKeyNotice(msg) {
+  const label = msg.label || "your API key";
+  const text = msg.type === "key_spike"
+    ? `Unusual usage of ${label}: ${msg.reason || ""}. Check it in your provider's console.`
+    : msg.kind === "admin"
+      ? `An administrator paused ${label}${msg.reason ? ` (${msg.reason})` : ""}. No run uses it until an administrator resumes it.`
+      : `${label} was paused: ${msg.reason || "unusual usage"}. If this usage was not yours, rotate the key at the provider; if it was, resume it under API endpoints.`;
+  toast(text);
+  loadApiCredentials();
+}
+
 async function apiKeyRowAction(ev) {
   const btn = ev.target.closest("button[data-act]");
   if (!btn) return;
@@ -2762,6 +2827,17 @@ async function apiKeyRowAction(ev) {
 
   if (btn.dataset.act === "edit") { editApiKey(cred); return; }
   if (btn.dataset.act === "del") { await deleteEndpointById(id); return; }
+  if (btn.dataset.act === "pause" || btn.dataset.act === "resume") {
+    btn.disabled = true;
+    try {
+      const res = await fetch(`/api/llm-credentials/${id}/${btn.dataset.act}${q}`, { method: "POST" });
+      const d = await res.json();
+      toast(res.ok ? `${cred.label}: ${btn.dataset.act === "pause" ? "paused — no run uses it until you resume it" : "resumed"}`
+        : (d.error || "Could not change the key"));
+      await loadApiCredentials();
+    } finally { btn.disabled = false; }
+    return;
+  }
   btn.disabled = true;
   btn.textContent = "Testing…";
   try {
@@ -2885,7 +2961,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "plan_expiring", "run_usage", "confirm_request", "confirm_done",
+  "plan_status", "run_usage", "confirm_request", "confirm_done",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -2920,6 +2996,7 @@ function handleWsMessage(msg) {
     case "datasets_changed": onDatasetsChanged(); break;         // a dataset moved from HPC3 to the server
     case "result_saved": onResultSaved(msg); break;              // a result copied back from HPC3 is saved
     case "usage_update": onUsageUpdate(msg); break;              // a model call was recorded
+    case "key_paused": case "key_spike": onKeyNotice(msg); break; // one of your API keys was paused
     case "duo_prompt": showDuoPanel(msg.prompt); break;
     case "duo_done": hideDuoPanel(); break;
     case "error": toast(msg.message); break;
@@ -2980,7 +3057,6 @@ function handleRunEvent(c, msg) {
     case "decision_prompt": holdPlanPrompt(c, "decision", { goal: msg.goal || "", options: msg.options || [] }, msg); break;
     case "plan_done": hidePlanPanel(c); break;
     case "plan_status": if (chatVisible(c)) setPlanStatus(msg.text); break;
-    case "plan_expiring": notePlanExpiring(c, msg); break;
     case "confirm_request": holdConfirm(c, msg); break;
     case "confirm_done": releaseConfirm(c, msg); break;
   }
@@ -3556,6 +3632,9 @@ async function disconnect() {
     if (res.ok && d.session && d.session.closed_at) {
       const said = sessionHeadline(d.session, state.ttlDays);
       if (said) toast(`Session closed. ${said}`);
+    } else if (res.ok && d.ending) {
+      // Large results take minutes to copy; the server goes on after this reply.
+      toast("Session closed. Its results are being copied from HPC3 to the server; its HPC3 files are removed once they are checked. My account → Storage → Sessions shows how it ends.");
     }
   } catch (err) {
     if (isUnreachable(err)) toast("Local server was already down — clearing the session. Check HPC3 with `squeue --me`.");
@@ -3773,11 +3852,7 @@ function holdPlanPrompt(c, kind, payload, msg) {
       && JSON.stringify([held.agenda, held.doc]) === JSON.stringify([next.agenda, next.doc]);
     next.revised = msg.revised || (repeated ? held.revised : []);
   }
-  // A warning that this prompt expires (notePlanExpiring) stays with it when the same prompt is sent
-  // again; a different one starts a review window of its own.
-  const { expiry, ...heldBody } = held || {};
-  const same = !!held && JSON.stringify(heldBody) === JSON.stringify(next);
-  if (same && expiry) next.expiry = expiry;
+  const same = !!held && JSON.stringify(held) === JSON.stringify(next);
   c.plan = next;
   c.planPending = true;
   c.answered = null;
@@ -3816,7 +3891,6 @@ function releasePlanPrompt(c = activeChat()) {
   const was = !!c.plan || c.planPending;
   c.plan = null;
   c.planPending = false;
-  if (chatVisible(c)) dropPlanExpiry();
   saveRunOwners();
   if (was) renderSessionList();
 }
@@ -3909,7 +3983,7 @@ function removePlanCard() {
   state.planStatusEl = null;   // the old card's status line went with it
 }
 
-// kind: "plan" | "clarify" | "decision" — what the card waits for, which is what its expiry line says.
+// kind: "plan" | "clarify" | "decision" — what the card waits for.
 function planCardShell(kind) {
   removePlanCard();
   if (state.planAnsweredEl) { state.planAnsweredEl.remove(); state.planAnsweredEl = null; }
@@ -4044,6 +4118,16 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
       + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
       + `</div>`
     : "";
+  // What the step should leave behind: declared by its skill, or by the active pipeline for its tool.
+  // Checked after the step; a required one that is missing keeps the step from being accepted.
+  const outs = step && Array.isArray(step.outputs) ? step.outputs : [];
+  const outputs = outs.length
+    ? `<div class="plan-step-outputs"><div class="plan-outputs-head">${planIcon("output")}<span>Expected outputs</span></div><ul>`
+      + outs.map((o) => `<li><code title="Under the run's artifacts folder">${escapeHtml(o.path)}</code>`
+        + `<span class="plan-output-kind">${escapeHtml(String(o.kind || "").replace("_", " "))}${o.required === false ? " · optional" : ""}</span>`
+        + `<span class="plan-output-desc">${escapeHtml(o.description || "")}</span></li>`).join("")
+      + `</ul></div>`
+    : "";
   const open = !!parts.body && planStepOpen(text, revised);
   return `<li class="plan-step${revised ? " revised" : ""}${open ? " open" : ""}"`
     + (editable ? ` data-id="${escapeHtml(step.id)}"` : "") + `>`
@@ -4060,7 +4144,7 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
       + `aria-label="Show the whole step" title="Show the whole step">${planIcon("expand_more")}</button>` : "")
     + `</span></div>`
     + (parts.body ? `<div class="plan-step-body">${planEmphasisHtml(renderMarkdown(parts.body), settings)}</div>` : "")
-    + meta + `</div></li>`;
+    + meta + outputs + `</div></li>`;
 }
 
 // One decimal from 1 up, two below it: an estimate is a range, and 2.667 hours claims more than it knows.
@@ -4144,7 +4228,6 @@ function planRevisedNote(revised) {
 //   "review" (default) — waiting for a decision: the document's editor and Run / Cancel;
 //   "status"           — answered, the PI has it: `opts.status` instead of the buttons;
 //   "saved"            — a plan this chat approved: read-only, with its document.
-// `opts.expiry` is the waiting plan's expiry line.
 function planCardHtml(agenda, doc, revisedSteps, opts) {
   const o = opts || {};
   const mode = o.mode || "review";
@@ -4174,7 +4257,6 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
     + planReviseHtml(o.words)
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
-    + (o.expiry ? `<div class="plan-expiry" role="status">${planIcon("hourglass_bottom")}<span>${escapeHtml(o.expiry)}</span></div>` : "")
     + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
     + (doc && doc.yaml ? `<button class="secondary" data-plan="yaml">${planIcon("data_object")}<span>Edit as YAML</span></button>` : "")
     + `<button class="secondary quiet" data-plan="cancel">Cancel</button></div>`;
@@ -4472,8 +4554,8 @@ function planInlineEdit(li, el, initial, label, commit) {
     if (ev.key === "Enter") { ev.preventDefault(); finish(true, false); }
     else if (ev.key === "Escape") { ev.preventDefault(); finish(false, false); }
   });
-  // Leaving the box applies the change, but a box that left because the panel was drawn again (an
-  // expiry warning, a status line) is not the person leaving it: nothing is sent for that.
+  // Leaving the box applies the change, but a box that left because the panel was drawn again (a
+  // status line) is not the person leaving it: nothing is sent for that.
   input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, true); }, 0));
 }
 
@@ -4547,7 +4629,6 @@ function showPlanPanel(agenda) {
   el.innerHTML = planEntryHtml(state.planAgenda, state.planDoc, { pending: true, revised: state.planRevisedSteps,
     problems: state.planProblems, dirty: !!state.planDraftYaml });
   wirePlanEntry(el, c);
-  drawPlanExpiry();
   // The whole plan is in the side panel: it opens the first time each version of the plan is shown
   // in its chat (also when it arrived while another chat was on screen), not on every redraw.
   const seen = JSON.stringify([state.planAgenda, (state.planDoc && state.planDoc.yaml) || ""]);
@@ -4643,8 +4724,7 @@ function chatPlanView(c = activeChat()) {
   if (state.planView) return { mode: "saved", ...state.planView };
   if (c && c.plan && c.plan.kind === "plan") {
     return { mode: "review", agenda: c.plan.agenda || [], doc: c.plan.doc || null, revised: c.plan.revised || [],
-             estimate: c.plan.estimate || null,
-             expiry: c.plan.expiry ? planExpiryText("plan", c.plan.expiry.at) : "" };
+             estimate: c.plan.estimate || null };
   }
   if (c && c.answered) return { mode: "status", ...c.answered };
   const s = activeSession();
@@ -4665,7 +4745,7 @@ function renderPlanPanel() {
   }
   host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
     + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
-                   { mode: view.mode, status: view.status || "", expiry: view.expiry || "", estimate: view.estimate || null,
+                   { mode: view.mode, status: view.status || "", estimate: view.estimate || null,
                      words: (c && c.planWords) || "" })
     + `</div>`;
   wirePlanSteps(host, view.agenda || []);
@@ -4709,8 +4789,8 @@ function refreshPlanRevise(host, c) {
 }
 
 // A step opens and closes by its chevron, or opens by a click on its two lines; "Expand all" does
-// every step. What the person chose is kept per step text, so a redraw (a status line, an expiry
-// warning, a revision that left the step alone) does not fold it again.
+// every step. What the person chose is kept per step text, so a redraw (a status line, a revision
+// that left the step alone) does not fold it again.
 function wirePlanSteps(host, agenda) {
   const items = [...host.querySelectorAll(".plan-step")];
   const setOpen = (li, i, open) => {
@@ -4825,7 +4905,6 @@ function showClarify(questions) {
     wrap.appendChild(opts);
     el.appendChild(wrap);
   }
-  drawPlanExpiry();
   $("chatInput").placeholder = "Answer the PI, or type your own…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
@@ -4862,7 +4941,6 @@ function showDecision(goal, options) {
   defer.addEventListener("click", () => submitDecision("", c));
   opts.appendChild(defer);
   el.appendChild(opts);
-  drawPlanExpiry();
   $("chatInput").placeholder = "Pick an option — or leave it to the agent…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
@@ -4882,12 +4960,32 @@ async function submitDecision(choice, c = activeChat()) {
   }
   updateComposerButton();
   try {
-    await fetch("/api/lab/plan", {
+    const res = await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action: "revise", feedback: choice || "" }),
     });
+    if (await planAnswerStale(res)) { planNotDelivered(c); return; }
     toast(choice ? "Decision recorded — continuing…" : "Continuing…");
   } catch (err) { toast("Failed to send decision: " + err.message); }
+}
+
+// /api/lab/plan answers {status: "stale"} when no run of this chat is waiting for the answer any
+// more (it ended, or the gateway restarted): the answer went nowhere.
+async function planAnswerStale(res) {
+  if (!res || !res.ok) return false;
+  const body = await res.json().catch(() => null);
+  return !!body && body.status === "stale";
+}
+
+// Said on the card and in the chat, and the chat stops showing a run: without this the card kept
+// "Sent to the PI — reading your reply…" for good, waiting for a run that was gone.
+function planNotDelivered(c) {
+  const text = "Not delivered — this chat's run is no longer waiting for an answer. Send your request again.";
+  if (c.answered) c.answered.status = text;
+  if (chatVisible(c) && state.planStatusEl && state.planStatusEl.isConnected) state.planStatusEl.textContent = text;
+  if (c.running) { finishAssistantStream(c); setChatRunning(c, false); }
+  if (chatVisible(c)) renderPlanPanel();
+  toast(text);
 }
 
 // Resolve the live plan/clarify card with a short status line (drop the buttons), and on
@@ -4917,8 +5015,6 @@ function finalizePlanCard(note, persist, c = activeChat()) {
     if (editor) editor.remove();
     const row = state.planCardEl.querySelector(".plan-actions-row");
     if (row) row.innerHTML = `<span class="plan-actions-status">${escapeHtml(note)}</span>`;
-    const expiry = state.planCardEl.querySelector(".plan-expiry");   // a question's or a decision's
-    if (expiry) expiry.remove();
     // Keep a handle to the STATUS line after the card is resolved. The card is the only thing on
     // screen while the PI works, and what it says is the user's only signal about which of the two
     // things is happening (answering vs re-planning) — see setPlanStatus.
@@ -4940,62 +5036,11 @@ function setPlanStatus(text) {
   if (c && c.answered && text) { c.answered.status = text; renderPlanPanel(); }
 }
 
-// ---- the waiting prompt's expiry warning ----------------------------------------------------------
-// The gateway sends plan_expiring once, when three quarters of the review window have passed with no
-// answer. It is about the card that is WAITING, so it is shown on that card: a line above its buttons
-// (a plan) or under its options (a question, a decision point). It used to go to setPlanStatus, which
-// writes only to a RESOLVED card's status line, so it never appeared anywhere. It is kept ON the held
-// prompt (its chat's ``plan.expiry``), not only in the card: the card is drawn again from that prompt — a
-// switch of chats, a replayed prompt after a reconnect — and the warning comes back with it. It goes
-// when the prompt is released (releasePlanPrompt): answered, resolved by the server, or the run over.
-function notePlanExpiring(c, msg) {
-  const p = c.plan;
-  if (!p) return;   // nothing is waiting, so there is nothing for it to be about
-  const secs = Number(msg && msg.seconds_left);
-  p.expiry = { at: Number.isFinite(secs) && secs >= 0 ? Date.now() + secs * 1000 : null };
-  if (chatVisible(c)) { drawPlanExpiry(); renderPlanPanel(); }
-  else toast(`What is waiting in “${chatTitle(c.sid).trim()}” expires soon — open that chat to answer it.`);
-}
-
-// A clock time rather than "in N minutes": the line stays on screen until the prompt is answered,
-// and a countdown drawn once would be wrong a minute later.
-function planExpiryText(kind, at) {
-  const when = at ? "at " + new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "in a few minutes";
-  if (kind === "clarify") return `This question expires ${when} — answer it before then, or nothing will run.`;
-  if (kind === "decision") return `This decision expires ${when} — choose before then, or the run goes on without your answer.`;
-  return `This plan expires ${when} — run it, change it or reply before then, or nothing will run.`;
-}
-
-// Draws the chat on screen's waiting prompt's warning on its card. planCardEl is only ever that
-// prompt's card: a card is drawn only from its chat's prompt, and only while that chat is on screen.
-function drawPlanExpiry() {
-  const card = state.planCardEl;
-  const expiry = state.planPrompt && state.planPrompt.expiry;
-  if (!card || !expiry) return;
-  let line = card.querySelector(".plan-expiry");
-  if (!line) {
-    line = document.createElement("div");
-    line.className = "plan-expiry";
-    line.setAttribute("role", "status");
-    const row = card.querySelector(".plan-actions-row");
-    if (row) row.prepend(line); else card.appendChild(line);
-  }
-  line.innerHTML = planIcon("hourglass_bottom")
-    + `<span>${escapeHtml(planExpiryText(card.dataset.prompt, expiry.at))}</span>`;
-}
-
-// The prompt was released: a card of it still on screen (plan_done for a card answered elsewhere)
-// stops saying it expires.
-function dropPlanExpiry() {
-  const line = state.planCardEl && state.planCardEl.querySelector(".plan-expiry");
-  if (line) line.remove();
-}
-
 function hidePlanPanel(c = activeChat()) {
   // plan_done (any resolution). Card finalization happens in submitPlan; here we only
   // clear the pending state + restore the composer (idempotent).
   if (!c) return;
-  // A plan still held here was not answered on this page: the review expired or the run stopped.
+  // A plan still held here was not answered on this page: the run stopped or ended.
   const closed = c.plan && c.plan.kind === "plan" ? c.plan : null;
   if (closed) c.answered = { agenda: closed.agenda || [], doc: closed.doc || null, revised: closed.revised || [],
                              status: "This plan is no longer waiting for a decision." };
@@ -5049,11 +5094,12 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
   if (chatVisible(c)) repaintWorking();
   updateComposerButton();
   try {
-    await fetch("/api/lab/plan", {
+    const res = await fetch("/api/lab/plan", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connection_id: state.connectionId, conversation_id: c.sid, action, feedback: feedback || "",
                              plan_yaml: action === "edit" || action === "revise" ? (planYaml || "") : "" }),
     });
+    if (action !== "cancel" && await planAnswerStale(res)) { planNotDelivered(c); return; }
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
     else if (action === "edit") toast("Edit sent — checking it…");
@@ -6182,6 +6228,10 @@ async function bindServerPath(path) {
   if (!path) return false;
   if (!state.connectionId) { toast("Connect first: binding server data needs a session."); return false; }
   const sid = state.activeId, line = `bind:${sid}`;   // the chat it was asked in, which may be left meanwhile
+  // The Bind bar still offers Bind while that chat's card waits: a second click would scan the
+  // folder again and then be refused, so it says what it waits for instead.
+  const waitingText = "A Bind is already waiting for your answer in this chat.";
+  if (bindWaiting(chatOf(sid))) { toast(waitingText); return false; }
   const post = async (url) => {
     const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ connection_id: state.connectionId, path, conversation_id: String(sid || "") }) });
@@ -6204,9 +6254,13 @@ async function bindServerPath(path) {
     }
     const message = (base) => [base, ...overlaps].filter(Boolean).join("\n");
     // Large copies are confirmed first: the size and what will be skipped are in the message.
-    if (info.confirm && !await confirmServerBind(c, message(info.message))) {
-      toast("Bind cancelled.");
-      return false;
+    if (info.confirm) {
+      // Two clicks whose checks were both in flight: the first one's card is the one to answer.
+      if (bindWaiting(c)) { toast(waitingText); return false; }
+      if (!await confirmServerBind(c, message(info.message))) {
+        toast("Bind cancelled.");
+        return false;
+      }
     }
     const d = await post("/api/server-data/bind");
     if (c) c.serverBoundTyped.add(path);
@@ -6733,11 +6787,26 @@ async function loadSystem() {
       `<div class="card"><div class="card-main"><strong>${escapeHtml(s.name)}</strong>` +
       `<span class="sys-desc">${escapeHtml(s.persona)}</span></div></div>`).join("");
     const rel = d.release || {};
-    const relRow = (label, r) => `<span class="cap ${r && r.tag ? "on" : "off"}">${escapeHtml(label)}: ` +
-      `${escapeHtml((r && r.tag) || "unknown")}${r && r.sha ? " (" + escapeHtml(String(r.sha).slice(0, 7)) + ")" : ""}` +
-      `${r && r.installed === false ? " (not installed)" : ""}</span>`;
+    // An rsync deploy has no release tag but knows its commit: "untagged (abc1234)".
+    // skills: the release skills/current points at; "app pins" when that is not the app's own pin.
+    const relRow = (label, r) => {
+      const ok = !!(r && (r.tag || r.sha)) && !(r && (r.installed === false || r.error));
+      const name = (r && r.tag) || (r && r.sha ? "untagged" : "unknown");
+      return `<span class="cap ${ok ? "on" : "off"}">${escapeHtml(label)}: ${escapeHtml(name)}` +
+        `${r && r.sha ? " (" + escapeHtml(String(r.sha).slice(0, 7)) + ")" : ""}` +
+        `${r && r.installed === false ? " (not installed)" : ""}` +
+        `${r && r.pinned ? " (app pins " + escapeHtml(r.pinned) + ")" : ""}` +
+        `${r && r.error ? " (refused: " + escapeHtml(r.error) + ")" : ""}</span>`;
+    };
+    const schema = rel.schema;
+    const schemaRow = schema
+      ? `<span class="cap ${schema.database === schema.release ? "on" : "off"}">database schema: ` +
+        `${escapeHtml(schema.database || "unversioned")}` +
+        `${schema.database === schema.release ? "" : " (release has " + escapeHtml(schema.release) + ")"}</span>`
+      : "";
     el.innerHTML =
-      `<h3>Running versions</h3><div class="cap-row">${relRow("app", rel.app)}${relRow("skills", rel.skills)}</div>` +
+      `<h3>Running versions</h3><div class="cap-row">${relRow("app", rel.app)}${relRow("skills", rel.skills)}` +
+      `${schemaRow}</div>` +
       `<h3>Capabilities (this server)</h3><div class="cap-row">${caps}</div>` +
       `<p class="sys-note">What the web server has itself. A tool that runs on HPC3 brings its software in ` +
       `its job's container, so it is not checked here: each tool below says where it runs.</p>` +
@@ -7634,7 +7703,8 @@ async function openDatasetPreview(base, name, file) {
     $("dsPreviewMeta").textContent = `Folder · ${data.folder.total_files} files · ${fmtSize(data.folder.total_bytes)} · ${where}`;
     dl.onclick = (e) => { if (!confirmLargeDownload(data.folder.total_bytes, name)) e.preventDefault(); };
     dl.textContent = "Download (.zip)";
-    body.innerHTML = dsFolderHtml(base, data.folder);
+    body.innerHTML = dsFolderHtml(base, data.folder) + dsDescriptionSlot(base);
+    loadDatasetDescription(base);
     return;
   }
   const f = data.file || {};
@@ -7643,7 +7713,94 @@ async function openDatasetPreview(base, name, file) {
   $("dsPreviewMeta").textContent = [dsKindLabel(f.kind, data.preview), fmtSize(f.size_bytes), where].filter(Boolean).join(" · ");
   const back = file && ds.is_folder
     ? `<button type="button" class="ds-back ghost small" data-ds-back="1">${icon("arrow_back")} ${escapeHtml(name)}/</button>` : "";
-  body.innerHTML = back + dsPreviewHtml(base, file, data.preview || {});
+  body.innerHTML = back + dsPreviewHtml(base, file, data.preview || {}) + (file ? "" : dsDescriptionSlot(base));
+  if (!file) loadDatasetDescription(base);
+}
+
+// ---- the dataset's description, DATASET.md (issue 10) ----
+// Shown below the preview of a dataset (not of one file inside a folder). The PI writes it the first
+// time a run reads the dataset; the owner can edit it, and an edit is kept: a later run reads it and
+// never writes over it. Every statement is marked as read from the data, inferred, or the owner's.
+
+function dsDescriptionSlot(base) {
+  return /^\/api\/datasets\/\d+$/.test(base) ? `<section id="dsDescription" class="ds-description" aria-live="polite"></section>` : "";
+}
+
+async function loadDatasetDescription(base) {
+  const box = $("dsDescription");
+  if (!box) return;
+  box.innerHTML = `<div class="ds-note">${icon("hourglass_top")} Reading the description…</div>`;
+  let d;
+  try {
+    const res = await fetch(`${base}/description`);
+    d = await res.json();
+    if (!res.ok) throw new Error(d.detail || d.error || `HTTP ${res.status}`);
+  } catch (err) {
+    if (dsPreview.base === base) box.innerHTML = "";     // no accounts, or no record: show nothing
+    return;
+  }
+  if (dsPreview.base === base) renderDatasetDescription(box, base, d);
+}
+
+function dsDescriptionWho(d) {
+  const day = (iso) => (iso ? String(iso).slice(0, 10) : "");
+  if (d.state === "owner") return `Edited by you${d.owner_edited_at ? ` on ${day(d.owner_edited_at)}` : ""}`;
+  if (d.state === "pi") return `Written by the PI${d.written_at ? ` on ${day(d.written_at)}` : ""}${d.model ? ` (${d.model})` : ""}`;
+  return "";
+}
+
+function renderDatasetDescription(box, base, d, editing) {
+  const head = `<div class="ds-desc-head"><h3>${icon("description")}<span>Description</span><code>DATASET.md</code></h3>`
+    + (d.state !== "none" ? `<span class="ds-desc-who">${escapeHtml(dsDescriptionWho(d))}</span>` : "") + `</div>`;
+  if (d.state === "none" && !editing) {
+    box.innerHTML = head + `<p class="ds-note">No description yet. The PI writes one the first time a run reads this dataset: `
+      + `what the data is, its design, how it was processed, and what it can and cannot support, each statement marked as read from the data or inferred.</p>`;
+    return;
+  }
+  if (editing) {
+    box.innerHTML = head
+      + `<textarea class="ds-desc-edit" spellcheck="true" aria-label="DATASET.md">${escapeHtml(d.markdown || "")}</textarea>`
+      + `<div class="ds-desc-acts"><button type="button" class="primary small" data-desc-save>Save</button>`
+      + `<button type="button" class="ghost small" data-desc-cancel>Cancel</button>`
+      + `<span class="ds-note">Your text is kept: a later run reads it and does not write over it.</span></div>`;
+    const ta = box.querySelector("textarea");
+    ta.focus();
+    box.querySelector("[data-desc-cancel]").onclick = () => renderDatasetDescription(box, base, d);
+    box.querySelector("[data-desc-save]").onclick = async () => {
+      const btn = box.querySelector("[data-desc-save]");
+      btn.disabled = true;
+      try {
+        const res = await fetch(`${base}/description`, { method: "PUT", headers: { "Content-Type": "application/json" },
+                                                          body: JSON.stringify({ markdown: ta.value }) });
+        const out = await res.json();
+        if (!res.ok) throw new Error(out.detail || `HTTP ${res.status}`);
+        toast("Description saved.");
+        renderDatasetDescription(box, base, out);
+      } catch (err) { btn.disabled = false; toast(`Not saved: ${err.message}`); }
+    };
+    return;
+  }
+  const notes = [];
+  if (d.stale) notes.push("The data changed after this was written: the next run that reads the dataset writes it again.");
+  if (d.data_changed_after_edit) notes.push("The data changed after you edited this description. Check it still holds.");
+  box.innerHTML = head
+    + notes.map((n) => `<p class="ds-desc-warn">${icon("info")}<span>${escapeHtml(n)}</span></p>`).join("")
+    + `<div class="ds-desc-body">${renderMarkdown(d.markdown || "")}</div>`
+    + `<div class="ds-desc-acts"><button type="button" class="ghost small" data-desc-edit>${icon("edit")}<span>Edit</span></button>`
+    + `<a class="ghost small" href="${base}/DATASET.md" download>${icon("download")}<span>DATASET.md</span></a>`
+    + (d.state === "owner" && d.pi_markdown ? `<button type="button" class="ghost small" data-desc-reset title="Drop your edit and show the PI's description">Restore the PI's version</button>` : "")
+    + `</div>`;
+  box.querySelector("[data-desc-edit]").onclick = () => renderDatasetDescription(box, base, d, true);
+  const reset = box.querySelector("[data-desc-reset]");
+  if (reset) reset.onclick = async () => {
+    if (!confirm("Drop your edit and show the PI's description again?")) return;
+    try {
+      const res = await fetch(`${base}/description/edit`, { method: "DELETE" });
+      const out = await res.json();
+      if (!res.ok) throw new Error(out.detail || `HTTP ${res.status}`);
+      renderDatasetDescription(box, base, out);
+    } catch (err) { toast(`Not restored: ${err.message}`); }
+  };
 }
 
 function dsKindLabel(kind, p) {
@@ -7847,7 +8004,7 @@ async function deleteRun(b) {
 
 // What a run hands on besides its bundle, neither of them in the zip: the processed dataset (an
 // .h5ad) and, after CellQC, CellQC's whole result folder with the per-library matrices. Both are
-// kept beside the run until the session disconnects (a few days at most); "Save to my data" makes one a dataset, and the folder also
+// kept beside the run on HPC3 until the session ends, then copied to the run's folder on the server; "Save to my data" makes one a dataset, and the folder also
 // downloads as one zip. Shown on the run's card and under the results in its chat.
 let resultHandoffs = null;              // a promise of { run id: row }; null = ask the server again
 function loadResultHandoffs(fresh) {
@@ -7863,7 +8020,9 @@ function resultHandoffHtml(runId, r) {
   const kept = (x, label, what) => (x.saved_to
     ? `<span class="ok small" title="${escapeHtml(x.saved_to)}">Saved to my data</span>`
     : x.saving ? `<span class="muted small">Copying from HPC3 to your data on the server…</span>`
-    : `<span class="muted small">kept ${x.location === "hpc3" ? "on HPC3" : "on the server"} ${x.until_disconnect ? `until you disconnect (at most ${escapeHtml(String(x.kept_days ?? ""))} days)` : `for ${escapeHtml(String(x.kept_days ?? ""))} days`}</span>` +
+    : `<span class="muted small">${x.until_disconnect ? "kept on HPC3 until the session ends, then with the run on the server"
+      : x.location !== "hpc3" && !x.kept_days ? "kept with the run on the server"
+      : `kept ${x.location === "hpc3" ? "on HPC3" : "on the server"} for ${escapeHtml(String(x.kept_days ?? ""))} days`}</span>` +
       (x.save_error ? `<span class="bad small" title="${escapeHtml(x.save_error)}">The last save failed</span>` : "") +
       `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="${escapeHtml(what)}" data-label="${escapeHtml(label)}">${escapeHtml(label)}</button>`);
   let html = "";
@@ -8662,6 +8821,59 @@ async function loadAdminUsage() {
     if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
     el.innerHTML = adminUsageHtml(await r.json());
   } catch (err) { el.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(err.message)}</div>`; }
+  loadAdminKeys();
+}
+
+// Admin › LLM usage › API keys: every key on the server (public rows only) with its last window's
+// use, and Pause / Resume (key_guard, RCHENLAB/AiScientist issue 16).
+async function loadAdminKeys() {
+  const el = $("adminKeysBody");
+  if (!el) return;
+  try {
+    const r = await fetch("/api/admin/llm-keys");
+    if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
+    const d = await r.json();
+    const keys = d.keys || [];
+    if (!keys.length) { el.innerHTML = '<p class="usage-empty">No API keys on this server.</p>'; return; }
+    const win = Math.round((d.spike || {}).window_min || 60);
+    const rows = keys.map((k) => {
+      const w = k.window || {};
+      const use = w.calls == null ? "" : `${plural(w.calls, "call")} · ${fmtUsd(w.spend_usd || 0)} in the last ${win} min`;
+      const by = { owner: "its owner", admin: "an administrator", auto: "the spike check" }[k.paused_by] || "";
+      const st = k.paused_at ? `<span class="bad">paused by ${escapeHtml(by)}${k.pause_reason ? ` — ${escapeHtml(k.pause_reason)}` : ""}</span>` : "active";
+      const btn = k.paused_at
+        ? '<button type="button" class="ghost small" data-admin-key="resume">Resume</button>'
+        : '<button type="button" class="ghost small" data-admin-key="pause">Pause</button>';
+      return `<li class="usage-row" data-owner="${escapeHtml(k.owner)}" data-id="${escapeHtml(k.id)}"><div class="usage-row-main">` +
+        `<div class="usage-row-name">${escapeHtml(k.owner)} · ${escapeHtml(k.label || "")}</div>` +
+        `<div class="usage-row-meta">${escapeHtml(k.provider || "")} · key ${escapeHtml(k.key_hint || "")}` +
+        `${k.session_only ? " · this session only" : ""} · ${st}${use ? ` · ${use}` : ""}</div></div>` +
+        `<div class="usage-row-cost">${btn}</div></li>`;
+    }).join("");
+    el.innerHTML = `<div class="usage-list"><ul>${rows}</ul></div>` +
+      (d.revoked_at ? `<p class="usage-foot">Every key was revoked at ${escapeHtml(new Date(d.revoked_at).toLocaleString())}.</p>` : "");
+  } catch (err) { el.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(err.message)}</div>`; }
+}
+
+async function adminKeyAction(ev) {
+  const btn = ev.target.closest("[data-admin-key]");
+  if (!btn) return;
+  const row = btn.closest("[data-id]");
+  const act = btn.dataset.adminKey;
+  let reason = "";
+  if (act === "pause") {
+    reason = window.prompt("Why? The key's owner reads this in the console and by email.", "");
+    if (reason === null) return;
+  }
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/admin/llm-keys/${act}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner: row.dataset.owner, credential_id: row.dataset.id, reason }),
+    });
+    const d = await r.json();
+    toast(r.ok ? (act === "pause" ? "Paused; the owner was told." : "Resumed.") : (d.error || d.detail || "Failed"));
+  } finally { btn.disabled = false; loadAdminKeys(); }
 }
 
 // Scroll to the budget form and put the cursor in its first field.
@@ -8701,6 +8913,7 @@ function wireUsage() {
   $("usageBody").addEventListener("click", onUsageClick);
   $("usageBreakdown").addEventListener("click", onUsageClick);
   $("adminUsageRefresh").addEventListener("click", loadAdminUsage);
+  $("adminKeysBody").addEventListener("click", adminKeyAction);
   $("adminUsageDays").addEventListener("change", loadAdminUsage);
   $("chatUsage").addEventListener("click", () => openAccount("usage"));
   $("apiKeysUsageLink").addEventListener("click", (e) => { e.preventDefault(); $("apiKeysModal").classList.add("hidden"); openAccount("usage"); });

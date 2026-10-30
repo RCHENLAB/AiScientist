@@ -1,0 +1,29 @@
+# The Eye Server's deploy from Git tags: deploy/deploy_release.sh --auto, started by
+# aiscientist-deploy.timer. It installs the newest release of RCHENLAB/AiScientist that carries a
+# package (built by .github/workflows/release.yml when a v* tag is pushed), migrates the database,
+# switches app/current and restarts aiscientist.service once no run is in progress, then brings
+# skills/current to the pinned aiscientist-skills release. A release rolled back from, or one whose
+# health check failed, is held and not installed again (deploy/README.md).
+#
+# Install, as root, with the release layout in place:
+#     cp deploy/systemd/aiscientist-deploy.{service,timer} /etc/systemd/system/
+#     systemctl daemon-reload && systemctl enable --now aiscientist-deploy.timer
+# The service account needs `sudo -n systemctl restart aiscientist.service` without a password.
+# What it did: /data/aiscientist/logs/deploy.log, and journalctl -u aiscientist-deploy.service.
+
+[Unit]
+Description=AiScientist: deploy the newest release and the pinned skills release
+After=network-online.target aiscientist.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aiscientist
+Group=aiscientist
+WorkingDirectory=/data/aiscientist
+# The script of the release that is running; switching app/current does not change the copy that runs.
+ExecStart=/data/aiscientist/app/current/deploy/deploy_release.sh --auto
+# A first install of a release creates its venv and installs its lock (a few minutes).
+TimeoutStartSec=45min
+# 75 = another deploy holds the lock: not a failure.
+SuccessExitStatus=75

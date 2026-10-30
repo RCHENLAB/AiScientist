@@ -34,7 +34,7 @@ a ``numpy`` on member B's ``sys.path``, A can run code as B. Four fences:
   * only plain PyPI requirements are accepted — no VCS URLs, no local paths, no index override —
     and every publish records who did it.
 
-Storage lives under ``<shared_root>/pkgs/<key>/``, keyed by image and Python version so a tree
+Storage lives under ``<shared_root>/envs/run-code-pkgs/<key>/``, keyed by image and Python version so a tree
 built for ``analysis.sif``/3.11 is never imported into ``vep.sif``/3.9.
 """
 
@@ -92,7 +92,7 @@ def top_level_name(requirement: str) -> str:
 class SharedPackageCache:
     """The lab-shared install cache for one container image.
 
-    ``root`` is the shared parent (``<shared_root>/pkgs``); the per-image, per-Python subdirectory
+    ``root`` is the shared parent (``<shared_root>/envs/run-code-pkgs``); the per-image, per-Python subdirectory
     is derived, so several images can share one root without ever sharing a tree.
     """
 

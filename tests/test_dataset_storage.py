@@ -128,6 +128,9 @@ def test_additive_legacy_schema_backfill(storage):
     from sqlalchemy import text
     engine = db.get_engine()
     with engine.begin() as conn:
+        # A database from before migrations: no revision table (gateway/migrations/), datasets
+        # without the identity columns. init_db brings it to the baseline, rows kept.
+        conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
         conn.execute(text("DROP TABLE datasets"))
         conn.execute(text("CREATE TABLE datasets (id INTEGER PRIMARY KEY, user_id INTEGER, "
                           "name VARCHAR(255), path VARCHAR(1024), size_bytes BIGINT, "

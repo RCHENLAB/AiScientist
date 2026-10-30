@@ -102,6 +102,8 @@ parallel steps may overlap.
 Set `AISCIENTIST_CPU_HOUR_RATE` and `AISCIENTIST_GPU_HOUR_RATE` in the gateway environment
 (USD per allocated hour; zero defaults mean unpriced). Tool calls, including failures, are
 recorded in the existing database; successful runs refine later estimates for the same tool.
+Each run counts once (its slowest call per unit), and a run under a fifth of the median time
+does not set the low end.
 SLURM uses allocation accounting where available; other measurements use wall time and
 requested resources and remain rough. Run API records expose `compute_usage`.
 

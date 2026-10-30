@@ -64,6 +64,13 @@ biomni = [
 literature = [
   "paper-qa[local]>=5",
 ]
+# The Eye Server copy of the RetiGene index (gateway/local_corpus.py): a search embeds its queries with
+# PubMedBERT on the gateway's CPU instead of a Slurm job on HPC3. Install torch from the CPU index
+# first (deploy/deploy_release.sh does), or pip pulls the CUDA build and its NVIDIA libraries, which
+# this server never uses. Without this extra the searches run on HPC3.
+corpus = [
+  "sentence-transformers>=3",
+]
 # Single-cell analysis stack for the run_code (CodeAct) sandbox + the analysis line
 # (real scanpy QC/cluster/DE + gseapy enrichment + matplotlib figures). Eye-server
 # only; the lightweight core/CI never import these. The CodeSandbox runs the app

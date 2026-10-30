@@ -3,6 +3,37 @@ name: scgpt_annotation
 description: scGPT foundation-model per-cell annotation for a .h5ad — transfers reference cell-type labels + calibrated confidence to every cell, AND independently cross-validates ANY existing celltype/majorclass labels the data already carries. Use for scGPT / .sif / foundation-model annotation, per-cell labelling, OR an independent second-opinion check of a dataset's existing cell-type labels.
 tools: scgpt_annotate, run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, literature_search, run_code
 data_type: scrna
+outputs:
+  - path: data/scgpt_predictions.csv
+    kind: table
+    tool: scgpt_annotate
+    description: The scGPT cell-type label and confidence for every cell of the uploaded matrix, indexed by the original cell barcode.
+    required: true
+  - path: figures/umap_clusters.png
+    kind: figure
+    tool: run_clustering
+    description: UMAP of the cells coloured by Leiden cluster.
+    required: true
+  - path: tables/de_*_all.csv
+    kind: table
+    tool: run_de
+    description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
+    required: true
+  - path: figures/volcano_*.png
+    kind: figure
+    tool: run_de
+    description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
+    required: false
+  - path: figures/dotplot__markers.png
+    kind: figure
+    tool: run_de
+    description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
+    required: false
+  - path: tables/enrichment_*.csv
+    kind: table
+    tool: run_enrichment
+    description: Over-representation results per group, split into up- and down-regulated halves for a contrast, with term, gene-set library, adjusted p-value, combined score and overlap.
+    required: true
 ---
 
 Rigorous scGPT foundation-model annotation protocol. scGPT is a pretrained gene/expression

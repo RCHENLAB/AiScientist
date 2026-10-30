@@ -239,8 +239,9 @@ def test_each_run_writes_its_job_files_in_its_own_scratch_folder():
     c = _conn()
     a = gw_app._scratch_dir(c, "runcode", run_id="runA")
     b = gw_app._scratch_dir(c, "runcode", run_id="runB")
-    base = gw_app._scratch_dir(c, "runcode")
-    assert a == f"{base}/runA" and b == f"{base}/runB"     # bioagent_python_1.out no longer shared
+    base = gw_app._temp_base(c)
+    # Each run's job files are in its own folder: bioagent_python_1.out is no longer shared.
+    assert a == f"{base}/runs/runA/jobs/runcode" and b == f"{base}/runs/runB/jobs/runcode"
 
 
 def test_stop_answers_a_clarify_card_before_the_run_is_running():

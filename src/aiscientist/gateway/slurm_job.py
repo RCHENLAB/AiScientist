@@ -97,7 +97,7 @@ class SlurmJobSpec:
     """A complete ``#!/bin/bash`` sbatch script + a per-user job name.
 
     ``submit_dir`` is where the script file is written. It has no default on purpose: every job
-    line names a directory under the application's own storage (``<shared_root>/Temp/<user>/``),
+    line names a directory under the application's own storage (``<shared_root>/sessions/<id>/``),
     so nothing lands in the user's home directory because a caller left it out."""
 
     script: str

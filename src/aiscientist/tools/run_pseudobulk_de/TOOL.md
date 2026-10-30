@@ -32,8 +32,9 @@ Sums each sample's raw counts into one profile per sample (per cell type when gr
 
 ## Outputs
 
-- `tables/pseudobulk_all.csv` and `tables/pseudobulk_<group>.csv`, plus the same hand-off files `run_de` writes (`de_<key>_all.csv`, the universe, `.rnk` files), so `run_enrichment` and `run_gsea_prerank` can follow.
-- Result: per-group counts, the test used, `skipped_groups`, `warnings`.
+- `tables/pseudobulk_all.csv` and `tables/pseudobulk_<group>.csv` (the first 2,000 genes of each group by p-value).
+- The hand-off files `run_enrichment` and `run_gsea_prerank` read, under the tool's own key `pseudobulk_<group_key>` (`pseudobulk` without a group key), so they never write over a `run_de` result of the same column: `de_pseudobulk_<group_key>_all.csv`, one complete table per group (`de_pseudobulk_<group_key>_<group>.csv`, every tested gene), the tested universe, `rank_pseudobulk_<group_key>_<group>.rnk` and the slug index, and the two labels `run_de` also writes: `de_pseudobulk_<group_key>_inference.json` (`inference: replicated`) and `de_pseudobulk_<group_key>_significance.json` (complete per-group tables, significant counts per group).
+- Result: per-group counts, the test used, `skipped_groups`, `warnings`, and `de_key`: the key `run_enrichment` and `run_gsea_prerank` take as `groupby`. With no `groupby` they prefer this replicated test over a cell-level `run_de` table.
 
 ## Where it runs
 
@@ -68,7 +69,8 @@ On the fast chat path: no (research runs only).
 > untestably-low genes and runs DESeq2 (negative-binomial Wald, via pydeseq2; Welch t on log2 CPM
 > as a LOUD fallback) + BH. REFUSES a group with fewer than 2 samples per arm and reports it in
 > `skipped_groups` rather than falling back to the cell-level test. Writes
-> `tables/de_<group_key>_all.csv` (+ the tested universe and per-group .rnk files), so
-> run_enrichment and run_gsea_prerank pick the result up with NO `genes` argument — do not paste a
-> gene list into them.
+> `tables/de_pseudobulk_<group_key>_all.csv` (+ one complete table per group, the tested universe
+> and per-group .rnk files), never run_de's file names, so run_enrichment and run_gsea_prerank
+> pick the result up with NO `genes` argument (they prefer this replicated test over a cell-level
+> one; `groupby="pseudobulk_<group_key>"` names it) — do not paste a gene list into them.
 <!-- /generated:model-description -->

@@ -82,6 +82,8 @@ def skill_release(tmp_path, monkeypatch):
 
     releases = tmp_path / "skill-releases"
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT", str(releases))
+    # No skills/current link unless the test makes one: the pinned tag decides.
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_CURRENT", str(tmp_path / "skills-current"))
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_STATS", str(tmp_path / "skill_versions.sqlite3"))
 
     def install(source: Path, *, refresh: bool = True, **kw) -> Path:

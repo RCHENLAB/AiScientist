@@ -50,35 +50,38 @@ Ranks the chunks of the corpus text cache (`mechanism_cache/chunks.jsonl`, vecto
 
 ## Where it runs
 
-The gateway first uses an Eye Server copy when the index and offline embedding model are available.
-It runs the same retrieval in a worker thread on CPU, with one lazily loaded embedder per process;
-it does not submit a Slurm job. Otherwise the HPC3 route below remains the fallback.
-Local retrieval can enable the literature line without `AISCIENTIST_PAPERQA_ON_HPC`; the GPU Corpus
-scan still requires its HPC3 configuration.
+The gateway first uses its copy of the index on the Eye Server, when the copy and the offline
+embedding model are there: the same retrieval, in a worker thread on the gateway's CPU, with one
+embedding model loaded per process and no Slurm job. Otherwise the HPC3 job below runs, as it does
+when the copy is stale: before a search the gateway compares the copy with the HPC3 index (the
+sizes and modification times of its files and the manifest's checksum, read with one `stat` on the
+login node at most every 5 minutes, `AISCIENTIST_LOCAL_CORPUS_CHECK_S`), and searches HPC3 while they
+differ. A session that cannot reach HPC3 searches the copy as it is. Local retrieval can enable the
+literature line without `AISCIENTIST_PAPERQA_ON_HPC`; the Corpus scan still needs its HPC3
+configuration.
 
-On the Eye Server (with `rsync`, an SSH key for HPC3 and `sentence-transformers` installed), run:
+The copy lives in `<data root>/reference/retigene/` (`AISCIENTIST_LOCAL_CORPUS_ROOT` to change it):
+`current` names the version searches read, `versions/<time>/` holds `mechanism_cache/`,
+`manifest.csv`, `hgnc_complete_set.txt` and `SOURCE.json` (what was copied, from where, when), and
+`hf_cache/` the embedding model. The gateway's environment needs the `corpus` extra
+(`sentence-transformers`, with torch from the CPU index).
+
+To add papers, put the PDFs and their manifest rows in the corpus on HPC3, then on the Eye Server,
+as the service account:
 
 ```sh
-PYTHONPATH=src python scripts/sync_corpus_index.py \
-  --source <user>@access-hpc3.rcic.uci.edu:/dfs3b/ruic20_lab/software/AiScientist/retigene \
-  --with-model --with-hgnc
+python scripts/update_corpus_index.py --rebuild
 ```
 
-The copy goes through RCIC's transfer node `access-hpc3.rcic.uci.edu`: RCIC allows no data
-transfer on the HPC3 login nodes, and the script refuses a login-node source.
-
-The default destination is `<AISCIENTIST_DATA_ROOT or DATA_ROOT>/literature`, following the
-gateway's data-root default when neither is set. Set `AISCIENTIST_LOCAL_CORPUS_ROOT` in the gateway
-and sync command to override it, or pass `--destination` to the script. The layout is
-`mechanism_cache/`, `manifest.csv`, optional `hf_cache/` and `hgnc_complete_set.txt`. The manifest
-source defaults to `paperqa_manifest.csv` (`--manifest` overrides its filename). The model can also
-be installed in the normal Hugging Face cache. Retrieval loads it offline and never downloads it.
-Repeat the command after rebuilding the HPC3 index: rsync compares checksums and transfers only
-changed files, retaining unrelated destination files. Run synchronization while retrieval is idle
-so a request cannot read chunks and vectors from different index revisions; a copy whose vectors do
-not match its chunks is not used (the request goes to HPC3), since searching it would embed the
-whole corpus again on the gateway's CPU. The index sync does
-not copy PDFs. `--with-model` and `--with-hgnc` require those optional source paths to exist.
+It rebuilds the index on HPC3 in one CPU Slurm job inside `paperqa.sif` (only the new papers are
+extracted and embedded; the result is checked and put in place, the previous index kept as
+`mechanism_cache.prev`), then copies it: only the files that changed, through RCIC's transfer node
+`access-hpc3.rcic.uci.edu` (RCIC allows no data transfer on the login nodes), into a new version
+that becomes current in one step, so a search never reads a half-copied index. A copy that does not
+have one vector per chunk is never made current. Without `--rebuild` it only copies; `--check` says
+whether the copy is the HPC3 index; `--rollback` switches back to the previous version. It logs in
+to HPC3 with `--hpc-user` and `--ssh-key`, by default the shared model server's login.
+`scripts/sync_corpus_index.py` copies from any other source or into another folder.
 
 <!-- generated:runs-on -->
 As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through `python -m aiscientist.tools.paperqa_cli`. Its job runs no language model: it needs no GPU allocation.
@@ -96,13 +99,15 @@ On the fast chat path: yes.
 
 - No LLM re-ranking: the merge is by rank only. A question whose answer is worded differently from it in every paper still depends on the embedding.
 - Gene symbols are matched as written, not expanded to their HGNC aliases.
-- The cache is rebuilt by hand (`scripts/build_mechanism_cache.py`) when papers are added.
+- New papers reach the index only when someone runs `scripts/update_corpus_index.py --rebuild`; nothing watches the corpus folder.
+- A rebuild on HPC3 swaps the index with two renames: a search job that opens the index in that instant fails and must be asked again.
 - Excerpts of the corpus papers go to the session's model provider as prompt text.
 
 ## Code and tests
 
 - `tool.py`; the shared corpus loaders and the hybrid ranking (`TextIndex`, `hybrid_rank`) in `../_lib/corpus.py`; the job entry point is `../paperqa_cli.py`.
-- Tests: `tests/test_search_corpus.py`, `tests/test_corpus_hybrid.py`.
+- The Eye Server copy: `../../gateway/local_corpus.py` (searching it) and `../../gateway/corpus_index.py` (copying it); `scripts/update_corpus_index.py`, `scripts/build_mechanism_cache.py`.
+- Tests: `tests/test_search_corpus.py`, `tests/test_corpus_hybrid.py`, `tests/test_local_corpus.py`, `tests/test_local_corpus_route.py`, `tests/test_corpus_index.py`.
 
 ## What the model is told
 

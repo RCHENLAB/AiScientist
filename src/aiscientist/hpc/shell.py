@@ -17,12 +17,19 @@ that login nodes are for logging in and submitting jobs, so:
 
 Two more fences, because a near-complete shell on a SHARED lab account is a real capability:
 
-* **Path confinement.** Reads are confined to the user's own areas plus registered datasets and
-  the shared read-only assets; writes to the user's own areas only. The lab account is shared, so
-  "it's my account" is not the same as "it's my data".
-* **HITL, not silent refusal.** When the agent needs to cross a line it raises a
-  human-in-the-loop confirmation carrying the exact command, rather than failing opaquely or
-  proceeding quietly. Yijun's instruction: give it a real shell, obey RCIC, and *ask* at the edge.
+* **The AiScientist folder is the only place the agent writes.** Writes go only to the session's
+  own folders under the AiScientist root (its ``sessions/<session>`` folder, and the user's
+  ``Temp/<user>`` and ``uploads/<user>`` of the retired layout): never ``$HOME``, the
+  member's personal lab folder, or anything else. A write, move or delete outside them is refused
+  outright, with no confirmation to approve it (Yijun, 2026-10-25). Reads are wider: the user's own
+  areas, registered datasets and the shared read-only assets.
+* **The boundary is a sandbox, not a parser.** ``run_shell`` runs inside Apptainer on the worker
+  (:class:`ShellSandbox`): only the AiScientist folders are mounted writable, the readable areas
+  read-only, and RCIC's module software (``/opt/apps``) plus the host's ``/usr`` read-only, so
+  ``module load`` works as on the node. The textual checks before it only explain a refusal early.
+* **HITL for what stays inside.** A command that deletes or moves data inside the folders raises a
+  confirmation carrying the exact command (Yijun's instruction: give it a real shell, obey RCIC,
+  and *ask* at the edge).
 """
 
 from __future__ import annotations
@@ -74,6 +81,71 @@ _REDIRECT = re.compile(r"(?<![0-9<>])>{1,2}(?!&)")
 # positive. It is not a cheap one: it blocks on a human confirmation, and one unanswered
 # `find … 2>/dev/null` burned 600s of a production run before timing out into a refusal.
 _DISCARD_DEVICES = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero"})
+
+# The image run_shell's commands run in: the compute nodes' own OS (Rocky Linux 9.7), so RCIC's
+# module software and the host's userland, mounted read-only, behave as on the node itself. A dated
+# tag, so the image cannot change under us. Pulled on the worker (a compute node) on first use.
+SHELL_IMAGE_REF = "docker://rockylinux/rockylinux:9.7.20251123"
+# Mounted read-only from the host into the shell sandbox: RCIC's software (/opt/apps) and module
+# files (/opt/rcic), and /usr, because module software links host system libraries (the R module
+# needs libicu, and /usr/lib64 alone is not enough: measured on HPC3, 2026-10-25).
+SHELL_HOST_RO = ("/opt/apps", "/opt/rcic", "/usr")
+
+
+@dataclass
+class ShellSandbox:
+    """How ``run_shell`` commands are contained on the worker node.
+
+    Each command runs as ``apptainer exec --containall --no-mount bind-paths`` in a Rocky Linux 9
+    image. Mounted: the session's writable folders read-write (and nothing else writable), its
+    readable areas and :data:`SHELL_HOST_RO` read-only. ``--no-mount bind-paths`` drops the site
+    paths HPC3's ``apptainer.conf`` would add (``/dfs3b`` among them), so the rest of lab storage,
+    ``$HOME`` and personal folders are simply not there. ``HOME`` inside is a folder in the
+    AiScientist area, so tools that write ``~/.cache`` never touch the real home.
+    """
+
+    image: str                              # the SIF in the shared containers folder
+    image_ref: str = SHELL_IMAGE_REF
+    container_bin: str = "apptainer"
+    container_module: str = ""              # e.g. apptainer/1.4.5; `apptainer` is not on PATH until loaded
+    network: bool = True                    # AISCIENTIST_SANDBOX_NETWORK, as for run_code
+    host_ro: tuple[str, ...] = SHELL_HOST_RO
+
+    def wrap(self, command: str, *, read_only: tuple[str, ...], writable: tuple[str, ...],
+             home: str, cwd: str) -> str:
+        """The worker-side script that runs ``command`` inside the sandbox."""
+        q = shlex.quote
+        lines: list[str] = []
+        if self.container_module:
+            lines.append(f"module load {q(self.container_module)} >/dev/null 2>&1 || true")
+        lines += [
+            f"S={q(self.image)}",
+            # First use: pull the image here, on the compute node (RCIC bans downloads on login
+            # nodes), publishing it with `mv -n` so two sessions pulling at once cannot clash.
+            'if [ ! -s "$S" ]; then',
+            '  C="${TMPDIR:-/tmp}/aisci-shell-pull-$$"; mkdir -p "$C"',
+            f'  APPTAINER_CACHEDIR="$C" APPTAINER_TMPDIR="${{TMPDIR:-/tmp}}" {self.container_bin} pull '
+            f'--name "$S.partial.$$" {q(self.image_ref)} >/dev/null 2>&1 && mv -n "$S.partial.$$" "$S"',
+            '  rm -f "$S.partial.$$"; rm -rf "$C"',
+            "fi",
+            '[ -s "$S" ] || { echo "The shell sandbox image is not available: $S" >&2; exit 125; }',
+            "B=()",
+        ]
+        for p in dict.fromkeys(self.host_ro + tuple(read_only)):
+            if p and p not in writable:
+                lines.append(f"[ -e {q(p)} ] && B+=(-B {q(p + ':' + p + ':ro')})")
+        for p in dict.fromkeys(writable):
+            lines.append(f"mkdir -p {q(p)} 2>/dev/null; [ -d {q(p)} ] && B+=(-B {q(p + ':' + p)})")
+        lines.append(f"mkdir -p {q(home)}")
+        # RCIC's module files end with `exec /bin/logger ... $env(USER)`: under --containall USER is
+        # unset, and every dependency load (`gcc`, `OpenBLAS`) then fails. Measured on HPC3, 2026-10-25.
+        lines.append('export APPTAINERENV_MODULEPATH="$MODULEPATH" APPTAINERENV_MODULESHOME=/usr/share/Modules '
+                     'APPTAINERENV_USER="${USER:-$(id -un)}" APPTAINERENV_LOGNAME="${USER:-$(id -un)}"')
+        net = " --net --network none" if not self.network else ""
+        inner = "source /usr/share/Modules/init/bash >/dev/null 2>&1 || true\n" + command
+        lines.append(f'exec {self.container_bin} exec --containall --no-mount bind-paths{net} '
+                     f'--home {q(home)} --pwd {q(cwd)} "${{B[@]}}" "$S" /bin/bash -c {q(inner)}')
+        return "\n".join(lines)
 
 
 class HpcShellError(RuntimeError):
@@ -198,6 +270,7 @@ class HpcShell:
     fetch_allowlist: tuple[str, ...] = DEFAULT_FETCH_ALLOWLIST
     max_fetch_mb: int = 2048
     package_cache: Any = None                     # SharedPackageCache | None
+    sandbox: ShellSandbox | None = None           # None: run_shell runs bare (tests, sandbox switched off)
     _audit: list[dict] = field(default_factory=list)
 
     # --- plumbing ------------------------------------------------------------
@@ -363,13 +436,17 @@ class HpcShell:
         outside = [t for t in _write_targets(cmd, self.workspace, self.home)
                    if not self.workspace.can_write(t)]
         if outside:
-            if not self._ask(ConfirmRequest(
-                    "write_outside",
-                    f"Write outside your workspace: {', '.join(outside[:3])}",
-                    cmd, reversible=False)):
-                return {"status": "declined", "reason": "The user declined a write outside the workspace.",
-                        "command": cmd}
-        elif risky:
+            # Not a question for the user: the agent never writes, moves or deletes outside the
+            # session's AiScientist folders (Yijun, 2026-10-25). The sandbox would stop it anyway;
+            # refusing here says why before anything runs.
+            self._audit.append({"refused": {"kind": "write_outside", "command": cmd, "paths": outside[:5]}})
+            self._say("warning", f"Refused a write outside the AiScientist folder: {', '.join(outside[:3])}")
+            return {"status": "refused", "command": cmd,
+                    "reason": (f"{', '.join(outside[:3])} is outside the folders this session may write "
+                               f"({', '.join(self.workspace.write_roots) or 'none'}). Writing, moving or "
+                               "deleting anything outside them is not allowed, and the user cannot approve "
+                               "it. Write the result inside your AiScientist folder instead.")}
+        if risky:
             if not self._ask(ConfirmRequest(
                     "destructive", "Run a command that can delete or move data", cmd,
                     reversible=False)):
@@ -379,12 +456,65 @@ class HpcShell:
             self._say("info", f"Writing to your workspace: {cmd[:120]}")
 
         cwd = self._read_path(workdir) if workdir else None
-        res = self._worker(cmd, timeout_s or self.command_timeout_s)
-        return {"status": "ok" if getattr(res, "exit_status", 1) == 0 else "failed",
-                "exit_status": getattr(res, "exit_status", None),
-                "stdout": _clip(getattr(res, "stdout", "")),
-                "stderr": _clip(getattr(res, "stderr", ""), 4000),
-                "ran_on": "worker_node", "workdir": cwd, "command": cmd}
+        sandboxed = self.sandbox is not None and bool(self.workspace.write_roots)
+        to_run = (self.sandbox.wrap(cmd, read_only=self.workspace.read_roots,
+                                    writable=self.workspace.write_roots, home=self._shell_home(),
+                                    cwd=cwd or self.workspace.write_roots[0])
+                  if sandboxed else cmd)
+        res = self._worker(to_run, timeout_s or self.command_timeout_s)
+        out = {"status": "ok" if getattr(res, "exit_status", 1) == 0 else "failed",
+               "exit_status": getattr(res, "exit_status", None),
+               "stdout": _clip(getattr(res, "stdout", "")),
+               "stderr": _clip(getattr(res, "stderr", ""), 4000),
+               "ran_on": "worker_node", "sandbox": "apptainer" if sandboxed else "none",
+               "workdir": cwd, "command": cmd}
+        if out["status"] != "ok":
+            note = self.missing_software_note(f"{out['stderr']}\n{out['stdout']}", where="run_shell")
+            if note:
+                out["missing_software"] = note
+        return out
+
+    # --- software: HPC3's modules -------------------------------------------------
+
+    def module_catalog(self) -> Any:
+        """RCIC's module catalog for this cluster (``hpc/modules.py``), read on the login node and
+        kept for a day; None when it cannot be read."""
+        from .modules import cached_catalog, catalog_command
+        key = str(getattr(self.remote, "host", "") or "hpc3")
+        return cached_catalog(key, lambda: getattr(self._login(catalog_command(), timeout=120), "stdout", ""))
+
+    def find_software(self, name: str) -> dict[str, Any]:
+        """Which HPC3 modules provide a program or package, and how to use one. Login node only."""
+        q = (name or "").strip()
+        if not q:
+            raise HpcShellError("Name the program or package to look for.")
+        catalog = self.module_catalog()
+        if catalog is None:
+            return {"status": "error", "query": q, "error": "The HPC3 module list could not be read."}
+        matches = catalog.find(q)
+        if matches:
+            return {"status": "ok", "query": q, "modules": matches, "how_to_use": (
+                "Run module software with run_shell: `module load <load> && <program> ...` (the `load` "
+                "field is the newest version). It does not exist inside run_code's image: write the "
+                "inputs to your AiScientist folder (AISCIENTIST_WORK) from run_code, run the program with "
+                "run_shell, then read its output back in run_code.")}
+        return {"status": "not_found", "query": q, "modules": [], "next": (
+            f"No HPC3 module provides '{q}'. If it is a Python package, import it in run_code (the install "
+            "is offered to the user). Otherwise there is no approved way to install it in this session "
+            f"yet: say that the step needs {q}, and do not hand-write a replacement of the method.")}
+
+    def missing_software_note(self, text: str, where: str = "run_code") -> list[dict[str, Any]]:
+        """For a failed command's output: each missing program or R package, and which module
+        provides it. Empty when nothing in ``text`` looks like missing software."""
+        from .modules import missing_from_output, software_note
+        if not missing_from_output(text):
+            return []
+        return software_note(text, self.module_catalog(), where=where)
+
+    def _shell_home(self) -> str:
+        """``HOME`` inside the shell sandbox: a folder in the first writable root, so a tool that
+        writes ``~/.cache`` or ``~/.config`` stays inside the AiScientist folder."""
+        return posixpath.join(self.workspace.write_roots[0], "shell-home")
 
     def fetch_url(self, url: str, dest_dir: str = "", max_mb: int = 0) -> dict[str, Any]:
         """Download a file **onto the worker node**, never over a login node.
@@ -397,10 +527,13 @@ class HpcShell:
         if not re.match(r"^https?://", u):
             raise HpcShellError("Only http:// and https:// URLs can be fetched.")
 
-        dest = self._read_path(dest_dir) if dest_dir else self.workspace.resolve(
-            posixpath.join(self.home or "~", "downloads"), self.home)
+        if not dest_dir and not self.workspace.write_roots:
+            raise HpcShellError("This session has no folder it may write to.")
+        dest = self._read_path(dest_dir) if dest_dir else posixpath.join(self.workspace.write_roots[0], "downloads")
         if not self.workspace.can_write(dest):
-            raise HpcShellError(f"{dest} is not a directory this session may write to.")
+            raise HpcShellError(
+                f"{dest} is outside the folders this session may write ({', '.join(self.workspace.write_roots)}). "
+                "Downloads go inside your AiScientist folder.")
 
         cap_mb = max(1, int(max_mb or self.max_fetch_mb))
         if not host_allowed(u, self.fetch_allowlist):
@@ -560,12 +693,29 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
             category="filesystem",
         ),
         HarnessTool(
+            name="find_software",
+            description=("Find software on HPC3 before anything is installed: which of the cluster's "
+                         "modules (R, samtools, STAR, GATK, salmon, ...; about 360) provides a program "
+                         "or package, matched by module name, by the programs it installs (`bedtools` "
+                         "is in bedtools2, `Rscript` in R) or by description. Returns the `module load` "
+                         "line for the newest version. Module software runs with run_shell, not "
+                         "inside run_code. Answered on the login node, no allocation."),
+            parameters={"type": "object", "properties": {
+                "name": {"type": "string", "description": "A program, tool or package name, e.g. 'bedtools' or 'Rscript'."},
+            }, "required": ["name"]},
+            executor=_ok(lambda a, _c: shell.find_software(_str(a, "name"))),
+            category="filesystem",
+        ),
+        HarnessTool(
             name="run_shell",
             description=("Run a shell command on this session's dedicated HPC3 compute node "
-                         "(NOT a login node, and no Slurm queue wait). Use it for real work: "
-                         "decompressing, grepping across files, bcftools/samtools, checksums. "
-                         "Commands that delete or move data, or write outside your workspace, "
-                         "ask the user for confirmation first."),
+                         "(NOT a login node, and no Slurm queue wait), inside a sandbox. Use it for "
+                         "real work: decompressing, grepping across files, checksums. HPC3's software "
+                         "modules work here: find one with find_software, then e.g. `module load "
+                         "R/4.5.2 && Rscript ...` or `module load samtools/1.15.1 && samtools ...`. Only your AiScientist folders (this session's "
+                         "folder, and your Temp/ and uploads/ of the old layout) are writable; your home, your personal folders and anything "
+                         "else cannot be written, moved or deleted, and the user cannot approve it. "
+                         "Deleting or moving data inside your folders asks the user first."),
             parameters={"type": "object", "properties": {
                 "command": {"type": "string", "description": "The shell command line."},
                 "workdir": {"type": "string", "description": "Optional directory to run in."},
@@ -583,7 +733,7 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
                          "reference hosts download directly; anything else asks the user first."),
             parameters={"type": "object", "properties": {
                 "url": {"type": "string"},
-                "dest_dir": {"type": "string", "description": "Where to put it (defaults to ~/downloads)."},
+                "dest_dir": {"type": "string", "description": "Where to put it, inside your AiScientist folder (default: its downloads/)."},
                 "max_mb": {"type": "integer", "description": "Abort past this size."},
             }, "required": ["url"]},
             executor=_ok(lambda a, _c: shell.fetch_url(

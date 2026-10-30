@@ -47,7 +47,7 @@ Then enable the HPC paths (in .env / HPCSettings):
   AISCIENTIST_ANALYSIS_ON_HPC=1               # scanpy QC/cluster/DE/enrichment as CPU Slurm jobs (Phase 4)
   AISCIENTIST_UPLOADS_ON_HPC=1                # uploads land on dfs3b so analysis reads them in place (Phase 2)
 
-The AiScientist TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway (over its SSH session)
+The AiScientist TOOLS are synced to <shared_root>/sessions/<session>/app by the gateway (over its SSH session)
 and bind-mounted in — so a tool edit needs only a normal code deploy, NOT an image rebuild. The
 dataset lives on dfs3b; the analysis run dir is created under <lab_storage>/<user>/analysis/<run_id>.
 If HPC is unreachable (or the tool sync fails), analysis falls back in-process.

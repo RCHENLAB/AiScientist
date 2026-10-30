@@ -3,6 +3,32 @@ name: perturbation_analysis
 description: Analyze a pooled CRISPR / Perturb-seq screen — rank which perturbations change the transcriptome, then per-perturbation DE vs the non-targeting control
 tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, run_code, literature_search
 data_type: scrna
+outputs:
+  - path: figures/umap_clusters.png
+    kind: figure
+    tool: run_clustering
+    description: UMAP of the cells coloured by Leiden cluster.
+    required: true
+  - path: tables/de_*_all.csv
+    kind: table
+    tool: run_de
+    description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
+    required: true
+  - path: figures/volcano_*.png
+    kind: figure
+    tool: run_de
+    description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
+    required: false
+  - path: figures/dotplot__markers.png
+    kind: figure
+    tool: run_de
+    description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
+    required: false
+  - path: tables/enrichment_*.csv
+    kind: table
+    tool: run_enrichment
+    description: Over-representation results per group, split into up- and down-regulated halves for a contrast, with term, gene-set library, adjusted p-value, combined score and overlap.
+    required: true
 ---
 
 Pooled-perturbation protocol (**Perturb-seq / CROP-seq / CRISPRi-a screens**). Use when each cell

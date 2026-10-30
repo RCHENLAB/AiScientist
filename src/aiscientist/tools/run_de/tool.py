@@ -25,6 +25,7 @@ from .._lib.scrna import (
     _slug,
     _step_input,
     counts_not_logged,
+    group_table_slug,
     _write_table,
 )
 from ..sdk import HarnessTool
@@ -294,7 +295,7 @@ def run_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         # adjusted p) is the analyst's deliverable; for markers keep the historical top-N.
         rows_file = (sorted(rows_full, key=lambda r: r["pval_adj"]) if contrast
                      else rows_full[:n_genes])
-        _write_table(tables / f"de_{key}_{_slug(label)}.csv", rows_file, fields)
+        _write_table(tables / f"de_{key}_{group_table_slug(label)}.csv", rows_file, fields)
         rows_by_group[label] = len(rows_file)
         if contrast:
             up, down, totals = _significant_both_directions(rows_full, padj_max, lfc_min, n_genes)

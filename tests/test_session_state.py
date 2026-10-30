@@ -351,7 +351,7 @@ def test_a_run_whose_result_is_not_saved_is_kept_on_hpc3_at_disconnect(gw, tmp_p
     said: list[str] = []
     conn.emit = lambda level, stage, text, **k: said.append(text)
     gw._end_session_cleanup(conn)
-    assert any("Kept on HPC3 because saving it" in s and "unsaved2" in s for s in said)
+    assert any("Kept on HPC3 because its results are not safely on the server" in s and "unsaved2" in s for s in said)
     snap = conn.session.snapshot()
     assert snap["state"] == "failed" and snap["cleanup"]["kept_unsaved"] == ["unsaved2"]
     assert snap["cleanup"]["status"] == "queued" and snap["cleanup"]["job_id"] == "8123456"

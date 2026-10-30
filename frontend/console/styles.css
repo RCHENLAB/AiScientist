@@ -578,16 +578,6 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-actions-row button.primary { padding: 8px 17px 8px 15px; }
 .plan-actions-hint { margin-left: 6px; font-size: 12px; color: var(--text-tertiary); }
 .plan-actions-status { font-size: 12.5px; font-weight: 600; color: var(--text-secondary); }
-/* The waiting card's review window is about to close (plan_expiring). Amber like the revision note:
-   it asks for attention, it is not an error. On a plan it heads the actions band, on its own line;
-   on a question or a decision point it closes the card. */
-.plan-expiry {
-  display: flex; align-items: center; gap: 7px; flex-basis: 100%;
-  font-size: 12.5px; font-weight: 550; line-height: 1.4; color: #7a4a05;
-}
-.plan-expiry .msym { flex: none; font-size: 16px; color: var(--amber); }
-.plan-actions-row .plan-expiry { margin-bottom: 2px; }
-.plan-card > .plan-expiry { margin-top: 12px; }
 
 /* "Change it in words": the other way to change a waiting plan, above the document's editor. */
 .plan-revise { border-top: 1px solid var(--border); padding: 12px 20px 13px; }
@@ -720,6 +710,15 @@ button.small { padding: 6px 12px; font-size: 12px; }
 }
 .plan-step-skill .msym { font-size: 14px; }
 .plan-entry-step .plan-step-skill { margin-left: 6px; }
+/* The outputs a step is expected to leave (its skill's, or its tool's under the pipeline). */
+.plan-step-outputs { margin-top: 8px; padding: 7px 10px; border-radius: 9px; background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border); }
+.plan-outputs-head { display: flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600; color: var(--text-secondary); }
+.plan-outputs-head .msym { font-size: 14px; }
+.plan-step-outputs ul { list-style: none; margin: 5px 0 0; padding: 0; display: grid; gap: 5px; }
+.plan-step-outputs li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 7px; font-size: 12px; line-height: 1.4; }
+.plan-step-outputs code { font-size: 11.5px; color: var(--text); overflow-wrap: anywhere; }
+.plan-output-kind { font-size: 11px; color: var(--text-secondary); }
+.plan-output-desc { flex-basis: 100%; color: var(--text-secondary); }
 .plan-skill-remove {
   display: inline-flex; align-items: center; border: 0; background: none; padding: 0; margin-left: 2px;
   color: var(--text-secondary); cursor: pointer;
@@ -1325,7 +1324,14 @@ button.full { width: 100%; margin-top: 6px; }
 .file-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 10px; background: var(--surface); border: 0; border-top: 1px solid var(--border, #eee); cursor: pointer; text-align: left; font-size: 12.5px; }
 .file-row:hover { background: var(--surface-hover); }
 .file-row-icon { flex: 0 0 auto; }
+.file-row-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.file-row:has(.file-row-desc) { align-items: flex-start; border-radius: 0; }
 .file-row-name { flex: 1 1 auto; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A produced file's declared description (issue 10): what it holds, and the step that made it. */
+.file-row-desc { color: var(--text-secondary); font-size: 11.5px; line-height: 1.35; white-space: normal; }
+.file-row-step { display: inline-block; margin-right: 6px; padding: 0 6px; border-radius: 6px; font-size: 10.5px; font-weight: 600; color: var(--text-secondary); background: var(--surface-sunken); box-shadow: inset 0 0 0 1px var(--border); }
+.file-row-bad { display: inline-flex; align-items: center; gap: 2px; color: var(--red-text); font-weight: 600; }
+.file-row-bad .msym { font-size: 13px; }
 .file-row-size { flex: 0 0 auto; color: var(--text-tertiary); font-size: 11px; }
 .preview-card { width: min(900px, 94vw); max-height: 88vh; }
 .preview-actions { display: flex; align-items: center; gap: 10px; }
@@ -1944,6 +1950,26 @@ button.primary .msym, button.secondary .msym {
 .ds-section { margin: 0 0 18px; }
 .ds-section h3 { font-size: 15px; font-weight: 650; margin: 0 0 8px; letter-spacing: -0.01em; }
 .ds-note { margin: 6px 0 0; font-size: 13px; color: var(--text-secondary); }
+/* The dataset's description (DATASET.md, issue 10), below its preview. */
+.ds-description { margin: 22px 0 0; padding-top: 16px; border-top: 1px solid var(--border); }
+.ds-desc-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin-bottom: 8px; }
+.ds-desc-head h3 { display: inline-flex; align-items: center; gap: 6px; font-size: 15px; font-weight: 650; margin: 0; }
+.ds-desc-head h3 .msym { font-size: 18px; color: var(--text-secondary); }
+.ds-desc-head h3 code { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.ds-desc-who { font-size: 12.5px; color: var(--text-secondary); }
+.ds-desc-body { padding: 14px 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-reading); font-size: 14px; line-height: 1.6; max-width: 80ch; }
+.ds-desc-body h1 { font-size: 17px; margin: 0 0 8px; }
+.ds-desc-body h2 { font-size: 15px; margin: 16px 0 6px; }
+.ds-desc-body ul { margin: 4px 0 8px; padding-left: 20px; }
+.ds-desc-body li { margin: 2px 0; }
+.ds-desc-body em { color: var(--text-secondary); }
+.ds-desc-body code { font-size: 12.5px; overflow-wrap: anywhere; }
+.ds-desc-warn { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 8px; padding: 8px 10px; border-radius: 8px; font-size: 13px; color: var(--amber-text); background: #fdf3e1; }
+.ds-desc-warn .msym { font-size: 16px; }
+.ds-desc-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.ds-desc-acts .msym { font-size: 16px; }
+.ds-desc-acts a, .ds-desc-acts button { display: inline-flex; align-items: center; gap: 4px; }
+.ds-desc-edit { width: 100%; min-height: 360px; padding: 12px; border: 1px solid var(--border-strong); border-radius: 10px; font: 13px/1.5 var(--font-mono, ui-monospace, monospace); color: var(--text); background: var(--surface-reading); resize: vertical; }
 .ds-dim { color: var(--text-secondary); font-size: 12.5px; font-variant-numeric: tabular-nums; }
 
 .ds-table-wrap { overflow: auto; max-height: 56vh; border: 1px solid var(--border); border-radius: 10px; }

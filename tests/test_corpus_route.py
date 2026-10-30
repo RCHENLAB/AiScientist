@@ -178,12 +178,13 @@ def test_literature_executor_gets_a_per_run_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
     monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/x/paperqa.sif")
     monkeypatch.setattr(gw_app, "_sync_aiscientist_source_to_hpc", lambda c: "/dfs/pysrc/tester")
-    monkeypatch.setattr(gw_app, "_temp_base", lambda c: "/dfs/Temp/tester")
+    monkeypatch.setattr(gw_app, "_temp_base", lambda c: "/dfs/sessions/s1")
     ex = gw_app._build_literature_executor(conn, run_id="abc123")
-    assert ex.remote_workspace == "/dfs/Temp/tester/corpus/abc123"
+    assert ex.remote_workspace == gw_app._run_home(conn, "abc123").dir("corpus")
+    assert ex.remote_workspace.endswith(f"/sessions/{conn.id}/runs/abc123/corpus")
     assert ex.local_workspace == conn.workspace / "abc123"
     ex2 = gw_app._build_literature_executor(conn)
-    assert ex2.remote_workspace == "/dfs/Temp/tester/paperqa" and ex2.local_workspace == conn.workspace
+    assert ex2.remote_workspace == "/dfs/sessions/s1/paperqa" and ex2.local_workspace == conn.workspace
 
 
 def test_corpus_scan_resubmits_when_its_model_died(tmp_path, monkeypatch):
@@ -518,7 +519,8 @@ def test_the_scan_executor_has_its_own_gpu_and_never_the_sessions_model(tmp_path
         st.corpus_scan_partition, st.corpus_scan_account, st.corpus_scan_gres, st.corpus_scan_constraint)
     assert ex.network is True and ex.live_args is None and callable(ex.job_prelude)
     assert ex.inject_args["model"] == corpus_scan.scan_model(st) and "llm_base_url" not in ex.inject_args
-    assert ex.job_prefix == "bioagent_corpusscan" and ex.remote_workspace == "/dfs/Temp/tester/corpus/abc123"
+    assert ex.job_prefix == "bioagent_corpusscan"
+    assert ex.remote_workspace.endswith(f"/sessions/{conn.id}/runs/abc123/corpus")
     assert gw_app._classify_session_job("bioagent_corpusscan_extract_haploinsufficient_genes_1") == "gpu"
     # the other literature jobs are unchanged: CPU, the session's model
     lit = gw_app._build_literature_executor(conn, run_id="abc123")

@@ -347,6 +347,7 @@ def test_gateway_forwards_every_cli_knob_from_its_env(monkeypatch, tmp_path):
         expected[arg_key] = f"value-of-{arg_key}"
         monkeypatch.setenv(env_key, expected[arg_key])
     conn = types.SimpleNamespace(
+        id="s1", run_homes={},
         settings=HPCSettings(), executor=types.SimpleNamespace(username="tester"), mock=False,
         alloc=types.SimpleNamespace(node="hpc3-gpu-m54-01", port=39124), owner="tester",
         workspace=tmp_path, selected_model="RedHatAI/Qwen3.8-27B-INT4",
@@ -374,6 +375,7 @@ def test_a_session_on_the_users_api_key_gets_search_corpus_not_deep_literature(m
     monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/shared/containers/paperqa.sif")
     monkeypatch.setitem(sys.modules, "paperqa", None)      # the prod gateway venv has no paper-qa
     conn = types.SimpleNamespace(
+        id="s1", run_homes={},
         settings=HPCSettings(), executor=types.SimpleNamespace(username="tester"), mock=False,
         alloc=None, owner="tester", workspace=tmp_path, selected_model="claude-haiku-5-5",
         chat_stop=threading.Event(), hpc_pysrc="/shared/pysrc/tester")
@@ -409,6 +411,7 @@ def test_without_a_served_model_no_deep_literature_job_is_submitted(monkeypatch,
     monkeypatch.setattr(slurm_analysis.SlurmAnalysisExecutor, "run_tool",
                         lambda self, tool, args, ctx: submitted.append(tool) or {"status": "ok"})
     conn = types.SimpleNamespace(
+        id="s1", run_homes={},
         settings=HPCSettings(), executor=types.SimpleNamespace(username="tester"), mock=False,
         alloc=None, owner="tester", workspace=tmp_path, selected_model="claude-haiku-5-5",
         chat_stop=threading.Event(), hpc_pysrc="/shared/pysrc/tester")

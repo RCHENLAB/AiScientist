@@ -7,6 +7,10 @@ SQLAlchemy 2.0 over a single ``AISCIENTIST_DATABASE_URL``:
 * **Server** — set ``AISCIENTIST_DATABASE_URL=postgresql+psycopg://bioagent:<pw>@localhost/bioagent``
   and the SAME code runs against PostgreSQL (only the connection string changes).
 
+The schema is versioned: ``gateway/migrations/versions/`` holds one Alembic revision per change, and
+:func:`migrate` applies the missing ones (``aiscientist-admin migrate``, run by every deploy). A
+change to a model needs a revision; ``tests/test_db_migrations.py`` fails until it has one.
+
 The engine is created lazily + cached so importing this module costs nothing; tests
 call :func:`reset` to point at a fresh temp database. No external API, no network.
 """
@@ -61,53 +65,149 @@ def session_scope() -> Session:
 
 
 def init_db() -> None:
-    """Create all tables if missing (dev/first-run convenience; prod uses Alembic)."""
+    """Bring the database to the newest schema: the gateway's startup, the admin CLI and the tests.
+
+    The schema is versioned by Alembic (``gateway/migrations/versions/``); a deploy runs
+    :func:`migrate` before it switches to a new release, so at startup this finds nothing to do.
+    Without Alembic (a host without the ``auth`` extra) the tables are created from the models and
+    the additive columns added, as before migrations existed."""
     from . import models  # noqa: F401 - register the ORM models on Base.metadata
 
+    try:
+        import alembic  # noqa: F401
+    except ImportError:
+        engine = get_engine()
+        Base.metadata.create_all(engine)
+        _legacy_upgrade(engine)
+        return
+    migrate()
+
+
+def migrate() -> tuple[str | None, str]:
+    """Apply every migration the database lacks. Returns ``(revision before, revision after)``.
+
+    - An empty database gets the models' tables and is stamped with the newest revision (the same
+      schema the migrations build: ``tests/test_db_migrations.py`` checks that they agree).
+    - A database created before migrations existed (tables, no ``alembic_version``) is brought to
+      the baseline by the steps that created it, stamped ``0001``, then upgraded.
+    - Otherwise the pending revisions run in order, in one transaction.
+
+    Migrations only add: a rollback to an older release keeps the newer schema, so a revision must
+    leave the database usable by the release before it (a new nullable column, a new table)."""
+    from alembic import command
+    from alembic.runtime.migration import MigrationContext
+    from sqlalchemy import inspect
+
+    from . import models  # noqa: F401
+
     engine = get_engine()
-    Base.metadata.create_all(engine)
-    # Lightweight additive migrations for columns added after a table was first created.
-    # ``create_all`` never ALTERs an existing table, so a column added to a model would be
-    # absent from an already-deployed DB and every INSERT would fail. Each entry is an
-    # idempotent ADD COLUMN (skipped when the column already exists), which SQLite and
-    # PostgreSQL both support for a nullable column with no default. Keep these forward-only.
-    _ensure_columns(engine, "runs", {"conversation_id": "VARCHAR(64)"})
-    _ensure_columns(engine, "datasets", {
+    cfg = _alembic_config()
+    with engine.begin() as conn:
+        cfg.attributes["connection"] = conn
+        before = MigrationContext.configure(conn).get_current_revision()
+        tables = set(inspect(conn).get_table_names())
+        if before is None and not tables & set(Base.metadata.tables):
+            Base.metadata.create_all(conn)
+            command.stamp(cfg, "head")
+        else:
+            if before is None:
+                Base.metadata.create_all(conn)
+                _legacy_upgrade(conn)
+                command.stamp(cfg, BASELINE)
+            command.upgrade(cfg, "head")
+        after = MigrationContext.configure(conn).get_current_revision()
+    return before, after or ""
+
+
+# The revision a database created before migrations is stamped with (see migrate()).
+BASELINE = "0001"
+
+
+def _alembic_config():
+    from alembic.config import Config
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(Path(__file__).with_name("migrations")))
+    return cfg
+
+
+def head_revision() -> str:
+    """The newest revision this release ships."""
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(_alembic_config()).get_current_head() or ""
+
+
+def current_revision() -> str | None:
+    """The revision the database is at, or None when it has never been migrated."""
+    from alembic.runtime.migration import MigrationContext
+
+    with get_engine().connect() as conn:
+        return MigrationContext.configure(conn).get_current_revision()
+
+
+def _legacy_upgrade(bind) -> None:
+    """How a database got its newer columns before migrations: each an idempotent ADD COLUMN
+    (``create_all`` never alters an existing table), then a backfill of the dataset identity columns
+    (issue 5). Kept so a database of that time reaches the baseline; a new column is a migration."""
+    _ensure_columns(bind, "runs", {"conversation_id": "VARCHAR(64)"})
+    _ensure_columns(bind, "datasets", {
         "conversation_id": "VARCHAR(64)",
         "uuid": "VARCHAR(36)", "status": "VARCHAR(24)", "updated_at": "TIMESTAMP",
     })
-    _ensure_columns(engine, "llm_calls", {
+    _ensure_columns(bind, "metadata_records", {"description": "TEXT"})
+    _ensure_columns(bind, "llm_calls", {
         "conversation_id": "VARCHAR(64)", "step": "VARCHAR(160)", "provider": "VARCHAR(16)",
         "input_tokens": "INTEGER", "cache_write_tokens": "INTEGER", "cache_read_tokens": "INTEGER",
-        "est_cost_usd": "FLOAT", "status": "VARCHAR(16)", "error_type": "VARCHAR(32)"})
+        "est_cost_usd": "FLOAT", "status": "VARCHAR(16)", "error_type": "VARCHAR(32)",
+        "key_fp": "VARCHAR(32)"})
     # Backfill the dataset identity columns (issue 5) on rows written before them. Metadata only:
     # existing paths and files stay where they are.
     import uuid
+    from contextlib import nullcontext
+
     from sqlalchemy import text
-    with engine.begin() as conn:
+    with (bind.begin() if isinstance(bind, Engine) else nullcontext(bind)) as conn:
         for row in conn.execute(text("SELECT id FROM datasets WHERE uuid IS NULL")).all():
             conn.execute(text("UPDATE datasets SET uuid=:uuid WHERE id=:id"),
                          {"uuid": str(uuid.uuid4()), "id": row[0]})
         conn.execute(text("UPDATE datasets SET status='complete' WHERE status IS NULL"))
         conn.execute(text("UPDATE datasets SET updated_at=uploaded_at WHERE updated_at IS NULL"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_datasets_uuid ON datasets (uuid)"))
+    # The spike check reads one key's last hour after the calls it pays for (key_guard). Its own
+    # transaction, best-effort: a missing index makes that query slower, never the start fail.
+    if isinstance(bind, Engine):
+        try:
+            with bind.begin() as conn:
+                conn.execute(text(_KEY_FP_INDEX))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[db] index on llm_calls.key_fp skipped: {exc}")
+    else:   # inside migrate()'s transaction: a failure fails the migration, as any other step
+        bind.execute(text(_KEY_FP_INDEX))
 
 
-def _ensure_columns(engine: Engine, table: str, columns: dict[str, str]) -> None:
+# Added with llm_calls.key_fp (issue 16); revision 0002 adds the same on a migrated database.
+_KEY_FP_INDEX = "CREATE INDEX IF NOT EXISTS ix_llm_calls_key_fp_created ON llm_calls (key_fp, created_at)"
+
+
+def _ensure_columns(bind, table: str, columns: dict[str, str]) -> None:
     """Best-effort ``ALTER TABLE <table> ADD COLUMN`` for any of ``columns`` (name -> SQL
     type) missing from an existing table. No-op when the table doesn't exist yet (create_all
-    just made it with the columns). Never raises past a warning — history is best-effort."""
+    just made it with the columns). ``bind`` is an Engine or an open Connection. A failure is
+    printed, not raised."""
+    from contextlib import nullcontext
+
     from sqlalchemy import inspect, text
 
     try:
-        insp = inspect(engine)
+        insp = inspect(bind)
         if table not in insp.get_table_names():
             return
         existing = {c["name"] for c in insp.get_columns(table)}
         missing = {name: sqltype for name, sqltype in columns.items() if name not in existing}
         if not missing:
             return
-        with engine.begin() as conn:
+        with (bind.begin() if isinstance(bind, Engine) else nullcontext(bind)) as conn:
             for name, sqltype in missing.items():
                 conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {sqltype}'))
     except Exception as exc:  # noqa: BLE001 - a migration failure must not block startup

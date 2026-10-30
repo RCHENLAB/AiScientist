@@ -168,7 +168,9 @@ results carry **logFC + adjusted p-values**.
 <summary><b>Step 4 · Pathway enrichment per cell type</b></summary>
 
 **What.** Call `run_enrichment` with **no `genes` argument**. It finds Step 3's `de_<key>_all.csv` itself
-and runs ORA per cell type, splitting each into its **up-** and **down-**regulated halves.
+(`de_pseudobulk_<cell-type column>_all.csv` for a pseudobulk test, which it prefers when a cell-level
+`run_de` table exists too) and runs ORA per cell type, splitting each into its **up-** and
+**down-**regulated halves.
 
 **Why.** Enrichment turns each cell type's changed-gene list into interpretable pathways — computed per
 cell type so the biology stays lineage-specific, and per direction so an up-regulated and a

@@ -1,5 +1,6 @@
 {
   "release_tag": "v0.1.0",
   "allowed_tiers": ["core", "verified", "community"],
-  "releases_root": "skills/releases"
+  "releases_root": "skills/releases",
+  "current": "skills/current"
 }

@@ -81,7 +81,7 @@ class _Remote:
 
 
 def _backend(remote=None, **kw):
-    return compute.HPC3Backend(remote or _Remote(), shared_root=ROOT, user="tester",
+    return compute.HPC3Backend(remote or _Remote(), shared_root=ROOT, user="tester", session_id="s1",
                                partition="free", account="lab_account", **kw)
 
 
@@ -150,11 +150,15 @@ def test_stage_out_refuses_a_file_that_arrives_short(tmp_path):
 
 def test_clean_up_is_the_session_cleanup_job_unchanged():
     remote = _Remote()
-    script = f"{ROOT}/bin/tester/session_clean.sh"
-    res = _backend(remote, clean_script=script).clean_up(runs=["aaa111"], session="sess01")
+    script = f"{ROOT}/sessions/s1/scripts/session_clean.sh"
+    res = _backend(remote, clean_script=script).clean_up(
+        session_dirs=[f"{ROOT}/sessions/s0"], run_dirs={"aaa111": f"{ROOT}/sessions/s0/runs/aaa111"})
     direct = _Remote()
-    expected = hpc_gc.clean_session(direct, ROOT, "tester", runs=["aaa111"], session="sess01",
-                                    partition="free", account="lab_account", script_path=script)
+    expected = hpc_gc.clean_session(direct, ROOT, "tester", session_id="s1",
+                                    session_dirs=[f"{ROOT}/sessions/s0"],
+                                    run_dirs={"aaa111": f"{ROOT}/sessions/s0/runs/aaa111"},
+                                    tag="session", partition="free", account="lab_account",
+                                    script_path=script)
     assert res == expected and remote.commands == direct.commands
     assert remote.commands[0].startswith("sbatch --job-name=aiscientist-sessionclean-tester")
     assert _backend(_Remote()).clean_up() == {"status": "nothing", "runs": 0}
@@ -218,7 +222,7 @@ def conn(gw, tmp_path, monkeypatch):
     c.emit = lambda *a, **k: None
     c._publish = lambda payload: None
     gw.CONNECTIONS[c.id] = c
-    rec = _Recording(compute.HPC3Backend(c.executor, shared_root=ROOT, user="tester"))
+    rec = _Recording(compute.HPC3Backend(c.executor, shared_root=ROOT, user="tester", session_id=c.id))
     monkeypatch.setattr(gw, "_compute", lambda _c: rec)
     c.recording = rec
     return c
@@ -250,7 +254,7 @@ def test_the_disconnect_cleanup_goes_through_the_backend(gw, conn):
     conn.end_run(conn.begin_run("conv", "aaa111"))
     assert gw._end_session_cleanup(conn)["status"] == "submitted"
     assert conn.recording.calls == ["clean_up"]
-    assert "--run aaa111" in conn.executor.commands[-1]
+    assert f"--run-dir {ROOT}/sessions/{conn.id}/runs/aaa111" in conn.executor.commands[-1]
 
 
 def test_saving_a_result_home_goes_through_the_backend(gw, conn, tmp_path, monkeypatch):

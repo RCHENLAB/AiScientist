@@ -39,6 +39,22 @@ def test_git_sha_prefers_deploy_marker():
         prov._git_sha_cache = prov._UNSET          # leave the cache clean for other tests
 
 
+def test_git_sha_reads_a_release_package_version(tmp_path, monkeypatch):
+    """A release package (deploy/deploy_release.sh) has no .deployed_sha and no .git: its VERSION
+    file names the commit, so every run's stamp still records the code version."""
+    (tmp_path / "VERSION").write_text("tag=v0.4.0\nsha=" + "d" * 40 + "\n")
+    monkeypatch.setattr(prov, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(prov, "_git_sha_cache", prov._UNSET)
+    try:
+        assert prov.git_sha() == "d" * 40
+        # The rsync marker still wins when both exist.
+        (tmp_path / ".deployed_sha").write_text("e" * 40 + " main 2026-10-25T00:00:00Z\n")
+        prov._git_sha_cache = prov._UNSET
+        assert prov.git_sha() == "e" * 40
+    finally:
+        prov._git_sha_cache = prov._UNSET
+
+
 def test_seed_env_toggles(monkeypatch):
     monkeypatch.setenv(prov.SEED_ENV, "42")
     assert prov.resolve_seed() == 42

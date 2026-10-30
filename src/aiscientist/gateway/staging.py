@@ -251,6 +251,7 @@ class StagingQueue:
     # -- control --------------------------------------------------------------
 
     def submit(self, job: StagingJob) -> Future:
+        announced = threading.Event()
         with self._lock:
             running = self._futures.get(job.id)
             if running is not None and not running.done():
@@ -260,9 +261,14 @@ class StagingQueue:
             job.error = ""
             self.store.save(job)
             self._cancel[job.id] = threading.Event()
-            fut = self._pool.submit(self._run, job.id)
+            fut = self._pool.submit(self._run, job.id, announced)
             self._futures[job.id] = fut
-        self._changed(job)
+        # The copy waits until "queued" is announced: a worker that started first moved the shared
+        # job on to "pushing" before this notice ran, so "queued" was never seen (CI, 2026-10-28).
+        try:
+            self._changed(job)
+        finally:
+            announced.set()
         return fut
 
     def resume(self) -> list[StagingJob]:
@@ -370,7 +376,9 @@ class StagingQueue:
     def _finish(self, job: StagingJob, state: str, error: str = "") -> None:
         self._set(job, state, error=error)
 
-    def _run(self, job_id: str) -> None:
+    def _run(self, job_id: str, announced: "threading.Event | None" = None) -> None:
+        if announced is not None:
+            announced.wait()
         job = self.get(job_id)
         if job is None:
             return

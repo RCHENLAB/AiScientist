@@ -542,9 +542,12 @@ def bind_settings(text: str, properties: "Mapping[str, Any]",
             dropped.append({"param": key, "value": value, "why": "multiple_choices_in_text"})
             continue
         if isinstance(value, list):
+            # Refused when any item the step names is missing, whatever else the list holds: a
+            # shortened "Sample3" is no subset of the names the step writes out in full, and
+            # run_cellqc would refuse it on every call.
             named = _named_list_items(text, key, spec, value)
             selected = {str(v).strip().lower() for v in value}
-            if selected < named:
+            if named - selected:
                 dropped.append({"param": key, "value": value, "why": "incomplete_list"})
                 continue
         settings[key] = value

@@ -5,8 +5,9 @@
 # gateway submits this script with sbatch instead of running rm on a login node: removing data is
 # filesystem work, which RCIC keeps off the login nodes. It deletes each --path it is given when
 #   * the path is strictly inside one of the user's own folders: <root>/Temp/<user>/,
-#     <root>/uploads/<user>/ or, when --personal names it, the personal lab folder (which must end
-#     in /<user>); never one of those folders itself;
+#     <root>/uploads/<user>/, a session folder <root>/sessions/<id> the user owns (the folder
+#     itself, or anything in it) or, when --personal names it, the personal lab folder (which must
+#     end in /<user>); never one of the other folders itself;
 #   * the path has no '..', '.' or empty component, and no symbolic link above it: the physical
 #     folder it is in must be the one named.
 # A path that is itself a symbolic link is removed as a link; what it points to is not touched.
@@ -73,6 +74,7 @@ fi
 
 TEMP="${ROOT%/}/Temp/${ONLY_USER}"
 UPLOADS="${ROOT%/}/uploads/${ONLY_USER}"
+SESSIONS="${ROOT%/}/sessions"
 
 deleted=0; skipped=0
 
@@ -92,6 +94,18 @@ for path in "${PATHS[@]}"; do
     case "$path" in
         "$TEMP"/?*|"$UPLOADS"/?*) inside=1 ;;
     esac
+    if [ "$inside" -eq 0 ]; then
+        # A session folder, or anything in one, of a session folder this user owns.
+        case "$path" in
+            "$SESSIONS"/?*)
+                sid="${path#"$SESSIONS"/}"
+                sid="${sid%%/*}"
+                if is_name "$sid" && [ -d "$SESSIONS/$sid" ] && [ ! -L "$SESSIONS/$sid" ] && [ -O "$SESSIONS/$sid" ]; then
+                    inside=1
+                fi
+                ;;
+        esac
+    fi
     if [ "$inside" -eq 0 ] && [ -n "$PERSONAL" ]; then
         case "$path" in
             "$PERSONAL"/?*) inside=1 ;;

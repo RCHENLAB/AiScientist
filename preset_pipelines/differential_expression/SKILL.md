@@ -4,6 +4,37 @@ version: 2
 description: Compare an experimental condition vs control (e.g. KO vs WT) per cell type, with pathway interpretation (v2 — pseudobulk when replicates exist, and honest about it when they don't)
 tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_pseudobulk_de, run_depth_matched_de, run_composition, run_enrichment, run_gsea_prerank, deep_literature, run_code
 data_type: scrna
+outputs:
+  - path: tables/de_*_all.csv
+    kind: table
+    tool: run_de
+    description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
+    required: true
+  - path: figures/volcano_*.png
+    kind: figure
+    tool: run_de
+    description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
+    required: false
+  - path: figures/dotplot__markers.png
+    kind: figure
+    tool: run_de
+    description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
+    required: false
+  - path: tables/pseudobulk_all.csv
+    kind: table
+    tool: run_pseudobulk_de
+    description: Pseudobulk condition contrast tested across samples, one row per gene and cell type with log2 fold change, p-value, adjusted p-value and test statistic, the top 500 genes of each tested cell type.
+    required: true
+  - path: tables/composition*.csv
+    kind: table
+    tool: run_composition
+    description: Cell-type proportions, pooled when no sample column is given, otherwise per sample, plus per condition and a centred-log-ratio test between the arms when each arm has at least two samples.
+    required: true
+  - path: tables/enrichment_*.csv
+    kind: table
+    tool: run_enrichment
+    description: Over-representation results per group, split into up- and down-regulated halves for a contrast, with term, gene-set library, adjusted p-value, combined score and overlap.
+    required: true
 ---
 
 ## Read this before planning step 3
@@ -169,8 +200,10 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    redistribution is licence-restricted). "Run pathway enrichment" without naming a library leaves
    the executor to choose one, which is the PI's call, not the executor's. They
    use different inputs and different nulls — do NOT require them to agree, and keep null
-   results. Call both with **no `genes` argument**: step 3 wrote `tables/de_<key>_all.csv` and
-   they find it, run ORA per cell type, and split each into its up- and down-regulated halves.
+   results. Call both with **no `genes` argument**: step 3 wrote `tables/de_<key>_all.csv`
+   (`de_pseudobulk_<cell-type column>_all.csv` from `run_pseudobulk_de`, which they prefer when a
+   cell-level `run_de` table exists too) and they find it, run ORA per cell type, and split each
+   into its up- and down-regulated halves.
    Pasting a pooled gene list collapses every cell type into one `input` group and drops the
    tested-universe background, which inflates every p-value. Check the result: `background_source`
    must be `tested_universe`, not `constant_fallback`.

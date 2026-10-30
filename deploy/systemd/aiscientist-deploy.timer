@@ -1,0 +1,13 @@
+# Starts aiscientist-deploy.service every 10 minutes (deploy/deploy_release.sh --auto). See the
+# service file for what a run does. Stop deploys from tags: systemctl disable --now aiscientist-deploy.timer.
+
+[Unit]
+Description=AiScientist: look for a new release every 10 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=10min
+RandomizedDelaySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -59,7 +59,6 @@ sandbox.state.planProblems = [];
 sandbox.state.planDraftYaml = "";
 out.status = api.planCardHtml(agenda, doc, [], { mode: "status", status: "✎ Applying your edit…" });
 out.saved = api.planCardHtml(agenda, doc, [], { mode: "saved", status: "Approved" });
-out.expiring = api.planCardHtml(agenda, doc, [], { expiry: "This plan expires at 9:30 PM — run it, change it or reply before then, or nothing will run." });
 out.entry = api.planEntryHtml(agenda, doc, { pending: true, revised: [2] });
 out.entryDirty = api.planEntryHtml(agenda, doc, { pending: true, dirty: true });
 out.entryRefused = api.planEntryHtml(agenda, doc, { pending: true, problems: ["x"] });
@@ -161,11 +160,6 @@ def test_a_plan_no_longer_waiting_has_no_editor_and_no_buttons():
     assert '<details class="plan-yaml plan-yaml-read">' in out["saved"] and "&lt;QC&gt;" in out["saved"], \
         "a saved plan keeps its document, to read"
     assert '<div class="plan-title">Plan</div>' in out["saved"]
-
-
-def test_the_waiting_plan_in_the_panel_says_when_it_expires():
-    row = _card()["expiring"].split('<div class="plan-actions-row">', 1)[1]
-    assert row.startswith('<div class="plan-expiry" role="status">') and "This plan expires at 9:30 PM" in row
 
 
 def test_the_chat_shows_the_plan_as_an_entry_titles_and_tools_with_the_decision():

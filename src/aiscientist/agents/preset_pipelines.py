@@ -34,8 +34,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from . import skill_outputs
 from .loop_utils import safe_json_loads
 from .research_harness import EventFn
+from .skill_outputs import DeclaredOutput
 
 
 # --- data model --------------------------------------------------------------
@@ -60,6 +62,10 @@ class PresetPipeline:
     # Expression") and its front-matter description, a line shorter than ``label``. Empty otherwise.
     title: str = ""
     summary: str = ""
+    # The deliverables the pipeline's tool steps leave under the artifacts directory (``outputs:``
+    # in the front matter; each entry names the tool whose step writes it). Shown on the plan under
+    # that step and checked after it, like a skill's (``skill_outputs.py``).
+    outputs: "tuple[DeclaredOutput, ...]" = ()
 
     def missing_tools(self, available: "frozenset[str] | None") -> tuple[str, ...]:
         """Declared tools this deployment cannot actually run, in declaration order.
@@ -101,9 +107,11 @@ def _parse_skill(text: str) -> tuple[dict[str, str], str]:
         if end != -1:
             front = rest[:end]
             body = rest[end + 4:]
-            for line in front.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or ":" not in line:
+            for raw in front.splitlines():
+                line = raw.strip()
+                # An indented line belongs to a block (``outputs:``, read by skill_outputs), never
+                # to the top level: an output's ``description`` must not become the pipeline's.
+                if not line or line.startswith("#") or ":" not in line or raw[:1] in (" ", "\t"):
                     continue
                 k, _, v = line.partition(":")
                 meta[k.strip()] = v.strip()
@@ -119,9 +127,13 @@ def _load_pipelines() -> dict[str, PresetPipeline]:
         return out
     for skill_md in sorted(root.glob("*/SKILL.md")):
         try:
-            meta, body = _parse_skill(skill_md.read_text(encoding="utf-8"))
+            text = skill_md.read_text(encoding="utf-8")
         except OSError:
             continue
+        meta, body = _parse_skill(text)
+        outputs, problems = skill_outputs.from_text(text, needs_tool=True)
+        if problems:
+            print(f"[pipelines] {skill_md.parent.name}: declared outputs left out: {'; '.join(problems)}")
         key = meta.get("name") or skill_md.parent.name
         if not key or not body:
             continue
@@ -135,6 +147,7 @@ def _load_pipelines() -> dict[str, PresetPipeline]:
             data_type=meta.get("data_type", "").strip().lower(),
             title=title,
             summary=summary,
+            outputs=outputs,
         )
     return out
 
@@ -171,6 +184,7 @@ def list_pipelines() -> list[dict]:
             "data_type": p.data_type,
             "title": p.title,
             "summary": p.summary,
+            "outputs": [o.to_public() for o in p.outputs],
         }
         for p in PIPELINES.values()
     ]

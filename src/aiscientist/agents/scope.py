@@ -37,6 +37,7 @@ QC_ONLY_TOOLS = frozenset({"run_scanpy_qc", "run_cellqc", "run_doublet_detection
 NOT_AN_ANALYSIS = frozenset({
     "finish", "inspect_dataset", "read_tool_source", "describe_environment", "search_skills",
     "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text", "disk_usage",
+    "find_software",
     "run_code", "run_shell", "run_in_environment"})
 
 

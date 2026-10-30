@@ -15,6 +15,8 @@ from .._lib.scrna import (
     _genesets_dir,
     gene_sets_note,
     installed_gene_sets,
+    preferred_de_keys,
+    PSEUDOBULK_KEY_PREFIX,
     _missing,
     _rel,
     _run_files,
@@ -80,19 +82,23 @@ def run_gsea_prerank(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         # groupby is routinely itself underscored (`cell_type`, `major_class`), so any positional
         # split of `rank_cell_type_Club_Secretory` guesses the boundary wrong.
         if not groupby:
-            idx_files = sorted(tables.glob("rank_*_index.csv"))
-            # Same preference as run_enrichment: an ANNOTATED grouping carries more biology than
-            # raw leiden ids, so if both exist rank the annotated one.
-            idx_files = [p for p in idx_files if p.name != "rank_leiden_index.csv"] or idx_files
-            if idx_files:
-                groupby = idx_files[0].name[len("rank_"):-len("_index.csv")]
+            # Same preference as run_enrichment (preferred_de_keys): a replicated condition test
+            # first, then an ANNOTATED grouping before raw leiden ids.
+            keys = [p.name[len("rank_"):-len("_index.csv")] for p in tables.glob("rank_*_index.csv")]
+            groupby = next(iter(preferred_de_keys(keys)), "")
         if groupby:
             index_csv = tables / f"rank_{groupby}_index.csv"
             if index_csv.exists():
                 with index_csv.open(encoding="utf-8") as fh:
                     labels = {row["slug"]: row["group"] for row in csv.DictReader(fh)}
-        rnk_files = sorted(tables.glob(f"rank_{groupby}_*.rnk") if groupby
-                           else tables.glob("rank_*.rnk"))
+        if labels:
+            # Exactly the groups the index names: `rank_<groupby>_*.rnk` also matches the files of
+            # a longer key that starts the same (`pseudobulk` and `pseudobulk_majorclass`).
+            rnk_files = sorted(p for p in (tables / f"rank_{groupby}_{slug}.rnk" for slug in labels)
+                               if p.exists())
+        else:
+            rnk_files = sorted(tables.glob(f"rank_{groupby}_*.rnk") if groupby
+                               else tables.glob("rank_*.rnk"))
         prefix = f"rank_{groupby}_" if groupby else "rank_"
         if not rnk_files:
             return {"status": "error", "step": "gsea_prerank",
@@ -186,7 +192,9 @@ def run_gsea_prerank(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "params": {"min_size": min_size, "max_size": max_size, "permutations": permutations,
                    "seed": seed, "fdr_max": fdr_max,
                    # A caller's own .rnk files carry whatever statistic THEY ranked by.
-                   "ranking_statistic": "as supplied in `input`" if from_input else "wilcoxon_z"},
+                   "ranking_statistic": ("as supplied in `input`" if from_input else
+                                         "pseudobulk test statistic (DESeq2 Wald, or Welch t)"
+                                         if groupby.startswith(PSEUDOBULK_KEY_PREFIX) else "wilcoxon_z")},
         "read_from": [_run_rel(ctx, p) for p in rnk_files][:40],
         "tables": [_rel(art, tables / f"gsea_{_slug(g)}.csv") for g in results],
         "errors": errors,
@@ -215,7 +223,13 @@ def make_tool() -> HarnessTool:
            if installed_gene_sets() else ""),
         {"type": "object", "properties": {
             "gene_sets": {"type": "array", "items": {"type": "string"}},
-            "groupby": {"type": "string"}, "top_n_terms": {"type": "integer"},
+            "groupby": {"type": "string",
+                        "description": ("which ranked lists to read, by the key in "
+                                        "tables/rank_<groupby>_<group>.rnk: the column run_de "
+                                        "grouped by, or the `de_key` run_pseudobulk_de returned; "
+                                        "omit to choose automatically, a replicated pseudobulk "
+                                        "test first")},
+            "top_n_terms": {"type": "integer"},
             "min_size": {"type": "integer"}, "max_size": {"type": "integer"},
             "permutations": {"type": "integer"}, "fdr_max": {"type": "number"},
             "seed": {"type": "integer"},

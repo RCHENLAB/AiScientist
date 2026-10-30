@@ -564,3 +564,66 @@ def test_an_unanswered_decision_proceeds_on_the_agents_judgment():
     conn.push = lambda *_a: None
     out = gw_app._decision_review(conn, lambda *a, **k: None, _Fork(), timeout=0.05)
     assert out == {"action": "proceed", "timed_out": True}
+
+
+# --- a chat that finishes never ends another chat's run ------------------------
+#
+# Prod 2026-10-28, one session, two chats: chat 184's run waited at its plan card while chat 185's
+# RetiGene request (curation plan → a second scope → literature answer) finished. _dispatch_lab's
+# cleanup then ended "the active run" — after its own had ended, that was the session's newest live
+# run, chat 184's. Its reply to the plan ("change threshold of mitochondrial percentage to 25%")
+# came back "stale" and the run waited with nobody able to reach it.
+
+def _waiting_chat(conn, conversation_id="184", run_id="c29a015ff8c6"):
+    run = conn.begin_run(conversation_id)
+    conn.bind_run_id(run, run_id)
+    run.pending_plan = {"kind": "plan", "payload": ["**Cell QC** — run_cellqc on both libraries."]}
+    return run
+
+
+def test_a_chat_that_finishes_does_not_end_another_chats_run_waiting_at_its_plan(monkeypatch):
+    conn = _conn(chat_running=True)
+    waiting = _waiting_chat(conn)
+
+    async def curation_then_literature(conn, req):
+        # The curation's scope ends; the note opens a second scope, which its run function ends.
+        conn.end_run(conn.active_run)
+        second = conn.begin_run(req.conversation_id)
+        conn.bind_run_id(second, "73f1758c07de")
+        conn.end_run(second)
+
+    monkeypatch.setattr(gw_app, "_dispatch_lab_run", curation_then_literature)
+    asyncio.run(gw_app._dispatch_lab(conn, gw_app.LabRequest(
+        connection_id=conn.id, question="what are haploinsufficient genes on RetiGene papers?",
+        conversation_id="185")))
+
+    assert conn.live_runs == [waiting]
+    r = TestClient(gw_app.app).post("/api/lab/plan", json={
+        "connection_id": conn.id, "conversation_id": "184", "action": "revise",
+        "feedback": "change threshold of mitochondrial percentage to 25%."})
+    assert r.json() == {"status": "ok", "action": "revise"}
+    assert waiting.plan_event.is_set() and waiting.plan_value["feedback"].startswith("change threshold")
+
+
+def test_the_cleanup_still_closes_a_second_scope_its_own_chat_left_open(monkeypatch):
+    conn = _conn(chat_running=True)
+    waiting = _waiting_chat(conn)
+
+    async def leaves_a_scope_open(conn, req):
+        conn.begin_run(req.conversation_id)
+
+    monkeypatch.setattr(gw_app, "_dispatch_lab_run", leaves_a_scope_open)
+    asyncio.run(gw_app._dispatch_lab(conn, gw_app.LabRequest(
+        connection_id=conn.id, question="q", conversation_id="185")))
+    assert conn.live_runs == [waiting]
+
+
+def test_closing_the_session_answers_a_plan_that_waits_with_no_time_limit():
+    """A plan card has no time limit, so a session closed under it must answer it, or the run's
+    thread waits until the gateway restarts."""
+    conn = _conn(chat_running=True, executor=None, alloc=None)    # summary() reads alloc.job_id
+    waiting = _waiting_chat(conn)
+    r = TestClient(gw_app.app).post("/api/disconnect", json={"connection_id": conn.id})
+    assert r.json()["status"] == "disconnected"
+    assert waiting.plan_event.is_set() and waiting.plan_value == {"action": "cancel"}
+    assert waiting.chat_stop.is_set() and waiting.pending_plan is None

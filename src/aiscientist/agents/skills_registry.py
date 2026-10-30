@@ -16,6 +16,8 @@ from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
+from . import run_manifest
+
 ROOT = Path(__file__).resolve().parents[3]
 # Where the pinned releases are published (configs/skills_registry.json pins the tag).
 REGISTRY_REPO = "lijinbio/aiscientist-skills"
@@ -30,32 +32,53 @@ ACTIVE: ContextVar = ContextVar("active_registry_skill", default=_UNSET)
 # ends (``step_scope``). Unset outside a step, where each call is counted as it ends.
 _STEP_CALLS: ContextVar["dict | None"] = ContextVar("registry_skill_step_calls", default=None)
 LOG = logging.getLogger(__name__)
-_MANIFEST_LOCK = threading.RLock()
 _COUNT_LOCK = threading.Lock()
 _SCOPES = itertools.count()
 
 
+# What the last load found: the release tag it read and how many curated skills it gave, or the
+# error that refused it. /health reports it, so deploy/deploy_skills.sh can see the switch take.
+STATUS: dict = {"tag": None, "skills": 0, "error": None}
+_VERSION_RE = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?"
+
+
 def config() -> dict:
+    """The registry settings. ``release_tag`` is the release the curated skills come from: the one
+    ``current`` points at when that link exists (``skills/current``, switched by
+    ``deploy/deploy_skills.sh``), else the tag the configuration pins (``pinned_tag``)."""
     path = Path(os.environ.get("AISCIENTIST_SKILLS_REGISTRY_CONFIG",
                                ROOT / "configs/skills_registry.json"))
     cfg = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("release_tag", "releases_root", "allowed_tiers"):
+    for key in ("release_tag", "releases_root", "allowed_tiers", "current"):
         value = os.environ.get("AISCIENTIST_SKILLS_REGISTRY_" + key.upper())
         if value is not None:
             cfg[key] = ([v.strip() for v in value.split(",") if v.strip()] if key == "allowed_tiers"
                         else value)
-    if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", cfg["release_tag"]):
+    if not re.fullmatch("v" + _VERSION_RE, cfg["release_tag"]):
         raise ValueError("skills registry release_tag must be a pinned v<major>.<minor>.<patch> tag")
     tiers = cfg["allowed_tiers"]
     if not isinstance(tiers, list) or not tiers or set(tiers) - {"core", "verified", "community"}:
         raise ValueError("invalid skills registry allowed_tiers")
     root = Path(cfg["releases_root"])
     cfg["releases_root"] = root if root.is_absolute() else ROOT / root
+    cfg["pinned_tag"] = cfg["release_tag"]
+    cfg["release_path"] = None
+    if cfg.get("current"):
+        link = Path(cfg["current"])
+        link = link if link.is_absolute() else ROOT / link
+        cfg["current"] = link
+        if os.path.lexists(link):
+            target = link.resolve()
+            if not target.is_dir():
+                raise ValueError(f"{link} points at {target}, which is not an installed skills release")
+            if not re.fullmatch(_VERSION_RE, target.name):
+                raise ValueError(f"{link} points at {target.name!r}, which is not a release version")
+            cfg["release_tag"], cfg["release_path"] = "v" + target.name, target
     return cfg
 
 
 def release_dir(cfg: dict) -> Path:
-    return cfg["releases_root"] / cfg["release_tag"][1:]
+    return cfg.get("release_path") or cfg["releases_root"] / cfg["release_tag"][1:]
 
 
 def safe_path(root: Path, name: str) -> Path:
@@ -129,17 +152,16 @@ def install_command(cfg: dict) -> str:
 def load(load_from) -> dict:
     """The curated skills of the pinned release. An absent release is an empty library, said in the
     log with the command that installs it; an installed release that fails a check raises."""
+    STATUS.update(tag=None, skills=0, error=None)
     cfg = config()
     root = release_dir(cfg)
     if not root.exists():
         LOG.warning("Pinned skills release %s is not installed at %s: no curated skills are loaded. "
                     "Install it with: %s", cfg["release_tag"], root, install_command(cfg))
+        STATUS["error"] = f"release {cfg['release_tag']} is not installed"
         return {}
-    checked = verify(root)
+    checked = check_release(root, cfg["release_tag"])
     catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
-    if (catalog.get("schema_version") != 1 or catalog.get("registry") != "aiscientist-skills"
-            or catalog.get("registry_version") != cfg["release_tag"][1:]):
-        raise ValueError("skill catalog does not match pinned registry release")
     out = {}
     # The registry's release workflow publishes one aiscientist-skills-<version>.zip holding each
     # skill folder at its catalog path (aiscientist_skills/package.py); per-skill zips are still read.
@@ -152,7 +174,20 @@ def load(load_from) -> dict:
             _extract(safe_path(root, bundle_name), bundle)
         for row in catalog["skills"]:
             _load_row(row, cfg, root, checked, bundle, load_from, out)
+    STATUS.update(tag=cfg["release_tag"], skills=len(out))
     return out
+
+
+def check_release(root: Path, tag: str) -> set[str]:
+    """Check an installed release before anything of it is read: every file ``SHA256SUMS`` lists
+    matches its checksum, and ``catalog.json`` is the catalog of ``tag``. Returns the checked files.
+    ``deploy/deploy_skills.sh`` runs it (through :func:`_main`) before it switches ``skills/current``."""
+    checked = verify(root)
+    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
+    if (catalog.get("schema_version") != 1 or catalog.get("registry") != "aiscientist-skills"
+            or catalog.get("registry_version") != tag[1:]):
+        raise ValueError("skill catalog does not match pinned registry release")
+    return checked
 
 
 def _load_row(row: dict, cfg: dict, root: Path, checked: set[str], bundle: Path | None, load_from,
@@ -197,25 +232,14 @@ def _load_row(row: dict, cfg: dict, root: Path, checked: set[str], bundle: Path 
 
 
 def init_manifest(ctx) -> None:
+    """Start the run's manifest.json (agents/run_manifest.py) with the skills release it reads."""
     if ctx is None or ctx.workspace is None:
         return
-    path = Path(ctx.workspace) / "manifest.json"
     try:
         release = config()["release_tag"]
     except Exception:  # noqa: BLE001 - a bad registry config leaves the run without curated skills, not without a manifest
         release = None
-    with _MANIFEST_LOCK:
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _write(path, {"registry_release": release, "skills": []})
-
-
-def _write(path: Path, value: dict) -> None:
-    # Unique temporary files also support concurrent run workspaces.
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                     delete=False) as f:
-        json.dump(value, f, indent=2)
-    os.replace(f.name, path)
+    run_manifest.init(ctx, release)
 
 
 @contextmanager
@@ -244,10 +268,11 @@ def count_step(step: str, calls: dict) -> None:
     """Count once, per registry skill, the step whose code ran under it.
 
     ``calls`` is ``{(release, name, version): (skill, ctx, [(ok, code, tool), ...])}``, as
-    ``execute`` records it. A call runs the skill's method when it is a ``run_in_environment``
-    command (it runs only in a skill's own environment), when its code calls one of the skill's own
-    functions (``skill_code.skill_functions``), or when no such function can be found in the
-    skill's code. A step none of whose calls ran the method is not counted: it inspected files or
+    ``count_call`` records it. A call runs the skill's method when it is a call of a tool that runs
+    the skill (``run_cellqc``) or a ``run_in_environment`` command (both run only the skill), and a
+    ``run_code`` call when its code calls one of the skill's own functions
+    (``skill_code.skill_functions``) or no such function can be found in the skill's code. A step
+    none of whose calls ran the method is not counted: it inspected files or
     read another step's output, and said nothing about the version. The step is a success when one
     of those calls succeeded, an error when none did. A later attempt of the same step that
     succeeds turns that step's error into a success; nothing is counted twice."""
@@ -294,14 +319,17 @@ def record_in_manifest(ctx, skill) -> None:
     init_manifest(ctx)
     if ctx.workspace is None:
         return
-    path = Path(ctx.workspace) / "manifest.json"
-    with _MANIFEST_LOCK:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-        item = {"name": skill.name, "version": skill.version or "local",
-                "registry_release": skill.registry_release or None}
-        if item not in doc.setdefault("skills", []):
-            doc["skills"].append(item)
-            _write(path, doc)
+    item = {"name": skill.name, "version": skill.version or "local",
+            "registry_release": skill.registry_release or None}
+    if getattr(skill, "image", ""):
+        item["image"] = skill.image          # the environment the skill pins (its SKILL.md)
+
+    def add(doc: dict) -> bool:
+        if item in doc.setdefault("skills", []):
+            return False
+        doc["skills"].append(item)
+        return True
+    run_manifest.update(ctx, add)
 
 
 def active_skill(ctx, name: str = ""):
@@ -321,8 +349,8 @@ def active_skill(ctx, name: str = ""):
 def execute(skill, ctx, executor, call, tool: str, code: str = ""):
     """Apply immutable per-call policy; never mutate a shared executor or process environment.
 
-    ``code`` is what the call runs (the snippet, the command). Inside a plan step the call is
-    recorded for the step's count (``count_step``); outside one it is counted as it ends."""
+    ``code`` is what the call runs (the snippet, the command). The call is counted by
+    ``count_call``."""
     if skill is None:
         return call()
     record_use(ctx, skill)
@@ -364,16 +392,30 @@ def execute(skill, ctx, executor, call, tool: str, code: str = ""):
             value = [redact(v) for v in value]
         return value
     result = redact(result)
-    status = result.get("status") if isinstance(result, dict) else None
-    if status != "cancelled":   # the user pressed Stop: not a verdict on the skill version
-        ok = status in {"ok", "success"}
-        step = _STEP_CALLS.get()
-        if step is None:
-            _count(skill, "success" if ok else "error", ctx)
-        else:
-            key = (skill.registry_release, skill.name, skill.version)
-            step.setdefault(key, (skill, ctx, []))[2].append((ok, str(code or ""), tool))
+    count_call(skill, ctx, result, tool, code)
     return result
+
+
+def count_call(skill, ctx, result, tool: str, code: str = "") -> None:
+    """Count one call that ran under registry skill ``skill``, by its ``result``: a ``run_code`` or
+    ``run_in_environment`` call (``execute``), or a call of a tool that runs the skill's method
+    (``skill:`` in its TOOL.md, ``tool_skills.attach_skill``). Inside a plan step the call is
+    recorded for the step's count (``count_step``); outside one it is counted as it ends. A call
+    the user stopped, or one whose result was reused rather than run again, is not counted."""
+    if not skill.registry_release:
+        return
+    status = result.get("status") if isinstance(result, dict) else None
+    if status == "cancelled":   # the user pressed Stop: not a verdict on the skill version
+        return
+    if isinstance(result, dict) and result.get("reused_existing"):   # an earlier call's result
+        return
+    ok = status in {"ok", "success"}
+    step = _STEP_CALLS.get()
+    if step is None:
+        _count(skill, "success" if ok else "error", ctx)
+    else:
+        key = (skill.registry_release, skill.name, skill.version)
+        step.setdefault(key, (skill, ctx, []))[2].append((ok, str(code or ""), tool))
 
 
 def stats_path(ctx=None) -> Path:
@@ -414,3 +456,24 @@ def _adjust(skill, ctx, success: int = 0, error: int = 0) -> None:
     except (OSError, sqlite3.Error) as exc:
         # The counter is for rollback decisions; it must never fail the run itself.
         LOG.warning("could not record skill version outcome in %s: %s", path, exc)
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """``python -m aiscientist.agents.skills_registry check <release dir> <tag>``: the deploy's check
+    of a downloaded release, the same one the loader makes. Exit 0 when it passes."""
+    import sys
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) != 3 or args[0] != "check":
+        print("usage: python -m aiscientist.agents.skills_registry check <release dir> <tag>", file=sys.stderr)
+        return 2
+    try:
+        files = check_release(Path(args[1]), args[2])
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"{args[2]}: {len(files)} files match SHA256SUMS, catalog.json is the catalog of {args[2]}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

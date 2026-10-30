@@ -208,7 +208,8 @@ def test_a_new_session_sweeps_leftovers_but_keeps_live_sessions_holders(conns, m
     monkeypatch.setattr(worker_mod, "sweep_stale_workers", sweep)
     gw_app._sweep_leftover_workers(new)
     assert seen["keep"] == {"11"} and seen["stale_after_s"] == 900
-    assert seen["log_dir"].endswith("/Temp/alice/scratch/worker")
+    # Each session keeps its worker files in its own folder: the check looks in all of the user's.
+    assert seen["log_dir"] == f"{new.settings.shared_root}/sessions/*/jobs/worker"
 
 
 def test_the_sweep_never_breaks_a_login(conns, monkeypatch):
@@ -238,3 +239,32 @@ def test_concurrent_commands_never_submit_two_holders(conns, monkeypatch):
     for t in threads:
         t.join()
     assert submitted == [1]
+
+
+def test_a_heartbeat_in_another_sessions_folder_keeps_its_worker():
+    """The holder of an earlier session (another process, say) is still in use when its heartbeat,
+    in that session's own folder, is fresh: the new session must not cancel it."""
+    from aiscientist.gateway import worker as wm
+
+    class _Ex:
+        username = "alice"
+
+        def __init__(self):
+            self.commands = []
+
+        def exec(self, command, timeout=60.0):
+            self.commands.append(command)
+            if command.startswith("squeue"):
+                out = "11|1:00:00\n12|2:00:00\n"
+            elif command.startswith("date"):
+                out = ("1000000\n/r/sessions/s-old/jobs/worker/aiscientist-worker-alice-11.alive|999990\n"
+                       "/r/sessions/s-older/jobs/worker/aiscientist-worker-alice-12.alive|100\n")
+            else:
+                out = ""
+            return type("R", (), {"out": out, "ok": True, "stdout": out})()
+
+    ex = _Ex()
+    cancelled = wm.sweep_stale_workers(ex, log_dir="/r/sessions/*/jobs/worker", stale_after_s=900)
+    assert cancelled == ["12"]
+    stat = next(c for c in ex.commands if c.startswith("date"))
+    assert "/r/sessions/*/jobs/worker/aiscientist-worker-alice-11.alive" in stat

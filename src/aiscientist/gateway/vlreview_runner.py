@@ -32,6 +32,7 @@ def build_vlreview_review_fn(
     *,
     cluster_user_dir: str,
     run_id: str,
+    run_dir: str = "",
     local_review_dir: Path | None = None,
     emit: Callable[[str, str, str], None] | None = None,
     source_dir: str | None = None,
@@ -46,7 +47,9 @@ def build_vlreview_review_fn(
     def _review(local_pdf_path: str) -> dict:
         state["pass"] += 1
         n = state["pass"]
-        base = f"{cluster_user_dir.rstrip('/')}/vlreview/{run_id}/pass{n}"
+        # The run's own vlreview/ folder (session layout) when given, else under cluster_user_dir.
+        base = (f"{run_dir.rstrip('/')}/pass{n}" if run_dir
+                else f"{cluster_user_dir.rstrip('/')}/vlreview/{run_id}/pass{n}")
         remote_pdf = f"{base}/report.pdf"
         out_dir = f"{base}/out"
         try:

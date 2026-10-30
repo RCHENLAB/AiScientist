@@ -121,7 +121,9 @@ and write only into the corpus directories and manifests they are given.
 | `refresh_paperqa_manifest_authors.py` | Refresh the manifest's citations with full author lists. |
 | `build_paperqa_directory_index.py` | Build the PaperQA embedding index for the corpus. |
 | `query_paperqa_index.py` | Ask the index a question. |
-| `build_mechanism_cache.py` | Re-extract page text and sentence vectors for `extract_haploinsufficient_genes`. |
+| `build_mechanism_cache.py` | Extract page text and chunk vectors for `search_corpus` and `extract_haploinsufficient_genes`; `--replace` builds beside the index and puts it in place. |
+| `update_corpus_index.py` | On the Eye Server: rebuild the index on HPC3 when papers were added (`--rebuild`), copy it to the Eye Server, check the copy (`--check`), or switch back (`--rollback`). |
+| `sync_corpus_index.py` | Copy an index from any source into a copy's folder, as a new version made current in one step. |
 
 ## Adding a script
 

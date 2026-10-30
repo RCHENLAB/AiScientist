@@ -443,7 +443,7 @@ def test_check_then_remove(flow):
     assert status == 200, body
     plan = body["plan"]
     assert plan["check"]["job_id"] == "901" and plan["check"]["status"] == "queued"
-    paths = ho.remote_paths(ROOT, "tester", plan["id"], "check")
+    paths = ho.remote_paths(f"{ROOT}/sessions/{conn.id}", plan["id"], "check")
     assert hpc.files[paths["manifest"]] == f"file\t6\t{UPLOADS}/pbmc.h5ad\n".encode()
     assert paths["script"] in hpc.files
     sbatch_script = next(c for c in hpc.commands if c.startswith("mkdir -p") and "cat >" in c)
@@ -464,7 +464,7 @@ def test_check_then_remove(flow):
     status, body = _call(gw.remove_hpc_originals({"connection_id": conn.id, "plan_id": plan["id"]}, None))
     assert status == 200, body
     assert body["plan"]["remove"]["job_id"] == "902"
-    rpaths = ho.remote_paths(ROOT, "tester", plan["id"], "remove")
+    rpaths = ho.remote_paths(f"{ROOT}/sessions/{conn.id}", plan["id"], "remove")
     assert hpc.files[rpaths["manifest"]] == f"file\t6\t{UPLOADS}/pbmc.h5ad\n".encode()
 
     hpc.states["902"] = "COMPLETED"

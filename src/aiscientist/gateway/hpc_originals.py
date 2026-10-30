@@ -177,13 +177,14 @@ def manifest(entries: Iterable[dict]) -> str:
 
 # --- the job --------------------------------------------------------------------------------------
 
-def remote_paths(shared_root: str, user: str, plan_id: str, phase: str) -> dict:
-    """Where a plan's files go on HPC3, under ``<shared root>/bin/<user>/``."""
-    bin_dir = f"{shared_root.rstrip('/')}/bin/{user}"
-    return {"bin": bin_dir, "script": f"{bin_dir}/{SCRIPT_NAME}",
-            "dir": f"{bin_dir}/originals",
-            "manifest": f"{bin_dir}/originals/{plan_id}.{phase}.tsv",
-            "log": f"{bin_dir}/originals/{plan_id}.{phase}.log"}
+def remote_paths(session_dir: str, plan_id: str, phase: str) -> dict:
+    """Where a plan's files go on HPC3: the script in the session's ``scripts/``, what each phase
+    was given and said in ``logs/originals/`` (``hpc_layout``). The plan keeps each job's log path,
+    so a Remove in a later session still settles its Check."""
+    base = session_dir.rstrip("/")
+    logs = f"{base}/logs/originals"
+    return {"bin": f"{base}/scripts", "script": f"{base}/scripts/{SCRIPT_NAME}", "dir": logs,
+            "manifest": f"{logs}/{plan_id}.{phase}.tsv", "log": f"{logs}/{plan_id}.{phase}.log"}
 
 
 def command(script: str, shared_root: str, user: str, manifest_path: str, *,
@@ -210,12 +211,12 @@ def job_spec(payload: str, user: str, log_path: str, submit_dir: str, *,
     return SlurmJobSpec(script="\n".join(lines), job_name=f"{JOB_PREFIX}{user}", submit_dir=submit_dir)
 
 
-def stage(executor: Any, shared_root: str, user: str, plan_id: str, phase: str,
+def stage(executor: Any, session_dir: str, plan_id: str, phase: str,
           entries: Iterable[dict]) -> dict:
     """Put the script and this phase's manifest on HPC3 (through the transfer host); returns the
     remote paths."""
-    paths = remote_paths(shared_root, user, plan_id, phase)
-    executor.exec(f"mkdir -p {shlex.quote(paths['dir'])}", timeout=30)
+    paths = remote_paths(session_dir, plan_id, phase)
+    executor.exec(f"mkdir -p {shlex.quote(paths['dir'])} {shlex.quote(paths['bin'])}", timeout=30)
     executor.put_file(str(SCRIPT_SRC), paths["script"])
     fd, local = tempfile.mkstemp(prefix="originals-", suffix=".tsv")
     try:
@@ -228,10 +229,11 @@ def stage(executor: Any, shared_root: str, user: str, plan_id: str, phase: str,
 
 
 def submit(backend: Any, executor: Any, plan: dict, phase: str, entries: list[dict], *,
-           shared_root: str, partition: str, account: str = "", personal_dir: str = "") -> dict:
+           shared_root: str, session_dir: str, partition: str, account: str = "",
+           personal_dir: str = "") -> dict:
     """Stage and submit one phase (``check`` = the dry run, ``remove``); returns its job record."""
     user, plan_id = plan["hpc_user"], plan["id"]
-    paths = stage(executor, shared_root, user, plan_id, phase, entries)
+    paths = stage(executor, session_dir, plan_id, phase, entries)
     payload = command(paths["script"], shared_root, user, paths["manifest"],
                       personal_dir=personal_dir, dry_run=phase == "check")
     job_id = backend.submit(job_spec(payload, user, paths["log"], paths["bin"],

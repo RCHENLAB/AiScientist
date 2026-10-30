@@ -3,6 +3,37 @@ name: phenotype_variant_diagnosis
 description: Diagnose a rare-disease CASE — a VCF **plus** the patient's clinical description (free text, any language) — by reconciling two independent tracks: the prioritised variant shortlist (VEP/ClinVar/predictors) and a phenotype-driven per-disease differential (HPO → LIRICAL post-test probability). Use ONLY when the case's phenotype/symptoms/diagnosis are actually given; a VCF alone is the variant_annotation protocol.
 tools: annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
 data_type: variants
+outputs:
+  - path: tables/variant_annotation.tsv
+    kind: table
+    tool: annotate_variants
+    description: One row per annotated variant with gene, location, rsID, consequence, impact, ClinVar significance, gnomAD allele frequency, SIFT and PolyPhen, and predictor scores where they are configured.
+    required: true
+  - path: tables/variant_consequence_distribution.csv
+    kind: table
+    tool: annotate_variants
+    description: Number and percentage of annotated variants per functional consequence.
+    required: true
+  - path: tables/variant_clinical_significance.csv
+    kind: table
+    tool: annotate_variants
+    description: Number and percentage of annotated variants per ClinVar clinical significance, with not_in_clinvar for variants ClinVar does not list.
+    required: true
+  - path: tables/clinvar_pathogenic_variants.csv
+    kind: table
+    tool: annotate_variants
+    description: The ClinVar pathogenic and likely pathogenic variants with gene, position, rsID and significance, a header only when there are none.
+    required: false
+  - path: tables/high_priority_variants.csv
+    kind: table
+    tool: annotate_variants
+    description: Rare variants not in ClinVar that are high impact, predicted deleterious or IRD-flagged, ranked, at most 50, a header only when there are none.
+    required: false
+  - path: phenotype/lirical*.tsv
+    kind: table
+    tool: run_lirical
+    description: LIRICAL's ranked differential diagnosis, one row per candidate disease with its post-test probability, composite likelihood ratio and gene.
+    required: true
 ---
 
 **Rare-disease case diagnosis** from a VCF **+ the patient's clinical description**. This protocol exists

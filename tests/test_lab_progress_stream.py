@@ -188,6 +188,24 @@ def test_critic_accept_caps_a_runaway_critique():
     assert sub.endswith("[…]") and len(sub) < 1300   # generous ceiling still guards the console
 
 
+def test_a_step_kept_without_review_is_not_shown_with_a_quality_band():
+    # Two unusable Critic replies keep a step that succeeded, with score 0.0 and reviewed: False.
+    # The lowest band ("no usable result ...") would describe the opposite of what happened.
+    out = _lab_event_to_chat(
+        {"type": "critic", "verdict": "accept", "score": 0.0, "step": "Run CellQC",
+         "critique": "Step not reviewed: the Critic returned no usable review twice.", "reviewed": False})
+    assert _kinds(out) == ["chat_thinking", "lab_progress"]
+    assert "no usable review" in out[0]["token"] and "0.00" not in out[0]["token"]
+    assert out[1]["text"].startswith("⚠️ Step kept without review — Run CellQC")
+    assert out[1]["level"] == "warning"
+    assert "quality" not in out[1]["text"] and "no usable result" not in out[1]["text"]
+    # An ordinary accept, and one from an older run record without the field, are unchanged.
+    for ev in ({"reviewed": True}, {}):
+        out = _lab_event_to_chat({"type": "critic", "verdict": "accept", "score": 0.88,
+                                  "step": "Run DE", **ev})
+        assert out[1]["text"].startswith("✅ Step done")
+
+
 def test_critic_revise_has_no_key_acceptance():
     out = _lab_event_to_chat(
         {"type": "critic", "verdict": "revise", "score": 0.3, "step": "Run DE"})

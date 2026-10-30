@@ -64,10 +64,13 @@ class ComputeBackend(Protocol):
         at the size it has there. Returns the bytes copied."""
         ...
 
-    def clean_up(self, *, runs: "Iterable[str]" = (), session: str = "",
-                 legacy_mirrors: "Iterable[str]" = ()) -> dict:
-        """Queue the removal of an ended session's files there: the named runs' folders, the
-        session's copies of server data. Returns ``{"status": "submitted" | "nothing" | "error",
+    def clean_up(self, *, session_dirs: "Iterable[str]" = (), run_dirs: "dict[str, str] | None" = None,
+                 runs: "Iterable[str]" = (), session: str = "", legacy_mirrors: "Iterable[str]" = (),
+                 verify: "dict[str, str] | None" = None, tag: str = "", log_name: str = "") -> dict:
+        """Queue the removal of what ended sessions left there: session folders, the named runs'
+        folders (``run_dirs`` by run id; ``runs`` in the retired layout), old copies of server data.
+        ``verify`` maps a run to the stage-out manifest its results must match there before its
+        folder may go (``stage_out``). Returns ``{"status": "submitted" | "nothing" | "error",
         ...}``; never raises."""
         ...
 
@@ -77,11 +80,13 @@ class HPC3Backend:
 
     name = "hpc3"
 
-    def __init__(self, executor: Any, *, shared_root: str, user: str, partition: str = "standard",
-                 account: str = "", clean_script: "str | None" = None) -> None:
+    def __init__(self, executor: Any, *, shared_root: str, user: str, session_id: str = "",
+                 partition: str = "standard", account: str = "",
+                 clean_script: "str | None" = None) -> None:
         self.executor = executor
         self.shared_root = shared_root
         self.user = user
+        self.session_id = session_id
         self.partition = partition
         self.account = account
         self.clean_script = clean_script
@@ -113,12 +118,15 @@ class HPC3Backend:
                   on_bytes: "ByteCounter | None" = None) -> int:
         return pull_from_hpc(self.executor, src, dest, directory, on_bytes=on_bytes)
 
-    def clean_up(self, *, runs: "Iterable[str]" = (), session: str = "",
-                 legacy_mirrors: "Iterable[str]" = ()) -> dict:
+    def clean_up(self, *, session_dirs: "Iterable[str]" = (), run_dirs: "dict[str, str] | None" = None,
+                 runs: "Iterable[str]" = (), session: str = "", legacy_mirrors: "Iterable[str]" = (),
+                 verify: "dict[str, str] | None" = None, tag: str = "", log_name: str = "") -> dict:
         return hpc_gc.clean_session(
-            self.executor, self.shared_root, self.user, runs=list(runs), session=session,
-            legacy_mirrors=list(legacy_mirrors), partition=self.partition, account=self.account,
-            script_path=self.clean_script)
+            self.executor, self.shared_root, self.user, session_id=self.session_id,
+            session_dirs=list(session_dirs), run_dirs=run_dirs, runs=list(runs), session=session,
+            legacy_mirrors=list(legacy_mirrors), verify=verify, tag=tag or "session",
+            log_name=log_name or hpc_gc.CLEAN_LOG_NAME, partition=self.partition,
+            account=self.account, script_path=self.clean_script)
 
 
 def pull_from_hpc(ex: Any, src: str, target: Path, directory: bool, *,

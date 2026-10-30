@@ -19,7 +19,7 @@ import json
 
 import csv
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Callable, TYPE_CHECKING, Any
 
 from .executor import RemoteExecutor
 from .scgpt_job import HARMONIZATION_NAME, run_scgpt_inference, scgpt_job_name
@@ -45,11 +45,12 @@ def _label_counts(csv_path: Path) -> tuple[int, dict[str, int]]:
     return n, dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
 
 
-def build_scgpt_runner(executor: RemoteExecutor, settings: HPCSettings, *, cluster_user_dir: str):
+def build_scgpt_runner(executor: RemoteExecutor, settings: HPCSettings, *, cluster_user_dir: str,
+                       run_dir: "Callable[[str], str] | None" = None):
     """Return a ``(args, ctx) -> dict`` runner, or raise if prerequisites are unmet at
-    build time. ``cluster_user_dir`` is this user's process-file area on shared DFS
-    (``<shared_root>/Temp/<user>``) — the staged query.h5ad + predictions under ``scgpt/<run_id>``
-    are scratch and get swept with the rest of Temp once they go cold."""
+    build time. ``run_dir(run_id)`` is the run's scGPT folder on shared DFS (the session layout:
+    ``sessions/<session>/runs/<run_id>/scgpt``); without it, ``<cluster_user_dir>/scgpt/<run_id>``.
+    The staged query.h5ad + predictions there are scratch and go with the run's folder."""
 
     def _run(args: dict[str, Any], ctx: "HarnessContext") -> dict[str, Any]:
         local_h5ad = Path(str(ctx.decisions["dataset_path"]))
@@ -59,7 +60,7 @@ def build_scgpt_runner(executor: RemoteExecutor, settings: HPCSettings, *, clust
 
         # Per-run scratch on shared DFS (the GPU node reads/writes here, not $HOME).
         run_id = ctx.workspace.name if ctx.workspace else "run"
-        base = f"{cluster_user_dir.rstrip('/')}/scgpt/{run_id}"
+        base = run_dir(run_id) if run_dir else f"{cluster_user_dir.rstrip('/')}/scgpt/{run_id}"
         remote_h5ad = f"{base}/query.h5ad"
         out_dir = f"{base}/out"
 

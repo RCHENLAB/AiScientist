@@ -1,7 +1,8 @@
 name: Release
 
 # Build a runtime-only app package when a version tag is pushed, and attach it to a GitHub Release
-# together with SHA256SUMS. The Eye Server installs it with deploy/deploy_release.sh <tag>.
+# together with SHA256SUMS. The Eye Server's deploy timer finds the new release and installs it with
+# deploy/deploy_release.sh (deploy/README.md).
 
 on:
   push:
@@ -13,33 +14,26 @@ permissions:
 jobs:
   package:
     name: Build and publish release package
+    # Releases are cut on the public repository, where deploy/deploy_release.sh downloads them.
+    if: github.repository == 'RCHENLAB/AiScientist'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Build runtime-only package
+        # deploy/build_package.sh: the tagged commit's runtime files (git archive), VERSION and
+        # SHA256SUMS. The same script builds a package for a rehearsal or an air-gapped host.
+        run: deploy/build_package.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}" dist
+
+      # The GitHub CLI on the runner, not a third-party action holding a write token. A release cut by
+      # hand (`gh release create <tag>`) already exists: then the files are only added to it.
+      - name: Attach the package to the tag's GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          NAME="aiscientist-${TAG}"
-          mkdir -p "dist/${NAME}"
-          # Runtime files only: no tests, docs, examples or dev tooling.
-          cp -r src frontend preset_pipelines configs deploy pyproject.toml LICENSE README.md \
-             requirements.txt requirements-gateway.txt start.sh "dist/${NAME}/"
-          {
-            echo "tag=${TAG}"
-            echo "sha=${GITHUB_SHA}"
-            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > "dist/${NAME}/VERSION"
-          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
-          (cd dist && sha256sum "${NAME}.tar.gz" > SHA256SUMS)
-          cat dist/SHA256SUMS
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/aiscientist-*.tar.gz
-            dist/SHA256SUMS
-          generate_release_notes: true
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          gh release upload "$TAG" "dist/aiscientist-${TAG}.tar.gz" dist/SHA256SUMS --clobber

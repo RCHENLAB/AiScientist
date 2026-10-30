@@ -47,6 +47,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "CORPUS_DEFAULT_EMBEDDING": ("aiscientist.tools._lib.corpus", "DEFAULT_EMBEDDING"),
     "make_search_corpus_tool": ("aiscientist.tools.search_corpus.tool", "make_tool"),
     "run_search_corpus": ("aiscientist.tools.search_corpus.tool", "run_search"),
+    "preload_search_corpus": ("aiscientist.tools.search_corpus.tool", "preload"),
     "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
     "search_literature": ("aiscientist.tools.literature_search.tool", "search_europepmc"),
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),

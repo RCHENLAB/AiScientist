@@ -31,3 +31,6 @@ matplotlib>=3.8
 # checks every document AiScientist generates from the fixture datasets with it, and fails in CI when
 # it is missing, so a green build means mlcroissant accepted them.
 mlcroissant>=1.1
+# Alembic: tests/test_db_migrations.py builds the schema from gateway/migrations/ and compares it with
+# the models, so a model change without a migration fails in CI, not at the next deploy.
+alembic>=1.13

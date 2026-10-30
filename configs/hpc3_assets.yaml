@@ -1,0 +1,222 @@
+# What AiScientist runs on HPC3, pinned: each container image with its source and SHA-256, and each
+# model's weights with their exact revision and the SHA-256 of every weight file. Paths are relative
+# to the shared root (AISCIENTIST_HPC_SHARED_ROOT, /dfs3b/ruic20_lab/software/AiScientist).
+#
+# The settings that choose an image or a model (AISCIENTIST_*_IMAGE, AISCIENTIST_VLLM_MODEL, the
+# model list, AISCIENTIST_SHARED_LLM_*) name one of these; how the LLM servers are launched is in
+# gateway/settings.py, gateway/shared_llm.py and deploy/dsv4/. Each run's manifest.json records the
+# entries it used (agents/run_manifest.py). `python3 scripts/hpc3_assets_check.py` on HPC3 compares
+# this list with the files and prints what differs. A new or rebuilt image, or new weights, is a
+# change to this file in the same commit; docs/hpc3_assets.md says how each is built.
+#
+# Images: never overwritten in place; a rebuild gets a new file name and a new entry.
+# Models: `revision` is the Hugging Face commit the snapshot holds; `files` maps each weight file to
+# its SHA-256 (in the HF cache, the name of the blob the snapshot links to).
+schema_version: 1
+
+images:
+  vllm-0.28.0:
+    path: containers/vllm-0.28.0.sif
+    source: docker://vllm/vllm-openai:v0.28.0
+    version: "0.28.0"
+    sha256: 8cde274836efe8b7e4e1f6b9bcfb22a929c70f1ca6578f32384f8f4482c8cd8c
+    used_by: [session model server, shared reasoning-model server, corpus scan]
+  vllm-0.22.1:
+    path: containers/vllm.sif
+    source: docker://vllm/vllm-openai:v0.22.1
+    version: "0.22.1"
+    sha256: 81798c470c526aef8fdd56bce47b351ff38249181b79cf16add0f0c3cdaa1b47
+    used_by: [session model server for QuantTrio/Qwen3.6-35B-A3B-AWQ]
+  analysis:
+    path: containers/analysis.sif
+    source: deploy/analysis/analysis.def
+    sha256: 97fd705a498381e612813e77e0a3197efcd9870df3be2a9b547aed4dcbf2a4eb
+    used_by: [run_code, single-cell tools]
+  report:
+    path: containers/report.sif
+    source: deploy/report/report.def
+    sha256: 5c2d3a7bc7cfb358a27043532f9513587962538d3ccf279c7fdfd69633a4299f
+    used_by: [report rendering]
+  vep:
+    path: containers/vep.sif
+    source: deploy/vep/
+    sha256: 235bae1c5543613594c79411235da4ebe7b2646aa9da52cca9b1cc58cc35faab
+    used_by: [variant annotation]
+  lirical:
+    path: containers/lirical.sif
+    source: deploy/lirical/lirical.def
+    sha256: e7bfca20424114475c9d64a6bffe7480ceadf29b9bf002d3d1bd92b26685a2f8
+    used_by: [phenotype ranking]
+  scgpt:
+    path: containers/scgpt.sif
+    source: deploy/scgpt/scgpt.def
+    sha256: 1eec84afa56f6c38a11de788c0f9c003e579b9a1861e9872100dff1241f27dbc
+    used_by: [scGPT annotation]
+  vlreview:
+    path: containers/vlreview.sif
+    source: deploy/vlreview/
+    sha256: 01e4505256ed0da31055943d7c451c264fc71510126bd4a4f6492a5d72d5b878
+    used_by: [report review]
+  rockylinux-9.7:
+    path: containers/rockylinux_9.7.20251123.sif
+    source: docker://rockylinux/rockylinux:9.7.20251123
+    sha256: d00ab2176d4731517e6fbb5ce69337a91e26f7594d27196bf9c5cc482a8147bd
+    used_by: [run_shell]
+
+models:
+  RedHatAI/Qwen3.8-27B-INT4:
+    source: huggingface
+    path: hf/hub/models--RedHatAI--Qwen3.8-27B-INT4
+    revision: c063053e004e9783631651df95cf55d0bbf88b32
+    files:
+      model.safetensors: fd5c287e3a03f30b0e53fd5fe66ec90ab5fdd94807f7f8df699cca3ae9534910
+      model_mtp.safetensors: 1d8268aa85ace093a561e3e7b63b9d390dac1cd55a90cd55b5ec509c3c9da9fe
+      model.safetensors: fd5c287e3a03f30b0e53fd5fe66ec90ab5fdd94807f7f8df699cca3ae9534910
+      model_mtp.safetensors: 1d8268aa85ace093a561e3e7b63b9d390dac1cd55a90cd55b5ec509c3c9da9fe
+    image: vllm-0.28.0
+    used_by: [the default model of a session]
+  QuantTrio/Qwen3.6-35B-A3B-AWQ:
+    source: huggingface
+    path: hf/hub/models--QuantTrio--Qwen3.6-35B-A3B-AWQ
+    revision: 119886a1072372348f73ef0df2d801cdcc0f455b
+    files:
+      model-00001-of-00009.safetensors: a03ac5037c331d2c6767cecc90ef571560b88a81a90e4834842e2e38a6a822b6
+      model-00002-of-00009.safetensors: 9bf7aa9d3a7cd8a7becdb06067473fd08b363627233a062f556a190cdb28a3a8
+      model-00003-of-00009.safetensors: 5915093625360f6b7ed5b248626fdf1ed4aaf0cd05301b5a310d2ea2fb254415
+      model-00004-of-00009.safetensors: 887c7e148f244064ef82d4b99c51ee4760cfa8c0e1bd94673e826a656959cb91
+      model-00005-of-00009.safetensors: 702b9c5c04fe9733708c5b0ec83a64271219a7acaa15b8d398debfd477e58e36
+      model-00006-of-00009.safetensors: 69879d7d90c4e04d8360d0c0cf3c4a46d915bd2998b99b720806ea5837cf35a2
+      model-00007-of-00009.safetensors: 1a7f71638dd9715e8f25a0dd3c7fd5dc77c64bbd615ef9bcd8a879e84f7fbd34
+      model-00008-of-00009.safetensors: cba9d0fb148b93b24702aef707cb4b8cdfa0e586ca418c5f4a0e75d557f239f0
+      model-00009-of-00009.safetensors: fcffbdad2da205c7f9ab7a0365aaaec09cb942de9b4b39346f00d62da90e1d9e
+      model-00001-of-00009.safetensors: a03ac5037c331d2c6767cecc90ef571560b88a81a90e4834842e2e38a6a822b6
+      model-00002-of-00009.safetensors: 9bf7aa9d3a7cd8a7becdb06067473fd08b363627233a062f556a190cdb28a3a8
+      model-00003-of-00009.safetensors: 5915093625360f6b7ed5b248626fdf1ed4aaf0cd05301b5a310d2ea2fb254415
+      model-00004-of-00009.safetensors: 887c7e148f244064ef82d4b99c51ee4760cfa8c0e1bd94673e826a656959cb91
+      model-00005-of-00009.safetensors: 702b9c5c04fe9733708c5b0ec83a64271219a7acaa15b8d398debfd477e58e36
+      model-00006-of-00009.safetensors: 69879d7d90c4e04d8360d0c0cf3c4a46d915bd2998b99b720806ea5837cf35a2
+      model-00007-of-00009.safetensors: 1a7f71638dd9715e8f25a0dd3c7fd5dc77c64bbd615ef9bcd8a879e84f7fbd34
+      model-00008-of-00009.safetensors: cba9d0fb148b93b24702aef707cb4b8cdfa0e586ca418c5f4a0e75d557f239f0
+      model-00009-of-00009.safetensors: fcffbdad2da205c7f9ab7a0365aaaec09cb942de9b4b39346f00d62da90e1d9e
+    image: vllm-0.22.1
+    used_by: [the second model of the model list]
+  MJPansa/DeepSeek-V4-Flash-0731-NVFP4:
+    source: huggingface
+    path: hf/hub/models--MJPansa--DeepSeek-V4-Flash-0731-NVFP4
+    revision: 64d64cd89bc63a66aa46506da89d7821f7491c62
+    files:
+      model-00001-of-00048.safetensors: ff421fbe6f8ad389088735ce47de61f2203bd5c385caf471fc9cbf1ddffe040b
+      model-00002-of-00048.safetensors: 6ae9ed83095c43fdcb394dfaf6675c0a4e3c8e2345cd6bd17e8e9fa02bf1cbc1
+      model-00003-of-00048.safetensors: ea761836ec383a8cfa20ccbebde281f5c8c1790a143dcb2169a66b0e1519495d
+      model-00004-of-00048.safetensors: 336054bc99290626597e2b8b52ef71558b014538e2114ca6da25ed411a1b49a9
+      model-00005-of-00048.safetensors: 29db1df8f8053923e6f1914544304559ea9e54f86906c0133ddce7eb4a98bf35
+      model-00006-of-00048.safetensors: 3268ff7e2813a5c102d27306ade1c6d6d2b14fb5590bf3754417d852396e3355
+      model-00007-of-00048.safetensors: 9597c974a8e163411d69d4efaac71a78f6d46321499591c7a42829c13b43d86b
+      model-00008-of-00048.safetensors: ad5fdfd4d4362729e86d00b7f6cd3e3d2684434a501134295c3a4685105cfbfc
+      model-00009-of-00048.safetensors: cdee9e5907bff293943b432d95c3df21052b66d9c95bcda08a3da37a809d03af
+      model-00010-of-00048.safetensors: 6925c5eb40a0f61831d5c7e77b0bf165a76698b0f45f1900dc73921707c3e726
+      model-00011-of-00048.safetensors: 56815f094669e20d0e207d31a60081ba7c0b6e07bfd8cff7e30c681ce386e90e
+      model-00012-of-00048.safetensors: 608ec709245fcbd2537db71cf36d51e7c057d1d996383e51c60f9cbd1ad1f96c
+      model-00013-of-00048.safetensors: 357dea98b02536066229c1894b3322817504a75d569a719f63cc58f4acd571ec
+      model-00014-of-00048.safetensors: 5166fb9e27f04512e12c847056589913ef1054cfddf5d272fcb40f11c0faf096
+      model-00015-of-00048.safetensors: ee8e041e6743653d6d1846f9f50f27fdc9c77e5a93b6658a78780c41fda1bdbf
+      model-00016-of-00048.safetensors: 49dc2abc6223f8e478e9f55908d7b6aed7d02c02288a347254cbcc111083e08e
+      model-00017-of-00048.safetensors: 46c740f09c46f662b78569e901a206e296ce985fcf73eafcaa3957d65559910a
+      model-00018-of-00048.safetensors: 89954601abe7f642759f2553dd3cce5ee237031ce80536654d89aace52552218
+      model-00019-of-00048.safetensors: cef165738a86750e2f838e4b89f4e0f8d22655d73788f3788f1d1117e35248ce
+      model-00020-of-00048.safetensors: 1d35f2fd364c4ca023c2ff74570abc9d37cc91ecac76f90c209206925b79cc20
+      model-00021-of-00048.safetensors: 3bc6ee95adf90d13605495fccf35dfa02aa5d455e51775d27b2ae55259bf4867
+      model-00022-of-00048.safetensors: cde851d7248e19b051d7cec651ab34025ff340915bdfe1af777c7e60f8d56870
+      model-00023-of-00048.safetensors: ffd67c5680765dcaff826bda458bf19a8056d317d67f1f3a1030215058523364
+      model-00024-of-00048.safetensors: 4b431f599ca8ba51468b218c3fd600bee2042ca65ae498e708036d93a75da9cc
+      model-00025-of-00048.safetensors: a89c61c567561e3c5785db6b06dc154b9c539fe9876790055e46263577cc0705
+      model-00026-of-00048.safetensors: 627d48df9489e8ac7babe28ccec98b723ca25d25202ed47599f0e493c112e1c9
+      model-00027-of-00048.safetensors: 2a1e7f4d15498e6b44827ea82780696622b791f4c06b7a715dea8250fb108c09
+      model-00028-of-00048.safetensors: f25d3f44dcfe370f26d8b56b36e44f193dbf7baa0c29f399d7b855d1455ba2f0
+      model-00029-of-00048.safetensors: 7203e630d8799d973b7f281101ac33cddaefa821c8373e2e39dbfd66f5a23de1
+      model-00030-of-00048.safetensors: d831a23df7497d6628aec1d6fb544b231e9e1890e44c12cd280bebc5b6bacedd
+      model-00031-of-00048.safetensors: 38c367fe2f790c4637c236972f331aaeacc48c1eca9d2e9b96b0b1a07379f41f
+      model-00032-of-00048.safetensors: 4ea9aff7de91e22521eadd08e9fbaff584694f4422deeb8e0546611a57726276
+      model-00033-of-00048.safetensors: 17f8b74c522b5af354a94eb264b5ee2e3b7089169e35cc20d02f8249a704db4f
+      model-00034-of-00048.safetensors: a080b24380b72843fa54b032e64e0ac939fe8c14646b9093849d56f1d0d45a48
+      model-00035-of-00048.safetensors: bce1aa921e837d2506625c33902b438d3272ed2a872f9fd0a68360eeea08f9b9
+      model-00036-of-00048.safetensors: ac036cdcd21d7303b6685dd26c97f3d59a33829ef51a5dbdf20531cef8e3bc99
+      model-00037-of-00048.safetensors: d99296eb7a64e8fd6b6dc8e68f58aec6b9abfafe930d36cca6a332b671ca2737
+      model-00038-of-00048.safetensors: 31a2df32520a7497777d068ae808864b2b99ea5300ac00e94f8ecc5afc6bc3b4
+      model-00039-of-00048.safetensors: 61607da9e0f036498c32a5a497836afc052a55bc60025973a1e409070f08821a
+      model-00040-of-00048.safetensors: cc8852e2d5830ad9feed2869301d5f9f3b3ab8c593227483f32b0c118b5343f2
+      model-00041-of-00048.safetensors: 2fdc9cbbd9a95905e90b7a3f4b1974543b719b87544cf43b5fb94b6994e98c8c
+      model-00042-of-00048.safetensors: e848c78d1dba1944f36db38f765cf934b2629bf49e3a55c263e10c3164332bf4
+      model-00043-of-00048.safetensors: 190403acfbfc5133828e13ad3a8179ad14d7a8db9d55101541750a064034e3fa
+      model-00044-of-00048.safetensors: 7a11b82da9325e1c976497e8b40e4793a97cd96b56725f74d1a9a236529dd88d
+      model-00045-of-00048.safetensors: 96672cb701438851190137bbb8971293df4ee2077ee3738eb35eba19dad44055
+      model-00046-of-00048.safetensors: 79d8231ed0d15732bcbbbeae2060b96126bbd139e1b9595f48e592d2cc3b3d42
+      model-00047-of-00048.safetensors: d26c8842d38bb122348d1adbb3a5aab3e7574f48e057a166441f23270b2fa570
+      model-00048-of-00048.safetensors: aafce326d13417c7314b0cf357a9e369e2b53b6784ca39933e1b9a84f4226d36
+      model-00001-of-00048.safetensors: ff421fbe6f8ad389088735ce47de61f2203bd5c385caf471fc9cbf1ddffe040b
+      model-00002-of-00048.safetensors: 6ae9ed83095c43fdcb394dfaf6675c0a4e3c8e2345cd6bd17e8e9fa02bf1cbc1
+      model-00003-of-00048.safetensors: ea761836ec383a8cfa20ccbebde281f5c8c1790a143dcb2169a66b0e1519495d
+      model-00004-of-00048.safetensors: 336054bc99290626597e2b8b52ef71558b014538e2114ca6da25ed411a1b49a9
+      model-00005-of-00048.safetensors: 29db1df8f8053923e6f1914544304559ea9e54f86906c0133ddce7eb4a98bf35
+      model-00006-of-00048.safetensors: 3268ff7e2813a5c102d27306ade1c6d6d2b14fb5590bf3754417d852396e3355
+      model-00007-of-00048.safetensors: 9597c974a8e163411d69d4efaac71a78f6d46321499591c7a42829c13b43d86b
+      model-00008-of-00048.safetensors: ad5fdfd4d4362729e86d00b7f6cd3e3d2684434a501134295c3a4685105cfbfc
+      model-00009-of-00048.safetensors: cdee9e5907bff293943b432d95c3df21052b66d9c95bcda08a3da37a809d03af
+      model-00010-of-00048.safetensors: 6925c5eb40a0f61831d5c7e77b0bf165a76698b0f45f1900dc73921707c3e726
+      model-00011-of-00048.safetensors: 56815f094669e20d0e207d31a60081ba7c0b6e07bfd8cff7e30c681ce386e90e
+      model-00012-of-00048.safetensors: 608ec709245fcbd2537db71cf36d51e7c057d1d996383e51c60f9cbd1ad1f96c
+      model-00013-of-00048.safetensors: 357dea98b02536066229c1894b3322817504a75d569a719f63cc58f4acd571ec
+      model-00014-of-00048.safetensors: 5166fb9e27f04512e12c847056589913ef1054cfddf5d272fcb40f11c0faf096
+      model-00015-of-00048.safetensors: ee8e041e6743653d6d1846f9f50f27fdc9c77e5a93b6658a78780c41fda1bdbf
+      model-00016-of-00048.safetensors: 49dc2abc6223f8e478e9f55908d7b6aed7d02c02288a347254cbcc111083e08e
+      model-00017-of-00048.safetensors: 46c740f09c46f662b78569e901a206e296ce985fcf73eafcaa3957d65559910a
+      model-00018-of-00048.safetensors: 89954601abe7f642759f2553dd3cce5ee237031ce80536654d89aace52552218
+      model-00019-of-00048.safetensors: cef165738a86750e2f838e4b89f4e0f8d22655d73788f3788f1d1117e35248ce
+      model-00020-of-00048.safetensors: 1d35f2fd364c4ca023c2ff74570abc9d37cc91ecac76f90c209206925b79cc20
+      model-00021-of-00048.safetensors: 3bc6ee95adf90d13605495fccf35dfa02aa5d455e51775d27b2ae55259bf4867
+      model-00022-of-00048.safetensors: cde851d7248e19b051d7cec651ab34025ff340915bdfe1af777c7e60f8d56870
+      model-00023-of-00048.safetensors: ffd67c5680765dcaff826bda458bf19a8056d317d67f1f3a1030215058523364
+      model-00024-of-00048.safetensors: 4b431f599ca8ba51468b218c3fd600bee2042ca65ae498e708036d93a75da9cc
+      model-00025-of-00048.safetensors: a89c61c567561e3c5785db6b06dc154b9c539fe9876790055e46263577cc0705
+      model-00026-of-00048.safetensors: 627d48df9489e8ac7babe28ccec98b723ca25d25202ed47599f0e493c112e1c9
+      model-00027-of-00048.safetensors: 2a1e7f4d15498e6b44827ea82780696622b791f4c06b7a715dea8250fb108c09
+      model-00028-of-00048.safetensors: f25d3f44dcfe370f26d8b56b36e44f193dbf7baa0c29f399d7b855d1455ba2f0
+      model-00029-of-00048.safetensors: 7203e630d8799d973b7f281101ac33cddaefa821c8373e2e39dbfd66f5a23de1
+      model-00030-of-00048.safetensors: d831a23df7497d6628aec1d6fb544b231e9e1890e44c12cd280bebc5b6bacedd
+      model-00031-of-00048.safetensors: 38c367fe2f790c4637c236972f331aaeacc48c1eca9d2e9b96b0b1a07379f41f
+      model-00032-of-00048.safetensors: 4ea9aff7de91e22521eadd08e9fbaff584694f4422deeb8e0546611a57726276
+      model-00033-of-00048.safetensors: 17f8b74c522b5af354a94eb264b5ee2e3b7089169e35cc20d02f8249a704db4f
+      model-00034-of-00048.safetensors: a080b24380b72843fa54b032e64e0ac939fe8c14646b9093849d56f1d0d45a48
+      model-00035-of-00048.safetensors: bce1aa921e837d2506625c33902b438d3272ed2a872f9fd0a68360eeea08f9b9
+      model-00036-of-00048.safetensors: ac036cdcd21d7303b6685dd26c97f3d59a33829ef51a5dbdf20531cef8e3bc99
+      model-00037-of-00048.safetensors: d99296eb7a64e8fd6b6dc8e68f58aec6b9abfafe930d36cca6a332b671ca2737
+      model-00038-of-00048.safetensors: 31a2df32520a7497777d068ae808864b2b99ea5300ac00e94f8ecc5afc6bc3b4
+      model-00039-of-00048.safetensors: 61607da9e0f036498c32a5a497836afc052a55bc60025973a1e409070f08821a
+      model-00040-of-00048.safetensors: cc8852e2d5830ad9feed2869301d5f9f3b3ab8c593227483f32b0c118b5343f2
+      model-00041-of-00048.safetensors: 2fdc9cbbd9a95905e90b7a3f4b1974543b719b87544cf43b5fb94b6994e98c8c
+      model-00042-of-00048.safetensors: e848c78d1dba1944f36db38f765cf934b2629bf49e3a55c263e10c3164332bf4
+      model-00043-of-00048.safetensors: 190403acfbfc5133828e13ad3a8179ad14d7a8db9d55101541750a064034e3fa
+      model-00044-of-00048.safetensors: 7a11b82da9325e1c976497e8b40e4793a97cd96b56725f74d1a9a236529dd88d
+      model-00045-of-00048.safetensors: 96672cb701438851190137bbb8971293df4ee2077ee3738eb35eba19dad44055
+      model-00046-of-00048.safetensors: 79d8231ed0d15732bcbbbeae2060b96126bbd139e1b9595f48e592d2cc3b3d42
+      model-00047-of-00048.safetensors: d26c8842d38bb122348d1adbb3a5aab3e7574f48e057a166441f23270b2fa570
+      model-00048-of-00048.safetensors: aafce326d13417c7314b0cf357a9e369e2b53b6784ca39933e1b9a84f4226d36
+    image: vllm-0.28.0
+    used_by: [the shared reasoning-model server]
+  Qwen/Qwen2.5-VL-7B-Instruct:
+    source: huggingface
+    path: vlreview_model
+    revision: cc594898137f460bfe9f0759e9844b3ce807cfb5
+    files:
+      model-00001-of-00005.safetensors: e97b877e47fde53a6c6e77aafb36e58e91ee9d95c4a3eeac6f1b5c0e6a1c986e
+      model-00002-of-00005.safetensors: a9a300a43b4724eee2abe7c18ceb26768d0ab011eb0cad19d9bfd2476a24d024
+      model-00003-of-00005.safetensors: 111223d173e00bbee81cba1216fad28668df3476706b7fd26f4d5b50f8b3a507
+      model-00004-of-00005.safetensors: ef47f634fa57d46ee134edcc09f34085a47da1e16c12a2abe0d67118be6d72ed
+      model-00005-of-00005.safetensors: 0c859795ad3a627a9b95bcb762e059d5b768a4a36fdd4affeff269d93fdecc67
+      model-00001-of-00005.safetensors: e97b877e47fde53a6c6e77aafb36e58e91ee9d95c4a3eeac6f1b5c0e6a1c986e
+      model-00002-of-00005.safetensors: a9a300a43b4724eee2abe7c18ceb26768d0ab011eb0cad19d9bfd2476a24d024
+      model-00003-of-00005.safetensors: 111223d173e00bbee81cba1216fad28668df3476706b7fd26f4d5b50f8b3a507
+      model-00004-of-00005.safetensors: ef47f634fa57d46ee134edcc09f34085a47da1e16c12a2abe0d67118be6d72ed
+      model-00005-of-00005.safetensors: 0c859795ad3a627a9b95bcb762e059d5b768a4a36fdd4affeff269d93fdecc67
+    image: vlreview
+    used_by: [report review]

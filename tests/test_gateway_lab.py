@@ -335,45 +335,6 @@ def test_lab_plan_review_sets_decision_event(tmp_path):
         loop.close()
 
 
-def test_a_browser_that_subscribes_after_the_expiry_warning_is_warned_again():
-    """plan_expiring is pushed once, live. A reload after it used to get the waiting prompt back and
-    no warning: the replay now sends it after the prompt, with the time actually left."""
-    import asyncio
-    import time
-
-    from aiscientist.gateway.settings import HPCSettings
-
-    loop = asyncio.new_event_loop()
-    conn = gw_app.Connection(HPCSettings(), mock=True, loop=loop, username="tester")
-    conn._track_stream({"type": "chat_start", "run_id": "r1"})   # a run in flight: its replay follows
-    gw_app.CONNECTIONS[conn.id] = conn
-
-    def replayed() -> list[dict]:
-        with _client().websocket_connect(f"/ws/{conn.id}") as ws:
-            got = [ws.receive_json()]
-            while got[-1]["type"] != "chat_start":
-                got.append(ws.receive_json())
-        return got[1:]
-
-    try:
-        conn.pending_plan = {"kind": "agenda", "payload": ["a", "b"]}
-        assert [m["type"] for m in replayed()] == ["plan_prompt", "chat_start"]
-
-        conn.pending_plan["expires_at"] = time.monotonic() + 300
-        prompt, warning, _start = replayed()
-        assert prompt["type"] == "plan_prompt" and warning["type"] == "plan_expiring"
-        assert 290 <= warning["seconds_left"] <= 300
-
-        conn.pending_plan = {"kind": "clarify", "payload": [{"question": "q", "options": []}],
-                             "expires_at": time.monotonic() - 5}
-        prompt, warning, _start = replayed()
-        assert prompt["type"] == "plan_clarify"
-        assert (warning["type"], warning["seconds_left"]) == ("plan_expiring", 0)
-    finally:
-        gw_app.CONNECTIONS.pop(conn.id, None)
-        loop.close()
-
-
 def test_lab_plan_review_unknown_connection_is_404():
     r = _client().post("/api/lab/plan", json={"connection_id": "nope", "action": "approve"})
     assert r.status_code == 404

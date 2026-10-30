@@ -56,7 +56,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from . import skill_outputs
 from .research_harness import HarnessContext, HarnessTool
+from .skill_outputs import DeclaredOutput
 
 # Folders whose name starts with one of these are never scanned: ``_drafts/``, ``.git/`` of a cloned
 # skills repository, editor and OS litter.
@@ -105,6 +107,11 @@ class Skill:
     # requires hyphens; plans, presets and older runs wrote ``pairwise_de``), plus any listed in
     # ``metadata.aliases`` (comma-separated), e.g. the ``_v2`` name a skill was migrated from.
     aliases: tuple[str, ...] = ()
+    # What the skill should leave under $AISCIENTIST_ARTIFACTS (``outputs:`` in the front matter,
+    # see ``skill_outputs.py``): shown to the agent, checked after a step that uses the skill, and
+    # shown on the plan. Empty for a skill that declares none, which then works as before.
+    outputs: "tuple[DeclaredOutput, ...]" = ()
+    outputs_problems: tuple[str, ...] = ()     # declared entries that were left out, and why
 
 
 def _unquote(value: str) -> str:
@@ -153,12 +160,22 @@ def _parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
                         i += 1
                     joiner = "\n" if value.startswith("|") else " "   # literal keeps line breaks
                     value = joiner.join(b for b in block if b).strip()
+                elif key == "outputs":
+                    # A list of mappings, or a (JSON) string that may run over several lines: read
+                    # as one value (skill_outputs.py), never as nested or top-level keys.
+                    if value:
+                        meta[key], used = skill_outputs._quoted_value(value, lines[i:])
+                        i += used
+                    else:
+                        block, i = skill_outputs.block_after(lines, i, len(raw) - len(raw.lstrip()))
+                        meta[key] = skill_outputs.parse_block(block)
+                    continue
                 elif value == "":
                     # A nested block (``metadata:`` + indented lines). Without this, its children
                     # were read as TOP-LEVEL keys, so a skill's ``metadata.version`` silently became
                     # its ``version`` and the block itself an empty string.
                     indent = len(raw) - len(raw.lstrip())
-                    nested: dict[str, str] = {}
+                    nested: dict[str, Any] = {}
                     items: list[str] = []
                     while i < len(lines):
                         nxt = lines[i]
@@ -167,6 +184,17 @@ def _parse_front_matter(text: str) -> tuple[dict[str, Any], str]:
                         child = nxt.strip()
                         i += 1
                         if not child or child.startswith("#"):
+                            continue
+                        if child.split(":", 1)[0].strip() == "outputs":
+                            # ``metadata.outputs``, a nested list or a (JSON) string: its entries'
+                            # keys (path, kind, description ...) must not become metadata keys.
+                            cv = child.split(":", 1)[1].strip()
+                            if cv:
+                                nested["outputs"], used = skill_outputs._quoted_value(cv, lines[i:])
+                                i += used
+                            else:
+                                sub, i = skill_outputs.block_after(lines, i, len(nxt) - len(nxt.lstrip()))
+                                nested["outputs"] = skill_outputs.parse_block(sub)
                             continue
                         if child.startswith("- "):
                             items.append(_unquote(child[2:].strip()))
@@ -208,6 +236,8 @@ def _load_skills() -> dict[str, Skill]:
         # that never touches a skill, from starting.
         LOG.error("Pinned skills release refused, no curated skills are loaded: %s: %s",
                   type(exc).__name__, exc)
+        from .skills_registry import STATUS
+        STATUS.update(tag=None, skills=0, error=f"{type(exc).__name__}: {exc}")
         out = {}
     induced = _induced_dir()
     if induced is not None:
@@ -352,9 +382,10 @@ def _load_from(root: Path) -> dict[str, Skill]:
     for skill_md in _skill_md_files(root):
         folder = skill_md.parent
         try:
-            meta, body = _parse_front_matter(skill_md.read_text(encoding="utf-8"))
+            text = skill_md.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        meta, body = _parse_front_matter(text)
         name = str(meta.get("name") or folder.name).strip()
         if name in out:
             # Two folders claiming one name: the first in path order is kept, and the clash is said
@@ -364,6 +395,10 @@ def _load_from(root: Path) -> dict[str, Skill]:
         description = meta.get("description")
         summary = description if isinstance(description, str) and description else _first_line(body)
         metadata = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+        outputs, out_problems = skill_outputs.from_text(text)
+        if out_problems:
+            print(f"[skills] {folder}: declared outputs left out: {'; '.join(out_problems)}")
+        metadata = {k: v for k, v in metadata.items() if k != "outputs"}
         rel_parent = folder.parent.relative_to(root).as_posix() if folder != root else "."
         category = str(metadata.get("category") or ("" if rel_parent == "." else rel_parent))
         files = _bundled_files(folder)
@@ -377,7 +412,8 @@ def _load_from(root: Path) -> dict[str, Skill]:
                               category=category, metadata=dict(metadata), folder=str(folder),
                               image=env.get("image", ""), cpus=env.get("cpus", 0),
                               mem_gb=env.get("mem_gb", 0), time_limit=env.get("time_limit", ""),
-                              env_problem=env_problem, aliases=_aliases(name, metadata))
+                              env_problem=env_problem, aliases=_aliases(name, metadata),
+                              outputs=outputs, outputs_problems=out_problems)
     return out
 
 
@@ -570,7 +606,8 @@ def list_skills() -> list[dict]:
     refresh_skills()
     return [{"name": s.name, "summary": s.summary, "category": s.category, "image": s.image,
              "version": s.version, "status": s.status, "tags": list(s.tags),
-             "requirements": s.requirements, "registry_release": s.registry_release}
+             "requirements": s.requirements, "registry_release": s.registry_release,
+             "outputs": [o.to_public() for o in s.outputs]}
             for s in list(SKILLS.values())]
 
 
@@ -757,6 +794,14 @@ def make_skill_reference_tool(get_skills: "Callable[[], dict[str, Skill]] | None
                    registry_release=hit.registry_release)
         if hit.metadata:
             out["metadata"] = hit.metadata   # e.g. compute, requires-gpu, requires-network, tested-with
+        if hit.outputs:
+            # What the step must leave behind. Checked after the step: a required one that is
+            # missing, empty or a blank image keeps the step from being accepted.
+            out["outputs"] = [o.to_public() for o in hit.outputs]
+            out["outputs_note"] = (
+                "Write each output at its path under $AISCIENTIST_ARTIFACTS (a * in a path stands "
+                "for this dataset's names, e.g. the two groups). After the step the platform checks "
+                "that every required one exists, is not empty and, for a figure, is not blank.")
         # run_shell is refused once a registry skill is active (it cannot enforce the skill's policy).
         shell = ("shell commands via subprocess inside run_code"
                  + (", or run_in_environment for the skill's own environment" if hit.image else "")

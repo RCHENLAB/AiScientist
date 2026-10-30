@@ -1,7 +1,8 @@
 """The Storage tab's Delete (My account → Storage), as a Slurm job on HPC3.
 
-The Storage tab lists the user's own HPC3 folders (``app._storage_areas``: ``Temp/<user>``,
-``uploads/<user>`` and the personal lab folder) and deletes an entry on the user's click. The
+The Storage tab lists the user's own HPC3 folders (``app._storage_areas``: this session's folder,
+the user's earlier session folders, what is left of ``Temp/<user>`` and ``uploads/<user>``, and the
+personal lab folder) and deletes an entry on the user's click. The
 deletion is filesystem work, which RCIC keeps off the login nodes, so it is never an ``rm`` over
 the SSH session: the gateway stages ``deploy/hpc3/aiscientist_storage_delete.sh`` and submits it as
 a one-CPU job on the CPU partition (``cpu_partition``) through the compute backend, then answers
@@ -57,11 +58,12 @@ def allowed(path: str, areas: Iterable[str]) -> bool:
     return False
 
 
-def remote_paths(shared_root: str, user: str, delete_id: str) -> dict:
-    """Where a deletion's files go on HPC3, under ``<shared root>/bin/<user>/``."""
-    bin_dir = f"{shared_root.rstrip('/')}/bin/{user}"
-    return {"bin": bin_dir, "script": f"{bin_dir}/{SCRIPT_NAME}", "dir": f"{bin_dir}/deletes",
-            "log": f"{bin_dir}/deletes/{delete_id}.log"}
+def remote_paths(session_dir: str, delete_id: str) -> dict:
+    """Where a deletion's files go on HPC3: the script in the session's ``scripts/``, its log in
+    ``logs/deletes/`` (``hpc_layout``)."""
+    base = session_dir.rstrip("/")
+    return {"bin": f"{base}/scripts", "script": f"{base}/scripts/{SCRIPT_NAME}",
+            "dir": f"{base}/logs/deletes", "log": f"{base}/logs/deletes/{delete_id}.log"}
 
 
 def command(script: str, shared_root: str, user: str, paths: Iterable[str], *,
@@ -86,21 +88,21 @@ def job_spec(payload: str, user: str, log_path: str, submit_dir: str, *,
     return SlurmJobSpec(script="\n".join(lines), job_name=f"{JOB_PREFIX}{user}", submit_dir=submit_dir)
 
 
-def stage(executor: Any, shared_root: str, user: str) -> str:
+def stage(executor: Any, session_dir: str) -> str:
     """Put the script on HPC3 (through the transfer host) and make its log folder; returns the
     script's remote path."""
-    paths = remote_paths(shared_root, user, "x")
-    executor.exec(f"mkdir -p {shlex.quote(paths['dir'])}", timeout=30)
+    paths = remote_paths(session_dir, "x")
+    executor.exec(f"mkdir -p {shlex.quote(paths['dir'])} {shlex.quote(paths['bin'])}", timeout=30)
     executor.put_file(str(SCRIPT_SRC), paths["script"])
     return paths["script"]
 
 
-def submit(backend: Any, path: str, *, shared_root: str, user: str, script: str,
+def submit(backend: Any, path: str, *, shared_root: str, user: str, session_dir: str, script: str,
            partition: str, account: str = "", personal_dir: str = "") -> dict:
     """Submit the deletion of ``path`` (the script already staged at ``script``); returns its
     record. Does not wait for the job."""
     delete_id = uuid.uuid4().hex[:12]
-    paths = remote_paths(shared_root, user, delete_id)
+    paths = remote_paths(session_dir, delete_id)
     payload = command(script, shared_root, user, [path], personal_dir=personal_dir)
     spec = job_spec(payload, user, paths["log"], paths["bin"], partition=partition, account=account)
     with _SUBMIT_LOCK:

@@ -26,7 +26,7 @@ for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGEN
 
 BASE="${AISCIENTIST_LAB_BASE:-/dfs3b/ruic20_lab/software/AiScientist}"
 IMAGE="$BASE/containers/vlreview.sif"
-MODEL_DIR="${AISCIENTIST_VLREVIEW_MODEL_DIR:-$BASE/vlreview_model}"
+MODEL_DIR="${AISCIENTIST_VLREVIEW_MODEL_DIR:-$BASE/models/vlreview}"
 VL_REPO="${AISCIENTIST_VLREVIEW_HF_REPO:-Qwen/Qwen2.5-VL-7B-Instruct}"
 CT_MODULE="${AISCIENTIST_CONTAINER_MODULE:-apptainer/1.4.5}"
 CT_BIN="${AISCIENTIST_CONTAINER_BIN:-apptainer}"

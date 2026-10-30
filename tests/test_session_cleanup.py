@@ -82,42 +82,46 @@ def test_a_hostile_name_cannot_smuggle_a_second_command():
 
 def test_the_cleanup_runs_as_a_batch_job_on_a_compute_node():
     remote = _FakeRemote()
-    out = hpc_gc.clean_session(remote, ROOT, "tester", runs=["aaa111"], session="sess01",
-                               partition="free", account="lab_acct")
+    out = hpc_gc.clean_session(remote, ROOT, "tester", session_id="s1", runs=["aaa111"],
+                               session="sess01", partition="free", account="lab_acct")
     assert out == {"status": "submitted", "job_id": "8123456", "runs": 1, "session": "sess01",
-                   "legacy_mirrors": 0}
-    assert remote.staged == [(str(hpc_gc.CLEAN_SCRIPT_SRC), f"{ROOT}/bin/tester/session_clean.sh")]
+                   "legacy_mirrors": 0, "log": f"{ROOT}/sessions/s1/logs/clean.log"}
+    assert remote.staged == [(str(hpc_gc.CLEAN_SCRIPT_SRC), f"{ROOT}/sessions/s1/scripts/session_clean.sh")]
     (submit,) = remote.sbatch
     assert "--job-name=aiscientist-sessionclean-tester" in submit
     assert "--partition=free" in submit and "--account=lab_acct" in submit
-    # Its own log: the sweeper's is read back for the previous sweep's result.
-    assert f"--output={ROOT}/bin/tester/session_clean.log" in submit
-    assert "temp_gc.log" not in submit
+    # Its own log, in the session's logs/: the sweeper's is read back for the previous sweep's result.
+    assert f"--output={ROOT}/sessions/s1/logs/clean.log" in submit
+    assert "sweep.log" not in submit
+    # It runs a copy of the script on the node: the folder it was staged in may be the one it removes.
+    assert f"cp {ROOT}/sessions/s1/scripts/session_clean.sh" in submit
     # The login node submits; it never walks or removes a tree itself.
     assert not any(c.startswith(("rm ", "find ")) for c in remote.commands)
 
 
 def test_nothing_to_remove_submits_nothing():
     remote = _FakeRemote()
-    assert hpc_gc.clean_session(remote, ROOT, "tester")["status"] == "nothing"
+    assert hpc_gc.clean_session(remote, ROOT, "tester", session_id="s1")["status"] == "nothing"
     assert remote.commands == [] and remote.staged == []
 
 
 def test_a_cleanup_that_cannot_be_queued_is_reported_not_raised():
-    out = hpc_gc.clean_session(_FakeRemote(fail="sbatch"), ROOT, "tester", runs=["aaa111"])
+    out = hpc_gc.clean_session(_FakeRemote(fail="sbatch"), ROOT, "tester", session_id="s1",
+                               runs=["aaa111"])
     assert out == {"status": "error", "error": "boom"}
 
 
 def test_a_staged_script_is_not_staged_again():
     remote = _FakeRemote()
-    hpc_gc.clean_session(remote, ROOT, "tester", session="sess01", script_path="/staged/clean.sh")
-    assert remote.staged == [] and "bash /staged/clean.sh" in remote.sbatch[0]
+    hpc_gc.clean_session(remote, ROOT, "tester", session_id="s1", session="sess01",
+                         script_path="/staged/clean.sh")
+    assert remote.staged == [] and "cp /staged/clean.sh" in remote.sbatch[0]
 
 
-def test_the_session_mirror_is_under_temp_and_per_session():
-    a = hpc_gc.session_mirror_base(ROOT, "tester", "sess01")
-    b = hpc_gc.session_mirror_base(ROOT, "tester", "sess02")
-    assert a == f"{ROOT}/Temp/tester/server-data/sess01" and a != b
+def test_the_session_mirror_is_the_sessions_own_inputs_folder():
+    a = hpc_gc.session_mirror_base(ROOT, "sess01")
+    b = hpc_gc.session_mirror_base(ROOT, "sess02")
+    assert a == f"{ROOT}/sessions/sess01/inputs" and a != b
     assert "/uploads/" not in a
 
 
@@ -169,11 +173,8 @@ def test_a_disconnect_names_this_sessions_finished_runs(gw, tmp_path, monkeypatc
     _finished(conn, "bbb222")
     targets = gw._session_cleanup_targets(conn)
     assert targets["runs"] == ["aaa111", "bbb222"]
-    assert targets["session"] == ""                 # it copied no server data: nothing to remove
+    assert targets["session_dir"] == gw._temp_base(conn) == f"{ROOT}/sessions/{conn.id}"
     assert targets["legacy_mirrors"] == []          # server paths are not enabled here
-    conn.server_data_synced = True
-    assert (gw._session_cleanup_targets(conn)["session"] == gw._session_tag(conn)
-            == conn.id.replace("-", "")[:12])
 
 
 def test_a_run_still_executing_is_left_alone_and_so_are_the_sessions_copies(gw, tmp_path):
@@ -184,7 +185,7 @@ def test_a_run_still_executing_is_left_alone_and_so_are_the_sessions_copies(gw, 
     conn.chat_running = True
     targets = gw._session_cleanup_targets(conn)
     assert targets["runs"] == ["aaa111"] and targets["kept_busy"] == ["live99"]
-    assert targets["session"] == ""                 # the live run may be reading them
+    assert targets["session_dir"] == ""             # the live run's jobs import app/ and read inputs/
 
 
 def test_the_run_a_continuing_run_reads_from_is_left_alone(gw, tmp_path):
@@ -255,7 +256,8 @@ def test_disconnect_queues_the_cleanup_before_the_ssh_session_closes(gw, tmp_pat
     remote = conn.executor
     asyncio.run(gw.disconnect({"connection_id": conn.id}, None))
     (submit,) = remote.sbatch
-    assert "--run aaa111" in submit and f"--session {gw._session_tag(conn)}" in submit
+    assert f"--run-dir {ROOT}/sessions/{conn.id}/runs/aaa111" in submit
+    assert f"--session-dir {ROOT}/sessions/{conn.id}" in submit
     assert remote.closed and remote.commands.index(submit) == len(remote.commands) - 1
     assert any("Removing this session's temporary files" in s and "8123456" in s for s in said)
     # Nothing of the user's own data is named: not the uploads dir, not a personal folder.
@@ -305,20 +307,17 @@ def test_the_message_says_only_what_is_being_removed(gw, tmp_path, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_SERVER_DATA_ROOTS", "")
     conn = _conn(gw, tmp_path)
     conn.begin_run("conv", "live99")
-    conn.chat_running = True                        # no finished run, and the copies are in use
+    conn.chat_running = True                        # no finished run, and the folder is in use
     assert gw._end_session_cleanup(conn)["status"] == "nothing"
-    assert conn.executor.commands == []
+    assert conn.executor.sbatch == []               # no job for nothing
     conn.chat_running = False
     conn.session_cleaned = False
-    conn.hpc_run_ids.clear()                        # a session that ran nothing and copied nothing
-    assert gw._end_session_cleanup(conn)["status"] == "nothing"
-    assert conn.executor.commands == []             # no job for nothing
-    conn.session_cleaned = False
-    conn.server_data_synced = True                  # it did bind a server folder
+    conn.hpc_run_ids.clear()                        # a session that ran nothing still has its folder
     said: list[str] = []
     conn.emit = lambda level, stage, text, **k: said.append(text)
     assert gw._end_session_cleanup(conn)["status"] == "submitted"
-    assert "copies of server datasets." in said[0] and "run" not in said[0].split(":")[1]
+    assert "the session's folder with its copies of server datasets." in said[0]
+    assert "run" not in said[0].split(":")[1]
 
 
 def test_an_old_mirror_is_named_only_when_it_is_there(gw, tmp_path, monkeypatch):
@@ -327,12 +326,14 @@ def test_an_old_mirror_is_named_only_when_it_is_there(gw, tmp_path, monkeypatch)
     monkeypatch.setenv("AISCIENTIST_SERVER_DATA_ROOTS", str(shared))
     conn = _conn(gw, tmp_path)
     conn.executor.fail = "test -d"                  # no uploads/<user>/server-data on HPC3
-    assert gw._end_session_cleanup(conn)["status"] == "nothing"
-    assert conn.executor.sbatch == []
+    assert gw._end_session_cleanup(conn)["status"] == "submitted"
+    assert "--legacy-mirror" not in conn.executor.sbatch[0]
     conn.executor.fail, conn.session_cleaned = "", False
+    conn.session.record["closed_at"] = None
+    conn.executor.commands.clear()
     assert gw._end_session_cleanup(conn)["status"] == "submitted"
     (submit,) = conn.executor.sbatch
-    assert "--legacy-mirror" in submit and "--session" not in submit and "--run" not in submit
+    assert "--legacy-mirror" in submit and "--run" not in submit
     assert f"test -d {ROOT}/uploads/tester/server-data" in conn.executor.commands
 
 
@@ -343,12 +344,12 @@ def test_the_report_bundle_is_staged_in_the_runs_own_folder(gw, tmp_path):
     conn = _conn(gw, tmp_path, report_on_hpc=True)
     fn = gw._build_report_render_fn(conn, "aaa111")
     assert isinstance(fn, SlurmReportRenderer)
-    assert fn.remote_base == f"{ROOT}/Temp/tester/reports/aaa111"
-    assert gw._build_report_render_fn(conn).remote_base == f"{ROOT}/Temp/tester/reports"
+    assert fn.remote_base == f"{ROOT}/sessions/{conn.id}/runs/aaa111/reports"
+    assert gw._build_report_render_fn(conn).remote_base == f"{ROOT}/sessions/{conn.id}/reports"
 
 
-def test_what_a_run_hands_on_says_it_goes_with_the_session(gw):
-    assert gw._keep_for(3, True) == "until you disconnect (at most 3 days)"
+def test_what_a_run_hands_on_says_it_goes_to_the_server_with_the_session(gw):
+    assert gw._keep_for(3, True) == "until the session ends, then with the run on the server"
     assert gw._keep_for(7, False) == "for 7 days"
 
 
@@ -392,7 +393,7 @@ def test_the_script_removes_the_named_run_and_session_and_nothing_else(tmp_path)
     out = _clean(root, "--user", "tester", "--run", "aaa111", "--session", "sess01",
                  "--legacy-mirror", "data_shared")
     assert out.returncode == 0, out.stderr
-    assert out.stdout.strip().splitlines()[-1] == "CLEAN_RESULT removed=5 missing=0"
+    assert out.stdout.strip().splitlines()[-1] == "CLEAN_RESULT removed=5 missing=0 kept=0"
     left = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
     assert left == [
         "Temp/other/analysis/aaa111/work/adata.h5ad",
@@ -434,7 +435,7 @@ def test_a_missing_target_is_counted_not_an_error(tmp_path):
     root = _tree(tmp_path)
     out = _clean(root, "--user", "tester", "--run", "nosuchrun", "--session", "nosess", "--quiet")
     assert out.returncode == 0
-    assert out.stdout.strip() == "CLEAN_RESULT removed=0 missing=2"
+    assert out.stdout.strip() == "CLEAN_RESULT removed=0 missing=2 kept=0"
 
 
 def test_a_link_is_never_followed(tmp_path):

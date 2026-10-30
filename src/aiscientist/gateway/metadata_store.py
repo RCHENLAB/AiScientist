@@ -177,7 +177,8 @@ def draft_dataset_record(dataset_id: int, *, files: "list[dict] | None" = None, 
                 s.add(row)
             user_fields = row.loads("user_fields") if row.user_fields else {}
             row.facts = _dumps(facts)
-            _store_built(row, md.build_dataset(d.uuid, facts, user_fields, base_url=base_url()))
+            _store_built(row, md.build_dataset(d.uuid, facts, user_fields, base_url=base_url(),
+                                               description=row.loads("description")))
             if derived_from and derived_from.get("uuid"):
                 _link(s, d.user_id, str(derived_from["uuid"]), d.uuid, "saved_from")
             s.commit()
@@ -244,12 +245,133 @@ def save_form(user_id: int, ref: str, fields: dict) -> "dict | None":
         merged = {**row.loads("user_fields"), **clean}
         row.user_fields = _dumps(merged)
         row.status = "reviewed"
-        _store_built(row, md.build_dataset(row.uuid, row.loads("facts"), merged, base_url=base_url()))
+        _store_built(row, md.build_dataset(row.uuid, row.loads("facts"), merged, base_url=base_url(),
+                                           description=row.loads("description")))
         d = s.get(Dataset, row.dataset_id) if row.dataset_id else None
         if d is not None and clean.get("name"):
             d.name = clean["name"][:255]                       # the display name, everywhere
         s.commit()
         return _view(s, row, with_form=True)
+
+
+# --- the dataset description, DATASET.md (issue 10) ----------------------------------------------
+
+#: The longest DATASET.md an owner may save.
+MAX_DESCRIPTION_CHARS = 100_000
+
+
+def _description_state(row: MetadataRecord) -> dict:
+    """What a dataset's DATASET.md is now: the owner's edit if there is one, else the PI's, as
+    ``{"state", "markdown", ...}``; ``state`` is ``owner``, ``pi`` or ``none``."""
+    from ..metadata import description as dmd
+    rec = row.loads("description")
+    facts = row.loads("facts")
+    current_key = dmd.profile_key(facts)
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    pi_md = (dmd.render(dmd.from_record(rec, facts, row.loads("user_fields"), name=row.name))
+             if rec.get("written_at") else "")
+    out: dict[str, Any] = {
+        "uuid": row.uuid, "dataset_id": row.dataset_id, "name": row.name,
+        "state": "owner" if owner.get("markdown") else "pi" if pi_md else "none",
+        "markdown": owner.get("markdown") or pi_md,
+        "written_at": rec.get("written_at"), "model": rec.get("model"), "run_id": rec.get("run_id"),
+        # The data no longer matches what the description was written from (files added, a file
+        # replaced): the next run that reads the dataset writes the PI's part again.
+        "stale": bool(pi_md) and rec.get("profile_key") != current_key,
+    }
+    if owner.get("markdown"):
+        out.update(owner_edited_at=owner.get("edited_at"), owner_edited_by=owner.get("by"),
+                   data_changed_after_edit=owner.get("profile_key") not in (None, current_key),
+                   pi_markdown=pi_md)
+    return out
+
+
+def _rebuild(row: MetadataRecord) -> None:
+    _store_built(row, md.build_dataset(row.uuid, row.loads("facts"), row.loads("user_fields"),
+                                       base_url=base_url(), description=row.loads("description")))
+
+
+def description_view(user_id: int, ref: str) -> "dict | None":
+    """The caller's dataset's DATASET.md and its state, None when the caller has no such dataset."""
+    with session_scope() as s:
+        row = _find(s, user_id, ref, kind="dataset")
+        return None if row is None else _description_state(row)
+
+
+def description_for_run(user_id: int, uuid: str) -> "dict | None":
+    """What a run starting on the dataset ``uuid`` needs: its DATASET.md if one is kept and still
+    describes the data, and the dataset's facts and owner's fields for the PI to write one when it
+    is not. None when the caller has no such dataset (or no record of it yet)."""
+    with session_scope() as s:
+        row = _find(s, user_id, uuid, kind="dataset")
+        if row is None:
+            return None
+        view = _description_state(row)
+        facts = row.loads("facts")
+        return {**view, "facts": {k: facts.get(k) for k in ("name", "kind", "size_bytes", "files",
+                                                             "file_count", "accessions")},
+                "user_fields": row.loads("user_fields")}
+
+
+def save_pi_description(user_id: int, uuid: str, *, profile: dict, inferred: dict, model: str,
+                        written_at: str, run_id: str) -> bool:
+    """Keep what the PI wrote about a dataset (its profile and statements; issue 10) and rebuild the
+    croissant.json from it. The owner's edit, if any, is kept as it is. Never raises: a run must not
+    fail over its description."""
+    from ..metadata import description as dmd
+    try:
+        with session_scope() as s:
+            row = _find(s, user_id, uuid, kind="dataset")
+            if row is None:
+                return False
+            rec = row.loads("description")
+            rec.update(version=dmd.VERSION, profile=profile, inferred=inferred, model=model,
+                       written_at=written_at, run_id=run_id,
+                       profile_key=dmd.profile_key(row.loads("facts")))
+            row.description = _dumps(rec)
+            _rebuild(row)
+            s.commit()
+            return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[metadata] the description of {uuid} was not kept: {type(exc).__name__}: {exc}")
+        return False
+
+
+def save_owner_description(user_id: int, ref: str, markdown: str, *, by: str = "") -> "dict | None":
+    """The owner's own DATASET.md. Kept as written; a later run reads it and never overwrites it.
+    Raises ValueError for an empty or over-long text; None when the caller has no such dataset."""
+    from ..metadata import description as dmd
+    text = (markdown or "").replace("\r\n", "\n").strip()
+    if not text:
+        raise ValueError("The description is empty. To go back to the PI's version, reset it instead.")
+    if len(text) > MAX_DESCRIPTION_CHARS:
+        raise ValueError(f"The description is longer than {MAX_DESCRIPTION_CHARS:,} characters.")
+    with session_scope() as s:
+        row = _find(s, user_id, ref, kind="dataset")
+        if row is None:
+            return None
+        rec = row.loads("description")
+        rec["owner"] = {"markdown": text + "\n", "by": by,
+                        "edited_at": _now().isoformat(timespec="seconds"),
+                        "profile_key": dmd.profile_key(row.loads("facts"))}
+        row.description = _dumps(rec)
+        _rebuild(row)
+        s.commit()
+        return _description_state(row)
+
+
+def reset_owner_description(user_id: int, ref: str) -> "dict | None":
+    """Drop the owner's edit: DATASET.md is the PI's again (or none)."""
+    with session_scope() as s:
+        row = _find(s, user_id, ref, kind="dataset")
+        if row is None:
+            return None
+        rec = row.loads("description")
+        rec.pop("owner", None)
+        row.description = _dumps(rec) if rec else None
+        _rebuild(row)
+        s.commit()
+        return _description_state(row)
 
 
 # --- results ----------------------------------------------------------------------------------------
@@ -293,6 +415,41 @@ def record_result(user_id: int, run_id: str, facts: dict, inputs: Iterable[dict]
             return built.document
     except Exception as exc:  # noqa: BLE001 - metadata must never fail a run
         print(f"[metadata] result metadata for run {run_id} failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+def note_handed_on(user_id: int, run_id: str, records: "dict[str, dict]", *,
+                   staged_at: str = "") -> "dict | None":
+    """A run's handed-on outputs were copied from HPC3 to the run's folder on the server (issue 6):
+    say so in its result's metadata. ``records`` maps an output's name to its record (``location``,
+    ``sha256``, ``saved_to``). Returns the rebuilt document, or None (no record, or not the caller's).
+    Never raises."""
+    try:
+        uid = result_uuid(run_id)
+        with session_scope() as s:
+            row = s.scalars(select(MetadataRecord).where(MetadataRecord.uuid == uid)).first()
+            if row is None or row.user_id != user_id:
+                return None
+            facts = json.loads(row.facts or "{}")
+            changed = False
+            for h in facts.get("handed_on") or []:
+                rec = records.get(str(h.get("name") or "")) or {}
+                if rec.get("location") == "gateway" or rec.get("saved_to"):
+                    h["location"] = "server"
+                    if rec.get("sha256"):
+                        h["sha256"] = str(rec["sha256"])
+                    if staged_at:
+                        h["staged_out_at"] = staged_at
+                    changed = True
+            if not changed:
+                return None
+            row.facts = _dumps(facts)
+            built = md.build_result(uid, facts, base_url=base_url())
+            _store_built(row, built)
+            s.commit()
+            return built.document
+    except Exception as exc:  # noqa: BLE001 - metadata must never fail a stage-out
+        print(f"[metadata] stage-out of run {run_id} not recorded: {type(exc).__name__}: {exc}")
         return None
 
 
@@ -497,7 +654,8 @@ def recheck_all() -> dict:
         for r in s.scalars(select(MetadataRecord)).all():
             try:
                 if r.kind == "dataset":
-                    built = md.build_dataset(r.uuid, r.loads("facts"), r.loads("user_fields"), base_url=base_url())
+                    built = md.build_dataset(r.uuid, r.loads("facts"), r.loads("user_fields"), base_url=base_url(),
+                                             description=r.loads("description"))
                 else:
                     built = md.build_result(r.uuid, r.loads("facts"), base_url=base_url())
                 _store_built(r, built)

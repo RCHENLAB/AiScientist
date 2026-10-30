@@ -1,63 +1,54 @@
-"""Incrementally copy a corpus index and manifest from HPC3 to the Eye Server using rsync."""
+"""Copy the corpus index and manifest from HPC3 to the Eye Server: only the files that changed, into a
+new version that becomes current in one step (``gateway/corpus_index.py`` describes the layout).
+``scripts/update_corpus_index.py`` runs this copy with the deployment's settings, and can rebuild
+the index on HPC3 first; use this script for a copy from another source or into another folder:
+
+    python scripts/sync_corpus_index.py \\
+        --source <user>@access-hpc3.rcic.uci.edu:/dfs3b/ruic20_lab/software/AiScientist/retigene \\
+        --with-model --with-hgnc [--ssh-key <key>] [--destination <dir>]
+    python scripts/sync_corpus_index.py --rollback [--destination <dir>]
+
+The copy goes through RCIC's transfer node: the script refuses an HPC3 login node as the source.
+"""
 from __future__ import annotations
 
 import argparse
-import re
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from aiscientist.gateway.local_corpus import local_root
+from aiscientist.gateway import corpus_index  # noqa: E402
+from aiscientist.gateway.local_corpus import local_root  # noqa: E402
 
-# RCIC allows no data transfer on the HPC3 login nodes: copies go through its transfer node.
-TRANSFER_HOST = "access-hpc3.rcic.uci.edu"
-_LOGIN_HOST = re.compile(r"(?:hpc3|login-i\d+)(?:\.rcic\.uci\.edu)?", re.IGNORECASE)
-
-
-def _source_host(source: str) -> str:
-    """The host of an rsync source ``[user@]host:path``; empty for a local path."""
-    head, sep, _ = source.partition(":")
-    return head.rsplit("@", 1)[-1] if sep and "/" not in head else ""
-
-
-def sync(source: str, destination: Path, *, manifest: str = "paperqa_manifest.csv",
-         with_model: bool = False, with_hgnc: bool = False) -> None:
-    """source is an rsync source directory, e.g. access-hpc3.rcic.uci.edu:/dfs3b/.../retigene."""
-    if source.startswith("-") or Path(manifest).name != manifest:
-        raise ValueError("source must be a directory and manifest must be a filename")
-    if _LOGIN_HOST.fullmatch(_source_host(source)):
-        raise ValueError(f"{_source_host(source)} is an HPC3 login node, where RCIC allows no data "
-                         f"transfer: copy through {TRANSFER_HOST} instead")
-    destination.mkdir(parents=True, exist_ok=True)
-    source = source.rstrip("/")
-    pairs = [("mechanism_cache/", destination / "mechanism_cache"),
-             (manifest, destination / "manifest.csv")]
-    if with_model:
-        pairs.append(("hf_cache/", destination / "hf_cache"))
-    if with_hgnc:
-        pairs.append(("hgnc_complete_set.txt", destination / "hgnc_complete_set.txt"))
-    for name, target in pairs:
-        if name.endswith("/"):
-            target.mkdir(parents=True, exist_ok=True)
-        # Checksums detect changed contents even when timestamps/sizes match; unchanged files
-        # are not transferred. Delay replacement until each transfer completes.
-        subprocess.run(["rsync", "-rltc", "--delay-updates", "--protect-args", "--",
-                        f"{source}/{name}", str(target)], check=True)
+TRANSFER_HOST = corpus_index.TRANSFER_HOST
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True,
-                        help=f"[user@]host:path of the corpus parent directory, through {TRANSFER_HOST}")
-    parser.add_argument("--destination", type=Path, default=None)
-    parser.add_argument("--manifest", default="paperqa_manifest.csv")
-    parser.add_argument("--with-model", action="store_true", help="also sync the offline hf_cache")
-    parser.add_argument("--with-hgnc", action="store_true", help="also sync hgnc_complete_set.txt")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--source", help=f"[user@]host:path of the corpus root, through {TRANSFER_HOST}")
+    parser.add_argument("--destination", type=Path, default=None, help="the copy's root (default: the gateway's)")
+    parser.add_argument("--manifest", default="paperqa_manifest.csv", help="the manifest's file name at the source")
+    parser.add_argument("--with-model", action="store_true", help="also copy the offline hf_cache")
+    parser.add_argument("--with-hgnc", action="store_true", help="also copy hgnc_complete_set.txt")
+    parser.add_argument("--ssh-key", default="", help="private key for the transfer node")
+    parser.add_argument("--rollback", action="store_true", help="make the previous version current")
     args = parser.parse_args(argv)
-    sync(args.source, args.destination or local_root(), manifest=args.manifest,
-         with_model=args.with_model, with_hgnc=args.with_hgnc)
+    dest = args.destination or local_root()
+    try:
+        if args.rollback:
+            print(f"current: {corpus_index.rollback(dest)}")
+            return 0
+        if not args.source:
+            parser.error("--source is required")
+        res = corpus_index.sync(args.source, dest, manifest=args.manifest, with_model=args.with_model,
+                                with_hgnc=args.with_hgnc,
+                                ssh=corpus_index.ssh_command(key=args.ssh_key) if args.ssh_key else None)
+    except corpus_index.SyncError as exc:
+        print(f"not copied: {exc}", file=sys.stderr)
+        return 1
+    state = "copied" if res.changed else "unchanged"
+    print(f"{state}: {res.version} ({res.papers} papers, {res.chunks} chunks)")
     return 0
 
 

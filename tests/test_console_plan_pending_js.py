@@ -325,6 +325,24 @@ def test_a_reply_in_words_keeps_the_draft_and_running_or_cancelling_drops_it():
     assert out["cancelled"] == {"draft": "", "stored": False}
 
 
+def test_an_answer_no_run_was_waiting_for_says_so_and_ends_the_chats_run():
+    """Prod 2026-10-28: the run behind a waiting plan was gone, /api/lab/plan answered
+    {status: "stale"}, and the card said "Sent to the PI — reading your reply…" for good."""
+    out = _run("""
+  api.handleWsMessage({ type: "chat_start", conversation_id: "A", run_id: "r1" });
+  api.handleWsMessage(plan());
+  A().running = true;
+  sandbox.fetch = async () => ({ ok: true, json: async () => ({ status: "stale", action: "ignored" }) });
+  await api.submitPlan("revise", "change threshold of mitochondrial percentage to 25%.");
+  out.running = A().running; out.run = A().run || null;
+  out.status = A().answered ? A().answered.status : null;
+  out.toasts = log.filter((x) => x.startsWith("toast:"));
+""")
+    assert out["running"] is False and out["run"] is None
+    assert out["status"].startswith("Not delivered")
+    assert [t for t in out["toasts"] if "Not delivered" in t] and not [t for t in out["toasts"] if "re-planning" in t]
+
+
 def test_the_context_meter_of_a_turn_is_never_shown_in_another_chat():
     out = _run("""
   S.activeId = "B";

@@ -110,6 +110,23 @@ def _rows(user_id: int | None, since: _dt.datetime | None = None, *,
         return list(rows)
 
 
+def models_of_run(run_id: str) -> list[dict]:
+    """The models a run's calls went to, in the order first called: ``{"model", "provider"}`` each.
+    For the run's manifest.json (agents/run_manifest.py)."""
+    from sqlalchemy import select
+
+    from .db import session_scope
+    from .models import LlmCall
+    stmt = (select(LlmCall.model, LlmCall.provider, LlmCall.id).where(LlmCall.run_id == run_id)
+            .order_by(LlmCall.id))
+    out: list[dict] = []
+    with session_scope() as s:
+        for model, provider, _ in s.execute(stmt):
+            if model and not any(o["model"] == model for o in out):
+                out.append({"model": model, "provider": provider})
+    return out
+
+
 def _tokens0() -> dict:
     return dict.fromkeys(_TOKEN_KEYS, 0)
 
@@ -294,6 +311,70 @@ def budget_gate(user_id: int | None, tz: str | None = None) -> dict | None:
     except Exception as exc:  # noqa: BLE001 - see the docstring
         print(f"[llm-usage] budget check skipped: {exc}")
         return None
+
+
+def cycle_spend(user_id: int, tz: str | None = None) -> dict:
+    """This billing cycle's estimated spend for ``user_id``, summed in the database (the in-run
+    budget check calls this between model calls), with the budget it is compared against.
+
+    ``{"spent_usd", "hard_limit_usd", "mode", "cycle_end", "reached"}``; ``hard_limit_usd`` is None
+    when the user set no hard limit (then nothing is summed)."""
+    from sqlalchemy import func, select
+
+    from .db import session_scope
+    from .models import LlmCall
+    row = _budget_row(user_id)
+    out: dict[str, Any] = {"spent_usd": 0.0, "hard_limit_usd": None, "mode": None,
+                           "cycle_end": None, "reached": False}
+    if row is None or row.hard_limit_usd is None or row.hard_limit_usd < 0:
+        return out
+    zone = _zone(tz)
+    start, end = billing_cycle(_now(zone).date(), row.reset_day)
+    spend = func.coalesce(LlmCall.cost_usd, LlmCall.est_cost_usd)
+    with session_scope() as s:
+        spent = s.execute(select(func.coalesce(func.sum(spend), 0.0))
+                          .where(LlmCall.user_id == user_id,
+                                 LlmCall.created_at >= _start_of(start, zone))).scalar_one()
+    out.update(spent_usd=round(float(spent or 0.0), 6), hard_limit_usd=float(row.hard_limit_usd),
+               mode="block" if row.hard_limit_mode == "block" else "confirm",
+               cycle_end=end.isoformat(), reached=float(spent or 0.0) >= float(row.hard_limit_usd))
+    return out
+
+
+def key_window(key_fp: str, since: _dt.datetime) -> dict:
+    """Calls and estimated spend of one API key (by fingerprint) since ``since``."""
+    from sqlalchemy import func, select
+
+    from .db import session_scope
+    from .models import LlmCall
+    spend = func.coalesce(LlmCall.cost_usd, LlmCall.est_cost_usd)
+    with session_scope() as s:
+        calls, usd = s.execute(select(func.count(LlmCall.id), func.coalesce(func.sum(spend), 0.0))
+                               .where(LlmCall.key_fp == key_fp, LlmCall.created_at >= since)).one()
+    return {"calls": int(calls or 0), "spend_usd": round(float(usd or 0.0), 6)}
+
+
+def key_busiest_hour(key_fp: str, since: _dt.datetime, until: _dt.datetime) -> dict:
+    """The key's busiest clock hour between ``since`` and ``until``: most calls and most spend in
+    any one hour (each maximum on its own). ``{"calls": 0, "spend_usd": 0.0}`` for a new key."""
+    from sqlalchemy import func, select
+
+    from .db import session_scope
+    from .models import LlmCall
+    spend = func.coalesce(LlmCall.cost_usd, LlmCall.est_cost_usd)
+    with session_scope() as s:
+        rows = s.execute(select(LlmCall.created_at, spend)
+                         .where(LlmCall.key_fp == key_fp, LlmCall.created_at >= since,
+                                LlmCall.created_at < until)).all()
+    calls: dict[str, int] = {}
+    usd: dict[str, float] = {}
+    for created, cost in rows:
+        if created is None:
+            continue
+        hour = _local(created, _dt.timezone.utc).strftime("%Y-%m-%dT%H")
+        calls[hour] = calls.get(hour, 0) + 1
+        usd[hour] = usd.get(hour, 0.0) + float(cost or 0.0)
+    return {"calls": max(calls.values(), default=0), "spend_usd": round(max(usd.values(), default=0.0), 6)}
 
 
 def _next_day(iso: str) -> str:

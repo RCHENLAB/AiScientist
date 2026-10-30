@@ -7,6 +7,7 @@ in ``aiscientist.tools._lib.scrna``.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from .._lib.scrna import (
     _INPUT_SPEC,
@@ -24,6 +25,8 @@ from .._lib.scrna import (
     _slug,
     _step_input,
     _write_table,
+    group_table_slug,
+    pseudobulk_de_key,
 )
 from ..sdk import HarnessTool
 
@@ -189,7 +192,15 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
 
     from scipy import stats as sstats
 
+    # Every hand-off file goes under the tool's OWN key, ``pseudobulk_<group_key>``. Sharing
+    # run_de's ``de_<group_key>_*`` names let the two tools overwrite each other piecemeal: after a
+    # stratified run_de and then this tool on the same column, ``de_<key>_all.csv`` was the
+    # pseudobulk table while the per-group tables and run_de's "exploratory_ranking" label were
+    # still run_de's, so run_enrichment ran the cell-level Wilcoxon result as if it were this test.
+    de_key = pseudobulk_de_key(group_key)
+    padj_max = float(_p("run_pseudobulk_de", "padj", args))
     all_rows: list[dict[str, Any]] = []
+    full_by_group: dict[str, list[dict[str, Any]]] = {}
     per_group: dict[str, Any] = {}
     skipped: dict[str, str] = {}
     tested_universe: set[str] = set()
@@ -259,17 +270,17 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                  "mean_" + b_name: round(float(B[:, i].mean()), 4)}
                 for i in range(len(sub_genes))]
         rows.sort(key=lambda r: r["pval"])
-        _write_table(tables / f"pseudobulk_{_slug(label)}.csv", rows[:2000],
+        full_by_group[label] = rows
+        _write_table(tables / f"pseudobulk_{group_table_slug(label)}.csv", rows[:2000],
                      ["group", "gene", "log2fc", "pval", "pval_adj", "score",
                       f"mean_{a_name}", f"mean_{b_name}"])
         # The ranked list run_gsea_prerank consumes (every tested gene, signed by the t-statistic
         # so a positive NES means "up in the condition arm"). Without it GSEA has no input for a
         # pseudobulk contrast and the protocol's step 4 is half-runnable.
-        (tables / f"rank_{_slug(group_key or 'pseudobulk')}_{_slug(label)}.rnk").write_text(
+        (tables / f"rank_{de_key}_{_slug(label)}.rnk").write_text(
             "".join(f"{r['gene']}\t{r['score']:.6g}\n"
                     for r in sorted(rows, key=lambda r: -r["score"])), encoding="utf-8")
-        n_sig = sum(1 for r in rows
-                    if r["pval_adj"] < float(_p("run_pseudobulk_de", "padj", args)))
+        n_sig = sum(1 for r in rows if r["pval_adj"] < padj_max)
         per_group[label] = {
             "contrast": f"{b_name} vs {a_name}",
             "test": test_used,
@@ -296,18 +307,35 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         cols = ["group", "gene", "log2fc", "pval", "pval_adj", "score"]
         combined = [{k: r.get(k) for k in cols} for r in all_rows]
         _write_table(tables / "pseudobulk_all.csv", combined, cols)
-        # ALSO write the canonical DE names. run_enrichment / run_gsea_prerank discover DE results
-        # as `de_<key>_all.csv` + `de_<key>_universe.txt`; a pseudobulk contrast that only wrote
-        # `pseudobulk_all.csv` was invisible to them, so the recommended (replicated) path silently
-        # lost its per-cell-type enrichment and its ORA background fell back to a 20000 constant.
-        de_key = _slug(group_key or "pseudobulk")
+        # ALSO write the hand-off set run_enrichment / run_gsea_prerank read, under this tool's
+        # own key: `de_<key>_all.csv`, each group's complete tested table, the tested universe (the
+        # ORA background), the slug index, and the two labels run_de writes beside its tables —
+        # "replicated" inference, and complete per-group tables — so a reader never mixes this
+        # test's files with a cell-level test's.
         de_table = tables / f"de_{de_key}_all.csv"
         _write_table(de_table, combined, cols)
+        for label, rows in full_by_group.items():
+            _write_table(tables / f"de_{de_key}_{group_table_slug(label)}.csv",
+                         [{k: r.get(k) for k in cols} for r in rows], cols)
         (tables / f"de_{de_key}_universe.txt").write_text(
             "\n".join(sorted(tested_universe)) + "\n", encoding="utf-8")
         # Slug -> real label, so a later step reports "Club/Secretory", not "Club_Secretory".
         _write_table(tables / f"rank_{de_key}_index.csv",
                      [{"slug": _slug(g), "group": g} for g in per_group], ["slug", "group"])
+        try:
+            (tables / f"de_{de_key}_inference.json").write_text(json.dumps({
+                "tool": "run_pseudobulk_de", "mode": "contrast", "inference": "replicated",
+                "groupby": condition_key, "stratify_by": group_key or None,
+                "unit_of_replication": sample_key,
+                "contrasts": {g: v["contrast"] for g, v in per_group.items()}}), encoding="utf-8")
+            (tables / f"de_{de_key}_significance.json").write_text(json.dumps({
+                "per_group_tables": "complete", "padj_max": padj_max, "abs_log2fc_min": 0.0,
+                "significant_by_group": {
+                    g: {"up": sum(1 for r in rows if r["pval_adj"] < padj_max and r["log2fc"] > 0),
+                        "down": sum(1 for r in rows if r["pval_adj"] < padj_max and r["log2fc"] < 0)}
+                    for g, rows in full_by_group.items()}}), encoding="utf-8")
+        except OSError:
+            pass    # a label we could not write must never fail the test itself
     return {
         "status": "ok",
         "step": "pseudobulk_de",
@@ -325,9 +353,11 @@ def run_pseudobulk_de(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         **({"warnings": fallback_warnings} if fallback_warnings else {}),
         "tables": ([_rel(art, tables / "pseudobulk_all.csv"), _rel(art, de_table)]
                    if all_rows else []),
-        # Call run_enrichment with NO `genes` argument — it picks this table up on its own and
-        # runs ORA per group and per direction.
+        # Call run_enrichment with NO `genes` argument — it picks this table up on its own (a
+        # replicated test is preferred over a cell-level one) and runs ORA per group and per
+        # direction; `groupby=<de_key>` names it explicitly.
         "de_table": _rel(art, de_table) if de_table is not None else None,
+        "de_key": de_key if de_table is not None else None,
         "table_columns": ["group", "gene", "log2fc", "pval", "pval_adj", "score"],
         "read_from": _run_rel(ctx, counts_ckpt),
         "raw_data_to_llm": False,
@@ -347,9 +377,11 @@ def make_tool() -> HarnessTool:
         "(negative-binomial Wald, via pydeseq2; Welch t on log2 CPM as a LOUD fallback) + "
         "BH. REFUSES a group with fewer than 2 samples per arm and reports it in "
         "`skipped_groups` rather than falling back to the cell-level test. Writes "
-        "`tables/de_<group_key>_all.csv` (+ the tested universe and per-group .rnk files), so "
-        "run_enrichment and run_gsea_prerank pick the result up with NO `genes` argument — do "
-        "not paste a gene list into them.",
+        "`tables/de_pseudobulk_<group_key>_all.csv` (+ one complete table per group, the tested "
+        "universe and per-group .rnk files), never run_de's file names, so run_enrichment and "
+        "run_gsea_prerank pick the result up with NO `genes` argument (they prefer this "
+        "replicated test over a cell-level one; `groupby=\"pseudobulk_<group_key>\"` names it) — "
+        "do not paste a gene list into them.",
         _schema("run_pseudobulk_de",
                 sample_key={"type": "string",
                             "description": "obs column holding the sample / donor / library id"},

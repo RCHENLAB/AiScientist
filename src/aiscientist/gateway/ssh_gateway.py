@@ -16,7 +16,8 @@ from typing import Any, Callable, Iterator
 
 import paramiko
 
-from .errors import GatewayError, error_detail, public_error
+from .errors import (GatewayError, error_detail, public_error, redact_key_store_paths,
+                     redact_server_paths)
 from .executor import ExecResult
 
 EmitFn = Callable[[str, str, str], None]  # (level, stage, message)
@@ -511,7 +512,7 @@ class SSHExecutor:
             sftp.put(local_path, remote_path)
         except (OSError, paramiko.SSHException) as exc:
             raise GatewayError(
-                f"Failed to upload {local_path} -> {remote_path}.",
+                f"Failed to upload {os.path.basename(local_path)} to {remote_path}.",
                 stage="ssh_put",
                 detail=error_detail(exc),
             ) from exc
@@ -551,7 +552,7 @@ class SSHExecutor:
             landed = int(sftp.stat(part).st_size or 0)
             if landed != total:
                 raise GatewayError(
-                    f"Upload of {local_path} stopped at {landed} of {total} bytes.",
+                    f"Upload of {os.path.basename(local_path)} stopped at {landed} of {total} bytes.",
                     stage="ssh_put",
                 )
             if progress is not None:
@@ -567,7 +568,7 @@ class SSHExecutor:
                 sftp.rename(part, remote_path)
         except (OSError, paramiko.SSHException) as exc:
             raise GatewayError(
-                f"Failed to upload {local_path} -> {remote_path}.",
+                f"Failed to upload {os.path.basename(local_path)} to {remote_path}.",
                 stage="ssh_put",
                 detail=error_detail(exc),
             ) from exc
@@ -731,9 +732,12 @@ class SSHExecutor:
                 return True
             err.seek(0)
             why = err.read().decode(errors="replace").strip().splitlines()
+        # OpenSSH names the identity file it was given (``Load key "<path>": …``): never the key
+        # store's path in an event (issue 16).
+        reason = redact_server_paths(redact_key_store_paths(why[-1])) if why else f"exit {proc.returncode}"
         self._emit("warning", "ssh_transfer",
                    f"The OpenSSH client could not copy {os.path.basename(local_path)} "
-                   f"({why[-1] if why else f'exit {proc.returncode}'}); continuing with paramiko.")
+                   f"({reason}); continuing with paramiko.")
         return False
 
     def read_bytes(self, remote_path: str, max_bytes: int | None = None) -> bytes:
@@ -847,7 +851,7 @@ class SSHExecutor:
             os.replace(part, local_path)
         except (OSError, paramiko.SSHException) as exc:
             raise GatewayError(
-                f"Failed to download {remote_path} -> {local_path}.",
+                f"Failed to download {remote_path}.",
                 stage="ssh_get",
                 detail=error_detail(exc),
             ) from exc
@@ -861,7 +865,7 @@ class SSHExecutor:
             sftp.get(remote_path, local_path)
         except (OSError, paramiko.SSHException) as exc:
             raise GatewayError(
-                f"Failed to download {remote_path} -> {local_path}.",
+                f"Failed to download {remote_path}.",
                 stage="ssh_get",
                 detail=error_detail(exc),
             ) from exc

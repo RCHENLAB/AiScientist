@@ -88,7 +88,7 @@ class FakeHPCNoOutput(FakeHPC):
     missing remote file — which used to escape and crash the whole run."""
 
     def get_file(self, remote_path, local_path):
-        raise GatewayError(f"Failed to download {remote_path} -> {local_path}.", stage="ssh_get")
+        raise GatewayError(f"Failed to download {remote_path}.", stage="ssh_get")
 
 
 def test_report_render_missing_output_is_diagnosable_and_never_throws(tmp_path):

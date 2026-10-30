@@ -13,7 +13,7 @@ Runs gseapy's preranked GSEA on the complete ranked gene list of each group (the
 
 ## When the agent uses it
 
-- After `run_de`, as a complement to `run_enrichment`: the two use different null hypotheses, so disagreement between them is not an error.
+- After `run_de` or `run_pseudobulk_de`, as a complement to `run_enrichment`: the two use different null hypotheses, so disagreement between them is not an error. With no `groupby` it ranks a `run_pseudobulk_de` result first (a replicated test), then an annotated grouping, then `leiden`, and reads exactly the groups that result's index names.
 - On ranked lists a `run_code` step wrote, through `input`.
 
 ## Inputs
@@ -22,7 +22,7 @@ Runs gseapy's preranked GSEA on the complete ranked gene list of each group (the
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
 | `gene_sets` | array of string | — |  |
-| `groupby` | string | — |  |
+| `groupby` | string | — | which ranked lists to read, by the key in tables/rank_<groupby>_<group>.rnk: the column run_de grouped by, or the `de_key` run_pseudobulk_de returned; omit to choose automatically, a replicated pseudobulk test first |
 | `top_n_terms` | integer | — |  |
 | `min_size` | integer | — |  |
 | `max_size` | integer | — |  |

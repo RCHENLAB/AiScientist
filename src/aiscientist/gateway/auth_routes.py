@@ -13,13 +13,14 @@ import os
 import re
 import secrets
 from collections.abc import Callable
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
 
-from . import auth, email_send
+from . import auth, email_send, rate_limit
 from .db import session_scope
 from .models import (Conversation, Dataset, LlmCall, Message, PendingRegistration, Run,
                      UsageBudget, User)
@@ -29,6 +30,17 @@ router = APIRouter(prefix="/api")
 # Called with the user who is logging out, before the cookie is cleared. The gateway registers
 # what a logout releases on HPC3 (the account's CPU worker); a failing hook never blocks a logout.
 LOGOUT_HOOKS: list = []
+# ``hook(owner_name, session_tag)`` at logout, for state tied to ONE browser session (session-only
+# API keys, ``llm_credentials.end_session``) rather than to the account.
+SESSION_END_HOOKS: list = []
+
+
+def session_tag(request: Request) -> str:
+    """A stable, non-secret name for the browser session behind ``request``: a hash of its login
+    cookie (the cookie itself never leaves this function). "" without a cookie (accounts off)."""
+    import hashlib
+    token = (getattr(request, "cookies", None) or {}).get(auth.COOKIE_NAME) or ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] if token else ""
 
 
 # --- dependencies ------------------------------------------------------------
@@ -69,16 +81,56 @@ class LoginRequest(BaseModel):
     password: str
 
 
+# --- per-client limits (KrimsonSun/BioAgentPrototype issue 115) --------------
+# Failed sign-ins are counted three ways: one account from one address (a person's typos, or one
+# guesser), one account from anywhere (guessing from rotating addresses), and one address for any
+# account (one source trying many accounts). Only failures count, and a successful sign-in clears
+# that account's counts, so people behind one shared campus address are not locked out by each
+# other's typos. Registration starts are counted per address and per email address, so nobody can
+# flood an inbox with codes or keep cancelling someone else's signup. Verification tries are
+# counted per address on top of the 5 tries each code allows.
+LOGIN_FAILS_ACCOUNT_ADDRESS = rate_limit.SlidingWindow(5, 15 * 60)
+LOGIN_FAILS_ACCOUNT = rate_limit.SlidingWindow(20, 15 * 60)
+LOGIN_FAILS_ADDRESS = rate_limit.SlidingWindow(30, 15 * 60)
+REGISTER_STARTS_ADDRESS = rate_limit.SlidingWindow(5, 60 * 60)
+REGISTER_STARTS_EMAIL = rate_limit.SlidingWindow(3, 60 * 60)
+VERIFY_FAILS_ADDRESS = rate_limit.SlidingWindow(20, 60 * 60)
+
+
+def _refuse_if_limited(checks: "list[tuple[rate_limit.SlidingWindow, str]]", what: str) -> None:
+    """429 with ``Retry-After`` when any of ``checks`` (limit, key) has no room left."""
+    if not rate_limit.enabled():
+        return
+    wait = max((lim.retry_after(key) for lim, key in checks), default=0.0)
+    if wait > 0:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(int(wait) + 1)},
+                            detail=f"{what}. Try again in {rate_limit.wait_words(wait)}.")
+
+
+def _count(checks: "list[tuple[rate_limit.SlidingWindow, str]]") -> None:
+    if rate_limit.enabled():
+        for lim, key in checks:
+            lim.hit(key)
+
+
 @router.post("/auth/login")
-def login(req: LoginRequest, response: Response) -> dict:
+def login(req: LoginRequest, request: Request, response: Response) -> dict:
+    address = rate_limit.client_ip(request)
+    account = (req.username or "").strip().lower()
+    counted = [(LOGIN_FAILS_ACCOUNT_ADDRESS, f"{account}|{address}"), (LOGIN_FAILS_ACCOUNT, account),
+               (LOGIN_FAILS_ADDRESS, address)]
+    _refuse_if_limited(counted, "Too many failed sign-ins")
     with session_scope() as s:
         user = s.scalar(select(User).where(User.username == req.username))
         if user is None or not user.is_active or not auth.verify_password(req.password, user.password_hash):
+            _count(counted)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         user.last_login_at = _dt.datetime.now(_dt.timezone.utc)
         s.commit()
         token = auth.make_session_token(user.id)
         info = user.public()
+    LOGIN_FAILS_ACCOUNT_ADDRESS.clear(f"{account}|{address}")
+    LOGIN_FAILS_ACCOUNT.clear(account)
     response.set_cookie(
         auth.COOKIE_NAME, token, max_age=auth.SESSION_MAX_AGE,
         httponly=True, samesite="lax", secure=auth.secure_cookies(),
@@ -88,13 +140,20 @@ def login(req: LoginRequest, response: Response) -> dict:
 
 @router.post("/auth/logout")
 def logout(request: Request, response: Response) -> dict:
-    user = current_user(request) if LOGOUT_HOOKS else None
+    user = current_user(request) if (LOGOUT_HOOKS or SESSION_END_HOOKS) else None
     if user is not None:
+        tag = session_tag(request)
         for hook in list(LOGOUT_HOOKS):
             try:
                 hook(user)
             except Exception as exc:  # noqa: BLE001 - housekeeping never blocks a logout
                 print(f"[auth] logout hook {getattr(hook, '__name__', hook)} failed: "
+                      f"{type(exc).__name__}: {exc}")
+        for hook in list(SESSION_END_HOOKS):
+            try:
+                hook(user.username, tag)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[auth] session-end hook {getattr(hook, '__name__', hook)} failed: "
                       f"{type(exc).__name__}: {exc}")
     response.delete_cookie(auth.COOKIE_NAME, samesite="lax", secure=auth.secure_cookies())
     return {"status": "ok"}
@@ -164,13 +223,13 @@ def auth_config() -> dict:
 
 
 @router.post("/auth/register/start")
-def register_start(req: RegisterStartRequest) -> dict:
+def register_start(req: RegisterStartRequest, request: Request) -> dict:
     # Convert any *unexpected* failure (e.g. a schema-drift ``OperationalError`` when the
     # ``pending_registrations`` table is missing) into a clean JSON 500 with a ``detail``.
     # A bare 500 returns plain text, which the UI can't parse — the user then sees only the
     # opaque "Could not start registration." fallback with no clue what went wrong.
     try:
-        return _register_start(req)
+        return _register_start(req, rate_limit.client_ip(request))
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 - surface a diagnosable error, never a bare 500
@@ -180,7 +239,17 @@ def register_start(req: RegisterStartRequest) -> dict:
             "shortly, or contact an admin if it persists.")) from exc
 
 
-def _register_start(req: RegisterStartRequest) -> dict:
+def _drop_expired_registrations(s: Any, now: "_dt.datetime") -> None:
+    """Remove pending signups whose code has expired: nobody can finish them any more."""
+    for row in s.scalars(select(PendingRegistration)).all():
+        expires = row.expires_at
+        if expires is not None and expires.tzinfo is None:   # SQLite returns naive datetimes
+            expires = expires.replace(tzinfo=_dt.timezone.utc)
+        if expires is not None and expires < now:
+            s.delete(row)
+
+
+def _register_start(req: RegisterStartRequest, address: str = "") -> dict:
     if not self_register_enabled():
         raise HTTPException(status_code=403, detail="Self-registration is disabled on this server.")
     username = (req.username or "").strip()
@@ -195,9 +264,14 @@ def _register_start(req: RegisterStartRequest) -> dict:
         allowed = ", ".join("@" + d for d in allowed_email_domains())
         raise HTTPException(status_code=400, detail=f"Registration is limited to {allowed} email addresses.")
 
+    counted = [(REGISTER_STARTS_ADDRESS, address or "unknown"), (REGISTER_STARTS_EMAIL, email)]
+    _refuse_if_limited(counted, "Too many registration attempts")
+    _count(counted)
     code = _gen_code()
-    expires = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=CODE_TTL_MINUTES)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    expires = now + _dt.timedelta(minutes=CODE_TTL_MINUTES)
     with session_scope() as s:
+        _drop_expired_registrations(s, now)
         if s.scalar(select(User).where(func.lower(User.username) == username.lower())):
             raise HTTPException(status_code=409, detail="That username is taken.")
         # Email is intentionally NOT unique: one person may hold several accounts (e.g. an
@@ -238,10 +312,15 @@ def _register_start(req: RegisterStartRequest) -> dict:
 
 
 @router.post("/auth/register/verify")
-def register_verify(req: RegisterVerifyRequest, response: Response) -> dict:
+def register_verify(req: RegisterVerifyRequest, request: Request, response: Response) -> dict:
+    address = rate_limit.client_ip(request)
+    counted = [(VERIFY_FAILS_ADDRESS, address)]
+    _refuse_if_limited(counted, "Too many verification attempts")
     try:
         return _register_verify(req, response)
-    except HTTPException:
+    except HTTPException as exc:
+        if exc.status_code in (400, 404):      # a wrong or unknown code, not a server problem
+            _count(counted)
         raise
     except Exception as exc:  # noqa: BLE001 - surface a diagnosable error, never a bare 500
         print(f"[auth] register_verify failed: {type(exc).__name__}: {exc}")
@@ -569,7 +648,8 @@ def record_llm_call(*, run_id: str | None, user_id: int | None, role: str, model
                     endpoint: str, remote: bool, usage: dict | None,
                     max_tokens: int | None, duration_ms: int,
                     conversation_id: str | None = None, step: str | None = None,
-                    provider: str | None = None, error_type: str | None = None) -> None:
+                    provider: str | None = None, error_type: str | None = None,
+                    key_fp: str | None = None) -> None:
     """Persist what one model call cost, or why it failed. Best-effort, and deliberately so.
 
     Accounting must never be able to fail an analysis: a dropped row costs a line in a cost report,
@@ -583,6 +663,8 @@ def record_llm_call(*, run_id: str | None, user_id: int | None, role: str, model
 
     ``error_type`` marks a failed request (``status = "error"``): the cause the transport classified
     (auth, credit, rate, …), so a user can see why a run stopped. No message text is stored.
+
+    ``key_fp`` is the paying key's fingerprint (a hash prefix), for the per-key spike check.
     """
     try:
         usage = usage or {}
@@ -613,7 +695,8 @@ def record_llm_call(*, run_id: str | None, user_id: int | None, role: str, model
                           est_cost_usd=estimate,
                           status="error" if error_type else "ok",
                           error_type=(error_type or None) and str(error_type)[:32],
-                          max_tokens=max_tokens, duration_ms=max(0, int(duration_ms))))
+                          max_tokens=max_tokens, duration_ms=max(0, int(duration_ms)),
+                          key_fp=(key_fp or None) and str(key_fp)[:32]))
             s.commit()
     except Exception as exc:  # noqa: BLE001 - accounting never breaks a run
         print(f"[llm-usage] call not recorded: {exc}")
@@ -682,6 +765,27 @@ def record_run_finish(run_id: str, status: str, artifacts_path: str | None = Non
             run.summary = (summary or "")[:4000]
             run.finished_at = _dt2.datetime.now(_dt2.timezone.utc)
             s.commit()
+
+
+def run_statuses(user_id: int, run_ids: "list[str]") -> "dict[str, str]":
+    """``{run_id: status}`` for this user's runs among ``run_ids`` (``running``, ``done``,
+    ``cancelled``, ``error``, ``interrupted``); a run of another user, or with no row, is left out."""
+    ids = [r for r in dict.fromkeys(run_ids) if r]
+    if not ids:
+        return {}
+    with session_scope() as s:
+        rows = s.execute(select(Run.run_id, Run.status).where(Run.user_id == user_id,
+                                                              Run.run_id.in_(ids))).all()
+    return {str(r): str(st or "") for r, st in rows}
+
+
+def active_run_count() -> int:
+    """Runs the live gateway has in progress: rows still ``running`` (a run waiting for its plan to
+    be approved included). The startup closes rows a dead process left behind
+    (:func:`mark_interrupted_runs`), so every one counted here belongs to the process that is up,
+    and a restart would interrupt it. The deploy waits while this is not 0."""
+    with session_scope() as s:
+        return int(s.scalar(select(func.count()).select_from(Run).where(Run.status == "running")) or 0)
 
 
 def mark_interrupted_runs() -> int:

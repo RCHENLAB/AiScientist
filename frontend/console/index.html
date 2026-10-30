@@ -404,6 +404,9 @@
               </div>
               <p class="page-sub">Tokens and estimated cost by account, model and day. No key, prompt or answer is stored with these figures. The Claude Console is the authoritative record of what each key spent.</p>
               <div id="adminUsageBody"><div class="empty-hint">Loading…</div></div>
+              <h3>API keys</h3>
+              <p class="page-sub">Every API key on this server, saved or for one session only, as its owner sees it (never the key). Pause stops every use of a key at its next model call; the owner is told, and only an administrator can resume it. The spike check pauses a key on its own when its last hour far exceeds its usual use.</p>
+              <div id="adminKeysBody"><div class="empty-hint">Loading…</div></div>
             </div>
           </div>
         </section>
@@ -704,6 +707,7 @@
         <label>Label <span class="hint-inline">optional</span>
           <input id="apiKeyLabel" type="text" placeholder="My DeepSeek" autocomplete="off" />
         </label>
+        <label class="check" id="apiKeySessionRow"><input id="apiKeySessionOnly" type="checkbox" /> Use for this browser session only — don't save the key <span class="hint-inline" id="apiKeySessionHint">kept in the server's memory until you log out or leave it unused for 12 hours</span></label>
         <p id="apiKeyError" class="login-error hidden"></p>
         <div class="btn-row">
           <button id="apiKeySave" type="submit" class="primary">Verify &amp; save</button>

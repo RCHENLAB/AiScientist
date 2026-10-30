@@ -3,6 +3,32 @@ name: variant_annotation
 description: Interpret a VCF's variants (germline/somatic, WGS/WES) — gene + functional consequence (Ensembl VEP), ClinVar pathogenicity, gnomAD frequency, deleteriousness (CADD/REVEL/AlphaMissense) + splice disruption (SpliceAI), then prioritise. Rare-disease known-gene-first (IRD). Offline, WGS-scale.
 tools: annotate_variants, run_code, literature_search
 data_type: variants
+outputs:
+  - path: tables/variant_annotation.tsv
+    kind: table
+    tool: annotate_variants
+    description: One row per annotated variant with gene, location, rsID, consequence, impact, ClinVar significance, gnomAD allele frequency, SIFT and PolyPhen, and predictor scores where they are configured.
+    required: true
+  - path: tables/variant_consequence_distribution.csv
+    kind: table
+    tool: annotate_variants
+    description: Number and percentage of annotated variants per functional consequence.
+    required: true
+  - path: tables/variant_clinical_significance.csv
+    kind: table
+    tool: annotate_variants
+    description: Number and percentage of annotated variants per ClinVar clinical significance, with not_in_clinvar for variants ClinVar does not list.
+    required: true
+  - path: tables/clinvar_pathogenic_variants.csv
+    kind: table
+    tool: annotate_variants
+    description: The ClinVar pathogenic and likely pathogenic variants with gene, position, rsID and significance, a header only when there are none.
+    required: false
+  - path: tables/high_priority_variants.csv
+    kind: table
+    tool: annotate_variants
+    description: Rare variants not in ClinVar that are high impact, predicted deleterious or IRD-flagged, ranked, at most 50, a header only when there are none.
+    required: false
 ---
 
 Germline/somatic **variant annotation** protocol. Use when the input is a **VCF** (variant calls,

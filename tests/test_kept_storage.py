@@ -14,7 +14,7 @@ import json
 import types
 import zipfile
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
@@ -277,7 +277,7 @@ def test_saving_a_result_kept_on_hpc3_copies_it_back_in_the_background(kept, tmp
     conn = _live(gw, tmp_path, monkeypatch)
     try:
         run_id, name = "fedcba987654", "s2.cellqc.20261018-1200.fedcba987654"
-        src = f"{gw._temp_base(conn)}/analysis/{run_id}/result/cellqc"
+        src = f"{gw._run_home(conn, run_id).dir('analysis')}/result/cellqc"
         conn.executor.files.update({f"{src}/report.html": b"<html>", f"{src}/lib1/obs.csv": b"cell,qc\n"})
         from aiscientist.tools.api import CELLQC_RESULT_POINTER
         pointer = gw.CONSOLE_RUNS_DIR / "tester" / run_id / "artifacts" / "data" / CELLQC_RESULT_POINTER

@@ -83,6 +83,28 @@ def sha256_text(text: str) -> str:
 
 _UNSET = object()                       # sentinel: git_sha not yet computed
 _git_sha_cache: str | None | object = _UNSET
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def read_version_file(path: Path) -> dict[str, str]:
+    """``KEY=value`` lines of a release package's ``VERSION`` file; {} when it is missing."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            out[key.strip()] = value.strip()
+    return out
+
+
+def release_version() -> dict[str, str]:
+    """The running release package's ``VERSION`` (``tag``, ``sha``, ``built_at``), written by
+    ``.github/workflows/release.yml`` and installed by ``deploy/deploy_release.sh``; {} for an
+    rsync deploy or a checkout."""
+    return read_version_file(_REPO_ROOT / "VERSION")
 
 
 def git_sha() -> str | None:
@@ -90,19 +112,23 @@ def git_sha() -> str | None:
 
     Prefers the ``.deployed_sha`` marker the rsync deploy writes at the repo root: on the
     server the checked-in ``.git`` is a stale, rsync-frozen relic (or absent) that would
-    report the WRONG commit, so the marker is the only truthful source. Falls back to a live
-    ``git rev-parse HEAD`` for a real checkout (dev). None if neither is available."""
+    report the WRONG commit, so the marker is the only truthful source. A release package has
+    no marker and no ``.git``: its ``VERSION`` file names the commit. Falls back to a live
+    ``git rev-parse HEAD`` for a real checkout (dev). None if none is available."""
     global _git_sha_cache
     if _git_sha_cache is not _UNSET:     # already resolved (incl. cached None)
         return _git_sha_cache  # type: ignore[return-value]
     sha: str | None = None
-    # 1. deploy marker (repo root / .deployed_sha) — first token is the deployed SHA.
+    # 1. deploy marker (repo root / .deployed_sha) — first token is the deployed SHA;
+    #    else the release package's VERSION sha.
     try:
-        marker = Path(__file__).resolve().parents[3] / ".deployed_sha"
+        marker = _REPO_ROOT / ".deployed_sha"
         if marker.is_file():
             tokens = marker.read_text(encoding="utf-8", errors="replace").split()
             if tokens:
                 sha = tokens[0] or None
+        if sha is None:
+            sha = release_version().get("sha") or None
     except Exception:
         sha = None
     # 2. live git checkout (dev, or any tree with no marker).

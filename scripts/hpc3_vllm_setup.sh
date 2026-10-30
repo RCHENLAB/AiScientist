@@ -16,7 +16,7 @@ for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGEN
 
 BASE="${AISCIENTIST_LAB_BASE:-/dfs3b/ruic20_lab/software/AiScientist}"
 IMAGE="${AISCIENTIST_VLLM_IMAGE:-$BASE/containers/vllm-0.28.0.sif}"
-HF="$BASE/hf"
+HF="$BASE/models/hf"
 MODEL="${AISCIENTIST_VLLM_MODEL:-RedHatAI/Qwen3.8-27B-INT4}"
 VLLM_IMG="${VLLM_DOCKER:-docker://vllm/vllm-openai:v0.28.0}"
 CT_MODULE="${AISCIENTIST_CONTAINER_MODULE:-apptainer/1.4.5}"

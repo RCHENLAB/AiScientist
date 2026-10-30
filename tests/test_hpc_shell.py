@@ -183,12 +183,23 @@ def test_an_approved_destructive_command_runs_and_the_prompt_carries_the_exact_c
     assert seen[0].reversible is False
 
 
-def test_a_write_outside_the_workspace_asks_even_without_a_destructive_verb():
-    seen: list[ConfirmRequest] = []
-    sh = _shell(confirm=lambda r: seen.append(r) or True)
-    sh.run_shell("echo hi > /etc/motd")
-    assert seen and seen[0].kind == "write_outside"
-    assert "/etc/motd" in seen[0].summary
+@pytest.mark.parametrize("command", [
+    "echo hi > /etc/motd",
+    f"rm -rf {HOME}/data",                                   # the home directory
+    "cp results.csv ~/results.csv",                          # ~ is the home directory too
+    f"mv {TEMP}/a.bam /dfs3b/ruic20_lab/alice/a.bam",        # a member's personal lab folder
+    f"echo x >> {SHARED_RO}/analysis.sif",                   # a shared asset
+])
+def test_a_write_outside_the_aiscientist_folder_is_refused_without_asking(command):
+    """Yijun, 2026-10-25: the agent never deletes or rewrites anything outside its AiScientist
+    folder, and this is not a question for the user: no confirmation, no run."""
+    sh = _shell(confirm=lambda r: pytest.fail(f"must not ask: {r.summary}"))
+    sh.workspace = HpcWorkspace(read_roots=(HOME, TEMP, SHARED_RO), write_roots=(TEMP,))
+    out = sh.run_shell(command)
+    assert out["status"] == "refused" and "outside the folders this session may write" in out["reason"]
+    assert "cannot approve" in out["reason"]
+    assert sh.worker_calls == [], "a refused command must not run"
+    assert sh.audit()[-1]["refused"]["kind"] == "write_outside"
 
 
 def test_writes_inside_the_workspace_do_not_interrupt_the_user():
@@ -310,7 +321,7 @@ def test_no_session_means_no_tools_rather_than_broken_tools():
 def test_catalog_exposes_the_expected_tools():
     names = {t.name for t in hs.hpc_shell_catalog(_shell())}
     assert names == {"list_dir", "stat_path", "find_files", "read_text", "disk_usage",
-                     "run_shell", "fetch_url", "install_package"}
+                     "find_software", "run_shell", "fetch_url", "install_package"}
 
 
 def test_worker_backed_tools_declare_their_dependency():
@@ -351,7 +362,7 @@ def test_the_shared_model_dirs_are_readable_but_never_writable(monkeypatch):
     monkeypatch.setattr(hs_mod, "HpcWorkspace", _WS)
     monkeypatch.setattr(gw_app, "_hpc_user", lambda _c: "tester")
     # mock=False: _build_hpc_shell returns None for a mock session before it builds any roots.
-    conn = types.SimpleNamespace(settings=st, executor=object(), mock=False,
+    conn = types.SimpleNamespace(id="s1", settings=st, executor=object(), mock=False,
                                  emit=lambda *a, **k: None, workspace=None)
     try:
         gw_app._build_hpc_shell(conn, None)
@@ -412,3 +423,213 @@ def test_a_command_that_failed_on_its_own_is_not_run_again(err):
     sh = HpcShell(remote=FakeRemote(), workspace=HpcWorkspace(read_roots=(HOME,), write_roots=(HOME,)),
                   home=HOME, worker_provider=object, run_on_worker=run_on_worker)
     assert not sh._worker("false").ok and calls == ["false"]
+
+
+# --- the fixed AiScientist folder and the shell sandbox ------------------------
+# docs/environments/README.md §5. The textual check above explains a refusal early; the boundary is
+# run_shell's Apptainer sandbox, where only the AiScientist folders are mounted writable.
+
+def test_downloads_default_to_the_aiscientist_folder_and_never_the_home_directory():
+    sh = _shell()
+    sh.workspace = HpcWorkspace(read_roots=(HOME, TEMP), write_roots=(TEMP,))
+    out = sh.fetch_url("https://ftp.ensembl.org/pub/x.gtf.gz")
+    assert out["dest_dir"] == f"{TEMP}/downloads"
+    with pytest.raises(HpcShellError, match="inside your AiScientist folder"):
+        sh.fetch_url("https://ftp.ensembl.org/pub/x.gtf.gz", dest_dir=HOME)
+
+
+def _sandboxed(network=True, **kw):
+    sh = _shell(**kw)
+    sh.workspace = HpcWorkspace(read_roots=(HOME, TEMP, SHARED_RO), write_roots=(TEMP,))
+    sh.sandbox = hs.ShellSandbox(image=f"{SHARED_RO}/rockylinux_9.7.20251123.sif",
+                                 container_module="apptainer/1.4.5", network=network)
+    return sh
+
+
+def test_run_shell_runs_inside_the_sandbox_with_only_the_aiscientist_folder_writable():
+    sh = _sandboxed()
+    out = sh.run_shell("module load samtools/1.15.1 && samtools --version")
+    (script,) = sh.worker_calls
+    assert out["sandbox"] == "apptainer" and out["status"] == "ok"
+    assert "module load apptainer/1.4.5" in script
+    assert "exec apptainer exec --containall --no-mount bind-paths --home" in script
+    assert "--net --network none" not in script                    # network per AISCIENTIST_SANDBOX_NETWORK
+    assert f"B+=(-B {TEMP}:{TEMP})" in script                       # the only writable mount
+    assert f"B+=(-B {HOME}:{HOME}:ro)" in script                    # the home directory: read-only
+    for host in ("/opt/apps", "/opt/rcic", "/usr"):
+        assert f"B+=(-B {host}:{host}:ro)" in script                # RCIC modules work, read-only
+    assert f"--home {TEMP}/shell-home --pwd {TEMP}" in script       # ~ inside is in the folder
+    assert 'APPTAINERENV_USER="${USER:-$(id -un)}"' in script      # RCIC module files need USER
+    assert "samtools --version" in script
+    assert sh.sandbox.image_ref in script                          # pulled on the worker on first use
+
+
+def test_without_network_the_sandbox_is_offline_and_a_workdir_becomes_its_cwd():
+    sh = _sandboxed(network=False)
+    sh.run_shell("ls", workdir=f"{TEMP}/run1")
+    (script,) = sh.worker_calls
+    assert "--net --network none" in script and f"--pwd {TEMP}/run1" in script
+
+
+def test_the_sandbox_script_passes_the_command_through_unchanged(tmp_path):
+    """Run the generated script with a stand-in `apptainer` that prints its arguments: the binds,
+    the flags and the user's command (quotes and all) must arrive exactly."""
+    import json
+    import os
+    import shutil
+    import subprocess
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not installed")
+    ro, rw = tmp_path / "home", tmp_path / "aiscientist" / "Temp" / "alice"
+    ro.mkdir()
+    image = tmp_path / "rocky.sif"
+    image.write_bytes(b"sif")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "apptainer").write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+    (fake / "apptainer").chmod(0o755)
+    command = """awk '{print $1}' "a b.txt" > out.txt; echo 'done'"""
+    script = hs.ShellSandbox(image=str(image), host_ro=()).wrap(
+        command, read_only=(str(ro),), writable=(str(rw),), home=f"{rw}/shell-home", cwd=str(rw))
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                          env={**os.environ, "PATH": f"{fake}:{os.environ['PATH']}", "MODULEPATH": "/m"})
+    assert done.returncode == 0, done.stderr
+    argv = json.loads(done.stdout)
+    assert argv[:4] == ["exec", "--containall", "--no-mount", "bind-paths"]
+    assert ["-B", f"{ro}:{ro}:ro"] == argv[argv.index(f"{ro}:{ro}:ro") - 1:argv.index(f"{ro}:{ro}:ro") + 1]
+    assert f"{rw}:{rw}" in argv and rw.is_dir() and (rw / "shell-home").is_dir()
+    assert argv[argv.index("--home") + 1] == f"{rw}/shell-home" and argv[argv.index("--pwd") + 1] == str(rw)
+    assert argv[-4:-1] == [str(image), "/bin/bash", "-c"]
+    assert argv[-1].endswith("\n" + command), "the command reaches the sandbox exactly as written"
+
+
+def test_the_gateway_gives_the_agent_only_the_aiscientist_folders_and_a_sandboxed_shell(monkeypatch):
+    """`_build_hpc_shell`: the home directory is readable but not writable; every writable root is
+    under the AiScientist root; run_shell gets the sandbox unless switched off."""
+    import types
+    from aiscientist.gateway import app as gw_app
+    from aiscientist.gateway.settings import HPCSettings
+    from aiscientist.hpc import shell as hs_mod
+
+    captured: dict = {}
+
+    class _Shell:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(hs_mod, "HpcShell", _Shell)
+    monkeypatch.setattr(gw_app, "_hpc_user", lambda _c: "tester")
+    monkeypatch.setattr(gw_app, "_hpc_home", lambda _c: "/data/homezvol3/tester")
+    st = HPCSettings()
+    conn = types.SimpleNamespace(id="s1", settings=st, executor=object(), mock=False,
+                                 emit=lambda *a, **k: None, workspace=None)
+    gw_app._build_hpc_shell(conn, None)
+    ws = captured["workspace"]
+    assert "/data/homezvol3/tester" in ws.read_roots
+    assert "/data/homezvol3/tester" not in ws.write_roots
+    shared = st.shared_root.rstrip("/")
+    # This session's folder first (the shell's HOME and downloads), then the retired layout's
+    # Temp/<user> (a run continued from before session folders) and uploads/<user>.
+    assert ws.write_roots == (f"{shared}/sessions/s1", f"{shared}/Temp/tester", f"{shared}/uploads/tester")
+    assert not any(r.startswith(f"{shared}/sessions/") and r != f"{shared}/sessions/s1" for r in ws.write_roots)
+    sb = captured["sandbox"]
+    assert sb is not None and sb.image == f"{shared}/containers/rockylinux_9.7.20251123.sif"
+    assert sb.container_module == st.container_module
+
+    captured.clear()
+    monkeypatch.setenv("AISCIENTIST_SHELL_SANDBOX", "0")
+    gw_app._build_hpc_shell(conn, None)
+    assert captured["sandbox"] is None
+
+
+
+# --- software: HPC3's module catalog (hpc/modules.py) ------------------------------------------
+
+_MODULE_CATALOG = "\n".join([
+    "M\tBIOTOOLS\tbedtools2/2.29.2\tBedtools2 utilities are a swiss-army knife of tools",
+    "M\tBIOTOOLS\tbedtools2/2.30.0\tBedtools2 utilities are a swiss-army knife of tools",
+    "C\tbedtools2/2.30.0\tbedtools",
+    "M\tLANGUAGES\tR/4.5.2\tR is a freely available language and environment for statistical computing.",
+    "C\tR/4.5.2\tRscript",
+])
+
+
+@pytest.fixture
+def module_shell(monkeypatch):
+    from aiscientist.hpc import modules
+    monkeypatch.setattr(modules, "_CACHE", {})
+    remote = FakeRemote(rules=[(r"modulefiles", _MODULE_CATALOG, "", 0)])
+    return _shell(remote)
+
+
+def _tool(sh, name):
+    return next(t for t in hs.hpc_shell_catalog(sh) if t.name == name)
+
+
+def test_find_software_answers_on_the_login_node_and_reads_the_catalog_once(module_shell):
+    sh = module_shell
+    out = _tool(sh, "find_software").executor({"name": "bedtools"}, None)
+    assert out["status"] == "ok" and out["modules"][0]["load"] == "bedtools2/2.30.0"
+    assert out["modules"][0]["matched_by"] == "program `bedtools`"
+    assert "run_shell" in out["how_to_use"]
+    sh.find_software("Rscript")
+    assert sum("modulefiles" in c for c in sh.remote.cmds) == 1      # cached for the next search
+    assert sh.worker_calls == []                                     # no allocation for a lookup
+    assert "find_software" not in {t.name for t in hs.hpc_shell_catalog(sh) if "hpc_worker" in t.requires}
+
+
+def test_find_software_says_what_to_do_when_nothing_provides_it(module_shell):
+    out = module_shell.find_software("mosdepth")
+    assert out["status"] == "not_found" and "do not hand-write a replacement" in out["next"]
+
+
+def test_find_software_reports_an_unreadable_catalog(monkeypatch):
+    from aiscientist.hpc import modules
+    monkeypatch.setattr(modules, "_CACHE", {})
+    sh = _shell(FakeRemote(rules=[(r"modulefiles", "", "Permission denied", 1)]))
+    assert sh.find_software("bedtools")["status"] == "error"
+    with pytest.raises(HpcShellError):
+        sh.find_software("  ")
+
+
+def test_a_failed_run_shell_names_the_module_it_lacked(module_shell):
+    sh = module_shell
+    sh.run_on_worker = lambda alloc, cmd, t: ExecResult(cmd, 127, "", "bash: line 1: bedtools: command not found")
+    out = sh.run_shell(f"bedtools intersect -a {TEMP}/a.bed -b {TEMP}/b.bed")
+    assert out["status"] == "failed"
+    note = out["missing_software"][0]
+    assert note["name"] == "bedtools" and note["modules"] == ["bedtools2/2.30.0"]
+    assert "module load bedtools2/2.30.0 && bedtools" in note["hint"]
+
+
+def test_a_successful_or_unrelated_failure_does_not_read_the_catalog(module_shell):
+    sh = module_shell
+    assert "missing_software" not in sh.run_shell(f"ls {TEMP}")
+    sh.run_on_worker = lambda alloc, cmd, t: ExecResult(cmd, 2, "", "ls: cannot access 'x': No such file")
+    assert "missing_software" not in sh.run_shell(f"ls {TEMP}/x")
+    assert not any("modulefiles" in c for c in sh.remote.cmds)
+
+
+def test_a_failed_run_code_snippet_names_the_module_it_lacked(module_shell):
+    from aiscientist.agents.research_lab import make_run_code_tool
+    from aiscientist.agents.research_harness import HarnessContext
+
+    def sandbox(code):
+        return {"status": "error", "stderr": "bash: line 1: Rscript: command not found", "returncode": 127}
+
+    note_fn = lambda text: module_shell.missing_software_note(text, "run_code")  # noqa: E731
+    tool = make_run_code_tool(sandbox, software_note=note_fn)
+    out = tool.executor({"code": "import subprocess; subprocess.run('Rscript x.R', shell=True)"},
+                        HarnessContext())
+    note = out["missing_software"][0]
+    assert note["modules"] == ["R/4.5.2"] and "run_shell" in note["hint"]
+    assert "find_software" in tool.description
+
+    ok = make_run_code_tool(lambda code: {"status": "ok", "stdout": "fine"}, software_note=note_fn)
+    assert "missing_software" not in ok.executor({"code": "print(1)"}, HarnessContext())
+
+    def broken(_text):
+        raise RuntimeError("catalog bug")
+
+    survives = make_run_code_tool(sandbox, software_note=broken)
+    assert survives.executor({"code": "print(1)"}, HarnessContext())["status"] == "error"

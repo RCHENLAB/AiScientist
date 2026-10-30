@@ -65,15 +65,16 @@ def test_leaving_the_directory_out_is_an_error_not_a_file_in_the_home_directory(
 # --- the gateway: one function names the directory, for every job line --------------------------
 
 
-def test_the_gateway_puts_job_files_under_the_swept_temp_area():
+def test_the_gateway_puts_job_files_in_the_sessions_folder():
     pytest.importorskip("fastapi")      # gateway.app needs it; CI installs it only for app tests
     from aiscientist.gateway import app as gw
 
-    conn = types.SimpleNamespace(executor=types.SimpleNamespace(username="tester"), owner="tester",
-                                 settings=HPCSettings())
+    conn = types.SimpleNamespace(id="s1", executor=types.SimpleNamespace(username="tester"), owner="tester",
+                                 settings=HPCSettings(), run_homes={})
     for kind in JOB_LINES:
         path = gw._scratch_dir(conn, kind)
-        assert path == f"{SHARED_ROOT}/Temp/tester/scratch/{kind}"
+        assert path == f"{SHARED_ROOT}/sessions/s1/jobs/{kind}"
+        assert gw._scratch_dir(conn, kind, run_id="r1") == f"{SHARED_ROOT}/sessions/s1/runs/r1/jobs/{kind}"
         assert path.startswith("/") and "$" not in path     # Slurm expands nothing in --output
         assert not path.startswith(gw._storage_base(conn) + "/")    # nor the personal lab folder
 
@@ -105,7 +106,7 @@ def test_the_report_renderer_the_gateway_builds_writes_under_temp(tmp_path):
     conn.executor = types.SimpleNamespace(username="tester")
     fn = gw._build_report_render_fn(conn)
     assert isinstance(fn, SlurmReportRenderer)
-    assert fn.scratch_dir == f"{SHARED_ROOT}/Temp/tester/scratch/report"
+    assert fn.scratch_dir == f"{SHARED_ROOT}/sessions/{conn.id}/jobs/report"
 
 
 # --- scGPT and the render review: the script goes beside the job's log --------------------------

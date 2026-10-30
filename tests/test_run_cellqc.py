@@ -716,6 +716,93 @@ def test_the_router_attaches_the_installed_skill_and_records_it(tmp_path, delive
     assert config["geneset"] == _skill_settings()["genesets"]["mouse"]
     doc = json.loads((ws / "manifest.json").read_text())
     assert any(s["name"] == "qc-snrna-with-cellqc-standalone" for s in doc["skills"])
+    assert _version_counts() == [_counted(1, 0)]
+
+
+# -- a call counts for the CellQC skill's version (RCHENLAB/AiScientist issue 30) ----------------
+# Prod's skill_versions.sqlite3 had no row for the CellQC skill after 15 run_cellqc calls: the
+# platform recorded the skill in each run's manifest.json but counted only run_code and
+# run_in_environment calls.
+
+def _version_counts() -> list:
+    import sqlite3
+    from aiscientist.agents.skills_registry import stats_path
+    if not stats_path().exists():
+        return []
+    with sqlite3.connect(stats_path()) as db:
+        return db.execute("SELECT release, name, version, success, error FROM skill_versions").fetchall()
+
+
+def _counted(success: int, error: int) -> tuple:
+    from aiscientist.agents.skills_registry import config
+    return (config()["release_tag"], "qc-snrna-with-cellqc-standalone", "1.2.0", success, error)
+
+
+def _routed_cellqc(results: list):
+    """The routed run_cellqc, its tool code replaced by one returning (or raising) ``results`` in
+    turn, and the arguments of each call that reached that code."""
+    import dataclasses
+    from aiscientist.agents.registry import _router
+    from aiscientist.tools import catalog
+    m = catalog.manifest("run_cellqc")
+    pending, calls = list(results), []
+
+    def run(args, ctx):
+        calls.append(args)
+        out = pending.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    return _router({})(m, dataclasses.replace(catalog.build(m), executor=run)), calls
+
+
+def test_each_call_counts_for_the_skill_version_it_ran(tmp_path, cellqc_release):
+    from aiscientist.tools import catalog
+    tool, calls = _routed_cellqc([{"status": "ok"}, {"status": "error", "error": "CellQC failed"},
+                                  {"status": "cancelled"}, RuntimeError("the job vanished")])
+    ctx = _ctx(tmp_path / "run", None)
+    assert tool.executor({}, ctx)["status"] == "ok"
+    assert calls[0][catalog.SKILL_ARG]["version"] == "1.2.0"
+    assert _version_counts() == [_counted(1, 0)]
+    assert tool.executor({}, ctx)["status"] == "error"
+    assert _version_counts() == [_counted(1, 1)]
+    tool.executor({}, ctx)                              # the user pressed Stop: no verdict
+    assert _version_counts() == [_counted(1, 1)]
+    with pytest.raises(RuntimeError):                   # the harness reports it; it is an error
+        tool.executor({}, ctx)
+    assert _version_counts() == [_counted(1, 2)]
+
+
+def test_a_plan_step_counts_once_like_its_run_code(tmp_path, cellqc_release):
+    from aiscientist.agents.skills_registry import step_scope
+    tool, _ = _routed_cellqc([{"status": "error", "error": "bad threshold"}, {"status": "ok"},
+                              {"status": "error", "error": "CellQC failed"}])
+    ctx = _ctx(tmp_path / "run", None)
+    with step_scope(step="Run CellQC on every library"):
+        tool.executor({}, ctx)                          # the Critic's revision of the same step
+        tool.executor({}, ctx)
+    assert _version_counts() == [_counted(1, 0)]
+    with step_scope(step="QC the second cohort"):
+        tool.executor({}, ctx)
+    assert _version_counts() == [_counted(1, 1)]
+
+
+def test_a_failed_cellqc_run_counts_as_an_error(tmp_path, cellqc_release):
+    from aiscientist.agents.registry import _router
+    from aiscientist.tools import catalog
+    m = catalog.manifest("run_cellqc")
+    tool = _router({})(m, catalog.build(m))
+    out = tool.executor({}, _ctx(tmp_path / "run", tmp_path / "no-such-delivery"))
+    assert out["status"] == "error", out
+    assert _version_counts() == [_counted(0, 1)]
+
+
+def test_a_skill_that_cannot_be_used_counts_nothing(tmp_path, skill_release):
+    tool, calls = _routed_cellqc([{"status": "ok"}])    # no release installed: no CellQC skill
+    out = tool.executor({}, _ctx(tmp_path / "run", None))
+    assert out["status"] == "error" and "not installed" in out["error"]
+    assert calls == [] and _version_counts() == []
 
 
 def test_unusable_skill_settings_stop_the_run_with_a_clear_error(tmp_path, delivery, fake_cellqc):

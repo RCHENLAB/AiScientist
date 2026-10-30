@@ -126,7 +126,7 @@ cat <<EOF
   AISCIENTIST_LIRICAL_EXOMISER_HG38=${EXOMISER_DIR}/${EXOMISER_DATA_VERSION}_hg38
   AISCIENTIST_UPLOADS_ON_HPC=1            # so the VCF lands on dfs3b and is scored in place
 
-The AiScientist TOOLS are synced to <lab_storage>/<user>/pysrc by the gateway and bind-mounted in -- a
+The AiScientist TOOLS are synced to <shared_root>/sessions/<session>/app by the gateway and bind-mounted in -- a
 tool edit needs only a code deploy, NOT an image rebuild. If HPC is unreachable (or LIRICAL is not
 staged), the phenotype step reports not_installed and the run continues without the differential.
 EOF

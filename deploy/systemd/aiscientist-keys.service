@@ -1,0 +1,46 @@
+# systemd unit for the AiScientist key service: the one process that holds users' API keys and makes
+# the model calls with them (src/aiscientist/gateway/key_service.py). It runs as its own account,
+# aiscientist-keys, so the web server's account (aiscientist), which also runs the agents' tools,
+# cannot read the keys. Installed by deploy/keys/install_key_service.sh, which fills in @PYTHON@.
+#
+#     sudo systemctl restart aiscientist-keys.service
+#     journalctl -u aiscientist-keys -f
+
+[Unit]
+Description=AiScientist key service (holds users' API keys)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiscientist-keys
+Group=aiscientist-keys
+Environment=AISCIENTIST_STATE_DIR=/var/lib/aiscientist-keys
+Environment=AISCIENTIST_KEY_SERVICE_TOKEN_FILE=/etc/aiscientist-keys/token
+# An hour longer than the web server's own idle limit, so the web server's expiry is the one users see.
+Environment=AISCIENTIST_SESSION_KEY_IDLE_HOURS=13
+Environment=PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/var/lib/aiscientist-keys
+ExecStart=@PYTHON@ -m aiscientist.gateway.key_service --host 127.0.0.1 --port 8899
+Restart=always
+RestartSec=2
+StateDirectory=aiscientist-keys
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aiscientist-keys
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

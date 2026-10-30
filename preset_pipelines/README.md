@@ -36,6 +36,12 @@ name: <the folder name; also the key the console sends>
 description: <one line: shown in the console, and what the router reads to pick a pipeline>
 tools: <comma-separated tools this protocol composes>
 data_type: scrna        # or: variants. Leave it out for a protocol that fits any data.
+outputs:                # the deliverables of its tool steps, each named with the tool that writes it
+  - path: tables/de_*_all.csv
+    kind: table         # table, figure, h5ad, json, report_section or folder
+    tool: run_de
+    description: One row per gene and group with log2 fold change and adjusted p-value.
+    required: true      # true only when the tool always writes it on success
 ---
 
 <The guidance: when this protocol applies, the ordered steps and the tool each one uses, and the
@@ -51,7 +57,10 @@ Add the folder and restart the gateway: pipelines are loaded when it starts. No 
 `AISCIENTIST_PIPELINES_DIR` points the loader at another directory.
 
 `tests/test_pipeline_library.py` checks that every folder has both files, that `name` equals the
-folder name, and that `tools` lists only tools that exist.
+folder name, and that `tools` lists only tools that exist. `tests/test_skill_outputs.py` checks
+that every pipeline declares valid `outputs`, each naming one of its `tools`. A plan step that runs
+the named tool shows the entry on the plan card and is checked for it after the step (see
+[Declared outputs](../docs/skills_and_pipelines_architecture.md#declared-outputs)).
 
 ## Writing one
 

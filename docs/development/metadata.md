@@ -53,6 +53,7 @@ reference for the parts a contributor touches.
 | A server folder or file is bound | The dataset row (`source: server`) | same |
 | A run finishes (research run or corpus scan) | The run's result | `metadata_records` (`kind: result`), and `croissant.json` in the run's bundle |
 | "Save to my data" on a run's result | The saved dataset, derived from the result | `metadata_records` and a `saved_from` lineage link |
+| A run first reads one of the account's datasets | Its description, `DATASET.md` (below) | `metadata_records.description`, and `data/DATASET.md` in the run's bundle |
 | The gateway starts, then weekly | Rows that predate their metadata get drafted; every document is rebuilt and validated | same |
 
 Accounts must be on for the registry. Without accounts, a run still writes `croissant.json` into
@@ -104,6 +105,34 @@ The `aiscientist:` prefix is this page:
 | `aiscientist:parameters` | `prov:Activity` | JSON list: `{step, tool, args}` for each tool call of an accepted step; code and free text are left out, and paths are cut to the file name |
 | `aiscientist:status` | `prov:Activity` | `done`, `incomplete` or `failed` |
 
+## The dataset description (DATASET.md)
+
+`croissant.json` is for machines; `DATASET.md` says the same in prose, for people. The PI writes it
+the first time a run reads one of the account's datasets, before the plan is drafted, in eight
+sections modelled on a *Scientific Data* Data Descriptor with the fields MINSEQE and the CELLxGENE
+schema ask for: Summary, Biological source, Experimental design, Assay and processing, Data
+records, Quality and caveats, What the data supports, About this description.
+
+- **Every number is read from the data.** The counts, levels, per-group medians, file sizes and
+  checksums come from the run-start profile and the registry record, written in code. The PI's
+  reading (one model call) is marked *inferred*; a statement of it that gives a number the profile
+  does not hold is left out, and the last section says how many were.
+- **Each statement is marked** *read from the data*, *inferred* or *entered by the owner* (the
+  review form). A field the data does not establish says *not recorded*.
+- **One source with `croissant.json`.** The record (`MetadataRecord.description`) keeps the profile
+  the PI read and its statements; `DATASET.md` and `croissant.json` are both built from it, with the
+  facts and the review form as they are now. The organism and tissue the profile establishes are
+  the document's drafted `about` terms, and its `description`, when the owner wrote none, is the
+  summary of `DATASET.md`.
+- **The owner can edit it** below the dataset's preview on the Files page. The edit is kept as
+  written: a later run reads it and never writes over it, and it becomes the croissant
+  `description`. Restoring the PI's version drops the edit.
+- **Later runs read it** instead of writing it again; the PI writes it again only when the data has
+  changed (a different file list, size or checksum) and the owner has not edited it.
+
+`src/aiscientist/metadata/description.py` builds and renders it; `research_lab._describe_dataset`
+writes or reads it at the start of a run.
+
 ## Where the code is
 
 | Path | What it does |
@@ -132,6 +161,10 @@ entered in the form, where it is kept as a label with no ID.
 | `GET /api/results/{run-id-or-uuid}/metadata`, `.../croissant.json` | The same for a run's result |
 | `GET /api/metadata/{uuid}/lineage?direction=upstream\|downstream\|both&depth=3` | Returns the lineage graph |
 | `GET /api/metadata/vocabulary` | Returns the form's ontology choices and licenses |
+| `GET /api/datasets/{id-or-uuid}/description` | Returns the dataset's `DATASET.md`, whose it is (`pi`, `owner` or `none`), and whether the data changed since |
+| `PUT /api/datasets/{id-or-uuid}/description` | Saves the owner's edit (`{"markdown": ...}`) |
+| `DELETE /api/datasets/{id-or-uuid}/description/edit` | Drops the owner's edit |
+| `GET /api/datasets/{id-or-uuid}/DATASET.md` | Returns the Markdown file |
 | `GET/POST/DELETE /api/account/tokens` | Lists, makes or revokes personal access tokens for MCP clients |
 
 ## MCP server

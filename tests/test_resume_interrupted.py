@@ -294,7 +294,9 @@ def test_checkpoints_of_a_run_that_analysed_on_hpc3_are_found_there(gw, tmp_path
     r = _post(gw, {"connection_id": conn.id, "run_id": "78a707cd79e9", "resume_interrupted": True})
 
     assert r.status_code == 200, r.text
-    assert len(sent) == 1 and "/Temp/tester/analysis/78a707cd79e9/work/adata_*.h5ad" in sent[0]
+    # A run from before the session folders keeps its Temp/<user> checkpoints: found there first.
+    assert len(sent) == 2 and sent[0].startswith("test -d ") and "/Temp/tester/analysis/78a707cd79e9" in sent[0]
+    assert "/Temp/tester/analysis/78a707cd79e9/work/adata_*.h5ad" in sent[1]
 
 
 def test_a_run_whose_hpc3_checkpoints_were_swept_is_still_refused(gw, tmp_path, monkeypatch):

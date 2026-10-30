@@ -111,7 +111,7 @@ class SlurmAnalysisExecutor:
     # own loud fallbacks cover the gap.
     deps_dir: str | None = None
     # Where each job's script, args/result files and logs go. Required, with no default: the
-    # gateway passes a directory under <shared_root>/Temp/<user>/scratch/, never the user's home.
+    # gateway passes a directory in the session's folder (<shared_root>/sessions/<id>/...), never the user's home.
     scratch_dir: str = field(kw_only=True)
     entrypoint: str = f"python -m {ANALYSIS_ENTRYPOINT}"
     job_prefix: str = "bioagent_analysis"   # squeue job-name prefix (variant line overrides it)

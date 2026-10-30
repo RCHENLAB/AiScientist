@@ -11,7 +11,7 @@ import statistics
 import time
 from dataclasses import replace
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..tools import catalog
 from .db import session_scope
@@ -21,6 +21,9 @@ log = logging.getLogger(__name__)
 # A tool can submit several batch jobs; accounting belongs to that call, even with DAG threads.
 job_usage: contextvars.ContextVar[list | None] = contextvars.ContextVar("job_usage", default=None)
 FIELDS = ("seconds", "cpu_hours", "gpu_hours", "cost")
+HISTORY_RUNS = 30
+# A run faster than this share of the median did not do the same work, so it never sets the low end.
+LOW_OUTLIER = 0.2
 
 
 def profile(skill: str) -> dict:
@@ -68,17 +71,31 @@ def input_units(p: dict, inputs: dict) -> tuple[float, bool]:
 
 
 def history(skill: str) -> list[ComputeUsage]:
+    """Successful calls of ``skill`` in the ``HISTORY_RUNS`` runs that called it most recently."""
+    ok = (ComputeUsage.skill == skill, ComputeUsage.success.is_(True))
+    recent = (select(ComputeUsage.run_id).where(*ok).group_by(ComputeUsage.run_id)
+              .order_by(func.max(ComputeUsage.id).desc()).limit(HISTORY_RUNS))
     with session_scope() as db:
-        return list(db.scalars(select(ComputeUsage).where(
-            ComputeUsage.skill == skill, ComputeUsage.success.is_(True))
-            .order_by(ComputeUsage.id.desc()).limit(30)))
+        return list(db.scalars(select(ComputeUsage).where(*ok, ComputeUsage.run_id.in_(recent))))
+
+
+def per_run(rows: list) -> list:
+    """One observation per run, its slowest call per unit. A run's later calls of the same tool are
+    mostly re-runs that reuse earlier outputs (CellQC's Snakemake skips the rules already done), so
+    they are not separate measurements of the work."""
+    slowest = {}
+    for r in rows:
+        kept = slowest.get(r.run_id)
+        if r.units > 0 and (kept is None or r.seconds / r.units > kept.seconds / kept.units):
+            slowest[r.run_id] = r
+    return list(slowest.values())
 
 
 def estimate_skill(skill: str, inputs: dict, settings, *, previous=None) -> dict:
     p = profile(skill)
     units, unknown_size = input_units(p, inputs)
     factor = units / p.get("baseline", 1)
-    rows = history(skill) if previous is None else previous
+    rows = per_run(history(skill) if previous is None else previous)
     ranges = {key: [0.0, 0.0] for key in FIELDS}
     for step in p["steps"]:
         for i, minutes in enumerate(step["minutes"]):
@@ -89,10 +106,14 @@ def estimate_skill(skill: str, inputs: dict, settings, *, previous=None) -> dict
     # Resource hours are learned separately: elapsed time alone cannot predict changing allocations.
     if rows:
         for key in ("seconds", "cpu_hours", "gpu_hours"):
-            values = [getattr(r, key) / r.units * units for r in rows if r.units > 0]
+            values = [getattr(r, key) / r.units * units for r in rows]
             if values:
                 center = statistics.median(values)
-                ranges[key] = [min(min(values), center * .75), max(max(values), center * 1.5)]
+                # A far faster run (outputs reused, or stopped early while reporting success) does
+                # not set the low end. Ignoring a fast real run costs little: the low end stays at
+                # most 3/4 of the median.
+                typical = [v for v in values if v >= center * LOW_OUTLIER]
+                ranges[key] = [min(min(typical), center * .75), max(max(values), center * 1.5)]
     ranges["cost"] = [ranges["cpu_hours"][i] * settings.cpu_hour_rate
                       + ranges["gpu_hours"][i] * settings.gpu_hour_rate for i in range(2)]
     return {"skill": skill, **ranges, "rough": bool(p.get("rough")) or unknown_size or len(rows) < 3,

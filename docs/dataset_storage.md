@@ -65,11 +65,11 @@ connected. Nothing is written to HPC3 at upload time.
 HPC3's compute nodes cannot see the gateway host's disks. When a run's analysis or `run_code` runs on
 HPC3, every dataset bound to it from the account's dataset folder (and each bound server folder) is
 copied, at the start of the run, into the session's own area,
-`<HPC3 shared root>/Temp/<ucinetid>/server-data/<session>/` (see
+`<HPC3 shared root>/sessions/<session>/inputs/` (see
 [`hpc3_storage_layout.md`](hpc3_storage_layout.md)). The copy is incremental (a second run in the
 same session copies nothing) and resumable, and goes through the transfer host, not a login node.
 Tools on the gateway host read the original in place. The session's copies are removed when it
-disconnects, and the 3-day `Temp/` sweep removes those a session left without disconnecting; a run
+disconnects, and the sweep removes those a session left without disconnecting (after 3 days); a run
 continued in a later session copies its inputs again.
 
 Several bound folders are several samples: each is read as a folder (a Cell Ranger library in it is
@@ -79,17 +79,23 @@ in one step. A bound dataset the run cannot use is named to the planner with the
 ## Results
 
 A run's deliverables (report, figures, tables) come back to `analysis_results/` (or
-`AISCIENTIST_RESULTS_DIR`) after each step. Its processed dataset and CellQC's result folder are
-saved to the user's data when the run completes; until then they stay beside the run, on HPC3 for
-an HPC3 run. "Save to my data" on the Runs page does the same for a run whose save did not happen.
-Saving one makes it a dataset:
+`AISCIENTIST_RESULTS_DIR`) after each step. Its processed dataset and CellQC's result folder stay
+beside the run, on HPC3 for an HPC3 run, until the session ends: then they are copied into the run's
+folder here (`<results>/<account>/<run_id>/result/`), each file checked by size and its SHA-256
+recorded in `<run_id>/stage_out.json`, before the HPC3 folder is removed (what counts as a result,
+and how the removal checks it, is in [`hpc3_storage_layout.md`](hpc3_storage_layout.md)). They stay
+with the run until the run is deleted.
+
+They are saved to the user's data when the run completes if the run asked for it; "Save to my data"
+on the Runs page does the same later. Saving one makes it a dataset:
 
 - kept on HPC3: copied back in the background into a new `users/<account>/datasets/<uuid>/original/`,
   each file checked by size, and listed when it is all there. The request answers 202 at once, and
-  the console shows the copy's progress and says when the dataset is in Files → Datasets. The HPC3
-  copy goes with the run's other files, except when the copy home is still running or failed: then
-  the run's folder is kept at disconnect, so a later session can save it, until the 3-day sweep;
-- kept on the gateway host: moved there.
+  the console shows the copy's progress and says when the dataset is in Files → Datasets. At the
+  session's end the saved copy stands for the HPC3 file, which is not copied a second time. While
+  the copy home is still running or failed, the run's folder is kept at disconnect, and the next
+  connect brings it home;
+- kept on the gateway host (a run that computed here, or one whose session has ended): moved there.
 
 ## Moving existing datasets
 

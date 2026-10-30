@@ -600,7 +600,7 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
             str(_p(_TOOL, "chemistry", args)),
             [_chemistry(Path(lib["dir"])) for lib in members], "next_gem", "10x chemistry", warnings)
         if species not in settings["genesets"] or chemistry not in settings["doublet"]["rate"]:
-            done = {"error": (f"the CellQC skill's settings have no "
+            done = {"error": ("the CellQC skill's settings have no "
                               + (f"gene sets for {species}" if species not in settings["genesets"]
                                  else f"doublet rate for the {chemistry} chemistry")
                               + f" (it has {sorted(settings['genesets'])} and "

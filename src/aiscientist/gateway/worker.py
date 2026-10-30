@@ -40,6 +40,7 @@ offline against a scripted fake — no Slurm, no SSH.
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from dataclasses import dataclass
 
 from .errors import GatewayError
@@ -67,6 +68,16 @@ def job_name(username: str) -> str:
 def heartbeat_path(log_dir: str, name: str, job_id: str) -> str:
     """The file a holder watches: every command on it refreshes the file's mtime."""
     return f"{log_dir.rstrip('/')}/{name}-{job_id}.alive"
+
+
+def _stat_arg(log_dir: str, fname: str) -> str:
+    """One ``stat`` argument for a heartbeat file in ``log_dir``. A ``*`` in ``log_dir`` stays a
+    shell glob (each session keeps its worker files in its own folder, ``sessions/*/jobs/worker``);
+    everything else is quoted."""
+    head, star, tail = log_dir.rstrip("/").partition("*")
+    if not star:
+        return shlex.quote(f"{head}/{fname}")
+    return f"{shlex.quote(head)}*{shlex.quote(f'{tail}/{fname}')}"
 
 
 @dataclass
@@ -222,9 +233,9 @@ def sweep_stale_workers(executor: RemoteExecutor, *, log_dir: str, keep=(), stal
             jobs[jid.strip()] = _elapsed_s(elapsed)
     if not jobs:
         return []
-    beats = {heartbeat_path(log_dir, name, jid): jid for jid in jobs}
+    beats = {Path(heartbeat_path(log_dir, name, jid)).name: jid for jid in jobs}
     got = executor.exec("date +%s; stat -c '%n|%Y' "
-                        + " ".join(shlex.quote(p) for p in beats) + " 2>/dev/null")
+                        + " ".join(_stat_arg(log_dir, f) for f in beats) + " 2>/dev/null")
     lines = (getattr(got, "out", "") or "").splitlines()
     if not lines or not lines[0].strip().isdigit():
         return []                  # no clock to compare against: never cancel on a guess
@@ -232,8 +243,9 @@ def sweep_stale_workers(executor: RemoteExecutor, *, log_dir: str, keep=(), stal
     touched: dict[str, int] = {}
     for line in lines[1:]:
         path, _, mtime = line.strip().rpartition("|")
-        if path in beats and mtime.isdigit():
-            touched[beats[path]] = int(mtime)
+        jid = beats.get(path.rsplit("/", 1)[-1])
+        if jid and mtime.isdigit():
+            touched[jid] = max(touched.get(jid, 0), int(mtime))
     stale = []
     for jid, elapsed in sorted(jobs.items()):
         if jid in touched:

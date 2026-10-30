@@ -57,6 +57,39 @@ The loader reads both again before a step whenever their files changed, so a new
 release, or an induced skill added, edited or removed, takes effect at the next step of a running
 analysis, without a restart. A curated skill always wins over an induced skill of the same name.
 
+### Declared outputs
+
+A skill may list the files it should leave under `$AISCIENTIST_ARTIFACTS`, in its front matter, at
+the top level or under `metadata:` (there also as a JSON string, for a registry that keeps every
+metadata value a string):
+
+```yaml
+outputs:
+  - path: tables/de_*_vs_*.csv        # a path or glob under $AISCIENTIST_ARTIFACTS
+    kind: table                       # table, figure, h5ad, json, report_section or folder
+    description: One row per gene with log2 fold change, p-value and adjusted p-value.
+    required: true                    # the step is incomplete without it (true when left out)
+```
+
+`agents/skill_outputs.py` reads and checks the declaration; an entry it cannot use (an absolute
+path, `..`, an unknown kind, no description) is left out and the log says why. What the platform
+does with it:
+
+- **The agent** gets the outputs with the skill: `read_skill_reference` returns them, and the brief
+  of a step the plan assigned the skill to lists them.
+- **The plan** shows each step's expected outputs on its card, so the researcher sees what a step
+  will give before approving the plan.
+- **After the step** each declared output is looked for: a file matching the path, written or
+  copied back during this step, not empty (a table needs a data row), and for a figure not one flat
+  colour. A required output that is not there goes to the Critic, which may not accept the step;
+  after the revision budget the step ends unaccepted, and the technical report's Diagnostics name
+  the missing files.
+- **The results**: `process/declared_outputs.json` records each step's check. The Results panel
+  labels each matched file with its declared description and step, and the result's
+  `croissant.json` uses the description for that file.
+
+A skill without `outputs` works as before: nothing is checked and nothing is shown.
+
 ### How a skill reaches the model
 
 A skill's text enters the model's context only when a step uses it:
@@ -190,8 +223,9 @@ Successes and errors are counted per release, skill and version in one file for 
 `<AISCIENTIST_STATE_DIR>/skill_versions.sqlite3` (`AISCIENTIST_SKILLS_REGISTRY_STATS` overrides
 it), so a broken version can be found and the pin rolled back. A registry skill is counted once
 per plan step whose code ran its method: a `run_code` call that calls one of the skill's own
-functions (every call, for a skill whose code has none to find), or a `run_in_environment`
-command. The step is a success when one of those calls succeeded and an error when none did. A
+functions (every call, for a skill whose code has none to find), a `run_in_environment`
+command, or a call of a tool that runs the skill (`skill:` in its TOOL.md, such as `run_cellqc`).
+The step is a success when one of those calls succeeded and an error when none did. A
 step that only listed files or read what another step made is not counted. The attempts of one
 step are one use: a revision that succeeds turns the step's error into a success. Outside a plan
 step each call is counted as it ends. A call the user stops is not counted.
@@ -224,8 +258,10 @@ still reserves its name, so the same procedure is not learned twice.
 ## Pipelines
 
 A pipeline is a folder with a `SKILL.md` whose front matter gives `name`, `description`, the
-`tools` it composes and the `data_type` it is for (`scrna` or `variants`), and whose body is the
-guidance the PI plans from. A `PROTOCOL.md` beside it is the same protocol written for a
+`tools` it composes, the `data_type` it is for (`scrna` or `variants`) and the `outputs` its tool
+steps leave, and whose body is the guidance the PI plans from. A pipeline's output entry is a
+skill's (see [Declared outputs](#declared-outputs)) plus the `tool` whose step writes it: a plan
+step that runs that tool shows the entry and is checked for it. A `PROTOCOL.md` beside it is the same protocol written for a
 researcher to read and audit; the platform does not load it. `agents/preset_pipelines.py` loads
 the folders when the gateway starts.
 

@@ -179,7 +179,7 @@ _MODEL_CODE_TOOLS = {"run_code", "run_in_environment", "run_shell", "shell"}
 # directory listings, a file re-read), and literature (a paper's numbers are not this run's).
 _NOT_EVIDENCE = {"finish", "read_tool_source", "describe_environment", "search_skills",
                  "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text",
-                 "disk_usage", "literature_search", "deep_literature", "search_corpus"}
+                 "disk_usage", "find_software", "literature_search", "deep_literature", "search_corpus"}
 _ID_COLUMN = re.compile(r"^(leiden|louvain|cluster|clusters|cl|rank|index|idx|id|row|sample|"
                         r"sampleid|group|groups|slug|round|step)$", re.IGNORECASE)
 
@@ -576,14 +576,14 @@ def qc_section(rounds: "list[Any]") -> "tuple[list[str], dict]":
 
 
 def steps_section(agenda: "list[str]", rounds: "list[Any]") -> "tuple[list[str], dict]":
-    last: dict[str, tuple[str, float, str]] = {}
+    last: dict[str, tuple[str, float, str, bool]] = {}
     for r in rounds:
         step = str(_get(r, "step") or "")
         v = _get(r, "verdict") or {}
         last[step] = (str(_get(v, "verdict") or ""), float(_get(v, "score") or 0.0),
-                      str(_get(v, "critique") or ""))
+                      str(_get(v, "critique") or ""), _get(v, "reviewed", True) is not False)
     lines: list[str] = []
-    incomplete, reserved = 0, 0
+    incomplete, reserved, unreviewed = 0, 0, 0
     for i, item in enumerate(agenda or [], 1):
         title = re.sub(r"\*\*", "", item.split(" — ", 1)[0]).strip()[:90]
         got = last.get(item)
@@ -591,11 +591,16 @@ def steps_section(agenda: "list[str]", rounds: "list[Any]") -> "tuple[list[str],
             lines.append(f"- Step {i}, {title}: never ran.")
             incomplete += 1
             continue
-        verdict, score, critique = got
+        verdict, score, critique, reviewed = got
         first = re.split(r"(?<=[.!?])\s", critique.strip(), maxsplit=1)[0][:260]
         if verdict != "accept":
             incomplete += 1
             lines.append(f"- Step {i}, {title}: NOT completed (last review {score:.2f}). {first}")
+        elif not reviewed:
+            # Its score is not a review: the Critic gave no usable reply twice and the result was kept.
+            unreviewed += 1
+            lines.append(f"- Step {i}, {title}: kept without review (the Critic returned no usable "
+                         "review twice).")
         elif score < 0.6:
             reserved += 1
             lines.append(f"- Step {i}, {title}: accepted with reservations ({score:.2f}). {first}")
@@ -603,7 +608,8 @@ def steps_section(agenda: "list[str]", rounds: "list[Any]") -> "tuple[list[str],
         lines.append(f"- All {len(agenda or [])} planned steps completed and were accepted by the "
                      "reviewer." if len(agenda or []) != 1 else
                      "- The one planned step completed and was accepted by the reviewer.")
-    return lines, {"steps_incomplete": incomplete, "steps_reserved": reserved}
+    return lines, {"steps_incomplete": incomplete, "steps_reserved": reserved,
+                   "steps_unreviewed": unreviewed}
 
 
 def scope_section(art: Path, lit: "dict | None", discussion: bool = True) -> "tuple[list[str], dict]":
@@ -765,6 +771,9 @@ def manuscript_note(summary: dict) -> str:
         bits.append("The QC step's per-stage counts do NOT add up (see the statement).")
     if summary.get("steps_incomplete"):
         bits.append(f"{summary['steps_incomplete']} planned step(s) did not complete.")
+    if summary.get("steps_unreviewed"):
+        bits.append(f"{summary['steps_unreviewed']} step(s) were kept without a review: the Critic "
+                    "returned no usable review twice.")
     if summary.get("literature_checked") is False:
         bits.append("The interpretation was not checked against published literature."
                     if summary.get("discussion", True) else

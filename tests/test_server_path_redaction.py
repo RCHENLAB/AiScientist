@@ -85,3 +85,115 @@ def test_a_saved_ssh_key_s_path_is_not_in_its_errors(tmp_path):
         SSHExecutor._load_key(str(broken), None)
     assert str(tmp_path) not in info.value.message
     assert str(tmp_path) not in repr(info.value.detail)
+
+
+# --- the chat: a failed run's message (run 82fab7a4a437) -----------------------------------------
+#
+# A GatewayError's message went to the chat as it was, so an upload that failed showed the user's
+# dataset folder on the gateway host: "Failed to upload /data/aiscientist/data/users/lijinbio/
+# datasets/<uuid>/original/analysis/…/clusters.csv -> /dfs3b/…".
+
+HPC3_DEST = "/dfs3b/ruic20_lab/lijinbio/aiscientist/82fab7a4a437/clusters.csv"
+
+
+def _upload_failure(data_root: str) -> str:
+    return (f"Failed to upload {data_root}/users/lijinbio/datasets/3f2c9a1e-5b7d-4c8e-9f0a-1b2c3d4e5f60"
+            f"/original/analysis/leiden/clusters.csv -> {HPC3_DEST}.")
+
+
+def _connection():
+    import asyncio
+
+    pytest.importorskip("fastapi")
+    from aiscientist.gateway.app import Connection
+    from aiscientist.gateway.settings import HPCSettings
+
+    conn = Connection(HPCSettings(), mock=True, loop=asyncio.new_event_loop(), username="tester")
+    published: list[dict] = []
+    conn._publish = lambda payload: published.append(dict(payload))
+    return conn, published
+
+
+def test_a_chat_error_loses_the_server_path_live_and_on_replay(monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_DATA_ROOT", "/data/aiscientist/data")
+    conn, published = _connection()
+    conn.push({"type": "chat_start"})
+    conn.push({"type": "chat_error", "message": _upload_failure("/data/aiscientist/data")})
+
+    shown = next(p for p in published if p["type"] == "chat_error")["message"]
+    assert shown == f"Failed to upload …/clusters.csv -> {HPC3_DEST}."
+    replayed = conn.stream_replay_payloads()[-1]
+    assert replayed["type"] == "chat_error" and replayed["message"] == shown
+
+
+def test_a_lab_run_that_fails_on_an_upload_shows_no_server_path(tmp_path, monkeypatch):
+    import asyncio
+
+    pytest.importorskip("fastapi")
+    from aiscientist.agents import research_lab as rl
+    from aiscientist.gateway import app as gw_app
+
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("AISCIENTIST_DATA_ROOT", str(data_root))
+    message = _upload_failure(str(data_root))
+
+    class _FailingLab:
+        def __init__(self, *a, **k):
+            self.guidance = None
+            self.protocols = []
+            self.self_sourced = ""
+            self.execution_profile = {}
+
+        def run(self, *a, **k):
+            raise GatewayError(message, stage="ssh_put")
+
+    monkeypatch.setattr(rl, "ResearchLab", _FailingLab)
+    conn, published = _connection()
+    conn.workspace = tmp_path / "tester"
+    conn.status = "ready"
+    conn.executor = object()
+    conn.alloc = object()
+    gw_app.CONNECTIONS[conn.id] = conn
+    try:
+        req = gw_app.LabRequest(connection_id=conn.id, question="cluster this", conversation_id="c1")
+        conn.begin_run("c1")
+        asyncio.run(gw_app._run_lab(conn, req))
+    finally:
+        gw_app.CONNECTIONS.pop(conn.id, None)
+
+    error = next(p for p in published if p["type"] == "chat_error")["message"]
+    assert str(data_root) not in error and "lijinbio/datasets" not in error
+    assert error == f"Failed to upload …/clusters.csv -> {HPC3_DEST}."
+    logged = [e for e in conn.log if e["level"] == "error" and e["stage"] == "ssh_put"]
+    assert logged and str(data_root) not in logged[-1]["message"]
+
+
+def test_transfer_failures_name_the_file_not_its_server_folder(tmp_path, monkeypatch):
+    from aiscientist.gateway.ssh_gateway import SSHExecutor
+
+    folder = tmp_path / "users" / "lijinbio" / "datasets" / "u1" / "original"
+    folder.mkdir(parents=True)
+    local = folder / "clusters.csv"
+    local.write_text("cell,cluster\n", encoding="utf-8")
+
+    class _BrokenSFTP:
+        def put(self, *a, **k):
+            raise OSError("Permission denied")
+
+        get = put
+
+        def close(self):
+            pass
+
+    ex = SSHExecutor.__new__(SSHExecutor)
+    monkeypatch.setattr(ex, "exec", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(ex, "_open_sftp", lambda: _BrokenSFTP(), raising=False)
+
+    with pytest.raises(GatewayError) as up:
+        ex.put_file(str(local), HPC3_DEST)
+    assert up.value.message == f"Failed to upload clusters.csv to {HPC3_DEST}."
+
+    with pytest.raises(GatewayError) as down:
+        ex.get_file(HPC3_DEST, str(local))
+    assert down.value.message == f"Failed to download {HPC3_DEST}."
+    assert str(tmp_path) not in up.value.message + down.value.message

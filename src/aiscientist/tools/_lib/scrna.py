@@ -574,6 +574,35 @@ def _slug(name: str) -> str:
     return safe.strip("_") or "group"
 
 
+def group_table_slug(name: str) -> str:
+    """:func:`_slug` for a group's own table, ``de_<key>_<slug>.csv``. A group called ``all``
+    would be written over by the combined ``de_<key>_all.csv`` (and ``pseudobulk_all.csv``),
+    so its table is ``..._all_group.csv``. Writers and readers must both use this."""
+    slug = _slug(name)
+    return f"{slug}_group" if slug.lower() == "all" else slug
+
+
+#: The DE key ``run_pseudobulk_de`` writes under: ``pseudobulk_<group_key>`` (``pseudobulk`` with no
+#: group key). Its own namespace, so it never writes over a ``run_de`` table of the same column.
+PSEUDOBULK_KEY_PREFIX = "pseudobulk"
+
+
+def pseudobulk_de_key(group_key: str) -> str:
+    return f"{PSEUDOBULK_KEY_PREFIX}_{_slug(group_key)}" if group_key else PSEUDOBULK_KEY_PREFIX
+
+
+def preferred_de_keys(keys: "list[str]") -> "list[str]":
+    """DE keys in the order ``run_enrichment`` and ``run_gsea_prerank`` choose among them when
+    the caller names none: a replicated condition test (``run_pseudobulk_de``) first, since it is
+    the valid input whenever it exists; then an annotated grouping before raw ``leiden`` ids; then
+    the rest. Alphabetical within each tier."""
+    def tier(key: str) -> int:
+        if key == PSEUDOBULK_KEY_PREFIX or key.startswith(PSEUDOBULK_KEY_PREFIX + "_"):
+            return 0
+        return 2 if key == "leiden" else 1
+    return sorted(keys, key=lambda k: (tier(k), k))
+
+
 # Default gene-set libraries (freely redistributable). KEGG is intentionally NOT a
 # default — its GMT redistribution is license-restricted; add "KEGG_2021_Human" via
 # args.gene_sets only if you've cleared that locally.

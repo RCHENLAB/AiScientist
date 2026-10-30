@@ -9,7 +9,7 @@ for _old in $(compgen -v BIOAGENT_ || true); do _new="AISCIENTIST_${_old#BIOAGEN
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DFS_DIR="${AISCIENTIST_SCGPT_DIR:-/dfs3b/ruic20_lab/software/AiScientist/containers}"
-MODEL_DIR="${AISCIENTIST_SCGPT_MODEL_DIR:-/dfs3b/ruic20_lab/software/AiScientist/scgpt_model}"
+MODEL_DIR="${AISCIENTIST_SCGPT_MODEL_DIR:-/dfs3b/ruic20_lab/software/AiScientist/models/scgpt}"
 SIF="${DFS_DIR}/scgpt.sif"
 # Where YOUR scGPT_refactor lives (it gets copied into the build context next to the .def).
 REFACTOR_SRC="${AISCIENTIST_SCGPT_REFACTOR_SRC:-$HOME/scGPT_mwe/scGPT_refactor}"

@@ -8,7 +8,8 @@ platform's side of that arrangement:
 - :func:`with_skill` attaches the skill to a call (:data:`catalog.SKILL_ARG`), so the tool reads its
   settings from its arguments wherever it runs, and records the skill version in the run's
   manifest.json;
-- :func:`attach_skill` wraps a built tool so that every call carries its skill.
+- :func:`attach_skill` wraps a built tool so that every call carries its skill, and counts the
+  call's outcome for the skill's version (``skill_versions.sqlite3``).
 
 The tools never load skills themselves: they ship as their own package and import nothing from
 the platform.
@@ -54,31 +55,50 @@ def with_skill(m: Any, args: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     version and release, and its ``assets/`` files. The skill is recorded in the run's
     manifest.json, without becoming the run's active skill. A call that already carries its skill,
     or a tool that names none, is returned unchanged."""
+    return _attach(m, args, ctx)[0]
+
+
+def _attach(m: Any, args: dict[str, Any], ctx: Any) -> "tuple[dict[str, Any], Any]":
+    """:func:`with_skill`, and the skill it attached: None when it attached none."""
     if not m.skill or isinstance(args.get(catalog.SKILL_ARG), dict):
-        return args
+        return args, None
     skill = tool_skill(m)
     from .skills_registry import record_in_manifest
     record_in_manifest(ctx, skill)
     return {**args, catalog.SKILL_ARG: {
         "name": skill.name, "version": skill.version or "local",
         "registry_release": skill.registry_release or None,
-        "files": {k: v for k, v in sorted(skill.files.items()) if k.startswith("assets/")}}}
+        "files": {k: v for k, v in sorted(skill.files.items()) if k.startswith("assets/")}}}, skill
 
 
 def attach_skill(m: Any, tool: Any) -> Any:
     """``tool`` with an executor that attaches its skill to every call, wherever the call then runs
-    (an HPC3 executor, or in-process). A skill that cannot be used is reported as the call's error."""
+    (an HPC3 executor, or in-process). A skill that cannot be used is reported as the call's error.
+
+    Each call is counted for the skill's version as a ``run_code`` call under that skill is
+    (``skills_registry.count_call``): once per plan step, or per call outside a step, a success when
+    the tool returned ``ok``. Counted here, the one place every call passes, so a call that goes to
+    HPC3 and falls back in-process is still one call."""
     if not m.skill:
         return tool
     inner = tool.executor
 
     def _exec(args: dict, ctx: Any, _m=m, _inner=inner) -> dict:
         try:
-            args = with_skill(_m, args or {}, ctx)
+            args, skill = _attach(_m, args or {}, ctx)
         except ToolSkillError as exc:
             return {"status": "error", "error": f"{exc}. Install or allow that skill, then run "
                                                 f"{_m.name} again."}
-        return _inner(args, ctx)
+        if skill is None:
+            return _inner(args, ctx)
+        from .skills_registry import count_call
+        try:
+            result = _inner(args, ctx)
+        except Exception:
+            count_call(skill, ctx, None, _m.name)       # an error; the harness reports the exception
+            raise
+        count_call(skill, ctx, result, _m.name)
+        return result
 
     _exec.__wrapped__ = getattr(inner, "__wrapped__", inner)   # source introspection finds the tool
     try:

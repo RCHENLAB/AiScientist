@@ -240,9 +240,9 @@ def test_a_run_admits_own_uploads_and_server_data_and_drops_the_rest(shared, tmp
     assert [a["path"] for a in admitted] == [str(own), sample]
     assert any("Not bound" in s and "keys.txt" in s for s in said)
     remote, copied = mirrors[sample]
-    # A temporary copy, in this session's own area under Temp — never among the user's uploads.
+    # A temporary copy, in this session's own inputs/ — never among the user's uploads.
     assert remote.startswith(f"{gw_app._session_mirror_base(conn)}/")
-    assert f"/Temp/tester/server-data/{gw_app._session_tag(conn)}/" in remote
+    assert f"/sessions/{conn.id}/inputs/" in remote
     assert not remote.startswith(gw_app._hpc_uploads_dir(conn))
     assert "outs/filtered_feature_bc_matrix.h5" in copied
     assert f"{remote}/outs/filtered_feature_bc_matrix.h5" in conn.executor.files

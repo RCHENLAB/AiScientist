@@ -175,10 +175,9 @@ class VerifyResult:
 def _scrub(text: str, api_key: str) -> str:
     """Never let a provider's error text carry the key back into a log, an event, or the UI.
     Some gateways echo the ``Authorization`` header verbatim in 4xx bodies, so this is a real
-    leak path rather than a theoretical one."""
-    if api_key and len(api_key) >= 8:
-        text = text.replace(api_key, "<key>")
-    return text
+    leak path rather than a theoretical one (:func:`errors.scrub_secrets`)."""
+    from .errors import scrub_secrets
+    return scrub_secrets(text, api_key)
 
 
 def _request(url: str, api_key: str, payload: dict | None, timeout: float) -> tuple[int, str]:

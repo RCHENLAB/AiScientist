@@ -132,3 +132,18 @@ def test_an_enforced_setting_is_shown_with_both_values():
     text = _text({"type": "plan_setting_enforced", "tool": "run_clustering",
                   "overrode": [{"param": "resolution", "approved": 1.2, "model": 0.5}]})
     assert "resolution = 1.2" in text and "0.5" in text
+
+
+def test_a_dropped_setting_names_why_in_words():
+    # A multi-library step's species and samples are stated in its text, so "does not state them"
+    # would be wrong for them (#56 re-test, B2).
+    text = _text({"type": "plan_bind_dropped", "dropped": [
+        {"step": 1, "tool": "run_cellqc", "param": "species", "value": "human",
+         "why": "multiple_choices_in_text"},
+        {"step": 1, "tool": "run_cellqc", "param": "samples", "value": ["Sample3_GSM5676874"],
+         "why": "incomplete_list"},
+        {"step": 2, "tool": "run_de", "param": "padj", "value": 0.01, "why": "not_in_text"}]})
+    assert "step 1 species='human' (the step names more than one of its choices)" in text
+    assert "step 1 samples=['Sample3_GSM5676874'] (the step names items this list leaves out)" in text
+    assert "step 2 padj=0.01 (the step's text does not state it)" in text
+    assert "does not state them" not in text

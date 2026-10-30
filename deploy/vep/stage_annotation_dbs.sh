@@ -98,7 +98,7 @@ if [[ "${STAGE_SPLICEAI:-1}" == 1 ]]; then
   SA_MODELS="${SA_MODELS:-/dfs3b/ruic20_lab/software/reference/spliceai/OSAI-MANE-10000nt}"
   if [[ -x "$SA_ENV/bin/openspliceai" ]]; then say "skip (present): openspliceai env"; else
     say "create conda env + pip install openspliceai (conda-forge; pulls torch)"
-    export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-/dfs3b/ruic20_lab/software/AiScientist/.conda-pkgs}"
+    export CONDA_PKGS_DIRS="${CONDA_PKGS_DIRS:-/dfs3b/ruic20_lab/software/AiScientist/envs/conda-pkgs}"
     module load miniconda3/25.11.1 2>/dev/null || true
     conda create -y -p "$SA_ENV" -c conda-forge --override-channels python=3.10 pip \
       && "$SA_ENV/bin/pip" install --no-input openspliceai || say "WARN: openspliceai env build failed"

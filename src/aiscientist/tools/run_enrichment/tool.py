@@ -23,6 +23,8 @@ from .._lib.scrna import (
     _rel,
     _schema,
     _slug,
+    group_table_slug,
+    preferred_de_keys,
     _write_table,
 )
 from ..sdk import HarnessTool
@@ -221,9 +223,11 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         cand = tables / f"de_{groupby}_all.csv"
         de_all = cand if cand.exists() else None
     if de_all is None:
-        cands = sorted(tables.glob("de_*_all.csv"))
-        non_leiden = [c for c in cands if c.name != "de_leiden_all.csv"]
-        de_all = (non_leiden or cands or [None])[0]
+        # A replicated condition test (run_pseudobulk_de) first, then an annotated grouping, then
+        # leiden (preferred_de_keys). A per-group file of run_de's that is literally named
+        # "..._all_group.csv" never matches `_all.csv` as a combined table.
+        keys = [c.name[len("de_"):-len("_all.csv")] for c in tables.glob("de_*_all.csv")]
+        de_all = next((tables / f"de_{k}_all.csv" for k in preferred_de_keys(keys)), None)
 
     # (display label, base group, direction, genes) — direction is "" when the table has only one.
     selections: list[tuple[str, str, str, list[str]]] = []
@@ -266,7 +270,7 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
             — a truncation applied upstream, invisible here, and with no basis in how ORA is run.
             The per-group file carries the full tested table for a contrast; for markers it is the
             top n_genes too, which `_upstream_truncation` reports."""
-            src = tables / f"de_{key}_{_slug(group)}.csv"
+            src = tables / f"de_{key}_{group_table_slug(group)}.csv"
             fh_path = src if src.exists() else de_all
             with fh_path.open(encoding="utf-8") as fh:
                 rows = [r for r in csv.DictReader(fh)
@@ -445,6 +449,9 @@ def run_enrichment(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
                  "failure of either."),
         **({"warnings": warnings} if warnings else {}),
         **({"input_inference": descriptive_de} if descriptive_de else {}),
+        # Which DE result this read, so a reader can tell a replicated test's enrichment from a
+        # cell-level ranking's when both were run.
+        **({"de_table_read": f"tables/{de_all.name}"} if de_all is not None and de_all.exists() else {}),
         "raw_data_to_llm": False,
     }
 
@@ -483,9 +490,11 @@ def make_tool() -> HarnessTool:
                 groupby={"type": "string",
                          "description": ("which DE table to read, by the key in its file name "
                                          "tables/de_<groupby>_all.csv: the column run_de grouped "
-                                         "by (e.g. leiden, majorclass), not the `group` column "
-                                         "inside the table; omit to find the table "
-                                         "automatically")},
+                                         "by (e.g. leiden, majorclass), or the `de_key` "
+                                         "run_pseudobulk_de returned (pseudobulk_<group_key>), "
+                                         "not the `group` column inside the table; omit to find "
+                                         "the table automatically, a replicated pseudobulk test "
+                                         "first")},
                 genes={"type": "array", "items": {"type": "string"},
                        "description": "explicit gene list; omit so the DE tables are found instead"}),
         run_enrichment,

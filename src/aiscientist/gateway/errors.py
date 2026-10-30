@@ -61,6 +61,77 @@ def _short_frame(match: re.Match) -> str:
     return match.group(0)
 
 
+# --- secrets in text -------------------------------------------------------------------------------
+
+# Key-shaped tokens a provider may echo back in an error body even when it is not the key we sent
+# (a masked form, a key from another request, an Authorization header copied verbatim).
+_KEY_SHAPED = re.compile(
+    r"(?i)(?:\bBearer\s+[A-Za-z0-9._~+/=*-]{8,}"
+    r"|\b(?:sk|rk|pk)-[A-Za-z0-9_*-]{8,}"
+    r"|\bAIza[0-9A-Za-z_-]{20,}"
+    r"|\b(?:x-api-key|api[_-]?key|authorization)[\"']?\s*[:=]\s*[\"']?(?!Bearer\b)[^\s\"',}]{8,})")
+# The shortest piece of a key that is replaced when it appears on its own: long enough that it
+# cannot be an ordinary word, short enough to catch a provider that prints a key's first 20 chars.
+_KEY_PIECE = 12
+
+
+def scrub_secrets(text: Any, *secrets: str | None) -> str:
+    """``text`` with every API key in it replaced by ``<key>``: the given ``secrets`` whole, any
+    run of 12 or more of their characters, and anything key-shaped (``sk-…``, ``Bearer …``,
+    ``api_key=…``).
+
+    For a provider's error body before it goes into an error message, an event, the run's log or
+    the browser. Some gateways copy the ``Authorization`` header into a 4xx body, others print a
+    masked key or its first characters; none of that may travel further than the HTTP layer
+    (RCHENLAB/AiScientist issue 16).
+    """
+    text = "" if text is None else str(text)
+    if not text:
+        return text
+    for secret in secrets:
+        secret = (secret or "").strip()
+        if len(secret) < 8:
+            continue
+        text = text.replace(secret, "<key>")
+        if len(secret) > _KEY_PIECE:
+            pieces = {secret[i:i + _KEY_PIECE] for i in range(len(secret) - _KEY_PIECE + 1)}
+            hits = [p for p in pieces if p in text]
+            if hits:
+                # Grow each hit to the longest run of the key it belongs to, so "<key>" replaces
+                # the whole fragment rather than leaving its ends behind.
+                pattern = "|".join(re.escape(p) for p in sorted(hits, key=len, reverse=True))
+                text = re.sub(rf"(?:{pattern})+[{re.escape(secret)}]*", "<key>", text)
+    return _KEY_SHAPED.sub("<key>", text)
+
+
+def _key_store_roots() -> list[str]:
+    """The API-key and SSH-key stores and the API keys' master key, as path strings (absolute and
+    resolved): where the keys are kept, which no log or message may name."""
+    roots: set[str] = set()
+    try:
+        from . import llm_credentials, ssh_credentials
+        paths = [*llm_credentials.private_paths(), *ssh_credentials.private_paths()]
+    except Exception:  # noqa: BLE001 - a redaction must never fail the message it protects
+        return []
+    for path in paths:
+        try:
+            forms = {path.absolute(), path.resolve()}
+        except (OSError, RuntimeError):
+            forms = {path}
+        roots.update(str(p).rstrip("/") for p in forms if str(p) not in ("", "/", "."))
+    return sorted(roots, key=len, reverse=True)
+
+
+def redact_key_store_paths(text: str) -> str:
+    """``text`` with every path inside a key store replaced by ``<key store>``: not even the file
+    name is kept, because a key file's name is the credential's id."""
+    if not text:
+        return text
+    for root in _key_store_roots():
+        text = re.sub(re.escape(root) + _PATH_TAIL, "<key store>", text)
+    return text
+
+
 def redact_server_paths(text: str) -> str:
     """``text`` without this host's paths, for anything a user can see (issue 37).
 
@@ -68,7 +139,7 @@ def redact_server_paths(text: str) -> str:
     the state dir, the code checkout — which tell a user nothing and show everyone the server's
     layout. A traceback frame keeps its module path; any other server path keeps only its file
     name (``…/run_state.json``), which is all a user can act on. Paths on HPC3 are left alone:
-    they are the user's own.
+    they are the user's own. (A run's log goes further: :func:`redact_key_store_paths` first.)
     """
     if not text:
         return text

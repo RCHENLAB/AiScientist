@@ -112,6 +112,56 @@ def test_history_refines_resource_hours_and_excludes_failures(declared_profile, 
     assert not got["rough"]
 
 
+# run_cellqc's successful calls on prod up to 2026-10-27 (run, samples, sacct seconds). Run
+# 3f2262b60e33 called it a second time and that call reused the first one's outputs: 72 s for 3
+# samples, which made every later CellQC estimate start at 24 s per sample.
+CELLQC_HISTORY = [
+    ("ea0144867892", 2, 1432), ("3211083e868d", 1, 669), ("59565071ab4e", 1, 584),
+    ("1848bce37c5d", 1, 650), ("a3e283ebadba", 3, 1353), ("42050ab441af", 3, 1493),
+    ("a62a418aec5c", 4, 1422), ("3f2262b60e33", 3, 1352), ("3f2262b60e33", 3, 72),
+    ("c3bac0af153c", 1, 653), ("66a41fc2a0ce", 1, 658), ("590ae700ea7e", 1, 664),
+    ("b3249bd944c7", 3, 1377), ("ef1cf50c4bb4", 3, 1305), ("a0dea07cc085", 1, 621),
+]
+
+
+def test_a_fast_repeat_call_does_not_set_the_low_end(declared_profile, rates):
+    for run_id, samples, seconds in CELLQC_HISTORY:
+        estimates.record_usage(run_id, "qc", {"samples": samples}, seconds, rates, success=True,
+                               jobs=[{"seconds": seconds, "cpu_hours": seconds / 3600 * 16, "gpu_hours": 0}])
+    got = estimates.estimate_skill("qc", {"samples": 2}, rates)
+    assert got["history_count"] == 14  # runs, not calls
+    # Low end: the 4-sample run's 355.5 s per sample (was 24 s: "48 s - 29 min" for 2 samples);
+    # high end: 1.5 x the median of 602.5 s per sample. Jin's 2-sample run took 1432 s.
+    assert got["seconds"] == pytest.approx([711, 1807.5])
+    assert got["cpu_hours"] == pytest.approx([711 / 225, 1807.5 / 225])
+    assert not got["rough"]
+
+
+def test_a_fast_run_on_its_own_does_not_set_the_low_end(declared_profile, rates):
+    rows = [SimpleNamespace(run_id=str(n), units=1, seconds=600, cpu_hours=1, gpu_hours=0) for n in range(3)]
+    rows.append(SimpleNamespace(run_id="reused", units=1, seconds=24, cpu_hours=0.04, gpu_hours=0))
+    got = estimates.estimate_skill("qc", {"samples": 1}, rates, previous=rows)
+    assert got["history_count"] == 4
+    assert got["seconds"] == [450, 900]       # 3/4 and 1.5 x the median of 600 s
+    assert got["cpu_hours"] == [0.75, 1.5]
+    assert got["gpu_hours"] == [0, 0]
+    # A spread of real runs still widens the range as before.
+    rows[-1].seconds, rows[-1].cpu_hours = 300, 0.5
+    assert estimates.estimate_skill("qc", {"samples": 1}, rates, previous=rows)["seconds"] == [300, 900]
+
+
+def test_history_window_counts_runs_not_calls(declared_profile, rates, monkeypatch):
+    for number in range(3):
+        estimates.record_usage(f"run{number}", "qc", {"samples": 1}, 600, rates, success=True)
+    for _ in range(40):
+        estimates.record_usage("busy", "qc", {"samples": 1}, 60, rates, success=True)
+    estimates.record_usage("failed", "qc", {"samples": 1}, 6, rates, success=False)
+    assert {r.run_id for r in estimates.history("qc")} == {"run0", "run1", "run2", "busy"}
+    assert estimates.estimate_skill("qc", {"samples": 1}, rates)["history_count"] == 4
+    monkeypatch.setattr(estimates, "HISTORY_RUNS", 2)
+    assert {r.run_id for r in estimates.history("qc")} == {"run2", "busy"}
+
+
 def test_usage_and_estimate_persist_across_database_reopen(declared_profile, rates):
     planned = estimates.estimate_plan(["qc"], [SimpleNamespace(name="qc")], {"samples": 1}, rates)
     estimates.save_estimate("run", planned)

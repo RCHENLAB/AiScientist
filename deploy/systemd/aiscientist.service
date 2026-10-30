@@ -33,15 +33,11 @@ Type=simple
 # Service account (no login shell).
 User=aiscientist
 Group=aiscientist
-# Versioned layout (deploy/deploy_release.sh): app/current is a symlink to the active release and
-# each release has its own venv, so a deploy or rollback is a symlink switch plus a restart.
-WorkingDirectory=/data/aiscientist/app/current
+WorkingDirectory=/data/aiscientist/app
 # The app loads /data/aiscientist/app/.env on startup; EnvironmentFile is belt-and-suspenders
 # for anything read at import time. Comment out if you rely solely on the app's .env loader.
-EnvironmentFile=-/data/aiscientist/shared/.env
-ExecStart=/data/aiscientist/app/current/.venv/bin/python -m aiscientist.gateway --host 128.200.71.197 --port 8800
-# The start fails if the app does not answer /health, so a bad release shows in systemctl.
-ExecStartPost=/usr/bin/curl --retry 30 --retry-delay 2 --retry-connrefused -fsS -o /dev/null http://128.200.71.197:8800/health
+EnvironmentFile=-/data/aiscientist/app/.env
+ExecStart=/data/aiscientist/env/bin/python -m aiscientist.gateway --host 128.200.71.197 --port 8800
 Restart=always
 RestartSec=2
 # Give in-flight requests a moment to drain on restart.

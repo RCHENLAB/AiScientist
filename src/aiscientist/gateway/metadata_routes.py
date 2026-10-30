@@ -7,6 +7,10 @@ account only (the same cookie and the same filter as ``/api/datasets``):
                                               confidence and validation of one dataset
 * ``PUT  /api/datasets/{ref}/metadata``       save the review form; the croissant.json is rebuilt
 * ``GET  /api/datasets/{ref}/croissant.json`` the document itself
+* ``GET  /api/datasets/{ref}/description``    its DATASET.md (issue 10) and whose it is
+* ``PUT  /api/datasets/{ref}/description``    save the owner's edit (kept; no run overwrites it)
+* ``DELETE /api/datasets/{ref}/description/edit`` drop the owner's edit
+* ``GET  /api/datasets/{ref}/DATASET.md``     the Markdown file
 * ``GET  /api/results/{ref}/metadata``        a run's result (``ref`` = run id or result UUID)
 * ``GET  /api/results/{ref}/croissant.json``
 * ``GET  /api/metadata/{ref}/lineage``        upstream / downstream graph
@@ -81,6 +85,56 @@ def dataset_croissant(ref: str, request: Request) -> Response:
     if doc is None:
         raise HTTPException(status_code=404, detail="Dataset not found.")
     return _ld_json(doc, "croissant.json")
+
+
+@router.get("/datasets/{ref}/description")
+def dataset_description(ref: str, request: Request) -> JSONResponse:
+    user = require_user(request)
+    view = store.description_view(user.id, ref)
+    if view is None:
+        store.ensure_dataset_records(user.id)
+        view = store.description_view(user.id, ref)
+    if view is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    return JSONResponse(view, headers={"Cache-Control": "no-store"})
+
+
+@router.put("/datasets/{ref}/description")
+async def save_dataset_description(ref: str, request: Request) -> dict:
+    user = require_user(request)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Send {\"markdown\": ...} as JSON.") from None
+    if not isinstance(body, dict) or not isinstance(body.get("markdown"), str):
+        raise HTTPException(status_code=400, detail="Send {\"markdown\": ...} as JSON.")
+    try:
+        view = store.save_owner_description(user.id, ref, body["markdown"], by=user.username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if view is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    return view
+
+
+@router.delete("/datasets/{ref}/description/edit")
+def reset_dataset_description(ref: str, request: Request) -> dict:
+    user = require_user(request)
+    view = store.reset_owner_description(user.id, ref)
+    if view is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    return view
+
+
+@router.get("/datasets/{ref}/DATASET.md")
+def dataset_description_file(ref: str, request: Request) -> Response:
+    user = require_user(request)
+    view = store.description_view(user.id, ref)
+    if view is None or not view.get("markdown"):
+        raise HTTPException(status_code=404, detail="This dataset has no description yet.")
+    return Response(view["markdown"], media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="DATASET.md"',
+                             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/results/{ref}/metadata")

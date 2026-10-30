@@ -4,6 +4,37 @@ version: 2
 description: Single-cell cell-type annotation + report (v2 — stability-selected resolution, raw-expression label confirmation, preranked GSEA)
 tools: run_scanpy_qc, run_cellqc, run_doublet_detection, run_integration, run_clustering, run_de, run_marker_annotation, run_composition, run_enrichment, run_gsea_prerank, literature_search, run_code
 data_type: scrna
+outputs:
+  - path: figures/umap_clusters.png
+    kind: figure
+    tool: run_clustering
+    description: UMAP of the cells coloured by Leiden cluster.
+    required: true
+  - path: tables/de_*_all.csv
+    kind: table
+    tool: run_de
+    description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
+    required: true
+  - path: figures/volcano_*.png
+    kind: figure
+    tool: run_de
+    description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
+    required: false
+  - path: figures/dotplot__markers.png
+    kind: figure
+    tool: run_de
+    description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
+    required: false
+  - path: tables/cluster_cell_types.csv
+    kind: table
+    tool: run_marker_annotation
+    description: One row per cluster with the assigned cell type, the first-pass label, the confidence, the deciding marker evidence and, for an Unassigned cluster, the reason.
+    required: true
+  - path: figures/umap_cell_types.png
+    kind: figure
+    tool: run_marker_annotation
+    description: UMAP of the cells coloured by assigned cell type.
+    required: false
 ---
 
 Canonical marker-based single-cell cell-type annotation protocol. Use when the goal is to

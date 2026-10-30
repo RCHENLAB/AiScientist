@@ -293,11 +293,14 @@ def test_pseudobulk_writes_the_table_enrichment_discovers(tmp_path):
 
     assert out["status"] == "ok", out
     tables = tmp_path / "artifacts" / "tables"
-    assert (tables / "de_celltype_all.csv").exists(), "run_enrichment discovers de_<key>_all.csv"
-    assert (tables / "de_celltype_universe.txt").exists(), "ORA background must be the real universe"
-    assert (tables / "rank_celltype_Alpha.rnk").exists(), "run_gsea_prerank needs a ranked list"
+    # Under the tool's own key, never run_de's de_celltype_* names (tests/test_de_handoff_names.py).
+    assert out["de_key"] == "pseudobulk_celltype"
+    assert (tables / "de_pseudobulk_celltype_all.csv").exists(), "run_enrichment discovers de_<key>_all.csv"
+    assert (tables / "de_pseudobulk_celltype_universe.txt").exists(), "ORA background must be the real universe"
+    assert (tables / "rank_pseudobulk_celltype_Alpha.rnk").exists(), "run_gsea_prerank needs a ranked list"
+    assert not (tables / "de_celltype_all.csv").exists()
     # Schema-compatible with run_de's table, so enrichment needs no special case.
-    header = (tables / "de_celltype_all.csv").read_text(encoding="utf-8").splitlines()[0]
+    header = (tables / "de_pseudobulk_celltype_all.csv").read_text(encoding="utf-8").splitlines()[0]
     assert header.split(",") == ["group", "gene", "log2fc", "pval", "pval_adj", "score"]
 
 

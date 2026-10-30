@@ -316,6 +316,8 @@ class TextIndex:
     length in words: enough for exact matching and BM25 without a stored index (building it takes
     a few seconds for the 39,563 RetiGene chunks)."""
 
+    MEMO_MAX = 4096                  # terms whose counts are remembered
+
     def __init__(self, texts: Iterable[str]):
         folded = [fold(t) for t in texts]
         low = [t.lower() for t in folded]
@@ -340,6 +342,9 @@ class TextIndex:
         """Chunk index -> how often ``term`` occurs in it (chunks without it left out)."""
         key = (term.kind, term.text, term.pattern)
         if key not in self._counts:
+            if len(self._counts) >= self.MEMO_MAX:
+                # An index kept for many searches (the gateway's copy) must not grow without end.
+                self._counts.clear()
             rx, view, word_start = term_regex(term)
             text, starts = self._views[view]
             out: Counter[int] = Counter()
