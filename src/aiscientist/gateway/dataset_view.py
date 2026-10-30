@@ -18,6 +18,8 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+from .errors import public_error   # a note names the file, never its folder on this host
+
 # A text file's preview reads this much of its head (a gzip head is decompressed to at most TEXT_MAX).
 HEAD_BYTES = 1 << 20
 TEXT_MAX = 4 << 20
@@ -391,7 +393,7 @@ def h5ad_preview(source: Any) -> dict[str, Any]:
                            "n_vars": _frame(raw["var"])["n"] if "var" in raw else None}
                           if raw is not None else {"present": False})
     except Exception as exc:  # noqa: BLE001 - a damaged file is described, not raised
-        out["note"] = f"The file could not be read as HDF5 ({type(exc).__name__}: {str(exc)[:200]})."
+        out["note"] = f"The file could not be read as HDF5 ({type(exc).__name__}: {public_error(exc)[:200]})."
     return out
 
 
@@ -429,7 +431,7 @@ def hdf5_preview(source: Any) -> dict[str, Any]:
                         kinds[_str(v)] = kinds.get(_str(v), 0) + 1
                     out["cellranger"]["feature_types"] = kinds
     except Exception as exc:  # noqa: BLE001
-        out["note"] = f"The file could not be read as HDF5 ({type(exc).__name__}: {str(exc)[:200]})."
+        out["note"] = f"The file could not be read as HDF5 ({type(exc).__name__}: {public_error(exc)[:200]})."
     return out
 
 

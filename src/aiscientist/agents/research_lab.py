@@ -611,21 +611,33 @@ _PLAN_QA_SYSTEM = (
 )
 
 
+# The prompt's "nothing to disclose" sentence, written into the agenda without the prefix: "none —
+# every choice in this plan comes from the guidance and the dataset profile." It ran nothing and named
+# no tool, so a scope limit dropped it as a step, and the feed said "Left out 1 step(s) your request
+# ruled out: none" (RCHENLAB/AiScientist issue 75, the #56 re-test's A2). "None of the …" stays a step.
+_BARE_DISCLOSURE_RE = re.compile(
+    r"^none\b\s*(?:[—–:;.,-]|$)|^every choice in this plan comes from the guidance", re.IGNORECASE)
+
+
 def _split_self_sourced(steps: "list[str]") -> "tuple[list[str], str]":
     """Separate the ``SELF-SOURCED:`` disclosure from the executable agenda.
 
     Returns ``(agenda, disclosure_text)``. The disclosure is a statement about the plan, not work
     to run — left in the agenda it would be dispatched to the Scientist as a step. Empty string
     when the PI made no disclosure. Tolerates the prefix appearing on any line, since models put it
-    first about as often as last."""
+    first about as often as last, and the prompt's "none — every choice …" sentence put in the
+    agenda without it."""
     agenda: list[str] = []
     notes: list[str] = []
     for s in steps:
         t = (s or "").strip().lstrip("*-# ").strip()
+        bare = re.sub(r"[*`]", "", t).strip()
         if t.upper().startswith(_SELF_SOURCED_PREFIX):
             body = t[len(_SELF_SOURCED_PREFIX):].strip()
             if body:
                 notes.append(body)
+        elif _BARE_DISCLOSURE_RE.match(bare):
+            notes.append(bare)
         else:
             agenda.append(s)
     return agenda, " ".join(notes).strip()
@@ -3389,6 +3401,9 @@ class LabConfig:
     skill_induction: bool = False
     induced_skills_dir: str | None = None
     max_induced_skills: int = 2         # per run — a library of near-duplicates is worse than none
+    # The gateway's id for this run: an induced skill records it as ``origin_run``, so its review
+    # and the run's skill request (gateway/skill_requests.py) point at each other.
+    run_id: str = ""
     # Run-scope context management (agents/context_budget.py). The Scientist's brief carries every
     # accepted finding, so that prefix grows linearly and a long run ends up paying for its own
     # history until the per-step trimmer starts discarding real work. On: the run MEASURES that
@@ -3520,6 +3535,10 @@ class LabResult:
     # the separate checks it went through and its status. Binding for both writers; shown in the
     # technical report. Empty when the audit is off or nothing was accepted.
     claim_audit: dict[str, Any] = field(default_factory=dict)
+    # The steps the user skipped at a failed step's decision point ("Skip this step"), by their text.
+    # The rounds show that such a step was never accepted, not that the user chose to leave it; the
+    # QC reply says which (RCHENLAB/AiScientist issue 75).
+    skipped_steps: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -3532,6 +3551,7 @@ class LabResult:
             "hypotheses": list(self.hypotheses),
             "design_background": list(self.design_background),
             "claim_audit": dict(self.claim_audit),
+            "skipped_steps": list(self.skipped_steps),
         }
 
     @classmethod
@@ -3544,6 +3564,7 @@ class LabResult:
             [h for h in (d.get("hypotheses") or []) if isinstance(h, dict)],
             [c for c in (d.get("design_background") or []) if isinstance(c, dict)],
             dict(d.get("claim_audit") or {}),
+            [str(s) for s in (d.get("skipped_steps") or []) if str(s).strip()],
         )
 
 
@@ -3984,7 +4005,11 @@ class ResearchLab:
         # result that were not added: declined, unanswered, or with nobody to ask.
         self._decision_review: "Callable[[Any], dict[str, Any]] | None" = None
         self._proposed_steps: list[dict[str, Any]] = []
+        # Skills induced at the end of this run (``_induce_skills``), for its skill request.
+        self.induced_skills: list[str] = []
         self._step_asks_unanswered = False
+        # The steps the user skipped at a failed step's decision point (``LabResult.skipped_steps``).
+        self._skipped_steps: list[str] = []
         # The skills steering THIS run: the user-PINNED ones (mandatory) + one the PI auto-selects on
         # top (Axis B), extended in ``run()``. Carry their reference-code templates (progressive
         # disclosure). Empty = free planning.
@@ -4150,6 +4175,8 @@ class ResearchLab:
                 result.design_background = list(self._design_citations)
         if isinstance(result, LabResult) and not result.claim_audit and self._claim_audit:
             result.claim_audit = dict(self._claim_audit)
+        if isinstance(result, LabResult) and not result.skipped_steps and self._skipped_steps:
+            result.skipped_steps = list(dict.fromkeys(self._skipped_steps))
         if isinstance(result, LabResult) and self._approved_plan is not None and result.rounds:
             # Compared here, on the one exit every path shares, for the same reason as above. A run
             # with no rounds (cancelled at review) has nothing to compare.
@@ -4180,6 +4207,7 @@ class ResearchLab:
         self._checkpoint = checkpoint
         self._decision_review = decision_review
         self._proposed_steps, self._step_asks_unanswered = [], False
+        self._skipped_steps = []
 
         # A2 continuation: re-enter the SAME state machine without re-planning. Skip skill/mode/PI
         # planning, reuse the prior agenda + accepted rounds, and re-execute from the changed step
@@ -4783,7 +4811,8 @@ class ResearchLab:
                 taken=set(_LIB), max_new=self.config.max_induced_skills)
             written: list[str] = []
             for skill in kept:
-                out = write_skill(self.config.induced_skills_dir, skill)
+                out = write_skill(self.config.induced_skills_dir, skill,
+                                  origin_run=self.config.run_id)
                 if out is None:
                     rejected.append(f"could not write {skill.name}")
                     continue
@@ -4795,6 +4824,7 @@ class ResearchLab:
                                      doc=skill.skill_md(), files={"reference.py": skill.code},
                                      induced=True, supersedes=skill.supersedes))
                 written.append(written_name)
+                self.induced_skills.append(written_name)
                 emit({"type": "skill_induced", "name": written_name, "review": "pending",
                       "description": skill.description, "reason": skill.reason,
                       "origin_step": skill.origin_step, "path": str(folder),
@@ -5506,7 +5536,11 @@ class ResearchLab:
             return ("retry", alternatives[0])
         choice = str(decision.get("choice", "")).strip()
         low = choice.lower()
-        if not choice or low == skip_opt.lower():
+        if low == skip_opt.lower():
+            # Recorded: the step's rounds say that it was not accepted, not that the user left it.
+            self._skipped_steps.append(node.goal)
+            return ("skip", "")
+        if not choice:
             return ("skip", "")
         if low == abort_opt.lower():
             return ("abort", "")

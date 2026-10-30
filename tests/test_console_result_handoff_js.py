@@ -49,3 +49,45 @@ def test_legacy_single_dataset_keeps_its_save_control():
     assert "legacy.h5ad" in html
     assert 'data-what="dataset"' in html
     assert html.count("data-save-result=") == 1
+
+
+SERVER_FOLDER = "/data/aiscientist/data/users/alice/datasets/3f2c9a1e-5b7d-4c8e-9f0a-1b2c3d4e5f60/original"
+
+
+def test_a_saved_result_is_named_never_shown_by_its_server_folder():
+    """Issue 37: "Saved to my data" used to carry the server folder as its tooltip."""
+    html = _render({"name": "pbmc.processed.h5ad", "datasets": [
+        {"name": "pbmc.processed.h5ad", "what": "dataset", "n_cells": 12, "n_genes": 5,
+         "saved_to": f"{SERVER_FOLDER}/pbmc.processed.h5ad"}],
+        "tables": {"name": "retigene_curation.r7", "files": ["genes.csv"], "n_genes": 1, "saved_to": SERVER_FOLDER}})
+    assert "/data/" not in html
+    assert 'title="In Files → Datasets as pbmc.processed.h5ad"' in html
+    assert 'title="In Files → Datasets as retigene_curation.r7"' in html
+
+
+def test_the_save_toast_names_the_dataset_not_the_reply_s_path():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    source = APP_JS.read_text(encoding="utf-8")
+    block = source[source.index("async function onSaveResultClick("):source.index("function onRunsClick(")]
+    reply = {"ok": True, "path": f"{SERVER_FOLDER}/pbmc.processed.h5ad", "dataset_id": 3,
+             "name": "pbmc.processed.h5ad", "kind": "file"}
+    script = r"""
+const vm = require("vm");
+const src = require("fs").readFileSync(0, "utf8");
+const toasts = [];
+const api = vm.runInNewContext(src + "\n;({ onSaveResultClick })", {
+  toast: (m) => toasts.push(m),
+  fetch: async () => ({ ok: true, json: async () => (__REPLY__) }),
+  loadResultHandoffs: async () => ({}), showResultHandoff: () => {}, outputsShown: () => false,
+  loadOutputs: () => {}, loadRuns: () => {}, loadDatasets: () => {}, encodeURIComponent,
+});
+const button = { dataset: { saveResult: "r7", what: "dataset", label: "Save to my data" },
+                 disabled: false, textContent: "", closest: () => null };
+api.onSaveResultClick({ target: { closest: () => button } }).then(() => console.log(JSON.stringify(toasts)));
+""".replace("__REPLY__", json.dumps(reply))
+    done = subprocess.run([node, "-e", script], input=block, capture_output=True, text=True, encoding="utf-8",
+                          timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == ["Saved “pbmc.processed.h5ad” to your data: it is in Files → Datasets now."]

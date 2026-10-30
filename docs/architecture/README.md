@@ -92,7 +92,9 @@ of the lab's RetiGene corpus (`search_corpus`: the question's meaning and the mo
 merged by rank) at the same time; the model answers from the corpus passages and the abstracts, and
 code writes the reference list from the papers the answer cites; the answer is kept with the run.
 A question that names the RetiGene papers searches the corpus alone, and PubMed only when it asks for
-it. A list question about them ("What are haploinsufficient genes in RetiGene papers?") gets a
+it. A list question about them ("What are haploinsufficient genes in RetiGene papers?"), or one that
+names no source ("What are haploinsufficient genes?", in a chat with no data and no analysis: its plan
+card says it reads the RetiGene papers and that "search PubMed" asks the public literature), gets a
 RetiGene curation plan instead, which says how long it takes on the session: `extract_haploinsufficient_genes`
 reads the whole corpus (a GPU job of its own, or the session's API model through the gateway, or a
 kept scan of the same corpus at once), and the gateway builds two tables from its sentences

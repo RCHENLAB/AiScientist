@@ -107,7 +107,7 @@ together:
 `deep_literature` and `extract_haploinsufficient_genes` run as HPC3 jobs that read these files.
 The literature line owns the directory; the other members' jobs only read it. The corpus scan's job
 also starts its own model on a paid-partition GPU from `<root>/containers/vllm-0.28.0.sif` and the
-weights in `<root>/hf` (`deploy/paperqa/README.md`).
+weights in `<root>/models/hf` (`deploy/paperqa/README.md`).
 
 | Path | Size | What | Setting |
 |---|---|---|---|

@@ -66,7 +66,7 @@ images:
 models:
   RedHatAI/Qwen3.8-27B-INT4:
     source: huggingface
-    path: hf/hub/models--RedHatAI--Qwen3.8-27B-INT4
+    path: models/hf/hub/models--RedHatAI--Qwen3.8-27B-INT4
     revision: c063053e004e9783631651df95cf55d0bbf88b32
     files:
       model.safetensors: fd5c287e3a03f30b0e53fd5fe66ec90ab5fdd94807f7f8df699cca3ae9534910
@@ -77,7 +77,7 @@ models:
     used_by: [the default model of a session]
   QuantTrio/Qwen3.6-35B-A3B-AWQ:
     source: huggingface
-    path: hf/hub/models--QuantTrio--Qwen3.6-35B-A3B-AWQ
+    path: models/hf/hub/models--QuantTrio--Qwen3.6-35B-A3B-AWQ
     revision: 119886a1072372348f73ef0df2d801cdcc0f455b
     files:
       model-00001-of-00009.safetensors: a03ac5037c331d2c6767cecc90ef571560b88a81a90e4834842e2e38a6a822b6
@@ -102,7 +102,7 @@ models:
     used_by: [the second model of the model list]
   MJPansa/DeepSeek-V4-Flash-0731-NVFP4:
     source: huggingface
-    path: hf/hub/models--MJPansa--DeepSeek-V4-Flash-0731-NVFP4
+    path: models/hf/hub/models--MJPansa--DeepSeek-V4-Flash-0731-NVFP4
     revision: 64d64cd89bc63a66aa46506da89d7821f7491c62
     files:
       model-00001-of-00048.safetensors: ff421fbe6f8ad389088735ce47de61f2203bd5c385caf471fc9cbf1ddffe040b
@@ -205,7 +205,7 @@ models:
     used_by: [the shared reasoning-model server]
   Qwen/Qwen2.5-VL-7B-Instruct:
     source: huggingface
-    path: vlreview_model
+    path: models/vlreview
     revision: cc594898137f460bfe9f0759e9844b3ce807cfb5
     files:
       model-00001-of-00005.safetensors: e97b877e47fde53a6c6e77aafb36e58e91ee9d95c4a3eeac6f1b5c0e6a1c986e

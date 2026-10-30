@@ -45,7 +45,8 @@ from . import upload_storage, dataset_storage
 from . import upload_log                  # what happened to each upload, per user
 from . import run_monitor                 # where each run is now (the System page's live graph)
 from . import corpus_scan                 # the corpus scan's own GPU job + the scans kept on the Eye Server
-from .errors import GatewayError, VLLMNetworkError, error_detail, public_error, redact_server_paths
+from .errors import (GatewayError, RedactErrorReplies, VLLMNetworkError, error_detail, public_error,
+                     redact_server_paths, redact_server_paths_in, scrub_secrets)
 from .executor import RemoteExecutor
 from .mock_host import MockExecutor
 from .settings import HPCSettings
@@ -196,6 +197,12 @@ _CURRENT_RUN: contextvars.ContextVar["RunState | None"] = contextvars.ContextVar
 # DAG nodes running side by side (each in a copy of the context) each keep their own step.
 _USAGE_STEP: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "aiscientist_usage_step", default=None)
+
+# Set in the thread of a call the user did not ask for and need not wait on (a skill request's
+# summary, written for the team after the reply): a reached budget refuses that call instead of
+# asking the user whether to go on (``_key_use``).
+_BUDGET_ASK_OFF: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "aiscientist_budget_ask_off", default=False)
 
 
 class RunState:
@@ -560,6 +567,20 @@ class Connection:
 
     def emit(self, level: str, stage: str, message: str, detail: Any = None, *,
              run: RunState | None = None) -> None:
+        """Log an event and publish it to the progress feed.
+
+        A ``warning`` or an ``error`` often carries an exception's text, which names the folder of a
+        file it failed on; the feed (live, replayed, and the bundle's event log) shows it, so it
+        loses this host's paths here, its detail too, whoever sends it (issue 71). The server's log
+        keeps the unfiltered line. HPC3 paths stay (``errors.redact_server_paths``)."""
+        if level in ("warning", "error"):
+            text = message if isinstance(message, str) else str(message)
+            shown, shown_detail = redact_server_paths_in((text, detail))
+            if shown != text or shown_detail != detail:
+                print(f"[{stage}] {level}: {scrub_secrets(text)}"
+                      + (f" | detail: {scrub_secrets(json.dumps(detail, default=str))[:2000]}"
+                         if shown_detail != detail else ""))
+            message, detail = shown, shown_detail
         event = {
             "type": "event",
             "level": level,
@@ -1840,6 +1861,9 @@ async def _monitor_gpu(conn: Connection) -> None:
 # --- FastAPI app -----------------------------------------------------------
 
 app = FastAPI(title="AiScientist HPC3 Console")
+# No error reply shows where this host keeps its files: every JSON body with status 400 or more
+# loses this host's paths below the routes, the original going to the journal (issue 71).
+app.add_middleware(RedactErrorReplies)
 
 # User accounts / login / admin (Phase 1). Mounted only when the `auth` extra
 # (sqlalchemy/bcrypt/itsdangerous) is installed — a host without it still runs the
@@ -5505,7 +5529,7 @@ def _event_log_text(events: list[dict[str, Any]]) -> str:
         if detail is not None:
             line += "\n    detail: " + json.dumps(detail, default=str)[:2000]
         lines.append(line)
-    from .errors import redact_key_store_paths, scrub_secrets
+    from .errors import redact_key_store_paths
     return scrub_secrets(redact_server_paths(redact_key_store_paths("\n".join(lines)))) + "\n"
 
 
@@ -6404,8 +6428,34 @@ def _refresh_originals(conn: Connection, plan: dict) -> dict:
                                       if r.get("verdict") == "removed")
         conn.emit("success", "storage", f"Removed {n} HPC3 original(s) of datasets kept on the server "
                                         f"({size / 1024 ** 3:.1f} GB, job {plan['remove']['job_id']}).")
+    # An original a job found already gone ("not there") is recorded as removed too, when its server
+    # copy is complete, so the next check does not offer it again. Once per finished job.
+    fresh = [ph for ph in ("check", "remove") if (plan.get(ph) or {}).get("status") == "done"
+             and ph not in (plan.get("missing_phases") or [])]
+    if fresh:
+        n = hpc_originals.record_missing(conn.owner, plan)
+        plan["missing_phases"] = sorted(set(plan.get("missing_phases") or []) | set(fresh))
+        plan["marked_missing"] = int(plan.get("marked_missing") or 0) + n
+        if n:
+            conn.emit("info", "storage", f"{n} HPC3 original(s) of datasets kept on the server were "
+                                         "already gone from HPC3; recorded as removed (the server "
+                                         "copies are complete).")
     hpc_originals.save_plan(conn.workspace, plan)
     return plan
+
+
+def _settle_originals(conn: Connection) -> None:
+    """Settle every plan of this HPC3 account that still has something to settle, not only the
+    newest: a Check made right after a Remove becomes the newest plan, and the Remove's result would
+    otherwise never reach ``source.json`` (seen on 2026-10-20: job 58329394 removed two originals
+    that stayed listed as removable). SSH-bound: call via a thread."""
+    from . import hpc_originals
+    for plan in hpc_originals.unsettled(hpc_originals.load_plans(conn.workspace), _hpc_user(conn)):
+        try:
+            _refresh_originals(conn, plan)
+        except Exception as exc:  # noqa: BLE001 - the next look tries again
+            print(f"[originals] plan {plan.get('id')} of {conn.owner} not settled: "
+                  f"{type(exc).__name__}: {exc}")
 
 
 @app.get("/api/hpc-originals")
@@ -6413,13 +6463,12 @@ async def get_hpc_originals(request: Request, connection_id: str = "", plan_id: 
     """The caller's latest plan (or ``plan_id``) for removing HPC3 originals, brought up to date."""
     from . import hpc_originals
     conn = _originals_ready(_owned_conn(connection_id, request, missing=("Not connected", 409)))
+    await asyncio.to_thread(_settle_originals, conn)
     plans = hpc_originals.load_plans(conn.workspace)
     plan = (next((p for p in plans if p["id"] == plan_id), None) if plan_id
             else (plans[-1] if plans else None))
     if plan is not None and plan.get("hpc_user") != _hpc_user(conn):
         plan = None
-    if plan is not None:
-        plan = await asyncio.to_thread(_refresh_originals, conn, plan)
     return JSONResponse({"plan": hpc_originals.public(plan) if plan else None,
                          "personal_allowed": hpc_originals.personal_allowed()})
 
@@ -6431,6 +6480,8 @@ async def check_hpc_originals(payload: dict, request: Request) -> JSONResponse:
     from . import hpc_originals
     conn = _originals_ready(_owned_conn(payload.get("connection_id", ""), request,
                                         missing=("Not connected", 409)))
+    # Earlier removals first, so what they removed is not offered again.
+    await asyncio.to_thread(_settle_originals, conn)
     check, kept = await asyncio.to_thread(_originals_candidates, conn)
     plan = hpc_originals.new_plan(conn.owner, _hpc_user(conn), check, kept,
                                   personal=hpc_originals.personal_allowed())
@@ -7830,6 +7881,8 @@ async def preview_dataset(dataset_id: int, request: Request, file: "str | None" 
                             status_code=504)
     except GatewayError as exc:
         return JSONResponse({"error": f"The file could not be read: {exc}"}, status_code=502)
+    except OSError as exc:   # a file on this host; the reply keeps its name, not its folder
+        return JSONResponse({"error": f"The file could not be read: {exc}"}, status_code=500)
     return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
 
@@ -8415,9 +8468,13 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         conn.push({"type": "chat_stopped"})
         return
     # A list question about the RetiGene papers is a curation of the whole corpus (issue 46): its own
-    # plan card, then the tables. A note on that plan that changes the request is routed below.
-    if _corpus_curation(conn, req.question):
-        conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence.")
+    # plan card, then the tables. So is one that names no papers (issue 20), in a chat with no data
+    # and no analysis. A note on that plan that changes the request is routed below.
+    if _corpus_curation(conn, req.question,
+                        with_context=target is not None or bool(_select_bound_datasets(req))):
+        from ..agents import request_router
+        conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence"
+                  + ("." if request_router.names_corpus(req.question) else " (the question names no papers)."))
         handoff = await _run_corpus_scan(conn, req, review=True)
         if handoff is None:
             return
@@ -8773,18 +8830,29 @@ def _vllm_log_tail(conn: Connection, path: str) -> str:
         return ""
 
 
-def _corpus_curation(conn: Connection, question: str) -> bool:
+def _corpus_curation(conn: Connection, question: str, *, with_context: bool = False) -> bool:
     """A list question about the RetiGene papers ("What are haploinsufficient genes in RetiGene
     papers?"): the console's route sends it to the corpus curation, the whole corpus read for the
     genes and their evidence, instead of the literature line's best passages (RCHENLAB/AiScientist
-    issue 46). Only a question that names the corpus, asks for the list and not about the user's
-    data, on a session that reaches the corpus on HPC3: the curation reads it there, so the Eye
-    Server copy alone (``local_corpus``) does not make one possible; the question then goes to the
-    literature line, which searches that copy. Haploinsufficiency is the one property curated."""
+    issue 46). Only a question that asks for the list and not about the user's data, on a session
+    that reaches the corpus on HPC3: the curation reads it there, so the Eye Server copy alone
+    (``local_corpus``) does not make one possible; the question then goes to the literature line,
+    which searches that copy. Haploinsufficiency is the one property curated.
+
+    The question either names the RetiGene papers, or names no source at all (issue 20: "What are
+    haploinsufficient genes?"). The second is read strictly: a plain request for the genes as a
+    set (``asks_for_gene_list(strict=True)``), naming no papers, PubMed, literature or database and
+    pointing at nothing in the chat (``request_router.names_no_source``), and not when data is
+    attached or the chat already ran an analysis (``with_context``), where "which genes" may mean
+    the user's own. Its plan card says that it reads the RetiGene papers and how to ask PubMed."""
     from ..agents import request_router
     q = str(question or "")
-    return (request_router.names_corpus(q) and corpus_scan.asks_for_gene_list(q)
-            and not request_router.refers_to_data(q) and _literature_corpus_on_hpc(conn))
+    if request_router.names_corpus(q):
+        asks = corpus_scan.asks_for_gene_list(q)
+    else:
+        asks = (not with_context and request_router.names_no_source(q)
+                and corpus_scan.asks_for_gene_list(q, strict=True))
+    return asks and not request_router.refers_to_data(q) and _literature_corpus_on_hpc(conn)
 
 
 # What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
@@ -8825,13 +8893,24 @@ async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callabl
                                   api: "dict[str, Any] | None") -> "bool | str | None":
     """The curation's plan card: True when the user runs it; None when the run is over (cancelled or
     stopped); the request with the user's note when the note changes it (to plan again)."""
+    from ..agents import request_router
     when = await asyncio.to_thread(_curation_time_words, conn, stored, api)
-    say("🧬 This asks for the genes the RetiGene papers report, so the plan is a curation of all the "
-        "RetiGene papers, not an answer from their best passages: every gene with its claim, the paper's own "
-        "sentence, the paper and the page, as a table. Run it, or say in the chat what to change.")
+    # A question that names no papers (issue 20) is read as one about the RetiGene papers: the card
+    # says so, and how to ask the public literature instead.
+    no_papers = not request_router.names_corpus(question)
+    if no_papers:
+        say("🧬 This asks for a list of haploinsufficient genes and names no papers, so the plan reads the "
+            "lab's RetiGene papers: a curation of all of them, not an answer from their best passages: every "
+            "gene with its claim, the paper's own sentence, the paper and the page, as a table. Run it, say "
+            "“search PubMed” in the chat for an answer from the public literature instead, or say what to change.")
+    else:
+        say("🧬 This asks for the genes the RetiGene papers report, so the plan is a curation of all the "
+            "RetiGene papers, not an answer from their best passages: every gene with its claim, the paper's own "
+            "sentence, the paper and the page, as a table. Run it, or say in the chat what to change.")
     while True:
-        decision = await asyncio.to_thread(_literature_plan_review, conn, emit,
-                                           corpus_scan.curation_plan_step(question, when), "corpus")
+        decision = await asyncio.to_thread(
+            _literature_plan_review, conn, emit,
+            corpus_scan.curation_plan_step(question, when, names_no_papers=no_papers), "corpus")
         action = str(decision.get("action") or "cancel")
         if action == "approve":
             return True
@@ -10635,6 +10714,8 @@ def _key_use(conn: Connection, cred: dict, **kw: Any) -> Any:
         run = _run()
         if run is None or getattr(run, "kind", "research") != "research":
             return None                   # a chat turn has no card to wait on: refuse, send again
+        if _BUDGET_ASK_OFF.get():
+            return None                   # a call for the team, not the user: refuse, never ask
         from ..hpc.shell import ConfirmRequest
         ask = _hitl_confirm(conn, run)
         return ask(ConfirmRequest(kind="budget", summary=summary, detail=detail)) if ask else None
@@ -11574,8 +11655,13 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     elif t == "steps_pruned":
         dropped = list(ev.get("dropped") or [])
         if ev.get("reason") == "user_scope":
-            progress(f"✂️ Left out {len(dropped)} step(s) your request ruled out: "
-                     + "; ".join(str(s).split(" — ")[0].replace("**", "")[:60] for s in dropped[:6]))
+            # Each left-out step by its title; nothing to name, no line (the #56 re-test's A2 read
+            # "Left out 1 step(s) your request ruled out: none").
+            names = [n for n in (str(s).split(" — ")[0].replace("**", "").strip()[:60]
+                                 for s in dropped) if n]
+            if names:
+                progress(f"✂️ Left out {len(names)} step(s) your request ruled out: "
+                         + "; ".join(names[:6]) + (" …" if len(names) > 6 else ""))
         elif ev.get("reason") == "no_experimental_contrast":
             progress(f"✂️ Dropped {len(dropped)} pathway-enrichment step(s): the dataset is already "
                      f"annotated with no experimental contrast, so enrichment on identity markers "
@@ -13388,6 +13474,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                              max_cycles=max_cycles,
                                              skill_induction=skill_induction,
                                              induced_skills_dir=induced_dir,
+                                             run_id=run_id,
                                              plan_review=plan_review,
                                              plan_yaml=plan_yaml,
                                              context_management=context_management),
@@ -13704,6 +13791,27 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # just because the last step (rendering) struggled. Re-affirmed after publish, below. Scoped
         # per-conversation so ONLY this chat's next message treats it as the run to amend.
         _remember_run(conn, run)
+        # Which steps ran tested tools and which ran code the model wrote during the run (issue 13):
+        # the reply and the reports open with a notice naming the untested ones, their code is kept
+        # in process/untested_code.md, and the run becomes a skill request for the team. Labels and
+        # records only: none of it may cost the run its report.
+        untested_md, skill_request = "", None
+        try:
+            from ..agents.code_provenance import has_untested_code, run_provenance, untested_notice
+            provenance = run_provenance(result.rounds)
+            if has_untested_code(provenance):
+                (art / "process").mkdir(parents=True, exist_ok=True)
+                (art / "process" / "untested_code.md").write_text(
+                    _untested_code_md(provenance), encoding="utf-8")
+                skill_request = _save_skill_request(conn, run_id, req, result, lab_obj, decisions,
+                                                    session_meta, provenance)
+            untested_md = untested_notice(provenance, recorded=skill_request is not None)
+            if untested_md:
+                n = len(provenance["untested_accepted"])
+                emit("warning", "lab", f"🧪 {n} completed step(s) ran code written during this run, "
+                                       "not a tested tool — the reply says which.")
+        except Exception as exc:  # noqa: BLE001 - a label, never a reason to lose the run
+            emit("warning", "lab", f"Could not label untested code: {type(exc).__name__}: {exc}"[:200])
         # A run that only did quality control is answered in the chat, unless its request asks for a
         # written report: then the model writes one (Yijun, 2026-10-18). Either way the bundle is the
         # complete folder.
@@ -13883,6 +13991,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             # Title the document by CONTENT (the report's own H1 / main finding), not a generic
             # constant — promotes the first heading to the pandoc title and drops it from the body.
             report_title, report_md = _promote_doc_title(report_md, "AiScientist Research Report")
+            if untested_md:
+                report_md = untested_md + "\n" + report_md
             try:
                 if abandoned():
                     # Skip pandoc (and its Slurm job) but never the .md — the bundle must still carry a
@@ -13972,6 +14082,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     _llm_provenance_note(_llm))
                 tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
                 tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
+                if untested_md:
+                    tech_md = untested_md + "\n" + tech_md
                 if verification_md:
                     # The same statement, one heading level down, so the technical PDF carries it too.
                     tech_md = tech_md.rstrip() + "\n\n" + re.sub(
@@ -14005,12 +14117,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             if reply:
                 result.final_answer = reply.rstrip() + "\n\n" + pointer + "\n"
         if chat_only:
-            say_key("✅ Done — the summary is below; the result files are in the Downloads panel.",
-                    "success")
+            # A warning, as the reply's first line, when the QC step was not accepted (issue 75).
+            say_key(*_qc_closing_line(result))
         else:
             say_key("✅ Report ready — see below and the Downloads panel." if not abandoned()
                     else "🛑 Write-up skipped — the run's figures, tables and report.md are in the "
                          "Downloads panel.", "success" if not abandoned() else "warning")
+        if untested_md:
+            result.final_answer = untested_md + "\n" + (result.final_answer or "")
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
         conn.push({"type": "chat_done"})
         if later_asks:
@@ -14094,6 +14208,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         run_status = "done" if (result and result.converged) else "incomplete"
         _finish_run_record(conn, run_id, run_status, str(art),
                            result.final_answer if result else None)
+        if skill_request is not None:
+            # Last, once the reply, the reports and the files are out: the summary is for the team.
+            # Still inside the run, so its one classify call is billed and counted with the run's
+            # usage (shown next, from ``finally``), and no other chat's run is charged for it.
+            await asyncio.to_thread(_summarize_skill_request, skill_request, complete_fn, lab_obj)
     except GatewayError as exc:
         # Also persist to STDOUT → journal: the WS error feed is in-memory and lost on
         # restart, so without this a `journalctl` pull can't see why a run died.
@@ -14954,14 +15073,21 @@ def _brief_doublet_lines(lib: dict, row: "dict[str, str]", decider: str,
     return out
 
 
-def _brief_qc_lines(qc: "tuple[str, dict] | None", art: Path) -> "list[str]":
-    """What QC did, from the tool's own return value and CellQC's metrics table: per-library counts,
-    why cells were removed, ambient RNA, doublets, nuclear fraction, the tool's warnings, and the QC
-    figure."""
+def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
+    """What QC did, from the tool's own return value and CellQC's metrics table: how the step ended
+    and the bound libraries it left out, as the chat reply says them; per-library counts, why cells
+    were removed, ambient RNA, doublets, nuclear fraction, the tool's warnings, and the QC figure.
+    ``qc`` is :func:`_qc_step_outcome`'s."""
     if qc is None:
         return []
-    tool, r = qc
+    tool, r = qc["tool"], qc["result"]
     lines = ["## Quality control", ""]
+    ending = _qc_ending_text(qc)
+    if ending:
+        lines += [f"**{_QC_HEADLINES[qc['status']]}.** {ending}", ""]
+    left_out = _qc_bound_not_qcd(art, r)
+    if left_out:
+        lines += [f"**Bound but not QC'd:** {', '.join(left_out)}.", ""]
     libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
     if libs:
         # CellQC's own median is the filter step's, over every Cell Ranger cell; run_cellqc adds the
@@ -15142,7 +15268,7 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     dataset = _dataset_section(art, result)
     if dataset:
         out += [dataset.rstrip(), ""]
-    out += _brief_qc_lines(_qc_step_result(result), art)
+    out += _brief_qc_lines(_qc_step_outcome(result), art)
     out += _brief_labels_lines(art)
     pipeline = _pipeline_section(result)
     if pipeline:
@@ -15261,11 +15387,18 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
 
     Run 6275df1213ab (CellQC on one library) answered with a model-written Summary, Methods,
     Results, Limitations and Conclusion, plus a rendered PDF/DOCX. Yijun, 2026-10-16: a simple step
-    needs no report — a short reply in the chat with the necessary numbers."""
-    qc = _qc_step_result(result)
-    if qc is None:
+    needs no report — a short reply in the chat with the necessary numbers.
+
+    The first line says how the step ended (:func:`_qc_step_outcome`), and a line names the bound
+    libraries the result leaves out: run cfc9b93a7ac5's step was skipped after three rejected
+    rounds that each QC'd one of three libraries, and its reply opened "Quality control done"."""
+    outcome = _qc_step_outcome(result)
+    if outcome is None:
         return ""
-    tool, r = qc
+    tool, r = outcome["tool"], outcome["result"]
+    headline = _QC_HEADLINES[outcome["status"]]
+    ending = _qc_ending_text(outcome)
+    left_out = _qc_bound_not_qcd(art, r)
     th = r.get("thresholds") if isinstance(r.get("thresholds"), dict) else {}
 
     def n(v: Any) -> str:
@@ -15280,12 +15413,14 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
              else "")
     if libs:
         names = ", ".join(str(lib.get("sample")) for lib in libs[:4]) + (" …" if len(libs) > 4 else "")
-        lines = [f"**Quality control done** — `{tool}` on {names}.", ""]
+        lines = [f"**{headline}** — `{tool}` on {names}." + (f" {ending}" if ending else ""), ""]
     else:
-        lines = [f"**Quality control done** — `{tool}`.", ""]
+        lines = [f"**{headline}** — `{tool}`." + (f" {ending}" if ending else ""), ""]
     if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before:
         lines.append(f"- **{int(after):,} of {int(before):,} cells kept "
                      f"({100 * after / before:.1f}%)**{genes}.")
+    if left_out:
+        lines.append(f"- **Bound but not QC'd:** {', '.join(left_out)}.")
     if len(libs) == 1:
         lib = libs[0]
         removed = lib.get("removed_only_by") or {}
@@ -15373,28 +15508,145 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
 
 
 def _qc_step_result(result: Any) -> "tuple[str, dict] | None":
-    """The latest accepted round's QC result, else the latest QC result, or None.
+    """``(tool, result)`` of :func:`_qc_step_outcome`: the latest accepted round's QC result, else
+    the latest QC result, or None."""
+    outcome = _qc_step_outcome(result)
+    return (outcome["tool"], outcome["result"]) if outcome else None
+
+
+def _round_field(rnd: Any, key: str) -> Any:
+    return rnd.get(key) if isinstance(rnd, dict) else getattr(rnd, key, None)
+
+
+def _round_qc(rnd: Any) -> "tuple[str, dict] | None":
+    """The round's completed QC call, ``(tool, result)``, or None."""
+    for st in ((_round_field(rnd, "scientist_result") or {}).get("steps") or []):
+        r = st.get("result") if isinstance(st, dict) else None
+        if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
+                and r.get("cells_before") is not None):
+            return str(st["tool"]), r
+    return None
+
+
+def _qc_step_outcome(result: Any) -> "dict[str, Any] | None":
+    """The QC result the reply and the short report show — the latest accepted round's, else the
+    latest round's — and how its step ended, or None when no round completed a QC call.
+
+    The reply used to get the result alone, so it could not tell a skipped step from an accepted one:
+    run cfc9b93a7ac5's CellQC step was sent back three times and skipped, and the reply opened
+    "Quality control done" (RCHENLAB/AiScientist issue 75). Keys:
+
+    - ``tool``, ``result``: the QC call shown;
+    - ``status``: ``"accepted"``; ``"unreviewed"`` (the Critic returned no usable review twice and
+      the result was kept as it is); ``"not_accepted"`` (no round of the step was accepted: skipped
+      at the decision point, or moved on after its last attempt); ``"unknown"`` (a round with no
+      verdict, which says nothing either way);
+    - ``attempts``: the step's rounds; ``attempt``: the shown round's place among them;
+    - ``critique``: the Critic's on the shown round; ``skipped``: the user chose "Skip this step".
 
     Reads both round shapes: LabRound dataclasses in production, dicts in tests and run_state.json
     replays. This section used to read only dicts — the defect _pipeline_section had — so a live
     run's report never carried its QC paragraph."""
-    latest = None
-    for rnd in reversed(getattr(result, "rounds", None) or []):
-        sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
-              else getattr(rnd, "scientist_result", None))
-        verdict = rnd.get("verdict") if isinstance(rnd, dict) else getattr(rnd, "verdict", None)
-        verdict = verdict.get("verdict") if isinstance(verdict, dict) else getattr(verdict, "verdict", None)
-        for st in ((sr or {}).get("steps") or []):
-            r = st.get("result") if isinstance(st, dict) else None
-            if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
-                    and r.get("cells_before") is not None):
-                qc = str(st["tool"]), r
-                if verdict == "accept":
-                    return qc
-                if latest is None:
-                    latest = qc
-                break
-    return latest
+    rounds = list(getattr(result, "rounds", None) or [])
+    chosen: "tuple[int, str, dict] | None" = None
+    for i in range(len(rounds) - 1, -1, -1):
+        qc = _round_qc(rounds[i])
+        if qc is None:
+            continue
+        accepted = _round_field(_round_field(rounds[i], "verdict"), "verdict") == "accept"
+        if accepted or chosen is None:
+            chosen = (i, *qc)
+        if accepted:
+            break
+    if chosen is None:
+        return None
+    i, tool, r = chosen
+    verdict = _round_field(rounds[i], "verdict")      # None on a round recorded without one
+    said = str(_round_field(verdict, "verdict") or "")
+    if said == "accept":
+        status = "unreviewed" if _round_field(verdict, "reviewed") is False else "accepted"
+    else:
+        status = "not_accepted" if said else "unknown"
+    step = str(_round_field(rounds[i], "step") or "")
+    same = [j for j, rnd in enumerate(rounds) if str(_round_field(rnd, "step") or "") == step]
+    critique = _round_field(verdict, "critique") or ""
+    return {"tool": tool, "result": r, "status": status, "step": step,
+            "attempts": len(same), "attempt": same.index(i) + 1,
+            "critique": " ".join(str(critique).split()),
+            "skipped": bool(step) and step in (getattr(result, "skipped_steps", None) or ())}
+
+
+# The reply's bold opening, and the short report's, by how the QC step ended (_qc_step_outcome).
+_QC_HEADLINES = {"accepted": "Quality control done", "unknown": "Quality control done",
+                 "unreviewed": "Quality control kept without review",
+                 "not_accepted": "Quality control not accepted"}
+
+
+def _short_critique(text: str, limit: int = 300) -> str:
+    """The Critic's words, cut at a sentence end when one falls in the second half of ``limit``."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("; "))
+    if end >= limit // 2:
+        return cut[:end + 1]
+    return cut.rsplit(" ", 1)[0].rstrip(",;:") + " …"
+
+
+def _qc_ending_text(outcome: "dict[str, Any]") -> str:
+    """How the QC step ended, after the reply's and the short report's bold opening; '' for an
+    accepted step. A step that was not accepted says so, which attempt the numbers below are from,
+    and what the Critic last said."""
+    if outcome["status"] == "unreviewed":
+        return ("The Critic returned no usable review twice, so this result was kept as it is, "
+                "without review.")
+    if outcome["status"] != "not_accepted":
+        return ""
+    n, k = outcome["attempts"], outcome["attempt"]
+    tries = f"{n} attempt{'s' if n != 1 else ''}"
+    how = (f"You skipped the step after {tries}" if outcome["skipped"] else
+           "The Critic did not accept it" if n == 1 else f"The Critic accepted none of its {tries}")
+    shown = ("that attempt's" if n == 1 else "the last attempt's" if k == n
+             else f"from attempt {k} of {n}")
+    text = f"{how}; the numbers below are {shown}."
+    if outcome["critique"]:
+        text += f" The Critic: {_short_critique(outcome['critique'])}"
+    return text
+
+
+def _qc_bound_not_qcd(art: Path, r: dict) -> "list[str]":
+    """The bound libraries a QC result leaves out: the run's Cell Ranger delivery
+    (``data/dataset_results.json`` → ``cellranger_layout``, the sample ids run_cellqc runs under)
+    less the libraries the result reports. [] when the result names no library (scanpy QC) or the
+    run recorded no delivery. Run cfc9b93a7ac5 bound three libraries, QC'd one, and its reply named
+    only that one."""
+    qcd = {str(lib.get("sample")) for lib in (r.get("libraries") or [])
+           if isinstance(lib, dict) and lib.get("sample")}
+    if not qcd:
+        return []
+    try:
+        dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    layout = dr.get("cellranger_layout") if isinstance(dr, dict) else None
+    bound = [str(lib.get("sample")) for lib in ((layout or {}).get("libraries") or [])
+             if isinstance(lib, dict) and lib.get("sample")] if isinstance(layout, dict) else []
+    return [name for name in dict.fromkeys(bound) if name not in qcd]
+
+
+def _qc_closing_line(result: Any) -> "tuple[str, str]":
+    """The status line, and its level, that closes a QC-only run's reply: a warning when the QC step
+    was not accepted or was kept without review, as the reply's first line says."""
+    outcome = _qc_step_outcome(result)
+    status = outcome["status"] if outcome else ""
+    if status == "not_accepted":
+        return ("⚠️ Quality control not accepted — the summary below says why; the result files are "
+                "in the Downloads panel.", "warning")
+    if status == "unreviewed":
+        return ("⚠️ Quality control kept without review — the summary is below; the result files "
+                "are in the Downloads panel.", "warning")
+    return "✅ Done — the summary is below; the result files are in the Downloads panel.", "success"
 
 
 def _qc_input_counts(qc: "tuple[str, dict] | None", primary: str) -> str:
@@ -15929,6 +16181,114 @@ def _insert_verification_note(md: str, summary: dict) -> str:
     """The short ``## Verification`` section, placed before References (or the file index)."""
     from ..reporting.verification import manuscript_note
     return _insert_before_backmatter(md, manuscript_note(summary))
+
+
+def _untested_code_md(provenance: dict) -> str:
+    """``process/untested_code.md``: every code-tool call of the run, step by step, as it ran.
+
+    The bundle is the user's to download and share, so the file is cleaned the way the event log is
+    (``_event_log_text``): no key-store path, no other path of this host, no key-shaped token that
+    a script or its error printed. Paths on HPC3 stay: they are the user's own."""
+    lines = ["# Code written during this run", "",
+             "These steps ran code that the AI wrote or typed during the run (`run_code`, "
+             "`run_shell`, `run_in_environment`), not a tested AiScientist tool. Every attempt is "
+             "listed, including the ones that failed. Check this code before relying on a result "
+             "that came from it.", ""]
+    n = 0
+    for step in provenance.get("steps") or []:
+        calls = step.get("code_calls") or []
+        if not calls:
+            continue
+        n += 1
+        state = "accepted" if step.get("accepted") else "not accepted"
+        lines += [f"## {n}. {_plain_step_title(step.get('step', ''))}", "",
+                  f"{state}; result from {'untested code' if step.get('status') == 'untested' else 'a tested tool' if step.get('status') == 'tested' else 'no tool'}; "
+                  f"{len(calls)} code attempt(s).", ""]
+        for i, c in enumerate(calls, 1):
+            head = f"**Attempt {i}** · `{c.get('tool')}`" + (f" · skill `{c['skill']}`" if c.get("skill") else "")
+            lines += [head + (" · ran" if c.get("ok") else " · failed"), ""]
+            fence = "python" if c.get("tool") == "run_code" else "bash"
+            lines += [f"```{fence}", str(c.get("code") or "").rstrip(), "```", ""]
+            if c.get("code_truncated_from"):
+                lines += [f"(cut from {c['code_truncated_from']} characters)", ""]
+            if c.get("error"):
+                lines += ["Error:", "", "```text", str(c["error"]).rstrip(), "```", ""]
+            elif c.get("summary"):
+                lines += [f"Result: {c['summary']}", ""]
+    from .errors import redact_key_store_paths, scrub_secrets
+    return scrub_secrets(redact_server_paths(redact_key_store_paths(
+        "\n".join(lines).rstrip()))) + "\n"
+
+
+def _save_skill_request(conn: "Connection", run_id: str, req: Any, result: Any, lab_obj: Any,
+                        decisions: dict, session_meta: dict, provenance: dict) -> "dict | None":
+    """The run as a skill request (gateway/skill_requests.py), saved before the reply says so."""
+    from . import skill_requests
+    if not skill_requests.enabled():
+        return None
+    datasets = [dict(d) for d in (decisions.get("datasets") or []) if isinstance(d, dict)]
+    if not datasets and decisions.get("dataset_path"):
+        datasets = [{"path": decisions["dataset_path"]}]
+    if datasets and decisions.get("content_modality"):
+        datasets[0].setdefault("content_modality", decisions["content_modality"])
+    rec = skill_requests.build_record(
+        run_id=run_id, account=str(conn.owner or ""), question=str(req.question or ""),
+        provenance=provenance, conversation_id=str(getattr(req, "conversation_id", "") or ""),
+        earlier_requests=[str(e.get("question") or "") for e in session_meta.get("session") or []
+                          if isinstance(e, dict)],
+        datasets=datasets, pipelines=[str(p.get("key")) for p in lab_obj.protocols],
+        skills=_skill_request_skills(lab_obj, provenance),
+        converged=bool(result.converged), claim_audit=getattr(result, "claim_audit", None),
+        induced_skills=list(getattr(lab_obj, "induced_skills", None) or []))
+    skill_requests.save(rec)
+    return rec
+
+
+def _skill_request_skills(lab_obj: Any, provenance: dict) -> "list[str]":
+    """The vetted skills (pinned registry release) behind the run's code: the ones its plan assigned
+    to a step, and the ones a code call named. A request that needed code although a skill was
+    there says the skill needs work, not that one is missing."""
+    names: list[str] = []
+    try:
+        from ..agents.plan_doc import parse_plan_yaml
+        approved = str(getattr(lab_obj, "approved_plan_yaml", "") or "")
+        if approved:
+            names += [st.skill for st in parse_plan_yaml(approved).steps if st.skill]
+    except Exception as exc:  # noqa: BLE001 - the record stands without it
+        print(f"[skill_requests] plan skills not read: {type(exc).__name__}: {exc}")
+    names += [str(c["skill"]) for st in provenance.get("steps") or []
+              for c in st.get("code_calls") or [] if c.get("skill")]
+    return list(dict.fromkeys(n for n in names if n))[:20]
+
+
+def _summarize_skill_request(rec: dict, complete_fn: Any, lab_obj: Any) -> None:
+    """Fill a saved skill request's structured summary. Best-effort: the record stands without it.
+
+    One ``classify`` call through the run's own ``complete_fn``, so it goes where the run's other
+    classify calls go (the session's model, its key, the key service) and lands in the run's usage
+    under its own step. It is for the team, not the user: a reached budget is never asked about for
+    it (``_BUDGET_ASK_OFF``) — the code-built summary is written instead."""
+    from . import skill_requests
+    from ..agents.code_provenance import NEUTRAL_TOOLS
+    from ..agents.plan_doc import CODE_TOOLS
+    from ..agents.preset_pipelines import PIPELINES
+    from ..agents.skills import SKILLS
+    tokens = (_USAGE_STEP.set("Skill request summary"), _BUDGET_ASK_OFF.set(True))
+    try:
+        catalog = getattr(getattr(lab_obj, "scientist", None), "catalog", None) or []
+        choices = sorted({*PIPELINES} | {*SKILLS} | {t.name for t in catalog
+                                                     if t.name not in CODE_TOOLS | NEUTRAL_TOOLS})
+        summary, by = skill_requests.summarize(
+            rec, (lambda messages, role="classify": _role_call(complete_fn, messages, role))
+            if complete_fn is not None else None, choices)
+        fresh = skill_requests.load(rec["id"]) or rec
+        fresh["summary"], fresh["summary_by"] = summary, by
+        skill_requests.save(fresh)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[skill_requests] could not summarize {rec.get('id')}: {type(exc).__name__}: {exc}")
+    finally:
+        _USAGE_STEP.reset(tokens[0])
+        _BUDGET_ASK_OFF.reset(tokens[1])
 
 
 def _earlier_work_note(prior: dict, from_dataset: bool) -> str:
@@ -17282,7 +17642,8 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
         return _save_run_result(owner, user_id, run_id,
                                 str(rec["datasets"][0].get("what") or "dataset:unknown"), conn)
     if rec.get("saved_to"):
-        return 200, {"ok": True, "path": rec["saved_to"], "already": True}
+        return 200, {"ok": True, "path": rec["saved_to"], "name": str(rec.get("name") or ""),
+                     "already": True}
     name, src = str(rec.get("name") or ""), str(rec.get("path") or "")
     if rec.get("saving"):
         return 202, {"ok": True, "saving": True, "name": name}
@@ -17361,7 +17722,8 @@ def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tu
     if rec is None:
         return 404, {"error": "This run has no curation tables."}
     if rec.get("saved_to"):
-        return 200, {"ok": True, "path": rec["saved_to"], "already": True}
+        return 200, {"ok": True, "path": rec["saved_to"], "name": str(rec.get("name") or ""),
+                     "already": True}
     name = str(rec.get("name") or "")
     if not _TABLES_NAME_RE.fullmatch(name):
         return 400, {"error": "unexpected result name"}
@@ -17393,7 +17755,8 @@ def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tu
                 shutil.copy2(src / n, dest_p / n)
             dest = str(dest_p)
     except (OSError, ValueError) as exc:
-        return 500, {"error": f"Could not save the tables: {public_error(exc)}"}
+        # The route's reply loses this host's paths (RedactErrorReplies); the journal keeps them.
+        return 500, {"error": f"Could not save the tables: {exc}"}
     dataset_id = None
     try:
         if user_id and not auth_routes.dataset_path_recorded(user_id, dest):
@@ -17521,8 +17884,11 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
         except Exception as exc:  # noqa: BLE001 - the analysis is done; never fail the run over this
             status, body = 500, {"error": str(exc)}
         if status == 200:
-            emit("success", "lab", f"💾 {label} is saved to your data: {body['path']} — it is in "
-                                   "Datasets, ready for the next analysis.")
+            # Named as Datasets lists it, never by its folder on this server (issue 37).
+            saved = str(body.get("name") or "")
+            named = f" as “{saved}”" if saved and saved not in label else ""
+            emit("success", "lab", f"💾 {label} is saved to your data{named}: it is in Datasets, ready "
+                                   "for the next analysis.")
         elif status == 202:
             emit("info", "lab", f"💾 {label} is being copied from HPC3 to your data on the server; it "
                                 "appears in Files → Datasets when it is there.")

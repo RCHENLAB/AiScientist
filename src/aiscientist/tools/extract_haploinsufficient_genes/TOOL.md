@@ -48,7 +48,11 @@ one working copy is not enough.
 
 - From the console: a list question about the RetiGene papers ("What are haploinsufficient genes
   in RetiGene papers?": it names the corpus, asks for the genes and not about the user's data) is
-  routed to the corpus curation (`gateway/app._corpus_curation`). Its plan card says what is read
+  routed to the corpus curation (`gateway/app._corpus_curation`). So is a plain gene-list question
+  that names no source ("What are haploinsufficient genes?": no papers, PubMed, literature or
+  database, in a chat with no data and no analysis); its plan card then says that the question names
+  no papers, that this reads the RetiGene papers, and that "search PubMed" asks the public
+  literature instead. The plan card says what is read
   and how long it takes on the session; once the user runs it, the gateway (`_run_corpus_scan`)
   submits one HPC3 job with a workspace of its own and puts the CSVs in the run's results. A
   client can also send `route: "corpus"` to `/api/lab`, which runs it without a plan.

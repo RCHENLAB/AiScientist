@@ -1485,6 +1485,18 @@ button.full { width: 100%; margin-top: 6px; }
   padding: 5px 13px; font: inherit; font-size: 13px; color: var(--text-secondary); cursor: pointer;
 }
 .skill-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.req-chip {
+  background: var(--surface-sunken); border: 1px solid var(--border); border-radius: 980px;
+  padding: 5px 13px; font: inherit; font-size: 13px; color: var(--text-secondary); cursor: pointer;
+}
+.req-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.req-groups { margin-bottom: 14px; }
+.status-pill.req-new { color: var(--amber); border-color: var(--amber); }
+.status-pill.req-released { color: var(--green); border-color: var(--green); }
+.status-pill.req-wont_do { color: var(--text-tertiary); }
+.skill-detail pre.err { color: var(--red, #b42318); }
+/* Not the "Revised" pill: an outline, in the readable amber, so the two never look alike. */
+.plan-step-flag.untested { color: var(--amber-text); background: transparent; box-shadow: inset 0 0 0 1px var(--amber); }
 .skill-card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
   padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; min-width: 0;

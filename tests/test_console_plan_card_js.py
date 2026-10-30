@@ -74,6 +74,9 @@ out.yaml = yaml;
 out.yamlHtml = api.planYamlHtml(yaml);
 out.withWords = api.planCardHtml(agenda, doc, [], { words: "drop <step 3> & rerun" });
 out.single = api.planCardHtml([agenda[0]], { yaml: doc.yaml, steps: [steps[0]] }, []);
+const codeDoc = { yaml: doc.yaml, steps: [{ id: "s1", tool: "run_code", skill: "score_signature" }, { id: "s2", tool: "run_in_environment" }, steps[1]] };
+out.codeCard = api.planCardHtml(agenda, codeDoc, []);
+out.codeEntry = api.planEntryHtml(agenda, codeDoc, { status: "Approved" });
 console.log(JSON.stringify(out));
 """.replace("__ESCAPE__", ESCAPE)
 
@@ -377,3 +380,17 @@ def test_the_composer_has_no_run_options_and_no_pipelines_and_skills_picker():
     for gone in ('$("modeSelect")', '$("planMode")', '$("autonomousMode")', '$("saveResults")', '$("methodsBtn")'):
         assert gone not in source
     assert "...FIXED_RUN_OPTIONS" in source, "the run is sent with the fixed options"
+
+
+def test_a_step_that_runs_code_the_ai_writes_is_marked_untested_before_it_is_approved():
+    """Issue 13: run_code / run_shell / run_in_environment run code written during the run, so the
+    plan says so on the step, in the side panel and in the chat's plan entry; a tool step does not."""
+    out = _card()
+    flag = '<span class="plan-step-flag untested"'
+    for html in (out["codeCard"], out["codeEntry"]):
+        assert html.count(flag) == 2, html
+        assert ">Untested code</span>" in html
+        # a vetted skill on the step does not make its code tested: the AI adapts the skill's code
+        assert "adapts the code of the skill score_signature" in html
+        assert "plan-step-skill" in html, "the skill chip stays beside the label"
+    assert flag not in out["card"] and flag not in out["entry"]

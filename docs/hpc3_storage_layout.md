@@ -397,7 +397,10 @@ The script removes an original only when it is strictly inside the user's upload
 link anywhere, a folder holds no link and no hidden file (neither was copied to the server), and its
 size on HPC3 equals the server copy's. Anything else is skipped with the reason. It refuses to run
 outside a Slurm job. When the removal finishes, each removed original is recorded in its dataset's
-`source.json` (`hpc3_removed`), and the next check no longer lists it. What each job was given and
+`source.json` (`hpc3_removed`), and the next check no longer lists it. Opening the Storage tab, and
+every new Check, first settles each earlier plan whose job has not been settled yet, not only the newest
+one. An original a job finds already gone (`not there`) is recorded the same way
+(`hpc3_removed.found_missing`), but only while its server copy is complete. What each job was given and
 what it said stay in the session's `logs/originals/` (the plan keeps their paths, so a Remove in a
 later session settles a Check of an earlier one). `tests/test_hpc_originals.py` runs the script
 against a real directory tree.

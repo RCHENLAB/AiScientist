@@ -530,3 +530,113 @@ def test_a_removed_original_still_leads_a_run_to_its_copy(flow):
     assert ho.record_removed("tester", plan) == 1
     assert gw._kept_copy_of(conn, f"{UPLOADS}/Sample2") == str(row)
     assert gw._kept_copy_of(conn, f"{UPLOADS}/Sample2/outs/a.h5") == str(row / "outs" / "a.h5")
+
+
+# --- every plan is settled, not only the newest (seen on prod 2026-10-20) --------------------------
+
+def _finish(hpc, log_path: str, job: str, lines: str) -> None:
+    hpc.states[job] = "COMPLETED"
+    hpc.files[log_path] = lines.encode()
+
+
+def test_a_removal_is_recorded_even_when_a_newer_check_came_right_after_it(flow):
+    """Prod, 2026-10-20 20:20: Remove (job 58329394) removed two originals, a Check 7 s later became
+    the newest plan, and the Storage tab only ever refreshed the newest one: the removal never
+    reached source.json and both originals stayed listed as removable."""
+    gw, conn, hpc = flow.gw, flow.conn, flow.conn.executor
+    uid, row = _homed("tester", f"{UPLOADS}/pbmc.h5ad", {"pbmc.h5ad": b"MATRIX"}, kind="file")
+    flow.rows.append({"uuid": uid, "path": str(row), "kind": "h5ad"})
+    _s, body = _call(gw.check_hpc_originals({"connection_id": conn.id}, None))
+    first = body["plan"]
+    _finish(hpc, first["check"]["log"], "901",
+            f"WOULD_REMOVE\t6\t{UPLOADS}/pbmc.h5ad\n"
+            "ORIGINALS_RESULT checked=1 would_remove=1 removed=0 skipped=0 bytes=6 dry_run=1 job=901\n")
+    _call(gw.get_hpc_originals(None, connection_id=conn.id))
+    _s, body = _call(gw.remove_hpc_originals({"connection_id": conn.id, "plan_id": first["id"]}, None))
+    remove_log = body["plan"]["remove"]["log"]
+    # The removal ran on HPC3, and the user checked again before anything refreshed the first plan.
+    hpc.files[remove_log] = (f"REMOVED\t6\t{UPLOADS}/pbmc.h5ad\n"
+                             "ORIGINALS_RESULT checked=1 would_remove=0 removed=1 skipped=0 bytes=6 "
+                             "dry_run=0 job=902\n").encode()
+    plans = ho.load_plans(conn.workspace)
+    assert [p["id"] for p in plans] == [first["id"]] and plans[0]["remove"]["status"] == "queued"
+    hpc.states["902"] = "COMPLETED"
+    _s, body = _call(gw.check_hpc_originals({"connection_id": conn.id}, None))
+    # The check settled the earlier removal first: nothing is offered again, no job submitted.
+    assert body["plan"]["candidates"] == [] and body["plan"]["check"] is None
+    source = json.loads((dataset_storage.dataset_dir(uid, "tester") / "source.json").read_text())
+    assert source["hpc3_removed"]["job_id"] == "902" and source["hpc3_removed"]["plan"] == first["id"]
+    # The newest plan is still the newest one (settling the older plan did not move it last).
+    plans = ho.load_plans(conn.workspace)
+    assert plans[0]["id"] == first["id"] and plans[0]["settled"] is True
+    assert plans[-1]["id"] == body["plan"]["id"]
+
+
+def test_the_storage_tab_settles_an_older_plan_it_does_not_show(flow):
+    gw, conn, hpc = flow.gw, flow.conn, flow.conn.executor
+    uid, row = _homed("tester", f"{UPLOADS}/a.h5ad", {"a.h5ad": b"AAAA"}, kind="file")
+    flow.rows.append({"uuid": uid, "path": str(row), "kind": "h5ad"})
+    older = ho.new_plan("tester", "tester",
+                        [{"path": f"{UPLOADS}/a.h5ad", "kind": "file", "bytes": 4, "dataset": uid,
+                          "name": "a.h5ad", "personal": False}], [], personal=False)
+    older["check"] = {"job_id": "700", "status": "done", "log": "/x/check.log",
+                      "results": [{"verdict": "would_remove", "bytes": 4, "path": f"{UPLOADS}/a.h5ad"}]}
+    older["remove"] = {"job_id": "701", "status": "queued", "log": "/x/remove.log"}
+    older["missing_phases"] = ["check"]
+    ho.save_plan(conn.workspace, older)
+    newer = ho.new_plan("tester", "tester", [], [], personal=False)
+    ho.save_plan(conn.workspace, newer)
+    _finish(hpc, "/x/remove.log", "701",
+            f"REMOVED\t4\t{UPLOADS}/a.h5ad\nORIGINALS_RESULT removed=1 dry_run=0 job=701\n")
+    _s, body = _call(gw.get_hpc_originals(None, connection_id=conn.id))
+    assert body["plan"]["id"] == newer["id"]                       # it shows the newest plan
+    assert ho.get_plan(conn.workspace, older["id"])["remove"]["status"] == "done"
+    source = json.loads((dataset_storage.dataset_dir(uid, "tester") / "source.json").read_text())
+    assert source["hpc3_removed"]["job_id"] == "701"
+    assert any("Removed 1 HPC3 original" in s for s in flow.said)
+
+
+def test_an_original_already_gone_is_recorded_when_its_server_copy_is_whole(flow):
+    gw, conn, hpc = flow.gw, flow.conn, flow.conn.executor
+    whole, wrow = _homed("tester", f"{UPLOADS}/whole.h5ad", {"whole.h5ad": b"WHOLE"}, kind="file")
+    short, srow = _homed("tester", f"{UPLOADS}/short.h5ad", {"short.h5ad": b"SHORT"}, kind="file")
+    flow.rows += [{"uuid": whole, "path": str(wrow), "kind": "h5ad"},
+                  {"uuid": short, "path": str(srow), "kind": "h5ad"}]
+    _s, body = _call(gw.check_hpc_originals({"connection_id": conn.id}, None))
+    plan = body["plan"]
+    # Between the plan and the job's end, one server copy lost bytes: that one is not recorded.
+    srow.write_bytes(b"SH")
+    _finish(hpc, plan["check"]["log"], "901",
+            f"SKIP\tnot there\t{UPLOADS}/short.h5ad\nSKIP\tnot there\t{UPLOADS}/whole.h5ad\n"
+            "ORIGINALS_RESULT checked=2 would_remove=0 removed=0 skipped=2 bytes=0 dry_run=1 job=901\n")
+    _s, body = _call(gw.get_hpc_originals(None, connection_id=conn.id))
+    assert body["plan"]["found_missing"] == 1
+    gone = json.loads((dataset_storage.dataset_dir(whole, "tester") / "source.json").read_text())
+    assert gone["hpc3_removed"]["found_missing"] is True and gone["hpc3_removed"]["job_id"] == "901"
+    kept = json.loads((dataset_storage.dataset_dir(short, "tester") / "source.json").read_text())
+    assert "hpc3_removed" not in kept
+    assert any("already gone from HPC3" in s for s in flow.said)
+    # Looked at once: a second look neither marks again nor says it again.
+    n = len(flow.said)
+    _call(gw.get_hpc_originals(None, connection_id=conn.id))
+    assert len(flow.said) == n
+
+
+def test_a_skip_for_another_reason_records_nothing(data_root):
+    uid, _row = _homed("tester", f"{UPLOADS}/x.h5ad", {"x.h5ad": b"X"}, kind="file")
+    plan = ho.new_plan("tester", "tester", [{"path": f"{UPLOADS}/x.h5ad", "kind": "file", "bytes": 1,
+                                             "dataset": uid, "name": "x.h5ad", "personal": False}],
+                       [], personal=False)
+    plan["check"] = {"job_id": "5", "status": "done",
+                     "results": [{"verdict": "skip", "reason": "size differs", "path": f"{UPLOADS}/x.h5ad"}]}
+    assert ho.record_missing("tester", plan) == 0
+
+
+def test_saving_an_older_plan_keeps_the_order(tmp_path):
+    a, b, c = (ho.new_plan("t", "t", [], [], personal=False) for _ in range(3))
+    for p in (a, b, c):
+        ho.save_plan(tmp_path, p)
+    a["note"] = "settled later"
+    ho.save_plan(tmp_path, a)
+    assert [p["id"] for p in ho.load_plans(tmp_path)] == [a["id"], b["id"], c["id"]]
+    assert ho.load_plans(tmp_path)[0]["note"] == "settled later"

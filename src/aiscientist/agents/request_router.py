@@ -123,6 +123,19 @@ _ASKS_PUBMED = re.compile(
     r"|\bother\s+(?:papers|publications|literature)\b"
     r"|公开文献|其他文献",
     re.IGNORECASE)
+# Any other source a question can name: papers or the literature in general, a gene database, the
+# web. A question that names one is about that source, not about the RetiGene papers.
+_NAMES_OTHER_SOURCE = re.compile(
+    r"\b(?:literature|publications?|published|papers?|articles?|studies|reviews|preprints?)\b"
+    r"|\b(?:clingen|omim|gnomad|decipher|clinvar|orphanet|hgmd|genereviews|uniprot|ensembl|panelapp|"
+    r"retnet|databases?|wikipedia|the\s+(?:web|internet))\b"
+    r"|文献|论文|数据库|网上",
+    re.IGNORECASE)
+# Something earlier in the chat that a question points at: "which of these genes", "the list above".
+_POINTS_BACK = re.compile(
+    r"\b(?:these|those|above|following|listed|aforementioned)\b|\b(?:this|that)\s+(?:list|table)\b"
+    r"|这些|那些|上面|以上|上述|下列|以下",
+    re.IGNORECASE)
 
 
 def names_corpus(text: str) -> bool:
@@ -139,6 +152,16 @@ def corpus_only(text: str) -> bool:
     """A question about the RetiGene papers that does not also ask for PubMed: it is answered from
     the corpus alone (issue 46). PubMed is added only when the message asks for it."""
     return names_corpus(text) and not asks_for_pubmed(text)
+
+
+def names_no_source(text: str) -> bool:
+    """The message names nothing to read and points at nothing earlier in the chat: not the RetiGene
+    papers, not PubMed or the literature, no other papers, no database ("according to ClinGen"), not
+    the user's data, not "these genes" or "the list above". A gene-list question of this kind is
+    answered from the RetiGene papers (RCHENLAB/AiScientist issue 20)."""
+    t = text or ""
+    return not (names_corpus(t) or asks_for_pubmed(t) or _NAMES_OTHER_SOURCE.search(t)
+                or refers_to_data(t) or _POINTS_BACK.search(t))
 
 
 @dataclass(frozen=True)

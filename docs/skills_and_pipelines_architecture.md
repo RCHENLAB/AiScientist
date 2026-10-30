@@ -253,7 +253,47 @@ induced-skill directory starts as `pending`. An admin approves or retires it in 
 *Admin → Skill review* tab, which shows its `SKILL.md`, its code and the step it came from. Only
 approved skills are listed for planning, for the Scientist and in search. The decisions are kept
 in `_review.json` in that directory and take effect at the next step of every run. A pending skill
-still reserves its name, so the same procedure is not learned twice.
+still reserves its name, so the same procedure is not learned twice. An induced skill records
+the run it came from (`origin_run`), which is also the id of that run's skill request.
+
+## Untested code and skill requests
+
+Only a tool is tested code. A step whose result came from `run_code`, `run_shell` or
+`run_in_environment` ran code the AI wrote during the run, even when it adapted the code of a
+vetted skill that the plan assigned to the step, or followed a pipeline. `agents/code_provenance.py`
+labels every step from the calls it made, by the rule the QC-only chat reply uses to tell a check
+from an analysis (`agents/scope.py`):
+
+- **untested**: its code wrote a table, figure or file, or code ran and no tool did;
+- **tested**: a tool produced the result, even if code then only read that result to check it;
+- **none**: the step only looked things up, or nothing succeeded.
+
+The user sees the label twice. The plan marks a step whose tool is a code tool as *Untested code*
+before it is approved, beside the step's vetted skill when it has one; approving the plan is the
+consent, and no step asks again. After the run, the chat reply, the report and the technical
+report open with a notice that names the accepted steps whose results came from untested code, and
+`process/untested_code.md` holds the code of every attempt, failed ones included, cleaned of this
+server's paths and of key-shaped tokens like the run's event log.
+
+A run with an untested step, or with a step where only code was tried and nothing worked, is a
+**skill request** (`gateway/skill_requests.py`). The request is recorded instead of refused. The
+record holds the request and the earlier turns of the chat, the datasets' metadata (never the
+data), the pipelines that steered the plan and the vetted skills its code ran under, every code
+attempt with its outcome, the files it wrote and the Critic's verdict, the number of audited claims,
+the skill induced from the run if any, and a structured summary: goal, inputs, outputs, methods,
+category, the closest existing pipeline, skill or tool, and what is missing. The summary is the
+run's last model call, made once the reply, the reports and the files are out: one `classify` call
+through the run's own model, counted in the run's usage as "Skill request summary". A reached
+budget never asks the user about it; the summary is then built from the record by code. Records
+are JSON files in `<AISCIENTIST_STATE_DIR>/skill_requests/`, mode 0600, scrubbed of credentials,
+key-store paths, server paths, e-mail addresses and SSN- or MRN-shaped numbers. Past
+`AISCIENTIST_SKILL_REQUEST_RETENTION_DAYS` (365) the request text and the code are dropped and the
+summary stays. `AISCIENTIST_SKILL_REQUESTS=0` stops recording, and nothing is recorded without
+`AISCIENTIST_STATE_DIR`; the labels stay either way.
+
+Admins read the records in the console's *Admin → Skill requests* tab: filtered by status
+(new, planned, in progress, released, won't do), grouped by category and closest skill with the
+number of requests and of accounts, each with its code, a status note and a history.
 
 ## Pipelines
 

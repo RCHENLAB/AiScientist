@@ -244,6 +244,153 @@ def test_qc_reply_uses_the_accepted_round_else_the_latest(tmp_path, as_dict, ver
         assert f"| {name} |" in text
 
 
+# RCHENLAB/AiScientist issue 75, the #56 re-test's B2 (run cfc9b93a7ac5): one CellQC step over three
+# bound libraries, pinned to the human one; three rounds QC'd Sample3 alone and the Critic sent each
+# back (0.40, 0.45, 0.40); the user picked "Skip this step". The reply opened "Quality control done".
+_B2_SAMPLES = ["Sample1_WT", "Sample2_Ddx41", "Sample3_GSM5676874"]
+_B2_STEP = ("**Quality control with CellQC** — Run `run_cellqc` on the three libraries, Sample1_WT, "
+            "Sample2_Ddx41 and Sample3_GSM5676874, with the default thresholds.")
+_B2_QC = {"status": "ok", "cells_before": 13559, "cells_after": 10223,
+          "thresholds": {"min_counts": 500, "min_features": 300, "max_pct_mt": 10},
+          "libraries": [{"sample": "Sample3_GSM5676874", "cells_cellranger": 13559,
+                         "cells_after_filter": 11064, "cells_after_doublets": 10223,
+                         "frac_retained": 0.754}]}
+_B2_CRITIQUES = [
+    "Only Sample3_GSM5676874 was QC'd; the step names three libraries.",
+    "Still one library of three: Sample1_WT and Sample2_Ddx41 were not QC'd.",
+    "The step asked for all three libraries and QC'd only Sample3_GSM5676874 again, so the mouse "
+    "libraries have no QC at all. " + "Re-run CellQC with species auto and no sample filter. " * 6,
+]
+
+
+def _b2_art(tmp_path):
+    art = tmp_path / "artifacts"
+    (art / "data").mkdir(parents=True)
+    (art / "data" / "dataset_results.json").write_text(json.dumps({
+        "dataset_path": "/data/Users/shared/jinl14/CellQC_testdata",
+        "cellranger_layout": {"n_libraries": 3, "libraries": [{"sample": s} for s in _B2_SAMPLES]}}))
+    return art
+
+
+def _b2_rounds(verdicts, as_dict):
+    from aiscientist.agents.research_lab import CriticVerdict, LabRound
+    rounds = []
+    for i, (verdict, score, critique, reviewed) in enumerate(verdicts):
+        rnd = LabRound(i + 1, 0, _B2_STEP, "QC",
+                       {"steps": [{"tool": "run_cellqc", "ok": True, "result": _B2_QC}]},
+                       CriticVerdict(verdict, score, critique, reviewed))
+        rounds.append(rnd.to_dict() if as_dict else rnd)
+    return rounds
+
+
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize("skipped", [True, False])
+def test_qc_reply_after_a_step_never_accepted_says_so_and_names_the_libraries_left_out(
+        tmp_path, as_dict, skipped):
+    from types import SimpleNamespace
+    from aiscientist.agents.research_lab import LabResult
+    from aiscientist.gateway.app import _build_brief_report, _qc_chat_reply, _qc_closing_line
+
+    art = _b2_art(tmp_path)
+    rounds = _b2_rounds([("revise", s, c, True) for s, c in zip((0.40, 0.45, 0.40), _B2_CRITIQUES)],
+                        as_dict)
+    skips = [_B2_STEP] if skipped else []
+    result = (SimpleNamespace(rounds=rounds, skipped_steps=skips) if as_dict
+              else LabResult("Do cellqc quality controll and give me a result.", [_B2_STEP], rounds,
+                             False, 0, "", skipped_steps=skips))
+    reply = _qc_chat_reply(art, result)
+    first = reply.splitlines()[0]
+    assert not reply.startswith("**Quality control done**")
+    assert first.startswith("**Quality control not accepted** — `run_cellqc` on Sample3_GSM5676874.")
+    assert (("You skipped the step after 3 attempts" if skipped
+             else "The Critic accepted none of its 3 attempts") in first)
+    # The numbers are labelled as the last round's, and the last critique is quoted, shortened.
+    assert "the numbers below are the last attempt's." in first
+    assert ("The Critic: The step asked for all three libraries and QC'd only Sample3_GSM5676874 "
+            "again, so the mouse libraries have no QC at all.") in first
+    assert _B2_CRITIQUES[0] not in reply and len(first) < 600
+    assert "- **10,223 of 13,559 cells kept (75.4%)**." in reply
+    assert "- **Bound but not QC'd:** Sample1_WT, Sample2_Ddx41." in reply
+    # The closing status line is a warning, and the short report says what the reply says.
+    line, level = _qc_closing_line(result)
+    assert level == "warning" and line.startswith("⚠️ Quality control not accepted")
+    assert "✅" not in line
+    md = _build_brief_report(art, "q", result)
+    qc = md.split("## Quality control", 1)[1]
+    assert qc.lstrip().startswith("**Quality control not accepted.** "
+                                  + ("You skipped the step after 3 attempts"
+                                     if skipped else "The Critic accepted none of its 3 attempts"))
+    assert "The Critic: The step asked for all three libraries" in qc
+    assert "**Bound but not QC'd:** Sample1_WT, Sample2_Ddx41." in qc
+    if not as_dict:
+        assert LabResult.from_dict(result.to_dict()).skipped_steps == skips
+
+
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_qc_reply_for_a_step_kept_without_review_says_so(tmp_path, as_dict):
+    from types import SimpleNamespace
+    from aiscientist.gateway.app import _build_brief_report, _qc_chat_reply, _qc_closing_line
+
+    art = _b2_art(tmp_path)
+    kept = ("accept", 0.0, "Step not reviewed: the Critic returned no usable review twice; the "
+            "existing result was kept without rerunning the step.", False)
+    result = SimpleNamespace(rounds=_b2_rounds([kept], as_dict))
+    reply = _qc_chat_reply(art, result)
+    assert reply.startswith("**Quality control kept without review** — `run_cellqc` on "
+                            "Sample3_GSM5676874. The Critic returned no usable review twice, so "
+                            "this result was kept as it is, without review.")
+    assert "not accepted" not in reply and "The Critic:" not in reply
+    assert "- **Bound but not QC'd:** Sample1_WT, Sample2_Ddx41." in reply
+    line, level = _qc_closing_line(result)
+    assert level == "warning" and line.startswith("⚠️ Quality control kept without review")
+    qc = _build_brief_report(art, "q", result).split("## Quality control", 1)[1]
+    assert qc.lstrip().startswith("**Quality control kept without review.** The Critic returned "
+                                  "no usable review twice")
+
+
+def test_qc_reply_for_an_accepted_round_covering_every_library_is_unchanged(tmp_path):
+    """The reply the code gave before issue 75, character for character: an accepted step says
+    nothing about how it ended, and no library was left out."""
+    from aiscientist.agents.research_lab import CriticVerdict, LabResult, LabRound
+    from aiscientist.gateway.app import (_brief_qc_lines, _qc_chat_reply, _qc_closing_line,
+                                         _qc_step_outcome)
+
+    cells = [(18681, 18011, 16750), (15872, 15482, 14553), (13559, 11000, 10223)]
+    qc = {"status": "ok", "cells_before": 48112, "cells_after": 41526,
+          "thresholds": {"min_counts": 500, "min_features": 300, "max_pct_mt": 10},
+          "warnings": ["Sample1_WT: the two doublet callers agree poorly (kappa 0.07)."],
+          "libraries": [{"sample": s, "cells_cellranger": a, "cells_after_filter": b,
+                         "cells_after_doublets": c, "frac_retained": round(c / a, 4)}
+                        for s, (a, b, c) in zip(_B2_SAMPLES, cells)]}
+    art = _b2_art(tmp_path)
+
+    def result(libs):
+        r = dict(qc, libraries=qc["libraries"][:libs])
+        return LabResult("q", [_B2_STEP], [LabRound(
+            1, 0, _B2_STEP, "QC", {"steps": [{"tool": "run_cellqc", "ok": True, "result": r}]},
+            CriticVerdict("accept", 0.72, "All three libraries were QC'd."))], True, 1, "")
+
+    assert _qc_chat_reply(art, result(3)) == (
+        "**Quality control done** — `run_cellqc` on Sample1_WT, Sample2_Ddx41, Sample3_GSM5676874."
+        "\n\n- **41,526 of 48,112 cells kept (86.3%)**.\n\n"
+        "| Library | Cell Ranger cells | after filters | after doublets | kept | "
+        "median % mito (before filtering) |\n|---|---:|---:|---:|---:|---:|\n"
+        "| Sample1_WT | 18,681 | 18,011 | 16,750 | 89.7% | — |\n"
+        "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | 91.7% | — |\n"
+        "| Sample3_GSM5676874 | 13,559 | 11,000 | 10,223 | 75.4% | — |\n\n"
+        "- Thresholds: `min_counts` = 500, `min_features` = 300, `max_pct_mt` = 10.\n"
+        "- ⚠️ Sample1_WT: the two doublet callers agree poorly (kappa 0.07).\n")
+    assert _qc_closing_line(result(3)) == (
+        "✅ Done — the summary is below; the result files are in the Downloads panel.", "success")
+    assert _brief_qc_lines(_qc_step_outcome(result(3)), art)[:3] == [
+        "## Quality control", "", "| Library | Cell Ranger cells | after count / gene / mito filters "
+        "| after doublet removal | kept | ambient RNA | median % mito before filtering |"]
+    # Accepted on fewer libraries than were bound: still "done", and the left-out one is named.
+    reply = _qc_chat_reply(art, result(2))
+    assert reply.startswith("**Quality control done** — `run_cellqc` on Sample1_WT, Sample2_Ddx41.\n")
+    assert "- **Bound but not QC'd:** Sample3_GSM5676874." in reply
+
+
 @pytest.mark.parametrize("bad_reply", ["", "not JSON", "{}", '{"verdict": "unknown"}',
                                      '{"verdict": "revise", "score": 0, "critique": "  "}',
                                      '{"verdict": "REVISE", "critique": null}'])
@@ -1665,6 +1812,8 @@ def test_failure_decision_offers_llm_alternatives_and_maps_choice():
     # An answer that names nothing is a REVIEWER saying "move on" -> skip. This is NOT the timeout
     # case (see below); labelling it "timeout" here is how the timeout gap survived unnoticed.
     assert fresh()._failure_decision("q", node, "b", [], dr({"action": "proceed", "choice": ""}), noop) == ("skip", "")
+    # Only the explicit "Skip this step" is recorded as the user's skip.
+    assert lab._skipped_steps == ["Cluster the cells"]
 
 
 def test_an_unanswered_failure_fork_self_heals_instead_of_dropping_the_step():
@@ -1710,12 +1859,16 @@ def test_failed_step_offers_alternatives_then_retries_then_skips():
                 "choice": "Lower the resolution to 0.5" if calls["n"] == 1 else "Skip this step"}
 
     events = []
-    lab.run("q", on_event=events.append, decision_review=decision_review)
+    result = lab.run("q", on_event=events.append, decision_review=decision_review)
     assert calls["opts"][:2] == ["Lower the resolution to 0.5", "Reuse the existing labels"]  # LLM alts
     assert any(e["type"] == "step_failure" and e.get("alternatives") for e in events)
     assert any(e["type"] == "step_retry" for e in events)          # picked an alternative once
     assert calls["n"] == 2                                         # asked twice (alt, then skip)
     assert any(e["type"] == "step_force_advance" for e in events)
+    # The result says the user skipped the step: its rounds say only that it was not accepted, and
+    # the QC reply tells the two apart (RCHENLAB/AiScientist issue 75).
+    assert result.skipped_steps == [result.rounds[-1].step]
+    assert all(r.verdict.verdict != "accept" for r in result.rounds)
 
 
 def test_failed_step_abort_cancels_the_run():
@@ -1733,9 +1886,10 @@ def test_failed_step_bypass_self_heals_with_alternative_then_advances():
     # of a silent skip — then force-advance if it still fails. No human is asked.
     lab = _dag_hitl_lab(_dag_always_revise_complete(["Run QC"]), [])
     events = []
-    lab.run("q", on_event=events.append)
+    result = lab.run("q", on_event=events.append)
     assert any(e["type"] == "step_retry" and e.get("approach") for e in events)   # self-healed
     assert any(e["type"] == "step_force_advance" for e in events)                  # then advanced
+    assert result.skipped_steps == []                                              # nobody skipped it
 
 
 def test_failed_step_fork_is_capped_against_infinite_retry():

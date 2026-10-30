@@ -8,6 +8,11 @@ curation: a plan card that says what is read and how long it takes, then the cor
 with its claim, one per sentence) and a chat answer written from them, with the genes the papers
 argue against apart. The tables can be saved to the user's data. Offline: the model, the scan job
 and the user's decisions are scripted.
+
+The bare question, "What are haploinsufficient genes?", names no papers; it gets the same curation
+(issue 20, option A), with a card that says it reads the RetiGene papers and that "search PubMed"
+asks the public literature. A list question that names PubMed or the literature, and a question
+about the concept, still go to the literature line.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ from aiscientist.gateway import corpus_scan  # noqa: E402
 from aiscientist.gateway.settings import HPCSettings  # noqa: E402
 
 QUESTION = "What are haploinsufficient genes in RetiGene papers?"
+BARE = "What are haploinsufficient genes?"         # names no papers (issue 20, option A)
 
 HIT_COLUMNS = ("pmid", "page", "gene", "gene_as_written", "gene_status", "gene_in_quote", "mechanism_class",
                "explicit", "negated", "human_retinal", "phenotype", "mechanism_statement", "quote",
@@ -102,16 +108,74 @@ def test_pubmed_is_added_only_when_asked_for():
     assert not rr.corpus_only("What is known about PRPF31?")          # names no corpus at all
 
 
-def test_the_curation_route_takes_list_questions_about_the_corpus_only(monkeypatch):
+def test_the_curation_route_takes_list_questions_about_the_corpus_or_naming_no_source(monkeypatch):
     conn = types.SimpleNamespace()
     monkeypatch.setattr(gw_app, "_literature_corpus_on_hpc", lambda c: True)
     assert gw_app._corpus_curation(conn, QUESTION)
     assert gw_app._corpus_curation(conn, "Which RetiGene genes are haploinsufficient?")
     assert not gw_app._corpus_curation(conn, "Is PRPF31 haploinsufficient in RetiGene papers?")  # one gene
-    assert not gw_app._corpus_curation(conn, "What are haploinsufficient genes?")                # no corpus named
     assert not gw_app._corpus_curation(conn, "Which haploinsufficient genes from RetiGene are in my data?")
+    # Issue 20, option A: the bare list question reads the RetiGene papers too.
+    assert gw_app._corpus_curation(conn, BARE)
+    assert gw_app._corpus_curation(conn, "Which genes are haploinsufficient in retinitis pigmentosa?")
+    # ... but not one that names another source, points at the chat, or is not a list question,
+    for other in ("What are haploinsufficient genes in PubMed?",
+                  "Which haploinsufficient genes are reported in the published literature?",
+                  "Which genes are haploinsufficient according to ClinGen?",
+                  "Which of these genes are haploinsufficient?",
+                  "Which haploinsufficient genes are in my data?",
+                  "What is haploinsufficiency?", "How do haploinsufficient genes cause disease?"):
+        assert not gw_app._corpus_curation(conn, other), other
+    # ... nor in a chat with data attached or an earlier analysis, where "which genes" may mean its own.
+    assert not gw_app._corpus_curation(conn, BARE, with_context=True)
+    assert gw_app._corpus_curation(conn, QUESTION, with_context=True)     # naming RetiGene is enough
     monkeypatch.setattr(gw_app, "_literature_corpus_on_hpc", lambda c: False)
     assert not gw_app._corpus_curation(conn, QUESTION)               # this session cannot reach the corpus
+    assert not gw_app._corpus_curation(conn, BARE)
+
+
+@pytest.mark.parametrize("question", [
+    BARE, "Which genes are haploinsufficient?", "What genes are haploinsufficient in retinal disease?",
+    "List all haploinsufficient genes", "Haploinsufficient genes in RP?", "Give examples of haploinsufficient genes",
+    "Can you list the haploinsufficient genes?", "How many genes are haploinsufficient in IRD?",
+    "Are there haploinsufficient genes in inherited retinal disease?",
+    "Which genes cause retinal disease through haploinsufficiency?", "What are haplo-insufficient genes?",
+    "What are the known haploinsufficient retinal disease genes?", "I need a list of haploinsufficient genes",
+    "哪些基因是单倍剂量不足的？", "单倍剂量不足的基因有哪些？", "列出所有单倍剂量不足的基因",
+])
+def test_a_plain_request_for_the_genes_is_a_list_question_when_read_strictly(question):
+    assert corpus_scan.asks_for_gene_list(question, strict=True)
+
+
+@pytest.mark.parametrize("question", [
+    # The concept, one gene, a mechanism: prose from the literature line. The loose reading, kept for
+    # questions that name the RetiGene papers, takes most of these as list questions.
+    "What is haploinsufficiency?", "What is a haploinsufficient gene?", "Is PRPF31 haploinsufficient?",
+    "Is PRPF31 haploinsufficient in all patients?", "Is PRPF31 one of the haploinsufficient genes?",
+    "Which mechanism underlies PRPF31 haploinsufficiency?", "How do haploinsufficient genes cause disease?",
+    "Why are some genes haploinsufficient?", "What makes genes haploinsufficient?",
+    "What are the effects of haploinsufficient genes?", "Tell me about haploinsufficient genes",
+    "How do we find haploinsufficient genes?", "Which is worse, haploinsufficiency or a dominant negative?",
+    "What genes cause Stargardt disease?", "PRPF31是单倍剂量不足的基因吗？", "单倍剂量不足是什么？",
+])
+def test_a_question_about_the_concept_or_one_gene_is_no_list_question_when_read_strictly(question):
+    assert not corpus_scan.asks_for_gene_list(question, strict=True)
+
+
+@pytest.mark.parametrize("text,none", [
+    (BARE, True), ("哪些基因是单倍剂量不足的？", True),
+    (QUESTION, False),                                                      # the RetiGene papers
+    ("What are haploinsufficient genes in PubMed?", False),
+    ("Which haploinsufficient genes are reported in the literature?", False),
+    ("Which haploinsufficient genes do papers report?", False),
+    ("Which genes are haploinsufficient according to ClinGen?", False),
+    ("文献里哪些基因是单倍剂量不足的？", False),
+    ("Which haploinsufficient genes are in my data?", False),                # the user's data
+    ("Which of these genes are haploinsufficient?", False),                 # something in the chat
+    ("Which genes in the list above are haploinsufficient?", False),
+])
+def test_a_question_names_no_source(text, none):
+    assert rr.names_no_source(text) is none
 
 
 def test_the_eye_server_copy_alone_makes_no_curation_and_is_not_loaded_to_decide(monkeypatch):
@@ -348,13 +412,112 @@ def test_the_issue_question_gets_a_curation_plan_then_the_tables_and_an_answer_f
     assert [p.get("type") for p in conn.pushed][-1] == "chat_done"
 
 
-def test_what_the_user_sees_names_retigene_never_the_corpus_alone(tmp_path, monkeypatch):
+def test_the_bare_question_gets_the_curation_and_its_card_says_it_names_no_papers(tmp_path, monkeypatch):
+    """Issue 20, option A: "What are haploinsufficient genes?" names no papers. It gets the RetiGene
+    curation, and its plan card says that the question names no papers, that this reads the RetiGene
+    papers, and that "search PubMed" asks the public literature instead."""
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "approve"}])
+    _dispatch(conn, BARE)
+
+    ((stage, step),) = w.shown
+    assert stage == "corpus" and step.startswith(
+        "**RetiGene curation** — The question names no papers, so this reads the lab's RetiGene papers; "
+        "say “search PubMed” for an answer from the public literature instead. Read the whole RetiGene corpus")
+    assert f"to answer: “{BARE}”" in step and "PubMed is not searched" in step
+    assert w.model.asked == []                                       # the model routed nothing
+    progress = [str(p.get("text")) for p in conn.pushed if p.get("type") == "lab_progress"]
+    assert any("names no papers, so the plan reads the lab's RetiGene papers" in t and "“search PubMed”" in t
+               for t in progress)
+    assert any(e.get("stage") == "route" and "(the question names no papers)" in e["message"]
+               for e in conn.log if e.get("type") == "event")
+    # Then the same curation as for the question that names the RetiGene papers.
+    assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
+    answer = next(p for p in conn.pushed if p.get("type") == "chat_token")["token"]
+    assert answer.startswith("**Haploinsufficient genes in the RetiGene corpus: 3**")
+    assert "| PRPF31 |" in answer and "[PMID 111](https://pubmed.ncbi.nlm.nih.gov/111/), p. 4" in answer
+    assert [p.get("type") for p in conn.pushed][-1] == "chat_done"
+
+
+def test_the_question_that_names_the_retigene_papers_keeps_its_card(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "cancel"}])
+    _dispatch(conn, QUESTION)
+    ((stage, step),) = w.shown
+    assert stage == "corpus" and step == corpus_scan.curation_plan_step(
+        QUESTION, gw_app._curation_time_words(conn, None, None))
+    assert "names no papers" not in step and "search PubMed" not in step
+    progress = [str(p.get("text")) for p in conn.pushed if p.get("type") == "lab_progress"]
+    assert any(t.startswith("🧬 This asks for the genes the RetiGene papers report") for t in progress)
+    assert not any("names no papers" in t for t in progress)
+
+
+def _to_literature(monkeypatch):
+    """The model's router, scripted to answer "literature", and the literature line, recorded."""
+    seen: list[str] = []
+
+    def route(c, req, prior=""):
+        seen.append(f"routed: {req.question}")
+        return rr.Route(rr.LITERATURE, 0.9, "papers", "model")
+
+    async def literature(c, req, r=None):
+        seen.append(f"literature: {req.question}")
+
+    monkeypatch.setattr(gw_app, "_route_request", route)
+    monkeypatch.setattr(gw_app, "_run_literature", literature)
+    return seen
+
+
+@pytest.mark.parametrize("question", [
+    "What are haploinsufficient genes in PubMed?",                  # names PubMed: the public literature
+    "Which haploinsufficient genes are reported in the published literature?",
+    "What is haploinsufficiency?",                                   # no list question: prose
+    "How do haploinsufficient genes cause disease?",
+])
+def test_a_list_question_naming_pubmed_or_a_question_about_the_concept_goes_to_the_literature_line(
+        tmp_path, monkeypatch, question):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [])
+    seen = _to_literature(monkeypatch)
+    _dispatch(conn, question)
+    assert w.shown == [] and w.jobs == []                            # no curation plan, no scan
+    assert seen == [f"routed: {question}", f"literature: {question}"]
+    assert not any(e.get("stage") == "route" and "curation" in str(e.get("message"))
+                   for e in conn.log if e.get("type") == "event")
+    # The literature line searches PubMed for it: it does not name the RetiGene papers alone.
+    assert not rr.corpus_only(question)
+
+
+def test_the_bare_question_in_a_chat_with_data_attached_goes_to_the_literature_line(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [])
+    seen = _to_literature(monkeypatch)
+    req = gw_app.LabRequest(connection_id=conn.id, conversation_id="conv-1", question=BARE, route="auto",
+                            dataset_path="/data/retina.h5ad")
+    asyncio.run(gw_app._dispatch_lab(conn, gw_app._fixed_run_options(req)))
+    assert w.shown == [] and w.jobs == [] and seen == [f"routed: {BARE}", f"literature: {BARE}"]
+
+
+def test_search_pubmed_on_the_bare_questions_plan_asks_the_public_literature(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    w = _wire(monkeypatch, [{"action": "feedback", "feedback": "search PubMed"}])
+    seen = _to_literature(monkeypatch)
+    _dispatch(conn, BARE)
+    combined = f"{BARE}\n\nsearch PubMed"
+    assert [stage for stage, _ in w.shown] == ["corpus"] and w.jobs == []
+    assert seen == [f"routed: {combined}", f"literature: {combined}"]
+    assert not rr.corpus_only(combined)                             # the literature line searches PubMed
+    assert not gw_app._corpus_curation(conn, combined)
+
+
+@pytest.mark.parametrize("question", [QUESTION, BARE])
+def test_what_the_user_sees_names_retigene_never_the_corpus_alone(tmp_path, monkeypatch, question):
     """Jin (issue 46): users do not know that "the corpus" is the RetiGene papers. The plan card, the
     chat's messages, the feed and the answer say "RetiGene" wherever they say "corpus"."""
     import re
     conn = _conn(tmp_path)
     w = _wire(monkeypatch, [{"action": "approve"}])
-    _dispatch(conn)
+    _dispatch(conn, question)
     seen = [step for _stage, step in w.shown]
     seen += [str(p.get(k)) for p in conn.pushed for k in ("text", "token", "message") if p.get(k)]
     seen += [str(e.get("message")) for e in conn.log if e.get("type") == "event"]

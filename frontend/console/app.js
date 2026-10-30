@@ -4090,6 +4090,18 @@ function planStepOpen(text, revised) {
 // and the settings are always shown; the prose is two lines until the step is opened.
 // `edit`: the plan is waiting and has a document, so its title and setting values can be changed
 // in place and (`edit.remove`) the step removed (wirePlanCardEdits).
+// A step whose tool runs code the AI writes during the run (agents/plan_doc.py CODE_TOOLS) is not a
+// tested AiScientist tool: the plan says so before it is approved (issue 13). A vetted skill on
+// the step does not change that: the AI adapts the skill's code to the data during the run.
+const PLAN_CODE_TOOLS = new Set(["run_code", "run_shell", "run_in_environment"]);
+function planUntestedFlag(step) {
+  if (!step || !PLAN_CODE_TOOLS.has(step.tool)) return "";
+  const why = step.skill
+    ? `No tested tool does this step: the AI adapts the code of the skill ${step.skill} during the run, and the result is labelled untested`
+    : "No tested tool does this step: the AI writes its code during the run, and the result is labelled untested";
+  return `<span class="plan-step-flag untested" title="${escapeHtml(why)}">Untested code</span>`;
+}
+
 function planStepHtml(text, n, step, revised, showWhere, edit) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
@@ -4137,6 +4149,7 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + `${renderMarkdown(parts.title)}</span>`
     + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
     + (step && step.tool ? `<code class="plan-step-tool">${escapeHtml(step.tool)}</code>` : "")
+    + planUntestedFlag(step)
     + `<span class="plan-step-acts">`
     + (editable && edit.remove ? `<button type="button" class="plan-step-remove" data-step-remove `
       + `aria-label="Remove step ${n}" title="Remove this step">${planIcon("delete")}</button>` : "")
@@ -4303,6 +4316,7 @@ function planEntryHtml(agenda, doc, opts) {
     + (docSteps[i] && docSteps[i].tool ? `<code class="plan-step-tool">${escapeHtml(docSteps[i].tool)}</code>` : "")
     + (docSteps[i] && docSteps[i].skill
       ? `<span class="plan-step-skill" title="Uses the vetted skill ${escapeHtml(docSteps[i].skill)}">${planIcon("extension")}<span>${escapeHtml(docSteps[i].skill)}</span></span>` : "")
+    + planUntestedFlag(docSteps[i])
     + `</li>`).join("");
   const refused = (o.problems || []).length
     ? `<div class="plan-note bad">${planIcon("error")}<span>Your edit was not applied — the plan is unchanged. Open the plan to see why.</span></div>`
@@ -6742,6 +6756,13 @@ function initShell() {
     renderSkillReviews();
   }));
   $("skillReviewList").addEventListener("click", onSkillReviewClick);
+  $("skillRequestRefresh").addEventListener("click", loadSkillRequests);
+  document.querySelectorAll(".req-chip").forEach((b) => b.addEventListener("click", () => {
+    skillRequests.filter = b.dataset.reqFilter;
+    document.querySelectorAll(".req-chip").forEach((c) => c.classList.toggle("active", c === b));
+    loadSkillRequests();
+  }));
+  $("skillRequestList").addEventListener("click", onSkillRequestClick);
   $("datasetsList").addEventListener("click", onDatasetsClick);
   $("metadataForm").addEventListener("submit", saveMetadata);
   $("metadataForm").addEventListener("change", (e) => { if (e.target.id === "mdf_human_data") mdSyncShowIf(); });
@@ -6764,7 +6785,7 @@ function switchView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
   if (name === "datasets") loadFiles();
   else if (name === "runs") loadRuns();
-  else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); }
+  else if (name === "admin") { loadAdminUsers(); loadSkillReviews(); loadSkillRequests(); }
   else if (name === "account") { renderAccount(state.user); loadUsage(); if (state.accountTab === "storage") loadStorageTab(); }
   else if (name === "system") loadSystem();
   if (name !== "system") stopSystemLive();
@@ -8018,7 +8039,7 @@ function resultHandoffHtml(runId, r) {
   if (!r) return "";
   const mb = (n) => `${(Number(n || 0) / 1e6).toFixed(0)} MB`;
   const kept = (x, label, what) => (x.saved_to
-    ? `<span class="ok small" title="${escapeHtml(x.saved_to)}">Saved to my data</span>`
+    ? `<span class="ok small" title="${escapeHtml(`In Files → Datasets as ${x.name || label}`)}">Saved to my data</span>`
     : x.saving ? `<span class="muted small">Copying from HPC3 to your data on the server…</span>`
     : `<span class="muted small">${x.until_disconnect ? "kept on HPC3 until the session ends, then with the run on the server"
       : x.location !== "hpc3" && !x.kept_days ? "kept with the run on the server"
@@ -8044,7 +8065,7 @@ function resultHandoffHtml(runId, r) {
     const files = (t.files || []).join(", ");
     html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 RetiGene curation tables · ${escapeHtml(String(t.n_genes ?? 0))} haploinsufficient genes · ${escapeHtml(String((t.files || []).length))} CSV files</span>` +
       (t.saved_to
-        ? `<span class="ok small" title="${escapeHtml(t.saved_to)}">Saved to my data</span>`
+        ? `<span class="ok small" title="${escapeHtml(`In Files → Datasets as ${t.name || "the curation tables"}`)}">Saved to my data</span>`
         : (t.save_error ? `<span class="bad small" title="${escapeHtml(t.save_error)}">The last save failed</span>` : "") +
           `<button class="ghost small" data-save-result="${escapeHtml(runId)}" data-what="tables" data-label="Save tables to my data">Save tables to my data</button>`) +
       `</div>`;
@@ -8095,7 +8116,8 @@ async function onSaveResultClick(e) {
       await loadResultHandoffs(true);
       return;
     }
-    toast(`Saved to ${j.path} — it is in Files → Datasets now.`);
+    // Named as Files → Datasets lists it: the reply's path is the folder on the server (issue 37).
+    toast(`Saved ${j.name ? `“${j.name}”` : "it"} to your data: it is in Files → Datasets now.`);
     await loadResultHandoffs(true);
     const inChat = b.closest(".result-handoff");
     if (inChat) showResultHandoff(inChat, runId); else if (outputsShown()) loadOutputs(); else loadRuns();
@@ -8145,6 +8167,7 @@ function switchAdminTab(tab) {
   document.querySelectorAll(".admin-tab").forEach((b) => b.classList.toggle("active", b.dataset.adminTab === tab));
   document.querySelectorAll(".admin-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "adminPane-" + tab));
   if (tab === "skills") loadSkillReviews();
+  else if (tab === "requests") loadSkillRequests();
   else if (tab === "usage") loadAdminUsage();
 }
 
@@ -8227,6 +8250,124 @@ async function onSkillReviewClick(e) {
       : status === "retired" ? `${name} retired: no run will be offered it.` : `${name} is pending review again.`);
     loadSkillReviews();
   } catch (err) { toast("Review failed: " + err.message); }
+}
+
+// --- Skill requests (issue 13): runs that needed code the AI wrote, kept for the team ---
+const skillRequests = { rows: [], groups: [], filter: "new", open: {} };
+const SKILL_REQUEST_LABELS = { new: "new", planned: "planned", in_progress: "in progress", released: "released", wont_do: "won't do" };
+
+async function loadSkillRequests() {
+  const el = $("skillRequestList");
+  try {
+    const f = skillRequests.filter;
+    const r = await fetch("/api/admin/skill-requests" + (f && f !== "all" ? "?status=" + encodeURIComponent(f) : ""));
+    if (!r.ok) { el.innerHTML = '<div class="empty-hint">Admin only.</div>'; return; }
+    const j = await r.json();
+    skillRequests.rows = j.requests || [];
+    skillRequests.groups = j.groups || [];
+    skillRequests.recording = j.recording;
+    skillRequests.statuses = j.statuses || Object.keys(SKILL_REQUEST_LABELS);
+    const fresh = (j.counts && j.counts.new) || 0;
+    const badge = $("skillRequestBadge");
+    badge.textContent = fresh ? String(fresh) : "";
+    badge.classList.toggle("hidden", !fresh);
+    renderSkillRequests();
+  } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
+}
+
+/** The server's groups of similar requests (same category and closest skill), most-requested first. */
+function skillRequestGroupsHtml(groups) {
+  groups = groups || [];
+  if (groups.length < 2 && !(groups[0] && groups[0].requests > 1)) return "";
+  return `<table class="user-table req-groups"><thead><tr><th>Category</th><th>Closest skill</th><th>Requests</th><th>Accounts</th><th>Latest</th></tr></thead><tbody>` +
+    groups.map((g) => `<tr><td>${escapeHtml(g.category)}</td><td>${g.closest_skill ? `<code>${escapeHtml(g.closest_skill)}</code>` : '<span class="muted">none</span>'}</td>` +
+      `<td>${g.requests}</td><td>${g.accounts}</td><td>${fmtDate(g.latest)}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+function renderSkillRequests() {
+  const el = $("skillRequestList");
+  const rows = skillRequests.rows;
+  $("skillRequestGroups").innerHTML = skillRequestGroupsHtml(skillRequests.groups);
+  if (!rows.length) {
+    el.innerHTML = `<div class="empty-hint">${skillRequests.recording === false
+      ? "Recording is off on this server (AISCIENTIST_SKILL_REQUESTS=0)."
+      : `No ${skillRequests.filter === "all" ? "" : (SKILL_REQUEST_LABELS[skillRequests.filter] || skillRequests.filter) + " "}requests.`}</div>`;
+    return;
+  }
+  el.innerHTML = rows.map((x) => {
+    const o = x.outcome || {};
+    const open = skillRequests.open[x.id];
+    const moves = (skillRequests.statuses || []).filter((st) => st !== x.status)
+      .map((st) => `<button class="ghost small${st === "wont_do" ? " danger" : ""}" data-req-act="${st}" data-req="${escapeHtml(x.id)}">${escapeHtml(SKILL_REQUEST_LABELS[st] || st)}</button>`).join("");
+    return `<div class="skill-card" data-card="${escapeHtml(x.id)}">` +
+      `<div class="skill-card-head"><div class="card-main"><strong>${escapeHtml(x.one_line || "(no summary yet)")}</strong>` +
+      `<span class="muted">${fmtDate(x.created_at)} · ${escapeHtml(x.account || "unknown account")} · run ${escapeHtml(x.run_id || x.id)} · ${escapeHtml(x.category || "other")}` +
+      `${x.closest_skill ? " · closest: " + escapeHtml(x.closest_skill) : ""}</span></div>` +
+      `<span class="status-pill req-${escapeHtml(x.status)}">${escapeHtml(SKILL_REQUEST_LABELS[x.status] || x.status)}</span></div>` +
+      (x.missing ? `<p class="skill-summary"><span class="muted">Missing:</span> ${escapeHtml(x.missing)}</p>` : "") +
+      `<p class="skill-origin">${o.untested_accepted || 0} of ${o.accepted_steps || 0} completed steps from untested code · ${o.code_attempts || 0} code attempts, ${o.code_failures || 0} failed` +
+      `${(x.pipelines || []).length ? " · pipelines: " + x.pipelines.map(escapeHtml).join(", ") : " · no pipeline matched"}` +
+      `${(x.skills || []).length ? " · vetted skill: " + x.skills.map(escapeHtml).join(", ") : ""}` +
+      `${(x.induced_skills || []).length ? " · induced skill: " + x.induced_skills.map(escapeHtml).join(", ") : ""}</p>` +
+      ((x.untested_steps || []).length ? `<p class="skill-origin"><span class="muted">Untested steps:</span> ${x.untested_steps.map((t) => escapeHtml(planStepParts(t).title)).join(" · ")}</p>` : "") +
+      (x.raw_expired ? `<p class="skill-origin muted">Past the retention period: the request text and the code were removed.</p>` : "") +
+      `<div class="row-actions"><button class="ghost small" data-req-view="${escapeHtml(x.id)}">${open ? "Hide details" : "View request and code"}</button>${moves}</div>` +
+      (open ? `<div class="skill-detail">${open}</div>` : "") +
+      `</div>`;
+  }).join("");
+}
+
+function skillRequestDetailHtml(j) {
+  const s = j.summary || {};
+  const list = (v) => (v || []).length ? v.map(escapeHtml).join(", ") : '<span class="muted">—</span>';
+  let h = `<h4>Request</h4><pre>${escapeHtml(j.request || "(removed)")}</pre>`;
+  if ((j.earlier_requests || []).length) h += `<h4>Earlier in the chat</h4><pre>${escapeHtml(j.earlier_requests.join("\n\n"))}</pre>`;
+  h += `<h4>Summary${j.summary_by ? " (" + escapeHtml(j.summary_by) + ")" : ""}</h4>` +
+    `<p class="skill-origin"><span class="muted">Goal:</span> ${escapeHtml(s.goal || "—")}</p>` +
+    `<p class="skill-origin"><span class="muted">Inputs:</span> ${list(s.inputs)} · <span class="muted">Outputs:</span> ${list(s.outputs)} · <span class="muted">Methods:</span> ${list(s.methods)}</p>`;
+  if ((j.datasets || []).length) h += `<h4>Data</h4><pre>${escapeHtml(j.datasets.map((d) => Object.entries(d).map(([k, v]) => `${k}: ${v}`).join(" · ")).join("\n"))}</pre>`;
+  for (const st of j.steps || []) {
+    if (!(st.code_calls || []).length) continue;
+    h += `<h4>${escapeHtml(planStepParts(st.step).title)} — ${st.accepted ? "accepted" : "not accepted"}, result from ${escapeHtml(st.status === "untested" ? "untested code" : st.status === "tested" ? "a tested tool" : "no tool")}</h4>`;
+    if (st.critique) h += `<p class="skill-origin"><span class="muted">Critic:</span> ${escapeHtml(st.critique)}</p>`;
+    st.code_calls.forEach((c, i) => {
+      h += `<p class="skill-origin">Attempt ${i + 1} · <code>${escapeHtml(c.tool)}</code>${c.skill ? " · skill " + escapeHtml(c.skill) : ""} · ${c.ok ? "ran" : "failed"}</p>` +
+        (c.code ? `<pre>${escapeHtml(c.code)}</pre>` : "") +
+        (c.error ? `<pre class="err">${escapeHtml(c.error)}</pre>` : c.summary ? `<p class="skill-origin">${escapeHtml(c.summary)}</p>` : "");
+    });
+  }
+  if ((j.status_history || []).length) h += `<h4>Status history</h4><pre>${escapeHtml(j.status_history.map((x) => `${x.at}  ${x.from} → ${x.to}  by ${x.by}${x.note ? "  — " + x.note : ""}`).join("\n"))}</pre>`;
+  return h;
+}
+
+async function onSkillRequestClick(e) {
+  const view = e.target.closest("[data-req-view]");
+  if (view) {
+    const id = view.dataset.reqView;
+    if (skillRequests.open[id]) { delete skillRequests.open[id]; renderSkillRequests(); return; }
+    try {
+      const r = await fetch(`/api/admin/skill-requests/${encodeURIComponent(id)}`);
+      const j = await r.json();
+      if (!r.ok) { toast(j.detail || "Could not load the request."); return; }
+      skillRequests.open[id] = skillRequestDetailHtml(j);
+      renderSkillRequests();
+    } catch (err) { toast("Could not load the request: " + err.message); }
+    return;
+  }
+  const act = e.target.closest("[data-req-act]");
+  if (!act) return;
+  const id = act.dataset.req, status = act.dataset.reqAct;
+  const note = prompt(`Mark this request "${SKILL_REQUEST_LABELS[status] || status}"? Optional note for the record:`, "");
+  if (note === null) return;
+  try {
+    const r = await fetch(`/api/admin/skill-requests/${encodeURIComponent(id)}/status`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status, note }) });
+    const j = await r.json();
+    if (!r.ok) { toast(j.detail || "Could not change the status."); return; }
+    toast(`Request marked ${SKILL_REQUEST_LABELS[status] || status}.`);
+    loadSkillRequests();
+  } catch (err) { toast("Could not change the status: " + err.message); }
 }
 
 async function createUser(e) {

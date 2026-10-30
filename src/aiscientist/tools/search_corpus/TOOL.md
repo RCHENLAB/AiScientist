@@ -126,8 +126,10 @@ On the fast chat path: yes.
 ## Gene tables and saving results
 
 In the console, a list question that names the RetiGene papers ("What are haploinsufficient genes in
-RetiGene papers?") is a curation of the whole corpus on HPC3, with its own plan card and two tables
-(`gateway/corpus_scan.py`). This tool serves the other questions, through the literature line.
+RetiGene papers?"), or names no source at all ("What are haploinsufficient genes?"), is a curation of
+the whole corpus on HPC3, with its own plan card and two tables (`gateway/corpus_scan.py`). This tool
+serves the other questions through the literature line, a list question that names PubMed or the
+literature among them.
 
 A client that asks for the chat route (`route="chat"`, the API) gets, for a gene-list question, a
 kept full corpus scan when there is one. Otherwise the session model extracts a table from the

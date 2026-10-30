@@ -266,13 +266,40 @@ def copy_into(stored: StoredScan, artifacts: Path) -> None:
 _HAPLO = re.compile(r"haplo-?\s?insufficien|单倍剂量不足|单倍体不足|剂量不足", re.I)
 _LIST = re.compile(r"\bgenes\b|\blist\b|\ball\b|\bwhich\b|哪些|列出|所有|清单", re.I)
 
+# The strict reading, for a question that names no papers (issue 20): "genes" next to the property,
+# and words that ask for the genes as a set. Not "What is haploinsufficiency?", "How do
+# haploinsufficient genes cause disease?", "Is PRPF31 one of the haploinsufficient genes?" or "Which
+# mechanism underlies PRPF31 haploinsufficiency?": the literature line answers those.
+_GENES_BY_HAPLO = re.compile(
+    r"haplo-?\s?insufficien\w*(?:[\s,/-]+[\w'-]+){0,3}?[\s,/-]+genes?\b"
+    r"|\bgenes?\b(?:[\s,/-]+[\w'-]+){0,8}?[\s,/-]+haplo-?\s?insufficien", re.I)
+_ASKS_FOR_SET = re.compile(
+    r"\bwhich\s+(?:[\w-]+\s+){0,3}?genes\b"
+    r"|\bwhat\s+(?:(?:other|kinds?\s+of|types?\s+of|sorts?\s+of)\s+)?genes\b"
+    r"|\bwhat\s+(?:are|were)\s+(?:(?!(?:of|in|for|with|about|on)\b)[\w-]+\s+){0,5}?genes\b"
+    r"|\b(?:list|name|enumerate|tabulate|catalog(?:ue)?|compile|give|show)\b(?:\W+[\w-]+){0,6}?\W+genes\b"
+    r"|\b(?:list|table|catalog(?:ue)?|set|examples?|number)\s+of\s+(?:[\w-]+\s+){0,4}?genes\b"
+    r"|\bare\s+there\s+(?:[\w-]+\s+){0,3}?genes\b"
+    r"|\bhow\s+many\s+(?:[\w-]+\s+){0,3}?genes\b"
+    r"|\ball\s+(?:the\s+)?(?:[\w-]+\s+){0,3}?genes\b|\bevery\s+(?:[\w-]+\s+){0,3}?gene\b"
+    r"|^\W*(?:(?:the|all|known)\s+)*(?:haplo-?\s?insufficien\w*\s+(?:[\w-]+\s+){0,3}?)?genes\b", re.I)
+_ZH_SET = re.compile(r"基因.*(?:哪些|列出|所有|清单|列表|多少)|(?:哪些|列出|所有|清单|列表|多少).*基因")
 
-def asks_for_gene_list(question: str) -> bool:
+
+def asks_for_gene_list(question: str, strict: bool = False) -> bool:
     """A request for the corpus' haploinsufficient genes as a list ("What are haploinsufficient
     genes?", "which genes are haploinsufficient in RP"), not a question about one gene ("is PRPF31
-    haploinsufficient?"), which the chat's corpus search answers."""
+    haploinsufficient?"), which the chat's corpus search answers.
+
+    ``strict``: for a question that names no papers, which then gets the RetiGene curation instead of
+    a literature answer (issue 20): only a plain request for the genes as a set counts, so a question
+    about the concept or about one gene keeps its prose answer."""
     q = question or ""
-    return bool(_HAPLO.search(q) and _LIST.search(q))
+    if not _HAPLO.search(q):
+        return False
+    if not strict:
+        return bool(_LIST.search(q))
+    return bool((_GENES_BY_HAPLO.search(q) and _ASKS_FOR_SET.search(q)) or ("基因" in q and _ZH_SET.search(q)))
 
 
 def gene_rows(tables: Path) -> list[dict[str, Any]]:
@@ -543,13 +570,17 @@ def write_curation(tables: Path, out: Path, papers: "dict[str, dict[str, str]] |
             "files": [CURATION_GENES, CURATION_EVIDENCE]}
 
 
-def curation_plan_step(question: str, when: str) -> str:
+def curation_plan_step(question: str, when: str, names_no_papers: bool = False) -> str:
     """The one step of a curation plan, as the plan card shows it. ``when``: how long it takes on
-    this session, and what it costs (the gateway's ``_curation_time_words``)."""
+    this session, and what it costs (the gateway's ``_curation_time_words``). ``names_no_papers``:
+    the question names no source (issue 20), so the card first says that the RetiGene papers are
+    what is read, and how to ask the public literature instead."""
     q = " ".join(str(question or "").split())
     if len(q) > 300:
         q = q[:297].rstrip() + "…"
-    return (f"**RetiGene curation** — Read the whole RetiGene corpus for every gene its papers report as "
+    lead = ("The question names no papers, so this reads the lab's RetiGene papers; say “search PubMed” "
+            "for an answer from the public literature instead. " if names_no_papers else "")
+    return (f"**RetiGene curation** — {lead}Read the whole RetiGene corpus for every gene its papers report as "
             f"haploinsufficient in retinal disease, and every gene they argue against, to answer: “{q}”. "
             "`extract_haploinsufficient_genes` has a model write search requests, reads every passage they "
             "retrieve and every passage that states a dosage mechanism in words (not only the best "

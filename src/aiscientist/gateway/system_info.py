@@ -192,7 +192,7 @@ _NO_MANIFEST_PLACE = {"run_code": "sandbox", "run_in_environment": "sandbox"}
 # The model roles, as the Model node lists them (the ``role=`` of each model call).
 MODEL_ROLES: dict[str, str] = {
     "classify": "routes a request (literature or analysis) and a follow-up, reads a request's scope, writes "
-                "literature queries",
+                "literature queries and summarizes a skill request",
     "plan": "drafts and revises the plan",
     "critic": "reviews the plan, then accepts or sends back each step",
     "scientist": "chooses each step's next tool call",

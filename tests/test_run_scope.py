@@ -222,6 +222,48 @@ def test_an_unlimited_request_is_planned_as_before():
     assert kind == "agenda" and agenda[:5] == _FULL_PLAN[:5]
 
 
+_NOTHING_TO_DISCLOSE = ("none — every choice in this plan comes from the guidance and the dataset "
+                        "profile.")
+
+
+@pytest.mark.parametrize("written", [_NOTHING_TO_DISCLOSE, f"`{_NOTHING_TO_DISCLOSE}`",
+                                     f"**none** — {_NOTHING_TO_DISCLOSE[7:]}", "None."])
+def test_the_plans_nothing_to_disclose_line_is_not_a_step_left_out(written):
+    """The #56 re-test's A2 ("Do cellqc quality controll and give me a result."): its feed read "Left
+    out 1 step(s) your request ruled out: none". The PI had put the prompt's "none — every choice …"
+    disclosure in `agenda`; it named no tool, so the limit dropped it as a step (RCHENLAB/AiScientist
+    issue 75)."""
+    def complete(messages):
+        if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+            return json.dumps({"agenda": [_FULL_PLAN[0], written]})
+        return "{}"
+
+    lab = _lab(complete)
+    lab._scope = RunScope(keep=("run_cellqc",))
+    events = []
+    kind, agenda = lab._pi_plan("Do cellqc quality controll and give me a result.", events.append)
+    assert kind == "agenda" and agenda == _FULL_PLAN[:1]
+    assert not [e for e in events if e.get("type") == "steps_pruned"]
+    assert lab.self_sourced.lower().startswith("none")
+    # A step that only opens with the word is still a step.
+    from aiscientist.agents.research_lab import _split_self_sourced
+    step = "None of the libraries is filtered yet: run `run_cellqc` on each."
+    assert _split_self_sourced([step]) == ([step], "")
+
+
+def test_the_feed_names_each_step_the_limit_left_out_and_is_silent_on_none():
+    from aiscientist.gateway.app import _lab_event_to_chat
+
+    def feed(dropped):
+        return [p["text"] for p in _lab_event_to_chat({"type": "steps_pruned", "reason": "user_scope",
+                                                       "dropped": dropped})
+                if p.get("type") == "lab_progress"]
+
+    assert feed(_FULL_PLAN[1:3]) == ["✂️ Left out 2 step(s) your request ruled out: Clustering; "
+                                     "Markers"]
+    assert feed(["", "  ", "**  **"]) == [] and feed([]) == []
+
+
 def test_a_limited_run_does_not_grow_new_steps():
     lab = _lab(lambda _m: "{}", hypothesis_driven=True)
     lab._scope = RunScope(keep=("run_cellqc",))

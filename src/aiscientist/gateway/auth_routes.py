@@ -1218,6 +1218,61 @@ def review_skill(name: str, req: SkillReviewRequest, admin: User = Depends(requi
     return {"status": "ok", "name": name, "review": rec}
 
 
+# --- skill requests (issue 13) -------------------------------------------------------------------
+# A run that needed code the model wrote is recorded as a skill request (gateway/skill_requests.py).
+# Admins only: a record carries the user's request and the code that ran.
+
+
+class SkillRequestStatus(BaseModel):
+    status: str                 # one of skill_requests.STATUSES
+    note: str = ""
+
+
+@router.get("/admin/skill-requests")
+def list_skill_requests(status: str = "", category: str = "", q: str = "",
+                        _admin: User = Depends(require_admin)) -> dict:
+    """Admin: every skill request (newest first) and the same requests grouped by category and
+    closest skill, most-requested first. Filters narrow both."""
+    from . import skill_requests
+    rows = skill_requests.listing(status=status.strip().lower(), category=category.strip().lower(),
+                                  q=q)
+    everything = rows if not (status or category or q) else skill_requests.listing()
+    return {"requests": rows, "groups": skill_requests.groups(rows),
+            "counts": {st: sum(1 for r in everything if r["status"] == st)
+                       for st in skill_requests.STATUSES},
+            "statuses": list(skill_requests.STATUSES),
+            "categories": list(skill_requests.CATEGORIES),
+            "recording": skill_requests.enabled(),
+            "retention_days": skill_requests.retention_days()}
+
+
+@router.get("/admin/skill-requests/{rid}")
+def skill_request_detail(rid: str, _admin: User = Depends(require_admin)) -> dict:
+    """Admin: one skill request in full — the request, the datasets' metadata, every code attempt
+    with its outcome and the Critic's verdict, and the summary."""
+    from . import skill_requests
+    rec = skill_requests.load(rid)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="no skill request by that id")
+    return rec
+
+
+@router.post("/admin/skill-requests/{rid}/status")
+def set_skill_request_status(rid: str, req: SkillRequestStatus,
+                             admin: User = Depends(require_admin)) -> dict:
+    """Admin: move a request along: new → planned → in progress → released, or won't do."""
+    from . import skill_requests
+    try:
+        rec = skill_requests.set_status(rid, req.status, by=admin.username, note=req.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="no skill request by that id") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not record the status: {exc}") from exc
+    return {"status": "ok", "id": rid, "request_status": rec["status"]}
+
+
 # --- account helpers (shared by the admin CLI; no plaintext ever on disk) -----
 
 

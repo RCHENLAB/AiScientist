@@ -198,3 +198,6 @@ def test_a_read_only_check_after_qc_does_not_turn_the_report_into_a_chat_reply(t
     reply = _reply(payloads)
     assert reply.startswith("**Quality control done**") and len(reply.strip().splitlines()) <= 12
     assert "CellQC kept 14,553 of 15,872 cells (91.7%)." not in reply
+    # a check of the tested tool's output is not untested code (issue 13): no notice, no code file
+    assert "Untested code" not in reply and "Untested code" not in rendered[0]
+    assert not (art / "process" / "untested_code.md").exists()

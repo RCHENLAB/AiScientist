@@ -93,6 +93,26 @@ SCRIPT_WRITES = re.compile(
     r"\bshutil\.|\bos\.(?:rename|replace|remove|makedirs|mkdir)\b|\.mkdir\s*\(")
 
 
+def call_wrote_outputs(call: Any) -> bool:
+    """Did this one successful generic-code call write a table, figure or file? An HPC3 run
+    reports every file it wrote, so that list is the answer; elsewhere the code's look decides."""
+    if not isinstance(call, dict) or call.get("tool") not in GENERIC_TOOLS or not call.get("ok"):
+        return False
+    res = call.get("result")
+    if isinstance(res, dict) and res.get("status") not in (None, "ok"):
+        return False
+    if isinstance(res, dict) and any(res.get(k) for k in ("tables", "figures", "artifacts")):
+        return True
+    if isinstance(res, dict) and res.get("execution_mode") == "hpc_slurm":
+        # An HPC3 run reports every file it wrote (slurm_sandbox.classify_written), so it
+        # reporting none is the answer. The code's look is only a guess: run 57c6b0c6ba0c's
+        # script READ tables/cellqc_metrics.csv through AISCIENTIST_ARTIFACTS, counted as a
+        # write, and the requested QC report went to the chat instead of the PDF.
+        return False
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    return bool(SCRIPT_WRITES.search(str(args.get("code") or args.get("command") or "")))
+
+
 def code_wrote_outputs(rounds: Any) -> bool:
     """Did a successful generic-code step write a table, figure or file? Such a step did analysis
     that no tool name shows: a skill applied with ``run_code`` (run 74873590ca7b scored every cell for
@@ -101,23 +121,8 @@ def code_wrote_outputs(rounds: Any) -> bool:
     for rnd in rounds or []:
         sr = (rnd.get("scientist_result") if isinstance(rnd, dict)
               else getattr(rnd, "scientist_result", None))
-        for st in ((sr or {}).get("steps") or []):
-            if not isinstance(st, dict) or st.get("tool") not in GENERIC_TOOLS or not st.get("ok"):
-                continue
-            res = st.get("result")
-            if isinstance(res, dict) and res.get("status") not in (None, "ok"):
-                continue
-            if isinstance(res, dict) and any(res.get(k) for k in ("tables", "figures", "artifacts")):
-                return True
-            if isinstance(res, dict) and res.get("execution_mode") == "hpc_slurm":
-                # An HPC3 run reports every file it wrote (slurm_sandbox.classify_written), so it
-                # reporting none is the answer. The code's look is only a guess: run 57c6b0c6ba0c's
-                # script READ tables/cellqc_metrics.csv through AISCIENTIST_ARTIFACTS, counted as a
-                # write, and the requested QC report went to the chat instead of the PDF.
-                continue
-            args = st.get("args") or {}
-            if SCRIPT_WRITES.search(str(args.get("code") or args.get("command") or "")):
-                return True
+        if any(call_wrote_outputs(st) for st in ((sr or {}).get("steps") or [])):
+            return True
     return False
 
 

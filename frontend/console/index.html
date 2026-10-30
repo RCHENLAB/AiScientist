@@ -360,6 +360,7 @@
             <div class="admin-tabs" role="tablist">
               <button class="admin-tab active" role="tab" data-admin-tab="users">Users</button>
               <button class="admin-tab" role="tab" data-admin-tab="skills">Skill review <span id="skillPendingBadge" class="tab-badge hidden"></span></button>
+              <button class="admin-tab" role="tab" data-admin-tab="requests">Skill requests <span id="skillRequestBadge" class="tab-badge hidden"></span></button>
               <button class="admin-tab" role="tab" data-admin-tab="usage">Usage</button>
             </div>
             <div id="adminPane-users" class="admin-pane">
@@ -392,6 +393,20 @@
                 <button class="skill-chip" data-skill-filter="all">All</button>
               </div>
               <div id="skillReviewList" class="card-list"><div class="empty-hint">Loading…</div></div>
+            </div>
+            <div id="adminPane-requests" class="admin-pane hidden">
+              <div class="page-head"><h2>Skill requests</h2><button id="skillRequestRefresh" class="ghost small">Refresh</button></div>
+              <p class="page-sub">Runs that needed code the AI wrote during the run, because no tested tool did the job. Each record holds the request, what kind of data it ran on (never the data), every code attempt with its result and the Critic's verdict, and a summary. Similar requests are grouped, so the most-needed skills stand out. Credentials, server paths and e-mail addresses are removed before a record is written; the request text and the code are dropped after the retention period.</p>
+              <div class="skill-filters" role="group" aria-label="Filter by status">
+                <button class="req-chip active" data-req-filter="new">New</button>
+                <button class="req-chip" data-req-filter="planned">Planned</button>
+                <button class="req-chip" data-req-filter="in_progress">In progress</button>
+                <button class="req-chip" data-req-filter="released">Released</button>
+                <button class="req-chip" data-req-filter="wont_do">Won't do</button>
+                <button class="req-chip" data-req-filter="all">All</button>
+              </div>
+              <div id="skillRequestGroups"></div>
+              <div id="skillRequestList" class="card-list"><div class="empty-hint">Loading…</div></div>
             </div>
             <div id="adminPane-usage" class="admin-pane hidden">
               <div class="page-head"><h2>LLM usage, all accounts</h2>
