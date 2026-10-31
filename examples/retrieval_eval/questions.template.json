@@ -1,0 +1,46 @@
+{
+  "placeholder": true,
+  "instructions": "Lab: replace every placeholder query and label with reviewed corpus-specific examples; remove placeholder flags. Empty labels are unscored. Chunk IDs must match chunks.jsonl, paired with PMID. Supply deployment revision at run time.",
+  "questions": [
+    {
+      "id": "replace-gene-1",
+      "placeholder": true,
+      "category": "gene-specific",
+      "queries": ["REPLACE: a question about a named gene"],
+      "terms": [],
+      "relevant_passages": [],
+      "supporting_passages": [],
+      "expected_pmids": []
+    },
+    {
+      "id": "replace-mechanism-1",
+      "placeholder": true,
+      "category": "mechanism",
+      "queries": ["REPLACE: a question about a biological mechanism"],
+      "terms": [],
+      "relevant_passages": [],
+      "supporting_passages": [],
+      "expected_pmids": []
+    },
+    {
+      "id": "replace-paraphrase-1",
+      "placeholder": true,
+      "category": "paraphrase",
+      "queries": ["REPLACE: a question using different wording from its supporting passages"],
+      "terms": [],
+      "relevant_passages": [],
+      "supporting_passages": [],
+      "expected_pmids": []
+    },
+    {
+      "id": "replace-list-1",
+      "placeholder": true,
+      "category": "exhaustive-list",
+      "queries": ["REPLACE: an exhaustive-list question with a reviewed complete expected PMID set"],
+      "terms": [],
+      "relevant_passages": [],
+      "supporting_passages": [],
+      "expected_pmids": []
+    }
+  ]
+}
