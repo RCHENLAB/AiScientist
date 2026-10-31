@@ -21,8 +21,9 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
 
 from . import auth, email_send, rate_limit
+from .dataset_limits import MAX_BOUND_DATASETS
 from .db import session_scope
-from .models import (Conversation, Dataset, LlmCall, Message, PendingRegistration, Run,
+from .models import (Conversation, ConversationDataset, Dataset, LlmCall, Message, PendingRegistration, Run,
                      UsageBudget, User)
 
 router = APIRouter(prefix="/api")
@@ -410,7 +411,8 @@ def my_datasets(request: Request) -> dict:
                 for r in s.scalars(select(MetadataRecord).where(MetadataRecord.user_id == user.id,
                                                                 MetadataRecord.kind == "dataset")).all()}
         from .dataset_storage import location_of
-        return {"datasets": [{**d.public(), "metadata": meta.get(d.id), "location": location_of(d.path)}
+        return {"max_bound_datasets": MAX_BOUND_DATASETS,
+                "datasets": [{**d.public(), "metadata": meta.get(d.id), "location": location_of(d.path)}
                              for d in rows]}
 
 
@@ -887,7 +889,47 @@ def get_conversation(cid: int, request: Request) -> dict:
         msgs = s.scalars(
             select(Message).where(Message.conversation_id == cid).order_by(Message.seq, Message.id)
         ).all()
-        return {"conversation": conv.public(), "messages": [m.public() for m in msgs]}
+        return {"conversation": conv.public(), "messages": [m.public() for m in msgs],
+                "datasets": [d.public() for d in conv.datasets],
+                "max_bound_datasets": MAX_BOUND_DATASETS}
+
+
+class ChatDatasetInput(BaseModel):
+    id: int
+    role: str | None = None
+
+
+class ChatDatasetsPut(BaseModel):
+    datasets: list[ChatDatasetInput]
+
+
+@router.put("/conversations/{cid}/datasets")
+def replace_conversation_datasets(cid: int, req: ChatDatasetsPut, request: Request) -> dict:
+    """Replace the attachment set atomically; resolve current paths from owned dataset IDs."""
+    user = require_user(request)
+    with session_scope() as s:
+        conv = _owned_conversation(s, cid, user.id)
+        s.refresh(conv, with_for_update=True)
+        entries = {d.id: d for d in req.datasets}
+        if len(entries) > MAX_BOUND_DATASETS:
+            raise HTTPException(400, f"At most {MAX_BOUND_DATASETS} datasets per run. Remove one first.")
+        if any(d.role not in (None, "primary", "reference", "sample", "extra_input") for d in entries.values()):
+            raise HTTPException(400, "Unknown dataset role")
+        if sum(d.role == "primary" for d in entries.values()) > 1:
+            raise HTTPException(400, "Choose only one main dataset")
+        rows = list(s.scalars(select(Dataset).where(
+            Dataset.user_id == user.id, Dataset.id.in_(entries))).all())
+        if len(rows) != len(entries):
+            raise HTTPException(404, "Dataset not found")
+        conv.datasets.clear()
+        s.flush()
+        for position, entry in enumerate(entries.values()):
+            conv.datasets.append(ConversationDataset(
+                dataset_id=entry.id, position=position, role=entry.role))
+        conv.updated_at = _dt.datetime.now(_dt.timezone.utc)
+        s.commit()
+        return {"datasets": [d.public() for d in conv.datasets],
+                "max_bound_datasets": MAX_BOUND_DATASETS}
 
 
 @router.patch("/conversations/{cid}")

@@ -311,8 +311,10 @@
             </div>
             <div id="filesPane-datasets" class="files-pane" role="tabpanel" aria-labelledby="filesTab-datasets">
             <div id="uploadsPanel" class="uploads-panel hidden"></div>
-            <p class="page-sub">Files you've uploaded to the server. Preview one to see what it holds, download it, review how it is described ("Metadata"), or click "Use" to load it into a Research run.</p>
+            <p class="page-sub">Files you've uploaded to the server. Preview one to see what it holds, download it, review how it is described ("Metadata"), or click "Use" to load it into a Research run. To attach several to the open chat at once, tick them and click "Use selected".</p>
             <div class="list-search">
+              <button id="datasetsUseSelected" class="primary small" disabled>Use selected (0)</button>
+              <span id="datasetsLimit" class="muted"></span>
               <input id="datasetsSearch" type="search" class="preset-search list-search-box" autocomplete="off" placeholder="Search name, type, chat…" aria-label="Search your datasets" />
               <span id="datasetsCount" class="list-search-n muted small"></span>
             </div>

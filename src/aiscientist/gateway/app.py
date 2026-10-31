@@ -21,12 +21,13 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
+from .dataset_limits import MAX_BOUND_DATASETS as _MAX_BOUND_DATASETS
 from . import cluster_models, gpu, vllm_client
 from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
 from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
@@ -2971,7 +2972,6 @@ def _primary_rank(name: str, depth: int, size: int) -> "tuple | None":
 # LabRequest's two dataset slots into ONE ordered list of bound files, primary first. It is the single
 # place that reconciles the legacy single ``dataset_path`` with the new ``datasets`` list, so both the
 # staging path and any consumer see the same view.
-_MAX_BOUND_DATASETS = 12   # a generous cap so a runaway client can't bind an unbounded fan-out
 
 
 # Roles a client may set on a bound file. "primary" pins the study's own data; "reference" marks
@@ -3005,7 +3005,7 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
 
     The primary (index 0) is what every legacy ``decisions["dataset_path"]`` consumer reads; the full
     list is what the multi-file consumers read. A ``role`` of "primary" pins the primary and
-    "reference" keeps a file out of that slot (see ``_bound_primary_key``). Never raises."""
+    "reference" keeps a file out of that slot (see ``_bound_primary_key``). Oversized sets are refused."""
     raw: list[dict] = []
     seen: set[str] = set()
     entries = req.datasets if isinstance(getattr(req, "datasets", None), list) else []
@@ -3026,7 +3026,9 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
         raw = [{"path": dp, "order": 0, "name": dp.rsplit("/", 1)[-1], "role": None}]
     raw.sort(key=lambda d: _bound_primary_key(d["path"], d["order"], d["role"]))
     out = [{"path": d["path"], "name": d["name"], "role": d["role"]} for d in raw]
-    return out[:_MAX_BOUND_DATASETS]
+    if len(out) > _MAX_BOUND_DATASETS:
+        raise HTTPException(400, f"At most {_MAX_BOUND_DATASETS} datasets per run. Remove one first.")
+    return out
 
 
 # A clinical note is prose, not data. The cap is generous for a real referral letter (~10k words) and
@@ -5032,6 +5034,20 @@ def _stage_secondary_dataset(conn: Connection, path: str, name: str, role: "str 
                 "hpc_primary": path, "remote": True, "primary": False}
     return {"path": path, "name": name, "role": role,
             "hpc_primary": None, "remote": False, "primary": False}
+
+
+def _plan_dataset_inputs(decisions: dict) -> dict:
+    """The staged inputs and actual QC grouping shown before a plan runs."""
+    together = {str(n).rstrip("/") for n in
+                (decisions.get("cellranger_layout") or {}).get("datasets", [])}
+    datasets = []
+    for rec in decisions.get("datasets") or []:
+        name = _display_name(rec)
+        role = str(rec.get("role") or "").lower()
+        use = ("reference" if role == "reference" else "main" if rec.get("primary") else
+               "sample" if name.rstrip("/") in together else "extra input")
+        datasets.append({"name": name, "role": rec.get("role"), "use": use})
+    return {"datasets": datasets, "unusable_inputs": list(decisions.get("unusable_inputs") or [])}
 
 
 def _input_folder_list(bound: "list[dict]", records: "list[dict]", decisions: dict,
@@ -10466,6 +10482,7 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
     this session's vLLM, streaming each role's progress to the log + the final report
     to the chat. A typed follow-up after a completed run is routed by _dispatch_lab (edit /
     re-run-step / new study) instead of always minting a fresh study."""
+    _select_bound_datasets(req)   # refuse an oversized set before scheduling any work
     conn = _owned_conn(req.connection_id, request)
     # A run needs the whole stack (SSH + GPU + a served model), and /api/connect brings those up
     # together — so "ready" is the only state a run may start from. Anything else (still
@@ -13967,7 +13984,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                                "outputs": s["outputs"]}
                             for s in (run_flags["plan_doc"] or {}).get("steps") or []
                             if isinstance(s, dict) and s.get("outputs")}
-            prompt = {"revised": list(run_flags["plan_revised"]),
+            prompt = {**_plan_dataset_inputs(decisions),
+                      "revised": list(run_flags["plan_revised"]),
                       "problems": list(run_flags["plan_problems"]),
                       **(run_flags.get("plan_answer") or {}),
                       "estimate": plan_estimate(agenda) if agenda else None,

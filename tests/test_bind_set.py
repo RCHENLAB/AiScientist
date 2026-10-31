@@ -63,10 +63,11 @@ def test_datasets_list_overrides_and_dedupes_and_drops_pathless():
     assert [b["path"] for b in bound] == ["/u/a.vcf.gz"]
 
 
-def test_bind_set_is_capped():
+def test_oversized_bind_set_is_refused():
     req = gw_app.LabRequest(connection_id="c", question="q",
                             datasets=[{"path": f"/u/f{i}.csv"} for i in range(30)])
-    assert len(gw_app._select_bound_datasets(req)) == gw_app._MAX_BOUND_DATASETS
+    with pytest.raises(gw_app.HTTPException, match="At most 12 datasets"):
+        gw_app._select_bound_datasets(req)
 
 
 # --- per-file staging records ------------------------------------------------------------------
@@ -263,3 +264,14 @@ def test_one_failed_upload_is_a_warning_not_a_lost_executor(tmp_path):
     decisions = {"datasets": [{"path": str(local), "name": "panel.bed", "primary": False}]}
     inputs, warnings = gw_app._remote_inputs(_FakeConn(executor=_Broken()), decisions, "/dfs/tmp/r")
     assert inputs == [] and "upload to HPC3 failed" in warnings[0]
+
+
+def test_plan_inputs_show_actual_uses_and_unusable_reasons():
+    data = gw_app._plan_dataset_inputs({
+        "datasets": [{"name": "main", "primary": True}, {"name": "second/", "kind": "folder"},
+                     {"name": "atlas", "role": "reference"}, {"name": "panel.bed"}],
+        "cellranger_layout": {"datasets": ["main", "second"]},
+        "unusable_inputs": [{"name": "missing", "reason": "its files were not found"}],
+    })
+    assert [d["use"] for d in data["datasets"]] == ["main", "sample", "reference", "extra input"]
+    assert data["unusable_inputs"] == [{"name": "missing", "reason": "its files were not found"}]

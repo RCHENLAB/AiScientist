@@ -29,6 +29,8 @@ const state = {
   // Each chat's run and dialog live in its own record (see chatOf below), not here. What stays
   // here is the one visible chat's DOM: the live bubble of its run and its plan card.
   streamDom: null,      // {body, think, thinkBody, feed} DOM refs of the visible chat's live bubble
+  maxBoundDatasets: null,
+  selectedDatasetIds: new Set(),
   datasets: [],                // uploaded files/folders this session: {name, path, kind}, newest first
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
@@ -159,9 +161,12 @@ function saveComposer(c) {
   if (!c) return;
   const entry = {};
   if (c.draft) entry.draft = c.draft;
-  if (c.bound.length) entry.bound = [...c.bound];
-  const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
-  if (roles.length) entry.roles = Object.fromEntries(roles);
+  const serverBacked = state.sessions.some((s) => s.id === c.sid && s.cid);
+  if (!serverBacked) {
+    if (c.bound.length) entry.bound = [...c.bound];
+    const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
+    if (roles.length) entry.roles = Object.fromEntries(roles);
+  }
   const all = readComposers();
   if (Object.keys(entry).length) all[c.sid] = entry; else delete all[c.sid];
   writeComposers(all);
@@ -170,6 +175,7 @@ function restoreComposer(c) {
   const e = readComposers()[c.sid];
   if (!e || typeof e !== "object") return;
   if (typeof e.draft === "string") c.draft = e.draft;
+  if (state.sessions.some((s) => s.id === c.sid && s.cid)) return;
   if (Array.isArray(e.bound)) c.bound = e.bound.filter((p) => typeof p === "string" && p);
   for (const [p, role] of Object.entries((e.roles && typeof e.roles === "object") ? e.roles : {})) {
     if (c.bound.includes(p) && typeof role === "string") c.roles[p] = role;
@@ -549,7 +555,10 @@ async function api(method, url, body) {
   const opt = { method, headers: {} };
   if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch(url, opt);
-  if (!r.ok) throw new Error(`${method} ${url} -> ${r.status}`);
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    throw new Error(data.detail || data.error || `${method} ${url} -> ${r.status}`);
+  }
   return r.status === 204 ? null : r.json();
 }
 
@@ -602,6 +611,8 @@ async function ensureMessages(s) {
     const data = await api("GET", `/api/conversations/${s.cid}`);
     s.messages = (data.messages || []).map(msgFromServer);
     s.title = data.conversation.title;
+    hydrateChatDatasets(chatOf(s.id), data);
+    if (s.id === state.activeId) syncDatasetSelection();
   } catch { /* keep whatever we have */ }
   s.loaded = true;
 }
@@ -3742,6 +3753,7 @@ async function sendChat(e) {
   // a change request for the previous chat's plan.
   const c = activeChat();
   if (!c) return;
+  if (c.datasetSave && !await c.datasetSave) return;
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
   if (c.planPending) {
@@ -4320,6 +4332,19 @@ function planDocumentHtml(doc) {
     + `<div class="plan-yaml-code"><pre class="plan-yaml-hl">${planYamlHtml(doc.yaml)}</pre></div></details>`;
 }
 
+// The chat's datasets as the run will use them (main / sample / reference / extra input), and the
+// ones it cannot use with the reason.
+function planDatasetsHtml(doc) {
+  const rows = ((doc && doc.datasets) || []).map((d) => {
+    const use = d.use === "sample" ? "sample (QC'd together)" : (d.use || "extra input");
+    return `<li><strong>${escapeHtml(d.name)}</strong> — ${escapeHtml(use)}</li>`;
+  });
+  for (const d of ((doc && doc.unusable_inputs) || [])) {
+    rows.push(`<li><strong>${escapeHtml(d.name)}</strong> — cannot be used: ${escapeHtml(d.reason)}</li>`);
+  }
+  return rows.length ? `<section class="plan-datasets"><h4>Datasets for this run</h4><ul>${rows.join("")}</ul></section>` : "";
+}
+
 // The plan as the chat shows it: the step titles and the tool each one runs, with the decision
 // beside them. The prose, the settings and the document are one click away in the side panel's Plan
 // tab, so the chat stays a conversation and a long plan does not push it off the screen. `opts`:
@@ -4352,6 +4377,7 @@ function planEntryHtml(agenda, doc, opts) {
   return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
     + `<div><div class="plan-title">${o.pending ? "Proposed plan" : "Plan"}</div><div class="plan-sub">${sub}</div></div></div>`
     + (o.pending ? planRevisedNote(revised) + refused : "")
+    + planDatasetsHtml(doc)
     + `<ol class="plan-entry-steps">${rows}</ol>`
     + `<div class="plan-actions-row">${actions}</div>`;
 }
@@ -6236,6 +6262,8 @@ function _suffixRank(name) {
 // _bound_primary_key: a file marked "reference" is ranked after every other file.
 function primaryBoundPath() {
   if (!state.boundPaths.length) return null;
+  const chosen = state.boundPaths.find((p) => state.boundRoles[p] === "primary");
+  if (chosen) return chosen;
   const meta = state.boundPaths.map((p, i) => {
     const d = state.datasets.find((x) => x.path === p);
     return { p, i, ref: state.boundRoles[p] === "reference" ? 1 : 0, r: _suffixRank(d ? d.name : p) };
@@ -6350,23 +6378,107 @@ async function bindServerPath(path) {
   }
 }
 
-// Mark/unmark one bound file as REFERENCE data (e.g. a cell-type atlas to compare against).
-function toggleReference(path) {
-  if (!path) return;
-  if (state.boundRoles[path] === "reference") delete state.boundRoles[path];
-  else state.boundRoles[path] = "reference";
-  syncDatasetSelection();
+// Mark/unmark one bound file and save the chat attachment set.
+// Server-backed chats keep their attachment set on the account, not in browser storage.
+function hydrateChatDatasets(c, data) {
+  if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+  if (!Array.isArray(data.datasets)) return;
+  c.bound = data.datasets.map((d) => d.path);
+  c.roles = Object.fromEntries(data.datasets.filter((d) => d.role).map((d) => [d.path, d.role]));
+  for (const d of data.datasets) {
+    const known = state.datasets.find((x) => x.id === d.id || x.path === d.path);
+    if (known) Object.assign(known, d); else state.datasets.push(d);
+  }
+  saveComposer(c);
 }
 
-// ADD a data file to a chat's bind-set — the chat on screen, or `sid` (the chat an upload was
-// started from, which may have been left while the file was uploading).
+function datasetLimitAllows(paths) {
+  if (state.maxBoundDatasets && paths.length > state.maxBoundDatasets) {
+    toast(`Up to ${state.maxBoundDatasets} datasets per run. Remove one first.`);
+    return false;
+  }
+  return true;
+}
+
+function changeChatDatasets(c, change) {
+  if (!c) return Promise.resolve(false);
+  const apply = async () => {
+    const next = { bound: [...c.bound], roles: { ...c.roles } };
+    change(next);
+    if (!datasetLimitAllows(next.bound)) return false;
+    const s = state.sessions.find((x) => String(x.id) === String(c.sid));
+    try {
+      if (s && s.cid) {
+        if (next.bound.some((path) => !state.datasets.some((d) => d.path === path && d.id != null))) {
+          const listing = await api("GET", "/api/datasets");
+          if (Number.isInteger(listing.max_bound_datasets)) state.maxBoundDatasets = listing.max_bound_datasets;
+          for (const d of listing.datasets || []) {
+            const known = state.datasets.find((x) => x.path === d.path);
+            if (known) Object.assign(known, d); else state.datasets.push(d);
+          }
+          if (!datasetLimitAllows(next.bound)) return false;
+        }
+        const datasets = next.bound.map((path) => {
+          const d = state.datasets.find((x) => x.path === path);
+          if (!d || d.id == null) throw new Error("This dataset is not saved yet. Refresh Files and try again.");
+          return { id: d.id, role: next.roles[path] || null };
+        });
+        const data = await api("PUT", `/api/conversations/${s.cid}/datasets`, { datasets });
+        hydrateChatDatasets(c, data);
+      } else { c.bound = next.bound; c.roles = next.roles; saveComposer(c); }
+      if (chatVisible(c)) syncDatasetSelection();
+      return true;
+    } catch (err) { toast(`Datasets not saved: ${err.message}`); return false; }
+  };
+  c.datasetSave = (c.datasetSave || Promise.resolve()).then(apply);
+  return c.datasetSave;
+}
+
+function toggleReference(path) {
+  return changeChatDatasets(activeChat(), (c) => {
+    if (c.roles[path] === "reference") delete c.roles[path]; else c.roles[path] = "reference";
+  });
+}
+
+function makeMainDataset(path) {
+  return changeChatDatasets(activeChat(), (c) => {
+    if (!c.bound.includes(path)) return;
+    for (const p of Object.keys(c.roles)) if (c.roles[p] === "primary") delete c.roles[p];
+    c.roles[path] = "primary";
+  });
+}
+
+// Uploads attach to the chat they started in, even when it is no longer on screen.
 function addDataset(d, sid) {
-  if (!d || !d.path) return;
-  if (!state.datasets.some((x) => x.path === d.path)) state.datasets.unshift(d);
-  const c = chatOf(sid || state.activeId);
-  if (c && !c.bound.includes(d.path)) c.bound.push(d.path);
-  if (!c || chatVisible(c)) syncDatasetSelection();
-  else saveComposer(c);   // its chips appear when that chat is opened (showDialog)
+  if (!d || !d.path) return Promise.resolve(false);
+  const known = state.datasets.find((x) => x.path === d.path);
+  if (known) Object.assign(known, d); else state.datasets.unshift(d);
+  return changeChatDatasets(chatOf(sid || state.activeId), (c) => {
+    if (!c.bound.includes(d.path)) c.bound.push(d.path);
+  });
+}
+
+async function useSelectedDatasets() {
+  const c = activeChat();
+  const selected = state.datasets.filter((d) => state.selectedDatasetIds.has(String(d.id)));
+  if (!selected.length) return;
+  const saved = await changeChatDatasets(c, (next) => {
+    next.bound = [...new Set([...next.bound, ...selected.map((d) => d.path)])];
+  });
+  if (saved) {
+    state.selectedDatasetIds.clear();
+    openChat(c.sid);
+    renderDatasetSelectionCount();
+  }
+}
+
+function renderDatasetSelectionCount() {
+  const button = $("datasetsUseSelected"), limit = $("datasetsLimit");
+  if (button) {
+    button.disabled = !state.selectedDatasetIds.size;
+    button.textContent = `Use selected (${state.selectedDatasetIds.size})`;
+  }
+  if (limit) limit.textContent = state.maxBoundDatasets ? `Up to ${state.maxBoundDatasets} datasets per run` : "";
 }
 
 // A deleted dataset leaves every chat it was attached to, the ones not opened since the reload too.
@@ -6420,12 +6532,13 @@ function openChat(sid) {
 // Add/remove one path from the bind-set (a recent-list toggle or a chip ×).
 function toggleBound(path) {
   if (!path) return;
-  const i = state.boundPaths.indexOf(path);
-  if (i >= 0) { state.boundPaths.splice(i, 1); delete state.boundRoles[path]; } else state.boundPaths.push(path);
-  syncDatasetSelection();
+  return changeChatDatasets(activeChat(), (c) => {
+    if (c.bound.includes(path)) { c.bound = c.bound.filter((p) => p !== path); delete c.roles[path]; }
+    else c.bound.push(path);
+  });
 }
 
-function clearBound() { state.boundPaths = []; state.boundRoles = {}; syncDatasetSelection(); }
+function clearBound() { return changeChatDatasets(activeChat(), (c) => { c.bound = []; c.roles = {}; }); }
 
 function syncDatasetSelection() {
   state.datasetPath = primaryBoundPath();
@@ -6437,7 +6550,7 @@ function syncDatasetSelection() {
 }
 // Back-compat alias: some call sites still say selectDataset(path|null) — a single-file select is just
 // "replace the set with this one" (or clear it).
-function selectDataset(path) { state.boundPaths = path ? [path] : []; state.boundRoles = {}; syncDatasetSelection(); }
+function selectDataset(path) { return changeChatDatasets(activeChat(), (c) => { c.bound = path ? [path] : []; c.roles = {}; }); }
 
 function renderDatasetChips() {
   const host = $("datasetChips");
@@ -6447,8 +6560,9 @@ function renderDatasetChips() {
   host.innerHTML = state.boundPaths.map((path) => {
     const d = state.datasets.find((x) => x.path === path) || { name: path.split("/").pop(), path, kind: "file" };
     const ico = datasetIcon(d.kind);
-    const isPrimary = path === primary && state.boundPaths.length > 1;
+    const isPrimary = path === primary;
     const isRef = state.boundRoles[path] === "reference";
+    const mainBtn = !isPrimary ? `<button type="button" class="dataset-chip-ref" data-main-path="${escapeHtml(path)}" title="Use as the main dataset">Make main</button>` : '<span class="dataset-chip-role">main</span>';
     const gist = d.gist ? ` — ${d.gist}` : "";                 // the file's ① skim, when known
     // The reference toggle appears once a second file is attached: one file is always the study.
     const refBtn = state.boundPaths.length > 1
@@ -6457,7 +6571,7 @@ function renderDatasetChips() {
       : "";
     return `<span class="dataset-chip active${isRef ? " reference" : ""}" title="${escapeHtml(d.path + gist)}">` +
       `<span class="material-symbols-outlined msym">${ico}</span>` +
-      `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + refBtn +
+      `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + mainBtn + refBtn +
       `<button type="button" class="dataset-chip-x" data-clear-path="${escapeHtml(path)}" title="Remove this file">×</button></span>`;
   }).join("");
 }
@@ -6577,7 +6691,9 @@ function wireDataDrop() {
 // visit) are known to the page: their chips, and Datasets → Use, which attaches one to the open chat.
 async function loadDatasetChips() {
   try {
-    const items = (await (await fetch("/api/datasets")).json()).datasets || [];
+    const data = await (await fetch("/api/datasets")).json();
+    if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+    const items = data.datasets || [];
     for (const x of items) {
       const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
       // A dataset moved from HPC3 to the server keeps its id and changes its path: the chip and every
@@ -6788,6 +6904,7 @@ async function doLogout() {
 function initShell() {
   document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
   $("datasetsRefresh").addEventListener("click", loadFiles);
+  $("datasetsUseSelected").addEventListener("click", useSelectedDatasets);
   $("runsRefresh").addEventListener("click", loadRuns);
   $("runsList").addEventListener("click", onRunsClick);
   $("outputsList").addEventListener("click", onOutputsClick);
@@ -7450,7 +7567,16 @@ async function loadDatasets() {
   renderUploads();   // show any in-flight/failed uploads at the top of the tab
   const el = $("datasetsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
-    const items = (await (await fetch("/api/datasets")).json()).datasets || [];
+    const data = await (await fetch("/api/datasets")).json();
+    if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+    const items = data.datasets || [];
+    for (const x of items) {
+      const known = state.datasets.find((d) => d.id === x.id || d.path === x.path);
+      if (known) Object.assign(known, x); else state.datasets.push(x);
+    }
+    const available = new Set(items.map((x) => String(x.id)));
+    for (const id of state.selectedDatasetIds) if (!available.has(id)) state.selectedDatasetIds.delete(id);
+    renderDatasetSelectionCount();
     el.innerHTML = items.length ? items.map((x) => {
       const from = chatLabel(x.conversation_id);
       const fromHtml = !from ? ""
@@ -7458,12 +7584,13 @@ async function loadDatasets() {
         : ` · ${escapeHtml(from.text)}`;
       const q = sysSearchText([x.name, x.kind, x.location === "hpc3" ? "on hpc3" : "on the server", from && from.text,
                                fmtDate(x.uploaded_at), (x.uploaded_at || "").slice(0, 10)]);
-      return `<div class="card" data-q="${escapeHtml(q)}"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
+      return `<div class="card" data-q="${escapeHtml(q)}"><input type="checkbox" data-select-dataset="${x.id}" aria-label="Select ${escapeHtml(x.name)}"${state.selectedDatasetIds.has(String(x.id)) ? " checked" : ""} /><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
       `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${x.location === "hpc3" ? ` · <span title="Kept only on HPC3 so far: it is moved to the server when you connect">on HPC3</span>` : ""}${metadataBadge(x.metadata)}</span></div>` +
       `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
       `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
       `<a class="ghost small" href="/api/datasets/${x.id}/download" download data-dl-size="${Number(x.size_bytes) || 0}" data-name="${escapeHtml(x.name)}" title="${isFolderKind(x.kind) ? "Download the folder as one .zip" : "Download the file"}">Download</a>` +
-      `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>` +
+      (state.boundPaths.includes(x.path) ? `<span class="muted">Attached</span>`
+        : `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>`) +
       `<button class="ghost small danger" data-del="${x.id}" data-path="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}" data-location="${escapeHtml(x.location || "server")}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`;
     }).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
@@ -7520,6 +7647,13 @@ function wireListSearch(boxId, listId, countId) {
   });
 }
 async function onDatasetsClick(e) {
+  const selected = e.target.closest("[data-select-dataset]");
+  if (selected) {
+    if (selected.checked) state.selectedDatasetIds.add(selected.dataset.selectDataset);
+    else state.selectedDatasetIds.delete(selected.dataset.selectDataset);
+    renderDatasetSelectionCount();
+    return;
+  }
   const open = e.target.closest("[data-open-chat]");
   if (open) { openChat(open.dataset.openChat); return; }
   const pv = e.target.closest("[data-preview]");
@@ -9213,6 +9347,8 @@ function init() {
   $("datasetFile").addEventListener("change", (e) => { for (const f of e.target.files || []) uploadDataset(f); e.target.value = ""; });   // multi-attach: each file joins the bind-set
   $("datasetDir").addEventListener("change", (e) => { if (e.target.files && e.target.files.length) uploadFolder(e.target.files); e.target.value = ""; });
   $("datasetChips").addEventListener("click", (e) => {
+    const main = e.target.closest("[data-main-path]");
+    if (main) { makeMainDataset(main.dataset.mainPath); return; }
     const r = e.target.closest("[data-ref-path]");
     if (r) { toggleReference(r.dataset.refPath); return; }
     const x = e.target.closest("[data-clear-path]");

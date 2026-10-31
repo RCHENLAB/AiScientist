@@ -129,3 +129,12 @@ def test_a_version_that_does_not_parse_is_a_value_error(tmp_path):
     with pytest.raises(ValueError, match="does not parse"):
         saved_plans.load(tmp_path)
     assert saved_plans.current_state(tmp_path) == "shown"
+
+
+def test_waiting_plan_keeps_dataset_uses_and_unusable_reasons(tmp_path):
+    inputs = {"datasets": [{"name": "study", "use": "main"}, {"name": "sample2", "use": "sample"}],
+              "unusable_inputs": [{"name": "missing", "reason": "its files were not found"}]}
+    saved_plans.save(tmp_path, PLAN, source="draft", prompt=inputs)
+    card = saved_plans.build_prompt(tmp_path)
+    assert card["plan"]["datasets"] == inputs["datasets"]
+    assert card["plan"]["unusable_inputs"] == inputs["unusable_inputs"]

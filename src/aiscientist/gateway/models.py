@@ -110,6 +110,9 @@ class Dataset(Base):
 
     owner: Mapped[User] = relationship(back_populates="datasets", foreign_keys=[user_id])
 
+    chat_attachments: Mapped[list["ConversationDataset"]] = relationship(
+        back_populates="dataset", cascade="all, delete-orphan")
+
     def public(self) -> dict:
         return {
             "id": self.id, "uuid": self.uuid, "owner": self.user_id,
@@ -181,6 +184,10 @@ class Conversation(Base):
         back_populates="conversation", cascade="all, delete-orphan",
         order_by="Message.seq", foreign_keys="Message.conversation_id")
 
+    datasets: Mapped[list["ConversationDataset"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan",
+        order_by="ConversationDataset.position")
+
     def public(self) -> dict:
         return {
             "id": self.id, "title": self.title,
@@ -188,6 +195,25 @@ class Conversation(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class ConversationDataset(Base):
+    """A saved dataset attached to a chat, with its order and user-selected role."""
+
+    __tablename__ = "conversation_datasets"
+
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), primary_key=True, index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    role: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    conversation: Mapped[Conversation] = relationship(back_populates="datasets")
+    dataset: Mapped[Dataset] = relationship(back_populates="chat_attachments")
+
+    def public(self) -> dict:
+        return {**self.dataset.public(), "role": self.role}
 
 
 class Message(Base):
