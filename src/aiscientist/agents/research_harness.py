@@ -538,6 +538,8 @@ class ResearchHarness:
                     # end the step now instead of treating it as a normal result and pressing on.
                     if isinstance(output, dict) and output.get("status") == "cancelled":
                         steps.append({"tool": name, "args": args, "ok": False, "result": output})
+                        emit({"type": "tool_result", "tool": name, "summary": _summarize(output),
+                              "timing_outcome": "cancelled"})
                         stop_reason = "cancelled"
                         break
 
@@ -577,7 +579,8 @@ class ResearchHarness:
                     # Carry ``args`` on success so the UI can surface a step's FINAL successful
                     # code (run_code) as a formatted block, without pasting the raw snippet into
                     # the always-visible progress feed.
-                    emit({"type": "tool_result", "tool": name, "summary": summary, "args": args})
+                    emit({"type": "tool_result", "tool": name, "summary": summary, "args": args,
+                          "timing_outcome": tool_result_outcome(output)})
                     fed = output
                     if enforced and isinstance(output, dict):
                         # The model must reason from the call that ran, not the one it wrote.
@@ -998,6 +1001,22 @@ def _summarize(output: Any) -> str:
 _FAILED_TOOL_STATUSES = frozenset(
     {"error", "failed", "timeout", "unavailable", "not_enabled", "dependency_missing", "cancelled"}
 )
+
+
+def tool_result_outcome(output: Any) -> str:
+    """Timing outcome from the tool's structured status, never from its human-facing summary.
+
+    A returned failure is still a completed call. Keep execution/retry behavior unchanged while
+    allowing observers to close its span accurately, including tools that catch their own errors.
+    """
+    status = str(output.get("status", "ok")).lower() if isinstance(output, dict) else "ok"
+    if status in {"cancelled", "timeout"}:
+        return status
+    if status.startswith("blocked"):
+        return "blocked"
+    if status in _FAILED_TOOL_STATUSES or status.startswith(("error", "fail")):
+        return "failed"
+    return "success"
 
 #: Read-only lookups: they say where things are and what a tool does, and produce none of a step's
 #: result. Their success does not arm the ``done_early`` stop, which means "the step has its result

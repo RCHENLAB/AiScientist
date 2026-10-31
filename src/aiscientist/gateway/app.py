@@ -504,7 +504,13 @@ class Connection:
             return
         run.running = False
         if run.monitor is not None:
+            if run.monitor.run_id is None:
+                # Routes which never start an analysis still retain their measured model calls.
+                run.monitor.run_id = run.run_id or run.monitor.key
+                run.monitor.bind_timing(_timing_path(self.workspace, run.monitor.run_id))
             run.monitor.end()           # a no-op when the run already said how it ended
+            if run_monitor.current_monitor() is run.monitor:
+                run_monitor.set_current_monitor(None)
         if run in self.live_runs:
             self.live_runs.remove(run)
         if self._bare_run is run:
@@ -606,6 +612,8 @@ class Connection:
         self._tag(payload, run)
         self._track_stream(payload, run)
         if run is not None and run.monitor is not None:
+            if payload.get("type") == "artifacts":
+                run.monitor.mark_result_ready()
             run.monitor.observe_push(payload)
         self._publish(payload)
 
@@ -5593,6 +5601,8 @@ def _cancel_pending_plan(conn: "Connection", run: "RunState") -> None:
     plan card has no time limit: whatever takes away the run's chance of an answer (Stop, Release
     GPU, closing the session) answers it here, or the run's thread would wait for good."""
     if run.pending_plan is not None:
+        if run.monitor is not None:
+            run.monitor.decision("cancel")
         run.plan_value = {"action": "cancel"}
         run.pending_plan = None
         run.plan_event.set()
@@ -6692,6 +6702,8 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
     # reviews, technical report) runs regardless, by design, so a stopped run still ships what
     # completed. Nobody could decline that tail, and it is the expensive half on a metered model.
     escalated = target.chat_stop.is_set()
+    if target.monitor is not None:
+        target.monitor.timing_event("stop_requested", action="hard_stop" if escalated else "stop")
     target.chat_stop.set()
     if escalated:
         target.hard_stop.set()
@@ -8400,6 +8412,9 @@ def _route_request(conn: Connection, req: LabRequest, prior_request: str = "") -
         except Exception as exc:  # noqa: BLE001 - routing falls back to the rules
             print(f"[route] the session's model is not available for routing: {exc}")
     route = request_router.route_request(complete, req.question, data=names, prior_request=prior_request)
+    mon = run_monitor.current_monitor()
+    if mon is not None:
+        mon.timing_event("request_routed", action="literature" if route.literature else "research")
     print(f"[route] {json.dumps(route.to_dict(), ensure_ascii=False)}")
     return route
 
@@ -8411,10 +8426,11 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     and asks on low confidence rather than guessing."""
     # Open this turn's run scope up front so its cancel/plan events + WS stream are isolated from any
     # OTHER window's run on the shared session, and the pre-run follow-up clarify uses this run's
-    # plan_event (not a connection-wide one). The run_id is bound later (a fresh study mints it; a
-    # resume/edit reuses the prior one). Downstream _run_lab reads conn.active_run.
-    run = conn.begin_run(req.conversation_id)
+    # plan_event (not a connection-wide one). Mint the id before routing so a killed classifier
+    # leaves a durable partial trace. A continuation later links this attempt to the prior id.
+    run = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
     _note_budget_choice(run, req)
+    _watch_run(conn, run, req)
     try:
         await _dispatch_lab_run(conn, req)
     finally:
@@ -8484,7 +8500,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             return
         curation_offered = True
         req = req.model_copy(update={"question": handoff})
-        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        _next = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
     # Which line (issue 21): a general question is answered from the literature, everything else is
     # the lab. The chat's earlier analysis is context: a question about it is an analysis. At most
@@ -8507,7 +8525,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         # has ended, and ``conn.active_run`` is now the session's newest live run, which can be
         # another chat's run waiting at its plan card.
         req = req.model_copy(update={"question": handoff})
-        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        _next = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
         # The curation was considered once, for the message that opened this run. A note can make the
         # question qualify for it that did not ("...in the RetiGene papers, without limiting it to 12
@@ -8525,7 +8545,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             return
         # A note on that plan is routed again, as on the opening message's curation.
         req = req.model_copy(update={"question": handoff})
-        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        _next = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
     if target is None:
         await _run_lab(conn, req)
@@ -8740,15 +8762,25 @@ async def _adopt_handed_on_dataset(conn: Connection, run_id: str, decisions: dic
                        stage="lab")
 
 
+def _timing_path(workspace: Path, run_id: str) -> Path:
+    return workspace / run_id / "artifacts" / "process" / "timing.jsonl"
+
+
 def _watch_run(conn: Connection, run: RunState, req: LabRequest) -> None:
     """Start the System page's picture of this run (gateway/run_monitor.py). Never raises."""
     try:
-        if run.monitor is not None:
-            run.monitor.end()           # this scope ran before (a continuation): that run is over
-        run.monitor = run_monitor.start(
-            kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,
-            conversation_id=run.conversation_id, run_id=run.run_id,
-            question=getattr(req, "question", "") or "", model=conn.selected_model or "")
+        run_monitor.enable_journal_logging()
+        if run.monitor is None or run.monitor.ended is not None:
+            run.monitor = run_monitor.start(
+                kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,
+                conversation_id=run.conversation_id, run_id=run.run_id,
+                question=getattr(req, "question", "") or "", model=conn.selected_model or "")
+        run.monitor.kind = run.kind
+        run.monitor.run_id = run.run_id
+        run.monitor.conversation_id = run.conversation_id
+        if run.run_id:
+            run.monitor.bind_timing(_timing_path(conn.workspace, run.run_id))
+        run_monitor.set_current_monitor(run.monitor)
         if run.kind in ("chat", "corpus"):
             run.monitor.enter(run.kind)
     except Exception as exc:  # noqa: BLE001 - watching a run never breaks it
@@ -8760,30 +8792,48 @@ def _watch_stage(run: RunState, stage: str) -> None:
         run.monitor.enter(stage)
 
 
-def _watch_llm(run: RunState, complete_fn: Callable[..., str],
+def _watch_llm(run: RunState | None, complete_fn: Callable[..., str],
                scientist_chat: Callable[..., Any]) -> tuple[Callable[..., str], Callable[..., Any]]:
     """The lab's two model entry points, telling the run's monitor which role is thinking (the
     claim audit and the writer have no lab event of their own: their calls mark those stages)."""
+    if getattr(complete_fn, "_run_watched", False):
+        return complete_fn, scientist_chat
+
     def watched_complete(messages, *, role: str | None = None):
-        mon = run.monitor
+        mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin(role)
+        outcome = "failed"
         try:
-            return complete_fn(messages, role=role)
+            result = complete_fn(messages, role=role)
+            outcome = "success"
+            return result
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) or getattr(exc, "stage", "") == "shared_llm_stopped":
+                outcome = "cancelled"
+            raise
         finally:
             if mon is not None:
-                mon.llm_end()
+                mon.llm_end(outcome)
 
     def watched_scientist(messages, tools):
-        mon = run.monitor
+        mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin("scientist")
+        outcome = "failed"
         try:
-            return scientist_chat(messages, tools)
+            result = scientist_chat(messages, tools)
+            outcome = "success"
+            return result
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) or getattr(exc, "stage", "") == "shared_llm_stopped":
+                outcome = "cancelled"
+            raise
         finally:
             if mon is not None:
-                mon.llm_end()
+                mon.llm_end(outcome)
 
+    watched_complete._run_watched = True
     return watched_complete, watched_scientist
 
 
@@ -9001,6 +9051,7 @@ def _curation_pointer_path(owner: str, run_id: str) -> Path:
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / corpus_scan.CURATION_POINTER
 
 
+@run_monitor.timed_stage("result_packaging", source="curation")
 def _point_at_curation_tables(conn: Connection, run_id: str, art: Path, curation: dict[str, Any]) -> None:
     """Record the curation tables a run wrote, so the chat and Runs offer to save them."""
     folder = art / corpus_scan.CURATION_SUBDIR
@@ -9647,7 +9698,19 @@ def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api
                                duration_ms=int((time.monotonic() - started) * 1000),
                                error_type=_usage_error_type(exc), key_use=key_use)
             raise
-    return _stream
+    def timed_stream(messages: list[dict], schemas: list[dict]):
+        run = getattr(conn, "_context_run", lambda: None)()
+        with run_monitor.timed_stage("model_call", category="observation", role="chat") as span:
+            try:
+                yield from _stream(messages, schemas)
+            except GeneratorExit:
+                span.end("cancelled" if run is not None and run.chat_stop.is_set() else "unknown")
+                raise
+            except GatewayError as exc:
+                if exc.stage == "shared_llm_stopped":
+                    span.end("cancelled")
+                raise
+    return timed_stream
 
 
 def _record_chat_usage(conn: Connection, *, role: str, model: str, base_url: str | None,
@@ -9711,6 +9774,7 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
         return vllm_client.count_tokens(port, model, messages, tools,
                                         base_url=base_url, api_key=api_key)
 
+    @run_monitor.timed_stage("model_call", category="observation", role="chat:summary")
     def summarize(messages: list[dict], max_tokens: int) -> str:
         # The rolling conversation memory. think=False and a small max_tokens keep it cheap
         # AND correct: with thinking ON, a Qwen3 reasoning trace can eat the whole budget and
@@ -10155,6 +10219,7 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
                               per_query=int(per_query or lit.PER_QUERY))
 
 
+@run_monitor.timed_stage("result_packaging", source="literature_answer")
 def _save_literature_answer(art: Path, question: str, answer: str, collected: Any, cited: list) -> None:
     """Keep the answer with the run: ``report/summary.md`` (the question, the answer with its
     references, how it was made), ``literature/papers.csv`` (every paper read) and, when the corpus
@@ -10374,9 +10439,12 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
         if corpus_job is not None:
             if not corpus_job.done():
                 conn.push({"type": "run_status", "text": "📚 Waiting for the RetiGene corpus search…"})
-            deadline = time.monotonic() + _LIT_CORPUS_WAIT_S
-            while not corpus_job.done() and time.monotonic() < deadline and not run.chat_stop.is_set():
-                await asyncio.wait({corpus_job}, timeout=2)
+            with run_monitor.timed_stage("corpus_wait", category="observation", source="retrieval") as wait_span:
+                deadline = time.monotonic() + _LIT_CORPUS_WAIT_S
+                while not corpus_job.done() and time.monotonic() < deadline and not run.chat_stop.is_set():
+                    await asyncio.wait({corpus_job}, timeout=2)
+                if not corpus_job.done():
+                    wait_span.end("cancelled" if run.chat_stop.is_set() else "timeout")
             corpus_out = (corpus_job.result() if corpus_job.done() else
                           {"status": "error", "error": f"no result within {_LIT_CORPUS_WAIT_S // 60} minutes"})
         if run.chat_stop.is_set():
@@ -10775,6 +10843,7 @@ def _keep_saved_plan_waiting(conn: Connection, run_id: str, art: Path, state: di
         return
     _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
     if card:
+        _saved_plan_timing(conn, run_id).observe_push(card)
         conn.push({**card, "run_id": run_id, "conversation_id": state.get("conversation_id"),
                    "saved": True})
 
@@ -10818,6 +10887,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         if action == "cancel":
             saved_plans.save(art, current["yaml"], source=current["source"], state="cancelled",
                              kind=current["kind"], payload=current.get("payload"))
+            _saved_plan_timing(conn, run_id).decision(action)
             _finish_run_record(conn, run_id, "cancelled", str(art), "Plan cancelled.")
             conn.push({"type": "plan_done", "run_id": run_id,
                        "conversation_id": state.get("conversation_id")})
@@ -10837,6 +10907,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         cont_req = LabRequest(**options)
         # The task loads the current document again, rather than using a copy from the card.
         _SAVED_PLAN_TASKS.add(art)
+        _saved_plan_timing(conn, run_id).decision(action)
         # The budget answer goes with the run, as for /api/lab and /api/lab/continue: the in-run
         # check (key_guard) does not ask again what the user just confirmed.
         _note_budget_choice(conn.begin_run(state.get("conversation_id"), run_id=run_id), req)
@@ -10847,12 +10918,18 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     if target is None:
         return JSONResponse({"status": "not_delivered", "action": "ignored",
                              "message": "Not delivered: no saved plan was found for this chat."})
+    if target.monitor is not None and target.pending_plan is not None:
+        target.monitor.decision(action)
     target.plan_value = {"action": action, "feedback": (req.feedback or "").strip(),
                          **({"plan_yaml": req.plan_yaml} if carries_doc else {})}
     target.pending_plan = None
     target.plan_event.set()
     conn.push({"type": "plan_done"}, run=target)
     return JSONResponse({"status": "ok", "action": action})
+
+
+def _saved_plan_timing(conn: Connection, run_id: str) -> run_monitor.RunMonitor:
+    return run_monitor.reopen_timing(_timing_path(conn.workspace, run_id), run_id=run_id)
 
 
 class ConfirmRequestBody(BaseModel):
@@ -11578,6 +11655,7 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         return vllm_client.count_tokens(_port(), model, messages, tools,
                                         base_url=base_url, api_key=api_key)
 
+    complete_fn, scientist_chat = _watch_llm(None, complete_fn, scientist_chat)
     return LabLLM(complete_fn, scientist_chat, model, label, count_tokens,
                   scientist_remote=_endpoint_is_off_host(base_url),
                   lab_role_remote=_endpoint_is_off_host(lab_base_url),
@@ -12788,6 +12866,9 @@ def _decision_review(conn: Any, emit: "Callable[..., Any]", node: Any,
          "A step outside your plan was proposed — it runs only if you approve it."
          if proposal else f"Decision point — {goal[:80]} (pick an option or type your own).")
     if not conn.plan_event.wait(timeout=timeout):
+        mon = run_monitor.current_monitor()
+        if mon is not None:
+            mon.decision("timeout")
         conn.pending_plan = None
         if proposal:
             conn.push({"type": "plan_done"})
@@ -14703,6 +14784,7 @@ def _with_declared_descriptions(files: list[dict], art: Path) -> list[dict]:
     return files
 
 
+@run_monitor.timed_stage("result_packaging", source="metadata")
 def _write_result_metadata(conn: Connection, run_id: str, art: Path, req: Any, decisions: dict,
                            status: str, rounds: "list[dict] | None" = None,
                            models: "list[str] | None" = None) -> None:
@@ -17687,6 +17769,25 @@ def _quarantine_strays(art: Path) -> list[str]:
     return moved
 
 
+@app.get("/api/timing/{owner}/{run_id}")
+async def get_run_timing(owner: str, run_id: str, request: Request) -> Response:
+    """Read the durable timeline, including failed runs and plans awaiting a later decision.
+
+    Uses the same owner boundary as downloads; no live connection or successful result is needed.
+    Reading never changes an open span into a claimed failure or completion.
+    """
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
+    if not all(part.replace("-", "").replace("_", "").isalnum() for part in (owner, run_id)):
+        return JSONResponse({"error": "Bad request"}, status_code=400)
+    path = _timing_path(CONSOLE_RUNS_DIR / owner, run_id)
+    root = (CONSOLE_RUNS_DIR / owner).resolve()
+    if not path.resolve().is_relative_to(root) or not path.is_file():
+        return JSONResponse({"error": "No timing recorded for this run."}, status_code=404)
+    return JSONResponse(await asyncio.to_thread(run_monitor.read_timing, path))
+
+
 @app.get("/api/bundle/{owner}/{run_id}")
 async def get_bundle(owner: str, run_id: str, request: Request) -> Response:
     """Zip a run's whole artifacts folder for a single 'download all' click."""
@@ -17783,6 +17884,7 @@ def _read_pointer(path: Path) -> "dict | None":
     return rec if isinstance(rec, dict) else None
 
 
+@run_monitor.timed_stage("result_packaging", source="literature_tables")
 def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dict | None":
     """Keep a saveable copy of literature tables; the run's downloads remain in artifacts. Both go
     in the run's own folder (``art``'s parent): on the server that is where ``_result_pointer_path``
@@ -17813,6 +17915,7 @@ def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dic
     return rec
 
 
+@run_monitor.timed_stage("result_packaging", source="cellqc")
 def _stamp_cellqc_result(conn: "Connection", run_id: str, decisions: dict, on_hpc: bool,
                          emit: Callable[..., Any]) -> "dict | None":
     """Complete run_cellqc's pointer with what only the gateway knows: the name the directory is
@@ -17964,6 +18067,48 @@ def md_result_uuid(run_id: str) -> str:
     return result_uuid(run_id)
 
 
+_SAVE_TIMING: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "result_save_timing", default=None)
+
+
+def _timed_result_operation(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Bind saves to the requested owner's artifact, including the background copy after 202.
+
+    A separate monitor keeps actual saving alive beyond run_complete. Never consult a connection's
+    newest live chat here: the original run may already be gone while another chat is computing.
+    """
+    @functools.wraps(fn)
+    def measured(owner: str, user_id: int | None, run_id: str, *args: Any, **kwargs: Any) -> Any:
+        identity = (owner, run_id)
+        if _SAVE_TIMING.get() == identity:
+            return fn(owner, user_id, run_id, *args, **kwargs)
+        try:
+            folder = _run_folder(safe_name(owner), run_id)
+            mon = (run_monitor.reopen_timing(_timing_path(folder.parent, run_id), run_id=run_id)
+                   if folder is not None and folder.is_dir() else None)
+        except Exception:  # timing must never prevent a save
+            mon = None
+        if mon is None:
+            return fn(owner, user_id, run_id, *args, **kwargs)
+        source = "background" if fn.__name__ == "_bring_result_home" else "request"
+        token = _SAVE_TIMING.set(identity)
+        try:
+            with run_monitor.bind_monitor(mon), mon.span("result_save", source=source) as span:
+                result = fn(owner, user_id, run_id, *args, **kwargs)
+                if isinstance(result, tuple):
+                    status, body = result
+                    outcome = ("failed" if status >= 400 else "queued" if status == 202
+                               else "already_saved" if body.get("already") else "success")
+                    span.end(outcome)
+                elif result is False:
+                    span.end("failed")
+                return result
+        finally:
+            _SAVE_TIMING.reset(token)
+    return measured
+
+
+@_timed_result_operation
 def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                      conn: "Connection | None") -> "tuple[int, dict]":
     """Make what a run handed on one of the owner's datasets: the processed dataset
@@ -18056,6 +18201,7 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                  "kind": "folder" if folder else "file"}
 
 
+@_timed_result_operation
 def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tuple[int, dict]":
     """Make a corpus curation's tables (``<run>/artifacts/curation/*.csv``, issue 46) one of the
     owner's datasets: copied into a new dataset folder (``users/<owner>/datasets/<uuid>/original``
@@ -18158,8 +18304,9 @@ def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder:
     return dataset_id
 
 
+@_timed_result_operation
 def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str,
-                       conn: "Connection", src: str, pointer_path: Path) -> None:
+                       conn: "Connection", src: str, pointer_path: Path) -> bool:
     """The background half of saving a result kept on HPC3 (issue 6): copy it into a new dataset
     folder of the owner's on this host, publish it, list it, and tell the owner's windows. The HPC3
     copy stays where the run left it, and goes with the session's process files."""
@@ -18193,6 +18340,7 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
                                      f"({size / 1e6:.0f} MB copied from HPC3 in "
                                      f"{time.monotonic() - started:.0f} s): it is in Files → Datasets.")
             c._publish({"type": "result_saved", "run_id": run_id, "what": what, "path": dest})
+        return True
     except Exception as exc:  # noqa: BLE001 - reported on the run's record and to the owner
         shutil.rmtree(stage, ignore_errors=True)
         conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {public_error(exc)}")
@@ -18208,6 +18356,7 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
             c.emit("error", "lab", f"Could not copy {name} from HPC3 to the server: {public_error(exc)}. "
                                    "It is still on HPC3; save it again from Runs.")
             c._publish({"type": "result_saved", "run_id": run_id, "what": what, "error": public_error(exc)[:300]})
+        return False
 
 
 async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[..., Any]) -> None:
@@ -18223,6 +18372,9 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
         if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
             continue
         try:
+            mon = run_monitor.current_monitor()
+            if mon is not None:
+                mon.timing_event("save_requested", action="automatic")
             status, body = await asyncio.to_thread(
                 _save_run_result, conn.owner, conn.app_user_id, run_id, what,
                 conn if conn.executor is not None else None)
@@ -18317,6 +18469,10 @@ async def save_result_dataset(run_id: str, request: Request, what: str = "datase
     if not run_id.isalnum() or (what not in _RESULT_KINDS
                                and not re.fullmatch(r"dataset:[A-Za-z0-9_-]+", what)):
         return JSONResponse({"error": "bad request"}, status_code=400)
+    folder = _run_folder(safe_name(user.username), run_id)
+    if folder is not None and folder.is_dir():
+        mon = run_monitor.reopen_timing(_timing_path(folder.parent, run_id), run_id=run_id)
+        mon.save_requested(action="manual")
     if what == "tables":
         status, body = await asyncio.to_thread(_save_curation_tables, user.username, user.id, run_id)
         return JSONResponse(body, status_code=status)

@@ -103,6 +103,7 @@ from .research_harness import (
     evidence_pointers,
     result_digest,
     step_succeeded,
+    tool_result_outcome,
 )
 
 def _call_with_role(fn: "Callable[..., str]", messages: list[dict[str, Any]], role: str) -> str:
@@ -6063,10 +6064,12 @@ class ResearchLab:
                           "tool": ev.get("tool"), "state": "start"})
                 elif et == "tool_result":
                     emit({"type": "expert_tool", "member": member, "tool": ev.get("tool"),
-                          "state": "done", "detail": str(ev.get("summary") or "")[:200]})
+                          "state": "done", "detail": str(ev.get("summary") or "")[:200],
+                          "timing_outcome": ev.get("timing_outcome", "unknown")})
                 elif et == "tool_error":
                     emit({"type": "expert_tool", "member": member, "tool": ev.get("tool"),
-                          "state": "error", "detail": str(ev.get("error") or "")[:200]})
+                          "state": "error", "detail": str(ev.get("error") or "")[:200],
+                          "timing_outcome": "failed"})
             return _on
 
         def _one(item: "tuple[str, list[dict[str, Any]]]") -> str:
@@ -7580,7 +7583,8 @@ class ResearchLab:
             res = output.get("results") if isinstance(output, dict) else []
             ok = isinstance(output, dict) and output.get("status") == "ok"
             emit({"type": "tool_result", "tool": "literature_search",
-                  "summary": f"{'ok' if ok else 'error'}: {len(res or [])}"})
+                  "summary": f"{'ok' if ok else 'error'}: {len(res or [])}",
+                  "timing_outcome": tool_result_outcome(output) if isinstance(output, dict) else "failed"})
             tool_calls.append({"tool": "literature_search", "args": args, "ok": bool(ok),
                                "summary": f"{len(res or [])} result(s)", "result": output})
             for c in (res or []):
@@ -7641,7 +7645,8 @@ class ResearchLab:
             why = " ".join(str(output.get(k) or "") for k in ("dependency", "error", "note")).strip()
         emit({"type": "tool_result", "tool": "deep_literature",
               "summary": f"{'ok' if ok else state}: {len(contexts)} context(s)"
-                         + (f" ({why[:240]})" if why else "")})
+                         + (f" ({why[:240]})" if why else ""),
+              "timing_outcome": tool_result_outcome(output) if isinstance(output, dict) else "failed"})
         tool_calls = [{"tool": "deep_literature", "args": args, "ok": bool(ok),
                        "summary": f"{len(contexts)} context(s)", "result": output}]
         # Build the accepted answer: the grounded cited answer, then a numbered list of the corpus
@@ -7736,7 +7741,8 @@ class ResearchLab:
             why = " ".join(str(output.get(k) or "") for k in ("dependency", "error", "note")).strip()
         emit({"type": "tool_result", "tool": "search_corpus",
               "summary": f"{'ok' if ok else (output or {}).get('status', 'error') if isinstance(output, dict) else 'error'}"
-                         f": {len(contexts)} passage(s)" + (f" ({why[:240]})" if why else "")})
+                         f": {len(contexts)} passage(s)" + (f" ({why[:240]})" if why else ""),
+              "timing_outcome": tool_result_outcome(output) if isinstance(output, dict) else "failed"})
         tool_calls = [{"tool": "search_corpus", "args": args, "ok": bool(ok),
                        "summary": f"{len(contexts)} passage(s)", "result": output}]
         incomplete = HarnessResult(

@@ -135,6 +135,7 @@ tests/             the offline test suite
 ## Documentation
 
 - [`docs/architecture/README.md`](docs/architecture/README.md): how the system is built.
+- [`docs/run_timing.md`](docs/run_timing.md): inspecting run stages, user waits and partial timelines.
 - [`docs/FINDINGS.md`](docs/FINDINGS.md): what has been measured and decided, and why.
 - [`src/aiscientist/tools/README.md`](src/aiscientist/tools/README.md): the tool index.
 - [`docs/skills_and_pipelines_architecture.md`](docs/skills_and_pipelines_architecture.md): tools,

@@ -45,6 +45,7 @@ from .chat_context import (
     SummarizeFn,
     build_chat_messages,
 )
+from .research_harness import tool_result_outcome
 
 # The answer-first contract, stated to the model. The ordering instruction is load-bearing:
 # without it Qwen opens with "Let me look that up…" and the streamed first sentence carries
@@ -455,7 +456,8 @@ def run_quick_chat(
                 forced = {**forced, "contexts": [
                     {**c, "summary": c.get("text", "")} for c in forced.get("contexts") or []
                     if isinstance(c, dict)]}
-            emit({"type": "tool_result", "tool": lit_name, "summary": _summarize(forced)})
+            emit({"type": "tool_result", "tool": lit_name, "summary": _summarize(forced),
+                  "timing_outcome": tool_result_outcome(forced)})
         except Exception as exc:  # noqa: BLE001 - a grounding failure is data for the model, not the
             forced = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}   # end of the turn
             emit({"type": "tool_error", "tool": lit_name, "error": forced["error"]})
@@ -538,7 +540,8 @@ def run_quick_chat(
                     payload = tool.executor(args, context)
                     if not isinstance(payload, dict):
                         payload = {"status": "ok", "result": payload}
-                    emit({"type": "tool_result", "tool": name, "summary": _summarize(payload)})
+                    emit({"type": "tool_result", "tool": name, "summary": _summarize(payload),
+                          "timing_outcome": tool_result_outcome(payload)})
                 except Exception as exc:  # noqa: BLE001 - a tool failure is data for the model,
                     # never the end of the user's chat turn. The model reads the error and either
                     # retries differently or answers without it.

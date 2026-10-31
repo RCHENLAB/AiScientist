@@ -31,6 +31,7 @@ from typing import Callable, Protocol
 
 from .errors import GatewayError
 from .executor import RemoteExecutor
+from .run_monitor import current_monitor, timed_stage
 
 EmitFn = Callable[[str, str, str], None]
 
@@ -258,6 +259,12 @@ def build_analysis_script(
 
 
 def _submit(executor: RemoteExecutor, spec: SlurmJobSpec) -> str:
+    # Do not record the script, job name or command: these may contain private paths/payloads.
+    with timed_stage("hpc_submit"):
+        return _submit_job(executor, spec)
+
+
+def _submit_job(executor: RemoteExecutor, spec: SlurmJobSpec) -> str:
     path = f"{spec.submit_dir}/{spec.job_name}.sbatch"
     write = executor.exec(
         f"mkdir -p {spec.submit_dir} && cat > {path} <<'{_EOF}'\n{spec.script}\n{_EOF}"
@@ -342,6 +349,47 @@ def _check_cancel(executor: RemoteExecutor, job_id: str, should_cancel: "Callabl
 
 
 def acquire_allocation(
+    executor: RemoteExecutor,
+    spec: SlurmJobSpec,
+    *,
+    config: AcquireConfig | None = None,
+    emit: EmitFn | None = None,
+    on_submit: Callable[[str], None] | None = None,
+    should_cancel: "Callable[[], bool] | None" = None,
+) -> tuple[str, str, int]:
+    """Acquire a node while retaining the observed wait for each submitted attempt.
+
+    Polling only bounds when the gateway noticed the allocation; it is not Slurm's queue time.
+    Exact queue/execution intervals are recorded separately from accounting when the job ends.
+    """
+    monitor = current_monitor()
+    span = None
+    outcome = "observed"
+
+    def submitted(job_id: str) -> None:
+        nonlocal span
+        if monitor is not None:
+            monitor.end_span(span, "retry")
+            span = monitor.begin_span("hpc_queue_observed", category="observation",
+                                      source="poll", job_id=job_id)
+        if on_submit is not None:
+            on_submit(job_id)
+
+    try:
+        return _acquire_allocation(executor, spec, config=config, emit=emit,
+                                   on_submit=submitted, should_cancel=should_cancel)
+    except JobCancelled:
+        outcome = "cancelled"
+        raise
+    except BaseException:
+        outcome = "failed"
+        raise
+    finally:
+        if monitor is not None:
+            monitor.end_span(span, outcome)
+
+
+def _acquire_allocation(
     executor: RemoteExecutor,
     spec: SlurmJobSpec,
     *,
@@ -466,30 +514,134 @@ def parse_accounting(text: str, job_id: str) -> dict | None:
 
 
 def collect_accounting(executor: RemoteExecutor, job_id: str, elapsed: float | None = None) -> None:
+    """Collect cost and stage timestamps in one query when a run monitor is bound."""
     from .estimates import job_usage
 
     collector = job_usage.get()
-    if collector is None:
+    monitor = current_monitor()
+    if collector is None and monitor is None:
         return
+    text = ""
     try:
-        result = _query(executor, f"sacct -j {job_id} --noheader --parsable2 "
-                        "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State")
-        usage = parse_accounting(result.stdout, job_id)
-        if usage:
-            collector.append(usage)
-            return
+        if monitor is not None:
+            # Timestamp columns extend the existing cost row; never add a query per poll.
+            result = executor.exec(
+                f"TZ=UTC SLURM_TIME_FORMAT=%s sacct -j {shlex.quote(job_id)} --noheader --parsable2 "
+                "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State,Submit,Start,End", timeout=5.0)
+        else:
+            result = _query(executor, f"sacct -j {job_id} --noheader --parsable2 "
+                            "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State")
+        if result.ok:
+            text = result.stdout
     except Exception:  # accounting may be disabled
         pass
-    if elapsed is not None:
-        # This timer starts after allocation, unlike the outer tool timer (which includes queuing).
-        collector.append({"seconds": elapsed, "source": "wall_clock"})
+    if collector is not None:
+        usage = parse_accounting(text, job_id)
+        if usage:
+            collector.append(usage)
+        elif elapsed is not None:
+            # Existing cost fallback is an estimate. It is never used as a stage execution duration.
+            collector.append({"seconds": elapsed, "source": "wall_clock"})
+    if monitor is not None:
+        _record_timing_accounting(monitor, job_id, parse_timing_accounting(text, job_id, combined=True))
+
+
+def parse_timing_accounting(text: str, job_id: str, *, combined: bool = False) -> dict | None:
+    """Parent allocation timestamps from ``SLURM_TIME_FORMAT=%s`` (Unix seconds).
+
+    Unknown, missing and inconsistent fields stay unknown. Slurm's Submit/Start interval is
+    the recorded queue interval, and Start/End is allocation wall time, not CPU/GPU busy time.
+    Slurm resets Submit on a requeue; this describes the accounting record returned for the job.
+    """
+    import math
+
+    def stamp(value: str) -> float | None:
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except ValueError:
+            return None
+
+    for line in text.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) < (8 if combined else 5) or fields[0] != job_id:
+            continue
+        if combined:  # timestamp columns appended to the existing cost-accounting row
+            fields = [fields[0], *fields[5:8], fields[4]]
+        submitted, started, ended = map(stamp, fields[1:4])
+        state = fields[4].strip().split()[0] if fields[4].strip() else ""
+        if submitted is not None and started is not None and started < submitted:
+            submitted = None
+        if not _is_terminal_sacct(state) or (started is not None and ended is not None and ended < started):
+            ended = None
+        return {"submitted": submitted, "started": started, "ended": ended, "state": state}
+    return None
+
+
+def collect_timing_accounting(executor: RemoteExecutor, job_id: str) -> None:
+    """One bounded best-effort accounting read at a job boundary, never per poll.
+
+    Missing accounting produces explicit unknown queue/execution rows. The independently
+    persisted polling spans remain observations and never stand in for true Slurm timestamps.
+    """
+    import re
+
+    monitor = current_monitor()
+    if monitor is None:
+        return
+    try:
+        record = None
+        if re.fullmatch(r"[0-9]+(?:_[0-9]+)?", job_id):
+            try:
+                result = executor.exec(
+                    f"TZ=UTC SLURM_TIME_FORMAT=%s sacct -j {job_id} --noheader --parsable2 "
+                    "--format=JobIDRaw,Submit,Start,End,State", timeout=5.0)
+                if result.ok:
+                    record = parse_timing_accounting(result.stdout, job_id)
+            except Exception:
+                pass  # accounting may be disabled, delayed, or temporarily unreachable
+        _record_timing_accounting(monitor, job_id, record)
+    except Exception:
+        pass  # telemetry must not turn a successful tool into a failed one
+
+
+def _record_timing_accounting(monitor, job_id: str, record: dict | None) -> None:
+    try:
+        record = record or {}
+        state = record.get("state", "")
+        outcome = ("success" if state.startswith("COMPLETED") else
+                   "cancelled" if state.startswith("CANCELLED") else "failed")
+        for stage, start_key, end_key, category in (
+            ("hpc_queue", "submitted", "started", "observation"),
+            ("hpc_execution", "started", "ended", "processing"),
+        ):
+            start, end = record.get(start_key), record.get(end_key)
+            known = start is not None and end is not None
+            stage_outcome = "success" if stage == "hpc_queue" else outcome
+            monitor.record_span(stage, started_at=start, ended_at=end,
+                                duration_seconds=end - start if known else None,
+                                category=category, outcome=stage_outcome if known else "unknown",
+                                source="sacct" if record else "unavailable", job_id=job_id, state=state)
+    except Exception:
+        pass  # telemetry must not turn a successful tool into a failed one
 
 
 def supervise_job(executor: RemoteExecutor, job_id: str, node: str, attempts: int, **kwargs) -> JobResult:
     started = time.monotonic()
+    monitor = current_monitor()
+    span = (monitor.begin_span("hpc_job_observed", category="observation", source="poll", job_id=job_id)
+            if monitor is not None else None)
+    outcome = "failed"
     try:
-        return _supervise_job(executor, job_id, node, attempts, **kwargs)
+        result = _supervise_job(executor, job_id, node, attempts, **kwargs)
+        outcome = "observed" if result.completed else "failed"
+        return result
+    except JobCancelled:
+        outcome = "cancelled"
+        raise
     finally:
+        if monitor is not None:
+            monitor.end_span(span, outcome)
         collect_accounting(executor, job_id, max(0, time.monotonic() - started))
 
 
@@ -623,6 +775,7 @@ def reattach_job(
         if _is_terminal_sacct(final):
             ok = final.startswith("COMPLETED")
             emit("info", "slurm", f"Reattached job {job_id}: already finished ({final}).")
+            collect_timing_accounting(executor, job_id)
             return JobResult(job_id, node, final, attempts, completed=ok)
         if not wait:
             emit("info", "slurm", f"Reattached job {job_id}: left queue, awaiting sacct ({final or 'no record'}).")
