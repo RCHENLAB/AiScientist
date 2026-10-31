@@ -592,55 +592,11 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-revise-draft .msym { flex: none; font-size: 15px; }
 .plan-revise-tip { margin-top: 6px; font-size: 11.5px; line-height: 1.45; color: var(--text-tertiary); }
 
-/* The plan document's editor: a file pane inside the card. */
-.plan-yaml { border-top: 1px solid var(--border); padding: 14px 20px 16px; background: rgba(242, 235, 220, 0.45); }
-.plan-yaml-bar { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 9px; }
-.plan-yaml-file {
-  display: inline-flex; align-items: center; gap: 5px; font: 600 12px/1 ui-monospace, "SF Mono", Menlo, monospace;
-  color: var(--text);
-}
-.plan-yaml-file .msym { font-size: 15px; color: var(--accent); }
-.plan-yaml-tip { font-size: 12px; color: var(--text-tertiary); line-height: 1.45; }
-/* The document, highlighted. In the editor the textarea lies on the highlighted copy with its own
-   text transparent; the textarea scrolls and the copy follows it, so the two must lay the text out
-   identically: same font, size, padding, no wrapping, no ligatures. The copy has room to scroll past
-   the end, so a textarea scrollbar never leaves it behind. */
-.plan-yaml-code {
-  overflow: hidden; border-radius: 10px; background: #fffdf9; border: 1px solid var(--border-strong);
-}
-.plan-yaml-stack { position: relative; }
-.plan-yaml-stack:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3.5px rgba(var(--accent-rgb), 0.16); }
-.plan-yaml-hl, .plan-yaml-text {
-  display: block; width: 100%; box-sizing: border-box; margin: 0; padding: 12px 14px; border: 0;
-  font: 12.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: 0; tab-size: 2;
-  font-variant-ligatures: none; white-space: pre; overflow-wrap: normal; color: var(--text);
-}
-.plan-yaml-stack .plan-yaml-hl {
-  position: absolute; inset: 0; overflow: hidden; padding-right: 54px; padding-bottom: 52px; pointer-events: none;
-}
-.plan-yaml-read .plan-yaml-hl { max-height: 440px; overflow: auto; }
-.plan-yaml-text, .plan-yaml-text:focus {
-  position: relative; resize: vertical; overflow: auto; border: 0; border-radius: 0; box-shadow: none; outline: none;
-  background: transparent; color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--text);
-}
-.plan-yaml-text::selection { background: rgba(var(--accent-rgb), 0.22); }
-.plan-yaml-hl .y-c { color: var(--text-tertiary); }
-.plan-yaml-hl .y-k, .plan-yaml-hl .y-p { color: #8d826f; }
-.plan-yaml-hl .y-sk { color: var(--text-secondary); }
-.plan-yaml-hl .y-d, .plan-yaml-hl .y-id { color: var(--accent); font-weight: 700; }
-.plan-yaml-hl .y-title { color: var(--text); font-weight: 700; }
-.plan-yaml-hl .y-tool { color: var(--accent-press); font-weight: 700; }
-.plan-yaml-hl .y-val { color: var(--accent-press); font-weight: 700; background: rgba(var(--accent-rgb), 0.08); border-radius: 3px; }
-.plan-yaml-hl .y-meta, .plan-yaml-hl .y-ind { color: var(--text-tertiary); }
-.plan-yaml-hl .y-prose { color: var(--text-secondary); }
-.plan-yaml-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
-.plan-yaml-problems {
-  display: flex; gap: 9px; margin: 0 0 10px; padding: 10px 12px; border-radius: 10px; font-size: 12.5px;
-  color: #7a2d1c; background: rgba(224, 70, 59, 0.08); box-shadow: inset 0 0 0 1px rgba(224, 70, 59, 0.30);
-}
-.plan-yaml-problems .msym { flex: none; font-size: 17px; color: var(--red); }
-.plan-yaml-problems ul { margin: 5px 0 0; padding-left: 17px; }
-.plan-yaml-problems li + li { margin-top: 3px; }
+/* Feedback for a structured value that has not passed validation. */
+.plan-edit-feedback { margin: 12px 16px; padding: 12px; border-radius: 10px; font-size: 13px;
+  color: #7a2d1c; background: rgba(224, 70, 59, 0.08); border: 1px solid rgba(224, 70, 59, 0.30); }
+.plan-edit-feedback p { overflow-wrap: anywhere; }
+.plan-edit-feedback ul { padding-left: 20px; }
 .plan-card .clarify-q { margin-top: 10px; }
 /* Clarify: option chips + a custom answer via the composer. */
 .plan-clarify { display: flex; flex-direction: column; gap: 12px; }
@@ -693,7 +649,6 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-panel .plan-note { margin: 11px 16px 0; }
 .plan-panel .plan-steps { padding: 6px 16px 4px; }
 .plan-panel .plan-estimate { margin: 8px 16px 0; }
-.plan-panel .plan-yaml { padding: 12px 16px 14px; }
 .plan-panel .plan-revise { padding: 12px 16px 13px; }
 .plan-panel .plan-actions-row { padding: 12px 16px 14px; }
 .plan-panel .plan-actions-hint { flex-basis: 100%; margin: 2px 0 0; }
@@ -725,9 +680,6 @@ button.small { padding: 6px 12px; font-size: 12px; }
 }
 .plan-skill-remove .msym { font-size: 14px; }
 .plan-skill-remove:hover, .plan-skill-remove:focus-visible { color: var(--text); }
-.plan-yaml-read > summary { cursor: pointer; list-style: none; }
-.plan-yaml-read > summary::-webkit-details-marker { display: none; }
-.plan-yaml-read .plan-yaml-code { margin-top: 10px; }
 .clarify-q { display: flex; flex-direction: column; gap: 7px; }
 .clarify-question { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .clarify-options { display: flex; flex-wrap: wrap; gap: 8px; }

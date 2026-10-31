@@ -97,10 +97,11 @@ def test_split_step_reads_a_titled_and_an_untitled_step():
 
 # --- a document a person edited: every defect, in one answer ---------------------------------------
 
-def test_a_yaml_error_says_where():
+def test_an_unreadable_plan_explains_how_to_retry():
     with pytest.raises(PlanError) as err:
         parse_plan_yaml("plan: 1\nsteps:\n  - id: s1\n    does: [unclosed\n")
-    assert "line" in err.value.problems[0]
+    assert "could not be read" in err.value.problems[0]
+    assert "revised plan" in err.value.problems[0]
 
 
 def test_every_structural_defect_is_reported_together():
@@ -119,9 +120,9 @@ steps:
     with pytest.raises(PlanError) as err:
         parse_plan_yaml(text)
     joined = " ".join(err.value.problems)
-    assert "used by an earlier step" in joined
-    assert "neither a title nor" in joined
-    assert "names no `tool`" in joined
+    assert "same step reference as an earlier step" in joined
+    assert "needs a title or description" in joined
+    assert "no tool selected" in joined
 
 
 def test_an_empty_plan_is_refused_rather_than_run_as_nothing():

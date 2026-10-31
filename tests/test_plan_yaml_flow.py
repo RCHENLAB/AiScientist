@@ -180,7 +180,7 @@ def test_on_the_dag_planner_the_approved_number_is_the_one_that_runs_too():
 
 
 @pytest.mark.parametrize("bad, reason", [
-    ("resolution: [unclosed", "does not parse"),
+    ("resolution: [unclosed", "could not be read"),
     ("resolutionn: 0.5", "no setting `resolutionn`"),
     ("resolution: fast", "cannot take resolution"),
 ])

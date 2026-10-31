@@ -145,8 +145,11 @@ the reason logged, and the skill still loads as guidance.
   names as hints. A name that is not in the library is dropped, and a failed call leaves the plan
   as it is. The model's match goes to one step per skill, the first in plan order: a later step
   that compares, tabulates or plots what that step produced gets no skill, unless its own text
-  names one. The match is the step's `skill:` in the plan document, shown on the plan card, where
-  the researcher can take it off (or set one in the YAML; an unknown name is refused).
+  names one. The match is the step's `skill:` in the internal plan document, shown on the readable
+  plan card, where the researcher can take it off and review the updated step before approval.
+  Settings are edited through the card's structured values; validation errors explain what needs
+  correcting. The normal review, approved-plan and history views do not expose the raw document,
+  which is retained internally for validation and execution.
 - **A step runs with its skill in hand.** The brief of a step the approved plan gave a skill holds
   the skill's SKILL.md and its first script (cut at 12,000 and 16,000 characters, with where to
   read the rest), and tells the Scientist to adapt it rather than write the analysis anew. The step

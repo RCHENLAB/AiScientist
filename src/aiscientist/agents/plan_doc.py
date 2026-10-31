@@ -261,11 +261,6 @@ _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
 _SETTING_VALUE_TYPES = (str, int, float, bool, type(None))
 
 
-def _where(exc: Exception) -> str:
-    mark = getattr(exc, "problem_mark", None)
-    return f" (line {mark.line + 1}, column {mark.column + 1})" if mark is not None else ""
-
-
 def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
     """Read a plan document a person edited. Raises :class:`PlanError` listing every defect found,
     so one round trip tells the editor everything that is wrong.
@@ -277,12 +272,11 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
     try:
         data = _load(text or "")
     except ImportError as exc:
-        raise PlanError(["This server cannot read YAML (PyYAML is not installed)."]) from exc
-    except Exception as exc:  # noqa: BLE001 - yaml.YAMLError; the message goes back to the editor
-        problem = getattr(exc, "problem", None) or str(exc).split("\n", 1)[0]
-        raise PlanError([f"The YAML does not parse: {problem}{_where(exc)}."]) from exc
+        raise PlanError(["Plan editing is temporarily unavailable. Please try again later."]) from exc
+    except Exception as exc:  # noqa: BLE001 - retain the cause for diagnostics, not the plan card
+        raise PlanError(["The plan could not be read. Ask for a revised plan, then try again."]) from exc
     if not isinstance(data, Mapping):
-        raise PlanError(["The plan must be a mapping with a `steps:` list."])
+        raise PlanError(["The plan needs a list of steps. Ask for a revised plan."])
     raw_steps = data.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise PlanError(["The plan has no steps. To run nothing, cancel the plan instead."])
@@ -294,7 +288,7 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         if isinstance(raw, str):
             raw = {"does": raw}
         if not isinstance(raw, Mapping):
-            problems.append(f"Step {n} must be a mapping (id, title, tool, settings, does).")
+            problems.append(f"Step {n} is incomplete. Ask for a revised step with a title and description.")
             continue
         title = _flat(str(raw.get("title") or ""))
         does = raw.get("does", raw.get("text", raw.get("goal", "")))
@@ -302,14 +296,14 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         if "\n" not in does:
             does = _flat(does)
         if not title and not does:
-            problems.append(f"Step {n} has neither a title nor a `does` text.")
+            problems.append(f"Step {n} needs a title or description.")
             continue
         sid = str(raw.get("id") or "").strip()
         if sid and not _ID_RE.match(sid):
-            problems.append(f"Step {n}: id {sid!r} must be letters, digits, `_` or `-`.")
+            problems.append(f"Step {n} has an invalid step reference. Ask for a revised plan.")
             sid = ""
         if sid in seen:
-            problems.append(f"Step {n}: id {sid!r} is used by an earlier step.")
+            problems.append(f"Step {n} has the same step reference as an earlier step. Ask for a revised plan.")
             sid = ""
         if sid:
             seen.add(sid)
@@ -321,18 +315,19 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         settings: dict[str, Any] = {}
         if settings_raw not in (None, {}, []):
             if not isinstance(settings_raw, Mapping):
-                problems.append(f"Step {n}: `settings` must be `name: value` lines.")
+                problems.append(f"Step {n} has unreadable settings. Ask for a revised plan.")
             else:
                 for key, value in settings_raw.items():
                     ok = isinstance(value, _SETTING_VALUE_TYPES) or (
                         isinstance(value, list)
                         and all(isinstance(v, _SETTING_VALUE_TYPES) for v in value))
                     if not ok:
-                        problems.append(f"Step {n}: setting `{key}` must be a value or a list of values.")
+                        problems.append(f"Step {n}: setting `{key}` needs text, a number, true/false, "
+                                        "no value, or a list of these.")
                     else:
                         settings[str(key)] = value
         if settings and not tool:
-            problems.append(f"Step {n} has settings but names no `tool` to pass them to.")
+            problems.append(f"Step {n} has settings but no tool selected to use them.")
         parsed.append({"id": sid, "title": title, "does": does, "tool": tool, "settings": settings,
                        "skill": skill})
     if problems:
