@@ -278,7 +278,8 @@
               </div>
               <div id="serverPathOffer" class="server-path-offer hidden" role="status"></div>
               <form id="chatForm" class="chat-input">
-                <textarea id="chatInput" rows="2" placeholder="Ask a question, or describe the analysis you want — the agent proposes a plan first…"></textarea>
+                <textarea id="chatInput" rows="2" role="combobox" aria-label="Chat message" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="datasetMentions" aria-expanded="false" placeholder="Ask a question, or describe the analysis you want — the agent proposes a plan first…"></textarea>
+                <div id="datasetMentions" class="dataset-mentions hidden" role="listbox" aria-label="Your datasets"></div>
                 <button id="chatSend" type="submit" class="primary">Send</button>
                 <button id="chatStop" type="button" class="danger-btn hidden" title="Stop the running analysis">■ Stop</button>
               </form>

@@ -6218,6 +6218,126 @@ async function restoreServerCards(stored, request = fetch) {
   }
 }
 
+// Dataset mentions use the account's Files → Datasets list, and its Use attachment path.
+const datasetMention = { query: null, items: null, rows: [], index: 0, dismissed: null, request: 0, error: false };
+
+function datasetMentionQuery(input) {
+  if (input.selectionStart !== input.selectionEnd) return null;
+  const end = input.selectionStart, before = input.value.slice(0, end);
+  const start = before.lastIndexOf("@");
+  if (start < 0 || (start > 0 && !/\s/.test(before[start - 1]))) return null;
+  const text = before.slice(start + 1);
+  if (/[\n\r]/.test(text)) return null;
+  return { start, end, text };
+}
+
+function closeDatasetMentions(dismiss = true) {
+  if (dismiss && datasetMention.query) datasetMention.dismissed = datasetMention.query.start;
+  datasetMention.query = null;
+  datasetMention.request++;
+  $("datasetMentions").classList.add("hidden");
+  $("chatInput").setAttribute("aria-expanded", "false");
+  $("chatInput").removeAttribute("aria-activedescendant");
+}
+
+// Mirror the textarea's wrapping and scroll to anchor the list below the actual caret.
+function positionDatasetMentions() {
+  const input = $("chatInput"), list = $("datasetMentions"), rect = input.getBoundingClientRect();
+  // The glass chat panel is a containing block for fixed descendants. Portal out of it.
+  if (list.parentElement !== document.body) document.body.appendChild(list);
+  const mirror = document.createElement("div"), style = getComputedStyle(input);
+  for (const key of ["font", "letterSpacing", "lineHeight", "padding", "border", "boxSizing", "wordSpacing", "tabSize"]) mirror.style[key] = style[key];
+  Object.assign(mirror.style, { position: "fixed", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", width: `${rect.width}px`, left: `${rect.left}px`, top: `${rect.top}px` });
+  mirror.textContent = input.value.slice(0, input.selectionStart);
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b";
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+  const caret = marker.getBoundingClientRect();
+  const left = Math.max(12, Math.min(caret.left - input.scrollLeft, window.innerWidth - list.offsetWidth - 12));
+  const top = Math.max(12, Math.min(caret.bottom - input.scrollTop, window.innerHeight - list.offsetHeight - 12));
+  list.style.left = `${left}px`;
+  list.style.top = `${top}px`;
+  mirror.remove();
+}
+
+function renderDatasetMentions() {
+  const m = datasetMention, list = $("datasetMentions"), input = $("chatInput");
+  if (!m.query) return;
+  m.rows = (m.items || []).filter((d) => d.name.toLowerCase().includes(m.query.text.toLowerCase()));
+  if (m.items && !m.rows.length && /\s$/.test(m.query.text)) { closeDatasetMentions(); return; }
+  m.index = Math.max(0, Math.min(m.index, m.rows.length - 1));
+  list.innerHTML = m.rows.map((d, i) => {
+    const from = chatLabel(d.conversation_id);
+    const detail = [isFolderKind(d.kind) ? "folder" : "file", fmtSize(d.size_bytes) || "Size unknown", fmtDate(d.uploaded_at), from ? from.text : "Source chat unknown"].join(" · ");
+    return `<div id="datasetMention-${i}" class="dataset-mention" role="option" aria-selected="${i === m.index}" data-mention-index="${i}"><strong>${escapeHtml(d.name)}</strong><small>${escapeHtml(detail)}</small></div>`;
+  }).join("") || `<div class="empty-hint" role="status">${!m.items && !m.error ? "Loading datasets…" : m.error ? "Could not load datasets. Use + Data to upload." : "No matching datasets. Use + Data to upload."}</div>`;
+  list.classList.remove("hidden");
+  input.setAttribute("aria-expanded", "true");
+  if (m.rows.length) input.setAttribute("aria-activedescendant", `datasetMention-${m.index}`);
+  else input.removeAttribute("aria-activedescendant");
+  positionDatasetMentions();
+  const selected = $("datasetMention-" + m.index);
+  if (m.rows.length && selected) selected.scrollIntoView({ block: "nearest" });
+}
+
+async function updateDatasetMentions() {
+  const m = datasetMention, query = datasetMentionQuery($("chatInput"));
+  if (!query) { m.dismissed = null; closeDatasetMentions(false); return; }
+  if (query.start === m.dismissed) return;
+  const opening = !m.query || m.query.start !== query.start;
+  m.query = query;
+  m.index = 0;
+  if (opening) { m.items = null; m.error = false; }
+  renderDatasetMentions();
+  if (!opening) return;
+  const request = ++m.request;
+  try {
+    const res = await fetch("/api/datasets");
+    if (!res.ok) throw new Error("Datasets unavailable");
+    const items = (await res.json()).datasets || [];
+    if (request !== m.request) return;
+    m.items = items.sort((a, b) => String(b.uploaded_at || "").localeCompare(String(a.uploaded_at || "")));
+  } catch {
+    if (request !== m.request) return;
+    m.items = []; m.error = true;
+  }
+  renderDatasetMentions();
+}
+
+function selectDatasetMention(index) {
+  const m = datasetMention, d = m.rows[index], input = $("chatInput"), q = m.query;
+  if (!d || !q) return;
+  const name = d.name;
+  if (addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes, at: d.uploaded_at }) === false) return;
+  input.value = input.value.slice(0, q.start) + "@" + name + input.value.slice(q.end);
+  const caret = q.start + name.length + 1;
+  input.setSelectionRange(caret, caret);
+  const c = activeChat();
+  if (c) { c.draft = input.value; saveComposer(c); }
+  closeDatasetMentions();
+  updateComposerButton();
+  input.focus();
+}
+
+function datasetMentionKeydown(e) {
+  const m = datasetMention;
+  if (!m.query || e.isComposing) return false;
+  if (e.key === "Escape") { e.preventDefault(); closeDatasetMentions(); return true; }
+  if (e.key === " " && !m.rows.length) { closeDatasetMentions(); return false; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    if (m.rows.length) m.index = (m.index + (e.key === "ArrowDown" ? 1 : m.rows.length - 1)) % m.rows.length;
+    renderDatasetMentions();
+    return true;
+  }
+  if ((e.key === "Enter" || e.key === "Tab") && m.rows.length) {
+    e.preventDefault(); selectDatasetMention(m.index); return true;
+  }
+  // An unmatched Enter must not accidentally send the message while the list is open.
+  if (e.key === "Enter") { e.preventDefault(); return true; }
+  return false;
+}
 // ---- dataset selection: one active chip + a "Data" popover -------------------
 // The composer shows only the CURRENTLY SELECTED dataset as a removable chip; uploading a
 // file/folder or picking a past upload happens in the "＋ Data" popover, so the recent-
@@ -6455,7 +6575,7 @@ function renderDatasetChips() {
       ? `<button type="button" class="dataset-chip-ref${isRef ? " on" : ""}" data-ref-path="${escapeHtml(path)}" ` +
         `title="${isRef ? "Reference data — click to use it as an ordinary file" : "Mark as reference data (e.g. a cell-type atlas to compare against)"}">ref</button>`
       : "";
-    return `<span class="dataset-chip active${isRef ? " reference" : ""}" title="${escapeHtml(d.path + gist)}">` +
+    return `<span class="dataset-chip active${isRef ? " reference" : ""}" title="${escapeHtml(d.name + gist)}">` +
       `<span class="material-symbols-outlined msym">${ico}</span>` +
       `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + refBtn +
       `<button type="button" class="dataset-chip-x" data-clear-path="${escapeHtml(path)}" title="Remove this file">×</button></span>`;
@@ -9245,9 +9365,20 @@ function init() {
     if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
   });
   $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") $("filePreviewModal").classList.add("hidden"); });
-  $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chatForm").requestSubmit(); } });
+  $("chatInput").addEventListener("keydown", (e) => { if (datasetMentionKeydown(e)) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("chatForm").requestSubmit(); } });
+  $("chatInput").addEventListener("click", updateDatasetMentions);
+  $("chatInput").addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateDatasetMentions(); });
+  $("chatInput").addEventListener("blur", () => { closeDatasetMentions(false); datasetMention.dismissed = null; });
+  $("chatInput").addEventListener("scroll", () => { if (datasetMention.query) positionDatasetMentions(); });
+  window.addEventListener("resize", () => { if (datasetMention.query) positionDatasetMentions(); });
+  $("datasetMentions").addEventListener("pointerdown", (e) => e.preventDefault());
+  $("datasetMentions").addEventListener("click", (e) => {
+    const row = e.target.closest("[data-mention-index]");
+    if (row) selectDatasetMention(Number(row.dataset.mentionIndex));
+  });
   // Live-swap Send⇄Stop as the user types during a run / plan review; the text is this chat's draft.
   $("chatInput").addEventListener("input", () => {
+    updateDatasetMentions();
     const c = activeChat();
     if (c) { c.draft = $("chatInput").value; saveComposer(c); }
     updateComposerButton();
