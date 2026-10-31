@@ -14219,6 +14219,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             reply = await asyncio.to_thread(_qc_chat_reply, art, result)
             if reply:
                 result.final_answer = reply
+            result.final_answer = _default_qc_display(result.final_answer or "", art, result)
             try:
                 # The same lines in the folder, so a downloaded bundle says what QC did. It is also
                 # what marks the run finished for the next message in this chat to continue.
@@ -14314,6 +14315,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             from ..agents import own_choices
             report_md = own_choices.add_section(report_md, lab_obj.self_sourced,
                                                 insert=_insert_before_backmatter)
+            # Enforce the display policy after every writer/reviewer, including Stop and fallback.
+            # Original diagnostic data and optional generated excerpts remain downloadable.
+            report_md = _default_qc_display(report_md, art, result)
             # How we know it is right: every number traced to the run's outputs, what each label rests
             # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
             # statement is report/verification.md, the manuscript carries its summary.
@@ -14327,6 +14331,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 # After the number check on purpose: this section restates another run's work.
                 report_md = _insert_before_backmatter(
                     report_md, _earlier_work_note(prior, continues_from_dataset))
+                report_md = _default_qc_display(report_md, art, result)
             _watch_stage(run, "report")
             say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
                     else "💾 Saving report.md — skipping the render.", "info")
@@ -14468,6 +14473,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                          "Downloads panel.", "success" if not abandoned() else "warning")
         if untested_md:
             result.final_answer = untested_md + "\n" + (result.final_answer or "")
+        result.final_answer = _default_qc_display(result.final_answer or "", art, result)
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
         conn.push({"type": "chat_done"})
         if later_asks:
@@ -14932,7 +14938,9 @@ def _manuscript_annotation_rule(kind: str) -> str:
 
 
 def _report_writer_system(kind: str = "single_cell") -> str:
+    from ..reporting.qc_summary import QC_SUMMARY_POLICY
     return (
+        QC_SUMMARY_POLICY + "\n" +
         f"{_manuscript_domain(kind)} The manuscript MUST be complete — every section below is "
         "present and substantive, with NO empty or placeholder sections. Use Markdown headings only "
         "(do NOT prefix them with your own '1.'/'2.' numbers):\n"
@@ -15062,22 +15070,31 @@ def _fmt_num(c: str) -> str:
     return s or "0"
 
 
-def _csv_preview_md(path: Path, *, max_rows: int = 8, max_cols: int = 8, cell: int = 40) -> str:
+def _csv_preview_md(path: Path, *, max_rows: int = 8, max_cols: int = 8, cell: int = 40,
+                    omit_doublet_details: bool = False) -> str:
     """Render the head of a CSV as a Markdown table (bounded rows/cols/cell width), with
     numeric cells compacted (see :func:`_fmt_num`) so wide stat tables stay legible in the
     rendered PDF instead of overprinting neighbouring columns."""
     import csv
 
     rows: list[list[str]] = []
+    columns: list[int] = []
     try:
         with open(path, newline="", encoding="utf-8", errors="replace") as fh:
             for i, row in enumerate(csv.reader(fh)):
                 if i > max_rows:
                     break
-                rows.append(row[:max_cols])
+                if i == 0:
+                    # Only the default manuscript preview omits these fields. The CSV and the
+                    # technical report keep them, and unrelated scores/kappa columns stay visible.
+                    columns = [j for j, name in enumerate(row) if not (omit_doublet_details and (
+                        re.search(r"doubletfinder|scdblfinder|concordance_doublet", name, re.I)
+                        or name.lower() in {"doublet_score", "doublet_kappa", "doublet_decider",
+                                            "doublet_class", "pann", "df.classifications"}))][:max_cols]
+                rows.append([row[j] if j < len(row) else "" for j in columns])
     except Exception:  # noqa: BLE001 - a bad CSV just gets skipped from the preview
         return ""
-    if len(rows) < 2:
+    if len(rows) < 2 or not columns:
         return ""
 
     def fmt(c: str) -> str:
@@ -15130,7 +15147,7 @@ def _scgpt_label_summary_md(path: Path, *, top: int = 15) -> str:
     return f"**{head}.**\n\n" + "\n".join(lines)
 
 
-def _data_artifacts_block(art: Path) -> str:
+def _data_artifacts_block(art: Path, *, omit_doublet_details: bool = False) -> str:
     """Surface ``data/`` artifacts to the report writer. scGPT predictions get a label-
     distribution summary; other small data CSVs get a head preview. Returns '' if none."""
     data_dir = art / "data"
@@ -15145,7 +15162,7 @@ def _data_artifacts_block(art: Path) -> str:
     for c in sorted(data_dir.glob("*.csv")):
         if c.name == "scgpt_predictions.csv" or c.stat().st_size > 200_000:
             continue
-        md = _csv_preview_md(c)
+        md = _csv_preview_md(c, omit_doublet_details=omit_doublet_details)
         if md:
             blocks.append(f"### data/{c.name}\n{md}")
     return "\n\n".join(blocks)
@@ -15350,12 +15367,6 @@ def _wants_brief_report(scope: Any, result: Any) -> bool:
     return bool(getattr(scope, "brief_report", False)) or _qc_only_run(result)
 
 
-# Below this agreement the two doublet callers are said to disagree, with the numbers: run_cellqc
-# warns at the same value.
-_DOUBLET_KAPPA_LOW = 0.2
-_DOUBLET_CALLERS = {"doubletfinder": "DoubletFinder", "scdblfinder": "scDblFinder"}
-
-
 def _cellqc_metrics_rows(art: Path) -> "dict[str, dict[str, str]]":
     """CellQC's own per-library metrics (``tables/cellqc_metrics.csv``), by sample. They hold what
     the tool's return value leaves out: each filter's total, and the second doublet caller's calls."""
@@ -15375,47 +15386,53 @@ def _metric_int(row: "dict[str, str]", key: str) -> "int | None":
     return int(x) if x == x else None
 
 
-def _brief_doublet_lines(lib: dict, row: "dict[str, str]", decider: str,
-                         cell_columns: "list[str]") -> "list[str]":
-    """The doublet rate and, when the callers disagree, how much, in plain counts: how many of the
-    decider's removals the other caller agrees on, and how many further cells it flags that stay.
+def _brief_doublet_lines(lib: dict) -> "list[str]":
+    from ..reporting.qc_summary import doublet_count_lines
+    return doublet_count_lines(lib)
 
-    Run 6275df1213ab said only "the two doublet callers agree at kappa 0.14": scDblFinder agreed on
-    245 of DoubletFinder's 929 removals and flagged 1,192 of the 14,553 kept cells. Those are counts,
-    not doublets left behind: an audit of that run found most of the 1,192 to be high-UMI rods with
-    no second lineage's markers, while the 245 both callers flagged were the clear doublets."""
-    dbl, filt, kept = (lib.get("doublets_removed"), lib.get("cells_after_filter"),
-                       lib.get("cells_after_doublets"))
-    if not isinstance(dbl, (int, float)):
-        return []
-    decider = str(row.get("doublet_decider") or decider or "")
-    name = _DOUBLET_CALLERS.get(decider, decider)
-    out = [f"Doublets removed: {int(dbl):,}"
-           + (f" of the {int(filt):,} filtered cells ({100 * dbl / filt:.1f}%)"
-              if isinstance(filt, (int, float)) and filt else "")
-           + (f", called by {name}" if name else "") + "."]
-    kappa = lib.get("doublet_kappa")
-    if not isinstance(kappa, (int, float)):
-        return out
-    other = next((m.group(1) for k in row if (m := re.match(r"doublet_(\w+?)_ndoublet$", k))
-                  and m.group(1) != decider), "")
-    n_other = _metric_int(row, f"doublet_{other}_ndoublet") if other else None
-    both = next((_metric_int(row, k) for k in row
-                 if k.startswith("concordance_") and k.endswith("_both_doublet")), None)
-    if (kappa >= _DOUBLET_KAPPA_LOW or n_other is None or both is None or not name
-            or n_other < both):
-        out.append(f"The two doublet callers agree at kappa {kappa:.2f}.")
-        return out
-    stayed = n_other - both
-    column = f"{other}_class"
-    out.append(f"The two doublet callers agree poorly (kappa {kappa:.2f}): "
-               f"{_DOUBLET_CALLERS.get(other, other)} agrees on {both:,} of {name}'s {int(dbl):,} "
-               f"removals and flags "
-               + (f"{stayed:,} of the {int(kept):,} kept cells ({100 * stayed / kept:.1f}%)"
-                  if isinstance(kept, (int, float)) and kept else f"{stayed:,} further cells")
-               + ", which stay in the dataset"
-               + (f" (its `{column}` column marks them)" if column in cell_columns else "") + ".")
-    return out
+
+def _brief_qc_warnings(result: dict) -> "list[str]":
+    from ..reporting.qc_summary import qc_warnings
+    return qc_warnings(result)
+
+
+def _default_qc_display(text: str, art: Path, result: Any = None) -> str:
+    """Final display boundary; retain generated doublet details in an optional download.
+
+    This never changes the source tool results, tables, matrices or technical report. It also
+    covers an old synthesis or a writer/reviewer that ignores the shared presentation prompt.
+    """
+    from ..reporting.qc_display import default_qc_text
+
+    display = default_qc_text(text)
+    if not display.changed:
+        return text
+    body = display.text.rstrip()
+    qc = _qc_step_outcome(result) if result is not None else None
+    if qc and not re.search(r"doublets?\s+removed|removed\s+[\d,]+\s+doublets?", body, re.I):
+        libs = [lib for lib in qc["result"].get("libraries") or [] if isinstance(lib, dict)]
+        counts = [f"{lib.get('sample') or 'Library'}: {line}"
+                  for lib in libs for line in _brief_doublet_lines(lib)]
+        if counts:
+            body += "\n\n" + "\n".join(counts)
+    if display.needs_review and "doublet filtering needs review" not in body.lower():
+        body += "\n\nDoublet filtering needs review; see the optional technical details."
+    path = art / "report" / "doublet_details.md"
+    try:
+        prior = path.read_text(encoding="utf-8") if path.is_file() else (
+            "# Optional doublet details\n\n"
+            "Generated excerpts omitted from the default result. They may include model-written "
+            "text and are not additional measurements. The original QC metrics and per-cell data remain "
+            "in the run's downloadable QC files and execution record.\n")
+        additions = [detail for detail in display.details if detail not in prior]
+        if additions:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(prior.rstrip() + "\n\n" + "\n\n".join(additions) + "\n", encoding="utf-8")
+        if path.is_file() and "report/doublet_details.md" not in body:
+            body += "\n\nOptional technical details: `report/doublet_details.md` in Downloads."
+    except OSError as exc:
+        print(f"[report] could not save optional doublet excerpts: {exc}")
+    return body.strip() + "\n"
 
 
 def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
@@ -15459,8 +15476,6 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
                 f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
         lines.append("")
         metrics = _cellqc_metrics_rows(art) if tool == "run_cellqc" else {}
-        cell_columns = _cells_columns(art)
-        decider = str((r.get("doublets") or {}).get("decider") or "")
         for lib in libs:
             removed = lib.get("removed_only_by") or {}
             if not removed and lib.get("doublets_removed") is None:
@@ -15488,7 +15503,7 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
                     and isinstance(filt, (int, float)) else "")
             parts = [f"the count, gene and mitochondrial filters removed{gone}: "
                      + (", ".join(why) if why else "none") + "."]
-            parts += _brief_doublet_lines(lib, row, decider, cell_columns)
+            parts += _brief_doublet_lines(lib)
             nf, iqr = lib.get("nuclear_fraction_median"), lib.get("nuclear_fraction_iqr") or []
             if isinstance(nf, (int, float)):
                 spread = (f", IQR {iqr[0]:.2f}–{iqr[1]:.2f}" if len(iqr) == 2
@@ -15503,9 +15518,9 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
     th = r.get("thresholds") if isinstance(r.get("thresholds"), dict) else {}
     if th:
         lines += ["Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".", ""]
-    warnings = [str(w) for w in (r.get("warnings") or []) if str(w).strip()]
+    warnings = _brief_qc_warnings(r)
     if warnings:
-        lines += ["**The tool's warnings:**", ""] + [f"- {w}" for w in warnings] + [""]
+        lines += ["**QC warnings:**", ""] + [f"- {w}" for w in warnings] + [""]
     fig = next((f for f in _report_figures(art) if "qc" in f.name), None)
     if fig is not None:
         lines += [f"![Per-cell QC metrics after filtering.](figures/{fig.name})", ""]
@@ -15697,7 +15712,7 @@ def _files_lines(art: Path, dataset_note: str) -> "list[str]":
     for rd in _result_dataset_pointers(art):
         files.append(f"- `{rd['name']}` — the processed dataset ({dataset_note}).")
     for rel, what in (("tables/cells.csv", _cells_table_what(art)),
-                      ("tables/cellqc_metrics.csv", "CellQC's per-library metrics"),
+                      ("tables/cellqc_metrics.csv", "optional technical details: CellQC's per-library metrics"),
                       ("result/report.html", "CellQC's own report; `result/` is CellQC's result "
                                              "directory, complete but for the per-library .h5ad"),
                       ("report/verification.md", "how each number here was checked")):
@@ -15750,8 +15765,7 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         return f"{int(v):,}" if isinstance(v, (int, float)) else "—"
 
     libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
-    warnings = [re.sub(r"\s*Report it\.?\s*$", "", str(w)).strip()
-                for w in (r.get("warnings") or []) if str(w).strip()]
+    warnings = _brief_qc_warnings(r)
     before, after = r.get("cells_before"), r.get("cells_after")
     genes = (f"; {int(r['genes_after']):,} genes" if len(r.get("checkpoints") or {}) < 2
              and isinstance(r.get("genes_after"), (int, float))
@@ -15783,14 +15797,9 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
             gone = (f" {int(cr) - int(filt):,}" if isinstance(cr, (int, float))
                     and isinstance(filt, (int, float)) else "")
             lines.append(f"- Filters removed{gone}: " + ", ".join(parts) + ".")
-        row = _cellqc_metrics_rows(art).get(str(lib.get("sample")), {})
-        decider = str((r.get("doublets") or {}).get("decider") or "")
-        dbl = _brief_doublet_lines(lib, row, decider, _cells_columns(art))
+        dbl = _brief_doublet_lines(lib)
         if dbl:
             lines.append("- " + " ".join(dbl))
-            # The doublet line already gives the callers' agreement with its counts.
-            if len(dbl) > 1:
-                warnings = [w for w in warnings if "doublet callers agree" not in w]
         mito = lib.get("median_pct_mt_kept")
         mito_words = "in the kept cells"
         if not isinstance(mito, (int, float)):
@@ -15810,13 +15819,14 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
     elif libs:
         mito_kept = all(isinstance(lib.get("median_pct_mt_kept"), (int, float)) for lib in libs)
         mkey = "median_pct_mt_kept" if mito_kept else "median_pct_mt"
-        lines += ["", "| Library | Cell Ranger cells | after filters | after doublets | kept | "
+        lines += ["", "| Library | Cell Ranger cells | after filters | after doublets | doublets removed | kept | "
                       + ("median % mito (kept)" if mito_kept else "median % mito (before filtering)")
-                      + " |", "|---|---:|---:|---:|---:|---:|"]
+                      + " |", "|---|---:|---:|---:|---:|---:|---:|"]
         for lib in libs:
             kept, mito = lib.get("frac_retained"), lib.get(mkey)
             lines.append(f"| {lib.get('sample', '—')} | {n(lib.get('cells_cellranger'))} | "
                          f"{n(lib.get('cells_after_filter'))} | {n(lib.get('cells_after_doublets'))} | "
+                         f"{n(lib.get('doublets_removed'))} | "
                          f"{f'{100 * kept:.1f}%' if isinstance(kept, (int, float)) else '—'} | "
                          f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
         lines.append("")
@@ -15846,9 +15856,11 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         lines += ["", f"**Result:** `{rd['name']}` — {n(rd.get('n_cells'))} cells × "
                       f"{n(rd.get('n_genes'))} genes; `X` is log-normalised"
                       + (f", `layers['counts']` holds {layer}" if layer else "") + f". It is {where}."]
-    if tool == "run_cellqc" and (art / "result" / "report.html").exists():
-        lines.append("CellQC's own report and per-library files are in `result/` "
-                     "(`result/report.html`).")
+    if tool == "run_cellqc":
+        details = [f"`{rel}`" for rel in ("tables/cells.csv", "tables/cellqc_metrics.csv",
+                                         "result/report.html") if (art / rel).is_file()]
+        if details:
+            lines.append("Optional technical details in Downloads: " + ", ".join(details) + ".")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -16407,13 +16419,13 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
                             key=lambda t: t.stat().st_size)[:10]
     previews: list[str] = []
     for t in preview_tables:
-        md = _csv_preview_md(t)
+        md = _csv_preview_md(t, omit_doublet_details=True)
         if md:
             previews.append(f"### tables/{t.name}\n{md}")
     previews_block = "\n\n".join(previews) or "(no small tables to preview)"
     # data/ artifacts (e.g. scGPT predictions) — these never appear in tables/, so surface
     # them explicitly or the model can't see a successful annotation result.
-    data_block = _data_artifacts_block(art) or "(no data/ artifacts to surface)"
+    data_block = _data_artifacts_block(art, omit_doublet_details=True) or "(no data/ artifacts to surface)"
     rd = _result_dataset_pointer(art)
     rd_block = (f"Result dataset delivered with this run: `{rd['name']}` ({rd.get('n_cells')} cells x "
                 f"{rd.get('n_genes')} genes; layers['counts'] = {rd.get('counts_layer')}). When the "
@@ -17148,8 +17160,10 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
 
 
 def _report_review_system(kind: str = "single_cell") -> str:
+  from ..reporting.qc_summary import QC_SUMMARY_POLICY
   study = "variant-annotation" if kind == "variant" else "single-cell RNA-seq"
   return (
+    QC_SUMMARY_POLICY + "\n" +
     f"You are a meticulous scientific editor reviewing a {study} MANUSCRIPT draft "
     "BEFORE it is rendered to PDF/DOCX. Return the corrected FULL Markdown, fixing:\n"
     "- Manuscript structure: Title, Abstract, Study question, Results, Discussion, Limitations, "

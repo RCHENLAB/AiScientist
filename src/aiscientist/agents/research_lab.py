@@ -44,6 +44,7 @@ from pathlib import Path
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterable
 
+from ..reporting.qc_summary import QC_SUMMARY_POLICY, qc_result_summary
 from . import claim_audit
 from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from .hypotheses import DesignFacts, HypothesisLedger
@@ -64,7 +65,7 @@ from .plan_doc import (
     split_step,
     sync_plan,
 )
-from .scope import RunScope, qc_only_run, read_scope, wants_written_report
+from .scope import QC_ONLY_TOOLS, RunScope, qc_only_run, read_scope, wants_written_report
 from .marker_claims import check_marker_claims
 from .label_claims import check_label_conflation, dataset_labels, label_glossary, labels_prompt
 from . import own_choices
@@ -374,7 +375,8 @@ _SYNTH_SYSTEM = (
     "planned assembly — state the assembly and execution_mode the result reports, never the plan's). "
     "Never state a PASS/non-PASS split, an allele-frequency cutoff, or a total the results do not show — "
     "do NOT write 'all PASS' or '0 non-PASS' unless the results report zero non-PASS. "
-    "State limitations honestly and frame conclusions as hypotheses to validate."
+    "State limitations honestly and frame conclusions as hypotheses to validate. "
+    + QC_SUMMARY_POLICY
 )
 
 # A run that only did quality control and whose request asks for a written report: what that report
@@ -382,8 +384,9 @@ _SYNTH_SYSTEM = (
 _QC_REPORT_NOTE = (
     "This run did quality control only, and the request asks for a written report. Write a "
     "quality-control report for the person who asked: what was run on which data, the numbers the QC "
-    "step reported (cells in and kept, why cells were removed, doublets, ambient RNA, mitochondrial "
-    "content), the tool's warnings, and what was handed back. Use tables where they help. No "
+    "step reported (cells in and kept, why cells were removed, a concise count of doublets removed, "
+    "ambient RNA, mitochondrial content), material QC warnings following the default QC "
+    "presentation policy, and what was handed back. Use tables where they help. No "
     "biological interpretation, no literature, no Discussion and no hypotheses: nothing beyond QC "
     "was run. The layout and length are yours to choose.\n"
 )
@@ -3498,6 +3501,22 @@ class LabRound:
         )
 
 
+def _stopped_round_answer(rnd: LabRound) -> str:
+    """Stopped QC steps use their records; preserve other analyses' outcomes and all raw rounds."""
+    if not qc_only_run([rnd]):
+        return str(rnd.scientist_result.get("final_answer") or "(no answer)")
+    summaries = []
+    for step in rnd.scientist_result.get("steps") or []:
+        if not isinstance(step, dict) or step.get("tool") not in QC_ONLY_TOOLS:
+            continue
+        result = step.get("result")
+        if step_succeeded(step) and isinstance(result, dict):
+            summaries.append(f"{step['tool']}: {qc_result_summary(result)}")
+        elif isinstance(result, dict) and result.get("error"):
+            summaries.append(f"{step['tool']} failed: {result['error']}")
+    return " ".join(summaries) or "QC results are recorded in the run's technical details."
+
+
 def _rounds_by_agenda_index(agenda: list[str], rounds: "list[LabRound]") -> "dict[int, LabRound]":
     """Map each round to the 0-based agenda step it ran, by the step's TEXT.
 
@@ -4834,7 +4853,7 @@ class ResearchLab:
               "hypotheses": len(self._ledger), "open": len(self._ledger.open_items())})
         converged = accepted_total == len(all_agenda) and len(all_agenda) > 0
         if stop_reason == "cancelled":
-            done = "\n".join(f"- {r.step}: {r.scientist_result.get('final_answer') or '(no answer)'}"
+            done = "\n".join(f"- {r.step}: {_stopped_round_answer(r)}"
                              for r in all_rounds if r.verdict.verdict == "accept") \
                    or "- (no steps completed yet)"
             emit({"type": "lab_done", "converged": False, "accepted_steps": accepted_total,
@@ -5198,7 +5217,7 @@ class ResearchLab:
             accepted = [r for r in rounds if r.verdict.verdict == "accept"]
             done = "\n".join(
                 f"- Step {r.step_index} ({r.step}): "
-                f"{r.scientist_result.get('final_answer') or '(no answer)'}"
+                f"{_stopped_round_answer(r)}"
                 for r in accepted
             ) or "- (no steps completed yet)"
             final_answer = (
@@ -5832,7 +5851,7 @@ class ResearchLab:
         if cancelled:
             accepted = [r for r in rounds if r.verdict.verdict == "accept"]
             done = "\n".join(
-                f"- {r.step}: {r.scientist_result.get('final_answer') or '(no answer)'}"
+                f"- {r.step}: {_stopped_round_answer(r)}"
                 for r in accepted) or "- (no steps completed yet)"
             final_answer = (f"Run stopped by the user before completion — {accepted_steps}/{n_nodes} "
                             f"planned tasks completed:\n{done}")

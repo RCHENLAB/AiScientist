@@ -373,13 +373,13 @@ def test_qc_reply_for_an_accepted_round_covering_every_library_is_unchanged(tmp_
     assert _qc_chat_reply(art, result(3)) == (
         "**Quality control done** — `run_cellqc` on Sample1_WT, Sample2_Ddx41, Sample3_GSM5676874."
         "\n\n- **41,526 of 48,112 cells kept (86.3%)**.\n\n"
-        "| Library | Cell Ranger cells | after filters | after doublets | kept | "
-        "median % mito (before filtering) |\n|---|---:|---:|---:|---:|---:|\n"
-        "| Sample1_WT | 18,681 | 18,011 | 16,750 | 89.7% | — |\n"
-        "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | 91.7% | — |\n"
-        "| Sample3_GSM5676874 | 13,559 | 11,000 | 10,223 | 75.4% | — |\n\n"
+        "| Library | Cell Ranger cells | after filters | after doublets | doublets removed | kept | "
+        "median % mito (before filtering) |\n|---|---:|---:|---:|---:|---:|---:|\n"
+        "| Sample1_WT | 18,681 | 18,011 | 16,750 | — | 89.7% | — |\n"
+        "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | — | 91.7% | — |\n"
+        "| Sample3_GSM5676874 | 13,559 | 11,000 | 10,223 | — | 75.4% | — |\n\n"
         "- Thresholds: `min_counts` = 500, `min_features` = 300, `max_pct_mt` = 10.\n"
-        "- ⚠️ Sample1_WT: the two doublet callers agree poorly (kappa 0.07).\n")
+        "- ⚠️ Sample1_WT: Doublet filtering needs review; see the technical details in the Downloads panel.\n")
     assert _qc_closing_line(result(3)) == (
         "✅ Done — the summary is below; the result files are in the Downloads panel.", "success")
     assert _brief_qc_lines(_qc_step_outcome(result(3)), art)[:3] == [

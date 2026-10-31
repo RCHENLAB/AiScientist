@@ -324,7 +324,7 @@ def _validate(libs: list[dict[str, Any]], status_rows: list[dict[str, str]],
     for lib in libs:
         k = lib["doublet_kappa"]
         if k is not None and k < _KAPPA_LOW:
-            # The warnings are copied into the user's report as they are: facts, no instructions.
+            # Keep the full diagnostic for audits; final-result presenters summarize the warning.
             warnings.append(f"{lib['sample']}: the two doublet callers agree poorly (kappa {k:.2f}), "
                             "so the choice of decider drives which cells are removed.")
     for lib in libs:
@@ -882,8 +882,11 @@ def make_tool() -> HarnessTool:
         _TOOL,
         "CellQC quality control for FOLDERS of 10x Cell Ranger outputs (one or more libraries with "
         "raw AND filtered matrices, in every folder bound to the run): SoupX ambient-RNA "
-        "correction, count/feature/mitochondrial filtering, DoubletFinder doublet removal "
-        "(scDblFinder as a second opinion), and the nuclear fraction from the BAM. Merges the "
+        "correction, count/feature/mitochondrial filtering, doublet removal, and the nuclear "
+        "fraction from the BAM. Default final results show the overall QC outcome and a concise "
+        "count of doublets removed; per-cell scores and caller comparisons stay in optional "
+        "technical details and downloadable QC files. Retain material QC warnings without "
+        "expanding caller comparisons. Merges the "
         "libraries of all the bound folders in one call (obs 'sampleid') and writes the "
         "normalized checkpoint the later tools read. Use it INSTEAD of run_scanpy_qc when the data "
         "are Cell Ranger outputs; do not run run_doublet_detection after it.",
