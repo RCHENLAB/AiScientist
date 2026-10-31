@@ -53,7 +53,7 @@ unchanged.
 | `ambient_compare` | string | `'decontx'` | a second ambient method that is estimated and reported but NOT applied, to show where the methods disagree; '' for none |
 | `chemistry` | string (`auto`, `next_gem`, `gem_x`) | `'auto'` | the 10x chemistry, which sets the expected doublet rate: next_gem (3' v2/v3/v3.1, ~0.8% per 1,000 cells) or gem_x (3' v4, about half that). 'auto' reads it from Cell Ranger's web summary |
 | `nreaction` | integer | `1` | 10x reactions (GEM wells) pooled into each library. It only changes the expected doublet rate (rate x cells / (nreaction x capacity)), describes how the libraries were made and is NOT measured from the data: confirm it with whoever prepared them |
-| `doublet_decider` | string (`doubletfinder`, `scdblfinder`) | `'doubletfinder'` | the doublet caller whose calls REMOVE cells; the other one only scores them, and the two are compared with Cohen's kappa |
+| `doublet_decider` | string (`doubletfinder`, `scdblfinder`) | `'doubletfinder'` | the doublet caller whose calls REMOVE cells; detailed diagnostics remain in the downloadable QC files |
 | `n_top_genes` | integer | `2000` | highly-variable genes kept for the embedding after the libraries are merged |
 | `seed` | integer | `42` | random seed for CellQC's stochastic steps, so a rerun reproduces |
 | `warn_ambient_frac` | number | `0.25` | flag a library whose mean SoupX contamination is above this. An ENGINEERING guard from the CellQC validation guide, not a literature threshold |
@@ -92,6 +92,15 @@ unchanged.
   and `warnings` — the CellQC validation checklist (a failed or fallback step, an excluded library,
   an inert mitochondrial filter, a library with low retention or high ambient load, poor doublet
   agreement).
+
+The default final result shows the overall QC outcome and a concise doublets-removed count.
+Per-cell scores and caller comparisons stay in the downloadable QC files or optional technical
+details. A material doublet warning is summarized as a need to review the removal, with a pointer
+to the available details; the original diagnostics and all analysis data are retained.
+If a writer or reviewer still includes doublet diagnostics, the final display moves those
+generated excerpts to `report/doublet_details.md` in Downloads. This optional file identifies
+them as presentation text, potentially model-written; the QC tables and execution record remain
+the measurement sources.
 
 ## Where it runs
 
@@ -132,9 +141,11 @@ On the fast chat path: no (research runs only).
 <!-- generated:model-description -->
 > CellQC quality control for FOLDERS of 10x Cell Ranger outputs (one or more libraries with raw
 > AND filtered matrices, in every folder bound to the run): SoupX ambient-RNA correction,
-> count/feature/mitochondrial filtering, DoubletFinder doublet removal (scDblFinder as a second
-> opinion), and the nuclear fraction from the BAM. Merges the libraries of all the bound folders
-> in one call (obs 'sampleid') and writes the normalized checkpoint the later tools read. Use it
-> INSTEAD of run_scanpy_qc when the data are Cell Ranger outputs; do not run run_doublet_detection
-> after it.
+> count/feature/mitochondrial filtering, doublet removal, and the nuclear fraction from the BAM.
+> Default final results show the overall QC outcome and a concise count of doublets removed; per-
+> cell scores and caller comparisons stay in optional technical details and downloadable QC files.
+> Retain material QC warnings without expanding caller comparisons. Merges the libraries of all
+> the bound folders in one call (obs 'sampleid') and writes the normalized checkpoint the later
+> tools read. Use it INSTEAD of run_scanpy_qc when the data are Cell Ranger outputs; do not run
+> run_doublet_detection after it.
 <!-- /generated:model-description -->

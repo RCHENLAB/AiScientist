@@ -57,7 +57,7 @@ def _conn(tmp_path):
     return conn
 
 
-def _run(tmp_path, monkeypatch, question: str, final_answer: str, extra_steps=()):
+def _run(tmp_path, monkeypatch, question: str, final_answer: str, extra_steps=(), writeup_mode="qc"):
     """``_run_lab`` end to end with the research lab replaced by one CellQC step. Returns
     ``(conn, req, payloads, art, rendered)``; ``rendered`` collects what was sent to pandoc."""
     from aiscientist.agents import research_lab as rl
@@ -74,6 +74,8 @@ def _run(tmp_path, monkeypatch, question: str, final_answer: str, extra_steps=()
             self.request_breadth = "specific"
 
         def run(self, question, on_event=None, plan_review=None, **_kw):
+            if writeup_mode == "stopped":
+                conn.hard_stop.set()
             steps = [{"tool": "run_cellqc", "ok": True, "args": {"species": "mouse"}, "result": _CELLQC},
                      *extra_steps, {"tool": "finish", "ok": True, "result": {}}]
             rnd = LabRound(1, 0, _STEP, "Scientist",
@@ -102,9 +104,28 @@ def _run(tmp_path, monkeypatch, question: str, final_answer: str, extra_steps=()
 
     monkeypatch.setattr(rl, "ResearchLab", _FakeLab)
     monkeypatch.delenv("AISCIENTIST_PLAN_YAML", raising=False)
-    for name in ("_build_report", "_build_brief_report", "_review_and_finalize_report",
-                 "_build_technical_report"):
+    original_build = gw_app._build_report
+    original_review = gw_app._review_and_finalize_report
+    for name in ("_build_report", "_review_and_finalize_report", "_build_technical_report"):
         monkeypatch.setattr(gw_app, name, _not_this)
+    if writeup_mode != "brief":
+        monkeypatch.setattr(gw_app, "_build_brief_report", _not_this)
+    if writeup_mode in {"full", "fallback"}:
+        def writer(_messages, **_kwargs):
+            if writeup_mode == "fallback":
+                raise RuntimeError("offline writer unavailable")
+            return final_answer
+
+        def reviewer(_messages, **_kwargs):
+            if writeup_mode == "fallback":
+                raise RuntimeError("offline reviewer unavailable")
+            # Deliberately disregard the shared prompt at the last model stage.
+            return final_answer + "\n\nThe doublet callers disagree (kappa 0.12)."
+
+        monkeypatch.setattr(gw_app, "_build_report", lambda synthesis, art, _complete, q, result:
+                            original_build(synthesis, art, writer, q, result))
+        monkeypatch.setattr(gw_app, "_review_and_finalize_report", lambda draft, art, _complete, q, lit:
+                            original_review(draft, art, reviewer, q, lit))
     monkeypatch.setattr(reporting, "build_pdf_report", _render)          # imported inside _run_lab
     monkeypatch.setattr(tools_api, "render_workflow_schematic", _schematic)
     payloads: list[dict] = []
@@ -130,7 +151,9 @@ def test_no_report_asked_for_the_answer_is_in_the_chat_and_the_folder_is_complet
     assert reply.startswith("**Quality control done** — `run_cellqc` on Sample2_Ddx41.")
     assert "- **14,553 of 15,872 cells kept (91.7%)**; 33,696 genes." in reply
     assert "Filters removed 390: 317 only for mitochondrial RNA above 10%" in reply
-    assert "Doublets removed: 929 of the 15,482 filtered cells (6.0%), called by DoubletFinder." in reply
+    assert "Doublets removed: 929 of the 15,482 filtered cells (6.0%)." in reply
+    assert "Doublet filtering needs review" in reply
+    assert "kappa" not in reply and "scDblFinder" not in reply and "DoubletFinder" not in reply
     assert len(reply.strip().splitlines()) <= 10
     said = [str(p.get("text") or "") for p in payloads]
     assert any("✅ Done — the summary is below" in s for s in said)
@@ -148,6 +171,7 @@ def test_no_report_asked_for_the_answer_is_in_the_chat_and_the_folder_is_complet
     # The next message in this chat still continues from this run ("now cluster these cells").
     state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
     assert state["agenda"] == [_STEP]
+    assert state["rounds"][0]["scientist_result"]["steps"][0]["result"] == _CELLQC
     target = gw_app._followup_target(conn, req)
     assert target is not None and target[0] == conn.last_run_by_conversation["conv-1"]
 
@@ -201,3 +225,42 @@ def test_a_read_only_check_after_qc_does_not_turn_the_report_into_a_chat_reply(t
     # a check of the tested tool's output is not untested code (issue 13): no notice, no code file
     assert "Untested code" not in reply and "Untested code" not in rendered[0]
     assert not (art / "process" / "untested_code.md").exists()
+
+
+@pytest.mark.parametrize("mode", ["qc", "full", "fallback", "brief", "stopped"])
+def test_final_outputs_enforce_policy_even_when_model_text_disobeys(tmp_path, monkeypatch, mode):
+    dirty = ("# Analysis result\n\n929 doublets removed. "
+             "DoubletFinder and scDblFinder agree poorly (kappa 0.10). "
+             "ISG score is 1.5. Annotation kappa is 0.8.\n\n"
+             "The mitochondrial filter removed no cells; review the threshold.")
+    extra = []
+    if mode == "brief":
+        extra = [{"tool": "run_code", "ok": True, "args": {"code": "write_summary()"},
+                  "result": {"status": "ok", "tables": ["tables/isg.csv"]}}]
+    elif mode != "qc":
+        extra = [{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}]
+    _, _, payloads, art, rendered = _run(
+        tmp_path, monkeypatch, "Analyze this dataset and write a report.", dirty,
+        extra_steps=extra, writeup_mode=mode)
+    report = rendered[0] if mode != "stopped" else (art / "report/report.md").read_text()
+    reply = _reply(payloads)
+    for output in (report, reply):
+        assert "DoubletFinder" not in output and "scDblFinder" not in output
+        assert "kappa 0.10" not in output and "kappa 0.12" not in output
+        assert "929" in output and "doublets removed" in output.lower()
+        assert "Doublet filtering needs review" in output
+    # QC chat is record-derived; mixed-run chat and all written reports retain other findings.
+    for output in ([report] if mode == "qc" else [report, reply]):
+        assert "ISG score is 1.5" in output and "Annotation kappa is 0.8" in output
+        assert "mitochondrial filter removed no cells" in output
+        assert "report/doublet_details.md" in output
+    details = (art / "report/doublet_details.md").read_text()
+    assert "kappa 0.10" in details and "model-written" in details
+    assert any(item["url"].endswith("/report/doublet_details.md")
+               for payload in payloads if payload.get("type") == "artifacts"
+               for item in payload["items"])
+    if mode == "full":
+        assert "kappa 0.12" in details
+    state = json.loads((art / "process/run_state.json").read_text())
+    assert state["final_answer"] == dirty
+    assert state["rounds"][0]["scientist_result"]["steps"][0]["result"] == _CELLQC
