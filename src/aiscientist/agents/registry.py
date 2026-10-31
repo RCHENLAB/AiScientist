@@ -126,10 +126,14 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
                                         route=_router(executors))
     # A failed snippet that lacked a program gets the HPC3 module that provides it (hpc/modules.py).
     note = ((lambda text: hpc_shell.missing_software_note(text, "run_code")) if hpc_shell is not None else None)
-    catalog.append(make_run_code_tool(code_executor, software_note=note))   # CodeAct (needs the sandbox)
+    # Lab environments the agent built with request_environment (hpc/environments.py), bound by id.
+    lab_envs = (hpc_shell.resolve_environments
+                if hpc_shell is not None and getattr(hpc_shell, "environments", None) is not None else None)
+    catalog.append(make_run_code_tool(code_executor, software_note=note,   # CodeAct (needs the sandbox)
+                                      environments=lab_envs))
     # A skill's declared environment (SKILL.md ``image:``) — only when the executor can run images
     # on HPC3, so a local run's roster stays honest.
-    env_tool = make_run_in_environment_tool(code_executor)
+    env_tool = make_run_in_environment_tool(code_executor, environments=lab_envs)
     if env_tool is not None:
         catalog.append(env_tool)
     if importlib.util.find_spec("scanpy") is not None:

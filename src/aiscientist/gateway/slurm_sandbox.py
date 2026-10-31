@@ -199,11 +199,13 @@ class SlurmCodeExecutor:
             return {"status": "error", "error": "no command provided"}
         if self.remote is None:
             return {"status": "not_enabled", "note": "needs a live HPC3 session"}
-        if not self.images_dir or not self.work_dir:
+        if (image and not self.images_dir) or not self.work_dir:
             return {"status": "not_enabled",
                     "note": "no shared containers directory / work dir is configured for HPC3"}
         try:
-            sif = self._image(image)
+            # No image: run_code's own image, with the lab environments the call binds
+            # (hpc.environments.using) mounted read-only and first on PATH.
+            sif = self._image(image) if image else self.container_image
             wd = f"{str(self.work_dir).rstrip('/')}/{workdir.strip('/')}"
             made = self.remote.exec(f"mkdir -p {shlex_quote(wd)}/.skill {shlex_quote(wd)}/.home "
                                     f"{shlex_quote(wd)}/.tmp")
@@ -228,8 +230,15 @@ class SlurmCodeExecutor:
             return {"status": "error", "error": f"Slurm job failed: {exc}", "returncode": None,
                     "stdout": "", "stderr": str(getattr(exc, "detail", "") or "")}
         out["execution_mode"] = "hpc_slurm_image"
-        out["environment"] = {"image": image, "sif": sif, "workdir": wd}
+        out["environment"] = {"image": image or "run_code's image", "sif": sif, "workdir": wd}
         return out
+
+    def run_command(self, command: str, *, workdir: str, cpus: int = 0, mem_gb: int = 0,
+                    time_limit: str = "") -> dict[str, object]:
+        """Run a SHELL ``command`` in run_code's own image as a Slurm job (``run_in_image`` with no
+        image): for a lab environment's programs that need a batch job's CPUs, memory and time."""
+        return self.run_in_image(command, "", workdir=workdir, cpus=cpus, mem_gb=mem_gb,
+                                 time_limit=time_limit)
 
     def _image(self, ref: str) -> str:
         if ref not in self._images:
@@ -377,13 +386,24 @@ class SlurmCodeExecutor:
         enter = f"cd {shlex_quote(cwd)}; " if cwd else ""
         if secret_file:
             enter = f". {shlex_quote(secret_file)}; " + enter
-        inner_payload = (f"{preamble}{exports}; {enter}{runner} {snippet} > {out_f} 2> {err_f}; "
+        # Lab environments this call binds (request_environment; hpc.environments.using): read-only,
+        # their bin/ first on PATH. The runner is resolved BEFORE that, so a snippet still runs on the
+        # image's Python even when an environment brings its own.
+        from ..hpc.environments import ACTIVE, activation
+        envs = tuple(e for e in ACTIVE.get() if e.kind != "image")
+        env_paths = tuple(e.path for e in envs)
+        run_cmd = runner
+        if env_paths:
+            enter = activation(env_paths) + enter
+            run_cmd = '"$_aisci_runner"'
+            preamble = f'_aisci_runner="$(command -v {runner})"; ' + preamble
+        inner_payload = (f"{preamble}{exports}; {enter}{run_cmd} {snippet} > {out_f} 2> {err_f}; "
                          f"echo $? > {rc_f}")
         root = (self.dataset_root or "").rstrip("/")
         inside_root = bool(root and self.dataset_path
                            and str(self.dataset_path).startswith(root + "/"))
         binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
-                                     *self._input_binds())
+                                     *self._input_binds(), *env_paths)
                          if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch) if p)
         from ..agents.skills_registry import POLICY, network_allowed
@@ -427,6 +447,8 @@ class SlurmCodeExecutor:
             self.job_store.mark(result.job_id, state=result.state, node=result.node,
                                 completed=result.completed)
         out = self._collect(result, out_f, err_f, rc_f, mem_gb=mem_gb)
+        if envs:
+            out["environments"] = [e.id for e in envs]
         written = self._written_since(before_files)
         self._sync_artifacts_back(changed=written)
         out.update(classify_written(written))

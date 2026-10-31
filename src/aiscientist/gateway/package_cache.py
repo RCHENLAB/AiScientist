@@ -207,7 +207,9 @@ class SharedPackageCache:
             raise PackageCacheError(
                 f"'{req}' is not a plain package requirement. Only PyPI names with an optional "
                 "version are accepted (e.g. 'pyranges' or 'scikit-bio==0.6.0') — not URLs, paths, "
-                "or pip flags, because this installs onto a path the whole lab imports from.")
+                "or pip flags, because this installs onto a path the whole lab imports from. A package "
+                "only on GitHub goes into a lab environment instead: request_environment with "
+                "pip ['git+https://github.com/<owner>/<repo>@<tag or commit>'], when that tool is offered.")
 
         slug = normalize_slug(req)
         module = (import_name or "").strip() or top_level_name(req)
@@ -267,7 +269,8 @@ class SharedPackageCache:
             shell._worker(f"rm -rf {shlex.quote(staging)}", 120)
             raise PackageCacheError(
                 f"pip could not install '{req}': "
-                f"{_tail(getattr(res, 'stderr', '') or getattr(res, 'stdout', ''))}")
+                f"{_tail(getattr(res, 'stderr', '') or getattr(res, 'stdout', ''))} If it is not on PyPI "
+                "(a conda-only or GitHub-only package), ask for a lab environment with request_environment.")
 
         # Drop pip's scratch before anything looks at the tree: it is not part of the package,
         # and leaving it would put a `.tmp` directory on the published import path.

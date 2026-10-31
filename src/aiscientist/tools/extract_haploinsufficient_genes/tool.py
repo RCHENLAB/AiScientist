@@ -176,6 +176,155 @@ KEYWORD_REQUEST = ("every passage that states a dosage mechanism in words: haplo
                    "dosage sensitivity, one functional copy or allele, loss of one copy, half the normal amount")
 
 
+# ---------------------------------------------------------------------------------------------
+# A scan for any property: the task spec
+# ---------------------------------------------------------------------------------------------
+#
+# Everything above that names haploinsufficiency is the built-in rules, used when a call passes no
+# ``spec``. A spec is the same rules for another property, written by a model from the user's
+# one-line question (``SPEC_SYSTEM``, checked by ``parse_spec``): its definition and rules become
+# the reading prompt, its requests and exact terms drive round one, and its terms are read in full
+# (``SPEC_TERM_CAP``), as the built-in rules read every chunk their dosage wording matches.
+# Retrieval, the pilot, the quote check, HGNC and the tables are the same code for every spec.
+
+SPEC_SYSTEM = """You are planning a whole-corpus curation over the lab's RetiGene corpus: about 1,700 full-text research papers on inherited retinal disease, split into about 40,000 passages.
+
+How the curation runs once you have written the spec:
+1. Retrieval. Each of your search requests is embedded (PubMedBERT) and takes its 50 nearest passages. Every passage that contains one of your exact terms is added too, but only for a term that occurs in at most 1% of the passages (a common term would add thousands).
+2. Reading. A language model reads each retrieved passage once, with your definition and rules, and for every gene a sentence talks about it assigns one of your classes, says whether the statement is explicit or hedged, negated or not, and within your scope or not, and copies the sentence verbatim.
+3. Second round. For each gene read as your target class, one more request is written and searched among the passages that name that gene, and those passages are read as well.
+4. The table. A gene is listed when at least one sentence states your target class for it explicitly, not negated, within scope, with the quote found in the paper.
+
+Write the spec as ONE JSON object with exactly these fields:
+- "target": a short name for what is collected (a few words).
+- "definition": 2-4 sentences that say exactly what a sentence must state for a gene to count, precise enough that two curators reading the same sentence would agree.
+- "counts_when": 2-6 rules: what a sentence must contain to count.
+- "does_not_count": 3-8 rules: near misses that look similar but must not count.
+- "classes": 4-7 snake_case labels the reader assigns to each gene and sentence: the target class first, then the near-miss classes, then "other" and "not_relevant".
+- "scope": one sentence: which diseases or phenotypes, and which kinds of evidence, count.
+- "requests": exactly 16 search requests. Each is one full sentence written the way a paper would state a qualifying finding, each from a different angle (the wording authors use for it, the kinds of variants or alleles involved, the kinds of evidence, the phenotypes). Name no specific gene: the genes must come from the papers.
+- "terms": at most 12 exact words or short phrases (1-4 words) that a qualifying sentence would contain, with their usual variants (noun and adjective forms, hyphenated and spaced spellings). Leave out words that also fill thousands of passages that do not qualify, such as gene and disease names or variant types on their own.
+
+Return ONLY the JSON object."""
+
+SPEC_FIELDS = ("target", "definition", "counts_when", "does_not_count", "classes", "scope", "requests", "terms")
+# A spec's own terms are read in full: they play the part of the built-in dosage wording, whose
+# chunks are all read. The built-in cap (max_term_passages, 300, rarest first) is for the model's
+# extra words; on a spec it dropped "haploinsufficiency" itself (332 of the 39,563 RetiGene
+# chunks, rarest words first), and with it most of the genes the corpus states explicitly.
+SPEC_TERM_CAP = 2000
+_SPEC_LIST_FIELDS = ("counts_when", "does_not_count", "classes", "requests", "terms")
+
+
+def parse_spec(spec: Any) -> dict[str, Any]:
+    """A drafted spec (a dict, or a model reply holding one) checked and normalised. Raises
+    ValueError naming what is wrong, so a draft that cannot drive a scan is never run."""
+    data = spec if isinstance(spec, dict) else _json_object(str(spec or ""))
+    if not isinstance(data, dict):
+        raise ValueError("the spec is not a JSON object")
+    missing = [f for f in SPEC_FIELDS if f not in data]
+    if missing:
+        raise ValueError(f"the spec has no {', '.join(missing)}")
+    out: dict[str, Any] = {f: data[f] for f in SPEC_FIELDS}
+    for f in ("target", "definition", "scope"):
+        if not isinstance(out[f], str) or not out[f].strip():
+            raise ValueError(f"the spec's {f} is empty")
+        out[f] = " ".join(out[f].split())
+    for f in _SPEC_LIST_FIELDS:
+        if not isinstance(out[f], list) or not all(isinstance(x, str) for x in out[f]):
+            raise ValueError(f"the spec's {f} is not a list of strings")
+        out[f] = [" ".join(x.split()) for x in out[f] if x.strip()]
+    classes: list[str] = []
+    for c in out["classes"]:
+        c = re.sub(r"[^a-z0-9_]+", "_", c.lower()).strip("_")
+        if c and c not in classes:
+            classes.append(c)
+    for c in ("other", "not_relevant"):
+        if c not in classes:
+            classes.append(c)
+    if len(classes) < 3:
+        raise ValueError("the spec names no target class")
+    out["classes"] = classes
+    out["requests"] = [r for r in out["requests"] if 4 <= len(r.split()) and len(r) <= 400][:16]
+    out["terms"] = [t for t in out["terms"] if 0 < len(t.split()) <= 4][:12]
+    if len(out["requests"]) < 4:
+        raise ValueError(f"the spec has {len(out['requests'])} usable search requests (at least 4)")
+    if not out["counts_when"] or not out["does_not_count"]:
+        raise ValueError("the spec needs rules for what counts and what does not")
+    return out
+
+
+def _bullets(xs: Iterable[str]) -> str:
+    return "\n".join(f"- {x}" for x in xs)
+
+
+def spec_judge_system(spec: dict[str, Any]) -> str:
+    """The reading prompt for a spec: the built-in prompt's task and output, the spec's definition."""
+    classes = " | ".join(f'"{c}"' for c in spec["classes"])
+    return f"""You are a careful curator of inherited retinal disease (IRD) genetics. You judge ONLY from the text given. Never use prior knowledge about any gene.
+
+TARGET: {spec["target"]}
+DEFINITION. {spec["definition"]}
+IT COUNTS WHEN:
+{_bullets(spec["counts_when"])}
+IT DOES NOT COUNT:
+{_bullets(spec["does_not_count"])}
+SCOPE. {spec["scope"]}
+
+TASK. The PASSAGE is a run of numbered sentences from one paper. Give one item for each gene and sentence where the sentence says something about that gene that bears on the definition, including the near misses, and classify it with one of the classes. A sentence that only says a gene is mutated in, associated with or causes a disease, with nothing that bears on the definition, gets no item. The gene symbol must appear in the PASSAGE; otherwise gene=null. If a sentence is a reference-list entry or a cited paper title rather than a statement by the authors, its class is "not_relevant".
+
+Return ONLY JSON: {{"items":[{{"gene": HGNC symbol as written in the text (null if no symbol appears in the PASSAGE),
+ "class": one of {classes},
+ "explicit": true if the text asserts it for this gene; false if hedged (may, might, suggests, possibly, could, consistent with, likely),
+ "negated": true if the text says it is NOT so, or unlikely, for this gene,
+ "in_scope": true ONLY if the phenotype and the evidence fit the SCOPE above,
+ "phenotype": disease name as written in the text or null,
+ "sentence": the number of the sentence the quote is,
+ "quote": that ONE complete sentence copied VERBATIM, character for character, from the PASSAGE. Never paraphrase, never shorten, never merge sentences.}}]}}
+If nothing in the passage bears on the definition, return {{"items":[]}}."""
+
+
+def spec_gene_requests_system(spec: dict[str, Any]) -> str:
+    return ("You are writing search requests for an embedding index of full-text papers on inherited retinal "
+            "disease. A first search found passages that state or suggest the following for the genes listed "
+            f"below, each with the phenotype the passages gave: {spec['target']} ({spec['definition']}) For "
+            "EACH gene write ONE full sentence that would find the other passages that state it for that gene: "
+            "name the gene, its phenotype, and the wording such a statement uses. Use only the gene symbols and "
+            "phenotypes given; add no other gene.\n\n"
+            'Return ONLY JSON: {"requests": {"GENE": "sentence", "...": "..."}}')
+
+
+def spec_gene_request_template(spec: dict[str, Any]) -> str:
+    """Round two's fallback request for a spec (``str.format`` with ``gene`` and ``phenotype``)."""
+    target = spec["target"].replace("{", "(").replace("}", ")")
+    return "{gene} in {phenotype}: a statement of " + target + " for {gene}."
+
+
+def spec_items(items: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """A spec reading's items in the scan's own fields: ``class`` is ``mechanism_class`` and
+    ``in_scope`` is ``human_retinal`` (hits.csv keeps its columns for every spec)."""
+    if items is None:
+        return None
+    out = []
+    for it in items:
+        it = dict(it)
+        it["mechanism_class"] = str(it.get("class") or it.get("mechanism_class") or "").strip().lower() or "other"
+        if "human_retinal" not in it:
+            it["human_retinal"] = bool(it.get("in_scope"))
+        out.append(it)
+    return out
+
+
+def spec_folder(spec: dict[str, Any]) -> str:
+    """Where a spec scan writes under ``work/`` and ``artifacts/``: one folder per spec."""
+    return "curation_" + spec_digest(spec)[:10]
+
+
+def spec_digest(spec: dict[str, Any]) -> str:
+    import hashlib  # noqa: PLC0415
+    return hashlib.sha256(json.dumps({f: spec[f] for f in SPEC_FIELDS}, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 @dataclass
 class Sentence:
     sid: str          # "<pmid>:<chunk>:<sent>"
@@ -417,9 +566,9 @@ def parse_requests(text: str, n: int) -> list[str] | None:
     return out[:n] if len(out) >= min(3, n) else None
 
 
-def gene_request_messages(genes: dict[str, list[str]]) -> list[dict[str, str]]:
+def gene_request_messages(genes: dict[str, list[str]], system: str | None = None) -> list[dict[str, str]]:
     lines = [f"{g} — {'; '.join(ph[:3]) if ph else 'phenotype not given'}" for g, ph in genes.items()]
-    return [{"role": "system", "content": GENE_REQUESTS_SYSTEM}, {"role": "user", "content": "\n".join(lines)}]
+    return [{"role": "system", "content": system or GENE_REQUESTS_SYSTEM}, {"role": "user", "content": "\n".join(lines)}]
 
 
 def parse_gene_requests(text: str, genes: Iterable[str]) -> dict[str, str] | None:
@@ -505,10 +654,10 @@ def locate(found: dict[int, list[str]], chunks: list[dict[str, Any]],
     return out
 
 
-def passage_prompt(p: Passage) -> list[dict[str, str]]:
+def passage_prompt(p: Passage, system: str | None = None) -> list[dict[str, str]]:
     lines = [f"PAPER: PMID {p.pmid}, page {p.page}", "PASSAGE:"]
     lines += [f"[{k + 1}] {s.text}" for k, s in enumerate(p.sentences)]
-    return [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": "\n".join(lines)}]
+    return [{"role": "system", "content": system or JUDGE_SYSTEM}, {"role": "user", "content": "\n".join(lines)}]
 
 
 def parse_items(text: str) -> list[dict[str, Any]] | None:
@@ -676,13 +825,19 @@ def _ask(fn: Callable[[list[dict[str, str]]], str], messages: list[dict[str, str
 def judge_passages(passages: list[Passage], judge_fn: Callable[[list[dict[str, str]]], str],
                    out_path: Path, concurrency: int = 16, log: Callable[[str], None] = lambda s: None,
                    should_stop: Callable[[], bool] | None = None, attempts: int = 3,
-                   dead_after: int | None = None) -> tuple[dict[str, Judgment], str]:
+                   dead_after: int | None = None, system: str | None = None,
+                   parse: Callable[[str], list[dict[str, Any]] | None] | None = None,
+                   ) -> tuple[dict[str, Judgment], str]:
     """Read every passage not already read in ``out_path``. Each line keeps the model's whole reply
     (``raw``): a line whose reply did not parse is parsed again first, so a parser fix costs no
     model call, and only a line with no usable reply is sent again. Returns ``(judgments,
     unreachable)``: the second is empty normally, else the error that made the pass give the
-    endpoint up for dead."""
+    endpoint up for dead. ``system`` and ``parse`` are a spec's reading prompt and item reader
+    (default: the built-in rules')."""
     dead_after = dead_after or _DEAD_AFTER
+    if parse is None:
+        def parse(text: str) -> list[dict[str, Any]] | None:
+            return parse_items(text)
     done: dict[str, Judgment] = {}
     if out_path.exists():
         with out_path.open(encoding="utf-8") as fh:
@@ -693,7 +848,7 @@ def judge_passages(passages: list[Passage], judge_fn: Callable[[list[dict[str, s
                     continue
                 items = d.get("items")
                 if items is None and d.get("raw"):
-                    items = parse_items(str(d["raw"]))
+                    items = parse(str(d["raw"]))
                 if items is not None:
                     done[d["sid"]] = Judgment(d["sid"], items, raw=str(d.get("raw") or ""))
     todo = [p for p in passages if p.sid not in done]
@@ -714,8 +869,8 @@ def judge_passages(passages: list[Passage], judge_fn: Callable[[list[dict[str, s
             if should_stop and should_stop():
                 return Judgment(p.sid, None, "stopped")
             try:
-                raw = judge_fn(passage_prompt(p))
-                items = parse_items(raw)
+                raw = judge_fn(passage_prompt(p, system))
+                items = parse(raw)
                 with lock:
                     streak = 0
                 if items is not None:
@@ -813,7 +968,7 @@ _SYMBOL_LIKE = re.compile(r"(?=[A-Za-z0-9-]*[A-Z])[A-Za-z0-9-]{2,15}")
 
 
 def round_two_genes(passages: list[Passage], judgments: dict[str, Judgment], hgnc: "Hgnc",
-                    ) -> dict[str, dict[str, Any]]:
+                    target: str = "haploinsufficiency") -> dict[str, dict[str, Any]]:
     """The genes round one read as haploinsufficient (not negated; hedged and non-retinal included,
     since another paper may state them plainly) whose symbol HGNC knows, or every symbol-like one
     without an HGNC table: ``symbol -> {"terms": symbols to search for, "phenotypes": as written}``,
@@ -822,7 +977,7 @@ def round_two_genes(passages: list[Passage], judgments: dict[str, Judgment], hgn
     for p in passages:
         j = judgments.get(p.sid)
         for it in (j.items if j and j.items else []):
-            if it.get("mechanism_class") != "haploinsufficiency" or it.get("negated"):
+            if it.get("mechanism_class") != target or it.get("negated"):
                 continue
             written = re.sub(r"[^A-Za-z0-9-]", "", str(it.get("gene") or ""))
             sym, status = hgnc.norm(it.get("gene"))
@@ -921,9 +1076,10 @@ GENE_COLUMNS = ("gene", "phenotype", "mechanism_statement", "n_papers", "n_hits"
                 "flag_garbled", "pmid_1", "quote_1", "pmid_2", "quote_2", "pmid_3", "quote_3")
 
 
-def eligible(h: dict[str, Any]) -> bool:
-    """genes.csv's entry condition = the hard requirements of the brief; everything else is a flag."""
-    return bool(h["mechanism_class"] == "haploinsufficiency" and h["explicit"] and not h["negated"]
+def eligible(h: dict[str, Any], target: str = "haploinsufficiency") -> bool:
+    """genes.csv's entry condition = the hard requirements of the brief; everything else is a flag.
+    ``target``: a spec's target class (``human_retinal`` then holds the spec's in-scope)."""
+    return bool(h["mechanism_class"] == target and h["explicit"] and not h["negated"]
                 and h["human_retinal"] and h["quote_verified"] and h["gene"] and h["gene_status"] != "missing")
 
 
@@ -932,9 +1088,18 @@ def _word(gw: str, text: str) -> bool:
 
 
 def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags: dict[str, dict[str, Any]],
-              hgnc: Hgnc, titles: Iterable[str], max_quotes: int = 3,
+              hgnc: Hgnc, titles: Iterable[str], max_quotes: int = 3, *, spec: dict[str, Any] | None = None,
               ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """``(gene rows, hit rows)`` from the raw judgments."""
+    """``(gene rows, hit rows)`` from the raw judgments. With a ``spec``: its target class is listed,
+    its near-miss classes are the conflicting ones, the statement is the spec term the quote holds,
+    and there is no dominance flag (that one belongs to haploinsufficiency)."""
+    target = spec["classes"][0] if spec else "haploinsufficiency"
+    near = tuple(c for c in spec["classes"][1:] if c not in ("other", "not_relevant")) if spec \
+        else ("dominant_negative", "gain_of_function")
+    statement = MECH if spec is None else (
+        re.compile("|".join(re.escape(t) for t in sorted(spec["terms"], key=len, reverse=True)), re.I)
+        if spec["terms"] else None)
+    prefer = "haploinsuffic" if spec is None else (spec["terms"][0].lower() if spec["terms"] else "")
     is_cite = make_is_cite(titles)
     hits: list[dict[str, Any]] = []
     for sid, j in judgments.items():
@@ -947,7 +1112,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
             q = str(it.get("quote") or "")
             gene, gstat = hgnc.norm(it.get("gene"))
             gw = str(it.get("gene") or "").strip()
-            m = MECH.search(fold(q)) or MECH.search(fold(s.text))
+            m = (statement.search(fold(q)) or statement.search(fold(s.text))) if statement else None
             h = {"pmid": s.pmid, "page": s.page, "gene": gene, "gene_as_written": gw, "gene_status": gstat,
                  "gene_in_quote": _word(gw, q), "gene_in_context": _word(gw, ctx),
                  "mechanism_class": it.get("mechanism_class"), "explicit": bool(it.get("explicit")),
@@ -955,9 +1120,9 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
                  "phenotype": it.get("phenotype"), "mechanism_statement": m.group(0).strip() if m else "",
                  "quote": q, "quote_verified": bool(q) and nz(q) in nz(ctx),
                  "cite_like": bool(fl.get("cite_like")) or is_cite(q, s.prev, s.next) or is_cite(s.text, s.prev, s.next),
-                 "dominance_marker": bool(DOM.search(fold(q + " " + ctx))), "garbled": bool(fl.get("garbled")),
-                 "sentence_id": sid}
-            h["eligible"] = eligible(h)
+                 "dominance_marker": bool(DOM.search(fold(q + " " + ctx))) if spec is None else True,
+                 "garbled": bool(fl.get("garbled")), "sentence_id": sid}
+            h["eligible"] = eligible(h, target)
             hits.append(h)
 
     by_gene: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
@@ -967,17 +1132,17 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
     other: dict[str, set[str]] = collections.defaultdict(set)
     hedged: collections.Counter[str] = collections.Counter()
     for h in hits:
-        if h["gene"] and h["mechanism_class"] in ("dominant_negative", "gain_of_function") and h["explicit"] \
-                and not h["negated"]:
+        if h["gene"] and h["mechanism_class"] in near and h["explicit"] and not h["negated"]:
             other[h["gene"]].add(h["mechanism_class"])
-        if h["gene"] and h["mechanism_class"] == "haploinsufficiency" and not h["explicit"] and h["human_retinal"]:
+        if h["gene"] and h["mechanism_class"] == target and not h["explicit"] and h["human_retinal"]:
             hedged[h["gene"]] += 1
     out: list[dict[str, Any]] = []
     for g, hs in sorted(by_gene.items()):
         # Quotes: body sentences before reference entries, clean before garbled, the gene in the
-        # quote, the word "haploinsufficiency" itself, then the longer sentence.
+        # quote, the target's own word ("haploinsufficiency", or a spec's first term), then the
+        # longer sentence.
         hs = sorted(hs, key=lambda h: (h["cite_like"], h["garbled"], not h["gene_in_quote"],
-                                       "haploinsuffic" not in fold(h["quote"]).lower(), -len(h["quote"])))
+                                       prefer not in fold(h["quote"]).lower(), -len(h["quote"])))
         picked: list[dict[str, Any]] = []
         seen: set[str] = set()
         for h in hs:
@@ -990,7 +1155,7 @@ def aggregate(judgments: dict[str, Judgment], by_sid: dict[str, Sentence], flags
         phen = collections.Counter(h["phenotype"] for h in hs if h["phenotype"]).most_common(1)
         row: dict[str, Any] = {
             "gene": g, "phenotype": phen[0][0] if phen else "",
-            "mechanism_statement": picked[0]["mechanism_statement"] or "haploinsufficiency",
+            "mechanism_statement": picked[0]["mechanism_statement"] or (spec["target"] if spec else "haploinsufficiency"),
             "n_papers": len({h["pmid"] for h in hs}), "n_hits": len(hs), "hedged_hits": hedged.get(g, 0),
             "conflicting_mechanism": "|".join(sorted(other.get(g, []))),
             "flag_only_cited_titles": all(h["cite_like"] for h in hs),
@@ -1057,6 +1222,10 @@ PARAMS: dict[str, tuple[Any, str]] = {
                              "is above max_cost_usd (0 = no pilot)"),
     "max_cost_usd": (0.0, "stop before the full pass when the pilot projects a model cost above this, in USD "
                           "(0 = no cap; only a model the gateway calls for the scan has a price)"),
+    "check_unread": (None, "1 = after round two, read the chunks that hold a usable term (the spec's terms or "
+                           "the model's words) but were not read, up to max_unread_passages; 0 = only count "
+                           "them; unset = on for a spec, off for the built-in rules"),
+    "max_unread_passages": (600, "at most this many unread chunks the check reads"),
 }
 # Pilot size bounds: 1% of 857 passages is 9; a small scan still gets 5, a huge one at most 25.
 _PILOT_MIN, _PILOT_MAX = 5, 25
@@ -1066,10 +1235,20 @@ REQUEST_COLUMNS = ("id", "round", "gene", "request", "n_passages")
 def _schema() -> dict[str, Any]:
     props: dict[str, Any] = {}
     for name, (default, meaning) in PARAMS.items():
-        props[name] = {"type": "number" if isinstance(default, float) else "integer", "default": default,
-                       "description": meaning}
+        props[name] = {"type": "number" if isinstance(default, float) else "integer", "description": meaning}
+        if default is not None:
+            props[name]["default"] = default
     props["pmids"] = {"type": "array", "items": {"type": "string"},
                       "description": "restrict the scan to these PMIDs (empty = the whole corpus)"}
+    props["spec"] = {
+        "type": "object",
+        "description": ("a task spec for another property than haploinsufficiency, drafted from the user's question "
+                        "(fields: " + ", ".join(SPEC_FIELDS) + "; see TOOL.md). Its definition and rules are the "
+                        "reading prompt, its requests and terms drive round one and its terms are read in full. "
+                        "Omit it for the built-in haploinsufficiency rules"),
+        "properties": {f: ({"type": "array", "items": {"type": "string"}} if f in _SPEC_LIST_FIELDS
+                           else {"type": "string"}) for f in SPEC_FIELDS},
+        "required": list(SPEC_FIELDS)}
     return {"type": "object", "properties": props}
 
 
@@ -1106,6 +1285,17 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     if not ws:
         return {"status": "error", "step": "literature", "error": f"{_TOOL} needs a run workspace"}
     ws = Path(ws)
+    # A spec (another property, drafted from the user's question) or the built-in rules.
+    spec: dict[str, Any] | None = None
+    if args.get("spec"):
+        try:
+            spec = parse_spec(args["spec"])
+        except ValueError as exc:
+            return {"status": "error", "step": "literature", "error": f"The task spec cannot drive a scan: {exc}"}
+    out_subdir = spec_folder(spec) if spec else _OUT_SUBDIR
+    target = spec["classes"][0] if spec else "haploinsufficiency"
+    read_system = spec_judge_system(spec) if spec else None
+    read_parse = (lambda text: spec_items(parse_items(text))) if spec else None
     paths = _corpus_paths(ctx, work_subdir=_OUT_SUBDIR)
     if paths is None:
         return {"status": "not_enabled", "step": "literature",
@@ -1130,8 +1320,8 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         write_fn = openai_judge_fn(base, model, max_tokens=2500)
         log(f"model {model} at {base}")
 
-    work = ws / "work" / _OUT_SUBDIR
-    art = ws / "artifacts" / _OUT_SUBDIR
+    work = ws / "work" / out_subdir
+    art = ws / "artifacts" / out_subdir
     work.mkdir(parents=True, exist_ok=True)
     genes_csv, hits_csv, requests_csv = art / "genes.csv", art / "hits.csv", art / "requests.csv"
     pmids = {str(p) for p in (args.get("pmids") or []) if str(p).strip()} or None
@@ -1209,6 +1399,11 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
 
     # Round one: the model writes the requests; each takes its nearest chunks of the whole corpus.
     requests = stored.get("round1")
+    if spec:
+        requests = list(spec["requests"])
+        if stored.get("round1") != requests:
+            stored["round1"] = requests
+            _save_json(store_path, stored)
     if not (isinstance(requests, list) and requests):
         requests, err, unreachable = _ask(write_fn, request_messages(n_req), lambda t: parse_requests(t, n_req))
         if requests is None:
@@ -1227,7 +1422,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         for i in got:
             found.setdefault(i, []).append(f"R{r + 1}")
     keyword_only = 0
-    if int(_p("keyword_round", args)):
+    if spec is None and int(_p("keyword_round", args)):
         worded = keyword_chunks(chunks, index)
         hits_per_request["K"] = len(worded)
         for i in worded:
@@ -1239,8 +1434,11 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     # does not have. Only the passages nothing else found are added.
     term_rows: list[Term] = []
     term_only = 0
+    term_cap = args.get("max_term_passages")
+    term_cap = max(0, int(term_cap if term_cap is not None
+                          else SPEC_TERM_CAP if spec else PARAMS["max_term_passages"][0]))
     if int(_p("term_round", args)):
-        raw_terms = stored.get("terms")
+        raw_terms = list(spec["terms"]) if spec else stored.get("terms")
         if not isinstance(raw_terms, list):
             raw_terms, err, unreachable = _ask(write_fn, terms_messages(), parse_model_terms)
             if raw_terms is None:
@@ -1251,14 +1449,13 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
                 raw_terms = []
             stored["terms"] = raw_terms
             _save_json(store_path, stored)
-        term_rows, by_terms = model_term_chunks(raw_terms, index, max(0, int(_p("max_term_passages", args))),
-                                                already=found)
+        term_rows, by_terms = model_term_chunks(raw_terms, index, term_cap, already=found)
         hits_per_request["T"] = len(by_terms)
         for i in sorted(by_terms):
             term_only += i not in found
             found.setdefault(i, []).append("T")
-        log(f"round one: the model's {len(raw_terms)} words, {sum(t.use == 'filter' for t in term_rows)} "
-            f"used, add {term_only} passages")
+        log(f"round one: the {'spec' if spec else 'model'}'s {len(raw_terms)} words, "
+            f"{sum(t.use == 'filter' for t in term_rows)} used, add {term_only} passages")
     passages = locate(found, chunks, sents_by_chunk)
     if max_p > 0:
         passages = passages[:max_p]
@@ -1271,7 +1468,8 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
     pilot_info: dict[str, Any] | None = None
     if pilot:
         before = meter.public()
-        judgments, unreachable = judge_passages(pilot, judge_fn, judgments_path, concurrency, log, should_stop)
+        judgments, unreachable = judge_passages(pilot, judge_fn, judgments_path, concurrency, log, should_stop,
+                                            system=read_system, parse=read_parse)
         if unreachable:
             return gone(unreachable, passages, judgments)
         bad = [p for p in pilot if not (judgments.get(p.sid) and judgments[p.sid].items is not None)]
@@ -1303,19 +1501,21 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
                     **counts(passages, judgments), "pilot": pilot_info,
                     "api_usage": meter.public(), "warnings": warnings}
 
-    judgments, unreachable = judge_passages(passages, judge_fn, judgments_path, concurrency, log, should_stop)
+    judgments, unreachable = judge_passages(passages, judge_fn, judgments_path, concurrency, log, should_stop,
+                                            system=read_system, parse=read_parse)
     if unreachable:
         return gone(unreachable, passages, judgments)
 
     # Round two: one request per gene round one read as haploinsufficient, searched only among the
     # chunks that name the gene; the passages not read yet are read.
-    genes2 = round_two_genes(passages, judgments, hgnc) if k2 else {}
+    genes2 = round_two_genes(passages, judgments, hgnc, target) if k2 else {}
     gene_requests: dict[str, str] = dict(stored.get("round2") or {})
     todo = [g for g in genes2 if g not in gene_requests]
     templated = 0
     for b in range(0, len(todo), _GENE_BATCH):
         batch = {g: genes2[g]["phenotypes"] for g in todo[b:b + _GENE_BATCH]}
-        got, err, unreachable = _ask(write_fn, gene_request_messages(batch),
+        got, err, unreachable = _ask(write_fn, gene_request_messages(
+                                         batch, spec_gene_requests_system(spec) if spec else None),
                                      lambda t, gs=list(batch): parse_gene_requests(t, gs))
         if got is None and unreachable:
             stored["round2"] = gene_requests
@@ -1325,7 +1525,8 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
             if got and g in got:
                 gene_requests[g] = got[g]
             else:
-                gene_requests[g] = GENE_REQUEST_TEMPLATE.format(gene=g, phenotype=ph[0] if ph else "retinal disease")
+                template = spec_gene_request_template(spec) if spec else GENE_REQUEST_TEMPLATE
+                gene_requests[g] = template.format(gene=g, phenotype=ph[0] if ph else "retinal disease")
                 templated += 1
     if todo:
         stored["round2"] = gene_requests
@@ -1354,10 +1555,40 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         passages2 = passages2[:max(0, max_p - len(passages))]
     if passages2:
         log(f"round two: {len(genes2)} gene requests, {len(passages2)} more passages")
-        judgments, unreachable = judge_passages(passages2, judge_fn, judgments_path, concurrency, log, should_stop)
+        judgments, unreachable = judge_passages(passages2, judge_fn, judgments_path, concurrency, log, should_stop,
+                                            system=read_system, parse=read_parse)
         if unreachable:
             return gone(unreachable, passages + passages2, judgments)
     passages_all = passages + passages2
+
+    # The check: chunks that hold a usable term (one in at most 1% of the chunks: a spec's terms,
+    # the model's words) but that no round read, because a cap or the requests left them out.
+    # Counted always; read (up to max_unread_passages) when check_unread is on, which it is for a
+    # spec: its terms are what defines the property, and a chunk that says one is a candidate.
+    check = _p("check_unread", args)
+    check = (spec is not None) if check is None else bool(int(check))
+    read_keys = {(p.pmid, p.chunk) for p in passages_all}
+    core: set[int] = set()
+    for t in term_rows:
+        if t.use in ("filter", "over_cap"):
+            core |= set(index.counts(t))
+    unread = sorted(i for i in core if (str(chunks[i]["pmid"]), int(chunks[i]["chunk"])) not in read_keys)
+    passages3: list[Passage] = []
+    if check and unread and max_p <= 0:
+        passages3 = locate({i: ["U"] for i in unread[:max(0, int(_p("max_unread_passages", args)))]},
+                           chunks, sents_by_chunk)
+        if passages3:
+            log(f"check: {len(unread)} chunks hold a usable term but were not read; reading {len(passages3)}")
+            hits_per_request["U"] = len(passages3)
+            judgments, unreachable = judge_passages(passages3, judge_fn, judgments_path, concurrency, log,
+                                                    should_stop, system=read_system, parse=read_parse)
+            if unreachable:
+                return gone(unreachable, passages_all + passages3, judgments)
+    passages_all = passages_all + passages3
+    unread_left = len(unread) - len(passages3)
+    if unread_left > 0:
+        warnings.append(f"{unread_left} chunks hold a usable term but were not read"
+                        + ("" if check else " (check_unread is off)") + ".")
 
     # Verify and aggregate.
     c = counts(passages_all, judgments)
@@ -1370,7 +1601,7 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
                 "error": "None of the retrieved passages could be read (every model call failed). "
                          "Check the model and rerun.", **c, "warnings": warnings}
     by_sent, by_sid, flags = sentence_judgments(passages_all, judgments)
-    genes, hits = aggregate(by_sent, by_sid, flags, hgnc, titles, int(_p("max_quotes_per_gene", args)))
+    genes, hits = aggregate(by_sent, by_sid, flags, hgnc, titles, int(_p("max_quotes_per_gene", args)), spec=spec)
     found_by = {p.sid: "|".join(p.found_by) for p in passages_all}
     for h in hits:
         h["found_by"] = found_by.get(str(h["sentence_id"]).rsplit(":", 1)[0], "")
@@ -1384,8 +1615,11 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
                          "n_passages": hits_per_request["K"]})
     if "T" in hits_per_request:
         req_rows.append({"id": "T", "round": 1, "gene": "", "n_passages": hits_per_request["T"],
-                         "request": "the model's words: " + "; ".join(
+                         "request": ("the spec's terms: " if spec else "the model's words: ") + "; ".join(
                              f"{t.text} ({t.n_passages}, {t.use})" for t in term_rows)})
+    if "U" in hits_per_request:
+        req_rows.append({"id": "U", "round": 3, "gene": "", "n_passages": hits_per_request["U"],
+                         "request": "the check: chunks holding a usable term that no round had read"})
     req_rows += [{"id": f"G:{g}", "round": 2, "gene": g, "request": gene_requests[g],
                   "n_passages": hits_per_request.get(f"G:{g}", 0)} for g in genes2]
     write_csv(requests_csv, req_rows, REQUEST_COLUMNS)
@@ -1406,7 +1640,10 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
         "requests": list(requests),
         "files": {"genes_csv": str(genes_csv.relative_to(ws)), "hits_csv": str(hits_csv.relative_to(ws)),
                   "requests_csv": str(requests_csv.relative_to(ws))},
-        "definition": DEFINITION,
+        "definition": spec["definition"] if spec else DEFINITION,
+        **({"spec": {"target": spec["target"], "classes": spec["classes"], "scope": spec["scope"],
+                     "terms": spec["terms"], "folder": out_subdir, "rules": rules_digest(spec)}} if spec else {}),
+        "unread_check": {"on": check, "found": len(unread), "read": len(passages3), "left": unread_left},
         "pilot": pilot_info,
         **({"api_usage": meter.public()} if meter.calls else {}),
         "warnings": warnings,
@@ -1425,10 +1662,12 @@ def run_extract(args: dict[str, Any], ctx: Any, *, judge_fn: Callable[[list[dict
 RULES_REVISION = 4
 
 
-def rules_digest() -> str:
+def rules_digest(spec: dict[str, Any] | None = None) -> str:
     """A fingerprint of everything that decides the scan's tables besides the corpus and the model:
     the definition, the model's instructions, the retrieval settings and the table columns. A stored
-    scan whose digest differs was made under other rules (gateway/corpus_scan.py does not reuse it)."""
+    scan whose digest differs was made under other rules (gateway/corpus_scan.py does not reuse it).
+    With a ``spec`` (checked by ``parse_spec``) the spec and the prompts built from it are added, so
+    each spec has its own digest and the built-in rules' digest is unchanged."""
     import hashlib  # noqa: PLC0415
 
     sample = Passage("p:0", "p", 0, 1, [Sentence(sid="p:0:0", pmid="p", chunk=0, sent=0, page=1, text="TEXT")])
@@ -1443,6 +1682,10 @@ def rules_digest() -> str:
                                           "max_term_passages", "k_per_gene", "max_quotes_per_gene")),
         ",".join(HIT_COLUMNS), ",".join(GENE_COLUMNS), ",".join(REQUEST_COLUMNS),
     ]
+    if spec is not None:
+        parts += ["spec", json.dumps({f: spec[f] for f in SPEC_FIELDS}, sort_keys=True), spec_judge_system(spec),
+                  spec_gene_requests_system(spec), spec_gene_request_template(spec), f"spec_term_cap={SPEC_TERM_CAP}",
+                  f"max_unread_passages={PARAMS['max_unread_passages'][0]}"]
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
 
 

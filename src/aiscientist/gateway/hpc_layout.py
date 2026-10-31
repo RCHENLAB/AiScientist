@@ -5,7 +5,8 @@ root (``AISCIENTIST_HPC_SHARED_ROOT``)::
 
     <root>/
     ├── envs/                      environments: openspliceai/, analysis-pydeps/, run-code-pkgs/,
-    │                              conda-pkgs/ (the lab's conda download cache)
+    │                              conda-pkgs/ (the lab's conda download cache), lab/ (environments
+    │                              the agent asked for, hpc/environments.py)
     ├── containers/                images
     ├── models/                    model weights
     └── sessions/<session-uuid>/   one session, removed once its results are on the server
@@ -88,6 +89,12 @@ def package_cache_root(root: str) -> str:
     """The packages ``run_code`` installs when the image lacks one, shared by the lab
     (``package_cache.py``; was ``<root>/pkgs``)."""
     return f"{envs_dir(root)}/run-code-pkgs"
+
+
+def lab_envs_dir(root: str) -> str:
+    """Environments built at the agent's request and shared by the lab, one folder per recipe
+    (``hpc/environments.py``)."""
+    return f"{envs_dir(root)}/lab"
 
 
 def conda_pkgs_dir(root: str) -> str:

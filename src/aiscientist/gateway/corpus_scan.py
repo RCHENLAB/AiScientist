@@ -208,8 +208,18 @@ class StoredScan:
     meta: dict[str, Any]
 
     @property
+    def subdir(self) -> str:
+        """The folder of its tables: the built-in rules' ``haploinsufficiency/``, or a spec's own."""
+        return _safe_subdir(self.meta.get("subdir"))
+
+    @property
     def tables(self) -> Path:
-        return self.dir / OUT_SUBDIR
+        return self.dir / self.subdir
+
+
+def _safe_subdir(name: Any) -> str:
+    name = str(name or "")
+    return name if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) and name not in (".", "..") else OUT_SUBDIR
 
 
 def load(key: str) -> "StoredScan | None":
@@ -220,25 +230,29 @@ def load(key: str) -> "StoredScan | None":
         result = json.loads((d / "result.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not (d / OUT_SUBDIR / "genes.csv").is_file() or not isinstance(result, dict):
+    meta = meta if isinstance(meta, dict) else {}
+    if not (d / _safe_subdir(meta.get("subdir")) / "genes.csv").is_file() or not isinstance(result, dict):
         return None
-    return StoredScan(key, d, result, meta if isinstance(meta, dict) else {})
+    return StoredScan(key, d, result, meta)
 
 
-def store(key: str, result: dict[str, Any], tables: Path, meta: dict[str, Any]) -> StoredScan:
+def store(key: str, result: dict[str, Any], tables: Path, meta: dict[str, Any],
+          subdir: str = OUT_SUBDIR) -> StoredScan:
     """Keep a finished scan: its result, its two tables (copied from ``tables``) and ``meta``. The
-    folder appears whole or not at all (written beside it, then renamed into place)."""
+    folder appears whole or not at all (written beside it, then renamed into place). ``subdir``: the
+    folder the tables are kept in, as the scan wrote them (a spec's scan writes its own)."""
+    subdir = _safe_subdir(subdir)
     root = cache_root()
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / f".tmp-{key}-{uuid.uuid4().hex[:8]}"
-    (tmp / OUT_SUBDIR).mkdir(parents=True)
+    (tmp / subdir).mkdir(parents=True)
     try:
         for name in TABLES:
             if (tables / name).is_file():
-                shutil.copy2(tables / name, tmp / OUT_SUBDIR / name)
+                shutil.copy2(tables / name, tmp / subdir / name)
         kept = {k: v for k, v in result.items() if k not in ("files", "execution_mode", "slurm_state")}
         (tmp / "result.json").write_text(json.dumps(kept, indent=1, default=str), encoding="utf-8")
-        meta = {**meta, "key": key, "stored_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        meta = {**meta, "key": key, "subdir": subdir, "stored_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         (tmp / "meta.json").write_text(json.dumps(meta, indent=1, default=str), encoding="utf-8")
         final = root / key
         if final.exists():
@@ -252,7 +266,7 @@ def store(key: str, result: dict[str, Any], tables: Path, meta: dict[str, Any]) 
 
 def copy_into(stored: StoredScan, artifacts: Path) -> None:
     """Put a kept scan's tables where a run's own scan would have written them."""
-    out = artifacts / OUT_SUBDIR
+    out = artifacts / stored.subdir
     out.mkdir(parents=True, exist_ok=True)
     for name in TABLES:
         if (stored.tables / name).is_file():
@@ -370,6 +384,52 @@ EVIDENCE_COLUMNS = (
 _TRUE = frozenset({"1", "true", "yes"})
 
 
+@dataclass(frozen=True)
+class Curation:
+    """What a curation collects, and where its tables go. :data:`HAPLOINSUFFICIENCY` is the scan's
+    built-in rules; :func:`curation_for` makes one from a task spec the session's model wrote (a
+    property the scan has no rules for). The tables' claims are the same words for every curation,
+    except a stated gene's: ``haploinsufficient`` for the built-in rules, ``stated`` for a spec."""
+
+    id: str                    # "haploinsufficiency", or the spec's folder (``curation_<digest>``)
+    name: str                  # what it collects, as the chat says it
+    target: str                # the class of a sentence that states it (hits.csv ``mechanism_class``)
+    stated: str                # the claim of a gene a paper states it for
+    subdir: str                # where the scan writes its own tables, under artifacts/
+    genes_file: str
+    evidence_file: str
+    prefer: str                # a word the best quote of a gene holds
+    conflicting: tuple[str, ...]   # an explicit statement of one of these is another mechanism
+    spec: "dict[str, Any] | None" = None
+
+    @property
+    def built_in(self) -> bool:
+        return self.spec is None
+
+    def claim_label(self, claim: str) -> str:
+        return self.stated if claim == SUPPORTED else claim
+
+
+HAPLOINSUFFICIENCY = Curation(
+    id="haploinsufficiency", name="haploinsufficient in retinal disease", target="haploinsufficiency",
+    stated=SUPPORTED, subdir=OUT_SUBDIR, genes_file=CURATION_GENES, evidence_file=CURATION_EVIDENCE,
+    prefer="haploinsuffic", conflicting=("dominant_negative", "gain_of_function"))
+# The curations defined in code, as the router names them (request_router.corpus_ask).
+KNOWN_CURATIONS = {HAPLOINSUFFICIENCY.id: "genes the papers report as haploinsufficient in retinal disease "
+                                         "(heterozygous loss of function, one copy not enough)"}
+
+
+def curation_for(spec: dict[str, Any], subdir: str) -> Curation:
+    """The curation a task spec (checked by the tool's ``parse_spec``) defines; ``subdir`` is the
+    folder the scan writes its tables to for that spec (the tool's ``spec_folder``)."""
+    target = str(spec["classes"][0])
+    return Curation(
+        id=subdir, name=str(spec["target"]), target=target, stated="stated", subdir=_safe_subdir(subdir),
+        genes_file=f"{target}_genes.csv", evidence_file=f"{target}_evidence.csv",
+        prefer=(str(spec["terms"][0]).lower() if spec.get("terms") else ""),
+        conflicting=tuple(c for c in spec["classes"][1:] if c not in ("other", "not_relevant")), spec=spec)
+
+
 def _yes(value: Any) -> bool:
     return str(value or "").strip().lower() in _TRUE
 
@@ -407,20 +467,20 @@ def papers_from_manifest(text: str) -> dict[str, dict[str, str]]:
     return out
 
 
-def _bears_on_claim(h: dict[str, str]) -> bool:
-    """A sentence that says something about the gene's haploinsufficiency in a human retinal disease,
-    whose quote is a sentence of the paper and whose gene is known: what the curation is made of.
-    (The scan's genes.csv is its explicit, not negated subset.)"""
-    return (str(h.get("mechanism_class") or "") == "haploinsufficiency" and bool(str(h.get("gene") or "").strip())
+def _bears_on_claim(h: dict[str, str], target: str = "haploinsufficiency") -> bool:
+    """A sentence that says something about the gene's haploinsufficiency (or a spec's target) in a
+    human retinal disease (a spec's scope), whose quote is a sentence of the paper and whose gene is
+    known: what the curation is made of. (The scan's genes.csv is its explicit, not negated subset.)"""
+    return (str(h.get("mechanism_class") or "") == target and bool(str(h.get("gene") or "").strip())
             and str(h.get("gene_status") or "") != "missing"
             and _yes(h.get("quote_verified")) and _yes(h.get("human_retinal")))
 
 
-def _argues_against_elsewhere(h: dict[str, str]) -> bool:
+def _argues_against_elsewhere(h: dict[str, str], target: str = "haploinsufficiency") -> bool:
     """A sentence against a gene's haploinsufficiency outside a human retinal disease (an animal
     model, another disease), whose quote is a sentence of the paper and not a reference entry: counter
     evidence for a gene the curation already holds, never a gene of its own."""
-    return (str(h.get("mechanism_class") or "") == "haploinsufficiency" and bool(str(h.get("gene") or "").strip())
+    return (str(h.get("mechanism_class") or "") == target and bool(str(h.get("gene") or "").strip())
             and str(h.get("gene_status") or "") != "missing" and _yes(h.get("negated"))
             and _yes(h.get("quote_verified")) and not _yes(h.get("human_retinal")) and not _yes(h.get("cite_like")))
 
@@ -447,13 +507,13 @@ def _sentence_flags(h: dict[str, str]) -> list[str]:
     return flags
 
 
-def _best_first(h: dict[str, str]) -> tuple:
+def _best_first(h: dict[str, str], prefer: str = "haploinsuffic") -> tuple:
     """The order a gene's quotes are shown in, as the scan picks them: body sentences before
     reference entries, clean before garbled, the gene in the quote, the word itself, then longer."""
     q = str(h.get("quote") or "")
     return (_yes(h.get("cite_like")), _yes(h.get("garbled")),
             "gene_in_quote" in h and not _yes(h.get("gene_in_quote")),
-            "haploinsuffic" not in q.lower(), -len(q))
+            bool(prefer) and prefer not in q.lower(), -len(q))
 
 
 def _int(value: Any) -> int:
@@ -464,23 +524,28 @@ def _int(value: Any) -> int:
 
 
 def curation_tables(tables: Path, papers: "dict[str, dict[str, str]] | None" = None,
+                    curation: Curation = HAPLOINSUFFICIENCY,
                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """``(gene rows, sentence rows)`` from a scan's tables (``hits.csv``, and ``genes.csv`` for the
     review flags it computed). ``papers`` (:func:`papers_from_manifest`) gives each paper's title and
-    DOI. Gene rows come strongest first: the claim (:data:`CLAIMS`), then how many papers make it."""
+    DOI. Gene rows come strongest first: the claim (:data:`CLAIMS`), then how many papers make it.
+    ``curation``: what the scan collected (its target class); the rows' ``claim`` is one of
+    :data:`CLAIMS` whatever it is, and :func:`write_curation` writes a stated gene's as the
+    curation's own word."""
     papers = papers or {}
+    target = curation.target
     flagged = {str(g.get("gene") or ""): g for g in _read_rows(tables / "genes.csv")}
     by_gene: dict[str, list[dict[str, str]]] = {}
     other: dict[str, set[str]] = {}
     elsewhere: dict[str, list[dict[str, str]]] = {}
     for h in _read_rows(tables / "hits.csv"):
         gene = str(h.get("gene") or "").strip()
-        if (gene and str(h.get("mechanism_class") or "") in ("dominant_negative", "gain_of_function")
+        if (gene and str(h.get("mechanism_class") or "") in curation.conflicting
                 and _yes(h.get("explicit")) and not _yes(h.get("negated"))):
             other.setdefault(gene, set()).add(str(h["mechanism_class"]))
-        if _bears_on_claim(h):
+        if _bears_on_claim(h, target):
             by_gene.setdefault(gene, []).append(h)
-        elif _argues_against_elsewhere(h):
+        elif _argues_against_elsewhere(h, target):
             elsewhere.setdefault(gene, []).append(h)
     for gene, hs in elsewhere.items():       # counter evidence only for a gene the curation holds
         if gene in by_gene:
@@ -492,7 +557,7 @@ def curation_tables(tables: Path, papers: "dict[str, dict[str, str]] | None" = N
     rows: list[dict[str, Any]] = []
     evidence: dict[str, list[dict[str, Any]]] = {}
     for gene, hs in by_gene.items():
-        said = {s: sorted((h for h in hs if _statement(h) == s), key=_best_first)
+        said = {s: sorted((h for h in hs if _statement(h) == s), key=lambda h: _best_first(h, curation.prefer))
                 for s in (STATES, HEDGES, DENIES, DENIES_ELSEWHERE)}
         against = said[DENIES] + said[DENIES_ELSEWHERE]          # a human retinal disease first
         pmids = {s: list(dict.fromkeys(str(h.get("pmid") or "") for h in said[s])) for s in said}
@@ -552,34 +617,80 @@ def curation_tables(tables: Path, papers: "dict[str, dict[str, str]] | None" = N
 
 
 def write_curation(tables: Path, out: Path, papers: "dict[str, dict[str, str]] | None" = None,
-                   ) -> dict[str, Any]:
+                   curation: Curation = HAPLOINSUFFICIENCY) -> dict[str, Any]:
     """Write the two curation tables into ``out`` and return ``{"rows", "n_sentences", "counts",
-    "files"}`` (``counts``: genes per claim). Nothing is written when the scan found no sentence."""
-    rows, evidence = curation_tables(tables, papers)
+    "files"}`` (``counts``: genes per claim, keyed by :data:`CLAIMS`). Nothing is written when the
+    scan found no sentence."""
+    rows, evidence = curation_tables(tables, papers, curation)
     counts = {c: sum(1 for r in rows if r["claim"] == c) for c in CLAIMS}
     if not rows:
         return {"rows": [], "n_sentences": 0, "counts": counts, "files": []}
     out.mkdir(parents=True, exist_ok=True)
-    for name, data, columns in ((CURATION_GENES, rows, GENE_TABLE_COLUMNS),
-                                (CURATION_EVIDENCE, evidence, EVIDENCE_COLUMNS)):
+    for name, data, columns in ((curation.genes_file, rows, GENE_TABLE_COLUMNS),
+                                (curation.evidence_file, evidence, EVIDENCE_COLUMNS)):
         with (out / name).open("w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=list(columns), extrasaction="ignore")
             w.writeheader()
-            w.writerows(data)
+            w.writerows({**r, "claim": curation.claim_label(r["claim"])} for r in data)
     return {"rows": rows, "n_sentences": len(evidence), "counts": counts,
-            "files": [CURATION_GENES, CURATION_EVIDENCE]}
+            "files": [curation.genes_file, curation.evidence_file]}
 
 
-def curation_plan_step(question: str, when: str, names_no_papers: bool = False) -> str:
+def _md_list(xs: Any, limit: int = 8) -> str:
+    """Rules as one line: each without its closing full stop, joined by semicolons."""
+    items = [" ".join(str(x).split()).rstrip(" .;") for x in (xs or []) if str(x).strip()]
+    shown = "; ".join(items[:limit])
+    return shown + (f"; and {len(items) - limit} more" if len(items) > limit else "") + ("." if items else "")
+
+
+def spec_plan_lines(spec: dict[str, Any]) -> list[str]:
+    """A task spec as the plan card lists it, one line a field."""
+    classes = list(spec.get("classes") or [])
+    terms = ", ".join(f"`{t}`" for t in spec.get("terms") or []) or "none"
+    return [
+        f"- **What counts:** {' '.join(str(spec.get('definition') or '').split())}",
+        f"- **It counts when:** {_md_list(spec.get('counts_when'))}",
+        f"- **It does not count:** {_md_list(spec.get('does_not_count'))}",
+        f"- **Scope:** {' '.join(str(spec.get('scope') or '').split())}",
+        f"- **Classes the reader assigns:** `{classes[0]}` (listed)"
+        + (", then " + ", ".join(f"`{c}`" for c in classes[1:]) if len(classes) > 1 else ""),
+        f"- **Search:** {len(spec.get('requests') or [])} requests written the way a paper states it, "
+        f"plus every passage that holds one of these terms, read in full: {terms}",
+    ]
+
+
+def curation_plan_step(question: str, when: str, curation: Curation = HAPLOINSUFFICIENCY,
+                       drafted_by: str = "", names_no_papers: bool = False) -> str:
     """The one step of a curation plan, as the plan card shows it. ``when``: how long it takes on
-    this session, and what it costs (the gateway's ``_curation_time_words``). ``names_no_papers``:
-    the question names no source (issue 20), so the card first says that the RetiGene papers are
-    what is read, and how to ask the public literature instead."""
+    this session, and what it costs (the gateway's ``_curation_time_words``). A curation from a task
+    spec lists the spec, which the user changes by saying so in the chat. ``names_no_papers``: the
+    question names no source (issue 20), so the card first says that the RetiGene papers are what is
+    read, and how to ask the public literature instead."""
     q = " ".join(str(question or "").split())
     if len(q) > 300:
         q = q[:297].rstrip() + "…"
     lead = ("The question names no papers, so this reads the lab's RetiGene papers; say “search PubMed” "
             "for an answer from the public literature instead. " if names_no_papers else "")
+    if not curation.built_in:
+        spec = curation.spec or {}
+        writer = drafted_by or "the session's model"
+        return "\n".join([
+            f"**RetiGene curation** — {lead}Read the whole RetiGene corpus for “{curation.name}”: every gene its "
+            f"papers state it for, and every gene they argue against, to answer: “{q}”. No rules for this are "
+            f"built in, so {writer} wrote a task spec from your question, and the scan reads every passage "
+            "with it:",
+            "",
+            *spec_plan_lines(spec),
+            "",
+            "`extract_haploinsufficient_genes` reads every passage those requests and terms retrieve, then "
+            "the chunks with a term that no round read; every quote is checked against its paper and every "
+            f"gene symbol against HGNC. The result is two tables: `{curation.genes_file}` (one row per gene: "
+            f"its claim, the strongest sentence verbatim, its paper and page) and `{curation.evidence_file}` "
+            "(one row per sentence), summarised in the chat. Only the RetiGene corpus is read; PubMed is not "
+            f"searched. Time: {when}.",
+            "",
+            "**To change the spec,** say what to change in the chat, or paste the whole spec as JSON.",
+        ])
     return (f"**RetiGene curation** — {lead}Read the whole RetiGene corpus for every gene its papers report as "
             f"haploinsufficient in retinal disease, and every gene they argue against, to answer: “{q}”. "
             "`extract_haploinsufficient_genes` has a model write search requests, reads every passage they "

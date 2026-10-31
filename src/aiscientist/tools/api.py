@@ -53,6 +53,11 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
     # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
     "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),
+    # a task spec for a property the scan has no rules for: the drafting prompt, its check, and the
+    # folder the scan writes that spec's tables to
+    "CORPUS_SCAN_SPEC_SYSTEM": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "SPEC_SYSTEM"),
+    "parse_corpus_scan_spec": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "parse_spec"),
+    "corpus_scan_spec_folder": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "spec_folder"),
     # the scRNA analysis line
     "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
     # curated marker references (run_marker_annotation), also read by the report's marker-claim check

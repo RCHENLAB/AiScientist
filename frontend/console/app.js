@@ -8123,7 +8123,9 @@ function resultHandoffHtml(runId, r) {
   const t = r.tables;
   if (t) {
     const files = (t.files || []).join(", ");
-    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 RetiGene curation tables · ${escapeHtml(String(t.n_genes ?? 0))} haploinsufficient genes · ${escapeHtml(String((t.files || []).length))} CSV files</span>` +
+    // A curation from a task spec names what it collected; the built-in one is haploinsufficiency.
+    const what = t.curation ? `genes · ${t.curation}` : "haploinsufficient genes";
+    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 RetiGene curation tables · ${escapeHtml(String(t.n_genes ?? 0))} ${escapeHtml(what)} · ${escapeHtml(String((t.files || []).length))} files</span>` +
       (t.saved_to
         ? `<span class="ok small" title="${escapeHtml(`In Files → Datasets as ${t.name || "the curation tables"}`)}">Saved to my data</span>`
         : (t.save_error ? `<span class="bad small" title="${escapeHtml(t.save_error)}">The last save failed</span>` : "") +

@@ -1,6 +1,6 @@
 [project]
 name = "aiscientist"
-version = "0.4.2"
+version = "0.4.3"
 description = "AiScientist — a privacy-first, DAG-planned multi-agent bioinformatics research console (UCI HPC3 + vLLM) for single-cell / ocular biology workflows."
 requires-python = ">=3.10"
 dependencies = [

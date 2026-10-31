@@ -5664,8 +5664,8 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
     uploads = hpc_layout.legacy_dir(shared, "uploads", user)
     read_roots = tuple(r for r in (home, session, legacy_temp, uploads,
                                    hpc_layout.containers_dir(shared), reference,
-                                   hpc_layout.package_cache_root(shared), st.scgpt_model_dir,
-                                   st.vlreview_model_dir) if r)
+                                   hpc_layout.package_cache_root(shared), hpc_layout.lab_envs_dir(shared),
+                                   st.scgpt_model_dir, st.vlreview_model_dir) if r)
     # The agent writes ONLY in the user's own AiScientist folders, never in `$HOME` or the member's
     # personal lab folder (Yijun, 2026-10-25: "固定一个aiscientist文件夹，他不允许出这个文件夹去删除或改写").
     # A write outside them is refused by run_shell / fetch_url, with no confirmation to approve it,
@@ -5708,6 +5708,7 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
     return HpcShell(
         remote=conn.executor,
         workspace=HpcWorkspace(read_roots=read_roots, write_roots=write_roots),
+        environments=_lab_environments(conn, run, user, shared) if (st.run_code_on_hpc or st.analysis_on_hpc) else None,
         home=home,
         worker_provider=(lambda: _ensure_session_worker(conn)) if st.worker_enabled else None,
         run_on_worker=_run_on_session_worker if st.worker_enabled else None,
@@ -5717,6 +5718,64 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
         package_cache=cache,
         sandbox=shell_sandbox,
     )
+
+
+def _lab_environments(conn: "Connection", run: "RunState | None", user: str, shared: str) -> Any:
+    """The lab's environment store for this run (``hpc/environments.py``): what ``request_environment``
+    builds and ``environment=`` binds. None for a run-less call, or with AISCIENTIST_LAB_ENVIRONMENTS=0.
+
+    A build is a Slurm batch job on a compute node (RCIC: conda and R installs run in jobs, never on a
+    login node or in ``$HOME``), in the micromamba image, which is pulled once into the shared
+    containers folder like any tool image. AISCIENTIST_ENV_APPROVAL=auto builds without the card."""
+    if run is None or os.environ.get("AISCIENTIST_LAB_ENVIRONMENTS", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return None
+    from ..hpc.environments import BASE_IMAGE, LabEnvironments
+    from .slurm_analysis import provision_image
+    from .slurm_job import (AcquireConfig, RunConfig, SlurmJobSpec, build_analysis_script, run_batch_job,
+                            slurm_time_to_seconds)
+    from .tool_images import image_sif_name
+
+    st = conn.settings
+    containers = hpc_layout.containers_dir(shared)
+    scratch = _scratch_dir(conn, "environments", run_id=run.run_id)
+    startup = int(os.environ.get("AISCIENTIST_ENV_STARTUP_TIMEOUT_S", "600") or 600)
+    base: dict[str, str] = {}
+
+    def run_job(script: str, job_name: str, cpus: int, mem_gb: int, time_limit: str) -> dict:
+        conn.executor.exec(f"mkdir -p {shlex.quote(scratch)}")
+        full = build_analysis_script(job_name, script, partition=st.cpu_partition, cpus=cpus, mem_gb=mem_gb,
+                                     time_limit=time_limit, account=st.cpu_account or "",
+                                     container_module=st.container_module, log_dir=scratch)
+        result = run_batch_job(conn.executor, SlurmJobSpec(script=full, job_name=job_name, submit_dir=scratch),
+                               acquire=AcquireConfig(startup_timeout_s=startup),
+                               run=RunConfig(run_timeout_s=slurm_time_to_seconds(time_limit) + 300),
+                               should_cancel=conn.chat_stop.is_set)
+        try:
+            log = conn.executor.read_bytes(f"{scratch}/{job_name}-{result.job_id}.log").decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - the log is a diagnostic
+            log = ""
+        return {"state": result.state, "job_id": result.job_id, "log": log}
+
+    def base_image() -> str:
+        if "sif" not in base:
+            base["sif"] = provision_image(
+                conn.executor, BASE_IMAGE, containers, scratch=scratch, job_name="aiscientist_env_base",
+                partition=st.cpu_partition, account=st.cpu_account or "", container_module=st.container_module,
+                container_bin=st.container_bin, startup_timeout_s=startup, should_cancel=conn.chat_stop.is_set,
+                say=lambda level, msg: conn.emit(level, "environments", msg))
+        return base["sif"]
+
+    try:
+        max_gb = max(1, int(os.environ.get("AISCIENTIST_ENV_MAX_GB", "10") or 10))
+    except ValueError:
+        max_gb = 10
+    approval = "auto" if os.environ.get("AISCIENTIST_ENV_APPROVAL", "ask").strip().lower() == "auto" else "ask"
+    return LabEnvironments(
+        remote=conn.executor, store=hpc_layout.lab_envs_dir(shared), run_job=run_job, base_image=base_image,
+        image_sif=lambda ref: f"{containers}/{image_sif_name(ref)}", stage_dir=f"{scratch}/recipes",
+        pkgs_cache=hpc_layout.conda_pkgs_dir(shared), container_bin=st.container_bin, max_gb=max_gb,
+        approval=approval, requested_by=user, account=str(getattr(conn, "owner", "") or ""),
+        run_id=run.run_id, session_id=str(conn.id), emit=conn.emit)
 
 
 def _ensure_session_worker(conn: "Connection"):
@@ -8472,14 +8531,19 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # A list question about the RetiGene papers is a curation of the whole corpus (issue 46): its own
     # plan card, then the tables. So is one that names no papers (issue 20), in a chat with no data
     # and no analysis. A note on that plan that changes the request is routed below. The chat's
-    # context is read once, here: a note on the literature plan is held to the same rule.
+    # context is read once, here: a note on the literature plan is held to the same rule. Whether a
+    # question that names the papers asks for one fact or for every gene with a property is the
+    # session's model's call.
     with_context = target is not None or bool(_select_bound_datasets(req))
     curation_offered = False
-    if _corpus_curation(conn, req.question, with_context=with_context):
+    ask = await asyncio.to_thread(_corpus_curation, conn, req.question, with_context=with_context)
+    if ask:
         from ..agents import request_router
         conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence"
-                  + ("." if request_router.names_corpus(req.question) else " (the question names no papers)."))
-        handoff = await _run_corpus_scan(conn, req, review=True)
+                  + (f" ({ask.prop}; no rules built in, so the model writes a task spec)."
+                     if getattr(ask, "known", "") is None else
+                     "." if request_router.names_corpus(req.question) else " (the question names no papers)."))
+        handoff = await _run_corpus_scan(conn, req, review=True, ask=ask)
         if handoff is None:
             return
         curation_offered = True
@@ -8515,12 +8579,14 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         # whole corpus with its best twelve passages instead (RCHENLAB/AiScientist issue 60, run
         # 73f1758c07de). So consider it again here — once, so a note cannot bounce a request between
         # the two lines. The literature line hands a request back for it only on the same test.
-        if curation_offered or not _corpus_curation(conn, req.question, with_context=with_context):
+        ask = None if curation_offered else await asyncio.to_thread(
+            _corpus_curation, conn, req.question, with_context=with_context)
+        if not ask:
             break
         curation_offered = True
         conn.emit("info", "route", "Routed to a curation of the RetiGene papers: the note asks for "
                                    "every gene with its evidence.")
-        handoff = await _run_corpus_scan(conn, req, review=True)
+        handoff = await _run_corpus_scan(conn, req, review=True, ask=ask)
         if handoff is None:
             return
         # A note on that plan is routed again, as on the opening message's curation.
@@ -8801,16 +8867,19 @@ def _corpus_path(req: LabRequest) -> bool:
 
 
 CORPUS_TOOL = "extract_haploinsufficient_genes"
+SPEC_FILE = "task_spec.json"   # a task spec's curation keeps the spec it read with, beside its tables
 CORPUS_MAX_ATTEMPTS = 3      # submissions of the job per run: the first plus two resumes after its model died
 # (A job that never left the queue is submitted again separately: settings.corpus_scan_queue_retries.)
 # One scan per corpus at a time: the key of each scan in progress (corpus_scan.scan_key) -> its run.
 _CORPUS_SCANS_RUNNING: dict[str, str] = {}
 
 
-def _corpus_scan_identity(conn: Connection) -> "tuple[str, dict[str, Any]] | None":
+def _corpus_scan_identity(conn: Connection, spec: "dict[str, Any] | None" = None,
+                          ) -> "tuple[str, dict[str, Any]] | None":
     """``(key, what it is made of)`` for a scan this session would make now: the corpus as it is on
-    HPC3, the scan's rules and its model (``corpus_scan.scan_key``). None without the literature
-    line, a live HPC3 session or a corpus text cache: nothing is reused or kept then."""
+    HPC3, the scan's rules (the built-in ones, or a task spec's, ``spec``) and its model
+    (``corpus_scan.scan_key``). None without the literature line, a live HPC3 session or a corpus
+    text cache: nothing is reused or kept then."""
     papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
     if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not papers
             or conn.executor is None or conn.mock):
@@ -8819,7 +8888,7 @@ def _corpus_scan_identity(conn: Connection) -> "tuple[str, dict[str, Any]] | Non
                                         os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", ""))
     if fp is None:
         return None
-    rules = _tools_api.corpus_scan_rules_digest()
+    rules = _tools_api.corpus_scan_rules_digest(spec)
     model = _corpus_scan_model(conn)
     return corpus_scan.scan_key(fp, rules, model), {"corpus": fp, "rules": rules, "model": model}
 
@@ -8862,29 +8931,130 @@ def _vllm_log_tail(conn: Connection, path: str) -> str:
         return ""
 
 
-def _corpus_curation(conn: Connection, question: str, *, with_context: bool = False) -> bool:
+def _corpus_curation(conn: Connection, question: str, *, with_context: bool = False) -> Any:
     """A list question about the RetiGene papers ("What are haploinsufficient genes in RetiGene
-    papers?"): the console's route sends it to the corpus curation, the whole corpus read for the
-    genes and their evidence, instead of the literature line's best passages (RCHENLAB/AiScientist
-    issue 46). Only a question that asks for the list and not about the user's data, on a session
-    that reaches the corpus on HPC3: the curation reads it there, so the Eye Server copy alone
-    (``local_corpus``) does not make one possible; the question then goes to the literature line,
-    which searches that copy. Haploinsufficiency is the one property curated.
+    papers?", "Which genes do they report as dominant negative?"): the console's route sends it to
+    the corpus curation, the whole corpus read for the genes and their evidence, instead of the
+    literature line's best passages (RCHENLAB/AiScientist issue 46). Returns the router's verdict
+    (``request_router.CorpusAsk``, a list) or None.
 
-    The question either names the RetiGene papers, or names no source at all (issue 20: "What are
-    haploinsufficient genes?"). The second is read strictly: a plain request for the genes as a
-    set (``asks_for_gene_list(strict=True)``), naming no papers, PubMed, literature or database and
+    Only a question that asks for the list and not about the user's data, on a session that reaches
+    the corpus on HPC3: the curation reads it there, so the Eye Server copy alone (``local_corpus``)
+    does not make one possible; the question then goes to the literature line, which searches that
+    copy.
+
+    A question that names the RetiGene papers: whether it asks for one fact or for every gene with a
+    property is the session's model's call (:func:`_corpus_ask`); haploinsufficiency has rules built
+    in, any other property gets a task spec the model writes (:func:`_draft_corpus_spec`).
+
+    A question that names no source at all (issue 20: "What are haploinsufficient genes?") is read
+    strictly, by words, for the built-in curation only: a plain request for the genes as a set
+    (``asks_for_gene_list(strict=True)``), naming no papers, PubMed, literature or database and
     pointing at nothing in the chat (``request_router.names_no_source``), and not when data is
     attached or the chat already ran an analysis (``with_context``), where "which genes" may mean
     the user's own. Its plan card says that it reads the RetiGene papers and how to ask PubMed."""
     from ..agents import request_router
     q = str(question or "")
     if request_router.names_corpus(q):
-        asks = corpus_scan.asks_for_gene_list(q)
+        if request_router.refers_to_data(q) or not _literature_corpus_on_hpc(conn):
+            return None
+        ask = _corpus_ask(conn, q)
+        return ask if ask.is_list else None
+    if (with_context or not request_router.names_no_source(q)
+            or not corpus_scan.asks_for_gene_list(q, strict=True)
+            or request_router.refers_to_data(q) or not _literature_corpus_on_hpc(conn)):
+        return None
+    known = corpus_scan.HAPLOINSUFFICIENCY.id
+    return request_router.CorpusAsk(request_router.LIST, corpus_scan.KNOWN_CURATIONS.get(known, known),
+                                    known, 1.0, "rules")
+
+
+def _corpus_list_rule(text: str) -> "str | None":
+    """The rule under the model's verdict: the built-in curation's list question, matched by words."""
+    return corpus_scan.HAPLOINSUFFICIENCY.id if corpus_scan.asks_for_gene_list(text) else None
+
+
+def _session_llm(conn: Connection, role: str) -> "tuple[Callable[[list[dict]], str] | None, str]":
+    """``(complete, model)`` on the session's model for one role; ``(None, "")`` when it has none
+    ready (a cold session is not woken to judge one sentence). Never raises."""
+    try:
+        if not _model_ready(conn):
+            return None, ""
+        llm = _lab_llm(conn)
+    except Exception as exc:  # noqa: BLE001 - the callers fall back to their rules
+        print(f"[route] the session's model is not available: {type(exc).__name__}: {exc}")
+        return None, ""
+    fn = llm.complete_fn
+    return (lambda messages: fn(messages, role=role)), str(getattr(llm, "model", "") or "")
+
+
+def _corpus_ask(conn: Connection, text: str) -> Any:
+    """One fact or every gene with a property, for a question that names the RetiGene corpus, by the
+    session's model (role ``classify``), with :func:`_corpus_list_rule` under it."""
+    from ..agents import request_router
+    key = " ".join(str(text or "").split())
+    memo = getattr(conn, "_corpus_asks", None)
+    if memo is not None and key in memo:
+        return memo[key]
+    complete, _ = _session_llm(conn, "classify")
+    ask = request_router.corpus_ask(complete, text, known=corpus_scan.KNOWN_CURATIONS, floor=_corpus_list_rule)
+    print(f"[route] corpus question: {json.dumps(ask.to_dict(), ensure_ascii=False)}")
+    # The same text asked twice in one turn (the literature plan hands a note back, then the
+    # dispatcher checks it) gets the same verdict, so the two cannot disagree.
+    if conn is not None and ask.source == "model":
+        if memo is None:
+            memo = {}
+            try:
+                conn._corpus_asks = memo
+            except AttributeError:          # a stand-in connection that takes no attributes
+                pass
+        memo[key] = ask
+        while len(memo) > 32:
+            memo.pop(next(iter(memo)))
+    return ask
+
+
+_SPEC_REVISE = ("Revise the spec to follow the user's note. Keep everything the note does not ask to change. "
+                "Return the whole revised spec as ONE JSON object with the same fields.")
+
+
+def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, Any] | None" = None,
+                       note: str = "") -> "tuple[dict[str, Any], str]":
+    """``(spec, model)``: a task spec for the curation, written by the session's model (role
+    ``plan``) from the question (the tool's ``SPEC_SYSTEM``), or ``current`` revised by the user's
+    ``note``. A reply the tool's ``parse_spec`` refuses is sent back once with the reason. Raises
+    ``GatewayError`` when no usable spec comes back."""
+    complete, model = _session_llm(conn, "plan")
+    if complete is None:
+        raise GatewayError("this session has no model ready to write the task spec with", stage="corpus")
+    if current is None:
+        user = str(question or "").strip()
+        if note:
+            user += f"\n\nThe user added: {note}"
     else:
-        asks = (not with_context and request_router.names_no_source(q)
-                and corpus_scan.asks_for_gene_list(q, strict=True))
-    return asks and not request_router.refers_to_data(q) and _literature_corpus_on_hpc(conn)
+        user = (f"The user's question: {question}\n\nThe current spec:\n"
+                f"{json.dumps(current, indent=1, ensure_ascii=False)}\n\nThe user's note on it: {note}\n\n"
+                + _SPEC_REVISE)
+    messages = [{"role": "system", "content": _tools_api.CORPUS_SCAN_SPEC_SYSTEM}, {"role": "user", "content": user}]
+    why = ""
+    for _ in range(2):
+        try:
+            raw = complete(messages)
+        except Exception as exc:  # noqa: BLE001 - reported to the user as the reason
+            raise GatewayError(f"the session's model could not be reached ({public_error(exc)})",
+                               stage="corpus") from exc
+        try:
+            return _tools_api.parse_corpus_scan_spec(raw), model
+        except ValueError as exc:
+            why = str(exc)
+            messages = [*messages, {"role": "assistant", "content": str(raw or "")[:8000]},
+                        {"role": "user", "content": f"That spec cannot drive the scan: {why}. Reply again with the "
+                                                    "whole spec as ONE JSON object."}]
+    raise GatewayError(f"the session's model wrote no usable task spec ({why})", stage="corpus")
+
+
+def _spec_curation(spec: dict[str, Any]) -> "corpus_scan.Curation":
+    return corpus_scan.curation_for(spec, _tools_api.corpus_scan_spec_folder(spec))
 
 
 # What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
@@ -8922,27 +9092,36 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
 async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callable[..., None],
                                   say: Callable[..., None], question: str,
                                   stored: "corpus_scan.StoredScan | None",
-                                  api: "dict[str, Any] | None") -> "bool | str | None":
+                                  api: "dict[str, Any] | None",
+                                  curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
+                                  drafted_by: str = "", intro: bool = True) -> "bool | str | None":
     """The curation's plan card: True when the user runs it; None when the run is over (cancelled or
-    stopped); the request with the user's note when the note changes it (to plan again)."""
+    stopped); the user's note when they said what to change (the caller revises the plan, or plans
+    the request again)."""
     from ..agents import request_router
     when = await asyncio.to_thread(_curation_time_words, conn, stored, api)
     # A question that names no papers (issue 20) is read as one about the RetiGene papers: the card
     # says so, and how to ask the public literature instead.
     no_papers = not request_router.names_corpus(question)
-    if no_papers:
+    if intro and not curation.built_in:
+        say(f"🧬 This asks for every gene the RetiGene papers report as “{curation.name}”, so the plan is a "
+            "curation of all the RetiGene papers, not an answer from their best passages. No rules for it are "
+            f"built in: {drafted_by or 'the session’s model'} wrote the task spec on the plan from your question, "
+            "and every passage is read with it. Run it, or say in the chat what to change.")
+    elif intro and no_papers:
         say("🧬 This asks for a list of haploinsufficient genes and names no papers, so the plan reads the "
             "lab's RetiGene papers: a curation of all of them, not an answer from their best passages: every "
             "gene with its claim, the paper's own sentence, the paper and the page, as a table. Run it, say "
             "“search PubMed” in the chat for an answer from the public literature instead, or say what to change.")
-    else:
+    elif intro:
         say("🧬 This asks for the genes the RetiGene papers report, so the plan is a curation of all the "
             "RetiGene papers, not an answer from their best passages: every gene with its claim, the paper's own "
             "sentence, the paper and the page, as a table. Run it, or say in the chat what to change.")
     while True:
         decision = await asyncio.to_thread(
             _literature_plan_review, conn, emit,
-            corpus_scan.curation_plan_step(question, when, names_no_papers=no_papers), "corpus")
+            corpus_scan.curation_plan_step(question, when, curation, drafted_by, names_no_papers=no_papers),
+            "corpus")
         action = str(decision.get("action") or "cancel")
         if action == "approve":
             return True
@@ -8963,17 +9142,59 @@ async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callabl
         # request back to the router, which would re-plan it as a bounded search and so answer a
         # request for more coverage with less (RCHENLAB/AiScientist issue 59, and the 12 passages of
         # issue 60). A note that asks for other sources, or for the user's data, still re-plans.
-        from ..agents import request_router as _rr
-        if (_rr.asks_for_more_coverage(note) and not _rr.asks_for_pubmed(note)
-                and not _rr.refers_to_data(note)):
+        if (request_router.asks_for_more_coverage(note) and not request_router.asks_for_pubmed(note)
+                and not request_router.refers_to_data(note)):
             say("ℹ The curation already reads every RetiGene paper, not a fixed number of them, so "
                 "your note is already covered and the plan is unchanged.")
             continue
-        conn.push({"type": "chat_token", "token": "🧭 Your note changes the request, so it is planned again."})
-        if run.monitor is not None:
-            run.monitor.end("ended")
-        conn.push({"type": "chat_done"})
-        return f"{question}\n\n{note}"
+        return note
+
+
+def _curation_handoff(conn: Connection, run: RunState, question: str, note: str = "",
+                      why: str = "🧭 Your note changes the request, so it is planned again.") -> str:
+    """End the curation's run and hand the request (with the note) back to be routed again."""
+    conn.push({"type": "chat_token", "token": why})
+    if run.monitor is not None:
+        run.monitor.end("ended")
+    conn.push({"type": "chat_done"})
+    return f"{question}\n\n{note}" if note else question
+
+
+def _looks_like_spec(text: str) -> bool:
+    t = str(text or "").strip()
+    return t.startswith(("{", "```")) and '"definition"' in t
+
+
+async def _revise_curation(conn: Connection, say: Callable[..., None], question: str,
+                           curation: "corpus_scan.Curation", drafted_by: str, note: str,
+                           ) -> "tuple[corpus_scan.Curation, str] | None":
+    """A note on the curation's plan: ``(curation, who wrote its spec)`` to show the plan again, or
+    None when the note asks for something other than this curation (PubMed, the user's data, one
+    fact), which is then planned again. A pasted spec is used as written; words revise the spec with
+    the session's model (on the built-in rules, they make a spec of their own)."""
+    from ..agents import request_router
+    if _looks_like_spec(note):
+        try:
+            spec = _tools_api.parse_corpus_scan_spec(note)
+        except ValueError as exc:
+            say(f"⚠ That spec cannot drive the scan: {exc}. The plan is unchanged.", "warning")
+            return curation, drafted_by
+        say("📝 Your spec is on the plan, as you wrote it.")
+        return _spec_curation(spec), "you"
+    if request_router.asks_for_pubmed(note) or request_router.refers_to_data(note):
+        return None
+    ask = await asyncio.to_thread(_corpus_ask, conn, f"{question}\n\n{note}")
+    if not ask.is_list:
+        return None
+    say("📝 Revising the task spec with your note …" if not curation.built_in else
+        "📝 Your note changes what the curation counts, so the session's model writes a task spec for it …")
+    try:
+        spec, by = await asyncio.to_thread(_draft_corpus_spec, conn, question, current=curation.spec, note=note)
+    except GatewayError as exc:
+        say(f"⚠ The plan could not be revised: {exc.message}. It is unchanged; say it again, or paste the whole "
+            "spec as JSON.", "warning")
+        return curation, drafted_by
+    return _spec_curation(spec), by
 
 
 # The corpus manifest is read whole for the papers' titles and DOIs; it is a few MB at most.
@@ -9001,19 +9222,24 @@ def _curation_pointer_path(owner: str, run_id: str) -> Path:
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / corpus_scan.CURATION_POINTER
 
 
-def _point_at_curation_tables(conn: Connection, run_id: str, art: Path, curation: dict[str, Any]) -> None:
-    """Record the curation tables a run wrote, so the chat and Runs offer to save them."""
+def _point_at_curation_tables(conn: Connection, run_id: str, art: Path, curation: dict[str, Any],
+                              what: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY) -> None:
+    """Record the curation tables a run wrote, so the chat and Runs offer to save them. A task spec's
+    curation records what it collected (``curation``) and saves its spec with the tables."""
     folder = art / corpus_scan.CURATION_SUBDIR
-    files = [{"name": n, "size": (folder / n).stat().st_size} for n in curation.get("files") or []
-             if (folder / n).is_file()]
+    names = list(curation.get("files") or []) + ([] if what.built_in else [SPEC_FILE])
+    files = [{"name": n, "size": (folder / n).stat().st_size} for n in names if (folder / n).is_file()]
     if not files:
         return
     counts = curation.get("counts") or {}
-    rec = {"name": f"retigene_haploinsufficiency.curation.{datetime.now().strftime('%Y%m%d-%H%M')}.{run_id}",
+    slug = "haploinsufficiency" if what.built_in else what.target
+    rec = {"name": f"retigene_{slug}.curation.{datetime.now().strftime('%Y%m%d-%H%M')}.{run_id}",
            "path": str(folder), "location": "gateway", "files": files,
            "size_bytes": sum(f["size"] for f in files),
            "n_genes": int(counts.get(corpus_scan.SUPPORTED, 0)) + int(counts.get(corpus_scan.CONTESTED, 0)),
-           "counts": counts, "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+           "counts": {what.claim_label(k): v for k, v in counts.items()},
+           **({} if what.built_in else {"curation": what.name}),
+           "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     path = conn.workspace / run_id / corpus_scan.CURATION_POINTER
     try:
         path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
@@ -9023,7 +9249,7 @@ def _point_at_curation_tables(conn: Connection, run_id: str, art: Path, curation
 
 async def _run_corpus_scan(conn: Connection, req: LabRequest,
                            stored: "corpus_scan.StoredScan | None" = None,
-                           review: bool = False) -> "str | None":
+                           review: bool = False, ask: Any = None) -> "str | None":
     """The haploinsufficient genes of the indexed corpus, curated: two tables (one row per gene with
     its claim, one per sentence) and a chat answer written from them. A scan of the corpus as it is
     now, if one is kept (``stored``, else looked up here), answers at once; otherwise
@@ -9033,8 +9259,10 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
 
     ``review``: the console's route for a list question about the RetiGene papers (issue 46,
     ``_corpus_curation``). The plan card shows the curation and how long it takes, and nothing runs
-    until the user runs it. Returns the request to plan again when the user's note on that plan
-    changes it (the caller routes it), else None.
+    until the user runs it. ``ask``: the router's verdict on the question (``CorpusAsk``); a property
+    with no built-in rules gets a task spec the session's model writes (``_draft_corpus_spec``),
+    which the card lists and a note revises. Returns the request to plan again when the user's note
+    changes it to something else (the caller routes it), else None.
 
     Shares the run lifecycle with the other lines (``chat_running``, per-run ``chat_stop``, the
     ``chat_start`` → ``chat_token`` → ``chat_done`` WS protocol, the ``artifacts`` event for the
@@ -9063,15 +9291,35 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
     model = api["model"] if api else corpus_scan.scan_model(conn.settings)
     question = str(req.question or "").strip()
     recorded = False
+    cur, drafted_by = corpus_scan.HAPLOINSUFFICIENCY, ""
     try:
+        if review and ask is not None and getattr(ask, "known", corpus_scan.HAPLOINSUFFICIENCY.id) is None:
+            say(f"📝 No rules for “{getattr(ask, 'prop', '') or 'this property'}” are built in, so the session's "
+                "model writes a task spec for the curation from your question …")
+            try:
+                spec, drafted_by = await asyncio.to_thread(_draft_corpus_spec, conn, question)
+            except GatewayError as exc:
+                return _curation_handoff(conn, run, question, why=(
+                    f"⚠ No task spec for a curation could be written: {exc.message}. The question goes to a search "
+                    "of the RetiGene papers' best passages instead."))
+            cur = _spec_curation(spec)
         ident = None
         if stored is None:
-            ident = await asyncio.to_thread(_corpus_scan_identity, conn)
+            ident = await asyncio.to_thread(_identity_for, conn, cur)
             stored = corpus_scan.load(ident[0]) if ident else None
-        if review:
-            go = await _review_corpus_curation(conn, run, emit, say, question, stored, api)
-            if go is not True:
-                return go
+        intro = True
+        while review:
+            go = await _review_corpus_curation(conn, run, emit, say, question, stored, api, cur, drafted_by, intro)
+            if go is True:
+                break
+            if go is None:
+                return None
+            revised = await _revise_curation(conn, say, question, cur, drafted_by, go)
+            if revised is None:
+                return _curation_handoff(conn, run, question, go)
+            cur, drafted_by, intro = revised[0], revised[1], False
+            ident = await asyncio.to_thread(_identity_for, conn, cur)
+            stored = corpus_scan.load(ident[0]) if ident else None
         if _AUTH_ENABLED and conn.app_user_id:
             try:
                 auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
@@ -9086,20 +9334,26 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             await asyncio.to_thread(corpus_scan.copy_into, stored, art)
             result = stored.result
         else:
-            result = await (_corpus_scan_via_relay(conn, run, run_id, ident, say, emit, api) if api
-                            else _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit))
+            result = await (_corpus_scan_via_relay(conn, run, run_id, ident, say, emit, api, cur) if api
+                            else _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit, cur))
             if result is None:                   # stopped
                 return None
-        tables = art / corpus_scan.OUT_SUBDIR
+        tables = art / cur.subdir
         papers = await asyncio.to_thread(_corpus_papers, conn)
         curation = await asyncio.to_thread(corpus_scan.write_curation, tables,
-                                           art / corpus_scan.CURATION_SUBDIR, papers)
+                                           art / corpus_scan.CURATION_SUBDIR, papers, cur)
+        if not cur.built_in:
+            (art / corpus_scan.CURATION_SUBDIR).mkdir(parents=True, exist_ok=True)
+            (art / corpus_scan.CURATION_SUBDIR / SPEC_FILE).write_text(json.dumps(
+                {"question": question, "written_by": drafted_by, "spec": cur.spec}, indent=1, ensure_ascii=False),
+                encoding="utf-8")
         conn.push({"type": "chat_token", "token": _corpus_summary_md(
             result, curation=curation["rows"],
             rows=None if curation["rows"] else corpus_scan.gene_rows(tables), model=model,
-            kept_since=(str(stored.meta.get("stored_at") or "")[:10] if stored is not None else ""))})
+            kept_since=(str(stored.meta.get("stored_at") or "")[:10] if stored is not None else ""),
+            what=cur, drafted_by=drafted_by)})
         await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [model])
-        await asyncio.to_thread(_point_at_curation_tables, conn, run_id, art, curation)
+        await asyncio.to_thread(_point_at_curation_tables, conn, run_id, art, curation, cur)
         if not curation.get("files"):
             # The curation tables are what "Save tables to my data" saves (issue 46); a scan that
             # wrote none still offers its own genes.csv, once.
@@ -9117,12 +9371,15 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
         n_genes = (counts[corpus_scan.SUPPORTED] + counts[corpus_scan.CONTESTED]) if curation["rows"] \
             else result.get("n_genes")
         emit("success", "corpus",
-             f"RetiGene curation done: {n_genes} haploinsufficient genes"
+             f"RetiGene curation done: {n_genes} " + ("haploinsufficient genes" if cur.built_in
+                                                      else f"genes, “{cur.name}”")
              + (f" ({counts[corpus_scan.CONTESTED]} contested), {counts[corpus_scan.AGAINST]} argued against, "
                 f"{counts[corpus_scan.SUGGESTED]} only suggested, from {curation['n_sentences']} verified sentences"
                 if curation["rows"] else f" from {result.get('n_hits_eligible')} verified sentences")
              + f" ({result.get('n_passages')} passages read, {result.get('n_papers')} papers).")
-        _finish_run_record(conn, run_id, "done", str(art), f"{n_genes} haploinsufficient genes (RetiGene curation)")
+        _finish_run_record(conn, run_id, "done", str(art),
+                           f"{n_genes} " + ("haploinsufficient genes" if cur.built_in else f"genes, {cur.name}")
+                           + " (RetiGene curation)")
         conn.push({"type": "chat_done"})
         return None
     except GatewayError as exc:
@@ -9148,9 +9405,12 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
 
 async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
                                   ident: "tuple[str, dict[str, Any]] | None",
-                                  say: Callable[..., None], emit: Callable[..., None]) -> "dict[str, Any] | None":
+                                  say: Callable[..., None], emit: Callable[..., None],
+                                  curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
+                                  ) -> "dict[str, Any] | None":
     """Run the scan as one job with its own GPU and model, keep its tables, and return its result
-    (None when the user stopped it). Raises ``GatewayError`` when it cannot run or does not finish."""
+    (None when the user stopped it). ``curation``: what it collects; a task spec's goes to the tool
+    as its ``spec``. Raises ``GatewayError`` when it cannot run or does not finish."""
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
@@ -9170,7 +9430,7 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
     st = conn.settings
     emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} on its own GPU ({st.corpus_scan_partition} "
                            f"{st.corpus_scan_gres}, model {model}).")
-    say("📚 Scanning all the RetiGene papers for explicitly reported haploinsufficient genes — one "
+    say(f"📚 Scanning all the RetiGene papers for {_curation_what(curation)} — one "
         "HPC3 job with a GPU of its own (an A30 or A100 on the lab's paid partition): it starts the "
         "scan's model, which writes search requests, reads the passages they retrieve and quotes "
         "the papers; every quote is checked against its paper, then the card is freed. The paid queue "
@@ -9190,7 +9450,7 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
         result: dict[str, Any] = {}
         resumes = requeues = 0
         while True:
-            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
+            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
             if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
                 conn.push({"type": "chat_stopped"})
                 return None
@@ -9224,21 +9484,41 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
         tail = await asyncio.to_thread(_vllm_log_tail, conn, str(result.get("vllm_log") or ""))
         raise GatewayError(f"The RetiGene corpus scan did not finish: {msg}", stage="corpus",
                            detail=(tail or json.dumps(result, default=str))[:2000])
-    await _keep_corpus_scan(conn, run_id, result, emit)
+    await _keep_corpus_scan(conn, run_id, result, emit, curation)
     return result
 
 
+def _corpus_scan_args(curation: "corpus_scan.Curation") -> dict[str, Any]:
+    """The scan tool's arguments: none for its built-in rules, the task spec otherwise."""
+    return {} if curation.built_in else {"spec": curation.spec}
+
+
+def _curation_what(curation: "corpus_scan.Curation") -> str:
+    """What a curation collects, as a progress line says it."""
+    return ("explicitly reported haploinsufficient genes" if curation.built_in
+            else f"“{curation.name}” (the task spec on the plan)")
+
+
+def _identity_for(conn: Connection, curation: "corpus_scan.Curation") -> "tuple[str, dict[str, Any]] | None":
+    return _corpus_scan_identity(conn) if curation.built_in else _corpus_scan_identity(conn, curation.spec)
+
+
 async def _keep_corpus_scan(conn: Connection, run_id: str, result: dict[str, Any],
-                            emit: Callable[..., None]) -> None:
+                            emit: Callable[..., None],
+                            curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY) -> None:
     """Keep a finished scan's tables, under the corpus as it is AFTER the job (a scan that had to
-    build the text cache changed it), so the next request for this corpus is answered from them."""
-    after = await asyncio.to_thread(_corpus_scan_identity, conn)
-    tables = conn.workspace / run_id / "artifacts" / corpus_scan.OUT_SUBDIR
+    build the text cache changed it), so the next request for this corpus is answered from them. A
+    task spec's scan is kept under that spec, with the spec beside it."""
+    after = await asyncio.to_thread(_identity_for, conn, curation)
+    tables = conn.workspace / run_id / "artifacts" / curation.subdir
     if after is not None and (tables / "genes.csv").is_file():
         try:
             kept = await asyncio.to_thread(corpus_scan.store, after[0], result, tables,
                                            {**after[1], "run_id": run_id, "owner": conn.owner,
-                                            "slurm_state": result.get("slurm_state")})
+                                            "slurm_state": result.get("slurm_state"),
+                                            **({} if curation.built_in else {"spec": curation.spec,
+                                                                              "curation": curation.name})},
+                                           curation.subdir)
             emit("info", "corpus", f"RetiGene corpus scan kept as {kept.key}: the next request about the "
                                    "RetiGene papers is answered from it.")
         except OSError as exc:
@@ -9287,7 +9567,9 @@ def _corpus_scan_cost_cap(conn: Connection) -> tuple[float, str]:
 async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
                                  ident: "tuple[str, dict[str, Any]] | None",
                                  say: Callable[..., None], emit: Callable[..., None],
-                                 api: dict[str, Any]) -> "dict[str, Any] | None":
+                                 api: dict[str, Any],
+                                 curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
+                                 ) -> "dict[str, Any] | None":
     """The scan on the session's own API model. One CPU job on HPC3 retrieves the passages and
     builds the tables; every model call it needs comes back here (``gateway/llm_relay.py``) and is
     made with the user's key, recorded against the user's usage and capped by the budget left. The
@@ -9378,7 +9660,7 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
                          llm_is_remote=True, read_roots=_tool_read_roots(conn))
     emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} with your API model {model} (a CPU job on HPC3; "
                            f"the model calls are made here, at most ${cap:.2f}: {cap_why}).")
-    say(f"📚 Scanning all the RetiGene papers for explicitly reported haploinsufficient genes with your "
+    say(f"📚 Scanning all the RetiGene papers for {_curation_what(curation)} with your "
         f"API model **{model}**, on your key. One HPC3 job (CPU only) retrieves the passages; this server "
         f"makes every model call and records it in your API usage. It reads about 1% of the passages "
         f"first and stops there if they fail or if they project a cost above ${cap:.2f} ({cap_why}).")
@@ -9386,13 +9668,13 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
         _CORPUS_SCANS_RUNNING[key] = run_id
     relay.start()
     try:
-        result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
+        result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
         if (result.get("model_unreachable") and not run.chat_stop.is_set()
                 and not relay.stats.stopped):
             say(f"⚠ The model stopped answering mid-scan ({result.get('n_judged', 0)} of "
                 f"{result.get('n_passages', '?')} passages read). Submitting the job once more; it "
                 "resumes where it stopped.", "warning")
-            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, {}, ctx)
+            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
     finally:
         stats = relay.stop()
         key_use.close()
@@ -9411,7 +9693,7 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
         raise GatewayError(f"The RetiGene corpus scan did not finish: {msg} Spent: {spent}.", stage="corpus",
                            detail=json.dumps(result, default=str)[:2000])
     emit("info", "corpus", f"RetiGene corpus scan model cost: {spent}.")
-    await _keep_corpus_scan(conn, run_id, result, emit)
+    await _keep_corpus_scan(conn, run_id, result, emit, curation)
     return result
 
 
@@ -9440,11 +9722,14 @@ def _short_quote(text: str, limit: int = 240) -> str:
     return quote if len(quote) <= limit else quote[:limit - 3].rstrip() + "…"
 
 
-def _curation_md(rows: list[dict[str, Any]]) -> list[str]:
-    """The chat's sections for the curation tables: the haploinsufficient genes, strongest evidence
-    first, then each other claim in a section of its own, so a gene the papers argue against is
-    never read as one of the list. Every row cites the paper and page of its sentence."""
+def _curation_md(rows: list[dict[str, Any]],
+                 what: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY) -> list[str]:
+    """The chat's sections for the curation tables: the haploinsufficient genes (or the genes a task
+    spec's property is stated for), strongest evidence first, then each other claim in a section of
+    its own, so a gene the papers argue against is never read as one of the list. Every row cites
+    the paper and page of its sentence."""
     by = {c: [r for r in rows if r.get("claim") == c] for c in corpus_scan.CLAIMS}
+    it = "haploinsufficiency" if what.built_in else "it"
     lines: list[str] = []
 
     def more(r: dict[str, Any], key: str, cited: str) -> str:
@@ -9453,7 +9738,8 @@ def _curation_md(rows: list[dict[str, Any]]) -> list[str]:
 
     sup = by[corpus_scan.SUPPORTED]
     if sup:
-        lines += [f"**Haploinsufficient — {len(sup)} gene{'s' if len(sup) != 1 else ''}**, the most papers first:", "",
+        head = "Haploinsufficient" if what.built_in else f"Stated — “{_md_cell(what.name)}”"
+        lines += [f"**{head} — {len(sup)} gene{'s' if len(sup) != 1 else ''}**, the most papers first:", "",
                   "| gene | phenotype (as written) | evidence (the paper's words) | papers | citation | review flags |",
                   "|---|---|---|---|---|---|"]
         for r in sup:
@@ -9465,7 +9751,7 @@ def _curation_md(rows: list[dict[str, Any]]) -> list[str]:
     con = by[corpus_scan.CONTESTED]
     if con:
         lines += [f"**Contested — {len(con)} gene{'s' if len(con) != 1 else ''}**: one paper states "
-                  "haploinsufficiency and another argues against it, in a human retinal disease or with an "
+                  f"{it} and another argues against it, in a human retinal disease or with an "
                   "animal model or another disease. Every sentence on both sides is in the evidence table.", "",
                   "| gene | stated (the paper's words) | argued against (the paper's words) | papers for / against |",
                   "|---|---|---|---|"]
@@ -9481,7 +9767,8 @@ def _curation_md(rows: list[dict[str, Any]]) -> list[str]:
     against = by[corpus_scan.AGAINST]
     if against:
         lines += [f"**Argued against — {len(against)} gene{'s' if len(against) != 1 else ''}**, not in the list: "
-                  "the papers say haploinsufficiency is not, or is unlikely to be, the mechanism.", "",
+                  + ("the papers say haploinsufficiency is not, or is unlikely to be, the mechanism." if what.built_in
+                     else "the papers say it is not so, or unlikely, for them."), "",
                   "| gene | the paper's words | citation |", "|---|---|---|"]
         for r in against:
             lines.append(f"| {_md_cell(r['gene'])} | “{_short_quote(r.get('quote'))}” | "
@@ -9500,13 +9787,15 @@ def _curation_md(rows: list[dict[str, Any]]) -> list[str]:
 
 def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | None" = None, *,
                        curation: "list[dict[str, Any]] | None" = None,
-                       model: str = "", kept_since: str = "") -> str:
+                       model: str = "", kept_since: str = "",
+                       what: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY, drafted_by: str = "") -> str:
     """The chat answer for a corpus curation, written from the tables and the scan's result, nothing
     generated: how many genes, the strongest evidence first, the genes the papers argue against
     apart, every row cited with its paper and page, then the flags and the warnings. ``curation``:
     the gene rows of ``corpus_scan.write_curation``; ``rows``: the scan's genes.csv
     (``corpus_scan.gene_rows``), shown when there is no curation. ``kept_since``: the date of the kept
-    scan this answer comes from."""
+    scan this answer comes from. ``what``: the curation (the built-in rules, or a task spec
+    ``drafted_by`` a model or the user)."""
     curation = list(curation or [])
     counts = {c: sum(1 for r in curation if r.get("claim") == c) for c in corpus_scan.CLAIMS}
     n_list = counts[corpus_scan.SUPPORTED] + counts[corpus_scan.CONTESTED]
@@ -9514,12 +9803,21 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
         extra = [f"{counts[c]} {label}" for c, label in ((corpus_scan.CONTESTED, "of them contested"),
                                                          (corpus_scan.AGAINST, "argued against"),
                                                          (corpus_scan.SUGGESTED, "only suggested")) if counts[c]]
-        title = (f"**Haploinsufficient genes in the RetiGene corpus: {n_list}** — the genes its papers state "
-                 "are haploinsufficient in retinal disease, from a curation of all the RetiGene papers"
-                 + (f" ({'; '.join(extra)})" if extra else "") + ".")
-    else:
+        if what.built_in:
+            title = (f"**Haploinsufficient genes in the RetiGene corpus: {n_list}** — the genes its papers state "
+                     "are haploinsufficient in retinal disease, from a curation of all the RetiGene papers"
+                     + (f" ({'; '.join(extra)})" if extra else "") + ".")
+        else:
+            title = (f"**“{_md_cell(what.name)}” in the RetiGene corpus: {n_list} gene{'s' if n_list != 1 else ''}** "
+                     "— the genes its papers "
+                     "state it for, from a curation of all the RetiGene papers with the task spec "
+                     + (f"{drafted_by} wrote" if drafted_by else "on the plan")
+                     + (f" ({'; '.join(extra)})" if extra else "") + ".")
+    elif what.built_in:
         title = ("**Haploinsufficient genes in the RetiGene corpus**" if kept_since else
                  "**RetiGene corpus scan finished** — explicitly reported haploinsufficient genes in retinal disease.")
+    else:
+        title = f"**RetiGene corpus scan finished** — “{_md_cell(what.name)}”."
     if kept_since:
         title += f" From the RetiGene corpus scan of {kept_since}, kept because the RetiGene papers have not changed since."
     lines = [
@@ -9533,6 +9831,11 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
         f"- Verified mechanism statements: **{result.get('n_hits_eligible')}** → "
         f"genes: **{result.get('n_genes')}**",
     ]
+    unread = result.get("unread_check") or {}
+    if unread.get("on"):
+        lines.append(f"- Chunks with a search term that no round had read: {unread.get('found', 0)}, "
+                     f"read now: {unread.get('read', 0)}"
+                     + (f", **left unread: {unread['left']}**" if unread.get("left") else ""))
     pilot = result.get("pilot") or {}
     if pilot:
         lines.append(f"- Pilot first: {pilot.get('read')} of {pilot.get('passages')} passages read"
@@ -9548,15 +9851,16 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
     lines.append("")
     if curation:
         lines += [
-            f"Under Results, `{corpus_scan.CURATION_SUBDIR}/`: `{corpus_scan.CURATION_GENES}` (one row per gene: "
+            f"Under Results, `{corpus_scan.CURATION_SUBDIR}/`: `{what.genes_file}` (one row per gene: "
             "its claim, explicit or hedged, negated or not, the phenotype as written, the strongest sentence "
-            f"verbatim, its paper's PMID, DOI and title, the page) and `{corpus_scan.CURATION_EVIDENCE}` (one row "
-            "per sentence). “Save tables to my data” keeps both in your Datasets. The scan's own tables "
-            f"(`{corpus_scan.OUT_SUBDIR}/`: genes.csv, hits.csv with every judged sentence, requests.csv with "
+            f"verbatim, its paper's PMID, DOI and title, the page) and `{what.evidence_file}` (one row "
+            "per sentence)" + ("" if what.built_in else f", with the task spec the scan read with (`{SPEC_FILE}`)")
+            + ". “Save tables to my data” keeps both in your Datasets. The scan's own tables "
+            f"(`{what.subdir}/`: genes.csv, hits.csv with every judged sentence, requests.csv with "
             "the search requests) are beside them for audit.",
             "",
         ]
-        lines += _curation_md(curation)
+        lines += _curation_md(curation, what)
     else:
         lines += [
             "`genes.csv` (one row per gene: HGNC symbol, phenotype and mechanism as written, up to 3 PMIDs "
@@ -9595,7 +9899,7 @@ def _corpus_summary_md(result: dict[str, Any], rows: "list[dict[str, Any]] | Non
         lines.append(f"⚠ {w}")
     lines.append("")
     lines.append(f"**How a gene qualifies** (the definition the model read every passage against): "
-                 f"{result.get('definition', '')}")
+                 f"{result.get('definition', '') or (what.spec or {}).get('definition', '')}")
     return "\n".join(lines)
 
 
@@ -10295,7 +10599,8 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
             # curation, which reads every paper: this line cannot do that, so it hands the request
             # back (issue 60). Decided on the note as the user wrote it, before the model rewrites
             # the question, so it does not depend on the rewrite's wording (issue 59).
-            if curation and _corpus_curation(conn, combined, with_context=with_context):
+            if curation and await asyncio.to_thread(_corpus_curation, conn, combined,
+                                                    with_context=with_context):
                 conn.push({"type": "chat_token", "token": (
                     "🧬 Your note asks for the genes the RetiGene papers report, so this becomes a "
                     "curation of all of them instead of a search of their best passages.")})
@@ -18285,8 +18590,8 @@ async def list_result_datasets(request: Request) -> JSONResponse:
             continue
         run_id = p.parent.name
         row = rows.setdefault(run_id, {"run_id": run_id, "created_at": rec.get("created_at")})
-        row["tables"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "n_genes", "counts", "created_at",
-                                                    "saved_to", "saved_at", "save_error")},
+        row["tables"] = {**{k: rec.get(k) for k in ("name", "size_bytes", "n_genes", "counts", "curation",
+                                                    "created_at", "saved_to", "saved_at", "save_error")},
                          "files": [str(f.get("name") or "") for f in rec.get("files") or []]}
     for p in home.glob(f"*/{_LITERATURE_RESULT_POINTER}"):
         rec = _read_pointer(p)

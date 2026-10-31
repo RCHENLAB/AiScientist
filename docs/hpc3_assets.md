@@ -63,6 +63,8 @@ a micromamba base and packed into a SIF named after the recipe.
 A build writes the exact package list beside the image as `<image>.sif.lock.txt`, and it reads and
 extends the lab's conda download cache, `<root>/envs/conda-pkgs/`, which the first build creates. To
 rebuild such an image, delete the file: the next job that needs it builds it again.
+The same micromamba base, pulled as `micromamba_2.9.0-debian12-slim.sif`, runs the builds of lab
+environments (`envs/lab/`); those are folders, not images.
 `cellqc-0.3.6_4509649d69.sif` has no lock file beside it; its package list is inside the image at
 `/opt/conda/aiscientist-packages.txt`.
 
@@ -92,6 +94,7 @@ configuration reads them. Together they are 60 G of the directory.
 | `envs/openspliceai/` | 5.1 G | a conda environment with OpenSpliceAI and PyTorch | `AISCIENTIST_SPLICEAI_BIN` | `deploy/vep/stage_annotation_dbs.sh` |
 | `envs/analysis-pydeps/` | 128 M | Python packages the analysis image lacks, added to the analysis jobs' import path: `pydeseq2` and what it needs (`formulaic`, `formulaic_contrasts`, `interface_meta`, `wrapt`) | `AISCIENTIST_HPC_PYDEPS` | `pip install --no-deps --target <root>/envs/analysis-pydeps <package>`, run inside `analysis.sif` so the wheels match its Python |
 | `envs/run-code-pkgs/` | under 1 M | the shared cache of packages that `run_code` installs when a snippet needs one the image lacks (`gateway/package_cache.py`) | fixed: `<root>/envs/run-code-pkgs` | fills itself |
+| `envs/lab/` | grows | environments built at the agent's request after the user's approval, one folder per recipe, with its record and lock file (`hpc/environments.py`, `docs/hpc3_storage_layout.md`) | fixed: `<root>/envs/lab` | fills itself (3775, any member's build) |
 
 Nothing in the product's code or in the production configuration reads the following, about 24 G
 together:

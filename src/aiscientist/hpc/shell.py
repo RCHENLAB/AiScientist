@@ -271,6 +271,7 @@ class HpcShell:
     max_fetch_mb: int = 2048
     package_cache: Any = None                     # SharedPackageCache | None
     sandbox: ShellSandbox | None = None           # None: run_shell runs bare (tests, sandbox switched off)
+    environments: Any = None                      # LabEnvironments | None (hpc/environments.py)
     _audit: list[dict] = field(default_factory=list)
 
     # --- plumbing ------------------------------------------------------------
@@ -420,7 +421,7 @@ class HpcShell:
     # --- worker-node tools ---------------------------------------------------
 
     def run_shell(self, command: str, timeout_s: int = 0,
-                  workdir: str = "") -> dict[str, Any]:
+                  workdir: str = "", environment: "str | list[str]" = "") -> dict[str, Any]:
         """Run a shell command on the session's CPU worker node.
 
         Always the worker, never the login node — that is what makes this safe to expose at all.
@@ -456,11 +457,19 @@ class HpcShell:
             self._say("info", f"Writing to your workspace: {cmd[:120]}")
 
         cwd = self._read_path(workdir) if workdir else None
+        # Lab environments (request_environment): mounted read-only, their bin/ first on PATH. The
+        # checks above read the command as written; the activation line is ours.
+        refs = self.resolve_environments(environment) if environment else []
+        if any(r.kind == "image" for r in refs):
+            raise HpcShellError("A container-image environment runs with run_in_environment, not run_shell.")
+        prefixes = [r.path for r in refs]
+        from .environments import activation
+        full = activation(prefixes) + cmd if prefixes else cmd
         sandboxed = self.sandbox is not None and bool(self.workspace.write_roots)
-        to_run = (self.sandbox.wrap(cmd, read_only=self.workspace.read_roots,
+        to_run = (self.sandbox.wrap(full, read_only=tuple(self.workspace.read_roots) + tuple(prefixes),
                                     writable=self.workspace.write_roots, home=self._shell_home(),
                                     cwd=cwd or self.workspace.write_roots[0])
-                  if sandboxed else cmd)
+                  if sandboxed else full)
         res = self._worker(to_run, timeout_s or self.command_timeout_s)
         out = {"status": "ok" if getattr(res, "exit_status", 1) == 0 else "failed",
                "exit_status": getattr(res, "exit_status", None),
@@ -468,6 +477,8 @@ class HpcShell:
                "stderr": _clip(getattr(res, "stderr", ""), 4000),
                "ran_on": "worker_node", "sandbox": "apptainer" if sandboxed else "none",
                "workdir": cwd, "command": cmd}
+        if refs:
+            out["environments"] = [r.id for r in refs]
         if out["status"] != "ok":
             note = self.missing_software_note(f"{out['stderr']}\n{out['stdout']}", where="run_shell")
             if note:
@@ -489,19 +500,84 @@ class HpcShell:
         if not q:
             raise HpcShellError("Name the program or package to look for.")
         catalog = self.module_catalog()
-        if catalog is None:
+        envs = self._lab_matches(q)
+        if catalog is None and not envs:
             return {"status": "error", "query": q, "error": "The HPC3 module list could not be read."}
-        matches = catalog.find(q)
-        if matches:
-            return {"status": "ok", "query": q, "modules": matches, "how_to_use": (
-                "Run module software with run_shell: `module load <load> && <program> ...` (the `load` "
-                "field is the newest version). It does not exist inside run_code's image: write the "
-                "inputs to your AiScientist folder (AISCIENTIST_WORK) from run_code, run the program with "
-                "run_shell, then read its output back in run_code.")}
-        return {"status": "not_found", "query": q, "modules": [], "next": (
-            f"No HPC3 module provides '{q}'. If it is a Python package, import it in run_code (the install "
-            "is offered to the user). Otherwise there is no approved way to install it in this session "
-            f"yet: say that the step needs {q}, and do not hand-write a replacement of the method.")}
+        matches = catalog.find(q) if catalog is not None else []
+        if matches or envs:
+            out: dict[str, Any] = {"status": "ok", "query": q, "modules": matches}
+            how = []
+            if envs:
+                out["lab_environments"] = envs
+                how.append("A lab environment already has it: pass environment='<environment>' to run_shell, "
+                           "run_code or run_in_environment (no install, no approval needed).")
+            if matches:
+                how.append("Run module software with run_shell: `module load <load> && <program> ...` (the "
+                           "`load` field is the newest version). It does not exist inside run_code's image: "
+                           "write the inputs to AISCIENTIST_WORK from run_code, run the program with run_shell, "
+                           "then read its output back in run_code.")
+            out["how_to_use"] = " ".join(how)
+            return out
+        return {"status": "not_found", "query": q, "modules": [], "next": self._not_found_next(q)}
+
+    def _lab_matches(self, query: str) -> list[dict[str, Any]]:
+        if self.environments is None:
+            return []
+        try:
+            return self.environments.find(query)
+        except Exception:  # noqa: BLE001 - a lookup aid; the module search still answers
+            return []
+
+    def _not_found_next(self, name: str) -> str:
+        if self.environments is None:
+            return (f"No HPC3 module provides '{name}'. If it is a Python package, import it in run_code (the "
+                    "install is offered to the user). Otherwise there is no approved way to install it in this "
+                    f"session: say that the step needs {name}, and do not hand-write a replacement of the method.")
+        return (f"No HPC3 module or lab environment provides '{name}'. A Python package on PyPI: import it in "
+                "run_code (the install is offered to the user). Anything else (a bioconda or conda-forge tool, "
+                "an R or Bioconductor package, a package only on GitHub, software released as source): call "
+                "request_environment with pinned packages; the user approves it on a card, it is built once on "
+                f"HPC3 and shared with the lab. Do not hand-write a replacement of the method.")
+
+    # --- software: lab environments (hpc/environments.py) ---------------------------
+
+    def resolve_environments(self, spec: "str | list[str]") -> list[Any]:
+        """The published lab environments ``spec`` names (ids, comma-separated or a list)."""
+        if self.environments is None:
+            raise HpcShellError("Lab environments are not enabled in this session.")
+        from .environments import RecipeError
+        try:
+            return self.environments.resolve(spec)
+        except RecipeError as exc:
+            raise HpcShellError(str(exc)) from exc
+
+    def request_environment(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Find or build the environment a recipe describes: an existing one is used at once; a new one
+        is built after the user approves it (``AISCIENTIST_ENV_APPROVAL=auto``: without asking)."""
+        if self.environments is None:
+            raise HpcShellError("Lab environments are not enabled in this session.")
+        from .environments import Recipe, RecipeError
+        lab = self.environments
+        try:
+            recipe = Recipe.from_args(args)
+        except RecipeError as exc:
+            return {"status": "invalid", "error": str(exc)}
+        existing = lab.record(recipe.env_id)
+        if existing is not None:
+            self._say("info", f"Using the lab environment {recipe.env_id}, built before.")
+            return lab.ready_result(recipe, existing, reused=True)
+        if lab.approval == "auto":
+            approved_by = "auto (AISCIENTIST_ENV_APPROVAL=auto)"
+            self._audit.append({"auto_approved": {"kind": "environment", "id": recipe.env_id}})
+        else:
+            req = ConfirmRequest("install", f"Build the software environment '{recipe.name}' on HPC3",
+                                 recipe.card_detail(max_gb=lab.max_gb))
+            if not self._ask(req):
+                return {"status": "declined", "environment": recipe.env_id, "reason": (
+                    "The user declined this environment. Say that the step needs this software, and do not "
+                    "hand-write a replacement of the method.")}
+            approved_by = lab.account or str(getattr(self.remote, "username", "") or "the user")
+        return lab.build(recipe, approved_by=approved_by)
 
     def missing_software_note(self, text: str, where: str = "run_code") -> list[dict[str, Any]]:
         """For a failed command's output: each missing program or R package, and which module
@@ -509,7 +585,8 @@ class HpcShell:
         from .modules import missing_from_output, software_note
         if not missing_from_output(text):
             return []
-        return software_note(text, self.module_catalog(), where=where)
+        return software_note(text, self.module_catalog(), where=where,
+                             lab_find=self._lab_matches if self.environments is not None else None)
 
     def _shell_home(self) -> str:
         """``HOME`` inside the shell sandbox: a folder in the first writable root, so a tool that
@@ -631,9 +708,12 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
         from ..agents.skills_registry import active_skill
         if active_skill(ctx) is not None:
             return {"status": "error", "error": "Registry skills require a policy-enforcing container; use run_code or run_in_environment."}
-        return shell.run_shell(_str(args, "command"), _int(args, "timeout_s", 0), _str(args, "workdir"))
+        env = args.get("environment") or ""
+        env = ",".join(str(e) for e in env) if isinstance(env, list) else str(env)
+        return shell.run_shell(_str(args, "command"), _int(args, "timeout_s", 0), _str(args, "workdir"),
+                               environment=env)
 
-    return [
+    tools = [
         HarnessTool(
             name="list_dir",
             description=("List a directory on HPC3 with sizes and modification times. Fast "
@@ -699,7 +779,8 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
                          "or package, matched by module name, by the programs it installs (`bedtools` "
                          "is in bedtools2, `Rscript` in R) or by description. Returns the `module load` "
                          "line for the newest version. Module software runs with run_shell, not "
-                         "inside run_code. Answered on the login node, no allocation."),
+                         "inside run_code. Also lists lab environments already built that provide it "
+                         "(use them with environment=...). Answered on the login node, no allocation."),
             parameters={"type": "object", "properties": {
                 "name": {"type": "string", "description": "A program, tool or package name, e.g. 'bedtools' or 'Rscript'."},
             }, "required": ["name"]},
@@ -720,6 +801,9 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
                 "command": {"type": "string", "description": "The shell command line."},
                 "workdir": {"type": "string", "description": "Optional directory to run in."},
                 "timeout_s": {"type": "integer", "description": "Per-command wall limit."},
+                "environment": {"type": "string", "description": (
+                    "Optional lab environment id(s) from request_environment or find_software, comma-"
+                    "separated: mounted read-only with its programs first on PATH.")},
             }, "required": ["command"]},
             executor=_ok(_run_skill_shell),
             reads_private_data=True,
@@ -756,3 +840,46 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
             requires=("hpc_worker",),
         ),
     ]
+    if shell.environments is not None:
+        tools.append(_request_environment_tool(shell))
+    return tools
+
+
+_LIST = {"type": "array", "items": {"type": "string"}}
+
+
+def _request_environment_tool(shell: HpcShell) -> HarnessTool:
+    return HarnessTool(
+        name="request_environment",
+        description=(
+            "Get software that neither run_code's image nor an HPC3 module has (check find_software first): "
+            "write a recipe, and a lab environment is built for it. `conda`: packages from conda-forge and "
+            "bioconda, pinned name=version (most bioinformatics tools; R and Bioconductor packages as "
+            "r-<name> / bioconductor-<name>). `pip`: name==version from PyPI, or "
+            "git+https://github.com/<owner>/<repo>@<tag or commit> for a package only on GitHub (needs "
+            "python=<version> in conda). `r`: cran:<name>==<version>, bioc:<name> or "
+            "github:<owner>/<repo>@<tag or commit> (needs r-base=<version> in conda). `script`: bash that "
+            "builds software released only as source into $PREFIX (git, gcc/g++/gfortran, make, cmake and "
+            "pkg-config are provided, with $CC, $CXX, $FC, $CPPFLAGS and $LDFLAGS set for $PREFIX; list the "
+            "libraries it links against under `conda`; clone a tag or commit, never a branch). Or `image`: "
+            "docker://<registry>/<repo>:<tag> "
+            "(quay.io/biocontainers has an image for every bioconda package). `provides` is checked after "
+            "the build (commands, 'R:<package>', 'py:<module>'). The user approves the recipe on a card; it "
+            "is built once in a Slurm job on an HPC3 compute node (minutes; up to 4 hours for a large R "
+            "stack), and the same recipe is reused at once by any later run. Use the returned `environment` "
+            "id with run_shell, run_code or run_in_environment. Prefer conda over pip, r and script: it is "
+            "faster and pins every dependency."),
+        parameters={"type": "object", "properties": {
+            "name": {"type": "string", "description": "Short name, e.g. 'mosdepth' or 'deseq2-r44'."},
+            "conda": {**_LIST, "description": "Pinned conda specs, e.g. ['mosdepth=0.3.10', 'r-base=4.4']."},
+            "pip": {**_LIST, "description": "Pinned pip requirements, or git+https://github.com/o/r@<tag>."},
+            "r": {**_LIST, "description": "cran:<name>==<version>, bioc:<name>, github:<owner>/<repo>@<ref>."},
+            "script": {"type": "string", "description": "Optional source build into $PREFIX (bash)."},
+            "image": {"type": "string", "description": "Instead of packages: docker://<registry>/<repo>:<tag>."},
+            "provides": {**_LIST, "description": "What must work afterwards: 'samtools', 'R:DESeq2', 'py:pysam'."},
+            "verify": {**_LIST, "description": "Optional commands that must succeed, e.g. 'mosdepth --version'."},
+            "reason": {"type": "string", "description": "Why the step needs it (shown to the user on the card)."},
+        }, "required": ["name", "provides", "reason"]},
+        executor=_ok(lambda a, _c: shell.request_environment(a)),
+        category="shell",
+    )

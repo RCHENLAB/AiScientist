@@ -20,7 +20,8 @@ HPC3 holds environments, images, model weights and one folder per session
 /dfs3b/ruic20_lab/software/AiScientist/   <- AISCIENTIST_HPC_SHARED_ROOT
 ├── envs/                     environments: openspliceai/, analysis-pydeps/ (Python packages the
 │                             analysis image lacks), run-code-pkgs/ (packages run_code installs),
-│                             conda-pkgs/ (the lab's conda download cache for image builds)
+│                             conda-pkgs/ (the lab's conda download cache for image builds),
+│                             lab/ (environments the agent asked for, one folder per recipe)
 ├── containers/               images (hpc3_assets.md)
 ├── models/                   model weights: hf/ (the Hugging Face cache), scgpt/, vlreview/
 └── sessions/<session-uuid>/  one session; the folder name is the session's id
@@ -291,6 +292,7 @@ The agent writes only in the user's own folders here: the session's folder, and 
 Nothing outside them, including `$HOME`, the member's personal folder `/dfs3b/ruic20_lab/<ucinetid>/`,
 other members' folders and the shared assets, can be written, moved or deleted by the agent, and
 the user is not asked to make an exception: `run_shell` and `fetch_url` refuse such a command before it runs.
+Deleting or moving data inside the user's own folders still asks the user first.
 
 `run_shell` runs inside Apptainer on the worker (`hpc/shell.py`, `ShellSandbox`):
 `apptainer exec --containall --no-mount bind-paths` in `<root>/containers/rockylinux_9.7.20251123.sif`.
@@ -303,7 +305,40 @@ the user is not asked to make an exception: `run_shell` and `fetch_url` refuse s
 
 The image is pulled on the worker on first use. `AISCIENTIST_SHELL_SANDBOX=0` runs `run_shell` bare
 with only the textual write check; it is an emergency switch, not a boundary.
-Deleting or moving data inside them still asks the user first.
+
+### Software the agent asks for: lab environments
+
+When a step needs software that neither run_code's image nor an HPC3 module has, the agent writes a
+recipe with `request_environment` (`hpc/environments.py`): pinned conda packages from conda-forge and
+bioconda, pip packages (PyPI, or a GitHub, GitLab, Bitbucket or Codeberg repository at a tag or
+commit), R packages (`cran:<name>==<version>`, `bioc:<name>`, `github:<owner>/<repo>@<tag or commit>`,
+on a pinned `r-base`), and a build script for software released only as source. A branch name is
+refused. A container image (`docker://` from quay.io, ghcr.io or docker.io, at a tag other than
+`latest`) can be asked for instead.
+
+- **Approval.** The user approves the recipe on the console's card, which lists every package and the
+  whole build script. `AISCIENTIST_ENV_APPROVAL=auto` builds without asking.
+- **Build.** One Slurm batch job on a compute node (8 CPUs, 32 GB, 4 hours). Every install command
+  runs in `<root>/containers/micromamba_2.9.0-debian12-slim.sif` (pulled on first use) with
+  `--containall --no-mount bind-paths`: writable are only the new environment and the job's local
+  scratch, and the network is on. The environment is built at its final path
+  (`<root>/envs/lab/<name>-<hash>/`, through a staging folder in `envs/lab/.staging/` bound there).
+  An image environment is pulled into `<root>/containers/` instead.
+- **Check.** What the recipe `provides` (commands, `R:<package>`, `py:<module>`) is run with the
+  environment read-only and the network off. Nothing is published if a check fails or the
+  environment is over `AISCIENTIST_ENV_MAX_GB`.
+- **Publish.** One `mv -T` of the staging folder. The folder name ends in a hash of the recipe, so a
+  recipe is built once: a later request for it, by any lab member, gets the existing environment with
+  no card. `<name>-<hash>/.aiscientist/` holds `record.json` (recipe, reason, who asked and approved,
+  run, Slurm job, size), `lock.txt` (every conda package with its URL and md5), `pip-freeze.txt`,
+  `r-packages.tsv` (with GitHub commits) and the recipe files.
+- **Use.** `run_shell`, `run_code` and `run_in_environment` take `environment=<id>`: the folder is
+  mounted read-only and its `bin/` comes first on `PATH`. A `run_code` snippet still runs on the
+  image's own Python. `find_software` lists the environments that provide a program or package.
+
+`envs/lab/`, like `envs/` and `containers/`, is group-writable, setgid and sticky (3775; *Permissions
+of the shared root*): any member's build can publish an environment or pull an image, and only its
+owner can remove it.
 
 The heartbeat is the session's `jobs/worker/aiscientist-worker-<ucinetid>-<jobid>.alive`; a new
 session looks for it in all of the user's session folders before it cancels a holder nothing uses. A command refreshes
@@ -430,13 +465,19 @@ Other removals still run on a login node over the SSH session:
 | `AISCIENTIST_TEMP_TTL_DAYS` | `3` | age after which an untouched session folder (or `Temp/` unit) is swept, results kept; `0` disables the sweep |
 | `AISCIENTIST_SESSION_CLEANUP` | `1` | bring a session's results home and remove its folder when it disconnects, and those of earlier sessions at the next connect; `0` leaves them to the sweep, which keeps each run's `result/` |
 | `AISCIENTIST_HPC_PYDEPS` | unset | `envs/analysis-pydeps`, added to the analysis jobs' import path |
+| `AISCIENTIST_LAB_ENVIRONMENTS` | `1` | offer `request_environment` and `environment=`; `0` turns lab environments off |
+| `AISCIENTIST_ENV_APPROVAL` | `ask` | `ask`: a card for each new environment; `auto`: build without asking |
+| `AISCIENTIST_ENV_MAX_GB` | `10` | the largest environment that is published |
+| `AISCIENTIST_ENV_STARTUP_TIMEOUT_S` | `600` | how long a build job waits in the queue per attempt |
 | `AISCIENTIST_HF_HOME`, `AISCIENTIST_SCGPT_MODEL_DIR`, `AISCIENTIST_VLREVIEW_MODEL_DIR` | `models/hf`, `models/scgpt`, `models/vlreview` under the root | the model weights |
 | `AISCIENTIST_REMOVE_PERSONAL_ORIGINALS` | off | let the Storage tab also remove originals in the personal lab folder |
 
 ## Permissions of the shared root
 
-The root is `drwxrwsr-x` (2775, setgid). `sessions/` is `drwxrwsr-t` (3775: group-writable,
-setgid, sticky), so any lab member's session can create its folder and only its owner can remove
-it; each session folder is 0700 (`hpc_gc.ensure_shared_dirs`). `/dfs3b/ruic20_lab` itself is not group-writable, which is why the
+The root is `drwxrwsr-x` (2775, setgid). `sessions/`, `envs/`, `envs/lab/` and `containers/` are
+`drwxrwsr-t` (3775: group-writable, setgid, sticky), so any lab member's session can create its
+folder, build a lab environment or pull an image, and only the owner of a folder or file can remove
+it; each session folder is 0700 (`hpc_gc.ensure_shared_dirs`). `models/` is `drwxr-sr-x` (2755):
+model weights are installed by its owner. `/dfs3b/ruic20_lab` itself is not group-writable, which is why the
 root is under `software/`. To move it, someone with `ruic20` rights creates the new directory and
 `AISCIENTIST_HPC_SHARED_ROOT` points to it; no code changes.

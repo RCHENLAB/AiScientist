@@ -812,8 +812,14 @@ def _close_unterminated_json(raw: str) -> "dict[str, Any] | None":
     return parsed if isinstance(parsed, dict) else None
 
 
+def _env_arg(args: dict[str, Any]) -> str:
+    env = args.get("environment") or ""
+    return ",".join(str(e) for e in env) if isinstance(env, list) else str(env).strip()
+
+
 def make_run_code_tool(executor: CodeExecutor | None,
-                       software_note: "Callable[[str], list[dict]] | None" = None) -> HarnessTool:
+                       software_note: "Callable[[str], list[dict]] | None" = None,
+                       environments: "Callable[[str], list] | None" = None) -> HarnessTool:
     """The hybrid CodeAct tool: the Scientist can write-and-run Python when the
     curated tools don't cover a step. Execution is delegated to ``executor`` (a
     sandboxed runtime on the server); without one it returns a clear 'not enabled'
@@ -821,7 +827,11 @@ def make_run_code_tool(executor: CodeExecutor | None,
 
     ``software_note(output)``: for a failed snippet, the programs or R packages it lacked and the
     HPC3 module that provides each (``HpcShell.missing_software_note``), so the model runs the
-    module with run_shell instead of rewriting the method (docs/environments/README.md §4)."""
+    module with run_shell instead of rewriting the method (docs/environments/README.md §4).
+
+    ``environments(ids)``: the published lab environments ``environment=`` names
+    (``HpcShell.resolve_environments``), mounted read-only into the snippet's job with their bin/ first
+    on PATH (``hpc/environments.py``). None when lab environments are off: the parameter is then refused."""
 
     def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
         code = str(args.get("code", "")).strip()
@@ -845,7 +855,21 @@ def make_run_code_tool(executor: CodeExecutor | None,
             skill = active_skill(ctx, str(args.get("skill") or ""))
         except ValueError as exc:
             return {"status": "error", "error": str(exc)}
-        result = execute(skill, ctx, executor, lambda: executor(to_run), "run_code", code=code)
+        refs: list = []
+        wanted = _env_arg(args)
+        if wanted:
+            if environments is None:
+                return {"status": "error", "error": "Lab environments are not enabled in this session."}
+            try:
+                refs = environments(wanted)
+            except Exception as exc:  # noqa: BLE001 - the model reads the reason
+                return {"status": "error", "error": str(exc)}
+            if any(getattr(r, "kind", "") == "image" for r in refs):
+                return {"status": "error", "error": ("A container-image environment runs with "
+                                                     "run_in_environment(environment=..., command=...).")}
+        from ..hpc.environments import using
+        with using(refs):
+            result = execute(skill, ctx, executor, lambda: executor(to_run), "run_code", code=code)
         duration_ms = int((_prov.perf_now() - t0) * 1000)
         if isinstance(result, dict):
             try:
@@ -890,7 +914,9 @@ def make_run_code_tool(executor: CodeExecutor | None,
         "silently half-work), and do NOT hand-write a replacement for a library you were denied. "
         "A program this Python image lacks (an R script, a command-line tool such as bedtools or STAR) "
         "may be one of HPC3's software modules: call find_software('<name>') and run it with run_shell "
-        "(`module load ...`), on files you write to AISCIENTIST_WORK. "
+        "(`module load ...`), on files you write to AISCIENTIST_WORK. Software no module has can be built "
+        "as a lab environment with request_environment (when that tool is offered); pass its id as "
+        "`environment` here and its programs (Rscript, mosdepth, ...) are on PATH for subprocess calls. "
         "STRICT: use this ONLY for analysis (compute figures into figures/, tables into tables/). Do "
         "NOT write or render a report or document (no .docx/.pdf/.html, no python-docx/reportlab/"
         "pandoc), and do NOT zip/package/export the outputs: the final PDF+DOCX report and the "
@@ -906,32 +932,73 @@ def make_run_code_tool(executor: CodeExecutor | None,
         name="run_code",
         description=description,
         parameters={"type": "object", "properties": {"code": {"type": "string"},
-                    "skill": {"type": "string", "description": "Skill being applied; defaults to the last skill read."}},
+                    "skill": {"type": "string", "description": "Skill being applied; defaults to the last skill read."},
+                    "environment": {"type": "string", "description": (
+                        "Optional lab environment id(s) (request_environment / find_software), comma-separated: "
+                        "mounted read-only, programs first on PATH.")}},
                     "required": ["code"]},
         executor=_exec,
         reads_private_data=False, category="codeact",
     )
 
 
-def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
+def make_run_in_environment_tool(executor: Any,
+                                 environments: "Callable[[str], list] | None" = None) -> "HarnessTool | None":
     """``run_in_environment`` — run a skill's shell commands inside the environment its SKILL.md
     declares (``image:``), as a Slurm job on HPC3. None when ``executor`` cannot run images (no HPC
     session), so a local run's roster does not list a tool that cannot work.
 
     This is what lets a skill that needs its own software stack (an R/Snakemake pipeline such as
     CellQC) work with no wrapper tool: the platform builds its declared image once for the lab, and the agent follows the skill's commands here. Only a skill's DECLARED image can be used —
-    the agent never names an image itself, so what runs is what the skill's author pinned."""
+    the agent never names an image itself, so what runs is what the skill's author pinned.
+
+    ``environments(ids)`` (``HpcShell.resolve_environments``): with ``environment=`` instead of a
+    skill, the command runs in a lab environment the user approved (``request_environment``): a
+    container-image one in its image, a package one in run_code's image with the environment mounted
+    read-only and first on PATH."""
     runner = getattr(executor, "run_in_image", None)
     if not callable(runner):
         return None
+
+    def _exec_env(wanted_env: str, command: str) -> dict[str, Any]:
+        import hashlib
+        if environments is None:
+            return {"status": "error", "error": "Lab environments are not enabled in this session."}
+        if not command:
+            return {"status": "error", "error": "no command provided"}
+        try:
+            refs = environments(wanted_env)
+        except Exception as exc:  # noqa: BLE001 - the model reads the reason
+            return {"status": "error", "error": str(exc)}
+        images = [r for r in refs if getattr(r, "kind", "") == "image"]
+        if images and len(refs) > 1:
+            return {"status": "error", "error": "A container-image environment cannot be combined with others."}
+        workdir = "env/" + re.sub(r"[^\w.\-]", "_", "+".join(r.id for r in refs))[:120]
+        if images:
+            result = runner(command, images[0].image, workdir=workdir)
+        else:
+            from ..hpc.environments import using
+            run_command = getattr(executor, "run_command", None)
+            if not callable(run_command):
+                return {"status": "not_enabled", "note": "this session cannot run batch jobs with an environment"}
+            with using(refs):
+                result = run_command(command, workdir=workdir)
+        if isinstance(result, dict):
+            result["environments"] = [r.id for r in refs]
+            result["provenance"] = {"environments": [r.id for r in refs],
+                                    "command_sha256": hashlib.sha256(command.encode()).hexdigest()[:16]}
+        return result
 
     def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
         from .skills import SKILLS, get_skill, refresh_skills
+        wanted_env = _env_arg(args)
+        command = str(args.get("command") or "").strip()
+        if wanted_env and not str(args.get("skill") or "").strip():
+            return _exec_env(wanted_env, command)
         refresh_skills()
         wanted = str(args.get("skill") or "").strip()
-        command = str(args.get("command") or "").strip()
         with_env = sorted(s.name for s in list(SKILLS.values()) if s.image)
         skill = get_skill(wanted) or next(
             (s for s in list(SKILLS.values()) if s.name.lower() == wanted.lower()), None)
@@ -993,16 +1060,24 @@ def make_run_in_environment_tool(executor: Any) -> "HarnessTool | None":
         "count. CPUs, memory and time come from the skill. The first use of an environment builds "
         "it once for the whole lab, which can take 10-30 minutes. Returns the exit code, the tails "
         "of stdout/stderr, and the files written under $AISCIENTIST_ARTIFACTS.")
+    if environments is not None:
+        description += (
+            " Or pass `environment` (an id from request_environment or find_software) instead of `skill` to "
+            "run the commands as a batch job in that lab environment (its programs first on PATH; 8 CPUs, the "
+            "run_code memory cap): for a program that needs more time or memory than run_shell gives.")
     if declared:
         description += "\nSkills that declare an environment:\n" + "\n".join(declared)
+    properties = {
+        "skill": {"type": "string", "description": "the skill whose environment to use"},
+        "command": {"type": "string", "description": "bash to run in it (several lines are fine)"}}
+    if environments is not None:
+        properties["environment"] = {"type": "string", "description": (
+            "a lab environment id, instead of a skill")}
     return HarnessTool(
         name="run_in_environment",
         description=description,
-        parameters={"type": "object", "properties": {
-            "skill": {"type": "string", "description": "the skill whose environment to use"},
-            "command": {"type": "string",
-                        "description": "bash to run in it (several lines are fine)"}},
-            "required": ["skill", "command"]},
+        parameters={"type": "object", "properties": properties,
+                    "required": ["command"] if environments is not None else ["skill", "command"]},
         executor=_exec,
         reads_private_data=False, category="codeact",
     )

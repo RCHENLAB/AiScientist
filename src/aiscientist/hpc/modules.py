@@ -198,16 +198,39 @@ def missing_from_output(text: str) -> list[tuple[str, str]]:
     return list(dict.fromkeys(found))
 
 
-def software_note(text: str, catalog: ModuleCatalog | None, *, where: str) -> list[dict[str, Any]]:
+_REQUEST = ("call request_environment with pinned packages (the user approves it on a card; it is built once "
+            "on HPC3 and shared with the lab)")
+
+
+def software_note(text: str, catalog: ModuleCatalog | None, *, where: str,
+                  lab_find: "Callable[[str], list[dict[str, Any]]] | None" = None) -> list[dict[str, Any]]:
     """What to tell the model about each missing program or package in ``text``. ``where`` is the
-    tool that failed (``run_code`` or ``run_shell``): module software runs only in ``run_shell``."""
+    tool that failed (``run_code`` or ``run_shell``): module software runs only in ``run_shell``.
+
+    ``lab_find(name)``: the lab environments that provide ``name`` (``hpc/environments.py``); given
+    only when lab environments are enabled, and then the hint offers ``request_environment``."""
     notes: list[dict[str, Any]] = []
     for kind, name in missing_from_output(text)[:3]:
+        envs = []
+        if lab_find is not None:
+            try:
+                envs = lab_find(name)
+            except Exception:  # noqa: BLE001 - a lookup aid only
+                envs = []
+        if envs:
+            ids = [e["environment"] for e in envs]
+            notes.append({"name": name, "kind": kind, "modules": [], "lab_environments": ids, "hint": (
+                f"The lab environment {ids[0]} provides '{name}': pass environment='{ids[0]}' to {where} "
+                "(or to run_shell / run_in_environment) and run it again.")})
+            continue
         if kind == "r_package":
+            how = (f"install it: {_REQUEST}, e.g. conda ['r-base=<version>', 'bioconductor-{name.lower()}=<version>'] "
+                   f"or r ['bioc:{name}'] / ['cran:{name}==<version>'] / ['github:<owner>/<repo>@<tag>'], then pass "
+                   "environment=<id> to run_code or run_shell"
+                   if lab_find is not None else "there is no approved way to install it in this session")
             notes.append({"name": name, "kind": kind, "modules": [], "hint": (
-                f"The R package '{name}' is not installed in this R. There is no approved way to install "
-                "it in this session yet: say that the step needs it, and do not hand-write a replacement "
-                "of the method.")})
+                f"The R package '{name}' is not installed in this R. To use it, {how}. Do not hand-write a "
+                "replacement of the method.")})
             continue
         matches = catalog.find(name, limit=3) if catalog is not None else []
         if matches:
@@ -222,6 +245,11 @@ def software_note(text: str, catalog: ModuleCatalog | None, *, where: str) -> li
         elif catalog is None:
             hint = (f"'{name}' is not available here, and the HPC3 module list could not be read: try "
                     f"find_software('{name}').")
+        elif lab_find is not None:
+            hint = (f"No HPC3 module or lab environment provides '{name}'. If it is a Python package, import it in "
+                    f"run_code (the install is offered to the user). Otherwise {_REQUEST}, e.g. conda "
+                    f"['{name.lower()}=<version>'] from bioconda, then pass environment=<id>. Do not hand-write a "
+                    "replacement.")
         else:
             hint = (f"No HPC3 module provides '{name}'. If it is a Python package, import it in run_code "
                     "(the install is offered to the user). Otherwise there is no approved way to install it "
