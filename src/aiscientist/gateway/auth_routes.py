@@ -410,7 +410,9 @@ def my_datasets(request: Request) -> dict:
                 for r in s.scalars(select(MetadataRecord).where(MetadataRecord.user_id == user.id,
                                                                 MetadataRecord.kind == "dataset")).all()}
         from .dataset_storage import location_of
-        return {"datasets": [{**d.public(), "metadata": meta.get(d.id), "location": location_of(d.path)}
+        from . import storage_policy
+        return {"datasets": [{**d.public(), "metadata": meta.get(d.id), "location": location_of(d.path),
+                              "removal_at": storage_policy.removal_at(d.public())}
                              for d in rows]}
 
 
@@ -574,6 +576,12 @@ def delete_dataset_record(user_id: int, dataset_id: int, delete_files=None) -> s
         from . import metadata_store
         metadata_store.delete_for_dataset(s, dataset_id)
         s.flush()
+        from .models import DatasetRetention
+        audit = s.get(DatasetRetention, row.uuid)
+        if audit is not None and not audit.removed_at:
+            from .storage_policy import _now
+            audit.removed_at = _now()
+            audit.size_bytes = row.size_bytes
         s.delete(row)
         s.commit()
         return path
@@ -1019,7 +1027,12 @@ def list_users(q: str | None = None, _admin: User = Depends(require_admin)) -> d
                 conds.append(User.id == int(term))
             stmt = stmt.where(or_(*conds))
         users = s.scalars(stmt.order_by(User.id)).all()
-        return {"users": [u.public() for u in users]}
+        from .app import _server_storage
+        from . import storage_policy
+        return {"users": [{**u.public(), "storage": {
+            "total_bytes": _server_storage(u.id, u.username)["total_bytes"],
+            "limit_bytes": storage_policy.limit_bytes(),
+            "due_datasets": storage_policy.due_datasets(u.id)}} for u in users]}
 
 
 def _store_owner(username: str) -> str:

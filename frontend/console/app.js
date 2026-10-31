@@ -3385,8 +3385,8 @@ async function originalsAction(kind, planId) {
 }
 
 // ---- My account → Storage (RCHENLAB/AiScientist issue 32) ---------------------------------------
-// Where the account's files are. On the server: its datasets and its runs' folders, kept until
-// deleted; read without an HPC3 session. On HPC3: the account's own folders there, read over this
+// Where the account's files are. On the server: its datasets and its runs' folders,
+// read without an HPC3 session. On HPC3: the account's own folders there, read over this
 // session's SSH, area by area, each saying what happens to the files in it.
 let _storeServer = null;                                   // the server listing as last read
 const _storeShowAll = { datasets: false, outputs: false };
@@ -3444,6 +3444,34 @@ function storeListHtml(key, title, rows, empty) {
     (rows.length ? (all ? rows : rows.slice(0, STORE_ROWS)).join("") + more : `<div class="storage-empty">${escapeHtml(empty)}</div>`) + `</div>`;
 }
 
+function storageUseText(d) {
+  if (d.limit_bytes == null) return fmtSize(d.total_bytes || 0);
+  return d.limit_bytes > 0 ? `${fmtSize(d.total_bytes || 0)} of ${fmtSize(d.limit_bytes)}`
+    : `${fmtSize(d.total_bytes || 0)} · no account limit`;
+}
+
+function retentionNoticesHtml(notices) {
+  if (!notices || !notices.length) return "";
+  return `<div class="store-retention" role="status"><strong>Datasets scheduled for removal</strong>` +
+    `<p>Download these datasets before their removal dates to keep a copy.</p>` + notices.map((n) => storeRowHtml({
+      name: n.dataset_name, bytes: n.size_bytes, meta: `Removal: ${fmtDay(n.removal_at, { year: true })}`,
+      action: `<a class="ghost small" href="${escapeHtml(n.download_url)}" download>Download</a>`,
+    })).join("") + `</div>`;
+}
+
+function isStorageLink(href) {
+  const url = new URL(href, window.location.href);
+  return url.origin === window.location.origin &&
+    (url.searchParams.get("account") === "storage" || url.hash === "#account/storage");
+}
+
+async function loadDatasetNotices() {
+  try {
+    const r = await fetch("/api/storage/server");
+    if (r.ok) $("datasetNotices").innerHTML = retentionNoticesHtml((await r.json()).notices);
+  } catch { /* Keep any notice already displayed while disconnected. */ }
+}
+
 async function loadServerStorage() {
   const body = $("storeServerBody");
   try {
@@ -3466,10 +3494,11 @@ function renderServerStorage(d, results) {
   if (!_storeServer) return;
   ({ d, results } = _storeServer);
   const datasets = d.datasets || [], outputs = d.outputs || [];
-  $("storeServerTotal").textContent = fmtSize(d.total_bytes || 0);
+  $("storeServerTotal").textContent = storageUseText(d);
   const dsRows = datasets.map((x) => storeRowHtml({
     name: x.name, bytes: x.bytes, title: x.path || "",
-    meta: [x.kind, x.uploaded_at ? `added ${fmtDay(x.uploaded_at)}` : ""].filter(Boolean).join(" · "),
+    meta: [x.kind, x.uploaded_at ? `added ${fmtDay(x.uploaded_at)}` : "",
+      x.removal_at ? `removal ${fmtDay(x.removal_at, { year: true })}` : ""].filter(Boolean).join(" · "),
     action: `<button type="button" class="ghost small danger" data-del="${x.id}" data-name="${escapeHtml(x.name)}" ` +
             `data-kind="${escapeHtml(x.kind || "")}" data-location="server" data-path="${escapeHtml(x.path || "")}">Delete</button>`,
   }));
@@ -3483,12 +3512,23 @@ function renderServerStorage(d, results) {
   const notes = [];
   if (d.linked) notes.push(`${d.linked} of your datasets only point at a shared folder on the server and take none of your space.`);
   if (d.on_hpc3) notes.push(`${d.on_hpc3} of your datasets are still kept on HPC3. They are copied to the server when you next connect.`);
+  const percent = d.limit_bytes > 0 ? (d.total_bytes || 0) / d.limit_bytes * 100 : 0;
+  const quota = d.limit_bytes > 0 ? `<div class="store-quota${percent >= 80 ? " warning" : ""}">` +
+    `<div class="store-bar" role="progressbar" aria-label="Account storage used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100, Math.round(percent))}">` +
+    `<i style="width:${Math.min(100, percent)}%"></i></div>` +
+    (percent >= 80 ? `<p>You have used ${Math.round(percent)}% of your account storage. Delete files to make room for uploads and saved datasets.</p>` : "") + `</div>` : "";
+  const removed = (d.retention_removals || []).map((x) => storeRowHtml({
+    name: x.dataset_name, bytes: x.size_bytes,
+    meta: `Removed ${fmtDay(x.removed_at, { year: true })} · owner ${x.owner}`,
+  }));
   $("storeServerBody").innerHTML =
+    quota + retentionNoticesHtml(d.notices) +
     storeBarHtml([{ label: "Datasets", bytes: d.datasets_bytes, cls: "k-datasets" },
                   { label: "Run outputs", bytes: d.outputs_bytes, cls: "k-outputs" }]) +
     storeListHtml("datasets", "Datasets", dsRows, "No datasets yet.") +
     storeListHtml("outputs", "Run outputs", runRows, "No run has written anything yet.") +
-    notes.map((n) => `<p class="store-note">${escapeHtml(n)}</p>`).join("");
+    notes.map((n) => `<p class="store-note">${escapeHtml(n)}</p>`).join("") +
+    (removed.length ? `<div class="store-group"><strong>Datasets removed after retention</strong>${removed.join("")}</div>` : "");
 }
 
 async function onServerStorageClick(e) {
@@ -5825,6 +5865,7 @@ function uploadCardView(u) {
   const buttons = [];
   if (UPLOAD_ACTIVE.includes(u.status)) buttons.push(["cancel", "Cancel"]);
   else if (u.status === "error") {
+    buttons.push(["storage", "Account storage"]);
     if (u.jobId || u.serverFolder) buttons.push(["retry", u.dest === "server" ? "Retry check" : "Retry copy"]);
     else if (u.kind === "folder") buttons.push(u.files ? ["resume", "Retry failed files"] : ["pickdir", "Choose the folder again"]);
     else if (u.file) buttons.push(["resume", "Resume"]);
@@ -6577,7 +6618,9 @@ function wireDataDrop() {
 // visit) are known to the page: their chips, and Datasets → Use, which attaches one to the open chat.
 async function loadDatasetChips() {
   try {
-    const items = (await (await fetch("/api/datasets")).json()).datasets || [];
+    const res = await fetch("/api/datasets");
+    if (!res.ok) return;
+    const items = (await res.json()).datasets || [];
     for (const x of items) {
       const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
       // A dataset moved from HPC3 to the server keeps its id and changes its path: the chip and every
@@ -6588,6 +6631,15 @@ async function loadDatasetChips() {
       if (known) { if (known.id == null) known.id = x.id; continue; }
       state.datasets.push({ id: x.id, name, path: x.path, kind: x.kind, at: x.uploaded_at, size: x.size_bytes });
     }
+    const paths = new Set(items.map((x) => x.path));
+    // Newly uploaded data may appear before its registry entry. Keep those chips while reconciling
+    // saved attachments, including chats restored after a dataset was removed while offline.
+    for (const d of state.datasets) if (d.id == null) paths.add(d.path);
+    const removed = new Set(state.datasets.filter((d) => !paths.has(d.path)).map((d) => d.path));
+    for (const s of state.sessions) {
+      for (const path of chatOf(s.id).bound) if (!paths.has(path)) removed.add(path);
+    }
+    for (const path of removed) unbindEverywhere(path);
   } catch { /* datasets need accounts; the list just stays empty otherwise */ }
   // Do NOT auto-select the last dataset: a fresh chat starts with an EMPTY dataset box rather than
   // silently inheriting whatever was loaded last time (that surprised users and mis-attached data to
@@ -6764,7 +6816,8 @@ function showApp(user) {
   if (mock && mock.closest("label")) mock.closest("label").classList.toggle("hidden", !!user && user.role !== "admin");
   if (!_appInited) { init(); initShell(); _appInited = true; }
   renderAccount(user);
-  switchView("research");
+  if (isStorageLink(window.location.href)) openAccount("storage");
+  else switchView("research");
   checkBudgetNotices();
 }
 
@@ -6786,6 +6839,12 @@ async function doLogout() {
 }
 
 function initShell() {
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest("a[href]");
+    if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || !isStorageLink(a.href)) return;
+    e.preventDefault();
+    openAccount("storage");
+  });
   document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
   $("datasetsRefresh").addEventListener("click", loadFiles);
   $("runsRefresh").addEventListener("click", loadRuns);
@@ -6832,6 +6891,7 @@ function initShell() {
   $("mcpTokens").addEventListener("click", onMcpTokensClick);
   $("uploadsPanel").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-act]");
+    if (b && b.dataset.act === "storage") { openAccount("storage"); return; }
     const card = b && b.closest("[data-upload-id]");
     if (card) uploadAction(b.dataset.act, card.dataset.uploadId);
   });
@@ -7448,6 +7508,7 @@ function onSystemRunsClick(e) {
 // ---- Datasets view ----
 async function loadDatasets() {
   renderUploads();   // show any in-flight/failed uploads at the top of the tab
+  loadDatasetNotices();
   const el = $("datasetsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
     const items = (await (await fetch("/api/datasets")).json()).datasets || [];
@@ -7460,6 +7521,7 @@ async function loadDatasets() {
                                fmtDate(x.uploaded_at), (x.uploaded_at || "").slice(0, 10)]);
       return `<div class="card" data-q="${escapeHtml(q)}"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
       `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${x.location === "hpc3" ? ` · <span title="Kept only on HPC3 so far: it is moved to the server when you connect">on HPC3</span>` : ""}${metadataBadge(x.metadata)}</span></div>` +
+      (x.removal_at ? `<span class="store-meta">Removal: ${escapeHtml(fmtDay(x.removal_at, { year: true }))}</span>` : "") +
       `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
       `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
       `<a class="ghost small" href="/api/datasets/${x.id}/download" download data-dl-size="${Number(x.size_bytes) || 0}" data-name="${escapeHtml(x.name)}" title="${isFolderKind(x.kind) ? "Download the folder as one .zip" : "Download the file"}">Download</a>` +
@@ -8158,7 +8220,8 @@ function outputsShown() {
 }
 function onDatasetsChanged() {
   if ($("view-datasets") && $("view-datasets").classList.contains("active")) loadDatasets();
-  loadDatasetChips();   // a moved dataset's chips, and the chats it is attached to, take its new path
+  if (storageShown()) loadServerStorage();
+  loadDatasetChips();   // update moved datasets and detach datasets that have been removed
 }
 
 async function onSaveResultClick(e) {
@@ -8194,20 +8257,20 @@ function onRunsClick(e) {
 
 // ---- Admin view ----
 async function loadAdminUsers() {
-  const body = $("userTableBody"); body.innerHTML = '<tr><td colspan="7" class="empty-hint">Loading…</td></tr>';
+  const body = $("userTableBody"); body.innerHTML = '<tr><td colspan="8" class="empty-hint">Loading…</td></tr>';
   const q = ($("userSearch") && $("userSearch").value.trim()) || "";
   try {
     const url = q ? `/api/admin/users?q=${encodeURIComponent(q)}` : "/api/admin/users";
     const r = await fetch(url);
-    if (!r.ok) { body.innerHTML = '<tr><td colspan="7" class="empty-hint">Admin only.</td></tr>'; return; }
+    if (!r.ok) { body.innerHTML = '<tr><td colspan="8" class="empty-hint">Admin only.</td></tr>'; return; }
     const users = (await r.json()).users || [];
-    if (!users.length) { body.innerHTML = `<tr><td colspan="7" class="empty-hint">${q ? "No users match your search." : "No users."}</td></tr>`; return; }
+    if (!users.length) { body.innerHTML = `<tr><td colspan="8" class="empty-hint">${q ? "No users match your search." : "No users."}</td></tr>`; return; }
     const meId = state.user && state.user.id;
     body.innerHTML = users.map((u) =>
       `<tr><td>${u.id}</td><td>${escapeHtml(u.username)}</td>` +
       `<td class="muted">${u.email ? escapeHtml(u.email) : "—"}</td><td>${u.role}</td>` +
       `<td>${u.is_active ? '<span class="ok">active</span>' : '<span class="bad">disabled</span>'}</td>` +
-      `<td class="muted">${fmtDate(u.last_login_at)}</td><td class="row-actions">` +
+      `<td class="muted">${fmtDate(u.last_login_at)}</td><td>${adminStorageHtml(u.storage)}</td><td class="row-actions">` +
       (u.is_active ? `<button class="ghost small" data-disable="${u.id}">Disable</button>`
                    : `<button class="ghost small" data-enable="${u.id}">Enable</button>`) +
       `<button class="ghost small" data-email="${u.id}" data-cur="${escapeHtml(u.email || "")}" data-name="${escapeHtml(u.username)}">Email</button>` +
@@ -8216,7 +8279,15 @@ async function loadAdminUsers() {
       (u.id === meId ? "" : `<button class="ghost small" data-role="${u.id}" data-to="${u.role === "admin" ? "user" : "admin"}" data-name="${escapeHtml(u.username)}">${u.role === "admin" ? "Make user" : "Make admin"}</button>`) +
       (u.id === meId ? "" : `<button class="ghost small danger" data-deluser="${u.id}" data-name="${escapeHtml(u.username)}">Delete</button>`) +
       `</td></tr>`).join("");
-  } catch { body.innerHTML = '<tr><td colspan="7" class="empty-hint">Failed to load.</td></tr>'; }
+  } catch { body.innerHTML = '<tr><td colspan="8" class="empty-hint">Failed to load.</td></tr>'; }
+}
+
+function adminStorageHtml(storage) {
+  if (!storage) return "—";
+  return `<strong>${escapeHtml(storageUseText(storage))}</strong>` +
+    ((storage.due_datasets || []).map((d) => `<div class="store-meta">${escapeHtml(d.name || d.dataset_name)} · ` +
+      `${escapeHtml(fmtSize(d.size_bytes == null ? d.bytes : d.size_bytes))} · ${escapeHtml(fmtDay(d.removal_at, { year: true }))}</div>`).join("") ||
+      `<div class="store-meta">No datasets due in the next 14 days.</div>`);
 }
 // ---- Admin: skill review ----
 // Induced skills are one run's code frozen into a template; none reaches the PI or the Scientist

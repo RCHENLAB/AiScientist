@@ -2036,9 +2036,22 @@ async def _start_checkpoint_gc() -> None:
     """Launch the two housekeeping sweeps: stale A2 analysis checkpoints in the eyeserver's local
     run bundles (default 7 days), and cold per-run process files in each live session's HPC3
     ``<shared_root>/Temp/<user>`` area (default 3 days)."""
+    asyncio.create_task(_dataset_retention_loop())
     asyncio.create_task(_upload_gc_loop())
     asyncio.create_task(_checkpoint_gc_loop())
     asyncio.create_task(_hpc_temp_gc_loop())
+
+
+async def _dataset_retention_loop() -> None:
+    from . import storage_policy
+    import sys
+    while True:
+        try:
+            if _AUTH_ENABLED:
+                await storage_policy.sweep(sys.modules[__name__])
+        except Exception as exc:  # noqa: BLE001 - maintenance must survive a failed deletion or email
+            print(f"[storage] retention sweep failed: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(3600)
 
 
 def _cancel_alloc(conn: Connection, reason: str = "provisioning failed") -> None:
@@ -6269,7 +6282,14 @@ async def get_server_storage(request: Request) -> JSONResponse:
     user = _optional_user(request)
     if user is None:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    return JSONResponse(await asyncio.to_thread(_server_storage, user.id, user.username))
+    from . import storage_policy
+    result = await asyncio.to_thread(_server_storage, user.id, user.username)
+    result.update(await asyncio.to_thread(storage_policy.summary, user.id))
+    result["limit_bytes"] = storage_policy.limit_bytes()
+    result["warning"] = bool(result["limit_bytes"] and result["total_bytes"] >= result["limit_bytes"] * .8)
+    for dataset in result["datasets"]:
+        dataset["removal_at"] = storage_policy.removal_at(dataset)
+    return JSONResponse(result)
 
 
 @app.get("/api/storage/{connection_id}")
@@ -6881,6 +6901,36 @@ class PlanReviewRequest(BaseModel):
     tz: str | None = None
 
 
+def _upload_quota_error(conn, incoming: int, exclude: Path | None = None) -> str | None:
+    """Reserve unfinished tus uploads and unregistered folder files against the account limit."""
+    from . import storage_policy
+    if not conn.app_user_id or not storage_policy.limit_bytes():
+        return None
+    registered = {Path(d["path"]).resolve() for d in auth_routes.list_dataset_records(conn.app_user_id)}
+    roots = {upload_storage.uploads(c) for c in _owner_connections(conn.owner)}
+    roots.add(upload_storage.uploads(conn))
+    pending = 0
+    for root in roots:
+        for meta_path in (root / ".parts").glob("*.json"):
+            if exclude is not None and meta_path.with_suffix(".part") == exclude:
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if meta.get("status") in ("uploading", "finalizing"):
+                    pending += int(meta.get("length") or 0)
+            except (OSError, ValueError, TypeError):
+                continue
+        if root.is_dir():
+            for file in root.rglob("*"):
+                if (file.is_symlink() or not file.is_file() or file == exclude
+                        or any(part.startswith(".") for part in file.relative_to(root).parts)):
+                    continue
+                resolved = file.resolve()
+                if not any(resolved == path or resolved.is_relative_to(path) for path in registered):
+                    pending += file.stat().st_size
+    return storage_policy.quota_error(conn.app_user_id, conn.owner, incoming + pending)
+
+
 @app.post("/api/upload")
 async def upload_dataset(
     request: Request,
@@ -6899,6 +6949,14 @@ async def upload_dataset(
     files are NOT recorded as individual datasets — the folder is registered once via
     /api/upload/register-folder after all its files land."""
     conn = _owned_conn(connection_id, request)
+    size = file.size
+    if size is None:
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+    if conn.app_user_id and (error := _upload_quota_error(conn, size)):
+        await file.close()
+        return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     dest_dir = upload_storage.uploads(conn)
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe_rel = safe_relpath(rel_path) if rel_path else ""
@@ -6993,6 +7051,11 @@ async def reserve_folder(payload: dict, request: Request) -> JSONResponse:
         return JSONResponse({"error": f"{busy}/ is still being copied to HPC3. Choose the folder again when "
                                       "that has finished: only the files that are missing will be sent."},
                             status_code=409)
+    chosen = _chosen_files(files)
+    if chosen and not got.get("merged") and not got.get("resume"):
+        error = _upload_quota_error(conn, sum(size for _, size in chosen))
+        if error:
+            return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     folder = got["folder"]
     shown = raw if upload_storage.enabled(conn) else folder      # a managed folder is a storage id
     partial = got.get("partial", 0)
@@ -7346,6 +7409,8 @@ async def upload_chunk(
         with open(p, "ab") as out:
             out.write(b)
 
+    if conn.app_user_id and (error := _upload_quota_error(conn, current + len(data), part)):
+        return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     await asyncio.to_thread(_append, part, data)
     received = current + len(data)
     if not done:
@@ -7629,6 +7694,11 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
         dataset_id = int(payload.get("id"))
     except (TypeError, ValueError):
         return JSONResponse({"error": "bad dataset id"}, status_code=400)
+    return await _delete_owned_dataset(user, dataset_id)
+
+
+async def _delete_owned_dataset(user, dataset_id: int) -> JSONResponse:
+    """Shared manual/retention deletion: files first, then registry and metadata."""
     conn = _active_conn_for_user(user)
 
     def remove(stored: str) -> None:
@@ -7701,6 +7771,8 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Dataset deletion failed: {public_error(exc)}"}, status_code=409)
     if stored is None:
         return JSONResponse({"error": "Dataset not found."}, status_code=404)
+    for connection in _owner_connections(safe_name(user.username)):
+        connection._publish({"type": "datasets_changed"})
     return JSONResponse({"ok": True, "deleted": dataset_id})
 
 
@@ -8004,6 +8076,32 @@ def _run_in_flight(run_id: str) -> bool:
     """True while any session is executing ``run_id``, or a run that continues it (it reads its files)."""
     return any(run_id in (r.run_id, r.continues)
                for c in list(CONNECTIONS.values()) for r in c.running_runs())
+
+
+def _dataset_in_use(user, path: str) -> bool:
+    """Keep inputs while an account's analysis or persisted plan can still read them."""
+    from .db import session_scope
+    from .models import Run
+    owner = safe_name(user.username)
+    if any(c.running_runs() for c in _owner_connections(owner)):
+        return True
+    with session_scope() as session:
+        waiting = [r.run_id for r in session.query(Run).filter(
+            Run.user_id == user.id, Run.status == "awaiting_plan")]
+    def references(value):
+        if isinstance(value, dict):
+            return any(references(v) for v in value.values())
+        if isinstance(value, list):
+            return any(references(v) for v in value)
+        return isinstance(value, str) and (value == path or value.startswith(path.rstrip("/") + "/"))
+    for run_id in waiting:
+        state = CONSOLE_RUNS_DIR / owner / run_id / "artifacts/process/run_state.json"
+        try:
+            if references(json.loads(state.read_text(encoding="utf-8"))):
+                return True
+        except (OSError, ValueError):
+            return True          # a waiting plan with unreadable inputs is kept conservatively
+    return False
 
 
 @app.post("/api/runs/delete")
@@ -17966,6 +18064,12 @@ def md_result_uuid(run_id: str) -> str:
 
 def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                      conn: "Connection | None") -> "tuple[int, dict]":
+    with _SAVING_LOCK:
+        return _save_run_result_locked(owner, user_id, run_id, what, conn)
+
+
+def _save_run_result_locked(owner: str, user_id: "int | None", run_id: str, what: str,
+                            conn: "Connection | None") -> "tuple[int, dict]":
     """Make what a run handed on one of the owner's datasets: the processed dataset
     (``what="dataset"``, an .h5ad), CellQC's result directory (``"cellqc"``), or literature
     tables (``"literature"``), both folders. Returns
@@ -17999,6 +18103,10 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
         return 400, {"error": "unexpected literature location"}
     owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
     kept = dataset_storage.configured()
+    from . import storage_policy
+    incoming = int(rec.get("size_bytes") or 0) if rec.get("location") == "hpc3" else 0
+    if user_id and (error := storage_policy.quota_error(user_id, owner, incoming)):
+        return 507, {"error": error, "storage_url": "#account/storage"}
     if rec.get("location") == "hpc3":
         if conn is None:
             return 409, {"error": "Connect to HPC3 first: the result is kept there."}
@@ -18057,6 +18165,11 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
 
 
 def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tuple[int, dict]":
+    with _SAVING_LOCK:
+        return _save_curation_tables_locked(owner, user_id, run_id)
+
+
+def _save_curation_tables_locked(owner: str, user_id: "int | None", run_id: str) -> "tuple[int, dict]":
     """Make a corpus curation's tables (``<run>/artifacts/curation/*.csv``, issue 46) one of the
     owner's datasets: copied into a new dataset folder (``users/<owner>/datasets/<uuid>/original``
     with a data root, else ``uploads/processed/<name>``), listed, and the run's record pointed at it.
@@ -18083,6 +18196,10 @@ def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tu
     names = [n for n in names if _CELLQC_FILE_RE.fullmatch(n) and (src / n).is_file()]
     if not same or not src.is_dir() or not names:
         return 409, {"error": "The tables are no longer on the server."}
+    from . import storage_policy
+    size = sum((src / n).stat().st_size for n in names)
+    if user_id and (error := storage_policy.quota_error(user_id, owner, size)):
+        return 507, {"error": error, "storage_url": "#account/storage"}
     try:
         if dataset_storage.configured():
             identity = str(uuid4())
@@ -18122,7 +18239,7 @@ def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tu
     return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name, "kind": "folder"}
 
 
-_SAVING_LOCK = threading.Lock()
+_SAVING_LOCK = threading.RLock()
 
 
 def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder: bool, name: str,

@@ -101,3 +101,10 @@ def skill_release(tmp_path, monkeypatch):
 def cellqc_release(skill_release):
     """A release holding the fixture CellQC skill, the one ``run_cellqc`` names in its TOOL.md."""
     return skill_release(FIXTURE_SKILLS)
+
+
+@pytest.fixture(autouse=True)
+def no_account_storage_limit(monkeypatch):
+    """The per-account limit (issue 74) is off unless a test turns it on: it reads the account's
+    datasets, which most tests save or upload without a database."""
+    monkeypatch.setenv("AISCIENTIST_ACCOUNT_STORAGE_GB", "0")

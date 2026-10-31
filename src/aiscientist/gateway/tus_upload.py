@@ -398,9 +398,17 @@ async def options() -> Response:
                                  "Access-Control-Allow-Headers": "Tus-Resumable,Upload-Length,Upload-Metadata,Upload-Offset,Upload-Checksum,Upload-Final-SHA256,X-Connection-ID,Content-Type"})
 
 
+_creation_lock = asyncio.Lock()
+
+
 @router.post("")
 @router.post("/")
 async def create(request: Request) -> Response:
+    async with _creation_lock:
+        return await _create_upload(request)
+
+
+async def _create_upload(request: Request) -> Response:
     if wrong := _require_version(request):
         return wrong
     gw = _gw()
@@ -412,6 +420,8 @@ async def create(request: Request) -> Response:
     if length < 0 or length > _MAX_SIZE:
         return _answer(413, body={"error": "upload exceeds Tus-Max-Size"})
     conn = gw._owned_conn(fields.get("connection_id"), request)
+    if conn.app_user_id and (error := gw._upload_quota_error(conn, length)):
+        return _answer(507, body={"error": error, "storage_url": "#account/storage"})
     upload_storage.uploads(conn).mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(upload_storage.uploads(conn)).free < length + 64 * 1024**2:
         upload_log.record(conn.workspace, "refused", name=fields.get("filename"), size=length,

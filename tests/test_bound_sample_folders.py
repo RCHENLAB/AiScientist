@@ -408,9 +408,10 @@ const chatOf = (sid) => chats[sid];
 const saveComposer = (c) => saved.push(c === chats.A ? "A" : "B");
 const isFolderKind = (k) => k === "folder";
 const renderDatasetChips = () => {}, renderDataMenuRecent = () => {};
-const fetch = async () => ({ json: async () => ({ datasets: [
+const fetch = async () => ({ ok: true, json: async () => ({ datasets: [
   { id: 33, name: "Sample3_GSM5676874", path: now, kind: "folder" },
-  { id: 36, name: "Sample1_WT", path: "/data/users/u/datasets/bbb/original", kind: "folder" }] }) });
+  { id: 36, name: "Sample1_WT", path: "/data/users/u/datasets/bbb/original", kind: "folder" },
+  { id: 37, name: "other.h5ad", path: "/x/other.h5ad", kind: "h5ad" }] }) });
 loadDatasetChips().then(() => process.stdout.write(JSON.stringify({
   paths: state.datasets.map((d) => d.path), ids: state.datasets.map((d) => d.id),
   bound: chats.A.bound, roles: chats.A.roles, saved })));
@@ -418,8 +419,9 @@ loadDatasetChips().then(() => process.stdout.write(JSON.stringify({
     done = subprocess.run([node, "-e", code], capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr
     out = json.loads(done.stdout)
-    assert out["paths"] == ["/data/users/u/datasets/aaa/original", "/data/users/u/datasets/bbb/original"]
-    assert out["ids"] == [33, 36]
+    assert out["paths"] == ["/data/users/u/datasets/aaa/original", "/data/users/u/datasets/bbb/original",
+                            "/x/other.h5ad"]
+    assert out["ids"] == [33, 36, 37]
     assert out["bound"] == ["/data/users/u/datasets/aaa/original", "/x/other.h5ad"]
     assert out["roles"] == {"/data/users/u/datasets/aaa/original": "primary"} and out["saved"] == ["A"]
 

@@ -23,6 +23,10 @@ def _run(harness: str) -> None:
     day = source[source.index("function fmtDay(iso"):source.index("// The chat header counter")]
     prelude = r'''
 const assert = require("assert");
+const localDateString = Date.prototype.toLocaleDateString;
+Date.prototype.toLocaleDateString = function(locale, options) {
+  return localDateString.call(this, locale || "en-US", options);
+};
 const els = {};
 const el = (id) => {
   if (!els[id]) {
@@ -133,6 +137,42 @@ assert(!html.slice(html.indexOf("old.h5ad") - 200).includes("removed after"), "t
 ''')
 
 
+def test_storage_links_in_quota_messages_open_the_account_storage_route():
+    _run(r'''
+const window = { location: { href: "https://eye.example/", origin: "https://eye.example" } };
+assert(isStorageLink("/?account=storage"));
+assert(isStorageLink("#account/storage"));
+assert(!isStorageLink("/?account=usage"));
+assert(!isStorageLink("https://other.example/?account=storage"));
+''')
+
+
+def test_server_quota_warning_retention_notices_and_removal_history():
+    _run(SERVER + r'''
+server.limit_bytes = 150 * 2 ** 30;
+server.total_bytes = 120 * 2 ** 30;
+server.datasets[0].removal_at = "2027-01-16T10:00:00";
+server.notices = [{ dataset_name: "retina <raw>", size_bytes: 2 ** 30,
+  removal_at: "2027-01-16T10:00:00", download_url: "/api/datasets/1/download" }];
+server.retention_removals = [{ dataset_name: "old retina", size_bytes: 2 ** 30,
+  owner: "alice", removed_at: "2026-10-30T10:00:00" }];
+renderServerStorage(server, {});
+let html = $("storeServerBody").innerHTML;
+assert.strictEqual($("storeServerTotal").textContent, "120.00 GB of 150.00 GB");
+assert(html.includes('class="store-quota warning"') && html.includes('aria-valuenow="80"'));
+assert(html.includes("You have used 80%") && html.includes("removal Jan 16, 2027"));
+assert(html.includes("retina &lt;raw&gt;") && html.includes('href="/api/datasets/1/download" download>Download'));
+assert(html.includes("old retina") && html.includes("Removed Oct 30, 2026 · owner alice"));
+server.total_bytes = 119 * 2 ** 30;
+renderServerStorage(server, {});
+assert(!$("storeServerBody").innerHTML.includes('class="store-quota warning"'));
+server.limit_bytes = 0;
+renderServerStorage(server, {});
+assert($("storeServerTotal").textContent.includes("no account limit"));
+assert(!$("storeServerBody").innerHTML.includes('role="progressbar"'));
+''')
+
+
 def test_without_an_hpc3_session_the_server_part_still_loads():
     _run(r'''
 (async () => {
@@ -164,3 +204,53 @@ def test_the_page_has_no_fixed_model_no_model_row_and_no_storage_dialog():
     assert 'data-account-tab="storage"' in html and 'id="accountPane-storage"' in html
     for gone in ("Pull a model tag from Ollama", '"/api/model"', "Qwen3 GPU job", 'getElementById("storageModal")'):
         assert gone not in js, gone
+
+
+def test_removed_datasets_leave_all_chat_attachments_after_refresh():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = APP.read_text(encoding="utf-8")
+    unbind = source[source.index("function unbindEverywhere(path)"):source.index("// A dataset whose path changed")]
+    repoint = source[source.index("function repointEverywhere(from, to)"):source.index("// The chat an upload attaches to:")]
+    load = source[source.index("async function loadDatasetChips()"):source.index("function hashStr(s)")]
+    script = r'''
+const assert = require("assert");
+const chats = { a: { bound: ["/old", "/kept"], roles: { "/old": "reference" } }, b: { bound: ["/old"], roles: {} } };
+const state = { datasets: [{ id: 1, path: "/old" }, { id: 2, path: "/kept" }], sessions: [{ id: "a" }, { id: "b" }] };
+const chatOf = id => chats[id], saved = [];
+const saveComposer = chat => saved.push(chat), syncDatasetSelection = () => {}, renderDatasetChips = () => {};
+const isFolderKind = () => false;
+let ok = false;
+const fetch = async () => ({ ok, json: async () => ({ datasets: [{ id: 2, path: "/kept", name: "kept", kind: "h5ad" }] }) });
+''' + unbind + repoint + load + r'''
+(async () => {
+  await loadDatasetChips();
+  assert.deepStrictEqual(chats.b.bound, ["/old"], "failed requests leave attachments intact");
+  ok = true;
+  await loadDatasetChips();
+  assert.deepStrictEqual(chats.a.bound, ["/kept"]);
+  assert.deepStrictEqual(chats.b.bound, []);
+  assert.deepStrictEqual(chats.a.roles, {});
+  assert.strictEqual(saved.length, 2);
+  assert.deepStrictEqual(state.datasets.map(d => d.id), [2]);
+  // A fresh page has no cached dataset IDs, but its saved composers still name the removed path.
+  state.datasets = [];
+  chats.a = { bound: ["/old", "/kept"], roles: { "/old": "reference" } };
+  chats.b = { bound: ["/old"], roles: {} };
+  await loadDatasetChips();
+  assert.deepStrictEqual(chats.a.bound, ["/kept"]);
+  assert.deepStrictEqual(chats.a.roles, {});
+  assert.deepStrictEqual(chats.b.bound, []);
+  // Follow moved datasets before pruning, and preserve an upload awaiting its registry entry.
+  state.datasets = [{ id: 2, path: "/before-move" }, { path: "/uploading" }];
+  chats.a = { bound: ["/before-move", "/uploading"], roles: { "/before-move": "reference" } };
+  chats.b = { bound: ["/before-move"], roles: {} };
+  await loadDatasetChips();
+  assert.deepStrictEqual(chats.a.bound, ["/kept", "/uploading"]);
+  assert.deepStrictEqual(chats.a.roles, { "/kept": "reference" });
+  assert.deepStrictEqual(chats.b.bound, ["/kept"]);
+})().catch(e => { console.error(e); process.exit(1); });
+'''
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr or out.stdout

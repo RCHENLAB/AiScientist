@@ -122,6 +122,22 @@ class Dataset(Base):
         }
 
 
+class DatasetRetention(Base):
+    """Notice and removal audit; survives deletion of the dataset and its owner."""
+
+    __tablename__ = "dataset_retention"
+
+    dataset_uuid: Mapped[str] = mapped_column(String(36), primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(Integer)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner: Mapped[str] = mapped_column(String(64))
+    dataset_name: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    notice_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True))
+    removal_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Run(Base):
     __tablename__ = "runs"
 

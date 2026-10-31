@@ -60,6 +60,35 @@ checked, whichever arrives last, the browser's "that was the last file" or the l
 that a restart interrupted continues when the gateway starts again, whether or not the account is
 connected. Nothing is written to HPC3 at upload time.
 
+## Account limits and retention
+
+`AISCIENTIST_ACCOUNT_STORAGE_GB` sets the per-account Eye Server limit (150 GB by default;
+0 disables it). Account ? Storage counts registered datasets and run folders, excluding shared
+folder pointers and HPC3 copies, and shows use against the limit with a warning from 80%.
+Uploads that would exceed it are refused with the space left and a link to Account ? Storage.
+Saving run results to Datasets checks the same total before moving or copying files. If the
+limit would be exceeded, saving is skipped and the run reply explains why. The analysis continues
+and its reports and files remain under Runs. A local result already counted under Runs is moved
+without counting its bytes twice; a copy adds to the account's use.
+
+`AISCIENTIST_DATASET_RETENTION_DAYS` sets dataset retention from its addition date (90 days by
+default; 0 keeps datasets until their owner deletes them). Files ? Datasets and Account ? Storage
+show each removal date. Run outputs are counted toward the limit but are not removed by age.
+Shared folder pointers are never removed by retention.
+
+The hourly background sweep sends an email and records a notice visible on the site, listing the
+dataset, size, removal date and Download link. `AISCIENTIST_DATASET_NOTICE_DAYS` defaults to 14;
+the minimum notice is 14 days. SMTP, the owner's email and `AISCIENTIST_PUBLIC_URL` must be
+configured for a successful notice. A failed or missing email prevents removal; an overdue dataset
+gets a full notice period after successful delivery. Removal uses the same file and registry deletion
+as Delete, including the session's HPC3 copy, and leaves the chats themselves intact. Inputs of an
+active analysis or waiting plan are kept until they are no longer in use. Account ? Storage shows
+the removal history (dataset, size, owner and date). Admin shows account use against the limit and
+datasets due within the next 14 days.
+
+Using a dataset does not restart its retention period. Whether use should restart the 90 days
+remains an open review point.
+
 ## When a run needs the data on HPC3
 
 HPC3's compute nodes cannot see the gateway host's disks. When a run's analysis or `run_code` runs on
