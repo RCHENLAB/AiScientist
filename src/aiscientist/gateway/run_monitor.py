@@ -11,8 +11,8 @@ the workflow graph.
 The graph's stage nodes are :data:`STAGES`, the list this module moves runs through, so the graph
 cannot show a stage no run reaches or miss one they do (``tests/test_run_monitor.py``).
 
-An observation is a few dict updates under a lock, with no I/O, and an error inside one is
-swallowed: watching a run must never slow it down or break it.
+Live observations update a small locked snapshot. Explicit timing transitions append to an optional
+per-run journal; polling does not write. Instrumentation errors never change the run outcome.
 """
 
 from __future__ import annotations
@@ -20,9 +20,20 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
+
+from .run_timing import (
+    RunTiming, Span, bind_monitor, current_monitor, enable_journal_logging, exception_outcome, read_timing,
+    reset_current_monitor, set_current_monitor, timed_stage,
+)
+
+# These are public entry points for gateway instrumentation.
+__all__ = ["RunMonitor", "bind_monitor", "current_monitor", "read_timing", "reopen_timing",
+           "reset_current_monitor", "set_current_monitor", "timed_stage", "enable_journal_logging"]
 
 KINDS = ("research", "literature", "chat", "corpus")
 
@@ -158,12 +169,34 @@ class RunMonitor:
         self.recent: list[dict[str, Any]] = []
         self._plan_cancelled = False
         self._lock = threading.Lock()
+        self._timing = RunTiming()
+        self._model_spans: dict[int, list[str]] = {}
+        self._tool_spans: dict[int, list[str]] = {}
+        self._review_span = ""
+        self._plan_span = ""
 
     # -- feeding ----------------------------------------------------------------------------------
 
     def observe(self, ev: dict[str, Any]) -> None:
-        """One lab ``on_event`` dict. Never raises."""
-        self._guarded(self._observe, ev)
+        """One lab event. Background tool completions remain measurable after the live run ends."""
+        try:
+            with self._lock:
+                if ev.get("type") == "expert_tool":
+                    # Expert-turn relays preserve structured outcomes but have their own live UI.
+                    # Keep their timing on the emitting thread's stack without changing run stages.
+                    if ev.get("state") == "start":
+                        self._tool_begin(ev)
+                    elif ev.get("state") in ("done", "error"):
+                        self._tool_end({**ev, "type": "tool_error" if ev["state"] == "error" else "tool_result"})
+                elif self.ended is None:
+                    self._observe(ev)
+                    self.updated = time.time()
+                elif ev.get("type") == "tool_start":
+                    self._tool_begin(ev)
+                elif ev.get("type") in ("tool_result", "tool_error"):
+                    self._tool_end(ev)
+        except Exception:
+            pass
 
     def observe_push(self, payload: dict[str, Any]) -> None:
         """One WebSocket payload pushed for this run. Never raises."""
@@ -175,11 +208,61 @@ class RunMonitor:
         self._guarded(lambda s: self._to(s) if s in STAGE_IDS else None, stage)
 
     def llm_begin(self, role: str | None) -> None:
-        """A model call starts in the calling thread."""
-        self._guarded(self._llm_begin, str(role or "reason"))
+        """A model call starts in the calling thread, including a background call after live end."""
+        try:
+            with self._lock:
+                if self.ended is None:
+                    self._llm_begin(str(role or "reason"))
+                    self.updated = time.time()
+                else:
+                    self._model_spans.setdefault(threading.get_ident(), []).append(
+                        self.begin_span("model_call", category="observation", role=str(role or "reason")))
+        except Exception:
+            pass
 
-    def llm_end(self) -> None:
-        self._guarded(lambda _: self._llm.pop(threading.get_ident(), None), None)
+    def llm_end(self, outcome: str = "success") -> None:
+        # Background calls may finish after the live run leaves the page.
+        try:
+            with self._lock:
+                self._llm_end(outcome)
+        except Exception:
+            pass
+
+    def bind_timing(self, path: str | Path) -> None:
+        self._timing.bind(path, self.run_id, self.conversation_id)
+
+    def begin_span(self, stage: str, category: str = "processing", **metadata: Any) -> str:
+        return self._timing.begin_span(stage, category, **metadata)
+
+    def end_span(self, ident: str, outcome: str = "success", **metadata: Any) -> None:
+        self._timing.end_span(ident, outcome, **metadata)
+
+    def record_span(self, stage: str, **kwargs: Any) -> None:
+        self._timing.record_span(stage, **kwargs)
+
+    @contextmanager
+    def span(self, stage: str, category: str = "processing", **metadata: Any):
+        handle = Span(self, self.begin_span(stage, category, **metadata))
+        try:
+            yield handle
+        except BaseException as exc:
+            handle.end(exception_outcome(exc))
+            raise
+        else:
+            handle.end()
+
+    def timing_event(self, event: str, **metadata: Any) -> None:
+        self._timing.event(event, **metadata)
+
+    def decision(self, action: str) -> None:
+        self._timing.decision(action)
+        self._review_span = ""
+
+    def mark_result_ready(self) -> None:
+        self.timing_event("result_ready")
+
+    def save_requested(self, action: str = "manual") -> None:
+        self._timing.save_requested(action)
 
     def end(self, outcome: str = "ended") -> None:
         """The run is over. Idempotent: the first outcome wins."""
@@ -212,6 +295,10 @@ class RunMonitor:
         self._active.clear()
         self._llm.clear()
         self._to("done")
+        if self._plan_span:
+            self.end_span(self._plan_span, self.outcome if self.outcome != "finished" else "success")
+            self._plan_span = ""
+        self._timing.finish(self.outcome)
 
     def _note(self, text: str, level: str = "info") -> None:
         text = _clip(text)
@@ -221,10 +308,36 @@ class RunMonitor:
 
     def _llm_begin(self, role: str) -> None:
         self.llm_calls += 1
-        self._llm[threading.get_ident()] = role
+        tid = threading.get_ident()
+        self._llm[tid] = role
+        self._model_spans.setdefault(tid, []).append(self.begin_span("model_call", category="observation", role=role))
         stage = _STAGE_OF_ROLE.get(role)
         if stage and self.kind == "research":
             self._to(stage)
+
+    def _llm_end(self, outcome: str) -> None:
+        tid = threading.get_ident()
+        self._llm.pop(tid, None)
+        spans = self._model_spans.get(tid, [])
+        if spans:
+            self.end_span(spans.pop(), outcome)
+        if not spans:
+            self._model_spans.pop(tid, None)
+
+    def _tool_begin(self, ev: dict[str, Any]) -> None:
+        self._tool_spans.setdefault(threading.get_ident(), []).append(
+            self.begin_span("tool_call", category="observation", tool=ev.get("tool", "unknown")))
+
+    def _tool_end(self, ev: dict[str, Any]) -> None:
+        tid = threading.get_ident()
+        spans = self._tool_spans.get(tid, [])
+        if spans:
+            outcome = ev.get("timing_outcome")
+            if not isinstance(outcome, str) or outcome not in {"success", "failed", "cancelled", "timeout", "blocked", "unknown"}:
+                outcome = "failed" if ev.get("type") == "tool_error" else "success"
+            self.end_span(spans.pop(), outcome)
+        if not spans:
+            self._tool_spans.pop(tid, None)
 
     def _node_n(self, node_id: str) -> int | None:
         for i, n in enumerate(self._nodes, 1):
@@ -253,6 +366,13 @@ class RunMonitor:
         stage = _STAGE_OF_EVENT.get(t)
         if stage and self.kind == "research":
             self._to(stage)
+            if stage == "plan" and not self._plan_span:
+                self._plan_span = self.begin_span("plan_generation", category="observation")
+            elif stage == "execute" and self._plan_span:
+                self.end_span(self._plan_span)
+                self._plan_span = ""
+        if t == "plan_approved":
+            self.decision("approve")
         if t == "pi_agenda":
             agenda = [_clip(s) for s in ev.get("agenda") or []]
             self.steps_total = len(agenda)
@@ -268,6 +388,7 @@ class RunMonitor:
             self.steps_total += len(added) if isinstance(added, list) and added else 1
         elif t == "plan_cancelled":
             self._plan_cancelled = True
+            self.decision("cancel")
         elif t == "node_claim":
             self._claimed[tid] = str(ev.get("node") or "")
         elif t == "scientist_start":
@@ -286,6 +407,7 @@ class RunMonitor:
                 entry.update(phase="model", tool="", since=now)
         elif t == "tool_start":
             self.tools_called += 1
+            self._tool_begin(ev)
             entry = self._active.get(tid)
             if entry is None and self.kind != "research":
                 # The literature, chat and corpus lines have no steps: one implicit step holds the tool.
@@ -294,6 +416,7 @@ class RunMonitor:
             if entry is not None:
                 entry.update(phase="tool", tool=_clip(ev.get("tool"), 60), since=now)
         elif t in ("tool_result", "tool_error"):
+            self._tool_end(ev)
             if t == "tool_error":
                 self.tool_errors += 1
             entry = self._active.get(tid)
@@ -325,17 +448,36 @@ class RunMonitor:
 
     def _observe_push(self, payload: dict[str, Any]) -> None:
         t = str(payload.get("type") or "")
-        if t in _WAITS_FOR_PLAN and self.kind in ("research", "literature"):
-            self._to("approve")
+        if t in _WAITS_FOR_PLAN:
+            if self._plan_span:
+                self.end_span(self._plan_span)
+                self._plan_span = ""
+            if not self._review_span:
+                self._review_span = self.begin_span("user_review", category="user_wait", source=t)
+            self.timing_event("plan_ready", source=t)
+            if self.kind in ("research", "literature"):
+                self._to("approve")
             self.waiting = "plan"
         elif t == "confirm_request":
+            if not self._review_span:
+                self._review_span = self.begin_span("user_review", category="user_wait", source="confirm_request")
             self.waiting = "confirm"
-        elif t in ("confirm_done", "plan_done") and self.waiting:
+        elif t == "confirm_done":
+            action = str(payload.get("outcome") or "unknown")
+            outcome = {"approved": "success", "declined": "declined", "timeout": "timeout",
+                       "stopped": "cancelled"}.get(action, "unknown")
+            if self._review_span:
+                self.end_span(self._review_span, outcome, action=action)
+                self._review_span = ""
+            self.timing_event("confirmation_decision", action=action)
+            self.waiting = ""
+        elif t == "plan_done" and self.waiting:
             self.waiting = ""
         elif t == "lab_progress":
             self._note(payload.get("text") or "", str(payload.get("level") or "info"))
         elif t == "chat_stopped":
-            self._finish("cancelled" if self._plan_cancelled else "stopped")
+            self._finish("ended" if payload.get("awaiting_plan") else
+                         "cancelled" if self._plan_cancelled else "stopped")
         elif t == "chat_error":
             self._finish("failed")
         elif t == "run_complete":
@@ -420,3 +562,11 @@ def live_view(viewer_id: int | None, *, admin: bool, accounts: bool) -> dict[str
 def _reset_for_tests() -> None:
     with _REG_LOCK:
         _MONITORS.clear()
+    set_current_monitor(None)
+
+
+def reopen_timing(path: str | Path, run_id: str, conversation_id: str | None = None) -> RunMonitor:
+    """Attach a later save/decision to its existing run without registering a new live run."""
+    monitor = RunMonitor(run_id=run_id, conversation_id=conversation_id)
+    monitor.bind_timing(path)
+    return monitor

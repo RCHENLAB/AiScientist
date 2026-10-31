@@ -8018,7 +8018,7 @@ async function loadRuns() {
         : `<span class="muted small">${escapeHtml(x.status)}</span>`;
       return `<div class="card run-card" data-q="${escapeHtml(runSearchText(x))}"><div class="card-main"><strong>${escapeHtml(runTitle(x))}</strong>` +
         `<span class="muted">${escapeHtml(x.status)}${x.plan_mode ? " · planned" : ""} · ${fmtDate(x.created_at)}</span>${resultHandoffHtml(x.run_id, results[x.run_id])}</div>` +
-        `<div class="run-card-actions"><button type="button" class="ghost small" data-run-usage="${escapeHtml(x.run_id)}" title="Tokens and estimated cost of this run, by pipeline step and model">Usage</button>${zip}` +
+        `<div class="run-card-actions"><button type="button" class="ghost small" data-run-usage="${escapeHtml(x.run_id)}" title="Tokens and estimated cost of this run, by pipeline step and model">Usage</button><button type="button" class="ghost small" data-run-timing="${escapeHtml(x.run_id)}" title="Processing, user waits and partial stage timings">Timing</button>${zip}` +
         `<button type="button" class="ghost small danger" data-run-del="${escapeHtml(x.run_id)}" data-name="${escapeHtml(runTitle(x))}" data-kept="${keptBesideRun(results[x.run_id]) ? "1" : ""}" title="Delete this run and its files from the server">Delete</button></div></div>`;
     }).join("") : '<div class="empty-hint">No runs yet.</div>';
   } catch { el.innerHTML = '<div class="empty-hint">Failed to load.</div>'; }
@@ -8185,6 +8185,8 @@ async function onSaveResultClick(e) {
   } catch (err) { toast("Could not save it: " + err.message); b.disabled = false; b.textContent = label; }
 }
 function onRunsClick(e) {
+  const timing = e.target.closest("[data-run-timing]");
+  if (timing) { toggleRunTiming(timing); return; }
   const u = e.target.closest("[data-run-usage]");
   if (u) { toggleRunUsage(u); return; }
   const d = e.target.closest("[data-run-del]");
@@ -8975,10 +8977,48 @@ async function saveBudget(e) {
   checkBudgetNotices();
 }
 
+async function toggleRunTiming(btn) {
+  const card = btn.closest(".run-card");
+  let box = card && card.querySelector(".run-timing");
+  if (box) { box.remove(); btn.textContent = "Timing"; return; }
+  box = document.createElement("div");
+  box.className = "run-usage run-timing";
+  box.innerHTML = '<span class="muted small">Loading…</span>';
+  card.appendChild(box);
+  btn.textContent = "Hide timing";
+  const owner = state.user ? state.user.username : "";
+  const url = `/api/timing/${encodeURIComponent(owner)}/${encodeURIComponent(btn.dataset.runTiming)}`;
+  try {
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Timing unavailable");
+    box.innerHTML = runTimingHtml(data) +
+      `<p><a href="${url}" target="_blank" rel="noopener">Full timing JSON</a> · Reopen Timing to refresh.</p>`;
+  } catch (err) { box.innerHTML = `<span class="muted small">${escapeHtml(err.message)}</span>`; }
+}
+
+function runTimingHtml(data) {
+  const spans = data.spans || [];
+  const explain = '<p class="muted small">User waits are separate from processing. Observations include enclosing calls and gateway waits; HPC execution times require accounting. Spans can overlap: durations do not add up to wall time. Unknown ends remain open.</p>';
+  if (!spans.length) return explain + '<p>No stage spans recorded.</p>';
+  const stamp = (value) => value ? escapeHtml(value) : "unknown";
+  return explain + `<p>${spans.length} stage spans${data.partial ? " · partial timeline" : ""}` +
+    `${spans.length > 500 ? " · first 500 shown" : ""}</p>` +
+    '<div style="overflow-x:auto"><table><thead><tr><th>Stage / source</th><th>Category</th><th>Start (UTC)</th><th>End (UTC)</th><th>Seconds</th><th>Outcome / action</th></tr></thead><tbody>' +
+    spans.slice(0, 500).map((span) => {
+      const meta = span.metadata || {};
+      const seconds = Number.isFinite(span.duration_seconds) ? span.duration_seconds.toFixed(3) : "unknown";
+      return `<tr><td>${escapeHtml(span.stage || "unknown")}${meta.source ? ` / ${escapeHtml(meta.source)}` : ""}` +
+        `${meta.role ? ` / ${escapeHtml(meta.role)}` : ""}${meta.job_id ? ` / job ${escapeHtml(meta.job_id)}` : ""}</td>` +
+        `<td>${escapeHtml(span.category || "unknown")}</td><td>${stamp(span.started_at)}</td><td>${stamp(span.ended_at)}</td>` +
+        `<td>${seconds}</td><td>${escapeHtml(span.outcome || "unknown")}${meta.action ? ` / ${escapeHtml(meta.action)}` : ""}</td></tr>`;
+    }).join("") + '</tbody></table></div>';
+}
+
 // A run's breakdown by pipeline step and model, under its card in Runs.
 async function toggleRunUsage(btn) {
   const card = btn.closest(".run-card");
-  let box = card && card.querySelector(".run-usage");
+  let box = card && card.querySelector(".run-usage:not(.run-timing)");
   if (box) { box.remove(); btn.textContent = "Usage"; return; }
   box = document.createElement("div");
   box.className = "run-usage";

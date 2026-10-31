@@ -323,3 +323,65 @@ def test_progress_reaches_the_total(tmp_path, key, fake_sftp):
 
 def test_sftp_quote_escapes_quotes_and_backslashes():
     assert ssh_gateway._sftp_quote('a "b"\\c') == '"a \\"b\\"\\\\c"'
+
+
+def test_cancelled_server_copy_persists_native_transfer_timing(tmp_path, key, monkeypatch):
+    """The real staging -> resumable put -> native polling path retains cancellation, not timeout."""
+    import json
+    import subprocess
+    from aiscientist.gateway import run_monitor, run_timing, server_data
+
+    clock = [100.0]
+    monkeypatch.setattr(run_timing.time, "monotonic", lambda: clock[0])
+    source = tmp_path / "private-input.bam"
+    source.write_bytes(b"x" * 100)
+    store = {}
+    executor = _executor(store, key)
+    proc = types.SimpleNamespace(returncode=None, killed=False)
+    proc.stdin = types.SimpleNamespace(write=lambda _: None, close=lambda: None)
+
+    def wait(timeout=None):
+        if timeout is None:
+            return -9
+        clock[0] += 2
+        store["/private/dataset.bam.part"] = [bytearray(b"x" * 20), time.time()]
+        raise subprocess.TimeoutExpired("command-not-for-the-timeline", timeout)
+
+    proc.wait = wait
+    proc.kill = lambda: setattr(proc, "killed", True)
+    monkeypatch.setattr(ssh_gateway.subprocess, "Popen", lambda *a, **k: proc)
+    monitor = run_monitor.RunMonitor(run_id="transfer-run", conversation_id="101")
+    path = tmp_path / "timing.jsonl"
+    monitor.bind_timing(path)
+    scan = server_data.Scan(source, tmp_path, False, copy=[(source.name, 100)])
+    with run_monitor.bind_monitor(monitor), pytest.raises(server_data.TransferCancelled):
+        server_data.sync_to_hpc(executor, scan, "/private/dataset.bam",
+                                should_cancel=lambda: clock[0] >= 106)
+    timeline = run_monitor.read_timing(path)
+    spans = timeline["spans"]
+    assert len(spans) == 3                 # staging, full upload, native attempt overlap
+    assert {s["stage"] for s in spans} == {"data_staging", "data_transfer"}
+    assert {s["duration_seconds"] for s in spans} == {6.0}
+    assert {s["outcome"] for s in spans} == {"cancelled"}
+    assert all(s["ended_at"] and not s["partial"] for s in spans)
+    assert proc.killed and "/private/dataset.bam.part" in store
+    serialized = json.dumps(timeline)
+    assert "private-input" not in serialized and "/private/" not in serialized
+    assert key not in serialized and "command-not-for-the-timeline" not in serialized
+    assert timeline["run_id"] == "transfer-run"
+
+
+def test_native_fallback_timing_is_distinct_from_successful_upload(tmp_path, key, fake_sftp):
+    from aiscientist.gateway import run_monitor
+
+    store, fake = fake_sftp
+    fake.stop_at = 4000
+    monitor = run_monitor.RunMonitor(run_id="fallback-run")
+    path = tmp_path / "timing.jsonl"
+    monitor.bind_timing(path)
+    with run_monitor.bind_monitor(monitor):
+        _executor(store, key).put_file_resumable(_local(tmp_path), "/dfs/u/big.h5ad")
+    spans = run_monitor.read_timing(path)["spans"]
+    assert [(s["metadata"]["source"], s["outcome"]) for s in spans] == [
+        ("sftp_upload", "success"), ("native_sftp", "fallback")]
+    assert len(store["/dfs/u/big.h5ad"][0]) == 10000

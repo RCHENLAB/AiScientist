@@ -16,10 +16,12 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from . import dataset_storage
+from .run_monitor import timed_stage
 from ..tools.api import (CorpusPaths, CORPUS_DEFAULT_EMBEDDING,
                          make_search_corpus_tool, preload_search_corpus, run_search_corpus)
 
@@ -140,13 +142,26 @@ def stale(executor: Any) -> list[str]:
     return diff
 
 
+@contextmanager
+def _loading_lock(lock: Any, source: str):
+    """Only contention is waiting; the holder's model/text load belongs to its own run."""
+    if not lock.acquire(blocking=False):
+        with timed_stage("corpus_wait", category="observation", source=source):
+            lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _preloaded(paths: Any) -> Any:
     st = (paths.cache / "chunks.jsonl").stat()
     key = (str(paths.cache), st.st_size, st.st_mtime_ns)
-    with _TEXT_LOCK:
+    with _loading_lock(_TEXT_LOCK, "local_text"):
         if key not in _TEXT:
             _TEXT.clear()            # the previous version's text goes once no search holds it
-            _TEXT[key] = preload_search_corpus(paths)
+            with timed_stage("corpus_load", source="local_text"):
+                _TEXT[key] = preload_search_corpus(paths)
         return _TEXT[key]
 
 
@@ -154,15 +169,16 @@ def _embedder(root: Path) -> Any:
     name = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", CORPUS_DEFAULT_EMBEDDING).removeprefix("st-")
     hf = root / "hf_cache" / "hub"
     key = (name, str(hf))
-    with _LOCK:
+    with _loading_lock(_LOCK, "local_embedder"):
         if key not in _EMBEDDERS:
             if time.monotonic() < _LOAD_FAILURES.get(key, 0):
                 raise RuntimeError("The offline embedding model is temporarily unavailable")
             try:
-                from sentence_transformers import SentenceTransformer
+                with timed_stage("corpus_load", source="local_embedder"):
+                    from sentence_transformers import SentenceTransformer
 
-                model = SentenceTransformer(name, device="cpu", local_files_only=True,
-                                            cache_folder=str(hf) if hf.is_dir() else None)
+                    model = SentenceTransformer(name, device="cpu", local_files_only=True,
+                                                cache_folder=str(hf) if hf.is_dir() else None)
             except Exception:
                 _LOAD_FAILURES[key] = time.monotonic() + _LOAD_RETRY_S
                 raise
@@ -192,7 +208,12 @@ def run_local_search(args: dict[str, Any], ctx: Any = None) -> dict[str, Any] | 
         paths = CorpusPaths(index, manifest if manifest.is_file() else None,
                             index / "mechanism_cache", False,
                             hgnc if hgnc.is_file() else None, root / "hf_cache")
-        return run_search_corpus(args, ctx, embed_fn=embed, paths=paths, preloaded=_preloaded(paths))
+        preloaded = _preloaded(paths)
+        with timed_stage("corpus_search", source="local_index") as span:
+            result = run_search_corpus(args, ctx, embed_fn=embed, paths=paths, preloaded=preloaded)
+            if result.get("status") != "ok":
+                span.end("failed")
+            return result
     except Exception:
         _LOG.warning("Local corpus retrieval unavailable; using HPC3 fallback", exc_info=True)
         return None

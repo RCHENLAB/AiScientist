@@ -195,3 +195,123 @@ def test_the_word_index_memo_stays_bounded(monkeypatch):
         idx.counts(parse_terms([word])[0])
         assert len(idx._counts) <= 3
     assert idx.counts(parse_terms(["beta"])[0]) == {0: 1, 1: 1}
+
+
+def test_real_local_search_separates_cold_load_and_search_timings(index, tmp_path, monkeypatch):
+    from aiscientist.gateway import run_monitor, run_timing
+
+    clock = [100.0]
+    monkeypatch.setattr(run_timing.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lc, "_TEXT", {})
+    original_preload = lc.preload_search_corpus
+    original_search = lc.run_search_corpus
+
+    class Model:
+        def __init__(self, *args, **kwargs):
+            clock[0] += 9
+
+        def encode(self, texts, **kwargs):
+            return [[1., 0.] for _ in texts]
+
+    def preload(paths):
+        clock[0] += 4
+        return original_preload(paths)
+
+    def search(*args, **kwargs):
+        clock[0] += 3
+        return original_search(*args, **kwargs)
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
+    monkeypatch.setattr(lc, "preload_search_corpus", preload)
+    monkeypatch.setattr(lc, "run_search_corpus", search)
+    monitor = run_monitor.RunMonitor(run_id="corpus-run")
+    path = tmp_path / "timing.jsonl"
+    monitor.bind_timing(path)
+    with run_monitor.bind_monitor(monitor):
+        tool = lc.make_local_tool()
+        assert tool.executor({"queries": ["PRPF31"]}, None)["status"] == "ok"
+        assert tool.executor({"queries": ["PRPF31"]}, None)["status"] == "ok"
+    spans = run_monitor.read_timing(path)["spans"]
+    assert [(s["stage"], s["metadata"]["source"], s["duration_seconds"]) for s in spans] == [
+        ("corpus_load", "local_embedder", 9), ("corpus_load", "local_text", 4),
+        ("corpus_search", "local_index", 3), ("corpus_search", "local_index", 3)]
+    assert {s["outcome"] for s in spans} == {"success"}
+    assert {s["category"] for s in spans} == {"processing"}
+    assert "PRPF31" not in path.read_text()     # no query text in the timing journal
+
+
+def test_failed_local_embedder_load_keeps_failure_before_hpc_fallback(index, tmp_path, monkeypatch):
+    from aiscientist.gateway import run_monitor
+
+    class MissingModel:
+        def __init__(self, *args, **kwargs):
+            raise OSError("sensitive path to a missing offline model")
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=MissingModel))
+    monitor = run_monitor.RunMonitor(run_id="corpus-fallback")
+    path = tmp_path / "timing.jsonl"
+    monitor.bind_timing(path)
+    with run_monitor.bind_monitor(monitor):
+        assert lc.make_local_tool() is None
+    spans = run_monitor.read_timing(path)["spans"]
+    assert len(spans) == 1 and spans[0]["outcome"] == "failed"
+    assert spans[0]["stage"] == "corpus_load"
+    assert "sensitive" not in path.read_text()
+
+
+def test_shared_embedder_loader_and_waiter_keep_separate_run_timelines(index, tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from aiscientist.gateway import run_monitor
+
+    previous_monitor = run_monitor.current_monitor()
+
+    entered, contended, release = threading.Event(), threading.Event(), threading.Event()
+
+    class Lock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def acquire(self, blocking=True):
+            got = self.lock.acquire(blocking=blocking)
+            if not got:
+                contended.set()
+            return got
+
+        def release(self):
+            self.lock.release()
+
+    class Model:
+        def __init__(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+
+        def encode(self, texts, **kwargs):
+            return [[1., 0.] for _ in texts]
+
+    monkeypatch.setattr(lc, "_LOCK", Lock())
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
+    first, second = (run_monitor.RunMonitor(run_id=ident) for ident in ("loader", "waiter"))
+    paths = [tmp_path / "loader.jsonl", tmp_path / "waiter.jsonl"]
+    first.bind_timing(paths[0])
+    second.bind_timing(paths[1])
+
+    def load(monitor):
+        with run_monitor.bind_monitor(monitor):
+            return lc.make_local_tool()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        loader = pool.submit(load, first)
+        assert entered.wait(5)
+        waiter = pool.submit(load, second)
+        try:
+            assert contended.wait(5)
+        finally:
+            release.set()
+        assert loader.result(5) is not None and waiter.result(5) is not None
+    loaded, waited = [run_monitor.read_timing(p) for p in paths]
+    assert loaded["run_id"] == "loader" and waited["run_id"] == "waiter"
+    assert [s["stage"] for s in loaded["spans"]] == ["corpus_load"]
+    assert [s["stage"] for s in waited["spans"]] == ["corpus_wait"]
+    assert waited["spans"][0]["category"] == "observation"
+    assert run_monitor.current_monitor() is previous_monitor
