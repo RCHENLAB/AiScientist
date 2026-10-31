@@ -6741,7 +6741,7 @@ async function doRegisterVerify(e) {
     const r = await fetch("/api/auth/register/verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { err.textContent = d.detail || `Verification failed (server error ${r.status}). Please try again shortly.`; err.classList.remove("hidden"); return; }
-    showApp(d.user);   // verified → account created + signed in
+    showApp(d.user, true);   // verified → account created + signed in
   } catch { err.textContent = "Can't reach the server."; err.classList.remove("hidden"); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
@@ -6752,7 +6752,7 @@ function showLogin() {
   showAuthPane("login");
 }
 
-function showApp(user) {
+function showApp(user, freshLogin = false) {
   state.user = user;
   $("loginOverlay").classList.add("hidden");
   $("appShell").classList.remove("hidden");
@@ -6763,6 +6763,8 @@ function showApp(user) {
   const mock = $("mockCheck");
   if (mock && mock.closest("label")) mock.closest("label").classList.toggle("hidden", !!user && user.role !== "admin");
   if (!_appInited) { init(); initShell(); _appInited = true; }
+  // Fresh account sign-in overrides the panel preference only for this visit.
+  if (freshLogin) setPanel("left", false, false);
   renderAccount(user);
   switchView("research");
   checkBudgetNotices();
@@ -6775,7 +6777,7 @@ async function doLogin(e) {
   try {
     const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); err.textContent = d.detail || "Invalid username or password"; err.classList.remove("hidden"); return; }
-    showApp((await r.json()).user);
+    showApp((await r.json()).user, true);
   } catch { err.textContent = "Can't reach the server."; err.classList.remove("hidden"); }
 }
 
