@@ -4,7 +4,7 @@ It is built by plain functions in ``frontend/console/app.js`` that return HTML. 
 functions under node with the page's globals stubbed (like the upload cards' arithmetic in
 ``test_upload_pace_js.py``) and pins what a person depends on when reading them: a plan step is
 shown with its title and prose whatever shape it arrives in, only the step a revision touched is
-marked, and an edit of the plan document that was refused comes back with what was typed. Also:
+marked, and a refused field edit comes back as readable feedback with what was typed. Also:
 a pipeline's hard-wrapped protocol text reads by paragraph on the System page, and the composer no
 longer carries the run options or the "Pipelines & skills" picker (issue 21). Skipped where node is
 not installed.
@@ -32,7 +32,7 @@ const src = require("fs").readFileSync(0, "utf8");
 const escapeHtml = __ESCAPE__;
 const sandbox = { state: { planDoc: null, planProblems: [], planDraftYaml: "" }, escapeHtml,
   renderMarkdown: (s) => escapeHtml(s).replace(/`([^`]+)`/g, "<code>$1</code>") };
-const api = vm.runInNewContext(src + "\n;({ planStepParts, planStepHtml, planCardHtml, planEditorHtml, planRunsOnText, planEntryHtml, planEmphasisHtml, planYamlHtml })", sandbox);
+const api = vm.runInNewContext(src + "\n;({ planStepParts, planStepHtml, planCardHtml, planEditorHtml, planRunsOnText, planEntryHtml, planEmphasisHtml })", sandbox);
 const agenda = [
   "**QC & normalization** — Filter cells with `run_scanpy_qc` below 200 genes.",
   "2. **Clustering <UMAP>** — Cluster at resolution 1.2.",
@@ -52,11 +52,16 @@ out.card = api.planCardHtml(agenda, doc, [2]);
 const mixed = { yaml: doc.yaml, steps: [steps[0], { ...steps[1], runs_on: "gpu:scgpt" }, steps[2]] };
 out.mixed = api.planCardHtml(agenda, mixed, []);
 out.editor = api.planEditorHtml(doc);
-sandbox.state.planProblems = ["step 1: bad setting"];
+sandbox.state.planProblems = ["step 1: bad setting <value>"];
+sandbox.state.planDraftChange = { id: "s1", title: "MY <EDIT>" };
 sandbox.state.planDraftYaml = "plan: 1\nsteps:\n  - id: s1\n    title: MY EDIT\n";
 out.refused = api.planEditorHtml(doc);
+out.refusedCard = api.planCardHtml(agenda, doc, []);
+sandbox.state.planProblems = [];
+out.draft = api.planEditorHtml(doc);
 sandbox.state.planProblems = [];
 sandbox.state.planDraftYaml = "";
+sandbox.state.planDraftChange = null;
 out.status = api.planCardHtml(agenda, doc, [], { mode: "status", status: "✎ Applying your edit…" });
 out.saved = api.planCardHtml(agenda, doc, [], { mode: "saved", status: "Approved" });
 out.entry = api.planEntryHtml(agenda, doc, { pending: true, revised: [2] });
@@ -67,11 +72,6 @@ const prose = "Keep cells with 200 genes and under 5.0% mito, n=1 per arm, a 1.6
   + "in DDX41 with log1p, as <code>min_genes=200</code> and it&#039;s 3 cells in <a href=\"x\">link 7</a>.";
 out.emphasis = api.planEmphasisHtml(prose, { min_genes: 200, max_mito_pct: 5.0, groups: ["KO", "WT"], fraction: 0.5 });
 out.percent = api.planEmphasisHtml("flag if more than 50% were removed", { fraction: 0.5 });
-const yaml = "# a comment\nplan: 1\nrequest: Compare <A> & B\nsteps:\n  - id: s1\n    title: QC & normalization\n"
-  + "    tool: run_scanpy_qc\n    runs_on: hpc:analysis\n    settings:\n      min_genes: 200\n      groups: [KO, WT]\n"
-  + "    does: >-\n      Measure quality: drop cells\n      below 200 genes.\n  - id: s2\n    title: Next  # why\n";
-out.yaml = yaml;
-out.yamlHtml = api.planYamlHtml(yaml);
 out.withWords = api.planCardHtml(agenda, doc, [], { words: "drop <step 3> & rerun" });
 out.single = api.planCardHtml([agenda[0]], { yaml: doc.yaml, steps: [steps[0]] }, []);
 const codeDoc = { yaml: doc.yaml, steps: [{ id: "s1", tool: "run_code", skill: "score_signature" }, { id: "s2", tool: "run_in_environment" }, steps[1]] };
@@ -133,25 +133,22 @@ def test_without_a_document_the_card_is_the_steps_alone():
     assert '<div class="plan-sub">3 steps</div>' in plain
 
 
-def test_the_editor_starts_closed_and_escapes_the_document():
-    editor = _card()["editor"]
-    assert editor.startswith('<div class="plan-yaml hidden">'), "closed until the person opens it"
-    assert "&lt;QC&gt;" in editor and "<QC>" not in editor
+def test_an_accepted_plan_needs_no_edit_feedback_or_raw_document():
+    assert _card()["editor"] == ""
 
 
-def test_a_refused_edit_reopens_with_what_was_typed_and_the_reasons():
-    refused = _card()["refused"]
-    assert refused.startswith('<div class="plan-yaml">')
-    assert "MY EDIT" in refused and "&lt;QC&gt;" not in refused
-    assert "step 1: bad setting" in refused
-
-
-def test_a_resolved_card_loses_its_editor_with_its_buttons():
-    """Left in place, "Apply edits" stays clickable on a plan that is no longer waiting."""
-    source = APP_JS.read_text(encoding="utf-8")
-    finalize = source[source.index("function finalizePlanCard"):source.index("function setPlanStatus")]
-    assert 'querySelector(".plan-yaml")' in finalize and "editor.remove()" in finalize
-
+def test_a_refused_field_edit_shows_the_requested_change_and_readable_reasons():
+    out = _card()
+    refused = out["refused"]
+    assert 'class="plan-edit-feedback" role="status"' in refused
+    assert "title → MY &lt;EDIT&gt;" in refused and "MY <EDIT>" not in refused
+    assert "step 1: bad setting &lt;value&gt;" in refused
+    assert 'data-plan="retry"' in refused and 'data-plan="reset"' in refused
+    assert "The steps above are unchanged" in refused
+    assert 'class="plan-setting-v editable"' in out["refusedCard"]
+    assert 'title="Change min_genes">200</span>' in out["refusedCard"], "the accepted value remains on the card"
+    assert 'data-plan="approve" disabled' in out["refusedCard"], "approval waits for correction or discard"
+    assert "title → MY &lt;EDIT&gt;" in out["draft"], "a pending field change remains readable without a server error"
 
 
 def test_a_plan_no_longer_waiting_has_no_editor_and_no_buttons():
@@ -160,8 +157,8 @@ def test_a_plan_no_longer_waiting_has_no_editor_and_no_buttons():
     for card in (out["status"], out["saved"]):
         assert "<textarea" not in card and 'data-plan="edit"' not in card and 'data-plan="approve"' not in card
     assert "✎ Applying your edit…" in out["status"]
-    assert '<details class="plan-yaml plan-yaml-read">' in out["saved"] and "&lt;QC&gt;" in out["saved"], \
-        "a saved plan keeps its document, to read"
+    assert "QC &amp; normalization" in out["saved"] and "Clustering &lt;UMAP&gt;" in out["saved"]
+    assert 'class="plan-setting-v">1.2</span>' in out["saved"], "approved values stay readable"
     assert '<div class="plan-title">Plan</div>' in out["saved"]
 
 
@@ -207,45 +204,25 @@ def test_the_numbers_in_a_step_are_bold_and_the_values_the_plan_fixes_are_marked
         "a percentage in the prose is the fraction the tool takes"
 
 
-def test_the_plan_document_is_highlighted_without_changing_a_character():
-    """The editor draws this copy under its own transparent text: one character more or less and the
-    caret no longer sits where the text appears."""
-    import html as html_lib
-    import re
-
+def test_every_normal_plan_surface_omits_raw_yaml_controls_and_content():
     out = _card()
-    shown = out["yamlHtml"]
-    assert html_lib.unescape(re.sub(r"<[^>]+>", "", shown)) == out["yaml"]
-    assert '<span class="y-c"># a comment</span>' in shown
-    assert '<span class="y-d">-</span> <span class="y-k">id</span><span class="y-p">:</span> <span class="y-id">s1</span>' in shown
-    assert '<span class="y-title">QC &amp; normalization</span>' in shown
-    assert '<span class="y-tool">run_scanpy_qc</span>' in shown
-    assert '<span class="y-sk">min_genes</span><span class="y-p">:</span> <span class="y-val">200</span>' in shown
-    assert '<span class="y-val">[KO, WT]</span>' in shown
-    assert '<span class="y-ind">&gt;-</span>' in shown
-    assert '<span class="y-prose">      Measure quality: drop cells</span>' in shown, "prose is not read as a key"
-    assert '<span class="y-meta">Compare &lt;A&gt; &amp; B</span>' in shown
-    assert '<span class="y-title">Next</span><span class="y-c">  # why</span>' in shown
-    assert "y-val" not in shown.split("does")[1].split("s2")[1], "the next step's keys are not settings"
-
-
-def test_the_editor_and_the_saved_document_show_the_highlighted_plan():
-    out = _card()
-    editor = out["editor"]
-    assert '<pre class="plan-yaml-hl" aria-hidden="true">' in editor and "<textarea" in editor
-    assert editor.count("&lt;QC&gt;") == 2, "the textarea and the copy under it hold the same text"
-    assert '<pre class="plan-yaml-hl">' in out["saved"] and "<textarea" not in out["saved"]
+    for name in ("plain", "card", "mixed", "editor", "refused", "refusedCard", "draft", "status", "saved",
+                 "entry", "entryDirty", "entryRefused", "entrySaved"):
+        shown = out[name]
+        assert "plan.yaml" not in shown and "Edit as YAML" not in shown, name
+        assert "plan-yaml" not in shown and 'data-plan="yaml"' not in shown, name
+        assert "plan: 1" not in shown and "title: &lt;QC&gt;" not in shown, name
+        assert "<pre" not in shown and "```yaml" not in shown, name
 
 
 def test_the_waiting_plan_can_be_changed_in_words_from_the_panel():
-    """Beside the YAML editor, the panel takes a change in words, as the chat does: the two ways to
-    change a plan are where the plan is."""
+    """The panel offers field edits and changes in words beside the plan being reviewed."""
     out = _card()
     card = out["card"]
     box = card.split('<div class="plan-revise">', 1)[1]
     assert '<textarea class="plan-revise-text"' in box and 'data-plan="revise" disabled' in box, \
         "Send waits for text"
-    assert card.index('class="plan-revise"') < card.index('class="plan-yaml'), "words first, then the document"
+    assert card.index('class="plan-steps"') < card.index('class="plan-revise"'), "readable steps precede the change request"
     assert "reply below" not in card, "the panel says how to change the plan itself, not where the composer is"
     assert 'class="plan-revise"' in out["plain"], "a plan without a document can still be changed in words"
     assert "drop &lt;step 3&gt; &amp; rerun</textarea>" in out["withWords"], "what was typed comes back, escaped"
@@ -259,8 +236,9 @@ const vm = require("vm");
 const src = require("fs").readFileSync(0, "utf8");
 const input = JSON.parse(process.env.PLAN_EDIT_INPUT);
 const sandbox = { state: {}, escapeHtml: __ESCAPE__ };
-const api = vm.runInNewContext(src + "\n;({ planYamlEdit })", sandbox);
-console.log(JSON.stringify(input.changes.map((c) => api.planYamlEdit(input.yaml, c))));
+const api = vm.runInNewContext(src + "\n;({ planYamlEdit, planSettingInput })", sandbox);
+console.log(JSON.stringify(input.changes.map((c) => api.planYamlEdit(input.yaml,
+  Object.prototype.hasOwnProperty.call(c, "current") ? { ...c, value: api.planSettingInput(c.current) + (c.append || "") } : c))));
 """.replace("__ESCAPE__", ESCAPE)
 
 
@@ -271,7 +249,7 @@ def _edits(yaml_text: str, changes: list) -> list:
     import os
 
     source = APP_JS.read_text(encoding="utf-8")
-    block = source[source.index("function planYamlUnquote"):source.index("// Make a change on the cards")]
+    block = source[source.index("function planYamlUnquote"):source.index("function commitPlanChange")]
     done = subprocess.run([node, "-e", EDIT_HARNESS], input=block, capture_output=True, text=True, timeout=30,
                           env={**os.environ, "PLAN_EDIT_INPUT": json.dumps({"yaml": yaml_text, "changes": changes})})
     assert done.returncode == 0, done.stderr
@@ -344,8 +322,120 @@ def test_a_change_on_the_cards_is_one_line_of_the_document_and_the_server_reads_
             assert isinstance(parse_plan_yaml(res["yaml"]).steps[0].settings["max_mito_pct"], float), \
                 "a float stays a float"
     assert [r.get("error") for r in out[7:]] == [
-        "A number is expected.", "true or false is expected.", "This step is no longer in the plan document.",
-        "not_there is not where the plan document keeps it: change it in the YAML editor.", "A step needs a title."]
+        "A finite number is expected.", "true or false is expected.", "This step is no longer in the plan document.",
+        "not_there is not where the plan document keeps it: ask for this change in words.", "A step needs a title."]
+
+
+@pytest.mark.parametrize("before, typed, expected", [
+    ("001", "002", "002"),
+    ("true", "false", "false"),
+    ("label", "", ""),
+    ("", "001", "001"),
+    (None, "", None),
+    (None, "none", None),
+    (None, "null", None),
+    (None, "off", "off"),
+    (False, "TRUE", True),
+    (1, "2", 2),
+    (1.0, "2", 2.0),
+    (1e-5, "1e-7", 1e-7),
+    (["001", "true"], "002, false, 003", ["002", "false", "003"]),
+    (["KO", "WT"], '\"KO, treated\", WT', ["KO, treated", "WT"]),
+    (["KO"], '\"\"', [""]),
+    (["KO"], "", []),
+    ([1, 2], "3, 4, 5", [3, 4, 5]),
+    ([False], "true, false", [True, False]),
+    ([1, "001", False, None], "2, 002, true, none", [2, "002", True, None]),
+    ([], "001, true", ["001", "true"]),
+    ([], "", []),
+])
+def test_field_values_round_trip_with_their_types(before, typed, expected):
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep, parse_plan_yaml
+
+    doc = PlanDoc("Fixture", (PlanStep("s1", "**Measure** — Read the sample.", "tool", {"value": before}),))
+    result = _edits(doc.to_yaml(), [{"id": "s1", "setting": "value", "value": typed}])[0]
+    assert "yaml" in result, result
+    actual = parse_plan_yaml(result["yaml"]).steps[0].settings["value"]
+    assert actual == expected and type(actual) is type(expected)
+    if isinstance(expected, list):
+        assert [type(item) for item in actual] == [type(item) for item in expected]
+
+
+@pytest.mark.parametrize("current", [
+    None, "", "001", "true", False, 0, 1.5, [],
+    ["001", "true", "KO, treated", 'say "yes"', "", "O'Brien"],
+    [" leading", "trailing ", " ", "\t tabs\t"],
+    [None, "001", False, 1.5],
+])
+def test_opening_a_field_preserves_values_when_its_input_is_applied_unchanged(current):
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep, parse_plan_yaml
+
+    doc = PlanDoc("Fixture", (PlanStep("s1", "**Measure** — Read the sample.", "tool", {"value": current}),))
+    result = _edits(doc.to_yaml(), [{"id": "s1", "setting": "value", "current": current}])[0]
+    assert "yaml" in result, result
+    assert parse_plan_yaml(result["yaml"], request=doc.request) == doc
+
+
+def test_adding_a_list_item_keeps_whitespace_in_untouched_values():
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep, parse_plan_yaml
+
+    current = ["  KO  ", "WT", " "]
+    doc = PlanDoc("Fixture", (PlanStep("s1", "**Measure** — Read the sample.", "tool", {"value": current}),))
+    result = _edits(doc.to_yaml(), [{"id": "s1", "setting": "value", "current": current, "append": ", new"}])[0]
+    assert "yaml" in result, result
+    assert parse_plan_yaml(result["yaml"]).steps[0].settings["value"] == [*current, "new"]
+
+
+@pytest.mark.parametrize("typed", ["Infinity", "-Infinity", "NaN", "1e999", "9007199254740993"])
+def test_a_numeric_edit_that_cannot_be_represented_safely_is_refused(typed):
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep
+
+    doc = PlanDoc("Fixture", (PlanStep("s1", "Measure", "tool", {"value": 1}),))
+    result = _edits(doc.to_yaml(), [{"id": "s1", "setting": "value", "value": typed}])[0]
+    assert result == {"error": "A finite number is expected."}
+
+
+def test_a_field_edit_preserves_nested_settings_other_steps_and_node_dependencies():
+    """Other plan kinds can carry more than the research plan's public fields. Keep their document."""
+    yaml = pytest.importorskip("yaml")
+    text = """plan: 1
+request: Literature fixture
+steps:
+  - id: s1
+    title: Search papers
+    tool: literature_search
+    settings:
+      filters:
+        value: 99
+        species: [human, mouse]
+      value: 10
+      labels: ['001', 'true']
+    node: search
+    depends_on: [query]
+  - id: s2
+    title: Summarise evidence
+    tool: literature_summary
+    settings:
+      value: 5
+    node: summary
+    depends_on: [search]
+nodes:
+  search: {needs: [query]}
+  summary: {needs: [search]}
+"""
+    result = _edits(text, [{"id": "s1", "setting": "value", "value": "20"}])[0]
+    assert result == {"yaml": text.replace("      value: 10", "      value: 20")}
+    expected = yaml.safe_load(text)
+    expected["steps"][0]["settings"]["value"] = 20
+    assert yaml.safe_load(result["yaml"]) == expected
+
+
+@pytest.mark.parametrize("literal", ["{value: 3}", "\n        nested: 3", "\n        - one\n        - two", "|-\n        wrapped text"])
+def test_complex_field_shapes_are_refused_without_overwriting_their_contents(literal):
+    text = f"plan: 1\nsteps:\n  - id: s1\n    title: Search\n    settings:\n      value: {literal}\n"
+    result = _edits(text, [{"id": "s1", "setting": "value", "value": "replacement"}])[0]
+    assert "yaml" not in result
+    assert "words" in result["error"] and "YAML" not in result["error"]
 
 
 # --- a pipeline's protocol text, as the System page shows it ---------------------------------------

@@ -71,9 +71,10 @@ function newChatRecord(sid) {
     plan: null,            // that prompt: {kind: "plan"|"clarify"|"decision", sid, run, agenda, doc,
                            // revised, problems, questions, goal, options}. Its card is drawn
                            // FROM it (drawPlanPrompt), so it survives a rebuild of the chat stream.
-    planDraftYaml: "",     // what is typed in the plan editor and not applied (or an edit just sent)
-    planDraftBase: "",     // the plan document (its YAML) that text and the open editor belong to
-    planEditorOpen: false, // the plan editor is open on the waiting card
+    planDraftYaml: "",     // internal document of a structured edit awaiting validation
+    planDraftChange: null, // the visible field change; never restore an invisible raw draft
+    planInlineFinish: null, // finish the active field before any plan action
+    planDraftBase: "",     // the accepted document to which this field change belongs
     planWords: "",         // a change to the plan typed in the side panel's box and not sent yet
     planShown: "",        // which version of the waiting plan has opened the side panel already
     bindConfirm: null,     // a local Bind choice, kept apart from an agent request in this chat
@@ -116,13 +117,14 @@ function chatTitle(sid) {
 function emptyChatField(field) {
   if (field === "serverBoundTyped") return new Set();
   return { bound: [], roles: {}, revised: [], problems: [], agenda: [] }[field] ??
-    (field === "running" || field === "planPending" || field === "planEditorOpen" ? false
+    (field === "running" || field === "planPending" ? false
       : field === "planDraftYaml" || field === "planDraftBase" ? "" : null);
 }
 for (const [key, field] of Object.entries({ boundPaths: "bound", boundRoles: "roles", datasetPath: "primary",
   serverBoundTyped: "serverBoundTyped",
   caseNote: "caseNote", running: "running", planPending: "planPending", planPrompt: "plan",
-  planDraftYaml: "planDraftYaml", planDraftBase: "planDraftBase", planEditorOpen: "planEditorOpen" })) {
+  planDraftYaml: "planDraftYaml", planDraftBase: "planDraftBase",
+  planDraftChange: "planDraftChange" })) {
   Object.defineProperty(state, key, {
     enumerable: true,
     get() { const c = activeChat(); return c ? c[field] : emptyChatField(field); },
@@ -1122,7 +1124,7 @@ function messageEl(m) {
     html += `<details class="run-recap">${summaryRow("science", `Steps & code (${milestones})`)}` +
       `<div class="lab-progress done">${m.feed.map(feedItemHtml).join("")}</div></details>`;
   }
-  html += `<div class="msg-body">${renderMarkdown(m.content || "")}</div>`;
+  html += `<div class="msg-body">${renderMarkdown(planMessageMarkdown(m))}</div>`;
   el.innerHTML = html;
   // Upgrade any ```mermaid placeholder to a real diagram. Async + fire-and-forget: the element is
   // returned (and appended) synchronously, so a slow/absent mermaid bundle can never delay or block
@@ -3784,7 +3786,7 @@ async function sendChat(e) {
   setChatRunning(c, true);
   const sess = activeSession();
   // An approved plan is part of the conversation a model is given: its steps and its document.
-  const history = sess.messages.filter((m) => (!m.kind || m.kind === "plan") && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
+  const history = sess.messages.filter((m) => (!m.kind || m.kind === "plan") && (m.role === "user" || m.role === "assistant")).slice(0, -1).map((m) => ({ role: m.role, content: planModelContent(m) }));
   const dataset_path = c.primary || null;
   // The BIND-SET (feature ②): every data file attached to THIS chat, ordered as attached (the server
   // re-ranks to pick the primary). Legacy single-file runs still send `dataset_path`; both together
@@ -3852,7 +3854,7 @@ const DEFAULT_PLACEHOLDER = "Ask a question, or describe the analysis you want �
 // A plan, a clarify question or a decision point waits for the user in ONE chat: the one that owns
 // the run. Several chats may each have one waiting. Its card is DOM, and renderChat() empties the
 // stream on every switch of chats, so the card alone cannot be where the prompt lives: switching
-// away and back left a composer that said a plan was pending and no Run / Cancel / Edit as YAML to
+// away and back left a composer that said a plan was pending and no Run / Cancel / Open plan to
 // act on, until a full page reload made the server replay it. So the prompt is held in its chat's
 // record (``c.plan``) from the moment it arrives until it is resolved, and the card is drawn FROM
 // it: when it arrives and its chat is on screen, when that chat is rebuilt, and for the first time
@@ -3911,31 +3913,28 @@ function releasePlanPrompt(c = activeChat()) {
   if (!c) return;
   const was = !!c.plan || c.planPending;
   c.plan = null;
+  c.planInlineFinish = null;
   c.planPending = false;
   saveRunOwners();
   if (was) renderSessionList();
 }
 
-// What is typed in a plan editor and not applied, and whether the editor is open, belong to ONE plan
-// document (``c.planDraftBase``) of one chat. They are kept for as long as the server keeps sending
-// that document: when the card is rebuilt, when the prompt is replayed after a reconnect or a page
-// reload (the browser's storage carries them over the reload), when the PI answers a question and
-// leaves the plan alone. A different document drops them. An edit the server refused left the plan
-// unchanged, so what was typed stays.
+// A structured change awaiting validation belongs to one accepted document in one chat. Keep
+// its readable field description and internal payload together across redraw/reconnect/reload.
+// A different accepted document drops both; rejected changes keep both so they can be corrected.
 function keepPlanDraft(c, p) {
   const yaml = (p.doc && p.doc.yaml) || "";
   if (yaml && !c.planDraftBase) loadPlanDraft(c, p);
-  const refused = (p.problems || []).length > 0 && !!c.planDraftYaml;
-  if (!yaml || (c.planDraftBase !== yaml && !refused)) {
+  if (!yaml || c.planDraftBase !== yaml || c.planDraftYaml === yaml) {
     c.planDraftYaml = "";
-    c.planEditorOpen = false;
+    c.planDraftChange = null;
   }
   c.planDraftBase = yaml;
   savePlanDraft(c);
 }
 
-// The editor reports each change as it happens, so there is never a card whose text exists only in
-// its textarea. Returns whether the text differs from the plan it edits.
+// Keep the internal payload of a field change until validation answers. Returns whether it
+// differs from the accepted document.
 function notePlanDraft(text, c = activeChat()) {
   if (!c) return false;
   const original = (c.plan && c.plan.doc && c.plan.doc.yaml) || "";
@@ -3944,12 +3943,6 @@ function notePlanDraft(text, c = activeChat()) {
   c.planDraftBase = original;
   savePlanDraft(c);
   return dirty;
-}
-
-function notePlanEditorOpen(open, c = activeChat()) {
-  if (!c) return;
-  c.planEditorOpen = !!open;
-  savePlanDraft(c);
 }
 
 // Every chat's draft, in one storage entry keyed by chat. An older page stored a single
@@ -3972,8 +3965,8 @@ function writePlanDrafts(all) {
 function savePlanDraft(c) {
   const p = c.plan;
   const all = readPlanDrafts();
-  if (p && p.kind === "plan" && c.planDraftBase && (c.planDraftYaml || c.planEditorOpen)) {
-    all[c.sid] = { run: p.run, base: c.planDraftBase, text: c.planDraftYaml, open: c.planEditorOpen };
+  if (p && p.kind === "plan" && c.planDraftBase && c.planDraftYaml && c.planDraftChange) {
+    all[c.sid] = { run: p.run, base: c.planDraftBase, text: c.planDraftYaml, change: c.planDraftChange };
   } else {
     delete all[c.sid];
   }
@@ -3984,17 +3977,19 @@ function savePlanDraft(c) {
 // it against the document the server sent.
 function loadPlanDraft(c, p) {
   const d = readPlanDrafts()[c.sid];
-  if (!d || (d.run || null) !== p.run) return;
+  // Older browsers saved raw editor drafts. They cannot be reviewed in this UI, so never send
+  // them invisibly or let them disable Run. The accepted server plan remains authoritative.
+  if (!d || !d.change || (d.run || null) !== p.run) return;
   c.planDraftBase = String(d.base || "");
   c.planDraftYaml = String(d.text || "");
-  c.planEditorOpen = !!d.open;
+  c.planDraftChange = d.change;
 }
 
 function dropPlanDraft(c = activeChat()) {
   if (!c) return;
   c.planDraftYaml = "";
+  c.planDraftChange = null;
   c.planDraftBase = "";
-  c.planEditorOpen = false;
   const all = readPlanDrafts();
   if (c.sid in all) { delete all[c.sid]; writePlanDrafts(all); }
 }
@@ -4039,8 +4034,10 @@ function planStepParts(text) {
 }
 
 function planSettingText(value) {
-  if (Array.isArray(value)) return value.map(planSettingText).join(", ");
+  if (Array.isArray(value)) return value.length ? value.map(planSettingText).join(", ") : "(empty list)";
   if (value === null || value === undefined) return "none";
+  if (typeof value === "object") return Object.entries(value).map(([k, v]) => `${k}: ${planSettingText(v)}`).join("; ");
+  if (value === "") return "(empty text)";
   return String(value);
 }
 
@@ -4127,14 +4124,15 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
   const editable = !!(edit && step && step.id);
-  const editAttrs = (what, key) => editable
+  const canEdit = (k) => settings[k] === null || typeof settings[k] !== "object" || (Array.isArray(settings[k]) && settings[k].every((v) => v === null || typeof v !== "object"));
+  const editAttrs = (what, key) => editable && (what === "title" || canEdit(key))
     ? ` data-edit="${what}"${key ? ` data-key="${escapeHtml(key)}"` : ""} tabindex="0" role="button" `
       + `title="${what === "title" ? "Change the title" : `Change ${escapeHtml(key)}`}"`
     : "";
   const chips = Object.keys(settings).map((k) =>
     `<span class="plan-setting" title="Passed to the tool exactly as written">`
     + `<span class="plan-setting-k">${escapeHtml(k)}</span>`
-    + `<span class="plan-setting-v${editable ? " editable" : ""}"${editAttrs("setting", k)}>`
+    + `<span class="plan-setting-v${editable && canEdit(k) ? " editable" : ""}"${editAttrs("setting", k)}>`
     + `${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
   const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
   // The vetted skill the step uses: matched by AiScientist, handed to the agent with its guidance
@@ -4259,9 +4257,9 @@ function planRevisedNote(revised) {
 }
 
 // The whole plan, as the side panel shows it. `opts.mode`:
-//   "review" (default) — waiting for a decision: the document's editor and Run / Cancel;
+//   "review" (default) — waiting for a decision: editable fields and Run / Cancel;
 //   "status"           — answered, the PI has it: `opts.status` instead of the buttons;
-//   "saved"            — a plan this chat approved: read-only, with its document.
+//   "saved"            — a plan this chat approved: read-only steps and settings.
 function planCardHtml(agenda, doc, revisedSteps, opts) {
   const o = opts || {};
   const mode = o.mode || "review";
@@ -4281,7 +4279,7 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
     + agenda.map((s, i) => planStepHtml(s, i + 1, docSteps[i], revised.has(i + 1), !onePlace, edit)).join("")
     + `</ol>`;
   if (mode !== "review") {
-    return head + steps + planEstimateHtml(o.estimate) + planDocumentHtml(doc)
+    return head + steps + planEstimateHtml(o.estimate)
       + `<div class="plan-actions-row"><span class="plan-actions-status">${escapeHtml(o.status || "")}</span></div>`;
   }
   const tip = edit ? `<div class="plan-edit-tip">${planIcon("edit")}<span>Click a title or a value to change it, `
@@ -4291,13 +4289,11 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
     + planReviseHtml(o.words)
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
-    + `<button class="primary" data-plan="approve">${planIcon("play_arrow")}Run this plan</button>`
-    + (doc && doc.yaml ? `<button class="secondary" data-plan="yaml">${planIcon("data_object")}<span>Edit as YAML</span></button>` : "")
+    + `<button class="primary" data-plan="approve"${state.planDraftYaml ? ' disabled title="Correct or discard your change first"' : ""}>${planIcon("play_arrow")}Run this plan</button>`
     + `<button class="secondary quiet" data-plan="cancel">Cancel</button></div>`;
 }
 
-// The two ways to change a waiting plan sit together in the panel: say what to change, here or in
-// the chat (the PI makes the change), or edit the document itself (Edit as YAML, applied by code).
+// A waiting plan can be changed in words (by the PI) or by clicking its fields (applied by code).
 // `words` is what was typed here and not sent, so a redraw of the panel keeps it.
 function planReviseHtml(words) {
   return `<div class="plan-revise">`
@@ -4306,18 +4302,11 @@ function planReviseHtml(words) {
     + `aria-label="Tell the PI what to change in the plan" `
     + `placeholder="e.g. drop the enrichment step, and cluster at resolution 0.8">${escapeHtml(words || "")}</textarea>`
     + `<button class="secondary small" data-plan="revise" disabled>${planIcon("send")}<span>Send</span></button></div>`
-    + `<div class="plan-revise-draft" hidden>${planIcon("info")}<span>Your YAML edit is not applied yet: it is applied `
+    + `<div class="plan-revise-draft" hidden>${planIcon("info")}<span>Your setting change is not applied yet: it is checked `
     + `first, and the PI changes the plan with it.</span></div>`
     + `<div class="plan-revise-tip">The PI changes the plan as it stands, with your own changes, and shows it to you `
     + `again; nothing runs until you run it. A question gets an answer and leaves the plan as it is. Same as replying `
     + `in the chat.</div></div>`;
-}
-
-// The document of a plan that is no longer waiting: there to read and copy, not to edit.
-function planDocumentHtml(doc) {
-  if (!doc || !doc.yaml) return "";
-  return `<details class="plan-yaml plan-yaml-read"><summary class="plan-yaml-file">${planIcon("data_object")}plan.yaml</summary>`
-    + `<div class="plan-yaml-code"><pre class="plan-yaml-hl">${planYamlHtml(doc.yaml)}</pre></div></details>`;
 }
 
 // The plan as the chat shows it: the step titles and the tool each one runs, with the decision
@@ -4356,78 +4345,34 @@ function planEntryHtml(agenda, doc, opts) {
     + `<div class="plan-actions-row">${actions}</div>`;
 }
 
-// The plan document's editor. Present only when the server sends the plan as a document (`plan`
-// on the plan prompt); a server that does not gets the card without it. An edit is applied by the
-// server's code, not by a model: a step that was not touched cannot change, and an edit that cannot
-// be applied is refused with its reasons while the text that was typed stays in the box.
-function planEditorHtml(doc) {
-  if (!doc || !doc.yaml) return "";
-  const problems = state.planProblems || [];
-  // A refused edit reopens with what was typed, not with the plan it failed to change. So does a
-  // card that is drawn again for the same document (keepPlanDraft): the text was never applied,
-  // and the textarea is the only place it was.
-  const mine = state.planDraftBase === doc.yaml;
-  const draft = (state.planDraftYaml && (problems.length || mine)) ? state.planDraftYaml : "";
-  const text = draft || doc.yaml;
-  // Open where the person left it open, and whenever it holds text that is not applied: "Run this
-  // plan" is disabled then, and the reason has to be on screen.
-  const open = problems.length > 0 || !!draft || (mine && !!state.planEditorOpen);
-  const rows = Math.max(8, Math.min(26, text.split("\n").length + 1));
-  const banner = problems.length
-    ? `<div class="plan-yaml-problems">${planIcon("error")}<div><strong>Your edit was not applied — the plan is unchanged.</strong>`
-      + `<ul>${problems.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul></div></div>`
-    : "";
-  return `<div class="plan-yaml${open ? "" : " hidden"}">`
-    + `<div class="plan-yaml-bar"><span class="plan-yaml-file">${planIcon("data_object")}plan.yaml</span>`
-    + `<span class="plan-yaml-tip">Change a setting, reword, remove, reorder or add a step. `
-    + `Your edit is applied exactly as written; nothing else in the plan changes.</span></div>`
-    + banner
-    // The text is typed into the textarea and read from the highlighted copy under it: the textarea's
-    // own text is transparent, and the copy follows its scrolling (wirePlanEditor).
-    + `<div class="plan-yaml-code plan-yaml-stack">`
-    + `<pre class="plan-yaml-hl" aria-hidden="true">${planYamlHtml(text)}</pre>`
-    + `<textarea class="plan-yaml-text" rows="${rows}" spellcheck="false" autocapitalize="off" `
-    + `autocomplete="off" aria-label="The plan as YAML">${escapeHtml(text)}</textarea></div>`
-    + `<div class="plan-yaml-actions"><button class="secondary small" data-plan="edit" disabled>Apply edits</button>`
-    + `<button class="secondary quiet small" data-plan="reset">Reset</button></div></div>`;
+// Structured edit feedback. The accepted steps remain visible until the server validates the
+// change; a refused value is shown here and can be corrected on its field or discarded.
+function planProblemText(problem) {
+  const text = String(problem || "");
+  return /YAML|PyYAML|does not parse|must be a mapping|name: value|line \d+, column \d+/i.test(text)
+    ? "Some plan details could not be read. Discard this change or ask for a revised plan." : text;
 }
 
-// The plan document as text to read: keys quiet, and what a reviewer looks for — each step's id and
-// title, its tool, the settings passed to it — in bold. Line by line, character for character: the
-// editor draws this under its own (transparent) text, so it must never add or drop one.
-function planYamlHtml(text) {
-  let block = -1;      // column of the key whose block scalar (`does: >-`) the deeper lines belong to
-  let settings = -1;   // column of `settings:`; the keys under it are the tool's arguments
-  const VALUE = { id: "y-id", title: "y-title", tool: "y-tool", plan: "y-meta", request: "y-meta", runs_on: "y-meta" };
-  return String(text == null ? "" : text).split("\n").map((line) => {
-    const col = line.length - line.trimStart().length;
-    if (block >= 0 && (!line.trim() || col > block)) return line.trim() ? `<span class="y-prose">${escapeHtml(line)}</span>` : escapeHtml(line);
-    block = -1;
-    if (line.trimStart().startsWith("#")) return `<span class="y-c">${escapeHtml(line)}</span>`;
-    const m = /^(\s*)(-\s+)?([^\s:#"'][^:#]*?):(?=\s|$)(\s*)(.*)$/.exec(line);
-    if (!m) return escapeHtml(line);
-    const [, sp, dash = "", key, gap, rest] = m;
-    const keyCol = sp.length + dash.length;
-    if (settings >= 0 && keyCol <= settings) settings = -1;
-    const inSettings = settings >= 0;
-    if (key === "settings" && !rest) settings = keyCol;
-    const c = /^([^"'#]*?)(\s+#.*)$/.exec(rest);
-    const value = c ? c[1] : rest;
-    const scalar = /^[>|][+-]?\d*$/.test(value);
-    if (scalar) block = keyCol;
-    const cls = inSettings ? "y-val" : scalar ? "y-ind" : (VALUE[key] || "y-v");
-    return escapeHtml(sp)
-      + (dash ? `<span class="y-d">-</span>${escapeHtml(dash.slice(1))}` : "")
-      + `<span class="${inSettings ? "y-sk" : "y-k"}">${escapeHtml(key)}</span><span class="y-p">:</span>${escapeHtml(gap)}`
-      + (value ? `<span class="${cls}">${escapeHtml(value)}</span>` : "")
-      + (c ? `<span class="y-c">${escapeHtml(c[2])}</span>` : "");
-  }).join("\n");
+function planEditorHtml(doc) {
+  if (!doc) return "";
+  const problems = state.planProblems || [];
+  const change = state.planDraftChange;
+  if (!problems.length && !change) return "";
+  const step = change && (doc.steps || []).find((s) => s.id === change.id);
+  const description = !change ? "" : `${step ? step.title || change.id : change.id}: `
+    + (change.remove ? "remove this step" : change.skill === null ? "remove the skill"
+      : change.title !== undefined ? `title → ${change.title}` : `${change.setting} → ${change.value || "(empty)"}`);
+  return `<div class="plan-edit-feedback" role="status"><strong>Your change has not been applied. The steps above are unchanged.</strong>`
+    + (description ? `<p>${escapeHtml(description)}</p>` : "")
+    + (problems.length ? `<ul>${problems.map((x) => `<li>${escapeHtml(planProblemText(x))}</li>`).join("")}</ul>` : "")
+    + (change ? `<button class="secondary small" data-plan="retry">Check change again</button> `
+      + `<button class="secondary quiet small" data-plan="reset">Discard change</button>` : "") + `</div>`;
 }
 
 // ---- changing the plan on its cards ----------------------------------------------------------------
 // A title, a setting's value or a removed step is written into the plan DOCUMENT, line by line, and
 // sent as an edit: the server parses it, checks it against the tools and applies it by code, with no
-// model, exactly like an edit made in the YAML editor. Every other line stays as the server wrote it,
+// model. Every other line stays as the server wrote it,
 // so the edit holds this one change and nothing else.
 
 function planYamlUnquote(text) {
@@ -4452,31 +4397,64 @@ function planYamlNumber(n, float) {
   return s.includes(".") ? s : s + ".0";
 }
 
-function planYamlItem(text) {
-  if (PLAN_YAML_NUMBER.test(text)) return planYamlNumber(Number(text), /[.eE]/.test(text));
-  if (/^(true|false)$/i.test(text)) return text.toLowerCase();
-  return JSON.stringify(text);
+// Split a comma-separated list without splitting a quoted item (for example "KO, treated").
+// The server writes flat flow lists; reject other shapes rather than guessing their meaning.
+function planListItems(text) {
+  const items = [];
+  let start = 0, quote = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') { i += 1; continue; }
+      if (ch === quote) {
+        if (quote === "'" && text[i + 1] === "'") { i += 1; continue; }
+        quote = "";
+      }
+    } else if ((ch === '"' || ch === "'") && !text.slice(start, i).trim()) quote = ch;
+    else if (ch === ",") { items.push(text.slice(start, i).trim()); start = i + 1; }
+  }
+  if (quote) return null;
+  items.push(text.slice(start).trim());
+  return items;
 }
 
-// What was typed for a setting, written as the same kind of value the document had there: a number
-// stays a number (and a float a float), a list a list, true/false a boolean; anything else is a
-// quoted string. {text} or {error}.
+function planSettingInput(value) {
+  if (value == null) return "";
+  if (Array.isArray(value)) return value.map((v) => typeof v === "string" && (!v || v !== v.trim() || /[,"'\n]/.test(v))
+    ? JSON.stringify(v) : v == null ? "none" : String(v)).join(", ");
+  return String(value);
+}
+
+// Convert one edited value using its existing type, never infer strings as numbers/booleans.
+// Only the target line is replaced; nested settings and all other document fields stay untouched.
 function planYamlValue(literal, typed) {
-  const raw = String(typed == null ? "" : typed).trim();
+  const text = String(typed == null ? "" : typed);
+  const raw = text.trim();
   const was = String(literal == null ? "" : literal).trim();
   if (/^\[.*\]$/.test(was)) {
-    const items = raw.split(",").map((x) => x.trim()).filter(Boolean);
-    return items.length ? { text: "[" + items.map(planYamlItem).join(", ") + "]" }
-      : { error: "Give at least one value, separated by commas." };
+    const before = planListItems(was.slice(1, -1));
+    const items = raw ? planListItems(raw) : [];
+    if (!before || !items) return { error: "Close the quotation marks around each list value." };
+    const values = [];
+    for (let i = 0; i < items.length; i += 1) {
+      const item = planYamlValue(before[i] || before[0] || '""', planYamlUnquote(items[i]));
+      if (item.error) return { error: `Value ${i + 1}: ${item.error}` };
+      values.push(item.text);
+    }
+    return { text: "[" + values.join(", ") + "]" };
   }
+  if (/^[{[>|]/.test(was) || !was) return { error: "Ask for this setting change in words." };
   if (/^(true|false)$/i.test(was)) {
     return /^(true|false)$/i.test(raw) ? { text: raw.toLowerCase() } : { error: "true or false is expected." };
   }
   if (PLAN_YAML_NUMBER.test(was)) {
-    return raw && PLAN_YAML_NUMBER.test(raw) ? { text: planYamlNumber(Number(raw), /[.eE]/.test(was)) }
-      : { error: "A number is expected." };
+    const n = Number(raw);
+    return raw && PLAN_YAML_NUMBER.test(raw) && Number.isFinite(n)
+      && (!Number.isInteger(n) || Number.isSafeInteger(n))
+      ? { text: planYamlNumber(n, /[.eE]/.test(was)) } : { error: "A finite number is expected." };
   }
-  return raw ? { text: JSON.stringify(raw) } : { error: "A value is expected." };
+  if (/^(null|~)$/i.test(was) && (!raw || /^(none|null)$/i.test(raw))) return { text: "null" };
+  return { text: JSON.stringify(text) };
 }
 
 // The plan document with one change made to it. `change`: {id, title} | {id, setting, value} (the
@@ -4506,7 +4484,7 @@ function planYamlEdit(yaml, change) {
         return { yaml: lines.join("\n") };
       }
     }
-    return { error: "The skill is not where the plan document keeps it: delete it in the YAML editor." };
+    return { error: "The skill is not where the plan document keeps it: ask for this change in words." };
   }
   if (change.title !== undefined) {
     const title = String(change.title).replace(/\s+/g, " ").trim();
@@ -4518,7 +4496,7 @@ function planYamlEdit(yaml, change) {
       lines[i] = `${m[1]}title: ${JSON.stringify(title)}`;
       return { yaml: lines.join("\n") };
     }
-    return { error: "The title is not where the plan document keeps it: change it in the YAML editor." };
+    return { error: "The title is not where the plan document keeps it: ask for this change in words." };
   }
   let settings = -1;
   for (let i = start + 1; i < end; i += 1) {
@@ -4528,31 +4506,32 @@ function planYamlEdit(yaml, change) {
     }
     if (lines[i].trim() && indent(lines[i]) <= settings) break;
     const m = /^(\s*)("[^"]*"|'[^']*'|[^\s:#"'][^:#]*?):(\s+)(.*)$/.exec(lines[i]);
-    if (!m || planYamlUnquote(m[2]) !== String(change.setting)) continue;
+    if (!m || indent(lines[i]) !== settings + 2 || planYamlUnquote(m[2]) !== String(change.setting)) continue;
     const c = /^["']/.test(m[4]) ? null : /^(.*?)(\s+#.*)$/.exec(m[4]);
     const value = planYamlValue(c ? c[1] : m[4], change.value);
     if (value.error) return value;
     lines[i] = `${m[1]}${m[2]}:${m[3]}${value.text}${c ? c[2] : ""}`;
     return { yaml: lines.join("\n") };
   }
-  return { error: `${change.setting} is not where the plan document keeps it: change it in the YAML editor.` };
+  return { error: `${change.setting} is not where the plan document keeps it: ask for this change in words.` };
 }
 
-// Make a change on the cards of the plan waiting in chat `c`, and send it. An edit typed in the YAML
-// editor and not applied yet is part of what the person has: the change is made on it, and both go
-// together. Returns why it could not be made, or "".
+// Make one field change on the accepted document and send it for validation. A correction
+// replaces the refused change, never silently carries an invisible edit. Returns an error or "".
 function commitPlanChange(c, change) {
   const doc = c && c.plan && c.plan.kind === "plan" ? c.plan.doc : null;
   if (!doc || !doc.yaml) return "This plan has no document to change.";
-  const out = planYamlEdit(c.planDraftYaml || doc.yaml, change);
+  const out = planYamlEdit(doc.yaml, change);
   if (out.error) return out.error;
+  c.planDraftChange = { ...change };
+  notePlanDraft(out.yaml, c);
   submitPlan("edit", "", out.yaml, c);
   return "";
 }
 
 // A title or a setting's value turned into a text box. Enter (or leaving the box) applies a change,
 // Escape puts the value back. A value that cannot be written stays open with the reason on Enter.
-function planInlineEdit(li, el, initial, label, commit) {
+function planInlineEdit(li, el, initial, label, commit, c = activeChat()) {
   if (el.querySelector("input")) return;
   const before = el.innerHTML;
   const input = document.createElement("input");
@@ -4567,16 +4546,18 @@ function planInlineEdit(li, el, initial, label, commit) {
   input.focus();
   input.select();
   let done = false;
-  const restore = () => { el.innerHTML = before; el.classList.remove("editing"); };
+  const restore = () => { el.innerHTML = before; el.classList.remove("editing"); c.planInlineFinish = null; };
   const finish = (save, leaving) => {
     if (done) return;
-    if (save && input.value.trim() !== String(initial).trim()) {
+    if (!input.isConnected) { done = true; c.planInlineFinish = null; return; }
+    if (save && input.value !== String(initial)) {
       // Sending draws the panel again at once, which takes the focus from this box: `done` first,
       // so that blur does not send the change a second time.
       done = true;
+      c.planInlineFinish = null;
       const why = commit(input.value);
       if (!why) return;
-      if (!leaving) { done = false; planStepError(li, why); input.focus(); return; }
+      if (!leaving) { done = false; c.planInlineFinish = finish; planStepError(li, why); input.focus(); return; }
       restore();
       planStepError(li, why);
       return;
@@ -4585,13 +4566,14 @@ function planInlineEdit(li, el, initial, label, commit) {
     restore();
     planStepError(li, "");
   };
+  c.planInlineFinish = finish;
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") { ev.preventDefault(); finish(true, false); }
     else if (ev.key === "Escape") { ev.preventDefault(); finish(false, false); }
   });
   // Leaving the box applies the change, but a box that left because the panel was drawn again (a
   // status line) is not the person leaving it: nothing is sent for that.
-  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, true); }, 0));
+  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, false); }, 0));
 }
 
 function planStepError(li, why) {
@@ -4616,9 +4598,9 @@ function wirePlanCardEdits(host, c, doc) {
       const isTitle = el.dataset.edit === "title";
       const key = el.dataset.key || "";
       const start = () => planInlineEdit(li, el,
-        isTitle ? (step.title || el.textContent) : planSettingText((step.settings || {})[key]),
+        isTitle ? (step.title || el.textContent) : planSettingInput((step.settings || {})[key]),
         isTitle ? "The step's title" : `The value of ${key}`,
-        (value) => commitPlanChange(c, isTitle ? { id, title: value } : { id, setting: key, value }));
+        (value) => commitPlanChange(c, isTitle ? { id, title: value } : { id, setting: key, value }), c);
       el.addEventListener("click", start);
       el.addEventListener("keydown", (ev) => {
         if (ev.target !== el || (ev.key !== "Enter" && ev.key !== " ")) return;
@@ -4655,7 +4637,7 @@ function wirePlanCardEdits(host, c, doc) {
 }
 
 // The waiting plan: its entry in the chat (titles, Run / Open plan / Cancel) and the whole plan, with
-// its document's editor, in the side panel.
+// its editable settings, in the side panel.
 function showPlanPanel(agenda) {
   const el = planCardShell("plan");
   el.classList.add("plan-sheet", "plan-entry");
@@ -4675,53 +4657,14 @@ function showPlanPanel(agenda) {
 }
 
 function wirePlanEditor(el, c) {
-  const panel = el.querySelector(".plan-yaml");
-  if (!panel) return;
-  const box = panel.querySelector(".plan-yaml-text");
-  const shown = panel.querySelector(".plan-yaml-hl");
-  const original = state.planDoc.yaml;
-  const apply = panel.querySelector('[data-plan="edit"]');
-  const runButtons = () => [el.querySelector('[data-plan="approve"]'),
-    chatVisible(c) && state.planCardEl ? state.planCardEl.querySelector('[data-plan="approve"]') : null].filter(Boolean);
-  const toggle = el.querySelector('[data-plan="yaml"]');
-  const label = () => { toggle.querySelector("span:last-child").textContent = panel.classList.contains("hidden") ? "Edit as YAML" : "Hide YAML"; };
-  // While the box holds an edit that has not been applied, "Run this plan" would run the plan
-  // WITHOUT it. So the edit becomes the primary action and Run waits for Apply or Reset.
-  const follow = () => { if (shown) { shown.scrollTop = box.scrollTop; shown.scrollLeft = box.scrollLeft; } };
-  const sync = () => {
-    if (shown) { shown.innerHTML = planYamlHtml(box.value); follow(); }
-    const dirty = notePlanDraft(box.value, c);
-    apply.disabled = !dirty;
-    apply.classList.toggle("primary", dirty);
-    apply.classList.toggle("secondary", !dirty);
-    for (const run of runButtons()) {
-      run.disabled = dirty;
-      run.title = dirty ? "Apply or reset your edit first" : "";
-    }
-    refreshPlanRevise(el, c);
-  };
-  toggle.addEventListener("click", () => {
-    panel.classList.toggle("hidden");
-    notePlanEditorOpen(!panel.classList.contains("hidden"), c);
-    label();
-    if (!panel.classList.contains("hidden")) box.focus();
+  const reset = el.querySelector('[data-plan="reset"]');
+  if (reset) reset.addEventListener("click", () => {
+    dropPlanDraft(c);
+    if (c.plan) c.plan.problems = [];
+    drawPlanPrompt(c);
   });
-  box.addEventListener("input", sync);
-  box.addEventListener("scroll", follow);
-  // Tab indents (YAML is indentation) instead of leaving the box.
-  box.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Tab" || ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
-    ev.preventDefault();
-    box.setRangeText("  ", box.selectionStart, box.selectionEnd, "end");
-    sync();
-  });
-  apply.addEventListener("click", () => submitPlan("edit", "", box.value, c));
-  panel.querySelector('[data-plan="reset"]').addEventListener("click", () => {
-    box.value = original;
-    sync();
-  });
-  label();
-  sync();
+  const retry = el.querySelector('[data-plan="retry"]');
+  if (retry) retry.addEventListener("click", () => commitPlanChange(c, c.planDraftChange));
 }
 
 // The chat entry's own buttons. They answer THIS chat's run, whatever is on screen when clicked.
@@ -4775,7 +4718,7 @@ function renderPlanPanel() {
   if (tab) tab.classList.toggle("waiting", !!(c && c.plan && c.plan.kind === "plan"));
   const view = chatPlanView(c);
   if (!view) {
-    host.innerHTML = '<div class="downloads-empty">No plan in this chat yet. When the PI proposes one it opens here: every step and the settings it fixes. You can change it in words, or edit it as a YAML document.</div>';
+    host.innerHTML = '<div class="downloads-empty">No plan in this chat yet. When the PI proposes one it opens here: every step and the settings it fixes. You can change it in words, or click a title or setting to change its value.</div>';
     return;
   }
   host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
@@ -4792,8 +4735,8 @@ function renderPlanPanel() {
   wirePlanEditor(host, c);
 }
 
-// The panel's "Change it in words" box. Enter sends (Shift+Enter is a new line). An edit in the YAML
-// editor that is not applied goes with the words (revisePlanInWords), and the box says so.
+// The panel's "Change it in words" box. Enter sends (Shift+Enter is a new line). A field change
+// that has not been applied goes with the words (revisePlanInWords), and the box says so.
 function wirePlanRevise(host, c) {
   const box = host.querySelector(".plan-revise-text");
   const send = host.querySelector('[data-plan="revise"]');
@@ -4901,16 +4844,52 @@ function openPlanPanel() {
   setPanel("right", true, false);
 }
 
-// The approved plan as the chat keeps it. `content` is what a model reading this conversation later
-// is given (the steps, and the document with the settings that ran); `plan` is what the entry and
-// the side panel are drawn from.
+// Saved chat text is readable too (exports and clients without the plan card use it). The
+// execution document stays in metadata and is added only to the internal model history.
 function planSavedMessage(p) {
-  const docMd = planEstimateMarkdown(p.estimate) + ((p.doc && p.doc.yaml)
-    ? "\n\n**Approved plan document**\n\n```yaml\n" + p.doc.yaml.trim() + "\n```"
-    : "");
+  const settings = ((p.doc && p.doc.steps) || []).map((s, i) => {
+    const values = Object.entries(s.settings || {});
+    return values.length ? `\n\nStep ${i + 1} settings\n` + values.map(([k, v]) => `- ${k}: ${planSettingText(v)}`).join("\n") : "";
+  }).join("");
   return { role: "assistant", kind: "plan",
-           content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n") + docMd,
+           content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n")
+             + settings + planEstimateMarkdown(p.estimate),
            plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved" } };
+}
+
+function planModelContent(m) {
+  const yaml = m.kind === "plan" && m.plan && m.plan.doc && m.plan.doc.yaml;
+  const text = m.content || "";
+  const document = yaml ? "\n\n**Approved plan document**\n\n```yaml\n" + yaml.trim() + "\n```" : "";
+  return !document || text.endsWith(document) ? text : text + document;
+}
+
+// Pre-card history stored the approved document as a specific Markdown suffix. Recognize only
+// that application-generated message (including kind=plan rows whose metadata was lost).
+// The original message is kept for continuation; regular chat/code examples are untouched.
+function planMessageMarkdown(m) {
+  const text = m.content || "";
+  if (m.role !== "assistant" || (m.kind !== "plan" && !/^## 📋 Research plan\s/.test(text))) return text;
+  return text.replace(/\n+\*\*Approved plan document\*\*\s*\n```ya?ml\s*\n([\s\S]*?)\n```(?=\s*$)/i, (_block, yaml) => {
+    const rows = [];
+    let step = 0, settings = false;
+    // Only read the canonical writer's display fields. Never use this projection for execution.
+    for (const line of yaml.split("\n")) {
+      if (/^  - id:/.test(line)) { step += 1; settings = false; }
+      if (/^    settings:\s*$/.test(line)) { settings = true; rows.push(`\nStep ${step} settings`); continue; }
+      if (/^    \S/.test(line)) settings = false;
+      if (!settings) continue;
+      const entry = /^      (.+?):\s*(.*)$/.exec(line);
+      if (!entry) continue;
+      const key = planYamlUnquote(entry[1]);
+      const raw = entry[2];
+      const items = /^\[.*\]$/.test(raw) ? planListItems(raw.slice(1, -1)) : null;
+      const value = items ? (raw === "[]" ? "(empty list)" : items.map(planYamlUnquote).join(", "))
+        : /^(null|~)$/.test(raw) ? "none" : planYamlUnquote(raw) || "(empty text)";
+      rows.push(`- ${key}: ${value}`);
+    }
+    return rows.length ? "\n\n" + rows.join("\n") : "";
+  });
 }
 
 function showClarify(questions) {
@@ -5048,8 +5027,6 @@ function finalizePlanCard(note, persist, c = activeChat()) {
   } else if (state.planCardEl && chatVisible(c)) {
     // A resolved card is a record: its editor goes with its buttons, or "Apply edits" would stay
     // clickable on a plan that is no longer waiting for anything.
-    const editor = state.planCardEl.querySelector(".plan-yaml");
-    if (editor) editor.remove();
     const row = state.planCardEl.querySelector(".plan-actions-row");
     if (row) row.innerHTML = `<span class="plan-actions-status">${escapeHtml(note)}</span>`;
     // Keep a handle to the STATUS line after the card is resolved. The card is the only thing on
@@ -5094,6 +5071,16 @@ function hidePlanPanel(c = activeChat()) {
 // person has it: an edit of the document they have not applied yet goes with them, and the server
 // applies it first (by code) and makes the change on the edited plan.
 function revisePlanInWords(c, text) {
+  c.planWords = text;
+  if (c.planInlineFinish) {
+    const before = c.plan;
+    c.planInlineFinish(true, false);
+    if (c.plan !== before || c.planInlineFinish) {
+      toast("Your message is kept in the plan panel. Review the setting change, then send it.");
+      return;
+    }
+  }
+  if (!c.plan) return;
   c.planWords = "";
   if (chatVisible(c)) appendUserMessage(text);
   submitPlan("revise", text, c.planDraftYaml || "", c);
@@ -5102,26 +5089,36 @@ function revisePlanInWords(c, text) {
 // action: "approve" | "revise" | "edit" | "cancel"; feedback only for "revise", planYaml only
 // for "edit" (the plan document as the user edited it).
 async function submitPlan(action, feedback, planYaml, c = activeChat()) {
-  if (!state.connectionId || !c) return;
+  if (!state.connectionId || !c || !c.plan) return;
+  if (action !== "edit" && c.planInlineFinish) {
+    const before = c.plan;
+    c.planInlineFinish(action !== "cancel", false);
+    // A field submission has to come back from validation before any approval/revision.
+    if (c.plan !== before || c.planInlineFinish) return;
+  }
+  if (action === "approve" && c.planDraftYaml) {
+    toast("Correct or discard your change, then review the updated plan before running it.");
+    return;
+  }
   // The approved document is saved with the plan: it is what the run was held to.
   const plan = c.plan || {};
   const draft = { planDraftYaml: action === "edit" ? (planYaml || "") : c.planDraftYaml,
-                  planDraftBase: c.planDraftBase, planEditorOpen: c.planEditorOpen };
+                  planDraftBase: c.planDraftBase, planDraftChange: c.planDraftChange };
   const restore = () => {
-    if (!plan.saved || c.plan) return;
+    if (c.plan) return;
     Object.assign(c, draft);
-    holdPlanPrompt(c, plan.kind, plan, { run_id: plan.run, saved: true, revised: plan.revised });
+    holdPlanPrompt(c, plan.kind, plan, { run_id: plan.run, saved: !!plan.saved, revised: plan.revised });
   };
   const savedPlan = (plan.agenda && plan.agenda.length) ? planSavedMessage(plan) : null;
   // An edit that is sent stays as the draft until the server answers: refused, it comes back in the
-  // editor. A reply in words leaves the draft alone too — the PI may answer a question and send the
+  // feedback panel. A reply in words leaves the draft alone too — the PI may answer a question and send the
   // same plan again. Only a plan that is run or cancelled has no use for it (keepPlanDraft drops it
   // when the plan changes).
-  if (action === "edit") c.planDraftYaml = planYaml || "";
+  if (action === "edit") { c.planDraftYaml = planYaml || ""; savePlanDraft(c); }
   else if (action !== "revise") dropPlanDraft(c);
   if (action === "approve") {
     if (c.run) { c.run.startedAt = Date.now(); c.run.statusLabel = ""; }
-    finalizePlanCard(plan.saved ? "Submitting approval…" : "▶ Approved — running…", plan.saved ? null : savedPlan, c);
+    finalizePlanCard("Submitting approval…", null, c);
     // Re-anchor the live bubble below the just-approved plan so the run's activity
     // (reasoning / running code / report) streams in AFTER it, where the user is looking.
     if (chatVisible(c)) { mountStream(); repaintWorking(); }
@@ -5160,7 +5157,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
       return;
     }
     // Refused (the run limit, the budget, a plan already being handled): the card and the
-    // editor's draft come back, so the answer can be sent again.
+    // structured draft come back, so the answer can be sent again.
     if (!res.ok) {
       const message = reply.message || reply.error || `The server refused the answer (${res.status}).`;
       const note = /^Not delivered\b/i.test(message) ? message : "Not delivered: " + message;
@@ -5170,7 +5167,11 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
       toast(note);
       return;
     }
-    if (action === "approve" && plan.saved && savedPlan) pushToSession(c.sid, savedPlan);
+    if (action === "approve" && savedPlan) {
+      c.answered = null;
+      pushToSession(c.sid, savedPlan);
+      if (chatVisible(c)) { renderChat(); renderPlanPanel(); }
+    }
     if (action === "approve") toast("Plan approved — running…");
     else if (action === "cancel") toast("Plan cancelled.");
     else if (action === "edit") toast("Edit sent — checking it…");

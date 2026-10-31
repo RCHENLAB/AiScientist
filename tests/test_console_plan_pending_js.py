@@ -5,14 +5,14 @@ throws away on every switch of chats. ``frontend/console/app.js`` therefore hold
 chat's record (``chatOf(sid).plan``; ``state.planPrompt`` is the chat on screen's) until it is
 resolved and draws the card from it. Several chats may each have one waiting. This runs the functions
 involved (the WebSocket handler, the prompt section, ``renderChat``, ``renderSessionList``, the
-plan editor's HTML, the submit and run-end paths) under node with the DOM-building functions
+field-edit feedback HTML, the submit and run-end paths) under node with the DOM-building functions
 stubbed, and pins what a person depends on:
 
 - switching away and back brings the card back, with its buttons;
 - a prompt that arrives while another chat is on screen is not drawn into it, is drawn when its own
   chat is shown, and the sidebar and a toast say where it waits;
-- text typed into the plan editor and not applied, and whether the editor is open, survive a
-  redraw, a replay of the prompt and a page reload for as long as the plan document is the same;
+- a structured field change awaiting validation survives a redraw, a replay and a page reload
+  for the same plan; old raw drafts are discarded and never submitted invisibly;
 - nothing is drawn again once the prompt is answered or the run is over.
 
 The chat-context meter of a fast-chat turn follows the same rule: it is shown only in its own chat.
@@ -40,7 +40,9 @@ BLOCKS = [
     ("function finishAssistantStream(c)", "function appendArtifacts("),
     ("const STREAM_TYPES", "// ---- actions"),
     ("const DEFAULT_PLACEHOLDER", "// A step arrives as"),
-    ("function planEditorHtml(", "function showPlanPanel("),
+    ("function planProblemText(", "function showPlanPanel("),
+    ("function planSettingText(", "function planRunsOnText("),
+    ("function planSavedMessage(", "function planModelContent("),
     ("async function submitDecision(", "// ---- uploads"),
 ]
 
@@ -51,6 +53,8 @@ const vm = require("vm");
 const src = require("fs").readFileSync(0, "utf8");
 const store = new Map();
 const log = [];
+const requests = [];
+const savedMessages = [];
 const els = {};
 const el = (id) => els[id] || (els[id] = { id, innerHTML: "", textContent: "", placeholder: "", value: "",
   scrollTop: 0, scrollHeight: 0, appendChild() {}, querySelector: () => null,
@@ -83,26 +87,41 @@ const sandbox = {
   // The side panel (its Plan tab) and the chat entry of an answered plan are drawn elsewhere.
   renderPlanPanel() {}, selectSideTab() {}, openPlanPanel: () => log.push("panel:open"), drawAnsweredPlan() {},
   wirePlanEntry() {}, planEntryHtml: () => "",
-  planSavedMessage: (p) => ({ role: "assistant", kind: "plan", content: "", plan: p }),
+  planEstimateMarkdown: () => "",
   setChatRunning: (c, r) => { c.running = r; },
   startAssistantStream: (c) => { c.run = { text: "", thinking: "", feed: [] }; },
   alreadyHaveRun: () => false, appendArtifacts() {},
   renderContextMeter: (m) => log.push("meter:" + m.used),
-  pushToSession: (sid) => log.push("saved:" + sid),
-  fetch: async () => ({ ok: true, json: async () => ({}) }), isUnreachable: () => false,
+  pushToSession: (sid, message) => { log.push("saved:" + sid); savedMessages.push({ sid, message }); },
+  fetch: async (url, options) => { requests.push(JSON.parse(options.body)); return { ok: true, json: async () => ({}) }; },
+  isUnreachable: () => false,
   setInterval, clearInterval,
 };
 const api = vm.runInNewContext(src + `
-;({ handleWsMessage, renderChat, renderSessionList, planEditorHtml, notePlanDraft, notePlanEditorOpen,
-    submitPlan, submitDecision, chatOf, chats })`, sandbox);
+;({ handleWsMessage, renderChat, renderSessionList, planEditorHtml, notePlanDraft, dropPlanDraft, commitPlanChange, planInlineEdit,
+    revisePlanInWords, submitPlan, submitDecision, chatOf, chats })`, sandbox);
 const S = sandbox.state;
 // This window launched chat A's run, so A's run events are this window's to handle.
 const A = () => api.chatOf("A");
 A().owned = true;
 const YAML = "plan: 1\nsteps:\n  - id: s1\n    title: QC\n  - id: s2\n    title: Clustering\n    settings:\n      resolution: 1.2\n";
 const EDIT = YAML.replace("resolution: 1.2", "resolution: 0.8");
+const CHANGE = { id: "s2", setting: "resolution", value: "0.8" };
+const editResolution = (typed) => {
+  let input;
+  const error = { textContent: "", remove() {} };
+  const li = { querySelector: () => ({ querySelector: () => error }) };
+  const field = { innerHTML: "1.2", querySelector: () => null, appendChild(el) { input = el; },
+    classList: { contains: () => true, add() {}, remove() {} } };
+  sandbox.document = { createElement: () => ({ style: {}, value: "", isConnected: true,
+    setAttribute() {}, addEventListener() {}, focus() {}, select() {} }) };
+  api.planInlineEdit(li, field, "1.2", "resolution", (value) => api.commitPlanChange(A(), { ...CHANGE, value }), A());
+  input.value = typed;
+  return { input, error };
+};
+const draft = () => { A().planDraftChange = { ...CHANGE }; return api.notePlanDraft(EDIT); };
 const plan = (extra) => ({ type: "plan_prompt", conversation_id: "A", run_id: "r1",
-  agenda: ["**QC** — filter.", "**Clustering** — resolution 1.2."], plan: { yaml: YAML, steps: [{ id: "s1" }, { id: "s2" }] },
+  agenda: ["**QC** — filter.", "**Clustering** — resolution 1.2."], plan: { yaml: YAML, steps: [{ id: "s1", title: "QC" }, { id: "s2", title: "Clustering", settings: { resolution: 1.2 } }] },
   revised: [], problems: [], ...extra });
 const draws = () => log.filter((x) => x.startsWith("draw:"));
 const sidebar = () => { api.renderSessionList(); return els.sessionList.innerHTML; };
@@ -217,17 +236,17 @@ def test_nothing_is_drawn_again_once_the_prompt_is_answered_or_the_run_is_over()
   const settle = () => { log.length = 0; api.renderChat(); return { held: S.planPrompt, pending: S.planPending, draws: draws(), marked: sidebar().includes("session-waiting") }; };
   api.handleWsMessage({ type: "chat_start", conversation_id: "A", run_id: "r1" });
   api.handleWsMessage(plan());
-  api.submitPlan("approve");
+  await api.submitPlan("approve");
   out.saved = log.includes("saved:A");
   out.approved = settle();
   api.handleWsMessage({ type: "decision_prompt", conversation_id: "A", run_id: "r1", goal: "g", options: [] });
-  api.submitDecision("");
+  await api.submitDecision("");
   out.decided = settle();
   api.handleWsMessage(plan());
   api.handleWsMessage({ type: "plan_done", conversation_id: "A", run_id: "r1" });
   out.done = settle();
   api.handleWsMessage(plan());
-  api.notePlanDraft(EDIT);
+  draft();
   api.handleWsMessage({ type: "chat_done", conversation_id: "A", run_id: "r1" });   // a review that expired: no plan_done
   out.runOver = { ...settle(), draft: S.planDraftYaml, stored: store.has("draft"), placeholder: els.chatInput.placeholder };
 """)
@@ -240,89 +259,117 @@ def test_nothing_is_drawn_again_once_the_prompt_is_answered_or_the_run_is_over()
     assert run_over["placeholder"].startswith("Ask a question, or describe"), "the composer is no longer the plan's reply box"
 
 
-def test_an_unapplied_edit_and_the_open_editor_survive_a_redraw_of_the_same_plan():
+def test_a_structured_change_survives_a_redraw_and_replay_of_the_same_plan():
     out = _run("""
   api.handleWsMessage(plan());
-  out.closed = api.planEditorHtml(S.planDoc);
-  api.notePlanEditorOpen(true);
-  out.openOnly = api.planEditorHtml(S.planDoc);
-  out.dirty = api.notePlanDraft(EDIT);
+  out.clean = api.planEditorHtml(S.planDoc);
+  out.dirty = draft();
   out.typed = api.planEditorHtml(S.planDoc);
-  api.notePlanEditorOpen(false);     // hidden with an edit not applied: Run is disabled, so it shows anyway
-  out.hiddenWithEdit = api.planEditorHtml(S.planDoc);
-  api.handleWsMessage(plan());       // the same plan sent again
+  api.renderChat();
+  out.redrawn = api.planEditorHtml(S.planDoc);
+  api.handleWsMessage(plan());
   out.replayed = api.planEditorHtml(S.planDoc);
 """)
-    assert out["closed"].startswith('<div class="plan-yaml hidden">')
-    assert out["openOnly"].startswith('<div class="plan-yaml">') and "resolution: 1.2" in out["openOnly"]
-    assert out["dirty"] is True
-    for key in ("typed", "hiddenWithEdit", "replayed"):
-        assert out[key].startswith('<div class="plan-yaml">') and "resolution: 0.8" in out[key], key
+    assert out["clean"] == "" and out["dirty"] is True
+    for key in ("typed", "redrawn", "replayed"):
+        assert 'class="plan-edit-feedback"' in out[key]
+        assert "Clustering: resolution → 0.8" in out[key]
+        assert "plan: 1" not in out[key] and "<textarea" not in out[key]
 
 
-def test_the_draft_survives_a_reload_for_the_same_run_and_plan_only():
+def test_the_structured_draft_survives_a_reload_for_the_same_run_and_plan_only():
     out = _run("""
   api.handleWsMessage(plan());
-  api.notePlanEditorOpen(true);
-  api.notePlanDraft(EDIT);
+  draft();
   out.stored = JSON.parse(store.get("draft"));
   const { revised, ...replay } = plan();
   reload(); api.handleWsMessage(replay);
-  out.sameRun = { html: api.planEditorHtml(S.planDoc), open: S.planEditorOpen };
+  out.sameRun = { html: api.planEditorHtml(S.planDoc), change: A().planDraftChange };
   reload(); api.handleWsMessage({ ...replay, run_id: "r2" });
-  out.otherRun = api.planEditorHtml(S.planDoc);
+  out.otherRun = { html: api.planEditorHtml(S.planDoc), draft: A().planDraftYaml, stored: store.has("draft") };
 """)
-    stored = out["stored"]["A"]                       # one entry per chat: several may wait at once
+    stored = out["stored"]["A"]
     assert list(out["stored"]) == ["A"]
-    assert stored == {"run": "r1", "base": stored["base"], "text": stored["text"], "open": True}
+    change = {"id": "s2", "setting": "resolution", "value": "0.8"}
+    assert stored == {"run": "r1", "base": stored["base"], "text": stored["text"], "change": change}
     assert "resolution: 0.8" in stored["text"] and "resolution: 1.2" in stored["base"]
-    assert out["sameRun"]["open"] is True and "resolution: 0.8" in out["sameRun"]["html"]
-    assert out["otherRun"].startswith('<div class="plan-yaml hidden">') and "resolution: 1.2" in out["otherRun"]
+    assert out["sameRun"]["change"] == change and "resolution → 0.8" in out["sameRun"]["html"]
+    assert out["otherRun"] == {"html": "", "draft": "", "stored": False}
 
 
-def test_a_new_plan_document_drops_the_draft_and_closes_the_editor():
+@pytest.mark.parametrize("legacy_single", [True, False])
+def test_old_raw_editor_drafts_are_discarded_and_never_sent_invisibly(legacy_single):
+    out = _run("""
+  const old = { sid: "A", run: "r1", base: YAML, text: EDIT, open: true };
+  store.set("draft", JSON.stringify(SINGLE ? old : { A: old }));
+  reload(); api.handleWsMessage(plan());
+  out.restored = { html: api.planEditorHtml(S.planDoc), draft: A().planDraftYaml, change: A().planDraftChange, stored: store.has("draft") };
+  await api.submitPlan("approve");
+  out.request = requests[0]; out.saved = savedMessages[0].message;
+""".replace("SINGLE", json.dumps(legacy_single)))
+    assert out["restored"] == {"html": "", "draft": "", "change": None, "stored": False}
+    assert out["request"]["action"] == "approve" and out["request"]["plan_yaml"] == ""
+    assert "resolution: 1.2" in out["saved"]["plan"]["doc"]["yaml"]
+    assert "resolution: 0.8" not in out["saved"]["plan"]["doc"]["yaml"]
+
+
+def test_a_new_plan_document_drops_the_draft_and_feedback():
     out = _run("""
   api.handleWsMessage(plan());
-  api.notePlanEditorOpen(true);
-  api.notePlanDraft(EDIT.replace("QC", "Quality control"));
-  api.submitPlan("edit", "", S.planDraftYaml);
+  draft();
+  await api.submitPlan("edit", "", S.planDraftYaml);
   api.handleWsMessage({ type: "plan_done", conversation_id: "A", run_id: "r1" });
-  api.handleWsMessage(plan({ plan: { yaml: EDIT, steps: [{ id: "s1" }, { id: "s2" }] }, revised: [2] }));   // applied
-  out.html = api.planEditorHtml(S.planDoc); out.draft = S.planDraftYaml; out.stored = store.has("draft");
+  api.handleWsMessage(plan({ plan: { yaml: EDIT, steps: [{ id: "s1" }, { id: "s2", settings: { resolution: 0.8 } }] }, revised: [2] }));
+  out.html = api.planEditorHtml(S.planDoc); out.draft = S.planDraftYaml;
+  out.change = A().planDraftChange; out.stored = store.has("draft");
 """)
-    assert out["html"].startswith('<div class="plan-yaml hidden">') and "Quality control" not in out["html"]
-    assert out["draft"] == "" and out["stored"] is False
+    assert out == {"html": "", "draft": "", "change": None, "stored": False}
 
 
-def test_a_refused_edit_comes_back_with_what_was_typed():
+def test_a_refused_change_keeps_the_requested_value_and_can_be_corrected():
     out = _run("""
   api.handleWsMessage(plan());
-  api.notePlanDraft(EDIT);
-  api.submitPlan("edit", "", EDIT);
+  draft();
+  await api.submitPlan("edit", "", EDIT);
   api.handleWsMessage({ type: "plan_done", conversation_id: "A", run_id: "r1" });
   api.handleWsMessage(plan({ problems: ["step s2: resolution must be above 1"] }));
-  out.html = api.planEditorHtml(S.planDoc);
+  out.refused = api.planEditorHtml(S.planDoc);
+  await api.submitPlan("approve");
+  out.blocked = { pending: A().planPending, count: requests.length, saved: savedMessages.length };
+  const corrected = YAML.replace("resolution: 1.2", "resolution: 1.5");
+  out.correctionError = api.commitPlanChange(A(), { ...CHANGE, value: "1.5" });
+  out.correctedRequest = requests[1];
+  api.handleWsMessage({ type: "plan_done", conversation_id: "A", run_id: "r1" });
+  api.handleWsMessage(plan({ plan: { yaml: corrected, steps: [{ id: "s1" }, { id: "s2", settings: { resolution: 1.5 } }] }, revised: [2] }));
+  out.applied = { html: api.planEditorHtml(S.planDoc), yaml: A().plan.doc.yaml, change: A().planDraftChange };
+  await api.submitPlan("approve");
+  out.saved = savedMessages[0].message;
 """)
-    assert out["html"].startswith('<div class="plan-yaml">')
-    assert "resolution: 0.8" in out["html"] and "resolution must be above 1" in out["html"]
+    assert "resolution → 0.8" in out["refused"] and "resolution must be above 1" in out["refused"]
+    assert "plan: 1" not in out["refused"] and "<textarea" not in out["refused"]
+    assert out["blocked"] == {"pending": True, "count": 1, "saved": 0}
+    assert out["correctionError"] == "" and out["correctedRequest"]["action"] == "edit"
+    assert out["correctedRequest"]["plan_yaml"] == out["applied"]["yaml"]
+    assert out["applied"]["html"] == "" and out["applied"]["change"] is None
+    assert out["saved"]["plan"]["doc"]["yaml"] == out["applied"]["yaml"]
+    assert "resolution: 1.5" in out["saved"]["content"] and "```" not in out["saved"]["content"]
 
 
-def test_a_reply_in_words_keeps_the_draft_and_running_or_cancelling_drops_it():
-    """The PI may answer a question and send the same plan back: the edit in progress is still wanted."""
+def test_a_reply_in_words_keeps_the_visible_change_and_cancelling_drops_it():
     out = _run("""
   api.handleWsMessage(plan());
-  api.notePlanDraft(EDIT);
-  api.submitPlan("revise", "why resolution 1.2?");
-  out.afterReply = { held: S.planPrompt, draft: S.planDraftYaml === EDIT, stored: store.has("draft") };
+  draft();
+  await api.submitPlan("revise", "why resolution 1.2?", A().planDraftYaml);
+  out.afterReply = { held: S.planPrompt, draft: S.planDraftYaml === EDIT, stored: store.has("draft"), sent: requests[0].plan_yaml === EDIT };
   api.handleWsMessage({ type: "plan_done", conversation_id: "A", run_id: "r1" });
   api.handleWsMessage(plan());
-  out.samePlanBack = api.planEditorHtml(S.planDoc).includes("resolution: 0.8");
-  api.submitPlan("cancel");
-  out.cancelled = { draft: S.planDraftYaml, stored: store.has("draft") };
+  out.samePlanBack = api.planEditorHtml(S.planDoc).includes("resolution → 0.8");
+  await api.submitPlan("cancel");
+  out.cancelled = { draft: S.planDraftYaml, change: A().planDraftChange, stored: store.has("draft") };
 """)
-    assert out["afterReply"] == {"held": None, "draft": True, "stored": True}
+    assert out["afterReply"] == {"held": None, "draft": True, "stored": True, "sent": True}
     assert out["samePlanBack"] is True
-    assert out["cancelled"] == {"draft": "", "stored": False}
+    assert out["cancelled"] == {"draft": "", "change": None, "stored": False}
 
 
 def test_an_answer_no_run_was_waiting_for_says_so_and_ends_the_chats_run():
@@ -363,7 +410,7 @@ def test_two_chats_each_keep_their_own_waiting_prompt():
   api.handleWsMessage({ type: "plan_clarify", conversation_id: "B", run_id: "r2", questions: [{ question: "Which tissue?", options: ["retina"] }] });
   out.held = { A: A().plan.kind, B: api.chatOf("B").plan.kind };
   out.sidebar = sidebar();
-  api.submitPlan("approve");                     // answers A's plan only
+  await api.submitPlan("approve");                     // answers A's plan only
   out.after = { A: A().plan, B: api.chatOf("B").plan && api.chatOf("B").plan.kind };
   log.length = 0; S.activeId = "B"; api.renderChat();
   out.inB = draws();
@@ -398,6 +445,8 @@ def test_waiting_prompts_hide_working_keep_stop_and_restart_the_timer(kind):
   if (prompt === "decision") await api.submitDecision("choice");
   else await api.submitPlan(prompt === "clarify" ? "revise" : "approve", "answer");
   if (prompt === "clarify") api.streamStatus(A(), "Working");
+  // A successful approval redraws the chat; mountStream supplies a fresh working line.
+  S.streamDom = { working, workingText: working };
   sandbox.now = 303000;
   api.repaintWorking();
   out.resumed = { display: working.style.display, text: working.textContent, start: A().run.startedAt };
@@ -431,7 +480,7 @@ def test_saved_plan_waits_without_a_running_stream_and_survives_replay():
     out = _run("""
   api.handleWsMessage({ type: "chat_start", conversation_id: "A", run_id: "r1" });
   api.handleWsMessage(plan({ saved: true }));
-  api.notePlanDraft(EDIT);
+  draft();
   out.runningWhenShown = A().running;
   api.handleWsMessage({ type: "chat_stopped", conversation_id: "A", run_id: "r1", awaiting_plan: true });
   out.waiting = { pending: A().planPending, running: A().running, run: A().run, draft: A().planDraftYaml };
@@ -475,18 +524,21 @@ def test_saved_clarify_replays_in_a_new_browser_without_a_running_slot():
 
 
 @pytest.mark.parametrize("action", ["approve", "edit", "revise"])
-def test_a_refused_saved_plan_remains_retryable_with_the_editor_draft(action):
+def test_a_refused_saved_plan_remains_retryable_with_its_visible_change(action):
     out = _run("""
   api.handleWsMessage(plan({ saved: true }));
-  api.notePlanDraft(EDIT); api.notePlanEditorOpen(true);
+  if (ACTION !== "approve") draft();
   sandbox.fetch = async () => ({ ok: false, json: async () => ({ error: "Not delivered: No run slot is available." }) });
-  await api.submitPlan(ACTION, "raise the limit", EDIT);
-  out.pending = A().planPending; out.yaml = A().planDraftYaml; out.open = A().planEditorOpen;
+  await api.submitPlan(ACTION, "raise the limit", ACTION === "approve" ? "" : EDIT);
+  out.pending = A().planPending; out.yaml = A().planDraftYaml; out.html = api.planEditorHtml(S.planDoc);
   out.saved = log.filter((x) => x.startsWith("saved:"));
   out.toasts = log.filter((x) => x.startsWith("toast:"));
 """.replace("ACTION", json.dumps(action)))
-    assert out["pending"] is True and out["open"] is True
-    assert "resolution: 0.8" in out["yaml"]
+    assert out["pending"] is True
+    if action == "approve":
+        assert out["yaml"] == "" and out["html"] == ""
+    else:
+        assert "resolution: 0.8" in out["yaml"] and "resolution → 0.8" in out["html"]
     assert out["saved"] == []
     assert out["toasts"] == ["toast:Not delivered: No run slot is available."]
 
@@ -509,3 +561,112 @@ def test_saved_plan_approval_can_confirm_the_budget_and_retry():
     assert out["requests"][1]["budget_ack"] is True
     assert out["requests"][1]["tz"] == "America/Los_Angeles"
     assert out["saved"] == ["saved:A"]
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_approval_is_saved_only_after_the_server_accepts_it(saved):
+    out = _run("""
+  api.handleWsMessage(plan({ saved: SAVED }));
+  let answer;
+  sandbox.fetch = async (url, options) => {
+    out.request = JSON.parse(options.body);
+    return new Promise((resolve) => { answer = resolve; });
+  };
+  const pending = api.submitPlan("approve");
+  out.beforeResponse = { messages: savedMessages.length, approvedToast: log.some((x) => x.includes("Plan approved")) };
+  answer({ ok: true, json: async () => ({ status: "ok" }) });
+  await pending;
+  out.afterResponse = { messages: savedMessages, approvedToast: log.some((x) => x.includes("Plan approved")) };
+""".replace("SAVED", json.dumps(saved)))
+    assert out["beforeResponse"] == {"messages": 0, "approvedToast": False}
+    assert out["request"]["action"] == "approve"
+    assert out["afterResponse"]["approvedToast"] is True
+    assert len(out["afterResponse"]["messages"]) == 1
+    message = out["afterResponse"]["messages"][0]
+    assert message["sid"] == "A" and message["message"]["kind"] == "plan"
+    assert "resolution: 1.2" in message["message"]["content"]
+    assert "```" not in message["message"]["content"]
+    assert "resolution: 1.2" in message["message"]["plan"]["doc"]["yaml"]
+
+
+@pytest.mark.parametrize("typed, valid", [("1.5", True), ("lots", False)])
+def test_clicking_run_finishes_the_active_field_and_waits_for_validation(typed, valid):
+    out = _run("""
+  api.handleWsMessage(plan());
+  let input;
+  const error = { textContent: "", remove() {} };
+  const li = { querySelector: () => ({ querySelector: () => error }) };
+  const field = { innerHTML: "1.2", querySelector: () => null, appendChild(el) { input = el; },
+    classList: { contains: () => true, add() {}, remove() {} } };
+  sandbox.document = { createElement: () => ({ style: {}, value: "", isConnected: true,
+    setAttribute() {}, addEventListener() {}, focus() {}, select() {} }) };
+  api.planInlineEdit(li, field, "1.2", "resolution", (value) => api.commitPlanChange(A(), { ...CHANGE, value }), A());
+  input.value = TYPED;
+  await api.submitPlan("approve");
+  out.requests = requests; out.saved = savedMessages; out.error = error.textContent;
+  out.pending = A().planPending; out.editing = !!A().planInlineFinish;
+""".replace("TYPED", json.dumps(typed)))
+    assert out["saved"] == [], "Run cannot save the old plan while a field edit is being checked"
+    assert not any(request["action"] == "approve" for request in out["requests"])
+    if valid:
+        assert len(out["requests"]) == 1 and out["requests"][0]["action"] == "edit"
+        assert "resolution: 1.5" in out["requests"][0]["plan_yaml"]
+        assert out["pending"] is False and out["editing"] is False
+    else:
+        assert out["requests"] == [] and "number" in out["error"]
+        assert out["pending"] is True and out["editing"] is True
+
+
+@pytest.mark.parametrize("typed", ["1.5", "lots"])
+def test_words_wait_for_the_active_field_without_being_lost_or_shown_as_sent(typed):
+    out = _run("""
+  api.handleWsMessage(plan());
+  const editor = editResolution(TYPED);
+  const messages = [];
+  sandbox.appendUserMessage = (text) => messages.push(text);
+  api.revisePlanInWords(A(), "Use a stricter cutoff in the next step");
+  out.waiting = { requests: requests.slice(), messages: messages.slice(), words: A().planWords,
+    error: editor.error.textContent };
+  if (A().planInlineFinish) {
+    editor.input.value = "1.5";
+    A().planInlineFinish(true, false);
+  }
+  const edited = YAML.replace("resolution: 1.2", "resolution: 1.5");
+  api.handleWsMessage(plan({
+    agenda: ["**QC** — filter.", "**Clustering** — resolution 1.5."],
+    plan: { yaml: edited, steps: [{ id: "s1", title: "QC" },
+      { id: "s2", title: "Clustering", settings: { resolution: 1.5 } }] }, revised: [2]
+  }));
+  out.afterValidation = { words: A().planWords, draft: A().planDraftYaml };
+  api.revisePlanInWords(A(), A().planWords);
+  out.sent = { requests, messages, words: A().planWords };
+""".replace("TYPED", json.dumps(typed)))
+    words = "Use a stricter cutoff in the next step"
+    waiting = out["waiting"]
+    assert waiting["messages"] == [] and waiting["words"] == words
+    assert [r["action"] for r in waiting["requests"]] == (["edit"] if typed == "1.5" else [])
+    assert out["afterValidation"] == {"words": words, "draft": ""}
+    assert [r["action"] for r in out["sent"]["requests"]] == ["edit", "revise"]
+    assert "resolution: 1.5" in out["sent"]["requests"][0]["plan_yaml"]
+    assert out["sent"]["requests"][1]["feedback"] == words
+    assert out["sent"]["requests"][1]["plan_yaml"] == ""
+    assert out["sent"]["messages"] == [words] and out["sent"]["words"] == ""
+
+
+@pytest.mark.parametrize("action", ["approve", "revise"])
+def test_a_field_removed_by_redrawing_never_submits_a_hidden_change(action):
+    out = _run("""
+  api.handleWsMessage(plan());
+  const editor = editResolution("2.4");
+  // The panel was rebuilt or switched to another saved plan. Its old input is gone.
+  editor.input.isConnected = false;
+  sandbox.appendUserMessage = () => {};
+  if (ACTION === "revise") api.revisePlanInWords(A(), "Explain the current plan");
+  else await api.submitPlan("approve");
+  out.requests = requests; out.saved = savedMessages; out.activeField = !!A().planInlineFinish;
+""".replace("ACTION", json.dumps(action)))
+    assert len(out["requests"]) == 1 and out["requests"][0]["action"] == action
+    assert out["requests"][0]["plan_yaml"] == ""
+    assert out["activeField"] is False
+    if action == "approve":
+        assert "resolution: 1.2" in out["saved"][0]["message"]["plan"]["doc"]["yaml"]

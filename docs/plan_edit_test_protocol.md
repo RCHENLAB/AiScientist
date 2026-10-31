@@ -24,7 +24,12 @@ imports the main checkout's code instead of this one's.
 
 ## The plan is a document, and its numbers are pinned
 
-The plan is a YAML document: every step keeps its prose
+The console shows readable steps and structured settings. Click a setting's value to change it,
+review the updated plan, then choose **Run this plan**. Pending, revised, approved and restored
+plans use this same readable presentation; the normal workflow has no raw document editor or YAML
+disclosure. A rejected edit explains what needs correcting and leaves the accepted plan unchanged.
+
+Internally, the plan remains a YAML document: every step keeps its prose
 (`does`) and gains `tool` + `settings` beside it, where `settings` are the tool arguments the plan
 fixes ([`plan_doc.py`](../src/aiscientist/agents/plan_doc.py)). Two consequences for testing:
 
@@ -45,6 +50,12 @@ If your gateway has the flag off, the plan card is prose steps and none of the a
 probe detects which format a file is and says so on its first line; grade both captures the same
 way.
 
+The `before.yaml` and `after.yaml` inputs below are technical test captures of the internal
+document, not something the reviewer must open in the console. For a local test run, saved versions
+are under the run's artifacts directory at `plan/vNN.yaml`; approval also writes `report/plan.yaml`.
+Use a local fixture or an authorized run's files for the probe. Keeping these internal documents
+allows validation and execution to use the exact plan the reviewer saw and changed.
+
 ## First: "mid-plan" is four different things
 
 They have different mechanisms and very different guarantees. Decide which one you mean before
@@ -52,7 +63,7 @@ reading a result as a pass or a fail.
 
 | # | When | What it goes through | What is guaranteed |
 |---|---|---|---|
-| **S0 · hand edit** | plan card, before Approve | `POST /api/lab/plan {action: "edit", plan_yaml}` — you edit the YAML, **code** applies it, checked against the tool schemas ([`app.py:7727`](../src/aiscientist/gateway/app.py#L7727)) | **Strongest: no model is involved.** A failure here is a code bug, not sampling |
+| **S0 · field edit** | plan card, before Run this plan | Change a structured setting on the card; the console submits the edit to `/api/lab/plan`, and **code** validates and applies it to the internal document | **Strongest: no model is involved.** A failure here is a code bug, not sampling |
 | **S1 · in words** | plan card, before Approve | `{action: "revise", feedback}` → the reference guard, then `_revise_plan_document`: the model returns *operations* on the document and code applies them ([`research_lab.py:6286`](../src/aiscientist/agents/research_lab.py#L6286)). Only if that cannot be done cleanly does it fall back to a single-step prose patch, then to a whole-plan redraft | **Strong.** A step no operation names is the same object afterwards — including when a step is added, removed or moved |
 | **S2 · mid-run** | **after** Approve, while steps execute | `POST /api/chat/inject` → folded in at the next **step boundary** as standing prose guidance | **Weak, by design.** The plan does **not** change. Your note is prose the model may or may not act on, and finished steps are not revisited |
 | **S3 · post-run** | after the report | follow-up → intent classifier → `rerun_step`, or `POST /api/lab/continue` | **Medium.** Re-runs the one step and everything downstream, reusing earlier checkpoints |
@@ -73,12 +84,13 @@ scaffolding or in the prompt.
 `probe` = `PYTHONPATH=$PWD/src .venv/bin/python scripts/plan_edit_probe.py`. Every row's verdict is
 mechanical — the script prints `=== PASS ===` / `=== FAIL ===` and exits non-zero on a fail.
 
-### S0 — the hand edit (start here)
+### S0 — the field edit (start here)
 
 | ID | What it stresses | What to do | Pass |
 |---|---|---|---|
-| **E1** | the deterministic path | in the YAML editor on the card, change one `settings` value (the `targets` output names one), Save | `probe grade before.yaml after.yaml --step 3 --param resolution --to 1.0` → PASS. **No model runs here, so this must pass every time**; a single failure is a code bug worth filing |
-| **E2** | the schema check | set a setting to something its tool does not accept (e.g. a word where a number belongs) | the edit is refused with a reason, and the plan is unchanged — not silently accepted |
+| **E1** | the deterministic path | Click one setting's value on the plan card (the `targets` output names one), change it and apply the field edit. Review the updated value and step before choosing **Run this plan** | `probe grade before.yaml after.yaml --step 3 --param resolution --to 1.0` → PASS. The card shows the new value and the approved document contains it. **No model runs here, so this must pass every time** |
+| **E2** | the schema check | Set a setting to something its tool does not accept (e.g. a word where a number belongs), then correct it | The edit is refused with a readable reason, without parser details or a raw editor. The accepted plan stays unchanged until the corrected edit succeeds; review it before approval |
+| **E3** | reload and history | After a successful field edit, reload the page, review and approve the restored plan, then reopen the chat and its plan | The edited settings and all untouched steps are preserved. Pending, revised, approved and restored cards show readable steps and settings without raw controls or YAML blocks. The execution uses the reviewed values |
 
 ### S1 — asking in words (the core set)
 
