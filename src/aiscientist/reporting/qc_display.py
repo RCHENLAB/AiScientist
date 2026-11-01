@@ -120,14 +120,15 @@ def _table(lines: list[str], context: bool) -> tuple[list[str], bool]:
     return ["| " + " | ".join(row) + " |" for row in display], True
 
 
-def default_qc_text(text: str) -> QCDisplayResult:
+def default_qc_text(text: str, *, salvage_counts: bool = True) -> QCDisplayResult:
     """Return the default narrative and any doublet-specific draft details moved out of it.
 
     Known caller names and explicit doublet diagnostic language establish scope. A bare score
     or kappa outside that scope is never removed. Markdown tables are filtered by column/row;
     prose is filtered by sentence/clause so independent scientific findings survive. This does
     not parse or alter the analysis files. Consumers should keep ``details`` in an optional
-    artifact and may append authoritative QC counts from the tool record.
+    artifact and may append authoritative QC counts from the tool record; a consumer that has them
+    passes ``salvage_counts=False``, since a count in a removed clause may be another caller's.
     """
     if not text:
         return QCDisplayResult(text)
@@ -196,7 +197,8 @@ def default_qc_text(text: str) -> QCDisplayResult:
                 removed = True
                 needs_review |= _review_needed(clause)
                 failed |= bool(_FAILURE.search(clause))
-                kept.extend(_counts(clause))
+                if salvage_counts:
+                    kept.extend(_counts(clause))
                 # A following bare "kappa was 0.10" still refers to this finding, including
                 # across sentence/line boundaries in the same paragraph.
                 sentence_context = True

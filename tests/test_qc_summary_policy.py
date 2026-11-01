@@ -229,3 +229,24 @@ def test_stopped_run_summarizes_qc_without_replaying_caller_comparisons(monkeypa
     assert result.rounds[0].scientist_result == original
     assert qc_result.to_dict() == original
     assert model_calls == []
+
+
+def _cellqc_result(**library):
+    from types import SimpleNamespace
+
+    lib = {"sample": "S1", "cells_after_filter": 15482, "cells_after_doublets": 14553,
+           "doublets_removed": 929, **library}
+    cellqc = {"status": "ok", "cells_before": 15872, "cells_after": 14553, "libraries": [lib]}
+    return SimpleNamespace(rounds=[{"verdict": {"verdict": "accept"}, "scientist_result": {
+        "steps": [{"tool": "run_cellqc", "ok": True, "result": cellqc}]}}])
+
+
+def test_the_record_count_replaces_a_count_read_from_removed_model_text(tmp_path):
+    pytest.importorskip("aiscientist.gateway.app")
+    from aiscientist.gateway.app import _default_qc_display
+
+    draft = ("DoubletFinder removed 929 cells as doublets; scDblFinder would have removed "
+             "1,192 doublets.\n")
+    text = _default_qc_display(draft, tmp_path, _cellqc_result())
+    assert "1,192" not in text
+    assert "S1: Doublets removed: 929 of the 15,482 filtered cells (6.0%)." in text

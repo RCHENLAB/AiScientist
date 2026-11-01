@@ -15404,17 +15404,18 @@ def _default_qc_display(text: str, art: Path, result: Any = None) -> str:
     """
     from ..reporting.qc_display import default_qc_text
 
-    display = default_qc_text(text)
+    qc = _qc_step_outcome(result) if result is not None else None
+    libs = [lib for lib in (qc["result"].get("libraries") or [] if qc else []) if isinstance(lib, dict)]
+    counts = [f"{lib.get('sample') or 'Library'}: {line}"
+              for lib in libs for line in _brief_doublet_lines(lib)]
+    # With the record's counts at hand, a count in a removed clause is not salvaged: it may be the
+    # other caller's ("scDblFinder would have removed 1,192 doublets"), and would hide the record's.
+    display = default_qc_text(text, salvage_counts=not counts)
     if not display.changed:
         return text
     body = display.text.rstrip()
-    qc = _qc_step_outcome(result) if result is not None else None
-    if qc and not re.search(r"doublets?\s+removed|removed\s+[\d,]+\s+doublets?", body, re.I):
-        libs = [lib for lib in qc["result"].get("libraries") or [] if isinstance(lib, dict)]
-        counts = [f"{lib.get('sample') or 'Library'}: {line}"
-                  for lib in libs for line in _brief_doublet_lines(lib)]
-        if counts:
-            body += "\n\n" + "\n".join(counts)
+    if counts and not re.search(r"doublets?\s+removed|removed\s+[\d,]+\s+doublets?", body, re.I):
+        body += "\n\n" + "\n".join(counts)
     if display.needs_review and "doublet filtering needs review" not in body.lower():
         body += "\n\nDoublet filtering needs review; see the optional technical details."
     path = art / "report" / "doublet_details.md"
