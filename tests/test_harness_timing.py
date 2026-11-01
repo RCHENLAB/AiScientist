@@ -139,3 +139,15 @@ def test_expert_tool_relay_retains_structured_failure_outcome(tmp_path, monkeypa
     assert len(done) == 1 and done[0]["timing_outcome"] == "blocked"
     spans = [span for span in run_timing.read_timing(path)["spans"] if span["stage"] == "tool_call"]
     assert len(spans) == 1 and spans[0]["outcome"] == "blocked" and not spans[0]["partial"]
+
+
+def test_a_tool_that_stop_ended_is_not_marked_done_in_the_activity_log():
+    from aiscientist.gateway import app as gw
+
+    def activity(ev):
+        return [p["token"] for p in gw._lab_event_to_chat(ev) if p["type"] == "chat_thinking"]
+
+    assert activity({"type": "tool_result", "tool": "run_code", "summary": "cancelled: stopped",
+                     "timing_outcome": "cancelled"}) == ["⏹ run_code: cancelled: stopped\n"]
+    assert activity({"type": "tool_result", "tool": "run_code", "summary": "ok",
+                     "timing_outcome": "success"}) == ["✓ run_code: ok\n"]

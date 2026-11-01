@@ -11760,7 +11760,8 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     elif t == "tool_result":
         tool = ev.get("tool")
         summary = str(ev.get("summary", "")).strip()
-        activity(f"✓ {tool}: {summary}")
+        mark = "⏹" if ev.get("timing_outcome") == "cancelled" else "✓"     # a tool Stop ended
+        activity(f"{mark} {tool}: {summary}")
         # For run_code, surface the FINAL successful snippet as a formatted code block; the
         # last success in a step overwrites the earlier ones on the client.
         if tool == "run_code":
