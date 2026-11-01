@@ -250,3 +250,24 @@ def test_the_record_count_replaces_a_count_read_from_removed_model_text(tmp_path
     text = _default_qc_display(draft, tmp_path, _cellqc_result())
     assert "1,192" not in text
     assert "S1: Doublets removed: 929 of the 15,482 filtered cells (6.0%)." in text
+
+
+def test_record_sections_and_back_matter_are_left_as_written(tmp_path):
+    pytest.importorskip("aiscientist.gateway.app")
+    from aiscientist.gateway.app import _default_qc_display
+
+    setting = ("- `doublet_decider` = `scdblfinder` — the doublet caller whose calls REMOVE cells; "
+               "detailed diagnostics remain in the downloadable QC files — **chosen for this run**")
+    reference = ("1. McGinnis CS et al. DoubletFinder: doublet detection in single-cell RNA sequencing "
+                 "data using artificial nearest neighbors. Cell Syst. 2019.")
+    report = ("# Report\n\n## Results\n\n929 doublets removed. The two callers agree poorly "
+              "(kappa 0.10).\n\n## What was run\n\n**1. `run_cellqc`** — Ran CellQC.\n\n"
+              f"{setting}\n\n## References\n\n{reference}\n\n"
+              "# Output Files Index\n\n- `tables/cells.csv`\n")
+    text = _default_qc_display(report, tmp_path, _cellqc_result())
+    assert "kappa 0.10" not in text
+    assert setting in text and reference in text
+    # The notes the display adds belong to the body, not to the References or the file index.
+    assert text.index("Doublet filtering needs review") < text.index("## References")
+    assert text.index("report/doublet_details.md") < text.index("## References")
+    assert text.endswith("# Output Files Index\n\n- `tables/cells.csv`\n")

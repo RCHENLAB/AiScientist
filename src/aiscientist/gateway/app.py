@@ -15396,6 +15396,13 @@ def _brief_qc_warnings(result: dict) -> "list[str]":
     return qc_warnings(result)
 
 
+# Written by code from the run's records and already to the QC policy, so the display leaves them
+# as they are: "The dataset" and "What was run" (the reviewer is told the same), and the back matter.
+# A chosen `doublet_decider` or a reference's title names a caller; cutting it misstates the record.
+_QC_RECORD_SECTIONS = re.compile(r"^(?:The dataset|What was run)\b", re.I)
+_BACKMATTER_HEADINGS = ("\n## References", "\n# Output Files Index", "\n## Background consulted")
+
+
 def _default_qc_display(text: str, art: Path, result: Any = None) -> str:
     """Final display boundary; retain generated doublet details in an optional download.
 
@@ -15404,15 +15411,17 @@ def _default_qc_display(text: str, art: Path, result: Any = None) -> str:
     """
     from ..reporting.qc_display import default_qc_text
 
+    starts = [i for i in (text.find(h) for h in _BACKMATTER_HEADINGS) if i != -1]
+    text, back = (text[:min(starts)], text[min(starts):]) if starts else (text, "")
     qc = _qc_step_outcome(result) if result is not None else None
     libs = [lib for lib in (qc["result"].get("libraries") or [] if qc else []) if isinstance(lib, dict)]
     counts = [f"{lib.get('sample') or 'Library'}: {line}"
               for lib in libs for line in _brief_doublet_lines(lib)]
     # With the record's counts at hand, a count in a removed clause is not salvaged: it may be the
     # other caller's ("scDblFinder would have removed 1,192 doublets"), and would hide the record's.
-    display = default_qc_text(text, salvage_counts=not counts)
+    display = default_qc_text(text, salvage_counts=not counts, keep=_QC_RECORD_SECTIONS)
     if not display.changed:
-        return text
+        return text + back
     body = display.text.rstrip()
     if counts and not re.search(r"doublets?\s+removed|removed\s+[\d,]+\s+doublets?", body, re.I):
         body += "\n\n" + "\n".join(counts)
@@ -15433,7 +15442,7 @@ def _default_qc_display(text: str, art: Path, result: Any = None) -> str:
             body += "\n\nOptional technical details: `report/doublet_details.md` in Downloads."
     except OSError as exc:
         print(f"[report] could not save optional doublet excerpts: {exc}")
-    return body.strip() + "\n"
+    return body.strip() + "\n" + back
 
 
 def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":

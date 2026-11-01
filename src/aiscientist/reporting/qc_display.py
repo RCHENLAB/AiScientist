@@ -120,7 +120,8 @@ def _table(lines: list[str], context: bool) -> tuple[list[str], bool]:
     return ["| " + " | ".join(row) + " |" for row in display], True
 
 
-def default_qc_text(text: str, *, salvage_counts: bool = True) -> QCDisplayResult:
+def default_qc_text(text: str, *, salvage_counts: bool = True,
+                    keep: "re.Pattern[str] | None" = None) -> QCDisplayResult:
     """Return the default narrative and any doublet-specific draft details moved out of it.
 
     Known caller names and explicit doublet diagnostic language establish scope. A bare score
@@ -129,6 +130,8 @@ def default_qc_text(text: str, *, salvage_counts: bool = True) -> QCDisplayResul
     not parse or alter the analysis files. Consumers should keep ``details`` in an optional
     artifact and may append authoritative QC counts from the tool record; a consumer that has them
     passes ``salvage_counts=False``, since a count in a removed clause may be another caller's.
+    A section whose heading matches ``keep`` is left as written, down to the next heading of its
+    level or above: code writes it from the run's records.
     """
     if not text:
         return QCDisplayResult(text)
@@ -138,6 +141,7 @@ def default_qc_text(text: str, *, salvage_counts: bool = True) -> QCDisplayResul
     needs_review = False
     failed = False
     doublet_level: int | None = None
+    keep_level: int | None = None
     paragraph_context = False
     i = 0
     while i < len(lines):
@@ -148,8 +152,16 @@ def default_qc_text(text: str, *, salvage_counts: bool = True) -> QCDisplayResul
             level, title = len(heading.group(1)), heading.group(2)
             if doublet_level is not None and level <= doublet_level:
                 doublet_level = None
-            if _DOUBLET.search(title) or _CALLER.search(title):
+            if keep_level is not None and level <= keep_level:
+                keep_level = None
+            if keep is not None and keep.search(title):
+                keep_level = level
+            elif _DOUBLET.search(title) or _CALLER.search(title):
                 doublet_level = level
+        if keep_level is not None:
+            output.append(line)
+            i += 1
+            continue
         context = doublet_level is not None
         if not line.strip():
             paragraph_context = False
