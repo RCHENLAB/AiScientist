@@ -30,6 +30,10 @@ _META = frozenset({"role", "tool", "action", "job_id", "state", "source", "backe
                    "duration_basis", "observation", "attempt", "kind", "phase"})
 _CATEGORIES = {"processing", "user_wait", "observation"}
 _BUFFER_LIMIT = 4096
+# One journal's size limit: past it a single ``journal_capped`` line is written and later span
+# lines are dropped. The other events (decisions, saves, the run's end) are few and still written.
+_MAX_JOURNAL_BYTES = 5 * 1024 * 1024
+_SPAN_EVENTS = frozenset({"span_start", "span_end", "span_record"})
 
 
 def _identifier(value: Any, fallback: str = "unknown") -> str:
@@ -48,6 +52,13 @@ def _iso(value: float | None) -> str | None:
         return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z") if value is not None else None
     except (ValueError, TypeError, OverflowError, OSError):
         return None
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def _path_lock(path: Path) -> Any:
@@ -133,6 +144,7 @@ class RunTiming:
         self._buffer: list[dict[str, Any]] = []
         self._active: dict[str, dict[str, Any]] = {}
         self._dropped = 0
+        self._capped = False
 
     def bind(self, path: str | Path, run_id: str | None, conversation_id: str | None,
              request_id: str | None = None) -> None:
@@ -151,6 +163,8 @@ class RunTiming:
                 self.path, self._file_lock = path, _path_lock(path)
                 pending, self._buffer = self._buffer, []
                 with self._file_lock:
+                    # A journal already over its limit has its marker: this writer only drops spans.
+                    self._capped = _size(path) >= _MAX_JOURNAL_BYTES
                     if not path.exists():
                         self._write({"event": "run_started", "timestamp": time.time(), "schema_version": 1,
                                      "conversation_id": self.conversation_id})
@@ -192,6 +206,7 @@ class RunTiming:
         self.path, self.run_id, self._file_lock = path, run_id, _path_lock(path)
         self.conversation_id = _identifier(conversation_id) if conversation_id is not None else None
         with self._file_lock:
+            self._capped = _size(path) >= _MAX_JOURNAL_BYTES
             if not path.exists():
                 self._write({"event": "run_started", "timestamp": time.time(), "schema_version": 1,
                              "conversation_id": self.conversation_id})
@@ -213,11 +228,21 @@ class RunTiming:
                 # A crashed writer may leave a partial line. Separate the next append so it remains readable.
                 with self.path.open("a+b") as stream:
                     stream.seek(0, 2)
-                    if stream.tell():
+                    size = stream.tell()
+                    if size:
                         stream.seek(-1, 2)
                         if stream.read(1) != b"\n":
                             stream.write(b"\n")
-                    stream.write((json.dumps(event, separators=(",", ":"), allow_nan=False) + "\n").encode())
+                    line = (json.dumps(event, separators=(",", ":"), allow_nan=False) + "\n").encode()
+                    if event.get("event") in _SPAN_EVENTS and size + len(line) > _MAX_JOURNAL_BYTES:
+                        if self._capped:
+                            return
+                        self._capped = True
+                        event = {"event": "journal_capped", "timestamp": time.time(),
+                                 "max_bytes": _MAX_JOURNAL_BYTES, "run_id": self.run_id,
+                                 "request_id": self.request_id, "segment_id": self.segment_id}
+                        line = (json.dumps(event, separators=(",", ":")) + "\n").encode()
+                    stream.write(line)
             # The journal has the timestamps/details; production logs contain only safe correlation fields.
             _LOG.info("run_timing run_id=%s stage=%s event=%s action=%s outcome=%s",
                       self.run_id, _identifier(event.get("stage"), "-"), _identifier(event.get("event"), "-"),
@@ -368,5 +393,6 @@ def read_timing(path: str | Path | None) -> dict[str, Any]:
     header = next((ev for ev in records if ev.get("event") == "run_started"), {})
     return {"schema_version": 1, "run_id": header.get("run_id"), "conversation_id": header.get("conversation_id"),
             "spans": list(spans.values()), "events": events, "partial": any(s["partial"] for s in spans.values()),
+            "truncated": any(ev.get("event") == "journal_capped" for ev in records),
             "ignored_lines": ignored, "durations_overlap": True,
             "note": "Spans can overlap; do not sum durations as wall time. Open spans have unknown outcomes and durations."}

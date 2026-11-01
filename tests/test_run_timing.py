@@ -366,3 +366,26 @@ def test_enclosing_plan_model_and_tool_waits_are_observations_not_exclusive_comp
     with m.span("result_packaging"):
         clock.advance(1)
     assert read_timing(path)["spans"][-1]["category"] == "processing"
+
+
+def test_journal_size_is_capped_with_one_marker_and_the_run_goes_on(tmp_path, monkeypatch, clock):
+    monkeypatch.setattr(run_timing, "_MAX_JOURNAL_BYTES", 4000)
+    path = tmp_path / "timing.jsonl"
+    m = RunMonitor(run_id="big-run")
+    m.bind_timing(path)
+    with bind_monitor(m):
+        for _ in range(100):
+            with timed_stage("data_transfer", source="sftp"):
+                clock.advance(1)
+    m.end("finished")
+    later = RunMonitor(run_id="big-run")     # a later save reopens the full journal
+    later.bind_timing(path)
+    with later.span("result_save"):
+        pass
+    later.save_requested()
+    events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+    assert events.count("journal_capped") == 1
+    assert "run_ended" in events and "save_requested" in events
+    assert path.stat().st_size < 4000 + 1000
+    data = read_timing(path)
+    assert data["truncated"] and 0 < len(data["spans"]) < 100

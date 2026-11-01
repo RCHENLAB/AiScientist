@@ -107,7 +107,7 @@ def test_console_timing_renderer_distinguishes_unknown_and_escapes_metadata():
         pytest.skip("node is not installed")
     source = (Path(__file__).parents[1] / "frontend" / "console" / "app.js").read_text()
     code = source[source.index("function runTimingHtml("):source.index("// A run's breakdown by pipeline")]
-    data = {"partial": True, "spans": [
+    data = {"partial": True, "truncated": True, "spans": [
         {"stage": "user_review", "category": "user_wait", "duration_seconds": 12.25,
          "started_at": "2026-10-30T00:00:00Z", "ended_at": "2026-10-30T00:00:12.250Z",
          "outcome": "success", "metadata": {"action": "approve"}},
@@ -122,6 +122,7 @@ const escapeHtml = (value) => String(value).replaceAll('&', '&amp;').replaceAll(
     assert result.returncode == 0, result.stderr
     html = result.stdout
     assert "partial timeline" in html and "user_wait" in html and "12.250" in html
+    assert "size limit reached" in html
     assert "durations do not add up to wall time" in html
     assert "<script>" not in html and "&lt;script&gt;" in html and "7&amp;9" in html
     assert "<td>unknown</td><td>unknown</td><td>unknown</td>" in html

@@ -9003,6 +9003,7 @@ function runTimingHtml(data) {
   if (!spans.length) return explain + '<p>No stage spans recorded.</p>';
   const stamp = (value) => value ? escapeHtml(value) : "unknown";
   return explain + `<p>${spans.length} stage spans${data.partial ? " · partial timeline" : ""}` +
+    `${data.truncated ? " · size limit reached: later stages were not recorded" : ""}` +
     `${spans.length > 500 ? " · first 500 shown" : ""}</p>` +
     '<div style="overflow-x:auto"><table><thead><tr><th>Stage / source</th><th>Category</th><th>Start (UTC)</th><th>End (UTC)</th><th>Seconds</th><th>Outcome / action</th></tr></thead><tbody>' +
     spans.slice(0, 500).map((span) => {

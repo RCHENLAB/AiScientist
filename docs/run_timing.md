@@ -55,8 +55,10 @@ be decided after its original worker exits or after a gateway restart.
 Starts and ends are appended immediately, only on transitions (never every poll or token).
 Each write is closed; complete lines survive a process restart and a torn line is skipped. This
 is best-effort local storage, not a power-loss/fsync guarantee. Failure to write timing never
-changes normal execution. An open processing span remains `partial=true`, with null end/duration
-and unknown outcome, until an actual completion is observed. Reading does not invent a crash
+changes normal execution. A journal keeps at most 5 MB: past that it gets one `journal_capped`
+event, later span lines are dropped (decisions, saves and the run's end are still written), and the
+timeline reports `truncated: true`. An open processing span remains `partial=true`, with null
+end/duration and unknown outcome, until an actual completion is observed. Reading does not invent a crash
 timestamp or call a WebSocket disconnect a run failure. A run's terminal event and a background
 operation's terminal event can legitimately differ.
 
