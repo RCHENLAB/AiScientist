@@ -4530,7 +4530,8 @@ function commitPlanChange(c, change) {
 }
 
 // A title or a setting's value turned into a text box. Enter (or leaving the box) applies a change,
-// Escape puts the value back. A value that cannot be written stays open with the reason on Enter.
+// Escape puts the value back. A value that cannot be written stays open with the reason; only Enter
+// keeps the focus in it, so leaving the box never takes the focus back from where the person went.
 function planInlineEdit(li, el, initial, label, commit, c = activeChat()) {
   if (el.querySelector("input")) return;
   const before = el.innerHTML;
@@ -4557,9 +4558,10 @@ function planInlineEdit(li, el, initial, label, commit, c = activeChat()) {
       c.planInlineFinish = null;
       const why = commit(input.value);
       if (!why) return;
-      if (!leaving) { done = false; c.planInlineFinish = finish; planStepError(li, why); input.focus(); return; }
-      restore();
+      done = false;
+      c.planInlineFinish = finish;
       planStepError(li, why);
+      if (!leaving) input.focus();
       return;
     }
     done = true;
@@ -4573,7 +4575,7 @@ function planInlineEdit(li, el, initial, label, commit, c = activeChat()) {
   });
   // Leaving the box applies the change, but a box that left because the panel was drawn again (a
   // status line) is not the person leaving it: nothing is sent for that.
-  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, false); }, 0));
+  input.addEventListener("blur", () => setTimeout(() => { if (input.isConnected) finish(true, true); }, 0));
 }
 
 function planStepError(li, why) {

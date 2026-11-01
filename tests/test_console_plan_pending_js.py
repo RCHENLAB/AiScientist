@@ -671,6 +671,36 @@ def test_words_held_back_by_an_invalid_field_are_shown_in_the_panel_box():
     assert out["held"] == {"box": words, "words": words, "requests": 0, "refreshed": True, "editing": True}
 
 
+LEAVE_FIELD = """
+  api.handleWsMessage(plan());
+  let input, focused = 0;
+  const listeners = {};
+  const error = { textContent: "", remove() {} };
+  const li = { querySelector: () => ({ querySelector: () => error }) };
+  const field = { innerHTML: "1.2", querySelector: () => null, appendChild(el) { input = el; },
+    classList: { contains: () => true, add() {}, remove() {} } };
+  sandbox.document = { createElement: () => ({ style: {}, value: "", isConnected: true, setAttribute() {},
+    addEventListener(name, fn) { listeners[name] = fn; }, focus() { focused += 1; }, select() {} }) };
+  sandbox.setTimeout = (fn) => fn();
+  api.planInlineEdit(li, field, "1.2", "resolution", (value) => api.commitPlanChange(A(), { ...CHANGE, value }), A());
+  const opened = focused;
+  input.value = "lots";
+  listeners.blur();   // the person clicks or tabs somewhere else on the page
+"""
+
+
+def test_leaving_a_field_with_an_unusable_value_does_not_take_the_focus_back():
+    """Taking it back made every other box on the page (the composer included) untypeable."""
+    out = _run(LEAVE_FIELD + """
+  out.left = { refocused: focused - opened, error: error.textContent, editing: !!A().planInlineFinish,
+    value: input.value, requests: requests.length };
+""")
+    left = out["left"]
+    assert left["refocused"] == 0
+    assert "number" in left["error"] and left["editing"] is True and left["value"] == "lots"
+    assert left["requests"] == 0
+
+
 
 @pytest.mark.parametrize("action", ["approve", "revise"])
 def test_a_field_removed_by_redrawing_never_submits_a_hidden_change(action):
