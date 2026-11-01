@@ -227,6 +227,35 @@ def test_cost_collection_and_stage_timing_share_one_accounting_query(tmp_path):
     assert by_stage(path)["hpc_execution"]["duration_seconds"] == 120
 
 
+def test_cost_accounting_keeps_its_timeout_and_retry_when_a_monitor_is_bound(tmp_path, monkeypatch):
+    from aiscientist.gateway.errors import GatewayError
+    from aiscientist.gateway.estimates import job_usage
+
+    class DropsFirstAccountingRead(Host):
+        dropped = False
+
+        def exec(self, command, timeout=60):
+            if "AllocCPUS" in command and not self.dropped:
+                self.dropped = True
+                raise GatewayError("session dropped", stage="ssh_exec")
+            return super().exec(command, timeout)
+
+    clock(monkeypatch)
+    monitor, path = monitor_at(tmp_path)
+    host = DropsFirstAccountingRead()
+    usage = []
+    token = job_usage.set(usage)
+    try:
+        with bind_monitor(monitor):
+            assert run(host).completed
+    finally:
+        job_usage.reset(token)
+    # The cost row is read as without a monitor: the default timeout, and once more after a drop.
+    assert usage == [{"seconds": 120, "cpu_hours": 4 * 120 / 3600, "gpu_hours": 0}]
+    assert [timeout for cmd, timeout in host.commands if "AllocCPUS" in cmd] == [60]
+    assert by_stage(path)["hpc_execution"]["duration_seconds"] == 120
+
+
 def test_reattached_finished_job_can_record_accounting_without_resubmission(tmp_path):
     monitor, path = monitor_at(tmp_path)
     host = Host([""])

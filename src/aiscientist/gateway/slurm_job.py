@@ -525,12 +525,13 @@ def collect_accounting(executor: RemoteExecutor, job_id: str, elapsed: float | N
     try:
         if monitor is not None:
             # Timestamp columns extend the existing cost row; never add a query per poll.
-            result = executor.exec(
-                f"TZ=UTC SLURM_TIME_FORMAT=%s sacct -j {shlex.quote(job_id)} --noheader --parsable2 "
-                "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State,Submit,Start,End", timeout=5.0)
+            command = (f"TZ=UTC SLURM_TIME_FORMAT=%s sacct -j {shlex.quote(job_id)} --noheader --parsable2 "
+                       "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State,Submit,Start,End")
         else:
-            result = _query(executor, f"sacct -j {job_id} --noheader --parsable2 "
-                            "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State")
+            command = (f"sacct -j {job_id} --noheader --parsable2 "
+                       "--format=JobIDRaw,ElapsedRaw,AllocCPUS,AllocTRES,State")
+        # The cost row keeps its query's timeout and retry; only a timing-only read is bounded.
+        result = _query(executor, command) if collector is not None else executor.exec(command, timeout=5.0)
         if result.ok:
             text = result.stdout
     except Exception:  # accounting may be disabled
