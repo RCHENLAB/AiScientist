@@ -224,6 +224,9 @@ class RunState:
         self.conn = conn
         self.conversation_id = conversation_id
         self.run_id = run_id
+        # The id was minted for routing (``_begin_routed_run``) and no run has bound it yet: its
+        # timing stays in memory, and it names no run folder here or on HPC3.
+        self.routing_id = False
         # Identifies this run's stream for a client that recovers it after a reconnect: a quick
         # chat answer has no run_id, and without an id the same finished answer was recovered
         # (and saved) again on every reconnect.
@@ -479,6 +482,7 @@ class Connection:
     def bind_run_id(self, run: RunState, run_id: str) -> None:
         """Assign the final run_id to a run (fresh mint or resume) and index it."""
         run.run_id = run_id
+        run.routing_id = False
         if run not in self.live_runs:
             if self._bare_run is run:
                 self._bare_run = None
@@ -504,10 +508,6 @@ class Connection:
             return
         run.running = False
         if run.monitor is not None:
-            if run.monitor.run_id is None:
-                # Routes which never start an analysis still retain their measured model calls.
-                run.monitor.run_id = run.run_id or run.monitor.key
-                run.monitor.bind_timing(_timing_path(self.workspace, run.monitor.run_id))
             run.monitor.end()           # a no-op when the run already said how it ended
             if run_monitor.current_monitor() is run.monitor:
                 run_monitor.set_current_monitor(None)
@@ -8420,10 +8420,12 @@ def _route_request(conn: Connection, req: LabRequest, prior_request: str = "") -
 
 
 def _begin_routed_run(conn: Connection, conversation_id: str | None) -> RunState:
-    """A request's run scope, its id minted before routing so its timing is durable. The id names
-    no HPC3 folder until a run binds it (``bind_run_id``): session end brings home and removes the
-    folders of ``hpc_run_ids``, and a chat turn or a reply that starts nothing has none there."""
+    """A request's run scope, its id minted before routing. Until a run binds the id
+    (``bind_run_id``) it names no run folder: its timing waits in memory, and it is not one of the
+    ``hpc_run_ids`` that session end brings home and removes. A chat turn or a reply that starts
+    nothing leaves no folder, here or on HPC3."""
     run = conn.begin_run(conversation_id, run_id=uuid4().hex[:12])
+    run.routing_id = True
     conn.hpc_run_ids.pop(run.run_id, None)
     return run
 
@@ -8435,8 +8437,8 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     and asks on low confidence rather than guessing."""
     # Open this turn's run scope up front so its cancel/plan events + WS stream are isolated from any
     # OTHER window's run on the shared session, and the pre-run follow-up clarify uses this run's
-    # plan_event (not a connection-wide one). Mint the id before routing so a killed classifier
-    # leaves a durable partial trace. A continuation later links this attempt to the prior id.
+    # plan_event (not a connection-wide one). The id is minted before routing; its routing timing is
+    # written with the run that binds it, or with the earlier run the request continues.
     run = _begin_routed_run(conn, req.conversation_id)
     _note_budget_choice(run, req)
     _watch_run(conn, run, req)
@@ -8784,11 +8786,12 @@ def _watch_run(conn: Connection, run: RunState, req: LabRequest) -> None:
                 kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,
                 conversation_id=run.conversation_id, run_id=run.run_id,
                 question=getattr(req, "question", "") or "", model=conn.selected_model or "")
+        request_id = run.monitor.run_id     # the id this request was routed under
         run.monitor.kind = run.kind
         run.monitor.run_id = run.run_id
         run.monitor.conversation_id = run.conversation_id
-        if run.run_id:
-            run.monitor.bind_timing(_timing_path(conn.workspace, run.run_id))
+        if run.run_id and not run.routing_id:
+            run.monitor.bind_timing(_timing_path(conn.workspace, run.run_id), request_id=request_id)
         run_monitor.set_current_monitor(run.monitor)
         if run.kind in ("chat", "corpus"):
             run.monitor.enter(run.kind)

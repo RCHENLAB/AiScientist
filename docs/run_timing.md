@@ -13,10 +13,10 @@ available without a live connection. It follows the run's existing retention/del
 Because it continues to grow after a result is published or saved, the timing journal is excluded
 from the result's immutable Croissant file checksum inventory; research-result metadata is unchanged.
 
-Requests receive a durable id before routing. If a request continues an older run, its timing
-segment is appended to that run with a stable `request_id` and `segment_id`. The original trace
-retains a `run_link` event naming the final `target_run_id`; the final run's endpoint includes the
-attached segment. The original linked trace can remain partial and must not be counted again.
+Requests receive an id before routing. Their routing events wait in memory until a run binds the
+id, and are then written to that run's journal. If a request continues an older run, its timing
+segment is appended to that run with the request's own `request_id` and `segment_id`. A chat turn,
+or a reply that starts no run, writes no journal and leaves no run folder.
 
 ## Reading a timeline
 

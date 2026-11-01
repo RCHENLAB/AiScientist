@@ -132,7 +132,8 @@ class RunTiming:
         self._active: dict[str, dict[str, Any]] = {}
         self._dropped = 0
 
-    def bind(self, path: str | Path, run_id: str | None, conversation_id: str | None) -> None:
+    def bind(self, path: str | Path, run_id: str | None, conversation_id: str | None,
+             request_id: str | None = None) -> None:
         try:
             with self._lock:
                 path = Path(path)
@@ -142,7 +143,8 @@ class RunTiming:
                     self._rebind(path, _identifier(run_id), conversation_id)
                     return
                 self.run_id = _identifier(run_id)
-                self.request_id = self.run_id
+                # A request that continues an earlier run keeps the id it was routed under.
+                self.request_id = _identifier(request_id) if request_id else self.run_id
                 self.conversation_id = _identifier(conversation_id) if conversation_id is not None else None
                 self.path, self._file_lock = path, _path_lock(path)
                 pending, self._buffer = self._buffer, []

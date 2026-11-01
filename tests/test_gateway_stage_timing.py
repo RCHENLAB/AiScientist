@@ -400,3 +400,52 @@ def test_an_id_minted_for_routing_is_an_hpc3_run_only_once_a_run_binds_it(connec
     monkeypatch.setattr(gw, "_dispatch_lab_run", starts_a_run)
     conn.loop.run_until_complete(gw._dispatch_lab(conn, req))
     assert list(conn.hpc_run_ids) == bound
+
+
+def test_turns_that_start_no_run_leave_no_folder_and_a_run_keeps_its_routing(connection, monkeypatch):
+    conn = connection
+    req = gw.LabRequest(connection_id=conn.id, conversation_id="routed", question="hi")
+    minted = []
+
+    def routed():
+        run = conn.active_run
+        minted.append(run.run_id)
+        run_monitor.current_monitor().timing_event("request_routed", action="research")
+        return run
+
+    async def starts_nothing(conn, req):
+        routed()
+        conn.push({"type": "chat_stopped"})
+
+    async def chat_turn(conn, req):
+        run = routed()
+        run.kind = "chat"                       # as _run_quick_chat does: no run id is bound
+        gw._watch_run(conn, run, req)
+        conn.push({"type": "chat_done"})
+
+    async def starts_a_run(conn, req):
+        run = routed()
+        conn.bind_run_id(run, run.run_id)       # as _run_lab / _run_literature do
+        gw._watch_run(conn, run, req)
+
+    async def continues_a_run(conn, req):
+        run = routed()
+        conn.bind_run_id(run, "priorrun")
+        gw._watch_run(conn, run, req)
+
+    for fake in (starts_nothing, chat_turn, starts_nothing):
+        monkeypatch.setattr(gw, "_dispatch_lab_run", fake)
+        conn.loop.run_until_complete(gw._dispatch_lab(conn, req))
+    assert not conn.workspace.exists() or not any(conn.workspace.iterdir())
+
+    monkeypatch.setattr(gw, "_dispatch_lab_run", starts_a_run)
+    conn.loop.run_until_complete(gw._dispatch_lab(conn, req))
+    timeline = _timeline(conn, minted[-1])
+    routing = [e for e in timeline["events"] if e["event"] == "request_routed"]
+    assert len(routing) == 1 and routing[0]["run_id"] == minted[-1]
+
+    monkeypatch.setattr(gw, "_dispatch_lab_run", continues_a_run)
+    conn.loop.run_until_complete(gw._dispatch_lab(conn, req))
+    routing = [e for e in _timeline(conn, "priorrun")["events"] if e["event"] == "request_routed"]
+    assert [(e["run_id"], e["request_id"]) for e in routing] == [("priorrun", minted[-1])]
+    assert sorted(p.name for p in conn.workspace.iterdir()) == sorted([minted[-2], "priorrun"])

@@ -228,8 +228,8 @@ class RunMonitor:
         except Exception:
             pass
 
-    def bind_timing(self, path: str | Path) -> None:
-        self._timing.bind(path, self.run_id, self.conversation_id)
+    def bind_timing(self, path: str | Path, request_id: str | None = None) -> None:
+        self._timing.bind(path, self.run_id, self.conversation_id, request_id)
 
     def begin_span(self, stage: str, category: str = "processing", **metadata: Any) -> str:
         return self._timing.begin_span(stage, category, **metadata)
