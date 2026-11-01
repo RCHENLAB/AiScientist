@@ -5100,7 +5100,15 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
     const before = c.plan;
     c.planInlineFinish(action !== "cancel", false);
     // A field submission has to come back from validation before any approval/revision.
-    if (c.plan !== before || c.planInlineFinish) return;
+    if (c.plan !== before || c.planInlineFinish) {
+      // A value that cannot be used keeps its box open, perhaps in a side panel that is closed:
+      // the button that was clicked must not do nothing without a word.
+      if (c.planInlineFinish) {
+        if (chatVisible(c)) openPlanPanel();
+        toast("Correct the setting you are changing first, or press Escape in it to put its value back.");
+      }
+      return;
+    }
   }
   if (action === "approve" && c.planDraftYaml) {
     toast("Correct or discard your change, then review the updated plan before running it.");

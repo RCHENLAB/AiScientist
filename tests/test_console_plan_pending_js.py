@@ -701,6 +701,18 @@ def test_leaving_a_field_with_an_unusable_value_does_not_take_the_focus_back():
     assert left["requests"] == 0
 
 
+def test_run_held_back_by_an_unusable_field_says_why_and_shows_the_field():
+    """From the chat entry, with the side panel closed, Run did nothing at all."""
+    out = _run(LEAVE_FIELD + """
+  log.length = 0;
+  await api.submitPlan("approve");
+  out.run = { requests: requests.length, pending: A().planPending, panel: log.includes("panel:open"),
+    toasts: log.filter((x) => x.startsWith("toast:")) };
+""")
+    run = out["run"]
+    assert run["requests"] == 0 and run["pending"] is True
+    assert run["panel"] is True and len(run["toasts"]) == 1 and "setting" in run["toasts"][0]
+
 
 @pytest.mark.parametrize("action", ["approve", "revise"])
 def test_a_field_removed_by_redrawing_never_submits_a_hidden_change(action):
