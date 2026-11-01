@@ -140,3 +140,16 @@ def test_guard_is_idempotent_and_preserves_original_diagnostic_block():
     assert not second.changed
     assert second.text == first.text
     assert "scdblfinder_score" in "\n".join(first.details)
+
+
+def test_a_sentence_after_a_doublet_finding_keeps_other_results():
+    # One paragraph, as an Abstract is: a doublet mention must not carry "compared" or "score"
+    # in later sentences into the details file.
+    draft = ("After ambient-RNA correction and doublet removal, 14,553 cells remained. "
+             "Comparing knockout with wild type, rods showed 412 differentially expressed genes, "
+             "and an interferon-response score was elevated in Muller glia. "
+             "The other caller agreed on 245 of them.")
+    display = default_qc_text(draft)
+    assert "Comparing knockout with wild type, rods showed 412 differentially expressed genes" in display.text
+    assert "interferon-response score was elevated" in display.text
+    assert "245" not in display.text

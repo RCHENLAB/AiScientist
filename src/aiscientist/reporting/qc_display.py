@@ -26,6 +26,11 @@ _DIAGNOSTIC = re.compile(
     r"scores?|\bpann\b|agree(?:ment)?|disagree|concordance|compar|\bkappa\b|κ|cohen|"
     r"second opinion|classifications?|\bcallers?\b|\bflags?\b|\bflagged\b|\boverlap\b|"
     r"比较|评分|一致性|分歧", re.I)
+# What still refers to the doublet finding in a later sentence: its comparison, not the generic
+# "compared", "score" or "flagged" that the next result in the paragraph is likely to use.
+_COMPARISON = re.compile(
+    r"\bpann\b|agree(?:ment)?|disagree|concordance|\bkappa\b|κ|cohen|second opinion|\bcallers?\b|"
+    r"一致性|分歧", re.I)
 _UNRELATED = re.compile(
     r"(?<![A-Za-z])ISG(?![A-Za-z])|"
     r"\b(?:signature|annotation|annotator|inter.?rater|cell.?type|cluster|clustering)\b", re.I)
@@ -49,7 +54,7 @@ def _without_links(text: str) -> str:
     return re.sub(r"`[^`\n]*[/\\][^`\n]*`", "", text)
 
 
-def _diagnostic(text: str, doublet_context: bool = False) -> bool:
+def _diagnostic(text: str, doublet_context: bool = False, nearby: bool = False) -> bool:
     if re.fullmatch(r"\s*(?:[-*+]\s+)?\[[^\]]+\]\([^)]*\)\s*\.?", text):
         return False  # A download link offers opt-in access; it does not show the values.
     for image in re.findall(r"!\[[^\]]*\]\([^)]*\)", text):
@@ -67,7 +72,9 @@ def _diagnostic(text: str, doublet_context: bool = False) -> bool:
         return True
     # A bare agreement/score belongs to doublets only under an explicit doublet heading or
     # within that sentence. Named unrelated results stay visible even in that section.
-    return bool(doublet_context and _DIAGNOSTIC.search(text) and not _UNRELATED.search(text))
+    if doublet_context and _DIAGNOSTIC.search(text) and not _UNRELATED.search(text):
+        return True
+    return bool(nearby and _COMPARISON.search(text) and not _UNRELATED.search(text))
 
 
 def _review_needed(text: str) -> bool:
@@ -179,12 +186,12 @@ def default_qc_text(text: str) -> QCDisplayResult:
         # Keep independent clauses in mixed prose. Decimal points are not followed by a space.
         clauses = re.split(r"(?<=[.;!?])\s+|(?<=[。！？；])\s*|,\s+(?=(?:whereas|while|but|and)\s)", line)
         kept: list[str] = []
-        sentence_context = context or paragraph_context
+        sentence_context = paragraph_context
         removed = False
         for clause in clauses:
             if not clause:
                 continue
-            diagnostic = _diagnostic(clause, sentence_context)
+            diagnostic = _diagnostic(clause, context, sentence_context)
             if diagnostic:
                 removed = True
                 needs_review |= _review_needed(clause)
@@ -198,7 +205,7 @@ def default_qc_text(text: str) -> QCDisplayResult:
                 if _DOUBLET.search(clause):
                     sentence_context = True
                 elif _UNRELATED.search(clause):
-                    sentence_context = context
+                    sentence_context = False
         paragraph_context = sentence_context if line.strip() else False
         if removed:
             details.append(line)
