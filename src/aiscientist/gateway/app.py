@@ -8419,6 +8419,15 @@ def _route_request(conn: Connection, req: LabRequest, prior_request: str = "") -
     return route
 
 
+def _begin_routed_run(conn: Connection, conversation_id: str | None) -> RunState:
+    """A request's run scope, its id minted before routing so its timing is durable. The id names
+    no HPC3 folder until a run binds it (``bind_run_id``): session end brings home and removes the
+    folders of ``hpc_run_ids``, and a chat turn or a reply that starts nothing has none there."""
+    run = conn.begin_run(conversation_id, run_id=uuid4().hex[:12])
+    conn.hpc_run_ids.pop(run.run_id, None)
+    return run
+
+
 async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     """Entry for a composer message: route a follow-up to edit-report / re-run-step / new-study,
     or fall through to a fresh run. Only engages when a prior bundle exists; classifies with the
@@ -8428,7 +8437,7 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     # OTHER window's run on the shared session, and the pre-run follow-up clarify uses this run's
     # plan_event (not a connection-wide one). Mint the id before routing so a killed classifier
     # leaves a durable partial trace. A continuation later links this attempt to the prior id.
-    run = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+    run = _begin_routed_run(conn, req.conversation_id)
     _note_budget_choice(run, req)
     _watch_run(conn, run, req)
     try:
@@ -8500,7 +8509,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             return
         curation_offered = True
         req = req.model_copy(update={"question": handoff})
-        _next = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+        _next = _begin_routed_run(conn, req.conversation_id)
         _note_budget_choice(_next, req)
         _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
@@ -8525,7 +8534,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         # has ended, and ``conn.active_run`` is now the session's newest live run, which can be
         # another chat's run waiting at its plan card.
         req = req.model_copy(update={"question": handoff})
-        _next = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+        _next = _begin_routed_run(conn, req.conversation_id)
         _note_budget_choice(_next, req)
         _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
@@ -8545,7 +8554,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             return
         # A note on that plan is routed again, as on the opening message's curation.
         req = req.model_copy(update={"question": handoff})
-        _next = conn.begin_run(req.conversation_id, run_id=uuid4().hex[:12])
+        _next = _begin_routed_run(conn, req.conversation_id)
         _note_budget_choice(_next, req)
         _watch_run(conn, _next, req)
         target = _followup_target(conn, req)

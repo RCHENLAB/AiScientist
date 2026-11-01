@@ -375,3 +375,28 @@ def test_automatic_save_records_action_without_manual_wait(connection, clock, mo
     assert any(e["event"] == "save_requested" and e["metadata"]["action"] == "automatic"
                for e in timeline["events"])
     connection.end_run(run)
+
+
+def test_an_id_minted_for_routing_is_an_hpc3_run_only_once_a_run_binds_it(connection, monkeypatch):
+    """Session end brings home and removes every run in ``hpc_run_ids`` (eight HPC3 listings per
+    run): a chat turn or a reply that starts nothing has no folder there."""
+    conn = connection
+    req = gw.LabRequest(connection_id=conn.id, conversation_id="routed", question="hi")
+    bound = []
+
+    async def starts_nothing(conn, req):
+        conn.push({"type": "chat_stopped"})
+
+    async def starts_a_run(conn, req):
+        run = conn.active_run
+        conn.bind_run_id(run, run.run_id)
+        bound.append(run.run_id)
+
+    monkeypatch.setattr(gw, "_dispatch_lab_run", starts_nothing)
+    for _ in range(2):
+        conn.loop.run_until_complete(gw._dispatch_lab(conn, req))
+    assert conn.hpc_run_ids == {}
+    assert gw._session_cleanup_targets(conn)["runs"] == []
+    monkeypatch.setattr(gw, "_dispatch_lab_run", starts_a_run)
+    conn.loop.run_until_complete(gw._dispatch_lab(conn, req))
+    assert list(conn.hpc_run_ids) == bound
