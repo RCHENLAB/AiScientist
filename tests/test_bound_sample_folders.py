@@ -453,3 +453,58 @@ def test_the_verification_names_each_species_checkpoint():
     text = "\n".join(lines)
     assert ("The QC checkpoints hold 26,000 cells (human: 11,000 in adata_qc.h5ad; mouse: 15,000 in "
             "adata_qc.mouse.h5ad); the libraries' final counts sum to 26,000 (consistent)") in text
+
+
+def test_the_plan_card_names_each_attached_folder_and_lists_an_unusable_one_once(kept, tmp_path, monkeypatch):  # noqa: F811 - a fixture imported above
+    """Through _run_lab, up to the saved plan card: the main dataset is the folder the user attached,
+    not the matrix found inside it, and a folder the run cannot use is listed only with its reason."""
+    pytest.importorskip("h5py")
+    _client, _conn, gw = kept
+    from aiscientist.agents import research_lab as rl
+    from aiscientist.agents.research_lab import LabConfig, LabResult
+    from aiscientist.gateway import dataset_storage
+    from aiscientist.gateway.settings import HPCSettings
+
+    monkeypatch.setattr(gw, "_AUTH_ENABLED", False)
+    sample3 = _library(dataset_storage.dataset_dir(str(uuid4()), "tester") / "original")
+    sample1 = _library(dataset_storage.dataset_dir(str(uuid4()), "tester") / "original")
+    notes = dataset_storage.dataset_dir(str(uuid4()), "tester") / "original"
+    notes.mkdir(parents=True)
+    (notes / "README.md").write_text("x")
+
+    class _Lab:
+        def __init__(self, ctx, *a, **k):
+            self.config, self.guidance, self.plan_context, self.later = LabConfig(), None, None, []
+            self.execution_profile, self.protocols, self.self_sourced = None, [], []
+
+        def run(self, question, on_event=None, plan_review=None, **_kw):
+            plan_review("agenda", ["QC both samples"])
+            return LabResult(question, ["QC"], [], False, 0, "")
+
+    monkeypatch.setattr(rl, "ResearchLab", _Lab)
+    monkeypatch.setattr(gw, "_build_report", lambda *a, **k: None)
+
+    def _no_model(*a, **k):
+        raise ConnectionError("no model in this test")
+    monkeypatch.setattr(gw.vllm_client, "complete", _no_model)
+
+    conn = gw.Connection(HPCSettings(), mock=True, loop=asyncio.new_event_loop(), username="tester")
+    conn.workspace, conn.status, conn.executor, conn.alloc = tmp_path / "ws", "ready", object(), object()
+    gw.CONNECTIONS[conn.id] = conn
+    published: list = []
+    monkeypatch.setattr(conn, "_publish", lambda payload: published.append(dict(payload)))
+    try:
+        req = gw.LabRequest(connection_id=conn.id, question="Run QC on these two samples",
+                            conversation_id="conv-1", plan_mode=True,
+                            datasets=[{"path": str(sample3), "name": "Sample3_GSM5676874/"},
+                                      {"path": str(sample1), "name": "Sample1_WT/"},
+                                      {"path": str(notes), "name": "notes/"}])
+        conn.begin_run("conv-1")
+        asyncio.run(gw._run_lab(conn, req))
+    finally:
+        gw.CONNECTIONS.pop(conn.id, None)
+
+    card = next(p for p in published if p.get("type") == "plan_prompt")
+    assert [(d["name"], d["use"]) for d in card["plan"]["datasets"]] == [
+        ("Sample3_GSM5676874", "main"), ("Sample1_WT", "sample")]
+    assert [d["name"] for d in card["plan"]["unusable_inputs"]] == ["notes"]

@@ -60,6 +60,23 @@ checked, whichever arrives last, the browser's "that was the last file" or the l
 that a restart interrupted continues when the gateway starts again, whether or not the account is
 connected. Nothing is written to HPC3 at upload time.
 
+## Datasets attached to a chat
+
+In Files → Datasets, check several dataset cards and choose **Use selected** to attach them to
+the open chat together. Search keeps checked selections, and cards mark datasets already attached.
+The page shows the per-run limit supplied by the server (currently 12); adding beyond it is refused.
+The server also rejects an oversized set instead of dropping inputs.
+
+Attachments, their order, and chosen roles are stored in `conversation_datasets` with the chat.
+They return after a reload, a new sign-in, or opening the chat on another computer. Removing a chip
+only detaches it from that chat; deleting a dataset removes its attachments from every chat.
+Use a dataset chip to make it the main input or mark comparison data as reference.
+
+Before execution, the plan card lists the main dataset, samples QC'd together, references and extra
+inputs. It also names inputs the run cannot use and gives the reason. Reference data is excluded
+from sample QC. Attachment records refer to dataset IDs, so moving a dataset to server storage
+keeps chats pointing at its current location.
+
 ## When a run needs the data on HPC3
 
 HPC3's compute nodes cannot see the gateway host's disks. When a run's analysis or `run_code` runs on
