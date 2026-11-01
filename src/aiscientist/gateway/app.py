@@ -14219,7 +14219,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             reply = await asyncio.to_thread(_qc_chat_reply, art, result)
             if reply:
                 result.final_answer = reply
-            result.final_answer = _default_qc_display(result.final_answer or "", art, result)
+            result.final_answer = _default_qc_display(result.final_answer or "", art, result,
+                                                      question=req.question)
             try:
                 # The same lines in the folder, so a downloaded bundle says what QC did. It is also
                 # what marks the run finished for the next message in this chat to continue.
@@ -14317,7 +14318,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                                 insert=_insert_before_backmatter)
             # Enforce the display policy after every writer/reviewer, including Stop and fallback.
             # Original diagnostic data and optional generated excerpts remain downloadable.
-            report_md = _default_qc_display(report_md, art, result)
+            report_md = _default_qc_display(report_md, art, result, question=req.question)
             # How we know it is right: every number traced to the run's outputs, what each label rests
             # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
             # statement is report/verification.md, the manuscript carries its summary.
@@ -14331,7 +14332,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 # After the number check on purpose: this section restates another run's work.
                 report_md = _insert_before_backmatter(
                     report_md, _earlier_work_note(prior, continues_from_dataset))
-                report_md = _default_qc_display(report_md, art, result)
+                report_md = _default_qc_display(report_md, art, result, question=req.question)
             _watch_stage(run, "report")
             say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
                     else "💾 Saving report.md — skipping the render.", "info")
@@ -14473,7 +14474,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                          "Downloads panel.", "success" if not abandoned() else "warning")
         if untested_md:
             result.final_answer = untested_md + "\n" + (result.final_answer or "")
-        result.final_answer = _default_qc_display(result.final_answer or "", art, result)
+        result.final_answer = _default_qc_display(result.final_answer or "", art, result,
+                                                  question=req.question)
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
         conn.push({"type": "chat_done"})
         if later_asks:
@@ -15403,13 +15405,17 @@ _QC_RECORD_SECTIONS = re.compile(r"^(?:The dataset|What was run)\b", re.I)
 _BACKMATTER_HEADINGS = ("\n## References", "\n# Output Files Index", "\n## Background consulted")
 
 
-def _default_qc_display(text: str, art: Path, result: Any = None) -> str:
+def _default_qc_display(text: str, art: Path, result: Any = None, *, question: str = "") -> str:
     """Final display boundary; retain generated doublet details in an optional download.
 
     This never changes the source tool results, tables, matrices or technical report. It also
-    covers an old synthesis or a writer/reviewer that ignores the shared presentation prompt.
+    covers an old synthesis or a writer/reviewer that ignores the shared presentation prompt. A
+    ``question`` that asks for the doublet comparison gets it: the writers are told the same.
     """
-    from ..reporting.qc_display import default_qc_text
+    from ..reporting.qc_display import asks_for_doublet_details, default_qc_text
+
+    if asks_for_doublet_details(question):
+        return text
 
     starts = [i for i in (text.find(h) for h in _BACKMATTER_HEADINGS) if i != -1]
     text, back = (text[:min(starts)], text[min(starts):]) if starts else (text, "")

@@ -264,3 +264,16 @@ def test_final_outputs_enforce_policy_even_when_model_text_disobeys(tmp_path, mo
     state = json.loads((art / "process/run_state.json").read_text())
     assert state["final_answer"] == dirty
     assert state["rounds"][0]["scientist_result"]["steps"][0]["result"] == _CELLQC
+
+
+def test_a_request_for_the_doublet_comparison_keeps_it(tmp_path, monkeypatch):
+    dirty = ("# Analysis result\n\n929 doublets removed. "
+             "DoubletFinder and scDblFinder agree poorly (kappa 0.10).\n")
+    _, _, payloads, art, rendered = _run(
+        tmp_path, monkeypatch, "Analyze this dataset and write a report that compares "
+        "DoubletFinder with scDblFinder.", dirty,
+        extra_steps=[{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}],
+        writeup_mode="full")
+    for output in (rendered[0], _reply(payloads)):
+        assert "DoubletFinder and scDblFinder agree poorly (kappa 0.10)." in output
+    assert not (art / "report/doublet_details.md").exists()

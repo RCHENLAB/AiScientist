@@ -77,6 +77,13 @@ def _diagnostic(text: str, doublet_context: bool = False, nearby: bool = False) 
     return bool(nearby and _COMPARISON.search(text) and not _UNRELATED.search(text))
 
 
+def asks_for_doublet_details(question: str) -> bool:
+    """Does the request itself ask about the doublet calls (their scores, agreement or comparison)?
+    Then they are the answer, not optional detail. Naming a caller as the decider does not ask."""
+    return any((_DOUBLET.search(clause) or _CALLER.search(clause)) and _DIAGNOSTIC.search(clause)
+               for clause in re.split(r"[.;,!?\n。！？；，]+|\bthen\b", question or ""))
+
+
 def _review_needed(text: str) -> bool:
     if _REVIEW.search(text):
         return True

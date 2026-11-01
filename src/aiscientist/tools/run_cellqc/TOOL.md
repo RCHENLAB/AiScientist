@@ -97,10 +97,10 @@ The default final result shows the overall QC outcome and a concise doublets-rem
 Per-cell scores and caller comparisons stay in the downloadable QC files or optional technical
 details. A material doublet warning is summarized as a need to review the removal, with a pointer
 to the available details; the original diagnostics and all analysis data are retained.
-If a writer or reviewer still includes doublet diagnostics, the final display moves those
-generated excerpts to `report/doublet_details.md` in Downloads. This optional file identifies
-them as presentation text, potentially model-written; the QC tables and execution record remain
-the measurement sources.
+If a writer or reviewer still includes doublet diagnostics the request did not ask for, the final
+display moves those generated excerpts to `report/doublet_details.md` in Downloads. This optional
+file identifies them as presentation text, potentially model-written; the QC tables and execution
+record remain the measurement sources.
 
 ## Where it runs
 

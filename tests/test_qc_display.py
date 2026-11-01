@@ -153,3 +153,19 @@ def test_a_sentence_after_a_doublet_finding_keeps_other_results():
     assert "Comparing knockout with wild type, rods showed 412 differentially expressed genes" in display.text
     assert "interferon-response score was elevated" in display.text
     assert "245" not in display.text
+
+
+@pytest.mark.parametrize("question, asks", [
+    ("Run CellQC and compare DoubletFinder with scDblFinder.", True),
+    ("Show me the doublet scores.", True),
+    ("How well do the two doublet callers agree?", True),
+    ("比较两种双细胞算法", True),
+    ("Run CellQC with scDblFinder as the decider.", False),
+    ("Run CellQC on these folders and write a QC report.", False),
+    ("Run QC with doublet removal, then compare knockout with wild type.", False),
+    ("", False),
+])
+def test_only_a_request_about_the_doublet_calls_asks_for_their_details(question, asks):
+    from aiscientist.reporting.qc_display import asks_for_doublet_details
+
+    assert asks_for_doublet_details(question) is asks
