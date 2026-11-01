@@ -62,14 +62,16 @@ def _failed(error: str, **extra: Any) -> dict[str, Any]:
 def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q_vecs: Any, *,
                   top_k: int, max_per_paper: int, allowed: set[str] | None = None,
                   terms: list[Term] | None = None, index: TextIndex | None = None,
-                  known_genes: frozenset[str] | None = None) -> tuple[list[dict[str, Any]], list[Term]]:
+                  known_genes: frozenset[str] | None = None, method: str = "hybrid",
+                  rank_depth: int = RANK_DEPTH) -> tuple[list[dict[str, Any]], list[Term]]:
     """The passages to return, as ``[{"idx", "score", "cosine", "query"}]``, and the terms used.
 
     Each query ranks the chunks with ``hybrid_rank``: by embedding and by BM25 over its own words plus
     ``terms``, merged by reciprocal rank; a query that names a gene the corpus has is answered from
     the chunks that name it. The result takes the best remaining chunk of each query in turn, so one
     broad query cannot crowd out the others, skipping a chunk already taken and a paper that has its
-    ``max_per_paper``."""
+    ``max_per_paper``. Experimental ``method`` and ``rank_depth`` overrides are internal to evaluation;
+    the tool always uses the hybrid default."""
     import numpy as np  # noqa: PLC0415
 
     index = index if index is not None else TextIndex.of_chunks(chunks)
@@ -86,7 +88,8 @@ def rank_passages(queries: list[str], chunks: list[dict[str, Any]], vecs: Any, q
         index.check(q_terms)
         for t in q_terms:
             used.setdefault((t.kind, t.text.lower()), t)
-        ranked.append(hybrid_rank(q_vecs[qi], vecs, index, q_terms, depth=RANK_DEPTH, allowed=allowed_idx))
+        ranked.append(hybrid_rank(q_vecs[qi], vecs, index, q_terms, depth=rank_depth,
+                                  allowed=allowed_idx, method=method))
 
     taken: set[int] = set()
     per_paper: dict[str, int] = {}

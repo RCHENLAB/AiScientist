@@ -468,7 +468,7 @@ def interleave(first: list[int], second: list[int], ratio: int = 1) -> list[int]
 
 
 def hybrid_rank(q_vec: Any, vecs: Any, index: TextIndex, terms: list[Term], *, depth: int = 200,
-                allowed: set[int] | None = None) -> list[tuple[int, float, float]]:
+                allowed: set[int] | None = None, method: str = "hybrid") -> list[tuple[int, float, float]]:
     """One query's chunks, best first, as ``(chunk index, score, cosine)``.
 
     Rankings, each cut at ``depth``: the embedding (cosine), BM25 over the question's own words, and
@@ -485,9 +485,24 @@ def hybrid_rank(q_vec: Any, vecs: Any, index: TextIndex, terms: list[Term], *, d
     When the query itself names genes that the corpus has, the chunks that name one of them are ranked
     among themselves and come first (a question about RPGR is answered from passages about RPGR);
     the other chunks follow, so a gene few passages name still gets a full answer list. ``allowed``
-    limits everything to those chunk indices. The score is 1 / (60 + position)."""
+    limits everything to those chunk indices. The score is 1 / (60 + position).
+
+    Experimental ``method="dense"`` and ``method="bm25"`` return cosine or BM25 scores respectively,
+    without fusion, interleaving or gene priority. Hybrid remains the default."""
     import numpy as np  # noqa: PLC0415
+    if method not in {"hybrid", "dense", "bm25"}:
+        raise ValueError(f"Unknown retrieval method: {method}")
     live = [t for t in terms if t.use != "absent"]
+    # Experimental baselines have no fusion, interleaving or gene priority.
+    if method == "bm25":
+        scores = index.bm25(live)
+        order = sorted((d for d in scores if allowed is None or d in allowed),
+                       key=lambda d: (-scores[d], d))[:depth]
+        return [(d, scores[d], 0.0) for d in order]
+    if method == "dense":
+        cos = np.asarray(vecs) @ np.asarray(q_vec, dtype="float32")
+        order = sorted(range(index.n) if allowed is None else allowed, key=lambda d: (-cos[d], d))[:depth]
+        return [(d, float(cos[d]), float(cos[d])) for d in order]
     # Only a gene the question itself names decides which chunks come first: a gene the model adds
     # to its terms (ZNHIT3 for a question about PEHO syndrome) would put its passages ahead of the answer.
     genes = [t for t in live if t.kind == "gene" and t.source == "query"]

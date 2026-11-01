@@ -26,6 +26,8 @@ def app_ctx(tmp_path, monkeypatch):
     from aiscientist.gateway import auth, auth_routes, db, models  # noqa: F401
     importlib.reload(db)
     importlib.reload(models)
+    from aiscientist.gateway import metadata_store
+    importlib.reload(metadata_store)
     importlib.reload(auth)
     importlib.reload(auth_routes)
     db.reset(url)
@@ -164,3 +166,91 @@ def test_an_answer_saved_by_two_windows_is_stored_once(app_ctx):
     msgs = client.get(f"/api/conversations/{cid}").json()["messages"]
     assert [(m["kind"], (m.get("meta") or {}).get("stream_id")) for m in msgs] == [
         ("text", "s1"), ("artifacts", "s1"), ("text", "s2")]
+
+
+def _saved_datasets(count=3):
+    from aiscientist.gateway import auth_routes, db, models
+    with db.session_scope() as s:
+        uid = s.query(models.User).filter_by(username="root").one().id
+    return [auth_routes.record_dataset(uid, f"sample{i}.h5ad", f"/data/sample{i}.h5ad", 12, "h5ad")
+            for i in range(count)]
+
+
+def test_chat_datasets_batch_roles_survive_new_signin(app_ctx):
+    client = app_ctx
+    _login(client, "root", "rootpass1")
+    ids = _saved_datasets()
+    cid = client.post("/api/conversations", json={}).json()["conversation"]["id"]
+    entries = [{"id": ids[0]}, {"id": ids[1], "role": "primary"},
+               {"id": ids[2], "role": "reference"}]
+    response = client.put(f"/api/conversations/{cid}/datasets", json={"datasets": entries})
+    assert response.status_code == 200
+    assert [d["id"] for d in response.json()["datasets"]] == ids
+    client.post("/api/auth/logout")
+    # A fresh client has no browser state or cookies from the original chat.
+    from fastapi.testclient import TestClient
+    with TestClient(client.app) as other:
+        _login(other, "root", "rootpass1")
+        data = other.get(f"/api/conversations/{cid}").json()
+    assert [(d["id"], d["role"]) for d in data["datasets"]] == [
+        (ids[0], None), (ids[1], "primary"), (ids[2], "reference")]
+    from aiscientist.gateway import app as gateway
+    bound = gateway._select_bound_datasets(gateway.LabRequest(
+        connection_id="c", question="q", datasets=data["datasets"]))
+    assert bound[0]["path"] == data["datasets"][1]["path"]
+
+
+def test_chat_dataset_limit_rejection_is_atomic(app_ctx):
+    client = app_ctx
+    _login(client, "root", "rootpass1")
+    ids = _saved_datasets(13)
+    cid = client.post("/api/conversations", json={}).json()["conversation"]["id"]
+    url = f"/api/conversations/{cid}/datasets"
+    assert client.get("/api/datasets").json()["max_bound_datasets"] == 12
+    assert client.put(url, json={"datasets": [{"id": i} for i in ids[:12]]}).status_code == 200
+    refused = client.put(url, json={"datasets": [{"id": i} for i in ids]})
+    assert refused.status_code == 400 and "At most 12" in refused.json()["detail"]
+    assert len(client.get(f"/api/conversations/{cid}").json()["datasets"]) == 12
+    from aiscientist.gateway import app as gateway
+    from fastapi.testclient import TestClient
+    response = TestClient(gateway.app).post("/api/lab", json={
+        "connection_id": "unused", "question": "q",
+        "datasets": [{"path": f"/data/{i}.csv"} for i in ids]})
+    assert response.status_code == 400 and "At most 12" in response.json()["detail"]
+
+
+def test_deleting_dataset_detaches_every_chat(app_ctx):
+    client = app_ctx
+    _login(client, "root", "rootpass1")
+    ids = _saved_datasets(2)
+    chats = [client.post("/api/conversations", json={}).json()["conversation"]["id"] for _ in range(2)]
+    for cid in chats:
+        assert client.put(f"/api/conversations/{cid}/datasets", json={
+            "datasets": [{"id": i} for i in ids]}).status_code == 200
+    from aiscientist.gateway import auth_routes, db, models
+    with db.session_scope() as s:
+        uid = s.query(models.User).filter_by(username="root").one().id
+    assert auth_routes.delete_dataset_record(uid, ids[0])
+    for cid in chats:
+        assert [d["id"] for d in client.get(f"/api/conversations/{cid}").json()["datasets"]] == ids[1:]
+    # Deleting a chat cascades its attachments without removing the dataset.
+    assert client.delete(f"/api/conversations/{chats[0]}").status_code == 200
+    assert client.get(f"/api/conversations/{chats[1]}").json()["datasets"][0]["id"] == ids[1]
+
+
+def test_chat_attachments_enforce_ownership_and_roles(app_ctx):
+    client = app_ctx
+    _login(client, "root", "rootpass1")
+    ids = _saved_datasets(2)
+    cid = client.post("/api/conversations", json={}).json()["conversation"]["id"]
+    url = f"/api/conversations/{cid}/datasets"
+    assert client.put(url, json={"datasets": [{"id": i, "role": "primary"} for i in ids]}).status_code == 400
+    assert client.put(url, json={"datasets": [{"id": ids[0], "role": "bad"}]}).status_code == 400
+    assert client.put(url, json={"datasets": [{"id": 99999}]}).status_code == 404
+    client.post("/api/admin/users", json={"username": "other", "password": "otherpass1"})
+    client.post("/api/auth/logout")
+    _login(client, "other", "otherpass1")
+    assert client.put(url, json={"datasets": []}).status_code == 404
+    other_cid = client.post("/api/conversations", json={}).json()["conversation"]["id"]
+    assert client.put(f"/api/conversations/{other_cid}/datasets", json={
+        "datasets": [{"id": ids[0]}]}).status_code == 404

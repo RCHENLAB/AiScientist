@@ -29,6 +29,8 @@ const state = {
   // Each chat's run and dialog live in its own record (see chatOf below), not here. What stays
   // here is the one visible chat's DOM: the live bubble of its run and its plan card.
   streamDom: null,      // {body, think, thinkBody, feed} DOM refs of the visible chat's live bubble
+  maxBoundDatasets: null,
+  selectedDatasetIds: new Set(),
   datasets: [],                // uploaded files/folders this session: {name, path, kind}, newest first
   serverRoots: [],             // server folders a dataset can be bound from by path (empty = off)
   serverOfferDismissed: new Set(),   // pasted server paths the user said "Not now" to
@@ -159,9 +161,12 @@ function saveComposer(c) {
   if (!c) return;
   const entry = {};
   if (c.draft) entry.draft = c.draft;
-  if (c.bound.length) entry.bound = [...c.bound];
-  const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
-  if (roles.length) entry.roles = Object.fromEntries(roles);
+  const serverBacked = state.sessions.some((s) => s.id === c.sid && s.cid);
+  if (!serverBacked) {
+    if (c.bound.length) entry.bound = [...c.bound];
+    const roles = Object.entries(c.roles).filter(([p]) => c.bound.includes(p));
+    if (roles.length) entry.roles = Object.fromEntries(roles);
+  }
   const all = readComposers();
   if (Object.keys(entry).length) all[c.sid] = entry; else delete all[c.sid];
   writeComposers(all);
@@ -170,6 +175,7 @@ function restoreComposer(c) {
   const e = readComposers()[c.sid];
   if (!e || typeof e !== "object") return;
   if (typeof e.draft === "string") c.draft = e.draft;
+  if (state.sessions.some((s) => s.id === c.sid && s.cid)) return;
   if (Array.isArray(e.bound)) c.bound = e.bound.filter((p) => typeof p === "string" && p);
   for (const [p, role] of Object.entries((e.roles && typeof e.roles === "object") ? e.roles : {})) {
     if (c.bound.includes(p) && typeof role === "string") c.roles[p] = role;
@@ -549,7 +555,12 @@ async function api(method, url, body) {
   const opt = { method, headers: {} };
   if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch(url, opt);
-  if (!r.ok) throw new Error(`${method} ${url} -> ${r.status}`);
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    // A validation error (422) carries a list in `detail`: only a string is a message.
+    const detail = typeof data.detail === "string" ? data.detail : "";
+    throw new Error(detail || data.error || `${method} ${url} -> ${r.status}`);
+  }
   return r.status === 204 ? null : r.json();
 }
 
@@ -602,6 +613,8 @@ async function ensureMessages(s) {
     const data = await api("GET", `/api/conversations/${s.cid}`);
     s.messages = (data.messages || []).map(msgFromServer);
     s.title = data.conversation.title;
+    hydrateChatDatasets(chatOf(s.id), data);
+    if (s.id === state.activeId) syncDatasetSelection();
   } catch { /* keep whatever we have */ }
   s.loaded = true;
 }
@@ -3629,13 +3642,14 @@ async function stopGpu() {
   await doStopGpu();
 }
 
-// Drop a stored connection the server refuses to serve to this user, without calling it.
-function forgetConnection() {
+// Drop a stored connection the server refuses to serve to this user, without calling it. With
+// `redraw` false the page is left as it is (it already shows the disconnected state).
+function forgetConnection(redraw = true) {
   if (state.ws) { try { state.ws.close(); } catch {} }
   try { localStorage.removeItem(CONN_KEY); localStorage.removeItem(RUNOWNER_KEY); localStorage.removeItem(PLANDRAFT_KEY); } catch {}
   state.connectionId = null;
   state.lastJobId = null;
-  applyStatus({ status: "disconnected", model: "" });
+  if (redraw) applyStatus({ status: "disconnected", model: "" });
 }
 
 async function disconnect() {
@@ -3742,6 +3756,9 @@ async function sendChat(e) {
   // a change request for the previous chat's plan.
   const c = activeChat();
   if (!c) return;
+  // A dataset change still being saved goes first. One that was refused left the chat's datasets
+  // as its chips show them, so the message is sent with those.
+  if (c.datasetSave) await c.datasetSave;
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
   if (c.planPending) {
@@ -3833,7 +3850,8 @@ async function sendChat(e) {
         return;
       }
       giveBack();
-      toast(d.error || "Run failed");
+      // A refusal raised as an HTTP error (more datasets than a run takes) says why in `detail`.
+      toast(d.error || (typeof d.detail === "string" && d.detail) || "Run failed");
     }
   } catch (err) {
     giveBack();
@@ -4320,6 +4338,19 @@ function planDocumentHtml(doc) {
     + `<div class="plan-yaml-code"><pre class="plan-yaml-hl">${planYamlHtml(doc.yaml)}</pre></div></details>`;
 }
 
+// The chat's datasets as the run will use them (main / sample / reference / extra input), and the
+// ones it cannot use with the reason.
+function planDatasetsHtml(doc) {
+  const rows = ((doc && doc.datasets) || []).map((d) => {
+    const use = d.use === "sample" ? "sample (QC'd together)" : (d.use || "extra input");
+    return `<li><strong>${escapeHtml(d.name)}</strong> — ${escapeHtml(use)}</li>`;
+  });
+  for (const d of ((doc && doc.unusable_inputs) || [])) {
+    rows.push(`<li><strong>${escapeHtml(d.name)}</strong> — cannot be used: ${escapeHtml(d.reason)}</li>`);
+  }
+  return rows.length ? `<section class="plan-datasets"><h4>Datasets for this run</h4><ul>${rows.join("")}</ul></section>` : "";
+}
+
 // The plan as the chat shows it: the step titles and the tool each one runs, with the decision
 // beside them. The prose, the settings and the document are one click away in the side panel's Plan
 // tab, so the chat stays a conversation and a long plan does not push it off the screen. `opts`:
@@ -4352,6 +4383,7 @@ function planEntryHtml(agenda, doc, opts) {
   return `<div class="plan-head"><span class="plan-head-icon">${planIcon("checklist")}</span>`
     + `<div><div class="plan-title">${o.pending ? "Proposed plan" : "Plan"}</div><div class="plan-sub">${sub}</div></div></div>`
     + (o.pending ? planRevisedNote(revised) + refused : "")
+    + planDatasetsHtml(doc)
     + `<ol class="plan-entry-steps">${rows}</ol>`
     + `<div class="plan-actions-row">${actions}</div>`;
 }
@@ -6218,6 +6250,142 @@ async function restoreServerCards(stored, request = fetch) {
   }
 }
 
+// Dataset mentions use the account's Files → Datasets list, and its Use attachment path.
+const datasetMention = { query: null, items: null, rows: [], index: 0, dismissed: null, request: 0, error: false };
+
+function datasetMentionQuery(input) {
+  if (input.selectionStart !== input.selectionEnd) return null;
+  const end = input.selectionStart, before = input.value.slice(0, end);
+  const start = before.lastIndexOf("@");
+  if (start < 0 || (start > 0 && !/\s/.test(before[start - 1]))) return null;
+  const text = before.slice(start + 1);
+  if (/[\n\r]/.test(text)) return null;
+  return { start, end, text };
+}
+
+function closeDatasetMentions(dismiss = true) {
+  if (dismiss && datasetMention.query) datasetMention.dismissed = datasetMention.query.start;
+  datasetMention.query = null;
+  datasetMention.request++;
+  $("datasetMentions").classList.add("hidden");
+  $("chatInput").setAttribute("aria-expanded", "false");
+  $("chatInput").removeAttribute("aria-activedescendant");
+}
+
+// Mirror the textarea's wrapping and scroll to anchor the list at the actual caret.
+function positionDatasetMentions() {
+  const input = $("chatInput"), list = $("datasetMentions"), rect = input.getBoundingClientRect();
+  // The glass chat panel is a containing block for fixed descendants. Portal out of it.
+  if (list.parentElement !== document.body) document.body.appendChild(list);
+  const mirror = document.createElement("div"), style = getComputedStyle(input);
+  for (const key of ["font", "letterSpacing", "lineHeight", "padding", "border", "boxSizing", "wordSpacing", "tabSize"]) mirror.style[key] = style[key];
+  Object.assign(mirror.style, { position: "fixed", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", width: `${rect.width}px`, left: `${rect.left}px`, top: `${rect.top}px` });
+  mirror.textContent = input.value.slice(0, input.selectionStart);
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b";
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+  const caret = marker.getBoundingClientRect();
+  const left = Math.max(12, Math.min(caret.left - input.scrollLeft, window.innerWidth - list.offsetWidth - 12));
+  // Under the caret line when the list fits there, else above it (the composer sits at the bottom of
+  // the window): never over the text being typed.
+  const below = caret.bottom - input.scrollTop, above = caret.top - input.scrollTop - list.offsetHeight;
+  const top = below + list.offsetHeight > window.innerHeight - 12 && above >= 12 ? above
+    : Math.max(12, Math.min(below, window.innerHeight - list.offsetHeight - 12));
+  list.style.left = `${left}px`;
+  list.style.top = `${top}px`;
+  mirror.remove();
+}
+
+function renderDatasetMentions() {
+  const m = datasetMention, list = $("datasetMentions"), input = $("chatInput");
+  if (!m.query) return;
+  m.rows = (m.items || []).filter((d) => d.name.toLowerCase().includes(m.query.text.toLowerCase()));
+  if (m.items && !m.rows.length && /\s$/.test(m.query.text)) { closeDatasetMentions(); return; }
+  m.index = Math.max(0, Math.min(m.index, m.rows.length - 1));
+  list.innerHTML = m.rows.map((d, i) => {
+    const from = chatLabel(d.conversation_id);
+    const detail = [isFolderKind(d.kind) ? "folder" : "file", fmtSize(d.size_bytes) || "Size unknown", fmtDate(d.uploaded_at), from ? from.text : "Source chat unknown"].join(" · ");
+    return `<div id="datasetMention-${i}" class="dataset-mention" role="option" aria-selected="${i === m.index}" data-mention-index="${i}"><strong>${escapeHtml(d.name)}</strong><small>${escapeHtml(detail)}</small></div>`;
+  }).join("") || `<div class="empty-hint" role="status">${!m.items && !m.error ? "Loading datasets…" : m.error ? "Could not load datasets. Use + Data to upload." : "No matching datasets. Use + Data to upload."}</div>`;
+  list.classList.remove("hidden");
+  input.setAttribute("aria-expanded", "true");
+  if (m.rows.length) input.setAttribute("aria-activedescendant", `datasetMention-${m.index}`);
+  else input.removeAttribute("aria-activedescendant");
+  positionDatasetMentions();
+  const selected = $("datasetMention-" + m.index);
+  if (m.rows.length && selected) selected.scrollIntoView({ block: "nearest" });
+}
+
+async function updateDatasetMentions() {
+  const m = datasetMention, query = datasetMentionQuery($("chatInput"));
+  if (!query) { m.dismissed = null; closeDatasetMentions(false); return; }
+  if (query.start === m.dismissed) return;
+  const opening = !m.query || m.query.start !== query.start;
+  // The list opens while an @ is being typed. Text already past a space (the box clicked again, a
+  // paste) is the message itself: an open list there would hold Enter back from sending it.
+  if (opening && /\s/.test(query.text)) { closeDatasetMentions(false); return; }
+  m.query = query;
+  m.index = 0;
+  if (opening) { m.items = null; m.error = false; }
+  renderDatasetMentions();
+  if (!opening) return;
+  const request = ++m.request;
+  try {
+    const res = await fetch("/api/datasets");
+    if (!res.ok) throw new Error("Datasets unavailable");
+    const items = (await res.json()).datasets || [];
+    if (request !== m.request) return;
+    m.items = items.sort((a, b) => String(b.uploaded_at || "").localeCompare(String(a.uploaded_at || "")));
+  } catch {
+    if (request !== m.request) return;
+    m.items = []; m.error = true;
+  }
+  renderDatasetMentions();
+}
+
+async function selectDatasetMention(index) {
+  const m = datasetMention, d = m.rows[index], input = $("chatInput"), q = m.query;
+  if (!d || !q) return;
+  const name = d.name, typed = input.value.slice(q.start, q.end);
+  closeDatasetMentions();
+  // The chat's datasets are saved on the server first: one it refuses (over the per-run limit, say)
+  // leaves the typed text as it is.
+  const attached = await addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes,
+                                      at: d.uploaded_at });
+  // Typing while the dataset was being saved moved the @word: the dataset is attached all the same.
+  if (attached && input.value.slice(q.start, q.end) === typed) {
+    // The caret may sit inside an @word typed earlier: the pick replaces the whole word.
+    const end = q.end + /^\S*/.exec(input.value.slice(q.end))[0].length;
+    input.value = input.value.slice(0, q.start) + "@" + name + input.value.slice(end);
+    const caret = q.start + name.length + 1;
+    input.setSelectionRange(caret, caret);
+    const c = activeChat();
+    if (c) { c.draft = input.value; saveComposer(c); }
+  }
+  updateComposerButton();
+  input.focus();
+}
+
+function datasetMentionKeydown(e) {
+  const m = datasetMention;
+  // Safari ends an IME composition with a keydown whose isComposing is false and keyCode is 229.
+  if (!m.query || e.isComposing || e.keyCode === 229) return false;
+  if (e.key === "Escape") { e.preventDefault(); closeDatasetMentions(); return true; }
+  if (e.key === " " && !m.rows.length) { closeDatasetMentions(); return false; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    if (m.rows.length) m.index = (m.index + (e.key === "ArrowDown" ? 1 : m.rows.length - 1)) % m.rows.length;
+    renderDatasetMentions();
+    return true;
+  }
+  if ((e.key === "Enter" || e.key === "Tab") && m.rows.length) {
+    e.preventDefault(); selectDatasetMention(m.index); return true;
+  }
+  // An unmatched Enter must not accidentally send the message while the list is open.
+  if (e.key === "Enter") { e.preventDefault(); return true; }
+  return false;
+}
 // ---- dataset selection: one active chip + a "Data" popover -------------------
 // The composer shows only the CURRENTLY SELECTED dataset as a removable chip; uploading a
 // file/folder or picking a past upload happens in the "＋ Data" popover, so the recent-
@@ -6236,6 +6404,8 @@ function _suffixRank(name) {
 // _bound_primary_key: a file marked "reference" is ranked after every other file.
 function primaryBoundPath() {
   if (!state.boundPaths.length) return null;
+  const chosen = state.boundPaths.find((p) => state.boundRoles[p] === "primary");
+  if (chosen) return chosen;
   const meta = state.boundPaths.map((p, i) => {
     const d = state.datasets.find((x) => x.path === p);
     return { p, i, ref: state.boundRoles[p] === "reference" ? 1 : 0, r: _suffixRank(d ? d.name : p) };
@@ -6350,23 +6520,114 @@ async function bindServerPath(path) {
   }
 }
 
-// Mark/unmark one bound file as REFERENCE data (e.g. a cell-type atlas to compare against).
-function toggleReference(path) {
-  if (!path) return;
-  if (state.boundRoles[path] === "reference") delete state.boundRoles[path];
-  else state.boundRoles[path] = "reference";
-  syncDatasetSelection();
+// Mark/unmark one bound file and save the chat attachment set.
+// Server-backed chats keep their attachment set on the account, not in browser storage.
+function hydrateChatDatasets(c, data) {
+  if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+  if (!Array.isArray(data.datasets)) return;
+  c.datasetsLoaded = true;
+  c.bound = data.datasets.map((d) => d.path);
+  c.roles = Object.fromEntries(data.datasets.filter((d) => d.role).map((d) => [d.path, d.role]));
+  for (const d of data.datasets) {
+    const known = state.datasets.find((x) => x.id === d.id || x.path === d.path);
+    if (known) Object.assign(known, d); else state.datasets.push(d);
+  }
+  saveComposer(c);
 }
 
-// ADD a data file to a chat's bind-set — the chat on screen, or `sid` (the chat an upload was
-// started from, which may have been left while the file was uploading).
+function datasetLimitAllows(paths) {
+  if (state.maxBoundDatasets && paths.length > state.maxBoundDatasets) {
+    toast(`Up to ${state.maxBoundDatasets} datasets per run. Remove one first.`);
+    return false;
+  }
+  return true;
+}
+
+function changeChatDatasets(c, change) {
+  if (!c) return Promise.resolve(false);
+  const apply = async () => {
+    const s = state.sessions.find((x) => String(x.id) === String(c.sid));
+    if (s && s.cid && !c.datasetsLoaded) {
+      // A chat this page has not loaded (an upload restored after a reload finishing in it): the
+      // change applies to its saved set, not to an empty one that would replace it.
+      try { hydrateChatDatasets(c, await api("GET", `/api/conversations/${s.cid}`)); }
+      catch (err) { toast(`Datasets not saved: ${err.message}`); return false; }
+    }
+    const next = { bound: [...c.bound], roles: { ...c.roles } };
+    change(next);
+    if (!datasetLimitAllows(next.bound)) return false;
+    try {
+      if (s && s.cid) {
+        if (next.bound.some((path) => !state.datasets.some((d) => d.path === path && d.id != null))) {
+          const listing = await api("GET", "/api/datasets");
+          if (Number.isInteger(listing.max_bound_datasets)) state.maxBoundDatasets = listing.max_bound_datasets;
+          for (const d of listing.datasets || []) {
+            const known = state.datasets.find((x) => x.path === d.path);
+            if (known) Object.assign(known, d); else state.datasets.push(d);
+          }
+          if (!datasetLimitAllows(next.bound)) return false;
+        }
+        const datasets = next.bound.map((path) => {
+          const d = state.datasets.find((x) => x.path === path);
+          if (!d || d.id == null) throw new Error("This dataset is not saved yet. Refresh Files and try again.");
+          return { id: d.id, role: next.roles[path] || null };
+        });
+        const data = await api("PUT", `/api/conversations/${s.cid}/datasets`, { datasets });
+        hydrateChatDatasets(c, data);
+      } else { c.bound = next.bound; c.roles = next.roles; saveComposer(c); }
+      if (chatVisible(c)) syncDatasetSelection();
+      return true;
+    } catch (err) { toast(`Datasets not saved: ${err.message}`); return false; }
+  };
+  c.datasetSave = (c.datasetSave || Promise.resolve()).then(apply);
+  return c.datasetSave;
+}
+
+function toggleReference(path) {
+  return changeChatDatasets(activeChat(), (c) => {
+    if (c.roles[path] === "reference") delete c.roles[path]; else c.roles[path] = "reference";
+  });
+}
+
+function makeMainDataset(path) {
+  return changeChatDatasets(activeChat(), (c) => {
+    if (!c.bound.includes(path)) return;
+    for (const p of Object.keys(c.roles)) if (c.roles[p] === "primary") delete c.roles[p];
+    c.roles[path] = "primary";
+  });
+}
+
+// Uploads attach to the chat they started in, even when it is no longer on screen.
 function addDataset(d, sid) {
-  if (!d || !d.path) return;
-  if (!state.datasets.some((x) => x.path === d.path)) state.datasets.unshift(d);
-  const c = chatOf(sid || state.activeId);
-  if (c && !c.bound.includes(d.path)) c.bound.push(d.path);
-  if (!c || chatVisible(c)) syncDatasetSelection();
-  else saveComposer(c);   // its chips appear when that chat is opened (showDialog)
+  if (!d || !d.path) return Promise.resolve(false);
+  const known = state.datasets.find((x) => x.path === d.path);
+  if (known) Object.assign(known, d); else state.datasets.unshift(d);
+  return changeChatDatasets(chatOf(sid || state.activeId), (c) => {
+    if (!c.bound.includes(d.path)) c.bound.push(d.path);
+  });
+}
+
+async function useSelectedDatasets() {
+  const c = activeChat();
+  const selected = state.datasets.filter((d) => state.selectedDatasetIds.has(String(d.id)));
+  if (!selected.length) return;
+  const saved = await changeChatDatasets(c, (next) => {
+    next.bound = [...new Set([...next.bound, ...selected.map((d) => d.path)])];
+  });
+  if (saved) {
+    state.selectedDatasetIds.clear();
+    openChat(c.sid);
+    renderDatasetSelectionCount();
+  }
+}
+
+function renderDatasetSelectionCount() {
+  const button = $("datasetsUseSelected"), limit = $("datasetsLimit");
+  if (button) {
+    button.disabled = !state.selectedDatasetIds.size;
+    button.textContent = `Use selected (${state.selectedDatasetIds.size})`;
+  }
+  if (limit) limit.textContent = state.maxBoundDatasets ? `Up to ${state.maxBoundDatasets} datasets per run` : "";
 }
 
 // A deleted dataset leaves every chat it was attached to, the ones not opened since the reload too.
@@ -6420,12 +6681,13 @@ function openChat(sid) {
 // Add/remove one path from the bind-set (a recent-list toggle or a chip ×).
 function toggleBound(path) {
   if (!path) return;
-  const i = state.boundPaths.indexOf(path);
-  if (i >= 0) { state.boundPaths.splice(i, 1); delete state.boundRoles[path]; } else state.boundPaths.push(path);
-  syncDatasetSelection();
+  return changeChatDatasets(activeChat(), (c) => {
+    if (c.bound.includes(path)) { c.bound = c.bound.filter((p) => p !== path); delete c.roles[path]; }
+    else c.bound.push(path);
+  });
 }
 
-function clearBound() { state.boundPaths = []; state.boundRoles = {}; syncDatasetSelection(); }
+function clearBound() { return changeChatDatasets(activeChat(), (c) => { c.bound = []; c.roles = {}; }); }
 
 function syncDatasetSelection() {
   state.datasetPath = primaryBoundPath();
@@ -6437,7 +6699,7 @@ function syncDatasetSelection() {
 }
 // Back-compat alias: some call sites still say selectDataset(path|null) — a single-file select is just
 // "replace the set with this one" (or clear it).
-function selectDataset(path) { state.boundPaths = path ? [path] : []; state.boundRoles = {}; syncDatasetSelection(); }
+function selectDataset(path) { return changeChatDatasets(activeChat(), (c) => { c.bound = path ? [path] : []; c.roles = {}; }); }
 
 function renderDatasetChips() {
   const host = $("datasetChips");
@@ -6447,17 +6709,18 @@ function renderDatasetChips() {
   host.innerHTML = state.boundPaths.map((path) => {
     const d = state.datasets.find((x) => x.path === path) || { name: path.split("/").pop(), path, kind: "file" };
     const ico = datasetIcon(d.kind);
-    const isPrimary = path === primary && state.boundPaths.length > 1;
+    const isPrimary = path === primary;
     const isRef = state.boundRoles[path] === "reference";
+    const mainBtn = !isPrimary ? `<button type="button" class="dataset-chip-ref" data-main-path="${escapeHtml(path)}" title="Use as the main dataset">Make main</button>` : '<span class="dataset-chip-role">main</span>';
     const gist = d.gist ? ` — ${d.gist}` : "";                 // the file's ① skim, when known
     // The reference toggle appears once a second file is attached: one file is always the study.
     const refBtn = state.boundPaths.length > 1
       ? `<button type="button" class="dataset-chip-ref${isRef ? " on" : ""}" data-ref-path="${escapeHtml(path)}" ` +
         `title="${isRef ? "Reference data — click to use it as an ordinary file" : "Mark as reference data (e.g. a cell-type atlas to compare against)"}">ref</button>`
       : "";
-    return `<span class="dataset-chip active${isRef ? " reference" : ""}" title="${escapeHtml(d.path + gist)}">` +
+    return `<span class="dataset-chip active${isRef ? " reference" : ""}" title="${escapeHtml(d.name + gist)}">` +
       `<span class="material-symbols-outlined msym">${ico}</span>` +
-      `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + refBtn +
+      `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + mainBtn + refBtn +
       `<button type="button" class="dataset-chip-x" data-clear-path="${escapeHtml(path)}" title="Remove this file">×</button></span>`;
   }).join("");
 }
@@ -6577,7 +6840,9 @@ function wireDataDrop() {
 // visit) are known to the page: their chips, and Datasets → Use, which attaches one to the open chat.
 async function loadDatasetChips() {
   try {
-    const items = (await (await fetch("/api/datasets")).json()).datasets || [];
+    const data = await (await fetch("/api/datasets")).json();
+    if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+    const items = data.datasets || [];
     for (const x of items) {
       const name = isFolderKind(x.kind) ? x.name + "/" : x.name;
       // A dataset moved from HPC3 to the server keeps its id and changes its path: the chip and every
@@ -6741,7 +7006,7 @@ async function doRegisterVerify(e) {
     const r = await fetch("/api/auth/register/verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) { err.textContent = d.detail || `Verification failed (server error ${r.status}). Please try again shortly.`; err.classList.remove("hidden"); return; }
-    showApp(d.user);   // verified → account created + signed in
+    showApp(d.user, true);   // verified → account created + signed in
   } catch { err.textContent = "Can't reach the server."; err.classList.remove("hidden"); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
@@ -6752,7 +7017,7 @@ function showLogin() {
   showAuthPane("login");
 }
 
-function showApp(user) {
+function showApp(user, freshLogin = false) {
   state.user = user;
   $("loginOverlay").classList.add("hidden");
   $("appShell").classList.remove("hidden");
@@ -6763,6 +7028,8 @@ function showApp(user) {
   const mock = $("mockCheck");
   if (mock && mock.closest("label")) mock.closest("label").classList.toggle("hidden", !!user && user.role !== "admin");
   if (!_appInited) { init(); initShell(); _appInited = true; }
+  // Fresh account sign-in overrides the panel preference only for this visit.
+  if (freshLogin) setPanel("left", false, false);
   renderAccount(user);
   switchView("research");
   checkBudgetNotices();
@@ -6775,7 +7042,7 @@ async function doLogin(e) {
   try {
     const r = await fetch("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
     if (!r.ok) { const d = await r.json().catch(() => ({})); err.textContent = d.detail || "Invalid username or password"; err.classList.remove("hidden"); return; }
-    showApp((await r.json()).user);
+    showApp((await r.json()).user, true);
   } catch { err.textContent = "Can't reach the server."; err.classList.remove("hidden"); }
 }
 
@@ -6788,6 +7055,7 @@ async function doLogout() {
 function initShell() {
   document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.view)));
   $("datasetsRefresh").addEventListener("click", loadFiles);
+  $("datasetsUseSelected").addEventListener("click", useSelectedDatasets);
   $("runsRefresh").addEventListener("click", loadRuns);
   $("runsList").addEventListener("click", onRunsClick);
   $("outputsList").addEventListener("click", onOutputsClick);
@@ -7450,7 +7718,16 @@ async function loadDatasets() {
   renderUploads();   // show any in-flight/failed uploads at the top of the tab
   const el = $("datasetsList"); el.innerHTML = '<div class="empty-hint">Loading…</div>';
   try {
-    const items = (await (await fetch("/api/datasets")).json()).datasets || [];
+    const data = await (await fetch("/api/datasets")).json();
+    if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+    const items = data.datasets || [];
+    for (const x of items) {
+      const known = state.datasets.find((d) => d.id === x.id || d.path === x.path);
+      if (known) Object.assign(known, x); else state.datasets.push(x);
+    }
+    const available = new Set(items.map((x) => String(x.id)));
+    for (const id of state.selectedDatasetIds) if (!available.has(id)) state.selectedDatasetIds.delete(id);
+    renderDatasetSelectionCount();
     el.innerHTML = items.length ? items.map((x) => {
       const from = chatLabel(x.conversation_id);
       const fromHtml = !from ? ""
@@ -7458,12 +7735,13 @@ async function loadDatasets() {
         : ` · ${escapeHtml(from.text)}`;
       const q = sysSearchText([x.name, x.kind, x.location === "hpc3" ? "on hpc3" : "on the server", from && from.text,
                                fmtDate(x.uploaded_at), (x.uploaded_at || "").slice(0, 10)]);
-      return `<div class="card" data-q="${escapeHtml(q)}"><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
+      return `<div class="card" data-q="${escapeHtml(q)}"><input type="checkbox" data-select-dataset="${x.id}" aria-label="Select ${escapeHtml(x.name)}"${state.selectedDatasetIds.has(String(x.id)) ? " checked" : ""} /><div class="card-main"><strong>${icon(datasetIcon(x.kind))} ${escapeHtml(x.name)}${isFolderKind(x.kind) ? "/" : ""}</strong>` +
       `<span class="muted">${escapeHtml(x.kind)} · ${fmtSize(x.size_bytes)} · ${fmtDate(x.uploaded_at)}${fromHtml}${x.location === "hpc3" ? ` · <span title="Kept only on HPC3 so far: it is moved to the server when you connect">on HPC3</span>` : ""}${metadataBadge(x.metadata)}</span></div>` +
       `<button class="ghost small" data-preview="${x.id}" data-name="${escapeHtml(x.name)}" title="See what this dataset holds">Preview</button>` +
       `<button class="ghost small" data-meta="${x.id}" title="Review how this dataset is described (Croissant metadata)">Metadata</button>` +
       `<a class="ghost small" href="/api/datasets/${x.id}/download" download data-dl-size="${Number(x.size_bytes) || 0}" data-name="${escapeHtml(x.name)}" title="${isFolderKind(x.kind) ? "Download the folder as one .zip" : "Download the file"}">Download</a>` +
-      `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>` +
+      (state.boundPaths.includes(x.path) ? `<span class="muted">Attached</span>`
+        : `<button class="ghost small" data-use="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}">Use</button>`) +
       `<button class="ghost small danger" data-del="${x.id}" data-path="${escapeHtml(x.path)}" data-name="${escapeHtml(x.name)}" data-kind="${escapeHtml(x.kind)}" data-location="${escapeHtml(x.location || "server")}">${x.kind.startsWith("server-") ? "Remove" : "Delete"}</button></div>`;
     }).join("")
       : '<div class="empty-hint">No datasets yet — upload one in Research.</div>';
@@ -7520,6 +7798,13 @@ function wireListSearch(boxId, listId, countId) {
   });
 }
 async function onDatasetsClick(e) {
+  const selected = e.target.closest("[data-select-dataset]");
+  if (selected) {
+    if (selected.checked) state.selectedDatasetIds.add(selected.dataset.selectDataset);
+    else state.selectedDatasetIds.delete(selected.dataset.selectDataset);
+    renderDatasetSelectionCount();
+    return;
+  }
   const open = e.target.closest("[data-open-chat]");
   if (open) { openChat(open.dataset.openChat); return; }
   const pv = e.target.closest("[data-preview]");
@@ -9254,6 +9539,8 @@ function init() {
   $("datasetFile").addEventListener("change", (e) => { for (const f of e.target.files || []) uploadDataset(f); e.target.value = ""; });   // multi-attach: each file joins the bind-set
   $("datasetDir").addEventListener("change", (e) => { if (e.target.files && e.target.files.length) uploadFolder(e.target.files); e.target.value = ""; });
   $("datasetChips").addEventListener("click", (e) => {
+    const main = e.target.closest("[data-main-path]");
+    if (main) { makeMainDataset(main.dataset.mainPath); return; }
     const r = e.target.closest("[data-ref-path]");
     if (r) { toggleReference(r.dataset.refPath); return; }
     const x = e.target.closest("[data-clear-path]");
@@ -9286,9 +9573,20 @@ function init() {
     if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
   });
   $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") $("filePreviewModal").classList.add("hidden"); });
-  $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chatForm").requestSubmit(); } });
+  $("chatInput").addEventListener("keydown", (e) => { if (datasetMentionKeydown(e)) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); $("chatForm").requestSubmit(); } });
+  $("chatInput").addEventListener("click", updateDatasetMentions);
+  $("chatInput").addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateDatasetMentions(); });
+  $("chatInput").addEventListener("blur", () => { closeDatasetMentions(false); datasetMention.dismissed = null; });
+  $("chatInput").addEventListener("scroll", () => { if (datasetMention.query) positionDatasetMentions(); });
+  window.addEventListener("resize", () => { if (datasetMention.query) positionDatasetMentions(); });
+  $("datasetMentions").addEventListener("pointerdown", (e) => e.preventDefault());
+  $("datasetMentions").addEventListener("click", (e) => {
+    const row = e.target.closest("[data-mention-index]");
+    if (row) selectDatasetMention(Number(row.dataset.mentionIndex));
+  });
   // Live-swap Send⇄Stop as the user types during a run / plan review; the text is this chat's draft.
   $("chatInput").addEventListener("input", () => {
+    updateDatasetMentions();
     const c = activeChat();
     if (c) { c.draft = $("chatInput").value; saveComposer(c); }
     updateComposerButton();
@@ -9344,8 +9642,9 @@ async function restoreConnection() {
     const res = await fetch(`/api/connections/${id}`);
     if (res.status === 401 || res.status === 403) {
       // Stored by another account on this browser (or before a logout): not ours to reattach to
-      // or to advertise — drop it, run owner included.
-      forgetConnection();
+      // or to advertise — drop it, run owner included. init() has just shown the disconnected
+      // state; showing it again would reopen the left panel a sign-in has just collapsed (issue 65).
+      forgetConnection(false);
       return;
     }
     if (!res.ok) {
