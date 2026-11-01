@@ -8780,7 +8780,8 @@ def _timing_path(workspace: Path, run_id: str) -> Path:
 def _watch_run(conn: Connection, run: RunState, req: LabRequest) -> None:
     """Start the System page's picture of this run (gateway/run_monitor.py). Never raises."""
     try:
-        run_monitor.enable_journal_logging()
+        if os.environ.get("AISCIENTIST_RUN_TIMING_LOG", "").strip().lower() in ("1", "true", "yes", "on"):
+            run_monitor.enable_journal_logging()
         if run.monitor is None or run.monitor.ended is not None:
             run.monitor = run_monitor.start(
                 kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,

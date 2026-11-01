@@ -60,7 +60,8 @@ and unknown outcome, until an actual completion is observed. Reading does not in
 timestamp or call a WebSocket disconnect a run failure. A run's terminal event and a background
 operation's terminal event can legitimately differ.
 
-The service journal emits `run_timing run_id=… stage=… event=… action=… outcome=…` on transitions.
+With `AISCIENTIST_RUN_TIMING_LOG=1`, the service journal also gets one
+`run_timing run_id=… stage=… event=… action=… outcome=…` line per transition; it is off by default.
 Timing records contain no prompts, raw commands, file paths, credentials or private payloads.
 For investigation, retain the run id, conversation id, timing JSON, deployment revision/configuration,
 and any available Slurm job accounting. Check the explicit action and stage before attributing a gap.

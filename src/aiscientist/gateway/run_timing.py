@@ -21,6 +21,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 _LOG = logging.getLogger(__name__)
+_LOG.setLevel(logging.WARNING)      # transition lines reach the service journal only on opt-in
 _CURRENT: contextvars.ContextVar[Any] = contextvars.ContextVar("run_timing_monitor", default=None)
 _LOCKS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
 _LOCKS_GUARD = threading.Lock()
@@ -60,7 +61,8 @@ def _path_lock(path: Path) -> Any:
 
 
 def enable_journal_logging() -> None:
-    """Install one INFO stderr handler when the gateway opts in (journald captures stderr)."""
+    """Install one INFO stderr handler when the gateway opts in with ``AISCIENTIST_RUN_TIMING_LOG``
+    (journald captures stderr)."""
     with _LOCKS_GUARD:
         if not any(getattr(h, "_run_timing", False) for h in _LOG.handlers):
             handler = logging.StreamHandler()

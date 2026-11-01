@@ -449,3 +449,26 @@ def test_turns_that_start_no_run_leave_no_folder_and_a_run_keeps_its_routing(con
     routing = [e for e in _timeline(conn, "priorrun")["events"] if e["event"] == "request_routed"]
     assert [(e["run_id"], e["request_id"]) for e in routing] == [("priorrun", minted[-1])]
     assert sorted(p.name for p in conn.workspace.iterdir()) == sorted([minted[-2], "priorrun"])
+
+
+@pytest.mark.parametrize("setting,mirrored", [(None, False), ("0", False), ("1", True)])
+def test_service_journal_mirror_is_opt_in(connection, monkeypatch, setting, mirrored):
+    import logging
+
+    logger = logging.getLogger("test.run_timing.mirror")
+    logger.handlers.clear()
+    logger.setLevel(logging.WARNING)
+    logger.propagate = True
+    monkeypatch.setattr(run_timing, "_LOG", logger)
+    if setting is None:
+        monkeypatch.delenv("AISCIENTIST_RUN_TIMING_LOG", raising=False)
+    else:
+        monkeypatch.setenv("AISCIENTIST_RUN_TIMING_LOG", setting)
+    run, _ = _watch(connection, "mirrorrun")
+    try:
+        assert any(getattr(h, "_run_timing", False) for h in logger.handlers) is mirrored
+        assert logger.isEnabledFor(logging.INFO) is mirrored
+        assert gw._timing_path(connection.workspace, "mirrorrun").is_file()   # kept either way
+    finally:
+        logger.handlers.clear()
+        connection.end_run(run)
