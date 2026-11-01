@@ -169,3 +169,26 @@ def test_only_a_request_about_the_doublet_calls_asks_for_their_details(question,
     from aiscientist.reporting.qc_display import asks_for_doublet_details
 
     assert asks_for_doublet_details(question) is asks
+
+
+def test_a_doublet_clause_with_a_generic_word_keeps_its_result():
+    # "compared" here is the next analysis, not a comparison of the callers.
+    kept = "After doublet removal, we compared knockout with wild type and found 412 DE genes."
+    display = default_qc_text(kept + " Doublet scores were higher in S2.")
+    assert kept in display.text
+    assert "Doublet scores" not in display.text
+
+
+def test_another_qc_problem_under_a_doublet_heading_stays_visible():
+    draft = ("## Quality control and doublet removal\n\n929 doublets were removed. CellQC flagged "
+             "S2 for low retention (40% kept); compare its min_counts threshold with S1's.\n")
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+    assert "Doublet filtering needs review" not in display.text
+
+
+def test_an_agreement_of_another_analysis_after_a_doublet_sentence_stays():
+    draft = ("After doublet removal, 14,553 cells remained. "
+             "scGPT and the marker labels agreed on 87% of cells.")
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed

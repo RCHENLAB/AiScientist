@@ -26,11 +26,16 @@ _DIAGNOSTIC = re.compile(
     r"scores?|\bpann\b|agree(?:ment)?|disagree|concordance|compar|\bkappa\b|κ|cohen|"
     r"second opinion|classifications?|\bcallers?\b|\bflags?\b|\bflagged\b|\boverlap\b|"
     r"比较|评分|一致性|分歧", re.I)
-# What still refers to the doublet finding in a later sentence: its comparison, not the generic
-# "compared", "score" or "flagged" that the next result in the paragraph is likely to use.
-_COMPARISON = re.compile(
+# A clause that names no caller is a doublet diagnostic only through these words, even under a
+# doublet heading: never the generic "compared", "score", "flagged" or "overlap" that the next
+# analysis, or another QC problem ("CellQC flagged S2 for low retention"), uses.
+_DOUBLET_TERMS = re.compile(
     r"\bpann\b|agree(?:ment)?|disagree|concordance|\bkappa\b|κ|cohen|second opinion|\bcallers?\b|"
-    r"一致性|分歧", re.I)
+    r"doublet[ _-]?scores?|双细胞评分|一致性|分歧", re.I)
+# What still refers to the doublet finding in a later sentence that does not mention doublets: the
+# comparison's statistics and the callers. A bare "agreed" there usually starts another result.
+_COMPARISON = re.compile(
+    r"\bpann\b|concordance|\bkappa\b|κ|cohen|second opinion|\bcallers?\b|doublet[ _-]?scores?", re.I)
 _UNRELATED = re.compile(
     r"(?<![A-Za-z])ISG(?![A-Za-z])|"
     r"\b(?:signature|annotation|annotator|inter.?rater|cell.?type|cluster|clustering)\b", re.I)
@@ -59,7 +64,7 @@ def _diagnostic(text: str, doublet_context: bool = False, nearby: bool = False) 
         return False  # A download link offers opt-in access; it does not show the values.
     for image in re.findall(r"!\[[^\]]*\]\([^)]*\)", text):
         # Unlike a download link, an image puts the data directly in the default result.
-        if _CALLER.search(image) or (_DOUBLET.search(image) and _DIAGNOSTIC.search(image)):
+        if _CALLER.search(image) or (_DOUBLET.search(image) and _DOUBLET_TERMS.search(image)):
             return True
     text = _without_links(text)
     if _CALLER.search(text):
@@ -68,11 +73,11 @@ def _diagnostic(text: str, doublet_context: bool = False, nearby: bool = False) 
         if _FAILURE.search(text) and not _DIAGNOSTIC.search(text):
             return False
         return True
-    if _DOUBLET.search(text) and _DIAGNOSTIC.search(text):
+    if _DOUBLET.search(text) and _DOUBLET_TERMS.search(text):
         return True
-    # A bare agreement/score belongs to doublets only under an explicit doublet heading or
+    # A bare agreement/kappa belongs to doublets only under an explicit doublet heading or
     # within that sentence. Named unrelated results stay visible even in that section.
-    if doublet_context and _DIAGNOSTIC.search(text) and not _UNRELATED.search(text):
+    if doublet_context and _DOUBLET_TERMS.search(text) and not _UNRELATED.search(text):
         return True
     return bool(nearby and _COMPARISON.search(text) and not _UNRELATED.search(text))
 
