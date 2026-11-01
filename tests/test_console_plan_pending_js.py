@@ -653,6 +653,25 @@ def test_words_wait_for_the_active_field_without_being_lost_or_shown_as_sent(typ
     assert out["sent"]["messages"] == [words] and out["sent"]["words"] == ""
 
 
+def test_words_held_back_by_an_invalid_field_are_shown_in_the_panel_box():
+    """The box (or the composer) is emptied to send the words; held back, they must be on screen
+    where the toast says they are, not only in memory until the next redraw."""
+    out = _run("""
+  api.handleWsMessage(plan());
+  const editor = editResolution("lots");
+  const box = { value: "", isConnected: true };
+  els.planPanel = { querySelector: (sel) => (sel === ".plan-revise-text" ? box : null) };
+  sandbox.refreshPlanRevise = () => log.push("revise:refresh");
+  sandbox.appendUserMessage = () => {};
+  api.revisePlanInWords(A(), "Use a stricter cutoff in the next step");
+  out.held = { box: box.value, words: A().planWords, requests: requests.length,
+    refreshed: log.includes("revise:refresh"), editing: !!A().planInlineFinish };
+""")
+    words = "Use a stricter cutoff in the next step"
+    assert out["held"] == {"box": words, "words": words, "requests": 0, "refreshed": True, "editing": True}
+
+
+
 @pytest.mark.parametrize("action", ["approve", "revise"])
 def test_a_field_removed_by_redrawing_never_submits_a_hidden_change(action):
     out = _run("""

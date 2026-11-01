@@ -5076,6 +5076,10 @@ function revisePlanInWords(c, text) {
     const before = c.plan;
     c.planInlineFinish(true, false);
     if (c.plan !== before || c.planInlineFinish) {
+      // The box or the composer was emptied to send the words: put them back in the box on screen.
+      const host = chatVisible(c) ? $("planPanel") : null;
+      const box = host && host.querySelector(".plan-revise-text");
+      if (box) { box.value = c.planWords; refreshPlanRevise(host, c); }
       toast("Your message is kept in the plan panel. Review the setting change, then send it.");
       return;
     }
