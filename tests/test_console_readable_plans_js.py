@@ -122,10 +122,10 @@ def test_plans_without_documents_keep_word_revision_and_readable_history(title):
 
 
 # Reuse the real gateway worker fixture, with only model/tool execution replaced by local doubles.
-from test_saved_plan_gateway import _reply, _show, lab_gateway  # noqa: E402, F401
+from test_saved_plan_gateway import _reply, _show  # noqa: E402
 
 
-def test_structured_edit_validation_correction_approval_execution_and_reload(lab_gateway):  # noqa: F811
+def test_structured_edit_validation_correction_approval_execution_and_reload(lab_gateway):
     from aiscientist.gateway import app as gw, saved_plans
 
     env = lab_gateway
