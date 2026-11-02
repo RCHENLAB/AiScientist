@@ -47,6 +47,7 @@ from typing import Any, Callable, Iterable
 from ..reporting.qc_summary import QC_SUMMARY_POLICY, qc_result_summary
 from . import claim_audit
 from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
+from .cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoff_request
 from .hypotheses import DesignFacts, HypothesisLedger
 from .loop_utils import safe_json_loads
 from .plan_doc import (
@@ -4567,12 +4568,25 @@ class ResearchLab:
                     emit({"type": "plan_answer", "question": fb, "answer": answer})
                     emit({"type": "pi_agenda", "agenda": payload})   # re-present it untouched
                     continue
+                # A cutoff named with a number ("raise the mitochondrial limit to 20") is read by code
+                # and set on the step; one that cannot be used is explained back, and the plan is
+                # re-presented as it was (issue 61).
+                cutoff_ops: "list[dict[str, Any]]" = []
+                if kind == "agenda" and fb:
+                    cutoff_ops, cutoff_problems = self._cutoff_request(fb)
+                    if cutoff_problems:
+                        emit({"type": "plan_answer", "question": fb,
+                              "answer": "Nothing was changed. " + " ".join(cutoff_problems)})
+                        emit({"type": "pi_agenda", "agenda": payload})
+                        continue
+                # (Before the reference check below: a step whose tool takes the cutoff is the step
+                # the message points at, whatever words that step uses.)
                 # A change request that points at a step the plan does NOT have, or names one of
                 # several equally good candidates, is a question in disguise — the reviewer and the
                 # plan disagree about what is in it. Say so and re-present the plan untouched,
                 # rather than silently constructing the missing step or picking a candidate. See
                 # ``resolve_plan_reference`` for the two production cases this replaces.
-                if kind == "agenda" and fb:
+                if kind == "agenda" and fb and not cutoff_ops:
                     verdict, topic, hits = resolve_plan_reference(fb, list(payload))
                     if verdict != "ok":
                         emit({"type": "plan_reference", "verdict": verdict, "topic": topic,
@@ -4583,10 +4597,19 @@ class ResearchLab:
                 # document: the model names what to change and code applies it, like a hand edit.
                 # Only when that cannot be done does the revision fall back to patch-or-redraft.
                 if kind == "agenda" and fb:
-                    revised = self._revise_plan_document(question, fb, emit)
+                    revised = self._revise_plan_document(
+                        question, fb, emit, **({"ops": cutoff_ops} if cutoff_ops else {}))
                     if revised is not None:
                         feedback_log.append(fb)
                         payload = revised
+                        emit({"type": "pi_agenda", "agenda": payload})
+                        continue
+                    if cutoff_ops:
+                        # Read and valid, but not applied (the value is already the plan's): say so
+                        # rather than redrafting the plan around a request that needs no change.
+                        emit({"type": "plan_answer", "question": fb,
+                              "answer": "Nothing was changed: the plan already uses " + ", ".join(
+                                  f"{k} = {v}" for o in cutoff_ops for k, v in o["settings"].items()) + "."})
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
                 if fb:
@@ -6779,6 +6802,12 @@ class ResearchLab:
             expected, _ = self._expected_outputs(step.text)
             if expected:
                 public["outputs"] = [o.to_public() for o in expected]
+            # The QC cutoffs the step's tool takes, with their value, unit and whether the researcher
+            # changed them from the default — shown on the card, set by a message (issue 61).
+            schema = _tool_schemas(list(getattr(self.scientist, "catalog", []))).get(str(step.tool or ""))
+            rows = cutoff_rows(step.settings, schema or {}) if schema else []
+            if rows:
+                public["cutoffs"] = rows
         return steps
 
     def _assign_plan_skills(self, doc: PlanDoc, fresh: "list[int]", emit: EventFn) -> PlanDoc:
@@ -6971,7 +7000,31 @@ class ResearchLab:
               "steps": sorted({c["step"] for c in changes if c["kind"] != "removed"})})
         return doc.agenda(), changes
 
-    def _revise_plan_document(self, question: str, request: str, emit: EventFn) -> "list[str] | None":
+    def _cutoff_request(self, request: str) -> "tuple[list[dict[str, Any]], list[str]]":
+        """``(operations, problems)`` for a reply that sets CellQC cutoffs ("raise the mitochondrial
+        limit to 20"): read by code, so the number typed is the number set, and checked before
+        anything runs. Operations go to every step whose tool takes that setting. A reply with any
+        problem gives no operations; one that is not about a cutoff gives neither."""
+        changes, problems = read_cutoff_request(request)
+        if not changes and not problems:
+            return [], []
+        doc = self._plan_doc
+        if doc is None or not self.config.plan_yaml:
+            return [], []
+        schemas = _tool_schemas(list(getattr(self.scientist, "catalog", [])))
+        if not any(s.tool and set(CUTOFF_SETTINGS) & set(schemas.get(s.tool) or {}) for s in doc.steps):
+            return [], []    # no step takes a CellQC cutoff: the words are for the other ways to revise
+        ops: list[dict[str, Any]] = []
+        for name, value in changes.items():
+            steps = [s for s in doc.steps if s.tool and name in (schemas.get(s.tool) or {})]
+            if not steps:
+                problems.append(f"No step of this plan takes {name}, so there is nothing to set it on.")
+                continue
+            ops.extend({"op": "change", "step": s.id, "settings": {name: value}} for s in steps)
+        return ([] if problems else ops), problems
+
+    def _revise_plan_document(self, question: str, request: str, emit: EventFn,
+                              ops: "list[dict[str, Any]] | None" = None) -> "list[str] | None":
         """Make the change the researcher asked for in words ON the plan document; the new agenda,
         or ``None`` to let the caller revise the old way (single-step patch, then redraft).
 
@@ -6982,25 +7035,26 @@ class ResearchLab:
         cannot be done cleanly (no document, no model, a reply that is not operations, operations
         that do not apply or name a tool or setting that does not exist, or no change at all): the
         plan is then never worse off than it was before this path existed."""
-        if not self.config.plan_yaml or self._plan_doc is None or self._complete_fn is None \
-                or not request.strip():
+        if not self.config.plan_yaml or self._plan_doc is None or not request.strip() \
+                or (self._complete_fn is None and not ops):
             return None
         before = self._plan_doc
         schemas = _tool_schemas(list(getattr(self.scientist, "catalog", [])))
         tools = "\n".join(
             f"- {name}: " + (", ".join(k for k, v in props.items() if isinstance(v, dict)) or "(no settings)")
             for name, props in schemas.items() if name != "finish")
-        try:
-            raw = self._complete([
-                {"role": "system", "content": _PLAN_REVISE_SYSTEM},
-                {"role": "user", "content": f"Plan:\n```yaml\n{before.to_yaml().strip()}\n```\n\n"
-                                            f"Tools (name: the settings it takes):\n{tools}\n\n"
-                                            f"Requested change:\n{request}"},
-            ], role="plan")
-        except Exception as exc:  # noqa: BLE001 - a failed revision call is not a failed revision
-            emit({"type": "plan_revise_skipped", "why": f"{type(exc).__name__}: {exc}"[:200]})
-            return None
-        ops = parse_plan_ops(raw)
+        if not ops:
+            try:
+                raw = self._complete([
+                    {"role": "system", "content": _PLAN_REVISE_SYSTEM},
+                    {"role": "user", "content": f"Plan:\n```yaml\n{before.to_yaml().strip()}\n```\n\n"
+                                                f"Tools (name: the settings it takes):\n{tools}\n\n"
+                                                f"Requested change:\n{request}"},
+                ], role="plan")
+            except Exception as exc:  # noqa: BLE001 - a failed revision call is not a failed revision
+                emit({"type": "plan_revise_skipped", "why": f"{type(exc).__name__}: {exc}"[:200]})
+                return None
+            ops = parse_plan_ops(raw)
         if ops is None:
             emit({"type": "plan_revise_skipped", "why": "the reply held no operations"})
             return None

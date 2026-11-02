@@ -539,6 +539,9 @@ button.small { padding: 6px 12px; font-size: 12px; }
 .plan-edit-tip { display: flex; align-items: center; gap: 6px; margin: 10px 20px 0; font-size: 12px; line-height: 1.4; color: var(--text-tertiary); }
 .plan-panel .plan-edit-tip { margin: 10px 16px 0; }
 .plan-edit-tip .msym { flex: none; font-size: 15px; }
+.plan-cutoff-unit { padding: 4px 6px 4px 0; color: var(--text-secondary); }
+.plan-cutoff-tag { padding: 4px 7px; font-size: 11px; color: var(--text-tertiary); border-left: 1px solid var(--border-strong); }
+.plan-cutoff.changed .plan-cutoff-tag { color: var(--amber-text); }
 .plan-step-title.editable, .plan-setting-v.editable { cursor: text; }
 .plan-step-title.editable { border-radius: 5px; }
 .plan-step-title.editable:not(.editing):hover { background: rgba(var(--accent-rgb), 0.08); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.08); }

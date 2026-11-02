@@ -48,6 +48,12 @@ const out = {};
 out.parts = agenda.map(api.planStepParts);
 out.where = ["hpc:analysis", "gpu:scgpt", "inprocess", ""].map(api.planRunsOnText);
 out.plain = api.planCardHtml(agenda, null, []);
+const cutoffStep = { id: "s1", tool: "run_cellqc", settings: { max_pct_mt: 20 }, cutoffs: [
+  { param: "max_pct_mt", label: "mitochondrial limit", value: 20, unit: "%", default: 10, changed: true },
+  { param: "min_counts", label: "minimum counts per barcode", value: 500, unit: "counts", default: 500, changed: false },
+] };
+out.cutoffs = api.planStepHtml(agenda[0], 1, cutoffStep, false, true, { remove: true });
+out.cutoffsReadOnly = api.planStepHtml(agenda[0], 1, cutoffStep, false, true, null);
 out.card = api.planCardHtml(agenda, doc, [2]);
 const mixed = { yaml: doc.yaml, steps: [steps[0], { ...steps[1], runs_on: "gpu:scgpt" }, steps[2]] };
 out.mixed = api.planCardHtml(agenda, mixed, []);
@@ -491,3 +497,18 @@ def test_a_step_that_runs_code_the_ai_writes_is_marked_untested_before_it_is_app
         assert "adapts the code of the skill score_signature" in html
         assert "plan-step-skill" in html, "the skill chip stays beside the label"
     assert flag not in out["card"] and flag not in out["entry"]
+
+
+def test_a_step_shows_each_qc_cutoff_with_its_unit_and_whether_it_was_changed():
+    """Issue 61: the value, unit and default/changed mark of every cutoff the step's tool takes."""
+    out = _card()
+    shown = out["cutoffs"]
+    assert shown.count('class="plan-setting-k">max_pct_mt<') == 1, "a cutoff is shown once, not also as a plain setting"
+    assert '<span class="plan-setting-v editable" data-edit="setting" data-key="max_pct_mt"' in shown, \
+        "a cutoff the plan fixes can be edited in place"
+    assert '<span class="plan-cutoff-unit">%</span><span class="plan-cutoff-tag">changed from 10%</span>' in shown
+    assert 'plan-cutoff changed' in shown and 'title="mitochondrial limit: changed from 10%"' in shown
+    default = shown.split('class="plan-setting-k">min_counts<')[1]
+    assert '<span class="plan-cutoff-unit">counts</span><span class="plan-cutoff-tag">default</span>' in default
+    assert 'data-edit' not in default.split("plan-cutoff-tag")[0], "a default cutoff is changed in the chat, not in place"
+    assert "data-edit" not in out["cutoffsReadOnly"].split("plan-step-meta")[1], "a plan no longer waiting is read-only"

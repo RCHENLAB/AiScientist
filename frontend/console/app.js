@@ -4201,7 +4201,24 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     ? ` data-edit="${what}"${key ? ` data-key="${escapeHtml(key)}"` : ""} tabindex="0" role="button" `
       + `title="${what === "title" ? "Change the title" : `Change ${escapeHtml(key)}`}"`
     : "";
-  const chips = Object.keys(settings).map((k) =>
+  // The QC cutoffs the step's tool takes (run_cellqc: min_counts, min_features, max_pct_mt): each one's
+  // value and unit, marked as the default or as changed from it. A cutoff the plan fixes can be edited
+  // in place like any setting; one still at its default is changed by writing it in the chat.
+  const cutoffs = step && Array.isArray(step.cutoffs) ? step.cutoffs : [];
+  const cutoffKeys = new Set(cutoffs.map((c) => c.param));
+  const cutoffChips = cutoffs.map((c) => {
+    const fixed = Object.prototype.hasOwnProperty.call(settings, c.param);
+    const unit = c.unit === "%" ? "%" : ` ${c.unit}`;
+    const tag = c.changed ? `changed from ${planSettingText(c.default)}${unit}` : "default";
+    return `<span class="plan-setting plan-cutoff${c.changed ? " changed" : ""}" `
+      + `title="${escapeHtml(c.label)}: ${escapeHtml(tag)}">`
+      + `<span class="plan-setting-k">${escapeHtml(c.param)}</span>`
+      + `<span class="plan-setting-v${editable && fixed && canEdit(c.param) ? " editable" : ""}"${fixed ? editAttrs("setting", c.param) : ""}>`
+      + `${escapeHtml(planSettingText(c.value))}</span>`
+      + `<span class="plan-cutoff-unit">${escapeHtml(unit.trim())}</span>`
+      + `<span class="plan-cutoff-tag">${escapeHtml(tag)}</span></span>`;
+  }).join("");
+  const chips = cutoffChips + Object.keys(settings).filter((k) => !cutoffKeys.has(k)).map((k) =>
     `<span class="plan-setting" title="Passed to the tool exactly as written">`
     + `<span class="plan-setting-k">${escapeHtml(k)}</span>`
     + `<span class="plan-setting-v${editable && canEdit(k) ? " editable" : ""}"${editAttrs("setting", k)}>`

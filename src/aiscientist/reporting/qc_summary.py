@@ -12,7 +12,9 @@ QC_SUMMARY_POLICY = (
     "the final result only when the user explicitly asks for those details. A request for a QC "
     "report alone does not ask for caller comparisons. Preserve material QC warnings in concise "
     "plain language: if doublet removal needs review, say so and point to available technical "
-    "details without naming or quantifying the caller comparison. Do not hide failed QC steps, "
+    "details without naming or quantifying the caller comparison. State the filter cutoffs the QC "
+    "actually used (the result's `thresholds`: min_counts, min_features, max_pct_mt) with their "
+    "units, and say which of them differ from `threshold_defaults`. Do not hide failed QC steps, "
     "excluded libraries or other QC problems. Name only detail files actually available in the "
     "run (for example tables/cellqc_metrics.csv or CellQC's result/ files); never invent a file. "
 )
@@ -58,6 +60,34 @@ def qc_warnings(result: dict) -> list[str]:
     return warnings
 
 
+_CUTOFF_UNITS = {"min_counts": "counts", "min_features": "genes", "max_pct_mt": "%"}
+
+
+def cutoff_lines(result: dict) -> list[str]:
+    """The filter cutoffs a QC run actually used, each with its unit and whether it is the default
+    or was changed from it: ``["Cutoffs used: max_pct_mt 20% (default 10%), ..."]``."""
+    used = result.get("thresholds")
+    if not isinstance(used, dict) or not used:
+        return []
+    defaults = result.get("threshold_defaults") if isinstance(result.get("threshold_defaults"), dict) else {}
+
+    def show(name: str, value: object) -> str:
+        unit = _CUTOFF_UNITS.get(name, "")
+        text = f"{value:g}" if isinstance(value, float) else str(value)
+        return f"{text}{unit}" if unit == "%" else f"{text} {unit}".strip()
+
+    items = []
+    for name in ("min_counts", "min_features", "max_pct_mt"):
+        if name not in used:
+            continue
+        mark = ""
+        if name in defaults:
+            mark = (" (default)" if used[name] == defaults[name]
+                    else f" (changed from the default {show(name, defaults[name])})")
+        items.append(f"{name} {show(name, used[name])}{mark}")
+    return ["Cutoffs used: " + "; ".join(items) + "."] if items else []
+
+
 def qc_result_summary(result: dict) -> str:
     """A concise result from QC records when a stopped run must not call a writer model."""
     parts = []
@@ -78,6 +108,7 @@ def qc_result_summary(result: dict) -> str:
         if result.get("step") == "doublets" and result.get("filtered") is not None \
                 and isinstance(before, (int, float)) and isinstance(after, (int, float)):
             parts.append(f"Doublets removed: {int(before - after):,}.")
+    parts.extend(cutoff_lines(result))
     excluded = result.get("excluded_libraries") or []
     if excluded:
         parts.append("Excluded libraries: " + ", ".join(str(sample) for sample in excluded) + ".")

@@ -704,6 +704,8 @@ def run_cellqc(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         "thresholds": {"min_counts": config["filterbycount"]["mincount"],
                        "min_features": config["filterbycount"]["minfeature"],
                        "max_pct_mt": config["filterbycount"]["mito"]},
+        # The CellQC skill's own values, so the reply can say which cutoffs were changed from them.
+        "threshold_defaults": dict(settings["thresholds"]),
         "assumptions": {"species": [head["species"] if not several else
                                     "+".join(d["species"] for d in runs), species_note],
                         "chemistry": [head["chemistry"] if not several else
