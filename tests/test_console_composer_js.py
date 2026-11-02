@@ -122,7 +122,8 @@ def composer():
     start = source.index("const FIXED_RUN_OPTIONS")
     code = source[start:source.index(");\n", start) + 3]
     code += source[source.index("const chats = new Map();"):source.index("function toast(")]
-    code += "".join(_function(source, name) for name in ("leaveDialog", "showDialog"))
+    code += "const DEFAULT_PLACEHOLDER = 'd';\n" + source[source.index("const PLAN_PLACEHOLDER"):source.index("\n", source.index("const PLAN_PLACEHOLDER"))] + "\n"
+    code += "".join(_function(source, name) for name in ("syncPlanCue", "leaveDialog", "showDialog"))
     return _run(COMPOSER, code)
 
 

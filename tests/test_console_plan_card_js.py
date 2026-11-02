@@ -72,7 +72,6 @@ const prose = "Keep cells with 200 genes and under 5.0% mito, n=1 per arm, a 1.6
   + "in DDX41 with log1p, as <code>min_genes=200</code> and it&#039;s 3 cells in <a href=\"x\">link 7</a>.";
 out.emphasis = api.planEmphasisHtml(prose, { min_genes: 200, max_mito_pct: 5.0, groups: ["KO", "WT"], fraction: 0.5 });
 out.percent = api.planEmphasisHtml("flag if more than 50% were removed", { fraction: 0.5 });
-out.withWords = api.planCardHtml(agenda, doc, [], { words: "drop <step 3> & rerun" });
 out.single = api.planCardHtml([agenda[0]], { yaml: doc.yaml, steps: [steps[0]] }, []);
 const codeDoc = { yaml: doc.yaml, steps: [{ id: "s1", tool: "run_code", skill: "score_signature" }, { id: "s2", tool: "run_in_environment" }, steps[1]] };
 out.codeCard = api.planCardHtml(agenda, codeDoc, []);
@@ -215,20 +214,28 @@ def test_every_normal_plan_surface_omits_raw_yaml_controls_and_content():
         assert "<pre" not in shown and "```yaml" not in shown, name
 
 
-def test_the_waiting_plan_can_be_changed_in_words_from_the_panel():
-    """The panel offers field edits and changes in words beside the plan being reviewed."""
+def test_the_panel_has_no_second_message_box_for_changing_the_plan():
+    """The chat's composer is the one box for changing a waiting plan (issue 58): the panel only says
+    where to type, and a plan that is no longer waiting says nothing."""
     out = _card()
     card = out["card"]
-    box = card.split('<div class="plan-revise">', 1)[1]
-    assert '<textarea class="plan-revise-text"' in box and 'data-plan="revise" disabled' in box, \
-        "Send waits for text"
-    assert card.index('class="plan-steps"') < card.index('class="plan-revise"'), "readable steps precede the change request"
-    assert "reply below" not in card, "the panel says how to change the plan itself, not where the composer is"
-    assert 'class="plan-revise"' in out["plain"], "a plan without a document can still be changed in words"
-    assert "drop &lt;step 3&gt; &amp; rerun</textarea>" in out["withWords"], "what was typed comes back, escaped"
+    assert "Type in the message box below" in card
+    assert "plan-revise-text" not in card and 'data-plan="revise"' not in card, "no textarea, no Send"
+    assert "<textarea" not in card.split('class="plan-revise"')[1].split('class="plan-actions-row"')[0]
+    assert card.index('class="plan-steps"') < card.index('class="plan-revise"'), "readable steps precede the note"
+    assert 'class="plan-revise"' in out["plain"], "a plan without a document points at the composer too"
     for done in (out["status"], out["saved"]):
         assert "plan-revise" not in done, "a plan that is no longer waiting cannot be changed"
     assert "reply below" in out["entry"], "the chat entry still points at the composer under it"
+
+
+def test_the_composer_marks_the_chat_that_has_a_plan_waiting():
+    src = APP_JS.read_text()
+    assert "function syncPlanCue(c)" in src and 'c.plan.kind === "plan"' in src
+    assert "planWords" not in src and "wirePlanRevise" not in src
+    # switching chats applies the cue for the chat entered, next to restoring its own draft
+    assert "syncPlanCue(c);" in src.split("function showDialog()")[1].split("\n}")[0]
+    assert "syncPlanCue(c);" in src.split("function updateComposerButton()")[1].split("\n}")[0]
 
 
 EDIT_HARNESS = r"""

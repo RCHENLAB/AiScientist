@@ -77,7 +77,6 @@ function newChatRecord(sid) {
     planDraftChange: null, // the visible field change; never restore an invisible raw draft
     planInlineFinish: null, // finish the active field before any plan action
     planDraftBase: "",     // the accepted document to which this field change belongs
-    planWords: "",         // a change to the plan typed in the side panel's box and not sent yet
     planShown: "",        // which version of the waiting plan has opened the side panel already
     bindConfirm: null,     // a local Bind choice, kept apart from an agent request in this chat
     confirm: null,         // a confirmation the agent waits on (confirm_request): {run, kind, summary,
@@ -704,6 +703,7 @@ function leaveDialog() {
 function showDialog() {
   const c = activeChat(), input = $("chatInput");
   if (input) input.value = (c && c.draft) || "";
+  syncPlanCue(c);
   syncDatasetSelection();
   renderUploadLine();
   // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
@@ -731,6 +731,19 @@ function methodUnwrap(text) {
     else out[out.length - 1] = prev.replace(/\s+$/, "") + " " + line.trim();
   }
   return out.join("\n");
+}
+
+// While THIS chat has a plan waiting, the one message box is where it is changed: the box says so and
+// is marked. Another chat's plan, or none, leaves it as it was. (A clarify or decision prompt sets
+// its own placeholder.)
+const PLAN_PLACEHOLDER = "Tell the PI what to change in the plan (e.g. 'drop the enrichment step') — or ask a question about it…";
+function syncPlanCue(c) {
+  const input = $("chatInput");
+  if (!input) return;
+  const waiting = !!c && !!c.plan && c.plan.kind === "plan";
+  if (input.classList) input.classList.toggle("plan-waiting", waiting);
+  if (waiting) input.placeholder = PLAN_PLACEHOLDER;
+  else if (input.placeholder === PLAN_PLACEHOLDER) input.placeholder = DEFAULT_PLACEHOLDER;
 }
 
 // The composer's placeholder, unless a plan is waiting in this chat (then it asks what to change).
@@ -3749,6 +3762,7 @@ function updateComposerButton() {
   if (!send || !stop || !input) return;
   const hasText = input.value.trim().length > 0;
   const c = activeChat();
+  syncPlanCue(c);
   const busy = !!c && (c.planPending || c.running);
   const showSend = !busy || hasText;             // idle → Send; busy → Send only once typing
   send.classList.toggle("hidden", !showSend);
@@ -4344,27 +4358,23 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
     + `or remove a step. Applied as written, without the model; the other steps stay as they are.</span></div>` : "";
   return head + planRevisedNote(revised) + tip + steps
     + planEstimateHtml(o.estimate)
-    + planReviseHtml(o.words)
+    + planReviseHtml()
     + planEditorHtml(doc)
     + `<div class="plan-actions-row">`
     + `<button class="primary" data-plan="approve"${state.planDraftYaml ? ' disabled title="Correct or discard your change first"' : ""}>${planIcon("play_arrow")}Run this plan</button>`
     + `<button class="secondary quiet" data-plan="cancel">Cancel</button></div>`;
 }
 
-// A waiting plan can be changed in words (by the PI) or by clicking its fields (applied by code).
-// `words` is what was typed here and not sent, so a redraw of the panel keeps it.
-function planReviseHtml(words) {
+// A waiting plan is changed in words in the chat's one message box (the composer), or by clicking its
+// fields (applied by code). The panel has no second box: it says where to type.
+function planReviseHtml() {
   return `<div class="plan-revise">`
     + `<div class="plan-revise-head">${planIcon("chat")}<span>Change it in words</span></div>`
-    + `<div class="plan-revise-row"><textarea class="plan-revise-text" rows="2" `
-    + `aria-label="Tell the PI what to change in the plan" `
-    + `placeholder="e.g. drop the enrichment step, and cluster at resolution 0.8">${escapeHtml(words || "")}</textarea>`
-    + `<button class="secondary small" data-plan="revise" disabled>${planIcon("send")}<span>Send</span></button></div>`
+    + `<div class="plan-revise-tip">Type in the message box below. The PI changes the plan as it stands, with your own `
+    + `changes, and shows it to you again; nothing runs until you click Run this plan. A question gets an answer and `
+    + `leaves the plan as it is.</div>`
     + `<div class="plan-revise-draft" hidden>${planIcon("info")}<span>Your setting change is not applied yet: it is checked `
-    + `first, and the PI changes the plan with it.</span></div>`
-    + `<div class="plan-revise-tip">The PI changes the plan as it stands, with your own changes, and shows it to you `
-    + `again; nothing runs until you run it. A question gets an answer and leaves the plan as it is. Same as replying `
-    + `in the chat.</div></div>`;
+    + `first, and the PI changes the plan with it.</span></div></div>`;
 }
 
 // The chat's datasets as the run will use them (main / sample / reference / extra input), and the
@@ -4725,7 +4735,6 @@ function showPlanPanel(agenda) {
   const seen = JSON.stringify([state.planAgenda, (state.planDoc && state.planDoc.yaml) || ""]);
   if (c && c.planShown !== seen) { c.planShown = seen; openPlanPanel(); }
   renderPlanPanel();
-  $("chatInput").placeholder = "Tell the PI what to change (e.g. 'drop the enrichment step')…";
   $("chatStream").scrollTop = $("chatStream").scrollHeight;
   updateComposerButton();
 }
@@ -4797,45 +4806,19 @@ function renderPlanPanel() {
   }
   host.innerHTML = `<div class="plan-card plan-sheet plan-panel-card" data-prompt="plan">`
     + planCardHtml(view.agenda || [], view.doc || null, view.revised || [],
-                   { mode: view.mode, status: view.status || "", estimate: view.estimate || null,
-                     words: (c && c.planWords) || "" })
+                   { mode: view.mode, status: view.status || "", estimate: view.estimate || null })
     + `</div>`;
   wirePlanSteps(host, view.agenda || []);
   if (view.mode !== "review") return;
   host.querySelector('[data-plan="approve"]').addEventListener("click", () => submitPlan("approve", undefined, undefined, c));
   host.querySelector('[data-plan="cancel"]').addEventListener("click", () => submitPlan("cancel", undefined, undefined, c));
-  wirePlanRevise(host, c);
+  refreshPlanRevise(host, c);
   wirePlanCardEdits(host, c, view.doc);
   wirePlanEditor(host, c);
 }
 
-// The panel's "Change it in words" box. Enter sends (Shift+Enter is a new line). A field change
-// that has not been applied goes with the words (revisePlanInWords), and the box says so.
-function wirePlanRevise(host, c) {
-  const box = host.querySelector(".plan-revise-text");
-  const send = host.querySelector('[data-plan="revise"]');
-  if (!box || !send) return;
-  const go = () => {
-    const text = box.value.trim();
-    if (!text || send.disabled) return;
-    box.value = "";
-    revisePlanInWords(c, text);
-  };
-  box.addEventListener("input", () => { c.planWords = box.value; refreshPlanRevise(host, c); });
-  box.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;
-    ev.preventDefault();
-    go();
-  });
-  send.addEventListener("click", go);
-  refreshPlanRevise(host, c);
-}
-
+// The note under "Change it in words": shown while a setting change not applied yet would go with the words.
 function refreshPlanRevise(host, c) {
-  const box = host.querySelector(".plan-revise-text");
-  const send = host.querySelector('[data-plan="revise"]');
-  if (!box || !send) return;
-  send.disabled = !box.value.trim();
   const note = host.querySelector(".plan-revise-draft");
   if (note) note.hidden = !(c && c.planDraftYaml);
 }
@@ -5138,28 +5121,25 @@ function hidePlanPanel(c = activeChat()) {
   updateComposerButton();
 }
 
-// A change to the waiting plan asked for in words, typed in the composer or in the side panel's box:
-// it shows in the chat as the person's message and goes to the PI as feedback. The PI answers a
+// A change to the waiting plan asked for in words, typed in the composer: it shows in the chat as the person's message and goes to the PI as feedback. The PI answers a
 // question and sends the plan back as it was, or makes the change on the plan document and sends
 // it back for review; nothing runs until the person runs it. Words are always about the plan as the
 // person has it: an edit of the document they have not applied yet goes with them, and the server
 // applies it first (by code) and makes the change on the edited plan.
 function revisePlanInWords(c, text) {
-  c.planWords = text;
   if (c.planInlineFinish) {
     const before = c.plan;
     c.planInlineFinish(true, false);
     if (c.plan !== before || c.planInlineFinish) {
-      // The box or the composer was emptied to send the words: put them back in the box on screen.
-      const host = chatVisible(c) ? $("planPanel") : null;
-      const box = host && host.querySelector(".plan-revise-text");
-      if (box) { box.value = c.planWords; refreshPlanRevise(host, c); }
-      toast("Your message is kept in the plan panel. Review the setting change, then send it.");
+      // The composer was emptied to send the words: put them back, in this chat's draft and on screen.
+      c.draft = text;
+      saveComposer(c);
+      if (chatVisible(c)) { $("chatInput").value = text; updateComposerButton(); }
+      toast("Your message is kept in the message box. Review the setting change, then send it.");
       return;
     }
   }
   if (!c.plan) return;
-  c.planWords = "";
   if (chatVisible(c)) appendUserMessage(text);
   submitPlan("revise", text, c.planDraftYaml || "", c);
 }

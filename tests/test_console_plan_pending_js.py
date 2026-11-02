@@ -151,7 +151,7 @@ def _run(scenario: str, *, working: bool = False) -> dict:
         ]:
             code += "\n" + source[source.index(start):source.index(end)]
         harness = harness.replace("repaintWorking() {},", "")
-        harness = harness.replace("setInterval, clearInterval,", "setInterval: () => 1, clearInterval() {}, Date: { now: () => sandbox.now }, now: 1000, renderServerPathOffer() {},")
+        harness = harness.replace("setInterval, clearInterval,", "setInterval: () => 1, clearInterval() {}, Date: { now: () => sandbox.now }, now: 1000, renderServerPathOffer() {}, syncPlanCue() {},")
         harness = harness.replace("submitPlan, submitDecision, chatOf, chats", "submitPlan, submitDecision, chatOf, chats, startAssistantStream, repaintWorking, streamStatus, streamToken, updateComposerButton")
     done = subprocess.run([node, "-e", harness.replace("__SCENARIO__", scenario)], input=code,
                           capture_output=True, text=True, timeout=30)
@@ -619,13 +619,16 @@ def test_clicking_run_finishes_the_active_field_and_waits_for_validation(typed, 
 
 @pytest.mark.parametrize("typed", ["1.5", "lots"])
 def test_words_wait_for_the_active_field_without_being_lost_or_shown_as_sent(typed):
+    """The words come back to the message box (the one box for them) and are sent from there once the
+    field is settled."""
     out = _run("""
   api.handleWsMessage(plan());
   const editor = editResolution(TYPED);
   const messages = [];
   sandbox.appendUserMessage = (text) => messages.push(text);
-  api.revisePlanInWords(A(), "Use a stricter cutoff in the next step");
-  out.waiting = { requests: requests.slice(), messages: messages.slice(), words: A().planWords,
+  const words = "Use a stricter cutoff in the next step";
+  api.revisePlanInWords(A(), words);
+  out.waiting = { requests: requests.slice(), messages: messages.slice(), draft: A().draft,
     error: editor.error.textContent };
   if (A().planInlineFinish) {
     editor.input.value = "1.5";
@@ -637,38 +640,36 @@ def test_words_wait_for_the_active_field_without_being_lost_or_shown_as_sent(typ
     plan: { yaml: edited, steps: [{ id: "s1", title: "QC" },
       { id: "s2", title: "Clustering", settings: { resolution: 1.5 } }] }, revised: [2]
   }));
-  out.afterValidation = { words: A().planWords, draft: A().planDraftYaml };
-  api.revisePlanInWords(A(), A().planWords);
-  out.sent = { requests, messages, words: A().planWords };
+  out.afterValidation = { draft: A().draft, yaml: A().planDraftYaml };
+  api.revisePlanInWords(A(), A().draft);
+  out.sent = { requests, messages };
 """.replace("TYPED", json.dumps(typed)))
     words = "Use a stricter cutoff in the next step"
     waiting = out["waiting"]
-    assert waiting["messages"] == [] and waiting["words"] == words
+    assert waiting["messages"] == [] and waiting["draft"] == words
     assert [r["action"] for r in waiting["requests"]] == (["edit"] if typed == "1.5" else [])
-    assert out["afterValidation"] == {"words": words, "draft": ""}
+    assert out["afterValidation"] == {"draft": words, "yaml": ""}
     assert [r["action"] for r in out["sent"]["requests"]] == ["edit", "revise"]
     assert "resolution: 1.5" in out["sent"]["requests"][0]["plan_yaml"]
     assert out["sent"]["requests"][1]["feedback"] == words
     assert out["sent"]["requests"][1]["plan_yaml"] == ""
-    assert out["sent"]["messages"] == [words] and out["sent"]["words"] == ""
+    assert out["sent"]["messages"] == [words]
 
 
-def test_words_held_back_by_an_invalid_field_are_shown_in_the_panel_box():
-    """The box (or the composer) is emptied to send the words; held back, they must be on screen
-    where the toast says they are, not only in memory until the next redraw."""
+def test_words_held_back_by_an_invalid_field_are_put_back_in_the_message_box():
+    """The composer is emptied to send the words; held back, they must be on screen where the toast
+    says they are, and kept in the chat's draft, not only in memory until the next redraw."""
     out = _run("""
   api.handleWsMessage(plan());
   const editor = editResolution("lots");
   const box = { value: "", isConnected: true };
-  els.planPanel = { querySelector: (sel) => (sel === ".plan-revise-text" ? box : null) };
-  sandbox.refreshPlanRevise = () => log.push("revise:refresh");
+  els.chatInput = box;
   sandbox.appendUserMessage = () => {};
   api.revisePlanInWords(A(), "Use a stricter cutoff in the next step");
-  out.held = { box: box.value, words: A().planWords, requests: requests.length,
-    refreshed: log.includes("revise:refresh"), editing: !!A().planInlineFinish };
+  out.held = { box: box.value, draft: A().draft, requests: requests.length, editing: !!A().planInlineFinish };
 """)
     words = "Use a stricter cutoff in the next step"
-    assert out["held"] == {"box": words, "words": words, "requests": 0, "refreshed": True, "editing": True}
+    assert out["held"] == {"box": words, "draft": words, "requests": 0, "editing": True}
 
 
 LEAVE_FIELD = """
