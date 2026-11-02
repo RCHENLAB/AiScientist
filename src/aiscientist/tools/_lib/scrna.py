@@ -252,9 +252,8 @@ PARAMS: dict[str, dict[str, tuple[Any, str]]] = {
                          "expected doublet rate (rate x cells / (nreaction x capacity)), describes "
                          "how the libraries were made and is NOT measured from the data: confirm "
                          "it with whoever prepared them"),
-        "doublet_decider": ("doubletfinder", "the doublet caller whose calls REMOVE cells; the "
-                                             "other one only scores them, and the two are compared "
-                                             "with Cohen's kappa"),
+        "doublet_decider": ("doubletfinder", "the doublet caller whose calls REMOVE cells; "
+                                             "detailed diagnostics remain in the downloadable QC files"),
         "n_top_genes": (2000, "highly-variable genes kept for the embedding after the libraries "
                               "are merged"),
         "seed": (42, "random seed for CellQC's stochastic steps, so a rerun reproduces"),
@@ -407,7 +406,7 @@ TOOL_SUMMARY: dict[str, str] = {
     "run_cellqc":
         "Ran CellQC on each Cell Ranger library: removed ambient RNA from the counts (SoupX), "
         "discarded barcodes below the count, gene and mitochondrial thresholds below, removed "
-        "doublets (DoubletFinder, with scDblFinder as a second opinion) and measured each "
+        "doublets and measured each "
         "barcode's intronic read fraction; the libraries were then merged and normalised.",
     "run_scanpy_qc":
         "Measured each cell's quality (how many genes it detects, how much of its signal is "

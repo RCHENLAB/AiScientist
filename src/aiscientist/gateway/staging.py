@@ -32,6 +32,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable
@@ -261,7 +262,8 @@ class StagingQueue:
             job.error = ""
             self.store.save(job)
             self._cancel[job.id] = threading.Event()
-            fut = self._pool.submit(self._run, job.id, announced)
+            # Worker threads do not inherit ContextVars: retain this submitting run only.
+            fut = self._pool.submit(copy_context().run, self._run, job.id, announced)
             self._futures[job.id] = fut
         # The copy waits until "queued" is announced: a worker that started first moved the shared
         # job on to "pushing" before this notice ran, so "queued" was never seen (CI, 2026-10-28).
@@ -456,7 +458,7 @@ class StagingQueue:
                 delay = RETRY_DELAYS[job.attempts - 1]
                 self._set(job, "queued", error=f"{msg} — retrying in {delay:.0f} s.")
                 self._cancel[job_id] = threading.Event()
-                timer = threading.Timer(delay, self._resubmit, args=(job_id,))
+                timer = threading.Timer(delay, copy_context().run, args=(self._resubmit, job_id))
                 timer.daemon = True
                 timer.start()
             else:
@@ -475,4 +477,4 @@ class StagingQueue:
             running = self._futures.get(job_id)
             if job is None or job.state != "queued" or (running is not None and not running.done()):
                 return
-            self._futures[job_id] = self._pool.submit(self._run, job_id)
+            self._futures[job_id] = self._pool.submit(copy_context().run, self._run, job_id)

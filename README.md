@@ -35,6 +35,10 @@ Browser ──HTTPS──▶ Envoy ingress
    cluster model through an SSH tunnel. Account › API usage shows what a key spends and the tokens
    each chat and run used on the shared model; the cluster models cost nothing per token.
 3. **Add data.** Upload it in the browser (resumable), or point to data already on the lab server.
+   In **Files → Datasets**, check saved datasets and choose **Use selected** to attach them to the
+   open chat. Attachments and roles stay with the chat across sign-ins and computers. The page
+   shows the server's per-run limit (currently 12); the plan lists each input's use and any that
+   cannot be used. Choose the main input from its dataset chip.
 4. **Ask.** A quick question is answered in the chat. A research question becomes a plan, a
    dependency graph of steps, which the user approves, edits or cancels before anything runs.
 5. **Run.** For each step the Scientist calls tools, most of them Slurm jobs on HPC3, and the Critic
@@ -135,6 +139,7 @@ tests/             the offline test suite
 ## Documentation
 
 - [`docs/architecture/README.md`](docs/architecture/README.md): how the system is built.
+- [`docs/run_timing.md`](docs/run_timing.md): inspecting run stages, user waits and partial timelines.
 - [`docs/FINDINGS.md`](docs/FINDINGS.md): what has been measured and decided, and why.
 - [`src/aiscientist/tools/README.md`](src/aiscientist/tools/README.md): the tool index.
 - [`docs/skills_and_pipelines_architecture.md`](docs/skills_and_pipelines_architecture.md): tools,

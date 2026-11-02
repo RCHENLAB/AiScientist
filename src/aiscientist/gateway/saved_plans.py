@@ -161,5 +161,7 @@ def build_prompt(art: Path) -> dict[str, Any] | None:
                     and known.get("tool") == step.get("tool") and known.get("skill") == step.get("skill")):
                 step["outputs"] = known["outputs"]
         prompt.update(type="plan_prompt", agenda=doc.agenda(),
-                      plan={"yaml": current["yaml"], "steps": steps})
+                      plan={"yaml": current["yaml"], "steps": steps,
+                            "datasets": prompt.get("datasets", []),
+                            "unusable_inputs": prompt.get("unusable_inputs", [])})
     return prompt

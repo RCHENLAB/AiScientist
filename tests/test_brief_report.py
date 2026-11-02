@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from aiscientist.agents.scope import RunScope
 from aiscientist.gateway.app import (
     _build_brief_report, _insert_verification_note, _tools_that_ran, _wants_brief_report)
@@ -53,6 +55,46 @@ _QC_STEPS = [{"tool": "inspect_dataset", "ok": True, "result": {"status": "ok"}}
              {"tool": "finish", "ok": True, "result": {}}]
 
 
+@pytest.mark.parametrize("surface", ["chat", "brief"])
+@pytest.mark.parametrize("case", ["one", "several", "no_metrics", "no_warning", "high_agreement", "zero"])
+def test_default_doublet_display_preserves_counts_warnings_and_downloads(tmp_path, surface, case):
+    from copy import deepcopy
+    from aiscientist.gateway.app import _qc_chat_reply
+
+    art = _ddx41_art(tmp_path)
+    qc = deepcopy(_DDX41)
+    if case == "several":
+        qc["libraries"].append(deepcopy(_QC["libraries"][0]))
+        qc["warnings"] += _QC["warnings"]
+    elif case == "no_metrics":
+        (art / "tables/cellqc_metrics.csv").unlink()
+    elif case == "no_warning":
+        qc["warnings"] = []
+    elif case == "high_agreement":
+        qc["libraries"][0]["doublet_kappa"] = 0.9
+        qc["warnings"] = []
+    elif case == "zero":
+        qc["libraries"][0]["doublets_removed"] = 0
+    qc["warnings"].append("Sample2_Ddx41: step ambient failed — missing raw matrix")
+    original = deepcopy(qc)
+    files = {p: p.read_bytes() for p in art.rglob("*") if p.is_file()}
+    result = _Result([{"tool": "run_cellqc", "ok": True, "result": qc}])
+    text = (_qc_chat_reply(art, result) if surface == "chat"
+            else _build_brief_report(art, "Run QC", result, None))
+
+    for detail in ("doubletfinder", "scdblfinder", "kappa", "agree poorly", "1,192", "pANN"):
+        assert detail.lower() not in text.lower(), text
+    assert "doublets removed" in text.lower()
+    assert ("929" if case != "zero" else "Doublets removed: 0") in text
+    assert "step ambient failed — missing raw matrix" in text
+    assert ("Doublet filtering needs review" in text) == (case != "high_agreement")
+    assert "tables/cells.csv" in text
+    if case != "no_metrics":
+        assert "tables/cellqc_metrics.csv" in text
+    assert qc == original
+    assert all(p.read_bytes() == content for p, content in files.items())
+
+
 def test_a_run_that_only_did_qc_gets_the_short_report_unasked():
     assert _tools_that_ran(_Result(_QC_STEPS))[:2] == ["inspect_dataset", "run_cellqc"]
     assert _wants_brief_report(None, _Result(_QC_STEPS))
@@ -78,8 +120,8 @@ def test_the_short_report_is_the_tools_own_numbers_and_nothing_else(tmp_path):
             "27 only for too few genes, 541 only for too much mitochondrial RNA, 98 for more than "
             "one of these.") in md
     assert "Doublets removed: 1,261 of the 18,011 filtered cells (7.0%)." in md
-    assert "The two doublet callers agree at kappa 0.07." in md   # no metrics table: no detail
-    assert "agree poorly" in md                                  # the tool's warning is kept
+    assert "kappa" not in md
+    assert "Sample1_WT: Doublet filtering needs review" in md
     assert "Sample1_WT.processed.20261011-1200.abc.h5ad" in md   # the result matrix is named
     assert "figures/violin_cellqc_after_qc.png" in md and "## What was run" in md
     for heading in ("## Abstract", "## Discussion", "## Methods", "## References", "## Limitations"):
@@ -206,18 +248,9 @@ def test_the_qc_numbers_say_what_they_count(tmp_path):
     assert ("— the count, gene and mitochondrial filters removed 390 cells: 2 only for too few counts "
             "(3 in total), 28 only for too few genes (71 in total), 317 only for too much "
             "mitochondrial RNA (360 in total), 43 for more than one of these.") in md
-    assert "Doublets removed: 929 of the 15,482 filtered cells (6.0%), called by DoubletFinder." in md
-    # Neutral counts: the other caller's further calls are not "doublets left in the data" (an
-    # audit of the run found most of the 1,192 to be high-UMI rods with no second lineage's markers).
-    assert ("The two doublet callers agree poorly (kappa 0.14): scDblFinder agrees on 245 of "
-            "DoubletFinder's 929 removals and flags 1,192 of the 14,553 kept cells (8.2%), which "
-            "stay in the dataset (its `scdblfinder_class` column marks them).") in md
-    assert "residual" not in md and "1,192 of the 14,553 kept cells (8.2%) doublets" not in md
-    # The column is named only when the per-cell table has it.
-    art = _ddx41_art(tmp_path / "nocol")
-    (art / "tables" / "cells.csv").write_text("barcode,n_genes_by_counts,doubletfinder_class\n")
-    md = _build_brief_report(art, "q", _Result(_DDX41_STEPS), None)
-    assert "(8.2%), which stay in the dataset. " in md and "scdblfinder_class" not in md
+    assert "Doublets removed: 929 of the 15,482 filtered cells (6.0%)." in md
+    assert "Doublet filtering needs review" in md
+    assert "kappa" not in md and "scDblFinder" not in md and "1,192" not in md
     assert "Nuclear fraction (share of intronic reads): median 0.34, IQR 0.25–0.41." in md
 
 
@@ -269,20 +302,20 @@ def test_a_qc_only_run_gets_a_short_chat_reply_with_the_tools_numbers(tmp_path):
     assert "- **14,553 of 15,872 cells kept (91.7%)**; 33,696 genes." in reply
     assert ("- Filters removed 390: 317 only for mitochondrial RNA above 10%, 28 only for fewer than "
             "300 genes, 2 only for fewer than 500 counts, 43 for more than one.") in reply
-    assert ("Doublets removed: 929 of the 15,482 filtered cells (6.0%), called by DoubletFinder. "
-            "The two doublet callers agree poorly (kappa 0.14): scDblFinder agrees on 245") in reply
+    assert "Doublets removed: 929 of the 15,482 filtered cells (6.0%)." in reply
     assert ("- Median mitochondrial RNA in the kept cells 0.69%; ambient RNA 1.6% (SoupX, already "
             "subtracted from the counts).") in reply
     assert ("**Result:** `Sample2_Ddx41.processed.20261014-1204.6275df1213ab.h5ad` — 14,553 cells × "
             "33,696 genes") in reply
     assert "kept on HPC3 until the session ends, then with the run on the server" in reply
     assert "`result/report.html`" in reply
-    # The kappa warning is not said twice, and no instruction to a model reaches the user.
-    assert reply.count("kappa") == 1 and "Report it" not in reply
+    # The diagnostic is a concise warning; the comparison stays in Downloads.
+    assert reply.count("Doublet filtering needs review") == 1
+    assert "kappa" not in reply and "Report it" not in reply
     # A reply, not a report: no sections, no literature, no "not run" list.
     for word in ("## ", "Methods", "Limitations", "Conclusion", "literature", "differential"):
         assert word not in reply, word
-    assert len(reply.strip().splitlines()) <= 10
+    assert len(reply.strip().splitlines()) <= 11
 
 
 def test_more_than_qc_is_not_answered_in_the_chat_only():
@@ -319,9 +352,9 @@ def test_the_chat_reply_for_several_libraries_and_for_scanpy_qc(tmp_path):
     art = _ddx41_art(tmp_path / "two")
     reply = _qc_chat_reply(art, _Result([{"tool": "run_cellqc", "ok": True, "result": two}]))
     assert "- **31,303 of 34,553 cells kept (90.6%)**; 33,696 genes." in reply
-    assert "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | 91.7% |" in reply
+    assert "| Sample2_Ddx41 | 15,872 | 15,482 | 14,553 | 929 | 91.7% |" in reply
     assert "- Thresholds: `min_counts` = 500, `min_features` = 300, `max_pct_mt` = 10.0." in reply
-    assert reply.count("kappa 0.07") == 1 and reply.count("kappa 0.14") == 1   # each library's
+    assert "kappa" not in reply and reply.count("Doublet filtering needs review") == 2
     assert "Report it" not in reply                                             # warning, once
     assert "ambient RNA 1.6% (SoupX estimate)" not in reply   # per-library detail stays in the table
     scanpy = {"status": "ok", "cells_before": 5000, "cells_after": 4600, "genes_before": 30000,

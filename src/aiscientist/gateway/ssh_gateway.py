@@ -19,6 +19,7 @@ import paramiko
 from .errors import (GatewayError, error_detail, public_error, redact_key_store_paths,
                      redact_server_paths)
 from .executor import ExecResult
+from .run_monitor import timed_stage
 
 EmitFn = Callable[[str, str, str], None]  # (level, stage, message)
 
@@ -496,6 +497,7 @@ class SSHExecutor:
         of many small reads and writes (``gateway/llm_relay.py``, the model calls of a job)."""
         return self._open_sftp()
 
+    @timed_stage("data_transfer", source="sftp_upload")
     def put_file(self, local_path: str, remote_path: str) -> None:
         """Upload ``local_path`` to ``remote_path`` via SFTP, mkdir-ing the remote parent
         first (SFTP does not auto-create dirs). Used to stage a dataset onto shared DFS for
@@ -519,6 +521,7 @@ class SSHExecutor:
         finally:
             sftp.close()
 
+    @timed_stage("data_transfer", source="sftp_upload")
     def put_file_resumable(self, local_path: str, remote_path: str,
                            progress: "Callable[[int, int], None] | None" = None,
                            make_parent: bool = True) -> None:
@@ -705,40 +708,42 @@ class SSHExecutor:
         paramiko channel; an exception from ``progress`` kills the client and propagates."""
         import tempfile
 
-        verb = "put -a" if offset > 0 else "put"
-        batch = f"{verb} {_sftp_quote(local_path)} {_sftp_quote(part)}\n"
-        with tempfile.TemporaryFile() as err:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
-            try:
-                assert proc.stdin is not None
-                proc.stdin.write(batch.encode())
-                proc.stdin.close()
-                while True:
-                    try:
-                        proc.wait(timeout=2.0)
-                        break
-                    except subprocess.TimeoutExpired:
-                        if progress is not None:
-                            try:
-                                sent = int(sftp.stat(part).st_size or 0)
-                            except OSError:
-                                continue
-                            progress(min(sent, total), total)
-            except BaseException:
-                proc.kill()
-                proc.wait()
-                raise
-            if proc.returncode == 0:
-                return True
-            err.seek(0)
-            why = err.read().decode(errors="replace").strip().splitlines()
-        # OpenSSH names the identity file it was given (``Load key "<path>": …``): never the key
-        # store's path in an event (issue 16).
-        reason = redact_server_paths(redact_key_store_paths(why[-1])) if why else f"exit {proc.returncode}"
-        self._emit("warning", "ssh_transfer",
-                   f"The OpenSSH client could not copy {os.path.basename(local_path)} "
-                   f"({reason}); continuing with paramiko.")
-        return False
+        with timed_stage("data_transfer", source="native_sftp") as span:
+            verb = "put -a" if offset > 0 else "put"
+            batch = f"{verb} {_sftp_quote(local_path)} {_sftp_quote(part)}\n"
+            with tempfile.TemporaryFile() as err:
+                proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write(batch.encode())
+                    proc.stdin.close()
+                    while True:
+                        try:
+                            proc.wait(timeout=2.0)
+                            break
+                        except subprocess.TimeoutExpired:
+                            if progress is not None:
+                                try:
+                                    sent = int(sftp.stat(part).st_size or 0)
+                                except OSError:
+                                    continue
+                                progress(min(sent, total), total)
+                except BaseException:
+                    proc.kill()
+                    proc.wait()
+                    raise
+                if proc.returncode == 0:
+                    return True
+                err.seek(0)
+                why = err.read().decode(errors="replace").strip().splitlines()
+            # OpenSSH names the identity file it was given (``Load key "<path>": …``): never the key
+            # store's path in an event (issue 16).
+            reason = redact_server_paths(redact_key_store_paths(why[-1])) if why else f"exit {proc.returncode}"
+            self._emit("warning", "ssh_transfer",
+                       f"The OpenSSH client could not copy {os.path.basename(local_path)} "
+                       f"({reason}); continuing with paramiko.")
+            span.end("fallback")
+            return False
 
     def read_bytes(self, remote_path: str, max_bytes: int | None = None) -> bytes:
         """Read (at most ``max_bytes`` of) a remote file, over SFTP.
@@ -817,6 +822,7 @@ class SSHExecutor:
         finally:
             sftp.close()
 
+    @timed_stage("data_transfer", source="sftp_download")
     def get_file_resumable(self, remote_path: str, local_path: str,
                            progress: "Callable[[int, int], None] | None" = None,
                            block: int = 16 * 1024 * 1024) -> None:
@@ -858,6 +864,7 @@ class SSHExecutor:
         finally:
             sftp.close()
 
+    @timed_stage("data_transfer", source="sftp_download")
     def get_file(self, remote_path: str, local_path: str) -> None:
         """Download ``remote_path`` to ``local_path`` via SFTP (pull a job's outputs back)."""
         sftp = self._open_sftp()

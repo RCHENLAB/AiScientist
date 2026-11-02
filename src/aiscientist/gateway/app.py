@@ -21,12 +21,13 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
+from .dataset_limits import MAX_BOUND_DATASETS as _MAX_BOUND_DATASETS
 from . import cluster_models, gpu, vllm_client
 from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
 from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
@@ -224,6 +225,9 @@ class RunState:
         self.conn = conn
         self.conversation_id = conversation_id
         self.run_id = run_id
+        # The id was minted for routing (``_begin_routed_run``) and no run has bound it yet: its
+        # timing stays in memory, and it names no run folder here or on HPC3.
+        self.routing_id = False
         # Identifies this run's stream for a client that recovers it after a reconnect: a quick
         # chat answer has no run_id, and without an id the same finished answer was recovered
         # (and saved) again on every reconnect.
@@ -479,6 +483,7 @@ class Connection:
     def bind_run_id(self, run: RunState, run_id: str) -> None:
         """Assign the final run_id to a run (fresh mint or resume) and index it."""
         run.run_id = run_id
+        run.routing_id = False
         if run not in self.live_runs:
             if self._bare_run is run:
                 self._bare_run = None
@@ -505,6 +510,8 @@ class Connection:
         run.running = False
         if run.monitor is not None:
             run.monitor.end()           # a no-op when the run already said how it ended
+            if run_monitor.current_monitor() is run.monitor:
+                run_monitor.set_current_monitor(None)
         if run in self.live_runs:
             self.live_runs.remove(run)
         if self._bare_run is run:
@@ -606,6 +613,8 @@ class Connection:
         self._tag(payload, run)
         self._track_stream(payload, run)
         if run is not None and run.monitor is not None:
+            if payload.get("type") == "artifacts":
+                run.monitor.mark_result_ready()
             run.monitor.observe_push(payload)
         self._publish(payload)
 
@@ -2036,9 +2045,22 @@ async def _start_checkpoint_gc() -> None:
     """Launch the two housekeeping sweeps: stale A2 analysis checkpoints in the eyeserver's local
     run bundles (default 7 days), and cold per-run process files in each live session's HPC3
     ``<shared_root>/Temp/<user>`` area (default 3 days)."""
+    asyncio.create_task(_dataset_retention_loop())
     asyncio.create_task(_upload_gc_loop())
     asyncio.create_task(_checkpoint_gc_loop())
     asyncio.create_task(_hpc_temp_gc_loop())
+
+
+async def _dataset_retention_loop() -> None:
+    from . import storage_policy
+    import sys
+    while True:
+        try:
+            if _AUTH_ENABLED:
+                await storage_policy.sweep(sys.modules[__name__])
+        except Exception as exc:  # noqa: BLE001 - maintenance must survive a failed deletion or email
+            print(f"[storage] retention sweep failed: {type(exc).__name__}: {exc}")
+        await asyncio.sleep(3600)
 
 
 def _cancel_alloc(conn: Connection, reason: str = "provisioning failed") -> None:
@@ -2971,7 +2993,6 @@ def _primary_rank(name: str, depth: int, size: int) -> "tuple | None":
 # LabRequest's two dataset slots into ONE ordered list of bound files, primary first. It is the single
 # place that reconciles the legacy single ``dataset_path`` with the new ``datasets`` list, so both the
 # staging path and any consumer see the same view.
-_MAX_BOUND_DATASETS = 12   # a generous cap so a runaway client can't bind an unbounded fan-out
 
 
 # Roles a client may set on a bound file. "primary" pins the study's own data; "reference" marks
@@ -3005,7 +3026,7 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
 
     The primary (index 0) is what every legacy ``decisions["dataset_path"]`` consumer reads; the full
     list is what the multi-file consumers read. A ``role`` of "primary" pins the primary and
-    "reference" keeps a file out of that slot (see ``_bound_primary_key``). Never raises."""
+    "reference" keeps a file out of that slot (see ``_bound_primary_key``). Oversized sets are refused."""
     raw: list[dict] = []
     seen: set[str] = set()
     entries = req.datasets if isinstance(getattr(req, "datasets", None), list) else []
@@ -3026,7 +3047,9 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
         raw = [{"path": dp, "order": 0, "name": dp.rsplit("/", 1)[-1], "role": None}]
     raw.sort(key=lambda d: _bound_primary_key(d["path"], d["order"], d["role"]))
     out = [{"path": d["path"], "name": d["name"], "role": d["role"]} for d in raw]
-    return out[:_MAX_BOUND_DATASETS]
+    if len(out) > _MAX_BOUND_DATASETS:
+        raise HTTPException(400, f"At most {_MAX_BOUND_DATASETS} datasets per run. Remove one first.")
+    return out
 
 
 # A clinical note is prose, not data. The cap is generous for a real referral letter (~10k words) and
@@ -5034,6 +5057,27 @@ def _stage_secondary_dataset(conn: Connection, path: str, name: str, role: "str 
             "hpc_primary": None, "remote": False, "primary": False}
 
 
+def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
+    """The staged inputs and actual QC grouping shown before a plan runs.
+
+    The main dataset is named as the chat attached it (``primary_name``): its record names the matrix
+    found inside a folder. A dataset the run cannot use is listed once, with the reason."""
+    together = {str(n).rstrip("/") for n in
+                (decisions.get("cellranger_layout") or {}).get("datasets", [])}
+    unusable = list(decisions.get("unusable_inputs") or [])
+    cannot = {str(d.get("name") or "") for d in unusable if isinstance(d, dict)}
+    datasets = []
+    for rec in decisions.get("datasets") or []:
+        name = (primary_name or _display_name(rec)) if rec.get("primary") else _display_name(rec)
+        if name in cannot:
+            continue
+        role = str(rec.get("role") or "").lower()
+        use = ("reference" if role == "reference" else "main" if rec.get("primary") else
+               "sample" if name.rstrip("/") in together else "extra input")
+        datasets.append({"name": name, "role": rec.get("role"), "use": use})
+    return {"datasets": datasets, "unusable_inputs": unusable}
+
+
 def _input_folder_list(bound: "list[dict]", records: "list[dict]", decisions: dict,
                        mirrors: "dict[str, tuple[str, set[str]]]") -> "list[dict]":
     """Every bound FOLDER a run reads its samples from, primary first, as ``{"name", "path",
@@ -5593,6 +5637,8 @@ def _cancel_pending_plan(conn: "Connection", run: "RunState") -> None:
     plan card has no time limit: whatever takes away the run's chance of an answer (Stop, Release
     GPU, closing the session) answers it here, or the run's thread would wait for good."""
     if run.pending_plan is not None:
+        if run.monitor is not None:
+            run.monitor.decision("cancel")
         run.plan_value = {"action": "cancel"}
         run.pending_plan = None
         run.plan_event.set()
@@ -6269,7 +6315,14 @@ async def get_server_storage(request: Request) -> JSONResponse:
     user = _optional_user(request)
     if user is None:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    return JSONResponse(await asyncio.to_thread(_server_storage, user.id, user.username))
+    from . import storage_policy
+    result = await asyncio.to_thread(_server_storage, user.id, user.username)
+    result.update(await asyncio.to_thread(storage_policy.summary, user.id))
+    result["limit_bytes"] = storage_policy.limit_bytes()
+    result["warning"] = bool(result["limit_bytes"] and result["total_bytes"] >= result["limit_bytes"] * .8)
+    for dataset in result["datasets"]:
+        dataset["removal_at"] = storage_policy.removal_at(dataset)
+    return JSONResponse(result)
 
 
 @app.get("/api/storage/{connection_id}")
@@ -6692,6 +6745,8 @@ async def chat_stop(req: StopRequest, request: Request) -> JSONResponse:
     # reviews, technical report) runs regardless, by design, so a stopped run still ships what
     # completed. Nobody could decline that tail, and it is the expensive half on a metered model.
     escalated = target.chat_stop.is_set()
+    if target.monitor is not None:
+        target.monitor.timing_event("stop_requested", action="hard_stop" if escalated else "stop")
     target.chat_stop.set()
     if escalated:
         target.hard_stop.set()
@@ -6881,6 +6936,36 @@ class PlanReviewRequest(BaseModel):
     tz: str | None = None
 
 
+def _upload_quota_error(conn, incoming: int, exclude: Path | None = None) -> str | None:
+    """Reserve unfinished tus uploads and unregistered folder files against the account limit."""
+    from . import storage_policy
+    if not conn.app_user_id or not storage_policy.limit_bytes():
+        return None
+    registered = {Path(d["path"]).resolve() for d in auth_routes.list_dataset_records(conn.app_user_id)}
+    roots = {upload_storage.uploads(c) for c in _owner_connections(conn.owner)}
+    roots.add(upload_storage.uploads(conn))
+    pending = 0
+    for root in roots:
+        for meta_path in (root / ".parts").glob("*.json"):
+            if exclude is not None and meta_path.with_suffix(".part") == exclude:
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if meta.get("status") in ("uploading", "finalizing"):
+                    pending += int(meta.get("length") or 0)
+            except (OSError, ValueError, TypeError):
+                continue
+        if root.is_dir():
+            for file in root.rglob("*"):
+                if (file.is_symlink() or not file.is_file() or file == exclude
+                        or any(part.startswith(".") for part in file.relative_to(root).parts)):
+                    continue
+                resolved = file.resolve()
+                if not any(resolved == path or resolved.is_relative_to(path) for path in registered):
+                    pending += file.stat().st_size
+    return storage_policy.quota_error(conn.app_user_id, conn.owner, incoming + pending)
+
+
 @app.post("/api/upload")
 async def upload_dataset(
     request: Request,
@@ -6899,6 +6984,14 @@ async def upload_dataset(
     files are NOT recorded as individual datasets — the folder is registered once via
     /api/upload/register-folder after all its files land."""
     conn = _owned_conn(connection_id, request)
+    size = file.size
+    if size is None:
+        file.file.seek(0, 2)
+        size = file.file.tell()
+        file.file.seek(0)
+    if conn.app_user_id and (error := await asyncio.to_thread(_upload_quota_error, conn, size)):
+        await file.close()
+        return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     dest_dir = upload_storage.uploads(conn)
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe_rel = safe_relpath(rel_path) if rel_path else ""
@@ -6993,6 +7086,11 @@ async def reserve_folder(payload: dict, request: Request) -> JSONResponse:
         return JSONResponse({"error": f"{busy}/ is still being copied to HPC3. Choose the folder again when "
                                       "that has finished: only the files that are missing will be sent."},
                             status_code=409)
+    chosen = _chosen_files(files)
+    if chosen and not got.get("merged") and not got.get("resume"):
+        error = await asyncio.to_thread(_upload_quota_error, conn, sum(size for _, size in chosen))
+        if error:
+            return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     folder = got["folder"]
     shown = raw if upload_storage.enabled(conn) else folder      # a managed folder is a storage id
     partial = got.get("partial", 0)
@@ -7346,6 +7444,9 @@ async def upload_chunk(
         with open(p, "ab") as out:
             out.write(b)
 
+    if conn.app_user_id and (error := await asyncio.to_thread(_upload_quota_error, conn,
+                                                              current + len(data), part)):
+        return JSONResponse({"error": error, "storage_url": "#account/storage"}, status_code=507)
     await asyncio.to_thread(_append, part, data)
     received = current + len(data)
     if not done:
@@ -7629,6 +7730,11 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
         dataset_id = int(payload.get("id"))
     except (TypeError, ValueError):
         return JSONResponse({"error": "bad dataset id"}, status_code=400)
+    return await _delete_owned_dataset(user, dataset_id)
+
+
+async def _delete_owned_dataset(user, dataset_id: int) -> JSONResponse:
+    """Shared manual/retention deletion: files first, then registry and metadata."""
     conn = _active_conn_for_user(user)
 
     def remove(stored: str) -> None:
@@ -7701,6 +7807,8 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
         return JSONResponse({"error": f"Dataset deletion failed: {public_error(exc)}"}, status_code=409)
     if stored is None:
         return JSONResponse({"error": "Dataset not found."}, status_code=404)
+    for connection in _owner_connections(safe_name(user.username)):
+        connection._publish({"type": "datasets_changed"})
     return JSONResponse({"ok": True, "deleted": dataset_id})
 
 
@@ -8004,6 +8112,32 @@ def _run_in_flight(run_id: str) -> bool:
     """True while any session is executing ``run_id``, or a run that continues it (it reads its files)."""
     return any(run_id in (r.run_id, r.continues)
                for c in list(CONNECTIONS.values()) for r in c.running_runs())
+
+
+def _dataset_in_use(user, path: str) -> bool:
+    """Keep inputs while an account's analysis or persisted plan can still read them."""
+    from .db import session_scope
+    from .models import Run
+    owner = safe_name(user.username)
+    if any(c.running_runs() for c in _owner_connections(owner)):
+        return True
+    with session_scope() as session:
+        waiting = [r.run_id for r in session.query(Run).filter(
+            Run.user_id == user.id, Run.status == "awaiting_plan")]
+    def references(value):
+        if isinstance(value, dict):
+            return any(references(v) for v in value.values())
+        if isinstance(value, list):
+            return any(references(v) for v in value)
+        return isinstance(value, str) and (value == path or value.startswith(path.rstrip("/") + "/"))
+    for run_id in waiting:
+        state = CONSOLE_RUNS_DIR / owner / run_id / "artifacts/process/run_state.json"
+        try:
+            if references(json.loads(state.read_text(encoding="utf-8"))):
+                return True
+        except (OSError, ValueError):
+            return True          # a waiting plan with unreadable inputs is kept conservatively
+    return False
 
 
 @app.post("/api/runs/delete")
@@ -8400,8 +8534,22 @@ def _route_request(conn: Connection, req: LabRequest, prior_request: str = "") -
         except Exception as exc:  # noqa: BLE001 - routing falls back to the rules
             print(f"[route] the session's model is not available for routing: {exc}")
     route = request_router.route_request(complete, req.question, data=names, prior_request=prior_request)
+    mon = run_monitor.current_monitor()
+    if mon is not None:
+        mon.timing_event("request_routed", action="literature" if route.literature else "research")
     print(f"[route] {json.dumps(route.to_dict(), ensure_ascii=False)}")
     return route
+
+
+def _begin_routed_run(conn: Connection, conversation_id: str | None) -> RunState:
+    """A request's run scope, its id minted before routing. Until a run binds the id
+    (``bind_run_id``) it names no run folder: its timing waits in memory, and it is not one of the
+    ``hpc_run_ids`` that session end brings home and removes. A chat turn or a reply that starts
+    nothing leaves no folder, here or on HPC3."""
+    run = conn.begin_run(conversation_id, run_id=uuid4().hex[:12])
+    run.routing_id = True
+    conn.hpc_run_ids.pop(run.run_id, None)
+    return run
 
 
 async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
@@ -8411,10 +8559,11 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     and asks on low confidence rather than guessing."""
     # Open this turn's run scope up front so its cancel/plan events + WS stream are isolated from any
     # OTHER window's run on the shared session, and the pre-run follow-up clarify uses this run's
-    # plan_event (not a connection-wide one). The run_id is bound later (a fresh study mints it; a
-    # resume/edit reuses the prior one). Downstream _run_lab reads conn.active_run.
-    run = conn.begin_run(req.conversation_id)
+    # plan_event (not a connection-wide one). The id is minted before routing; its routing timing is
+    # written with the run that binds it, or with the earlier run the request continues.
+    run = _begin_routed_run(conn, req.conversation_id)
     _note_budget_choice(run, req)
+    _watch_run(conn, run, req)
     try:
         await _dispatch_lab_run(conn, req)
     finally:
@@ -8484,7 +8633,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             return
         curation_offered = True
         req = req.model_copy(update={"question": handoff})
-        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        _next = _begin_routed_run(conn, req.conversation_id)
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
     # Which line (issue 21): a general question is answered from the literature, everything else is
     # the lab. The chat's earlier analysis is context: a question about it is an analysis. At most
@@ -8507,7 +8658,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         # has ended, and ``conn.active_run`` is now the session's newest live run, which can be
         # another chat's run waiting at its plan card.
         req = req.model_copy(update={"question": handoff})
-        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        _next = _begin_routed_run(conn, req.conversation_id)
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
         # The curation was considered once, for the message that opened this run. A note can make the
         # question qualify for it that did not ("...in the RetiGene papers, without limiting it to 12
@@ -8525,7 +8678,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
             return
         # A note on that plan is routed again, as on the opening message's curation.
         req = req.model_copy(update={"question": handoff})
-        _note_budget_choice(conn.begin_run(req.conversation_id), req)
+        _next = _begin_routed_run(conn, req.conversation_id)
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
     if target is None:
         await _run_lab(conn, req)
@@ -8740,15 +8895,27 @@ async def _adopt_handed_on_dataset(conn: Connection, run_id: str, decisions: dic
                        stage="lab")
 
 
+def _timing_path(workspace: Path, run_id: str) -> Path:
+    return workspace / run_id / "artifacts" / "process" / "timing.jsonl"
+
+
 def _watch_run(conn: Connection, run: RunState, req: LabRequest) -> None:
     """Start the System page's picture of this run (gateway/run_monitor.py). Never raises."""
     try:
-        if run.monitor is not None:
-            run.monitor.end()           # this scope ran before (a continuation): that run is over
-        run.monitor = run_monitor.start(
-            kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,
-            conversation_id=run.conversation_id, run_id=run.run_id,
-            question=getattr(req, "question", "") or "", model=conn.selected_model or "")
+        if os.environ.get("AISCIENTIST_RUN_TIMING_LOG", "").strip().lower() in ("1", "true", "yes", "on"):
+            run_monitor.enable_journal_logging()
+        if run.monitor is None or run.monitor.ended is not None:
+            run.monitor = run_monitor.start(
+                kind=run.kind, owner_id=conn.app_user_id, owner=conn.owner,
+                conversation_id=run.conversation_id, run_id=run.run_id,
+                question=getattr(req, "question", "") or "", model=conn.selected_model or "")
+        request_id = run.monitor.run_id     # the id this request was routed under
+        run.monitor.kind = run.kind
+        run.monitor.run_id = run.run_id
+        run.monitor.conversation_id = run.conversation_id
+        if run.run_id and not run.routing_id:
+            run.monitor.bind_timing(_timing_path(conn.workspace, run.run_id), request_id=request_id)
+        run_monitor.set_current_monitor(run.monitor)
         if run.kind in ("chat", "corpus"):
             run.monitor.enter(run.kind)
     except Exception as exc:  # noqa: BLE001 - watching a run never breaks it
@@ -8760,30 +8927,48 @@ def _watch_stage(run: RunState, stage: str) -> None:
         run.monitor.enter(stage)
 
 
-def _watch_llm(run: RunState, complete_fn: Callable[..., str],
+def _watch_llm(run: RunState | None, complete_fn: Callable[..., str],
                scientist_chat: Callable[..., Any]) -> tuple[Callable[..., str], Callable[..., Any]]:
     """The lab's two model entry points, telling the run's monitor which role is thinking (the
     claim audit and the writer have no lab event of their own: their calls mark those stages)."""
+    if getattr(complete_fn, "_run_watched", False):
+        return complete_fn, scientist_chat
+
     def watched_complete(messages, *, role: str | None = None):
-        mon = run.monitor
+        mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin(role)
+        outcome = "failed"
         try:
-            return complete_fn(messages, role=role)
+            result = complete_fn(messages, role=role)
+            outcome = "success"
+            return result
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) or getattr(exc, "stage", "") == "shared_llm_stopped":
+                outcome = "cancelled"
+            raise
         finally:
             if mon is not None:
-                mon.llm_end()
+                mon.llm_end(outcome)
 
     def watched_scientist(messages, tools):
-        mon = run.monitor
+        mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin("scientist")
+        outcome = "failed"
         try:
-            return scientist_chat(messages, tools)
+            result = scientist_chat(messages, tools)
+            outcome = "success"
+            return result
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) or getattr(exc, "stage", "") == "shared_llm_stopped":
+                outcome = "cancelled"
+            raise
         finally:
             if mon is not None:
-                mon.llm_end()
+                mon.llm_end(outcome)
 
+    watched_complete._run_watched = True
     return watched_complete, watched_scientist
 
 
@@ -9001,6 +9186,7 @@ def _curation_pointer_path(owner: str, run_id: str) -> Path:
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / corpus_scan.CURATION_POINTER
 
 
+@run_monitor.timed_stage("result_packaging", source="curation")
 def _point_at_curation_tables(conn: Connection, run_id: str, art: Path, curation: dict[str, Any]) -> None:
     """Record the curation tables a run wrote, so the chat and Runs offer to save them."""
     folder = art / corpus_scan.CURATION_SUBDIR
@@ -9647,7 +9833,19 @@ def _quickchat_stream_fn(conn: Connection, model: str, base_url: str | None, api
                                duration_ms=int((time.monotonic() - started) * 1000),
                                error_type=_usage_error_type(exc), key_use=key_use)
             raise
-    return _stream
+    def timed_stream(messages: list[dict], schemas: list[dict]):
+        run = getattr(conn, "_context_run", lambda: None)()
+        with run_monitor.timed_stage("model_call", category="observation", role="chat") as span:
+            try:
+                yield from _stream(messages, schemas)
+            except GeneratorExit:
+                span.end("cancelled" if run is not None and run.chat_stop.is_set() else "unknown")
+                raise
+            except GatewayError as exc:
+                if exc.stage == "shared_llm_stopped":
+                    span.end("cancelled")
+                raise
+    return timed_stream
 
 
 def _record_chat_usage(conn: Connection, *, role: str, model: str, base_url: str | None,
@@ -9711,6 +9909,7 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
         return vllm_client.count_tokens(port, model, messages, tools,
                                         base_url=base_url, api_key=api_key)
 
+    @run_monitor.timed_stage("model_call", category="observation", role="chat:summary")
     def summarize(messages: list[dict], max_tokens: int) -> str:
         # The rolling conversation memory. think=False and a small max_tokens keep it cheap
         # AND correct: with thinking ON, a Qwen3 reasoning trace can eat the whole budget and
@@ -10155,6 +10354,7 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
                               per_query=int(per_query or lit.PER_QUERY))
 
 
+@run_monitor.timed_stage("result_packaging", source="literature_answer")
 def _save_literature_answer(art: Path, question: str, answer: str, collected: Any, cited: list) -> None:
     """Keep the answer with the run: ``report/summary.md`` (the question, the answer with its
     references, how it was made), ``literature/papers.csv`` (every paper read) and, when the corpus
@@ -10374,9 +10574,12 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
         if corpus_job is not None:
             if not corpus_job.done():
                 conn.push({"type": "run_status", "text": "📚 Waiting for the RetiGene corpus search…"})
-            deadline = time.monotonic() + _LIT_CORPUS_WAIT_S
-            while not corpus_job.done() and time.monotonic() < deadline and not run.chat_stop.is_set():
-                await asyncio.wait({corpus_job}, timeout=2)
+            with run_monitor.timed_stage("corpus_wait", category="observation", source="retrieval") as wait_span:
+                deadline = time.monotonic() + _LIT_CORPUS_WAIT_S
+                while not corpus_job.done() and time.monotonic() < deadline and not run.chat_stop.is_set():
+                    await asyncio.wait({corpus_job}, timeout=2)
+                if not corpus_job.done():
+                    wait_span.end("cancelled" if run.chat_stop.is_set() else "timeout")
             corpus_out = (corpus_job.result() if corpus_job.done() else
                           {"status": "error", "error": f"no result within {_LIT_CORPUS_WAIT_S // 60} minutes"})
         if run.chat_stop.is_set():
@@ -10466,6 +10669,7 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
     this session's vLLM, streaming each role's progress to the log + the final report
     to the chat. A typed follow-up after a completed run is routed by _dispatch_lab (edit /
     re-run-step / new study) instead of always minting a fresh study."""
+    _select_bound_datasets(req)   # refuse an oversized set before scheduling any work
     conn = _owned_conn(req.connection_id, request)
     # A run needs the whole stack (SSH + GPU + a served model), and /api/connect brings those up
     # together — so "ready" is the only state a run may start from. Anything else (still
@@ -10775,6 +10979,7 @@ def _keep_saved_plan_waiting(conn: Connection, run_id: str, art: Path, state: di
         return
     _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
     if card:
+        _saved_plan_timing(conn, run_id).observe_push(card)
         conn.push({**card, "run_id": run_id, "conversation_id": state.get("conversation_id"),
                    "saved": True})
 
@@ -10818,6 +11023,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         if action == "cancel":
             saved_plans.save(art, current["yaml"], source=current["source"], state="cancelled",
                              kind=current["kind"], payload=current.get("payload"))
+            _saved_plan_timing(conn, run_id).decision(action)
             _finish_run_record(conn, run_id, "cancelled", str(art), "Plan cancelled.")
             conn.push({"type": "plan_done", "run_id": run_id,
                        "conversation_id": state.get("conversation_id")})
@@ -10837,6 +11043,7 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
         cont_req = LabRequest(**options)
         # The task loads the current document again, rather than using a copy from the card.
         _SAVED_PLAN_TASKS.add(art)
+        _saved_plan_timing(conn, run_id).decision(action)
         # The budget answer goes with the run, as for /api/lab and /api/lab/continue: the in-run
         # check (key_guard) does not ask again what the user just confirmed.
         _note_budget_choice(conn.begin_run(state.get("conversation_id"), run_id=run_id), req)
@@ -10847,12 +11054,18 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     if target is None:
         return JSONResponse({"status": "not_delivered", "action": "ignored",
                              "message": "Not delivered: no saved plan was found for this chat."})
+    if target.monitor is not None and target.pending_plan is not None:
+        target.monitor.decision(action)
     target.plan_value = {"action": action, "feedback": (req.feedback or "").strip(),
                          **({"plan_yaml": req.plan_yaml} if carries_doc else {})}
     target.pending_plan = None
     target.plan_event.set()
     conn.push({"type": "plan_done"}, run=target)
     return JSONResponse({"status": "ok", "action": action})
+
+
+def _saved_plan_timing(conn: Connection, run_id: str) -> run_monitor.RunMonitor:
+    return run_monitor.reopen_timing(_timing_path(conn.workspace, run_id), run_id=run_id)
 
 
 class ConfirmRequestBody(BaseModel):
@@ -11578,6 +11791,7 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         return vllm_client.count_tokens(_port(), model, messages, tools,
                                         base_url=base_url, api_key=api_key)
 
+    complete_fn, scientist_chat = _watch_llm(None, complete_fn, scientist_chat)
     return LabLLM(complete_fn, scientist_chat, model, label, count_tokens,
                   scientist_remote=_endpoint_is_off_host(base_url),
                   lab_role_remote=_endpoint_is_off_host(lab_base_url),
@@ -11669,7 +11883,8 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     elif t == "tool_result":
         tool = ev.get("tool")
         summary = str(ev.get("summary", "")).strip()
-        activity(f"✓ {tool}: {summary}")
+        mark = "⏹" if ev.get("timing_outcome") == "cancelled" else "✓"     # a tool Stop ended
+        activity(f"{mark} {tool}: {summary}")
         # For run_code, surface the FINAL successful snippet as a formatted code block; the
         # last success in a step overwrites the earlier ones on the client.
         if tool == "run_code":
@@ -12788,6 +13003,9 @@ def _decision_review(conn: Any, emit: "Callable[..., Any]", node: Any,
          "A step outside your plan was proposed — it runs only if you approve it."
          if proposal else f"Decision point — {goal[:80]} (pick an option or type your own).")
     if not conn.plan_event.wait(timeout=timeout):
+        mon = run_monitor.current_monitor()
+        if mon is not None:
+            mon.decision("timeout")
         conn.pending_plan = None
         if proposal:
             conn.push({"type": "plan_done"})
@@ -13967,7 +14185,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                                "outputs": s["outputs"]}
                             for s in (run_flags["plan_doc"] or {}).get("steps") or []
                             if isinstance(s, dict) and s.get("outputs")}
-            prompt = {"revised": list(run_flags["plan_revised"]),
+            prompt = {**_plan_dataset_inputs(decisions, primary_name),
+                      "revised": list(run_flags["plan_revised"]),
                       "problems": list(run_flags["plan_problems"]),
                       **(run_flags.get("plan_answer") or {}),
                       "estimate": plan_estimate(agenda) if agenda else None,
@@ -14219,6 +14438,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             reply = await asyncio.to_thread(_qc_chat_reply, art, result)
             if reply:
                 result.final_answer = reply
+            result.final_answer = _default_qc_display(result.final_answer or "", art, result,
+                                                      question=req.question)
             try:
                 # The same lines in the folder, so a downloaded bundle says what QC did. It is also
                 # what marks the run finished for the next message in this chat to continue.
@@ -14314,6 +14535,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             from ..agents import own_choices
             report_md = own_choices.add_section(report_md, lab_obj.self_sourced,
                                                 insert=_insert_before_backmatter)
+            # Enforce the display policy after every writer/reviewer, including Stop and fallback.
+            # Original diagnostic data and optional generated excerpts remain downloadable.
+            report_md = _default_qc_display(report_md, art, result, question=req.question)
             # How we know it is right: every number traced to the run's outputs, what each label rests
             # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
             # statement is report/verification.md, the manuscript carries its summary.
@@ -14327,6 +14551,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 # After the number check on purpose: this section restates another run's work.
                 report_md = _insert_before_backmatter(
                     report_md, _earlier_work_note(prior, continues_from_dataset))
+                report_md = _default_qc_display(report_md, art, result, question=req.question)
             _watch_stage(run, "report")
             say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
                     else "💾 Saving report.md — skipping the render.", "info")
@@ -14468,6 +14693,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                          "Downloads panel.", "success" if not abandoned() else "warning")
         if untested_md:
             result.final_answer = untested_md + "\n" + (result.final_answer or "")
+        result.final_answer = _default_qc_display(result.final_answer or "", art, result,
+                                                  question=req.question)
         conn.push({"type": "chat_token", "token": result.final_answer or "(no report produced)"})
         conn.push({"type": "chat_done"})
         if later_asks:
@@ -14703,6 +14930,7 @@ def _with_declared_descriptions(files: list[dict], art: Path) -> list[dict]:
     return files
 
 
+@run_monitor.timed_stage("result_packaging", source="metadata")
 def _write_result_metadata(conn: Connection, run_id: str, art: Path, req: Any, decisions: dict,
                            status: str, rounds: "list[dict] | None" = None,
                            models: "list[str] | None" = None) -> None:
@@ -14932,7 +15160,9 @@ def _manuscript_annotation_rule(kind: str) -> str:
 
 
 def _report_writer_system(kind: str = "single_cell") -> str:
+    from ..reporting.qc_summary import QC_SUMMARY_POLICY
     return (
+        QC_SUMMARY_POLICY + "\n" +
         f"{_manuscript_domain(kind)} The manuscript MUST be complete — every section below is "
         "present and substantive, with NO empty or placeholder sections. Use Markdown headings only "
         "(do NOT prefix them with your own '1.'/'2.' numbers):\n"
@@ -15062,22 +15292,31 @@ def _fmt_num(c: str) -> str:
     return s or "0"
 
 
-def _csv_preview_md(path: Path, *, max_rows: int = 8, max_cols: int = 8, cell: int = 40) -> str:
+def _csv_preview_md(path: Path, *, max_rows: int = 8, max_cols: int = 8, cell: int = 40,
+                    omit_doublet_details: bool = False) -> str:
     """Render the head of a CSV as a Markdown table (bounded rows/cols/cell width), with
     numeric cells compacted (see :func:`_fmt_num`) so wide stat tables stay legible in the
     rendered PDF instead of overprinting neighbouring columns."""
     import csv
 
     rows: list[list[str]] = []
+    columns: list[int] = []
     try:
         with open(path, newline="", encoding="utf-8", errors="replace") as fh:
             for i, row in enumerate(csv.reader(fh)):
                 if i > max_rows:
                     break
-                rows.append(row[:max_cols])
+                if i == 0:
+                    # Only the default manuscript preview omits these fields. The CSV and the
+                    # technical report keep them, and unrelated scores/kappa columns stay visible.
+                    columns = [j for j, name in enumerate(row) if not (omit_doublet_details and (
+                        re.search(r"doubletfinder|scdblfinder|concordance_doublet", name, re.I)
+                        or name.lower() in {"doublet_score", "doublet_kappa", "doublet_decider",
+                                            "doublet_class", "pann", "df.classifications"}))][:max_cols]
+                rows.append([row[j] if j < len(row) else "" for j in columns])
     except Exception:  # noqa: BLE001 - a bad CSV just gets skipped from the preview
         return ""
-    if len(rows) < 2:
+    if len(rows) < 2 or not columns:
         return ""
 
     def fmt(c: str) -> str:
@@ -15130,7 +15369,7 @@ def _scgpt_label_summary_md(path: Path, *, top: int = 15) -> str:
     return f"**{head}.**\n\n" + "\n".join(lines)
 
 
-def _data_artifacts_block(art: Path) -> str:
+def _data_artifacts_block(art: Path, *, omit_doublet_details: bool = False) -> str:
     """Surface ``data/`` artifacts to the report writer. scGPT predictions get a label-
     distribution summary; other small data CSVs get a head preview. Returns '' if none."""
     data_dir = art / "data"
@@ -15145,7 +15384,7 @@ def _data_artifacts_block(art: Path) -> str:
     for c in sorted(data_dir.glob("*.csv")):
         if c.name == "scgpt_predictions.csv" or c.stat().st_size > 200_000:
             continue
-        md = _csv_preview_md(c)
+        md = _csv_preview_md(c, omit_doublet_details=omit_doublet_details)
         if md:
             blocks.append(f"### data/{c.name}\n{md}")
     return "\n\n".join(blocks)
@@ -15350,12 +15589,6 @@ def _wants_brief_report(scope: Any, result: Any) -> bool:
     return bool(getattr(scope, "brief_report", False)) or _qc_only_run(result)
 
 
-# Below this agreement the two doublet callers are said to disagree, with the numbers: run_cellqc
-# warns at the same value.
-_DOUBLET_KAPPA_LOW = 0.2
-_DOUBLET_CALLERS = {"doubletfinder": "DoubletFinder", "scdblfinder": "scDblFinder"}
-
-
 def _cellqc_metrics_rows(art: Path) -> "dict[str, dict[str, str]]":
     """CellQC's own per-library metrics (``tables/cellqc_metrics.csv``), by sample. They hold what
     the tool's return value leaves out: each filter's total, and the second doublet caller's calls."""
@@ -15375,47 +15608,67 @@ def _metric_int(row: "dict[str, str]", key: str) -> "int | None":
     return int(x) if x == x else None
 
 
-def _brief_doublet_lines(lib: dict, row: "dict[str, str]", decider: str,
-                         cell_columns: "list[str]") -> "list[str]":
-    """The doublet rate and, when the callers disagree, how much, in plain counts: how many of the
-    decider's removals the other caller agrees on, and how many further cells it flags that stay.
+def _brief_doublet_lines(lib: dict) -> "list[str]":
+    from ..reporting.qc_summary import doublet_count_lines
+    return doublet_count_lines(lib)
 
-    Run 6275df1213ab said only "the two doublet callers agree at kappa 0.14": scDblFinder agreed on
-    245 of DoubletFinder's 929 removals and flagged 1,192 of the 14,553 kept cells. Those are counts,
-    not doublets left behind: an audit of that run found most of the 1,192 to be high-UMI rods with
-    no second lineage's markers, while the 245 both callers flagged were the clear doublets."""
-    dbl, filt, kept = (lib.get("doublets_removed"), lib.get("cells_after_filter"),
-                       lib.get("cells_after_doublets"))
-    if not isinstance(dbl, (int, float)):
-        return []
-    decider = str(row.get("doublet_decider") or decider or "")
-    name = _DOUBLET_CALLERS.get(decider, decider)
-    out = [f"Doublets removed: {int(dbl):,}"
-           + (f" of the {int(filt):,} filtered cells ({100 * dbl / filt:.1f}%)"
-              if isinstance(filt, (int, float)) and filt else "")
-           + (f", called by {name}" if name else "") + "."]
-    kappa = lib.get("doublet_kappa")
-    if not isinstance(kappa, (int, float)):
-        return out
-    other = next((m.group(1) for k in row if (m := re.match(r"doublet_(\w+?)_ndoublet$", k))
-                  and m.group(1) != decider), "")
-    n_other = _metric_int(row, f"doublet_{other}_ndoublet") if other else None
-    both = next((_metric_int(row, k) for k in row
-                 if k.startswith("concordance_") and k.endswith("_both_doublet")), None)
-    if (kappa >= _DOUBLET_KAPPA_LOW or n_other is None or both is None or not name
-            or n_other < both):
-        out.append(f"The two doublet callers agree at kappa {kappa:.2f}.")
-        return out
-    stayed = n_other - both
-    column = f"{other}_class"
-    out.append(f"The two doublet callers agree poorly (kappa {kappa:.2f}): "
-               f"{_DOUBLET_CALLERS.get(other, other)} agrees on {both:,} of {name}'s {int(dbl):,} "
-               f"removals and flags "
-               + (f"{stayed:,} of the {int(kept):,} kept cells ({100 * stayed / kept:.1f}%)"
-                  if isinstance(kept, (int, float)) and kept else f"{stayed:,} further cells")
-               + ", which stay in the dataset"
-               + (f" (its `{column}` column marks them)" if column in cell_columns else "") + ".")
-    return out
+
+def _brief_qc_warnings(result: dict) -> "list[str]":
+    from ..reporting.qc_summary import qc_warnings
+    return qc_warnings(result)
+
+
+# Written by code from the run's records and already to the QC policy, so the display leaves them
+# as they are: "The dataset" and "What was run" (the reviewer is told the same), and the back matter.
+# A chosen `doublet_decider` or a reference's title names a caller; cutting it misstates the record.
+_QC_RECORD_SECTIONS = re.compile(r"^(?:The dataset|What was run)\b", re.I)
+_BACKMATTER_HEADINGS = ("\n## References", "\n# Output Files Index", "\n## Background consulted")
+
+
+def _default_qc_display(text: str, art: Path, result: Any = None, *, question: str = "") -> str:
+    """Final display boundary; retain generated doublet details in an optional download.
+
+    This never changes the source tool results, tables, matrices or technical report. It also
+    covers an old synthesis or a writer/reviewer that ignores the shared presentation prompt. A
+    ``question`` that asks for the doublet comparison gets it: the writers are told the same.
+    """
+    from ..reporting.qc_display import asks_for_doublet_details, default_qc_text
+
+    if asks_for_doublet_details(question):
+        return text
+
+    starts = [i for i in (text.find(h) for h in _BACKMATTER_HEADINGS) if i != -1]
+    text, back = (text[:min(starts)], text[min(starts):]) if starts else (text, "")
+    qc = _qc_step_outcome(result) if result is not None else None
+    libs = [lib for lib in (qc["result"].get("libraries") or [] if qc else []) if isinstance(lib, dict)]
+    counts = [f"{lib.get('sample') or 'Library'}: {line}"
+              for lib in libs for line in _brief_doublet_lines(lib)]
+    # With the record's counts at hand, a count in a removed clause is not salvaged: it may be the
+    # other caller's ("scDblFinder would have removed 1,192 doublets"), and would hide the record's.
+    display = default_qc_text(text, salvage_counts=not counts, keep=_QC_RECORD_SECTIONS)
+    if not display.changed:
+        return text + back
+    body = display.text.rstrip()
+    if counts and not re.search(r"doublets?\s+removed|removed\s+[\d,]+\s+doublets?", body, re.I):
+        body += "\n\n" + "\n".join(counts)
+    if display.needs_review and "doublet filtering needs review" not in body.lower():
+        body += "\n\nDoublet filtering needs review; see the optional technical details."
+    path = art / "report" / "doublet_details.md"
+    try:
+        prior = path.read_text(encoding="utf-8") if path.is_file() else (
+            "# Optional doublet details\n\n"
+            "Generated excerpts omitted from the default result. They may include model-written "
+            "text and are not additional measurements. The original QC metrics and per-cell data remain "
+            "in the run's downloadable QC files and execution record.\n")
+        additions = [detail for detail in display.details if detail not in prior]
+        if additions:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(prior.rstrip() + "\n\n" + "\n\n".join(additions) + "\n", encoding="utf-8")
+        if path.is_file() and "report/doublet_details.md" not in body:
+            body += "\n\nOptional technical details: `report/doublet_details.md` in Downloads."
+    except OSError as exc:
+        print(f"[report] could not save optional doublet excerpts: {exc}")
+    return body.strip() + "\n" + back
 
 
 def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
@@ -15459,8 +15712,6 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
                 f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
         lines.append("")
         metrics = _cellqc_metrics_rows(art) if tool == "run_cellqc" else {}
-        cell_columns = _cells_columns(art)
-        decider = str((r.get("doublets") or {}).get("decider") or "")
         for lib in libs:
             removed = lib.get("removed_only_by") or {}
             if not removed and lib.get("doublets_removed") is None:
@@ -15488,7 +15739,7 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
                     and isinstance(filt, (int, float)) else "")
             parts = [f"the count, gene and mitochondrial filters removed{gone}: "
                      + (", ".join(why) if why else "none") + "."]
-            parts += _brief_doublet_lines(lib, row, decider, cell_columns)
+            parts += _brief_doublet_lines(lib)
             nf, iqr = lib.get("nuclear_fraction_median"), lib.get("nuclear_fraction_iqr") or []
             if isinstance(nf, (int, float)):
                 spread = (f", IQR {iqr[0]:.2f}–{iqr[1]:.2f}" if len(iqr) == 2
@@ -15503,9 +15754,9 @@ def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":
     th = r.get("thresholds") if isinstance(r.get("thresholds"), dict) else {}
     if th:
         lines += ["Thresholds: " + ", ".join(f"`{k}` = {v}" for k, v in th.items()) + ".", ""]
-    warnings = [str(w) for w in (r.get("warnings") or []) if str(w).strip()]
+    warnings = _brief_qc_warnings(r)
     if warnings:
-        lines += ["**The tool's warnings:**", ""] + [f"- {w}" for w in warnings] + [""]
+        lines += ["**QC warnings:**", ""] + [f"- {w}" for w in warnings] + [""]
     fig = next((f for f in _report_figures(art) if "qc" in f.name), None)
     if fig is not None:
         lines += [f"![Per-cell QC metrics after filtering.](figures/{fig.name})", ""]
@@ -15697,7 +15948,7 @@ def _files_lines(art: Path, dataset_note: str) -> "list[str]":
     for rd in _result_dataset_pointers(art):
         files.append(f"- `{rd['name']}` — the processed dataset ({dataset_note}).")
     for rel, what in (("tables/cells.csv", _cells_table_what(art)),
-                      ("tables/cellqc_metrics.csv", "CellQC's per-library metrics"),
+                      ("tables/cellqc_metrics.csv", "optional technical details: CellQC's per-library metrics"),
                       ("result/report.html", "CellQC's own report; `result/` is CellQC's result "
                                              "directory, complete but for the per-library .h5ad"),
                       ("report/verification.md", "how each number here was checked")):
@@ -15750,8 +16001,7 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         return f"{int(v):,}" if isinstance(v, (int, float)) else "—"
 
     libs = [lib for lib in (r.get("libraries") or []) if isinstance(lib, dict)]
-    warnings = [re.sub(r"\s*Report it\.?\s*$", "", str(w)).strip()
-                for w in (r.get("warnings") or []) if str(w).strip()]
+    warnings = _brief_qc_warnings(r)
     before, after = r.get("cells_before"), r.get("cells_after")
     genes = (f"; {int(r['genes_after']):,} genes" if len(r.get("checkpoints") or {}) < 2
              and isinstance(r.get("genes_after"), (int, float))
@@ -15783,14 +16033,9 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
             gone = (f" {int(cr) - int(filt):,}" if isinstance(cr, (int, float))
                     and isinstance(filt, (int, float)) else "")
             lines.append(f"- Filters removed{gone}: " + ", ".join(parts) + ".")
-        row = _cellqc_metrics_rows(art).get(str(lib.get("sample")), {})
-        decider = str((r.get("doublets") or {}).get("decider") or "")
-        dbl = _brief_doublet_lines(lib, row, decider, _cells_columns(art))
+        dbl = _brief_doublet_lines(lib)
         if dbl:
             lines.append("- " + " ".join(dbl))
-            # The doublet line already gives the callers' agreement with its counts.
-            if len(dbl) > 1:
-                warnings = [w for w in warnings if "doublet callers agree" not in w]
         mito = lib.get("median_pct_mt_kept")
         mito_words = "in the kept cells"
         if not isinstance(mito, (int, float)):
@@ -15810,13 +16055,14 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
     elif libs:
         mito_kept = all(isinstance(lib.get("median_pct_mt_kept"), (int, float)) for lib in libs)
         mkey = "median_pct_mt_kept" if mito_kept else "median_pct_mt"
-        lines += ["", "| Library | Cell Ranger cells | after filters | after doublets | kept | "
+        lines += ["", "| Library | Cell Ranger cells | after filters | after doublets | doublets removed | kept | "
                       + ("median % mito (kept)" if mito_kept else "median % mito (before filtering)")
-                      + " |", "|---|---:|---:|---:|---:|---:|"]
+                      + " |", "|---|---:|---:|---:|---:|---:|---:|"]
         for lib in libs:
             kept, mito = lib.get("frac_retained"), lib.get(mkey)
             lines.append(f"| {lib.get('sample', '—')} | {n(lib.get('cells_cellranger'))} | "
                          f"{n(lib.get('cells_after_filter'))} | {n(lib.get('cells_after_doublets'))} | "
+                         f"{n(lib.get('doublets_removed'))} | "
                          f"{f'{100 * kept:.1f}%' if isinstance(kept, (int, float)) else '—'} | "
                          f"{f'{mito:.2f}' if isinstance(mito, (int, float)) else '—'} |")
         lines.append("")
@@ -15846,9 +16092,11 @@ def _qc_chat_reply(art: Path, result: Any) -> str:
         lines += ["", f"**Result:** `{rd['name']}` — {n(rd.get('n_cells'))} cells × "
                       f"{n(rd.get('n_genes'))} genes; `X` is log-normalised"
                       + (f", `layers['counts']` holds {layer}" if layer else "") + f". It is {where}."]
-    if tool == "run_cellqc" and (art / "result" / "report.html").exists():
-        lines.append("CellQC's own report and per-library files are in `result/` "
-                     "(`result/report.html`).")
+    if tool == "run_cellqc":
+        details = [f"`{rel}`" for rel in ("tables/cells.csv", "tables/cellqc_metrics.csv",
+                                         "result/report.html") if (art / rel).is_file()]
+        if details:
+            lines.append("Optional technical details in Downloads: " + ", ".join(details) + ".")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -16407,13 +16655,13 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
                             key=lambda t: t.stat().st_size)[:10]
     previews: list[str] = []
     for t in preview_tables:
-        md = _csv_preview_md(t)
+        md = _csv_preview_md(t, omit_doublet_details=True)
         if md:
             previews.append(f"### tables/{t.name}\n{md}")
     previews_block = "\n\n".join(previews) or "(no small tables to preview)"
     # data/ artifacts (e.g. scGPT predictions) — these never appear in tables/, so surface
     # them explicitly or the model can't see a successful annotation result.
-    data_block = _data_artifacts_block(art) or "(no data/ artifacts to surface)"
+    data_block = _data_artifacts_block(art, omit_doublet_details=True) or "(no data/ artifacts to surface)"
     rd = _result_dataset_pointer(art)
     rd_block = (f"Result dataset delivered with this run: `{rd['name']}` ({rd.get('n_cells')} cells x "
                 f"{rd.get('n_genes')} genes; layers['counts'] = {rd.get('counts_layer')}). When the "
@@ -17148,8 +17396,10 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
 
 
 def _report_review_system(kind: str = "single_cell") -> str:
+  from ..reporting.qc_summary import QC_SUMMARY_POLICY
   study = "variant-annotation" if kind == "variant" else "single-cell RNA-seq"
   return (
+    QC_SUMMARY_POLICY + "\n" +
     f"You are a meticulous scientific editor reviewing a {study} MANUSCRIPT draft "
     "BEFORE it is rendered to PDF/DOCX. Return the corrected FULL Markdown, fixing:\n"
     "- Manuscript structure: Title, Abstract, Study question, Results, Discussion, Limitations, "
@@ -17687,6 +17937,25 @@ def _quarantine_strays(art: Path) -> list[str]:
     return moved
 
 
+@app.get("/api/timing/{owner}/{run_id}")
+async def get_run_timing(owner: str, run_id: str, request: Request) -> Response:
+    """Read the durable timeline, including failed runs and plans awaiting a later decision.
+
+    Uses the same owner boundary as downloads; no live connection or successful result is needed.
+    Reading never changes an open span into a claimed failure or completion.
+    """
+    refused = _owner_dir_error(owner, request)
+    if refused is not None:
+        return refused
+    if not all(part.replace("-", "").replace("_", "").isalnum() for part in (owner, run_id)):
+        return JSONResponse({"error": "Bad request"}, status_code=400)
+    path = _timing_path(CONSOLE_RUNS_DIR / owner, run_id)
+    root = (CONSOLE_RUNS_DIR / owner).resolve()
+    if not path.resolve().is_relative_to(root) or not path.is_file():
+        return JSONResponse({"error": "No timing recorded for this run."}, status_code=404)
+    return JSONResponse(await asyncio.to_thread(run_monitor.read_timing, path))
+
+
 @app.get("/api/bundle/{owner}/{run_id}")
 async def get_bundle(owner: str, run_id: str, request: Request) -> Response:
     """Zip a run's whole artifacts folder for a single 'download all' click."""
@@ -17783,6 +18052,7 @@ def _read_pointer(path: Path) -> "dict | None":
     return rec if isinstance(rec, dict) else None
 
 
+@run_monitor.timed_stage("result_packaging", source="literature_tables")
 def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dict | None":
     """Keep a saveable copy of literature tables; the run's downloads remain in artifacts. Both go
     in the run's own folder (``art``'s parent): on the server that is where ``_result_pointer_path``
@@ -17813,6 +18083,7 @@ def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dic
     return rec
 
 
+@run_monitor.timed_stage("result_packaging", source="cellqc")
 def _stamp_cellqc_result(conn: "Connection", run_id: str, decisions: dict, on_hpc: bool,
                          emit: Callable[..., Any]) -> "dict | None":
     """Complete run_cellqc's pointer with what only the gateway knows: the name the directory is
@@ -17964,8 +18235,56 @@ def md_result_uuid(run_id: str) -> str:
     return result_uuid(run_id)
 
 
+_SAVE_TIMING: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "result_save_timing", default=None)
+
+
+def _timed_result_operation(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Bind saves to the requested owner's artifact, including the background copy after 202.
+
+    A separate monitor keeps actual saving alive beyond run_complete. Never consult a connection's
+    newest live chat here: the original run may already be gone while another chat is computing.
+    """
+    @functools.wraps(fn)
+    def measured(owner: str, user_id: int | None, run_id: str, *args: Any, **kwargs: Any) -> Any:
+        identity = (owner, run_id)
+        if _SAVE_TIMING.get() == identity:
+            return fn(owner, user_id, run_id, *args, **kwargs)
+        try:
+            folder = _run_folder(safe_name(owner), run_id)
+            mon = (run_monitor.reopen_timing(_timing_path(folder.parent, run_id), run_id=run_id)
+                   if folder is not None and folder.is_dir() else None)
+        except Exception:  # timing must never prevent a save
+            mon = None
+        if mon is None:
+            return fn(owner, user_id, run_id, *args, **kwargs)
+        source = "background" if fn.__name__ == "_bring_result_home" else "request"
+        token = _SAVE_TIMING.set(identity)
+        try:
+            with run_monitor.bind_monitor(mon), mon.span("result_save", source=source) as span:
+                result = fn(owner, user_id, run_id, *args, **kwargs)
+                if isinstance(result, tuple):
+                    status, body = result
+                    outcome = ("failed" if status >= 400 else "queued" if status == 202
+                               else "already_saved" if body.get("already") else "success")
+                    span.end(outcome)
+                elif result is False:
+                    span.end("failed")
+                return result
+        finally:
+            _SAVE_TIMING.reset(token)
+    return measured
+
+
+@_timed_result_operation
 def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                      conn: "Connection | None") -> "tuple[int, dict]":
+    with _SAVING_LOCK:
+        return _save_run_result_locked(owner, user_id, run_id, what, conn)
+
+
+def _save_run_result_locked(owner: str, user_id: "int | None", run_id: str, what: str,
+                            conn: "Connection | None") -> "tuple[int, dict]":
     """Make what a run handed on one of the owner's datasets: the processed dataset
     (``what="dataset"``, an .h5ad), CellQC's result directory (``"cellqc"``), or literature
     tables (``"literature"``), both folders. Returns
@@ -17999,6 +18318,10 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
         return 400, {"error": "unexpected literature location"}
     owner_dir = (CONSOLE_RUNS_DIR / safe_name(owner)).resolve()
     kept = dataset_storage.configured()
+    from . import storage_policy
+    incoming = int(rec.get("size_bytes") or 0) if rec.get("location") == "hpc3" else 0
+    if user_id and (error := storage_policy.quota_error(user_id, owner, incoming)):
+        return 507, {"error": error, "storage_url": "#account/storage"}
     if rec.get("location") == "hpc3":
         if conn is None:
             return 409, {"error": "Connect to HPC3 first: the result is kept there."}
@@ -18056,7 +18379,13 @@ def _save_run_result(owner: str, user_id: "int | None", run_id: str, what: str,
                  "kind": "folder" if folder else "file"}
 
 
+@_timed_result_operation
 def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tuple[int, dict]":
+    with _SAVING_LOCK:
+        return _save_curation_tables_locked(owner, user_id, run_id)
+
+
+def _save_curation_tables_locked(owner: str, user_id: "int | None", run_id: str) -> "tuple[int, dict]":
     """Make a corpus curation's tables (``<run>/artifacts/curation/*.csv``, issue 46) one of the
     owner's datasets: copied into a new dataset folder (``users/<owner>/datasets/<uuid>/original``
     with a data root, else ``uploads/processed/<name>``), listed, and the run's record pointed at it.
@@ -18083,6 +18412,10 @@ def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tu
     names = [n for n in names if _CELLQC_FILE_RE.fullmatch(n) and (src / n).is_file()]
     if not same or not src.is_dir() or not names:
         return 409, {"error": "The tables are no longer on the server."}
+    from . import storage_policy
+    size = sum((src / n).stat().st_size for n in names)
+    if user_id and (error := storage_policy.quota_error(user_id, owner, size)):
+        return 507, {"error": error, "storage_url": "#account/storage"}
     try:
         if dataset_storage.configured():
             identity = str(uuid4())
@@ -18122,7 +18455,7 @@ def _save_curation_tables(owner: str, user_id: "int | None", run_id: str) -> "tu
     return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name, "kind": "folder"}
 
 
-_SAVING_LOCK = threading.Lock()
+_SAVING_LOCK = threading.RLock()
 
 
 def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder: bool, name: str,
@@ -18158,8 +18491,9 @@ def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder:
     return dataset_id
 
 
+@_timed_result_operation
 def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str,
-                       conn: "Connection", src: str, pointer_path: Path) -> None:
+                       conn: "Connection", src: str, pointer_path: Path) -> bool:
     """The background half of saving a result kept on HPC3 (issue 6): copy it into a new dataset
     folder of the owner's on this host, publish it, list it, and tell the owner's windows. The HPC3
     copy stays where the run left it, and goes with the session's process files."""
@@ -18193,6 +18527,7 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
                                      f"({size / 1e6:.0f} MB copied from HPC3 in "
                                      f"{time.monotonic() - started:.0f} s): it is in Files → Datasets.")
             c._publish({"type": "result_saved", "run_id": run_id, "what": what, "path": dest})
+        return True
     except Exception as exc:  # noqa: BLE001 - reported on the run's record and to the owner
         shutil.rmtree(stage, ignore_errors=True)
         conn.session.finish_transfer(tid, error=f"{type(exc).__name__}: {public_error(exc)}")
@@ -18208,6 +18543,7 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
             c.emit("error", "lab", f"Could not copy {name} from HPC3 to the server: {public_error(exc)}. "
                                    "It is still on HPC3; save it again from Runs.")
             c._publish({"type": "result_saved", "run_id": run_id, "what": what, "error": public_error(exc)[:300]})
+        return False
 
 
 async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[..., Any]) -> None:
@@ -18223,6 +18559,9 @@ async def _autosave_results(conn: "Connection", run_id: str, emit: Callable[...,
         if _read_pointer(_result_pointer_path(conn.owner, run_id, what)) is None:
             continue
         try:
+            mon = run_monitor.current_monitor()
+            if mon is not None:
+                mon.timing_event("save_requested", action="automatic")
             status, body = await asyncio.to_thread(
                 _save_run_result, conn.owner, conn.app_user_id, run_id, what,
                 conn if conn.executor is not None else None)
@@ -18317,6 +18656,10 @@ async def save_result_dataset(run_id: str, request: Request, what: str = "datase
     if not run_id.isalnum() or (what not in _RESULT_KINDS
                                and not re.fullmatch(r"dataset:[A-Za-z0-9_-]+", what)):
         return JSONResponse({"error": "bad request"}, status_code=400)
+    folder = _run_folder(safe_name(user.username), run_id)
+    if folder is not None and folder.is_dir():
+        mon = run_monitor.reopen_timing(_timing_path(folder.parent, run_id), run_id=run_id)
+        mon.save_requested(action="manual")
     if what == "tables":
         status, body = await asyncio.to_thread(_save_curation_tables, user.username, user.id, run_id)
         return JSONResponse(body, status_code=status)

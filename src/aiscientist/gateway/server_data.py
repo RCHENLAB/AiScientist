@@ -13,7 +13,7 @@ through the browser would copy it out of the server and back in. Instead a user 
    an interrupted copy stopped). It is a temporary copy: removed when the session disconnects, and
    made again from the server by the next session.
 
-Nothing here imports the rest of the gateway: the executor is passed in.
+The executor is passed in; the only shared gateway state used here is run timing context.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+from .run_monitor import timed_stage
 
 ROOTS_ENV = "AISCIENTIST_SERVER_DATA_ROOTS"
 CONFIRM_GB_ENV = "AISCIENTIST_SERVER_DATA_CONFIRM_GB"
@@ -340,6 +342,7 @@ def _remote_sizes(executor: Any, remote_dir: str) -> "dict[str, int]":
     return sizes
 
 
+@timed_stage("data_staging", source="server_data")
 def sync_to_hpc(executor: Any, scan_result: Scan, remote: str,
                 progress: "Callable[[str], None] | None" = None,
                 should_cancel: "Callable[[], bool] | None" = None,

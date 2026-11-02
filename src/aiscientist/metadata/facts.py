@@ -274,6 +274,9 @@ def result_files(root: Path, *, skip: Iterable[str] = ("croissant.json",)) -> li
     for a CSV/TSV, its columns. Sorted; at most :data:`MAX_FILES`."""
     out: list[dict] = []
     skipped = set(skip)
+    # Operational timing continues after result packaging (later saves, background completion).
+    # Its mutable journal is served separately; a snapshot checksum here would immediately stale.
+    skipped.add("process/timing.jsonl")
     try:
         paths = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
     except OSError:

@@ -401,3 +401,35 @@ def test_a_job_file_with_unknown_fields_still_loads(h):
     data["a_field_from_the_future"] = 1
     path.write_text(_json.dumps(data))
     assert [j.id for j in h.store.load_all()] == [job.id]
+
+
+def test_background_staging_and_retry_keep_submitting_run_context(h):
+    from aiscientist.gateway import run_monitor
+
+    previous_monitor = run_monitor.current_monitor()
+
+    first = run_monitor.RunMonitor(run_id="first-run")
+    second = run_monitor.RunMonitor(run_id="second-run")
+    seen = []
+    original_push = h.q.push
+    retried = threading.Event()
+
+    def push(job, progress):
+        monitor = run_monitor.current_monitor()
+        seen.append((job.name, monitor.run_id if monitor else None))
+        if job.name == "first.h5ad" and not retried.is_set():
+            retried.set()
+            raise OSError("retry once")
+        return original_push(job, progress)
+
+    h.q.push = push
+    first_job, second_job = h.job("first.h5ad"), h.job("second.h5ad")
+    with run_monitor.bind_monitor(first):
+        h.q.submit(first_job)
+    with run_monitor.bind_monitor(second):
+        h.q.submit(second_job)
+    assert _settle(h.q, first_job.id).state == "done"
+    assert _settle(h.q, second_job.id).state == "done"
+    assert [run for name, run in seen if name == "first.h5ad"] == ["first-run", "first-run"]
+    assert [run for name, run in seen if name == "second.h5ad"] == ["second-run"]
+    assert run_monitor.current_monitor() is previous_monitor
