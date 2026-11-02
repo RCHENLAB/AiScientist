@@ -277,3 +277,31 @@ def test_a_request_for_the_doublet_comparison_keeps_it(tmp_path, monkeypatch):
     for output in (rendered[0], _reply(payloads)):
         assert "DoubletFinder and scDblFinder agree poorly (kappa 0.10)." in output
     assert not (art / "report/doublet_details.md").exists()
+
+
+def test_final_manuscript_and_chat_keep_methods_limitations_and_residual_findings(tmp_path, monkeypatch):
+    method = "Doublets were identified with DoubletFinder (McGinnis et al., 2019) and removed."
+    limitation = ("Doublet calling relies on a single decider; cells the second caller flagged were "
+                  "retained and may confound rare-population analyses.")
+    finding = ("Cluster 7 shows elevated doublet scores and co-expresses 42 rod and cone marker "
+               "genes, suggesting residual doublets.")
+    failure = "- S2: scDblFinder second opinion failed: R package version 1.2.3 not installed."
+    warning = ("**Untested code.** The DoubletFinder follow-up step used generated code; "
+               "its results have not been independently verified.")
+    draft = (f"# Analysis result\n\n## Methods\n\n{method}\n\n## Limitations\n\n{limitation}\n\n"
+             f"## Results\n\n{finding}\n\n{failure}\n\n{warning}\n\n"
+             "DoubletFinder and scDblFinder agree poorly (kappa 0.10).\n")
+    _, _, payloads, art, rendered = _run(
+        tmp_path, monkeypatch, "Analyze this dataset and write a report.", draft,
+        extra_steps=[{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}],
+        writeup_mode="full")
+    for output in (rendered[0], _reply(payloads)):
+        for preserved in (method, limitation, finding, failure, warning):
+            assert preserved in output
+        assert "kappa 0.10" not in output and "kappa 0.12" not in output
+        assert "Doublet filtering needs review" in output
+    details = (art / "report/doublet_details.md").read_text()
+    assert "kappa 0.10" in details and "kappa 0.12" in details
+    state = json.loads((art / "process/run_state.json").read_text())
+    assert state["final_answer"] == draft
+    assert state["rounds"][0]["scientist_result"]["steps"][0]["result"] == _CELLQC
