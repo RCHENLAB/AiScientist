@@ -46,16 +46,22 @@ one working copy is not enough.
 
 ## How it is run
 
-- From the console: a list question about the RetiGene papers ("What are haploinsufficient genes
-  in RetiGene papers?": it names the corpus, asks for the genes and not about the user's data) is
-  routed to the corpus curation (`gateway/app._corpus_curation`). So is a plain gene-list question
-  that names no source ("What are haploinsufficient genes?": no papers, PubMed, literature or
-  database, in a chat with no data and no analysis); its plan card then says that the question names
-  no papers, that this reads the RetiGene papers, and that "search PubMed" asks the public
-  literature instead. The plan card says what is read
-  and how long it takes on the session; once the user runs it, the gateway (`_run_corpus_scan`)
-  submits one HPC3 job with a workspace of its own and puts the CSVs in the run's results. A
-  client can also send `route: "corpus"` to `/api/lab`, which runs it without a plan.
+- From the console: a question that names the RetiGene papers and not the user's data goes to
+  the corpus curation (`gateway/app._corpus_curation`) when the session's model says it asks for
+  every gene with a property, not for one fact (`agents/request_router.corpus_ask`). The
+  model also says whether the property is haploinsufficiency, which has rules built in, or a new
+  one. The old word rule (a dosage word and a list word) still sends its questions here whatever the
+  model says. A plain haploinsufficient-gene list question that names no source ("What are
+  haploinsufficient genes?": no papers, PubMed, literature or database, in a chat with no data and no
+  analysis) gets the built-in curation by a strict word rule; its plan card says that the question
+  names no papers, that this reads the RetiGene papers, and that "search PubMed" asks the public
+  literature instead. For a new property the session's model writes a task spec (below) from the
+  question (`_draft_corpus_spec`). The plan card lists the spec and says how long the scan takes on
+  the session. A note on the plan revises the spec, and a spec pasted as JSON replaces it. A note
+  that asks for PubMed, the user's data or one fact is routed again. Once the user runs it, the
+  gateway (`_run_corpus_scan`) submits one HPC3 job with a workspace of its own and puts the CSVs in
+  the run's results. A client can also send `route: "corpus"` to `/api/lab`, which runs the
+  built-in rules without a plan.
 - The job brings its own model (`gateway/corpus_scan.py`): it gets one GPU on the lab's paid
   `gpu` partition (the first free A30 or A100), starts vLLM there on the node's loopback, runs the scan
   against it and exits, which frees the card. Any session can run it, whatever model it uses
@@ -73,7 +79,8 @@ one working copy is not enough.
   why; on a priced model, if their cost projects past `max_cost_usd`, it stops as well. The pilot's
   passages are kept, so the full pass does not read them again.
 - A finished scan is kept on the Eye Server (`<data root>/corpus_scans/<key>/`), keyed by the
-  corpus files, the scan's rules (`rules_digest()`) and the model. The next request for the same
+  corpus files, the scan's rules (`rules_digest()`, or `rules_digest(spec)` for a task spec, kept
+  with its spec) and the model. The next request for the same
   corpus, from a scan request or from a `route: "chat"` message asking for the haploinsufficient
   genes, is answered from it at once; adding papers changes the key, and the next request scans again.
 - No model can call it (`research: false`, no `chat`): the PI cannot plan it and the Scientist
@@ -81,6 +88,32 @@ one working copy is not enough.
   Research run's literature job has no workspace of its own, so the tables would be written outside
   the run. To offer it to the agents, give the research line's literature executor the run's
   workspace first, then drop `research: false`.
+
+## Another property: a task spec
+
+A call may pass `spec`: the same scan for another property, written as a task spec. The console
+route has the session's model draft it from the user's one-line question (`SPEC_SYSTEM` is the
+drafting prompt; a reply `parse_spec` refuses is sent back once with the reason). The user reviews
+it on the plan card before it runs.
+
+- `target`, `definition`, `counts_when`, `does_not_count`, `classes` (the target class first) and
+  `scope` make the reading prompt (`spec_judge_system`). A gene is listed when a sentence states the
+  target class for it explicitly, not negated and in scope.
+- `requests` (up to 16 full sentences naming no gene) and `terms` (up to 12 exact words) are round
+  one, used as given: no model call writes them.
+- There is no built-in dosage wording (`keyword_round` does not apply). The spec's terms take its
+  place and are read in full: every chunk that holds one that is in at most 1% of the chunks, up to
+  2,000 chunks (`SPEC_TERM_CAP`) unless `max_term_passages` is given.
+- After round two the check reads the chunks that hold a usable term but that no round read
+  (`check_unread`, on for a spec, at most `max_unread_passages`): `found_by` and the requests.csv
+  row are `U`, and the result's `unread_check` says how many were found, read and left. With the
+  built-in rules the check only counts them.
+- The tables go to `artifacts/curation_<id>/`, one folder per spec. hits.csv keeps its columns:
+  `mechanism_class` holds the spec's class and `human_retinal` its in-scope; `mechanism_statement`
+  is the spec term the quote holds; there is no dominance flag.
+- Each spec has its own `rules_digest(spec)`; the built-in rules' digest does not change.
+- `parse_spec` refuses a spec that cannot drive a scan (a missing field, fewer than 4 usable
+  requests, no rules) before any work.
 
 ## What it is not for
 
@@ -104,7 +137,10 @@ one working copy is not enough.
 | `max_passages` | integer | `0` | read only the first N retrieved passages (0 = all); for a smoke test |
 | `pilot_fraction` | number | `0.01` | share of round one's passages read first as a pilot (at least 5, at most 25): the scan stops before the rest when half of them fail, or when the cost they project is above max_cost_usd (0 = no pilot) |
 | `max_cost_usd` | number | `0.0` | stop before the full pass when the pilot projects a model cost above this, in USD (0 = no cap; only a model the gateway calls for the scan has a price) |
+| `check_unread` | integer | — | 1 = after round two, read the chunks that hold a usable term (the spec's terms or the model's words) but were not read, up to max_unread_passages; 0 = only count them; unset = on for a spec, off for the built-in rules |
+| `max_unread_passages` | integer | `600` | at most this many unread chunks the check reads |
 | `pmids` | array of string | — | restrict the scan to these PMIDs (empty = the whole corpus) |
+| `spec` | object | — | a task spec for another property than haploinsufficiency, drafted from the user's question (fields: target, definition, counts_when, does_not_count, classes, scope, requests, terms; see TOOL.md). Its definition and rules are the reading prompt, its requests and terms drive round one and its terms are read in full. Omit it for the built-in haploinsufficiency rules |
 <!-- /generated:parameters -->
 
 ## Outputs
@@ -129,7 +165,9 @@ one working copy is not enough.
   the model's words, each with its passage count and use (`filter` = read, `rank`/`absent`/`over_cap`
   = not used).
 - `artifacts/curation/`, written by the gateway from `hits.csv` after the job (or from a kept
-  scan), so it needs no new scan (`gateway/corpus_scan.write_curation`): `haploinsufficient_genes.csv`,
+  scan), so it needs no new scan (`gateway/corpus_scan.write_curation`). For a task spec the tables
+  are named after its target class (`<class>_genes.csv`, `<class>_evidence.csv`), a stated gene's
+  claim is `stated`, and the spec is kept beside them (`task_spec.json`). For the built-in rules: `haploinsufficient_genes.csv`,
   one row per gene with its `claim` (`haploinsufficient`: a paper states it in so many words and
   none argues against it; `contested`: one states it and another argues against it; `suggested`:
   only hedged statements; `argued against`: papers on a human retinal disease say it is not, or
@@ -168,7 +206,8 @@ In the research agents' catalog: no. No model can call it: it runs only from its
 ## Known limits
 
 - Recall is bounded by retrieval: a paper that states the mechanism without any of the dosage
-  words, is in no request's nearest chunks, and names no gene round one found, is never read.
+  words (or, for a spec, any of its terms), is in no request's nearest chunks, and names no gene
+  round one found, is never read.
   `k_per_request` and `n_requests` widen round one; `requests.csv` and `found_by` (`K` = the
   keyword round) show which request found what.
 - The corpus cache (`mechanism_cache/` next to the papers: re-extracted page text, sentences, and
@@ -205,8 +244,11 @@ In the research agents' catalog: no. No model can call it: it runs only from its
   HGNC normalisation, aggregation.
 - `scripts/build_mechanism_cache.py`: the one-off cache build on HPC3.
 - Tests: `tests/test_extract_haploinsufficient_genes.py` (a fake model, a toy embedder and a
-  four-paper corpus), `tests/test_corpus_route.py` (the console line),
-  `tests/test_corpus_curation.py` (the route from a RetiGene list question, the curation tables, saving them).
+  four-paper corpus), `tests/test_curation_spec.py` (a scan from a task spec, its terms read in
+  full, the unread check), `tests/test_corpus_route.py` (the console line),
+  `tests/test_corpus_curation.py` (the route from a RetiGene list question, the curation tables, saving them),
+  `tests/test_corpus_spec_route.py` (the model's fact-or-list verdict, a drafted spec on the plan, a
+  note revising it, a pasted spec, kept scans keyed by spec).
 
 ## What the model is told
 

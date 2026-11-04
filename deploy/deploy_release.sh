@@ -2,7 +2,7 @@
 #
 # Versioned deploy of an AiScientist app release on the Eye Server, run as the service account.
 #
-#   deploy/deploy_release.sh <tag>            # e.g. v0.4.0: download, verify, install, migrate, switch, restart, check
+#   deploy/deploy_release.sh <tag>            # e.g. v0.4.0 or v0.5.0rc1: download, verify, install, migrate, switch, restart, check
 #   deploy/deploy_release.sh --prepare <tag>  # the same up to the database migration; nothing is switched or restarted
 #   deploy/deploy_release.sh --rollback       # back to the previous release, and hold the one rolled back from
 #   deploy/deploy_release.sh --auto           # what the deploy timer runs: the newest release, then the skills
@@ -35,17 +35,25 @@
 # not 0 (--auto tries again at its next start; a deploy by name stops unless AISCIENTIST_FORCE=1).
 # Releases beyond the newest $AISCIENTIST_KEEP (default 5) are pruned; current and previous stay.
 #
+# Tags: v1.2.3 is a release; v1.2.3a1, v1.2.3b1 and v1.2.3rc1 are pre-releases of it (the Python
+# version scheme: v1.2.3a1 < v1.2.3b1 < v1.2.3rc1 < v1.2.3rc2 < v1.2.3).
+#
 # --auto: the newest release of $AISCIENTIST_REPO that carries a package (or AISCIENTIST_APP_TAG
 # when config/deploy.env pins one), when it is newer than the current one and not held; then
 # deploy/deploy_skills.sh for the skills release AISCIENTIST_SKILLS_TAG names, else the one the
-# current release pins in configs/skills_registry.json.
+# current release pins in configs/skills_registry.json. AISCIENTIST_CHANNEL says which releases
+# count: stable (the default; the production site) takes the release GitHub calls latest, which is
+# never a pre-release; prerelease (the staging site) takes the newest of the recent releases, pre-
+# releases included, from the repository's releases feed.
 #
 # Other env: AISCIENTIST_REPO (default RCHENLAB/AiScientist), AISCIENTIST_SERVICE (default
 # aiscientist.service), AISCIENTIST_HOST (default: the --host the installed unit passes, else
-# 127.0.0.1), AISCIENTIST_PORT (8800), AISCIENTIST_EXTRAS (pip extras, default
-# gateway,auth,anthropic,langgraph,analysis; add corpus for the Eye Server copy of the RetiGene
-# index, which installs CPU torch from AISCIENTIST_TORCH_INDEX first), AISCIENTIST_PYTHON (python3;
-# its version must be the one requirements.lock was made for), AISCIENTIST_ENV_FILE (default
+# 127.0.0.1), AISCIENTIST_PORT (8800), AISCIENTIST_KEYS_SERVICE (default aiscientist-keys.service;
+# none = this site has no key service to restart, as on the staging site), AISCIENTIST_EXTRAS
+# (pip extras, default gateway,auth,anthropic,langgraph,analysis; add corpus for the Eye Server copy
+# of the RetiGene index, which installs CPU torch from AISCIENTIST_TORCH_INDEX first),
+# AISCIENTIST_PYTHON (python3; its version must be the one requirements.lock was made for),
+# AISCIENTIST_CHANNEL (stable or prerelease, above), AISCIENTIST_ENV_FILE (default
 # $AISCIENTIST_ROOT/config/.env),
 # AISCIENTIST_GENESETS_DIR_SRC (default $AISCIENTIST_ROOT/data/reference/genesets),
 # AISCIENTIST_HEALTH_TIMEOUT (seconds, default 60), AISCIENTIST_RESTART_CMD,
@@ -75,6 +83,7 @@ EXTRAS="${AISCIENTIST_EXTRAS:-gateway,auth,anthropic,langgraph,analysis}"
 PYTHON="${AISCIENTIST_PYTHON:-python3}"
 KEEP="${AISCIENTIST_KEEP:-5}"
 HEALTH_TIMEOUT="${AISCIENTIST_HEALTH_TIMEOUT:-60}"
+CHANNEL="${AISCIENTIST_CHANNEL:-stable}"
 RESTART_CMD="${AISCIENTIST_RESTART_CMD:-sudo -n systemctl restart $SERVICE}"
 KEYS_SERVICE="${AISCIENTIST_KEYS_SERVICE:-aiscientist-keys.service}"
 KEYS_RESTART_CMD="${AISCIENTIST_KEYS_RESTART_CMD:-sudo -n systemctl restart $KEYS_SERVICE}"
@@ -89,10 +98,15 @@ CURRENT="$APP_DIR/current"
 PREVIOUS="$APP_DIR/previous"
 HELD="$APP_DIR/held"
 LOG_FILE="$ROOT/logs/deploy.log"
-TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$'
 
 die() { echo "ERROR: $*" >&2; log "error: $*"; exit 1; }
 log() { mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) app $*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+case "$CHANNEL" in
+  stable|prerelease) ;;
+  *) echo "ERROR: AISCIENTIST_CHANNEL must be stable or prerelease (got '$CHANNEL')" >&2; exit 2 ;;
+esac
 
 # One deploy at a time (the timer and an operator), app and skills alike.
 lock() {
@@ -130,8 +144,39 @@ unhold() {
   mv -f "$HELD.tmp" "$HELD"
 }
 
+is_prerelease() { [[ "$1" =~ (a|b|rc)[0-9]+$ ]]; }
+
+# version_key v1.2.3rc4 -> "1 2 3 2 4": the release's numbers, then its stage (a 0, b 1, rc 2, the
+# release itself 3) and the stage's number. sort -V would put v1.2.3rc1 after v1.2.3.
+version_key() {
+  [[ "$1" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)((a|b|rc)([0-9]+))?$ ]] || return 1
+  local stage=3
+  case "${BASH_REMATCH[5]}" in a) stage=0 ;; b) stage=1 ;; rc) stage=2 ;; esac
+  echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]} $stage ${BASH_REMATCH[6]:-0}"
+}
+
 # version_newer A B: A is a later version than B.
-version_newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
+version_newer() {
+  local ka kb i
+  ka="$(version_key "$1")" && kb="$(version_key "$2")" || return 1
+  local -a a=($ka) b=($kb)
+  for i in 0 1 2 3 4; do
+    if [ "$((10#${a[i]}))" -gt "$((10#${b[i]}))" ]; then return 0; fi
+    if [ "$((10#${a[i]}))" -lt "$((10#${b[i]}))" ]; then return 1; fi
+  done
+  return 1
+}
+
+# The newest of the tags on stdin that this site installs: pre-releases only on the prerelease channel.
+newest_tag() {
+  local best="" t
+  while read -r t; do
+    [[ "$t" =~ $TAG_RE ]] || continue
+    if [ "$CHANNEL" != prerelease ] && is_prerelease "$t"; then continue; fi
+    if [ -z "$best" ] || version_newer "$t" "$best"; then best="$t"; fi
+  done
+  echo "$best"
+}
 
 # Healthy = /health answers with the expected release's tag and, unless allowed, accounts on.
 health_check() {
@@ -153,6 +198,7 @@ health_check() {
 # The key service (deploy/keys/, aiscientist-keys.service) runs the release's code too, and the app
 # makes its API-key calls through it: when it is installed it restarts first (docs/key_service_design.md).
 keys_installed() {
+  [ "$KEYS_SERVICE" != none ] || return 1
   [ -n "${AISCIENTIST_KEYS_RESTART_CMD:-}" ] && return 0
   command -v systemctl >/dev/null 2>&1 && systemctl cat "$KEYS_SERVICE" >/dev/null 2>&1
 }
@@ -240,19 +286,31 @@ fetch_package() {
   (cd "$dest" && grep -F "  $name" SHA256SUMS | sha256sum -c -) || die "checksum verification failed for $name"
 }
 
-# The newest release with a package: the newest package in AISCIENTIST_PACKAGE_DIR, else the
-# release GitHub calls latest (its redirect, which needs no API token and has no rate limit).
+# The newest release with a package that this site's channel takes: the newest such package in
+# AISCIENTIST_PACKAGE_DIR; else, on the stable channel, the release GitHub calls latest (its
+# redirect); on the prerelease channel, the newest release in the releases feed (the ten most
+# recent, pre-releases included). Neither needs an API token or has a rate limit.
 latest_tag() {
   if [ -n "${AISCIENTIST_PACKAGE_DIR:-}" ]; then
     (cd "$AISCIENTIST_PACKAGE_DIR" && ls aiscientist-v*.tar.gz 2>/dev/null) \
-      | sed 's/^aiscientist-\(.*\)\.tar\.gz$/\1/' | grep -E "$TAG_RE" | sort -V | tail -n 1
+      | sed 's/^aiscientist-\(.*\)\.tar\.gz$/\1/' | newest_tag
     return 0
   fi
   local tag
-  tag="$(curl -fsSI --max-time 20 "https://github.com/$REPO/releases/latest" 2>/dev/null \
-         | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/releases/tag/\(.*\)$#\1#p' | tail -n 1)" || tag=""
+  if [ "$CHANNEL" = prerelease ]; then
+    tag="$(curl -fsSL --max-time 20 "https://github.com/$REPO/releases.atom" 2>/dev/null \
+           | grep -o '/releases/tag/[^"<]*' | sed 's#^/releases/tag/##' | newest_tag)" || tag=""
+  else
+    tag="$(curl -fsSI --max-time 20 "https://github.com/$REPO/releases/latest" 2>/dev/null \
+           | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/releases/tag/\(.*\)$#\1#p' | tail -n 1)" || tag=""
+    # GitHub never calls a pre-release latest; a tag that looks like one is refused all the same.
+    if [ -n "$tag" ] && is_prerelease "$tag"; then
+      echo "the latest release $tag has a pre-release tag; the stable channel installs releases only" >&2; return 0
+    fi
+  fi
   [ -n "$tag" ] || return 0
-  # A release made before the release workflow existed has no package: nothing to install.
+  # A release made before the release workflow existed has no package, and a new release has none
+  # until the workflow attaches it: nothing to install yet.
   curl -fsSI --max-time 20 -o /dev/null "$(asset_base "$tag")/aiscientist-$tag.tar.gz" 2>/dev/null || {
     echo "the latest release $tag has no aiscientist-$tag.tar.gz; nothing to install" >&2; return 0; }
   echo "$tag"
@@ -308,7 +366,7 @@ init_db()")
 # Download, verify and install <tag> into app/releases/<tag>, migrate the database. Switches nothing.
 prepare_release() {
   local tag="$1" dest="$RELEASES/$1"
-  [[ "$tag" =~ $TAG_RE ]] || die "tag must look like v1.2.3 (got '$tag')"
+  [[ "$tag" =~ $TAG_RE ]] || die "tag must look like v1.2.3 or v1.2.3rc1 (got '$tag')"
   [ -f "$ENV_FILE" ] || die "$ENV_FILE not found: the app's settings and secrets live there (deploy/README.md)"
   grep -qE '^(AISCIENTIST|BIOAGENT)_RESULTS_DIR=.' "$ENV_FILE" \
     || die "$ENV_FILE does not set AISCIENTIST_RESULTS_DIR: run outputs would be written inside the release and deleted when it is pruned"
@@ -409,13 +467,13 @@ auto() {
   if [ -z "$want" ]; then
     echo "no release to install"
   elif ! [[ "$want" =~ $TAG_RE ]]; then
-    die "the release to install is '$want', not a v1.2.3 tag"
+    die "the release to install is '$want', not a v1.2.3 or v1.2.3rc1 tag"
   elif [ "$want" = "$cur" ]; then
     echo "app: $cur is current"
   elif is_held "$want"; then
     echo "app: $want is held (rolled back from, or its check failed); deploy it by name to try it again"
   elif [ -n "$cur" ] && version_newer "$cur" "$want" && [ -z "${AISCIENTIST_APP_TAG:-}" ]; then
-    echo "app: $cur is newer than the latest release $want; not going back"
+    echo "app: $cur is newer than $want, the latest $CHANNEL release; not going back"
   else
     install_release "$want" auto
   fi
@@ -435,7 +493,7 @@ case "${1:-}" in
   --auto)     auto ;;
   --prepare)  [ -n "${2:-}" ] || die "--prepare needs a tag"; lock; prepare_release "$2"
               echo "==> $2 is ready in $RELEASES/$2; deploy/deploy_release.sh $2 switches to it" ;;
-  ""|-h|--help) sed -n 2,52p "$0" ;;
+  ""|-h|--help) sed -n 2,63p "$0" ;;
   -*)         die "unknown option $1 (try --help)" ;;
   *)          lock; install_release "$1" ;;
 esac

@@ -3126,15 +3126,14 @@ async function connect(e) {
     // newly-minted key on a password+Duo login.
     key_passphrase: (useKey ? $("keyPassInput").value : ($("newKeyPassInput") && $("newKeyPassInput").value)) || null,
     host: $("hostInput").value.trim(),
-    mock: $("mockCheck").checked,
     // Chosen on THIS form, so the server knows before it provisions: with your own endpoint it
     // skips the GPU allocation entirely instead of queueing for a card nothing will use.
     llm_credential_id: connectEndpointChoice(),
     cluster_model_id: connectClusterChoice(),
     accept_egress: false,
   };
-  if (!body.mock && !body.ucinetid) { toast("Enter your UCInetID."); return; }
-  if (useKey && !body.credential_id && !body.mock) { toast("No saved SSH key — log in with password + Duo once first."); return; }
+  if (!body.ucinetid) { toast("Enter your UCInetID."); return; }
+  if (useKey && !body.credential_id) { toast("No saved SSH key — log in with password + Duo once first."); return; }
   const rh = $("reattachHint"); if (rh) rh.classList.add("hidden");  // hint served its purpose
   resetPipeline();
   const ls = $("logStream"); if (ls) ls.innerHTML = "";
@@ -3426,14 +3425,15 @@ function storageShown() {
   return !!view && view.classList.contains("active") && !!pane && !pane.classList.contains("hidden");
 }
 
-async function loadStorageTab() {
+// ``refresh`` = the Refresh button: read the HPC3 folders again even if they were just read.
+async function loadStorageTab(refresh = false) {
   loadServerStorage();
   loadComputeSessions();
   if (!state.connectionId) { renderStorage(null); return; }
   $("storeHpcBody").innerHTML = '<div class="storage-loading">Loading…</div>';
   loadOriginals();
   loadStorageDeletes();
-  await loadStorageListing();
+  await loadStorageListing(refresh);
 }
 
 // The session chip in the header: what the session is doing with HPC3, in detail.
@@ -3568,12 +3568,22 @@ async function onServerStorageClick(e) {
   if (run && await deleteRun(run)) loadServerStorage();
 }
 
-async function loadStorageListing() {
+// The server reads the folders in the background and answers within seconds: 202 with the areas
+// read so far while a slow one (often the member's own lab folder) is still being measured; the
+// panel then asks again until the listing is whole.
+let _storageListingPoll = null;
+async function loadStorageListing(refresh = false) {
+  clearTimeout(_storageListingPoll); _storageListingPoll = null;
+  if (!state.connectionId) return;
   try {
-    const res = await fetch(`/api/storage/${state.connectionId}`);
-    const d = await res.json();
+    const res = await fetch(`/api/storage/${state.connectionId}${refresh ? "?refresh=1" : ""}`);
+    // A proxy in front of the server answers a timeout with plain text, not JSON.
+    const d = await res.json().catch(() => ({ error: res.status === 504
+      ? "HPC3 took too long to answer. Try Refresh in a minute."
+      : `Could not read your folders on HPC3 (the server answered ${res.status}).` }));
     if (!res.ok) { $("storeHpcBody").innerHTML = `<div class="storage-empty">${escapeHtml(d.error || "Could not read your folders on HPC3.")}</div>`; return; }
     renderStorage(d);
+    if (d.scanning && storageShown()) _storageListingPoll = setTimeout(() => loadStorageListing(), 3000);
   } catch (err) {
     $("storeHpcBody").innerHTML = `<div class="storage-empty">${isUnreachable(err) ? "Can't reach the server." : escapeHtml(err.message)}</div>`;
   }
@@ -3611,13 +3621,17 @@ function renderStorage(d) {
     return;
   }
   const areas = d.areas || [];
-  $("storeHpcTotal").textContent = fmtSize(areas.reduce((n, a) => n + (a.bytes || 0), 0));
+  const total = fmtSize(areas.reduce((n, a) => n + (a.bytes || 0), 0));
+  $("storeHpcTotal").textContent = d.scanning ? `${total} so far` : total;
   const parts = d.quota ? [quotaHtml(d.quota)] : [];
   for (const a of areas) {
     const items = a.items || [];
-    if (a.key !== "temp" && !items.length) continue;     // the older areas show only while they hold something
-    const rows = items.map(storageItemHtml).join("") || '<div class="storage-empty">Nothing here now.</div>';
-    const size = `<span class="store-size">${escapeHtml(fmtSize(a.bytes || 0))}</span>`;
+    // The older areas show only while they hold something, or while they are still being read.
+    if (a.key !== "temp" && !items.length && !a.pending && !a.error) continue;
+    const rows = a.pending ? '<div class="storage-loading">Measuring this folder on HPC3…</div>'
+      : a.error ? `<div class="storage-empty">${escapeHtml(a.error)}</div>`
+      : items.map(storageItemHtml).join("") || '<div class="storage-empty">Nothing here now.</div>';
+    const size = `<span class="store-size">${a.pending ? "measuring…" : escapeHtml(fmtSize(a.bytes || 0))}</span>`;
     const note = `<p class="store-note">${escapeHtml(a.note || "")}</p>`;
     // The member's own lab folder holds their own files too: folded until they open it.
     parts.push(a.key === "personal"
@@ -3673,7 +3687,7 @@ async function loadStorageDeletes() {
     }
     if (!storageShown()) { clearTimeout(_storageDeletesPoll); _storageDeletesPoll = null; return; }
     const ended = renderStorageDeletes(d.deletes);
-    if (ended.length) loadStorageListing();          // a deletion ended: the folders changed
+    if (ended.length) loadStorageListing(true);      // a deletion ended: the folders changed
   } catch (err) { /* the next open of the panel asks again */ }
 }
 
@@ -7093,9 +7107,6 @@ function showApp(user, freshLogin = false) {
   $("userChip").textContent = user ? (user.username + (user.role === "admin" ? " · admin" : "")) : "accounts off";
   document.querySelectorAll(".admin-only").forEach((el) => el.classList.toggle("hidden", !user || user.role !== "admin"));
   const lo = $("leftLogoutBtn"); if (lo) lo.classList.toggle("hidden", !user);   // sign-out lives in the left panel now
-  // Mock mode runs the agent's code on the gateway server, so with accounts on only an admin gets it.
-  const mock = $("mockCheck");
-  if (mock && mock.closest("label")) mock.closest("label").classList.toggle("hidden", !!user && user.role !== "admin");
   if (!_appInited) { init(); initShell(); _appInited = true; }
   // Fresh account sign-in overrides the panel preference only for this visit.
   if (freshLogin) setPanel("left", false, false);
@@ -8487,7 +8498,9 @@ function resultHandoffHtml(runId, r) {
   const t = r.tables;
   if (t) {
     const files = (t.files || []).join(", ");
-    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 RetiGene curation tables · ${escapeHtml(String(t.n_genes ?? 0))} haploinsufficient genes · ${escapeHtml(String((t.files || []).length))} CSV files</span>` +
+    // A curation from a task spec names what it collected; the built-in one is haploinsufficiency.
+    const what = t.curation ? `genes · ${t.curation}` : "haploinsufficient genes";
+    html += `<div class="run-dataset"><span class="muted small" title="${escapeHtml(files)}">🧬 RetiGene curation tables · ${escapeHtml(String(t.n_genes ?? 0))} ${escapeHtml(what)} · ${escapeHtml(String((t.files || []).length))} files</span>` +
       (t.saved_to
         ? `<span class="ok small" title="${escapeHtml(`In Files → Datasets as ${t.name || "the curation tables"}`)}">Saved to my data</span>`
         : (t.save_error ? `<span class="bad small" title="${escapeHtml(t.save_error)}">The last save failed</span>` : "") +
@@ -9546,7 +9559,7 @@ function init() {
   $("disconnectBtn").addEventListener("click", disconnect);
   $("stopGpuBtn").addEventListener("click", stopGpu);
   $("sessChip").addEventListener("click", openStorageSessions);
-  $("storageRefresh").addEventListener("click", loadStorageTab);
+  $("storageRefresh").addEventListener("click", () => loadStorageTab(true));
   $("storeServerBody").addEventListener("click", onServerStorageClick);
   $("originalsBox").addEventListener("click", (e) => {
     const b = e.target.closest("button[data-orig]");

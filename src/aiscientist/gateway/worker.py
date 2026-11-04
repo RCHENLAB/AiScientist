@@ -45,7 +45,7 @@ from dataclasses import dataclass
 
 from .errors import GatewayError
 from .executor import RemoteExecutor
-from .settings import HPCSettings
+from .settings import HPCSettings, slurm_job_name
 from .slurm_job import AcquireConfig, SlurmJobError, SlurmJobSpec, acquire_allocation
 
 JOB_NAME = "aiscientist-worker"
@@ -60,9 +60,10 @@ _NEW_HOLDER_S = 120
 
 
 def job_name(username: str) -> str:
-    """Per-user job name, so ``squeue --me --name=`` can only ever match your own worker."""
+    """Per-user job name, so ``squeue --me --name=`` can only ever match your own worker (and, with
+    a job-name prefix, only this deployment's)."""
     safe = "".join(c for c in (username or "user") if c.isalnum() or c in "-_")
-    return f"{JOB_NAME}-{safe}"
+    return slurm_job_name(f"{JOB_NAME}-{safe}")
 
 
 def heartbeat_path(log_dir: str, name: str, job_id: str) -> str:

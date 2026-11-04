@@ -28,6 +28,10 @@ jobs:
 
       # The GitHub CLI on the runner, not a third-party action holding a write token. A release cut by
       # hand (`gh release create <tag>`) already exists: then the files are only added to it.
+      # A pre-release tag (v1.2.3a1, v1.2.3b1, v1.2.3rc1) makes a GitHub pre-release, never "Latest":
+      # the production server installs only the latest release, the staging site pre-releases too
+      # (deploy/README.md). It is marked before the package is attached, so the production server
+      # never sees a pre-release with a package as its latest release, even one created by hand.
       - name: Attach the package to the tag's GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,5 +39,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
+          PRE=()
+          if [[ "$TAG" =~ (a|b|rc)[0-9]+$ ]]; then PRE=(--prerelease); fi
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --generate-notes --title "$TAG" "${PRE[@]}"
+          if [ ${#PRE[@]} -gt 0 ]; then gh release edit "$TAG" --prerelease; fi
           gh release upload "$TAG" "dist/aiscientist-${TAG}.tar.gz" dist/SHA256SUMS --clobber

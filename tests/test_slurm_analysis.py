@@ -199,6 +199,47 @@ def test_source_dir_is_bound_and_on_pythonpath():
     assert "/dfs/lab/pysrc" in joined                      # bound read-only into the container
 
 
+CACHE = "/dfs/lab/envs/tool-cache/tester"
+
+
+def test_the_users_tool_cache_is_made_once_bound_and_handed_to_the_tool():
+    hpc = FakeHPC({"status": "ok"})
+    ex = _ex(hpc, tool_cache_dir=CACHE)
+    ex.run_tool("run_de", {}, ctx=None)
+    ex.run_tool("run_de", {}, ctx=None)
+    made = [c for c in hpc.all_cmds if c.startswith("mkdir -p -m 3775")]
+    assert made == [f"mkdir -p -m 3775 /dfs/lab/envs/tool-cache && mkdir -p {CACHE} && test -w {CACHE}"]
+    jobs = [c for c in hpc.all_cmds if "--tool run_de" in c]
+    assert jobs and all(f"export AISCIENTIST_TOOL_CACHE={CACHE};" in c for c in jobs)
+    assert all(f"-B {CACHE}:{CACHE} " in c for c in jobs)          # read-write: tectonic adds to it
+
+
+class _NoCacheHPC(FakeHPC):
+    """An HPC3 where the tool cache cannot be made (e.g. a folder of the same name that is not ours)."""
+
+    def exec(self, command, timeout=60.0):
+        if command.startswith("mkdir") and "tool-cache" in command:
+            self.all_cmds.append(command)
+            return ExecResult(command="", exit_status=1, stdout="", stderr="Permission denied")
+        return super().exec(command, timeout)
+
+
+def test_a_tool_cache_that_cannot_be_made_is_left_out_of_every_job():
+    hpc = _NoCacheHPC({"status": "ok"})
+    ex = _ex(hpc, tool_cache_dir=CACHE)
+    assert ex.run_tool("run_de", {}, ctx=None)["status"] == "ok"
+    assert ex.run_tool("run_de", {}, ctx=None)["status"] == "ok"
+    # Tried once; no job binds a folder that is not there (Apptainer would refuse to start it).
+    assert [c for c in hpc.all_cmds if "tool-cache" in c] == [
+        f"mkdir -p -m 3775 /dfs/lab/envs/tool-cache && mkdir -p {CACHE} && test -w {CACHE}"]
+
+
+def test_no_tool_cache_unless_the_gateway_names_one():
+    hpc = FakeHPC({"status": "ok"})
+    _ex(hpc).run_tool("run_de", {}, ctx=None)
+    assert not any("AISCIENTIST_TOOL_CACHE" in c or "tool-cache" in c for c in hpc.all_cmds)
+
+
 def test_no_remote_falls_back_in_process():
     calls = {}
 

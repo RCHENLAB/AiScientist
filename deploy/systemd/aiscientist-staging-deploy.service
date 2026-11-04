@@ -1,0 +1,24 @@
+# The staging site's deploy: deploy/deploy_release.sh --auto for /data/aiscientist-staging, started by
+# aiscientist-staging-deploy.timer. Its config/deploy.env sets AISCIENTIST_CHANNEL=prerelease, so it
+# installs the newest release of RCHENLAB/AiScientist, pre-releases included, and restarts
+# aiscientist-staging.service once no run is in progress there. Installed by deploy/setup_staging.sh.
+# The service account needs `sudo -n systemctl restart aiscientist-staging.service` without a password.
+# What it did: /data/aiscientist-staging/logs/deploy.log, and journalctl -u aiscientist-staging-deploy.
+
+[Unit]
+Description=AiScientist staging: deploy the newest pre-release
+After=network-online.target aiscientist-staging.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aiscientist-staging
+Group=aiscientist-staging
+Environment=AISCIENTIST_ROOT=/data/aiscientist-staging
+WorkingDirectory=/data/aiscientist-staging
+# The script of the release that is running; switching app/current does not change the copy that runs.
+ExecStart=/data/aiscientist-staging/app/current/deploy/deploy_release.sh --auto
+TimeoutStartSec=45min
+# 75 = another deploy holds the lock: not a failure.
+SuccessExitStatus=75
+InaccessiblePaths=-/data/aiscientist -/etc/aiscientist-keys -/var/lib/aiscientist-keys

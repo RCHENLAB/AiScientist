@@ -179,7 +179,8 @@ _MODEL_CODE_TOOLS = {"run_code", "run_in_environment", "run_shell", "shell"}
 # directory listings, a file re-read), and literature (a paper's numbers are not this run's).
 _NOT_EVIDENCE = {"finish", "read_tool_source", "describe_environment", "search_skills",
                  "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text",
-                 "disk_usage", "find_software", "literature_search", "deep_literature", "search_corpus"}
+                 "disk_usage", "find_software", "request_environment", "literature_search", "deep_literature",
+                 "search_corpus"}
 _ID_COLUMN = re.compile(r"^(leiden|louvain|cluster|clusters|cl|rank|index|idx|id|row|sample|"
                         r"sampleid|group|groups|slug|round|step)$", re.IGNORECASE)
 

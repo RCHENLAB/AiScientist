@@ -1,0 +1,36 @@
+# systemd unit for the AiScientist staging site: the same gateway as aiscientist.service, running the
+# newest pre-release (deploy/README.md, "Staging site"). Installed by deploy/setup_staging.sh.
+#
+# It is a second, separate site on the same host: its own service account (aiscientist-staging), root
+# (/data/aiscientist-staging), settings (config/.env), PostgreSQL database, accounts and port. It
+# binds loopback only, so it is reached through an SSH tunnel:
+#     ssh -L 8801:127.0.0.1:8801 <server>     then open http://localhost:8801
+# The production site's files are hidden from it (InaccessiblePaths): code that is still being
+# tested can neither read the production secrets nor write the production data.
+#
+#     sudo systemctl restart aiscientist-staging.service
+#     journalctl -u aiscientist-staging -f
+
+[Unit]
+Description=AiScientist staging site (pre-releases)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiscientist-staging
+Group=aiscientist-staging
+WorkingDirectory=/data/aiscientist-staging/app/current
+EnvironmentFile=-/data/aiscientist-staging/config/.env
+ExecStart=/data/aiscientist-staging/app/current/.venv/bin/python -m aiscientist.gateway --host 127.0.0.1 --port 8801
+# The start fails if the app does not answer /health, so a bad release shows in systemctl.
+ExecStartPost=/usr/bin/curl --retry 30 --retry-delay 2 --retry-connrefused -fsS -o /dev/null http://127.0.0.1:8801/health
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGINT
+PrivateTmp=yes
+InaccessiblePaths=-/data/aiscientist -/etc/aiscientist-keys -/var/lib/aiscientist-keys
+
+[Install]
+WantedBy=multi-user.target

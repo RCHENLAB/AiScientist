@@ -62,6 +62,9 @@ def test_names_are_ids_and_the_shared_caches_live_under_envs():
         layout.session_run(ROOT, "s1", "a/b")
     assert layout.package_cache_root(ROOT) == f"{ROOT}/envs/run-code-pkgs"
     assert layout.conda_pkgs_dir(ROOT) == f"{ROOT}/envs/conda-pkgs"
+    assert layout.tool_cache_dir(ROOT, "tester") == f"{ROOT}/envs/tool-cache/tester"
+    with pytest.raises(ValueError):
+        layout.tool_cache_dir(ROOT, "../other")
     st = HPCSettings()
     for weights in (st.hf_home, st.scgpt_model_dir, st.vlreview_model_dir):
         assert weights.startswith(f"{st.shared_root}/models/")

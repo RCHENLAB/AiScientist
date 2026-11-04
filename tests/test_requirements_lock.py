@@ -126,3 +126,40 @@ def test_the_package_holds_the_commit_s_runtime_files_only(tmp_path):
     assert sums.endswith("  aiscientist-v1.0.0.tar.gz\n")
     assert subprocess.run(["sha256sum", "-c", "SHA256SUMS"], cwd=tmp_path / "out",
                           capture_output=True, env={**os.environ}).returncode == 0
+
+
+@pytest.mark.skipif(not (shutil.which("git") and shutil.which("sha256sum")),
+                    reason="deploy/build_package.sh needs git and sha256sum")
+def test_a_pre_release_tag_builds_a_package_that_carries_its_version(tmp_path):
+    """v1.1.0rc1 and v1.1.0 can be built from the same commit: the package's pyproject.toml carries
+    the tag's version, so the installed distribution (and every run record) names it."""
+    repo = tmp_path / "repo"
+    files = {rel: rel for rel in ("src/aiscientist/__init__.py", "frontend/index.html", "preset_pipelines/p.yaml",
+                                  "configs/skills_registry.json", "deploy/deploy_release.sh", "scripts/s.py",
+                                  "LICENSE", "README.md", "requirements.txt", "requirements-gateway.txt",
+                                  "start.sh")}
+    files["pyproject.toml"] = '[project]\nname = "aiscientist"\nversion = "1.0.0"\n'
+    files["requirements.lock"] = "# python: 3.11\n"
+    for rel, text in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(text)
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.org"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "c"], check=True)
+    script = REPO / "deploy" / "build_package.sh"
+    run = lambda *a: subprocess.run(["bash", str(script), *a], cwd=repo, capture_output=True, text=True)  # noqa: E731
+
+    for tag, version in (("v1.1.0rc1", "1.1.0rc1"), ("v1.1.0", "1.1.0"), ("v2.0.0a3", "2.0.0a3")):
+        out = tmp_path / tag
+        r = run(tag, "HEAD", str(out))
+        assert r.returncode == 0, r.stderr
+        with tarfile.open(out / f"aiscientist-{tag}.tar.gz") as tf:
+            project = tf.extractfile(f"aiscientist-{tag}/pyproject.toml").read().decode()
+            stamp = tf.extractfile(f"aiscientist-{tag}/VERSION").read().decode()
+        assert f'version = "{version}"' in project and f"tag={tag}\n" in stamp
+    assert 'version = "1.0.0"' in (repo / "pyproject.toml").read_text()      # the checkout is untouched
+
+    for bad in ("v1.1.0-rc.1", "1.1.0", "v1.1"):
+        r = run(bad, "HEAD", str(tmp_path / "bad"))
+        assert r.returncode == 2 and "tag must look like v1.2.3" in r.stderr

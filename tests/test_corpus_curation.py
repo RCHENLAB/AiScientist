@@ -292,17 +292,25 @@ def _clean(tmp_path, monkeypatch):
     gw_app._CORPUS_SCANS_RUNNING.clear()
 
 
-class _Model:
-    """The session's model: it may screen the message, and must not be asked to route it."""
+CORPUS_ASKED = rr.CORPUS_ASK_SYSTEM[:60]
 
-    def __init__(self):
+
+class _Model:
+    """The session's model: it may screen the message and say whether it asks for one fact or a
+    list (``corpus_ask``), and must not be asked to route it to literature or analysis."""
+
+    def __init__(self, verdict='{"kind": "list", "property": "haploinsufficient in retinal disease", '
+                               '"known": "haploinsufficiency", "confidence": 0.95}'):
         self.asked: list[str] = []
+        self.verdict = verdict
 
     def __call__(self, messages, *, role=None):
         system = messages[0]["content"]
         if system == gw_app._NEW_STUDY_ROUTER_SYS:
             return '{"intent": "study", "confidence": 0.95}'
         self.asked.append(system[:60])
+        if system[:60] == CORPUS_ASKED:
+            return self.verdict
         if system == rr.ROUTER_SYSTEM:
             raise AssertionError("a curation question must not be routed by the model")
         raise AssertionError(f"unexpected model call: {system[:80]}")
@@ -380,7 +388,8 @@ def test_the_issue_question_gets_a_curation_plan_then_the_tables_and_an_answer_f
     ((stage, step),) = w.shown
     assert stage == "corpus" and step.startswith("**RetiGene curation**")
     assert "PubMed is not searched" in step and "about 2 hours on a GPU of its own" in step
-    assert corpus_scan.CURATION_GENES in step and w.model.asked == []          # the model routed nothing
+    # The model only said that it asks for a list (of a curation built in), and routed nothing else.
+    assert corpus_scan.CURATION_GENES in step and w.model.asked == [CORPUS_ASKED]
     assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
 
     (run_dir,) = [p for p in conn.workspace.iterdir() if p.is_dir()]

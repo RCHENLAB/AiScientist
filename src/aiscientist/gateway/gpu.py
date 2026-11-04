@@ -8,7 +8,7 @@ from typing import Callable
 
 from .errors import CommandFailure, GatewayError
 from .executor import RemoteExecutor
-from .settings import HPCSettings
+from .settings import HPCSettings, slurm_job_name, slurm_job_prefix
 
 EmitFn = Callable[[str, str, str], None]
 
@@ -31,9 +31,10 @@ SPEC_FILE = "$HOME/.bioagent/vllm.{job_id}.spec"
 
 
 def job_name(username: str) -> str:
-    """Per-user job name so we can only ever match the current user's own job."""
+    """Per-user job name so we can only ever match the current user's own job (and, with a job-name
+    prefix, only this deployment's)."""
     safe = "".join(c for c in (username or "user") if c.isalnum() or c in "-_")
-    return f"{JOB_NAME}-{safe}"
+    return slurm_job_name(f"{JOB_NAME}-{safe}")
 
 
 @dataclass
@@ -343,7 +344,9 @@ def _submit_candidate(
     cand_settings = replace(settings, partition=cand.partition, gres=cand.gres, account=cand.account)
     home = settings.serve_home
     safe = "".join(c if c.isalnum() else "_" for c in cand.partition) or "gpu"
-    script_path = f"{home}/serve.{safe}.sbatch"
+    # With the deployment's prefix too: both sites write here for the same user, and the write and
+    # the `sbatch` are two commands, so a shared file could be submitted with the other site's script.
+    script_path = f"{home}/{slurm_job_prefix()}serve.{safe}.sbatch"
     write = executor.exec(
         f"mkdir -p {home} && cat > {script_path} <<'AISCIENTIST_EOF'\n"
         f"{_serve_script(cand_settings, executor.username)}"

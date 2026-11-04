@@ -43,7 +43,8 @@ let replies = {};
 const fetch = async (url, opts) => {
   fetched.push([url, opts && opts.body ? JSON.parse(opts.body) : null]);
   const r = replies[url];
-  return { ok: r.ok !== false, json: async () => r.body };
+  return { ok: r.ok !== false, status: r.status || 200,
+           json: async () => { if (r.text !== undefined) throw new SyntaxError("Unexpected token 'u'"); return r.body; } };
 };
 const UPLOADS = "/r/uploads/tester";
 const listing = (items) => ({ quota: null, ttl_days: 3, items, areas: [
@@ -78,15 +79,16 @@ def test_a_delete_says_it_is_queued_and_the_list_is_read_again_when_its_job_ende
   replies["/api/storage/c1/deletes"] = { body: { deletes: [{ ...queued, slurm_state: "RUNNING" }] } };
   await loadStorageDeletes();
   assert($("storageDeletes").innerHTML.includes("job 901 running"));
-  assert(!fetched.some(([u]) => u === "/api/storage/c1"), "the folders are not read while it runs");
+  assert(!fetched.some(([u]) => u.startsWith("/api/storage/c1") && !u.endsWith("/deletes")),
+         "the folders are not read while it runs");
 
   // Ended: the folders are read again, and the row is gone (an empty Uploads area is not shown).
   replies["/api/storage/c1/deletes"] = { body: { deletes: [{ ...queued, status: "done" }] } };
-  replies["/api/storage/c1"] = { body: listing([]) };
+  replies["/api/storage/c1?refresh=1"] = { body: listing([]) };
   await loadStorageDeletes();
   await new Promise((r) => setImmediate(r));
   assert($("storageDeletes").innerHTML.includes("deleted"), $("storageDeletes").innerHTML);
-  assert(fetched.some(([u]) => u === "/api/storage/c1"), "the folders are read again");
+  assert(fetched.some(([u]) => u === "/api/storage/c1?refresh=1"), "the folders are read again, not from memory");
   const after = $("storeHpcBody").innerHTML;
   assert(!after.includes("My Sample 2") && !after.includes("Uploads on HPC3") && after.includes("Nothing here now."), after);
   assert.strictEqual(timers.length, 2, "nothing queued: no more asking");
@@ -126,3 +128,59 @@ def test_the_deletions_are_not_polled_while_the_tab_is_closed():
   assert.deepStrictEqual(timers, [8000]);
 })().catch((e) => { console.error(e); process.exit(1); });
 ''')
+
+
+def test_a_folder_still_being_measured_shows_the_rest_and_the_panel_asks_again():
+    # The server answers within seconds: 202 with the areas read so far while the member's own lab
+    # folder is measured (15.8 s for yijus12 on 2026-10-31, past the ingress's 15 s).
+    _run(r"""
+(async () => {
+  showStorage();
+  const personal = (extra) => ({ key: "personal", label: "Your own lab folder", note: "Never cleaned.",
+                                 path: "/r/tester", bytes: 0, items: [], pending: false, ...extra });
+  const scanning = { ...listing([{ name: "Sample2", bytes: 2048, path: `${UPLOADS}/Sample2`, area: "uploads" }]), scanning: true };
+  scanning.areas.push(personal({ pending: true }));
+  replies["/api/storage/c1"] = { status: 202, body: scanning };
+  await loadStorageListing();
+  let html = $("storeHpcBody").innerHTML;
+  assert(html.includes("Sample2") && html.includes("Measuring this folder on HPC3…") && html.includes("measuring…"), html);
+  assert.strictEqual($("storeHpcTotal").textContent, "2 KB so far");
+  assert.deepStrictEqual(timers, [3000], "it asks again while a folder is being measured");
+
+  const whole = listing([]);
+  whole.areas.push(personal({ bytes: 1024, items: [{ name: "old_run", bytes: 1024, path: "/r/tester/old_run", area: "personal" }] }));
+  replies["/api/storage/c1"] = { body: whole };
+  await loadStorageListing();
+  html = $("storeHpcBody").innerHTML;
+  assert(html.includes("old_run") && !html.includes("Measuring"), html);
+  assert.deepStrictEqual(timers, [3000], "whole: no more asking");
+
+  // Refresh reads the folders again instead of answering from memory.
+  replies["/api/storage/c1?refresh=1"] = { body: whole };
+  await loadStorageListing(true);
+  assert(fetched.some(([u]) => u === "/api/storage/c1?refresh=1"));
+
+  // A folder HPC3 could not measure says so; the others stay listed.
+  const failed = listing([]);
+  failed.areas.push(personal({ error: "HPC3 could not measure this folder within 5 minutes." }));
+  replies["/api/storage/c1"] = { body: failed };
+  await loadStorageListing();
+  assert($("storeHpcBody").innerHTML.includes("could not measure this folder within 5 minutes"));
+
+  // A proxy's timeout page is plain text: the panel says what happened, not a JSON parse error.
+  replies["/api/storage/c1"] = { ok: false, status: 504, text: "upstream request timeout" };
+  await loadStorageListing();
+  html = $("storeHpcBody").innerHTML;
+  assert(html.includes("HPC3 took too long to answer") && !html.includes("Unexpected token"), html);
+})().catch((e) => { console.error(e); process.exit(1); });
+""")
+
+
+def test_no_asking_again_behind_a_closed_tab():
+    _run(r"""
+(async () => {
+  replies["/api/storage/c1"] = { status: 202, body: { ...listing([]), scanning: true } };
+  await loadStorageListing();                       // the tab is not on screen
+  assert.deepStrictEqual(timers, []);
+})().catch((e) => { console.error(e); process.exit(1); });
+""")

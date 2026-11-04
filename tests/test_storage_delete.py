@@ -351,8 +351,10 @@ def test_delete_queues_a_job_and_settles_it(flow):
     log = f"{here}/logs/deletes/{conn.storage_deletes[0]['id']}.log"
     hpc.states["901"] = "COMPLETED"
     hpc.files[log] = f"DELETED\t{target}\nDELETE_RESULT deleted=1 skipped=0 job=901\n".encode()
+    conn.storage_scan = gw._new_storage_scan()          # a listing read before the job ended
     status, body = _call(gw.get_storage_deletes(conn.id, None))
     assert body["deletes"][0]["status"] == "done"
+    assert conn.storage_scan is None                    # the next look reads the folders again
     assert any(s.startswith(f"Deleted on HPC3: {target} (job 901") for s in flow.said)
 
     # Nothing queued: no sacct at all.

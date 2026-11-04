@@ -84,8 +84,8 @@ gh release download v0.1.0 -R lijinbio/aiscientist-skills -D skills/releases/0.1
 python3 -m pytest        # the test suite: offline, no cluster, .env or network needed
 ```
 
-- **Without a cluster:** tick "Mock mode" in the console, or set `AISCIENTIST_LLM_BASE_URL` to
-  any OpenAI-compatible endpoint. Storage and compute still expect HPC3.
+- **Without a cluster:** set `AISCIENTIST_LLM_BASE_URL` to any OpenAI-compatible endpoint.
+  Storage and compute still expect HPC3.
 - **Off campus:** the public site needs no VPN. A gateway run on your own computer does, because
   HPC3's SSH port answers only on the UCI campus network or the VPN.
 - **Skills:** the curated skills are the release `configs/skills_registry.json` pins, not files in

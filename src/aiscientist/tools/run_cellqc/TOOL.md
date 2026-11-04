@@ -116,6 +116,10 @@ Reads private data: yes; its results stay inside the run.
 On the fast chat path: no (research runs only).
 <!-- /generated:runs-on -->
 
+On HPC3 the TeX files of the slide deck (tectonic's cache) are kept in the user's tool cache,
+`envs/tool-cache/<hpc-user>/tectonic/` (`AISCIENTIST_TOOL_CACHE`): a user's first run downloads
+them and builds the LaTeX format, about 1 min 40 s; later runs take about 6 s and need no network.
+
 ## Known limits
 
 - CellQC does not re-call cells: Cell Ranger's cell calls are what enter, so over-calling shows up

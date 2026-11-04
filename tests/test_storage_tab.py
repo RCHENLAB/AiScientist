@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
+import threading
+import time
 import types
 
 import pytest
@@ -135,6 +138,106 @@ def test_the_mock_lists_every_area_and_forgets_what_was_deleted(gw):
     assert d["quota"]["pool"] == "dfs3b"
     conn.mock_deleted = {f"{PERSONAL}/old_pbmc_run.h5ad"}
     assert gw._list_storage(conn)["areas"][4]["items"] == []
+
+
+def test_the_quota_is_read_before_the_personal_folder_which_comes_last(gw):
+    hpc = _Hpc({"dfsquotas": DFSQUOTAS})
+    gw._list_storage(_conn(gw, hpc))
+    assert f"{PERSONAL}/*" in hpc.commands[-1]
+    assert hpc.commands[-2].startswith("dfsquotas")
+
+
+def test_a_folder_hpc3_cannot_measure_says_so_and_the_others_are_listed(gw):
+    class _Fails(_Hpc):
+        def exec(self, command, timeout=60.0):
+            if f"{PERSONAL}/*" in command:
+                assert timeout == gw.STORAGE_DU_TIMEOUT_S             # not the 60 s default
+                raise RuntimeError(f"Command timed out after {timeout:.0f}s: {command}")
+            if f"{TEMP}/*/*" in command:
+                raise RuntimeError("SSH session not active")
+            return super().exec(command, timeout)
+
+    d = gw._list_storage(_conn(gw, _Fails({f"{UPLOADS}/*": f"8\t1700000000\t{UPLOADS}/a.h5ad\n",
+                                           "dfsquotas": DFSQUOTAS})))
+    areas = {a["key"]: a for a in d["areas"]}
+    assert areas["personal"]["error"] == "HPC3 could not measure this folder within 5 minutes."
+    assert areas["legacy"]["error"].startswith("Could not read this folder on HPC3:")
+    assert areas["uploads"]["items"][0]["name"] == "a.h5ad" and "error" not in areas["uploads"]
+    assert d["quota"]["percent"] == 82.1 and d["scanning"] is False
+
+
+class _SlowHpc(_Hpc):
+    """The member's own lab folder takes long to measure, as yijus12's did (15.8 s on 2026-10-31)."""
+
+    def __init__(self, out: dict[str, str]) -> None:
+        super().__init__(out)
+        self.release = threading.Event()
+
+    def exec(self, command: str, timeout: float = 60.0) -> ExecResult:
+        if f"{PERSONAL}/*" in command:
+            self.release.wait(10)
+        return super().exec(command, timeout)
+
+
+@pytest.fixture()
+def slow(gw, monkeypatch):
+    conn = _conn(gw, None)
+    conn.executor = _SlowHpc({f"{UPLOADS}/*": f"16000000\t1700000000\t{UPLOADS}/Sample2_Ddx41\n",
+                              f"{PERSONAL}/*": f"900\t1700000000\t{PERSONAL}/old_run\n",
+                              "dfsquotas tester dfs3b": DFSQUOTAS})
+    monkeypatch.setattr(gw, "_owned_conn", lambda cid, request, **k: conn)
+    monkeypatch.setattr(gw, "STORAGE_WAIT_S", 0.5)
+    yield conn
+    conn.executor.release.set()
+
+
+def _get(gw, conn, **kw):
+    res = asyncio.run(gw.get_storage(conn.id, None, **kw))
+    return res.status_code, json.loads(res.body)
+
+
+def _personal_scans(hpc) -> int:
+    return sum(f"{PERSONAL}/*" in c for c in hpc.commands)
+
+
+def test_a_slow_folder_does_not_hold_up_the_storage_tab(gw, slow):
+    conn, hpc = slow, slow.executor
+    t0 = time.monotonic()
+    status, d = _get(gw, conn)
+    assert time.monotonic() - t0 < 3                       # far inside the ingress's 15 s
+    assert status == 202 and d["scanning"] is True and d["read_at"] is None
+    areas = {a["key"]: a for a in d["areas"]}
+    assert areas["personal"]["pending"] is True and areas["personal"]["items"] == []
+    assert areas["uploads"]["pending"] is False and areas["uploads"]["items"][0]["name"] == "Sample2_Ddx41"
+    assert d["quota"]["percent"] == 82.1                   # read before the slow folder
+
+    # Asked again while it runs: the same scan goes on, no second one starts.
+    assert _get(gw, conn)[0] == 202
+    hpc.release.set()
+    status, d = _get(gw, conn)
+    assert status == 200 and d["scanning"] is False and d["read_at"]
+    assert d["areas"][4]["pending"] is False and d["areas"][4]["items"][0]["name"] == "old_run"
+    assert _personal_scans(hpc) == 1
+
+    # Just read: answered from memory, with the deletions marked as they are now.
+    n = len(hpc.commands)
+    conn.storage_deletes = [{"path": f"{UPLOADS}/Sample2_Ddx41", "job_id": "901", "status": "queued"}]
+    status, d = _get(gw, conn)
+    assert status == 200 and len(hpc.commands) == n
+    assert d["areas"][3]["items"][0]["deleting"] == "901"
+
+    # Refresh reads it again; so does a look after the listing went stale.
+    assert _get(gw, conn, refresh=1)[0] == 200 and _personal_scans(hpc) == 2
+    conn.storage_scan["ended"] -= gw.STORAGE_FRESH_S + 1
+    assert _get(gw, conn)[0] == 200 and _personal_scans(hpc) == 3
+
+
+def test_a_scan_that_fails_still_ends_so_the_tab_does_not_wait_for_ever(gw, monkeypatch):
+    conn = _conn(gw, _Hpc({}))
+    monkeypatch.setattr(gw, "_storage_area_info", lambda c: (_ for _ in ()).throw(RuntimeError("boom")))
+    scan = gw._new_storage_scan()
+    gw._scan_storage_logged(conn, scan)
+    assert scan["ended"] is not None
 
 
 # --- the server side, per account --------------------------------------------------------------------

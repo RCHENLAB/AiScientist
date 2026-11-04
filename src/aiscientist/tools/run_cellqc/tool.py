@@ -237,6 +237,24 @@ def _run(cmd: list[str], cwd: Path, env: dict[str, str], log: Path) -> int:
                               check=False).returncode
 
 
+def _tex_cache() -> str:
+    """Where tectonic keeps the TeX files of CellQC's slide deck: ``tectonic/`` in the user's tool
+    cache when the job has one (``AISCIENTIST_TOOL_CACHE``), else "" (this run's own cache).
+
+    tectonic downloads those files and builds its LaTeX format on first use: 1 min 43 s of every
+    run with an empty cache, 6 s with a filled one, and a filled one needs no network (measured on
+    HPC3)."""
+    root = os.environ.get("AISCIENTIST_TOOL_CACHE", "").strip()
+    if not root:
+        return ""
+    cache = Path(root) / "tectonic"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return ""
+    return str(cache) if os.access(cache, os.W_OK | os.X_OK) else ""
+
+
 def _library_summary(row: dict[str, str], decider: str, comparer: str) -> dict[str, Any]:
     """One library's numbers from CellQC's ``metrics.csv``, under names a reader can follow."""
     sample = row.get("sampleid") or next(iter(row.values()), "")
@@ -813,6 +831,9 @@ def _run_cellqc_once(cellqc: str, libs: list[dict[str, Any]], staged: dict[str, 
     threads = int(os.environ.get("AISCIENTIST_JOB_CPUS") or os.cpu_count() or 4)
     env = {**os.environ, "HOME": str(qc / "home"), "TMPDIR": str(qc / "tmp"),
            "XDG_CACHE_HOME": str(qc / "cache"), "MPLBACKEND": "Agg"}
+    tex_cache = _tex_cache()
+    if tex_cache:
+        env["TECTONIC_CACHE_DIR"] = tex_cache
     log = qc / "cellqc.log"
     base_cmd = [cellqc, "-d", str(out), "-t", str(threads), "-c", str(qc / "config.yaml")]
     if _run([*base_cmd, "-n", "--", str(qc / "samples.txt")], qc, env, log) != 0:

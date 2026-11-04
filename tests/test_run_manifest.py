@@ -62,8 +62,19 @@ def test_the_repository_list_is_well_formed():
     """configs/hpc3_assets.yaml: every image has a path and a source, a checksum is a SHA-256, a
     model's revision is a 40-hex commit and its files map names to SHA-256."""
     import yaml
-    doc = yaml.safe_load((ROOT / "configs" / "hpc3_assets.yaml").read_text())
+    text = (ROOT / "configs" / "hpc3_assets.yaml").read_text()
+    doc = yaml.safe_load(text)
     assert doc["schema_version"] == 1
+    # YAML keeps the last of two equal keys without a word, so a weight file listed twice is found here.
+    block, seen, repeated = None, set(), []
+    for line in text.splitlines():
+        if re.match(r"^  \S.*:$", line):
+            block, seen = line.strip(), set()
+        m = re.match(r"^      (\S+):", line)
+        if m:
+            repeated += [f"{block} {m.group(1)}"] if m.group(1) in seen else []
+            seen.add(m.group(1))
+    assert not repeated, f"listed twice: {repeated[:3]}"
     paths = []
     for name, img in doc["images"].items():
         assert img["path"].startswith("containers/") and img["path"].endswith(".sif"), name

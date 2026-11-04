@@ -31,6 +31,7 @@ from typing import Any, Callable
 from ..agents.sandbox import sandbox_network_enabled
 from ..tools.api import ANALYSIS_ENTRYPOINT
 from .executor import RemoteExecutor
+from .settings import slurm_job_name
 from .slurm_job import (
     AcquireConfig, JobCancelled, RunConfig, SlurmJobError, SlurmJobSpec, SlurmQueueTimeout,
     build_analysis_script, run_batch_job, container_exec, slurm_time_to_seconds)
@@ -114,7 +115,7 @@ class SlurmAnalysisExecutor:
     # gateway passes a directory in the session's folder (<shared_root>/sessions/<id>/...), never the user's home.
     scratch_dir: str = field(kw_only=True)
     entrypoint: str = f"python -m {ANALYSIS_ENTRYPOINT}"
-    job_prefix: str = "bioagent_analysis"   # squeue job-name prefix (variant line overrides it)
+    job_prefix: str = "bioagent_analysis"   # job-name stem (variant line overrides it), before slurm_job_name
     mem_gb: int = 64
     cpus: int = 8
     partition: str = "standard"
@@ -197,6 +198,12 @@ class SlurmAnalysisExecutor:
     # The lab's shared conda download cache on dfs3b: a ``bioconda:`` image build reads packages an
     # earlier build already downloaded instead of fetching them again (see tool_images.build_command).
     pkgs_cache_dir: str = ""
+    # This HPC3 user's tool cache (``hpc_layout.tool_cache_dir``): what a tool downloads and keeps
+    # between runs, such as the TeX files tectonic fetches for CellQC's slide deck (1 min 43 s with
+    # an empty cache, 6 s with a filled one, measured on HPC3). Made on the first job (its
+    # parent 3775), bound read-write and handed to the tool as ``AISCIENTIST_TOOL_CACHE``. "" or
+    # a folder that cannot be made -> no cache: each run downloads again, as before.
+    tool_cache_dir: str = ""
     # A FOLDER dataset's root on dfs3b (e.g. a cohort of Cell Ranger libraries). Bound read-only and
     # handed to the job as ``--dataset-root``, so a tool can read the whole tree, not only the one
     # primary file ``remote_dataset`` names. None for a single-file dataset.
@@ -224,6 +231,7 @@ class SlurmAnalysisExecutor:
     _run_deps: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
     _deps_failed: dict[str, str] = field(default_factory=dict, repr=False)
     _deps_attempted: bool = field(default=False, repr=False)
+    _tool_cache_ok: bool | None = field(default=None, repr=False)
 
     def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         args = args or {}
@@ -421,7 +429,7 @@ class SlurmAnalysisExecutor:
         self._counter += 1
         sif = provision_image(
             self.remote, ref, self.images_dir, scratch=self._resolved_scratch(),
-            job_name=f"{self.job_prefix}_image_{self._counter}", partition=self.partition,
+            job_name=slurm_job_name(f"{self.job_prefix}_image_{self._counter}"), partition=self.partition,
             account=self.account, container_module=self.container_module,
             container_bin=self.container_bin, startup_timeout_s=self.startup_timeout_s,
             should_cancel=self.should_cancel, pkgs_cache=self.pkgs_cache_dir, say=self._say)
@@ -444,6 +452,27 @@ class SlurmAnalysisExecutor:
             return out
         return {"status": "error",
                 "error": f"analysis HPC execution unavailable ({reason}) and no local fallback is set."}
+
+    def _tool_cache(self) -> str:
+        """``tool_cache_dir`` once it exists and this user can write it, else "". Made on the first
+        job: Apptainer refuses to start a job whose bind source is missing, so a folder that cannot
+        be made is left out of every job instead."""
+        if self._tool_cache_ok is None:
+            d = self.tool_cache_dir.rstrip("/")
+            ok = False
+            if d and self.remote is not None:
+                parent, q = shlex.quote(str(Path(d).parent)), shlex.quote(d)
+                # -m sets the mode of a folder it makes and leaves an existing one alone.
+                try:
+                    got = self.remote.exec(f"mkdir -p -m 3775 {parent} && mkdir -p {q} && test -w {q}")
+                    ok, why = got.ok, (got.stderr or "").strip()
+                except Exception as exc:  # noqa: BLE001 - a cache must never stop the job
+                    ok, why = False, str(exc)
+                if not ok:
+                    print(f"[{self.job_prefix}] no tool cache at {d}: {why[:200]} — each run "
+                          "downloads what it needs again.")
+            self._tool_cache_ok = ok
+        return self.tool_cache_dir.rstrip("/") if self._tool_cache_ok else ""
 
     def _resolved_scratch(self) -> str:
         """Expand shell vars (e.g. ``$HOME``) in ``scratch_dir`` to a concrete remote path ONCE.
@@ -484,7 +513,7 @@ class SlurmAnalysisExecutor:
                       f"header; the offline path annotates the whole VCF).")
         job = self._job_settings(tool)          # may pull the tool's image first (once, ever)
         self._counter += 1
-        name = f"{self.job_prefix}_{tool}_{self._counter}"
+        name = slurm_job_name(f"{self.job_prefix}_{tool}_{self._counter}")
         scratch = self._resolved_scratch()
         args_f = f"{scratch}/{name}.args.json"
         res_f = f"{scratch}/{name}.result.json"
@@ -517,6 +546,8 @@ class SlurmAnalysisExecutor:
         deps_env = "" if job["own_image"] else self._deps_env()
         # The job's CPU count, for a tool that runs a multi-threaded pipeline of its own.
         cpus_env = f"export AISCIENTIST_JOB_CPUS={int(job['cpus'])}; "
+        tool_cache = self._tool_cache()
+        cache_env = f"export AISCIENTIST_TOOL_CACHE={shlex.quote(tool_cache)}; " if tool_cache else ""
         root_arg = f" --dataset-root {shlex.quote(root)}" if root else ""
         folders = [{"name": str(f.get("name") or ""), "path": str(f["path"])}
                    for f in self.input_folders if isinstance(f, dict) and f.get("path")]
@@ -525,7 +556,7 @@ class SlurmAnalysisExecutor:
         prelude, prelude_env = (self.job_prelude(name, scratch, res_f) if callable(self.job_prelude)
                                 else ("", ""))
         inner_payload = (
-            f"{pysrc_env}{deps_env}{cpus_env}{prelude_env}export MPLBACKEND=Agg; "
+            f"{pysrc_env}{deps_env}{cpus_env}{cache_env}{prelude_env}export MPLBACKEND=Agg; "
             f"{self.entrypoint} --tool {shlex.quote(tool)} --workspace {shlex.quote(ws)} "
             f"--dataset {shlex.quote(ds)}{root_arg}{folders_arg} --args {shlex.quote(args_f)} "
             f"> {res_f} 2> {log_f}"
@@ -551,7 +582,7 @@ class SlurmAnalysisExecutor:
                 folder_dirs.append(d)
         binds_ro = tuple(p for p in (root_dir, ds_dir, *folder_dirs, self.source_dir, deps_dir,
                                      *self.extra_ro_binds) if p)
-        binds_rw = tuple(p for p in (ws, scratch, *self.extra_rw_binds) if p)
+        binds_rw = tuple(p for p in (ws, scratch, tool_cache, *self.extra_rw_binds) if p)
         network = sandbox_network_enabled() if self.network is None else self.network
         inner = container_exec(
             job["image"], inner_payload,

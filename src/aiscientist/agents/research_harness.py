@@ -1025,7 +1025,7 @@ def tool_result_outcome(output: Any) -> str:
 #: (78a707cd79e9's ORA step ended the same way).
 LOOKUP_TOOLS = frozenset({"read_tool_source", "describe_environment", "search_skills",
                           "read_skill_reference", "list_dir", "stat_path", "find_files",
-                          "read_text", "disk_usage", "find_software"})
+                          "read_text", "disk_usage", "find_software", "request_environment"})
 
 
 def _returned_failure_sig(output: Any) -> str | None:

@@ -305,6 +305,7 @@ from pathlib import Path
 log = Path(os.environ["FAKE_CELLQC_LOG"])
 with log.open("a") as fh:
     fh.write(json.dumps(sys.argv[1:]) + "\n")
+log.with_suffix(".tectonic").write_text(os.environ.get("TECTONIC_CACHE_DIR", ""))
 if "-n" in sys.argv:
     sys.exit(0)
 out = Path(sys.argv[sys.argv.index("-d") + 1])
@@ -583,6 +584,33 @@ def test_a_mixed_species_cohort_is_qcd_one_species_per_cellqc_run(tmp_path, deli
     one = run_cellqc({"samples": ["S2"]}, _ctx(tmp_path / "run2", delivery))
     assert one["status"] == "ok" and one["assumptions"]["species"][0] == "human"
     assert "checkpoints" not in one
+
+
+def test_tectonic_keeps_its_tex_files_in_the_users_tool_cache(tmp_path, delivery, fake_cellqc,
+                                                               monkeypatch):
+    # CellQC's slide deck: 1 min 43 s with an empty tectonic cache, 6 s with a filled one.
+    from aiscientist.tools.run_cellqc.tool import run_cellqc
+    cache = tmp_path / "tool-cache" / "tester"
+    cache.mkdir(parents=True)
+    monkeypatch.setenv("AISCIENTIST_TOOL_CACHE", str(cache))
+    run_cellqc({}, _ctx(tmp_path / "run", delivery))
+    assert fake_cellqc.with_suffix(".tectonic").read_text() == str(cache / "tectonic")
+    assert (cache / "tectonic").is_dir()
+
+
+def test_without_a_tool_cache_tectonic_uses_the_runs_own(tmp_path, delivery, fake_cellqc, monkeypatch):
+    from aiscientist.tools.run_cellqc.tool import run_cellqc
+    monkeypatch.delenv("AISCIENTIST_TOOL_CACHE", raising=False)
+    run_cellqc({}, _ctx(tmp_path / "run", delivery))
+    assert fake_cellqc.with_suffix(".tectonic").read_text() == ""     # XDG_CACHE_HOME/tectonic
+
+
+def test_a_tool_cache_that_cannot_be_used_is_ignored(tmp_path, monkeypatch):
+    from aiscientist.tools.run_cellqc.tool import _tex_cache
+    not_a_folder = tmp_path / "tool-cache"
+    not_a_folder.write_text("")
+    monkeypatch.setenv("AISCIENTIST_TOOL_CACHE", str(not_a_folder))
+    assert _tex_cache() == ""
 
 
 def test_without_a_folder_it_points_at_run_scanpy_qc(tmp_path, fake_cellqc):

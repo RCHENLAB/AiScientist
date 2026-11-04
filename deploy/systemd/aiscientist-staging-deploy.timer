@@ -1,0 +1,13 @@
+# Starts aiscientist-staging-deploy.service every 10 minutes: the staging site installs each new
+# pre-release by itself. Stop it: systemctl disable --now aiscientist-staging-deploy.timer.
+
+[Unit]
+Description=AiScientist staging: look for a new pre-release every 10 minutes
+
+[Timer]
+OnBootSec=12min
+OnUnitInactiveSec=10min
+RandomizedDelaySec=1min
+
+[Install]
+WantedBy=timers.target

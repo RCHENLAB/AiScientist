@@ -10,11 +10,16 @@
 # deploy scripts, the operator scripts in scripts/ (some run on the server, such as
 # update_corpus_index.py) and requirements.lock; no tests, docs, experiments or handoffs. VERSION
 # names the tag, the commit and the build time. deploy/deploy_release.sh installs the result.
+#
+# A tag is a stable release (v1.2.3) or a pre-release of one (v1.2.3a1, v1.2.3b1, v1.2.3rc1: the
+# Python version scheme). The package's pyproject.toml carries the tag's version, so a pre-release
+# and the release that follows it can be built from the same commit.
 set -euo pipefail
 
-[ $# -eq 3 ] || { sed -n 2,12p "$0" >&2; exit 2; }
+[ $# -eq 3 ] || { sed -n 2,16p "$0" >&2; exit 2; }
 TAG="$1"; COMMIT="$2"; OUT="$3"
-[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like v1.2.3 (got '$TAG')" >&2; exit 2; }
+[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]] \
+  || { echo "tag must look like v1.2.3, or v1.2.3a1 / v1.2.3b1 / v1.2.3rc1 for a pre-release (got '$TAG')" >&2; exit 2; }
 SHA="$(git rev-parse --verify "$COMMIT^{commit}")"
 NAME="aiscientist-$TAG"
 RUNTIME=(src frontend preset_pipelines configs deploy scripts pyproject.toml LICENSE README.md
@@ -30,6 +35,9 @@ mkdir -p "$OUT"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 git archive --format=tar --prefix="$NAME/" "$SHA" -- "${RUNTIME[@]}" | tar -x -C "$STAGE"
+# The installed distribution's version (what run records name) is the tag's.
+sed -i.orig "s/^version = \".*\"$/version = \"${TAG#v}\"/" "$STAGE/$NAME/pyproject.toml"
+rm -f "$STAGE/$NAME/pyproject.toml.orig"
 {
   echo "tag=$TAG"
   echo "sha=$SHA"

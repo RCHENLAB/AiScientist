@@ -60,19 +60,32 @@ database are both named `bioagent`.
 
 ## Updating the server
 
-A deploy is a release: publish a tag `vX.Y.Z` on RCHENLAB/AiScientist, and the server installs it.
+A deploy is a release: publish a tag on RCHENLAB/AiScientist, and the server installs it. Each
+version is a pre-release first:
+
+- **`vX.Y.ZrcN`** (or `aN`, `bN`) is a **pre-release**. It becomes a GitHub pre-release, never the
+  "Latest" release. The [staging site](#the-staging-site) installs it; the production site does not.
+- **`vX.Y.Z`** is a **release**, and the production site installs it. It is tagged on the commit of
+  the pre-release that passed on the staging site, so production runs the code that was tried.
+
+The tag is the version: the package's `pyproject.toml` carries it, so a pre-release and its release
+are built from one commit. Versions are ordered as Python orders them:
+`v0.5.0a1 < v0.5.0b1 < v0.5.0rc1 < v0.5.0rc2 < v0.5.0`.
 
 1. **The package.** Pushing the tag runs
    [`.github/workflows/release.yml`](../.github/workflows/release.yml). It builds the tagged
    commit's runtime files with [`build_package.sh`](build_package.sh) (no tests, docs or
    experiments) and attaches `aiscientist-<tag>.tar.gz` and `SHA256SUMS` to the tag's GitHub
-   Release. The package's `VERSION` names the tag and the commit.
+   Release, which it marks as a pre-release for a pre-release tag. The package's `VERSION` names the
+   tag and the commit.
 2. **The install.** GitHub cannot reach the server inside the university network, but the server
    can reach GitHub. Every 10 minutes `aiscientist-deploy.timer` runs
    [`deploy_release.sh --auto`](deploy_release.sh) as the service account. When the latest release
-   has a package, is newer than the running one and is not held, it installs it. It switches once
-   no run is in progress: a restart interrupts runs, so it tries again at its next start. Then it
-   brings the skills to the pinned release ([Skills releases](#skills-releases)).
+   has a package, is newer than the running one and is not held, it installs it. On the production
+   site the latest release is the one GitHub calls Latest (`AISCIENTIST_CHANNEL=stable`, the
+   default), which is never a pre-release. It switches once no run is in progress: a restart
+   interrupts runs, so it tries again at its next start. Then it brings the skills to the pinned
+   release ([Skills releases](#skills-releases)).
 
 So a release is deployed by publishing it, and stopped by not publishing it. Nothing is copied to
 the server by hand. `AISCIENTIST_APP_TAG` in `config/deploy.env` holds the server at one tag
@@ -142,6 +155,73 @@ library again when `skills/current` changes, without a restart, and the script w
 `/health` reports the new release, or switches back. The deploy timer installs the release
 `config/deploy.env` pins (`AISCIENTIST_SKILLS_TAG`), else the one the running app release pins in
 `configs/skills_registry.json`. A skills release needs no app release.
+
+### The staging site
+
+A second site on the same server installs every pre-release, so a version is used before the
+production site gets it. It is the same gateway in the same layout, apart in everything else:
+
+| | Production site | Staging site |
+|---|---|---|
+| Address | <https://AiScientist.eye.som.uci.edu> | `http://localhost:8801`, through an SSH tunnel: the unit binds `127.0.0.1:8801` |
+| Installs | releases (`AISCIENTIST_CHANNEL=stable`, the default) | releases and pre-releases (`AISCIENTIST_CHANNEL=prerelease`): the newest in the [releases feed](https://github.com/RCHENLAB/AiScientist/releases.atom) |
+| Units | `aiscientist.service`, `aiscientist-deploy.timer` | [`aiscientist-staging.service`](systemd/aiscientist-staging.service), [`aiscientist-staging-deploy.timer`](systemd/aiscientist-staging-deploy.timer) |
+| Service account, root | `aiscientist`, `/data/aiscientist` | `aiscientist-staging`, `/data/aiscientist-staging` (the same folders) |
+| Database | PostgreSQL `bioagent` | PostgreSQL `aiscientist_staging` |
+| Settings | `config/.env` | `config/.env`: the production site's HPC3, Slurm, image and model settings, without its credentials, email, key service, shared model job and CPU worker node, plus its own folders and database |
+| Accounts | the users' | the testers', made by an admin in Admin → Users: registration is off, since every account on the host can reach the port |
+| API keys | through the key service | saved in the staging site's own `state/` (`AISCIENTIST_KEYS_SERVICE=none` for its deploys) |
+| HPC3 | the shared root `AISCIENTIST_HPC_SHARED_ROOT`; Slurm jobs without a prefix (`bioagent-vllm-<UCInetID>`, ...) | the same cluster and images; its own shared root `<production's>-staging`, so each site's cleanup keeps only its own sessions; its jobs named `stg-*` (`AISCIENTIST_SLURM_JOB_PREFIX=stg-`) |
+
+The staging units hide `/data/aiscientist` and the key service's files from the site
+(`InaccessiblePaths`), and its account cannot write there either: a pre-release can neither read
+the production secrets nor change the production data.
+
+Each site finds a user's Slurm jobs by name, to reuse, switch, cancel or release them. The staging
+site's names start with `stg-` (`stg-bioagent-vllm-<UCInetID>`, `stg-bioagent_analysis_*`, ...;
+[`configs/aiscientist.example.env`](../configs/aiscientist.example.env)), so the same HPC3 account
+can be connected to both sites: neither takes over or cancels the other's jobs, and "Stop GPU" on one
+leaves the other's running.
+
+**Using it.** With an account on the server:
+
+```bash
+ssh -L 8801:127.0.0.1:8801 <you>@eye.som.uci.edu    # then open http://localhost:8801
+```
+
+Sign in with the account an admin made for you, connect HPC3 and bring an API key, as on the
+production site.
+
+**Setting it up**, once, as root, from the package of the release to start with.
+[`setup_staging.sh`](setup_staging.sh) makes the account, the folders, the
+database (a random password written only into its `config/.env`), the settings, the units and the
+restart rule, installs the release and enables the timer. It changes nothing of the production site.
+Then make the first admin, and the staging shared root on HPC3 (group-writable, like production's):
+
+```bash
+sudo bash aiscientist-<tag>/deploy/setup_staging.sh --tag <tag>           # checks; changes nothing
+sudo bash aiscientist-<tag>/deploy/setup_staging.sh --tag <tag> --apply   # sets it up and starts it
+sudo bash aiscientist-<tag>/deploy/setup_staging.sh --remove              # stops it; keeps the account, folders and database
+sudo -u aiscientist-staging /data/aiscientist-staging/app/current/.venv/bin/aiscientist-admin create-admin <login>
+ssh <you>@hpc3.rcic.uci.edu 'mkdir -m 2775 <production shared root>-staging'      # once, on HPC3
+```
+
+By hand, as its service account:
+
+```bash
+S="sudo -u aiscientist-staging env AISCIENTIST_ROOT=/data/aiscientist-staging"
+$S /data/aiscientist-staging/app/current/deploy/deploy_release.sh --list
+sudo journalctl -u aiscientist-staging-deploy.service -n 50   # what its timer did
+```
+
+**From a pre-release to a release.**
+
+1. Tag `vX.Y.ZrcN` on the RCHENLAB commit. Within 10 minutes the staging site runs it: its
+   `/health` names the tag.
+2. Try it there: sign in, upload a dataset, chat, approve a plan, follow a run to its report, and
+   whatever the version changed.
+3. A problem is fixed in the next pre-release, `vX.Y.Zrc(N+1)`. When one passes, tag `vX.Y.Z` on the
+   same commit: within 10 minutes the production site runs it.
 
 ## Configuration
 

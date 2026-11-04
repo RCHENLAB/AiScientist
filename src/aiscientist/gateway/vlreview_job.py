@@ -31,7 +31,7 @@ import shlex
 from dataclasses import dataclass
 
 from .executor import RemoteExecutor
-from .settings import HPCSettings
+from .settings import HPCSettings, slurm_job_name
 from .slurm_job import (
     AcquireConfig,
     EmitFn,
@@ -50,7 +50,7 @@ REVIEW_NAME = "review.json"
 def vlreview_job_name(username: str) -> str:
     """Per-user job name so a run can only ever match the current user's own job."""
     safe = "".join(c for c in (username or "user") if c.isalnum() or c in "-_")
-    return f"bioagent-vlreview-{safe}"
+    return slurm_job_name(f"bioagent-vlreview-{safe}")
 
 
 @dataclass

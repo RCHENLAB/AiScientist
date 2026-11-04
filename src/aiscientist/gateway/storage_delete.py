@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .hpc_originals import is_terminal
+from .settings import slurm_job_name
 from .slurm_job import SlurmJobSpec
 
 SCRIPT_SRC = Path(__file__).resolve().parents[3] / "deploy" / "hpc3" / "aiscientist_storage_delete.sh"
@@ -80,12 +81,13 @@ def command(script: str, shared_root: str, user: str, paths: Iterable[str], *,
 def job_spec(payload: str, user: str, log_path: str, submit_dir: str, *,
              partition: str, account: str = "") -> SlurmJobSpec:
     """A one-CPU job on the CPU partition (``standard``) that runs ``payload``."""
-    lines = ["#!/bin/bash", f"#SBATCH --job-name={JOB_PREFIX}{user}", f"#SBATCH --partition={partition}"]
+    name = slurm_job_name(f"{JOB_PREFIX}{user}")
+    lines = ["#!/bin/bash", f"#SBATCH --job-name={name}", f"#SBATCH --partition={partition}"]
     if account:
         lines.append(f"#SBATCH --account={account}")
     lines += ["#SBATCH --cpus-per-task=1", "#SBATCH --mem=2G", "#SBATCH --time=02:00:00",
               f"#SBATCH --output={log_path}", "#SBATCH --open-mode=truncate", payload]
-    return SlurmJobSpec(script="\n".join(lines), job_name=f"{JOB_PREFIX}{user}", submit_dir=submit_dir)
+    return SlurmJobSpec(script="\n".join(lines), job_name=name, submit_dir=submit_dir)
 
 
 def stage(executor: Any, session_dir: str) -> str:

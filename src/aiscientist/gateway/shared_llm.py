@@ -9,9 +9,9 @@ Qwen, or an API key) never uses it — each session is on one model.
 
 This module is the keeper of that job:
 
-* it finds the job by name (``aiscientist-llm-shared``) under ONE HPC3 account, submits it when
-  there is none, and submits the next one ahead of the running job's time limit so the queue wait
-  happens in the background;
+* it finds the job by name (``aiscientist-llm-shared``, after the deployment's Slurm job-name
+  prefix) under ONE HPC3 account, submits it when there is none, and submits the next one ahead of
+  the running job's time limit so the queue wait happens in the background;
 * it holds one local port whose far end follows the job (node and port change at every renewal),
   so the address the gateway, or anything else on this host, uses never changes;
 * it moves to a newer job only once that job answers, lets calls in flight on the old one finish,
@@ -36,13 +36,27 @@ from typing import Any, Callable
 
 from .errors import GatewayError
 from .executor import RemoteExecutor
-from .settings import HPCSettings
+from .settings import HPCSettings, slurm_job_name, slurm_job_prefix
 from .slurm_job import slurm_time_to_seconds
 
-JOB_NAME = "aiscientist-llm-shared"
-# Port, readiness marker, key, script and logs of the shared job. ``~/.bioagent`` is the HPC3-side
-# directory the session serve job already uses; it keeps its old name (see CLAUDE.md).
-REMOTE_DIR = "$HOME/.bioagent/shared-llm"
+JOB_NAME = "aiscientist-llm-shared"     # the name's stem: job_name() adds the deployment's prefix
+
+
+def job_name() -> str:
+    """The shared job's Slurm name on this deployment."""
+    return slurm_job_name(JOB_NAME)
+
+
+def remote_dir_name() -> str:
+    """The folder under ``~/.bioagent`` with the shared job's port, readiness marker, key, script and
+    logs: ``shared-llm``, after the deployment's job-name prefix, so a second deployment keeps its
+    own job and key apart. ``~/.bioagent`` is the HPC3-side directory the session serve job already
+    uses; it keeps its old name (see CLAUDE.md)."""
+    return f"{slurm_job_prefix()}shared-llm"
+
+
+def remote_dir() -> str:
+    return f"$HOME/.bioagent/{remote_dir_name()}"
 
 # The serve flags of the verified run: DeepSeek-V4-Flash NVFP4 on stock vLLM 0.28.0, four RTX PRO
 # 6000 cards (HPC3 job 55644297: KV pool 823,709 tokens, tool calls correct). That run used a 131,072
@@ -164,14 +178,14 @@ _SCRIPT = r"""#!/bin/bash
 #SBATCH --mem=@@MEM_GB@@G
 #SBATCH --time=@@TIME_LIMIT@@
 #SBATCH --comment=model=@@SERVED_NAME@@
-#SBATCH --output=@@HOME@@/.bioagent/shared-llm/serve-%j.log
+#SBATCH --output=@@HOME@@/.bioagent/@@SHARED_DIR_NAME@@/serve-%j.log
 
 # The lab's shared reasoning-model server (see aiscientist.gateway.shared_llm). The gateway finds
 # this job by its name, reads the port from <jobid>.port and treats <jobid>.ready as "the server
 # answers".
 set -uo pipefail
 
-export SHARED_DIR="$HOME/.bioagent/shared-llm"
+export SHARED_DIR="$HOME/.bioagent/@@SHARED_DIR_NAME@@"
 export SIF="@@IMAGE@@"
 export MODEL="@@MODEL@@"
 export SERVED_NAME="@@SERVED_NAME@@"
@@ -248,7 +262,8 @@ def serve_script(s: SharedLLMSettings, hpc: HPCSettings, home: str, exclude: str
     bind_root = hpc.shared_root if hpc.hf_home.startswith(hpc.shared_root) else hpc.hf_home
     env = "".join(f" --env {kv}" for kv in s.container_env.split())
     values = {
-        "JOB_NAME": JOB_NAME,
+        "JOB_NAME": job_name(),
+        "SHARED_DIR_NAME": remote_dir_name(),
         "PARTITION": s.partition,
         "ACCOUNT_LINE": f"#SBATCH --account={account}\n" if account else "",
         "GRES": s.gres,
@@ -290,13 +305,16 @@ class SharedJob:
         return self.state == "R"
 
 
-_LIST_COMMAND = (
-    f'D="{REMOTE_DIR}"; echo "HOME|$HOME"; '
-    f"squeue --me --name={JOB_NAME} --states=R,PD,CF --noheader --format='JOB|%i|%t|%N|%L|%r'; "
-    'echo "RC|$?"; '
-    'for f in "$D"/*.port; do [ -f "$f" ] || continue; j=$(basename "$f" .port); '
-    'echo "PORT|$j|$(cat "$f" 2>/dev/null)|$([ -f "$D/$j.ready" ] && echo ready)"; done'
-)
+def list_command() -> str:
+    """The keeper's one listing command: the account's home, this deployment's shared jobs, and
+    their port and readiness files."""
+    return (
+        f'D="{remote_dir()}"; echo "HOME|$HOME"; '
+        f"squeue --me --name={job_name()} --states=R,PD,CF --noheader --format='JOB|%i|%t|%N|%L|%r'; "
+        'echo "RC|$?"; '
+        'for f in "$D"/*.port; do [ -f "$f" ] || continue; j=$(basename "$f" .port); '
+        'echo "PORT|$j|$(cat "$f" 2>/dev/null)|$([ -f "$D/$j.ready" ] && echo ready)"; done'
+    )
 
 
 def parse_listing(text: str) -> tuple[str, bool, list[SharedJob]]:
@@ -463,7 +481,7 @@ class SharedLLM:
         ex = self._connect()
         if ex is None:
             return
-        home, squeue_ok, jobs = parse_listing(ex.exec(_LIST_COMMAND, timeout=90.0).stdout)
+        home, squeue_ok, jobs = parse_listing(ex.exec(list_command(), timeout=90.0).stdout)
         self._home = home or self._home
         now = self._clock()
         if not squeue_ok:
@@ -536,7 +554,7 @@ class SharedLLM:
         try:
             ex = self._factory()
             key = ex.exec(
-                f'umask 077; D="{REMOTE_DIR}"; mkdir -p "$D"; [ -s "$D/api.key" ] || '
+                f'umask 077; D="{remote_dir()}"; mkdir -p "$D"; [ -s "$D/api.key" ] || '
                 "printf 'sk-aisci-%s' \"$(head -c 48 /dev/urandom | base64 | tr -d '/+=\\n' | head -c 40)\" "
                 '> "$D/api.key"; cat "$D/api.key"').out
             if not key:
@@ -561,7 +579,7 @@ class SharedLLM:
         with self._lock:
             self._executor, self._api_key, self._local_port = ex, key, port
         self._connect_failures = 0
-        self._log(f"keeping job '{JOB_NAME}' as {ex.username}@{ex.host}; local port {port}")
+        self._log(f"keeping job '{job_name()}' as {ex.username}@{ex.host}; local port {port}")
         return ex
 
     def _health(self, now: float, *, running: list[SharedJob] | None = None,
@@ -597,13 +615,14 @@ class SharedLLM:
         exclude = ",".join(dict.fromkeys(
             [n for n in (self.settings.exclude or "").split(",") if n] + self._excluded))
         script = serve_script(self.settings, self.hpc, self._home, exclude=exclude)
-        write = ex.exec(f'mkdir -p "{REMOTE_DIR}" && cat > "{REMOTE_DIR}/serve.sbatch" '
+        d = remote_dir()
+        write = ex.exec(f'mkdir -p "{d}" && cat > "{d}/serve.sbatch" '
                         f"<<'AISCIENTIST_SHARED_EOF'\n{script}AISCIENTIST_SHARED_EOF")
         # Port and readiness files of jobs that are gone, and logs older than two weeks.
-        ex.exec(f'D="{REMOTE_DIR}"; for f in "$D"/*.port "$D"/*.ready; do [ -f "$f" ] || continue; '
+        ex.exec(f'D="{d}"; for f in "$D"/*.port "$D"/*.ready; do [ -f "$f" ] || continue; '
                 'j=$(basename "${f%.*}"); squeue --noheader --jobs="$j" 2>/dev/null | grep -q . '
                 '|| rm -f "$f"; done; find "$D" -name "serve-*.log" -mtime +14 -delete 2>/dev/null; true')
-        res = ex.exec(f'cd "$HOME" && sbatch --parsable "{REMOTE_DIR}/serve.sbatch"') if write.ok else write
+        res = ex.exec(f'cd "$HOME" && sbatch --parsable "{d}/serve.sbatch"') if write.ok else write
         job_id = (res.out.split(";")[0] if res.ok else "").strip()
         self._last_submit_at = now
         if not job_id.isdigit():
@@ -618,7 +637,7 @@ class SharedLLM:
     def _note_failed_start(self, ex: RemoteExecutor, job_id: str) -> None:
         """A job we submitted left the queue without ever serving. Keep why, and stop offering
         Slurm a node whose cards the job could not all see."""
-        tail = ex.exec(f'tail -n 8 "{REMOTE_DIR}/serve-{job_id}.log" 2>/dev/null').out
+        tail = ex.exec(f'tail -n 8 "{remote_dir()}/serve-{job_id}.log" 2>/dev/null').out
         m = re.search(r"ABORT: (\S+) exposes", tail)
         node = m.group(1).split(".")[0] if m else ""
         if node and node not in self._excluded:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 
@@ -21,6 +22,39 @@ LAB_STORAGE = (os.environ.get("AISCIENTIST_LAB_STORAGE")
 SHARED_ROOT = f"{LAB_STORAGE}/software/AiScientist"
 # Reference data the whole lab shares and AiScientist only reads (VEP caches, SpliceAI, LIRICAL).
 REFERENCE_ROOT = f"{LAB_STORAGE}/software/reference"
+
+
+# --- Slurm job names --------------------------------------------------------------------------
+# Every Slurm job name the gateway submits, and every name or name prefix it looks for in `squeue`
+# to reuse, re-model, cancel or idle-release a job, is built by ``slurm_job_name``. Each site submits
+# under each user's own HPC3 account, so two deployments on one cluster (production and the staging
+# site) would otherwise share names, and one would reuse, re-model or cancel the other's jobs for the
+# same person. A second deployment sets a prefix (AISCIENTIST_SLURM_JOB_PREFIX=stg-) and then neither
+# site sees the other's jobs. Empty, the default, keeps the names unchanged: running jobs are found
+# by name, so production's names must not move.
+#
+# The prefix goes unquoted into shell commands, `squeue --name=` lists and file names, so it is
+# limited to letters, digits, '.', '_' and '-', starting with a letter or digit.
+_SLURM_JOB_PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}")
+
+
+def slurm_job_prefix() -> str:
+    """This deployment's Slurm job-name prefix (``AISCIENTIST_SLURM_JOB_PREFIX``), "" by default.
+
+    Read from the environment at each call, since the project ``.env`` is loaded after this module
+    is imported. A value the shell or Slurm could misread raises ``ValueError``: falling back to ""
+    would quietly put a second site back on production's names."""
+    raw = os.environ.get("AISCIENTIST_SLURM_JOB_PREFIX", "").strip()
+    if raw and not _SLURM_JOB_PREFIX_RE.fullmatch(raw):
+        raise ValueError(
+            f"AISCIENTIST_SLURM_JOB_PREFIX={raw!r} is not a valid Slurm job-name prefix: use up to 32 "
+            "letters, digits, '.', '_' or '-', starting with a letter or digit (for example 'stg-').")
+    return raw
+
+
+def slurm_job_name(base: str) -> str:
+    """``base`` with this deployment's prefix: the one way to name, or look for, a Slurm job."""
+    return slurm_job_prefix() + base
 
 
 @dataclass
@@ -105,6 +139,7 @@ class HPCSettings:
     # the *current user's own* serve job (named bioagent-vllm-<ucinetid> and
     # filtered with `squeue --me`). It never searches, reuses, or cancels another
     # lab member's jobs — one project must never be able to affect another.
+    # Per-deployment isolation is the job-name prefix: see ``slurm_job_name`` above.
     lab_storage: str = LAB_STORAGE   # research data lives here
     lab_data_group: str = "ruic20_hpc"        # `newgrp ruic20_hpc` before touching lab_storage
 

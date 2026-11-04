@@ -461,3 +461,167 @@ def test_the_key_service_restarts_before_the_app(server):
         assert r.returncode == 0, r.stderr
     restarts = [line for line in server.calls.read_text().split() if line.endswith("-restart")]
     assert restarts == ["keys-restart", "app-restart"] * 3
+
+
+def test_the_stable_channel_skips_pre_releases_and_the_prerelease_channel_takes_them(server):
+    """Production (stable, the default) installs releases only; the staging site (prerelease) takes
+    the newest tag, pre-releases included, in the Python order: rc2 < rc10 < the release itself."""
+    server.skills_package("v0.1.0")
+    for tag in ("v1.0.0", "v1.1.0rc1", "v1.1.0rc2"):
+        server.package(tag)
+    r = server.run("--auto")
+    assert r.returncode == 0, r.stderr
+    assert server.link("current") == "v1.0.0"
+
+    staging = {"AISCIENTIST_CHANNEL": "prerelease"}
+    r = server.run("--auto", **staging)
+    assert r.returncode == 0, r.stderr
+    assert server.link("current") == "v1.1.0rc2" and '"version":"v1.1.0rc2"' in server.served()
+
+    server.package("v1.1.0rc10")
+    assert server.run("--auto", **staging).returncode == 0
+    assert server.link("current") == "v1.1.0rc10"
+
+    server.package("v1.1.0")                    # the release comes after its candidates
+    assert server.run("--auto", **staging).returncode == 0
+    assert (server.link("current"), server.link("previous")) == ("v1.1.0", "v1.1.0rc10")
+
+    server.package("v1.2.0a1")
+    r = server.run("--auto")                    # stable: v1.1.0 is the newest release; nothing to do
+    assert r.returncode == 0 and "v1.1.0 is current" in r.stdout
+
+
+def test_the_stable_channel_never_goes_back_from_a_pre_release(server):
+    """A pre-release deployed by name stays until a release newer than it comes."""
+    server.skills_package("v0.1.0")
+    server.package("v1.0.0")
+    server.package("v1.1.0rc1")
+    assert server.run("v1.1.0rc1").returncode == 0
+    r = server.run("--auto")
+    assert r.returncode == 0 and "v1.1.0rc1 is newer than v1.0.0, the latest stable release" in r.stdout
+    assert server.link("current") == "v1.1.0rc1"
+
+    server.package("v1.1.0")
+    r = server.run("--auto")
+    assert r.returncode == 0, r.stderr
+    assert server.link("current") == "v1.1.0"
+
+
+def test_a_tag_outside_the_scheme_or_an_unknown_channel_is_refused(server):
+    server.package("v1.0.0")
+    r = server.run("v1.0.0-rc.1")
+    assert r.returncode == 1 and "v1.2.3rc1" in r.stderr
+    r = server.run("--auto", AISCIENTIST_CHANNEL="beta")
+    assert r.returncode == 2 and "AISCIENTIST_CHANNEL must be stable or prerelease" in r.stderr
+    assert server.link("current") is None
+
+
+def test_a_site_without_a_key_service_restarts_only_the_app(server):
+    """The staging site sets AISCIENTIST_KEYS_SERVICE=none: production's key service is not its own."""
+    keys = server.tmp / "restart_keys.sh"
+    keys.write_text('#!/bin/bash\necho "keys-restart" >> "$FAKE_CALLS"\n')
+    keys.chmod(0o755)
+    server.package("v1.0.0")
+    r = server.run("v1.0.0", AISCIENTIST_KEYS_RESTART_CMD=str(keys), AISCIENTIST_KEYS_SERVICE="none")
+    assert r.returncode == 0, r.stderr
+    assert [line for line in server.calls.read_text().split() if line.endswith("-restart")] == ["app-restart"]
+
+
+def test_setup_staging_makes_a_second_site_that_follows_pre_releases(server):
+    """deploy/setup_staging.sh on a scratch root, as an ordinary user: SQLite instead of PostgreSQL, a
+    stand-in systemctl. The staging site takes over the production site's HPC3 settings, none of its
+    credentials or its own folders, installs the tag it starts from and then follows pre-releases."""
+    import getpass
+
+    tmp = server.tmp
+    pkg = tmp / "pkg"                                     # the release package the script runs from
+    shutil.copytree(DEPLOY, pkg / "deploy")
+    (pkg / "VERSION").write_text(f"tag=v1.1.0rc1\nsha={'a' * 40}\n")
+    (pkg / "requirements.lock").write_text("# python: 3.11\n")
+    gateway = pkg / "src" / "aiscientist" / "gateway"
+    gateway.mkdir(parents=True)
+    (gateway / "settings.py").write_text('os.environ.get("AISCIENTIST_SLURM_JOB_PREFIX", "")\n')
+    prod = tmp / "prod"
+    (prod / "config").mkdir(parents=True)
+    (prod / "config" / ".env").write_text(
+        "AISCIENTIST_HPC_HOST=hpc.example.edu\nAISCIENTIST_HPC_SHARED_ROOT=/lab/software/AiScientist\n"
+        "AISCIENTIST_SCIENTIST_MAX_TOKENS=8000\nAISCIENTIST_VLLM_MODEL=org/model\n"
+        "AISCIENTIST_DATABASE_URL=postgresql+psycopg://bioagent:<password>@localhost/bioagent\n"
+        "AISCIENTIST_STATE_DIR=/prod/state\nAISCIENTIST_SMTP_HOST=smtp.example.edu\n"
+        "AISCIENTIST_SMTP_PASSWORD=<password>\nAISCIENTIST_LAB_LLM_API_KEY=<key>\n"
+        "AISCIENTIST_KEY_SERVICE=http://127.0.0.1:8899\nAISCIENTIST_SHARED_LLM=1\nAISCIENTIST_WORKER_NODE=1\n"
+        "AISCIENTIST_SLURM_JOB_PREFIX=prd-\n")
+    (prod / "data" / "reference" / "genesets").mkdir(parents=True)
+    (prod / "data" / "reference" / "genesets" / "KEGG.gmt").write_text("P\td\tG1\n")
+    calls = tmp / "systemctl.log"
+    fake_systemctl = tmp / "systemctl"
+    fake_systemctl.write_text(f'#!/bin/bash\necho "$*" >> "{calls}"\n')
+    fake_systemctl.chmod(0o755)
+    units, sudoers = tmp / "systemd", tmp / "sudoers"
+    units.mkdir()
+    sudoers.mkdir()
+    server.env_file.unlink()                              # the script writes the staging site's own
+    root = server.root
+    env = {"AISCIENTIST_STAGING_ROOT": str(root), "PROD_ROOT": str(prod), "SVC_USER": getpass.getuser(),
+           "REQUIRE_ROOT": "0", "AS_SVC": "", "PSQL": "", "SYSTEMCTL": str(fake_systemctl),
+           "SYSTEMD_DIR": str(units), "SUDOERS_DIR": str(sudoers), "PORT": str(server.port)}
+    setup = pkg / "deploy" / "setup_staging.sh"
+    server.skills_package("v0.1.0")
+    server.package("v1.0.0")
+    server.package("v1.1.0rc1")
+
+    r = server.run("--tag", "v1.1.0rc1", script=setup, **env)          # the check changes nothing
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not any(units.iterdir()) and not server.env_file.exists()
+
+    r = server.run("--tag", "v1.1.0rc1", "--apply", script=setup, **env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert server.link("current") == "v1.1.0rc1" and '"version":"v1.1.0rc1"' in server.served()
+    assert server.link("current", "skills") == "0.1.0"
+
+    conf = server.env_file.read_text()
+    assert stat.S_IMODE(server.env_file.stat().st_mode) == 0o600
+    for kept in ("AISCIENTIST_HPC_HOST=hpc.example.edu", "AISCIENTIST_SCIENTIST_MAX_TOKENS=8000",
+                 "AISCIENTIST_VLLM_MODEL=org/model"):
+        assert kept in conf
+    for gone in ("<password>", "<key>", "smtp.example.edu", "8899", "/prod/state", "prd-"):
+        assert gone not in conf
+    for own in (f"AISCIENTIST_DATABASE_URL=sqlite:///{root}/state/aiscientist.db",
+                f"AISCIENTIST_STATE_DIR={root}/state", f"AISCIENTIST_RESULTS_DIR={root}/data/analysis_results",
+                "AISCIENTIST_HPC_SHARED_ROOT=/lab/software/AiScientist-staging",
+                "AISCIENTIST_SHARED_LLM=0", "AISCIENTIST_WORKER_NODE=0", "AISCIENTIST_ALLOW_SELF_REGISTER=0",
+                "AISCIENTIST_SLURM_JOB_PREFIX=stg-"):
+        assert own in conf
+    deploy_env = (root / "config" / "deploy.env").read_text()
+    assert "AISCIENTIST_CHANNEL=prerelease" in deploy_env and "AISCIENTIST_KEYS_SERVICE=none" in deploy_env
+    assert (root / "data" / "reference" / "genesets" / "KEGG.gmt").exists()
+
+    unit = (units / "aiscientist-staging.service").read_text()
+    assert f"--port {server.port}" in unit and f"WorkingDirectory={root}/app/current" in unit
+    assert "InaccessiblePaths=-/data/aiscientist " in unit
+    assert f"Environment=AISCIENTIST_ROOT={root}" in (units / "aiscientist-staging-deploy.service").read_text()
+    assert "restart aiscientist-staging.service" in (sudoers / "aiscientist-staging-restart").read_text()
+    assert "enable --now aiscientist-staging-deploy.timer" in calls.read_text()
+
+    # What the staging timer then does: the next pre-release, by the staging site's own deploy.env.
+    server.package("v1.1.0rc2")
+    r = server.run("--auto", AISCIENTIST_ROOT=str(root))
+    assert r.returncode == 0, r.stderr
+    assert server.link("current") == "v1.1.0rc2"
+
+    r = server.run("--remove", script=setup, **env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not any(units.iterdir()) and not any(sudoers.iterdir())
+    assert server.env_file.exists() and (root / "app" / "releases" / "v1.1.0rc2").is_dir()   # data kept
+
+    r = server.run("--tag", "v1.1.0rc1", script=setup, **{**env, "AISCIENTIST_STAGING_ROOT": str(prod / "x")})
+    assert r.returncode == 1 and "inside the production root" in r.stderr
+
+    # Its Slurm jobs never take the production site's names.
+    for prefix, why in (("prd-", "is the production site's"), ("-x", "starting with a letter or digit"),
+                        ("a b", "starting with a letter or digit")):
+        r = server.run("--tag", "v1.1.0rc1", script=setup, **{**env, "STAGING_SLURM_JOB_PREFIX": prefix})
+        assert r.returncode == 1 and why in r.stderr, (prefix, r.stderr)
+    (gateway / "settings.py").unlink()                    # a release from before the prefix
+    r = server.run("--tag", "v1.1.0rc1", script=setup, **env)
+    assert r.returncode != 0 and "would take the production site's names" in r.stdout, r.stdout + r.stderr

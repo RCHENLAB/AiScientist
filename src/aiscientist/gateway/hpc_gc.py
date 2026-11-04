@@ -28,6 +28,7 @@ from pathlib import Path
 
 from . import hpc_layout as layout
 from .executor import RemoteExecutor
+from .settings import slurm_job_name
 
 # The sweeper as shipped in the repo, and where it is staged on the cluster.
 GC_SCRIPT_SRC = Path(__file__).resolve().parents[3] / "deploy" / "hpc3" / "aiscientist_temp_gc.sh"
@@ -175,8 +176,9 @@ def submit_command(payload: str, log_path: str, user: str, *,
     jobs"). So the login node only ever runs this `sbatch`; the `find`/`rm` happen on a compute
     node in the free CPU partition. ``--wrap`` means we do not even write a script file to submit.
     """
+    job = slurm_job_name(f"aiscientist-{name}-{user}")
     flags = [
-        f"--job-name=aiscientist-{name}-{user}",
+        f"--job-name={job}",
         f"--partition={partition}",
         "--cpus-per-task=1", "--mem=2G", f"--time={time_limit}",
         f"--output={shlex.quote(log_path)}", "--open-mode=truncate", "--parsable",

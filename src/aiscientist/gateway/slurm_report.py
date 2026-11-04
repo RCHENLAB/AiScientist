@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 from .executor import RemoteExecutor
+from .settings import slurm_job_name
 from .slurm_job import (
     AcquireConfig, RunConfig, SlurmJobError, SlurmJobSpec, build_analysis_script, run_batch_job)
 
@@ -163,7 +164,7 @@ class SlurmReportRenderer:
             self.container_image, *rcmd,
         ]
         inner = " ".join(shlex.quote(a) for a in sing)
-        name = f"bioagent_report_{self._counter}"
+        name = slurm_job_name(f"bioagent_report_{self._counter}")
         script = build_analysis_script(
             name, inner, partition=self.partition, cpus=self.cpus, mem_gb=self.mem_gb,
             time_limit=self.time_limit, account=self.account, gres="",

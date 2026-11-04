@@ -341,6 +341,118 @@ def parse_route(raw: str) -> "tuple[str, float, str] | None":
     return hits[0], max(0.0, min(1.0, conf)), reason
 
 
+# --- a question about the RetiGene papers: one fact, or every gene with a property ----------------
+# A list ("which genes do the RetiGene papers report as X?") is answered only by reading the whole
+# corpus (the curation, ``extract_haploinsufficient_genes``); a fact ("is PRPF31 haploinsufficient?")
+# by its best passages (the literature line). The model decides, and names the property: one of the
+# curations defined in code (haploinsufficiency), or a new one, which the session's model then writes
+# a task spec for. The gateway's list rule (``corpus_scan.asks_for_gene_list``) is the floor: a
+# question it matches is a curation whatever the model says, so no question that reached the
+# curation before goes elsewhere now.
+
+FACT = "fact"
+LIST = "list"
+CORPUS_LIST_CONFIDENCE = 0.6
+
+CORPUS_ASK_SYSTEM = (
+    "A message asks about the lab's RetiGene corpus: about 1,700 full-text papers on inherited retinal "
+    "disease. Decide how it must be answered:\n"
+    '- "list": it asks for EVERY gene the papers report with some property (which genes, all genes, a '
+    "list or table of genes). Only reading every paper answers it.\n"
+    '- "fact": anything else: a question about one named gene, one paper or one disease; what something '
+    "means; a summary or overview. The best few passages answer it.\n"
+    "For a list, write the property a gene must have, in a few words. If it is one of these curations, "
+    "give its id; otherwise known is null:\n{known}\n"
+    "Examples:\n"
+    '- "What are haploinsufficient genes in RetiGene papers?" -> list, "haploinsufficient in retinal '
+    'disease", known "haploinsufficiency"\n'
+    '- "Is PRPF31 haploinsufficient according to the RetiGene papers?" -> fact\n'
+    '- "Which genes do the RetiGene papers report as acting through a dominant-negative effect?" -> list, '
+    '"dominant-negative mechanism", known null\n'
+    '- "What do the RetiGene papers say about CRX?" -> fact\n'
+    '- "列出 RetiGene 论文里报告了不完全外显的基因" -> list, "incomplete penetrance", known null\n'
+    '- "Summarize what the RetiGene corpus says about Müller glia" -> fact\n'
+    "Reply with ONLY one line of JSON: "
+    '{{"kind": "list" or "fact", "property": "a few words, or empty", "known": "an id or null", '
+    '"confidence": 0.0 to 1.0}}'
+)
+
+
+@dataclass(frozen=True)
+class CorpusAsk:
+    """How a question about the RetiGene papers is answered. ``known``: the id of a curation defined
+    in code, None for a new property (or a fact). ``source`` as in :class:`Route`."""
+
+    kind: str
+    prop: str
+    known: "str | None"
+    confidence: float
+    source: str
+
+    @property
+    def is_list(self) -> bool:
+        return self.kind == LIST
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "property": self.prop, "known": self.known,
+                "confidence": round(self.confidence, 2), "source": self.source}
+
+
+def corpus_ask_messages(question: str, known: "dict[str, str]") -> list[dict]:
+    listed = "\n".join(f'- "{k}": {v}' for k, v in known.items()) or "(none)"
+    return [{"role": "system", "content": CORPUS_ASK_SYSTEM.format(known=listed)},
+            {"role": "user", "content": f"Message: {str(question or '').strip()[:4000]}"}]
+
+
+def parse_corpus_ask(raw: str, known: "dict[str, str]") -> "tuple[str, str, str | None, float] | None":
+    """``(kind, property, known id, confidence)`` from the reply, or None when it names no kind."""
+    text = str(raw or "").strip()
+    obj = safe_json_loads(text)
+    if not isinstance(obj, dict):
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        obj = safe_json_loads(m.group(0)) if m else None
+    if not isinstance(obj, dict):
+        return None
+    kind = str(obj.get("kind") or "").strip().lower()
+    if kind not in (FACT, LIST):
+        return None
+    try:
+        conf = float(str(obj.get("confidence", "")).strip().rstrip("%"))
+    except ValueError:
+        conf = 0.0
+    if conf > 1.0:
+        conf = conf / 100.0
+    prop = " ".join(str(obj.get("property") or "").split())[:160]
+    kid = str(obj.get("known") or "").strip().strip('"').lower()
+    return kind, prop, (kid if kid in known else None), max(0.0, min(1.0, conf))
+
+
+def corpus_ask(complete: "Callable[[list[dict]], str] | None", question: str, *,
+               known: "dict[str, str]", floor: "Callable[[str], str | None]") -> CorpusAsk:
+    """One fact or a list, for a question that names the RetiGene corpus. ``known``: the curations
+    defined in code, id -> what they collect. ``floor(question)``: the id of the known curation the
+    gateway's list rule matches, or None. Never raises."""
+    rule = floor(question)
+    by_rule = (CorpusAsk(LIST, known.get(rule, rule), rule, 0.5, "rules") if rule
+               else CorpusAsk(FACT, "", None, 0.5, "rules"))
+    if complete is None:
+        return by_rule
+    try:
+        parsed = parse_corpus_ask(complete(corpus_ask_messages(question, known)), known)
+    except Exception:  # noqa: BLE001 - routing never strands the request
+        parsed = None
+    if parsed is None:
+        return by_rule
+    kind, prop, kid, conf = parsed
+    if kind == LIST and conf >= CORPUS_LIST_CONFIDENCE:
+        if kid is None and rule:            # the rule names the property the model did not place
+            return CorpusAsk(LIST, prop or known.get(rule, rule), rule, conf, "guard")
+        return CorpusAsk(LIST, prop, kid, conf, "model")
+    if rule:                                # the floor: a question the curation answered before
+        return CorpusAsk(LIST, known.get(rule, rule), rule, conf, "guard")
+    return CorpusAsk(FACT, prop, None, conf, "model" if kind == FACT else "guard")
+
+
 def route_request(complete: "Callable[[list[dict]], str] | None", question: str, *,
                   data: Iterable[str] = (), prior_request: str = "") -> Route:
     """Route one request. ``complete`` sends messages to the session's model and returns the reply
