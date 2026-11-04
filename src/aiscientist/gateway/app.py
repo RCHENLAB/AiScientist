@@ -15663,6 +15663,15 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
     return [f"run_doublet_detection: Doublets removed: {chosen:,}."] if chosen is not None else []
 
 
+def _removal_stated(body: str, line: str) -> bool:
+    """Does the text already state the removal count of ``line`` ("...: Doublets removed: 60.")?"""
+    from ..reporting.qc_display import _REMOVED
+
+    count = line.rsplit(" ", 1)[-1].rstrip(".").replace(",", "")
+    return any(next(v for v in match.groups() if v is not None).replace(",", "") == count
+               for match in _REMOVED.finditer(body))
+
+
 def _insert_qc_display_notes(body: str, notes: list[str]) -> str:
     """Fill an emptied results section instead of appending QC notes inside Methods."""
     if not notes:
@@ -15711,7 +15720,11 @@ def _default_qc_display(text: str, art: Path, result: Any = None, *, question: s
             notes.append(note)
     # Restore every affected library, even if another library already has a count. A clean
     # QC-only chat still needs the standalone step's count: it was built from the earlier QC.
-    missing = [line for line in (counts if display.changed else []) + standalone_counts if line not in body]
+    # Any other write-up the filter left alone keeps its own words, and one that already says how
+    # many doublets the step removed ("Scrublet removed 60 doublets") is not told again.
+    standalone = [line for line in standalone_counts
+                  if (display.changed or _qc_only_run(result)) and not _removal_stated(body, line)]
+    missing = [line for line in (counts if display.changed else []) + standalone if line not in body]
     if not display.changed and not missing:
         return text + back
     if missing:

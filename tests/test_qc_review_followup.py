@@ -166,3 +166,34 @@ def test_planner_hint_describes_removal_without_promoting_a_second_opinion():
                                   "libraries": [{"sample": "S1", "bam": False}]})
     assert "doublet removal" in hint
     assert "second opinion" not in hint
+
+
+def _analysis_with_standalone_doublets():
+    """Doublet detection inside a full analysis (clustering after it): not a QC-only run."""
+    return _result("run_clustering", {"status": "ok"}, previous=[{
+        "tool": "run_doublet_detection", "ok": True,
+        "result": {"status": "ok", "cells_before": 1000, "cells_after": 940, "filtered": True},
+    }])
+
+
+@pytest.mark.parametrize("results", [
+    "Scrublet removed 60 doublets (6%) before clustering. Leiden found 14 clusters.",
+    "Leiden clustering at resolution 0.8 found 14 clusters.",
+])
+def test_a_write_up_the_filter_leaves_alone_gets_no_standalone_count_line(tmp_path, results):
+    from aiscientist.gateway.app import _qc_only_run
+
+    result = _analysis_with_standalone_doublets()
+    assert not _qc_only_run(result)
+    report = (f"# Rod loss\n\n## Results\n\n{results}\n\n## Discussion\n\nRods are reduced.\n\n"
+              f"## References\n\n1. {REFERENCE}\n")
+    assert _default_qc_display(report, tmp_path, result) == report
+
+
+def test_a_qc_reply_that_already_states_the_standalone_count_is_not_told_again(tmp_path):
+    result = _result("run_doublet_detection", {
+        "status": "ok", "cells_before": 1000, "cells_after": 940, "filtered": True,
+    }, previous=[{"tool": "run_scanpy_qc", "ok": True,
+                  "result": {"status": "ok", "cells_before": 2000, "cells_after": 1000}}])
+    reply = "Quality control kept 1,000 of 2,000 cells; doublet detection removed 60 doublets."
+    assert _default_qc_display(reply, tmp_path, result) == reply
