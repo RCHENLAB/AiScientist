@@ -15618,11 +15618,72 @@ def _brief_qc_warnings(result: dict) -> "list[str]":
     return qc_warnings(result)
 
 
-# Written by code from the run's records and already to the QC policy, so the display leaves them
-# as they are: "The dataset" and "What was run" (the reviewer is told the same), and the back matter.
-# A chosen `doublet_decider` or a reference's title names a caller; cutting it misstates the record.
-_QC_RECORD_SECTIONS = re.compile(r"^(?:The dataset|What was run)\b", re.I)
-_BACKMATTER_HEADINGS = ("\n## References", "\n# Output Files Index", "\n## Background consulted")
+# Record sections, scientific methods/limitations and back matter must retain their original
+# statements. Naming a caller here describes how the work was done, not a default comparison.
+_QC_RECORD_SECTIONS = re.compile(
+    r"^(?:The dataset|What was run|(?:Materials (?:and|&) )?Methods|Limitations|References|"
+    r"Background consulted|Output Files Index)\b", re.I)
+_BACKMATTER_HEADINGS = re.compile(
+    r"(?:\A|\n)#{1,6}[ \t]+(?:References|Output Files Index|Background consulted)\b", re.I)
+
+
+def _standalone_doublet_lines(result: Any) -> list[str]:
+    """Actual removals from the latest accepted standalone call, else latest completed call.
+
+    This is separate from _QC_TOOLS: a later doublet step must not replace the overall CellQC
+    outcome, per-library QC or warnings. Predictions alone never establish a removed count.
+    """
+    chosen = None
+    for rnd in reversed(list(getattr(result, "rounds", None) or [])):
+        accepted = _round_field(_round_field(rnd, "verdict"), "verdict") == "accept"
+        steps = (_round_field(rnd, "scientist_result") or {}).get("steps") or []
+        for step in reversed(steps):
+            if not isinstance(step, dict) or step.get("tool") != "run_doublet_detection" \
+                    or step.get("ok") is False:
+                continue
+            record = step.get("result")
+            if not isinstance(record, dict) or record.get("status") != "ok":
+                continue
+            before, after = record.get("cells_before"), record.get("cells_after")
+            if not all(isinstance(n, (int, float)) for n in (before, after)) or not before >= after >= 0:
+                continue
+            if record.get("skipped") or record.get("filtered") is False:
+                removed = 0
+            elif record.get("filtered") is True:
+                removed = int(before - after)
+            else:
+                continue
+            if chosen is None or accepted:
+                chosen = removed
+            break
+        else:
+            continue
+        if accepted:
+            break
+    return [f"run_doublet_detection: Doublets removed: {chosen:,}."] if chosen is not None else []
+
+
+def _removal_stated(body: str, line: str) -> bool:
+    """Does the text already state the removal count of ``line`` ("...: Doublets removed: 60.")?"""
+    from ..reporting.qc_display import _REMOVED
+
+    count = line.rsplit(" ", 1)[-1].rstrip(".").replace(",", "")
+    return any(next(v for v in match.groups() if v is not None).replace(",", "") == count
+               for match in _REMOVED.finditer(body))
+
+
+def _insert_qc_display_notes(body: str, notes: list[str]) -> str:
+    """Fill an emptied results section instead of appending QC notes inside Methods."""
+    if not notes:
+        return body
+    block = "\n\n".join(notes)
+    empty = re.search(
+        r"(?im)^#{1,6}[ \t]+(?:Results?|Quality control|QC|Doublets?[^\n]*)[ \t]*"
+        r"\n[ \t\n]*(?=^#{1,6}[ \t]|\Z)", body)
+    if empty:
+        end = empty.end()
+        return body[:end].rstrip() + "\n\n" + block + "\n\n" + body[end:]
+    return body + "\n\n" + block
 
 
 def _default_qc_display(text: str, art: Path, result: Any = None, *, question: str = "") -> str:
@@ -15632,27 +15693,46 @@ def _default_qc_display(text: str, art: Path, result: Any = None, *, question: s
     covers an old synthesis or a writer/reviewer that ignores the shared presentation prompt. A
     ``question`` that asks for the doublet comparison gets it: the writers are told the same.
     """
-    from ..reporting.qc_display import asks_for_doublet_details, default_qc_text
+    from ..reporting.qc_display import (
+        _GENERIC_FAILURE, _GENERIC_REVIEW, asks_for_doublet_details, default_qc_text,
+    )
 
     if asks_for_doublet_details(question):
         return text
 
-    starts = [i for i in (text.find(h) for h in _BACKMATTER_HEADINGS) if i != -1]
-    text, back = (text[:min(starts)], text[min(starts):]) if starts else (text, "")
+    backmatter = _BACKMATTER_HEADINGS.search(text)
+    text, back = (text[:backmatter.start()], text[backmatter.start():]) if backmatter else (text, "")
     qc = _qc_step_outcome(result) if result is not None else None
     libs = [lib for lib in (qc["result"].get("libraries") or [] if qc else []) if isinstance(lib, dict)]
     counts = [f"{lib.get('sample') or 'Library'}: {line}"
               for lib in libs for line in _brief_doublet_lines(lib)]
+    standalone_counts = _standalone_doublet_lines(result)
     # With the record's counts at hand, a count in a removed clause is not salvaged: it may be the
     # other caller's ("scDblFinder would have removed 1,192 doublets"), and would hide the record's.
-    display = default_qc_text(text, salvage_counts=not counts, keep=_QC_RECORD_SECTIONS)
-    if not display.changed:
-        return text + back
+    display = default_qc_text(text, salvage_counts=not (counts or standalone_counts), keep=_QC_RECORD_SECTIONS)
     body = display.text.rstrip()
-    if counts and not re.search(r"doublets?\s+removed|removed\s+[\d,]+\s+doublets?", body, re.I):
-        body += "\n\n" + "\n".join(counts)
-    if display.needs_review and "doublet filtering needs review" not in body.lower():
-        body += "\n\nDoublet filtering needs review; see the optional technical details."
+    notes = []
+    # The pure text filter appends a generated warning. Relocate only that added suffix, never
+    # an original warning, so it can accompany restored counts in the section it replaced.
+    for note in (_GENERIC_FAILURE, _GENERIC_REVIEW):
+        if body.endswith(note) and note not in text:
+            body = body[:-len(note)].rstrip()
+            notes.append(note)
+    # Restore every affected library, even if another library already has a count. A clean
+    # QC-only chat still needs the standalone step's count: it was built from the earlier QC.
+    # Any other write-up the filter left alone keeps its own words, and one that already says how
+    # many doublets the step removed ("Scrublet removed 60 doublets") is not told again.
+    standalone = [line for line in standalone_counts
+                  if (display.changed or _qc_only_run(result)) and not _removal_stated(body, line)]
+    missing = [line for line in (counts if display.changed else []) + standalone if line not in body]
+    if not display.changed and not missing:
+        return text + back
+    if missing:
+        notes.insert(0, "\n".join(missing))
+    if display.needs_review and "doublet filtering needs review" not in (body + " ".join(notes)).lower():
+        notes.append("Doublet filtering needs review; see the optional technical details.")
+    if not display.details:
+        return _insert_qc_display_notes(body, notes).strip() + "\n" + back
     path = art / "report" / "doublet_details.md"
     try:
         prior = path.read_text(encoding="utf-8") if path.is_file() else (
@@ -15665,10 +15745,10 @@ def _default_qc_display(text: str, art: Path, result: Any = None, *, question: s
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(prior.rstrip() + "\n\n" + "\n\n".join(additions) + "\n", encoding="utf-8")
         if path.is_file() and "report/doublet_details.md" not in body:
-            body += "\n\nOptional technical details: `report/doublet_details.md` in Downloads."
+            notes.append("Optional technical details: `report/doublet_details.md` in Downloads.")
     except OSError as exc:
         print(f"[report] could not save optional doublet excerpts: {exc}")
-    return body.strip() + "\n" + back
+    return _insert_qc_display_notes(body, notes).strip() + "\n" + back
 
 
 def _brief_qc_lines(qc: "dict[str, Any] | None", art: Path) -> "list[str]":

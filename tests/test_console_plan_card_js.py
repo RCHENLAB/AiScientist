@@ -225,7 +225,10 @@ def test_the_panel_has_no_second_message_box_for_changing_the_plan():
     where to type, and a plan that is no longer waiting says nothing."""
     out = _card()
     card = out["card"]
-    assert "Type in the message box below" in card
+    assert "Type in the chat's message box" in card
+    # The panel sits beside the chat, so the message box is not "below" it (the chat entry's
+    # "reply below" is, under that entry).
+    assert "below" not in card.split('class="plan-revise"')[1].split('class="plan-actions-row"')[0]
     assert "plan-revise-text" not in card and 'data-plan="revise"' not in card, "no textarea, no Send"
     assert "<textarea" not in card.split('class="plan-revise"')[1].split('class="plan-actions-row"')[0]
     assert card.index('class="plan-steps"') < card.index('class="plan-revise"'), "readable steps precede the note"

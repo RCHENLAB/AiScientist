@@ -115,7 +115,7 @@ def test_plans_without_documents_keep_word_revision_and_readable_history(title):
     plan = {"kind": "plan", "agenda": [f"**{title}** — Summarise the findings."], "doc": None}
     out = _console(plan, action="approve")
     # Words are typed in the chat's message box (issue 58); the card points there and has no box of its own.
-    assert 'class="plan-revise"' in out["review"] and "Type in the message box below" in out["review"]
+    assert 'class="plan-revise"' in out["review"] and "Type in the chat's message box" in out["review"]
     assert 'data-plan="revise"' not in out["review"] and "<textarea" not in out["review"]
     assert title in out["savedHtml"]
     _no_raw(out["review"])
@@ -125,10 +125,10 @@ def test_plans_without_documents_keep_word_revision_and_readable_history(title):
 
 
 # Reuse the real gateway worker fixture, with only model/tool execution replaced by local doubles.
-from test_saved_plan_gateway import _reply, _show, lab_gateway  # noqa: E402, F401
+from test_saved_plan_gateway import _reply, _show  # noqa: E402
 
 
-def test_structured_edit_validation_correction_approval_execution_and_reload(lab_gateway):  # noqa: F811
+def test_structured_edit_validation_correction_approval_execution_and_reload(lab_gateway):
     from aiscientist.gateway import app as gw, saved_plans
 
     env = lab_gateway

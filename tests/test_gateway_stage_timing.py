@@ -20,8 +20,6 @@ from aiscientist.gateway.settings import HPCSettings
 from test_literature_route import _Model
 from test_saved_plan_gateway import _reply, _show
 
-pytest_plugins = ("test_saved_plan_gateway",)
-
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):

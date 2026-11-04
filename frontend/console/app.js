@@ -4387,7 +4387,7 @@ function planCardHtml(agenda, doc, revisedSteps, opts) {
 function planReviseHtml() {
   return `<div class="plan-revise">`
     + `<div class="plan-revise-head">${planIcon("chat")}<span>Change it in words</span></div>`
-    + `<div class="plan-revise-tip">Type in the message box below. The PI changes the plan as it stands, with your own `
+    + `<div class="plan-revise-tip">Type in the chat's message box. The PI changes the plan as it stands, with your own `
     + `changes, and shows it to you again; nothing runs until you click Run this plan. A question gets an answer and `
     + `leaves the plan as it is.</div>`
     + `<div class="plan-revise-draft" hidden>${planIcon("info")}<span>Your setting change is not applied yet: it is checked `

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,98 +12,9 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from aiscientist.agents import registry, research_lab
 from aiscientist.agents.plan_doc import parse_plan_yaml
-from aiscientist.agents.research_harness import HarnessTool
 from aiscientist.agents.research_lab import ResearchLab as _ResearchLab
 from aiscientist.gateway import app as gw, saved_plans
-from aiscientist.gateway.settings import HPCSettings
-
-
-@pytest.fixture
-def lab_gateway(tmp_path, monkeypatch):
-    calls, models, cards, records = [], [], [], []
-    monkeypatch.setattr(gw, "_AUTH_ENABLED", False)
-    monkeypatch.setenv("AISCIENTIST_PLAN_YAML", "1")
-    monkeypatch.setenv("AISCIENTIST_PLAN_REVIEW", "0")
-    monkeypatch.setenv("AISCIENTIST_MAX_RUNS_PER_SESSION", "3")
-
-    def complete(messages, **kwargs):
-        system = messages[0]["content"]
-        models.append(system)
-        if "Principal Investigator of a bioinformatics lab" in system:
-            return json.dumps({"agenda": ["Filter cells with `run_scanpy_qc` at max_pct_mt 20."]})
-        if "filling in a form" in system:
-            return '[{"step":1,"settings":{"max_pct_mt":20}}]'
-        if "scientific Critic" in system:
-            return '{"verdict":"accept","score":0.9,"critique":"ok"}'
-        if "change" in system.lower() or "revis" in system.lower():
-            return '{"ops":[{"op":"change","step":"s1","settings":{"min_genes":300}}]}'
-        return "Report."
-
-    def scientist_chat(messages, tools, **kwargs):
-        done = any(m.get("role") == "tool" for m in messages)
-        return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
-            "name": "finish" if done else "run_scanpy_qc",
-            "arguments": json.dumps({"answer": "done"} if done else {"max_pct_mt": 5})}}]}
-
-    def tool(args, ctx):
-        calls.append(dict(args))
-        return {"status": "ok"}
-
-    catalog = [HarnessTool("run_scanpy_qc", "Filter cells", {"type": "object", "properties": {
-        "max_pct_mt": {"type": "number"}, "min_genes": {"type": "integer"}}}, tool)]
-    monkeypatch.setattr(registry, "build_scientist_catalog", lambda **kw: catalog)
-    # The step classifier caches the catalog's names; this one-tool catalog must not outlive the test.
-    research_lab._known_tool_names.cache_clear()
-    original_lab = research_lab.ResearchLab
-
-    def make_lab(ctx, config, **kw):
-        return original_lab(ctx, replace(config, auto_select_skill=False, plan_review=False), **kw)
-
-    monkeypatch.setattr(research_lab, "ResearchLab", make_lab)
-    monkeypatch.setattr(gw, "_lab_llm", lambda c: SimpleNamespace(
-        complete_fn=complete, scientist_chat=scientist_chat, model="offline", label="offline",
-        count_tokens=None, scientist_remote=False, lab_role_remote=False,
-        shared_endpoint=False, context_window=None))
-    monkeypatch.setattr(gw, "_finish_run_record", lambda *a: records.append(a))
-
-    async def roster(conn, tools, *args):
-        return tools
-
-    monkeypatch.setattr(gw, "_prepare_session_roster", roster)
-    # Report rendering is outside the plan lifecycle under test. The real lab still executes
-    # and pins the saved settings before this gateway tail is skipped.
-    monkeypatch.setattr(gw, "_run_produced_nothing", lambda *args: True)
-    conns = []
-
-    def connection():
-        conn = gw.Connection(HPCSettings(), mock=True, loop=asyncio.new_event_loop(), username="tester")
-        conn.workspace, conn.status, conn.executor = tmp_path / "workspace", "ready", object()
-        gw.CONNECTIONS[conn.id] = conn
-        conns.append(conn)
-        publish = conn._publish
-
-        def check_card(payload):
-            if payload.get("type") in {"plan_prompt", "plan_clarify"}:
-                rid = payload["run_id"]
-                art = conn.workspace / rid / "artifacts"
-                current = saved_plans.load(art)
-                state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
-                assert current is not None and state["rounds"] == []
-                assert payload["plan"]["yaml"] == current["yaml"]
-                cards.append(dict(payload))
-            publish(payload)
-
-        monkeypatch.setattr(conn, "_publish", check_card)
-        return conn
-
-    yield SimpleNamespace(connection=connection, calls=calls, models=models, cards=cards, records=records)
-    for conn in conns:
-        gw.CONNECTIONS.pop(conn.id, None)
-        conn.loop.close()
-    gw._SAVED_PLAN_TASKS.clear()
-    research_lab._known_tool_names.cache_clear()
 
 
 def _show(conn, conversation="conv-A"):

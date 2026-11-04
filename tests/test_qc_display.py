@@ -21,8 +21,8 @@ def test_mixed_prose_keeps_removals_other_scores_and_material_warning():
                                      "Doublets removed: 1,261, called by DoubletFinder"])
 def test_counts_survive_when_the_same_sentence_names_a_caller(removal):
     display = default_qc_text(removal + ".")
-    assert display.text == "Doublets removed: 1,261."
-    assert not display.needs_review
+    assert display.text == removal + "."
+    assert not display.needs_review and not display.changed
 
 
 def test_doublet_table_columns_leave_unrelated_scientific_columns_intact():
@@ -75,11 +75,12 @@ def test_doublet_failure_still_has_a_visible_failure_warning():
     assert not display.changed
 
 
-def test_comparison_with_failure_retains_a_generic_failure_and_the_original_reason():
+def test_score_values_are_optional_but_the_concrete_failure_remains_visible():
     draft = "DoubletFinder scores failed validation: empty matrix; scDblFinder score was 0.42."
     display = default_qc_text(draft)
-    assert "Doublet filtering failed" in display.text
-    assert display.needs_review
+    assert "DoubletFinder scores failed validation: empty matrix;" in display.text
+    assert "0.42" not in display.text
+    assert not display.needs_review
     assert draft in display.details
 
 
@@ -192,3 +193,131 @@ def test_an_agreement_of_another_analysis_after_a_doublet_sentence_stays():
              "scGPT and the marker labels agreed on 87% of cells.")
     display = default_qc_text(draft)
     assert display.text == draft and not display.changed
+
+
+def test_review_image_with_semicolon_is_preserved_as_a_complete_qc_figure():
+    image = "![Per-cell QC metrics after filtering; doublet scores are shown in panel C.](figures/qc.png)"
+    display = default_qc_text(image)
+    assert display.text == image and not display.changed
+
+
+def test_review_unclosed_fence_does_not_swallow_discussion():
+    draft = "```text\nDoubletFinder pANN = 0.21\n\n## Discussion\nRods retained their marker expression.\n"
+    display = default_qc_text(draft)
+    assert "## Discussion\nRods retained their marker expression." in display.text
+    assert "```" not in display.text
+    assert "0.21" not in display.text
+
+
+def test_review_residual_doublet_finding_is_not_a_caller_comparison():
+    draft = ("Cluster 7 shows elevated doublet scores and co-expresses rod and cone markers, "
+             "suggesting residual doublets.")
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+
+
+@pytest.mark.parametrize("draft", [
+    "Cluster 7 shows elevated doublet scores and co-expresses 42 rod and cone marker genes, suggesting residual doublets.",
+    "DoubletFinder flagged cells with low UMI counts in sample 2.",
+    "- S2: scDblFinder second opinion failed: R package version 1.2.3 was not installed.",
+])
+def test_review_unrelated_sentence_numbers_are_not_doublet_diagnostic_values(draft):
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+    assert not display.needs_review
+
+
+@pytest.mark.parametrize("draft", [
+    "DoubletFinder removed 120 doublets in S1 and 95 in S2.",
+    "DoubletFinder 移除了 929 个双细胞。",
+])
+def test_review_without_records_caller_removal_sentences_keep_all_sample_counts(draft):
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+
+
+@pytest.mark.parametrize("draft", ["DoubletFinder removed 120 doublets in S1 and 95 in S2.",
+                                  "DoubletFinder 移除了 929 个双细胞。"])
+def test_named_removal_counts_are_not_salvaged_when_the_caller_has_qc_records(draft):
+    display = default_qc_text(draft, salvage_counts=False)
+    assert display.changed and draft in display.details
+    assert "120" not in display.text and "95" not in display.text and "929" not in display.text
+
+
+def test_review_caller_table_scopes_bare_kappa_column_and_reads_its_low_value():
+    draft = "| Sample | DoubletFinder | scDblFinder | kappa |\n|---|---|---|---|\n| S1 | 120 | 140 | 0.10 |"
+    display = default_qc_text(draft)
+    assert "kappa" not in display.text.lower() and "0.10" not in display.text
+    assert "Doublet filtering needs review" in display.text and display.needs_review
+    assert draft in display.details
+
+
+def test_sample_counts_in_a_valued_comparison_are_salvaged_without_records():
+    draft = "DoubletFinder removed 120 doublets in S1 and 95 in S2, with caller agreement kappa 0.10."
+    display = default_qc_text(draft)
+    assert "S1: Doublets removed: 120." in display.text
+    assert "S2: Doublets removed: 95." in display.text
+    assert "kappa" not in display.text
+
+
+def test_numeric_per_cell_pann_field_still_moves_out_of_default_prose():
+    display = default_qc_text("doubletfinder_pANN = 0.21.")
+    assert display.changed and "0.21" not in display.text
+
+
+@pytest.mark.parametrize("draft", ["DoubletFinder flagged cells with low UMI counts.",
+                                  "DoubletFinder score standard error was 0.01."])
+def test_review_generic_low_or_error_does_not_invent_a_doublet_warning(draft):
+    display = default_qc_text(draft)
+    assert not display.needs_review
+    assert "Doublet filtering needs review" not in display.text
+    assert "Doublet filtering failed" not in display.text
+    if "low UMI" in draft:
+        assert display.text == draft
+
+
+def test_review_second_opinion_failure_keeps_sample_and_execution_reason():
+    draft = "- S2: scDblFinder second opinion failed: R package not installed."
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+
+
+def test_review_untested_code_notice_keeps_caller_named_step_title():
+    draft = ("> **Untested code.** This step ran code that the AI wrote during this run, not a tested "
+             "AiScientist tool: *Compare DoubletFinder with scDblFinder*. Treat its results as "
+             "exploratory and check them before relying on them.")
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+
+
+def test_regression_bare_marker_score_table_is_not_scoped_by_doublet_heading():
+    draft = "## Doublet review\n\n| Gene | score |\n|---|---|\n| RHO | 7.8 |\n| GNAT1 | 3.2 |"
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+
+
+def test_regression_concrete_caller_failure_row_stays_in_metric_table():
+    draft = ("## Doublet review\n\n| Metric | Value |\n|---|---|\n"
+             "| DoubletFinder failure | empty matrix |\n| Cells kept | 855 |")
+    display = default_qc_text(draft)
+    assert display.text == draft and not display.changed
+
+
+def test_regression_citation_year_is_not_a_caller_removal_count_with_records():
+    draft = "Doublets were identified with DoubletFinder (McGinnis et al., 2019) and removed."
+    display = default_qc_text(draft, salvage_counts=False)
+    assert display.text == draft and not display.changed
+
+
+def test_regression_remaining_cells_are_not_salvaged_as_removed_doublets():
+    draft = ("DoubletFinder removed 120 doublets in S1, leaving 880 in S1, "
+             "with caller agreement kappa 0.10.")
+    display = default_qc_text(draft)
+    assert "S1: Doublets removed: 120." in display.text
+    assert "Doublets removed: 880" not in display.text
+
+
+def test_single_sample_prefix_is_kept_when_salvaging_a_diagnostic_clause():
+    display = default_qc_text("- S2: DoubletFinder removed 95 doublets, with caller agreement kappa 0.10.")
+    assert "S2: Doublets removed: 95." in display.text
+    assert "kappa" not in display.text
