@@ -264,3 +264,167 @@ def test_the_qc_reply_states_the_cutoffs_used_and_which_were_changed():
     assert "max_pct_mt 20% (changed from the default 10%)" in qc_result_summary(result)
     assert cutoff_lines({}) == [] and cutoff_lines({"thresholds": {}}) == []
     assert "threshold_defaults" in QC_SUMMARY_POLICY and "max_pct_mt" in QC_SUMMARY_POLICY
+
+
+# --- review cases on #89: what the reader must NOT read, and replies that ask for more ------------------
+
+from aiscientist.agents.cellqc_cutoffs import read_cutoffs  # noqa: E402
+
+ORDINARY = [
+    "Cluster at resolution 0.8 and regress mito",
+    "Score mitotic cells (G2M) at resolution 1.0",
+    "Use 30 PCs, mito regression on",
+    "Use nfeatures=3000 for the highly variable genes",
+    "Exclude mitochondrial and ribosomal genes before clustering",
+    "Also regress out mitochondrial content",
+    "After QC, lower the marker logFC threshold to 0.25",
+    "Set the DE threshold to 0.25 for each cell type",
+    "filter genes with min count 10 before DE",
+    "Also run DE between clusters with min counts 10 per gene",
+]
+
+
+@pytest.mark.parametrize("text", ORDINARY)
+def test_a_number_near_a_cutoff_word_is_not_a_cutoff(text):
+    assert read_cutoff_request(text) == ({}, [])
+
+
+@pytest.mark.parametrize("text, changes", [
+    ("set min_counts to 1,000", {"min_counts": 1000}),
+    ("min genes 200", {"min_features": 200}),
+    ("Use a 15% mitochondrial cutoff", {"max_pct_mt": 15.0}),
+])
+def test_thousands_separators_and_a_value_right_after_the_name_are_read(text, changes):
+    assert read_cutoff_request(text) == (changes, [])
+
+
+@pytest.mark.parametrize("text, why", [
+    ("raise the mitochondrial limit by 5", "not how much to change it"),
+    ("mitochondrial fraction 0.05", "reads as a fraction"),
+])
+def test_a_relative_change_or_a_fraction_is_explained(text, why):
+    changes, problems = read_cutoff_request(text)
+    assert changes == {} and len(problems) == 1 and why in problems[0]
+
+
+@pytest.mark.parametrize("text, only", [
+    ("raise the mitochondrial limit to 20", True),
+    ("Please set min_counts to 1000 and the mito limit to 15, thanks", True),
+    ("raise the mitochondrial limit to 20 and cluster at resolution 0.8", False),
+    ("set the mito cutoff to 20 then cluster at resolution 0.8", False),
+    ("Raise the mitochondrial limit to 20 for sample S2", False),
+])
+def test_only_a_reply_of_nothing_but_cutoffs_is_left_to_code_alone(text, only):
+    reading = read_cutoffs(text)
+    assert reading.changes and not reading.problems and reading.only is only
+
+
+def _resolution_reply(**qc_settings):
+    ops = [{"op": "change", "step": "s2", "settings": {"resolution": 0.8}}]
+    if qc_settings:
+        ops.insert(0, {"op": "change", "step": "s1", "settings": qc_settings})
+    return json.dumps({"ops": ops})
+
+
+def _ran(calls, name):
+    return [args for tool, args in calls if tool == name]
+
+
+@pytest.mark.parametrize("qc_settings", [{}, {"max_pct_mt": 0.8}])
+def test_a_reply_with_a_cutoff_and_another_change_keeps_both(qc_settings):
+    # The model makes the other change; the stated cutoff wins over any value it gives.
+    calls: list = []
+    counts: dict = {}
+    _result, events, _seen = _run(_lab(calls, counts, _resolution_reply(**qc_settings)),
+                                  "raise the mitochondrial limit to 20 and cluster at resolution 0.8")
+    assert counts["revise"] == 1 and counts["plan"] == 1
+    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}]
+    assert _ran(calls, "run_clustering") == [{"resolution": 0.8}]
+    assert not _of(events, "plan_answer")
+
+
+def test_when_the_model_names_nothing_the_redraft_still_gets_the_stated_cutoff():
+    calls: list = []
+    counts: dict = {}
+    _result, _events, _seen = _run(_lab(calls, counts),
+                                   "raise the mitochondrial limit to 20 and cluster at resolution 0.8")
+    assert counts["revise"] == 1 and counts["plan"] == 2, "the model named nothing: patch, then redraft"
+    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}]
+
+
+def test_a_mito_word_and_another_number_go_to_the_reviser_untouched():
+    calls: list = []
+    counts: dict = {}
+    _result, events, _seen = _run(_lab(calls, counts, _resolution_reply()),
+                                  "regress out mitochondrial content and cluster at resolution 0.8")
+    assert counts["revise"] == 1 and not _of(events, "plan_answer")
+    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}]
+    assert _ran(calls, "run_clustering") == [{"resolution": 0.8}]
+
+
+@pytest.mark.parametrize("text", ORDINARY[4:7])
+def test_an_ordinary_revision_is_not_refused(text):
+    counts: dict = {}
+    _result, events, _seen = _run(_lab([], counts, _resolution_reply()), text)
+    assert counts["revise"] == 1
+    assert not [e for e in _of(events, "plan_answer") if e["answer"].startswith("Nothing was changed")]
+
+
+def test_a_number_that_contradicts_raise_is_explained_and_nothing_changes():
+    calls: list = []
+    counts: dict = {}
+    _result, events, seen = _run(_lab(calls, counts), "raise the mitochondrial limit to 5")
+    answer = _of(events, "plan_answer")[0]["answer"]
+    assert answer.startswith("Nothing was changed.") and "below the plan's 10%" in answer
+    assert seen[1] == seen[0] and "revise" not in counts
+    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}]
+
+
+SCANPY = ("**Scanpy QC** — Filter the cells with `run_scanpy_qc`: keep cells with at least 200 genes "
+          "and under 10% mitochondrial reads.")
+
+
+def test_a_cutoff_no_step_takes_goes_to_the_reviser_on_a_scanpy_plan():
+    # run_scanpy_qc takes max_pct_mt but calls the gene floor min_genes: "minimum genes per cell" is
+    # min_features to the reader, which no step takes, so the model maps it, as before issue 61.
+    calls: list = []
+    counts: dict = {}
+    reply = json.dumps({"ops": [{"op": "change", "step": "s1", "settings": {"min_genes": 150}}]})
+    lab = _lab(calls, counts, reply)
+    complete = lab._complete_fn
+
+    def scanpy_complete(messages, **kw):
+        if "Principal Investigator of a bioinformatics lab" in messages[0]["content"]:
+            counts["plan"] = counts.get("plan", 0) + 1
+            return json.dumps({"agenda": [SCANPY, CLUSTER]})
+        return complete(messages)
+
+    def scanpy_chat(messages, _tools):
+        brief = next(m["content"] for m in messages if m.get("role") == "user")
+        if not any(m.get("role") == "tool" for m in messages) and "`run_scanpy_qc`" in \
+                brief.split("Step to execute now:", 1)[1].split("\n", 1)[0]:
+            return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
+                "name": "run_scanpy_qc", "arguments": "{}"}}]}
+        return _scientist_chat(messages, _tools)
+
+    def run(args, _ctx):
+        calls.append(("run_scanpy_qc", dict(args)))
+        return {"status": "ok", "tool": "run_scanpy_qc"}
+
+    scanpy = HarnessTool("run_scanpy_qc", "scanpy QC test double", {"type": "object", "properties": {
+        "min_genes": {"type": "integer", "default": 200}, "max_pct_mt": {"type": "number", "default": 10.0}}}, run)
+    lab._complete_fn = scanpy_complete
+    lab.scientist = ResearchHarness(catalog=[scanpy] + [t for t in _catalog(calls) if t.name != "run_cellqc"],
+                                    chat_fn=scanpy_chat)
+    _result, events, _seen = _run(lab, "lower the minimum genes per cell to 150")
+    assert counts["revise"] == 1
+    assert not [e for e in _of(events, "plan_answer") if e["answer"].startswith("Nothing was changed")]
+    assert [args.get("min_genes") for args in _ran(calls, "run_scanpy_qc")] == [150]
+
+
+def test_a_cellqc_step_is_the_qc_step_a_reply_points_at():
+    from aiscientist.agents.research_lab import resolve_plan_reference
+
+    verdict, topic, steps = resolve_plan_reference(
+        "raise the mitochondrial limit to 20 and cluster at resolution 0.8", [QC, CLUSTER])
+    assert verdict == "ok", (verdict, topic, steps)

@@ -47,7 +47,7 @@ from typing import Any, Callable, Iterable
 from ..reporting.qc_summary import QC_SUMMARY_POLICY, qc_result_summary
 from . import claim_audit
 from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
-from .cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoff_request
+from .cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
 from .hypotheses import DesignFacts, HypothesisLedger
 from .loop_utils import safe_json_loads
 from .plan_doc import (
@@ -1650,7 +1650,9 @@ _PLAN_TOPICS: "dict[str, tuple[re.Pattern[str], Callable[[str], bool]]]" = {
         lambda s: bool(re.search(r"\b(gsea|prerank)\b", s.replace("_", " "), re.I))),
     "QC": (
         re.compile(r"\b(qc|quality control|percent\.?mt|mitochondrial)\b", re.I),
-        lambda s: bool(re.search(r"\b(qc|quality control|scanpy qc)\b", s.replace("_", " "), re.I))),
+        # "CellQC" / `run_cellqc` is a QC step too: without it, "raise the mitochondrial limit to 20 and
+        # cluster at 0.8" on a CellQC plan was told the plan has no QC step.
+        lambda s: bool(re.search(r"\b(qc|quality control|scanpy qc|cellqc)\b", s.replace("_", " "), re.I))),
     "differential expression": (
         re.compile(r"\b(differential expression|de|wilcoxon|rank.?genes)\b", re.I),
         _is_de_producer_step),
@@ -4490,6 +4492,7 @@ class ResearchLab:
         if plan_review is not None:
             feedback_log = self._plan_feedback
             reported_tooling: set[str] = set()
+            pending_cutoffs: "tuple[str, dict[str, Any]] | None" = None
             while True:
                 # A Stop clicked while the PI was re-drafting (the previous loop turn's model
                 # call) must land here, before another card is pushed at the user.
@@ -4503,6 +4506,17 @@ class ResearchLab:
                 if kind == "agenda" and saved_plan_decision is None:
                     payload = self._check_plan_tooling(list(payload), emit, reported_tooling)
                     self._present_plan_document(question, list(payload), emit)
+                    if pending_cutoffs is not None:
+                        # The last reply was revised from its words (patch or redraft); the cutoffs
+                        # it named are now set on that plan by code (issue 61).
+                        said, cutoffs = pending_cutoffs
+                        ops = self._cutoff_ops(cutoffs)
+                        pinned = self._revise_plan_document(question, said, emit, ops=ops) if ops else None
+                        if pinned is not None:
+                            payload = pinned
+                            emit({"type": "pi_agenda", "agenda": payload})
+                            self._present_plan_document(question, list(payload), emit)
+                pending_cutoffs = None
                 if saved_plan_decision is not None:
                     decision, saved_plan_decision = saved_plan_decision, None
                 else:
@@ -4569,24 +4583,41 @@ class ResearchLab:
                     emit({"type": "pi_agenda", "agenda": payload})   # re-present it untouched
                     continue
                 # A cutoff named with a number ("raise the mitochondrial limit to 20") is read by code
-                # and set on the step; one that cannot be used is explained back, and the plan is
-                # re-presented as it was (issue 61).
-                cutoff_ops: "list[dict[str, Any]]" = []
+                # and set on every step whose tool takes it, so the number typed is the number that
+                # runs; one that cannot be used is explained back, and the plan is re-presented as it
+                # was (issue 61). A reply that asks for something else too goes to the reviser with
+                # the cutoffs pinned, so the rest of it is not lost.
+                cutoffs: "dict[str, Any]" = {}
+                cutoffs_only = False
                 if kind == "agenda" and fb:
-                    cutoff_ops, cutoff_problems = self._cutoff_request(fb)
+                    cutoffs, cutoff_problems, cutoffs_only = self._cutoff_request(fb)
                     if cutoff_problems:
                         emit({"type": "plan_answer", "question": fb,
                               "answer": "Nothing was changed. " + " ".join(cutoff_problems)})
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
-                # (Before the reference check below: a step whose tool takes the cutoff is the step
-                # the message points at, whatever words that step uses.)
+                if cutoffs_only:
+                    # Nothing but cutoffs: set by code, no model call. (Before the reference check
+                    # below: a step whose tool takes the cutoff is the step the reply points at,
+                    # whatever words that step uses.)
+                    ops = self._cutoff_ops(cutoffs)
+                    revised = self._revise_plan_document(question, fb, emit, ops=ops) if ops else None
+                    if revised is not None:
+                        feedback_log.append(fb)
+                        payload = revised
+                    else:
+                        said = ", ".join(f"{k} = {v}" for k, v in cutoffs.items())
+                        emit({"type": "plan_answer", "question": fb, "answer": (
+                            f"Nothing was changed: the plan already uses {said}." if not ops else
+                            f"Nothing was changed: {said} could not be set on this plan.")})
+                    emit({"type": "pi_agenda", "agenda": payload})
+                    continue
                 # A change request that points at a step the plan does NOT have, or names one of
                 # several equally good candidates, is a question in disguise — the reviewer and the
                 # plan disagree about what is in it. Say so and re-present the plan untouched,
                 # rather than silently constructing the missing step or picking a candidate. See
                 # ``resolve_plan_reference`` for the two production cases this replaces.
-                if kind == "agenda" and fb and not cutoff_ops:
+                if kind == "agenda" and fb:
                     verdict, topic, hits = resolve_plan_reference(fb, list(payload))
                     if verdict != "ok":
                         emit({"type": "plan_reference", "verdict": verdict, "topic": topic,
@@ -4597,21 +4628,15 @@ class ResearchLab:
                 # document: the model names what to change and code applies it, like a hand edit.
                 # Only when that cannot be done does the revision fall back to patch-or-redraft.
                 if kind == "agenda" and fb:
-                    revised = self._revise_plan_document(
-                        question, fb, emit, **({"ops": cutoff_ops} if cutoff_ops else {}))
+                    revised = self._revise_plan_document(question, fb, emit, pinned=cutoffs)
                     if revised is not None:
                         feedback_log.append(fb)
                         payload = revised
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
-                    if cutoff_ops:
-                        # Read and valid, but not applied (the value is already the plan's): say so
-                        # rather than redrafting the plan around a request that needs no change.
-                        emit({"type": "plan_answer", "question": fb,
-                              "answer": "Nothing was changed: the plan already uses " + ", ".join(
-                                  f"{k} = {v}" for o in cutoff_ops for k, v in o["settings"].items()) + "."})
-                        emit({"type": "pi_agenda", "agenda": payload})
-                        continue
+                # The patch or redraft below works from the words; the cutoffs read from them are set
+                # on the plan it gives, when the loop brings the document up to date with it.
+                pending_cutoffs = (fb, cutoffs) if cutoffs else None
                 if fb:
                     feedback_log.append(fb)
                 before_plan = list(payload) if kind == "agenda" else []
@@ -4627,6 +4652,7 @@ class ResearchLab:
                         # The revision could not be read. The plan the researcher had is still a
                         # plan: keep it, say so, and let them ask again.
                         emit({"type": "plan_revision_failed", "request": fb[:200]})
+                        pending_cutoffs = None   # nothing of that reply is applied, its cutoffs included
                         kind, payload = "agenda", before_plan
                         emit({"type": "pi_agenda", "agenda": payload})
                         continue
@@ -7000,31 +7026,86 @@ class ResearchLab:
               "steps": sorted({c["step"] for c in changes if c["kind"] != "removed"})})
         return doc.agenda(), changes
 
-    def _cutoff_request(self, request: str) -> "tuple[list[dict[str, Any]], list[str]]":
-        """``(operations, problems)`` for a reply that sets CellQC cutoffs ("raise the mitochondrial
-        limit to 20"): read by code, so the number typed is the number set, and checked before
-        anything runs. Operations go to every step whose tool takes that setting. A reply with any
-        problem gives no operations; one that is not about a cutoff gives neither."""
-        changes, problems = read_cutoff_request(request)
-        if not changes and not problems:
-            return [], []
+    def _cutoff_request(self, request: str) -> "tuple[dict[str, Any], list[str], bool]":
+        """``(cutoffs, problems, only)`` for a reply that names CellQC cutoffs (issue 61).
+
+        ``cutoffs`` are the settings read for certain ("raise the mitochondrial limit to 20") that a
+        step of this plan takes; they are set by code on every such step, whatever else the reply
+        asks, so the number typed is the number that runs. ``only`` is true when the reply asks for
+        nothing else: it is then applied without the model. A cutoff no step takes ("minimum genes"
+        on a ``run_scanpy_qc`` plan, whose setting is ``min_genes``) is left to the model with the
+        rest of the reply. ``problems`` are explained back and nothing changes: a value out of range,
+        a cutoff named without its value or by how much to change it, a number that contradicts
+        "raise" or "lower", or a cutoff asked for without saying which."""
+        reading = read_cutoffs(request)
+        if not reading.changes and not reading.problems:
+            return {}, [], False
         doc = self._plan_doc
         if doc is None or not self.config.plan_yaml:
-            return [], []
+            return {}, [], False
         schemas = _tool_schemas(list(getattr(self.scientist, "catalog", [])))
-        if not any(s.tool and set(CUTOFF_SETTINGS) & set(schemas.get(s.tool) or {}) for s in doc.steps):
-            return [], []    # no step takes a CellQC cutoff: the words are for the other ways to revise
+        takers = {name: [s for s in doc.steps if s.tool and name in (schemas.get(s.tool) or {})]
+                  for name in CUTOFF_SETTINGS}
+        taken = [name for name, steps in takers.items() if steps]
+        if not taken:
+            return {}, [], False    # no step takes a CellQC cutoff: the words are for the other ways to revise
+        problems: list[str] = []
+        for setting, why in reading.problems:
+            if setting is None:
+                problems.append(why + " This plan's QC step takes " + ", ".join(
+                    f"{n} ({CUTOFF_SETTINGS[n].label})" for n in taken) + ".")
+            elif setting in taken:
+                problems.append(why)
+        cutoffs = {name: value for name, value in reading.changes.items() if name in taken}
+        for name, value in cutoffs.items():
+            spec, step = CUTOFF_SETTINGS[name], takers[name][0]
+            prop = (schemas.get(step.tool) or {}).get(name)
+            current = step.settings.get(name, prop.get("default", spec.fallback) if isinstance(prop, dict)
+                                        else spec.fallback)
+            way = reading.directions.get(name)
+            if isinstance(current, (int, float)) and (
+                    (way == "up" and value < current) or (way == "down" and value > current)):
+                unit = "%" if spec.unit == "%" else f" {spec.unit}"
+                problems.append(
+                    f"You asked to {'raise' if way == 'up' else 'lower'} {name}, but {value:g}{unit} is "
+                    f"{'below' if way == 'up' else 'above'} the plan's {current:g}{unit}. Say the value to use.")
+        if problems:
+            return {}, problems, False
+        return cutoffs, [], reading.only and set(reading.changes) <= set(cutoffs)
+
+    def _cutoff_ops(self, cutoffs: "dict[str, Any]") -> "list[dict[str, Any]]":
+        """Operations that set ``cutoffs`` on every step of the plan whose tool takes them, leaving out
+        a step that already has the value."""
+        doc = self._plan_doc
+        if doc is None or not cutoffs:
+            return []
+        schemas = _tool_schemas(list(getattr(self.scientist, "catalog", [])))
         ops: list[dict[str, Any]] = []
-        for name, value in changes.items():
-            steps = [s for s in doc.steps if s.tool and name in (schemas.get(s.tool) or {})]
-            if not steps:
-                problems.append(f"No step of this plan takes {name}, so there is nothing to set it on.")
-                continue
-            ops.extend({"op": "change", "step": s.id, "settings": {name: value}} for s in steps)
-        return ([] if problems else ops), problems
+        for step in doc.steps:
+            props = schemas.get(step.tool or "") or {}
+            change = {name: value for name, value in cutoffs.items()
+                      if name in props and step.settings.get(name) != value}
+            if change:
+                ops.append({"op": "change", "step": step.id, "settings": change})
+        return ops
+
+    def _pin_cutoffs(self, ops: "list[dict[str, Any]]", pinned: "dict[str, Any]") -> "list[dict[str, Any]]":
+        """The model's operations with the stated cutoffs taking precedence: a value it gave for one
+        of them is dropped, and the stated value is set on every step that takes it."""
+        out: list[dict[str, Any]] = []
+        for op in ops:
+            settings = op.get("settings") if isinstance(op, dict) else None
+            if isinstance(settings, dict) and set(settings) & set(pinned):
+                op = {**op, "settings": {k: v for k, v in settings.items() if k not in pinned}}
+                if str(op.get("op") or "").lower() == "change" and not op["settings"] \
+                        and not (set(op) - {"op", "step", "settings"}):
+                    continue    # it only set a pinned cutoff
+            out.append(op)
+        return out + self._cutoff_ops(pinned)
 
     def _revise_plan_document(self, question: str, request: str, emit: EventFn,
-                              ops: "list[dict[str, Any]] | None" = None) -> "list[str] | None":
+                              ops: "list[dict[str, Any]] | None" = None,
+                              pinned: "dict[str, Any] | None" = None) -> "list[str] | None":
         """Make the change the researcher asked for in words ON the plan document; the new agenda,
         or ``None`` to let the caller revise the old way (single-step patch, then redraft).
 
@@ -7034,7 +7115,11 @@ class ResearchLab:
         object afterwards, also when a step is added, removed or moved. ``None`` whenever that
         cannot be done cleanly (no document, no model, a reply that is not operations, operations
         that do not apply or name a tool or setting that does not exist, or no change at all): the
-        plan is then never worse off than it was before this path existed."""
+        plan is then never worse off than it was before this path existed.
+
+        ``ops`` given are applied without the model. ``pinned`` settings (CellQC cutoffs the reply
+        stated) win over the model's: they are set on every step that takes them, whatever value the
+        operations gave."""
         if not self.config.plan_yaml or self._plan_doc is None or not request.strip() \
                 or (self._complete_fn is None and not ops):
             return None
@@ -7058,6 +7143,14 @@ class ResearchLab:
         if ops is None:
             emit({"type": "plan_revise_skipped", "why": "the reply held no operations"})
             return None
+        if pinned:
+            if not ops:
+                # The reply asked for more than its cutoffs and the model named nothing to change:
+                # setting only the cutoffs would drop the rest without a word. The caller revises
+                # the old way and sets the cutoffs on the plan that gives.
+                emit({"type": "plan_revise_skipped", "why": "the reply held no operations"})
+                return None
+            ops = self._pin_cutoffs(ops, pinned)
         try:
             edited = apply_ops(before, ops)
         except PlanError as exc:
