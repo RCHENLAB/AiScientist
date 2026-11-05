@@ -62,7 +62,8 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 '''
 
 # Stands in for `python3 -m venv DIR`: a venv whose pip and python record their arguments. The venv
-# python answers the version question, `active-runs` (FAKE_ACTIVE_RUNS) and records `migrate`.
+# python answers the version question, `active-runs` (FAKE_ACTIVE_RUNS; it fails, as an old release's
+# did on a newer database, when its own path contains FAKE_BROKEN_CLI) and records `migrate`.
 FAKE_PYTHON = r"""#!/bin/bash
 [ "$1" = "-m" ] && [ "$2" = "venv" ] || exit 1
 mkdir -p "$3/bin"
@@ -74,7 +75,11 @@ cat > "$3/bin/python" <<'EOF'
 #!/bin/bash
 case "$*" in
   *version_info*) echo "${FAKE_PY_VERSION:-3.11}" ;;
-  *"admin_cli active-runs"*) echo "${FAKE_ACTIVE_RUNS:-0}" ;;
+  *"admin_cli active-runs"*)
+    if [ -n "${FAKE_BROKEN_CLI:-}" ] && [[ "$0" == *"$FAKE_BROKEN_CLI"* ]]; then
+      echo "alembic.util.exc.CommandError: Can't locate revision identified by '0005'" >&2; exit 1
+    fi
+    echo "${FAKE_ACTIVE_RUNS:-0}" ;;
   *"admin_cli migrate"*) echo "migrate $PWD" >> "$FAKE_CALLS"; echo "database schema: 0001" ;;
 esac
 exit 0
@@ -339,6 +344,28 @@ def test_a_switch_waits_for_runs_in_progress(server):
     r = server.run("v1.0.1", FAKE_ACTIVE_RUNS="2", AISCIENTIST_FORCE="1")
     assert r.returncode == 0, r.stderr
     assert server.link("current") == "v1.0.1"
+
+
+def test_a_current_release_that_cannot_count_runs_does_not_stop_the_switch(server):
+    """The current release's `active-runs` can fail on the database the new release has just
+    migrated (v0.4.2 on v0.4.3's revision 0005): the timer then asks the new release, which reads that
+    schema, instead of waiting for ever. With neither able to count, it still waits."""
+    server.skills_package("v0.1.0")
+    server.package("v1.0.0")
+    assert server.run("--auto").returncode == 0
+    server.package("v1.0.1")
+
+    r = server.run("--auto", FAKE_BROKEN_CLI="/app/current/", FAKE_ACTIVE_RUNS="1")
+    assert r.returncode == 0 and "1 run(s) in progress" in r.stdout      # counted by v1.0.1
+    assert server.link("current") == "v1.0.0"
+
+    r = server.run("--auto", FAKE_BROKEN_CLI="/.venv/bin/")              # no release can count
+    assert r.returncode == 0 and "cannot tell whether runs are in progress; waiting" in r.stdout
+    assert server.link("current") == "v1.0.0"
+
+    r = server.run("--auto", FAKE_BROKEN_CLI="/app/current/")
+    assert r.returncode == 0, r.stderr
+    assert server.link("current") == "v1.0.1" and "v1.0.1" in server.served()
 
 
 def test_auto_installs_the_newest_release_unless_held_busy_or_older(server):

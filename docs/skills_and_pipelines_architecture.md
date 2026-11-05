@@ -372,11 +372,10 @@ small `query.h5ad`, and do not reload the full atlas. The CLI timeout covers the
 four-hour job. The image is pinned to
 `docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a`.
 Image provisioning and the server's first HGNC download require deployment
-network access. `ATLAS_HGNC` sets the lab-shared HGNC cache file, defaulting to
-`<parent of executor images_dir>/skills/atlas-expression/hgnc_complete_set.txt`
-(or `/shared/skills/atlas-expression/hgnc_complete_set.txt` without images_dir).
-The executor creates and mounts its parent directory writable so one download
-serves all runs. Configure a dedicated cache directory visible on compute nodes.
+network access. The HGNC table is kept in the user's tool cache on HPC3,
+`envs/tool-cache/<hpc-user>/atlas-expression/` (`AISCIENTIST_TOOL_CACHE`, bound
+writable): a user's first call downloads it, and later runs reuse it. When that
+folder cannot be made, the table is downloaded into the run's own folder.
 
 After every successful call, `gene_resolution.tsv`, `summary_*.tsv`, PDF/PNG
 plots and `report.md` are copied to
@@ -386,7 +385,9 @@ mirrors them to the website's run artifacts and reports evidence paths.
 tools; direct `run_in_environment` calls for this skill are refused.
 
 Responses omit report Markdown and bound summary rows, reporting `rows_omitted`
-and `full_table` for the complete artifact. The collector also saves
+and `full_table` for the complete artifact. Every path in a response names the
+file in the run's results (`gene_expression/<query_id>/<file>`), never its HPC3
+path. The collector also saves
 `gene_expression/mcp_result.json` (replaced each call) and uses that evidence path
 for other oversized responses. Stdout stays below the executor's 20,000-character
 limit and is removed from the parsed tool response.

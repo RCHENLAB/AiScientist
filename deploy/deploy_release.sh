@@ -214,20 +214,30 @@ restart_and_check() {
 }
 
 # How many runs the live app has in progress, or "?" when that cannot be read (no current release,
-# a release without the command, no database).
+# a release without the command, no database). The current release is asked first, then the release
+# in $1 when one is given: it has just migrated the database, and a current release from before that
+# migration may fail on it (v0.4.2's command did on v0.4.3's revision, so the timer never switched).
 active_runs() {
-  local cur n
-  cur="$(target_of "$CURRENT")"
-  [ -n "$cur" ] && [ -x "$CURRENT/.venv/bin/python" ] || { echo "?"; return; }
-  n="$(cd "$CURRENT" && "$CURRENT/.venv/bin/python" -m aiscientist.gateway.admin_cli active-runs 2>/dev/null | tail -n 1)" || n=""
+  local n
+  [ -n "$(target_of "$CURRENT")" ] && n="$(count_runs "$CURRENT")" || n="?"
+  if [ "$n" = "?" ] && [ -n "${1:-}" ]; then n="$(count_runs "$1")"; fi
+  echo "$n"
+}
+
+# The count from the admin command of the release in $1, or "?".
+count_runs() {
+  local n
+  [ -x "$1/.venv/bin/python" ] || { echo "?"; return; }
+  n="$(cd "$1" && "$1/.venv/bin/python" -m aiscientist.gateway.admin_cli active-runs 2>/dev/null | tail -n 1)" || n=""
   [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo "?"
 }
 
 # Stop unless no run is in progress. $1 = "auto": an unknown count also waits; a deploy by name
-# goes ahead on an unknown count (the first install has no app to ask).
+# goes ahead on an unknown count (the first install has no app to ask). $2 = the release about to
+# be switched to, asked when the current one cannot count.
 wait_for_idle() {
   local n
-  n="$(active_runs)"
+  n="$(active_runs "${2:-}")"
   if [ "$n" = "?" ]; then
     [ "$1" = auto ] && [ -n "$(target_of "$CURRENT")" ] && { echo "cannot tell whether runs are in progress; waiting"; exit 0; }
     return 0
@@ -413,7 +423,7 @@ install_release() {
   # Installing and migrating restart nothing, so they go ahead while runs are in progress; the
   # switch waits for them (--auto finds the release ready at its next start).
   prepare_release "$tag"
-  wait_for_idle "${2:-named}"
+  wait_for_idle "${2:-named}" "$RELEASES/$tag"
 
   echo "==> switching current -> $tag"
   [ -z "$old" ] || switch_to "$PREVIOUS" "releases/$old"

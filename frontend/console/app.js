@@ -64,9 +64,10 @@ function newChatRecord(sid) {
     owned: false,          // this window handles this chat's run events
     running: false,        // the chat's run is in flight
     run: null,             // the live stream, DECOUPLED from the DOM so switching chats (or a reload)
-                           // never detaches it: {text, thinking, feed:[], status, statusLabel,
-                           // startedAt, runId, streamId}; `feed` is an ordered list of
-                           // {kind:"line",text,level} milestones and {kind:"code",code} step code.
+                           // never detaches it: {text, thinking, feed:[], jobs:[], status, statusLabel,
+                           // startedAt, runId, streamId, outcome, cardOpen}; `feed` is an ordered list of
+                           // {kind:"line",text,level} milestones and {kind:"code",code} step code;
+                           // `jobs` the run's Slurm jobs, one record each (the gateway's run_job).
     suppress: false,       // the stream being replayed is one this browser already saved
     deadRunTimer: null,    // grace timer that stops a "running" chat whose backend run died silently
     planPending: false,    // a PI plan / clarify / decision is waiting for the user
@@ -578,9 +579,12 @@ function msgFromServer(m) {
   // reviewable after a reload / on another device — not only in a downloaded log.
   const meta = m.meta || {};
   if (meta.stream_id) msg.streamId = meta.stream_id;
-  if (meta.thinking || (meta.feed && meta.feed.length)) {
+  if (meta.thinking || (meta.feed && meta.feed.length) || (meta.jobs && meta.jobs.length)) {
     msg.thinking = meta.thinking || "";
     msg.feed = meta.feed || [];
+    if (Array.isArray(meta.jobs)) msg.jobs = meta.jobs;
+    if (meta.outcome) msg.outcome = meta.outcome;
+    if (meta.ms != null) msg.ms = meta.ms;
   }
   return msg;
 }
@@ -594,9 +598,12 @@ function serverMsgPayload(msg) {
              meta: { items: msg.items || [], bundleUrl: msg.bundleUrl, ...(msg.streamId ? { stream_id: msg.streamId } : {}) } };
   }
   const payload = { role: msg.role, content: msg.content || "" };
-  if (msg.thinking || (msg.feed && msg.feed.length)) {
+  if (msg.thinking || (msg.feed && msg.feed.length) || (msg.jobs && msg.jobs.length)) {
     payload.kind = "text";
     payload.meta = { thinking: msg.thinking || "", feed: msg.feed || [] };
+    if (Array.isArray(msg.jobs)) payload.meta.jobs = msg.jobs;
+    if (msg.outcome) payload.meta.outcome = msg.outcome;
+    if (msg.ms != null) payload.meta.ms = msg.ms;
   }
   if (msg.streamId) { payload.kind = "text"; payload.meta = { ...(payload.meta || {}), stream_id: msg.streamId }; }
   return payload;
@@ -1138,18 +1145,10 @@ function messageEl(m) {
   const el = document.createElement("div");
   el.className = `msg ${m.role}`;
   if (m.role !== "assistant") { el.innerHTML = escapeHtml(m.content); return el; }
-  // Assistant: an optional COLLAPSED recap of the run (thinking + steps/code) stays with
-  // the message for later review — default-collapsed so it doesn't clutter, expand to audit.
+  // Assistant: the run behind the answer stays with it as one closed line (runCardHtml) — its Slurm
+  // jobs, progress, step code and activity log open from there.
   let html = "";
-  if (m.thinking) {
-    html += `<details class="think recap">${summaryRow("psychology", "Thinking & activity")}` +
-      `<div class="think-body">${escapeHtml(m.thinking)}</div></details>`;
-  }
-  if (m.feed && m.feed.length) {
-    const milestones = m.feed.filter((e) => e.kind !== "code").length;
-    html += `<details class="run-recap">${summaryRow("science", `Steps & code (${milestones})`)}` +
-      `<div class="lab-progress done">${m.feed.map(feedItemHtml).join("")}</div></details>`;
-  }
+  if (m.thinking || (m.feed && m.feed.length) || (m.jobs && m.jobs.length)) html += runCardHtml(m);
   html += `<div class="msg-body">${renderMarkdown(planMessageMarkdown(m))}</div>`;
   el.innerHTML = html;
   // Upgrade any ```mermaid placeholder to a real diagram. Async + fire-and-forget: the element is
@@ -1171,6 +1170,225 @@ function feedItemHtml(entry) {
   const raw = entry.text || "";
   const sub = /^\s{2,}/.test(raw);
   return `<div class="progress-line ${entry.level || "info"}${sub ? " sub" : ""}">${withSymbols(escapeHtml(raw.trim()))}</div>`;
+}
+
+// ---- the run card: one line in the chat, the details on a click -------------------------------
+// A run printed every milestone in full into the chat (the plan, the team meeting, each Critic
+// note…), so the reply sat under a wall of explanations. Now the chat shows ONE line: what the run
+// is doing now, its Slurm job's state and the time. Opened, it shows the run's Slurm jobs with their
+// states, then every progress line in full, the step code and the activity log. A finished answer
+// keeps the same line, closed, above its text.
+
+const JOB_ENDED = ["COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
+                   "BOOT_FAIL", "DEADLINE", "PREEMPTED", "REVOKED"];
+const JOB_STATE_LABEL = {
+  SUBMITTED: "Submitted", PENDING: "Queued", CONFIGURING: "Starting", RUNNING: "Running",
+  COMPLETING: "Finishing", COMPLETED: "Completed", FAILED: "Failed", CANCELLED: "Cancelled",
+  TIMEOUT: "Timed out", OUT_OF_MEMORY: "Out of memory", NODE_FAIL: "Node failed", BOOT_FAIL: "Failed to start",
+  DEADLINE: "Deadline passed", PREEMPTED: "Preempted", SUSPENDED: "Suspended", REQUEUED: "Requeued",
+};
+function jobEnded(state) { const s = String(state || "").toUpperCase(); return JOB_ENDED.some((t) => s.startsWith(t)); }
+function jobStateLabel(state) {
+  const s = String(state || "").toUpperCase();
+  return JOB_STATE_LABEL[s] || (s ? s.charAt(0) + s.slice(1).toLowerCase().replace(/_/g, " ") : "Unknown");
+}
+// run = running, wait = queued, ok = completed, bad = ended without completing.
+function jobTone(state) {
+  const s = String(state || "").toUpperCase();
+  if (s.startsWith("COMPLETED")) return "ok";
+  if (jobEnded(s)) return "bad";
+  if (s === "RUNNING" || s === "COMPLETING" || s === "CONFIGURING") return "run";
+  return "wait";
+}
+
+// One job record in the chat's list, replaced whole by the next one the gateway sends.
+function upsertJob(jobs, rec) {
+  if (!rec || !rec.job_id) return jobs;
+  const i = jobs.findIndex((j) => String(j.job_id) === String(rec.job_id));
+  const clean = { ...rec };
+  for (const k of ["type", "run_id", "conversation_id", "stream_id", "at"]) delete clean[k];
+  if (i >= 0) jobs[i] = { ...jobs[i], ...clean }; else jobs.push(clean);
+  return jobs;
+}
+
+// "Step 2: **QC** — run cellqc …" (the gateway's step label) -> "Step 2 · QC".
+function jobStepLabel(step) {
+  const m = /^Step\s*(\d+)?\s*:\s*([\s\S]*)$/.exec(String(step || "").trim());
+  if (!m) return String(step || "").trim();
+  const title = planStepParts(m[2]).title;
+  return (m[1] ? `Step ${m[1]}` : "Step") + (title ? ` · ${title}` : "");
+}
+
+// The line's head, for a one-line title: up to its first " — ", ": " or ". ".
+function feedLineTitle(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  const m = /^(.{6,90}?)(?:\s+[—–]\s+|:\s+|\.\s+)/.exec(t);
+  const head = m ? m[1] : t;
+  return head.length > 90 ? head.slice(0, 88).trimEnd() + "…" : head;
+}
+
+const RUN_STEP_LINE = /^🔬\s*([^:\n]{1,60}):\s*([\s\S]+)$/;
+// What the feed says about the run as a whole: the plan's size, the step it is on, warnings.
+function runOutline(feed) {
+  const o = { total: 0, n: 0, step: "", done: 0, warnings: 0, last: "" };
+  for (const e of feed || []) {
+    if (!e || e.kind === "code") continue;
+    const raw = String(e.text || "");
+    const text = raw.trim();
+    if (e.level === "warning") o.warnings++;
+    const plan = /^📋\s*Plan ready\s*[—–-]\s*(\d+)\s+step/.exec(text);
+    if (plan) { o.total = Number(plan[1]); o.n = 0; o.step = ""; o.done = 0; }
+    const step = RUN_STEP_LINE.exec(text);
+    if (step) { o.n++; o.step = planStepParts(step[2]).title; }
+    if (/^✅\s*Step done/.test(text)) o.done++;
+    if (text && !/^\s{2,}/.test(raw)) o.last = text;
+  }
+  return o;
+}
+
+function runStepText(o) {
+  if (!o.step) return "";
+  return (o.total ? `Step ${Math.min(o.n, o.total)} of ${o.total}` : `Step ${o.n}`) + ` · ${o.step}`;
+}
+
+// The Slurm chip on the line: the most active of the run's jobs. The CPU worker holds its node
+// between commands, so it is named only when no job of the run's own is running or queued.
+function runJobChip(jobs, ended) {
+  const list = jobs || [];
+  if (!list.length) return null;
+  const own = list.filter((j) => j.kind !== "worker");
+  const worker = list.find((j) => j.kind === "worker" && jobTone(j.state) === "run");
+  if (!ended && worker && !own.some((j) => ["run", "wait"].includes(jobTone(j.state)))) {
+    return { tone: "run", text: `CPU worker ${worker.job_id} running` };
+  }
+  const running = own.filter((j) => jobTone(j.state) === "run");
+  const waiting = own.filter((j) => jobTone(j.state) === "wait");
+  const failed = list.filter((j) => jobTone(j.state) === "bad");
+  if (!ended && running.length) {
+    return { tone: "run", text: running.length === 1 ? `Slurm ${running[0].job_id} running` : `${running.length} Slurm jobs running` };
+  }
+  if (!ended && waiting.length) {
+    return { tone: "wait", text: waiting.length === 1 ? `Slurm ${waiting[0].job_id} queued` : `${waiting.length} Slurm jobs queued` };
+  }
+  const n = list.length;
+  return { tone: failed.length ? "bad" : "ok",
+           text: `${n} Slurm job${n === 1 ? "" : "s"}` + (failed.length ? `, ${failed.length} not completed` : "") };
+}
+
+const RUN_WAIT_TITLE = {
+  plan: "Plan ready — waiting for your review",
+  clarify: "A question for you — waiting for your answer",
+  decision: "A choice for you — waiting for your decision",
+};
+// The card's one line. opts: live, status (the transient label), writing, waitingPlan (the kind of
+// prompt waiting for the user: plan | clarify | decision), outcome ("done" | "stopped" | "error" for
+// a finished run), elapsedMs.
+function runCardView(feed, jobs, thinking, opts = {}) {
+  const o = runOutline(feed);
+  const stepText = runStepText(o);
+  let title;
+  if (opts.live) {
+    if (opts.waitingPlan) title = RUN_WAIT_TITLE[opts.waitingPlan] || RUN_WAIT_TITLE.plan;
+    else if (opts.writing) title = stepText && o.done < Math.max(o.total, o.n) ? stepText : "Writing the answer";
+    else if (stepText) title = stepText;
+    else if (o.last) title = feedLineTitle(o.last);
+    else title = thinking ? "Thinking" : "Working";
+  } else {
+    const word = { stopped: "Run stopped", error: "Run ended with an error" }[opts.outcome] || "Run finished";
+    if (o.n) {
+      const total = Math.max(o.total, o.n);
+      title = opts.outcome === "stopped" || opts.outcome === "error"
+        ? `${word} · step ${o.n} of ${total}` : `${word} · ${total} step${total === 1 ? "" : "s"}`;
+    } else if ((feed || []).some((e) => e && e.kind !== "code")) title = `Run details · ${feedLineTitle(o.last)}`;
+    else title = thinking ? "Thinking & activity" : word;
+  }
+  const now = opts.live && !opts.waitingPlan
+    ? String(opts.writing ? "Writing…" : (opts.status || "")).replace(/^[^\p{L}\p{N}]+/u, "").trim() : "";
+  return { title, now: now && now !== title ? now : "", jobs: runJobChip(jobs, !opts.live),
+           warnings: o.warnings, time: opts.elapsedMs != null ? fmtElapsed(opts.elapsedMs) : "" };
+}
+
+// The line's parts as HTML: lead (the pulsing dot, or the outcome's icon), title, now, chips, time.
+function runSummaryParts(view, live, outcome) {
+  const lead = live ? '<span class="run-dot"></span>'
+    : icon({ stopped: "stop_circle", error: "error" }[outcome] || (view.jobs || view.warnings ? "task_alt" : "notes"));
+  const chips = [];
+  if (view.jobs) chips.push(`<span class="run-chip job-${view.jobs.tone}">${icon("dns")}${escapeHtml(view.jobs.text)}</span>`);
+  if (view.warnings) chips.push(`<span class="run-chip warn" title="${view.warnings} warning${view.warnings === 1 ? "" : "s"} — open to read">${icon("warning")}${view.warnings}</span>`);
+  return { lead, title: escapeHtml(view.title), now: view.now ? escapeHtml(view.now) : "",
+           chips: chips.join(""), time: view.time ? escapeHtml(view.time) : "" };
+}
+const RUN_SUM_SLOTS = ["lead", "title", "now", "chips", "time"];
+function runSummaryInner(view, live, outcome) {
+  const p = runSummaryParts(view, live, outcome);
+  return `<span class="run-lead">${p.lead}</span><span class="run-title">${p.title}</span>` +
+    `<span class="run-now"${p.now ? "" : " hidden"}>${p.now}</span><span class="run-chips">${p.chips}</span>` +
+    `<span class="run-time">${p.time}</span><span class="material-symbols-outlined msym chev">expand_more</span>`;
+}
+
+// What the job's time says: how long it queued, has run, or ran.
+function jobTimeText(j, nowS, live) {
+  const s = String(j.state || "").toUpperCase();
+  const span = (a, b) => (a && b && b >= a ? fmtElapsed((b - a) * 1000) : "");
+  if (jobEnded(s)) {
+    const ran = span(j.started_at, j.ended_at);
+    return ran ? `ran ${ran}` : (span(j.submitted_at, j.ended_at) ? `after ${span(j.submitted_at, j.ended_at)}` : "");
+  }
+  if (!live) return s === "RUNNING" ? "running when the run ended" : "";
+  if (j.started_at) return `running ${span(j.started_at, nowS)}`;
+  return j.submitted_at ? `queued ${span(j.submitted_at, nowS)}` : "";
+}
+
+function jobRowHtml(j, nowS, live) {
+  const tone = jobTone(j.state);
+  const what = j.kind === "worker" ? "CPU worker (the agent's shell)" + (j.step ? ` · now ${jobStepLabel(j.step)}` : "")
+    : (j.step ? jobStepLabel(j.step) : (j.name || "Slurm job"));
+  const where = [];
+  if (j.node) where.push(j.node);
+  if (j.partition) where.push(`partition ${j.partition}`);
+  if (j.gres) where.push(j.gres.replace(/^gpu:/i, "GPU "));
+  if (j.cpus) where.push(`${j.cpus} CPU`);
+  if (j.mem) where.push(j.mem);
+  if (j.time_limit) where.push(`limit ${j.time_limit}`);
+  const why = [];
+  if (j.reason) why.push(tone === "wait" ? `waiting: ${j.reason}` : j.reason);
+  if (j.eta && tone === "wait") why.push(`Slurm expects it to start ${String(j.eta).replace("T", " ")}`);
+  const time = jobTimeText(j, nowS, live);
+  return `<div class="job-row">` +
+    `<span class="job-state ${tone}">${escapeHtml(jobStateLabel(j.state))}</span>` +
+    `<span class="job-main"><span class="job-id">Job ${escapeHtml(j.job_id)}</span>` +
+    `<span class="job-what">${escapeHtml(what)}</span>` +
+    (where.length ? `<span class="job-meta">${escapeHtml(where.join(" · "))}</span>` : "") +
+    (why.length ? `<span class="job-why">${escapeHtml(why.join(" · "))}</span>` : "") + `</span>` +
+    (time ? `<span class="job-time">${escapeHtml(time)}</span>` : "") + `</div>`;
+}
+
+// The Slurm section: one row per job; model = the session's own model-server job, when it has one.
+function jobListHtml(jobs, { live = false, nowS = Date.now() / 1000, model = null } = {}) {
+  const rows = (jobs || []).map((j) => jobRowHtml(j, nowS, live)).join("");
+  const none = live ? "This run has not submitted a Slurm job yet." : "This run submitted no Slurm job.";
+  const modelLine = model && model.job_id
+    ? `<div class="job-model">${icon("memory")}Your model server is Slurm job ${escapeHtml(model.job_id)}` +
+      (model.node ? ` on ${escapeHtml(model.node)}` : "") + ".</div>" : "";
+  return `<div class="run-sec-head">${icon("dns")}Slurm jobs</div>` +
+    (rows ? `<div class="job-list">${rows}</div>` : `<div class="job-none">${none}</div>`) + modelLine;
+}
+
+// A finished answer's card (closed), from its saved record.
+function runCardHtml(m) {
+  const feed = m.feed || [];
+  const view = runCardView(feed, m.jobs || [], m.thinking || "",
+                           { live: false, outcome: m.outcome, elapsedMs: m.ms != null ? m.ms : null });
+  const steps = feed.length ? `<div class="run-sec-head">${icon("format_list_bulleted")}Progress</div>` +
+    `<div class="lab-progress done">${feed.map(feedItemHtml).join("")}</div>` : "";
+  const think = m.thinking ? `<details class="think recap">${summaryRow("psychology", "Activity log")}` +
+    `<div class="think-body">${escapeHtml(m.thinking)}</div></details>` : "";
+  // A message saved before runs recorded their jobs has no list at all: it says nothing about Slurm.
+  const jobs = Array.isArray(m.jobs) && (m.jobs.length || feed.length)
+    ? `<div class="run-sec">${jobListHtml(m.jobs)}</div>` : "";
+  return `<details class="run-card done">` +
+    `<summary class="run-sum">${runSummaryInner(view, false, m.outcome)}</summary>` +
+    `<div class="run-detail">${jobs}${steps ? `<div class="run-sec">${steps}</div>` : ""}${think}</div></details>`;
 }
 
 // The dataset the chat is bound to, as a short stem for the title: "Ddx41_DEG1", or "Ddx41_DEG1 +2"
@@ -1245,7 +1463,8 @@ function ownerVisible() { const c = activeChat(); return !!(c && c.run); }
 let runTicker = null;
 function startAssistantStream(c) {
   // A plan, clarify or decision prompt clears startedAt (holdPlanPrompt); approving it starts it again.
-  c.run = { text: "", thinking: "", feed: [], status: "running", statusLabel: "", startedAt: Date.now(), runId: null, streamId: null };
+  c.run = { text: "", thinking: "", feed: [], jobs: [], status: "running", statusLabel: "", startedAt: Date.now(),
+            runId: null, streamId: null, cardOpen: false };
   if (chatVisible(c)) { state.streamDom = null; mountStream(); }
   // Heartbeat: keep the "Working…" timer ticking even when no events arrive for a while (long
   // HPC3 compute steps are silent), so a run never looks frozen. One ticker serves every chat.
@@ -1267,6 +1486,8 @@ function fmtElapsed(ms) {
 
 // Ensure the live bubble exists in the CURRENT chat DOM (only when the owner chat is
 // visible) and repaint it from state. Safe to call repeatedly / after a re-render.
+// The bubble is the run card (one line, closed) above the answer as it streams; the card's body holds
+// the run's Slurm jobs, the progress lines, the step code and the activity log (see runCardView).
 function mountStream() {
   if (!ownerVisible()) { state.streamDom = null; return; }
   const stream = $("chatStream");
@@ -1280,42 +1501,41 @@ function mountStream() {
     // stranded above it.
     stream.appendChild(wrap);
   }
-  if (!wrap || !stream.contains(wrap)) {
+  const fresh = !wrap || !stream.contains(wrap);
+  if (fresh) {
     wrap = document.createElement("div");
     wrap.className = "msg assistant streaming";
-    const think = document.createElement("details");
-    think.className = "think";
-    think.open = true;
-    think.style.display = "none";
-    think.innerHTML = summaryRow("psychology", "activity") + '<div class="think-body"></div>';
-    const feed = document.createElement("div");
-    feed.className = "lab-progress";
-    feed.style.display = "none";
-    const working = document.createElement("div");
-    working.className = "stream-working";
-    working.innerHTML = '<span class="working-dot"></span><span class="working-text"></span>';
-    const body = document.createElement("div");
-    body.className = "msg-body";
-    wrap.appendChild(think);
-    wrap.appendChild(feed);
-    wrap.appendChild(working);
-    wrap.appendChild(body);
+    wrap.innerHTML = '<details class="run-card live"><summary class="run-sum"></summary>' +
+      '<div class="run-detail"><div class="run-sec run-jobs"></div>' +
+      '<div class="run-sec run-steps" style="display:none"><div class="run-sec-head">' + icon("format_list_bulleted") +
+      'Progress</div><div class="lab-progress"></div></div>' +
+      '<details class="think" style="display:none">' + summaryRow("psychology", "Activity log") +
+      '<div class="think-body"></div></details></div></details><div class="msg-body"></div>';
     stream.appendChild(wrap);
   }
+  const c = activeChat();
+  const card = wrap.querySelector(".run-card");
   state.streamDom = {
-    wrap,
+    wrap, card,
+    sum: wrap.querySelector(".run-sum"),
+    jobs: wrap.querySelector(".run-jobs"),
+    steps: wrap.querySelector(".run-steps"),
+    feed: wrap.querySelector(".lab-progress"),
     think: wrap.querySelector(".think"),
     thinkBody: wrap.querySelector(".think-body"),
-    feed: wrap.querySelector(".lab-progress"),
-    working: wrap.querySelector(".stream-working"),
-    workingText: wrap.querySelector(".working-text"),
     body: wrap.querySelector(".msg-body"),
+    rendered: [],
   };
+  if (fresh) {
+    // Open or closed is the reader's choice, kept for this run across repaints and chat switches.
+    card.open = !!(c && c.run && c.run.cardOpen);
+    card.addEventListener("toggle", () => { const x = activeChat(); if (x && x.run) x.run.cardOpen = card.open; });
+  }
   repaintStream();
 }
 
 // Render one feed entry ({kind:"line",...} milestone or {kind:"code",...} step code) into
-// the always-visible key-progress area.
+// the run card's progress list.
 function feedEntryEl(entry) {
   if (entry.kind === "code") {
     const d = document.createElement("details");
@@ -1352,7 +1572,8 @@ function stickToBottom() {
   if (s && state.stickBottom !== false) s.scrollTop = s.scrollHeight;
 }
 
-// Repaint the visible chat's live bubble from its run (idempotent full render — cheap; feeds are short).
+// Repaint the visible chat's live bubble from its run. Feed entries are appended, not redrawn, so a
+// step-code block the reader opened stays open while the run goes on.
 function repaintStream() {
   const dom = state.streamDom;
   const c = activeChat();
@@ -1360,29 +1581,56 @@ function repaintStream() {
   if (!dom || !run) return;
   if (run.thinking) { dom.think.style.display = ""; dom.thinkBody.textContent = run.thinking; }
   else dom.think.style.display = "none";
-  if (run.feed.length) {
-    dom.feed.style.display = "";
-    dom.feed.innerHTML = "";
-    for (const entry of run.feed) dom.feed.appendChild(feedEntryEl(entry));
-  } else dom.feed.style.display = "none";
+  const feed = run.feed;
+  let i = 0;
+  while (i < dom.rendered.length && i < feed.length && dom.rendered[i] === feed[i]) i++;
+  while (dom.feed.children.length > i) dom.feed.lastChild.remove();
+  dom.rendered.length = i;
+  for (; i < feed.length; i++) { dom.feed.appendChild(feedEntryEl(feed[i])); dom.rendered.push(feed[i]); }
+  dom.steps.style.display = feed.length ? "" : "none";
   dom.body.innerHTML = run.text ? renderMarkdown(run.text) : "";
   repaintWorking();
   stickToBottom();
 }
 
-// Live "Working…" liveness line — pulsing dot + latest activity + elapsed timer.
-// Kept ticking by the 1s heartbeat so a silent compute step never looks frozen.
+// The session's own model-server job, for the card's Slurm section (none on a shared model or a key).
+function modelServerJob() {
+  return state.lastJobId && state.status === "ready" ? { job_id: state.lastJobId, node: state.lastNode } : null;
+}
+
+// The card's one line (what the run does now, its Slurm job, the elapsed time) and its Slurm rows.
+// Kept ticking by the 1s heartbeat so a silent compute step never looks frozen. While a plan, a
+// question or a decision waits for the user, the line says so and shows no timer.
 function repaintWorking() {
   const dom = state.streamDom, c = activeChat(), run = c && c.run;
-  if (!dom || !dom.working || !run) return;
-  if (run.status !== "running" || c.planPending) { dom.working.style.display = "none"; return; }
-  const secs = Math.floor((Date.now() - (run.startedAt || Date.now())) / 1000);
-  // Prefer the REAL backend activity (model_call / tool_start) over a generic label.
-  const label = run.text ? "Writing…" : (run.statusLabel || "Working…");
-  // After a long silent stretch, reassure that compute is running (not stuck).
-  const hint = secs >= 30 && !run.text ? " · this can take a few minutes" : "";
-  dom.working.style.display = "flex";
-  dom.workingText.textContent = run.startedAt == null ? label : `${label} · ${fmtElapsed(secs * 1000)}${hint}`;
+  if (!dom || !dom.sum || !run) return;
+  const waiting = c.planPending ? ((c.plan && c.plan.kind) || "plan") : "";
+  const live = run.status === "running" && !waiting;
+  const view = runCardView(run.feed, run.jobs || [], run.thinking, {
+    live: true, waitingPlan: waiting, writing: !!run.text,
+    // A status the backend sent while the prompt waited is stale once it is answered.
+    status: live ? run.statusLabel : "",
+    elapsedMs: live && run.startedAt != null ? Date.now() - run.startedAt : null,
+  });
+  // Each part of the line is rewritten only when it changed: the timer ticks every second, and a
+  // line rebuilt whole under the pointer swallows the click that opens the card.
+  if (!dom.slots) {
+    dom.sum.innerHTML = runSummaryInner({ title: "" }, live);
+    dom.slots = {};
+    for (const k of RUN_SUM_SLOTS) dom.slots[k] = dom.sum.querySelector(`.run-${k}`);
+    dom.shown = {};
+  }
+  const parts = runSummaryParts(view, live);
+  for (const k of RUN_SUM_SLOTS) {
+    if (dom.shown[k] === parts[k] || !dom.slots[k]) continue;
+    dom.slots[k].innerHTML = parts[k];
+    dom.shown[k] = parts[k];
+    if (k === "now") dom.slots[k].hidden = !parts[k];
+  }
+  if (dom.jobs) {
+    const jobs = jobListHtml(run.jobs || [], { live: true, model: modelServerJob() });
+    if (dom.jobsHtml !== jobs) { dom.jobs.innerHTML = jobs; dom.jobsHtml = jobs; }
+  }
 }
 
 // ---- stream event ingest (DOM-independent; always updates the chat's record) -----------
@@ -1392,6 +1640,12 @@ function streamProgress(c, msg) { if (c.run) { c.run.feed.push({ kind: "line", t
 // Transient "what's happening right now" label from the backend (model_call / tool_start).
 // Drives the live working line so it shows real activity, not a generic "Working…".
 function streamStatus(c, text) { if (c.run) { if (!c.planPending && c.run.startedAt == null) c.run.startedAt = Date.now(); c.run.statusLabel = text || ""; if (chatVisible(c)) repaintWorking(); } }
+// A Slurm job's state (the gateway's run_job): the whole record, replacing the one before.
+function streamJob(c, msg) {
+  if (!c.run) return;
+  c.run.jobs = upsertJob(c.run.jobs || [], msg);
+  if (chatVisible(c)) repaintWorking();
+}
 function streamCode(c, code) {
   if (!c.run) return;
   // The last successful run_code of a step wins: drop the previous trailing code block.
@@ -1453,12 +1707,16 @@ function finishAssistantTurn(c, awaitingPlan) {
   // Persist the finished report to the chat that ran it (which may no longer be active), and
   // KEEP the run recap with it (thinking + steps/code) — collapsed, for later review —
   // instead of discarding it when the live bubble is replaced.
-  if (run.text || run.thinking || run.feed.length) {
+  const jobs = run.jobs || [];
+  if (run.text || run.thinking || run.feed.length || jobs.length) {
     pushToSession(c.sid, {
       role: "assistant",
       content: run.text || "",
       thinking: run.thinking || "",
       feed: run.feed.slice(),
+      jobs: jobs.slice(),
+      outcome: run.outcome || "done",
+      ms: run.startedAt != null ? Date.now() - run.startedAt : null,
       streamId: run.streamId || null,
     });
   }
@@ -2984,7 +3242,7 @@ function openWs(id) {
 // duplicate finished-run replay is suppressed, every one of these is a no-op for that chat until
 // its next chat_start clears the flag.
 const STREAM_TYPES = new Set([
-  "chat_token", "chat_thinking", "lab_progress", "run_status", "step_code",
+  "chat_token", "chat_thinking", "lab_progress", "run_status", "step_code", "run_job",
   "chat_done", "chat_stopped", "chat_error", "artifacts", "run_complete",
 ]);
 
@@ -3066,6 +3324,7 @@ function handleRunEvent(c, msg) {
     case "lab_progress": streamProgress(c, msg); break;
     case "run_status": streamStatus(c, msg.text); break;
     case "step_code": streamCode(c, msg.code); break;
+    case "run_job": streamJob(c, msg); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
     case "run_usage":
       if (msg.actual) {
@@ -3081,10 +3340,11 @@ function handleRunEvent(c, msg) {
         break;
       }
       if (c.run && !c.run.text) c.run.text = "_⏹ Stopped._";
+      if (c.run) c.run.outcome = "stopped";
       finishAssistantStream(c); setChatRunning(c, false);
       toast(chatVisible(c) ? "Run stopped — compute released." : `Run stopped in “${chatTitle(c.sid)}”.`); break;
     case "chat_error":
-      if (c.run) c.run.text = `**Chat error:** ${msg.message || ""}`;
+      if (c.run) { c.run.text = `**Chat error:** ${msg.message || ""}`; c.run.outcome = "error"; }
       finishAssistantStream(c); setChatRunning(c, false);
       toast(chatVisible(c) ? "Chat error" : `Chat error in “${chatTitle(c.sid)}”`); break;
     case "artifacts": appendArtifacts(c, msg.items || [], msg.bundle_url); break;

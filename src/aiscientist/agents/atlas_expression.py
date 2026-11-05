@@ -22,6 +22,22 @@ if isinstance(result, list):
     result = json.loads("".join(result))
 root = Path(os.environ["AISCI_DATA_DIR"]) / "atlas-expression-exploration"
 dest = Path(os.environ["AISCIENTIST_ARTIFACTS"]) / "gene_expression"
+# The server answers with absolute HPC3 paths. Name each by where the run's results keep it
+# (gene_expression/<query_id>/<file>), so no server path reaches the model or the website.
+roots = sorted({str(root), str(root.resolve())}, key=len, reverse=True)
+def shown(value):
+    if isinstance(value, dict):
+        return {k: shown(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [shown(v) for v in value]
+    if isinstance(value, str):
+        for r in roots:
+            if value == r:
+                return "gene_expression"
+            if value.startswith(r + "/"):
+                return "gene_expression/" + value[len(r) + 1:]
+    return value
+result = shown(result)
 for state in root.glob("*/state.json"):
     query = state.parent
     for pattern in ("gene_resolution.tsv", "summary_*.tsv", "*.pdf", "*.png", "report.md"):
@@ -36,7 +52,7 @@ dest.mkdir(parents=True, exist_ok=True)
 full = dest / "mcp_result.json"
 full.write_text(json.dumps(result))
 if "rows" in result:
-    result["full_table"] = "gene_expression/" + Path(result["table"]).relative_to(root).as_posix()
+    result["full_table"] = result["table"]
     result["rows_omitted"] = 0
     rows = result["rows"]
     result["rows"] = []
@@ -106,13 +122,15 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
             return {"status": "error", "error": "Attach a primary dataset listed in AISCIENTIST_ATLAS_FILES"}
         if args.get("atlas") and posixpath.normpath(args["atlas"]) != posixpath.normpath(atlas):
             return {"status": "error", "error": "atlas must be the attached primary dataset"}
-        shared = posixpath.dirname(str(getattr(executor, "images_dir", "") or "/shared/containers").rstrip("/"))
-        hgnc = os.environ.get("ATLAS_HGNC", shared + "/skills/atlas-expression/hgnc_complete_set.txt")
         command = (
             'export ATLAS_H5AD="$AISCIENTIST_DATASET"\n'
             'export AISCI_DATA_DIR="$AISCIENTIST_ENV_DIR" AISCI_EXECUTOR=inline\n'
             f"export AISCI_ATLAS_RELEASE={shlex.quote(version)}\n"
-            f"export ATLAS_HGNC={shlex.quote(hgnc)}\n"
+            # The HGNC table in this user's tool cache, downloaded by their first call; without
+            # a cache the server keeps it in this run's folder.
+            'if [ -n "${AISCIENTIST_TOOL_CACHE:-}" ]; then\n'
+            '  export ATLAS_HGNC="$AISCIENTIST_TOOL_CACHE/atlas-expression/hgnc_complete_set.txt"\n'
+            'fi\n'
             'export AISCI_ATLAS_RESULT=$(mktemp "$AISCIENTIST_ENV_DIR/.atlas-result.XXXXXX")\n'
             'trap \'rm -f "$AISCI_ATLAS_RESULT"\' EXIT\n'
             'aiscientist-mcp --server atlas-expression-exploration-mcp --timeout 15000 call '
@@ -120,8 +138,7 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
             "python - <<'AISCI_ATLAS_COLLECT'\n" + COLLECT + "AISCI_ATLAS_COLLECT\n")
         out = environment_tool.executor(
             {"skill": SKILL, "command": command}, ctx, _atlas_bridge=True,
-            _resources=None if name == "submit_query" else (2, 16, "00:30:00"),
-            _cache_dir=posixpath.dirname(hgnc))
+            _resources=None if name == "submit_query" else (2, 16, "00:30:00"), _tool_cache=True)
         if out.get("status") != "ok":
             return out
         try:

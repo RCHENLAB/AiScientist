@@ -1098,13 +1098,11 @@ button.full { width: 100%; margin-top: 6px; }
 /* Shared details-summary layout: leading icon + flexible label + a chevron that rotates on open.
    Replaces the emoji glyphs and the (hidden) native marker with one consistent Material Symbol row. */
 .msg.assistant .think summary,
-.msg.assistant .run-recap > summary,
 .msg.assistant .lab-progress .step-code > summary {
   cursor: pointer; user-select: none; list-style: none; outline: none;
   display: flex; align-items: center; gap: 7px;
 }
 .msg.assistant .think summary::-webkit-details-marker,
-.msg.assistant .run-recap > summary::-webkit-details-marker,
 .msg.assistant .lab-progress .step-code > summary::-webkit-details-marker { display: none; }
 .msg.assistant summary .msym { color: var(--text-tertiary); font-size: 17px; flex: none; }
 .msg.assistant summary .sum-label { flex: 1; min-width: 0; }
@@ -1116,7 +1114,7 @@ button.full { width: 100%; margin-top: 6px; }
 /* Smooth reveal on open. Native <details> can't transition its own height, so we fade+slide the
    revealed body in; the rotating chevron carries the collapse affordance the other direction. */
 .msg.assistant .think[open] > .think-body,
-.msg.assistant .run-recap[open] > .lab-progress,
+.msg.assistant .run-card[open] > .run-detail,
 .msg.assistant .step-code[open] > .step-code-body {
   animation: detailsReveal 0.24s var(--ease-spring);
 }
@@ -1197,15 +1195,6 @@ button.full { width: 100%; margin-top: 6px; }
 }
 
 .chat-controls select:disabled, .chat-controls input:disabled { cursor: not-allowed; }
-/* Persisted run recap kept with a finished answer (default-collapsed): thinking + steps/code. */
-.msg.assistant .think.recap { display: block; }
-.msg.assistant .run-recap { margin-bottom: 8px; }
-.msg.assistant .run-recap > summary {
-  cursor: pointer; user-select: none; list-style: none; outline: none;
-  font-size: 12px; font-weight: 500; color: var(--text-secondary); padding: 3px 0;
-}
-.msg.assistant .run-recap > summary::-webkit-details-marker { display: none; }
-.msg.assistant .run-recap .lab-progress.done { margin: 6px 0 0; }
 
 /* --- live key-progress feed (lab runs) --- */
 .msg.assistant .lab-progress {
@@ -1245,20 +1234,102 @@ button.full { width: 100%; margin-top: 6px; }
 }
 @keyframes progress-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
 
-/* Live "Working…" liveness line — a pulsing dot + latest activity + elapsed timer.
-   Kept ticking by a 1s heartbeat so a silent HPC3 compute step never looks frozen. */
-.msg.assistant .stream-working {
-  display: none; align-items: center; gap: 8px;
-  margin: 2px 0 8px; font-size: 13px; color: var(--text-secondary);
+/* --- the run card: one line in the chat, the details on a click ---------------------------
+   Closed, it is the run's one line: a pulsing dot while it runs, what it does now, its Slurm job's
+   state, warnings and the time. Open, it shows the run's Slurm jobs, then the progress lines, the
+   step code and the activity log. A finished answer keeps the same line, closed, above its text. */
+.msg.assistant .run-card {
+  margin-bottom: 10px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface); font-size: 13px;
+  transition: border-color 0.2s var(--ease-spring);
 }
-.msg.assistant .stream-working .working-dot {
+.msg.assistant .run-card:hover, .msg.assistant .run-card[open] { border-color: var(--border-strong); }
+.msg.assistant .run-card > summary.run-sum {
+  cursor: pointer; user-select: none; list-style: none; outline: none;
+  display: flex; align-items: center; gap: 8px; min-width: 0; padding: 7px 10px 7px 12px;
+}
+.msg.assistant .run-card > summary.run-sum::-webkit-details-marker { display: none; }
+.msg.assistant .run-card > summary.run-sum:focus-visible { box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.35); border-radius: 11px; }
+.msg.assistant .run-sum .run-dot {
   width: 8px; height: 8px; border-radius: 50%; flex: none;
   background: var(--accent); animation: working-pulse 1.2s ease-in-out infinite;
 }
-.msg.assistant .stream-working .working-text { font-variant-numeric: tabular-nums; }
+.msg.assistant .run-sum .run-lead { display: flex; align-items: center; flex: none; }
+.msg.assistant .run-sum .run-lead .msym { font-size: 17px; color: var(--text-tertiary); }
+.msg.assistant .run-sum .run-now[hidden], .msg.assistant .run-sum .run-time:empty { display: none; }
+.msg.assistant .run-sum .run-title {
+  flex: 0 1 auto; min-width: 4.5em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 500; color: var(--text);
+}
+.msg.assistant .run-card.done .run-sum .run-title { font-weight: 400; color: var(--text-secondary); }
+.msg.assistant .run-sum .run-now {
+  flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-tertiary);
+}
+.msg.assistant .run-sum .run-now::before { content: "·"; margin-right: 8px; }
+.msg.assistant .run-sum .run-chips {
+  margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 0;
+}
+.msg.assistant .run-sum .run-chip {
+  display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px 1px 5px; min-width: 0;
+  border-radius: 999px; font-size: 11.5px; line-height: 18px; white-space: nowrap; overflow: hidden;
+  background: var(--surface-sunken); color: var(--text-secondary);
+}
+.msg.assistant .run-sum .run-chip .msym { flex: none; }
+.msg.assistant .run-sum .run-chip .msym { font-size: 14px; color: inherit; }
+.msg.assistant .run-sum .run-chip.job-run { background: rgba(var(--accent-rgb), 0.1); color: var(--accent-press); }
+.msg.assistant .run-sum .run-chip.job-wait { color: var(--amber-text); }
+.msg.assistant .run-sum .run-chip.job-ok { color: var(--green-text); }
+.msg.assistant .run-sum .run-chip.job-bad { color: var(--red-text); }
+.msg.assistant .run-sum .run-chip.warn { color: var(--amber-text); }
+.msg.assistant .run-sum .run-time {
+  font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.msg.assistant .run-sum .chev { margin-left: 0; }
+.msg.assistant .run-detail {
+  border-top: 1px solid var(--border); padding: 8px 12px 10px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.msg.assistant .run-sec-head {
+  display: flex; align-items: center; gap: 5px; margin-bottom: 5px;
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.02em; color: var(--text-secondary);
+}
+.msg.assistant .run-sec-head .msym { font-size: 15px; color: var(--text-tertiary); }
+.msg.assistant .run-detail .lab-progress { margin-bottom: 0; background: var(--surface-reading); }
+.msg.assistant .run-detail .think { margin-bottom: 0; }
+/* Slurm jobs: state, the job and what it is for, where it runs, why it waits, its time. */
+.msg.assistant .job-list { display: flex; flex-direction: column; gap: 4px; }
+.msg.assistant .job-row {
+  display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; align-items: start; gap: 4px 10px;
+  padding: 6px 8px; border-radius: 8px; background: var(--surface-reading); border: 1px solid var(--border);
+}
+.msg.assistant .job-state {
+  justify-self: start; padding: 0 7px; border-radius: 999px; font-size: 11.5px; line-height: 19px;
+  font-weight: 500; white-space: nowrap; background: var(--surface-sunken); color: var(--text-secondary);
+}
+.msg.assistant .job-state.run { background: rgba(var(--accent-rgb), 0.12); color: var(--accent-press); }
+.msg.assistant .job-state.wait { background: rgba(232, 147, 12, 0.12); color: var(--amber-text); }
+.msg.assistant .job-state.ok { background: rgba(52, 168, 83, 0.12); color: var(--green-text); }
+.msg.assistant .job-state.bad { background: rgba(224, 70, 59, 0.1); color: var(--red-text); }
+.msg.assistant .job-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.msg.assistant .job-id { font-weight: 500; font-variant-numeric: tabular-nums; }
+.msg.assistant .job-what { color: var(--text); overflow-wrap: anywhere; }
+.msg.assistant .job-meta, .msg.assistant .job-why { font-size: 12px; color: var(--text-tertiary); overflow-wrap: anywhere; }
+.msg.assistant .job-why { color: var(--amber-text); }
+.msg.assistant .job-time {
+  font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.msg.assistant .job-none, .msg.assistant .job-model { font-size: 12.5px; color: var(--text-tertiary); }
+.msg.assistant .job-model { display: flex; align-items: center; gap: 5px; margin-top: 6px; }
+.msg.assistant .job-model .msym { font-size: 15px; }
 @keyframes working-pulse {
   0%, 100% { opacity: 0.35; transform: scale(0.85); }
   50%      { opacity: 1;    transform: scale(1.1); }
+}
+@media (max-width: 600px) {
+  .msg.assistant .run-sum .run-now, .msg.assistant .run-sum .run-chip.warn { display: none; }
+  .msg.assistant .job-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .msg.assistant .job-row .job-main { grid-column: 1 / -1; grid-row: 2; }
 }
 
 /* --- artifacts file grid + preview modal --- */

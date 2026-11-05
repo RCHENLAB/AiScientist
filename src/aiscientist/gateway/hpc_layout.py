@@ -7,7 +7,8 @@ root (``AISCIENTIST_HPC_SHARED_ROOT``)::
     ├── envs/                      environments: openspliceai/, analysis-pydeps/, run-code-pkgs/,
     │                              conda-pkgs/ (the lab's conda download cache), lab/ (environments
     │                              the agent asked for, hpc/environments.py), tool-cache/<hpc-user>/
-    │                              (what tools download and keep between runs: tectonic's TeX files)
+    │                              (what tools download and keep between runs: tectonic's TeX files,
+    │                              the atlas bridge's HGNC table)
     ├── containers/                images
     ├── models/                    model weights
     └── sessions/<session-uuid>/   one session, removed once its results are on the server
@@ -106,7 +107,8 @@ def conda_pkgs_dir(root: str) -> str:
 
 def tool_cache_dir(root: str, user: str) -> str:
     """What the analysis tools download and keep between runs, one folder per HPC3 user and inside
-    it one per program (run_cellqc's ``tectonic/``). Per user, not shared: tectonic writes its
+    it one per program (run_cellqc's ``tectonic/``, the atlas bridge's ``atlas-expression/``). Per
+    user, not shared: tectonic writes its
     LaTeX format file readable by its owner only (0600), so another member's run could not read it.
     ``tool-cache/`` itself is 3775, as ``sessions/`` is: every member makes their own folder there
     and no one removes another's."""

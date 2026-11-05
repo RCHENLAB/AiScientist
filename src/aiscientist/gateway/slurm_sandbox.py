@@ -129,6 +129,12 @@ class SlurmCodeExecutor:
     # download cache those builds read from. Empty images_dir -> run_in_image says it is not enabled.
     images_dir: str = ""
     pkgs_cache_dir: str = ""
+    # This HPC3 user's tool cache (``hpc_layout.tool_cache_dir``): what a skill environment
+    # downloads and keeps between runs, for a platform caller that asks for it
+    # (``run_in_image(tool_cache=True)``; the atlas bridge's HGNC table). Made on first use like the
+    # analysis jobs' (``slurm_analysis.ensure_tool_cache``); "" or a folder that cannot be made ->
+    # no cache, and the job runs without one.
+    tool_cache_dir: str = ""
     # Progress lines for the console, e.g. "building the image": (level, message).
     notify: Callable[[str, str], None] | None = None
     # The run's OTHER bound files ({name, role, path}, dfs3b paths), exposed read-only as
@@ -138,6 +144,7 @@ class SlurmCodeExecutor:
     _counter: int = field(default=0, repr=False)
     _images: dict[str, str] = field(default_factory=dict, repr=False)
     _scratch: str | None = field(default=None, repr=False)
+    _tool_cache_ok: bool | None = field(default=None, repr=False)
 
     @property
     def mem_mb(self) -> int:
@@ -186,7 +193,8 @@ class SlurmCodeExecutor:
 
     def run_in_image(self, command: str, image: str, *, workdir: str, cpus: int = 0,
                      mem_gb: int = 0, time_limit: str = "",
-                     files: "dict[str, str] | None" = None, cache_dir: str = "") -> dict[str, object]:
+                     files: "dict[str, str] | None" = None,
+                     tool_cache: bool = False) -> dict[str, object]:
         """Run a SHELL ``command`` inside container ``image`` (a skill's declared environment) as a
         Slurm job, with the same data contract as a snippet: the dataset read-only, work/artifacts
         writable, the AISCIENTIST_* variables set.
@@ -194,9 +202,10 @@ class SlurmCodeExecutor:
         ``workdir`` is the command's directory under the run's work dir (it persists across calls,
         so a pipeline's intermediate output survives to the next step); ``files`` are the skill's
         bundled files, ``{relative path: local path}``, staged into ``<workdir>/.skill``. Resources
-        default to this executor's. Platform-only ``cache_dir`` mounts a lab-shared reference
-        cache writable so downloads survive across runs. There is no local fallback: the command
-        needs the image."""
+        default to this executor's. ``tool_cache`` (platform callers only) binds this user's tool
+        cache writable and names it ``AISCIENTIST_TOOL_CACHE``, so a download survives across runs;
+        without one the job runs as before. There is no local fallback: the command needs the
+        image."""
         command = (command or "").strip()
         if not command:
             return {"status": "error", "error": "no command provided"}
@@ -217,18 +226,17 @@ class SlurmCodeExecutor:
                                     detail=made.stderr)
             for rel, local in (files or {}).items():
                 self.remote.put_file(local, f"{wd}/.skill/{rel}")
-            if cache_dir:
-                made = self.remote.exec(f"mkdir -p {shlex_quote(cache_dir)}")
-                if not made.ok:
-                    raise SlurmJobError("could not create the lab-shared reference cache")
+            cache = self._tool_cache() if tool_cache else ""
             cpus = int(cpus or self.cpus)
             time_limit = time_limit or self.time_limit
             exports = {"AISCIENTIST_ENV_DIR": wd, "AISCIENTIST_SKILL_DIR": f"{wd}/.skill",
                        "AISCIENTIST_JOB_CPUS": str(cpus), "HOME": f"{wd}/.home",
                        "TMPDIR": f"{wd}/.tmp"}
+            if cache:
+                exports["AISCIENTIST_TOOL_CACHE"] = cache
             out = self._submit(command, kind="env", runner="bash", image=sif, cpus=cpus,
                                mem_gb=int(mem_gb or self.mem_gb), time_limit=time_limit,
-                               cwd=wd, extra_exports=exports, package_cache=False, cache_dir=cache_dir,
+                               cwd=wd, extra_exports=exports, package_cache=False, cache_dir=cache,
                                run_timeout_s=slurm_time_to_seconds(time_limit) + 600)
         except JobCancelled:
             return {"status": "cancelled", "error": "Run cancelled by the user.",
@@ -239,6 +247,14 @@ class SlurmCodeExecutor:
         out["execution_mode"] = "hpc_slurm_image"
         out["environment"] = {"image": image or "run_code's image", "sif": sif, "workdir": wd}
         return out
+
+    def _tool_cache(self) -> str:
+        """``tool_cache_dir`` once it exists and this user can write it, else "" (checked once)."""
+        if self._tool_cache_ok is None:
+            from .slurm_analysis import ensure_tool_cache
+            self._tool_cache_ok = ensure_tool_cache(self.remote, self.tool_cache_dir,
+                                                    "run_in_environment")
+        return self.tool_cache_dir.rstrip("/") if self._tool_cache_ok else ""
 
     def run_command(self, command: str, *, workdir: str, cpus: int = 0, mem_gb: int = 0,
                     time_limit: str = "") -> dict[str, object]:

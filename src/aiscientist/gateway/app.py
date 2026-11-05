@@ -41,6 +41,7 @@ from . import compute                     # where a session computes: HPC3 behin
 from . import session_state               # what a session is doing with HPC3, shown in the console
 from . import storage_delete              # the Storage tab's Delete, as a Slurm job
 from . import shared_llm                  # the lab's shared reasoning-model server and its keeper
+from . import slurm_job                   # the Slurm lifecycle; its job states go to the run's chat
 from . import staging                     # background copies of uploads to HPC3
 from . import upload_storage, dataset_storage
 from . import upload_log                  # what happened to each upload, per user
@@ -204,6 +205,48 @@ _USAGE_STEP: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # asking the user whether to go on (``_key_use``).
 _BUDGET_ASK_OFF: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "aiscientist_budget_ask_off", default=False)
+
+
+#: How many Slurm jobs one run's chat lists (a run that resubmits in a loop cannot grow it without bound).
+_RUN_JOBS_MAX = 40
+
+#: A job record's fields a later state keeps unless it brings its own.
+_RUN_JOB_FIELDS = ("name", "node", "kind", "step", "partition", "time_limit", "gres", "cpus", "mem")
+
+
+def _merge_run_job(jobs: dict[str, dict[str, Any]], update: dict[str, Any]) -> dict[str, Any] | None:
+    """Fold one Slurm state (``slurm_job.report_job``) into the run's record of that job: when it was
+    submitted, started and ended, where it runs, and why it waits. Returns the whole record, which is
+    what the chat shows; None for an update without a job id, or past ``_RUN_JOBS_MAX`` jobs."""
+    job_id = str(update.get("job_id") or "").strip()
+    if not job_id:
+        return None
+    at = update.get("at")
+    at = float(at) if isinstance(at, (int, float)) else time.time()
+    rec = jobs.get(job_id)
+    if rec is None:
+        if len(jobs) >= _RUN_JOBS_MAX:
+            return None
+        rec = jobs[job_id] = {"job_id": job_id, "submitted_at": at}
+    for key in _RUN_JOB_FIELDS:
+        if update.get(key):
+            rec[key] = update[key]
+    state = str(update.get("state") or "")
+    changed = bool(state) and state != rec.get("state")
+    if state:
+        rec["state"] = state
+    # A reason says why the job waits, or why it ended; a new state without one clears the old.
+    for key in ("reason", "eta"):
+        if update.get(key):
+            rec[key] = update[key]
+        elif changed:
+            rec.pop(key, None)
+    if state == "RUNNING" and not rec.get("started_at"):
+        rec["started_at"] = at
+    if state and slurm_job._is_terminal_sacct(state) and not rec.get("ended_at"):
+        rec["ended_at"] = at
+    rec["updated_at"] = at
+    return dict(rec)
 
 
 class RunState:
@@ -680,7 +723,7 @@ class Connection:
         if t == "chat_start":
             if run is not None:
                 payload.setdefault("stream_id", run.stream_id)
-            self.stream = {"text": "", "thinking": "", "progress": [], "status": "running",
+            self.stream = {"text": "", "thinking": "", "progress": [], "jobs": {}, "status": "running",
                            "artifacts": None, "error": "", "status_label": "",
                            "run_id": payload.get("run_id"),
                            "conversation_id": payload.get("conversation_id"),
@@ -701,6 +744,12 @@ class Connection:
                                   "level": payload.get("level", "info")})
         elif t == "step_code":
             s["progress"].append({"kind": "code", "code": payload.get("code", "")})
+        elif t == "run_job":
+            # The client is sent the whole record, so a state that arrives on its own (RUNNING)
+            # still shows the job's name, step and resources.
+            rec = _merge_run_job(s.setdefault("jobs", {}), payload)
+            if rec is not None:
+                payload.update(rec)
         elif t == "chat_done":
             s["status"] = "done"
         elif t == "chat_stopped":
@@ -747,6 +796,8 @@ class Connection:
             else:
                 out.append({"type": "lab_progress", "text": p.get("text", ""),
                             "level": p.get("level", "info")})
+        for rec in (s.get("jobs") or {}).values():
+            out.append({"type": "run_job", **rec})
         if s["text"]:
             out.append({"type": "chat_token", "token": s["text"]})
         if s["status"] == "running" and s.get("status_label"):
@@ -11737,6 +11788,24 @@ def _note_usage_step(ev: dict[str, Any], flags: dict[str, Any]) -> None:
         _USAGE_STEP.set("Write-up")
 
 
+def _push_slurm_job(update: dict[str, Any]) -> None:
+    """A Slurm job's state (``slurm_job.report_job``), to the chat of the run the calling code works
+    for, with the pipeline step it belongs to. A job no run submitted (the model server, a cleanup)
+    is not sent anywhere: it has no chat."""
+    run = _CURRENT_RUN.get()
+    conn = getattr(run, "conn", None)
+    if run is None or conn is None:
+        return
+    payload = {"type": "run_job", **update}
+    step = _USAGE_STEP.get()
+    if step and not payload.get("step"):
+        payload["step"] = " ".join(step.split())[:160]
+    conn.push(payload, run=run)
+
+
+slurm_job.set_job_observer(_push_slurm_job)
+
+
 def _usage_error_type(exc: BaseException) -> str:
     """The cause to record for a failed model call — auth | credit | rate | model | context |
     network | endpoint | refusal — never the message itself, which can echo input. The Anthropic
@@ -13039,6 +13108,9 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         # once into the shared containers dir, from the lab's shared conda downloads.
         images_dir=f"{st.shared_root.rstrip('/')}/containers",
         pkgs_cache_dir=hpc_layout.conda_pkgs_dir(st.shared_root),
+        # This user's tool cache, for a skill environment that keeps a download between runs
+        # (the atlas bridge's HGNC table): made 3775 on first use, as the analysis jobs' is.
+        tool_cache_dir=_tool_cache_dir(conn),
         notify=lambda level, message: emit(level, "lab", message),
         inputs=tuple(rc_inputs),
     )

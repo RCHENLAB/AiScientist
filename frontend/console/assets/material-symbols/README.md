@@ -34,9 +34,14 @@ the default `font-variation-settings` live in `../../styles.css`. (The class is 
 
 | name | where |
 |------|-------|
-| `science` | nav rail (research) · run "Steps & code" summary |
-| `psychology` | model "Thinking & activity" summary |
+| `science` | nav rail (research) |
+| `psychology` | a run card's "Activity log" summary |
 | `data_object` | "Step code" summary |
+| `dns` | a run card's Slurm chip and its "Slurm jobs" heading |
+| `format_list_bulleted` | a run card's "Progress" heading |
+| `task_alt`, `stop_circle`, `error`, `notes` | a finished run card's line: finished, stopped, error, details only |
+| `warning` | a run card's warnings chip |
+| `memory` | a run card's model-server line |
 | `folder_open` | results/artifacts title |
 | `download` | download-bundle links, zip button |
 | `expand_more` | the rotating chevron on every collapsible `<details>` |

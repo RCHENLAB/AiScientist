@@ -93,6 +93,83 @@ def _noop_emit(level: str, stage: str, message: str) -> None:  # pragma: no cove
     return None
 
 
+# ---- job states for the run's chat ----------------------------------------------------------
+# Every Slurm job a run submits goes through this module, so the states it sees are reported here
+# as data, beside the log lines. The gateway registers one observer (``set_job_observer``), which
+# sends each state to the chat of the run the calling code works for; with none, nothing happens.
+
+JobObserver = Callable[[dict], None]
+_JOB_OBSERVER: "JobObserver | None" = None
+
+# squeue's short states, by the names sacct uses.
+_STATE_NAMES = {
+    "PD": "PENDING", "R": "RUNNING", "CG": "COMPLETING", "CF": "CONFIGURING", "CD": "COMPLETED",
+    "F": "FAILED", "CA": "CANCELLED", "TO": "TIMEOUT", "NF": "NODE_FAIL", "OOM": "OUT_OF_MEMORY",
+    "BF": "BOOT_FAIL", "DL": "DEADLINE", "PR": "PREEMPTED", "S": "SUSPENDED", "RQ": "REQUEUED",
+}
+
+# The sbatch options a person reads to know what a job asked for.
+_SBATCH_FIELDS = {"--partition": "partition", "-p": "partition", "--time": "time_limit", "-t": "time_limit",
+                  "--gres": "gres", "--cpus-per-task": "cpus", "-c": "cpus", "--mem": "mem"}
+
+
+def set_job_observer(fn: "JobObserver | None") -> "JobObserver | None":
+    """Register the function that receives each job state (the previous one is returned)."""
+    global _JOB_OBSERVER
+    previous, _JOB_OBSERVER = _JOB_OBSERVER, fn
+    return previous
+
+
+def job_state_name(state: str) -> str:
+    """``PD`` -> ``PENDING``, sacct's ``CANCELLED by 123`` -> ``CANCELLED``."""
+    head = (state or "").strip().upper().split(" ")[0].rstrip("+")
+    return _STATE_NAMES.get(head, head)
+
+
+def sbatch_resources(script: str) -> dict[str, str]:
+    """What the job asked for, from its ``#SBATCH`` lines: partition, time limit, GPUs, CPUs, memory."""
+    out: dict[str, str] = {}
+    for line in (script or "").splitlines():
+        line = line.strip()
+        if not line.startswith("#SBATCH"):
+            continue
+        try:
+            words = shlex.split(line[len("#SBATCH"):])
+        except ValueError:
+            continue
+        i = 0
+        while i < len(words):
+            word = words[i]
+            key, sep, value = word.partition("=")
+            if not sep and key in _SBATCH_FIELDS and i + 1 < len(words) and not words[i + 1].startswith("-"):
+                value = words[i + 1]
+                i += 1
+            field = _SBATCH_FIELDS.get(key)
+            if field and value and field not in out:
+                out[field] = value[:40]
+            i += 1
+    return out
+
+
+def report_job(job_id: str, state: str, *, name: str = "", node: str = "", reason: str = "",
+               eta: str = "", kind: str = "", script: str = "") -> None:
+    """Tell the observer that ``job_id`` is now in ``state``. Never raises: a display update must
+    not change what happens to the job."""
+    fn = _JOB_OBSERVER
+    if fn is None or not job_id:
+        return
+    update: dict = {"job_id": str(job_id), "state": job_state_name(state), "at": time.time()}
+    for key, value in (("name", name), ("node", node), ("reason", reason), ("eta", eta), ("kind", kind)):
+        if value:
+            update[key] = str(value)[:200]
+    if script:
+        update.update(sbatch_resources(script))
+    try:
+        fn(update)
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass
+
+
 @dataclass
 class SlurmJobSpec:
     """A complete ``#!/bin/bash`` sbatch script + a per-user job name.
@@ -345,6 +422,7 @@ def _check_cancel(executor: RemoteExecutor, job_id: str, should_cancel: "Callabl
     if should_cancel is not None and should_cancel():
         executor.exec(f"scancel {job_id}")
         emit("warning", "slurm", f"Job {job_id} cancelled by the user (scancelled).")
+        report_job(job_id, "CANCELLED", reason="stopped by you")
         raise JobCancelled("run cancelled by the user", job_id=job_id)
 
 
@@ -430,6 +508,7 @@ def _acquire_allocation(
             emit("step", "slurm",
                  f"Submitted {spec.job_name} as job {job_id} (submission {submissions}); "
                  "waiting for a node ...")
+            report_job(job_id, "SUBMITTED", name=spec.job_name, script=spec.script)
         windows_left -= 1
         deadline = time.monotonic() + config.startup_timeout_s
         died = False
@@ -439,6 +518,7 @@ def _acquire_allocation(
             state, node = _queue_state(executor, job_id)
             if state == _RUNNING and node:
                 emit("success", "slurm", f"Job {job_id} is RUNNING on {node}.")
+                report_job(job_id, state, node=node)
                 return job_id, node, submissions
             if state == "":
                 # Already left the queue during startup — a fast batch job may have run
@@ -447,11 +527,13 @@ def _acquire_allocation(
                 return job_id, node, submissions
             if state in _DEAD_STATES:
                 emit("warning", "slurm", f"Job {job_id} died on startup (state {state}); re-requesting ...")
+                report_job(job_id, state, reason="ended on startup; requested again")
                 died = True
                 break
             if state == _PENDING and not announced:
                 announced = True
                 emit("info", "slurm", f"Job {job_id} pending in the queue ...")
+                report_job(job_id, state)
             time.sleep(config.poll_interval_s)
         if died:
             job_id = ""
@@ -464,8 +546,10 @@ def _acquire_allocation(
                  f"Job {job_id} is held by Slurm{why} and will not start as it is; "
                  "cancelling and re-requesting.")
             executor.exec(f"scancel {job_id}")
+            report_job(job_id, "CANCELLED", reason=f"held by Slurm ({reason}); requested again")
             job_id = ""
             continue
+        report_job(job_id, _PENDING, reason=reason, eta=eta)
         expects = f"; Slurm expects it to start at {eta}" if eta else ""
         if windows_left > 0:
             emit("info", "slurm",
@@ -479,6 +563,7 @@ def _acquire_allocation(
                  "waiting for that rather than giving up its place.")
     if job_id:
         executor.exec(f"scancel {job_id}")
+        report_job(job_id, "CANCELLED", reason="no node came free in time")
     total_s = config.startup_timeout_s * (config.max_attempts + (1 if extended else 0))
     why = f"; Slurm's reason: {reason}" if reason else ""
     raise SlurmQueueTimeout(
@@ -675,6 +760,7 @@ def _supervise_job(
             if _is_terminal_sacct(final):            # genuinely finished
                 ok = final.startswith("COMPLETED")
                 emit("success" if ok else "error", "slurm", f"Job {job_id} finished: {final}.")
+                report_job(job_id, final, node=node)
                 return JobResult(job_id, node, final, attempts, completed=ok)
             # squeue is empty but sacct is NOT terminal yet: either sacct is lagging behind a
             # job that is actually still RUNNING/COMPLETING, or a transient empty squeue, or
@@ -684,15 +770,18 @@ def _supervise_job(
                 gone_polls += 1
                 if gone_polls >= _GONE_CONFIRM:
                     emit("success", "slurm", f"Job {job_id} left the queue (no sacct record); assuming COMPLETED.")
+                    report_job(job_id, "COMPLETED", node=node)
                     return JobResult(job_id, node, "COMPLETED", attempts, completed=True)
         else:
             gone_polls = 0
             if state in _DEAD_STATES:
                 final = _terminal_state(executor, job_id) or state
                 emit("error", "slurm", f"Job {job_id} failed: {final}.")
+                report_job(job_id, final, node=node)
                 return JobResult(job_id, node, final, attempts, completed=False)
         time.sleep(run.poll_interval_s)
     executor.exec(f"scancel {job_id}")
+    report_job(job_id, "CANCELLED", node=node, reason=f"ran past its {run.run_timeout_s}s limit")
     raise SlurmJobError(
         f"job {job_id} exceeded the {run.run_timeout_s}s run budget and was cancelled.",
         job_id=job_id,
@@ -776,6 +865,7 @@ def reattach_job(
         if _is_terminal_sacct(final):
             ok = final.startswith("COMPLETED")
             emit("info", "slurm", f"Reattached job {job_id}: already finished ({final}).")
+            report_job(job_id, final, node=node)
             collect_timing_accounting(executor, job_id)
             return JobResult(job_id, node, final, attempts, completed=ok)
         if not wait:
@@ -783,6 +873,7 @@ def reattach_job(
             return JobResult(job_id, node, final or "UNKNOWN", attempts, completed=False)
     elif not wait:
         emit("info", "slurm", f"Reattached job {job_id}: still {state} on {node or '?'}.")
+        report_job(job_id, state, node=node)
         return JobResult(job_id, node, state, attempts, completed=False)
     emit("step", "slurm", f"Reattaching to job {job_id} and supervising to completion ...")
     return supervise_job(executor, job_id, node, attempts, run=run, emit=emit)

@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from .errors import GatewayError
 from .executor import RemoteExecutor
 from .settings import HPCSettings, slurm_job_name
-from .slurm_job import AcquireConfig, SlurmJobError, SlurmJobSpec, acquire_allocation
+from .slurm_job import AcquireConfig, SlurmJobError, SlurmJobSpec, acquire_allocation, report_job
 
 JOB_NAME = "aiscientist-worker"
 
@@ -361,6 +361,8 @@ def run_on_worker(executor: RemoteExecutor, alloc: WorkerAllocation, command: st
     tearing down first and losing the diagnosis.
     """
     line = srun_command(alloc, command, timeout_s=timeout_s, cpus=cpus, chdir=chdir)
+    # The run's chat lists the worker among its Slurm jobs while its commands run there.
+    report_job(alloc.job_id, "RUNNING", node=alloc.node, kind="worker")
     return executor.exec(line, timeout=float(timeout_s) + 30.0)
 
 

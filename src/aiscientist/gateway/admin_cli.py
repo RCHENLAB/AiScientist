@@ -274,11 +274,13 @@ def main(argv: list[str] | None = None) -> int:
               else f"database schema: {after}, nothing to do")
         return 0
 
-    init_db()  # ensure tables exist (idempotent)
-
     if args.cmd == "active-runs":
+        # Only reads, and migrates nothing: a deploy asks the running release after the new one has
+        # migrated the database, to a revision the running release may not know.
         print(auth_routes.active_run_count())
         return 0
+
+    init_db()  # ensure tables exist (idempotent)
 
     if args.cmd == "create-admin":
         username = (args.username or input("Admin username: ")).strip()

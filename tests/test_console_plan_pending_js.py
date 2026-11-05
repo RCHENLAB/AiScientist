@@ -120,6 +120,15 @@ const editResolution = (typed) => {
   return { input, error };
 };
 const draft = () => { A().planDraftChange = { ...CHANGE }; return api.notePlanDraft(EDIT); };
+// The live run card's one line, as repaintWorking fills it: one element per part.
+const runLine = () => {
+  const parts = {};
+  return { parts, innerHTML: "", querySelector(sel) {
+    const k = sel.replace(".run-", "");
+    return parts[k] || (parts[k] = { innerHTML: "", hidden: false });
+  } };
+};
+const shown = (sum) => Object.fromEntries(Object.entries(sum.parts).map(([k, v]) => [k, v.innerHTML]));
 const plan = (extra) => ({ type: "plan_prompt", conversation_id: "A", run_id: "r1",
   agenda: ["**QC** — filter.", "**Clustering** — resolution 1.2."], plan: { yaml: YAML, steps: [{ id: "s1", title: "QC" }, { id: "s2", title: "Clustering", settings: { resolution: 1.2 } }] },
   revised: [], problems: [], ...extra });
@@ -145,7 +154,10 @@ def _run(scenario: str, *, working: bool = False) -> dict:
     if working:
         for start, end in [
             ("let runTicker = null;", "function mountStream()"),
-            ("function repaintWorking()", "function streamThinking("),
+            ("// The session's own model-server job", "function streamThinking("),
+            ("function feedItemHtml(entry)", "// The dataset the chat is bound to"),
+            ("function icon(name)", "function fileIcon(kind)"),
+            ("function planStepParts(text)", "function planSettingText("),
             ("function streamStatus(", "function streamCode("),
             ("function updateComposerButton()", "// Cancel a chat's in-flight run"),
         ]:
@@ -427,8 +439,8 @@ def test_waiting_prompts_hide_working_keep_stop_and_restart_the_timer(kind):
   api.startAssistantStream(A());
   A().running = true;
   out.initialStart = A().run.startedAt;
-  const working = { style: {}, textContent: "" };
-  S.streamDom = { working, workingText: working };
+  let sum = runLine();
+  S.streamDom = { sum };
   api.streamStatus(A(), "Drafting plan");
   sandbox.now = 61000;
   const prompt = __KIND__;
@@ -437,7 +449,8 @@ def test_waiting_prompts_hide_working_keep_stop_and_restart_the_timer(kind):
     conversation_id: "A", run_id: "r1", questions: [], options: []
   });
   api.streamStatus(A(), "Stale backend activity");
-  out.waiting = { display: working.style.display, start: A().run.startedAt };
+  api.repaintWorking();
+  out.waiting = { line: shown(sum), start: A().run.startedAt };
   // The actual composer still exposes Stop while review is pending.
   api.updateComposerButton();
   out.stopHidden = els.chatStop.hidden;
@@ -445,35 +458,43 @@ def test_waiting_prompts_hide_working_keep_stop_and_restart_the_timer(kind):
   if (prompt === "decision") await api.submitDecision("choice");
   else await api.submitPlan(prompt === "clarify" ? "revise" : "approve", "answer");
   if (prompt === "clarify") api.streamStatus(A(), "Working");
-  // A successful approval redraws the chat; mountStream supplies a fresh working line.
-  S.streamDom = { working, workingText: working };
+  // A successful approval redraws the chat; mountStream supplies a fresh card.
+  sum = runLine();
+  S.streamDom = { sum };
   sandbox.now = 303000;
   api.repaintWorking();
-  out.resumed = { display: working.style.display, text: working.textContent, start: A().run.startedAt };
+  out.resumed = { line: shown(sum), start: A().run.startedAt };
 """.replace("__KIND__", json.dumps(kind)), working=True)
     assert out["initialStart"] == 1000
-    assert out["waiting"] == {"display": "none", "start": None}
+    # While the prompt waits, the line says what waits for the user, with no timer and no live dot.
+    waiting = out["waiting"]["line"]
+    assert out["waiting"]["start"] is None
+    assert waiting["title"] == {"plan": "Plan ready — waiting for your review",
+                                "clarify": "A question for you — waiting for your answer",
+                                "decision": "A choice for you — waiting for your decision"}[kind]
+    assert waiting["time"] == "" and "run-dot" not in waiting["lead"] and waiting["now"] == ""
     assert out["stopHidden"] is False
-    assert out["resumed"]["display"] == "flex"
+    resumed = out["resumed"]["line"]
+    assert "run-dot" in resumed["lead"]
     assert out["resumed"]["start"] == 301000
-    assert "2s" in out["resumed"]["text"]
-    assert "Stale backend activity" not in out["resumed"]["text"]
+    assert resumed["time"] == "2s"
+    assert "Stale backend activity" not in json.dumps(resumed)
 
 
 def test_a_turn_without_a_plan_times_from_when_the_question_was_sent():
     out = _run("""
   api.startAssistantStream(A());
-  const working = { style: {}, textContent: "" };
-  S.streamDom = { working, workingText: working };
+  const sum = runLine();
+  S.streamDom = { sum };
   sandbox.scheduleRepaint = () => {};
   sandbox.now = 5000;
   api.streamToken(A(), "Answer");
   sandbox.now = 8000;
   api.repaintWorking();
-  out.start = A().run.startedAt; out.text = working.textContent;
+  out.start = A().run.startedAt; out.line = shown(sum);
 """, working=True)
     assert out["start"] == 1000
-    assert "7s" in out["text"]
+    assert out["line"]["time"] == "7s" and out["line"]["title"] == "Writing the answer"
 
 
 def test_saved_plan_waits_without_a_running_stream_and_survives_replay():

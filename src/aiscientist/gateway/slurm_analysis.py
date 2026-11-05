@@ -42,6 +42,27 @@ _RESULT_MARKER = "AISCIENTIST_RESULT_JSON "
 _LEGACY_RESULT_MARKER = "BIOAGENT_RESULT_JSON "
 
 
+def ensure_tool_cache(remote: Any, path: str, label: str) -> bool:
+    """Make this HPC3 user's tool cache ``path`` (``hpc_layout.tool_cache_dir``) and check that this
+    user can write it. Its parent ``tool-cache/`` is made 3775, as ``sessions/`` is, so every member
+    can make their own folder there and no one removes another's. False, with a note, when it cannot
+    be made: Apptainer refuses to start a job whose bind source is missing, so the job then runs
+    without a cache and downloads what it needs again."""
+    d = (path or "").rstrip("/")
+    if not d or remote is None:
+        return False
+    parent, q = shlex.quote(str(Path(d).parent)), shlex.quote(d)
+    # -m sets the mode of a folder it makes and leaves an existing one alone.
+    try:
+        got = remote.exec(f"mkdir -p -m 3775 {parent} && mkdir -p {q} && test -w {q}")
+        ok, why = got.ok, (got.stderr or "").strip()
+    except Exception as exc:  # noqa: BLE001 - a cache must never stop the job
+        ok, why = False, str(exc)
+    if not ok:
+        print(f"[{label}] no tool cache at {d}: {why[:200]} — each run downloads what it needs again.")
+    return ok
+
+
 def provision_image(remote: Any, ref: str, images_dir: str, *, scratch: str, job_name: str,
                     partition: str, account: str = "", container_module: str = "",
                     container_bin: str = "apptainer", startup_timeout_s: int = 600,
@@ -458,20 +479,7 @@ class SlurmAnalysisExecutor:
         job: Apptainer refuses to start a job whose bind source is missing, so a folder that cannot
         be made is left out of every job instead."""
         if self._tool_cache_ok is None:
-            d = self.tool_cache_dir.rstrip("/")
-            ok = False
-            if d and self.remote is not None:
-                parent, q = shlex.quote(str(Path(d).parent)), shlex.quote(d)
-                # -m sets the mode of a folder it makes and leaves an existing one alone.
-                try:
-                    got = self.remote.exec(f"mkdir -p -m 3775 {parent} && mkdir -p {q} && test -w {q}")
-                    ok, why = got.ok, (got.stderr or "").strip()
-                except Exception as exc:  # noqa: BLE001 - a cache must never stop the job
-                    ok, why = False, str(exc)
-                if not ok:
-                    print(f"[{self.job_prefix}] no tool cache at {d}: {why[:200]} — each run "
-                          "downloads what it needs again.")
-            self._tool_cache_ok = ok
+            self._tool_cache_ok = ensure_tool_cache(self.remote, self.tool_cache_dir, self.job_prefix)
         return self.tool_cache_dir.rstrip("/") if self._tool_cache_ok else ""
 
     def _resolved_scratch(self) -> str:

@@ -8,6 +8,7 @@ import pytest
 from aiscientist.agents import atlas_expression as atlas, skills, skills_registry
 from aiscientist.agents.research_harness import HarnessContext
 from aiscientist.agents.registry import build_scientist_catalog
+from aiscientist.gateway.executor import ExecResult
 
 FIXTURE = Path(__file__).parent / "fixtures" / "atlas_expression"
 IMAGE = ("docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:"
@@ -196,7 +197,7 @@ def test_large_response_survives_stdout_tail(release, tmp_path, monkeypatch, cap
         assert compact["full_table"] == "gene_expression/q/summary_majorclass.tsv"
     elif kind == "report":
         assert "markdown" not in compact
-        assert compact["file"] == result["file"]
+        assert compact["file"] == "gene_expression/q/report.md"
     else:
         assert compact["response_omitted"]
     runner = Runner()
@@ -215,7 +216,7 @@ def test_direct_skill_refused_even_with_model_override_arguments(release):
     assert out["status"] == "error"
     assert all(name in out["error"] for name in atlas.TOOLS)
     assert not runner.calls
-    assert not {"_atlas_bridge", "_resources", "_cache_dir"} & tool.parameters["properties"].keys()
+    assert not {"_atlas_bridge", "_resources", "_tool_cache"} & tool.parameters["properties"].keys()
 
 
 def test_configured_paths_are_normalized_and_supply_the_release(release, monkeypatch):
@@ -228,16 +229,74 @@ def test_configured_paths_are_normalized_and_supply_the_release(release, monkeyp
     assert tools(runner)["resolve_genes"].executor({"genes": GENES}, None)["status"] == "error"
 
 
+CACHE = "/dfs/envs/tool-cache/tester"
+
+
 @pytest.mark.parametrize("name", sorted(set(atlas.TOOLS) - {"submit_query"}))
-def test_light_tools_use_small_jobs_and_shared_hgnc(release, name, monkeypatch):
+def test_light_tools_use_small_jobs_and_the_users_tool_cache(release, name):
+    """The HGNC table lives in this HPC3 user's tool cache, whose parent is made 3775 as the
+    analysis jobs' is: a folder one member made in a lab-shared place would lock the others out."""
     from test_run_in_environment import _HPC, _executor
     hpc = _HPC()
-    runner = _executor(hpc)
+    runner = _executor(hpc, tool_cache_dir=CACHE)
     runner.dataset_path = Runner.dataset_path
-    monkeypatch.setenv("ATLAS_HGNC", "/shared/skills/hgnc/complete.txt")
     args = {key: "q" for key in atlas.TOOLS[name][1]["required"]}
     tools(runner)[name].executor(args, None)
     script = "\n".join(hpc.commands)
     for value in ("--cpus-per-task=2", "--mem=16G", "--time=00:30:00",
-                  "ATLAS_HGNC=/shared/skills/hgnc/complete.txt", "/shared/skills/hgnc:/shared/skills/hgnc"):
+                  "mkdir -p -m 3775 /dfs/envs/tool-cache", f"export AISCIENTIST_TOOL_CACHE={CACHE}",
+                  f"-B {CACHE}:{CACHE} ",
+                  'ATLAS_HGNC="$AISCIENTIST_TOOL_CACHE/atlas-expression/hgnc_complete_set.txt"'):
         assert value in script
+    assert "/skills/atlas-expression" not in script.replace("tool-cache/tester", "")
+
+
+def test_without_a_tool_cache_the_job_runs_and_the_table_stays_in_the_run(release):
+    from test_run_in_environment import _HPC, _executor
+
+    class NoCache(_HPC):
+        def exec(self, command, timeout=60.0):
+            if command.startswith("mkdir -p -m 3775"):
+                self.commands.append(command)
+                return ExecResult(command, 1, "", "Permission denied")
+            return super().exec(command, timeout)
+
+    hpc = NoCache()
+    runner = _executor(hpc, tool_cache_dir=CACHE)
+    runner.dataset_path = Runner.dataset_path
+    tools(runner)["resolve_genes"].executor({"genes": GENES}, None)
+    script = "\n".join(c for c in hpc.commands if not c.startswith("mkdir -p -m 3775"))
+    assert "sbatch" in script
+    assert "export AISCIENTIST_TOOL_CACHE" not in script and f"-B {CACHE}" not in script
+
+
+def test_responses_and_the_saved_result_name_results_files_not_hpc3_paths(release, tmp_path,
+                                                                          monkeypatch, capsys):
+    data = tmp_path / "work"
+    query = data / "atlas-expression-exploration" / "q"
+    query.mkdir(parents=True)
+    (query / "state.json").write_text("{}")
+    (query / "report.md").write_text("report")
+    plots = [str(query / f"dotplot_majorclass.{ext}") for ext in ("pdf", "png")]
+    result = {"files": plots, "file": str(query / "report.md"), "table": str(query / "summary_celltype.tsv"),
+              "rows": [], "data_dir": str(data / "atlas-expression-exploration"),
+              "queries": [{"query_id": "q", "genes": ["LRAT"]}]}
+    source = tmp_path / "atlas.h5ad"
+    source.write_text("atlas")
+    raw = tmp_path / "result.json"
+    raw.write_text(json.dumps(result))
+    artifacts = tmp_path / "artifacts"
+    for key, value in {"AISCI_DATA_DIR": data, "AISCIENTIST_ARTIFACTS": artifacts,
+                       "ATLAS_H5AD": source, "AISCI_ATLAS_RESULT": raw,
+                       "AISCI_ATLAS_RELEASE": "heca/v2026.11"}.items():
+        monkeypatch.setenv(key, str(value))
+    exec(atlas.COLLECT, {})
+    shown = json.loads(capsys.readouterr().out)["result"]
+    assert shown["files"] == ["gene_expression/q/dotplot_majorclass.pdf", "gene_expression/q/dotplot_majorclass.png"]
+    assert shown["file"] == "gene_expression/q/report.md"
+    assert shown["table"] == shown["full_table"] == "gene_expression/q/summary_celltype.tsv"
+    assert shown["data_dir"] == "gene_expression"
+    assert shown["queries"] == result["queries"]
+    saved = (artifacts / "gene_expression" / "mcp_result.json").read_text()
+    assert str(tmp_path) not in saved and str(data) not in saved
+    assert json.loads(saved)["file"] == "gene_expression/q/report.md"

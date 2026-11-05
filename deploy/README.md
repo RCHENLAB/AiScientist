@@ -84,7 +84,9 @@ are built from one commit. Versions are ordered as Python orders them:
    has a package, is newer than the running one and is not held, it installs it. On the production
    site the latest release is the one GitHub calls Latest (`AISCIENTIST_CHANNEL=stable`, the
    default), which is never a pre-release. It switches once no run is in progress: a restart
-   interrupts runs, so it tries again at its next start. Then it brings the skills to the pinned
+   interrupts runs, so it tries again at its next start. The running release counts its runs
+   (`aiscientist-admin active-runs`); when it cannot, the new release, which has just migrated the
+   database, counts them; when neither can, the timer waits. Then it brings the skills to the pinned
    release ([Skills releases](#skills-releases)).
 
 So a release is deployed by publishing it, and stopped by not publishing it. Nothing is copied to
@@ -130,7 +132,7 @@ app runs it at start. A database from before migrations is recorded as revision 
 time. A change to a model in `gateway/models.py` needs a revision
 (`tests/test_db_migrations.py` fails until it has one), written to only add: a new nullable column, a
 new table. The release before it then still works on the migrated database, so a rollback needs no
-downgrade.
+downgrade: a release that finds the database at a revision it does not ship leaves it as it is.
 
 **A new Python dependency** is a change to `pyproject.toml` and to `requirements.lock`
 (`scripts/lock_requirements.sh`, after `pip install uv`), then a release. A large one weighs on every

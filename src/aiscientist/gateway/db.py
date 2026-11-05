@@ -91,11 +91,17 @@ def migrate() -> tuple[str | None, str]:
     - A database created before migrations existed (tables, no ``alembic_version``) is brought to
       the baseline by the steps that created it, stamped ``0001``, then upgraded.
     - Otherwise the pending revisions run in order, in one transaction.
+    - A database at a revision this release does not ship was migrated by a newer release: it is
+      left as it is (see below).
 
     Migrations only add: a rollback to an older release keeps the newer schema, so a revision must
-    leave the database usable by the release before it (a new nullable column, a new table)."""
+    leave the database usable by the release before it (a new nullable column, a new table). That
+    release then runs on the newer schema as it is. Upgrading would fail on the unknown revision, and
+    both the app's start and ``aiscientist-admin`` call this: a rollback would start without its
+    account setup, and before a switch the running release could not count its runs."""
     from alembic import command
     from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
     from sqlalchemy import inspect
 
     from . import models  # noqa: F401
@@ -105,6 +111,13 @@ def migrate() -> tuple[str | None, str]:
     with engine.begin() as conn:
         cfg.attributes["connection"] = conn
         before = MigrationContext.configure(conn).get_current_revision()
+        if before is not None:
+            script = ScriptDirectory.from_config(cfg)
+            if before not in {rev.revision for rev in script.walk_revisions()}:
+                print(f"[db] the database is at revision {before}, which this release does not ship "
+                      f"(its newest is {script.get_current_head()}): a newer release migrated it; "
+                      "left as it is")
+                return before, before
         tables = set(inspect(conn).get_table_names())
         if before is None and not tables & set(Base.metadata.tables):
             Base.metadata.create_all(conn)

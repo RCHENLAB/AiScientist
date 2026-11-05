@@ -140,6 +140,27 @@ def test_admin_cli_migrate_and_active_runs(fresh_db, capsys, monkeypatch):
     assert admin_cli.main(["active-runs"]) == 0
     assert capsys.readouterr().out.strip() == "2"
 
+    # A deploy asks this before switching, after the new release migrated the database: it reads
+    # the count and migrates nothing.
+    monkeypatch.setattr(db, "migrate", lambda: pytest.fail("active-runs must not migrate"))
+    assert admin_cli.main(["active-runs"]) == 0
+    assert capsys.readouterr().out.strip() == "2"
+
+
+def test_a_database_a_newer_release_migrated_is_left_as_it_is(fresh_db, capsys):
+    """A rollback, or the current release asked before a switch, meets a database at a revision it
+    does not ship. migrate() and the app's start leave it as it is instead of failing on it (v0.4.2
+    on v0.4.3's revision 0005 could not count its runs, so the deploy timer never switched)."""
+    db, url = fresh_db
+    db.init_db()
+    with create_engine(url).begin() as c:
+        c.execute(text("UPDATE alembic_version SET version_num = '9999'"))
+
+    assert db.migrate() == ("9999", "9999")
+    assert "revision 9999, which this release does not ship" in capsys.readouterr().out
+    db.init_db()                                    # the app's start goes on
+    assert db.current_revision() == "9999"
+
 
 def test_0002_adds_key_fp_and_its_index_once(fresh_db):
     """A database at the baseline gets llm_calls.key_fp and its index from 0002; one that already has

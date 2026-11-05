@@ -996,7 +996,7 @@ def make_run_in_environment_tool(executor: Any,
 
     def _exec(args: dict[str, Any], ctx: HarnessContext, *,
               _atlas_bridge: bool = False, _resources: tuple | None = None,
-              _cache_dir: str = "") -> dict[str, Any]:
+              _tool_cache: bool = False) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
         from .skills import SKILLS, get_skill, refresh_skills
@@ -1027,9 +1027,10 @@ def make_run_in_environment_tool(executor: Any,
                  if folder is not None and (folder / rel).is_file()}
         workdir = "env/" + re.sub(r"[^\w.\-]", "_", skill.name)
         from .skills_registry import execute
-        # Platform callers select resources without exposing overrides to the model.
+        # Platform callers select resources and the user's tool cache; neither is in the schema, so
+        # the model cannot set them.
         cpus, mem_gb, time_limit = _resources or (skill.cpus, skill.mem_gb, skill.time_limit)
-        cache = {"cache_dir": _cache_dir} if _cache_dir else {}
+        cache = {"tool_cache": True} if _tool_cache else {}
         def run():
             if skill.registry_release:
                 import tempfile
