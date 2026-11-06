@@ -1109,6 +1109,12 @@ def delete_user(user_id: int, admin: User = Depends(require_admin)) -> dict:
         # the delete for any account that ever made a model call.
         s.execute(sa_delete(LlmCall).where(LlmCall.user_id == user_id))
         s.execute(sa_delete(UsageBudget).where(UsageBudget.user_id == user_id))
+        # Shared datasets (issue 92) outlive the account: it stops maintaining them, and the versions
+        # it published keep their files and lose only the name of who published them.
+        from .models import SharedDatasetMaintainer, SharedDatasetVersion
+        s.execute(sa_delete(SharedDatasetMaintainer).where(SharedDatasetMaintainer.user_id == user_id))
+        s.query(SharedDatasetVersion).filter(SharedDatasetVersion.published_by == user_id).update(
+            {SharedDatasetVersion.published_by: None}, synchronize_session=False)
         s.delete(user)   # cascades datasets/runs/conversations/messages
         s.commit()
     # The account's saved keys go with it, at once: an API key left on disk after its owner is gone

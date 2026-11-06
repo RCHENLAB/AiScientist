@@ -3741,7 +3741,8 @@ function storageUseText(d) {
 function retentionNoticesHtml(notices) {
   if (!notices || !notices.length) return "";
   return `<div class="store-retention" role="status"><strong>Datasets scheduled for removal</strong>` +
-    `<p>Download these datasets before their removal dates to keep a copy.</p>` + notices.map((n) => storeRowHtml({
+    `<p>Download these datasets before their removal dates to keep a copy, or use one in a run to keep it here: ` +
+    `a dataset is removed only after it has not been used in a run for the retention period.</p>` + notices.map((n) => storeRowHtml({
       name: n.dataset_name, bytes: n.size_bytes, meta: `Removal: ${fmtDay(n.removal_at, { year: true })}`,
       action: `<a class="ghost small" href="${escapeHtml(n.download_url)}" download>Download</a>`,
     })).join("") + `</div>`;
@@ -8864,7 +8865,7 @@ function adminStorageHtml(storage) {
   return `<strong>${escapeHtml(storageUseText(storage))}</strong>` +
     ((storage.due_datasets || []).map((d) => `<div class="store-meta">${escapeHtml(d.name || d.dataset_name)} · ` +
       `${escapeHtml(fmtSize(d.size_bytes == null ? d.bytes : d.size_bytes))} · ${escapeHtml(fmtDay(d.removal_at, { year: true }))}</div>`).join("") ||
-      `<div class="store-meta">No datasets due in the next 14 days.</div>`);
+      `<div class="store-meta">No datasets due for removal soon.</div>`);
 }
 // ---- Admin: skill review ----
 // Induced skills are one run's code frozen into a template; none reaches the PI or the Scientist

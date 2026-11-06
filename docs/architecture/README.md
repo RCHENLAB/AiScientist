@@ -47,7 +47,9 @@ user. A deploy is a release tag on RCHENLAB/AiScientist, which the server's depl
 ([deploy/README.md](../../deploy/README.md)).
 
 Users' data is kept on the gateway host ([dataset storage](../dataset_storage.md)); HPC3 holds a copy
-only while a session's runs need it. A session's data movement and housekeeping there go through a
+only while a session's runs need it. Datasets the lab maintains for every account, such as the eye atlas, are
+[shared datasets](../shared_datasets.md): published in immutable versions, with one read-only copy
+on each host. A session's data movement and housekeeping there go through a
 compute backend (`gateway/compute.py`: stage-in, submit, status, stage-out, clean-up), of which HPC3
 is the one implementation, and the console shows each session's state as it goes (staging in,
 running, staging out, cleaning up, closed, failed; `gateway/session_state.py`).

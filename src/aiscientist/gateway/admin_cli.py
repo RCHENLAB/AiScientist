@@ -24,6 +24,19 @@ Email (a dry run unless --send; one message per account, addressed to that accou
     aiscientist-admin email-users --subject S --body-file F [--send] [--yes]
     aiscientist-admin email-users --template key-incident [--send] [--yes]
 
+Shared datasets (RCHENLAB/AiScientist issue 92; run as the service account, which owns the store at
+AISCIENTIST_SHARED_DATASETS_ROOT; see gateway/shared_datasets.py):
+
+    aiscientist-admin shared-dataset list
+    aiscientist-admin shared-dataset create <slug> --name NAME [--description D] [--citation C]
+    aiscientist-admin shared-dataset edit <slug> [--name NAME] [--description D] [--citation C]
+    aiscientist-admin shared-dataset maintainer <slug> add|remove|list [<account>]
+    aiscientist-admin shared-dataset publish <slug> <label> --from DIR --changelog FILE --by ACCOUNT
+                                             [--facets FILE]
+    aiscientist-admin shared-dataset withdraw <slug> <label> --by ACCOUNT
+    aiscientist-admin shared-dataset verify <slug> [<label>]      # re-hash the store against the manifest
+    aiscientist-admin shared-dataset hpc-verified <slug> <label>  # after sync_shared_dataset.sh passed
+
 Run after the `auth` extra is installed and AISCIENTIST_DATABASE_URL points at the DB.
 """
 
@@ -204,6 +217,96 @@ def _email_users(args: argparse.Namespace, users: list[dict]) -> int:
     return 1 if failed else 0
 
 
+def _add_shared_dataset_parser(sub: "argparse._SubParsersAction") -> None:
+    sd = sub.add_parser("shared-dataset", help="shared datasets: create, publish and withdraw versions")
+    act = sd.add_subparsers(dest="action", required=True)
+    act.add_parser("list", help="every shared dataset, its versions and maintainers")
+    for name in ("create", "edit"):
+        p = act.add_parser(name, help=f"{name} a shared dataset (admins)")
+        p.add_argument("slug")
+        p.add_argument("--name", required=name == "create")
+        p.add_argument("--description")
+        p.add_argument("--citation")
+    m = act.add_parser("maintainer", help="who may publish a shared dataset")
+    m.add_argument("slug")
+    m.add_argument("op", choices=("add", "remove", "list"))
+    m.add_argument("account", nargs="?")
+    p = act.add_parser("publish", help="publish a prepared folder as a new, immutable version")
+    p.add_argument("slug")
+    p.add_argument("label", help="the version, e.g. v2026.11; never reused")
+    p.add_argument("--from", dest="source", required=True,
+                   help="the prepared folder, inside an allowlisted server folder")
+    p.add_argument("--changelog", required=True, help="a text file: what changed and why")
+    p.add_argument("--by", required=True, help="the publishing account: an admin or a maintainer")
+    p.add_argument("--facets", help="a JSON file mapping file names to facets (tissue, modality, ...)")
+    w = act.add_parser("withdraw", help="stop offering a version (its files stay readable)")
+    w.add_argument("slug")
+    w.add_argument("label")
+    w.add_argument("--by", required=True)
+    v = act.add_parser("verify", help="re-hash a version in the store against its manifest")
+    v.add_argument("slug")
+    v.add_argument("label", nargs="?", default="latest")
+    h = act.add_parser("hpc-verified", help="record that the version's HPC3 copy passed its checksum job")
+    h.add_argument("slug")
+    h.add_argument("label")
+
+
+def _shared_dataset_command(args: argparse.Namespace) -> int:
+    import json
+
+    from . import shared_datasets as sd
+    try:
+        if args.action == "list":
+            if sd.store_root() is None:
+                print(f"shared datasets are off ({sd.ROOT_ENV} is not set)")
+            for d in sd.dataset_views():
+                print(f"{d['slug']}: {d['name']}  latest={d['latest'] or '-'}  "
+                      f"maintainers={','.join(d['maintainers']) or '-'}")
+                for v in d["versions"]:
+                    print(f"    {v['label']:<14} {v['status']:<10} {v['n_files']:>4} files "
+                          f"{v['size_bytes'] / 1e9:8.2f} GB  {v['published_at'] or ''}"
+                          f"{'  on HPC3' if v['on_hpc3'] else ''}")
+            return 0
+        if args.action == "create":
+            print(sd.create_dataset(args.slug, args.name, description=args.description or "",
+                                    citation=args.citation or ""))
+            return 0
+        if args.action == "edit":
+            print(sd.update_dataset(args.slug, name=args.name, description=args.description,
+                                    citation=args.citation))
+            return 0
+        if args.action == "maintainer":
+            if args.op == "list":
+                print("\n".join(sd.maintainers(args.slug)) or "(none)")
+                return 0
+            if not args.account:
+                print("give the account to add or remove", file=sys.stderr)
+                return 2
+            print(", ".join(sd.set_maintainer(args.slug, args.account, add=args.op == "add")) or "(none)")
+            return 0
+        if args.action == "publish":
+            changelog = Path(args.changelog).read_text(encoding="utf-8")
+            facets = json.loads(Path(args.facets).read_text(encoding="utf-8")) if args.facets else None
+            result = sd.publish(args.slug, args.label, args.source, by=args.by, changelog=changelog,
+                                facets=facets, log=print)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.action == "withdraw":
+            print(sd.withdraw(args.slug, args.label, by=args.by))
+            return 0
+        if args.action == "verify":
+            bad = sd.verify(args.slug, args.label, log=print)
+            print("intact" if not bad else f"{len(bad)} file(s) differ from the manifest")
+            return 1 if bad else 0
+        if args.action == "hpc-verified":
+            print(sd.mark_hpc_verified(args.slug, args.label))
+            return 0
+    except sd.SharedDatasetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="aiscientist-admin", description="AiScientist account management")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -244,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     em.add_argument("--send", action="store_true", help="really send (default: print what would be sent)")
     em.add_argument("--yes", action="store_true", help="do not ask for the confirmation phrase")
     em.add_argument("--pause", type=float, default=0.5, help="seconds between two messages (default 0.5)")
+    _add_shared_dataset_parser(sub)
     args = parser.parse_args(argv)
 
     # Load the project .env (AISCIENTIST_DATABASE_URL / SECRET_KEY / ...) the same way the
@@ -306,6 +410,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "email-users":
         return _email_users(args, auth_routes.all_users())
+
+    if args.cmd == "shared-dataset":
+        return _shared_dataset_command(args)
 
     if args.cmd == "list-users":
         for u in auth_routes.all_users():

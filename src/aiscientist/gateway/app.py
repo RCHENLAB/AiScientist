@@ -1946,6 +1946,10 @@ try:
 
     app.include_router(metadata_routes.router)
     app.include_router(mcp_server.router)
+    # Shared datasets (issue 92): published for every account, read from the same database.
+    from . import shared_routes  # noqa: E402
+
+    app.include_router(shared_routes.router)
 except Exception as _auth_exc:  # noqa: BLE001 - missing extra must not break the console
     print(f"[auth] accounts disabled (install .[auth]): {type(_auth_exc).__name__}: {_auth_exc}")
 
@@ -2109,6 +2113,14 @@ async def _start_checkpoint_gc() -> None:
 async def _dataset_retention_loop() -> None:
     from . import storage_policy
     import sys
+    if _AUTH_ENABLED:
+        # Runs made before dataset use was recorded still restart their datasets' periods.
+        try:
+            changed = await asyncio.to_thread(storage_policy.backfill_last_used, CONSOLE_RUNS_DIR)
+            if changed:
+                print(f"[storage] last run use read back from earlier runs for {changed} dataset(s)")
+        except Exception as exc:  # noqa: BLE001 - maintenance must survive an unreadable run record
+            print(f"[storage] could not read dataset use from earlier runs: {type(exc).__name__}: {exc}")
     while True:
         try:
             if _AUTH_ENABLED:
@@ -13514,6 +13526,18 @@ def _decision_review(conn: Any, emit: "Callable[..., Any]", node: Any,
     return {"action": "proceed", "choice": str(v.get("feedback", "")).strip()}
 
 
+def _mark_bound_datasets_used(conn: "Connection", *paths: "list[str]") -> None:
+    """The run is using these datasets: their retention periods restart (``storage_policy.mark_used``).
+    The paths the chat holds and the ones the run reads (a dataset moved from HPC3) both count."""
+    if not (_AUTH_ENABLED and getattr(conn, "app_user_id", None)):
+        return
+    try:
+        from . import storage_policy
+        storage_policy.mark_used(conn.app_user_id, [p for group in paths for p in group])
+    except Exception as exc:  # noqa: BLE001 - retention bookkeeping never stops a run
+        print(f"[storage] could not record which datasets this run uses: {exc}")
+
+
 async def _run_lab(conn: Connection, req: LabRequest, *,
                    resume: "ResumeState | None" = None,
                    resume_run_id: str | None = None,
@@ -13599,11 +13623,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             session_meta["bound_primary"] = ((prior or {}).get("bound_primary")
                                              or (bound[0]["path"] if bound else ""))
         if resume is None and saved_state is None and bound:
+            chat_paths = [d["path"] for d in bound]
             # A dataset moved from HPC3 to this host is read from here, whatever path the chat
             # still holds for it.
             bound, moved = await asyncio.to_thread(_current_bound_paths, conn, bound)
             for line in moved:
                 say_key(line)
+            await asyncio.to_thread(_mark_bound_datasets_used, conn, chat_paths, [d["path"] for d in bound])
         continues_from_dataset = False
         if prior is not None and resume is None:
             session_meta["continues"] = prior.get("run_id")

@@ -165,8 +165,9 @@ app_loaded() {
 }
 
 switch_release() {
-  local tag="$1" version="${1#v}" old before_prev rc=0
+  local tag="$1" version="${1#v}" old before_prev from rc=0
   old="$(target_of "$CURRENT")"; before_prev="$(target_of "$PREVIOUS")"
+  from="${old:+v$old}"; from="${from:-nothing}"
   [ "$old" != "$version" ] || { echo "skills $tag is current already"; unhold "$tag"; return 0; }
   echo "==> switching skills/current -> $version"
   [ -z "$old" ] || switch_to "$PREVIOUS" "releases/$old"
@@ -174,9 +175,9 @@ switch_release() {
   unhold "$tag"
   app_loaded "$tag" || rc=$?
   case "$rc" in
-    0) echo "==> the app runs skills $tag"; log "switched ${old:+v$old}${old:-nothing} -> $tag" ;;
+    0) echo "==> the app runs skills $tag"; log "switched $from -> $tag" ;;
     2) echo "==> skills/current -> $version; no running app reports its skills release, so the next start reads it"
-       log "switched ${old:+v$old}${old:-nothing} -> $tag (not confirmed by a running app)" ;;
+       log "switched $from -> $tag (not confirmed by a running app)" ;;
     *) hold "$tag"
        if [ -n "$old" ]; then
          switch_to "$CURRENT" "releases/$old"

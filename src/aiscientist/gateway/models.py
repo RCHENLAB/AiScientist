@@ -23,7 +23,7 @@ import json as _json
 import uuid as _uuid
 
 from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String,
-                        Text, func)
+                        Text, UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -104,6 +104,9 @@ class Dataset(Base):
     kind: Mapped[str] = mapped_column(String(32), default="other")
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     uploaded_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # When a run last used it (``storage_policy.mark_used``): its retention period restarts then.
+    # NULL for a dataset no run has used since the column was added.
+    last_used_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # The chat the upload was started from (the console's conversation id), so the Datasets page can
     # say where each upload came from. NULL for data no chat started and for rows older than this.
     conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -121,6 +124,7 @@ class Dataset(Base):
             "created_at": self.uploaded_at.isoformat() if self.uploaded_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "kind": self.kind, "uploaded_at": self.uploaded_at.isoformat() if self.uploaded_at else None,
+            "last_used_at": self.last_used_at.isoformat() if self.last_used_at else None,
             "conversation_id": self.conversation_id,
         }
 
@@ -139,6 +143,77 @@ class DatasetRetention(Base):
     notice_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True))
     removal_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True))
     removed_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# --- shared datasets (RCHENLAB/AiScientist issue 92) ---------------------------------------------
+# A dataset the lab maintains for every account: it has no owner, its maintainers publish it in
+# immutable versions, and its files live in the shared-datasets store (gateway/shared_datasets.py),
+# never in an account's storage. Paths are not stored: they follow from slug and label.
+
+
+class SharedDataset(Base):
+    __tablename__ = "shared_datasets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    uuid: Mapped[str] = mapped_column(String(36), default=lambda: str(_uuid.uuid4()), unique=True)
+    slug: Mapped[str] = mapped_column(String(40), unique=True)          # "heca": the folder name
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, default="")
+    citation: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SharedDatasetVersion(Base):
+    """One published version. ``status`` only moves forward: ``publishing`` (files being copied),
+    ``published``, ``withdrawn`` (kept readable, never offered again). ``hpc_verified_at`` is set
+    once the HPC3 copy has passed its checksum job."""
+
+    __tablename__ = "shared_dataset_versions"
+    __table_args__ = (UniqueConstraint("dataset_id", "label"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    uuid: Mapped[str] = mapped_column(String(36), default=lambda: str(_uuid.uuid4()), unique=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("shared_datasets.id", ondelete="CASCADE"), index=True)
+    label: Mapped[str] = mapped_column(String(40))                      # "v2026.11": the folder name
+    status: Mapped[str] = mapped_column(String(16), default="publishing")
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    changelog: Mapped[str] = mapped_column(Text, default="")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    n_files: Mapped[int] = mapped_column(Integer, default=0)
+    published_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    published_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    withdrawn_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hpc_verified_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SharedDatasetFile(Base):
+    """One file of a version, as its manifest lists it. ``facets`` is JSON: tissue, modality and,
+    for an .h5ad, n_obs, n_vars and the obs column names."""
+
+    __tablename__ = "shared_dataset_files"
+    __table_args__ = (UniqueConstraint("version_id", "name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version_id: Mapped[int] = mapped_column(
+        ForeignKey("shared_dataset_versions.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(512))                      # relative to the version folder
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    facets: Mapped[str] = mapped_column(Text, default="{}")
+
+
+class SharedDatasetMaintainer(Base):
+    """An account that may publish and withdraw versions of one shared dataset. Admins appoint them."""
+
+    __tablename__ = "shared_dataset_maintainers"
+
+    dataset_id: Mapped[int] = mapped_column(
+        ForeignKey("shared_datasets.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True, index=True)
+    added_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Run(Base):

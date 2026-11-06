@@ -434,6 +434,11 @@ def test_skills_are_installed_checked_switched_and_rolled_back(server):
     assert server.link("current", "skills") == "0.1.0" and '"skills":"v0.1.0"' in server.served()
     assert "v0.2.0  <- previous  (held)" in server.run("--list", script=SKILLS_SCRIPT).stdout
 
+    log = [line.split(" ", 1)[1] for line in (server.root / "logs" / "deploy.log").read_text().splitlines()
+           if " skills " in line]
+    assert "skills switched nothing -> v0.1.0" in log and "skills switched v0.1.0 -> v0.2.0" in log
+    assert "skills rolled back v0.2.0 -> v0.1.0; v0.2.0 held" in log
+
 
 def test_a_skills_release_that_fails_its_check_is_never_installed(server):
     server.skills_package("v0.4.0", catalog_version="0.3.9")      # the catalog of another release

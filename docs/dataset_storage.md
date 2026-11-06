@@ -3,6 +3,9 @@
 Where users' datasets live, how they reach HPC3 when a run needs them there, and how they are
 removed.
 
+Datasets the lab maintains for every account are kept apart, in their own store, and none of
+this page applies to them: see [shared datasets](shared_datasets.md).
+
 ## Where data is kept
 
 With a data root (`AISCIENTIST_DATA_ROOT`, or `DATA_ROOT`) on a volume outside the code directory,
@@ -88,22 +91,25 @@ limit would be exceeded, saving is skipped and the run reply explains why. The a
 and its reports and files remain under Runs. A local result already counted under Runs is moved
 without counting its bytes twice; a copy adds to the account's use.
 
-`AISCIENTIST_DATASET_RETENTION_DAYS` sets dataset retention from its addition date (90 days by
-default; 0 keeps datasets until their owner deletes them). Files → Datasets and Account → Storage
-show each removal date. Run outputs are counted toward the limit but are not removed by age.
-Shared folder pointers are never removed by retention.
+`AISCIENTIST_DATASET_RETENTION_DAYS` sets how long a dataset is kept (90 days by default; 0 keeps
+datasets until their owner deletes them). The period starts when the dataset was added or, if later,
+when a run last used it: every run that binds a dataset restarts its period (`datasets.last_used_at`;
+at start the gateway also reads the inputs of earlier runs from their `artifacts/croissant.json`).
+A run result saved to Datasets is a dataset of its own, with its own period from when it was saved.
+Files → Datasets and Account → Storage show each removal date. Run outputs under Runs are counted
+toward the limit but are not removed by age. Shared folder pointers are never removed by retention.
 
-The hourly background sweep sends an email and records a notice visible on the site, listing the
-dataset, size, removal date and Download link. `AISCIENTIST_DATASET_NOTICE_DAYS` defaults to 14;
-the minimum notice is 14 days. SMTP, the owner's email and `AISCIENTIST_PUBLIC_URL` must be
-configured for a successful notice. A failed or missing email prevents removal; an overdue dataset
-gets a full notice period after successful delivery. Removal uses the same file and registry deletion
-as Delete, including the session's HPC3 copy, and leaves the chats themselves intact. Inputs of an
-active analysis or waiting plan are kept until they are no longer in use. Account → Storage shows
-the removal history (dataset, size, owner and date). Admin shows account use against the limit and
-datasets due within the next 14 days.
-
-Using a dataset does not restart its retention period.
+The hourly background sweep records a notice visible on the site `AISCIENTIST_DATASET_NOTICE_DAYS`
+before removal (7 by default, and at least 7), listing the dataset, size, removal date and Download
+link, and emails it to the owner. An account with an email address is removed only after that email
+was delivered, so SMTP and `AISCIENTIST_PUBLIC_URL` must be configured; a failed send is retried the
+next hour, and an overdue dataset gets a full notice period after delivery. An account with no email
+address gets the notice on the site only. Using a dataset in a run withdraws a waiting notice. Removal
+uses the same file and registry deletion as Delete, including the session's HPC3 copy, and leaves the
+chats themselves intact; the owner then gets a second email saying what was removed. Inputs of an
+active analysis or waiting plan are kept until they are no longer in use. Account → Storage shows the
+removal history (dataset, size, owner and date). Admin shows account use against the limit and the
+datasets due within the notice period.
 
 ## When a run needs the data on HPC3
 

@@ -11,6 +11,8 @@ root (``AISCIENTIST_HPC_SHARED_ROOT``)::
     │                              the atlas bridge's HGNC table)
     ├── containers/                images
     ├── models/                    model weights
+    ├── datasets/<slug>/<label>/   shared datasets, one read-only copy per version, never swept
+    │                              (gateway/shared_datasets.py, deploy/hpc3/sync_shared_dataset.sh)
     └── sessions/<session-uuid>/   one session, removed once its results are on the server
         ├── manifest.json          session, account, HPC3 user, app version, when it started
         ├── app/                   the AiScientist package its jobs import
@@ -42,6 +44,7 @@ import re
 from dataclasses import dataclass
 
 ENVS, CONTAINERS, MODELS, SESSIONS = "envs", "containers", "models", "sessions"
+DATASETS = "datasets"
 TOOL_CACHE = "tool-cache"
 # Retired: nothing new is written there. Removed once empty (see the cutover plan).
 LEGACY = ("Temp", "uploads", "pysrc", "bin", "pkgs", "pydeps")
@@ -86,6 +89,11 @@ def containers_dir(root: str) -> str:
 
 def models_dir(root: str) -> str:
     return f"{_root(root)}/{MODELS}"
+
+
+def datasets_dir(root: str) -> str:
+    """Shared datasets: ``datasets/<slug>/<label>/``, one read-only copy of each published version."""
+    return f"{_root(root)}/{DATASETS}"
 
 
 def package_cache_root(root: str) -> str:

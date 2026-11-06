@@ -162,11 +162,14 @@ def current_revision() -> str | None:
 def _legacy_upgrade(bind) -> None:
     """How a database got its newer columns before migrations: each an idempotent ADD COLUMN
     (``create_all`` never alters an existing table), then a backfill of the dataset identity columns
-    (issue 5). Kept so a database of that time reaches the baseline; a new column is a migration."""
+    (issue 5). Kept so a database of that time reaches the baseline. A column a later migration adds
+    to an existing table is listed here too: without Alembic, init_db runs only this, and a host
+    whose table predates the column would fail on its first write (tests/test_dataset_storage.py)."""
     _ensure_columns(bind, "runs", {"conversation_id": "VARCHAR(64)"})
     _ensure_columns(bind, "datasets", {
         "conversation_id": "VARCHAR(64)",
         "uuid": "VARCHAR(36)", "status": "VARCHAR(24)", "updated_at": "TIMESTAMP",
+        "last_used_at": "TIMESTAMP",   # revision 0007
     })
     _ensure_columns(bind, "metadata_records", {"description": "TEXT"})
     _ensure_columns(bind, "llm_calls", {

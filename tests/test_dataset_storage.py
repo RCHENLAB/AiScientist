@@ -149,6 +149,36 @@ def test_additive_legacy_schema_backfill(storage):
         assert session.get(models.Dataset, 1).uuid == first_uuid
 
 
+def test_every_column_a_migration_adds_is_added_without_alembic():
+    """Without Alembic, init_db creates the missing tables and runs ``db._legacy_upgrade`` only, so a
+    column a migration adds to an existing table has to be listed there as well."""
+    import ast
+    import inspect
+    from pathlib import Path
+
+    from aiscientist.gateway import db
+    listed: dict[str, set[str]] = {}
+    for node in ast.walk(ast.parse(inspect.getsource(db._legacy_upgrade))):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_ensure_columns":
+            listed.setdefault(node.args[1].value, set()).update(k.value for k in node.args[2].keys)
+    added = set()
+    for path in sorted((Path(db.__file__).parent / "migrations" / "versions").glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.With):      # with op.batch_alter_table("t") as batch: batch.add_column(...)
+                call = node.items[0].context_expr
+                if isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "batch_alter_table":
+                    for inner in ast.walk(node):
+                        if isinstance(inner, ast.Call) and getattr(inner.func, "attr", "") == "add_column":
+                            added.add((call.args[0].value, inner.args[0].args[0].value))
+            elif (isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "add_column"
+                  and getattr(node.func.value, "id", "") == "op"):    # op.add_column("t", sa.Column(...))
+                added.add((node.args[0].value, node.args[1].args[0].value))
+    assert ("llm_calls", "key_fp") in added and ("datasets", "last_used_at") in added
+    missing = sorted((t, c) for t, c in added if c not in listed.get(t, set()))
+    assert missing == [], f"add these to db._legacy_upgrade: {missing}"
+
+
 def test_reconcile_preserves_remote_and_bound_rows(storage, tmp_path):
     store, routes, db, models, uid = storage
     remote = routes.record_dataset(uid, "remote", "/dfs3b/lab/remote/file.h5ad", 1, "h5ad")

@@ -25,6 +25,8 @@ HPC3 holds environments, images, model weights and one folder per session
 │                             tool-cache/<hpc-user>/ (what tools keep between a user's runs)
 ├── containers/               images (hpc3_assets.md)
 ├── models/                   model weights: hf/ (the Hugging Face cache), scgpt/, vlreview/
+├── datasets/<slug>/<label>/  shared datasets: one read-only copy of each published version, and
+│                             latest (shared_datasets.md)
 └── sessions/<session-uuid>/  one session; the folder name is the session's id
     ├── manifest.json         session and account ids, HPC3 user, app version and commit, when it
     │                         started, when it is removed
@@ -49,6 +51,7 @@ create its folder there, and no one can remove another's. A session folder is it
 Never deleted automatically:
 
 * `envs/`, `containers/`, `models/`: the built assets.
+* `datasets/`: the shared datasets' published versions ([shared datasets](shared_datasets.md)).
 * `/dfs3b/ruic20_lab/<ucinetid>/`: each member's personal folder.
 * `$HOME/.bioagent/`: the vLLM serve job's own files, `serve.<partition>.sbatch`,
   `vllm.<jobid>.port` and `vllm.<jobid>.spec` (how the gateway finds and steers a running serve
