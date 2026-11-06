@@ -112,15 +112,23 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
         if set(args) - set(schema["properties"]) or any(k not in args for k in schema["required"]):
             return {"status": "error", "error": "Unexpected or missing atlas tool arguments"}
         atlas = str(getattr(executor, "dataset_path", "") or "")
+        # A file bound as server data reaches HPC3 as this session's copy, whose path is new each
+        # session: the file it was copied from is the one that has to be listed.
+        source = str(getattr(executor, "dataset_source", "") or "")
         configured = {}
         for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
             label, sep, path = entry.strip().partition("=")
             if sep and label and path.startswith("/") and label.lower().split("/")[-1] != "latest":
                 configured[posixpath.normpath(path)] = label
-        version = configured.get(posixpath.normpath(atlas))
+        version = configured.get(posixpath.normpath(atlas)) if atlas else None
+        if not version and atlas and source:
+            version = configured.get(posixpath.normpath(source))
+        else:
+            source = ""
         if not version:
             return {"status": "error", "error": "Attach a primary dataset listed in AISCIENTIST_ATLAS_FILES"}
-        if args.get("atlas") and posixpath.normpath(args["atlas"]) != posixpath.normpath(atlas):
+        if args.get("atlas") and posixpath.normpath(args["atlas"]) not in {
+                posixpath.normpath(p) for p in (atlas, source) if p}:
             return {"status": "error", "error": "atlas must be the attached primary dataset"}
         command = (
             'export ATLAS_H5AD="$AISCIENTIST_DATASET"\n'
@@ -150,7 +158,8 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
         except (ValueError, KeyError, TypeError) as exc:
             return {**out, "status": "error", "error": f"Invalid atlas MCP response: {exc}"}
         from . import run_manifest
-        run_manifest.update(ctx, lambda doc: doc.update(atlas=provenance))
+        recorded = {**provenance, "copied_from": source} if source else provenance
+        run_manifest.update(ctx, lambda doc: doc.update(atlas=recorded))
         out.pop("stdout", None)
         response = {**out, **result, "atlas": provenance}
         if result.get("state") in {"FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}:

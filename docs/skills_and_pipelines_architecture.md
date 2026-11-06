@@ -347,15 +347,19 @@ CRALBP -> RLBP1 (alias), ABCR -> ABCA4 (previous symbol), rho -> RHO (case), and
 any unresolved or ambiguous names from the server. Report donor support with
 expression claims; these are descriptive summaries, not differential tests.
 
-Attach the HECA `.h5ad` as the primary dataset at its shared, immutable path on
-HPC3, visible to the compute nodes. The executor binds that dataset read-only;
-the bridge neither copies it nor accepts an alternative atlas path. Provisioning
-shared HECA versions and mounting Eye Server storage on HPC3 are deployment work
-from issue 92, not performed by this bridge. Set `AISCIENTIST_ATLAS_FILES` to a
-semicolon-separated mapping, for example
+Attach the HECA `.h5ad` as the primary dataset, either at its shared, immutable
+path on HPC3, visible to the compute nodes, or as a read-only file bound as
+server data on the gateway host. A server file reaches HPC3 as the session's own
+copy, at a path that changes with every session; the executor keeps the file it
+was copied from (`dataset_source`), and the bridge accepts the copy when that
+file is listed. The executor binds the dataset read-only; the bridge does not
+copy it itself. Provisioning shared HECA versions is issue 92. Set
+`AISCIENTIST_ATLAS_FILES` to a semicolon-separated mapping, for example
 `heca/v2026.11=/shared/heca/v2026.11/HRCA_snRNA_allcells.h5ad`.
-The primary dataset must match a configured path after POSIX path normalization;
-the matched entry supplies the immutable release label.
+The primary dataset, or the server file it was copied from, must match a
+configured path after POSIX path normalization; the matched entry supplies the
+immutable release label, and `manifest.json` records a server file as
+`copied_from`.
 Each successful call records the label, resolved path, size and mtime in the
 run's `manifest.json`, alongside the skill release and image provenance. The
 label must describe that file's actual immutable release; size and mtime are

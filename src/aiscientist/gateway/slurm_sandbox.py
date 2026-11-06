@@ -88,6 +88,10 @@ class SlurmCodeExecutor:
     # exposed as AISCIENTIST_DATASET_ROOT. Binding only the primary FILE hid the rest of the
     # delivery: a snippet could not open the raw matrix sitting next to the filtered one.
     dataset_root: str | None = None
+    # When ``dataset_path`` is this session's copy of a file bound as server data on the gateway
+    # host: that file's path there. Not bound or read by the job; a tool that accepts only listed
+    # files (the atlas bridge) checks it, since the copy's own path changes with every session.
+    dataset_source: str | None = None
     # Eyeserver-local dir to mirror the job's artifacts back into (the report bundler is still on the
     # host). NOT bind-mounted — only a get_file target — so a local path here is correct. None → no sync.
     local_artifacts: str | None = None

@@ -229,6 +229,43 @@ def test_configured_paths_are_normalized_and_supply_the_release(release, monkeyp
     assert tools(runner)["resolve_genes"].executor({"genes": GENES}, None)["status"] == "error"
 
 
+SERVER_FILE = "/data/Users/shared/heca/HRCA_snRNA_allcells.h5ad"
+SESSION_COPY = "/dfs/sessions/abc123/server-data/heca/HRCA_snRNA_allcells.h5ad"
+
+
+def test_a_session_copy_of_a_listed_server_file_is_accepted(release, monkeypatch, tmp_path):
+    """A file bound as server data reaches HPC3 as this session's copy, at a new path each
+    session: the file it was copied from is the one that has to be listed."""
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "heca/v2026.11=" + SERVER_FILE)
+    runner = Runner()
+    runner.dataset_path = SESSION_COPY
+    runner.dataset_source = SERVER_FILE
+    ctx = HarnessContext(workspace=tmp_path)
+    result = tools(runner)["resolve_genes"].executor({"genes": GENES, "atlas": SERVER_FILE}, ctx)
+    assert result["status"] == "ok"
+    command = runner.calls[0][0]
+    assert "AISCI_ATLAS_RELEASE=heca/v2026.11" in command
+    assert 'ATLAS_H5AD="$AISCIENTIST_DATASET"' in command      # the job reads its HPC3 copy
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["atlas"]["copied_from"] == SERVER_FILE
+    assert "copied_from" not in result["atlas"]                # no server path in the reply
+    # The copy's own path is accepted too, and nothing else is.
+    assert tools(runner)["resolve_genes"].executor({"genes": GENES, "atlas": SESSION_COPY}, ctx)["status"] == "ok"
+    assert tools(runner)["resolve_genes"].executor({"genes": GENES, "atlas": "/other.h5ad"}, ctx)["status"] == "error"
+
+
+def test_an_unlisted_server_file_or_a_source_without_a_copy_is_refused(release, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", "heca/v2026.11=" + SERVER_FILE)
+    runner = Runner()
+    runner.dataset_path = SESSION_COPY
+    runner.dataset_source = "/data/Users/shared/heca/some_other.h5ad"
+    assert tools(runner)["resolve_genes"].executor({"genes": GENES}, None)["status"] == "error"
+    runner.dataset_path = None                                 # nothing on HPC3 to read
+    runner.dataset_source = SERVER_FILE
+    assert tools(runner)["resolve_genes"].executor({"genes": GENES}, None)["status"] == "error"
+    assert not runner.calls
+
+
 CACHE = "/dfs/envs/tool-cache/tester"
 
 

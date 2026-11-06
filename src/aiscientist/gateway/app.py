@@ -11340,6 +11340,8 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
         resume_decisions["dataset_path"] = state["dataset_path"]
     if state.get("hpc_primary"):
         resume_decisions["hpc_primary"] = state["hpc_primary"]
+    if state.get("server_primary"):
+        resume_decisions["server_primary"] = state["server_primary"]
     if state.get("datasets"):
         # Restore the multi-file BIND-SET so a resumed step sees every bound file, not just the primary.
         resume_decisions["datasets"] = state["datasets"]
@@ -13100,6 +13102,9 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         # shared-mounted deployment).
         dataset_path=os.environ.get("AISCIENTIST_HPC_DATASET") or rc_remote_ds,
         dataset_root=decisions.get("hpc_dataset_root"),
+        # The server file a per-session copy above was made from (None for an HPC3 upload).
+        dataset_source=(decisions.get("server_primary") if not os.environ.get("AISCIENTIST_HPC_DATASET")
+                        and rc_remote_ds == decisions.get("hpc_primary") else None),
         work_dir=os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work",
         artifacts_dir=os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{rc_remote_ws}/artifacts",
         local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
@@ -13222,6 +13227,8 @@ def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: di
         state["dataset_path"] = str(decisions.get("dataset_path") or "") or None
         if decisions.get("hpc_primary"):
             state["hpc_primary"] = decisions["hpc_primary"]
+        if decisions.get("server_primary"):
+            state["server_primary"] = decisions["server_primary"]
         if decisions.get("datasets"):
             # The multi-file BIND-SET (feature ②): persist the whole set of staged records so a resume
             # re-enters with every bound file (not just the primary). Legacy single-file runs have one
@@ -13750,6 +13757,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                         hpc_file = _mirror_of(server_mirrors, primary_path, primary)
                         if hpc_file:
                             decisions["hpc_primary"] = hpc_file
+                            # The file the HPC3 copy was made from, for a tool that only accepts
+                            # listed files (the atlas bridge, AISCIENTIST_ATLAS_FILES).
+                            decisions["server_primary"] = str(primary)
                 else:
                     emit("info", "lab", f"Folder {primary_name}/ has no recognized dataset file (.h5ad/.h5/.loom/.csv/.vcf/.vcf.gz) — the agent can still read its files via run_code (AISCIENTIST_UPLOADS).")
                     say_key(f"📂 Loaded folder: {primary_name}/ (no primary dataset auto-detected)")
@@ -13765,6 +13775,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 decisions["dataset_path"] = str(p)
                 if primary_path in server_mirrors:
                     decisions["hpc_primary"] = _mirror_of(server_mirrors, primary_path)
+                    decisions["server_primary"] = str(p)
             else:
                 emit("warning", "lab", f"Dataset not found: {p} — {_no_data_warning}")
                 say_key(f"⚠ Dataset not found: {p.name} — analysis will have no data figures.", "warning")
