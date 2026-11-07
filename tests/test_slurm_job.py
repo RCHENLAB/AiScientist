@@ -124,6 +124,30 @@ def test_container_exec_mounts_dataset_readonly_and_contains():
     assert "--nv" not in cmd                            # CPU job, no GPU passthrough
 
 
+def test_a_skill_image_job_gets_the_images_own_path_back_after_the_login_shell(tmp_path):
+    """`bash -lc` resets PATH from /etc/profile; a pulled Docker image (the atlas MCP server keeps
+    its CLI in /opt/conda/bin) then fails with "command not found". The skill-image job re-runs the
+    image's environment scripts first and keeps the login PATH behind them."""
+    import shlex
+    import subprocess
+    from aiscientist.gateway.slurm_job import IMAGE_ENV_RESTORE
+    cmd = container_exec("/img.sif", "aiscientist-mcp --help", cleanenv=True)
+    inner = shlex.split(cmd)[-1]
+    assert inner.startswith(IMAGE_ENV_RESTORE + "; ")
+    assert inner.endswith("aiscientist-mcp --help")
+    assert IMAGE_ENV_RESTORE not in container_exec("/img.sif", "python x.py")   # other jobs as before
+    # The line itself, in a shell: an image env script that sets PATH absolutely (as Docker's does)
+    # wins, a later one prepends, and the login PATH stays reachable behind them.
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "10-docker.sh").write_text('export PATH="/opt/conda/bin:/usr/bin"\n')
+    (env_dir / "90-extra.sh").write_text('export PATH="/opt/extra/bin:$PATH"\n')
+    script = IMAGE_ENV_RESTORE.replace("/.singularity.d/env", str(env_dir)) + '; echo "$PATH"'
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True,
+                         env={"PATH": "/usr/local/bin:/usr/bin:/bin"}).stdout.strip()
+    assert out == "/opt/extra/bin:/opt/conda/bin:/usr/bin:/usr/local/bin:/usr/bin:/bin"
+
+
 def test_build_analysis_script_has_sbatch_headers():
     inner = container_exec("/img.sif", "python x.py")
     script = build_analysis_script(

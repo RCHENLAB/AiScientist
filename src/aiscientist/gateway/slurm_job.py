@@ -239,6 +239,16 @@ def slurm_time_to_seconds(hms: str, default: int = 7200) -> int:
 
 # --- Container command builder ----------------------------------------------
 
+# The job runs ``bash -lc``, and a login shell's /etc/profile resets PATH. A pulled Docker image
+# then loses what its ENV put there: the atlas MCP image keeps ``aiscientist-mcp`` in
+# /opt/conda/bin, and the job failed with "command not found". This re-runs the image's own
+# environment scripts (what Apptainer runs when the container starts) after the profile, then keeps
+# the login PATH behind them, so nothing either one adds is lost. Checked on HPC3 with the atlas,
+# CellQC and analysis images: the atlas CLI is found, and the others resolve as before.
+IMAGE_ENV_RESTORE = ('_aisci_login_path="$PATH"; for _f in /.singularity.d/env/*.sh; do '
+                     '[ -r "$_f" ] && . "$_f"; done; export PATH="$PATH:$_aisci_login_path"; '
+                     'unset _f _aisci_login_path')
+
 
 def container_exec(
     image: str,
@@ -255,7 +265,8 @@ def container_exec(
 
     - ``--containall`` hides every host path except the explicit binds (no $HOME, /tmp).
     - ``cleanenv`` also states ``--cleanenv`` explicitly (``--containall`` implies it), for the
-      registry skills whose job must carry no host environment.
+      registry skills whose job must carry no host environment, and restores the image's own
+      environment after the login shell (:data:`IMAGE_ENV_RESTORE`).
     - ``--writable-tmpfs`` gives an ephemeral writable overlay, discarded on exit.
     - ``binds_ro`` (the dataset) mount **read-only** — contained code cannot delete or
       modify the raw data; ``binds_rw`` (work/artifacts) are writable for outputs.
@@ -272,6 +283,8 @@ def container_exec(
         parts += ["-B", f"{p}:{p}:ro"]
     for p in binds_rw:
         parts += ["-B", f"{p}:{p}"]
+    if cleanenv:
+        command = f"{IMAGE_ENV_RESTORE}; {command}"
     parts += [image, "bash", "-lc", shlex.quote(command)]
     return " ".join(parts)
 
