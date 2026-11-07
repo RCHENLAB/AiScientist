@@ -5,21 +5,18 @@ owns gene resolution and analysis; the existing executor owns Slurm and transfer
 """
 from __future__ import annotations
 
-import json
 import os
 import posixpath
 import shlex
-from typing import Any
+from typing import Any, Callable
+
+from .mcp_bridge import READ_RESULT, PreparedCall
 
 SKILL = "explore-atlas-expression-with-aiscientist-mcp"
 
 # Runs inside the image after a successful CLI call. Checkpoints stay in work/;
 # only deliverables enter artifacts/, which the executor mirrors to the website.
-COLLECT = '''import json, os, shutil
-from pathlib import Path
-result = json.loads(Path(os.environ["AISCI_ATLAS_RESULT"]).read_text())
-if isinstance(result, list):
-    result = json.loads("".join(result))
+COLLECT = READ_RESULT + '''import shutil
 root = Path(os.environ["AISCI_DATA_DIR"]) / "atlas-expression-exploration"
 dest = Path(os.environ["AISCIENTIST_ARTIFACTS"]) / "gene_expression"
 # The server answers with absolute HPC3 paths. Name each by where the run's results keep it
@@ -74,33 +71,8 @@ print(json.dumps({"result": result, "atlas": {"path": str(atlas.resolve()),
 '''
 
 
-def _schema(properties: dict, required: tuple = ()) -> dict:
-    return {"type": "object", "properties": properties, "required": list(required),
-            "additionalProperties": False}
-
-
-S = {"type": "string"}
-QUERY = {"query_id": S}
-TOOLS = {
-    "resolve_genes": ("Resolve names first; report aliases, previous symbols, case and ambiguity.",
-                      _schema({"genes": S, "atlas": S}, ("genes",))),
-    "submit_query": ("Load the full atlas once for all genes on a 300 GB Slurm node. Inline: returns when complete.",
-                     _schema({"genes": S, "atlas": S, "rerun": {"type": "boolean"}}, ("genes",))),
-    "query_status": ("Check query state; only analyze COMPLETED queries.", _schema(QUERY, ("query_id",))),
-    "get_summary": ("Donor-aware descriptive CP10k summary; report n_donors and frac_donors_detected.",
-                    _schema({**QUERY, "level": {"type": "string", "enum": ["majorclass", "celltype", "region_class"]},
-                             "gene": S, "top": {"type": "integer"}}, ("query_id",))),
-    "plot_dotplot": ("Write PDF and PNG dotplots by class and cell type.", _schema(QUERY, ("query_id",))),
-    "plot_violin": ("Write PDF and PNG violin plots.", _schema({**QUERY, "groupby": S}, ("query_id",))),
-    "plot_featureplot": ("Write PDF and PNG UMAP feature plots.", _schema(QUERY, ("query_id",))),
-    "write_report": ("Write report.md with resolution, donor support, figures and caveats.", _schema(QUERY, ("query_id",))),
-    "list_queries": ("List this run's atlas queries and states.", _schema({})),
-}
-
-
 def configured_atlases() -> dict[str, str]:
-    """``{normalized path: release label}`` from ``AISCIENTIST_ATLAS_FILES`` (``label=path;…``).
-    An entry without an absolute path, or labelled ``latest``, is ignored."""
+    """Normalized absolute atlas paths and pinned labels from deployment configuration."""
     configured = {}
     for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
         label, sep, path = entry.strip().partition("=")
@@ -110,30 +82,29 @@ def configured_atlases() -> dict[str, str]:
 
 
 def direct_call_refusal() -> str:
-    """What ``run_in_environment`` answers when asked to run this skill itself."""
+    """Keep raw shell access closed, including deployments with no usable atlas."""
     if configured_atlases():
-        return "Use the atlas bridge tools: " + ", ".join(TOOLS)
+        from .mcp_bridge import protected_skill_tools
+        return "Use the atlas bridge tools: " + ", ".join(protected_skill_tools(SKILL))
     return ("Atlas expression is not set up on this deployment: no atlas is listed in "
             "AISCIENTIST_ATLAS_FILES.")
 
 
-def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
-    """Expose all nine tools only with an installed, allowed skill, an image runner and at least one
-    configured atlas: without one every call would fail, so the planner is not offered them."""
-    from .skills import get_skill
-    from .research_harness import HarnessTool
+class AtlasAdapter:
+    """Atlas-specific bindings and outputs; transport and tool schemas live in mcp_bridge."""
 
-    skill = get_skill(SKILL)
-    if environment_tool is None or skill is None or not skill.image or not configured_atlases():
-        return []
+    def __init__(self, *, planner_name: Callable[[str], str]):
+        flow = " -> ".join(planner_name(name) for name in
+                           ("resolve_genes", "submit_query", "query_status", "get_summary"))
+        plots = ", ".join(planner_name(name) for name in ("plot_dotplot", "plot_violin", "plot_featureplot"))
+        self.description = (
+            f" Flow: {flow}, {plots} -> {planner_name('write_report')}. "
+            "Use these typed tools; run_in_environment refuses this skill. "
+            "Uses the attached atlas read in place; outputs appear in gene_expression/. "
+            "The outer Slurm job owns scheduling; submit_query uses inline and returns when complete.")
 
-    def call(name: str, args: dict, ctx: Any) -> dict:
-        schema = TOOLS[name][1]
-        if set(args) - set(schema["properties"]) or any(k not in args for k in schema["required"]):
-            return {"status": "error", "error": "Unexpected or missing atlas tool arguments"}
+    def prepare(self, args: dict, executor: Any) -> PreparedCall:
         atlas = str(getattr(executor, "dataset_path", "") or "")
-        # A file bound as server data reaches HPC3 as this session's copy, whose path is new each
-        # session: the file it was copied from is the one that has to be listed.
         source = str(getattr(executor, "dataset_source", "") or "")
         configured = configured_atlases()
         version = configured.get(posixpath.normpath(atlas)) if atlas else None
@@ -141,52 +112,35 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
             version = configured.get(posixpath.normpath(source))
         else:
             source = ""
-        if not version:
-            return {"status": "error", "error": "Attach a primary dataset listed in AISCIENTIST_ATLAS_FILES"}
+        if not atlas.endswith(".h5ad") or not version:
+            raise ValueError("Attach a primary .h5ad dataset listed in AISCIENTIST_ATLAS_FILES")
         if args.get("atlas") and posixpath.normpath(args["atlas"]) not in {
                 posixpath.normpath(p) for p in (atlas, source) if p}:
-            return {"status": "error", "error": "atlas must be the attached primary dataset"}
-        command = (
-            'export ATLAS_H5AD="$AISCIENTIST_DATASET"\n'
-            'export AISCI_DATA_DIR="$AISCIENTIST_ENV_DIR" AISCI_EXECUTOR=inline\n'
-            f"export AISCI_ATLAS_RELEASE={shlex.quote(version)}\n"
-            # The HGNC table in this user's tool cache, downloaded by their first call; without
-            # a cache the server keeps it in this run's folder.
-            'if [ -n "${AISCIENTIST_TOOL_CACHE:-}" ]; then\n'
-            '  export ATLAS_HGNC="$AISCIENTIST_TOOL_CACHE/atlas-expression/hgnc_complete_set.txt"\n'
-            'fi\n'
-            'export AISCI_ATLAS_RESULT=$(mktemp "$AISCIENTIST_ENV_DIR/.atlas-result.XXXXXX")\n'
-            'trap \'rm -f "$AISCI_ATLAS_RESULT"\' EXIT\n'
-            'aiscientist-mcp --server atlas-expression-exploration-mcp --timeout 15000 call '
-            f'{name} {shlex.quote(json.dumps(args))} > "$AISCI_ATLAS_RESULT" || exit $?\n'
-            "python - <<'AISCI_ATLAS_COLLECT'\n" + COLLECT + "AISCI_ATLAS_COLLECT\n")
-        out = environment_tool.executor(
-            {"skill": SKILL, "command": command}, ctx, _atlas_bridge=True,
-            _resources=None if name == "submit_query" else (2, 16, "00:30:00"), _tool_cache=True)
-        if out.get("status") != "ok":
-            return out
-        try:
-            payload = json.loads(out.get("stdout", ""))
-            result = payload["result"]
-            if not isinstance(result, dict):
-                raise ValueError("MCP result is not an object")
-            provenance = payload["atlas"]
-        except (ValueError, KeyError, TypeError) as exc:
-            return {**out, "status": "error", "error": f"Invalid atlas MCP response: {exc}"}
+            raise ValueError("atlas must be the attached primary dataset")
+        setup = ('export ATLAS_H5AD="$AISCIENTIST_DATASET"\n'
+                 f"export AISCI_ATLAS_RELEASE={shlex.quote(version)}\n"
+                 'if [ -n "${AISCIENTIST_TOOL_CACHE:-}" ]; then\n'
+                 '  export ATLAS_HGNC="$AISCIENTIST_TOOL_CACHE/atlas-expression/hgnc_complete_set.txt"\n'
+                 'fi\n')
+        # Both the source path and its session copy are accepted above. Let the
+        # server read its bound copy through ATLAS_H5AD, never the source host path.
+        arguments = {key: value for key, value in args.items() if key != "atlas"}
+        return PreparedCall(arguments, setup, COLLECT, tool_cache=True, context={"copied_from": source})
+
+    def finish(self, out: dict, payload: dict, ctx: Any, prepared: PreparedCall) -> dict:
         from . import run_manifest
+        result, provenance = payload["result"], payload["atlas"]
+        if not isinstance(provenance, dict):
+            raise ValueError("Invalid atlas provenance")
+        source = prepared.context.get("copied_from")
         recorded = {**provenance, "copied_from": source} if source else provenance
         run_manifest.update(ctx, lambda doc: doc.update(atlas=recorded))
-        out.pop("stdout", None)
-        response = {**out, **result, "atlas": provenance}
+        # Preserve the old flat Atlas API without allowing tool data to replace
+        # trusted execution status, artifacts or image provenance.
+        reserved = {"status", "error", "stdout", "stderr", "returncode", "artifacts", "provenance",
+                    "environment", "execution_mode", "skill", "mcp", "atlas"}
+        response = {**{k: v for k, v in result.items() if k not in reserved},
+                    **{k: v for k, v in out.items() if k != "stdout"}, "atlas": provenance}
         if result.get("state") in {"FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}:
             response.update(status="error", error=f"Atlas query ended in {result['state']}")
         return response
-
-    return [HarnessTool(name=name, description="Atlas expression: " + description +
-                        " Flow: resolve_genes -> submit_query -> query_status -> get_summary, "
-                        "plot_dotplot, plot_violin, plot_featureplot -> write_report. "
-                        "Use these nine typed tools; run_in_environment refuses this skill. "
-                        "Uses the attached atlas read in place; outputs appear in gene_expression/.",
-                        parameters=schema, executor=lambda args, ctx, n=name: call(n, args or {}, ctx),
-                        reads_private_data=True, category="single-cell")
-            for name, (description, schema) in TOOLS.items()]

@@ -50,6 +50,7 @@ from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from .cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
 from .hypotheses import DesignFacts, HypothesisLedger
 from .loop_utils import safe_json_loads
+from .tool_schema import TOOL_NAME, NAME_LEFT, NAME_RIGHT, REPORT_TOOL, PlanParameters, plan_parameters
 from .plan_doc import (
     CODE_TOOLS,
     PlanDoc,
@@ -1001,7 +1002,7 @@ def make_run_in_environment_tool(executor: Any,
         return result
 
     def _exec(args: dict[str, Any], ctx: HarnessContext, *,
-              _atlas_bridge: bool = False, _resources: tuple | None = None,
+              _mcp_server: Any = None, _resources: tuple | None = None,
               _tool_cache: bool = False) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
@@ -1018,9 +1019,15 @@ def make_run_in_environment_tool(executor: Any,
         if skill is None:
             return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "
                                                 f"environment: {with_env or 'none'}"}
-        from .atlas_expression import SKILL, direct_call_refusal
-        if skill.name == SKILL and not _atlas_bridge:
-            return {"status": "error", "error": direct_call_refusal()}
+        from .mcp_bridge import protected_skill_tools
+        from .atlas_expression import SKILL as ATLAS_SKILL, direct_call_refusal
+        protected = protected_skill_tools(skill.name)
+        if protected and _mcp_server is None:
+            message = (direct_call_refusal() if skill.name == ATLAS_SKILL
+                       else "Use the MCP bridge tools: " + ", ".join(protected))
+            return {"status": "error", "error": message}
+        if _mcp_server is not None and (skill.name != _mcp_server.skill or skill.image != _mcp_server.image):
+            return {"status": "error", "error": "MCP pinned image differs from the installed skill image"}
         if not skill.image:
             why = f" ({skill.env_problem})" if skill.env_problem else ""
             return {"status": "error",
@@ -1226,8 +1233,8 @@ _BACKTICK_TOOL_RE = re.compile(r"`(run_[A-Za-z0-9_]+)(?:\s*\([^`]*\))?`")   # ca
 # scgpt_annotate never invoked, and (literature steps do not retry) silently force-advanced.
 # Backticks also hold obs column names (`majorclass`, `sampleid`), so a bare identifier is NOT
 # evidence of a tool: candidates are intersected with the real catalog below.
-_BACKTICK_NAME_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_]*)(?:\s*\([^`]*\))?`")
-_ANY_TOOL_CALL_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)\s*\(([^)]*)\)")
+_BACKTICK_NAME_RE = re.compile(r"`(" + TOOL_NAME + r")(?:\s*\([^`]*\))?`")
+_ANY_TOOL_CALL_RE = re.compile(NAME_LEFT + "(" + TOOL_NAME + ")" + NAME_RIGHT + r"\s*\(([^)]*)\)")
 
 #: Tools whose presence MAKES a step a literature step. The catalog's real names — the historical
 #: set named ``run_literature``/``run_paperqa``, neither of which the Scientist catalog serves, so
@@ -1251,11 +1258,10 @@ def _known_tool_names() -> frozenset[str]:
         from .registry import build_scientist_catalog
         # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
         # a step that names it must still be recognised as that tool's step.
-        from .atlas_expression import TOOLS as atlas_tools
-        # write_report is a plan step the gateway carries out after the analysis (#102), not a tool
-        # the Scientist calls, so it is in no catalog.
+        from .mcp_bridge import configured_tool_names
+        # The gateway owns the report step; it is not a Scientist catalog tool.
         return (frozenset(t.name for t in build_scientist_catalog())
-                | {"run_in_environment", REPORT_TOOL} | atlas_tools.keys())
+                | {"run_in_environment", REPORT_TOOL} | configured_tool_names())
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
@@ -1321,17 +1327,16 @@ _TOOL_NAME_FIXES = {
 # ``run_de(groupby="sampleid", method="DESeq2")`` — the call as a plan writes it. Only the argument
 # NAMES and any quoted/bare literal values are read; nothing is executed and nothing is inferred
 # from a call the regex cannot parse.
-_TOOL_CALL_RE = re.compile(r"\b(run_[A-Za-z0-9_]+)\s*\(([^)]*)\)")
 _KWARG_RE = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.\-]+))""")
 
 
 def _tool_schemas(catalog: "list[Any]") -> "dict[str, dict[str, Any]]":
     """``{tool name: JSON-schema properties}`` for every tool in the catalog."""
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, dict[str, Any]] = {REPORT_TOOL: {}}
     for tool in catalog or ():
         name = getattr(tool, "name", None)
         if name:
-            out[str(name)] = ((getattr(tool, "parameters", None) or {}).get("properties") or {})
+            out[str(name)] = plan_parameters(getattr(tool, "parameters", None) or {})
     return out
 
 
@@ -1348,29 +1353,39 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
 
     An empty ``catalog`` yields no findings: a caller with no tools cannot judge, and inventing
     findings from an unknown registry would be worse than silence."""
-    schemas = _tool_schemas(catalog)
-    if not schemas:
+    if not catalog:
         return list(agenda), []
+    schemas = _tool_schemas(catalog)
     findings: list[dict[str, Any]] = []
     fixed: list[str] = []
     for step in agenda:
         text = str(step)
         # 1. Names. Correct the unambiguous ones in place; report the rest.
-        for raw in set(_BACKTICK_TOOL_RE.findall(text)) | {m.group(1) for m in _TOOL_CALL_RE.finditer(text)}:
+        for raw in set(_BACKTICK_NAME_RE.findall(text)) | {m.group(1) for m in _ANY_TOOL_CALL_RE.finditer(text)}:
             if raw in schemas or raw == REPORT_TOOL or get_skill(raw) is not None:
                 continue                      # a tool, the report step, or a skill applied with run_code
+            if not raw.startswith("run_"):
+                continue                      # retain the legacy typo policy, using complete names
             target = _TOOL_NAME_FIXES.get(raw.lower())
             if target and target in schemas:
-                text = re.sub(rf"\b{re.escape(raw)}\b", target, text)
+                text = re.sub(NAME_LEFT + re.escape(raw) + NAME_RIGHT, target, text)
                 findings.append({"kind": "renamed", "tool": raw, "detail": target})
             else:
                 findings.append({"kind": "unknown_tool", "tool": raw, "detail": ""})
         # 2. Arguments — checked against the (possibly corrected) name's own schema.
-        for call in _TOOL_CALL_RE.finditer(text):
+        for call in _ANY_TOOL_CALL_RE.finditer(text):
             name, args = call.group(1), call.group(2)
             props = schemas.get(name)
-            if not props:
-                continue                      # already reported as unknown above
+            if props is None:
+                continue                      # unknown tools are handled above
+            if isinstance(props, PlanParameters):
+                doc = PlanDoc(request="", steps=(PlanStep(id="check", text=text, tool=name,
+                              settings=call_settings(text, name, json_literals=True)),))
+                _, errors = check_plan(doc, {name: props})
+                findings.extend({"kind": "bad_value", "tool": name, "detail": f["detail"]} for f in errors)
+                continue
+            if not props or not name.startswith("run_"):
+                continue                      # preserve the legacy non-MCP prose check's scope
             for kw in _KWARG_RE.finditer(args):
                 key = kw.group(1)
                 value = next((g for g in kw.groups()[1:] if g is not None), "")
@@ -1698,6 +1713,9 @@ _REPORT_BUSYWORK_RE = re.compile(
 
 
 def _is_report_busywork(step: str) -> bool:
+    from .mcp_bridge import configured_tool_names
+    if not (_declared_tools(step) & _GENERIC_TOOLS) and _primary_tool(step) in configured_tool_names():
+        return False  # a typed domain output (e.g. Atlas report.md) is an actual tool operation
     return bool(_REPORT_BUSYWORK_RE.search((step or "").replace("_", " ")))
 
 
@@ -1706,7 +1724,6 @@ def _is_report_busywork(step: str) -> bool:
 # Scientist never runs it; the lab hands it to the gateway, which writes the report after the analysis
 # (``write_report``, also an MCP tool for a finished run). Without the step a run ends with its answer
 # in the chat.
-REPORT_TOOL = "write_report"
 REPORT_STEP = ("**Written report** — Write the methods and results report from the accepted results "
                "with `write_report`: the manuscript with its references and verification statement, as "
                "PDF and DOCX. It runs after the analysis steps.")
@@ -3243,12 +3260,12 @@ def retick_tools(steps: "list[str]", names: "Iterable[str]") -> "list[str]":
     check, the plan review's contracts, the DAG's node kinds. The PI's finalising turn rewrites
     steps and sometimes writes ``run run_scanpy_qc`` without them (measured 2026-10-12: one of
     fifteen reviewed plans, all three of its steps), after which the plan names no tool at all as
-    far as the code can tell. Only names with an underscore are restored, so no ordinary word is
+    far as the code can tell. Only names with an underscore or hyphen are restored, so no ordinary word is
     ever quoted; a longer name is never split (``run_de`` inside ``run_depth_matched_de``)."""
-    wanted = sorted({n for n in names if "_" in n}, key=len, reverse=True)
+    wanted = sorted({n for n in names if "_" in n or "-" in n}, key=len, reverse=True)
     if not wanted:
         return list(steps)
-    bare = re.compile(r"(?<![`\w])(" + "|".join(re.escape(n) for n in wanted) + r")(?![`\w])")
+    bare = re.compile(r"(?<![`\w-])(" + "|".join(re.escape(n) for n in wanted) + r")(?![`\w-])")
     return [bare.sub(r"`\1`", step) for step in steps]
 
 
@@ -3854,9 +3871,15 @@ def _tool_skill(tool: str) -> "Skill | None":
     try:
         from ..tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
+        if found is not None and found.skill:
+            return get_skill(found.skill)
+        from .mcp_bridge import configured_tool_skills
+        skill_name = configured_tool_skills().get(tool)
+        if skill_name:
+            refresh_skills()
+        return get_skill(skill_name) if skill_name else None
     except Exception:  # noqa: BLE001 - an unreadable manifest names no skill
         return None
-    return get_skill(found.skill) if found is not None and found.skill else None
 
 
 def _tool_ends_step(tool: str) -> bool:
@@ -7105,11 +7128,12 @@ class ResearchLab:
         # of run_code (a snippet, or the skill it uses — `skill:` says that) would hand the step a value
         # nobody approved as one. The same rule as a revision (_revise_plan_document).
         askable = [i for i in fresh if steps[i].tool and steps[i].tool not in CODE_TOOLS
-                   and schemas.get(steps[i].tool)]
+                   and (schemas.get(steps[i].tool) or isinstance(schemas.get(steps[i].tool), PlanParameters))]
         if not askable:
             return doc
         proposed: dict[int, dict[str, Any]] = {
-            i: call_settings(steps[i].text, str(steps[i].tool)) for i in askable}
+            i: call_settings(steps[i].text, str(steps[i].tool),
+                             json_literals=isinstance(schemas[steps[i].tool], PlanParameters)) for i in askable}
         if self._complete_fn is not None:
             emit({"type": "plan_binding", "steps": len(askable)})   # a model call: say what the wait is
             listing = "\n\n".join(

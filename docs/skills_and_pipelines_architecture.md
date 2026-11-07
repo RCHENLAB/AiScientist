@@ -370,15 +370,24 @@ Install the three release assets and verify `SHA256SUMS` as above. The loader
 continues to verify the entire release before exposing skills; no analysis code
 or unverified copy of the skill is bundled into AiScientist.
 
-`agents/atlas_expression.py` exposes the server's nine typed tools to the planner
-when the allowed skill, an image executor and at least one atlas in
-`AISCIENTIST_ATLAS_FILES` are available; without an atlas the planner is not
-offered them. It calls
+`agents/mcp_bridge.py` exposes the server's nine typed capabilities from the reviewed
+schema snapshot pinned by `src/aiscientist/agents/mcp_catalog/mcp_servers.json`. Registration reads local
+files and verifies the snapshot checksum; it does not contact the server. The
+allowed skill, an image executor and at least one valid atlas in
+`AISCIENTIST_ATLAS_FILES` must be available; without an atlas the planner is not
+offered these tools. The skill's image must exactly match the registry's digest pin.
+The bridge calls
 `aiscientist-mcp --server atlas-expression-exploration-mcp --timeout 15000 call <tool> '<json>'`
 through `run_in_environment`. The image's bundled client starts the MCP server
 over stdio; the gateway needs no MCP or scanpy installation. The server owns
-resolution and analysis. Follow `resolve_genes` -> `submit_query` -> `query_status`
--> `get_summary`, the three plot tools -> `write_report`; `list_queries` lists
+resolution and analysis; `AtlasAdapter` in `agents/atlas_expression.py` owns the
+attached-atlas checks and deliverable collection. The
+[MCP bridge contract](development/mcp_bridge.md) describes configuration, schema
+export, execution policy and the supported CPU-only boundary. The other 23
+application tools retain their existing implementations.
+
+Follow `resolve_genes` -> `submit_query` -> `query_status`
+-> `get_summary`, the three plot tools -> `atlas_write_report`; `list_queries` lists
 only this run's queries. Pass all requested names together, unchanged. Report
 CRALBP -> RLBP1 (alias), ABCR -> ABCA4 (previous symbol), rho -> RHO (case), and
 any unresolved or ambiguous names from the server. Report donor support with
@@ -399,14 +408,17 @@ immutable release label, and `manifest.json` records a server file as
 `copied_from`.
 Each successful call records the label, resolved path, size and mtime in the
 run's `manifest.json`, alongside the skill release and image provenance. The
+bridge also records the server's package version, release tag, image digest,
+schema checksum and execution route under `mcp_servers`. The
 label must describe that file's actual immutable release; size and mtime are
 additional identity metadata, not cryptographic checksum verification.
 
 Inside the container `ATLAS_H5AD=$AISCIENTIST_DATASET`,
 `AISCI_DATA_DIR=$AISCIENTIST_ENV_DIR` (a persistent directory within this run),
 and `AISCI_EXECUTOR=inline`. Only `submit_query` requests the skill's 4 CPUs,
-300 GB and 04:00:00. All other tools use 2 CPUs, 16 GB and 00:30:00, including
-status and list calls, which preserve the server's state handling in a light job.
+300 GB and 04:00:00. Registry resource overrides give all other tools 2 CPUs,
+16 GB and 00:30:00, including status and list calls, which preserve the server's
+state handling in a light job.
 The platform supplies these resources internally, outside the tool JSON schema.
 There is no nested Slurm submission or gateway fallback. Plot/report calls read the
 small `query.h5ad`, and do not reload the full atlas. The CLI timeout covers the
@@ -425,6 +437,16 @@ mirrors them to the website's run artifacts and reports evidence paths.
 `query.h5ad`, logs and job state stay in work storage. Use the nine typed atlas
 tools; direct `run_in_environment` calls for this skill are refused.
 
+Tool arguments are validated against their schemas before scheduling. The Atlas
+domain adapter rejects undeclared arguments; generic MCP schemas retain their
+authored additional-property semantics. Execution options never come from tool
+arguments. Atlas's planner alias `atlas_write_report` still calls the server's
+`write_report(query_id)` to produce `report.md`; the gateway's independent
+`write_report` plan step requests the whole run's PDF/DOCX report. The runner rechecks the skill
+image at call time and retains the existing skill access policy. Server content
+cannot replace the execution status, artifact list or image provenance in the
+returned Atlas response.
+
 Responses omit report Markdown and bound summary rows, reporting `rows_omitted`
 and `full_table` for the complete artifact. Every path in a response names the
 file in the run's results (`gene_expression/<query_id>/<file>`), never its HPC3
@@ -432,3 +454,9 @@ path. The collector also saves
 `gene_expression/mcp_result.json` (replaced each call) and uses that evidence path
 for other oversized responses. Stdout stays below the executor's 20,000-character
 limit and is removed from the parsed tool response.
+
+The checked-in schemas came from a real MCP `tools/list` against the pinned
+0.0.3 source release. That metadata check does not establish a successful run of
+the released image, the website or HPC3. Real website/HPC3 end-to-end validation
+remains outstanding; GPU/inprocess execution, sampling and HTTP transport are
+not implemented by this bridge.

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "servers": [
+    {
+      "name": "atlas-expression-exploration",
+      "version": "0.0.3",
+      "release_tag": "atlas-expression-exploration-v0.0.3",
+      "image": "docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a",
+      "entrypoint": "atlas-expression-exploration-mcp",
+      "skill": "explore-atlas-expression-with-aiscientist-mcp",
+      "runs_on": "hpc:atlas-expression",
+      "tools_file": "mcp/atlas-expression-exploration-0.0.3.tools.json",
+      "tools_sha256": "069f629e1056c37b57d3e6173d6b257200c4cc8b70782b128fa6a6111fcb0020",
+      "adapter": "atlas-expression",
+      "aliases": {"write_report": "atlas_write_report"},
+      "timeout": 15000,
+      "resources": {
+        "resolve_genes": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "query_status": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "get_summary": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "plot_dotplot": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "plot_violin": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "plot_featureplot": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "write_report": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "list_queries": [
+          2,
+          16,
+          "00:30:00"
+        ]
+      }
+    }
+  ]
+}

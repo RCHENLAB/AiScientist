@@ -7,8 +7,12 @@ import pytest
 
 from aiscientist.agents import atlas_expression as atlas, skills, skills_registry
 from aiscientist.agents.research_harness import HarnessContext
+from aiscientist.agents.mcp_bridge import load_servers
 from aiscientist.agents.registry import build_scientist_catalog
 from aiscientist.gateway.executor import ExecResult
+
+_SERVER = load_servers()[0]
+ATLAS_TOOLS = {_SERVER.planner_name(entry["name"]): entry["inputSchema"] for entry in _SERVER.tools}
 
 FIXTURE = Path(__file__).parent / "fixtures" / "atlas_expression"
 IMAGE = ("docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:"
@@ -53,16 +57,16 @@ def test_release_metadata_checksum_tier_and_exposure(release, monkeypatch):
     skill = skills.get_skill(atlas.SKILL)
     assert (skill.status, skill.registry_release) == ("community", "v0.2.0")
     assert (skill.image, skill.cpus, skill.mem_gb, skill.time_limit) == (IMAGE, 4, 300, "04:00:00")
-    assert set(atlas.TOOLS) <= tools(Runner()).keys()
-    assert not set(atlas.TOOLS) & tools(None).keys()
+    assert set(ATLAS_TOOLS) <= tools(Runner()).keys()
+    assert not set(ATLAS_TOOLS) & tools(None).keys()
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified")
-    assert not set(atlas.TOOLS) & tools(Runner()).keys()
+    assert not set(ATLAS_TOOLS) & tools(Runner()).keys()
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified,community")
     bundle = release / "aiscientist-skills-0.2.0.zip"
     bundle.write_bytes(bundle.read_bytes() + b"tampered")
     with pytest.raises(ValueError, match="checksum"):
         skills_registry.check_release(release, "v0.2.0")
-    assert not set(atlas.TOOLS) & tools(Runner()).keys()
+    assert not set(ATLAS_TOOLS) & tools(Runner()).keys()
 
 
 @pytest.mark.parametrize("value", ["", "heca/latest=/shared/heca/x.h5ad", "heca/v1=relative/x.h5ad"])
@@ -70,7 +74,7 @@ def test_without_a_configured_atlas_the_tools_are_not_offered(release, monkeypat
     """A deployment that lists no atlas would offer nine tools that always fail."""
     monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", value)
     catalog = tools(Runner())
-    assert not set(atlas.TOOLS) & catalog.keys()
+    assert not set(ATLAS_TOOLS) & catalog.keys()
     out = catalog["run_in_environment"].executor({"skill": atlas.SKILL, "command": "true"}, None)
     assert out["status"] == "error" and "not set up on this deployment" in out["error"]
 
@@ -108,13 +112,27 @@ def test_all_nine_exact_signatures(release):
         "resolve_genes": {"genes", "atlas"}, "submit_query": {"genes", "atlas", "rerun"},
         "query_status": {"query_id"}, "get_summary": {"query_id", "level", "gene", "top"},
         "plot_dotplot": {"query_id"}, "plot_violin": {"query_id", "groupby"},
-        "plot_featureplot": {"query_id"}, "write_report": {"query_id"}, "list_queries": set(),
+        "plot_featureplot": {"query_id"}, "atlas_write_report": {"query_id"}, "list_queries": set(),
     }
     for name, fields in expected.items():
         assert set(catalog[name].parameters["properties"]) == fields
     from aiscientist.agents.research_lab import _primary_tool
     assert _primary_tool("Resolve with `resolve_genes`.") == "resolve_genes"
     assert _primary_tool("Extract with `submit_query`.") == "submit_query"
+
+
+def test_atlas_flow_hints_use_all_configured_planner_names(release):
+    from dataclasses import replace
+    from aiscientist.agents.mcp_bridge import build_mcp_tools
+    from aiscientist.agents.research_lab import make_run_in_environment_tool
+    server = replace(_SERVER, prefix="atlas_", aliases={"resolve_genes": "resolve", "write_report": "query_report"})
+    runner = Runner()
+    catalog = {t.name: t for t in build_mcp_tools(runner, make_run_in_environment_tool(runner), servers=(server,))}
+    description = catalog["atlas_resolve"].description
+    assert "atlas_resolve -> atlas_submit_query -> atlas_query_status -> atlas_get_summary" in description
+    assert "atlas_plot_dotplot, atlas_plot_violin, atlas_plot_featureplot -> atlas_query_report" in description
+    assert catalog["atlas_resolve"].executor({"genes": "LRAT"}, None)["status"] == "ok"
+    assert " call resolve_genes " in runner.calls[0][0]
 
 
 def test_invalid_binding_version_and_failed_container(release, monkeypatch):
@@ -151,7 +169,7 @@ def test_deliverables_are_collected_without_checkpoint_or_atlas(release, tmp_pat
     monkeypatch.setenv("AISCI_DATA_DIR", str(data))
     monkeypatch.setenv("AISCIENTIST_ARTIFACTS", str(artifacts))
     monkeypatch.setenv("ATLAS_H5AD", str(source))
-    monkeypatch.setenv("AISCI_ATLAS_RESULT", str(tmp_path / ".atlas-result.json"))
+    monkeypatch.setenv("AISCI_MCP_RESULT", str(tmp_path / ".atlas-result.json"))
     monkeypatch.setenv("AISCI_ATLAS_RELEASE", "heca/v2026.11")
     exec(atlas.COLLECT, {})
     response = json.loads(capsys.readouterr().out)
@@ -193,7 +211,7 @@ def test_large_response_survives_stdout_tail(release, tmp_path, monkeypatch, cap
     raw = tmp_path / "result.json"
     raw.write_text(json.dumps(result))
     for key, value in {"AISCI_DATA_DIR": data, "AISCIENTIST_ARTIFACTS": tmp_path / "artifacts",
-                       "ATLAS_H5AD": source, "AISCI_ATLAS_RESULT": raw,
+                       "ATLAS_H5AD": source, "AISCI_MCP_RESULT": raw,
                        "AISCI_ATLAS_RELEASE": "heca/v2026.11"}.items():
         monkeypatch.setenv(key, str(value))
     exec(atlas.COLLECT, {})
@@ -222,11 +240,45 @@ def test_direct_skill_refused_even_with_model_override_arguments(release):
     runner = Runner()
     tool = tools(runner)["run_in_environment"]
     out = tool.executor({"skill": atlas.SKILL.upper(), "command": "true",
-                         "_atlas_bridge": True, "_resources": [1, 1, "00:01:00"]}, None)
+                         "_mcp_server": {"image": "fake"}, "_resources": [1, 1, "00:01:00"]}, None)
     assert out["status"] == "error"
-    assert all(name in out["error"] for name in atlas.TOOLS)
+    assert all(name in out["error"] for name in ATLAS_TOOLS)
     assert not runner.calls
-    assert not {"_atlas_bridge", "_resources", "_tool_cache"} & tool.parameters["properties"].keys()
+    assert not {"_mcp_server", "_resources", "_tool_cache"} & tool.parameters["properties"].keys()
+
+
+@pytest.mark.parametrize("other_server", [False, True])
+def test_omitting_atlas_registration_does_not_reopen_its_shell(release, tmp_path, monkeypatch, other_server):
+    from aiscientist.agents.research_lab import make_run_in_environment_tool
+    from test_mcp_bridge import write_config
+
+    if other_server:
+        path = write_config(tmp_path)
+    else:
+        path = tmp_path / "mcp_servers.json"
+        path.write_text(json.dumps({"schema_version": 1, "servers": []}))
+    monkeypatch.setenv("AISCIENTIST_MCP_CONFIG", str(path))
+    runner = Runner()
+    direct = make_run_in_environment_tool(runner)
+    result = direct.executor({"skill": atlas.SKILL, "command": "true"}, None)
+    assert result["status"] == "error" and "Atlas MCP" in result["error"]
+    assert not runner.calls
+
+
+@pytest.mark.parametrize("changes", [
+    {"adapter": "json"}, {"adapter": None}, {"skill": "unrelated-skill"},
+    {"name": "other", "release_tag": "other-v0.0.3"},
+])
+def test_atlas_binding_cannot_select_a_generic_adapter(tmp_path, changes):
+    from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG
+    cfg = json.loads(DEFAULT_CONFIG.read_text())
+    cfg["servers"][0].update(changes)
+    if cfg["servers"][0]["adapter"] is None:
+        cfg["servers"][0].pop("adapter")
+    path = tmp_path / "mcp_servers.json"
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(ValueError, match="Atlas"):
+        load_servers(path)
 
 
 def test_configured_paths_are_normalized_and_supply_the_release(release, monkeypatch):
@@ -256,6 +308,8 @@ def test_a_session_copy_of_a_listed_server_file_is_accepted(release, monkeypatch
     command = runner.calls[0][0]
     assert "AISCI_ATLAS_RELEASE=heca/v2026.11" in command
     assert 'ATLAS_H5AD="$AISCIENTIST_DATASET"' in command      # the job reads its HPC3 copy
+    cli = next(line for line in command.splitlines() if line.startswith("aiscientist-mcp "))
+    assert json.loads(shlex.split(cli)[7]) == {"genes": GENES}  # source host paths never reach the server
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["atlas"]["copied_from"] == SERVER_FILE
     assert "copied_from" not in result["atlas"]                # no server path in the reply
@@ -279,7 +333,7 @@ def test_an_unlisted_server_file_or_a_source_without_a_copy_is_refused(release, 
 CACHE = "/dfs/envs/tool-cache/tester"
 
 
-@pytest.mark.parametrize("name", sorted(set(atlas.TOOLS) - {"submit_query"}))
+@pytest.mark.parametrize("name", sorted(set(ATLAS_TOOLS) - {"submit_query"}))
 def test_light_tools_use_small_jobs_and_the_users_tool_cache(release, name):
     """The HGNC table lives in this HPC3 user's tool cache, whose parent is made 3775 as the
     analysis jobs' is: a folder one member made in a lab-shared place would lock the others out."""
@@ -287,7 +341,7 @@ def test_light_tools_use_small_jobs_and_the_users_tool_cache(release, name):
     hpc = _HPC()
     runner = _executor(hpc, tool_cache_dir=CACHE)
     runner.dataset_path = Runner.dataset_path
-    args = {key: "q" for key in atlas.TOOLS[name][1]["required"]}
+    args = {key: "q" for key in ATLAS_TOOLS[name].get("required", [])}
     tools(runner)[name].executor(args, None)
     script = "\n".join(hpc.commands)
     for value in ("--cpus-per-task=2", "--mem=16G", "--time=00:30:00",
@@ -334,7 +388,7 @@ def test_responses_and_the_saved_result_name_results_files_not_hpc3_paths(releas
     raw.write_text(json.dumps(result))
     artifacts = tmp_path / "artifacts"
     for key, value in {"AISCI_DATA_DIR": data, "AISCIENTIST_ARTIFACTS": artifacts,
-                       "ATLAS_H5AD": source, "AISCI_ATLAS_RESULT": raw,
+                       "ATLAS_H5AD": source, "AISCI_MCP_RESULT": raw,
                        "AISCI_ATLAS_RELEASE": "heca/v2026.11"}.items():
         monkeypatch.setenv(key, str(value))
     exec(atlas.COLLECT, {})

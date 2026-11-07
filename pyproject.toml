@@ -5,6 +5,7 @@ description = "AiScientist — a privacy-first, DAG-planned multi-agent bioinfor
 requires-python = ">=3.10"
 dependencies = [
   "h5py>=3.0",
+  "jsonschema>=4.18",  # pinned MCP catalogs and planner argument validation, including base installs
 ]
 
 [project.optional-dependencies]
@@ -97,6 +98,9 @@ bioagent-admin = "aiscientist.gateway.admin_cli:main"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+aiscientist = ["agents/mcp_catalog/*.json", "agents/mcp_catalog/mcp/*.json", "tools/*/TOOL.md"]
 
 [tool.ruff]
 target-version = "py310"

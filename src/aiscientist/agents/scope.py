@@ -302,7 +302,7 @@ def _mentioned(clause: str, tool_names: "frozenset[str]", keep: bool) -> "list[s
     low = clause.lower()
     found: list[str] = []
     for name in sorted(tool_names, key=len, reverse=True):
-        if re.search(r"(?<![a-z0-9_])" + re.escape(name).replace("_", r"[_ ]") + r"(?![a-z0-9_])", low):
+        if re.search(r"(?<![a-z0-9_-])" + re.escape(name.lower()).replace("_", r"[_ ]") + r"(?![a-z0-9_-])", low):
             found.append(name)
     for pattern, keeps, excludes in _WORDS:
         if re.search(pattern, low, re.IGNORECASE):

@@ -1,5 +1,8 @@
 pytest>=9.0
 ruff>=0.6
+# Build real wheels for the offline base-install regression (no build isolation/network).
+setuptools>=68
+wheel
 # Offline auth unit tests (tests/test_auth_accounts.py) import aiscientist.gateway.auth,
 # which pulls in bcrypt (password hashing) + itsdangerous (signed cookies). Both are
 # pure-Python/offline. psycopg and alembic remain server-only (CI and local dev run on

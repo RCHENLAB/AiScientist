@@ -1,0 +1,182 @@
+[
+  {
+    "name": "resolve_genes",
+    "description": "Resolve gene names (comma- or space-separated; any case; HGNC aliases, previous symbols, HGNC\nor Ensembl IDs) against the atlas genes. Reads only the gene list, so it takes seconds.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "genes": {
+          "title": "Genes",
+          "type": "string"
+        },
+        "atlas": {
+          "default": "",
+          "title": "Atlas",
+          "type": "string"
+        }
+      },
+      "required": [
+        "genes"
+      ],
+      "title": "resolve_genesArguments"
+    }
+  },
+  {
+    "name": "submit_query",
+    "description": "Start a query: resolve names, then load the full atlas on a big-memory node and write query.h5ad\nplus summary tables. With the Slurm or local executor it returns at once with a query_id (poll\nquery_status); with the inline executor it returns when the step ends. Reuses a finished or\nrunning query unless rerun=True.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "genes": {
+          "title": "Genes",
+          "type": "string"
+        },
+        "atlas": {
+          "default": "",
+          "title": "Atlas",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "genes"
+      ],
+      "title": "submit_queryArguments"
+    }
+  },
+  {
+    "name": "query_status",
+    "description": "State of a query's full-atlas step (PENDING, RUNNING, COMPLETED, FAILED, ...). A preempted\nSlurm job is resubmitted automatically with AISCI_SLURM_FALLBACK.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query_id"
+      ],
+      "title": "query_statusArguments"
+    }
+  },
+  {
+    "name": "get_summary",
+    "description": "Summary rows ranked by pseudobulk CP10k. level: majorclass, celltype or region_class. Fields:\nn_cells, n_expressing, pct_expressing, mean_lognorm, pseudobulk_cp10k, n_donors, donor_median_cp10k,\ndonor_q25_cp10k, donor_q75_cp10k, frac_donors_detected, rank_pseudobulk.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        },
+        "level": {
+          "default": "majorclass",
+          "title": "Level",
+          "type": "string"
+        },
+        "gene": {
+          "default": "",
+          "title": "Gene",
+          "type": "string"
+        },
+        "top": {
+          "default": 10,
+          "title": "Top",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query_id"
+      ],
+      "title": "get_summaryArguments"
+    }
+  },
+  {
+    "name": "plot_dotplot",
+    "description": "scanpy dot plots by major class and by cell type (PDF with editable text, plus PNG).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query_id"
+      ],
+      "title": "plot_dotplotArguments"
+    }
+  },
+  {
+    "name": "plot_violin",
+    "description": "scanpy violin plot of per-cell log1p(CP10k), all cells; groupby defaults to the class column.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        },
+        "groupby": {
+          "default": "",
+          "title": "Groupby",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query_id"
+      ],
+      "title": "plot_violinArguments"
+    }
+  },
+  {
+    "name": "plot_featureplot",
+    "description": "scanpy UMAP feature plot; zero cells gray, expressing cells on top, color capped at q99 of\nexpressing cells per gene.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query_id"
+      ],
+      "title": "plot_featureplotArguments"
+    }
+  },
+  {
+    "name": "write_report",
+    "description": "Short Markdown report: resolution, top groups with donor support, figures present, caveats.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query_id": {
+          "title": "Query Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query_id"
+      ],
+      "title": "write_reportArguments"
+    }
+  },
+  {
+    "name": "list_queries",
+    "description": "Queries in this server's data directory, with their state.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "title": "list_queriesArguments"
+    }
+  }
+]

@@ -39,6 +39,8 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
+from .tool_schema import NAME_LEFT, NAME_RIGHT, PlanParameters
+
 PLAN_VERSION = 1
 
 #: Tools that run code the model writes. A plan step that names one has no fixed operation to
@@ -395,7 +397,7 @@ def sync_plan(prev: "PlanDoc | None", agenda: "list[str]", *, request: str,
 
 _NUMBER_RE = re.compile(
     r"(?<![\w.])\d{1,3}(?:,\d{3})+(?:\.\d+)?(?!\w)|(?<![\w.])\d+(?:\.\d+)?(?!\w|\.\d)")
-_CALL_RE = r"\b{name}\s*\(([^)]*)\)"
+_CALL_RE = NAME_LEFT + r"{name}" + NAME_RIGHT + r"\s*\(([^)]*)\)"
 _KWARG_RE = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.\-]+))""")
 
 
@@ -458,13 +460,23 @@ def _coerce(value: Any, spec: "Mapping[str, Any]") -> "tuple[Any, bool]":
     return value, True
 
 
-def call_settings(text: str, tool: str) -> "dict[str, Any]":
-    """Arguments a step writes as a call — ``run_de(groupby="sampleid", padj=0.05)`` — untyped."""
+def call_settings(text: str, tool: str, *, json_literals: bool = False) -> "dict[str, Any]":
+    """Read call arguments; optionally parse unquoted JSON/Python scalar literals for MCP.
+
+    Legacy callers keep strings for their existing schema-based coercion. Quoted
+    strings are never converted, and this parser never evaluates code.
+    """
     out: dict[str, Any] = {}
     for call in re.finditer(_CALL_RE.format(name=re.escape(tool)), text or ""):
         for kw in _KWARG_RE.finditer(call.group(1)):
             quoted = kw.group(2) if kw.group(2) is not None else kw.group(3)
-            out[kw.group(1)] = quoted if quoted is not None else kw.group(4)
+            value = quoted if quoted is not None else kw.group(4)
+            if json_literals and quoted is None:
+                try:
+                    value = json.loads({"True": "true", "False": "false", "None": "null"}.get(value, value))
+                except ValueError:
+                    pass  # a bare name remains a string, as for existing tools
+            out[kw.group(1)] = value
     return out
 
 
@@ -505,19 +517,25 @@ def bind_settings(text: str, properties: "Mapping[str, Any]",
     lowered = (text or "").lower()
     for key, value in (proposed or {}).items():
         spec = (properties or {}).get(key)
-        if not isinstance(spec, Mapping):
+        if isinstance(properties, PlanParameters):
+            spec = spec or {}
+            ok = True  # MCP pins retain their JSON types; the whole schema decides validity
+        elif not isinstance(spec, Mapping):
             dropped.append({"param": key, "value": value, "why": "unknown_param"})
             continue
-        value, ok = _coerce(value, spec)
+        else:
+            value, ok = _coerce(value, spec)
         if not ok:
             dropped.append({"param": key, "value": value, "why": "wrong_type"})
             continue
-        allowed = spec.get("enum")
+        allowed = spec.get("enum") if not isinstance(properties, PlanParameters) else None
         if allowed and value not in allowed:
             dropped.append({"param": key, "value": value, "why": "not_allowed"})
             continue
         if isinstance(value, bool):
             stated = True
+        elif value is None and isinstance(properties, PlanParameters):
+            stated = bool(re.search(r"\b(?:null|none)\b", lowered))
         elif isinstance(value, (int, float)):
             stated = _states_number(text, float(value))
         elif isinstance(value, str):
@@ -546,6 +564,12 @@ def bind_settings(text: str, properties: "Mapping[str, Any]",
                 dropped.append({"param": key, "value": value, "why": "incomplete_list"})
                 continue
         settings[key] = value
+    if isinstance(properties, PlanParameters) and settings:
+        errors = properties.errors(settings)
+        if errors:
+            dropped.extend({"param": k, "value": v, "why": "invalid_schema", "detail": errors[0].message}
+                           for k, v in settings.items())
+            settings = {}
     return settings, dropped
 
 
@@ -597,12 +621,16 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
         typed: dict[str, Any] = {}
         for key, value in step.settings.items():
             spec = props.get(key)
-            if not isinstance(spec, Mapping):
+            if isinstance(props, PlanParameters):
+                spec = spec or {}
+                coerced, ok = value, True
+            elif not isinstance(spec, Mapping):
                 findings.append({**base, "kind": "unknown_setting", "param": key,
                                  "detail": ", ".join(sorted(props)) or "(the tool takes no settings)"})
                 continue
-            coerced, ok = _coerce(value, spec)
-            allowed = spec.get("enum")
+            else:
+                coerced, ok = _coerce(value, spec)
+            allowed = spec.get("enum") if not isinstance(props, PlanParameters) else None
             if not ok:
                 findings.append({**base, "kind": "bad_value", "param": key,
                                  "detail": f"{value!r} is not a {spec.get('type')}"})
@@ -611,6 +639,9 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
                                  "detail": f"{value!r}; allowed: {', '.join(map(str, allowed))}"})
             else:
                 typed[key] = coerced
+        if isinstance(props, PlanParameters) and typed:
+            findings.extend({**base, "kind": "bad_value", "param": ".".join(map(str, error.absolute_path))
+                             or "settings", "detail": error.message} for error in props.errors(typed))
         steps.append(PlanStep(id=step.id, text=step.text, tool=step.tool,
                               settings=typed, runs_on=step.runs_on, skill=step.skill))
     return PlanDoc(request=doc.request, steps=tuple(steps)), findings
@@ -686,7 +717,7 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
             # The step's sentence names its tool, and that sentence is what the Scientist is handed.
             # Left alone it would ask for the old tool while the settings went to the new one.
             if old.tool and step.tool and same_prose:
-                text = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(old.tool)}(?![A-Za-z0-9_])", step.tool, text)
+                text = re.sub(NAME_LEFT + re.escape(old.tool) + NAME_RIGHT, step.tool, text)
         if (step.skill or None) != (old.skill or None):
             changes.append({"kind": "skill", "step": n, "id": step.id,
                             "before": old.skill or "", "after": step.skill or ""})
