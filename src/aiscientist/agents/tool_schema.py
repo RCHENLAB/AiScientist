@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import re
 from typing import Any
 
 TOOL_NAME = r"[A-Za-z_][A-Za-z0-9_-]{0,63}"
@@ -132,12 +133,55 @@ class PlanParameters(dict):
                     return True
             return False
 
+        def stable_conflict(error):
+            """Can appending root arguments never repair this validation error?
+
+            Supplied property values are complete. Root-object failures need a
+            proof of stability: additional fields can satisfy dependencies or
+            change evaluated-property annotations. Unknown failures stay unknown.
+            """
+            if error.instance is not settings:
+                return True
+            keyword = error.validator
+            if keyword in {"anyOf", "oneOf"} and error.context:
+                # A union is impossible only if *every* branch has a stable
+                # failure. Other failures in that same branch may be repairable.
+                branches = defaultdict(list)
+                for child in error.context:
+                    if child.schema_path:
+                        branches[child.schema_path[0]].append(child)
+                return all(any(stable_conflict(child) for child in branches[index])
+                           for index in range(len(error.validator_value)))
+            if keyword in {"const", "enum"}:
+                candidates = [error.validator_value] if keyword == "const" else error.validator_value
+                # Compare complete candidates with the fixed fields overlaid.
+                # JSON Schema equality distinguishes booleans from numbers.
+                return not any(isinstance(candidate, dict) and Draft202012Validator({"const": candidate}).is_valid(
+                    {**candidate, **settings}) for candidate in candidates)
+            if keyword in {"not", "oneOf"}:
+                return not unbound({keyword: error.validator_value})
+            if keyword == "unevaluatedProperties" and error.validator_value is False:
+                # An upper bound, not an alternative annotation collector: even
+                # inactive branches/dependencies may later evaluate these keys.
+                # A key absent from this bound can never be rescued by new pins.
+                possible = set()
+                for node in self._nodes(error.schema):
+                    if "$dynamicRef" in node or any(key in node and node[key] is not False
+                        for key in ("additionalProperties", "unevaluatedProperties")):
+                        return False  # no static proof for this broader evaluation scope
+                    possible.update(node.get("properties", {}))
+                    possible.update(key for key in settings for pattern in node.get("patternProperties", {})
+                                    if re.search(pattern, key))
+                return bool(settings.keys() - possible)
+            return error.schema is False or keyword in {"type", "maxProperties", "additionalProperties"}
+
         def decide(validator):
-            # Check fixed values first: an unbound optional flag cannot repair
-            # a discriminator already pinned to the wrong value.
-            if next(validator.iter_errors(settings), None) is not None:
+            # An absent trigger can repair annotation errors, but cannot repair
+            # an already fixed discriminator or a complete nested value.
+            errors = list(validator.iter_errors(settings))
+            if any(stable_conflict(error) for error in errors):
                 return False
-            if not unbound(validator.schema):
+            if not errors and not unbound(validator.schema):
                 return True
             key = id(validator.schema)
             if key not in choices:

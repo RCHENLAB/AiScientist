@@ -155,6 +155,97 @@ def test_fixed_false_condition_cannot_be_rescued_by_an_unbound_property(registry
     assert not props.errors({"value": 3})  # mode genuinely remains unknown
 
 
+def future_evaluation_predicate():
+    return {"dependentSchemas": {"flag": {"properties": {"flag": {}, "value": {"type": "string"}}}},
+            "unevaluatedProperties": False}
+
+
+def conditional_value_schema(predicate):
+    return {"type": "object", "if": predicate, "then": {"properties": {"value": {"type": "string"}}},
+            "else": {"properties": {"value": {"type": "number"}}}}
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "allOf", "anyOf", "oneOf", "$ref", "not"])
+def test_future_dependency_can_repair_conditional_evaluation_errors(registry, wrapper):
+    predicate = future_evaluation_predicate()
+    schema = conditional_value_schema(predicate)
+    if wrapper == "allOf":
+        schema["if"] = {"allOf": [predicate]}
+    elif wrapper in {"anyOf", "oneOf"}:
+        schema["if"] = {wrapper: [predicate, {"properties": {"value": {"type": "number"}}}]}
+    elif wrapper == "$ref":
+        schema["if"] = {"$ref": "#/$defs/Condition"}
+        schema["$defs"] = {"Condition": {"$schema": "https://json-schema.org/draft/2020-12/schema", **predicate}}
+    elif wrapper == "not":
+        schema["if"] = {"not": predicate}
+        schema["then"], schema["else"] = schema["else"], schema["then"]
+    runner, tool = configured(registry, schema)
+    props = _tool_schemas([tool])[tool.name]
+    pins = {"value": "word"}
+    doc = PlanDoc("", (PlanStep("s1", 'value="word"', tool.name, pins),))
+    checked, findings = check_plan(doc, {tool.name: props})
+    assert not findings and checked.steps[0].settings == pins
+    assert bind_settings('value="word"', props, pins) == (pins, [])
+    assert tool.executor(pins, None)["status"] == "error"
+    assert not runner.calls
+    assert tool.executor({**pins, "flag": True}, None)["status"] == "ok"
+    assert len(runner.calls) == 1
+    if wrapper != "not":
+        assert props.errors({**pins, "never_declared": True})
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "allOf", "anyOf", "oneOf"])
+def test_repairable_annotation_errors_do_not_hide_fixed_value_conflicts(registry, wrapper):
+    # Put the repairable error first: finding a later const error must still
+    # disprove the predicate. In a union, every branch needs a stable conflict.
+    predicate = {"unevaluatedProperties": False, **future_evaluation_predicate(),
+                 "properties": {"mode": {"const": "number"}}}
+    if wrapper == "allOf":
+        predicate = {"allOf": [predicate]}
+    elif wrapper in {"anyOf", "oneOf"}:
+        predicate = {wrapper: [predicate, {"properties": {"mode": {"const": "other"}}}]}
+    _, tool = configured(registry, conditional_value_schema(predicate))
+    props = _tool_schemas([tool])[tool.name]
+    pins = {"value": "word", "mode": "text"}
+    assert props.errors(pins)
+    assert bind_settings(json.dumps(pins), props, pins)[0] == {}
+    assert tool.executor({**pins, "flag": True}, None)["status"] == "error"
+
+
+def test_nested_supplied_objects_cannot_defer_their_evaluation_errors(registry):
+    predicate = {"properties": {"options": future_evaluation_predicate()}}
+    _, tool = configured(registry, conditional_value_schema(predicate))
+    props = _tool_schemas([tool])[tool.name]
+    pins = {"value": "word", "options": {"value": "word"}}
+    assert props.errors(pins)
+    assert props.errors({**pins, "flag": True})  # a root field cannot repair a complete nested object
+    assert tool.executor(pins, None)["status"] == "error"
+    assert not props.errors({"value": "word", "options": {"value": "word", "flag": True}})
+
+
+@pytest.mark.parametrize("other_properties", [{}, {"optional": {}}, {"options": {
+    "type": "object", "properties": {"value": {}}}}])
+def test_annotation_conflicts_without_a_possible_producer_remain_false(registry, other_properties):
+    predicate = {"properties": other_properties, "unevaluatedProperties": False}
+    _, tool = configured(registry, conditional_value_schema(predicate))
+    props = _tool_schemas([tool])[tool.name]
+    assert props.errors({"value": "word"})
+    assert tool.executor({"value": "word"}, None)["status"] == "error"
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum"])
+def test_whole_object_matches_distinguish_missing_fields_from_fixed_conflicts(registry, keyword):
+    expected = {"flag": True, "value": "word"}
+    predicate = {keyword: expected if keyword == "const" else [expected]}
+    _, tool = configured(registry, conditional_value_schema(predicate))
+    props = _tool_schemas([tool])[tool.name]
+    assert not props.errors({"value": "word"})
+    assert props.errors({"value": "different"})
+    assert props.errors({"value": "word", "flag": 1})  # JSON boolean != number
+    assert tool.executor({"value": "word"}, None)["status"] == "error"
+    assert tool.executor(expected, None)["status"] == "ok"
+
+
 @pytest.mark.parametrize("dialect", ["https://json-schema.org/draft/2020-12/schema",
                                      "http://json-schema.org/draft-07/schema#"])
 def test_reference_dialect_preserves_partial_root_and_complete_nested_validation(registry, dialect):
