@@ -85,8 +85,8 @@ Hearing is normal — no history of hearing loss. No ataxia. No polydactyly.
 
 > **Tracks A and B are INDEPENDENT — do not make one wait on the other.** `run_lirical` does *not*
 > consume `annotate_variants`' output: in genotype-aware mode it scores the raw VCF itself through its
-> own Exomiser database. Plan them as distinct agenda steps that meet only at Step 7. The methods+results
-> report is assembled automatically — **do not add a report-writing step.**
+> own Exomiser database. Plan them as distinct agenda steps that meet only at Step 7. **Plan no other
+> report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ---
 

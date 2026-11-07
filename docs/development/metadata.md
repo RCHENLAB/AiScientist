@@ -177,6 +177,10 @@ with a token made on the Datasets page (only its SHA-256 is stored), or the cons
 cookie. Every lookup is filtered on that account, as `/api/datasets` is. A revoked token, a disabled
 account, or a browser page from another origin is refused.
 
+**Scopes:** a token reads (`mcp:read`) unless it was made with "Allow running tools" ticked, which
+adds `mcp:run`: the scope for tools that start work billed to the account. The session cookie has
+both. A read-only token calling such a tool gets an `isError` reply that says so.
+
 **Tools:**
 - `list_datasets`: the account's datasets and results.
 - `search_datasets`: search by text, organism, assay, tissue or accession (labels or ontology IDs).
@@ -184,6 +188,13 @@ account, or a browser page from another origin is refused.
 - `get_provenance`: the lineage graph, upstream and/or downstream.
 - `preview_records`: a few rows of a table, read with mlcroissant. Data kept on HPC3 needs the
   account's HPC3 session to be connected.
+- `write_report` (`mcp:run`): writes the report of a finished run from its folder, as the end of a
+  run would: the manuscript with references and a verification statement, as PDF and DOCX under the
+  run's `report/`. It starts in the background and returns at once. It uses the account's live
+  website session: its model writes, HPC3 typesets, and the calls are billed to that run. A run still
+  in progress, or one with no saved state, is refused.
+- `report_status`: `none`, `running`, `done` or `error` for a run's report, the job's last log lines,
+  and the report files with their download paths (`process/report_job.json` holds the record).
 
 **Resources:** `aiscientist://datasets/<uuid>/croissant.json` and
 `aiscientist://results/<uuid>/croissant.json`.

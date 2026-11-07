@@ -324,10 +324,11 @@
                  user chooses reads these datasets' Croissant metadata, as this account and only this one. -->
             <div id="mcpSection" class="page-section hidden">
               <h3>Use your datasets from an AI assistant (MCP)</h3>
-              <p class="page-sub">An MCP client you choose (Claude Code, an IDE assistant, a script) can list, search and read your datasets' and results' metadata, follow their lineage and preview their tables, with a token you make here. A token sees exactly what you see here, nothing more; revoke it when you no longer use it.</p>
+              <p class="page-sub">An MCP client you choose (Claude Code, an IDE assistant, a script) can list, search and read your datasets' and results' metadata, follow their lineage and preview their tables, with a token you make here. A token sees exactly what you see here, nothing more; revoke it when you no longer use it. A token that may also run tools can write a finished run's report (<code>write_report</code>), with your session's model, billed to that run.</p>
               <div id="mcpTokens" class="storage-items"></div>
               <form id="mcpTokenForm" class="form mcp-token-form">
                 <input id="mcpTokenName" type="text" maxlength="64" placeholder="Name it, e.g. my laptop" autocomplete="off" />
+                <label class="mcp-token-run"><input id="mcpTokenRun" type="checkbox" /> Allow running tools</label>
                 <button type="submit" class="primary small">Create token</button>
               </form>
               <div id="mcpTokenShown" class="mcp-token-shown hidden"></div>

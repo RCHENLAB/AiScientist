@@ -199,6 +199,10 @@ _CURRENT_RUN: contextvars.ContextVar["RunState | None"] = contextvars.ContextVar
 # DAG nodes running side by side (each in a copy of the context) each keep their own step.
 _USAGE_STEP: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "aiscientist_usage_step", default=None)
+# The run a completion is billed to when it is not the connection's active run: the report written
+# later for a finished run (``write_report``, RCHENLAB/AiScientist#102).
+_USAGE_RUN: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "aiscientist_usage_run", default=None)
 
 # Set in the thread of a call the user did not ask for and need not wait on (a skill request's
 # summary, written for the team after the reply): a reached budget refuses that call instead of
@@ -586,7 +590,9 @@ class Connection:
         """The run a targeted interaction (cancel / plan approve) should hit. A request that names a
         run_id or conversation_id ONLY matches a run that is still live — so an interaction meant for
         a finished run never lands on whatever run is live now, and one chat's Stop never reaches
-        another chat's run. No identifiers → the active run (back-compat for older clients)."""
+        another chat's run. No identifiers (an older client) → the run the request works for, or the
+        only run in flight; with several in flight it guesses none. Guessing took the newest: a Stop
+        pressed in one chat, sent without its chat's id, cancelled another chat's Slurm job."""
         candidates = list(reversed(self.live_runs))
         if self._bare_run is not None:
             candidates.append(self._bare_run)
@@ -594,6 +600,11 @@ class Connection:
             return next((r for r in candidates if r.run_id == run_id), None)
         if conversation_id:
             return next((r for r in candidates if r.conversation_id == conversation_id), None)
+        cur = self._context_run()
+        if cur is not None and cur in self.live_runs:
+            return cur
+        if len(self.live_runs) > 1:
+            return None
         return self.active_run
 
     def _tag_run(self) -> RunState | None:
@@ -11751,7 +11762,10 @@ def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -
         # the promise above (accounting never breaks a run) is only true if reading the run id
         # cannot raise either. Offline harnesses pass a stand-in connection with neither attribute.
         active = getattr(conn, "active_run", None)
-        run_id = (getattr(active, "run_id", None) if active is not None else None) \
+        billed = _USAGE_RUN.get()
+        if billed:
+            active = None      # the report of a finished run: not the run this session has open
+        run_id = billed or (getattr(active, "run_id", None) if active is not None else None) \
             or getattr(conn, "last_run_id", None)
         conversation_id = getattr(active, "conversation_id", None) if active is not None else None
         from . import auth_routes
@@ -12634,6 +12648,17 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
     elif t == "scope_unmatched":
         progress(f"🎯 Your limit ({ev.get('text', '')}) matched no step of this plan, so the plan is "
                  "shown whole — remove what you do not want in chat.", level="warning")
+    elif t == "report_step":
+        progress("📝 The written report runs after the analysis: it is written from the accepted "
+                 "results once every analysis step is done.")
+    elif t == "report_step_added":
+        skills = [str(s) for s in (ev.get("skills") or [])]
+        progress("📝 Added the written-report step (`write_report`), last: "
+                 + (f"skill {', '.join(skills)} asks for a report." if skills
+                    else "the request asks for a written report."))
+    elif t == "steps_pruned" and ev.get("reason") == "report_not_asked":
+        progress("✂️ Left out the report step: the request does not ask for a written report, so the "
+                 "run answers in the chat. Ask for one (“with a written report”) to get the PDF.")
     elif t == "steps_pruned":
         dropped = list(ev.get("dropped") or [])
         if ev.get("reason") == "user_scope":
@@ -12650,8 +12675,8 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                      f"would be circular.")
         elif ev.get("reason") == "report_busywork":
             progress(f"✂️ Dropped {len(dropped)} step(s) that only export/package/render outputs — "
-                     f"every table and figure is already written to artifacts/ and the report is "
-                     f"assembled automatically: " + "; ".join(str(s)[:100] for s in dropped[:3]))
+                     f"every table and figure is already written to artifacts/, and a written "
+                     f"report is the plan's write_report step: " + "; ".join(str(s)[:100] for s in dropped[:3]))
         elif ev.get("reason") == "enrichment_without_de":
             progress(f"✂️ Dropped {len(dropped)} enrichment step(s): nothing in the plan produces a "
                      f"DE table for them to read, and the dataset profile shows no condition column "
@@ -13545,6 +13570,390 @@ def _mark_bound_datasets_used(conn: "Connection", *paths: "list[str]") -> None:
         print(f"[storage] could not record which datasets this run uses: {exc}")
 
 
+async def _write_report(conn: "Connection | None", art: Path, result: Any, question: str, *,
+                        complete_fn: Callable[..., str], report_render_fn: Any,
+                        emit: Callable[..., Any], say_key: Callable[..., Any],
+                        scope: Any = None, self_sourced: str = "", dataset_result: Any = None,
+                        prior: "dict[str, Any] | None" = None, continues_from_dataset: bool = False,
+                        untested_md: str = "", figure_diag: str = "", provenance: str = "",
+                        qc_report: bool = False, abandoned: Callable[[], bool] = lambda: False,
+                        on_stage: Callable[[str], Any] = lambda _stage: None) -> dict[str, Any]:
+    """The written report of a run: the manuscript (or the QC report, or the short report a request
+    asked for), its references, self-review, verification statement, PDF and DOCX, the post-render
+    reviews and the technical report, all under ``art/report``.
+
+    Written only when asked for (RCHENLAB/AiScientist#102): at the end of a run whose plan kept a
+    ``write_report`` step, or later for a finished run through the MCP tool of the same name, with the
+    run rebuilt from its folder. ``abandoned`` is the second Stop, which skips the narrative and
+    keeps report.md. Returns ``vl_attempted`` (whether the visual review got a document), the
+    render's ``status`` and the formats ``rendered``."""
+    from ..reporting.report import build_pdf_report
+    vl_attempted = False   # did the post-render visual review get a document to read?
+    brief = _wants_brief_report(scope, result)
+    if abandoned():
+        report_md = ("# Research report (write-up skipped)\n\n"
+                     "You stopped this run a second time, so the model-written report, the "
+                     "self-review and the rendered PDF/DOCX were skipped. The figures and "
+                     "tables every completed step produced are in this bundle, and "
+                     "`process/run_state.json` can resume it.\n\n"
+                     f"{result.final_answer or ''}\n")
+    elif qc_report:
+        # QC only, and a written report asked for: the writer's report (it chose the layout),
+        # then the files the run handed back.
+        say_key("📝 Writing the quality-control report…")
+        report_md = _qc_report_md(result.final_answer or "", art)
+    elif brief:
+        # Asked for ("a short report"): a one-page summary built from what the tools
+        # returned — no manuscript, no model-written prose to check.
+        say_key("📝 Writing the short report…")
+        report_md = await asyncio.to_thread(
+            _build_brief_report, art, question, result, scope)
+    else:
+        say_key("📝 Writing the research report…")
+        report_md = await asyncio.to_thread(
+            _build_report, result.final_answer or "", art, complete_fn, question, result)
+    # Literature module: fill the manuscript's reserved '## References' slot from citations
+    # actually produced by an accepted in-loop literature step. The research pipeline grounds
+    # literature via `deep_literature` (PaperQA over the lab's curated corpus); `literature_search`
+    # (Europe PMC) is the dev/no-HPC fallback. Reuse whichever ran — do NOT perform a hidden
+    # report-time search; if neither was accepted, the References section says so honestly.
+    from ..reporting.literature_references import (
+        append_design_background, degradation_note, empty_references, insert_references,
+        strip_intext_citation_markers)
+
+    if not brief:
+        say_key("📚 Collecting accepted literature citations…")
+    # Prefer deep_literature (the corpus tool the pipeline actually runs); fall back to an
+    # accepted Europe PMC literature_search step (dev / no-HPC runs).
+    lit = _references_from_accepted_deep_literature(result)
+    if lit is None:
+        lit = _references_from_accepted_literature_search(result)
+    if lit is None:
+        lit = empty_references("no accepted literature citations from this run")
+    # The report writer emits inline citation markers ("[3]", "[1, 2]") that are
+    # narrative artifacts: they map to nothing, since the References list below is rebuilt
+    # independently from the run's accepted citations. Strip them so the manuscript never
+    # shows a citation number that disagrees with the reference list; the real,
+    # corpus-backed list is kept.
+    report_md = strip_intext_citation_markers(report_md)
+    report_md = insert_references(report_md, lit)
+    # The expert team's design-phase reading, kept separate from References on purpose: those
+    # assert support for a finding and come only from accepted analysis steps, while these were
+    # never adjudicated. A run can spend a dozen real DOI-backed lookups shaping its plan, and
+    # showing none of them was the other way to be wrong about this.
+    design_background = list(getattr(result, "design_background", None) or [])
+    report_md = append_design_background(report_md, design_background)
+    if design_background:
+        emit("info", "lab",
+             f"Design background: {len(design_background)} paper(s) the team consulted while "
+             "planning (listed separately from References — not adjudicated as evidence).")
+    lit_note = degradation_note(lit)
+    try:
+        (art / "process" / "literature_references.json").write_text(
+            json.dumps(lit, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    if lit["tier"] in ("lab_deep_literature", "lab_literature_search"):
+        _src = "RetiGene corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
+            else "literature-search step"
+        emit("success", "lab", f"References: reused {len(lit['citations'])} citation(s) from the accepted {_src}.")
+    elif not brief:
+        emit("warning", "lab", "References: no accepted literature citations in this run (none fabricated; no hidden fallback search).")
+    # Self-review the draft BEFORE rendering: strip leftover/placeholder content, fix
+    # numbering, validate figure refs, embed tables (best-effort; keeps draft on failure).
+    if not abandoned() and not brief:
+        say_key("🔍 Self-reviewing the draft…")
+        report_md = await asyncio.to_thread(
+            _review_and_finalize_report, report_md, art, complete_fn, question, lit)
+        emit("info", "lab", "Self-reviewed the report draft before rendering.")
+    # Checked on the FINAL text: the writer and the self-review both write prose of their own.
+    report_md = _correct_manuscript_markers(report_md, result, dataset_result)
+    # The plan's record of the choices the PI made itself, in every kind of report (the
+    # brief one is built by code and never saw the synthesis that carries it).
+    from ..agents import own_choices
+    report_md = own_choices.add_section(report_md, self_sourced,
+                                        insert=_insert_before_backmatter)
+    # Enforce the display policy after every writer/reviewer, including Stop and fallback.
+    # Original diagnostic data and optional generated excerpts remain downloadable.
+    report_md = _default_qc_display(report_md, art, result, question=question)
+    # How we know it is right: every number traced to the run's outputs, what each label rests
+    # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
+    # statement is report/verification.md, the manuscript carries its summary.
+    verification_md, verification = await asyncio.to_thread(
+        _verification_statement, report_md, art, result, lit, brief, qc_report)
+    if verification_md:
+        if not abandoned():
+            report_md = _insert_verification_note(report_md, verification)
+        emit("info", "lab", _verification_chat_line(verification))
+    if prior is not None:
+        # After the number check on purpose: this section restates another run's work.
+        report_md = _insert_before_backmatter(
+            report_md, _earlier_work_note(prior, continues_from_dataset))
+        report_md = _default_qc_display(report_md, art, result, question=question)
+    on_stage("report")
+    say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
+            else "💾 Saving report.md — skipping the render.", "info")
+    report_md = _drop_strip_embeds(report_md, art, emit, "report")
+    # Title the document by CONTENT (the report's own H1 / main finding), not a generic
+    # constant — promotes the first heading to the pandoc title and drops it from the body.
+    report_title, report_md = _promote_doc_title(report_md, "AiScientist Research Report")
+    if untested_md:
+        report_md = untested_md + "\n" + report_md
+    try:
+        if abandoned():
+            # Skip pandoc (and its Slurm job) but never the .md — the bundle must still carry a
+            # readable entry point to what ran. `made` stays empty, which also skips the
+            # post-render reviews below without needing a second guard for them.
+            (art / "report").mkdir(parents=True, exist_ok=True)
+            # Put the H1 back: _promote_doc_title lifted it out for pandoc's front matter, and
+            # nothing renders this file, so without it the .md opens mid-sentence.
+            (art / "report" / "report.md").write_text(
+                f"# {report_title}\n\n{report_md}", encoding="utf-8")
+            rep = {"status": "markdown_only", "md_path": str(art / "report" / "report.md"),
+                   "pdf_path": None, "docx_path": None}
+        else:
+            rep = await asyncio.to_thread(
+                build_pdf_report, report_md, art / "report",
+                title=report_title, basename="report", assets_root=art, render_fn=report_render_fn)
+    except Exception as exc:  # noqa: BLE001 - the report is the LAST step and the analysis is
+        # already done + checkpointed; a render crash must NEVER discard the whole run. Degrade to
+        # an error result so the bundle (incl. report.md, written first inside build_pdf_report)
+        # still ships and the run finishes with its deliverables rather than losing them to a
+        # render crash. The renderer already returns instead of throwing (slurm_report), so this
+        # is defense-in-depth against any other render crash.
+        traceback.print_exc()
+        rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
+               "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
+    made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
+    if made:
+        emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
+        if "pdf_path" not in made and rep.get("error"):
+            # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
+            emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
+    elif rep["status"] == "markdown_only":
+        emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
+    else:
+        # Persist the FULL render error (incl. the HPC3 Slurm-log tail with the real LaTeX
+        # cause) to the bundle — the chat emit is truncated, so without this the actual reason
+        # is lost. Best-effort; the .md always survives regardless.
+        full_err = str(rep.get("error", "") or "").strip()
+        if full_err:
+            try:
+                err_dir = art / "process"
+                err_dir.mkdir(parents=True, exist_ok=True)
+                (err_dir / "report_render_error.log").write_text(full_err, encoding="utf-8")
+            except OSError:
+                pass
+        emit("warning", "lab",
+             f"Report render failed (full log: process/report_render_error.log): {full_err[:160]}")
+    # Post-render text review: read the rendered document back and flag any remaining
+    # issues (advisory — saved to process/report_review.md, never blocks the run).
+    visual_diag = ""
+    if made and not brief:
+        # Post-render reviews are ADVISORY and must NEVER throw past here: the analysis is done
+        # and checkpointed, and the bundle is published BELOW — a review that raises would skip
+        # the publish and the user would lose the ENTIRE run (analysis included) to a "Chat
+        # error", with no downloadable bundle. The VL review especially runs as an HPC3 vision-
+        # model job and can time out / drop the SSH channel. So wrap the whole review block.
+        try:
+            review_note = await asyncio.to_thread(_postrender_text_check, rep, art, complete_fn)
+            if review_note:
+                emit("warning", "lab",
+                     f"Post-render review flagged issues (see process/report_review.md): {review_note[:200]}")
+            else:
+                emit("info", "lab", "Post-render review: report reads clean.")
+            # Post-render VISUAL review (opt-in): a vision model on HPC3 looks at the rendered
+            # pages for LAYOUT defects the text checks are blind to (overlap, clipping, broken
+            # tables) and RE-RENDERS with escalated format to fix them. Residual defects feed the
+            # technical report's Diagnostics only — the manuscript ships clean.
+            vl_attempted = True
+            visual_diag = await asyncio.to_thread(
+                _postrender_visual_check, rep, report_md, report_title, art, conn,
+                report_render_fn)
+        except Exception as exc:  # noqa: BLE001 - advisory; degrade to a warning, keep the bundle
+            traceback.print_exc()
+            emit("warning", "lab", f"Post-render review skipped (non-fatal, bundle preserved): {exc}")
+
+    # Second deliverable: the internal TECHNICAL report — built from the FULL run log
+    # (every step incl. failures/substitutions), rendered alongside the manuscript as
+    # report/technical_report.{pdf,docx}. Best-effort; never blocks the manuscript.
+    try:
+        if abandoned():
+            raise _WriteupAbandoned
+        if brief:
+            raise _BriefReportOnly
+        tech_md = await asyncio.to_thread(
+            _build_technical_report, result, art, complete_fn, question, lit_note,
+            "\n\n".join(d for d in (figure_diag, visual_diag) if d),
+            provenance)
+        tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
+        tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
+        if untested_md:
+            tech_md = untested_md + "\n" + tech_md
+        if verification_md:
+            # The same statement, one heading level down, so the technical PDF carries it too.
+            tech_md = tech_md.rstrip() + "\n\n" + re.sub(
+                r"(?m)^(#{1,5}) ", lambda m: "#" + m.group(1) + " ", verification_md)
+        tech_rep = await asyncio.to_thread(
+            build_pdf_report, tech_md, art / "report",
+            title=tech_title, basename="technical_report", assets_root=art, render_fn=report_render_fn)
+        tech_made = [f for f in ("pdf_path", "docx_path") if tech_rep.get(f)]
+        if tech_made:
+            emit("success", "lab",
+                 f"Rendered technical_report.{' + technical_report.'.join(f.split('_')[0] for f in tech_made)} (pandoc).")
+        elif tech_rep["status"] == "markdown_only":
+            emit("info", "lab", "technical_report.md written — install pandoc for PDF/DOCX.")
+        else:
+            emit("warning", "lab", f"Technical report render failed: {str(tech_rep.get('error', ''))[:160]}")
+    except _WriteupAbandoned:
+        emit("info", "lab", "Technical report skipped — you stopped the write-up.")
+    except _BriefReportOnly:
+        emit("info", "lab", "Short report only — no technical report was written. The run "
+                            "record is in process/, and report/verification.md lists every check.")
+    except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
+        emit("warning", "lab", f"Technical report step failed: {exc}")
+    return {"vl_attempted": vl_attempted, "status": rep.get("status"),
+            "rendered": [f.split("_")[0] for f in made]}
+
+
+# --- write_report for a finished run: the MCP tools write_report / report_status (#102) -------------
+
+_REPORT_JOB_FILE = "report_job.json"
+_REPORT_JOB_STALE_S = 3 * 3600     # a "running" record older than this died with its gateway
+
+
+class ReportJobError(Exception):
+    """Why ``write_report`` cannot start for this run, said to the caller as it is."""
+
+
+def _finished_run_dir(owner: str, run_id: str) -> Path:
+    """The artifacts folder of one of ``owner``'s finished runs, or :class:`ReportJobError`."""
+    art = _run_artifacts_base(owner, run_id) if _RUN_ID_RE.fullmatch(run_id or "") else None
+    if art is None:
+        raise ReportJobError(f"No run {run_id!r} in this account.")
+    if not (art / "process" / "run_state.json").is_file():
+        raise ReportJobError(f"Run {run_id} has no saved state (it was stopped before any step "
+                             "finished), so there is nothing to write a report from.")
+    return art
+
+
+def _read_report_job(art: Path) -> "dict[str, Any]":
+    try:
+        rec = json.loads((art / "process" / _REPORT_JOB_FILE).read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_report_job(art: Path, rec: "dict[str, Any]") -> None:
+    try:
+        from .saved_plans import _write
+        (art / "process").mkdir(parents=True, exist_ok=True)
+        _write(art / "process" / _REPORT_JOB_FILE, json.dumps(rec, indent=2, default=str))
+    except OSError as exc:
+        print(f"[report] could not record the report job: {exc}")
+
+
+def report_job_status(owner: str, run_id: str) -> "dict[str, Any]":
+    """What ``report_status`` answers: the job's state (``none``, ``running``, ``done``, ``error``),
+    its last log lines, and the report files with their download paths."""
+    art = _finished_run_dir(owner, run_id)
+    rec = _read_report_job(art)
+    state = str(rec.get("state") or "")
+    if state == "running" and time.time() - float(rec.get("started", 0) or 0) > _REPORT_JOB_STALE_S:
+        state = "error"
+        rec["error"] = "The report job stopped without finishing (the server restarted?). Start it again."
+    files = [{"path": f"report/{f.name}", "bytes": f.stat().st_size,
+              "url": f"/api/file/{owner}/{run_id}/report/{f.name}"}
+             for f in sorted((art / "report").glob("*"))
+             if f.is_file() and f.suffix in (".pdf", ".docx", ".md")]
+    if not state:
+        state = "done" if (art / "report" / "report.md").is_file() else "none"
+    return {"run_id": run_id, "state": state, "started_at": rec.get("started_at"),
+            "finished_at": rec.get("finished_at"), "error": rec.get("error"),
+            "rendered": rec.get("rendered") or [], "log": list(rec.get("log") or [])[-20:],
+            "files": files}
+
+
+def start_report_job(user: Any, run_id: str) -> "dict[str, Any]":
+    """Start writing the report of one of ``user``'s finished runs, in the background, and return
+    its status at once (the ingress ends a request after 15 s; the report takes minutes). It uses
+    the account's live website session: its model writes, and HPC3 typesets. Raises
+    :class:`ReportJobError` for what the caller has to change first."""
+    owner = safe_name(user.username)
+    art = _finished_run_dir(owner, run_id)
+    for c in _owner_connections(owner):
+        if any(getattr(r, "run_id", None) == run_id for r in getattr(c, "live_runs", []) or []):
+            raise ReportJobError(f"Run {run_id} is still running. Its plan decides whether it "
+                                 "writes a report; ask again when it has finished.")
+    rec = _read_report_job(art)
+    if (rec.get("state") == "running"
+            and time.time() - float(rec.get("started", 0) or 0) <= _REPORT_JOB_STALE_S):
+        return report_job_status(owner, run_id)
+    conn = _owner_hpc_conn(owner, getattr(user, "id", None))
+    if conn is None:
+        raise ReportJobError("Open AiScientist in the browser and connect to HPC3 first: the report "
+                             "is written by your session's model and typeset on HPC3.")
+    if not _model_ready(conn):
+        raise ReportJobError("Your session's model is not ready yet. Try again once the website "
+                             "says the session is ready.")
+    from . import llm_usage
+    gate = llm_usage.budget_gate(getattr(user, "id", None))
+    if gate is not None:
+        raise ReportJobError(gate["message"].replace(" Start this run anyway?", "")
+                             + " Raise the limit under Account › Usage to write this report.")
+    _write_report_job(art, {"run_id": run_id, "state": "running", "started": time.time(),
+                            "started_at": datetime.now(timezone.utc).isoformat(), "log": []})
+    job = _report_job(conn, owner, run_id, art)
+    loop = getattr(conn, "loop", None)
+    if loop is not None and loop.is_running():
+        asyncio.run_coroutine_threadsafe(job, loop)
+    else:
+        threading.Thread(target=lambda: asyncio.run(job), name=f"report-{run_id}", daemon=True).start()
+    return report_job_status(owner, run_id)
+
+
+async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) -> None:
+    """The report of a finished run, rebuilt from its folder: :func:`_write_report` as at the end
+    of a run, its model calls billed to that run. Records the outcome in process/report_job.json."""
+    log: "list[str]" = []
+    rec = _read_report_job(art)
+
+    def emit(level: str, _stage: str = "", message: str = "", **_kw: Any) -> None:
+        log.append(f"[{level}] {message}"[:400])
+
+    def say_key(message: str, level: str = "info") -> None:
+        log.append(f"[{level}] {message}"[:400])
+
+    _USAGE_RUN.set(run_id)
+    _USAGE_STEP.set("Written report (write_report)")
+    try:
+        from ..agents.research_lab import LabResult
+        from ..agents.scope import RunScope, read_scope
+        state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+        result = LabResult.from_dict(state)
+        question = str(state.get("question") or result.question or "")
+        saved_scope = (state.get("plan_context") or {}).get("scope")
+        scope = (RunScope.from_dict(saved_scope) if isinstance(saved_scope, dict)
+                 else read_scope(question, {}))
+        decisions = state.get("decisions") or {}
+        llm = _lab_llm(conn)
+        figure_diag = await asyncio.to_thread(_check_figure_shapes, art, emit)
+        done = await _write_report(
+            conn, art, result, question, complete_fn=llm.complete_fn,
+            report_render_fn=_build_report_render_fn(conn, run_id), emit=emit, say_key=say_key,
+            scope=scope, self_sourced=str(state.get("self_sourced") or ""),
+            dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
+            provenance=_llm_provenance_note(llm),
+            qc_report=_qc_only_run(result) and not _code_wrote_outputs(result))
+        rec.update(state="done", rendered=done.get("rendered") or [], render_status=done.get("status"))
+    except Exception as exc:  # noqa: BLE001 - said in report_status, never raised into the gateway
+        traceback.print_exc()
+        rec.update(state="error", error=f"{type(exc).__name__}: {exc}"[:500])
+    rec.update(finished_at=datetime.now(timezone.utc).isoformat(), log=log[-50:])
+    _write_report_job(art, rec)
+
+
 async def _run_lab(conn: Connection, req: LabRequest, *,
                    resume: "ResumeState | None" = None,
                    resume_run_id: str | None = None,
@@ -13586,7 +13995,6 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         from ..agents.research_harness import HarnessConfig, HarnessContext, ResearchHarness
         from ..agents.research_lab import LabConfig, ResearchLab
         from ..tools.api import run_dataset_smoke_analysis
-        from ..reporting.report import build_pdf_report
         from ..reporting.research_bundle import write_process_artifacts
         from ..tools.api import render_workflow_schematic
 
@@ -14454,6 +14862,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # step whose result contradicts the plan's premise yields a falsifiable hypothesis + the step
         # that tests it). Env opt-in — off = today's execute-the-drafted-plan behaviour exactly.
         # Costs extra LLM turns and extra analysis steps, so it is a deliberate switch, not a default.
+        # Even on, a step is explored only when a skill it uses declares ``exploration`` (#102).
         hypothesis_driven = (os.environ.get("AISCIENTIST_HYPOTHESIS_DRIVEN", "").strip().lower()
                              in ("1", "true", "yes"))
         try:
@@ -14901,12 +15310,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                                        "not a tested tool — the reply says which.")
         except Exception as exc:  # noqa: BLE001 - a label, never a reason to lose the run
             emit("warning", "lab", f"Could not label untested code: {type(exc).__name__}: {exc}"[:200])
-        # A run that only did quality control is answered in the chat, unless its request asks for a
-        # written report: then the model writes one (Yijun, 2026-10-18). Either way the bundle is the
-        # complete folder.
-        from ..agents.scope import wants_written_report
+        # A written report only when the plan kept a write_report step, which it has when the request
+        # asked for one or a skill declares one (RCHENLAB/AiScientist#102). Without it a run that only
+        # did quality control gets the QC reply in the chat (Yijun, 2026-10-18), and any other run its
+        # answer. Either way the bundle is the complete folder.
+        report_wanted = bool(getattr(lab_obj, "report_requested", False)
+                             or getattr(result, "report_requested", False))
         qc_run = _qc_only_run(result) and not _code_wrote_outputs(result)
-        qc_report = qc_run and wants_written_report(req.question)
+        qc_report = qc_run and report_wanted
         chat_only = qc_run and not qc_report
         # Always draw a deterministic methods/workflow schematic from the PI agenda
         # (zero AI — one box per step, holding its number and title, laid out by graphviz in a
@@ -14936,7 +15347,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # calls and two renders, it took 11 minutes, and the Stop button had just said "ending the
         # current run" — so the user watched a run they had stopped keep spending. Say what is
         # actually happening, and let a second Stop out of it.
-        if run.chat_stop.is_set() and not chat_only:
+        if run.chat_stop.is_set() and report_wanted:
             say_key(f"🛑 Analysis stopped — writing up the {result.accepted_steps} step(s) that "
                     "completed. This takes a few minutes. Press Stop again to skip the write-up "
                     "and keep just the result files.", "warning")
@@ -14956,7 +15367,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
 
         vl_attempted = False   # did the post-render visual review get a document to read?
         # The lab is done; what is left is the write-up (or, for QC only, the chat reply).
-        _watch_stage(run, "report" if chat_only else "writeup")
+        _watch_stage(run, "writeup" if report_wanted else "report")
         if chat_only:
             # Quality control is all this run did: the answer is a short reply in the chat, written
             # by code from the QC tool's own numbers. No report, no PDF/DOCX, no References and no
@@ -14977,230 +15388,30 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 pass
             emit("info", "lab", "Quality control only — the summary is in the chat; no report was "
                                 "written.")
-        else:
-            brief = _wants_brief_report(getattr(lab_obj, "scope", None), result)
-            if abandoned():
-                report_md = ("# Research report (write-up skipped)\n\n"
-                             "You stopped this run a second time, so the model-written report, the "
-                             "self-review and the rendered PDF/DOCX were skipped. The figures and "
-                             "tables every completed step produced are in this bundle, and "
-                             "`process/run_state.json` can resume it.\n\n"
-                             f"{result.final_answer or ''}\n")
-            elif qc_report:
-                # QC only, and a written report asked for: the writer's report (it chose the layout),
-                # then the files the run handed back.
-                say_key("📝 Writing the quality-control report…")
-                report_md = _qc_report_md(result.final_answer or "", art)
-            elif brief:
-                # Asked for ("a short report"): a one-page summary built from what the tools
-                # returned — no manuscript, no model-written prose to check.
-                say_key("📝 Writing the short report…")
-                report_md = await asyncio.to_thread(
-                    _build_brief_report, art, req.question, result, getattr(lab_obj, "scope", None))
-            else:
-                say_key("📝 Writing the research report…")
-                report_md = await asyncio.to_thread(
-                    _build_report, result.final_answer or "", art, complete_fn, req.question, result)
-            # Literature module: fill the manuscript's reserved '## References' slot from citations
-            # actually produced by an accepted in-loop literature step. The research pipeline grounds
-            # literature via `deep_literature` (PaperQA over the lab's curated corpus); `literature_search`
-            # (Europe PMC) is the dev/no-HPC fallback. Reuse whichever ran — do NOT perform a hidden
-            # report-time search; if neither was accepted, the References section says so honestly.
-            from ..reporting.literature_references import (
-                append_design_background, degradation_note, empty_references, insert_references,
-                strip_intext_citation_markers)
-
-            if not brief:
-                say_key("📚 Collecting accepted literature citations…")
-            # Prefer deep_literature (the corpus tool the pipeline actually runs); fall back to an
-            # accepted Europe PMC literature_search step (dev / no-HPC runs).
-            lit = _references_from_accepted_deep_literature(result)
-            if lit is None:
-                lit = _references_from_accepted_literature_search(result)
-            if lit is None:
-                lit = empty_references("no accepted literature citations from this run")
-            # The report writer emits inline citation markers ("[3]", "[1, 2]") that are
-            # narrative artifacts: they map to nothing, since the References list below is rebuilt
-            # independently from the run's accepted citations. Strip them so the manuscript never
-            # shows a citation number that disagrees with the reference list; the real,
-            # corpus-backed list is kept.
-            report_md = strip_intext_citation_markers(report_md)
-            report_md = insert_references(report_md, lit)
-            # The expert team's design-phase reading, kept separate from References on purpose: those
-            # assert support for a finding and come only from accepted analysis steps, while these were
-            # never adjudicated. A run can spend a dozen real DOI-backed lookups shaping its plan, and
-            # showing none of them was the other way to be wrong about this.
-            design_background = list(getattr(result, "design_background", None) or [])
-            report_md = append_design_background(report_md, design_background)
-            if design_background:
-                emit("info", "lab",
-                     f"Design background: {len(design_background)} paper(s) the team consulted while "
-                     "planning (listed separately from References — not adjudicated as evidence).")
-            lit_note = degradation_note(lit)
+        elif not report_wanted:
+            # No written report was asked for (RCHENLAB/AiScientist#102): the answer is the chat
+            # reply, and report/summary.md keeps it in the folder (it also marks the run finished, so
+            # the next message in this chat can continue from it). write_report, an MCP tool, can
+            # still write the report of this run later.
             try:
-                (art / "process" / "literature_references.json").write_text(
-                    json.dumps(lit, indent=2, ensure_ascii=False), encoding="utf-8")
+                (art / "report").mkdir(parents=True, exist_ok=True)
+                (art / "report" / "summary.md").write_text(result.final_answer or "",
+                                                           encoding="utf-8")
             except OSError:
                 pass
-            if lit["tier"] in ("lab_deep_literature", "lab_literature_search"):
-                _src = "RetiGene corpus (deep_literature)" if lit["tier"] == "lab_deep_literature" \
-                    else "literature-search step"
-                emit("success", "lab", f"References: reused {len(lit['citations'])} citation(s) from the accepted {_src}.")
-            elif not brief:
-                emit("warning", "lab", "References: no accepted literature citations in this run (none fabricated; no hidden fallback search).")
-            # Self-review the draft BEFORE rendering: strip leftover/placeholder content, fix
-            # numbering, validate figure refs, embed tables (best-effort; keeps draft on failure).
-            if not abandoned() and not brief:
-                say_key("🔍 Self-reviewing the draft…")
-                report_md = await asyncio.to_thread(
-                    _review_and_finalize_report, report_md, art, complete_fn, req.question, lit)
-                emit("info", "lab", "Self-reviewed the report draft before rendering.")
-            # Checked on the FINAL text: the writer and the self-review both write prose of their own.
-            report_md = _correct_manuscript_markers(report_md, result, decisions.get("dataset_result"))
-            # The plan's record of the choices the PI made itself, in every kind of report (the
-            # brief one is built by code and never saw the synthesis that carries it).
-            from ..agents import own_choices
-            report_md = own_choices.add_section(report_md, lab_obj.self_sourced,
-                                                insert=_insert_before_backmatter)
-            # Enforce the display policy after every writer/reviewer, including Stop and fallback.
-            # Original diagnostic data and optional generated excerpts remain downloadable.
-            report_md = _default_qc_display(report_md, art, result, question=req.question)
-            # How we know it is right: every number traced to the run's outputs, what each label rests
-            # on, the QC arithmetic, unfinished steps. Built by code on the FINAL text; the full
-            # statement is report/verification.md, the manuscript carries its summary.
-            verification_md, verification = await asyncio.to_thread(
-                _verification_statement, report_md, art, result, lit, brief, qc_report)
-            if verification_md:
-                if not abandoned():
-                    report_md = _insert_verification_note(report_md, verification)
-                emit("info", "lab", _verification_chat_line(verification))
-            if prior is not None:
-                # After the number check on purpose: this section restates another run's work.
-                report_md = _insert_before_backmatter(
-                    report_md, _earlier_work_note(prior, continues_from_dataset))
-                report_md = _default_qc_display(report_md, art, result, question=req.question)
-            _watch_stage(run, "report")
-            say_key("📄 Rendering the report (PDF / DOCX)…" if not abandoned()
-                    else "💾 Saving report.md — skipping the render.", "info")
-            report_md = _drop_strip_embeds(report_md, art, emit, "report")
-            # Title the document by CONTENT (the report's own H1 / main finding), not a generic
-            # constant — promotes the first heading to the pandoc title and drops it from the body.
-            report_title, report_md = _promote_doc_title(report_md, "AiScientist Research Report")
-            if untested_md:
-                report_md = untested_md + "\n" + report_md
-            try:
-                if abandoned():
-                    # Skip pandoc (and its Slurm job) but never the .md — the bundle must still carry a
-                    # readable entry point to what ran. `made` stays empty, which also skips the
-                    # post-render reviews below without needing a second guard for them.
-                    (art / "report").mkdir(parents=True, exist_ok=True)
-                    # Put the H1 back: _promote_doc_title lifted it out for pandoc's front matter, and
-                    # nothing renders this file, so without it the .md opens mid-sentence.
-                    (art / "report" / "report.md").write_text(
-                        f"# {report_title}\n\n{report_md}", encoding="utf-8")
-                    rep = {"status": "markdown_only", "md_path": str(art / "report" / "report.md"),
-                           "pdf_path": None, "docx_path": None}
-                else:
-                    rep = await asyncio.to_thread(
-                        build_pdf_report, report_md, art / "report",
-                        title=report_title, basename="report", assets_root=art, render_fn=report_render_fn)
-            except Exception as exc:  # noqa: BLE001 - the report is the LAST step and the analysis is
-                # already done + checkpointed; a render crash must NEVER discard the whole run. Degrade to
-                # an error result so the bundle (incl. report.md, written first inside build_pdf_report)
-                # still ships and the run finishes with its deliverables rather than losing them to a
-                # render crash. The renderer already returns instead of throwing (slurm_report), so this
-                # is defense-in-depth against any other render crash.
-                traceback.print_exc()
-                rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
-                       "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
-            made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
-            if made:
-                emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
-                if "pdf_path" not in made and rep.get("error"):
-                    # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
-                    emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
-            elif rep["status"] == "markdown_only":
-                emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
-            else:
-                # Persist the FULL render error (incl. the HPC3 Slurm-log tail with the real LaTeX
-                # cause) to the bundle — the chat emit is truncated, so without this the actual reason
-                # is lost. Best-effort; the .md always survives regardless.
-                full_err = str(rep.get("error", "") or "").strip()
-                if full_err:
-                    try:
-                        err_dir = art / "process"
-                        err_dir.mkdir(parents=True, exist_ok=True)
-                        (err_dir / "report_render_error.log").write_text(full_err, encoding="utf-8")
-                    except OSError:
-                        pass
-                emit("warning", "lab",
-                     f"Report render failed (full log: process/report_render_error.log): {full_err[:160]}")
-            # Post-render text review: read the rendered document back and flag any remaining
-            # issues (advisory — saved to process/report_review.md, never blocks the run).
-            visual_diag = ""
-            if made and not brief:
-                # Post-render reviews are ADVISORY and must NEVER throw past here: the analysis is done
-                # and checkpointed, and the bundle is published BELOW — a review that raises would skip
-                # the publish and the user would lose the ENTIRE run (analysis included) to a "Chat
-                # error", with no downloadable bundle. The VL review especially runs as an HPC3 vision-
-                # model job and can time out / drop the SSH channel. So wrap the whole review block.
-                try:
-                    review_note = await asyncio.to_thread(_postrender_text_check, rep, art, complete_fn)
-                    if review_note:
-                        emit("warning", "lab",
-                             f"Post-render review flagged issues (see process/report_review.md): {review_note[:200]}")
-                    else:
-                        emit("info", "lab", "Post-render review: report reads clean.")
-                    # Post-render VISUAL review (opt-in): a vision model on HPC3 looks at the rendered
-                    # pages for LAYOUT defects the text checks are blind to (overlap, clipping, broken
-                    # tables) and RE-RENDERS with escalated format to fix them. Residual defects feed the
-                    # technical report's Diagnostics only — the manuscript ships clean.
-                    vl_attempted = True
-                    visual_diag = await asyncio.to_thread(
-                        _postrender_visual_check, rep, report_md, report_title, art, conn,
-                        report_render_fn)
-                except Exception as exc:  # noqa: BLE001 - advisory; degrade to a warning, keep the bundle
-                    traceback.print_exc()
-                    emit("warning", "lab", f"Post-render review skipped (non-fatal, bundle preserved): {exc}")
-
-            # Second deliverable: the internal TECHNICAL report — built from the FULL run log
-            # (every step incl. failures/substitutions), rendered alongside the manuscript as
-            # report/technical_report.{pdf,docx}. Best-effort; never blocks the manuscript.
-            try:
-                if abandoned():
-                    raise _WriteupAbandoned
-                if brief:
-                    raise _BriefReportOnly
-                tech_md = await asyncio.to_thread(
-                    _build_technical_report, result, art, complete_fn, req.question, lit_note,
-                    "\n\n".join(d for d in (figure_diag, visual_diag) if d),
-                    _llm_provenance_note(_llm))
-                tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
-                tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
-                if untested_md:
-                    tech_md = untested_md + "\n" + tech_md
-                if verification_md:
-                    # The same statement, one heading level down, so the technical PDF carries it too.
-                    tech_md = tech_md.rstrip() + "\n\n" + re.sub(
-                        r"(?m)^(#{1,5}) ", lambda m: "#" + m.group(1) + " ", verification_md)
-                tech_rep = await asyncio.to_thread(
-                    build_pdf_report, tech_md, art / "report",
-                    title=tech_title, basename="technical_report", assets_root=art, render_fn=report_render_fn)
-                tech_made = [f for f in ("pdf_path", "docx_path") if tech_rep.get(f)]
-                if tech_made:
-                    emit("success", "lab",
-                         f"Rendered technical_report.{' + technical_report.'.join(f.split('_')[0] for f in tech_made)} (pandoc).")
-                elif tech_rep["status"] == "markdown_only":
-                    emit("info", "lab", "technical_report.md written — install pandoc for PDF/DOCX.")
-                else:
-                    emit("warning", "lab", f"Technical report render failed: {str(tech_rep.get('error', ''))[:160]}")
-            except _WriteupAbandoned:
-                emit("info", "lab", "Technical report skipped — you stopped the write-up.")
-            except _BriefReportOnly:
-                emit("info", "lab", "Short report only — no technical report was written. The run "
-                                    "record is in process/, and report/verification.md lists every check.")
-            except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
-                emit("warning", "lab", f"Technical report step failed: {exc}")
+            emit("info", "lab", "No written report was asked for — the answer is in the chat. "
+                                "write_report (an MCP tool) can write one for this run later.")
+        else:
+            done = await _write_report(
+                conn, art, result, req.question, complete_fn=complete_fn,
+                report_render_fn=report_render_fn, emit=emit, say_key=say_key,
+                scope=getattr(lab_obj, "scope", None), self_sourced=lab_obj.self_sourced,
+                dataset_result=decisions.get("dataset_result"), prior=prior,
+                continues_from_dataset=continues_from_dataset, untested_md=untested_md,
+                figure_diag=figure_diag, provenance=_llm_provenance_note(_llm),
+                qc_report=qc_report, abandoned=abandoned,
+                on_stage=lambda stage: _watch_stage(run, stage))
+            vl_attempted = done["vl_attempted"]
 
         if qc_report:
             # The chat gets the numbers; the written report is in the folder.
@@ -15214,6 +15425,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if chat_only:
             # A warning, as the reply's first line, when the QC step was not accepted (issue 75).
             say_key(*_qc_closing_line(result))
+        elif not report_wanted:
+            say_key("✅ Done — the answer is below; the figures and tables are in the Downloads panel.",
+                    "success")
         else:
             say_key("✅ Report ready — see below and the Downloads panel." if not abandoned()
                     else "🛑 Write-up skipped — the run's figures, tables and report.md are in the "
@@ -15244,7 +15458,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             freed = _drop_process_files(conn.workspace / run_id)
             if freed:
                 emit("info", "lab",
-                     f"{'Done' if chat_only else 'Report written'} — released "
+                     f"{'Report written' if report_wanted else 'Done'} — released "
                      f"{freed / (1 << 20):.0f} MB of process files "
                      "(checkpoints + the staged input copy); artifacts kept.")
             if analysis_executor is not None:

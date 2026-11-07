@@ -65,6 +65,16 @@ def test_release_metadata_checksum_tier_and_exposure(release, monkeypatch):
     assert not set(atlas.TOOLS) & tools(Runner()).keys()
 
 
+@pytest.mark.parametrize("value", ["", "heca/latest=/shared/heca/x.h5ad", "heca/v1=relative/x.h5ad"])
+def test_without_a_configured_atlas_the_tools_are_not_offered(release, monkeypatch, value):
+    """A deployment that lists no atlas would offer nine tools that always fail."""
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", value)
+    catalog = tools(Runner())
+    assert not set(atlas.TOOLS) & catalog.keys()
+    out = catalog["run_in_environment"].executor({"skill": atlas.SKILL, "command": "true"}, None)
+    assert out["status"] == "error" and "not set up on this deployment" in out["error"]
+
+
 def test_resolution_flow_preserves_all_user_names_and_provenance(release, tmp_path):
     runner = Runner()
     catalog = tools(runner)

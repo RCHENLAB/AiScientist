@@ -117,8 +117,8 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
    When it is planned: search on the cell types, markers and pathway terms the analysis actually
    surfaced. The manuscript's `## References` are built ONLY from an ACCEPTED literature step, so
    a run without one has no reference list, and its report says so.
-7. Do NOT plan a report-WRITING or rendering step — the methods + results report is assembled
-   automatically from the accepted results. That is about writing it, NOT about interpreting:
+7. Do NOT plan a report-WRITING or rendering step of your own — a written report is one `write_report` step, last, planned only when the request asks for it.
+   That is about writing it, NOT about interpreting:
    the enrichment (step 4) evidence is still part of a whole analysis.
 
 Ground every label in the marker genes the tools actually returned. Do not fabricate cell

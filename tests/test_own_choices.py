@@ -70,9 +70,9 @@ def test_the_gateway_adds_it_to_every_kind_of_report():
 
     from aiscientist.gateway import app as gw
 
-    src = inspect.getsource(gw._run_lab)
+    src = inspect.getsource(gw._write_report)      # the report, at the end of a run or later (#102)
     checked = src.index("report_md = _correct_manuscript_markers(report_md, result")
-    added = src.index("own_choices.add_section(report_md, lab_obj.self_sourced")
+    added = src.index("own_choices.add_section(report_md, self_sourced")
     verified = src.index("_verification_statement, report_md")
     assert checked < added < verified
 

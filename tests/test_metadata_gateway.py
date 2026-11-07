@@ -325,7 +325,8 @@ def test_mcp_lists_searches_reads_and_previews_with_a_token(env):
                        headers={"Authorization": f"Bearer {token}"})
     assert note.status_code == 202
     tools = {t["name"] for t in _rpc(client, "tools/list", token=token).json()["result"]["tools"]}
-    assert tools == {"list_datasets", "search_datasets", "get_dataset_metadata", "get_provenance", "preview_records"}
+    assert tools == {"list_datasets", "search_datasets", "get_dataset_metadata", "get_provenance",
+                     "preview_records", "write_report", "report_status"}
 
     def call(name, **args):
         out = _rpc(client, "tools/call", {"name": name, "arguments": args}, token=token).json()["result"]
@@ -467,3 +468,96 @@ def test_the_planner_reads_the_bound_datasets_metadata_marked_reviewed_or_drafte
     assert "panel.csv (UUID u-2; drafted automatically, not reviewed)" in text
     assert "Homo sapiens (drafted — verify against the data)" in text
     assert ResearchLab._metadata_context(SimpleNamespace(ctx=SimpleNamespace(decisions={}))) == ""
+
+
+# --- write_report: the report of a finished run (RCHENLAB/AiScientist#102) ------------------------------
+
+
+def _finished_run(env, run_id: str = "rpt000000001", owner: str = "alice"):
+    art = env["tmp"] / "runs" / owner / run_id / "artifacts"
+    (art / "process").mkdir(parents=True)
+    state = {"question": "Cluster these cells", "agenda": ["**Clustering** — Run `run_clustering`."],
+             "rounds": [], "converged": True, "accepted_steps": 1, "final_answer": "Three clusters.",
+             "decisions": {}, "self_sourced": "resolution 0.5, my choice"}
+    (art / "process" / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+    return art
+
+
+def _tool(client, token: str, name: str, **args) -> dict:
+    return _rpc(client, "tools/call", {"name": name, "arguments": args}, token=token).json()["result"]
+
+
+def _wait_done(client, token: str, run_id: str, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    while True:
+        out = _tool(client, token, "report_status", run_id=run_id)["structuredContent"]
+        if out["state"] != "running" or time.time() > deadline:
+            return out
+        time.sleep(0.05)
+
+
+def test_mcp_write_report_runs_only_with_a_token_allowed_to_run_tools(env, monkeypatch):
+    gw = env["gw"]
+    art = _finished_run(env)
+    seen: dict = {}
+
+    async def fake_report(conn, art_, result, question, **kw):
+        seen.update(question=question, self_sourced=kw["self_sourced"], qc_report=kw["qc_report"],
+                    billed=gw._USAGE_RUN.get())
+        (art_ / "report").mkdir(exist_ok=True)
+        for ext in ("md", "pdf", "docx"):
+            (art_ / "report" / f"report.{ext}").write_text("# Report\n", encoding="utf-8")
+        return {"vl_attempted": False, "status": "ok", "rendered": ["pdf", "docx"]}
+
+    class _Llm:
+        complete_fn = staticmethod(lambda messages, **_k: "")
+
+    monkeypatch.setattr(gw, "_write_report", fake_report)
+    monkeypatch.setattr(gw, "_model_ready", lambda conn: True)
+    monkeypatch.setattr(gw, "_lab_llm", lambda conn: _Llm())
+    monkeypatch.setattr(gw, "_llm_provenance_note", lambda llm: "")
+    monkeypatch.setattr(gw, "_build_report_render_fn", lambda conn, run_id="": None)
+
+    alice = env["client"]("alice")
+    read = alice.post("/api/account/tokens", json={"name": "reader"}).json()
+    runner = alice.post("/api/account/tokens", json={"name": "runner", "run": True}).json()
+    assert read["scope"] == "mcp:read" and "mcp:run" in runner["scope"]
+    client = env["client"](None)
+
+    refused = _tool(client, read["token"], "write_report", run_id="rpt000000001")
+    assert refused["isError"] and "allowed to run tools" in refused["content"][0]["text"]
+    assert _tool(client, read["token"], "report_status", run_id="rpt000000001")[
+        "structuredContent"]["state"] == "none"            # reading needs no more than mcp:read
+
+    started = _tool(client, runner["token"], "write_report", run_id="rpt000000001")
+    assert not started["isError"] and started["structuredContent"]["state"] in ("running", "done")
+    done = _wait_done(client, runner["token"], "rpt000000001")
+    assert done["state"] == "done" and done["rendered"] == ["pdf", "docx"]
+    assert {"path": "report/report.pdf", "bytes": 9,
+            "url": "/api/file/alice/rpt000000001/report/report.pdf"} in done["files"]
+    # rebuilt from the run's folder, billed to that run
+    assert seen == {"question": "Cluster these cells", "self_sourced": "resolution 0.5, my choice",
+                    "qc_report": False, "billed": "rpt000000001"}
+    assert json.loads((art / "process" / "report_job.json").read_text())["state"] == "done"
+
+
+def test_mcp_write_report_answers_one_account_and_says_what_is_missing(env, monkeypatch):
+    gw = env["gw"]
+    _finished_run(env)
+    _finished_run(env, run_id="rpt000000009", owner="bob")
+    monkeypatch.setattr(gw, "_model_ready", lambda conn: True)
+    bob = env["client"]("bob").post("/api/account/tokens", json={"name": "b", "run": True}).json()["token"]
+    alice = env["client"]("alice").post("/api/account/tokens", json={"name": "a", "run": True}).json()["token"]
+    client = env["client"](None)
+    other = _tool(client, bob, "write_report", run_id="rpt000000001")
+    assert other["isError"] and "No run" in other["content"][0]["text"]
+    assert _tool(client, alice, "write_report", run_id="../bob")["isError"]
+    missing = _tool(client, alice, "write_report", run_id="rpt000000404")
+    assert missing["isError"] and "No run" in missing["content"][0]["text"]
+    # bob has a finished run but no website session: nothing can write it
+    nosession = _tool(client, bob, "write_report", run_id="rpt000000009")
+    assert nosession["isError"] and "connect to HPC3" in nosession["content"][0]["text"]
+    # a run still in progress decides its own report
+    env["conn"].live_runs.append(gw.RunState(env["conn"], "conv-1", run_id="rpt000000001"))
+    busy = _tool(client, alice, "write_report", run_id="rpt000000001")
+    assert busy["isError"] and "still running" in busy["content"][0]["text"]

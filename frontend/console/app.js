@@ -4046,8 +4046,11 @@ function updateComposerButton() {
 }
 
 // Cancel a chat's in-flight run so the GPU + compute are released. Used by the Stop
-// button and by deleting the chat that owns the run.
-async function stopRun(c = activeChat()) {
+// button and by deleting the chat that owns the run. Anything that is not a chat (a click event)
+// means the chat on screen: the request must name its chat, or the server cannot tell which run
+// to stop when several chats are running.
+async function stopRun(chat) {
+  const c = chat && chat.sid ? chat : activeChat();
   if (!state.connectionId || !c) return;
   if (chatVisible(c)) {
     const stop = $("chatStop");
@@ -8333,7 +8336,8 @@ async function loadMcpTokens() {
     const tokens = (await res.json()).tokens || [];
     box.classList.remove("hidden");
     $("mcpTokens").innerHTML = tokens.length ? tokens.map((t) =>
-      `<div class="storage-item"><span class="si-name">${icon("key")} ${escapeHtml(t.name)} <code>${escapeHtml(t.prefix)}…</code></span>` +
+      `<div class="storage-item"><span class="si-name">${icon("key")} ${escapeHtml(t.name)} <code>${escapeHtml(t.prefix)}…</code>` +
+      `${String(t.scope || "").includes("mcp:run") ? ' <span class="storage-note">· runs tools</span>' : ""}</span>` +
       `<span class="si-size">${t.last_used_at ? "used " + fmtDate(t.last_used_at) : "never used"}</span>` +
       `<button type="button" class="si-del" data-revoke-token="${t.id}">Revoke</button></div>`).join("")
       : '<div class="storage-note">No tokens yet.</div>';
@@ -8344,10 +8348,12 @@ async function createMcpToken(e) {
   e.preventDefault();
   try {
     const res = await fetch("/api/account/tokens", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: $("mcpTokenName").value.trim() || "MCP client" }) });
+      body: JSON.stringify({ name: $("mcpTokenName").value.trim() || "MCP client",
+                             run: Boolean($("mcpTokenRun") && $("mcpTokenRun").checked) }) });
     const j = await res.json();
     if (!res.ok) { toast(j.detail || "Could not create a token."); return; }
     $("mcpTokenName").value = "";
+    if ($("mcpTokenRun")) $("mcpTokenRun").checked = false;
     const url = `${location.origin}/mcp`;
     const shown = $("mcpTokenShown");
     shown.innerHTML = `<p><strong>Copy this token now:</strong> it is shown only once.</p>` +
@@ -9897,7 +9903,7 @@ function init() {
   loadApiCredentials();     // populate the login picker on first paint, before any session exists
   loadClusterModels();      // and its cluster-model options
   $("chatForm").addEventListener("submit", sendChat);
-  $("chatStop").addEventListener("click", stopRun);
+  $("chatStop").addEventListener("click", () => stopRun());
   $("datasetFile").addEventListener("change", (e) => { for (const f of e.target.files || []) uploadDataset(f); e.target.value = ""; });   // multi-attach: each file joins the bind-set
   $("datasetDir").addEventListener("change", (e) => { if (e.target.files && e.target.files.length) uploadFolder(e.target.files); e.target.value = ""; });
   $("datasetChips").addEventListener("click", (e) => {

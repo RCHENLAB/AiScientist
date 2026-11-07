@@ -68,11 +68,23 @@ _NO_REPORT = re.compile(
 
 
 def wants_written_report(question: "str | None") -> bool:
-    """Does the request ask for a written report? A run that only did QC answers in the chat unless
-    it does (Yijun, 2026-10-18: no report asked for, the chat reply; a report asked for, the model
-    writes it)."""
+    """Does the request ask for a written report? Only then does the plan get a ``write_report``
+    step; without it a run answers in the chat (Yijun, 2026-10-18, for QC; every run since
+    RCHENLAB/AiScientist#102)."""
     q = question or ""
     return bool(_REPORT_WORD.search(q)) and not _NO_REPORT.search(q)
+
+
+# A note on a plan under review that takes its report step out: "drop the report step", "删掉报告".
+_DROP_REPORT = re.compile(
+    r"\b(?:drop|remove|delete|cut|skip|omit)\b[^.;\n]{0,30}\b(?:reports?|write-?ups?)\b|"
+    r"(?:删|删掉|删除|去掉|去除|拿掉)[^。；\n]{0,8}报告", re.IGNORECASE)
+
+
+def rules_out_report(text: "str | None") -> bool:
+    """Does ``text`` say there should be no written report (``no report``, ``drop the report step``)?"""
+    t = text or ""
+    return bool(_NO_REPORT.search(t) or _DROP_REPORT.search(t))
 
 
 def qc_only(tools: "Iterable[str]") -> bool:
@@ -256,8 +268,9 @@ class RunScope:
         if self.exclude:
             parts.append("plan NO step run by " + ", ".join(f"`{t}`" for t in self.exclude) + ";")
         parts.append("do not add other work to make up for it (no literature, figure, audit or "
-                     "follow-up step the request did not ask for). The processed dataset and the "
-                     "report are produced automatically when the run ends — plan no step for them.")
+                     "follow-up step the request did not ask for). The processed dataset is produced "
+                     "automatically when the run ends — plan no step for it; a written report is a "
+                     "`write_report` step, planned only when the request asks for one.")
         return " ".join(parts)
 
     def describe(self) -> str:

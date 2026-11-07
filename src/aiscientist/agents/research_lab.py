@@ -66,7 +66,8 @@ from .plan_doc import (
     split_step,
     sync_plan,
 )
-from .scope import QC_ONLY_TOOLS, RunScope, qc_only_run, read_scope, wants_written_report
+from .scope import (QC_ONLY_TOOLS, RunScope, qc_only_run, read_scope, rules_out_report,
+                    wants_written_report)
 from .marker_claims import check_marker_claims
 from .label_claims import check_label_conflation, dataset_labels, label_glossary, labels_prompt
 from . import own_choices
@@ -81,6 +82,7 @@ from .skill_code import fit_scripts, skill_functions
 from .skills import (
     SKILLS as ATOMIC_SKILLS,
     Skill,
+    declares,
     default_file,
     get_skill,
     make_search_skills_tool,
@@ -175,12 +177,15 @@ _PI_SYSTEM = (
     "agenda step for `deep_literature` near the end, using focused biomedical terms from the "
     "question and findings, IN ADDITION to the analysis steps. In every other case — a whole "
     "analysis included, and whatever the guidance lists — do NOT plan a literature step: name it "
-    "in `later` instead. The word 'report' is not such a request; every run ends with a report. "
-    "Do NOT add ANY step that "
+    "in `later` instead. The word 'report' is not such a request. "
+    "A WRITTEN REPORT IS ALSO A STEP OF ITS OWN, PLANNED ONLY WHEN ASKED FOR: when the request asks "
+    "for a written report (a report, write-up, manuscript, PDF or DOCX), plan ONE `write_report` step, "
+    "LAST; otherwise plan none, and the run answers in the chat. Do NOT add any other step that "
     "writes, renders, packages, zips, organizes, exports, or duplicates a report/document/archive "
-    "(no .docx/.pdf/.html/.zip, no 'compile the report', no 'bundle the outputs'): the figures, "
-    "tables, and the final PDF+DOCX report are assembled AUTOMATICALLY when the run finishes, so any "
-    "such step is wasted, duplicate work. Plan ONLY the analysis. "
+    "(no .docx/.pdf/.html/.zip, no 'compile the report', no 'bundle the outputs'): the tools write "
+    "the figures and tables, and the downloadable bundle is assembled automatically when the run "
+    "finishes, so any such step is wasted, duplicate work. Plan ONLY the analysis, plus that one "
+    "report step when it is asked for. "
     "USE THE DATASET PROFILE when one is given (cell/gene counts + the dataset's obs/metadata "
     "columns, with category values when few): plan around the data's ACTUAL design, not a generic "
     "template. (a) When the request is for the whole analysis, or asks about the groups, and a "
@@ -924,9 +929,10 @@ def make_run_code_tool(executor: CodeExecutor | None,
         "`environment` here and its programs (Rscript, mosdepth, ...) are on PATH for subprocess calls. "
         "STRICT: use this ONLY for analysis (compute figures into figures/, tables into tables/). Do "
         "NOT write or render a report or document (no .docx/.pdf/.html, no python-docx/reportlab/"
-        "pandoc), and do NOT zip/package/export the outputs: the final PDF+DOCX report and the "
-        "downloadable bundle of everything under AISCIENTIST_ARTIFACTS are created AUTOMATICALLY when "
-        "the run finishes. Building your own report or archive is duplicate work and will be discarded."
+        "pandoc), and do NOT zip/package/export the outputs: the downloadable bundle of everything "
+        "under AISCIENTIST_ARTIFACTS is created AUTOMATICALLY when the run finishes, and a written "
+        "report comes only from the plan's own `write_report` step. Building your own report or "
+        "archive is duplicate work and will be discarded."
     )
     # Append the LIVE execution-environment context (real paths, obs schema, CWD + memory caveats)
     # so the model stops guessing column names / relative paths / working directory — the largest,
@@ -1012,9 +1018,9 @@ def make_run_in_environment_tool(executor: Any,
         if skill is None:
             return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "
                                                 f"environment: {with_env or 'none'}"}
-        from .atlas_expression import SKILL, TOOLS
+        from .atlas_expression import SKILL, direct_call_refusal
         if skill.name == SKILL and not _atlas_bridge:
-            return {"status": "error", "error": "Use the atlas bridge tools: " + ", ".join(TOOLS)}
+            return {"status": "error", "error": direct_call_refusal()}
         if not skill.image:
             why = f" ({skill.env_problem})" if skill.env_problem else ""
             return {"status": "error",
@@ -1246,8 +1252,10 @@ def _known_tool_names() -> frozenset[str]:
         # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
         # a step that names it must still be recognised as that tool's step.
         from .atlas_expression import TOOLS as atlas_tools
+        # write_report is a plan step the gateway carries out after the analysis (#102), not a tool
+        # the Scientist calls, so it is in no catalog.
         return (frozenset(t.name for t in build_scientist_catalog())
-                | {"run_in_environment"} | atlas_tools.keys())
+                | {"run_in_environment", REPORT_TOOL} | atlas_tools.keys())
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
@@ -1349,8 +1357,8 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
         text = str(step)
         # 1. Names. Correct the unambiguous ones in place; report the rest.
         for raw in set(_BACKTICK_TOOL_RE.findall(text)) | {m.group(1) for m in _TOOL_CALL_RE.finditer(text)}:
-            if raw in schemas or get_skill(raw) is not None:
-                continue                      # a tool, or a skill the step applies with run_code
+            if raw in schemas or raw == REPORT_TOOL or get_skill(raw) is not None:
+                continue                      # a tool, the report step, or a skill applied with run_code
             target = _TOOL_NAME_FIXES.get(raw.lower())
             if target and target in schemas:
                 text = re.sub(rf"\b{re.escape(raw)}\b", target, text)
@@ -1655,8 +1663,9 @@ def _is_enrichment_step(step: str) -> bool:
     return bool(_ENRICHMENT_STEP_RE.search((step or "").replace("_", " ")))
 
 
-# Report/packaging busywork the PI is already told never to plan (the figures, tables and the final
-# PDF+DOCX are assembled automatically when the run finishes). Re-checked DETERMINISTICALLY for a
+# Report/packaging busywork the PI is already told never to plan (the tools write the figures and
+# tables, the bundle is assembled when the run finishes, and a written report is the plan's own
+# ``write_report`` step, which ``_is_report_step`` sets apart first). Re-checked DETERMINISTICALLY for a
 # step proposed mid-run by exploration, where no plan-time review will catch it.
 _REPORT_BUSYWORK_RE = re.compile(
     r"\b(write|writing|render|rendering|compile|compiling|assemble|assembling|package|packaging"
@@ -1690,6 +1699,29 @@ _REPORT_BUSYWORK_RE = re.compile(
 
 def _is_report_busywork(step: str) -> bool:
     return bool(_REPORT_BUSYWORK_RE.search((step or "").replace("_", " ")))
+
+
+# The written report is a step of its own, planned only when asked for (RCHENLAB/AiScientist#102):
+# the request asks for a written report, or a skill the plan uses declares ``writes-report``. The
+# Scientist never runs it; the lab hands it to the gateway, which writes the report after the analysis
+# (``write_report``, also an MCP tool for a finished run). Without the step a run ends with its answer
+# in the chat.
+REPORT_TOOL = "write_report"
+REPORT_STEP = ("**Written report** — Write the methods and results report from the accepted results "
+               "with `write_report`: the manuscript with its references and verification statement, as "
+               "PDF and DOCX. It runs after the analysis steps.")
+
+
+def _is_report_step(step: str) -> bool:
+    """A step the plan gives to ``write_report`` (it names the tool)."""
+    return REPORT_TOOL in _declared_tools(step or "")
+
+
+# The planner's line for it, beside the catalog's tools.
+_REPORT_TOOL_LINE = (
+    f"- {REPORT_TOOL}: the run's written report (the methods and results manuscript with its "
+    "references and verification statement, as PDF and DOCX), written from the accepted results "
+    "after the analysis. Plan it only when the request asks for a written report, as the LAST step.")
 
 
 def _norm_step(step: str) -> str:
@@ -2966,7 +2998,8 @@ _EXPLORE_SYSTEM = (
     "Each proposed step must: be achievable with the LISTED TOOLS; be ONE tool's worth of work; NOT "
     "duplicate or restate any step already in the plan (the verbatim plan is given — check it); and "
     "actually test one of your hypotheses. Never propose a step that writes, renders, packages, or "
-    "exports a report/figure bundle — those are produced automatically at the end of the run. "
+    "exports a report/figure bundle: the bundle is assembled at the end of the run, and a written "
+    "report is a step the user asks for, never one you add. "
     "Write each step in plain scientific English for a researcher to read — the action, what it is "
     "performed on, and what it would show — NAMING the tool it runs in backticks, matching the "
     "style of the existing plan. No bare keyword arguments, no code, no file paths.\n"
@@ -3018,8 +3051,8 @@ _NEXT_CYCLE_SYSTEM = (
     "written in plain scientific English for a researcher — the action, what it is performed on, "
     "and what it reveals — NAMING the tool it runs in backticks, with no bare keyword arguments, "
     "no code, and no file paths. Never plan a step "
-    "that writes, renders, packages, or exports a report: the manuscript is assembled automatically "
-    "once all cycles finish.\n"
+    "that writes, renders, packages, or exports a report: a written report is the `write_report` "
+    "step of the first plan, run once all cycles finish, and only when the user asked for it.\n"
     "Reply with ONLY a JSON object: "
     '{"continue": true|false, "reason": "<one sentence: what this cycle would settle, or why the '
     'study should stop>", "agenda": ["<step>", ...]}. '
@@ -3042,8 +3075,9 @@ _PLAN_REVIEW_CRITIC_SYSTEM = (
     "(1) NECESSARY — a step is an orphan only when NOTHING consumes its output AND the request does "
     "not ask for it. A step that only re-reads, parses, tabulates or restates what an earlier step "
     "already produced is not an analysis step; it produces no new knowledge and must be dropped. "
-    "The same goes for re-RENDERING: volcano plots, per-group DEG tables and the final report are "
-    "produced automatically by the tools that computed them, so a step that exists to draw or "
+    "The same goes for re-RENDERING: volcano plots and per-group DEG tables are produced "
+    "automatically by the tools that computed them, and a written report only by a `write_report` "
+    "step the request asked for (leave that one in place), so a step that exists to draw or "
     "compile those again is duplicate work — but do NOT flag a step merely because it names no "
     "existing tool: writing an ad-hoc analysis (via `run_code`) that the toolset lacks is allowed "
     "when it adds real scientific value. Two misses to learn from: a plan spent a whole `run_code` "
@@ -3477,6 +3511,8 @@ class LabConfig:
     # test) and appends the step(s) that test it — each one still passing the pre-flight gate, the
     # Critic, and ``max_steps`` before it costs anything. Later steps adjudicate the open hypotheses,
     # so the ledger closes the loop instead of just generating work. See ``agents/hypotheses.py``.
+    # On is the operator's permission, not a default for every step: a step is explored only when a
+    # skill it uses declares ``exploration`` in its SKILL.md metadata (``_explores_after``, #102).
     hypothesis_driven: bool = False
     # Hard cap on steps ADDED by exploration across the whole run (``max_steps`` still caps the total
     # plan length). This is the runaway guard: without it a model that finds everything surprising
@@ -3654,6 +3690,9 @@ class LabResult:
     # The rounds show that such a step was never accepted, not that the user chose to leave it; the
     # QC reply says which (RCHENLAB/AiScientist issue 75).
     skipped_steps: list[str] = field(default_factory=list)
+    # The approved plan had a ``write_report`` step (#102): the gateway writes the report after the
+    # analysis. False: the run ends with its answer in the chat.
+    report_requested: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -3667,6 +3706,7 @@ class LabResult:
             "design_background": list(self.design_background),
             "claim_audit": dict(self.claim_audit),
             "skipped_steps": list(self.skipped_steps),
+            "report_requested": self.report_requested,
         }
 
     @classmethod
@@ -3680,6 +3720,7 @@ class LabResult:
             [c for c in (d.get("design_background") or []) if isinstance(c, dict)],
             dict(d.get("claim_audit") or {}),
             [str(s) for s in (d.get("skipped_steps") or []) if str(s).strip()],
+            bool(d.get("report_requested", False)),
         )
 
 
@@ -3705,6 +3746,7 @@ class ResumeState:
     guidance: str | None = None
     redo_indices: "frozenset[int] | None" = None   # None = evaluate; else the exact 0-based set to re-run
     self_sourced: str = ""
+    report_requested: bool = False   # the plan had a write_report step, kept out of ``agenda`` (#102)
 
     @classmethod
     def from_run_state(cls, state: dict[str, Any], from_step_index: int, *, modify_note: str = "",
@@ -3718,7 +3760,8 @@ class ResumeState:
         return cls(list(state.get("agenda", [])), kept, int(from_step_index),
                    modify_note=modify_note, guidance=guidance or state.get("guidance"),
                    redo_indices=frozenset(redo_indices) if redo_indices is not None else None,
-                   self_sourced=str(state.get("self_sourced") or ""))
+                   self_sourced=str(state.get("self_sourced") or ""),
+                   report_requested=bool(state.get("report_requested", False)))
 
     @classmethod
     def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
@@ -3733,7 +3776,8 @@ class ResumeState:
             raise ValueError("Every planned step of this run already has an accepted result — "
                              "there is nothing left to continue. Re-run a chosen step instead.")
         return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
-                   redo_indices=frozenset(todo), self_sourced=resume.self_sourced)
+                   redo_indices=frozenset(todo), self_sourced=resume.self_sourced,
+                   report_requested=resume.report_requested)
 
 
 # --- plan revision: patch ONE step instead of re-drafting the whole plan -----------------------
@@ -3802,6 +3846,17 @@ def _tool_runs_on(tool: str) -> str:
     except Exception:  # noqa: BLE001 - a label on the plan card, never a reason to fail a plan
         return ""
     return found.runs_on if found is not None else ""
+
+
+def _tool_skill(tool: str) -> "Skill | None":
+    """The skill a tool's manifest names (``skill:`` in TOOL.md, e.g. run_cellqc's CellQC skill), if it
+    is in the library; ``None`` for a tool that names none."""
+    try:
+        from ..tools import catalog as tool_catalog
+        found = tool_catalog.manifest(tool)
+    except Exception:  # noqa: BLE001 - an unreadable manifest names no skill
+        return None
+    return get_skill(found.skill) if found is not None and found.skill else None
 
 
 def _tool_ends_step(tool: str) -> bool:
@@ -4116,6 +4171,9 @@ class ResearchLab:
         # Steps the researcher said yes to DURING the run (``_approve_new_step``). They are not in
         # the approved document, and the read-back must not report them as unapproved work.
         self._approved_additions: list[str] = []
+        # The plan's write_report step(s), kept out of the analysis and handed to the gateway (#102).
+        self._report_requested = False
+        self._report_steps: list[str] = []
         # When each step's first attempt began, by its plan text: the check of its declared outputs
         # counts only files written since then as the step's own (skill_outputs.check).
         self._step_started: dict[str, float] = {}
@@ -4254,6 +4312,12 @@ class ResearchLab:
         return self._self_sourced
 
     @property
+    def report_requested(self) -> bool:
+        """The approved plan has a ``write_report`` step: the gateway writes the report after the
+        analysis (#102). ``False``: the run ends with its answer in the chat."""
+        return self._report_requested
+
+    @property
     def execution_profile(self) -> "dict[str, Any]":
         """HOW this run was executed — the resolved mode, the team, the planner and the switches.
 
@@ -4300,8 +4364,10 @@ class ResearchLab:
         if self._checkpoint is None:
             return
         try:
-            self._checkpoint(LabResult(question, list(agenda), list(rounds), False, accepted, "",
-                                       self._ledger.to_list()))
+            state = LabResult(question, list(agenda), list(rounds), False, accepted, "",
+                              self._ledger.to_list())
+            state.report_requested = self._report_requested
+            self._checkpoint(state)
         except Exception as exc:  # noqa: BLE001 - durability metadata must never fail a run
             print(f"[lab] mid-run checkpoint failed: {exc}")
 
@@ -4334,15 +4400,20 @@ class ResearchLab:
             result.claim_audit = dict(self._claim_audit)
         if isinstance(result, LabResult) and not result.skipped_steps and self._skipped_steps:
             result.skipped_steps = list(dict.fromkeys(self._skipped_steps))
+        if isinstance(result, LabResult) and self._report_requested:
+            result.report_requested = True
         if isinstance(result, LabResult) and self._approved_plan is not None and result.rounds:
             # Compared here, on the one exit every path shares, for the same reason as above. A run
-            # with no rounds (cancelled at review) has nothing to compare.
+            # with no rounds (cancelled at review) has nothing to compare. The report step is the
+            # gateway's, after the analysis: it is handed over, not skipped.
             self._plan_adherence = check_adherence(self._approved_plan, [
                 {"step": r.step, "accepted": r.verdict.verdict == "accept",
                  "calls": [{"tool": c.get("tool"), "args": c.get("args") or {},
                             "ok": step_succeeded(c)}
                            for c in (r.scientist_result.get("steps") or []) if isinstance(c, dict)]}
-                for r in result.rounds], approved_additions=self._approved_additions)
+                for r in result.rounds] + [
+                {"step": s, "accepted": True, "calls": [{"tool": REPORT_TOOL, "args": {}, "ok": True}]}
+                for s in self._report_steps], approved_additions=self._approved_additions)
             on_event = kwargs.get("on_event") or (args[1] if len(args) > 1 else None)
             if on_event is not None:
                 on_event({"type": "plan_adherence", **self._plan_adherence})
@@ -4386,7 +4457,9 @@ class ResearchLab:
                 self._guidance = resume.guidance
             if resume.self_sourced and not self._self_sourced:
                 self._self_sourced = resume.self_sourced     # the plan is not redrafted, so keep its record
-            agenda = list(resume.agenda)
+            # The plan's report step was kept out of the agenda the first time; its request is not.
+            self._report_requested = self._report_requested or resume.report_requested
+            agenda = [s for s in resume.agenda if not _is_report_step(s)]
             k = max(0, min(resume.from_step_index, len(agenda) - 1))
             # Decide which downstream steps actually depend on the change and must be re-run; the
             # rest (e.g. an independent literature step) are reused. Explicit set wins; else evaluate.
@@ -4565,7 +4638,8 @@ class ResearchLab:
             # has already been critiqued still decides everything; they just decide with the Critic's
             # objections in front of them instead of without them.
             if plan_review is not None and kind == "agenda":
-                payload = self._apply_scope(self._plan_review(question, list(payload), emit), emit)
+                payload = self._keep_report_step(list(payload), self._apply_scope(
+                    self._plan_review(question, list(payload), emit), emit))
                 emit({"type": "pi_agenda", "agenda": payload})
 
         # Plan mode (human-in-the-loop): the user does NOT text-edit the plan — they
@@ -4765,7 +4839,8 @@ class ResearchLab:
         # In plan mode this already ran ABOVE, before the human saw the plan; here it covers the
         # autonomous path, where nothing else ever reads the plan back.
         if plan_review is None and approved_plan is None:
-            agenda = self._apply_scope(self._plan_review(question, agenda, emit), emit)
+            agenda = self._keep_report_step(agenda, self._apply_scope(
+                self._plan_review(question, agenda, emit), emit))
 
         # Read-back guard (deterministic). A step that only re-reads a table an earlier step wrote
         # produces nothing and consumes a slot a real analysis needed. The PI prompt already forbids
@@ -4790,7 +4865,16 @@ class ResearchLab:
         # steps added later (exploration / step meetings), so a PI-drafted "**Artifact export** —
         # Export all computed DE tables … to the artifacts directory for automatic report
         # assembly" reached a plan card. Everything the tools compute is already written to
-        # artifacts/ and the report is assembled automatically; the step is a slot for nothing.
+        # artifacts/ and the bundle is assembled automatically; the step is a slot for nothing.
+        # The plan's write_report step is not analysis: it is handed to the gateway, which writes the
+        # report from the accepted results once the analysis is done (#102). Taken out BEFORE the
+        # busywork rule, which would otherwise drop it as one more report step.
+        report_steps = [s for s in agenda if _is_report_step(s)]
+        if report_steps:
+            agenda = [s for s in agenda if not _is_report_step(s)]
+            self._report_requested = True
+            self._report_steps = report_steps
+            emit({"type": "report_step", "steps": report_steps})
         busy = [s for s in agenda if _is_report_busywork(s)]
         if busy and len(busy) < len(agenda):
             agenda = [s for s in agenda if not _is_report_busywork(s)]
@@ -7332,6 +7416,26 @@ class ResearchLab:
             return None
         return get_skill(found.skill)
 
+    def _step_skills(self, step: str) -> "list[Skill]":
+        """Every skill ``step`` uses: the one the plan assigned (``skill:``), any its text names, and
+        the one its tool's TOOL.md names (run_cellqc runs the CellQC skill). Each skill once."""
+        found: "list[Skill]" = []
+        assigned = self._assigned_skill(step)
+        if assigned is not None:
+            found.append(assigned)
+        found += [s for s in map(get_skill, skills_named_in(step)) if s is not None]
+        tool = _primary_tool(step)
+        by_tool = _tool_skill(tool) if tool else None
+        if by_tool is not None:
+            found.append(by_tool)
+        return list({s.name: s for s in found}.values())
+
+    def _explores_after(self, step: str) -> bool:
+        """Whether a skill ``step`` uses asks for exploration after it (``exploration: "true"`` in its
+        SKILL.md ``metadata``). Most skills need none, CellQC's and the RAG skills among them, so it is
+        the skill's choice, not the platform's default (RCHENLAB/AiScientist#102)."""
+        return any(declares(s, "exploration") for s in self._step_skills(step))
+
     def _pinned_settings(self, step: str) -> "dict[str, dict[str, Any]]":
         """``{tool: settings}`` the approved plan fixes for this step ({} when it fixes none)."""
         if self._approved_plan is None:
@@ -7452,7 +7556,7 @@ class ResearchLab:
         tools_desc = "\n".join(
             f"- {t.name}: {_planner_tool_description(t)}"
             for t in self.scientist.catalog if t.name != "finish"
-        )
+        ) + "\n" + _REPORT_TOOL_LINE
         # A pre-selected research path STEERS the PI here (it does not bypass it): the PI
         # still drafts the agenda — adapting the guidance to this dataset — and plan mode
         # still lets the user shape the result, in natural language, before any tool runs.
@@ -7585,16 +7689,63 @@ class ResearchLab:
             # chat: what they ask for there is the newer instruction, and the PI has both.
             if not feedback:
                 payload = self._apply_scope(list(payload), emit)
+            payload = self._ensure_report_step(list(payload), question, feedback=feedback,
+                                               note=request, prior_agenda=prior_agenda, emit=emit)
             emit({"type": "pi_agenda", "agenda": payload})
             if self._later:
                 emit({"type": "plan_later", "later": list(self._later),
                       "breadth": self._request_breadth})
         return kind, payload
 
+    def _ensure_report_step(self, agenda: "list[str]", question: str, *, feedback: str = "",
+                            note: str = "", prior_agenda: "list[str] | None" = None,
+                            emit: EventFn) -> "list[str]":
+        """The plan has one ``write_report`` step, last, exactly when a written report is asked for
+        (RCHENLAB/AiScientist#102): by the request, or by a skill a step uses (``writes-report:
+        "true"`` in its SKILL.md metadata). A note on a plan under review decides when it mentions
+        the report ("add a written report", "drop the report step"); a note that does not keeps the
+        plan as it was. The model's own report step is not one asked for."""
+        steps = [s for s in agenda if not _is_report_step(s)]
+        drafted = [s for s in agenda if _is_report_step(s)]
+        declared: "list[str]" = []
+        if feedback:
+            if rules_out_report(note):
+                want = False
+            elif wants_written_report(note):
+                want = True
+            else:
+                want = any(_is_report_step(s) for s in (prior_agenda or []))
+        else:
+            declared = sorted({sk.name for s in steps for sk in self._step_skills(s)
+                               if declares(sk, "writes-report")})
+            want = wants_written_report(question) or bool(declared)
+        if not want:
+            if drafted:
+                emit({"type": "steps_pruned", "reason": "report_not_asked", "dropped": drafted})
+            return steps
+        if not drafted:
+            emit({"type": "report_step_added", "skills": declared})
+        return steps + [drafted[0] if drafted else REPORT_STEP]
+
+    @staticmethod
+    def _keep_report_step(before: "list[str]", after: "list[str]") -> "list[str]":
+        """The plan review judges the analysis; whether there is a report step was decided before it
+        (``_ensure_report_step``), so the reviewed plan keeps the draft's report step and gets no
+        other."""
+        report = [s for s in before if _is_report_step(s)]
+        return [s for s in after if not _is_report_step(s)] + report[:1]
+
     def _apply_scope(self, agenda: list[str], emit: EventFn) -> list[str]:
-        """Drop the steps the request ruled out (:class:`~aiscientist.agents.scope.RunScope`)."""
+        """Drop the steps the request ruled out (:class:`~aiscientist.agents.scope.RunScope`). The
+        report step is not analysis the limit is about ("only QC, and write a report"): it stays,
+        last, as ``_ensure_report_step`` decided."""
         if not self._scope.limited:
             return agenda
+        report = [s for s in agenda if _is_report_step(s)]
+        kept, dropped = self._apply_scope_to([s for s in agenda if not _is_report_step(s)], emit)
+        return kept + report
+
+    def _apply_scope_to(self, agenda: list[str], emit: EventFn) -> "tuple[list[str], list[str]]":
         kept, dropped = self._scope.filter(agenda, _primary_tool)
         if dropped:
             emit({"type": "steps_pruned", "reason": "user_scope", "dropped": dropped})
@@ -7602,7 +7753,7 @@ class ResearchLab:
             # Every step falls outside the limit: it could not be matched to this plan, so the plan
             # is shown whole rather than empty, and says so.
             emit({"type": "scope_unmatched", "text": self._scope.describe()})
-        return kept
+        return kept, dropped
 
     def _accepted_findings_block(self, rounds: list[LabRound]) -> str:
         """Accepted upstream findings, each with the artifact paths that back it, framed for
@@ -8134,7 +8285,8 @@ class ResearchLab:
         parts.append(
             "Tools you can call: " + tool_names + ". Prefer the purpose-built analysis tools for "
             "standard steps; use run_code ONLY for analysis none of the tools cover — and never to "
-            "write a report or package/zip outputs (those are produced automatically). Data you "
+            "write a report or package/zip outputs (the bundle is automatic, and a written report is "
+            "a `write_report` step of its own). Data you "
             "prepared with run_code goes to a tool through its `input` parameter (a file in "
             "AISCIENTIST_WORK) — do not re-implement the tool's analysis in code to use it."
         )
@@ -8607,7 +8759,9 @@ class ResearchLab:
         This is the one method that lets the plan GROW, so every guard lives here and is
         DETERMINISTIC — the model proposes, the code decides what survives:
 
-        * off unless ``config.hypothesis_driven``;
+        * off unless ``config.hypothesis_driven`` (the operator's switch);
+        * off after a step unless a skill that step uses declares ``exploration`` (``_explores_after``):
+          the skill decides, so a step with no skill, or with one that needs none, is never explored;
         * a proposed step is dropped unless it names a hypothesis we actually hold (no orphan work);
         * dropped if it duplicates an existing plan step (normalized) — the model's most common
           failure is restating a planned step as a discovery;
@@ -8622,6 +8776,8 @@ class ResearchLab:
         """
         if not self.config.hypothesis_driven or self._scope.limited:
             return []   # a run the user limited does not grow new steps
+        if not self._explores_after(step):
+            return []   # no skill of this step asks for exploration (RCHENLAB/AiScientist#102)
         room = min(self.config.max_new_steps - self._new_steps_added,
                    self.config.max_steps - len(plan_steps))
         if room <= 0:
@@ -8933,7 +9089,9 @@ class ResearchLab:
             # the run's files. Run 6275df1213ab (CellQC alone) had the writer produce Summary,
             # Methods, Results, Limitations and Conclusion around one table, after a claim audit that
             # asked of each QC count whether it claimed causation in a two-arm comparison.
-            if not wants_written_report(question):
+            # Asked for = the plan kept a write_report step (#102), which it has when the request
+            # asked for a written report.
+            if not self._report_requested:
                 emit({"type": "synthesize", "accepted": len(accepted), "qc_only": True})
                 return "\n\n".join(str(r.scientist_result.get("final_answer") or "").strip()
                                    for r in (accepted or rounds[-1:])).strip()

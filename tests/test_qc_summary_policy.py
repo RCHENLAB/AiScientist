@@ -40,6 +40,7 @@ def test_synthesis_writer_receives_default_qc_policy_without_losing_audit_data(m
     lab = ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="offline-test"),
                       LabConfig(), complete_fn=complete)
     question = "Write a report on this QC run." if qc_only else "Analyze this dataset and write a report."
+    lab._report_requested = True    # the plan's write_report step, which this request gets (#102)
     lab._synthesize(question, rounds, lambda _event: None)
     writer = next(messages for messages in calls
                   if "Principal Investigator writing the final research report" in messages[0]["content"])

@@ -98,13 +98,33 @@ TOOLS = {
 }
 
 
+def configured_atlases() -> dict[str, str]:
+    """``{normalized path: release label}`` from ``AISCIENTIST_ATLAS_FILES`` (``label=path;…``).
+    An entry without an absolute path, or labelled ``latest``, is ignored."""
+    configured = {}
+    for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
+        label, sep, path = entry.strip().partition("=")
+        if sep and label and path.startswith("/") and label.lower().split("/")[-1] != "latest":
+            configured[posixpath.normpath(path)] = label
+    return configured
+
+
+def direct_call_refusal() -> str:
+    """What ``run_in_environment`` answers when asked to run this skill itself."""
+    if configured_atlases():
+        return "Use the atlas bridge tools: " + ", ".join(TOOLS)
+    return ("Atlas expression is not set up on this deployment: no atlas is listed in "
+            "AISCIENTIST_ATLAS_FILES.")
+
+
 def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
-    """Expose all nine tools only with an installed, allowed skill and image runner."""
+    """Expose all nine tools only with an installed, allowed skill, an image runner and at least one
+    configured atlas: without one every call would fail, so the planner is not offered them."""
     from .skills import get_skill
     from .research_harness import HarnessTool
 
     skill = get_skill(SKILL)
-    if environment_tool is None or skill is None or not skill.image:
+    if environment_tool is None or skill is None or not skill.image or not configured_atlases():
         return []
 
     def call(name: str, args: dict, ctx: Any) -> dict:
@@ -115,11 +135,7 @@ def build_atlas_tools(executor: Any, environment_tool: Any) -> list:
         # A file bound as server data reaches HPC3 as this session's copy, whose path is new each
         # session: the file it was copied from is the one that has to be listed.
         source = str(getattr(executor, "dataset_source", "") or "")
-        configured = {}
-        for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
-            label, sep, path = entry.strip().partition("=")
-            if sep and label and path.startswith("/") and label.lower().split("/")[-1] != "latest":
-                configured[posixpath.normpath(path)] = label
+        configured = configured_atlases()
         version = configured.get(posixpath.normpath(atlas)) if atlas else None
         if not version and atlas and source:
             version = configured.get(posixpath.normpath(source))

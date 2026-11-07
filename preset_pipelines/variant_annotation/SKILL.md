@@ -80,7 +80,7 @@ Plan the phases below as SEPARATE steps; do NOT collapse them into a single anno
 normalization (step 2), which `annotate_variants` performs INTERNALLY on the offline path, so it is NOT
 a separate agenda step there (see step 2). The heavy compute lives inside `annotate_variants` (step 4),
 so steps 5–6 REPORT from the tables it already wrote — never hand-roll `run_code` to re-derive those
-tables, and never add a report-writing step (the methods + results report is assembled automatically).
+tables, and never add another report-writing step (a written report is one `write_report` step, last, planned only when the request asks for it).
 The QC (step 1) and known-gene / AF narrowing (step 3) pre-analysis is what makes the annotation
 trustworthy and focused; skipping those is how a variant study silently ships wrong or unfocused results.
 
@@ -153,8 +153,7 @@ actually returned — never invent a gene, a consequence, an rsID, or a pathogen
 significance is reported verbatim (e.g. `pathogenic`, `likely_pathogenic`, `uncertain_significance`);
 do not upgrade "uncertain" to "pathogenic". State the genome assembly, the `execution_mode`, and the
 number of variants annotated vs skipped. Frame biological/clinical implications as hypotheses
-requiring orthogonal validation, not diagnoses. The methods + results report is assembled
-automatically — do NOT plan a report-writing step.
+requiring orthogonal validation, not diagnoses. Plan no other report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ## Tools & data used by this path
 

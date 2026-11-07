@@ -98,8 +98,8 @@ Adapt parameters to THIS dataset; plan ordered steps that:
    `literature_search` on the cell types and genes the analysis surfaced is OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
    A run without it has no reference list, and its report says so. Annotation is not by itself a
    finding: state what the labels and their disagreements MEAN for the question that was asked.
-8. Do NOT plan a report-WRITING or rendering step — the manuscript is assembled automatically from
-   the accepted results. That is about writing it, NOT about interpreting: step 7 is still required.
+8. Do NOT plan a report-WRITING or rendering step of your own — a written report is one `write_report` step, last, planned only when the request asks for it.
+   That is about writing it, NOT about interpreting: step 7 is still required.
 
 **⚑ THE CELL SETS DIFFER — always merge by barcode.** scGPT labels EVERY cell of the RAW upload
 (step 1); QC (step 2) filters some out, so the QC'd / clustered `adata` has FEWER cells than the

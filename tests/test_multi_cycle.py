@@ -238,7 +238,10 @@ def test_cancelling_between_cycles_stops_without_writing_a_manuscript():
 
 # --- composition with exploration -------------------------------------------
 
-def test_exploration_and_cycles_compose_within_and_across_cycles():
+def test_exploration_and_cycles_compose_within_and_across_cycles(monkeypatch):
+    # Exploration runs after a step only when a skill the step uses declares it (#102); these steps
+    # count as using one.
+    monkeypatch.setattr(ResearchLab, "_explores_after", lambda self, step: True)
     statement = "The knockout effect is driven by one degraded animal, not by genotype"
     new_step = ("Repeat the comparison with and without the outlier animal to measure how much of "
                 "the difference depends on it")

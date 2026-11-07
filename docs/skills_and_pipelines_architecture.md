@@ -90,6 +90,41 @@ does with it:
 
 A skill without `outputs` works as before: nothing is checked and nothing is shown.
 
+### Declared exploration
+
+After a step is accepted, the PI may read its result and propose a hypothesis with a step that
+tests it (`_explore_after_step` in `agents/research_lab.py`). The proposed step runs only if the
+user approves it. This happens only after a step that uses a skill declaring it:
+
+```yaml
+metadata:
+  exploration: "true"
+```
+
+A step uses a skill when the plan assigns it (`skill:`), when the step's text names it, or when the
+step's tool names it in its `TOOL.md` (`run_cellqc` names the CellQC skill). A step with no skill,
+or whose skills do not declare `exploration`, is not explored. The deployment's
+`AISCIENTIST_HYPOTHESIS_DRIVEN` can still turn exploration off everywhere.
+
+### Declared report
+
+A run writes a report only when its plan has a `write_report` step. The step is planned, last, when
+the request asks for a written report (a report, write-up, manuscript, PDF or DOCX), or when a skill a
+step uses declares one:
+
+```yaml
+metadata:
+  writes-report: "true"
+```
+
+The step shows on the plan card like any other: removing it there, or a note such as "drop the report
+step", leaves it out. The Scientist does not run it. Once the analysis steps are done, the gateway
+writes the report from the accepted results (`_write_report` in `gateway/app.py`): the manuscript, its
+references, verification statement, PDF and DOCX, and the technical report. A run without the step
+ends with its answer in the chat and `report/summary.md`. A run that only did quality control gets
+the QC reply. The report of a finished run can be written later with the MCP tool `write_report`
+(`docs/development/metadata.md`).
+
 ### How a skill reaches the model
 
 A skill's text enters the model's context only when a step uses it:
@@ -336,7 +371,9 @@ continues to verify the entire release before exposing skills; no analysis code
 or unverified copy of the skill is bundled into AiScientist.
 
 `agents/atlas_expression.py` exposes the server's nine typed tools to the planner
-when the allowed skill and an image executor are available. It calls
+when the allowed skill, an image executor and at least one atlas in
+`AISCIENTIST_ATLAS_FILES` are available; without an atlas the planner is not
+offered them. It calls
 `aiscientist-mcp --server atlas-expression-exploration-mcp --timeout 15000 call <tool> '<json>'`
 through `run_in_environment`. The image's bundled client starts the MCP server
 over stdio; the gateway needs no MCP or scanpy installation. The server owns

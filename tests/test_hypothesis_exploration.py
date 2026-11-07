@@ -26,6 +26,14 @@ from aiscientist.agents.research_lab import LabConfig, ResearchLab
 _EXPLORE_MARK = "opened a research path the CURRENT PLAN DOES NOT COVER"
 
 
+@pytest.fixture(autouse=True)
+def _steps_declare_exploration(monkeypatch):
+    """These tests are about what exploration does once it runs, so every step here counts as using a
+    skill that declares ``exploration``. Whether a step's skill declares it is tested in
+    test_exploration_declared_by_skill.py."""
+    monkeypatch.setattr(ResearchLab, "_explores_after", lambda self, step: True)
+
+
 def _ctx(decisions=None) -> HarnessContext:
     return HarnessContext(decisions=decisions or {}, tunnel_port=1, model="m")
 

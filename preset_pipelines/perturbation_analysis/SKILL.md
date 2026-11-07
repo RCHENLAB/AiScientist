@@ -105,7 +105,7 @@ category values are given at planning time) and infer:
 9. **(Optional) Literature context** (`literature_search`): for the strongest hits, pull real
    citations linking the perturbed gene to the observed program. Cite only what the tool returns.
 
-The final methods + results report is assembled automatically — do NOT plan a report-writing step.
+Plan no other report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ## Grounding
 

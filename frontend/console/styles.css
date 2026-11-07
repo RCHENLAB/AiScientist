@@ -2260,6 +2260,8 @@ button.primary .msym, button.secondary .msym {
 .page-section h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
 .mcp-token-form { flex-direction: row; align-items: center; margin: 10px 0 0; }
 .mcp-token-form input { flex: 1; min-width: 0; }
+.mcp-token-form .mcp-token-run { display: flex; flex-direction: row; align-items: center; gap: 6px; white-space: nowrap; font-size: 0.9em; }
+.mcp-token-form .mcp-token-run input { flex: none; }
 .mcp-token-shown { margin-top: 12px; padding: 12px 14px; border-radius: var(--radius-sm); background: var(--surface-sunken);
   font-size: 13px; }
 .mcp-token-shown p { margin: 0 0 6px; }

@@ -72,8 +72,13 @@ def _run(tmp_path, monkeypatch, question: str, final_answer: str, extra_steps=()
             self.guidance, self.protocols, self.self_sourced = None, [], ""
             self.execution_profile, self.later, self.proposed_steps = {}, [], []
             self.request_breadth = "specific"
+            self.report_requested = False
 
         def run(self, question, on_event=None, plan_review=None, **_kw):
+            from aiscientist.agents.scope import wants_written_report
+            # As the real lab: a request that asks for a written report gets the plan's
+            # write_report step, which the gateway carries out (#102).
+            self.report_requested = wants_written_report(question)
             if writeup_mode == "stopped":
                 conn.hard_stop.set()
             steps = [{"tool": "run_cellqc", "ok": True, "args": {"species": "mouse"}, "result": _CELLQC},
@@ -305,3 +310,21 @@ def test_final_manuscript_and_chat_keep_methods_limitations_and_residual_finding
     state = json.loads((art / "process/run_state.json").read_text())
     assert state["final_answer"] == draft
     assert state["rounds"][0]["scientist_result"]["steps"][0]["result"] == _CELLQC
+
+
+def test_an_analysis_with_no_report_asked_for_answers_in_the_chat(tmp_path, monkeypatch):
+    """RCHENLAB/AiScientist#102: a run whose plan has no write_report step writes no report. The
+    answer is the chat reply and report/summary.md; nothing is sent to pandoc, and the next message
+    in the chat can still continue from the run."""
+    conn, req, payloads, art, rendered = _run(
+        tmp_path, monkeypatch, "Cluster these cells.", "Three clusters were found.",
+        extra_steps=[{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}])
+    assert rendered == []
+    assert not (art / "report" / "report.md").exists()
+    assert "Three clusters were found." in _reply(payloads)
+    assert "Three clusters were found." in (art / "report" / "summary.md").read_text(encoding="utf-8")
+    said = [str(p.get("text") or p.get("message") or "") for p in payloads]
+    assert any("No written report was asked for" in s for s in said)
+    assert not any("Report ready" in s for s in said)
+    target = gw_app._followup_target(conn, req)
+    assert target is not None and target[0] == conn.last_run_by_conversation["conv-1"]

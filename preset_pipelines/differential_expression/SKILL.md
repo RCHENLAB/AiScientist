@@ -217,8 +217,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    in <cell type> in <disease>?"), not a topic dump.
 6. **Figures / tables** (via `run_code`, adapting the template): a per-cell-type DEG-count summary
    table; a volcano plot per cell type; shared up- and down-regulated gene heatmaps; an enrichment
-   bar plot per cell type. The final report is assembled automatically — do NOT plan a
-   report-writing step.
+   bar plot per cell type. Plan no other report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ## When this protocol and the question disagree
 
