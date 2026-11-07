@@ -336,7 +336,7 @@ continues to verify the entire release before exposing skills; no analysis code
 or unverified copy of the skill is bundled into AiScientist.
 
 `agents/mcp_bridge.py` exposes the server's nine typed tools from the reviewed
-schema snapshot pinned by `configs/mcp_servers.json`. Registration reads local
+schema snapshot pinned by `src/aiscientist/agents/mcp_catalog/mcp_servers.json`. Registration reads local
 files and verifies the snapshot checksum; it does not contact the server. The
 allowed skill and an image executor must be available, and the skill's image must
 exactly match the registry's digest pin. The bridge calls

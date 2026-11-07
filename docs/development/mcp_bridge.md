@@ -14,7 +14,10 @@ Real website/HPC3 end-to-end validation remains outstanding.
 
 ## Registry and tool schemas
 
-`configs/mcp_servers.json` is the default registry. A deployment can set
+`src/aiscientist/agents/mcp_catalog/mcp_servers.json` is the default registry. It and its snapshots ship as Python package data, so
+non-editable wheel and Docker installs use the same reviewed defaults as a source
+checkout. The base package declares `jsonschema`; no gateway extra is needed to
+load the catalog or System overview. A deployment can set
 `AISCIENTIST_MCP_CONFIG` to another local registry. Its top-level fields are
 `schema_version: 1` and `servers`, an array of server records:
 
@@ -40,11 +43,23 @@ References must be local fragments; schema loading cannot resolve network or
 filesystem references. Duplicate server names, skill bindings and planner names
 are rejected, as are collisions with existing planner tools.
 
-The planner gets the catalog description and a copy of the input schema. If the
-simple top-level schema omits `additionalProperties`, the bridge sets it to `false`.
-Root references and composed schemas retain their authored semantics, as do
-schemas that explicitly permit additional properties. Calls
-are validated before scheduling, including required arguments and types. Arguments
+The planner gets the catalog description and a copy of the original input schema.
+The generic bridge preserves its semantics, including `dependentSchemas`, branches
+and permissive additional properties. Atlas retains its existing domain restriction
+on unknown arguments. Calls are validated against the complete schema before
+scheduling, including required arguments and types.
+
+Plan parameter discovery follows local references, composed schemas, conditional
+branches and dependencies. This is only a display view: validation keeps
+the original schema and its relationships. Plan settings fix part of a future call,
+so unbound required arguments and undecidable root branch choices are deferred.
+MCP plan settings retain their JSON types; unquoted call-syntax JSON literals and
+the Python scalar spellings `True`, `False`, and `None` are parsed without evaluating
+code. Supplied values, types, bounds and branch constraints are checked; supplied
+nested objects and arrays are complete values. Execution always validates the full
+call with the original schema. Non-MCP tools keep their existing plan coercion and
+validation behavior. Tool names with hyphens or a leading underscore work in plan
+classification, call syntax, edits and scope matching. Arguments
 must also serialize as strict JSON, so NaN and Infinity are rejected. Tool names,
 descriptions and results do not select executables, images, resources, imports or
 access policy. There is no automatic registration of a server's other tools or
@@ -75,7 +90,8 @@ Slurm scheduler or configure `AISCI_SLURM`/`AISCI_JOB_PREFIX` inside that contai
 The released common CLI starts the configured server over stdio and calls one
 tool. An MCP tool error produces a nonzero CLI exit, which the executor reports
 as an error. Successful output may be a structured JSON object or text blocks;
-JSON text is decoded, and plain text is retained as content blocks. Malformed
+JSON text is decoded only when it represents an object; scalar, array and plain
+text remain the original ordered content blocks. Malformed
 responses fail instead of being reported as success.
 
 The default JSON adapter keeps server data under `result`, separate from execution

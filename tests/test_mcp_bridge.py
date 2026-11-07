@@ -22,7 +22,7 @@ SCHEMA = {
     "type": "object", "properties": {
         "text": {"type": "string"}, "count": {"type": "integer", "minimum": 1},
         "options": {"$ref": "#/$defs/options"}},
-    "required": ["text"],
+    "required": ["text"], "additionalProperties": False,
     "$defs": {"options": {"type": "object", "properties": {"enabled": {"type": "boolean"}},
                             "additionalProperties": False}},
 }
@@ -91,7 +91,7 @@ def test_second_server_registers_schema_and_runs_through_skill_policy(registry, 
     assert "Check a table without changing it." in tool.description
     assert tool.parameters["$defs"] == SCHEMA["$defs"]
     assert tool.parameters["additionalProperties"] is False
-    assert "additionalProperties" not in bridge.load_servers()[0].tools[0]["inputSchema"]
+    assert bridge.load_servers()[0].tools[0]["inputSchema"]["additionalProperties"] is False
     ctx = HarnessContext(workspace=tmp_path / "run")
     # Quotes, substitutions and a newline must stay in the single JSON argument.
     args = {"text": "a'; $(touch nope) `touch nope`\nline", "count": 3,

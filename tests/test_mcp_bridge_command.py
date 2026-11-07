@@ -80,6 +80,11 @@ def command_bridge(tmp_path, monkeypatch, skill_release):
     ({"rows": 7}, {"rows": 7}),
     (["{\"rows\":", "7}"], {"rows": 7}),
     (["ordinary text"], {"content": [{"type": "text", "text": "ordinary text"}]}),
+    (["42"], {"content": [{"type": "text", "text": "42"}]}),
+    (["true"], {"content": [{"type": "text", "text": "true"}]}),
+    (["[1,2]"], {"content": [{"type": "text", "text": "[1,2]"}]}),
+    (["null"], {"content": [{"type": "text", "text": "null"}]}),
+    (["4", "2"], {"content": [{"type": "text", "text": "4"}, {"type": "text", "text": "2"}]}),
 ])
 def test_generated_command_quotes_arguments_collects_results_and_cleans_up(command_bridge, raw, expected):
     runner, tool, ctx = command_bridge
@@ -121,3 +126,13 @@ def test_nonzero_cli_exit_preserves_error_skips_collection_and_cleans_up(command
     recorded = json.loads(runner.capture.read_text())
     assert not Path(recorded["result_file"]).exists()
     assert not list(runner.work.glob(".mcp-result.*"))
+
+
+def test_long_json_array_text_is_saved_verbatim_and_bounded(command_bridge):
+    runner, tool, ctx = command_bridge
+    text = json.dumps(list(range(10000)))
+    runner.fixture.write_text(json.dumps([text]))
+    result = tool.executor({"text": "fixture"}, ctx)
+    assert result["status"] == "ok" and result["result"]["response_omitted"]
+    evidence = runner.artifacts / result["result"]["full_result"]
+    assert json.loads(evidence.read_text()) == {"content": [{"type": "text", "text": text}]}

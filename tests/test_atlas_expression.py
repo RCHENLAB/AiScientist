@@ -245,8 +245,8 @@ def test_omitting_atlas_registration_does_not_reopen_its_shell(release, tmp_path
     {"name": "other", "release_tag": "other-v0.0.3"},
 ])
 def test_atlas_binding_cannot_select_a_generic_adapter(tmp_path, changes):
-    from aiscientist.agents.mcp_bridge import ROOT
-    cfg = json.loads((ROOT / "configs/mcp_servers.json").read_text())
+    from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG
+    cfg = json.loads(DEFAULT_CONFIG.read_text())
     cfg["servers"][0].update(changes)
     if cfg["servers"][0]["adapter"] is None:
         cfg["servers"][0].pop("adapter")

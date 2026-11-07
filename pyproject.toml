@@ -5,6 +5,7 @@ description = "AiScientist — a privacy-first, DAG-planned multi-agent bioinfor
 requires-python = ">=3.10"
 dependencies = [
   "h5py>=3.0",
+  "jsonschema>=4.18",  # pinned MCP catalogs and planner argument validation, including base installs
 ]
 
 [project.optional-dependencies]
@@ -17,7 +18,6 @@ gateway = [
   # every gateway host through uvicorn[standard]; named here because the code now imports it.
   "pyyaml>=6.0",
   "sqlalchemy>=2.0",  # durable plan estimates and compute usage, including auth-free deployments
-  "jsonschema>=4.18",  # validate pinned MCP tool arguments without an MCP runtime on the gateway
 ]
 # LangGraph execution shell (agents/lab_graph.py, LabConfig.planner="langgraph").
 # DELIBERATELY NOT part of `gateway`: installing it pulls ~19 transitive packages
@@ -98,6 +98,9 @@ bioagent-admin = "aiscientist.gateway.admin_cli:main"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+aiscientist = ["agents/mcp_catalog/*.json", "agents/mcp_catalog/mcp/*.json", "tools/*/TOOL.md"]
 
 [tool.ruff]
 target-version = "py310"

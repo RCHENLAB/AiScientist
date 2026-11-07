@@ -17,9 +17,11 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[3]
+from .tool_schema import MCPInputSchema, TOOL_NAME
+
+DEFAULT_CONFIG = Path(__file__).with_name("mcp_catalog") / "mcp_servers.json"
 LOG = logging.getLogger(__name__)
-NAME = r"[a-zA-Z_][a-zA-Z0-9_-]{0,63}"
+NAME = TOOL_NAME
 
 # Runs inside the pinned image. The common CLI returns structured JSON or a list
 # of text blocks; an MCP is_error exits nonzero before any collector can run.
@@ -29,10 +31,12 @@ result = json.loads(Path(os.environ["AISCI_MCP_RESULT"]).read_text())
 if isinstance(result, list):
     if not all(isinstance(item, str) for item in result):
         raise ValueError("MCP text blocks must be strings")
+    blocks = result
     try:
-        result = json.loads("".join(result))
+        decoded = json.loads("".join(blocks))
     except ValueError:
-        result = {"content": [{"type": "text", "text": item} for item in result]}
+        decoded = None
+    result = decoded if isinstance(decoded, dict) else {"content": [{"type": "text", "text": item} for item in blocks]}
 if not isinstance(result, dict):
     raise ValueError("MCP result must be an object or text blocks")
 '''
@@ -107,7 +111,7 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
     from .atlas_expression import SKILL as ATLAS_SKILL
     from .skills_registry import safe_path
 
-    path = Path(path or os.environ.get("AISCIENTIST_MCP_CONFIG", ROOT / "configs/mcp_servers.json"))
+    path = Path(path or os.environ.get("AISCIENTIST_MCP_CONFIG", DEFAULT_CONFIG))
     cfg = json.loads(path.read_text(encoding="utf-8"))
     if set(cfg) != {"schema_version", "servers"} or cfg["schema_version"] != 1 or not isinstance(cfg["servers"], list):
         raise ValueError("Invalid MCP registry format")
@@ -242,11 +246,10 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
         else:
             adapter = JsonAdapter()
         for entry in server.tools:
-            schema = copy.deepcopy(entry["inputSchema"])
-            # Named Python tools must never accept model-supplied execution options.
-            # Preserve schemas that explicitly support arbitrary argument maps.
-            composed = {"$ref", "$dynamicRef", "allOf", "anyOf", "oneOf", "if", "then", "else"} & schema.keys()
-            if not composed:
+            schema = MCPInputSchema(copy.deepcopy(entry["inputSchema"]))
+            # Atlas's existing typed API rejects unknown arguments. Other servers
+            # keep their exact JSON Schema semantics, including permissive extras.
+            if server.adapter == "atlas-expression":
                 schema.setdefault("additionalProperties", False)
             validator = Draft202012Validator(schema)
 
