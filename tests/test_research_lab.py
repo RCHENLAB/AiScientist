@@ -1002,7 +1002,9 @@ def test_plan_review_shows_the_plan_the_note_asked_for():
     events: list[dict] = []
     lab.run(_QC_REQUEST, events.append, plan_review=review)
 
-    assert shown == [[_QC_STEP, _LIT_STEP], [_QC_STEP]]
+    # _QC_REQUEST asks for a report, so both cards end with the write_report step (#102).
+    from aiscientist.agents.research_lab import REPORT_STEP
+    assert shown == [[_QC_STEP, _LIT_STEP, REPORT_STEP], [_QC_STEP, REPORT_STEP]]
     # What went is in front of the reviewer, as with any step a redraft drops.
     delta = [e for e in events if e.get("type") == "plan_redraft_delta"]
     assert delta and delta[-1]["dropped"] == [_LIT_STEP]
@@ -1058,12 +1060,14 @@ def test_a_removed_literature_step_stays_out_until_the_user_asks_for_it_again():
 
 
 def test_a_protocol_naming_a_reference_panel_or_literature_forces_no_step():
+    from aiscientist.agents.research_lab import REPORT_STEP
     lab = _guard_lab([_QC_STEP, _CLUSTER_STEP], preset_prompt=_PROTOCOL)
-    for question in (_QC_REQUEST,
-                     # ...and neither do the user's words, when the reference is what the
-                     # analysis is run against.
-                     "Annotate the clusters against the retina reference panel."):
-        assert lab._pi_plan(question, lambda _event: None) == ("agenda", [_QC_STEP, _CLUSTER_STEP])
+    # _QC_REQUEST asks for a report: that is the write_report step (#102), not a literature step.
+    assert lab._pi_plan(_QC_REQUEST, lambda _event: None) == (
+        "agenda", [_QC_STEP, _CLUSTER_STEP, REPORT_STEP])
+    # ...and neither do the user's words, when the reference is what the analysis is run against.
+    assert lab._pi_plan("Annotate the clusters against the retina reference panel.",
+                        lambda _event: None) == ("agenda", [_QC_STEP, _CLUSTER_STEP])
 
 
 def test_what_a_sentence_says_about_literature():

@@ -216,8 +216,8 @@ invented here).
 **volcano plot per cell type**, **shared up- and down-regulated gene heatmaps**, and an **enrichment bar
 plot per cell type**.
 
-**Why / honesty.** These render the statistics from Steps 3–5; they do not create new results. **The final
-report is assembled automatically — do NOT plan a report-writing step.**
+**Why / honesty.** These render the statistics from Steps 3–5; they do not create new results. **Plan no other
+report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
 **What runs** — the `run_code` tool call:
 ```

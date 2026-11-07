@@ -53,8 +53,8 @@ phenotype.
 > The heavy compute lives inside the `run_code` **E-distance** (Step 4) and **DE** (Step 6) templates;
 > `run_de` is per-cluster one-vs-rest and **cannot** do the shared-control comparison, so it is not used
 > for the DE step. Steps 5, 7, 8, 9 are genuinely **optional** — take them only when the data supports
-> them. The final methods + results report is assembled automatically — **do NOT plan a report-writing
-> step.**
+> them. **Plan no other report-writing
+> step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ### Reading the screen from the data (do this even with a vague/empty question)
 

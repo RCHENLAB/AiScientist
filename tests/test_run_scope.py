@@ -202,7 +202,9 @@ def test_a_qc_only_request_plans_qc_only_whatever_the_models_say():
         return {"action": "cancel"}
 
     lab.run(_QC_ONLY_ZH, events.append, plan_review=review)
-    assert plans and plans[-1] == _FULL_PLAN[:1]
+    # "报告尽量简短" still asks for a (short) report: the plan's write_report step, last (#102).
+    from aiscientist.agents.research_lab import REPORT_STEP
+    assert plans and plans[-1] == _FULL_PLAN[:1] + [REPORT_STEP]
     assert "SCOPE SET BY THE USER" in seen["pi_user"]
     types = [e.get("type") for e in events]
     assert "scope" in types and "skill_selected" not in types      # no protocol was matched

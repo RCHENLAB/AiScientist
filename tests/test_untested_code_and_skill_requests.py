@@ -412,6 +412,7 @@ def test_a_run_whose_code_wrote_results_says_so_and_leaves_a_request(tmp_path, m
             self.execution_profile, self.later, self.proposed_steps = {}, [], []
             self.request_breadth, self.induced_skills = "specific", []
             self.scientist = type("S", (), {"catalog": []})()
+            self.report_requested = True  # its plan kept a write_report step (#102)
 
         def run(self, question, on_event=None, plan_review=None, **_kw):
             r1 = LabRound(1, 0, qc._STEP, "Scientist", {"final_answer": "QC done", "steps": [

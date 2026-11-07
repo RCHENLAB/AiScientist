@@ -76,13 +76,19 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_token(user_id: int, name: str) -> tuple[str, dict]:
+TOKEN_READ, TOKEN_RUN = "mcp:read", "mcp:run"
+
+
+def create_token(user_id: int, name: str, *, run: bool = False) -> tuple[str, dict]:
     """A new personal access token for ``user_id``. Returns ``(token, its public row)``; the token
-    itself is never stored, so this is the only time it can be shown."""
+    itself is never stored, so this is the only time it can be shown. ``run`` also lets it start work
+    billed to the account (``mcp:run``: ``write_report``, RCHENLAB/AiScientist#102); without it the
+    token only reads."""
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    scope = f"{TOKEN_READ} {TOKEN_RUN}" if run else TOKEN_READ
     with session_scope() as s:
         row = AccessToken(user_id=user_id, name=(name or "MCP client").strip()[:64] or "MCP client",
-                          token_hash=_hash_token(token), prefix=token[:12], scope="mcp:read")
+                          token_hash=_hash_token(token), prefix=token[:12], scope=scope)
         s.add(row)
         s.commit()
         return token, row.public()
@@ -108,31 +114,45 @@ def revoke_token(user_id: int, token_id: int) -> bool:
 
 def user_for_token(token: str) -> "User | None":
     """The ACTIVE account a token acts for, or None (unknown, revoked, or the account disabled)."""
+    return _token_user(token)[0]
+
+
+def _token_user(token: str) -> "tuple[User | None, frozenset[str]]":
+    """The ACTIVE account a token acts for and the scopes it was made with; ``(None, ∅)`` for an
+    unknown or revoked token or a disabled account."""
     if not token or not token.startswith(TOKEN_PREFIX):
-        return None
+        return None, frozenset()
     with session_scope() as s:
         row = s.scalars(select(AccessToken).where(AccessToken.token_hash == _hash_token(token))).first()
         if row is None or row.revoked_at is not None:
-            return None
+            return None, frozenset()
         user = s.get(User, row.user_id)
         if user is None or not user.is_active:
-            return None
+            return None, frozenset()
         row.last_used_at = _now()
+        scopes = frozenset((row.scope or TOKEN_READ).split()) or frozenset({TOKEN_READ})
         s.commit()
         s.expunge(user)
-        return user
+        return user, scopes
 
 
 def authenticate(request) -> "User | None":
     """The account an MCP request acts as: a bearer token, else the console's session cookie."""
+    return authenticate_scoped(request)[0]
+
+
+def authenticate_scoped(request) -> "tuple[User | None, frozenset[str]]":
+    """:func:`authenticate` and what the credential allows: a token its own scopes, the website's
+    session cookie both (it is the signed-in user)."""
     header = request.headers.get("authorization") or ""
     if header.lower().startswith("bearer "):
-        return user_for_token(header[7:].strip())      # a bad token never falls back to the cookie
+        return _token_user(header[7:].strip())      # a bad token never falls back to the cookie
     from . import auth_routes
     try:
-        return auth_routes.current_user(request)
+        user = auth_routes.current_user(request)
     except Exception:  # noqa: BLE001
-        return None
+        user = None
+    return user, (frozenset({TOKEN_READ, TOKEN_RUN}) if user is not None else frozenset())
 
 
 # --- datasets --------------------------------------------------------------------------------------------

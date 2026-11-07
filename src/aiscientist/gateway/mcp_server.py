@@ -44,7 +44,9 @@ _INSTRUCTIONS = (
     "results used a dataset, what a result was made from) with get_provenance; look at a few rows of "
     "a table with preview_records. Values whose provenance says 'drafted' were inferred "
     "automatically and not yet reviewed by the owner: check their confidence before relying on them. "
-    "Cite inputs by name and UUID, and by their accession when one is given.")
+    "Cite inputs by name and UUID, and by their accession when one is given. write_report writes "
+    "the report of a finished analysis run (minutes; it needs the account's website session and a "
+    "token allowed to run tools); follow it with report_status.")
 
 # JSON-RPC error codes
 _PARSE_ERROR, _INVALID_REQUEST, _METHOD_NOT_FOUND, _INVALID_PARAMS, _INTERNAL = (
@@ -122,7 +124,40 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["id"]},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
+    {
+        "name": "write_report",
+        "title": "Write a run's report",
+        "description": "Write the report of a FINISHED analysis run from its accepted results: the "
+                       "methods and results manuscript with references and a verification "
+                       "statement, as PDF and DOCX under the run's report/ folder (RCHENLAB/"
+                       "AiScientist#102). Runs only when asked: a run whose plan had no "
+                       "write_report step ends with its answer in the chat. Starts in the background "
+                       "and returns at once; the report takes minutes, so poll report_status. Uses the "
+                       "account's live website session (its model writes, HPC3 typesets) and bills "
+                       "the run. Needs a token made with 'run tools' allowed.",
+        "inputSchema": {"type": "object", "properties": {
+            "run_id": {"type": "string", "description": "The run id (12 characters, as in Runs)."}},
+            "required": ["run_id"]},
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
+                        "openWorldHint": False},
+    },
+    {
+        "name": "report_status",
+        "title": "Report status",
+        "description": "Where write_report is for a run: 'none' (never asked), 'running', 'done' or "
+                       "'error', the last log lines, and the report files with their download paths.",
+        "inputSchema": {"type": "object", "properties": {
+            "run_id": {"type": "string", "description": "The run id."}},
+            "required": ["run_id"]},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
 ]
+
+#: Scopes. ``mcp:read`` reads metadata; ``mcp:run`` starts work billed to the account. A token gets
+#: ``mcp:run`` only when made with it; the website's own session cookie has both.
+READ, RUN = "mcp:read", "mcp:run"
+ALL_SCOPES = frozenset({READ, RUN})
+_NEEDS: dict[str, str] = {"write_report": RUN}
 
 
 def _limit(args: dict, key: str, default: int, top: int) -> int:
@@ -180,6 +215,29 @@ def _tool_provenance(user, args: dict) -> dict:
     return graph
 
 
+def _require_run(args: dict) -> str:
+    run_id = str(args.get("run_id") or "").strip()
+    if not run_id:
+        raise ToolError("run_id is required: the id of one of this account's runs")
+    return run_id
+
+
+def _tool_write_report(user, args: dict) -> dict:
+    from . import app as gw
+    try:
+        return gw.start_report_job(user, _require_run(args))
+    except gw.ReportJobError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _tool_report_status(user, args: dict) -> dict:
+    from . import app as gw
+    try:
+        return gw.report_job_status(gw.safe_name(user.username), _require_run(args))
+    except gw.ReportJobError as exc:
+        raise ToolError(str(exc)) from exc
+
+
 def _tool_preview(user, args: dict) -> dict:
     from . import metadata_preview
     try:
@@ -195,14 +253,22 @@ _HANDLERS: dict[str, Callable[[Any, dict], dict]] = {
     "get_dataset_metadata": _tool_metadata,
     "get_provenance": _tool_provenance,
     "preview_records": _tool_preview,
+    "write_report": _tool_write_report,
+    "report_status": _tool_report_status,
 }
 
 
-def call_tool(user, name: str, args: "dict | None") -> dict:
-    """One ``tools/call`` result. Also what the in-process callers use (same checks, same output)."""
+def call_tool(user, name: str, args: "dict | None", scopes: "frozenset[str]" = ALL_SCOPES) -> dict:
+    """One ``tools/call`` result. Also what the in-process callers use (same checks, same output).
+    ``scopes``: what the request's credential allows; a tool that needs more is refused as content."""
     handler = _HANDLERS.get(name)
     if handler is None:
         raise KeyError(name)
+    needed = _NEEDS.get(name, READ)
+    if needed not in scopes:
+        return {"content": [{"type": "text", "text": (
+            f"{name} needs a token allowed to run tools ({needed}); this one only reads. Make a new "
+            "token in Files → Datasets with 'Allow running tools' ticked.")}], "isError": True}
     try:
         out = handler(user, dict(args or {}))
     except ToolError as exc:
@@ -284,7 +350,7 @@ def _server_version() -> str:
         return "0"
 
 
-def _dispatch(user, method: str, params: dict) -> Any:
+def _dispatch(user, method: str, params: dict, scopes: "frozenset[str]" = ALL_SCOPES) -> Any:
     if method == "initialize":
         asked = str(params.get("protocolVersion") or "")
         return {"protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
@@ -303,7 +369,7 @@ def _dispatch(user, method: str, params: dict) -> Any:
         if not isinstance(args, dict):
             raise _RpcError(_INVALID_PARAMS, "arguments must be an object")
         try:
-            return call_tool(user, name, args)
+            return call_tool(user, name, args, scopes)
         except KeyError:
             raise _RpcError(_INVALID_PARAMS, f"Unknown tool: {name}") from None
     if method == "resources/list":
@@ -315,8 +381,9 @@ def _dispatch(user, method: str, params: dict) -> Any:
     raise _RpcError(_METHOD_NOT_FOUND, f"Method not found: {method}")
 
 
-def handle_message(user, msg: Any) -> "dict | None":
-    """Answer one JSON-RPC message; None for a notification (nothing is sent back for it)."""
+def handle_message(user, msg: Any, scopes: "frozenset[str]" = ALL_SCOPES) -> "dict | None":
+    """Answer one JSON-RPC message; None for a notification (nothing is sent back for it). ``scopes``:
+    what the request's credential allows (a read-only token cannot start work)."""
     if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
         if isinstance(msg, dict) and "method" not in msg and ("result" in msg or "error" in msg):
             return None                       # a response to a request we never send: ignore it
@@ -327,7 +394,7 @@ def handle_message(user, msg: Any) -> "dict | None":
     if not isinstance(params, dict):
         params = {}
     try:
-        result = _dispatch(user, msg["method"], params)
+        result = _dispatch(user, msg["method"], params, scopes)
     except _RpcError as exc:
         if not has_id:
             return None
@@ -369,7 +436,7 @@ def _unauthorized(message: str) -> JSONResponse:
 async def mcp_post(request: Request) -> Response:
     if _foreign_origin(request):
         return JSONResponse({"error": "Origin not allowed"}, status_code=403)
-    user = await asyncio.to_thread(store.authenticate, request)
+    user, scopes = await asyncio.to_thread(store.authenticate_scoped, request)
     if user is None:
         return _unauthorized("Sign in, or send 'Authorization: Bearer <token>' with a personal access "
                              "token made in Files → Datasets.")
@@ -383,9 +450,10 @@ async def mcp_post(request: Request) -> Response:
             return JSONResponse({"jsonrpc": "2.0", "id": None,
                                  "error": {"code": _INVALID_REQUEST, "message": "Empty batch"}},
                                 status_code=400)
-        answers = [a for a in [await asyncio.to_thread(handle_message, user, m) for m in payload] if a]
+        answers = [a for a in [await asyncio.to_thread(handle_message, user, m, scopes)
+                               for m in payload] if a]
         return JSONResponse(answers) if answers else Response(status_code=202)
-    answer = await asyncio.to_thread(handle_message, user, payload)
+    answer = await asyncio.to_thread(handle_message, user, payload, scopes)
     if answer is None:
         return Response(status_code=202)    # a notification or a response: accepted, nothing to say
     return JSONResponse(answer)

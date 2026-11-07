@@ -54,8 +54,8 @@ tiers the survivors by **inheritance model** — the lab's IRD protocol, reprodu
 
 > Plan these as **distinct agenda steps** — a real variant study is not one "annotate" call. The heavy
 > compute lives inside `annotate_variants` (Step 4); Steps 5–6 **report from the tables it already wrote**
-> (never hand-roll `run_code` to re-derive them). The methods+results report is assembled automatically —
-> **do not add a report-writing step.**
+> (never hand-roll `run_code` to re-derive them). **Plan no other report-writing step:**
+> a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ### Rare-disease / IRD strategy (DEFAULT for a Mendelian study)
 

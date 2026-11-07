@@ -147,9 +147,10 @@ def test_a_whole_analysis_gets_no_literature_step_from_the_protocol_either():
     pipeline 都必须的"). The protocol text names it in every pipeline; only the user's words add it."""
     for reply in ({"breadth": "whole", "agenda": [_QC, _CLUSTER]}, {"agenda": [_QC, _CLUSTER]}):
         assert _plan_under_protocol(reply, "analyse this dataset") == [_QC, _CLUSTER]
-    # ... and a report is not a request for literature: every run ends with one.
+    # ... and a report is not a request for literature: it is the plan's write_report step (#102).
+    from aiscientist.agents.research_lab import REPORT_STEP
     assert _plan_under_protocol({"agenda": [_QC]}, "Run CellQC on the uploaded sample to generate "
-                                                   "quality control report.") == [_QC]
+                                                   "quality control report.") == [_QC, REPORT_STEP]
 
 
 def test_naming_a_reference_to_analyse_against_is_not_asking_for_citations():

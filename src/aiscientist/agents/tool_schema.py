@@ -15,6 +15,7 @@ from typing import Any
 TOOL_NAME = r"[A-Za-z_][A-Za-z0-9_-]{0,63}"
 NAME_LEFT = r"(?<![A-Za-z0-9_-])"
 NAME_RIGHT = r"(?![A-Za-z0-9_-])"
+REPORT_TOOL = "write_report"  # gateway-owned plan step; never a Scientist/MCP callable
 
 
 class MCPInputSchema(dict):
@@ -144,7 +145,13 @@ class PlanParameters(dict):
                 return
             seen.add(key)
             # Respect the selected dialect, including legacy $ref siblings.
-            applicable = dict(validator._APPLICABLE_VALIDATORS(schema))
+            applicable = dict(type(validator)._APPLICABLE_VALIDATORS(schema))
+            if "$ref" in schema and schema.keys() - applicable.keys():
+                # jsonschema's annotation collector can still inspect legacy
+                # $ref siblings that keyword validation ignores. Do not use a
+                # narrower static bound to reject a completion it would accept.
+                yield None
+                return
             node = {key: value for key, value in applicable.items() if key in validator.VALIDATORS}
             yield node
             if "$ref" in node:
@@ -202,7 +209,7 @@ class PlanParameters(dict):
                 # using the same if decisions as validation and annotations.
                 possible = set()
                 for node in reachable_nodes(validator.evolve(schema=error.schema)):
-                    if "$dynamicRef" in node or any(key in node and node[key] is not False
+                    if node is None or "$dynamicRef" in node or any(key in node and node[key] is not False
                         for key in ("additionalProperties", "unevaluatedProperties")):
                         return False  # no static proof for this broader evaluation scope
                     possible.update(node.get("properties", {}))

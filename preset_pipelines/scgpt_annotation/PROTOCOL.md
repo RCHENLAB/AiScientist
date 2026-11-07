@@ -50,7 +50,7 @@ not ground truth**.
 > Plan these as **distinct agenda steps**. Step 1 is the annotation; Steps 2–4 build a **data-driven
 > structure that does NOT depend on the scGPT labels**; Steps 5–6 **check** scGPT against that
 > structure. **Do NOT normalize / HVG / log1p the data before Step 1** — `scgpt_annotate` preprocesses
-> internally. The report is assembled automatically — **do not add a report-writing step.**
+> internally. **Plan no other report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ### The two jobs — transfer AND independent cross-validation (why the extra steps)
 
@@ -252,8 +252,8 @@ fine-tuning** on this query, and **query-vs-reference differences** shift calibr
 labels as a **strong hypothesis to validate**, not ground truth, and read them **together** with the
 independent Leiden structure and (when present) the existing `celltype`/`majorclass` labels. If
 `scgpt_annotate` is **not enabled** (no GPU / image) or errors, **say so and fall back to the
-marker-based path** (the `celltype_annotation` skill) rather than inventing labels. The report is
-assembled automatically — **do not plan a report-writing step.**
+marker-based path** (the `celltype_annotation` skill) rather than inventing labels. **Plan no other report-writing step:**
+a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ## Method provenance
 

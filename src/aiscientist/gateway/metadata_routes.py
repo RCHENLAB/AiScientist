@@ -171,6 +171,7 @@ def metadata_lineage(ref: str, request: Request, direction: str = "both", depth:
 
 class TokenCreate(BaseModel):
     name: str = "MCP client"
+    run: bool = False      # also allow tools that start work billed to the account (write_report)
 
 
 @router.get("/account/tokens")
@@ -184,7 +185,7 @@ def new_token(req: TokenCreate, request: Request) -> JSONResponse:
     user = require_user(request)
     if len(store.list_tokens(user.id)) >= 20:
         raise HTTPException(status_code=400, detail="At most 20 tokens: revoke one first.")
-    token, row = store.create_token(user.id, req.name)
+    token, row = store.create_token(user.id, req.name, run=req.run)
     # The token is in this answer only: it is not stored, so it cannot be shown again.
     return JSONResponse({"token": token, **row}, headers={"Cache-Control": "no-store"})
 

@@ -11,7 +11,8 @@ from aiscientist.agents.mcp_bridge import load_servers
 from aiscientist.agents.registry import build_scientist_catalog
 from aiscientist.gateway.executor import ExecResult
 
-ATLAS_TOOLS = {entry["name"]: entry["inputSchema"] for entry in load_servers()[0].tools}
+_SERVER = load_servers()[0]
+ATLAS_TOOLS = {_SERVER.planner_name(entry["name"]): entry["inputSchema"] for entry in _SERVER.tools}
 
 FIXTURE = Path(__file__).parent / "fixtures" / "atlas_expression"
 IMAGE = ("docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:"
@@ -68,6 +69,16 @@ def test_release_metadata_checksum_tier_and_exposure(release, monkeypatch):
     assert not set(ATLAS_TOOLS) & tools(Runner()).keys()
 
 
+@pytest.mark.parametrize("value", ["", "heca/latest=/shared/heca/x.h5ad", "heca/v1=relative/x.h5ad"])
+def test_without_a_configured_atlas_the_tools_are_not_offered(release, monkeypatch, value):
+    """A deployment that lists no atlas would offer nine tools that always fail."""
+    monkeypatch.setenv("AISCIENTIST_ATLAS_FILES", value)
+    catalog = tools(Runner())
+    assert not set(ATLAS_TOOLS) & catalog.keys()
+    out = catalog["run_in_environment"].executor({"skill": atlas.SKILL, "command": "true"}, None)
+    assert out["status"] == "error" and "not set up on this deployment" in out["error"]
+
+
 def test_resolution_flow_preserves_all_user_names_and_provenance(release, tmp_path):
     runner = Runner()
     catalog = tools(runner)
@@ -101,7 +112,7 @@ def test_all_nine_exact_signatures(release):
         "resolve_genes": {"genes", "atlas"}, "submit_query": {"genes", "atlas", "rerun"},
         "query_status": {"query_id"}, "get_summary": {"query_id", "level", "gene", "top"},
         "plot_dotplot": {"query_id"}, "plot_violin": {"query_id", "groupby"},
-        "plot_featureplot": {"query_id"}, "write_report": {"query_id"}, "list_queries": set(),
+        "plot_featureplot": {"query_id"}, "atlas_write_report": {"query_id"}, "list_queries": set(),
     }
     for name, fields in expected.items():
         assert set(catalog[name].parameters["properties"]) == fields

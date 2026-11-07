@@ -172,6 +172,34 @@ def test_stop_endpoint_without_ids_is_back_compat():
     assert r.json()["status"] == "stopping" and run.chat_stop.is_set()
 
 
+def test_a_stop_that_names_no_chat_stops_neither_of_two_running_chats():
+    """The console's Stop button once sent no conversation id (its click event took the place of
+    the chat), and with two chats running the server stopped the newest: Stop pressed in chat A
+    cancelled chat B's Slurm job (2026-11-06). Without ids it now stops a run only when that is the
+    only run in flight; the named chat's Stop still reaches exactly its own run."""
+    import contextvars
+
+    conn = _conn(chat_running=True)
+    # Each chat's run starts and binds its id in its own task, as /api/lab's tasks do; the request
+    # that carries the Stop is another task, with no run of its own.
+    def start(conversation_id, run_id):
+        run = conn.begin_run(conversation_id)
+        conn.bind_run_id(run, run_id)
+        return run
+
+    a = contextvars.copy_context().run(start, "conv-A", "runA")
+    b = contextvars.copy_context().run(start, "conv-B", "runB")
+    assert contextvars.Context().run(conn.resolve_run) is None     # no ids, no run of its own
+    assert contextvars.Context().run(lambda: conn.resolve_run(conversation_id="conv-A")) is a
+    client = TestClient(gw_app.app)
+    r = client.post("/api/chat/stop", json={"connection_id": conn.id})
+    assert r.json()["status"] == "idle"
+    assert not a.chat_stop.is_set() and not b.chat_stop.is_set()
+    r = client.post("/api/chat/stop", json={"connection_id": conn.id, "conversation_id": "conv-A"})
+    assert r.json()["status"] == "stopping"
+    assert a.chat_stop.is_set() and not b.chat_stop.is_set()
+
+
 def test_summary_exposes_active_run_identity():
     # A reconnecting/reloading client re-adopts the run owner from summary.active_run so the Stop
     # button POSTs the matching conversation_id — otherwise resolve_run no-ops the Stop (a client id
@@ -436,6 +464,7 @@ def _lab_stopped_during(conn, monkeypatch, *, presses: int):
             self.protocols = []
             self.self_sourced = ""
             self.execution_profile = {}
+            self.report_requested = True  # its plan kept a write_report step (#102)
 
         # **_kw so a new optional control callable on ResearchLab.run does not break the double.
         def run(self, question, on_event=None, plan_review=None, should_cancel=None,

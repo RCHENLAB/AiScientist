@@ -46,7 +46,7 @@ Adapt every parameter to **this** dataset.
 
 > Plan these as **distinct agenda steps** — real cell-type annotation is not one call. Steps 5–6 read from
 > the marker tables the earlier tools already wrote; ground the labels in those, don't re-derive markers by
-> hand. **The methods + results report is assembled automatically — do NOT add a report-writing step.**
+> hand. **Plan no other report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ---
 
@@ -220,8 +220,8 @@ truth.
 scanpy — per-cell QC + `normalize_total`/`log1p`/HVG · `PCA → neighbors → Leiden → UMAP` · `rank_genes`
 per-cluster differential expression · (optional) marker/pathway enrichment · optional `run_code` adaptation
 of the `annotate_clusters_by_markers.py` reference template for label assignment. Tools: `run_scanpy_qc`,
-`run_clustering`, `run_de`, `run_enrichment`, `run_code` (see this pipeline's `SKILL.md`). The methods +
-results report is assembled automatically — do not plan a report-writing step.
+`run_clustering`, `run_de`, `run_enrichment`, `run_code` (see this pipeline's `SKILL.md`). Plan no other
+report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.
 
 <sub>This protocol renders the `celltype_annotation` SKILL.md; where the SKILL leaves a knob to the agent it
 is marked *(agent-chosen per study)* rather than given a fabricated value.</sub>

@@ -205,6 +205,7 @@ def test_a_qc_only_run_asked_for_a_report_gets_the_writer_and_no_audit(monkeypat
     qc = LabRound(1, 1, "CellQC", "sci", {"final_answer": "kept 9 of 10", "steps": steps},
                   CriticVerdict("accept", 0.8, ""))
     events: list = []
+    lab._report_requested = True    # the plan's write_report step, which this request gets (#102)
     out = lab._synthesize("Only run CellQC and write me a report", [qc], events.append)
     assert out.startswith("# QC report") and len(calls) == 1          # the writer, and nothing else
     assert "Principal Investigator writing the final research report" in calls[0][0]["content"]

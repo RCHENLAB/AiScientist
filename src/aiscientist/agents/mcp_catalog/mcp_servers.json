@@ -12,6 +12,7 @@
       "tools_file": "mcp/atlas-expression-exploration-0.0.3.tools.json",
       "tools_sha256": "069f629e1056c37b57d3e6173d6b257200c4cc8b70782b128fa6a6111fcb0020",
       "adapter": "atlas-expression",
+      "aliases": {"write_report": "atlas_write_report"},
       "timeout": 15000,
       "resources": {
         "resolve_genes": [

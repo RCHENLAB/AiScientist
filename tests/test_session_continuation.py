@@ -312,6 +312,7 @@ def test_a_continuing_run_starts_from_the_earlier_runs_dataset(tmp_path, libs, m
             self.execution_profile = {}
             self.later = ["Run pathway enrichment on the markers."]
             self.request_breadth = "specific"
+            self.report_requested = True  # its plan kept a write_report step (#102)
             self.proposed_steps = [{"step": "**Doublet audit** — Re-check the doublet calls.",
                                     "why": "two callers disagree", "decision": "declined"}]
 

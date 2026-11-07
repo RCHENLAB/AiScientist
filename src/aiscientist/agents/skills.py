@@ -611,6 +611,19 @@ def list_skills() -> list[dict]:
             for s in list(SKILLS.values())]
 
 
+_DECLARED_ON = frozenset({"true", "yes", "on", "1"})
+
+
+def declares(skill: "Skill | None", key: str) -> bool:
+    """Whether ``skill`` switches on a behaviour in its SKILL.md ``metadata`` block, for example
+    ``exploration: "true"`` (RCHENLAB/AiScientist#102). Front-matter values are read as strings, so
+    "true", "yes", "on" and "1" count; anything else, or no such key, does not."""
+    if skill is None:
+        return False
+    value = (skill.metadata or {}).get(key)
+    return str(value if value is not None else "").strip().strip("\"'").lower() in _DECLARED_ON
+
+
 def superseded_names(lib: "dict[str, Skill]") -> "set[str]":
     """Names that some OTHER skill in the library declares itself a better version of. Induction
     versions rather than overwrites, so both live on disk; this is what makes the newer one the

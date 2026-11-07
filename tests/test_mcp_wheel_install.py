@@ -94,6 +94,7 @@ def test_base_wheel_contains_registry_and_can_register_atlas(tmp_path, skill_rel
     skill_config.write_text(json.dumps({"release_tag": "v0.2.0", "releases_root": str(release.parent),
                                         "allowed_tiers": ["community"], "current": ""}))
     env["AISCIENTIST_SKILLS_REGISTRY_CONFIG"] = str(skill_config)
+    env["AISCIENTIST_ATLAS_FILES"] = "fixture/v1=/fixture/atlas.h5ad"
     probe = '''
 import importlib.util, json, sys
 from pathlib import Path
@@ -114,7 +115,7 @@ class Runner:
     def run_in_image(self, *args, **kwargs):
         raise AssertionError('registration must not execute a job')
 enabled = {tool.name for tool in build_scientist_catalog(code_executor=Runner())}
-assert {tool['name'] for tool in servers[0].tools} <= enabled
+assert {servers[0].planner_name(tool['name']) for tool in servers[0].tools} <= enabled
 print(json.dumps({'base_tools': len(plain), 'atlas_tools': len(servers[0].tools)}))
 '''
     result = subprocess.run([str(python), "-I", "-c", probe], cwd=empty, env=env,

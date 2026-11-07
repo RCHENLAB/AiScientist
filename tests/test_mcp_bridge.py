@@ -131,11 +131,28 @@ def test_invalid_arguments_are_rejected_before_a_job(registry, args):
     {"runs_on": "gpu:scgpt"}, {"runs_on": "inprocess"},
     {"resources": {"other": [1, 1, "00:01:00"]}},
     {"resources": {"check": [True, 1, "00:01:00"]}},
+    {"aliases": []}, {"aliases": {"check": "bad;name"}}, {"aliases": {"other": "unused"}},
+    {"prefix": "", "aliases": {"check": "write_report"}},
 ])
 def test_invalid_pins_paths_and_execution_policy_are_refused(tmp_path, change):
     config = write_config(tmp_path, overrides=change)
     with pytest.raises(ValueError):
         bridge.load_servers(config)
+
+
+def test_alias_changes_only_the_planner_name(registry):
+    config, _ = registry
+    write_config(config.parent, overrides={"aliases": {"check": "inspect"}})
+    runner = Runner()
+    tool, = build(runner)
+    assert tool.name == "tables_inspect"
+    assert bridge.configured_tool_names() == {tool.name}
+    assert bridge.protected_skill_tools("check-table") == [tool.name]
+    assert bridge.configured_tool_skills() == {tool.name: "check-table"}
+    assert tool.executor({"text": "fixture"}, None)["status"] == "ok"
+    command, _image, kwargs, _policy = runner.calls[0]
+    cli = shlex.split(next(line for line in command.splitlines() if line.startswith("aiscientist-mcp ")))
+    assert cli[6] == "check" and kwargs["cpus"] == 2
 
 
 def test_snapshot_checksum_covers_descriptions_and_schemas(tmp_path):

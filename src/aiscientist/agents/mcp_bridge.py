@@ -17,7 +17,7 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
-from .tool_schema import MCPInputSchema, TOOL_NAME
+from .tool_schema import MCPInputSchema, REPORT_TOOL, TOOL_NAME
 
 DEFAULT_CONFIG = Path(__file__).with_name("mcp_catalog") / "mcp_servers.json"
 LOG = logging.getLogger(__name__)
@@ -76,6 +76,10 @@ class Server:
     prefix: str = ""
     timeout: int = 15000
     resources: dict | None = None
+    aliases: dict | None = None
+
+    def planner_name(self, wire_name: str) -> str:
+        return self.prefix + (self.aliases or {}).get(wire_name, wire_name)
 
     def identity(self) -> dict:
         return {key: getattr(self, key) for key in
@@ -117,7 +121,7 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
         raise ValueError("Invalid MCP registry format")
     servers, names, tool_names, skills = [], set(), set(), set()
     required = {"name", "version", "release_tag", "image", "entrypoint", "skill", "runs_on", "tools_file", "tools_sha256"}
-    optional = {"adapter", "prefix", "timeout", "resources"}
+    optional = {"adapter", "prefix", "timeout", "resources", "aliases"}
     for row in cfg["servers"]:
         if not isinstance(row, dict) or not required <= row.keys() or row.keys() - required - optional:
             raise ValueError("Invalid MCP server fields")
@@ -156,13 +160,20 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
         entries = json.loads(raw)
         if not isinstance(entries, list) or not entries:
             raise ValueError("MCP tool catalog must be a nonempty list")
+        aliases = row.get("aliases", {})
+        if not isinstance(aliases, dict) or any(not isinstance(name, str) or not re.fullmatch(NAME, name)
+                                               for name in aliases.values()):
+            raise ValueError("Invalid MCP planner aliases")
         for entry in entries:
             if not isinstance(entry, dict) or set(entry) != {"name", "description", "inputSchema"}:
                 raise ValueError("Invalid MCP tool descriptor")
             name = entry["name"]
-            if not isinstance(name, str) or not re.fullmatch(NAME, name) or not re.fullmatch(NAME, prefix + name):
+            planner_name = prefix + aliases.get(name, name) if isinstance(name, str) else ""
+            if not isinstance(name, str) or not re.fullmatch(NAME, name) or not re.fullmatch(NAME, planner_name):
                 raise ValueError("Invalid MCP tool name")
-            if prefix + name in tool_names:
+            if planner_name == REPORT_TOOL:
+                raise ValueError("MCP planner name write_report is reserved for the gateway report step; use an alias")
+            if planner_name in tool_names:
                 raise ValueError("Duplicate MCP planner tool name")
             if not isinstance(entry["description"], str):
                 raise ValueError("Invalid MCP tool description")
@@ -177,7 +188,9 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
                     resolver.lookup(ref)
                 except Unresolvable as exc:
                     raise ValueError(f"Unresolved local MCP schema reference: {ref}") from exc
-            tool_names.add(prefix + name)
+            tool_names.add(planner_name)
+        if aliases.keys() - {tool["name"] for tool in entries}:
+            raise ValueError("Unknown MCP alias tool")
         resources = row.get("resources", {})
         if not isinstance(resources, dict) or resources.keys() - {t["name"] for t in entries}:
             raise ValueError("Unknown MCP resource override tool")
@@ -194,12 +207,16 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
 
 
 def configured_tool_names() -> set[str]:
-    return {server.prefix + tool["name"] for server in load_servers() for tool in server.tools}
+    return set(configured_tool_skills())
+
+
+def configured_tool_skills() -> dict[str, str]:
+    return {server.planner_name(tool["name"]): server.skill for server in load_servers() for tool in server.tools}
 
 
 def protected_skill_tools(skill: str) -> list[str]:
     from .atlas_expression import SKILL as ATLAS_SKILL
-    names = [server.prefix + tool["name"] for server in load_servers()
+    names = [server.planner_name(tool["name"]) for server in load_servers()
              if server.skill == skill for tool in server.tools]
     # Disabling registration must not reopen Atlas's previously forbidden shell
     # entry point, which would bypass the dataset allowlist in its adapter.
@@ -226,11 +243,11 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
     from .skills import get_skill
 
     servers = load_servers() if servers is None else servers
-    registered = set(existing_names)
+    registered = set(existing_names) | {REPORT_TOOL}
     tools = []
     for server in servers:
         for entry in server.tools:
-            name = server.prefix + entry["name"]
+            name = server.planner_name(entry["name"])
             if name in registered:
                 raise ValueError(f"MCP tool collides with an existing planner tool: {name}")
             registered.add(name)
@@ -241,8 +258,10 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
             LOG.error("MCP %s disabled: skill image differs from pinned server image", server.name)
             continue
         if server.adapter == "atlas-expression":
-            from .atlas_expression import AtlasAdapter
-            adapter = AtlasAdapter()
+            from .atlas_expression import AtlasAdapter, configured_atlases
+            if not configured_atlases():
+                continue
+            adapter = AtlasAdapter(report_tool=server.planner_name("write_report"))
         else:
             adapter = JsonAdapter()
         for entry in server.tools:
@@ -287,7 +306,7 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                 except (ValueError, TypeError, KeyError, OSError) as exc:
                     return {"status": "error", "error": f"MCP {s.name}: {exc}", "mcp": s.identity()}
 
-            tools.append(HarnessTool(name=server.prefix + entry["name"],
+            tools.append(HarnessTool(name=server.planner_name(entry["name"]),
                                      description=f"MCP {server.name}: {entry['description']}" + adapter.description,
                                      parameters=schema, executor=call,
                                      reads_private_data=True, category=skill.category or "mcp"))

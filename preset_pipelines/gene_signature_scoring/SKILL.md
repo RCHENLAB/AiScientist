@@ -34,7 +34,7 @@ assign cell types (use `celltype_annotation`). Adapt to THIS dataset; plan order
 2. (Optional) Cluster the cells (`run_clustering`) if the comparison is per-cluster rather than per-condition.
 3. Score every cell for the signature. No curated tool covers this — adapt the reference template `score_signature.py` via `run_code` (scanpy `sc.tl.score_genes`), then summarize the score per cluster/condition.
 4. Produce figures: a UMAP colored by the signature score and a violin/box plot of the score per group.
-5. The report is assembled automatically — do NOT plan a report-writing step.
+5. Plan no other report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.
 
 State which genes from the signature were actually present in the data (missing genes weaken the
 score). Report the score distribution per group, not a single number; do not claim a group is

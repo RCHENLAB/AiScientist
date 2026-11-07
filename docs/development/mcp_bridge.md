@@ -34,6 +34,7 @@ load the catalog or System overview. A deployment can set
 | `tools_sha256` | SHA-256 of the exact snapshot bytes, checked before registration. |
 | `adapter` | Optional: `json` by default, or the built-in `atlas-expression` adapter for the Atlas server. |
 | `prefix` | Optional prefix added to planner tool names; the original name is sent to MCP. Default: empty. |
+| `aliases` | Optional original-name to planner-name mapping, applied before `prefix`. Wire names and resource keys remain unchanged. |
 | `timeout` | Optional CLI call timeout in seconds, from 1 to 86400. Default: 15000. |
 | `resources` | Optional mapping from original tool name to `[cpus, mem_gb, time_limit]`. Omitted tools inherit the skill's resources. |
 
@@ -41,7 +42,10 @@ Each snapshot is a JSON array of `{name, description, inputSchema}` objects.
 Schemas must describe objects and pass JSON Schema Draft 2020-12 validation.
 References must be local fragments; schema loading cannot resolve network or
 filesystem references. Duplicate server names, skill bindings and planner names
-are rejected, as are collisions with existing planner tools.
+are rejected, as are collisions with existing planner tools. The gateway plan
+step `write_report` is reserved; a server with that wire name must use an alias
+or prefix. MCP tool-to-skill bindings also supply the installed skill's
+`exploration` and `writes-report` declarations to the planner.
 
 The planner gets the catalog description and a copy of the original input schema.
 The generic bridge preserves its semantics, including `dependentSchemas`, branches
@@ -126,14 +130,19 @@ docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e
 ```
 
 Its skill is `explore-atlas-expression-with-aiscientist-mcp`. The nine planner names
-stay unchanged: `resolve_genes`, `submit_query`, `query_status`, `get_summary`,
-`plot_dotplot`, `plot_violin`, `plot_featureplot`, `write_report` and `list_queries`.
+are `resolve_genes`, `submit_query`, `query_status`, `get_summary`,
+`plot_dotplot`, `plot_violin`, `plot_featureplot`, `atlas_write_report` and `list_queries`.
+`atlas_write_report(query_id)` calls the server's unchanged `write_report` tool to
+produce a query's `report.md`. The separate gateway plan step `write_report`
+requests the whole run's PDF/DOCX manuscript and is never dispatched to Atlas.
 Transport and registration are generic; `AtlasAdapter` in
 `agents/atlas_expression.py` owns these domain restrictions and outputs:
 
 - The primary dataset must be a `.h5ad` matching a normalized absolute path in the
   deployment's `AISCIENTIST_ATLAS_FILES` allowlist. Entries are semicolon-separated
   `label=/absolute/path.h5ad` pairs; a label ending in `latest` is not accepted.
+  Without a valid configured atlas these tools are not offered; direct shell
+  access stays blocked with an explicit deployment-not-configured message.
   A session copy is also accepted when the executor's `dataset_source` is listed.
   An explicit `atlas` argument must name the attached dataset or that authorized
   source; after validation it is omitted from the call so the server reads its

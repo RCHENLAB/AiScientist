@@ -71,24 +71,40 @@ print(json.dumps({"result": result, "atlas": {"path": str(atlas.resolve()),
 '''
 
 
+def configured_atlases() -> dict[str, str]:
+    """Normalized absolute atlas paths and pinned labels from deployment configuration."""
+    configured = {}
+    for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
+        label, sep, path = entry.strip().partition("=")
+        if sep and label and path.startswith("/") and label.lower().split("/")[-1] != "latest":
+            configured[posixpath.normpath(path)] = label
+    return configured
+
+
+def direct_call_refusal() -> str:
+    """Keep raw shell access closed, including deployments with no usable atlas."""
+    if configured_atlases():
+        from .mcp_bridge import protected_skill_tools
+        return "Use the atlas bridge tools: " + ", ".join(protected_skill_tools(SKILL))
+    return ("Atlas expression is not set up on this deployment: no atlas is listed in "
+            "AISCIENTIST_ATLAS_FILES.")
+
+
 class AtlasAdapter:
     """Atlas-specific bindings and outputs; transport and tool schemas live in mcp_bridge."""
 
-    description = (
-        " Flow: resolve_genes -> submit_query -> query_status -> get_summary, "
-        "plot_dotplot, plot_violin, plot_featureplot -> write_report. "
-        "Use these typed tools; run_in_environment refuses this skill. "
-        "Uses the attached atlas read in place; outputs appear in gene_expression/. "
-        "The outer Slurm job owns scheduling; submit_query uses inline and returns when complete.")
+    def __init__(self, *, report_tool: str):
+        self.description = (
+            " Flow: resolve_genes -> submit_query -> query_status -> get_summary, "
+            f"plot_dotplot, plot_violin, plot_featureplot -> {report_tool}. "
+            "Use these typed tools; run_in_environment refuses this skill. "
+            "Uses the attached atlas read in place; outputs appear in gene_expression/. "
+            "The outer Slurm job owns scheduling; submit_query uses inline and returns when complete.")
 
     def prepare(self, args: dict, executor: Any) -> PreparedCall:
         atlas = str(getattr(executor, "dataset_path", "") or "")
         source = str(getattr(executor, "dataset_source", "") or "")
-        configured = {}
-        for entry in os.environ.get("AISCIENTIST_ATLAS_FILES", "").split(";"):
-            label, sep, path = entry.strip().partition("=")
-            if sep and label and path.startswith("/") and label.lower().split("/")[-1] != "latest":
-                configured[posixpath.normpath(path)] = label
+        configured = configured_atlases()
         version = configured.get(posixpath.normpath(atlas)) if atlas else None
         if not version and atlas and source:
             version = configured.get(posixpath.normpath(source))

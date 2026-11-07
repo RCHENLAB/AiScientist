@@ -262,6 +262,22 @@ def test_unreachable_branches_cannot_supply_future_property_annotations(registry
     assert tool.executor({"mode": "number", "value": "word"}, None)["status"] == "ok"
 
 
+@pytest.mark.parametrize("legacy_ref", [False, True])
+def test_future_annotations_preserve_referenced_dialect_behavior(registry, legacy_ref):
+    branch = {"$schema": "http://json-schema.org/draft-07/schema#",
+              "properties": {"flag": {}, "value": {"type": "string"}}}
+    if legacy_ref:
+        branch["$ref"] = "#/$defs/Base"
+    predicate = {"properties": {"mode": {}}, "dependentSchemas": {"flag": branch},
+                 "unevaluatedProperties": False}
+    schema = {**conditional_value_schema(predicate), "$defs": {"Base": {"properties": {"mode": {}, "flag": {}}}}}
+    _, tool = configured(registry, schema)
+    props = _tool_schemas([tool])[tool.name]
+    pins = {"mode": "text", "value": "word"}
+    assert not props.errors(pins)
+    assert tool.executor({**pins, "flag": True}, None)["status"] == "ok"
+
+
 @pytest.mark.parametrize("keyword", ["const", "enum"])
 def test_whole_object_matches_distinguish_missing_fields_from_fixed_conflicts(registry, keyword):
     expected = {"flag": True, "value": "word"}
