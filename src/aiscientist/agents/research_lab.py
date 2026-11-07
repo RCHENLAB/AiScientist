@@ -995,7 +995,7 @@ def make_run_in_environment_tool(executor: Any,
         return result
 
     def _exec(args: dict[str, Any], ctx: HarnessContext, *,
-              _atlas_bridge: bool = False, _resources: tuple | None = None,
+              _mcp_server: Any = None, _resources: tuple | None = None,
               _tool_cache: bool = False) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
@@ -1012,9 +1012,12 @@ def make_run_in_environment_tool(executor: Any,
         if skill is None:
             return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "
                                                 f"environment: {with_env or 'none'}"}
-        from .atlas_expression import SKILL, TOOLS
-        if skill.name == SKILL and not _atlas_bridge:
-            return {"status": "error", "error": "Use the atlas bridge tools: " + ", ".join(TOOLS)}
+        from .mcp_bridge import protected_skill_tools
+        protected = protected_skill_tools(skill.name)
+        if protected and _mcp_server is None:
+            return {"status": "error", "error": "Use the MCP bridge tools: " + ", ".join(protected)}
+        if _mcp_server is not None and (skill.name != _mcp_server.skill or skill.image != _mcp_server.image):
+            return {"status": "error", "error": "MCP pinned image differs from the installed skill image"}
         if not skill.image:
             why = f" ({skill.env_problem})" if skill.env_problem else ""
             return {"status": "error",
@@ -1245,9 +1248,9 @@ def _known_tool_names() -> frozenset[str]:
         from .registry import build_scientist_catalog
         # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
         # a step that names it must still be recognised as that tool's step.
-        from .atlas_expression import TOOLS as atlas_tools
+        from .mcp_bridge import configured_tool_names
         return (frozenset(t.name for t in build_scientist_catalog())
-                | {"run_in_environment"} | atlas_tools.keys())
+                | {"run_in_environment"} | configured_tool_names())
     except Exception:  # noqa: BLE001 - classification degrades, it does not fail
         return frozenset()
 
