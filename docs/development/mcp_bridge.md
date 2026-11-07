@@ -53,6 +53,11 @@ Plan parameter discovery follows local references, composed schemas, conditional
 branches and dependencies. This is only a display view: validation keeps
 the original schema and its relationships. Plan settings fix part of a future call,
 so unbound required arguments and undecidable root branch choices are deferred.
+Fixed values that disprove a condition select its `else` branch even when other
+arguments are unbound. Remaining unknown conditions are tried against the whole
+schema with one consistent branch assignment, including `unevaluatedProperties`;
+attributes from incompatible branches are never combined. Reference dialect
+changes preserve both the dialect and these root-only deferrals.
 MCP plan settings retain their JSON types; unquoted call-syntax JSON literals and
 the Python scalar spellings `True`, `False`, and `None` are parsed without evaluating
 code. Supplied values, types, bounds and branch constraints are checked; supplied

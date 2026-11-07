@@ -1317,7 +1317,6 @@ _TOOL_NAME_FIXES = {
 # ``run_de(groupby="sampleid", method="DESeq2")`` — the call as a plan writes it. Only the argument
 # NAMES and any quoted/bare literal values are read; nothing is executed and nothing is inferred
 # from a call the regex cannot parse.
-_TOOL_CALL_RE = re.compile(r"\b(run_[A-Za-z0-9_]+)\s*\(([^)]*)\)")
 _KWARG_RE = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.\-]+))""")
 
 
@@ -1352,12 +1351,14 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
     for step in agenda:
         text = str(step)
         # 1. Names. Correct the unambiguous ones in place; report the rest.
-        for raw in set(_BACKTICK_TOOL_RE.findall(text)) | {m.group(1) for m in _TOOL_CALL_RE.finditer(text)}:
+        for raw in set(_BACKTICK_NAME_RE.findall(text)) | {m.group(1) for m in _ANY_TOOL_CALL_RE.finditer(text)}:
             if raw in schemas or get_skill(raw) is not None:
                 continue                      # a tool, or a skill the step applies with run_code
+            if not raw.startswith("run_"):
+                continue                      # retain the legacy typo policy, using complete names
             target = _TOOL_NAME_FIXES.get(raw.lower())
             if target and target in schemas:
-                text = re.sub(rf"\b{re.escape(raw)}\b", target, text)
+                text = re.sub(NAME_LEFT + re.escape(raw) + NAME_RIGHT, target, text)
                 findings.append({"kind": "renamed", "tool": raw, "detail": target})
             else:
                 findings.append({"kind": "unknown_tool", "tool": raw, "detail": ""})

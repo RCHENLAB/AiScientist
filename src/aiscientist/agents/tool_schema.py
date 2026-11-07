@@ -73,10 +73,11 @@ class PlanParameters(dict):
     def errors(self, settings: dict) -> list:
         """Validate partial pins; nested supplied values remain complete values.
 
-        A missing runtime argument is allowed. At the root, an unresolved oneOf
-        choice may still be made by later arguments, and an if/not predicate that
-        reads an unbound property cannot choose a branch yet. The ordinary full
-        schema still validates every actual invocation.
+        A missing runtime argument is allowed. Fixed values can disprove a
+        condition even when other arguments are unknown. Otherwise, unresolved
+        conditions are tried one assignment at a time against the entire schema;
+        validation and evaluated-property annotations share that same assignment.
+        Nested supplied values and every actual invocation remain complete.
         """
         from jsonschema import Draft202012Validator, validators
         from jsonschema.exceptions import ValidationError
@@ -86,7 +87,27 @@ class PlanParameters(dict):
         except (TypeError, ValueError) as exc:
             return [ValidationError(f"Settings must be strict JSON: {exc}")]
 
-        ordinary = Draft202012Validator.VALIDATORS
+        if self.validator.is_valid(settings):
+            return []  # a complete valid call is also a valid set of partial pins
+
+        class Undecided(Exception):
+            def __init__(self, predicate):
+                self.key = id(predicate)
+
+        # Register before validation: unevaluatedProperties may precede if in
+        # the document, and its annotation collector independently tests if.
+        predicates = set()
+
+        def register(schema, seen=None):
+            seen = set() if seen is None else seen
+            for node in self._nodes(schema, seen):
+                if "if" in node:
+                    predicates.add(id(node["if"]))
+                if "not" in node:
+                    register(node["not"], seen)
+
+        register(self.schema)
+        choices: dict[int, bool] = {}
 
         def unbound(schema, seen=None):
             seen = set() if seen is None else seen
@@ -100,44 +121,98 @@ class PlanParameters(dict):
                     return True
                 # Future arguments can change predicates over the whole object,
                 # even if every explicitly named property is already pinned.
-                if {"minProperties", "maxProperties", "propertyNames", "patternProperties",
+                if node.get("minProperties", 0) > len(settings):
+                    return True
+                if "maxProperties" in node and len(settings) <= node["maxProperties"]:
+                    return True
+                if {"propertyNames", "patternProperties",
                     "additionalProperties", "unevaluatedProperties", "const", "enum"} & node.keys():
                     return True
                 if "not" in node and unbound(node["not"], seen):
                     return True
             return False
 
-        def required(validator, value, instance, schema):
-            if instance is not settings:
-                yield from ordinary["required"](validator, value, instance, schema)
+        def decide(validator):
+            # Check fixed values first: an unbound optional flag cannot repair
+            # a discriminator already pinned to the wrong value.
+            if next(validator.iter_errors(settings), None) is not None:
+                return False
+            if not unbound(validator.schema):
+                return True
+            key = id(validator.schema)
+            if key not in choices:
+                raise Undecided(validator.schema)
+            return choices[key]
 
-        def min_properties(validator, value, instance, schema):
-            if instance is not settings:
-                yield from ordinary["minProperties"](validator, value, instance, schema)
+        partial_classes = {}
 
-        def dependent_required(validator, value, instance, schema):
-            if instance is not settings:
-                yield from ordinary["dependentRequired"](validator, value, instance, schema)
+        def partial_class(base):
+            """Extend each selected dialect locally, without global registration.
 
-        def one_of(validator, value, instance, schema):
-            keyword = "anyOf" if instance is settings and unbound({"anyOf": value}) else "oneOf"
-            yield from ordinary[keyword](validator, value, instance, schema)
+            jsonschema.evolve may select a different class at a $schema boundary.
+            Keep its dialect and resolver, adding the same root-only plan rules.
+            """
+            if base in partial_classes:
+                return partial_classes[base]
+            ordinary = base.VALIDATORS
 
-        def conditional(validator, value, instance, schema):
-            if instance is settings and unbound(value):
-                yield from ordinary["anyOf"](validator, [schema.get("then", True), schema.get("else", True)],
-                                              instance, schema)
-            else:
-                yield from ordinary["if"](validator, value, instance, schema)
+            def defer_root(keyword):
+                def validate(validator, value, instance, schema):
+                    if instance is not settings:
+                        yield from ordinary[keyword](validator, value, instance, schema)
+                return validate
 
-        def negated(validator, value, instance, schema):
-            if instance is not settings or not unbound(value):
-                yield from ordinary["not"](validator, value, instance, schema)
+            def one_of(validator, value, instance, schema):
+                keyword = "anyOf" if instance is settings and unbound({"anyOf": value}) else "oneOf"
+                yield from ordinary[keyword](validator, value, instance, schema)
 
-        partial = validators.extend(Draft202012Validator, {"required": required, "minProperties": min_properties,
-                                    "dependentRequired": dependent_required, "oneOf": one_of,
-                                    "if": conditional, "not": negated})
-        return list(partial(self.schema).iter_errors(settings))
+            def negated(validator, value, instance, schema):
+                if instance is not settings or not unbound(value):
+                    yield from ordinary["not"](validator, value, instance, schema)
+
+            overrides = {key: defer_root(key) for key in ("required", "minProperties", "dependentRequired")
+                         if key in ordinary}
+            overrides.update({key: fn for key, fn in {"oneOf": one_of, "not": negated}.items() if key in ordinary})
+            partial = validators.extend(base, overrides)
+            partial_classes[base] = partial
+            original_evolve, original_is_valid = partial.evolve, partial.is_valid
+
+            def evolve(validator, **changes):
+                evolved = original_evolve(validator, **changes)
+                if type(evolved) in partial_classes.values():
+                    return evolved
+                # Use the library's chosen dialect and resolution state. Merely
+                # deleting $schema would silently change referenced semantics.
+                return partial_class(type(evolved))(
+                    evolved.schema, resolver=evolved._ref_resolver, format_checker=evolved.format_checker,
+                    registry=evolved._registry, _resolver=evolved._resolver)
+
+            def is_valid(validator, instance, _schema=None):
+                if _schema is not None:
+                    return validator.evolve(schema=_schema).is_valid(instance)
+                if instance is settings and id(validator.schema) in predicates:
+                    return decide(validator)
+                return original_is_valid(validator, instance)
+
+            partial.evolve, partial.is_valid = evolve, is_valid
+            return partial
+
+        partial = partial_class(Draft202012Validator)
+        pending, failures = [{}], None
+        while pending:
+            choices = pending.pop()
+            try:
+                errors = list(partial(self.schema).iter_errors(settings))
+            except Undecided as exc:
+                # Restart at the root so annotations from incompatible branches
+                # can never be combined, regardless of schema keyword order.
+                pending.extend([{**choices, exc.key: True}, {**choices, exc.key: False}])
+                continue
+            if not errors:
+                return []
+            if failures is None:
+                failures = errors
+        return failures
 
 
 def plan_parameters(schema: dict) -> dict:

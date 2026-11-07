@@ -97,6 +97,89 @@ def test_root_ref_plan_edit_and_harness_execution_use_the_approved_setting(regis
     assert json.loads(shlex.split(cli)[7]) == {"value": 4}
 
 
+@pytest.mark.parametrize("form", ["{name}", "{name}(value=3)"])
+def test_name_correction_preserves_complete_names_and_corrects_only_standalone_aliases(registry, form):
+    from aiscientist.agents.research_harness import HarnessTool
+    schema = {"type": "object", "properties": {"value": {"type": "integer"}}}
+    _, tool = configured(registry, schema, "tables-run_qc_scanpy")
+    legacy = HarnessTool("run_scanpy_qc", "Legacy", schema, lambda args, ctx: {})
+    exact = form.format(name=tool.name)
+    typo = form.format(name="run_qc_scanpy")
+    text = f"Use `{exact}` and `{typo}`; other-run_qc_scanpy(value=3)."
+    fixed, findings = check_plan_tooling([text], [tool, legacy])
+    assert fixed == [text.replace(f"`{typo}`", f"`{form.format(name=legacy.name)}`")]
+    assert findings == [{"kind": "renamed", "tool": "run_qc_scanpy", "detail": legacy.name}]
+    _, registered_alias = configured(registry, schema, "run_qc_scanpy")
+    assert check_plan_tooling([f"Use `{typo}`."], [registered_alias, legacy]) == ([f"Use `{typo}`."], [])
+
+
+@pytest.mark.parametrize("early_unevaluated", [False, True])
+def test_conditional_annotations_follow_one_consistent_branch(registry, early_unevaluated):
+    schema = {"type": "object", "properties": {"kind": {"type": "string"}, "query_id": {"type": "string"}},
+              "if": {"properties": {"kind": {"const": "a"}}, "required": ["kind"]},
+              "then": {"properties": {"a": {"type": "string"}}},
+              "else": {"properties": {"b": {"type": "string"}}}, "unevaluatedProperties": False}
+    if early_unevaluated:
+        schema = {"unevaluatedProperties": False, **schema}
+    _, tool = configured(registry, schema)
+    props = _tool_schemas([tool])[tool.name]
+    assert tool.executor({"b": "ok"}, None)["status"] == "ok"
+    assert bind_settings('b="ok"', props, {"b": "ok"}) == ({"b": "ok"}, [])
+    _, findings = check_plan(PlanDoc("", (PlanStep("s1", "Check", tool.name, {"b": "ok"}),)),
+                             {tool.name: props})
+    assert not findings
+    # These pins need a future runtime argument, so ordinary full validation
+    # cannot short-circuit the branch/annotation check.
+    _, tool = configured(registry, {**schema, "required": ["query_id"]})
+    props = _tool_schemas([tool])[tool.name]
+    assert not props.errors({"a": "ok"}) and not props.errors({"b": "ok"})
+    assert props.errors({"a": "ok", "b": "ok"})  # cannot combine annotations from incompatible branches
+    assert props.errors({"kind": "a", "b": "ok"})
+    assert props.errors({"other": "unexpected"})
+
+
+def test_fixed_false_condition_cannot_be_rescued_by_an_unbound_property(registry):
+    schema = {"type": "object", "if": {"properties": {
+        "mode": {"const": "number"}, "flag": {"type": "boolean"}}},
+        "then": {"properties": {"value": {"type": "integer"}}},
+        "else": {"properties": {"value": {"type": "string"}}}}
+    _, tool = configured(registry, schema)
+    props = _tool_schemas([tool])[tool.name]
+    pins = {"mode": "text", "value": 3}
+    _, findings = check_plan(PlanDoc("", (PlanStep("s1", "Check", tool.name, pins),)), {tool.name: props})
+    assert findings
+    bound, dropped = bind_settings('mode="text", value=3', props, pins)
+    assert bound == {} and dropped
+    assert tool.executor(pins, None)["status"] == "error"
+    assert not props.errors({"mode": "text", "value": "word"})
+    assert not props.errors({"value": 3})  # mode genuinely remains unknown
+
+
+@pytest.mark.parametrize("dialect", ["https://json-schema.org/draft/2020-12/schema",
+                                     "http://json-schema.org/draft-07/schema#"])
+def test_reference_dialect_preserves_partial_root_and_complete_nested_validation(registry, dialect):
+    args = {"$schema": dialect, "type": "object", "properties": {
+        "query_id": {"type": "string"}, "top": {"type": "integer"}}, "required": ["query_id"]}
+    schema = {"type": "object", "$ref": "#/$defs/Args", "$defs": {"Args": args},
+              "properties": {"nested": {"$ref": "#/$defs/Args"}}}
+    _, tool = configured(registry, schema)
+    props = _tool_schemas([tool])[tool.name]
+    assert bind_settings("top=5", props, {"top": 5}) == ({"top": 5}, [])
+    _, findings = check_plan(PlanDoc("", (PlanStep("s1", "top=5", tool.name, {"top": 5}),)), {tool.name: props})
+    assert not findings
+    assert props.errors({"top": "wrong"})
+    assert props.errors({"nested": {"top": 5}})
+    assert not props.errors({"nested": {"top": 5, "query_id": "runtime"}})
+    assert tool.executor({"top": 5}, None)["status"] == "error"
+    assert tool.executor({"top": 5, "query_id": "runtime"}, None)["status"] == "ok"
+    # Preserve the chosen dialect, not merely the deferred required check:
+    # unevaluatedProperties was introduced after Draft 7.
+    _, tool = configured(registry, {"type": "object", "$ref": "#/$defs/Args", "$defs": {
+        "Args": {**args, "unevaluatedProperties": False}}})
+    errors = _tool_schemas([tool])[tool.name].errors({"top": 5, "extra": "permitted in Draft 7"})
+    assert bool(errors) == ("2020-12" in dialect)
+
+
 @pytest.mark.parametrize("schema, valid, invalid", [
     ({"type": "object", "allOf": [
         {"properties": {"n": {"type": "integer", "minimum": 1}}},
