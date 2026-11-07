@@ -261,7 +261,7 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
             from .atlas_expression import AtlasAdapter, configured_atlases
             if not configured_atlases():
                 continue
-            adapter = AtlasAdapter(report_tool=server.planner_name("write_report"))
+            adapter = AtlasAdapter(planner_name=server.planner_name)
         else:
             adapter = JsonAdapter()
         for entry in server.tools:

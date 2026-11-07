@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import posixpath
 import shlex
-from typing import Any
+from typing import Any, Callable
 
 from .mcp_bridge import READ_RESULT, PreparedCall
 
@@ -93,10 +93,12 @@ def direct_call_refusal() -> str:
 class AtlasAdapter:
     """Atlas-specific bindings and outputs; transport and tool schemas live in mcp_bridge."""
 
-    def __init__(self, *, report_tool: str):
+    def __init__(self, *, planner_name: Callable[[str], str]):
+        flow = " -> ".join(planner_name(name) for name in
+                           ("resolve_genes", "submit_query", "query_status", "get_summary"))
+        plots = ", ".join(planner_name(name) for name in ("plot_dotplot", "plot_violin", "plot_featureplot"))
         self.description = (
-            " Flow: resolve_genes -> submit_query -> query_status -> get_summary, "
-            f"plot_dotplot, plot_violin, plot_featureplot -> {report_tool}. "
+            f" Flow: {flow}, {plots} -> {planner_name('write_report')}. "
             "Use these typed tools; run_in_environment refuses this skill. "
             "Uses the attached atlas read in place; outputs appear in gene_expression/. "
             "The outer Slurm job owns scheduling; submit_query uses inline and returns when complete.")

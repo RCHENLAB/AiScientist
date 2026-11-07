@@ -121,6 +121,20 @@ def test_all_nine_exact_signatures(release):
     assert _primary_tool("Extract with `submit_query`.") == "submit_query"
 
 
+def test_atlas_flow_hints_use_all_configured_planner_names(release):
+    from dataclasses import replace
+    from aiscientist.agents.mcp_bridge import build_mcp_tools
+    from aiscientist.agents.research_lab import make_run_in_environment_tool
+    server = replace(_SERVER, prefix="atlas_", aliases={"resolve_genes": "resolve", "write_report": "query_report"})
+    runner = Runner()
+    catalog = {t.name: t for t in build_mcp_tools(runner, make_run_in_environment_tool(runner), servers=(server,))}
+    description = catalog["atlas_resolve"].description
+    assert "atlas_resolve -> atlas_submit_query -> atlas_query_status -> atlas_get_summary" in description
+    assert "atlas_plot_dotplot, atlas_plot_violin, atlas_plot_featureplot -> atlas_query_report" in description
+    assert catalog["atlas_resolve"].executor({"genes": "LRAT"}, None)["status"] == "ok"
+    assert " call resolve_genes " in runner.calls[0][0]
+
+
 def test_invalid_binding_version_and_failed_container(release, monkeypatch):
     runner = Runner()
     tool = tools(runner)["resolve_genes"]
