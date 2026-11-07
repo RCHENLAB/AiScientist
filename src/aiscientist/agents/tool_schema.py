@@ -133,7 +133,44 @@ class PlanParameters(dict):
                     return True
             return False
 
-        def stable_conflict(error):
+        def reachable_nodes(validator, seen=None):
+            """Same-instance annotation sources under the current branch choices."""
+            schema = validator.schema
+            if not isinstance(schema, dict):
+                return
+            seen = set() if seen is None else seen
+            key = (id(schema), type(validator))
+            if key in seen:
+                return
+            seen.add(key)
+            # Respect the selected dialect, including legacy $ref siblings.
+            applicable = dict(validator._APPLICABLE_VALIDATORS(schema))
+            node = {key: value for key, value in applicable.items() if key in validator.VALIDATORS}
+            yield node
+            if "$ref" in node:
+                resolved = validator._resolver.lookup(node["$ref"])
+                yield from reachable_nodes(validator.evolve(schema=resolved.contents, _resolver=resolved.resolver), seen)
+            for keyword in ("allOf", "anyOf", "oneOf"):
+                for branch in node.get(keyword, []):
+                    child = validator.evolve(schema=branch)
+                    if probe(child) is not False:
+                        yield from reachable_nodes(child, seen)
+            if "if" in node:
+                condition = validator.evolve(schema=node["if"])
+                if decide(condition):
+                    yield from reachable_nodes(condition, seen)
+                    branch = applicable.get("then", True)
+                else:
+                    branch = applicable.get("else", True)
+                yield from reachable_nodes(validator.evolve(schema=branch), seen)
+            # A missing trigger may be supplied at runtime. Its schema can
+            # contribute annotations unless fixed values already rule it out.
+            for branch in node.get("dependentSchemas", {}).values():
+                child = validator.evolve(schema=branch)
+                if probe(child) is not False:
+                    yield from reachable_nodes(child, seen)
+
+        def stable_conflict(error, validator):
             """Can appending root arguments never repair this validation error?
 
             Supplied property values are complete. Root-object failures need a
@@ -150,7 +187,7 @@ class PlanParameters(dict):
                 for child in error.context:
                     if child.schema_path:
                         branches[child.schema_path[0]].append(child)
-                return all(any(stable_conflict(child) for child in branches[index])
+                return all(any(stable_conflict(child, validator) for child in branches[index])
                            for index in range(len(error.validator_value)))
             if keyword in {"const", "enum"}:
                 candidates = [error.validator_value] if keyword == "const" else error.validator_value
@@ -161,11 +198,10 @@ class PlanParameters(dict):
             if keyword in {"not", "oneOf"}:
                 return not unbound({keyword: error.validator_value})
             if keyword == "unevaluatedProperties" and error.validator_value is False:
-                # An upper bound, not an alternative annotation collector: even
-                # inactive branches/dependencies may later evaluate these keys.
-                # A key absent from this bound can never be rescued by new pins.
+                # An upper bound over reachable branches and future dependencies,
+                # using the same if decisions as validation and annotations.
                 possible = set()
-                for node in self._nodes(error.schema):
+                for node in reachable_nodes(validator.evolve(schema=error.schema)):
                     if "$dynamicRef" in node or any(key in node and node[key] is not False
                         for key in ("additionalProperties", "unevaluatedProperties")):
                         return False  # no static proof for this broader evaluation scope
@@ -175,14 +211,28 @@ class PlanParameters(dict):
                 return bool(settings.keys() - possible)
             return error.schema is False or keyword in {"type", "maxProperties", "additionalProperties"}
 
+        probing = set()
+
+        def probe(validator):
+            """True/False only when proved; None leaves future arguments open."""
+            key = (id(validator.schema), type(validator))
+            if key in probing:
+                return None  # a recursive proof cannot establish a fixed conflict
+            probing.add(key)
+            try:
+                errors = list(validator.iter_errors(settings))
+                if any(stable_conflict(error, validator) for error in errors):
+                    return False
+                if not errors and not unbound(validator.schema):
+                    return True
+                return None
+            finally:
+                probing.remove(key)
+
         def decide(validator):
-            # An absent trigger can repair annotation errors, but cannot repair
-            # an already fixed discriminator or a complete nested value.
-            errors = list(validator.iter_errors(settings))
-            if any(stable_conflict(error) for error in errors):
-                return False
-            if not errors and not unbound(validator.schema):
-                return True
+            state = probe(validator)
+            if state is not None:
+                return state
             key = id(validator.schema)
             if key not in choices:
                 raise Undecided(validator.schema)

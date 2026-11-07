@@ -59,7 +59,8 @@ does not disprove the condition; errors on complete supplied values remain fixed
 conflicts. An `anyOf` or unmatched `oneOf` is disproved only when every branch has
 a fixed conflict. Remaining unknown conditions are tried against the whole
 schema with one consistent branch assignment, including `unevaluatedProperties`;
-attributes from incompatible branches are never combined. Reference dialect
+attributes from incompatible or provably unreachable branches are never combined.
+Future dependency triggers can still contribute reachable declarations. Reference dialect
 changes preserve both the dialect and these root-only deferrals.
 MCP plan settings retain their JSON types; unquoted call-syntax JSON literals and
 the Python scalar spellings `True`, `False`, and `None` are parsed without evaluating

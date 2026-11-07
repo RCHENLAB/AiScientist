@@ -233,6 +233,35 @@ def test_annotation_conflicts_without_a_possible_producer_remain_false(registry,
     assert tool.executor({"value": "word"}, None)["status"] == "error"
 
 
+@pytest.mark.parametrize("wrapper", ["direct", "allOf", "anyOf", "oneOf", "$ref"])
+def test_unreachable_branches_cannot_supply_future_property_annotations(registry, wrapper):
+    declaration = {"properties": {"value": {"type": "string"}}}
+    predicate = {"properties": {"mode": {}}, "if": {"properties": {"mode": {"const": "number"}}},
+                 "then": declaration, "unevaluatedProperties": False}
+    schema = conditional_value_schema(predicate)
+    if wrapper == "allOf":
+        schema["if"] = {"allOf": [predicate]}
+    elif wrapper in {"anyOf", "oneOf"}:
+        schema["if"] = {"properties": {"mode": {}}, wrapper: [
+            {"properties": {"mode": {"const": "number"}, **declaration["properties"]}},
+            {"properties": {"mode": {"const": "text"}}}], "unevaluatedProperties": False}
+    elif wrapper == "$ref":
+        schema["if"] = {"$ref": "#/$defs/Condition"}
+        schema["$defs"] = {"Condition": {"$schema": "https://json-schema.org/draft/2020-12/schema", **predicate}}
+    runner, tool = configured(registry, schema)
+    props = _tool_schemas([tool])[tool.name]
+    pins = {"mode": "text", "value": "word"}
+    _, findings = check_plan(PlanDoc("", (PlanStep("s1", json.dumps(pins), tool.name, pins),)), {tool.name: props})
+    assert findings
+    assert bind_settings(json.dumps(pins), props, pins)[0] == {}
+    assert props.errors({**pins, "flag": True})
+    assert tool.executor(pins, None)["status"] == "error" and not runner.calls
+    # An undecided discriminator still has a reachable branch that can evaluate
+    # value; freezing it to number is one valid completion of these pins.
+    assert not props.errors({"value": "word"})
+    assert tool.executor({"mode": "number", "value": "word"}, None)["status"] == "ok"
+
+
 @pytest.mark.parametrize("keyword", ["const", "enum"])
 def test_whole_object_matches_distinguish_missing_fields_from_fixed_conflicts(registry, keyword):
     expected = {"flag": True, "value": "word"}
