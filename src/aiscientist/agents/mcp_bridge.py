@@ -206,20 +206,47 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
     return tuple(servers)
 
 
+_LOADED: dict[str, tuple[str, tuple[Server, ...]]] = {}
+
+
+def configured_servers() -> tuple[Server, ...]:
+    """The deployment's servers, loaded once per registry version.
+
+    A registry that cannot be used (invalid, unreadable, or jsonschema missing) disables the
+    MCP tools and is logged once; it never stops a run, the System page or any other tool.
+    """
+    path = Path(os.environ.get("AISCIENTIST_MCP_CONFIG") or DEFAULT_CONFIG)
+    try:
+        version = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        version = f"unreadable: {exc}"
+    cached = _LOADED.get(str(path))
+    if cached and cached[0] == version:
+        return cached[1]
+    try:
+        servers = load_servers(path)
+    except Exception as exc:  # ValueError, OSError, ImportError, SchemaError, JSON errors
+        LOG.error("MCP tools disabled: the registry %s cannot be used: %s", path, exc)
+        servers = ()
+    _LOADED[str(path)] = (version, servers)
+    return servers
+
+
 def configured_tool_names() -> set[str]:
     return set(configured_tool_skills())
 
 
 def configured_tool_skills() -> dict[str, str]:
-    return {server.planner_name(tool["name"]): server.skill for server in load_servers() for tool in server.tools}
+    return {server.planner_name(tool["name"]): server.skill for server in configured_servers()
+            for tool in server.tools}
 
 
 def protected_skill_tools(skill: str) -> list[str]:
     from .atlas_expression import SKILL as ATLAS_SKILL
-    names = [server.planner_name(tool["name"]) for server in load_servers()
+    names = [server.planner_name(tool["name"]) for server in configured_servers()
              if server.skill == skill for tool in server.tools]
-    # Disabling registration must not reopen Atlas's previously forbidden shell
-    # entry point, which would bypass the dataset allowlist in its adapter.
+    # Disabling registration, or a registry that cannot be loaded, must not reopen Atlas's
+    # previously forbidden shell entry point, which would bypass its adapter's dataset allowlist.
     if skill == ATLAS_SKILL and not names:
         return ["Atlas MCP tools (the Atlas bridge is not configured)"]
     return names
@@ -237,20 +264,29 @@ def _record(ctx: Any, server: Server) -> None:
 
 def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                     servers: tuple[Server, ...] | None = None) -> list:
-    """Register reviewed schemas, retaining the existing skill policy and image runner."""
-    from jsonschema import Draft202012Validator
+    """Register reviewed schemas, retaining the existing skill policy and image runner.
+
+    A server that cannot be offered (a name taken by another tool, a skill image that differs
+    from the pinned one) is left out and logged; the rest of the catalog is unaffected.
+    """
     from .research_harness import HarnessTool
     from .skills import get_skill
 
-    servers = load_servers() if servers is None else servers
+    servers = configured_servers() if servers is None else servers
+    if not servers:
+        return []
+    from jsonschema import Draft202012Validator
+
     registered = set(existing_names) | {REPORT_TOOL}
     tools = []
     for server in servers:
-        for entry in server.tools:
-            name = server.planner_name(entry["name"])
-            if name in registered:
-                raise ValueError(f"MCP tool collides with an existing planner tool: {name}")
-            registered.add(name)
+        names = [server.planner_name(entry["name"]) for entry in server.tools]
+        taken = sorted(set(names) & registered)
+        if taken:
+            LOG.error("MCP %s disabled: its tool names collide with existing planner tools: %s",
+                      server.name, ", ".join(taken))
+            continue
+        registered.update(names)
         skill = get_skill(server.skill)
         if environment_tool is None or skill is None:
             continue
@@ -292,7 +328,6 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                         f"aiscientist-mcp --server {shlex.quote(s.entrypoint)} --timeout {s.timeout} call "
                         f"{shlex.quote(e['name'])} {shlex.quote(encoded)} > \"$AISCI_MCP_RESULT\" || exit $?\n"
                         "python - <<'AISCI_MCP_COLLECT'\n" + prepared.collector + "AISCI_MCP_COLLECT\n")
-                    _record(ctx, s)
                     out = environment_tool.executor(
                         {"skill": s.skill, "command": command}, ctx, _mcp_server=s,
                         _resources=(s.resources or {}).get(e["name"]), _tool_cache=prepared.tool_cache)
@@ -302,6 +337,9 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
                         raise ValueError("MCP response must contain a result object")
                     response = a.finish(out, payload, ctx, prepared)
+                    # The server answered: the run used it. Refused calls and failed jobs are
+                    # not uses; their results still name the server.
+                    _record(ctx, s)
                     return {**response, "mcp": s.identity()}
                 except (ValueError, TypeError, KeyError, OSError) as exc:
                     return {"status": "error", "error": f"MCP {s.name}: {exc}", "mcp": s.identity()}

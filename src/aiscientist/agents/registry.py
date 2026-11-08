@@ -151,8 +151,14 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     # enrichment tools read from. Progressive disclosure, like the skill tools — the manifest is
     # fetched when a step needs it, never prepended to every turn.
     catalog.append(_make_describe_environment_tool(hpc_shell))
+    # MCP server tools come last. Whatever goes wrong with them leaves them out of this catalog
+    # and is logged; it never stops a run or the System page.
     from .mcp_bridge import build_mcp_tools
-    catalog.extend(build_mcp_tools(code_executor, env_tool, existing_names={t.name for t in catalog}))
+    try:
+        catalog.extend(build_mcp_tools(code_executor, env_tool, existing_names={t.name for t in catalog}))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("MCP tools left out of the catalog")
     return catalog
 
 

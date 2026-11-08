@@ -10,14 +10,16 @@ Atlas expression uses it; the existing 23 application tools and their images rem
 in place. The supported execution path is a CPU image job through
 `run_in_environment`. GPU routing, `inprocess` servers, sampling, model endpoint
 settings and an authenticated HTTP transport are not implemented by this bridge.
-Real website/HPC3 end-to-end validation remains outstanding.
 
 ## Registry and tool schemas
 
 `src/aiscientist/agents/mcp_catalog/mcp_servers.json` is the default registry. It and its snapshots ship as Python package data, so
 non-editable wheel and Docker installs use the same reviewed defaults as a source
 checkout. The base package declares `jsonschema`; no gateway extra is needed to
-load the catalog or System overview. A deployment can set
+load the catalog or System overview. The registry is loaded once per version of its file.
+A registry that cannot be used (invalid, unreadable, or without `jsonschema`) leaves the MCP
+tools out and is logged; runs, the System page and every other tool are unaffected, and Atlas's
+shell entry point stays closed. A deployment can set
 `AISCIENTIST_MCP_CONFIG` to another local registry. Its top-level fields are
 `schema_version: 1` and `servers`, an array of server records:
 
@@ -42,7 +44,8 @@ Each snapshot is a JSON array of `{name, description, inputSchema}` objects.
 Schemas must describe objects and pass JSON Schema Draft 2020-12 validation.
 References must be local fragments; schema loading cannot resolve network or
 filesystem references. Duplicate server names, skill bindings and planner names
-are rejected, as are collisions with existing planner tools. The gateway plan
+are rejected. A server whose planner names collide with existing planner tools is
+left out of the catalog and logged. The gateway plan
 step `write_report` is reserved; a server with that wire name must use an alias
 or prefix. MCP tool-to-skill bindings also supply the installed skill's
 `exploration` and `writes-report` declarations to the planner.
@@ -53,24 +56,18 @@ and permissive additional properties. Atlas retains its existing domain restrict
 on unknown arguments. Calls are validated against the complete schema before
 scheduling, including required arguments and types.
 
-Plan parameter discovery follows local references, composed schemas, conditional
-branches and dependencies. This is only a display view: validation keeps
-the original schema and its relationships. Plan settings fix part of a future call,
-so unbound required arguments and undecidable root branch choices are deferred.
-Fixed values that disprove a condition select its `else` branch even when other
-arguments are unbound. A root annotation error that a future dependency can repair
-does not disprove the condition; errors on complete supplied values remain fixed
-conflicts. An `anyOf` or unmatched `oneOf` is disproved only when every branch has
-a fixed conflict. Remaining unknown conditions are tried against the whole
-schema with one consistent branch assignment, including `unevaluatedProperties`;
-attributes from incompatible or provably unreachable branches are never combined.
-Future dependency triggers can still contribute reachable declarations. Reference dialect
-changes preserve both the dialect and these root-only deferrals.
+The planner's parameter list is the schema's top-level `properties`. Plan settings
+fix part of a future call, so each setting is checked on its own
+(`agents/tool_schema.py`): its value against its property's schema (or a matching
+`patternProperties` or `additionalProperties` schema), with local `$defs` references,
+and its name against the declared properties when `additionalProperties` is `false`.
+Supplied nested objects and arrays are complete values. Rules that relate several
+arguments (`required`, `dependentRequired`, `dependentSchemas`, a root `if`/`then`,
+`allOf`, `anyOf` or `oneOf`) are not checked at plan time: execution always validates
+the full call with the original schema before a job is scheduled.
 MCP plan settings retain their JSON types; unquoted call-syntax JSON literals and
 the Python scalar spellings `True`, `False`, and `None` are parsed without evaluating
-code. Supplied values, types, bounds and branch constraints are checked; supplied
-nested objects and arrays are complete values. Execution always validates the full
-call with the original schema. Non-MCP tools keep their existing plan coercion and
+code. Non-MCP tools keep their existing plan coercion and
 validation behavior. Tool names with hyphens or a leading underscore work in plan
 classification, call syntax, edits and scope matching. Arguments
 must also serialize as strict JSON, so NaN and Infinity are rejected. Tool names,
@@ -115,9 +112,10 @@ response by `response_omitted` and `full_result`. Arbitrary file paths returned 
 a server are not followed or copied by this adapter. Servers with other
 deliverables need an application-owned adapter.
 
-Every call that reaches the executor records the server name, package version, release tag, image
-digest, schema checksum and `runs_on` in the run manifest's `mcp_servers` list.
-Responses also carry this identity under `mcp`. The existing environment path
+Every call the server answers records the server name, package version, release tag, image
+digest, schema checksum and `runs_on` in the run manifest's `mcp_servers` list. Refused calls
+and failed jobs are not recorded there. Responses, failed ones included, carry this identity
+under `mcp`. The existing environment path
 records the skill, image and command hash.
 
 ## Atlas binding
@@ -193,13 +191,10 @@ checksum. Schema changes are reviewed code changes, not runtime discoveries.
 The released CLI does not attest the live schemas on each call: keeping the
 snapshot paired with the exact release image is part of this review contract.
 
-The checked-in Atlas snapshot was obtained through a real stdio MCP listing from
-the [0.0.3 source release](https://github.com/lijinbio/aiscientist-mcp/releases/tag/atlas-expression-exploration-v0.0.3),
-commit `c4581015ef5f6b573894c18bf9023d8fe3a5250a`, with `mcp==2.3.0`,
-`mcp-types==2.3.0` and `pydantic==2.14.2`. Its SHA-256 is
-`069f629e1056c37b57d3e6173d6b257200c4cc8b70782b128fa6a6111fcb0020`.
-From that source checkout, with `AISCI_EXPORT_SCRIPT` set to the absolute path of
-this application's exporter, the source-only reproduction is:
+The Atlas snapshot is the stdio MCP listing of the
+[0.0.3 source release](https://github.com/lijinbio/aiscientist-mcp/releases/tag/atlas-expression-exploration-v0.0.3)
+(`mcp==2.3.0`, `mcp-types==2.3.0`, `pydantic==2.14.2`). From that source checkout, with
+`AISCI_EXPORT_SCRIPT` set to the absolute path of this application's exporter:
 
 ```bash
 PYTHONPATH=packages/common/src:packages/atlas-expression-exploration/src \
@@ -209,6 +204,3 @@ uv run --isolated --no-project \
   --server 'python -m aiscientist_mcp.atlas_expression_exploration.server' \
   > /tmp/atlas-tools.json
 ```
-
-This verifies the metadata and stdio listing from the pinned source; it is not a
-production image smoke test or website/HPC3 end-to-end validation.

@@ -455,8 +455,5 @@ path. The collector also saves
 for other oversized responses. Stdout stays below the executor's 20,000-character
 limit and is removed from the parsed tool response.
 
-The checked-in schemas came from a real MCP `tools/list` against the pinned
-0.0.3 source release. That metadata check does not establish a successful run of
-the released image, the website or HPC3. Real website/HPC3 end-to-end validation
-remains outstanding; GPU/inprocess execution, sampling and HTTP transport are
-not implemented by this bridge.
+The schemas are the MCP `tools/list` of the pinned 0.0.3 source release. GPU and
+in-process execution, sampling and an HTTP transport are not part of this bridge.

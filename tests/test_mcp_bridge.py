@@ -227,8 +227,8 @@ def test_duplicate_servers_tools_and_builtin_names_are_refused(registry):
     cfg["servers"].pop()
     config.write_text(json.dumps(cfg))
     runner = Runner()
-    with pytest.raises(ValueError, match="collides"):
-        bridge.build_mcp_tools(runner, make_run_in_environment_tool(runner), existing_names={"tables_check"})
+    # A name another tool already has leaves that server out; it does not stop the catalog.
+    assert bridge.build_mcp_tools(runner, make_run_in_environment_tool(runner), existing_names={"tables_check"}) == []
 
 
 def test_exposure_and_call_time_skill_guard(registry, skill_release, monkeypatch):
@@ -280,7 +280,9 @@ def test_transport_errors_and_failed_attempts_keep_server_identity(registry, tmp
     assert result["mcp"]["version"] == "1.2.3"
     if "stderr" in response:
         assert result["stderr"] == response["stderr"]
-    assert json.loads((ctx.workspace / "manifest.json").read_text())["mcp_servers"] == [result["mcp"]]
+    # A failed attempt is not a use: the result names the server, the manifest does not.
+    manifest = ctx.workspace / "manifest.json"
+    assert not manifest.exists() or "mcp_servers" not in json.loads(manifest.read_text())
 
 
 def test_server_result_cannot_replace_execution_metadata(registry):
@@ -353,3 +355,53 @@ def test_exporter_paginates_and_refuses_duplicate_names_or_cursor_loops():
         asyncio.run(exporter.list_tool_schemas(Client([first, first])))
     with pytest.raises(ValueError, match="cursor"):
         asyncio.run(exporter.list_tool_schemas(Client([first, SimpleNamespace(tools=[], next_cursor="next")])))
+
+
+@pytest.mark.parametrize("broken", ["invalid", "unreadable", "no_jsonschema"])
+def test_an_unusable_registry_leaves_out_only_the_mcp_tools(registry, tmp_path, monkeypatch, caplog, broken):
+    import sys
+    from aiscientist.agents import atlas_expression as atlas
+    from aiscientist.agents.registry import build_scientist_catalog
+    from aiscientist.agents.research_lab import _known_tool_names
+
+    config, _ = registry
+    if broken == "invalid":
+        config.write_text(json.dumps({"schema_version": 1, "servers": [{"name": "x"}]}))
+    elif broken == "unreadable":
+        monkeypatch.setenv("AISCIENTIST_MCP_CONFIG", str(tmp_path / "missing.json"))
+    else:
+        monkeypatch.setattr(bridge, "_LOADED", {})
+        monkeypatch.setitem(sys.modules, "jsonschema", None)
+    assert bridge.configured_servers() == ()
+    assert "MCP tools disabled" in caplog.text
+    names = {t.name for t in build_scientist_catalog(code_executor=Runner())}
+    assert "tables_check" not in names and "run_in_environment" in names
+    _known_tool_names.cache_clear()
+    try:
+        assert "run_in_environment" in _known_tool_names()
+    finally:
+        _known_tool_names.cache_clear()
+    # Atlas's shell stays closed while its registration cannot be read (run_in_environment
+    # refuses a skill whose protected tools are listed here).
+    assert bridge.protected_skill_tools(atlas.SKILL) == ["Atlas MCP tools (the Atlas bridge is not configured)"]
+
+
+def test_the_registry_is_loaded_once_per_version(registry, monkeypatch):
+    config, _ = registry
+    calls = []
+    real = bridge.load_servers
+
+    def counted(path=None):
+        calls.append(path)
+        return real(path)
+
+    monkeypatch.setattr(bridge, "load_servers", counted)
+    monkeypatch.setattr(bridge, "_LOADED", {})
+    first = bridge.configured_servers()
+    assert bridge.configured_servers() is first and bridge.configured_tool_names() == {"tables_check"}
+    assert len(calls) == 1
+    cfg = json.loads(config.read_text())
+    cfg["servers"][0]["prefix"] = "other_"
+    config.write_text(json.dumps(cfg))
+    assert bridge.configured_tool_names() == {"other_check"}
+    assert len(calls) == 2
