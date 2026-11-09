@@ -74,22 +74,66 @@ def test_sample_count_from_cellranger_layout(declared_profile, rates, nested):
     assert got["seconds"] == [2700, 5400]
 
 
-def test_unknown_tool_and_missing_size_are_rough(monkeypatch, rates):
+@pytest.fixture
+def no_profile(monkeypatch):
     monkeypatch.setattr(estimates.catalog, "resource_profile", lambda name: None)
     monkeypatch.setattr(estimates.catalog, "manifest", lambda name: None)
-    got = estimates.estimate_skill("new_tool", {}, rates)
-    assert got["rough"]
-    assert 0 < got["seconds"][0] < got["seconds"][1]
-    assert got["gpu_hours"] == [0, 0]
-    assert got["profile_steps"][0]["mem_gb"] > 0
+
+
+def test_a_tool_without_profile_or_history_has_no_estimate(no_profile, rates):
+    got = estimates.estimate_skill("new_tool", {"cells": 10000}, rates)
+    assert got["unknown"] and got["rough"]
+    assert all(got[key] is None for key in estimates.FIELDS)
+    assert got["history_count"] == 0
+    assert got["profile_steps"][0]["mem_gb"] > 0     # still there to account a call without sacct
     plan = estimates.estimate_plan(["Unknown analysis"], [], {}, rates)
-    assert plan["steps"][0]["skill"] == "Unspecified"
-    assert plan["total"]["rough"]
+    step = plan["steps"][0]
+    assert step["skill"] == "Unspecified"
+    assert step["unknown"] and not step["partial"] and step["seconds"] is None
+    assert plan["total"]["unknown"] and not plan["total"]["partial"]
+    assert plan["total"]["seconds"] is None and plan["total"]["rough"]
 
 
-def test_default_profile_stays_rough_with_history(monkeypatch, rates):
-    monkeypatch.setattr(estimates.catalog, "resource_profile", lambda name: None)
-    monkeypatch.setattr(estimates.catalog, "manifest", lambda name: None)
+# 2026-11-06, run c5acf27763be: six Atlas steps on HRCA's 3,177,310 cells, none with a resource
+# profile or an earlier run. The generic 5-30 minutes per 10,000 cells made it 158.9-953.2 hours;
+# the run's tools took 19.8 minutes.
+ATLAS_STEPS = ["resolve_genes", "submit_query", "query_status", "get_summary", "plot_dotplot", "plot_violin"]
+
+
+def test_the_atlas_plan_is_not_given_invented_hours(no_profile, rates):
+    tools = [SimpleNamespace(name=name) for name in ATLAS_STEPS]
+    plan = estimates.estimate_plan(ATLAS_STEPS, tools, {"n_cells": 3177310}, rates, step_tools=ATLAS_STEPS)
+    assert all(step["unknown"] for step in plan["steps"])
+    assert plan["total"]["unknown"] and plan["total"]["seconds"] is None
+
+
+def test_one_successful_run_gives_a_tool_an_estimate(no_profile, rates):
+    estimates.record_usage("first", "submit_query", {"n_cells": 3177310}, 812, rates, success=True,
+                           jobs=[{"seconds": 812, "cpu_hours": 11.28, "gpu_hours": 0}])
+    estimates.record_usage("failed", "resolve_genes", {"n_cells": 3177310}, 0, rates, success=False)
+    got = estimates.estimate_skill("submit_query", {"n_cells": 3177310}, rates)
+    assert not got["unknown"] and got["rough"]           # rough until three runs
+    assert got["seconds"] == pytest.approx([609, 1218])  # 3/4 and 1.5 x the one run
+    assert got["cpu_hours"] == pytest.approx([8.46, 16.92])
+    assert estimates.estimate_skill("resolve_genes", {"n_cells": 3177310}, rates)["unknown"]
+
+
+def test_a_total_without_some_steps_is_partial(declared_profile, rates, monkeypatch):
+    monkeypatch.setattr(estimates.catalog, "resource_profile",
+                        lambda name: declared_profile if name == "qc" else None)
+    tools = [SimpleNamespace(name="qc"), SimpleNamespace(name="new_tool")]
+    plan = estimates.estimate_plan(["Run qc", "Run new_tool", "Run qc and new_tool"], tools,
+                                   {"samples": 2}, rates)
+    qc, new, both = plan["steps"]
+    assert not qc["unknown"] and not qc["partial"]
+    assert new["unknown"] and new["seconds"] is None
+    assert both["partial"] and not both["unknown"]
+    assert both["seconds"] == qc["seconds"] == [1800, 3600]
+    assert plan["total"]["partial"] and not plan["total"]["unknown"]
+    assert plan["total"]["seconds"] == [3600, 7200]       # the two qc steps only
+
+
+def test_default_profile_stays_rough_with_history(no_profile, rates):
     for number in range(3):
         estimates.record_usage(str(number), "new_tool", {"cells": 10000}, 120, rates, success=True)
     got = estimates.estimate_skill("new_tool", {"cells": 10000}, rates)

@@ -12,6 +12,23 @@
   python -m pytest
   ```
 
+## Testing on HPC3
+
+The offline tests check the logic against a scripted cluster. Only HPC3 itself shows queue waits,
+modules, images, file systems and quotas, so a change to Slurm jobs, SSH, staging or HPC3 storage
+is also tried there. The gateway on your own computer stands in for the lab server: you need no
+account on it.
+
+- Copy `configs/aiscientist.example.env` to `.env` and fill it in. Give your jobs a name prefix of
+  your own, such as `AISCIENTIST_SLURM_JOB_PREFIX=dev-`, so your gateway never reuses or cancels
+  the website's jobs for your account.
+- Start it with `./start.sh` and sign in with your own UCI HPC3 account. Off campus this needs the
+  UCI VPN. Jobs run as your HPC3 user and are charged to the Slurm accounts in `.env`.
+- Follow RCIC's rules: login nodes only log in and submit jobs, compute runs in Slurm jobs, and
+  files move through `access-hpc3.rcic.uci.edu`. Commands you type yourself follow them too.
+- Use public or test data, or lab data you are allowed to read. Data stays on UCI systems.
+- In the pull request, list what ran on HPC3: the job ids, the partition and the data.
+
 ## Rules every change follows
 
 - **Data has Croissant metadata.** Every new dataset type, pipeline, or result type produces valid

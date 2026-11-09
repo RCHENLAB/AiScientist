@@ -2013,13 +2013,28 @@ def handed_on_note(dr: "dict[str, Any] | None") -> str:
             "table) must have the step that computes it in THIS plan.")
 
 
+def _contrast_columns(dr: "dict[str, Any] | None") -> "list[tuple[str, list[str]]]":
+    """The obs columns the mode rule reads as an experimental contrast, with up to three of their
+    values: a non-QC, non-label column with 2-3 levels."""
+    if not isinstance(dr, dict):
+        return []
+    cats = dr.get("obs_categoricals") or {}
+    if not isinstance(cats, dict):
+        return []
+    return [(str(c), [str(v) for v in (info.get("values") or [])][:3])
+            for c, info in cats.items()
+            if isinstance(info, dict) and isinstance(info.get("n"), int) and 2 <= info["n"] <= 3
+            and not _looks_like_celltype_col(c) and not _looks_like_qc_col(c)]
+
+
 def _dataset_mode_rule(dr: "dict[str, Any] | None") -> str:
     """``"team"`` / ``"single"`` when the dataset profile settles it, else ``""``.
 
     team   — an experimental CONTRAST (a non-QC, non-label obs column with 2-3 levels) is present:
-             the study is comparative, and comparative single-cell design is where a statistician,
-             a biologist and a data expert disagree productively (unit of replication, composition
-             confounding, stratification).
+             the dataset can carry a comparative study, and comparative single-cell design is where
+             a statistician, a biologist and a data expert disagree productively (unit of
+             replication, composition confounding, stratification). Whether THIS request asks for a
+             comparison is :meth:`ResearchLab._route_mode`'s question.
     single — cell-type labels present but NO contrast: a descriptive atlas; nothing to debate.
     ""     — no profile, or a profile with neither (a VCF, a folder, an unlabelled object): defer.
     """
@@ -2028,16 +2043,41 @@ def _dataset_mode_rule(dr: "dict[str, Any] | None") -> str:
     cats = dr.get("obs_categoricals") or {}
     if not isinstance(cats, dict) or not cats:
         return ""
-    has_contrast = any(
-        isinstance(info, dict) and isinstance(info.get("n"), int) and 2 <= info["n"] <= 3
-        and not _looks_like_celltype_col(c) and not _looks_like_qc_col(c)
-        for c, info in cats.items())
     has_labels = any(_looks_like_celltype_col(c) for c in cats)
-    if has_contrast:
+    if _contrast_columns(dr):
         return "team"
     if has_labels:
         return "single"
     return ""
+
+
+# A comparison asked for in so many words. On a dataset with a contrast it keeps the design meeting
+# without asking the model; a request without one is asked about (``_COMPARISON_ROUTE_SYSTEM``).
+_COMPARISON_CUE = re.compile(
+    r"\b(?:compar\w*|versus|vs\.?|contrast\w*|differs?|differed|differen(?:ce|ces|tial|tially)|"
+    r"DEGs?|DE|changes?|changed|changing|up-?regulat\w*|down-?regulat\w*|effects?\s+of|"
+    r"impact\s+of|loss\s+of|knock-?outs?|mutants?|treat\w*)\b"
+    r"|比较|对比|差异|区别|变化|上调|下调|影响|敲除|突变",
+    re.IGNORECASE)
+
+_COMPARISON_ROUTE_SYSTEM = (
+    "You read one request sent to a single-cell analysis console, before its analysis is planned. "
+    "The user message lists how the dataset groups its cells or samples. Decide what the request "
+    "asks for:\n"
+    '- "compare": a difference between such groups (conditions, genotypes, regions, time points, '
+    "treatments, donor attributes): what changes, what differs, what is up or down, the effect of "
+    "one on another, or a test between them. A question about a mutation, a disease or a "
+    "treatment in a dataset that has the matching groups is a comparison even when it does not "
+    "say 'compare'.\n"
+    '- "describe": what the data shows without contrasting those groups: where genes are '
+    "expressed, which cells express them, what the cell types are, quality control, clustering, "
+    "or showing values across cell types.\n"
+    'When unsure, answer "compare". Return ONLY JSON: {"asks": "compare|describe", '
+    '"confidence": <0.0-1.0>}.'
+)
+
+#: Below this a "describe" answer keeps the design meeting.
+_DESCRIBE_CONFIDENCE = 0.6
 
 
 def _annotated_without_contrast(dr: "dict[str, Any] | None") -> bool:
@@ -6163,8 +6203,19 @@ class ResearchLab:
         A dataset with an experimental contrast AND existing cell-type labels is exactly the
         multi-disciplinary case the meeting exists for (design + statistics + biology), so it is
         team by rule; a single-arm / label-only descriptive dataset is single by rule; only when
-        the profile says neither does the PI's judgement of the question decide."""
-        forced = _dataset_mode_rule((self.ctx.decisions or {}).get("dataset_result"))
+        the profile says neither does the PI's judgement of the question decide.
+
+        The rule says the dataset CAN carry a comparison, not that the request asks for one. A
+        descriptive question on a dataset with a contrast column (the retina atlas's
+        fovea/macula/periphery ``tissue``: "where are LRAT, CRALBP, rho and ABCR expressed?") held
+        a two-round meeting of 20+ minutes whose experts said, in round one, that nothing was
+        being compared. So a request that compares none of the dataset's groups is planned by one
+        scientist (:meth:`_asks_for_comparison`)."""
+        dr = (self.ctx.decisions or {}).get("dataset_result")
+        forced = _dataset_mode_rule(dr)
+        if forced == "team" and not self._asks_for_comparison(question, _contrast_columns(dr)):
+            emit({"type": "mode_selected", "mode": "single", "reason": "descriptive"})
+            return "single"
         if forced:
             emit({"type": "mode_selected", "mode": forced, "reason": "dataset_design"})
             return forced
@@ -6175,6 +6226,35 @@ class ResearchLab:
         mode = "team" if "team" in raw.strip().lower()[:24] else "single"
         emit({"type": "mode_selected", "mode": mode, "reason": "question"})
         return mode
+
+    def _asks_for_comparison(self, question: str, contrasts: "list[tuple[str, list[str]]]") -> bool:
+        """Does the request compare the dataset's groups (``contrasts``)? A comparison named in so
+        many words answers yes at once. Otherwise the session's model is asked, and only a
+        confident "describe" answers no: a failed call, an unreadable answer or a doubt keeps the
+        design meeting, as before this check."""
+        if _COMPARISON_CUE.search(question or ""):
+            return True
+        groups = "; ".join(f"{c} ({', '.join(v)})" if v else c for c, v in contrasts) or "(none named)"
+        try:
+            raw = self._complete([
+                {"role": "system", "content": _COMPARISON_ROUTE_SYSTEM},
+                {"role": "user", "content": f"Groupings in the dataset: {groups}\n\nThe request:\n"
+                                            f"{question}\n\nReturn the JSON."},
+            ], role="classify")
+        except Exception as exc:  # noqa: BLE001 - the meeting stays, as before this check (Stop is a BaseException)
+            print(f"[lab] comparison check failed: {type(exc).__name__}: {exc}")
+            return True
+        obj = safe_json_loads(raw)
+        if obj is None:
+            m = re.search(r"\{.*\}", str(raw or ""), re.DOTALL)
+            obj = safe_json_loads(m.group(0)) if m else None
+        if not obj or str(obj.get("asks", "")).strip().lower() != "describe":
+            return True
+        try:
+            confidence = float(obj.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return confidence < _DESCRIBE_CONFIDENCE
 
     def _study_context(self, question: str) -> str:
         """What the study IS, for the roles that run before planning — team formation and the

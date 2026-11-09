@@ -4563,17 +4563,27 @@ function estimateCell(value) {
   return String(value == null ? "" : value).replace(/[|\r\n]/g, " ");
 }
 
+// A step whose tool has no resource profile and has not run here has no estimate ("unknown"); a
+// total that leaves such steps out is "partial".
+function estimateFlag(entry) {
+  return entry.unknown ? "" : entry.partial ? " (partial)" : entry.rough ? " (rough)" : "";
+}
+
 function planEstimateMarkdown(estimate) {
   if (!estimate || !Array.isArray(estimate.steps)) return "";
   const currency = estimateCell(estimate.currency || "USD");
-  const row = (entry, label, skill) => `| ${estimateCell(label)}${entry.rough ? " (rough)" : ""} | ${estimateCell(skill)} | `
-    + `${estimateRange(entry.seconds, true)} | ${estimateRange(entry.cpu_hours)} | ${estimateRange(entry.gpu_hours)} | `
-    + `${estimate.rates_configured ? estimateRange(entry.cost) + " " + currency : "—"} |`;
+  const row = (entry, label, skill) => `| ${estimateCell(label)}${estimateFlag(entry)} | ${estimateCell(skill)} | `
+    + `${entry.unknown ? "no estimate yet" : estimateRange(entry.seconds, true)} | ${estimateRange(entry.cpu_hours)} | `
+    + `${estimateRange(entry.gpu_hours)} | `
+    + `${estimate.rates_configured && !entry.unknown ? estimateRange(entry.cost) + " " + currency : "—"} |`;
+  const missing = estimate.steps.some((entry) => entry.unknown || entry.partial);
   return "\n\n**Estimated resources and cost**\n\n"
     + "| Step | Skill | Time | CPU hours | GPU hours | Est. cost |\n| --- | --- | --- | --- | --- | --- |\n"
     + estimate.steps.map((entry, i) => row(entry, entry.step || i + 1, entry.skill)).join("\n")
     + (estimate.total ? "\n" + row(estimate.total, "Total", "") : "")
     + "\n\nRough estimates have limited run history. "
+    + (missing ? "A tool with no resource profile has no estimate until it has run here once; "
+      + "a partial total leaves it out. " : "")
     + (estimate.rates_configured ? "" : "Rates not configured: no cost is shown. ")
     + estimateCell(estimate.note || "HPC3 queue wait time is not included.") + "\n";
 }
@@ -4585,11 +4595,15 @@ function runUsageMarkdown(msg) {
   const cost = (value) => estimate.rates_configured
     ? `${value} ${estimateCell(estimate.currency || "USD")}` : "—";
   return "**Run resources and cost**\n\n| | Estimated | Actual |\n| --- | --- | --- |\n"
-    + `| Time | ${estimateRange(total.seconds, true)} | ${estimateNumber(actual.seconds / 60)} min |\n`
+    + `| Time | ${total.unknown ? "no estimate yet" : estimateRange(total.seconds, true)} | `
+    + `${estimateNumber(actual.seconds / 60)} min |\n`
     + `| CPU hours | ${estimateRange(total.cpu_hours)} | ${estimateNumber(actual.cpu_hours)} |\n`
     + `| GPU hours | ${estimateRange(total.gpu_hours)} | ${estimateNumber(actual.gpu_hours)} |\n`
-    + `| Cost | ${cost(estimateRange(total.cost))} | ${cost(estimateNumber(actual.cost))} |\n\n`
-    + (total.rough ? "Estimate: rough. " : "") + (actual.rough ? "Actual resource accounting: rough. " : "")
+    + `| Cost | ${total.unknown ? "—" : cost(estimateRange(total.cost))} | ${cost(estimateNumber(actual.cost))} |\n\n`
+    + (total.unknown ? "No estimate: none of the plan's tools had a resource profile or an earlier run. "
+      : total.partial ? "Estimate: partial, without the steps that had no estimate yet. "
+      : total.rough ? "Estimate: rough. " : "")
+    + (actual.rough ? "Actual resource accounting: rough. " : "")
     + (estimate.rates_configured ? "" : "Rates not configured: no cost is shown. ")
     + "Time is summed tool compute time; model/report overhead and HPC3 queue wait time are excluded.";
 }

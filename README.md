@@ -116,7 +116,9 @@ Tools may declare `resource_profile.json` beside `TOOL.md`: `unit` (`samples`, `
 `baseline`, and `steps`, each with `name`, requested `cpus`, `gpus`, `mem_gb` and a two-value
 `minutes` range. See `src/aiscientist/tools/run_cellqc/resource_profile.json`. Dataset metadata
 supplies the sample count, cell count or GB for scaling; Cell Ranger library counts are inferred.
-Tools without profiles use rough defaults.
+A tool without a profile has no estimate ("no estimate yet") until it has run successfully once;
+from then on its runs give the estimate, scaled by cell count. A total that leaves such steps
+out is marked partial.
 
 ## Repository layout
 
@@ -151,6 +153,6 @@ tests/             the offline test suite
   credits with AiScientist, keeping the key safe, and watching what it spends.
 - [`docs/development/metadata.md`](docs/development/metadata.md): the metadata guideline, the
   metadata API and the MCP server.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute, and how to test a change on HPC3.
 
 Released under the [MIT License](LICENSE).

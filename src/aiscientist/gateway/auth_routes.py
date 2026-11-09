@@ -740,23 +740,23 @@ def run_llm_cost(run_id: str) -> dict:
 
 
 def latest_run_id_for_conversation(user_id: int, conversation_id: str,
-                                   accept: Callable[[str], bool] | None = None) -> str | None:
+                                   accept: Callable[[str], bool] | None = None,
+                                   statuses: "tuple[str, ...] | None" = ("done", "incomplete")) -> str | None:
     """The most recent COMPLETED run this user produced in a conversation (``done``/``incomplete`` —
     i.e. one that reached the report stage, not a cancelled/errored/running one). Used by the
     follow-up router to recognise a prior run across a gateway restart, when the in-memory last-run
     map is empty. ``accept`` keeps only the runs it returns True for (the gateway passes "has a run
     state": a literature answer is finished but is no study to continue); the latest of the last 20
-    completed runs it accepts. None when the conversation has no such run."""
+    completed runs it accepts. None when the conversation has no such run. ``statuses=None`` takes
+    a run of any status: the latest run with a plan, finished or not."""
     if not conversation_id:
         return None
     with session_scope() as s:
-        rows = s.scalars(
-            select(Run.run_id)
-            .where(Run.user_id == user_id,
-                   Run.conversation_id == conversation_id,
-                   Run.status.in_(("done", "incomplete")))
-            .order_by(Run.created_at.desc(), Run.id.desc())
-            .limit(1 if accept is None else 20)).all()
+        query = select(Run.run_id).where(Run.user_id == user_id, Run.conversation_id == conversation_id)
+        if statuses is not None:
+            query = query.where(Run.status.in_(tuple(statuses)))
+        rows = s.scalars(query.order_by(Run.created_at.desc(), Run.id.desc())
+                         .limit(1 if accept is None else 20)).all()
     for run_id in rows:
         if accept is None or accept(run_id):
             return run_id

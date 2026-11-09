@@ -41,6 +41,13 @@ console.log(JSON.stringify({
   rounded:api.planEstimateMarkdown({steps:[{step:2,skill:"qc",seconds:[5400,9600],cpu_hours:[24.75,45.87],
     gpu_hours:[0,0],cost:[0,0],rough:false}],rates_configured:false}),
   noHtml:api.planEstimateHtml(null),
+  partialPlan:api.planEstimateMarkdown({...estimate,
+    steps:[{...row,step:1,skill:"cellqc"},
+           {step:2,skill:"submit_query",seconds:null,cpu_hours:null,gpu_hours:null,cost:null,rough:true,unknown:true}],
+    total:{...row,partial:true}}),
+  unknownUsage:api.runUsageMarkdown({estimate:{...estimate,
+    total:{seconds:null,cpu_hours:null,gpu_hours:null,cost:null,rough:true,unknown:true}},actual}),
+  partialUsage:api.runUsageMarkdown({estimate:{...estimate,total:{...row,partial:true}},actual}),
 }));
 '''
     done = subprocess.run(
@@ -91,3 +98,25 @@ def test_the_plan_card_draws_the_estimate_in_its_own_block(estimates):
     assert estimates["html"].startswith('<div class="plan-estimate"><md>')
     assert "| Step | Skill | Time | CPU hours | GPU hours | Est. cost |" in estimates["html"]
     assert estimates["noHtml"] == ""
+
+
+def test_a_step_without_an_estimate_says_so_and_the_total_is_partial(estimates):
+    plan = estimates["partialPlan"]
+    assert "| 1 (rough) | cellqc | ~25–40 min | 1–2 | 0–1 | 0.1–0.3 USD |" in plan
+    assert "| 2 | submit_query | no estimate yet | — | — | — |" in plan
+    assert "| Total (partial) |  | ~25–40 min |" in plan
+    assert "no estimate until it has run here once" in plan
+    assert "no estimate until" not in estimates["plan"]
+
+
+def test_completed_usage_without_an_estimate_shows_none(estimates):
+    unknown = estimates["unknownUsage"]
+    assert "| Time | no estimate yet | 30 min |" in unknown
+    assert "| CPU hours | — | 1.5 |" in unknown
+    assert "| Cost | — | 0.2 USD |" in unknown
+    assert "No estimate: none of the plan's tools" in unknown
+    assert "Estimate: rough." not in unknown
+    partial = estimates["partialUsage"]
+    assert "| Time | ~25–40 min | 30 min |" in partial
+    assert "Estimate: partial, without the steps that had no estimate yet." in partial
+    assert "Estimate: rough." not in partial

@@ -21,7 +21,8 @@
 #      its credentials, its key service, its email, its shared model job and its folders; then this
 #      site's own: the database, the staging folders, its own folder on HPC3 (<production shared
 #      root>-staging, which must exist on HPC3), no CPU worker node, no self-registration (an admin
-#      makes the accounts; the port is reachable by every account on the host); and
+#      makes the accounts; the port is reachable by every account on the host), and a test-site
+#      lifetime: chats, runs and datasets left 7 days are removed (AISCIENTIST_TEST_SITE_DAYS); and
 #      config/deploy.env: the prerelease channel, the unit, port 8801, no key service;
 #   5. aiscientist-staging.service, aiscientist-staging-deploy.{service,timer} and the restart rule
 #      /etc/sudoers.d/aiscientist-staging-restart;
@@ -39,7 +40,7 @@
 # PROD_ROOT, SYSTEMD_DIR, SUDOERS_DIR, SYSTEMCTL, REQUIRE_ROOT=0, AS_SVC ("" = run as yourself),
 # PSQL ("" = a SQLite file in state/ instead of PostgreSQL, for a rehearsal only),
 # STAGING_HPC_SHARED_ROOT (default: the production site's AISCIENTIST_HPC_SHARED_ROOT + -staging),
-# STAGING_SLURM_JOB_PREFIX (default: stg-).
+# STAGING_SLURM_JOB_PREFIX (default: stg-), STAGING_TEST_SITE_DAYS (default: 7).
 set -euo pipefail
 
 ROOT="${AISCIENTIST_STAGING_ROOT:-/data/aiscientist-staging}"
@@ -89,11 +90,14 @@ PROD_SHARED="$(prod_env_value HPC_SHARED_ROOT)"
 HPC_ROOT="${STAGING_HPC_SHARED_ROOT:-${PROD_SHARED:+$PROD_SHARED-staging}}"
 # Never empty or production's: the two sites find a user's Slurm jobs by name.
 JOB_PREFIX="${STAGING_SLURM_JOB_PREFIX:-stg-}"
+# Days after which the site removes chats, runs and datasets nobody touched (gateway/test_site.py).
+TEST_DAYS="${STAGING_TEST_SITE_DAYS:-7}"
+[[ "$TEST_DAYS" =~ ^[1-9][0-9]{0,2}$ ]] || die "STAGING_TEST_SITE_DAYS=$TEST_DAYS: a number of days, 1 to 999"
 PROD_JOB_PREFIX="$(prod_env_value SLURM_JOB_PREFIX)"
 # Settings of the production site that stay its own: this site's folders and database, the key
 # service, email, the shared model job (two keepers would cancel each other's jobs), the CPU worker
 # (the other site would take it over, then cancel it as stale), registration; and every credential.
-SKIP='DATABASE_URL|STATE_DIR|DATA_ROOT|RESULTS_DIR|INDUCED_SKILLS_DIR|SKILLS_REGISTRY_RELEASES_ROOT|HPC_SHARED_ROOT|SLURM_JOB_PREFIX|KEY_SERVICE.*|SMTP_.*|SHARED_LLM.*|WORKER_NODE|PUBLIC_HTTPS|ALLOW_SELF_REGISTER|ADMIN_.*|SECRET_KEY.*|LLM_KEY_.*|LOCAL_TUNNEL_PORT|OLLAMA_LOCAL_PORT|LOCAL_CORPUS_ROOT|BIOMNI_DATA_PATH'
+SKIP='DATABASE_URL|STATE_DIR|DATA_ROOT|RESULTS_DIR|TEST_SITE_DAYS|INDUCED_SKILLS_DIR|SKILLS_REGISTRY_RELEASES_ROOT|HPC_SHARED_ROOT|SLURM_JOB_PREFIX|KEY_SERVICE.*|SMTP_.*|SHARED_LLM.*|WORKER_NODE|PUBLIC_HTTPS|ALLOW_SELF_REGISTER|ADMIN_.*|SECRET_KEY.*|LLM_KEY_.*|LOCAL_TUNNEL_PORT|OLLAMA_LOCAL_PORT|LOCAL_CORPUS_ROOT|BIOMNI_DATA_PATH'
 # A name that ends in a credential word (..._API_KEY, ..._TOKEN_FILE, ..._PASSWORD); not ..._MAX_TOKENS.
 CREDENTIAL='(KEY|TOKEN|PASSWORD|PASSWD|SECRET|CREDENTIALS?)(_FILE)?'
 
@@ -222,6 +226,8 @@ write_config() {
     ok "config/.env exists: kept"
     grep -q '^AISCIENTIST_SLURM_JOB_PREFIX=.' "$ROOT/config/.env" \
       || warn "it has no AISCIENTIST_SLURM_JOB_PREFIX: add AISCIENTIST_SLURM_JOB_PREFIX=$JOB_PREFIX while no one uses the site"
+    grep -q '^AISCIENTIST_TEST_SITE_DAYS=' "$ROOT/config/.env" \
+      || warn "it has no AISCIENTIST_TEST_SITE_DAYS: add AISCIENTIST_TEST_SITE_DAYS=$TEST_DAYS so what testers leave is removed"
   else
     local url; url="$(database_url)"
     umask 077
@@ -253,6 +259,8 @@ AISCIENTIST_SLURM_JOB_PREFIX=$JOB_PREFIX
 AISCIENTIST_PUBLIC_HTTPS=0
 # Every account on this host can reach the port: an admin makes the accounts (Admin -> Users).
 AISCIENTIST_ALLOW_SELF_REGISTER=0
+# A test site: chats, runs and datasets left this many days are removed, without notice.
+AISCIENTIST_TEST_SITE_DAYS=$TEST_DAYS
 EOF
     } > "$ROOT/config/.env.new"
     install -m 0600 ${OWN[@]+"${OWN[@]}"} "$ROOT/config/.env.new" "$ROOT/config/.env"

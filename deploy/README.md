@@ -174,6 +174,7 @@ production site gets it. It is the same gateway in the same layout, apart in eve
 | Accounts | the users' | the testers', made by an admin in Admin → Users: registration is off, since every account on the host can reach the port |
 | API keys | through the key service | saved in the staging site's own `state/` (`AISCIENTIST_KEYS_SERVICE=none` for its deploys) |
 | HPC3 | the shared root `AISCIENTIST_HPC_SHARED_ROOT`; Slurm jobs without a prefix (`bioagent-vllm-<UCInetID>`, ...) | the same cluster and images; its own shared root `<production's>-staging`, so each site's cleanup keeps only its own sessions; its jobs named `stg-*` (`AISCIENTIST_SLURM_JOB_PREFIX=stg-`) |
+| What is kept | datasets 90 days from their last use, after a notice; chats and runs until their owner deletes them | 7 days (`AISCIENTIST_TEST_SITE_DAYS=7`): a chat with no activity for 7 days goes with its messages, runs and result folders, and a dataset added or last used 7 days ago goes, without notice |
 
 The staging units hide `/data/aiscientist` and the key service's files from the site
 (`InaccessiblePaths`), and its account cannot write there either: a pre-release can neither read
@@ -192,7 +193,10 @@ ssh -L 8801:127.0.0.1:8801 <you>@eye.som.uci.edu    # then open http://localhost
 ```
 
 Sign in with the account an admin made for you, connect HPC3 and bring an API key, as on the
-production site.
+production site. It is for trying a version, not for keeping work: each hour it removes what was
+left 7 days, through the same deletions as the site's Delete buttons
+([`gateway/test_site.py`](../src/aiscientist/gateway/test_site.py)), and a run in progress or a
+dataset a run is using is never removed. A dataset kept on HPC3 goes once its owner is connected.
 
 **Setting it up**, once, as root, from the package of the release to start with.
 [`setup_staging.sh`](setup_staging.sh) makes the account, the folders, the

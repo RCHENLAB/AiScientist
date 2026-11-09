@@ -191,7 +191,8 @@ def markdown_summary(findings: list[Finding], files: list[Path]) -> str:
             "Policy reminders:",
             "- Do not commit `.env`, API keys, private datasets, or generated run artifacts.",
             "- Literature/network tools must use sanitized public queries only.",
-            "- Slurm submit remains review-gated until production approval.",
+            "- Try Slurm, SSH and HPC3 storage changes on HPC3 under your own account; "
+            "compute runs in Slurm jobs, never on login nodes.",
         ]
     )
     return "\n".join(lines) + "\n"

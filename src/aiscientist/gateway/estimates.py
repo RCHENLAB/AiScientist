@@ -39,10 +39,12 @@ def profile(skill: str) -> dict:
         # names), so the resources are declared once and the profile only holds the timings.
         return {**declared, "steps": [{"cpus": env.get("cpus") or 1, "mem_gb": env.get("mem_gb") or 8,
                                        **step} for step in declared["steps"]]}
-    return {"unit": "cells", "baseline": 10000, "rough": True, "steps": [
+    # No declared profile: the job's resources (to account a call without sacct) and the unit its
+    # history scales by, but no timings. Until the tool has run, it has no estimate.
+    return {"unit": "cells", "baseline": 10000, "rough": True, "declared": False, "steps": [
         {"name": skill, "cpus": env.get("cpus") or 1,
          "gpus": 1 if manifest and manifest.runs_on.startswith("gpu:") else 0,
-         "mem_gb": env.get("mem_gb") or 8, "minutes": [5, 30]}]}
+         "mem_gb": env.get("mem_gb") or 8}]}
 
 
 def input_units(p: dict, inputs: dict) -> tuple[float, bool]:
@@ -92,13 +94,19 @@ def per_run(rows: list) -> list:
 
 
 def estimate_skill(skill: str, inputs: dict, settings, *, previous=None) -> dict:
+    """Ranges of time, CPU/GPU hours and cost for ``inputs``. A tool with neither a declared profile
+    nor a successful run has none (``unknown``): a generic guess scaled by the cell count once put a
+    20-minute Atlas query on 3.2 million cells at 159-953 hours."""
     p = profile(skill)
     units, unknown_size = input_units(p, inputs)
-    factor = units / p.get("baseline", 1)
     rows = per_run(history(skill) if previous is None else previous)
+    if not rows and p.get("declared") is False:
+        return {"skill": skill, **dict.fromkeys(FIELDS), "unknown": True, "rough": True,
+                "profile_steps": p["steps"], "units": units, "history_count": 0}
+    factor = units / p.get("baseline", 1)
     ranges = {key: [0.0, 0.0] for key in FIELDS}
     for step in p["steps"]:
-        for i, minutes in enumerate(step["minutes"]):
+        for i, minutes in enumerate(step.get("minutes") or ()):
             seconds = minutes * 60 * factor
             ranges["seconds"][i] += seconds
             ranges["cpu_hours"][i] += seconds / 3600 * step["cpus"]
@@ -116,8 +124,17 @@ def estimate_skill(skill: str, inputs: dict, settings, *, previous=None) -> dict
                 ranges[key] = [min(min(typical), center * .75), max(max(values), center * 1.5)]
     ranges["cost"] = [ranges["cpu_hours"][i] * settings.cpu_hour_rate
                       + ranges["gpu_hours"][i] * settings.gpu_hour_rate for i in range(2)]
-    return {"skill": skill, **ranges, "rough": bool(p.get("rough")) or unknown_size or len(rows) < 3,
+    return {"skill": skill, **ranges, "unknown": False,
+            "rough": bool(p.get("rough")) or unknown_size or len(rows) < 3,
             "profile_steps": p["steps"], "units": units, "history_count": len(rows)}
+
+
+def _sums(entries: list) -> dict:
+    """The summed ranges of the entries that have an estimate; ``None`` when none of them has one."""
+    known = [e for e in entries if not e.get("unknown")]
+    if entries and not known:
+        return dict.fromkeys(FIELDS)
+    return {key: [sum(e[key][i] for e in known) for i in range(2)] for key in FIELDS}
 
 
 def estimate_plan(agenda: list[str], tools: list, inputs: dict, settings,
@@ -132,11 +149,15 @@ def estimate_plan(agenda: list[str], tools: list, inputs: dict, settings,
             t.name for t in tools if t.name != "finish" and
             re.search(r"(?<![\w])" + re.escape(t.name) + r"(?![\w])", text)]
         estimates = [estimate_skill(name, inputs, settings) for name in matched or ["unspecified"]]
-        row = {key: [sum(e[key][i] for e in estimates) for i in range(2)] for key in FIELDS}
-        steps.append({"step": number, "skill": ", ".join(matched) or "Unspecified",
-                      **row, "rough": any(e["rough"] for e in estimates)})
-    total = {key: [sum(e[key][i] for e in steps) for i in range(2)] for key in FIELDS}
-    return {"steps": steps, "total": {**total, "rough": any(e["rough"] for e in steps)},
+        unknown = [e["unknown"] for e in estimates]
+        steps.append({"step": number, "skill": ", ".join(matched) or "Unspecified", **_sums(estimates),
+                      "rough": any(e["rough"] for e in estimates),
+                      "unknown": all(unknown), "partial": any(unknown) and not all(unknown)})
+    # A total that leaves out steps without an estimate says so (``partial``); none at all: ``unknown``.
+    unknown = [s["unknown"] for s in steps]
+    total = {**_sums(steps), "rough": any(s["rough"] for s in steps), "unknown": bool(steps) and all(unknown),
+             "partial": not all(unknown) and any(u or s["partial"] for u, s in zip(unknown, steps))}
+    return {"steps": steps, "total": total,
             "currency": "USD", "rates_configured": bool(settings.cpu_hour_rate or settings.gpu_hour_rate),
             "note": "HPC3 queue wait time is not included. Sequential compute time; parallel steps may overlap."}
 

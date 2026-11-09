@@ -582,7 +582,7 @@ def test_setup_staging_makes_a_second_site_that_follows_pre_releases(server):
         "AISCIENTIST_STATE_DIR=/prod/state\nAISCIENTIST_SMTP_HOST=smtp.example.edu\n"
         "AISCIENTIST_SMTP_PASSWORD=<password>\nAISCIENTIST_LAB_LLM_API_KEY=<key>\n"
         "AISCIENTIST_KEY_SERVICE=http://127.0.0.1:8899\nAISCIENTIST_SHARED_LLM=1\nAISCIENTIST_WORKER_NODE=1\n"
-        "AISCIENTIST_SLURM_JOB_PREFIX=prd-\n")
+        "AISCIENTIST_SLURM_JOB_PREFIX=prd-\nAISCIENTIST_TEST_SITE_DAYS=999\n")
     (prod / "data" / "reference" / "genesets").mkdir(parents=True)
     (prod / "data" / "reference" / "genesets" / "KEGG.gmt").write_text("P\td\tG1\n")
     calls = tmp / "systemctl.log"
@@ -622,8 +622,9 @@ def test_setup_staging_makes_a_second_site_that_follows_pre_releases(server):
                 f"AISCIENTIST_STATE_DIR={root}/state", f"AISCIENTIST_RESULTS_DIR={root}/data/analysis_results",
                 "AISCIENTIST_HPC_SHARED_ROOT=/lab/software/AiScientist-staging",
                 "AISCIENTIST_SHARED_LLM=0", "AISCIENTIST_WORKER_NODE=0", "AISCIENTIST_ALLOW_SELF_REGISTER=0",
-                "AISCIENTIST_SLURM_JOB_PREFIX=stg-"):
+                "AISCIENTIST_SLURM_JOB_PREFIX=stg-", "AISCIENTIST_TEST_SITE_DAYS=7"):
         assert own in conf
+    assert "=999" not in conf                             # its own lifetime, never production's
     deploy_env = (root / "config" / "deploy.env").read_text()
     assert "AISCIENTIST_CHANNEL=prerelease" in deploy_env and "AISCIENTIST_KEYS_SERVICE=none" in deploy_env
     assert (root / "data" / "reference" / "genesets" / "KEGG.gmt").exists()
@@ -648,6 +649,9 @@ def test_setup_staging_makes_a_second_site_that_follows_pre_releases(server):
 
     r = server.run("--tag", "v1.1.0rc1", script=setup, **{**env, "AISCIENTIST_STAGING_ROOT": str(prod / "x")})
     assert r.returncode == 1 and "inside the production root" in r.stderr
+
+    r = server.run("--tag", "v1.1.0rc1", script=setup, **{**env, "STAGING_TEST_SITE_DAYS": "0"})
+    assert r.returncode == 1 and "a number of days" in r.stderr
 
     # Its Slurm jobs never take the production site's names.
     for prefix, why in (("prd-", "is the production site's"), ("-x", "starting with a letter or digit"),

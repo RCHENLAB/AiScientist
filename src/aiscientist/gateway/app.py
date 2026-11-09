@@ -465,6 +465,9 @@ class Connection:
         # run as a stale "replan". ``last_run_id`` (below) stays as the connection-wide fallback for
         # older clients that don't send a conversation_id.
         self.last_run_by_conversation: dict[str, str] = {}
+        # Per-CONVERSATION latest run with a plan on disk, finished or not: a run that failed or was
+        # stopped part-way is picked up from it by the next message (``_stopped_run_target``).
+        self.last_planned_run_by_conversation: dict[str, str] = {}
         # Per-CONVERSATION rolling chat memory: {conversation_id: {"summary": str, "through": int}}.
         # The fast chat path compacts older turns into a model-written summary; keeping it here
         # (rather than re-deriving it from the history the client resends) is what makes
@@ -2132,12 +2135,19 @@ async def _dataset_retention_loop() -> None:
                 print(f"[storage] last run use read back from earlier runs for {changed} dataset(s)")
         except Exception as exc:  # noqa: BLE001 - maintenance must survive an unreadable run record
             print(f"[storage] could not read dataset use from earlier runs: {type(exc).__name__}: {exc}")
+    from . import test_site
     while True:
         try:
             if _AUTH_ENABLED:
                 await storage_policy.sweep(sys.modules[__name__])
         except Exception as exc:  # noqa: BLE001 - maintenance must survive a failed deletion or email
             print(f"[storage] retention sweep failed: {type(exc).__name__}: {exc}")
+        try:
+            # A test site (AISCIENTIST_TEST_SITE_DAYS, the staging site) removes what testers left.
+            if _AUTH_ENABLED and test_site.days():
+                await test_site.sweep(sys.modules[__name__])
+        except Exception as exc:  # noqa: BLE001 - maintenance must survive a failed deletion
+            print(f"[storage] test-site sweep failed: {type(exc).__name__}: {exc}")
         await asyncio.sleep(3600)
 
 
@@ -8620,6 +8630,13 @@ def _followup_target(conn: Connection, req: LabRequest) -> tuple[str, Path, dict
         return None
     if not state.get("agenda"):
         return None
+    if _binds_other_dataset(req, state):
+        return None    # a DIFFERENT dataset was explicitly chosen → this is a new study
+    return run_id, art, state
+
+
+def _binds_other_dataset(req: LabRequest, state: dict) -> bool:
+    """Did this message bind a different dataset from the one the earlier run read?"""
     prior_ds = str(state.get("dataset_path") or "")
     # Compare the PRIMARY of the bound set (feature ②) so a multi-file attach is handled too; legacy
     # single-file requests resolve to exactly ``dataset_path``.
@@ -8630,11 +8647,8 @@ def _followup_target(conn: Connection, req: LabRequest) -> tuple[str, Path, dict
     # says nothing about whether the user changed datasets.
     bound_then = str(state.get("bound_primary") or "")
     if new_primary and bound_then:
-        if new_primary.rstrip("/") != bound_then.rstrip("/"):
-            return None
-    elif new_primary and prior_ds and Path(new_primary).name != Path(prior_ds).name:
-        return None    # a DIFFERENT dataset was explicitly chosen → this is a new study
-    return run_id, art, state
+        return new_primary.rstrip("/") != bound_then.rstrip("/")
+    return bool(new_primary and prior_ds and Path(new_primary).name != Path(prior_ds).name)
 
 
 async def _ask_followup_clarify(conn: Connection) -> str | None:
@@ -8662,6 +8676,200 @@ async def _ask_followup_clarify(conn: Connection) -> str | None:
     if "new" in fb or "fresh" in fb or "brand" in fb:
         return "new_study"
     return None
+
+
+# --- a run that stopped part-way --------------------------------------------------------------
+# A run that failed (the shared model did not answer), was stopped, or died with the gateway leaves
+# its question, its approved plan and every finished step on disk. The next message used to see none
+# of it: only a FINISHED run is a follow-up target, so "I switch to haiku, can you use haiku continue
+# this session research" (chat 195, 2026-11-07, after run fc393bf52a3b failed at its first step)
+# became the whole question of a new study, and that study's design meeting debated a sentence about
+# models. A message that carries on is now routed to the stopped run: the same run id, question and
+# plan, the finished steps kept, on the model the session uses now.
+
+_RESUME_WORDS = re.compile(
+    r"\b(?:continue|continuing|resume|retry|try again|go on|carry on|keep going|pick up|"
+    r"start again|run (?:it )?again)\b|继续|接着|重试|再试|重新跑|重跑|恢复", re.IGNORECASE)
+#: A longer message with one of those words may ask for more than carrying on ("continue, and add
+#: pathway enrichment"): the model reads it.
+_RESUME_WORDS_MAX_CHARS = 80
+
+_STOPPED_ROUTER_SYS = (
+    "You route a message in a single-cell bioinformatics console. The user's previous analysis in "
+    "this chat STOPPED before it finished (an error, a model that did not answer, or Stop). Its "
+    "question, its approved plan and its finished steps are saved. Classify the new message:\n"
+    '- "resume": carry on with that analysis where it stopped: continue, retry, go on, try again, '
+    "'I switched the model, continue', or a message that asks to finish the same work.\n"
+    '- "new_study": a different request: a new question, another dataset, or a change to what '
+    "the analysis should do.\n"
+    'Return ONLY a JSON object: {"intent": "resume|new_study", "confidence": <0.0-1.0>, '
+    '"reason": "<one short clause>"}.'
+)
+
+
+def _remember_planned_run(conn: "Connection", run: "RunState") -> None:
+    """Record the run whose plan is now on disk as its conversation's latest planned run."""
+    if run is not None and run.run_id and run.conversation_id:
+        conn.last_planned_run_by_conversation[run.conversation_id] = run.run_id
+
+
+def _latest_planned_run(conn: Connection, conversation_id: str) -> str:
+    """The conversation's latest run with a plan on disk, finished or not: this session's map first,
+    then the DB (any status), so a run stopped by a gateway restart is still found. "" when none."""
+    rid = (conn.last_planned_run_by_conversation.get(conversation_id) or "").strip()
+    if rid or not (_AUTH_ENABLED and conn.app_user_id):
+        return rid
+    try:
+        rid = (auth_routes.latest_run_id_for_conversation(
+            conn.app_user_id, conversation_id, statuses=None,
+            accept=lambda r: (conn.workspace / safe_name(r) / "artifacts" / "process"
+                              / "run_state.json").exists()) or "").strip()
+    except Exception as exc:  # noqa: BLE001 - a lookup failure just means "no stopped run known"
+        print(f"[followup] DB planned-run lookup failed: {exc}")
+        return ""
+    if rid:
+        conn.last_planned_run_by_conversation[conversation_id] = rid
+    return rid
+
+
+def _stopped_run_target(conn: Connection, req: LabRequest) -> "tuple[str, Path, dict, Any] | None":
+    """``(run_id, art, state, resume)`` when this chat's latest planned run stopped before it
+    finished and has steps left to run; else None. A finished run is the follow-up router's
+    (:func:`_followup_target`); a plan still waiting for its reply, or one the user cancelled, has
+    its own card; a run still going is not touched."""
+    if not req.conversation_id:
+        return None
+    run_id = _latest_planned_run(conn, req.conversation_id)
+    if not run_id or any(r.run_id == run_id and r.running for r in conn.live_runs):
+        return None
+    art = conn.workspace / safe_name(run_id) / "artifacts"
+    if (art / "report" / "report.md").exists() or (art / "report" / "summary.md").exists():
+        return None
+    from . import saved_plans
+    try:
+        if saved_plans.current_state(art) in ("shown", "cancelled"):
+            return None
+        state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not state.get("agenda") or _binds_other_dataset(req, state):
+        return None
+    from ..agents.research_lab import ResumeState
+    try:
+        resume = ResumeState.from_interrupted(state, guidance=state.get("guidance"))
+    except ValueError:
+        return None      # every step has a result: nothing is left to carry on with
+    return run_id, art, state, resume
+
+
+def _classify_stopped_followup(complete_fn: Any, state: dict, question: str) -> dict | None:
+    """Ask the session's model whether ``question`` carries on with the stopped run. Never raises."""
+    agenda = [str(s) for s in (state.get("agenda") or [])]
+    prompt = (f"The stopped analysis's question: {state.get('question') or ''}\n"
+              "Its approved plan:\n" + "\n".join(f"{i + 1}. {_plain_step_title(s)}"
+                                                 for i, s in enumerate(agenda))
+              + f"\n\nThe user's new message:\n{question}\n\nReturn the routing JSON.")
+    try:
+        raw = complete_fn([{"role": "system", "content": _STOPPED_ROUTER_SYS},
+                           {"role": "user", "content": prompt}])
+    except Exception as exc:  # noqa: BLE001 - the caller asks instead
+        print(f"[followup] stopped-run classify failed: {exc}")
+        return None
+    obj = _extract_json_object(raw if isinstance(raw, str) else str(raw))
+    if not obj or str(obj.get("intent", "")).lower() not in ("resume", "new_study"):
+        return None
+    try:
+        conf = max(0.0, min(1.0, float(obj.get("confidence"))))
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {"intent": str(obj["intent"]).lower(), "confidence": conf,
+            "reason": str(obj.get("reason") or "")[:200]}
+
+
+async def _ask_resume_clarify(conn: Connection, from_step: int, total: int) -> str | None:
+    """The carry-on / start-over card for a message after a stopped run. Returns "resume",
+    "new_study", or None when it went unanswered."""
+    q = {"question": f"The last analysis in this chat stopped at step {from_step} of {total}. "
+                     "What should this message do?",
+         "options": [f"Continue the stopped analysis from step {from_step}", "Start a new analysis"]}
+    conn.plan_value = None
+    conn.plan_event.clear()
+    conn.pending_plan = {"kind": "clarify", "payload": [q]}
+    conn.push({"type": "plan_clarify", "questions": [q]})
+    got = await asyncio.to_thread(conn.plan_event.wait, 600)
+    conn.pending_plan = None
+    conn.push({"type": "plan_done"})
+    if not got:
+        return None
+    # The answer comes back as "<question>: <chosen option>", and the question itself says "stopped".
+    fb = str((conn.plan_value or {}).get("feedback", "")).lower()
+    conn.plan_value = None
+    answer = fb.rsplit("?:", 1)[-1]
+    if "continue the stopped analysis" in answer:
+        return "resume"
+    if "start a new analysis" in answer:
+        return "new_study"
+    return None
+
+
+async def _carries_on_stopped_run(conn: Connection, req: LabRequest, state: dict, from_step: int,
+                                  total: int) -> bool:
+    """Does this message carry on with the stopped run? A short message that says so in words
+    does at once; otherwise the session's model decides, and a doubt is put to the user."""
+    q = (req.question or "").strip()
+    if _RESUME_WORDS.search(q) and len(q) <= _RESUME_WORDS_MAX_CHARS:
+        return True
+    verdict = None
+    if _model_ready(conn):
+        try:
+            complete_fn, *_ = _lab_llm(conn)
+            verdict = await asyncio.to_thread(_classify_stopped_followup, complete_fn, state, q)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[followup] stopped-run classify unavailable: {exc}")
+    if verdict and verdict["confidence"] >= FOLLOWUP_CONFIDENCE:
+        return verdict["intent"] == "resume"
+    return await _ask_resume_clarify(conn, from_step, total) == "resume"
+
+
+def _resume_hint(art: "Path | None") -> str:
+    """What a failed run's error adds when its question and plan are saved: how to carry on.
+    "" when there is nothing to carry on with (no plan yet, or every step done)."""
+    if art is None:
+        return ""
+    try:
+        state = json.loads((Path(art) / "process" / "run_state.json").read_text(encoding="utf-8"))
+        from ..agents.research_lab import ResumeState
+        resume = ResumeState.from_interrupted(state, guidance=state.get("guidance"))
+    except Exception:  # noqa: BLE001 - a hint must never hide the error it follows
+        return ""
+    total = len(state.get("agenda") or [])
+    return ("\n\nThe question and the approved plan are saved. Send “continue” to carry on from "
+            f"step {resume.from_step_index + 1} of {total}, after switching this session's model if "
+            "you like: nothing is planned again.")
+
+
+async def _resume_stopped_run(conn: Connection, req: LabRequest, run_id: str, art: Path,
+                              state: dict) -> None:
+    """Pick the stopped run up in place: its question and approved plan, every finished step kept
+    (``/api/lab/continue``'s ``resume_interrupted``). When the finished steps' checkpoints are gone,
+    the saved plan runs again from its first step, still without a new plan or meeting."""
+    total = len(state.get("agenda") or [])
+    try:
+        resume, resume_decisions, cont_req, idx = await asyncio.to_thread(
+            _prepare_continue, req.connection_id, conn, run_id, art, state, 0,
+            interrupted=True, hpc_checkpoints=True)
+        kept = total - len(resume.redo_indices or ())
+    except ValueError:
+        resume, resume_decisions, cont_req, idx = await asyncio.to_thread(
+            _prepare_continue, req.connection_id, conn, run_id, art, state, 0)
+        kept = 0
+    cont_req = cont_req.model_copy(update={"conversation_id": req.conversation_id})
+    kept_note = (f", keeping the {kept} finished step{'' if kept == 1 else 's'}" if kept else "")
+    conn.push({"type": "lab_progress", "level": "info",
+               "text": f"↻ Carrying on with the analysis that stopped: the same question and approved "
+                       f"plan, from step {idx + 1} of {total}{kept_note}, on the model this session "
+                       "uses now. No new plan or design meeting."})
+    await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id, resume_decisions=resume_decisions)
 
 
 # Does this message ask for an ANALYSIS, or is it a conversational turn?
@@ -8755,8 +8963,16 @@ def _model_ready(conn: Connection) -> bool:
     runs on an endpoint (its API key, the lab's shared model), which is always there. A GPU session
     whose job is not up yet is not asked: a classifier is not worth a cold start. (The screens below
     asked only when ``conn.alloc`` was set, so on an endpoint they never asked the model: every
-    follow-up got the "what would you like me to do" card.)"""
-    return conn.alloc is not None or _session_credential(conn) is not None
+    follow-up got the "what would you like me to do" card.) The lab's shared model is not ready while
+    it does not answer: a call would wait up to ten minutes for it to come back."""
+    if conn.alloc is not None:
+        return True
+    cred = _session_credential(conn)
+    if cred is None:
+        return False
+    if (getattr(conn, "llm_choice", None) or {}).get("credential_id") == shared_llm.ENDPOINT_ID:
+        return shared_llm.endpoint_binding() is not None
+    return True
 
 
 # --- which line a request goes to (RCHENLAB/AiScientist issue 21) ---------------------------------
@@ -8850,6 +9066,16 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     if _corpus_path(req):
         await _run_corpus_scan(conn, req)
         return
+    # The chat's last analysis stopped part-way (an error, Stop, a restart): a message that carries on
+    # picks it up where it stopped, with its question and approved plan; any other message goes on
+    # below as it would have.
+    stopped = _stopped_run_target(conn, req)
+    if stopped is not None:
+        s_run_id, s_art, s_state, s_resume = stopped
+        if await _carries_on_stopped_run(conn, req, s_state, s_resume.from_step_index + 1,
+                                         len(s_state.get("agenda") or [])):
+            await _resume_stopped_run(conn, req, s_run_id, s_art, s_state)
+            return
     target = _followup_target(conn, req)
     # Nothing to attach a follow-up to, so this message would mint a FRESH run. Refuse to do that for
     # a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
@@ -11924,16 +12150,26 @@ _SHARED_DOWN_POLL_S = 5.0
 def _await_shared_binding(notice: _SharedWaitNotice) -> "shared_llm.Binding":
     """The shared server's address now, waiting up to ``AISCIENTIST_SHARED_LLM_DOWN_WAIT_SECONDS``
     while it does not answer (its job is renewed, preempted or still loading) instead of failing the
-    step at once. Runs in a worker thread, never on the event loop."""
+    step at once. Runs in a worker thread, never on the event loop.
+
+    The wait is once per run. Run fc393bf52a3b (2026-11-07) waited the full ten minutes three times,
+    a planning call and a classifier that fall back on failure and then the step that could not:
+    thirty minutes for one error, while the server's next job sat in the HPC3 queue for days. A run
+    whose call already waited the full time, while the server has not answered since, is told so at
+    once; its plan is saved, so "continue" picks it up later."""
     from . import shared_llm_gate
     bound = shared_llm.endpoint_binding()
-    deadline = time.monotonic() + shared_llm_gate.down_wait_s()
+    run = getattr(notice, "run", None)
+    waited_out = run is not None and getattr(run, "shared_llm_waited_out", False)
+    deadline = time.monotonic() + (0.0 if waited_out else shared_llm_gate.down_wait_s())
     while bound is None and time.monotonic() < deadline:
         if notice.cancelled():
             raise GatewayError("Stopped while waiting for the shared model.", stage="shared_llm_stopped")
         notice("down")
         time.sleep(max(0.0, min(_SHARED_DOWN_POLL_S, deadline - time.monotonic())))
         bound = shared_llm.endpoint_binding()
+    if run is not None:
+        run.shared_llm_waited_out = bound is None
     if bound is None:
         raise GatewayError(
             "The lab's shared model is not answering right now (its GPU job is starting or being "
@@ -12528,6 +12764,7 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         # Never rendered before, so a 7-minute wait and a 1-minute wait on the same question
         # looked like random slowness. Say which and why.
         why = {"dataset_design": "the dataset has an experimental contrast (comparative study)",
+               "descriptive": "your request describes the data and compares none of its groups",
                "question": "the PI's read of the question",
                "scope": "your request names the only analyses it wants",
                "continuation": "this message adds to the analysis already done in this chat"}.get(
@@ -15098,6 +15335,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             _write_run_state(art, snapshot, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, protocols=lab_obj.protocols,
                              self_sourced=lab_obj.self_sourced, extra=session_meta, strict=True)
+            _remember_planned_run(conn, run)
 
         def plan_review(kind: str, payload: Any) -> dict[str, Any]:
             from ..agents.plan_doc import PlanDoc, PlanStep
@@ -15167,6 +15405,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             ``lab_obj.guidance`` is read live because the PI resolves it during run()."""
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
+            _remember_planned_run(conn, run)
 
         saved_args: dict[str, Any] = {}
         if saved_state is not None:
@@ -15532,13 +15771,15 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         print(f"[lab] run failed ({exc.stage or 'lab'}): {exc.message}")
         traceback.print_exc()
         conn.emit("error", exc.stage or "lab", public_error(exc), detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": public_error(exc)})
+        conn.push({"type": "chat_error",
+                   "message": public_error(exc) + _resume_hint(locals().get("art"))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc.message))
     except Exception as exc:  # noqa: BLE001 - any lab failure is reported, never fatal
         print(f"[lab] run failed (unhandled): {type(exc).__name__}: {exc}")
         traceback.print_exc()
         conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
-        conn.push({"type": "chat_error", "message": public_error(exc)})
+        conn.push({"type": "chat_error",
+                   "message": public_error(exc) + _resume_hint(locals().get("art"))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():

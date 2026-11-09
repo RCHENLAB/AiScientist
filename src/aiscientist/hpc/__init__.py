@@ -1,3 +1,1 @@
-from .slurm import SlurmAdapter, SlurmJobSpec, SlurmQueueFallbackPlan, SlurmQueuePolicy
-
-__all__ = ["SlurmAdapter", "SlurmJobSpec", "SlurmQueueFallbackPlan", "SlurmQueuePolicy"]
+"""HPC3: the agent's shell session and tools, lab environments, module lookup and archive unpacking."""

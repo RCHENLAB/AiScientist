@@ -318,6 +318,87 @@ def test_mode_routing_is_decided_by_the_dataset_first():
                                                     "majorclass": {"n": 11}}}) == "single"
 
 
+# The retina atlas (HRCA snRNA) as its profile reads: a 3-level region column next to the labels.
+_ATLAS_PROFILE = {"cells": 3177310, "genes": 36601,
+                  "obs_categoricals": {"tissue": {"n": 3, "values": ["fovea", "macula", "periphery"]},
+                                       "majorclass": {"n": 10, "values": ["AC", "Astrocyte", "BC"]}},
+                  "obs_keys": ["tissue", "majorclass", "sampleid"]}
+
+
+def _mode_lab(profile, answer):
+    """A lab whose session model answers every call with ``answer`` (a str, or an exception to
+    raise); returns the lab and the list of calls it received."""
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
+    from aiscientist.agents.research_lab import LabConfig, ResearchLab
+
+    calls: list = []
+
+    def complete(messages):
+        calls.append(messages)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+    ctx = HarnessContext(decisions={"dataset_result": profile}, tunnel_port=1, model="m")
+    lab = ResearchLab(ctx, LabConfig(auto_select_skill=False), complete_fn=complete,
+                      scientist=ResearchHarness(catalog=[], chat_fn=lambda m, t: {"content": "", "tool_calls": []}))
+    return lab, calls
+
+
+def test_a_descriptive_question_on_a_dataset_with_a_contrast_holds_no_design_meeting():
+    """Run fc393bf52a3b (2026-11-06): "Where are LRAT, CRALBP, rho and ABCR expressed in this
+    retina atlas?" on HRCA, whose ``tissue`` column has 3 levels. The dataset rule made it a
+    comparative study: two meeting rounds, 25 minutes before the plan, and the experts said in
+    round one that nothing was being compared. The request is asked about first."""
+    lab, calls = _mode_lab(_ATLAS_PROFILE, '{"asks": "describe", "confidence": 0.9}')
+    events: list = []
+    q = ("Where are LRAT, CRALBP, rho and ABCR expressed in this retina atlas? "
+         "Show them across the major retinal cell classes.")
+    assert lab._route_mode(q, events.append) == "single"
+    assert events == [{"type": "mode_selected", "mode": "single", "reason": "descriptive"}]
+    assert len(calls) == 1
+    # the model is told which groups the dataset has, so "in the fovea vs periphery" can be read
+    assert "tissue (fovea, macula, periphery)" in calls[0][-1]["content"]
+
+
+def test_a_comparison_keeps_the_design_meeting():
+    """The rule exists because comparative questions on a two-arm dataset went team or single on
+    the same words, and the team plans were the sound ones. A comparison named in words keeps
+    team without asking; so does one the model reads as a comparison."""
+    lab, calls = _mode_lab(_ATLAS_PROFILE, '{"asks": "describe", "confidence": 0.99}')
+    events: list = []
+    for q in ("Compare RHO expression between fovea and periphery",
+              "Which genes are differentially expressed in rods, fovea vs periphery?",
+              "What changes in Müller glia across regions?",
+              "比较中央凹和周边视网膜的视杆细胞"):
+        assert lab._route_mode(q, events.append) == "team", q
+    assert calls == []                       # named in words: the model is not asked
+    lab, calls = _mode_lab(_ATLAS_PROFILE, '{"asks": "compare", "confidence": 0.8}')
+    events = []
+    assert lab._route_mode("What does the macula do to rod gene programs?", events.append) == "team"
+    assert events[-1] == {"type": "mode_selected", "mode": "team", "reason": "dataset_design"}
+
+
+def test_a_doubtful_or_failed_comparison_check_keeps_the_design_meeting():
+    """Only a confident "describe" drops the meeting: a low confidence, an answer that cannot be
+    read and a model that fails all keep the behaviour from before the check."""
+    q = "Where is ABCA4 expressed?"
+    for answer in ('{"asks": "describe", "confidence": 0.4}', "describe it", "",
+                   RuntimeError("the shared model is not answering")):
+        lab, _ = _mode_lab(_ATLAS_PROFILE, answer)
+        assert lab._route_mode(q, lambda e: None) == "team", answer
+    # a fenced or chatty answer still reads
+    lab, _ = _mode_lab(_ATLAS_PROFILE, 'Sure.\n```json\n{"asks": "describe", "confidence": 0.8}\n```')
+    assert lab._route_mode(q, lambda e: None) == "single"
+
+
+def test_a_dataset_without_a_contrast_is_not_asked_about():
+    """A labelled single-arm atlas is single by rule, as before: no extra model call."""
+    labels_only = {"obs_categoricals": {"majorclass": {"n": 10, "values": ["Rod"]}}}
+    lab, calls = _mode_lab(labels_only, '{"asks": "compare", "confidence": 1.0}')
+    assert lab._route_mode("Where is RHO expressed?", lambda e: None) == "single"
+    assert calls == []
+
+
 def test_remote_dfs3b_paths_are_not_reported_as_missing_evidence(tmp_path):
     """The HPC3 shell tools return the dfs3b paths they looked at; checked on the gateway host
     those never exist, so a production ORA step was told ALL its evidence was missing while its
