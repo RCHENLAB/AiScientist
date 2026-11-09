@@ -20,7 +20,10 @@ pytest.importorskip("bcrypt")
 pytest.importorskip("itsdangerous")
 pytest.importorskip("fastapi")
 
-from test_shared_datasets import _publish, env  # noqa: E402,F401  (the store fixture)
+import test_shared_datasets as _store_tests  # noqa: E402
+
+_publish = _store_tests._publish
+env = _store_tests.env  # the store fixture, used by name below
 
 HPC_ROOT = "/dfs3b/lab/shared"
 
@@ -58,19 +61,37 @@ def test_latest_is_resolved_once_and_the_hpc3_path_appears_only_when_verified(gw
     assert [f["name"] for f in one["files"]] == ["Lens_scRNA_allcells.h5ad"] and one["files"][0]["sha256"]
 
 
+def _pin_chat(env, user_id, version):
+    """A chat of this account pinned to ``version`` of heca, attached the way the console does it."""
+    models = env["models"]
+    with env["db"].session_scope() as s:
+        conv = models.Conversation(user_id=user_id, title="pinned")
+        s.add(conv)
+        s.flush()
+        env["sd"].replace_attachments(s, conv.id, [{"shared": "heca", "version": version}])
+        s.commit()
+
+
 def test_a_withdrawn_version_is_not_reached_by_latest_but_a_pinned_chat_still_runs(gw, env, tmp_path):
     from fastapi import HTTPException
     _publish(env)
     (env["source"] / "Lens_scRNA_allcells.h5ad").write_bytes(b"lens v2 " * 1000)
     _publish(env, label="v2026.12", changelog="Lens.")
-    env["sd"].withdraw("heca", "v2026.12", by="jin")
     conn = _conn(tmp_path)
+    _pin_chat(env, conn.app_user_id, "v2026.12")
+    env["sd"].withdraw("heca", "v2026.12", by="jin")
     assert gw._resolve_shared_refs(_req(gw, [{"shared": "heca"}]), conn)[0]["version"] == "v2026.11"
     env["sd"].withdraw("heca", "v2026.11", by="jin")
     with pytest.raises(HTTPException):
         gw._resolve_shared_refs(_req(gw, [{"shared": "heca"}]), conn)
     pinned = gw._resolve_shared_refs(_req(gw, [{"shared": "heca", "version": "v2026.12"}]), conn)[0]
     assert pinned["version"] == "v2026.12" and pinned["status"] == "withdrawn"
+    # No chat of this account is pinned to v2026.11, and no chat of another account to v2026.12:
+    # the request body alone does not reach a withdrawn version.
+    other = SimpleNamespace(**{**vars(conn), "app_user_id": conn.app_user_id + 1})
+    for who, version in ((conn, "v2026.11"), (other, "v2026.12")):
+        with pytest.raises(HTTPException, match="withdrawn"):
+            gw._resolve_shared_refs(_req(gw, [{"shared": "heca", "version": version}]), who)
     for bad in ({"shared": "nope"}, {"shared": "heca", "version": "v2026.12", "files": ["x.h5ad"]}):
         with pytest.raises(HTTPException):
             gw._resolve_shared_refs(_req(gw, [bad]), conn)
@@ -151,13 +172,17 @@ def test_a_run_that_computes_here_reads_the_store_in_place_with_no_copy(gw, env,
 
 
 def test_remote_paths_are_admitted_by_allowlisted_prefix_only(gw, tmp_path):
+    from aiscientist.gateway import session_state
     conn = _conn(tmp_path)
+    session_state.save_record(conn.workspace, {"id": "rec0", "connection_id": "sess0"})
     ok = [f"/dfs3b/lab/{gw._hpc_user(conn)}/uploads/a.h5ad", f"{HPC_ROOT}/datasets/heca/v1/x.h5ad",
-          f"{HPC_ROOT}/sessions/s1/inputs/x.h5ad"]
+          f"{HPC_ROOT}/sessions/sess1/inputs/x.h5ad", f"{HPC_ROOT}/sessions/sess0/runs/r1/result/x.csv"]
     for path in ok:
         assert gw._remote_path_admitted(conn, path), path
+    # Another account's session folder is not this account's, though it sits in the same sessions/.
     for path in ("/dfs3b/lab/someone_else/uploads/a.h5ad", "/dfs3b/lab/x.h5ad",
-                 f"{HPC_ROOT}/datasets/../../other/x.h5ad", ""):
+                 f"{HPC_ROOT}/sessions/someone_elses/inputs/x.h5ad", f"{HPC_ROOT}/sessions/sess1x/x.h5ad",
+                 f"{HPC_ROOT}/sessions", f"{HPC_ROOT}/datasets/../../other/x.h5ad", ""):
         assert not gw._remote_path_admitted(conn, path), path
 
 

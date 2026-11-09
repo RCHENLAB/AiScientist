@@ -3184,7 +3184,8 @@ def _prior_shared_versions(conn: Connection, prior: "dict | None") -> dict[str, 
 def _resolve_shared_refs(req: "LabRequest", conn: Connection) -> list[dict]:
     """Resolve the chat's shared-dataset references ONCE, at run start (issue 100). ``latest`` becomes
     the label it means now and keeps meaning that for this run. A pinned version that was withdrawn
-    still resolves (the chat keeps running); a withdrawn one is never reached through ``latest``.
+    still resolves for an account with a chat pinned to it (that chat keeps running), and for no one
+    else; a withdrawn one is never reached through ``latest``.
     Each attachment lists its entries (``path`` in the store, the HPC3 copy's path once verified), and
     the files with their checksums, for ``process/inputs.json``. Raises HTTPException(400) for a bad
     reference. Server paths stay inside the gateway: nothing here goes back to the browser."""
@@ -3202,8 +3203,13 @@ def _resolve_shared_refs(req: "LabRequest", conn: Connection) -> list[dict]:
         version = str(ref.get("version") or sd.LATEST).strip() or sd.LATEST
         if sd.store_root() is None:
             raise HTTPException(400, "Shared datasets are not enabled on this server.")
+        # With accounts on, a withdrawn version runs only for a chat of this account pinned to it: the
+        # attach route refuses to pin one, and a request body must not get round that.
+        pinned_ok = version != sd.LATEST and (
+            not _AUTH_ENABLED or (bool(conn.app_user_id)
+                                  and sd.pinned_by_user(int(conn.app_user_id), slug, version)))
         try:
-            found = sd.resolve(slug, version, allow_withdrawn=version != sd.LATEST,
+            found = sd.resolve(slug, version, allow_withdrawn=pinned_ok,
                                hpc_shared_root=conn.settings.shared_root or None)
         except sd.SharedDatasetError as exc:
             raise HTTPException(400, str(exc)) from None
@@ -5094,12 +5100,21 @@ def _display_name(entry: dict) -> str:
     return name or str(entry.get("path") or "").rstrip("/").rsplit("/", 1)[-1] or "dataset"
 
 
+def _own_session_ids(conn: Connection) -> "set[str]":
+    """This session and the account's earlier sessions the gateway keeps a record of (the newest
+    ``session_state.KEEP_SESSIONS``): the HPC3 session folders a run of this account may read."""
+    ids = {str(conn.id or "")}
+    ids.update(str(r.get("connection_id") or "") for r in session_state.load_records(conn.workspace))
+    return {i for i in ids if hpc_layout.is_id(i)}
+
+
 def _remote_path_admitted(conn: Connection, path: str) -> bool:
     """A dfs3b path a run may bind (issue 100). Not anything under the lab's folder, which holds every
     member's data, but the allowlisted prefixes only: this account's own uploads and personal folder
-    (``_remote_dataset_allowed``), the session's and the retired layout's Temp folders, a session
-    folder an earlier run of this account left, and the verified HPC3 copies of the shared datasets.
-    A prefix test, so ``..`` is refused outright."""
+    (``_remote_dataset_allowed``), the retired layout's Temp folder, this session's folder and those of
+    the account's earlier sessions (``_own_session_ids``; another account's session folder is not
+    admitted), and the verified HPC3 copies of the shared datasets. A prefix test, so ``..`` is
+    refused outright."""
     if not path or ".." in str(path).split("/"):
         return False
     if _remote_dataset_allowed(conn, path):
@@ -5107,7 +5122,8 @@ def _remote_path_admitted(conn: Connection, path: str) -> bool:
     root = conn.settings.shared_root.rstrip("/")
     prefixes: list[str] = []
     if root:
-        prefixes += [hpc_layout.datasets_dir(root), hpc_layout.sessions_dir(root)]
+        prefixes.append(hpc_layout.datasets_dir(root))
+        prefixes += [hpc_layout.session_dir(root, sid) for sid in sorted(_own_session_ids(conn))]
         try:
             prefixes.append(_shared_dir(conn, "Temp"))
         except ValueError:

@@ -691,6 +691,22 @@ def verify(slug: str, version: str = LATEST, *, store: "Path | str | None" = Non
 ATTACH_ROLES = ("primary", "reference", "sample", "extra_input")
 
 
+def pinned_by_user(user_id: int, slug: str, label: str) -> bool:
+    """Whether a chat of this account is pinned to this version of the dataset. A withdrawn version
+    still runs for such a chat (``resolve(allow_withdrawn=True)``), and for no one else."""
+    from .db import session_scope
+    from .models import Conversation, ConversationSharedDataset, SharedDataset, SharedDatasetVersion
+    with session_scope() as s:
+        row = (s.query(ConversationSharedDataset.conversation_id)
+               .join(Conversation, Conversation.id == ConversationSharedDataset.conversation_id)
+               .join(SharedDatasetVersion, SharedDatasetVersion.id == ConversationSharedDataset.version_id)
+               .join(SharedDataset, SharedDataset.id == SharedDatasetVersion.dataset_id)
+               .filter(Conversation.user_id == user_id, SharedDataset.slug == slug,
+                       SharedDatasetVersion.label == label)
+               .first())
+    return row is not None
+
+
 def attachment_views(session, conversation_id: int) -> list[dict]:
     """A chat's attached shared datasets for the browser: a reference (slug, requested version, files),
     never a path. ``version`` is the label a ``latest`` attachment means right now; a pinned version

@@ -84,7 +84,7 @@ const $ = id => ({});
   console.log("ok");
 })().catch(e => { console.error(e); process.exit(1); });
 '''
-    out = subprocess.run([_node(), "-e", harness + block + checks], capture_output=True, text=True, timeout=30)
+    out = subprocess.run([node, "-e", harness + block + checks], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "ok"
 

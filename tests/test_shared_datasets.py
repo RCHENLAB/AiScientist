@@ -328,7 +328,10 @@ def test_attach_whole_or_one_file_latest_or_pinned_and_reload_keeps_it(env):
     _publish(env)
     client = _client(env)
     cid = _chat(env, client)
-    put = lambda items: client.put(f"/api/conversations/{cid}/shared-datasets", json={"shared_datasets": items})
+
+    def put(items):
+        return client.put(f"/api/conversations/{cid}/shared-datasets", json={"shared_datasets": items})
+
     got = put([{"shared": "heca"}])
     assert got.status_code == 200
     first = got.json()["shared_datasets"][0]
@@ -361,7 +364,7 @@ def test_a_whole_version_counts_once_toward_the_limit(env):
     _publish(env)
     client = _client(env)
     cid = _chat(env, client)
-    sd, models = env["sd"], env["models"]
+    models = env["models"]
     from aiscientist.gateway.dataset_limits import MAX_BOUND_DATASETS
     with env["db"].session_scope() as s:
         uid = s.query(models.User).filter_by(username="bob").one().id

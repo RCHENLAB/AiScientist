@@ -109,7 +109,8 @@ attached; a chat already pinned to it keeps it.
 
 A chat's shared attachments go to `POST /api/lab` as references (`shared_datasets`), never as paths.
 At run start the gateway resolves each once (`shared_datasets.resolve`) and keeps what `latest` meant
-for the whole run. A pinned version that was withdrawn still resolves; `latest` never reaches one.
+for the whole run. A withdrawn version still resolves for an account with a chat pinned to it, and
+for no other request; `latest` never reaches one.
 
 * On the gateway host, tools read the store in place.
 * On HPC3, a version whose copy is verified is bound read-only where it is (`hpc_primary`,
@@ -117,8 +118,8 @@ for the whole run. A pinned version that was withdrawn still resolves; `latest` 
   account's storage is unchanged. A version with no verified copy falls back to the per-session copy
   and the run says so.
 * `_admit_bound_paths` admits the store and the HPC3 copies as allowlisted prefixes. A dfs3b path
-  outside this account's own uploads and personal folder, the session folders and
-  `<shared root>/datasets/` is refused (it used to be admitted when it was anywhere under the lab folder).
+  outside this account's own uploads and personal folder, this account's session folders and
+  `<shared root>/datasets/` is refused.
 * The planner is told the version and each file's tissue, modality, cells, genes and obs columns. Loading
   all of HRCA snRNA (3.18M nuclei) peaks at about 218 GiB of memory, and the plan is told so.
 * A shared file attached as the primary dataset is accepted by the atlas bridge with no
