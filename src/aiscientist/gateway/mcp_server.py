@@ -69,7 +69,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "list_datasets",
         "title": "List datasets and results",
         "description": "List this account's datasets and analysis results, newest first: UUID, name, "
-                       "kind, formats, organism/tissue/assay where known, size and review status.",
+                       "kind, formats, organism/tissue/assay where known, size and review status. "
+                       "The lab's shared datasets (every published version, read-only) come first, "
+                       "marked \"shared\": true.",
         "inputSchema": {"type": "object", "properties": {
             "kind": _KIND_PROP,
             "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
@@ -188,20 +190,52 @@ def _tool_list(user, args: dict) -> dict:
         offset = 0
     items, total = store.list_summaries(user.id, kind=_kind(args), limit=_limit(args, "limit", 50, 200),
                                         offset=offset)
-    return {"items": items, "total": total, "offset": offset}
+    shared = _shared_items(args)
+    # The lab's shared datasets lead the first page, marked "shared": true; paging walks the account's own.
+    return {"items": (shared if offset == 0 else []) + items, "total": total + len(shared), "offset": offset}
+
+
+def _shared_items(args: dict, **filters: str) -> list[dict]:
+    """The shared dataset versions this call also returns (every token; read-only), or none for a
+    results-only call or a deployment with no shared datasets."""
+    if _kind(args) == "result":
+        return []
+    try:
+        from . import shared_datasets as sd
+        if sd.store_root() is None:
+            return []
+        return sd.mcp_search(**filters)
+    except Exception:  # noqa: BLE001 - shared datasets never break the account's own listing
+        return []
 
 
 def _tool_search(user, args: dict) -> dict:
     filters = {k: str(args.get(k) or "").strip() for k in ("query", "organism", "assay", "tissue", "accession")}
-    items = store.search(user.id, kind=_kind(args), limit=_limit(args, "limit", 20, 200), **filters)
+    limit = _limit(args, "limit", 20, 200)
+    items = store.search(user.id, kind=_kind(args), limit=limit, **filters)
+    # A shared dataset matches free text and tissue; organism, assay and accession are not recorded for it.
+    shared = [] if any(filters[k] for k in ("organism", "assay", "accession")) else _shared_items(
+        args, query=filters["query"], tissue=filters["tissue"])
+    items = (shared + items)[:limit]
     return {"items": items, "count": len(items)}
 
 
 def _tool_metadata(user, args: dict) -> dict:
-    view = store.metadata_view(user.id, _require_id(args))
+    ref = _require_id(args)
+    view = store.metadata_view(user.id, ref)
+    if view is None:
+        view = _shared_view(ref)
     if view is None:
         raise ToolError("No dataset or result with that id in this account.")
     return view
+
+
+def _shared_view(ref: str) -> "dict | None":
+    try:
+        from . import shared_datasets as sd
+        return sd.mcp_view(ref) if sd.store_root() is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _tool_provenance(user, args: dict) -> dict:
@@ -326,6 +360,9 @@ def _resources_read(user, params: dict) -> dict:
         raise _RpcError(_INVALID_PARAMS, f"Unknown resource: {uri}")
     kind, uuid = parsed
     doc = store.document_for(user.id, uuid, kind=kind)
+    if doc is None and kind == "dataset":
+        shared = _shared_view(uuid)
+        doc = shared["croissant"] if shared else None
     if doc is None:
         # -32002 is the code the MCP spec names for a resource that is not found.
         raise _RpcError(-32002, "Resource not found", {"uri": uri})

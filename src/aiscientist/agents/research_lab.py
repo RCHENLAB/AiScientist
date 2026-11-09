@@ -6918,10 +6918,11 @@ class ResearchLab:
         """The run's OTHER attached files (feature ②) with the role the user gave each, or ``''``
         for a single-file run. The profile above describes only the primary; without this the
         planner never learned that a second upload — a reference atlas, say — existed at all."""
+        shared = self._shared_inputs_context()
         records = [r for r in ((self.ctx.decisions or {}).get("datasets") or [])
                    if isinstance(r, dict) and r.get("name")]
         if len(records) <= 1:
-            return ""
+            return shared
         layout = (self.ctx.decisions or {}).get("cellranger_layout")
         together = {str(d) for d in ((layout or {}).get("datasets") or [])} if isinstance(layout, dict) else set()
         lines = ["Attached files (the profile above describes the PRIMARY only; run_code reads the "
@@ -6946,6 +6947,39 @@ class ResearchLab:
                 "atlas): plan to use it as comparison evidence for the primary dataset (through "
                 "run_code, AISCIENTIST_REFERENCE), never as the study's own data — do not QC, "
                 "cluster or test it as if it were.")
+        return "\n".join(lines + ([shared] if shared else []))
+
+    def _shared_inputs_context(self) -> str:
+        """The shared datasets attached to the run (issue 100): the version each means for this run and,
+        for every file, its tissue, modality, cells, genes and obs columns, so the plan picks the right
+        file and sizes its memory. ``''`` when none is attached."""
+        rows = [r for r in ((self.ctx.decisions or {}).get("shared_inputs") or []) if isinstance(r, dict)]
+        if not rows:
+            return ""
+        lines = ["Shared datasets (the lab's, read in place, never copied into the account's storage):"]
+        big = False
+        for r in rows:
+            requested = str(r.get("requested") or "latest")
+            lines.append(f"  - {r.get('title') or r.get('dataset')} {r.get('version')}"
+                         + (" (latest at the start of this run)" if requested == "latest" else " (pinned)"))
+            for f in (r.get("files") or [])[:40]:
+                fac = f.get("facets") if isinstance(f.get("facets"), dict) else {}
+                bits = [str(fac[k]) for k in ("tissue", "modality") if fac.get(k)]
+                if fac.get("n_obs") is not None:
+                    bits.append(f"{int(fac['n_obs']):,} cells")
+                if fac.get("n_vars") is not None:
+                    bits.append(f"{int(fac['n_vars']):,} genes")
+                cols = fac.get("obs_columns")
+                if isinstance(cols, list) and cols:
+                    bits.append("obs: " + ", ".join(str(c) for c in cols[:12]) + (" …" if len(cols) > 12 else ""))
+                lines.append(f"      {f.get('name')}" + (f" — {'; '.join(bits)}" if bits else ""))
+                nm = str(f.get("name") or "").lower()
+                big = big or ("hrca" in nm and "snrna" in nm)
+            if len(r.get("files") or []) > 40:
+                lines.append(f"      … and {len(r['files']) - 40} more files")
+        if big:
+            lines.append("Memory: loading all of HRCA snRNA (3.18M nuclei) into memory peaks at about "
+                         "218 GiB. Subset first or read it backed, and size the job's memory to match.")
         return "\n".join(lines)
 
     def _answer_plan_question(self, question: str, agenda: list[str], asked: str) -> str:

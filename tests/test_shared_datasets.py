@@ -102,7 +102,7 @@ def test_publish_copies_hashes_freezes_and_points_latest(env):
     assert result["n_files"] == 3 and result["latest"] == "v2026.11" and result["linked"] == 0
     assert sorted(p.name for p in folder.iterdir()) == [
         "CHANGELOG.md", "Iris_snRNA_allcells.h5ad", "Lens_scRNA_allcells.h5ad", "README.txt", "SHA256SUMS",
-        "manifest.json"]                                      # no .DS_Store, no facets.json
+        "croissant.json", "manifest.json"]                                      # no .DS_Store, no facets.json
     assert os.readlink(env["store"] / "heca" / "latest") == "v2026.11"
     assert stat.S_IMODE(folder.stat().st_mode) == 0o555
     assert stat.S_IMODE((folder / "README.txt").stat().st_mode) == 0o444
@@ -243,6 +243,7 @@ def _client(env):
     app = FastAPI()
     app.include_router(env["auth_routes"].router)
     app.include_router(env["shared_routes"].router)
+    app.include_router(env["shared_routes"].chat_router)
     return TestClient(app)
 
 
@@ -313,3 +314,123 @@ def test_the_admin_cli_publishes_and_lists(env, capsys):
     out = capsys.readouterr().out
     assert "retina: Retina atlas  latest=v1  maintainers=bob" in out and "on HPC3" in out
     assert "heca: Human Eye Cell Atlas (HECA)  latest=-" in out
+
+
+# --- attaching to a chat (issue 100) --------------------------------------------------------------
+
+
+def _chat(env, client, user="bob"):
+    assert client.post("/api/auth/login", json={"username": user, "password": f"{user}pass1"}).status_code == 200
+    return client.post("/api/conversations", json={"title": "Eye"}).json()["conversation"]["id"]
+
+
+def test_attach_whole_or_one_file_latest_or_pinned_and_reload_keeps_it(env):
+    _publish(env)
+    client = _client(env)
+    cid = _chat(env, client)
+    put = lambda items: client.put(f"/api/conversations/{cid}/shared-datasets", json={"shared_datasets": items})
+    got = put([{"shared": "heca"}])
+    assert got.status_code == 200
+    first = got.json()["shared_datasets"][0]
+    assert (first["requested"], first["version"], first["files"], first["role"]) == (
+        "latest", "v2026.11", None, "reference")
+    assert first["n_files"] == 3
+    pinned = put([{"shared": "heca", "version": "v2026.11", "files": ["Lens_scRNA_allcells.h5ad"],
+                   "role": "primary"}]).json()["shared_datasets"][0]
+    assert (pinned["requested"], pinned["files"], pinned["role"], pinned["n_files"]) == (
+        "v2026.11", ["Lens_scRNA_allcells.h5ad"], "primary", 1)
+    reloaded = client.get(f"/api/conversations/{cid}").json()
+    assert reloaded["shared_datasets"] == [pinned]
+    assert str(env["store"]) not in json.dumps(reloaded)
+
+
+def test_attach_is_refused_for_unknown_file_version_role_dataset_and_other_chats(env):
+    _publish(env)
+    client = _client(env)
+    cid = _chat(env, client)
+    url = f"/api/conversations/{cid}/shared-datasets"
+    for item in ({"shared": "heca", "files": ["nope.h5ad"]}, {"shared": "heca", "files": []},
+                 {"shared": "heca", "version": "v9"}, {"shared": "heca", "role": "boss"}, {"shared": "zzz"}):
+        assert client.put(url, json={"shared_datasets": [item]}).status_code == 400, item
+    other = _client(env)
+    assert other.post("/api/auth/login", json={"username": "jin", "password": "jinpass1"}).status_code == 200
+    assert other.put(url, json={"shared_datasets": [{"shared": "heca"}]}).status_code == 404
+
+
+def test_a_whole_version_counts_once_toward_the_limit(env):
+    _publish(env)
+    client = _client(env)
+    cid = _chat(env, client)
+    sd, models = env["sd"], env["models"]
+    from aiscientist.gateway.dataset_limits import MAX_BOUND_DATASETS
+    with env["db"].session_scope() as s:
+        uid = s.query(models.User).filter_by(username="bob").one().id
+        for i in range(MAX_BOUND_DATASETS):
+            d = models.Dataset(user_id=uid, name=f"d{i}", path=f"/x/d{i}", kind="file", size_bytes=1)
+            s.add(d)
+            s.flush()
+            s.add(models.ConversationDataset(conversation_id=cid, dataset_id=d.id, position=i))
+        s.commit()
+    full = client.put(f"/api/conversations/{cid}/shared-datasets", json={"shared_datasets": [{"shared": "heca"}]})
+    assert full.status_code == 400
+    with env["db"].session_scope() as s:
+        s.query(models.ConversationDataset).filter_by(conversation_id=cid, position=0).delete()
+        s.commit()
+    ok = client.put(f"/api/conversations/{cid}/shared-datasets", json={"shared_datasets": [{"shared": "heca"}]})
+    assert ok.status_code == 200 and ok.json()["shared_datasets"][0]["n_files"] == 3   # 3 files, one slot
+
+
+def test_withdrawn_version_cannot_be_newly_attached_but_a_pinned_chat_keeps_it(env):
+    _publish(env)
+    (env["source"] / "Lens_scRNA_allcells.h5ad").write_bytes(b"lens v2 " * 1000)
+    _publish(env, label="v2026.12", changelog="Lens updated.")
+    client = _client(env)
+    cid = _chat(env, client)
+    url = f"/api/conversations/{cid}/shared-datasets"
+    assert client.put(url, json={"shared_datasets": [{"shared": "heca", "version": "v2026.11"}]}).status_code == 200
+    env["sd"].withdraw("heca", "v2026.11", by="jin")
+    again = client.put(url, json={"shared_datasets": [{"shared": "heca", "version": "v2026.11",
+                                                       "role": "primary"}]})
+    assert again.status_code == 200                                   # already pinned: kept
+    kept = again.json()["shared_datasets"][0]
+    assert kept["withdrawn"] is True and kept["version"] == "v2026.11"
+    cid2 = _chat(env, client)
+    refused = client.put(f"/api/conversations/{cid2}/shared-datasets",
+                         json={"shared_datasets": [{"shared": "heca", "version": "v2026.11"}]})
+    assert refused.status_code == 400 and "withdrawn" in refused.json()["detail"]
+
+
+def test_following_latest_shows_the_newer_version_after_a_release(env):
+    _publish(env)
+    client = _client(env)
+    cid = _chat(env, client)
+    client.put(f"/api/conversations/{cid}/shared-datasets", json={"shared_datasets": [{"shared": "heca"}]})
+    (env["source"] / "Lens_scRNA_allcells.h5ad").write_bytes(b"lens v2 " * 1000)
+    _publish(env, label="v2026.12", changelog="Lens updated.")
+    view = client.get(f"/api/conversations/{cid}").json()["shared_datasets"][0]
+    assert (view["requested"], view["version"]) == ("latest", "v2026.12")
+
+
+def test_a_shared_file_is_previewed_and_downloaded_only_if_the_version_lists_it(env, monkeypatch):
+    pytest.importorskip("httpx")
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from aiscientist.gateway import app as gw_app
+    _publish(env)
+    monkeypatch.setattr(gw_app, "_AUTH_ENABLED", True)
+    user = {"u": object()}
+    monkeypatch.setattr(gw_app, "_optional_user", lambda request: user["u"])
+    client = TestClient(gw_app.app)
+    base = "/api/shared-datasets/heca/versions/v2026.11"
+    pv = client.get(f"{base}/preview", params={"file": "Iris_snRNA_allcells.h5ad"})
+    assert pv.status_code == 200
+    body = pv.json()
+    assert body["file"]["name"] == "Iris_snRNA_allcells.h5ad" and body["preview"]["type"] == "h5ad"
+    assert str(env["store"]) not in json.dumps(body) and "id" not in body["dataset"]
+    assert client.get(f"{base}/preview", params={"file": "../../etc/passwd"}).status_code == 404
+    assert client.get(f"{base}/preview", params={"file": "manifest.json"}).status_code == 404   # not a listed file
+    assert client.get("/api/shared-datasets/heca/versions/v9/preview", params={"file": "README.txt"}).status_code == 404
+    dl = client.get(f"{base}/download", params={"file": "README.txt"})
+    assert dl.status_code == 200 and dl.content == b"Human Eye Cell Atlas\n"
+    user["u"] = None
+    assert client.get(f"{base}/preview", params={"file": "README.txt"}).status_code == 401

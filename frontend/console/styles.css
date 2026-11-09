@@ -2328,3 +2328,18 @@ button.primary .msym, button.secondary .msym {
 
 /* A plan is waiting in this chat: the one message box is where it is changed. */
 .chat-input textarea.plan-waiting { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent); }
+
+/* Files → Shared (issue 100) */
+.shared-card { display: block; }
+.shared-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.shared-head .card-main { flex: 1 1 260px; }
+.shared-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.shared-grid { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+.shared-grid th, .shared-grid td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+.shared-grid th { color: var(--text-secondary); font-weight: 600; }
+.shared-cell { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.shared-files { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.shared-file { display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.shared-panel { margin-top: 12px; padding: 10px 12px; background: var(--surface-sunken); border-radius: 8px; overflow-wrap: anywhere; }
+.shared-panel pre { white-space: pre-wrap; margin: 0; font: inherit; }
+.dataset-mention-group { padding: 6px 10px 2px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }

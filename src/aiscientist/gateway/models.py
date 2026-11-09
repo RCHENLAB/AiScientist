@@ -216,6 +216,23 @@ class SharedDatasetMaintainer(Base):
     added_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ConversationSharedDataset(Base):
+    """A shared dataset attached to a chat. ``version_id`` NULL follows ``latest``; ``files`` is a JSON
+    list of file names, NULL for the whole version. A whole version is one attachment."""
+
+    __tablename__ = "conversation_shared_datasets"
+
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(
+        ForeignKey("shared_datasets.id", ondelete="CASCADE"), primary_key=True, index=True)
+    version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shared_dataset_versions.id", ondelete="CASCADE"), nullable=True)
+    files: Mapped[str | None] = mapped_column(Text, nullable=True)
+    role: Mapped[str] = mapped_column(String(32), default="reference", server_default="reference")
+    position: Mapped[int] = mapped_column(Integer)
+
+
 class Run(Base):
     __tablename__ = "runs"
 
@@ -278,6 +295,8 @@ class Conversation(Base):
     datasets: Mapped[list["ConversationDataset"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan",
         order_by="ConversationDataset.position")
+    shared_datasets: Mapped[list["ConversationSharedDataset"]] = relationship(
+        cascade="all, delete-orphan", order_by="ConversationSharedDataset.position")
 
     def public(self) -> dict:
         return {

@@ -131,7 +131,8 @@ def mentions():
     code = source[start:source.index("\n", start)] + "\n"
     code += "".join(_function(source, name) for name in (
         "datasetMentionQuery", "closeDatasetMentions", "renderDatasetMentions", "updateDatasetMentions",
-        "selectDatasetMention", "datasetMentionKeydown", "addDataset", "chatLabel", "renderDatasetChips"))
+        "selectDatasetMention", "datasetMentionKeydown", "addDataset", "chatLabel", "renderDatasetChips",
+        "sharedMentionItems", "sharedChipsHtml", "sharedChipLabel", "attachSharedDataset"))
     # Files → Use may share the multi-attachment helper with issue 72.
     if "function addDatasets(" in source:
         code += _function(source, "addDatasets") + _function(source, "canAttachDatasets")

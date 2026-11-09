@@ -572,6 +572,69 @@ def build_dataset(uuid: str, facts: dict, user_fields: "dict | None" = None, *, 
     return Built(doc, ledger.entries, ledger.confidence(), facets, search_text)
 
 
+SHARED_LICENSE_TEXT = ("Shared inside this AiScientist deployment: the lab maintains it for every account. "
+                       "Reuse outside the lab needs the maintainers' permission.")
+SHARED_ACCESS_TEXT = ("Readable by every account of this AiScientist deployment, in the web interface, "
+                      "the API and the MCP server. Read-only: nobody edits a published version.")
+
+
+def build_shared_version(*, dataset: dict, version: dict, files: list[dict], base_url: str = "") -> dict:
+    """The ``croissant.json`` of one published version of a shared dataset (issue 100). Every file is a
+    ``cr:FileObject`` carrying the manifest's SHA-256 (mlcroissant needs one; files over 2 GiB get none
+    in an account's own dataset); ``version`` is the label; each file's facets (tissue, modality, cells,
+    genes, obs columns) are under the ``aiscientist:`` namespace.
+
+    ``dataset``: slug, uuid, name, description, citation, maintainers. ``version``: label, uuid,
+    published_at, published_by, changelog, manifest_sha256, previous_version.
+    ``files``: name, size_bytes, sha256, facets."""
+    ledger = _Ledger()           # the ledger is for an account's own datasets; nothing here is drafted
+    ids = _Ids()
+    did = f"urn:uuid:{version['uuid']}"
+    slug, label = dataset["slug"], version["label"]
+    published = str(version.get("published_at") or iso_now())
+    name = f"{dataset.get('name') or slug} {label}"
+    maintainers = [m for m in dataset.get("maintainers") or [] if m]
+    by = version.get("published_by")
+    creators = [{"@type": "sc:Person", "name": m} for m in (maintainers or ([by] if by else []))]
+    distribution, _tables = _distribution(
+        [{"path": f["name"], "sha256": f["sha256"], "size": f["size_bytes"], "verified": "computed"}
+         for f in files], ids, ledger, size_source=SOURCE_COMPUTED, sha_source=SOURCE_COMPUTED)
+    for entry, f in zip(distribution, files):
+        if f.get("facets"):
+            entry["aiscientist:facets"] = f["facets"]
+    description = (str(dataset.get("description") or "").strip() or f"{dataset.get('name') or slug}, a dataset "
+                   "the lab maintains for every account") + f" Version {label}."
+    doc: dict[str, Any] = {
+        "@context": CONTEXT,
+        "@type": "sc:Dataset",
+        "@id": did,
+        "conformsTo": CROISSANT_1_1,
+        "name": name,
+        "description": description,
+        "url": f"{base_url}/api/shared-datasets/{slug}/versions/{label}/croissant.json" if base_url else did,
+        "identifier": [did, f"urn:aiscientist:shared:{slug}/{label}"],
+        "creator": creators[0] if len(creators) == 1 else (creators or {"@type": "sc:Person", "name": "unknown"}),
+        "datePublished": _date(published),
+        "dateCreated": _date(published),
+        "version": label,
+        "license": SHARED_LICENSE_TEXT,
+        "conditionsOfAccess": SHARED_ACCESS_TEXT,
+        "isAccessibleForFree": False,
+        "citeAs": str(dataset.get("citation") or "").strip()
+                  or f"{', '.join(maintainers) or 'AiScientist lab'} ({_date(published)[:4]}). {name}. AiScientist shared dataset {did}.",
+        "keywords": sorted({str(v) for f in files for k in ("tissue", "modality")
+                            for v in [(f.get("facets") or {}).get(k)] if v} | {"shared dataset"}),
+        "aiscientist:sharedDataset": {"slug": slug, "uuid": dataset.get("uuid")},
+        "aiscientist:manifestSha256": version.get("manifest_sha256") or "",
+        "distribution": distribution,
+    }
+    if version.get("changelog"):
+        doc["aiscientist:changelog"] = str(version["changelog"])
+    if version.get("previous_version"):
+        doc["aiscientist:previousVersion"] = str(version["previous_version"])
+    return doc
+
+
 def _keywords(uf: dict, about_terms: dict, fmts: list[formats.Format]) -> list[str]:
     words: list[str] = [str(k) for k in uf.get("keywords") or []]
     for terms in about_terms.values():

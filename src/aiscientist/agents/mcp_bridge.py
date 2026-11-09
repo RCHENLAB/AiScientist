@@ -294,8 +294,8 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
             LOG.error("MCP %s disabled: skill image differs from pinned server image", server.name)
             continue
         if server.adapter == "atlas-expression":
-            from .atlas_expression import AtlasAdapter, configured_atlases
-            if not configured_atlases():
+            from .atlas_expression import AtlasAdapter, atlases_available
+            if not atlases_available():
                 continue
             adapter = AtlasAdapter(planner_name=server.planner_name)
         else:

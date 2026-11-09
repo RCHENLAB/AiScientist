@@ -10,9 +10,11 @@ Code: `src/aiscientist/gateway/shared_datasets.py` (store, publishing, reading),
 `deploy/hpc3/sync_shared_dataset.sh` (the HPC3 copy). Tables: `shared_datasets`,
 `shared_dataset_versions`, `shared_dataset_files`, `shared_dataset_maintainers`.
 
-Accounts can list shared datasets and read their versions, files and changelogs through the API.
-Attaching one to a chat, runs reading it, the Files → Shared tab, per-version Croissant metadata and
-MCP access are not built yet.
+Accounts can list shared datasets and read their versions, files and changelogs through the API,
+see them in Files → Shared (version select, Metadata, Changelog, a tissue × modality grid with each
+file's size and Preview) and attach them to a chat, whole or one file, following `latest` or pinned
+to a version. Runs read them in place, every published version has a `croissant.json`, MCP tokens
+list them, and maintainers publish and withdraw versions from the Shared tab.
 
 ## Where the files are
 
@@ -91,3 +93,59 @@ Every logged-in account; no answer carries a server path.
 | `GET /api/shared-datasets` | `{"enabled", "datasets": [{slug, name, description, citation, maintainers, latest, can_publish, versions: [{label, status, published_at, size_bytes, n_files, manifest_sha256, on_hpc3}]}]}` |
 | `GET /api/shared-datasets/{slug}?version=latest` | one version (a label or `latest`) with its changelog, who published it and its files: `{name, size_bytes, sha256, facets}` |
 | `GET /api/shared-datasets/{slug}/versions/{label}/manifest.json` | the version's manifest |
+| `GET /api/shared-datasets/{slug}/versions/{label}/preview?file=<name>` | a bounded look at one listed file (an `.h5ad` shows obs/var, never the matrix); `download?file=<name>` serves it |
+| `PUT /api/conversations/{cid}/shared-datasets` | replace the chat's shared attachments, body `{"shared_datasets": [{"shared": "heca", "version": "latest" \| "<label>", "files": [..] \| null, "role": "reference"}]}`; saved apart from the account's own datasets (table `conversation_shared_datasets`, migration 0008) |
+| `GET /api/shared-datasets/{slug}/versions/{label}/croissant.json` | the version's Croissant 1.1 metadata (also written into the version folder at publish) |
+| `POST /api/shared-datasets/{slug}/publish` | maintainers and admins (403 otherwise): `{"source", "label", "changelog"}`; starts a background job, answers `202 {"job", "state", "lines"}` |
+| `GET /api/shared-datasets/{slug}/publish-jobs/{job}` | the job's `state` (`running`, `done`, `error`), progress `lines`, `result` or `error` |
+| `POST /api/shared-datasets/{slug}/versions/{label}/withdraw` | maintainers and admins: stop offering a version |
+
+`GET /api/conversations/{cid}` also returns `shared_datasets`: `{shared, name, requested, version, files,
+role, n_files, withdrawn}`, a reference and never a path. A whole version counts as one attachment toward the
+12-per-chat limit, together with the account's own datasets. A withdrawn version cannot be newly
+attached; a chat already pinned to it keeps it.
+
+## Runs
+
+A chat's shared attachments go to `POST /api/lab` as references (`shared_datasets`), never as paths.
+At run start the gateway resolves each once (`shared_datasets.resolve`) and keeps what `latest` meant
+for the whole run. A pinned version that was withdrawn still resolves; `latest` never reaches one.
+
+* On the gateway host, tools read the store in place.
+* On HPC3, a version whose copy is verified is bound read-only where it is (`hpc_primary`,
+  `hpc_dataset_root`, `AISCIENTIST_INPUTS`). Nothing is copied into `sessions/<id>/inputs/` and the
+  account's storage is unchanged. A version with no verified copy falls back to the per-session copy
+  and the run says so.
+* `_admit_bound_paths` admits the store and the HPC3 copies as allowlisted prefixes. A dfs3b path
+  outside this account's own uploads and personal folder, the session folders and
+  `<shared root>/datasets/` is refused (it used to be admitted when it was anywhere under the lab folder).
+* The planner is told the version and each file's tissue, modality, cells, genes and obs columns. Loading
+  all of HRCA snRNA (3.18M nuclei) peaks at about 218 GiB of memory, and the plan is told so.
+* A shared file attached as the primary dataset is accepted by the atlas bridge with no
+  `AISCIENTIST_ATLAS_FILES` entry.
+* A run never writes into a shared dataset's metadata: the PI's description is skipped for shared inputs.
+
+Each run writes `artifacts/process/inputs.json`:
+
+```json
+{"shared_inputs": [{"dataset": "heca", "requested": "latest", "version": "v2026.11",
+  "version_uuid": "…", "manifest_sha256": "…",
+  "files": [{"name": "HRCA_snRNA_allcells.h5ad", "size": 19450278232, "sha256": "…"}]}]}
+```
+
+When a chat follows `latest` and a newer version has appeared since its previous run, the reply says which
+version the run used. The result's `croissant.json` links the version's uuid as an input.
+
+## Metadata and MCP
+
+Publishing writes `croissant.json` into the version folder: each file is a `cr:FileObject` with the
+manifest's sha256 (mlcroissant needs one), `version` is the label, and each file's facets are under the
+`aiscientist:` namespace. `list_datasets`, `search_datasets` and `get_dataset_metadata` also return the
+published versions, marked `"shared": true`, for every token, read-only (`aiscientist://datasets/<version uuid>/croissant.json`).
+
+## Publishing from the console
+
+On Files → Shared, a maintainer or admin sees **Publish new version** (source folder inside an
+allowlisted server folder, label, changelog) and **Withdraw**. The form runs `shared_datasets.publish`
+as a background job and shows its progress; the server checks `can_publish`, so anyone else gets 403.
+A job is kept in the gateway's memory: after a restart, publish again with the same label until it is published.

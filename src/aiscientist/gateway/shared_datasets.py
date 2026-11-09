@@ -54,7 +54,8 @@ _LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
 # scRNA, snRNA, scATAC, snMultiome, scRNAseq ...: the modality token of names like Iris_snRNA_allcells.h5ad
 _MODALITY_RE = re.compile(r"(?i)^(sc|sn)(rna|atac|multiome|cite)(-?seq)?$")
 _CHUNK = 8 * 1024 * 1024
-_RESERVED = {MANIFEST, CHECKSUMS, CHANGELOG, FACETS_FILE}
+CROISSANT = "croissant.json"          # written at publish: the version's Croissant metadata
+_RESERVED = {MANIFEST, CHECKSUMS, CHANGELOG, FACETS_FILE, CROISSANT}
 
 
 class SharedDatasetError(ValueError):
@@ -419,6 +420,7 @@ def publish(slug: str, label: str, source: "str | Path", *, by: str, changelog: 
             s.add(row)
             s.commit()
         version_id, version_uuid, dataset_uuid, dataset_name = row.id, row.uuid, ds.uuid, ds.name
+        dataset_description, dataset_citation = ds.description, ds.citation
         user_id = user.id
         previous = next((v for v in _published(s, ds.id) if v.id != version_id), None)
         prev_label = previous.label if previous else None
@@ -478,10 +480,19 @@ def publish(slug: str, label: str, source: "str | Path", *, by: str, changelog: 
     }
     data = _manifest_bytes(manifest)
     (stage / MANIFEST).write_bytes(data)
+    manifest_sha = hashlib.sha256(data).hexdigest()
+    from ..metadata.croissant import build_shared_version
+    (stage / CROISSANT).write_text(json.dumps(build_shared_version(
+        dataset={"slug": slug, "uuid": dataset_uuid, "name": dataset_name, "description": dataset_description,
+                 "citation": dataset_citation, "maintainers": maintainers(slug)},
+        version={"label": label, "uuid": version_uuid, "published_at": _iso(published_at), "published_by": by,
+                 "changelog": changelog.strip(), "manifest_sha256": manifest_sha, "previous_version": prev_label},
+        files=[{"name": e["name"], "size_bytes": e["size_bytes"], "sha256": e["sha256"],
+                "facets": e.get("facets") or {}} for e in entries]), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
     (stage / CHECKSUMS).write_text("".join(f"{e['sha256']}  {e['name']}\n" for e in entries),
                                    encoding="utf-8")
     (stage / CHANGELOG).write_text(changelog.strip() + "\n", encoding="utf-8")
-    manifest_sha = hashlib.sha256(data).hexdigest()
     for dirpath, _dirnames, filenames in os.walk(stage):
         for f in filenames:
             os.chmod(Path(dirpath) / f, 0o444)
@@ -673,3 +684,170 @@ def verify(slug: str, version: str = LATEST, *, store: "Path | str | None" = Non
         else:
             say(f"  {f['name']}: ok")
     return bad
+
+
+# --- attaching to chats (issue 100) --------------------------------------------------------------
+
+ATTACH_ROLES = ("primary", "reference", "sample", "extra_input")
+
+
+def attachment_views(session, conversation_id: int) -> list[dict]:
+    """A chat's attached shared datasets for the browser: a reference (slug, requested version, files),
+    never a path. ``version`` is the label a ``latest`` attachment means right now; a pinned version
+    that was withdrawn is still shown, with ``withdrawn`` set, and still runs."""
+    from .models import (ConversationSharedDataset, SharedDataset, SharedDatasetFile,
+                         SharedDatasetVersion)
+    out = []
+    rows = (session.query(ConversationSharedDataset).filter_by(conversation_id=conversation_id)
+            .order_by(ConversationSharedDataset.position).all())
+    for row in rows:
+        ds = session.get(SharedDataset, row.dataset_id)
+        if ds is None:
+            continue
+        pinned = session.get(SharedDatasetVersion, row.version_id) if row.version_id else None
+        try:
+            v = pinned or _pick(session, ds, LATEST, allow_withdrawn=False)
+        except SharedDatasetError:
+            v = None
+        names = json.loads(row.files) if row.files else None
+        n_files = len(names) if names is not None else (
+            session.query(SharedDatasetFile).filter_by(version_id=v.id).count() if v else 0)
+        out.append({"shared": ds.slug, "name": ds.name, "requested": pinned.label if pinned else LATEST,
+                    "version": v.label if v else None, "files": names, "role": row.role,
+                    "n_files": n_files, "withdrawn": bool(v is not None and v.status == "withdrawn")})
+    return out
+
+
+def replace_attachments(session, conversation_id: int, entries: list[dict], *, other_attached: int = 0,
+                        limit: int = 12) -> list[dict]:
+    """Replace a chat's shared-dataset attachments. Each entry is ``{"shared": slug, "version":
+    "latest" | label, "files": [names] | None, "role": ...}``. One dataset appears once. A whole
+    version counts as one attachment toward ``limit``, together with ``other_attached`` own datasets.
+    A withdrawn version cannot be newly attached, but a chat already pinned to it keeps it."""
+    from .models import (ConversationSharedDataset, SharedDatasetFile, SharedDatasetVersion)
+    wanted: dict[str, dict] = {}
+    for e in entries:
+        wanted[str(e.get("shared") or "")] = e
+    if len(wanted) + other_attached > limit:
+        raise SharedDatasetError(f"At most {limit} datasets per run. Remove one first.")
+    existing = {r.dataset_id: r for r in session.query(ConversationSharedDataset)
+                .filter_by(conversation_id=conversation_id).all()}
+    rows = []
+    for position, (slug, e) in enumerate(wanted.items()):
+        ds = _dataset(session, slug)
+        role = e.get("role") or "reference"
+        if role not in ATTACH_ROLES:
+            raise SharedDatasetError("Unknown dataset role")
+        version = e.get("version") or LATEST
+        version_id = None
+        if version == LATEST:
+            v = _pick(session, ds, LATEST, allow_withdrawn=False)
+        else:
+            kept = existing.get(ds.id)
+            v = (session.query(SharedDatasetVersion)
+                 .filter_by(dataset_id=ds.id, label=check_label(version)).one_or_none())
+            already = kept is not None and v is not None and kept.version_id == v.id
+            if v is None or v.status == "publishing" or (v.status == "withdrawn" and not already):
+                v = _pick(session, ds, version, allow_withdrawn=False)   # raises with the reason
+            version_id = v.id
+        names = e.get("files")
+        if names is not None:
+            have = {f.name for f in session.query(SharedDatasetFile).filter_by(version_id=v.id).all()}
+            names = list(dict.fromkeys(str(n) for n in names))
+            missing = [n for n in names if n not in have]
+            if missing or not names:
+                raise SharedDatasetError(f"{slug} {v.label} has no file {missing[0]!r}." if missing
+                                         else "Choose at least one file, or the whole dataset.")
+        rows.append(ConversationSharedDataset(
+            conversation_id=conversation_id, dataset_id=ds.id, version_id=version_id,
+            files=json.dumps(names) if names is not None else None, role=role, position=position))
+    for r in existing.values():
+        session.delete(r)
+    session.flush()
+    session.add_all(rows)
+    session.flush()
+    return attachment_views(session, conversation_id)
+
+
+# --- Croissant and MCP (issue 100, section 4) ----------------------------------------------------
+
+
+def version_croissant(slug: str, version: str = LATEST, *, base_url: str = "") -> dict:
+    """The Croissant metadata of a published or withdrawn version (``latest`` allowed), built from the
+    store's records, so a version published before ``croissant.json`` was written has one too."""
+    from ..metadata.croissant import build_shared_version
+    view = version_view(slug, version)
+    v = view["version"]
+    previous = None
+    for other in dataset_views():
+        if other["slug"] == slug:
+            older = [x["label"] for x in other["versions"] if x["published_at"] and x["published_at"] < (v["published_at"] or "")]
+            previous = older[0] if older else None
+    return build_shared_version(
+        dataset={"slug": slug, "uuid": view["uuid"], "name": view["name"], "description": view["description"],
+                 "citation": view["citation"], "maintainers": maintainers(slug)},
+        version={"label": v["label"], "uuid": v["uuid"], "published_at": v["published_at"],
+                 "published_by": v["published_by"], "changelog": v["changelog"],
+                 "manifest_sha256": v["manifest_sha256"], "previous_version": previous},
+        files=[{"name": f["name"], "size_bytes": f["size_bytes"], "sha256": f["sha256"],
+                "facets": f["facets"]} for f in v["files"]], base_url=base_url)
+
+
+def _summary(slug: str, view: dict, v: dict) -> dict:
+    """One published version in the shape of the MCP tools' dataset summaries, marked ``shared``."""
+    facets = [f["facets"] for f in v["files"]] if "files" in v else []
+    return {"uuid": v["uuid"], "kind": "dataset", "shared": True, "slug": slug,
+            "name": f"{view['name']} {v['label']}", "status": v["status"], "dataset_id": None, "run_id": None,
+            "organism": [], "assay": sorted({str(f["modality"]) for f in facets if f.get("modality")}),
+            "tissue": sorted({str(f["tissue"]) for f in facets if f.get("tissue")}), "accession": [],
+            "format": ["h5ad"] if any(f["name"].lower().endswith(".h5ad") for f in v.get("files", [])) else [],
+            "size_bytes": v["size_bytes"], "file_count": v["n_files"], "valid": True,
+            "updated_at": v["published_at"],
+            "resource": f"aiscientist://datasets/{v['uuid']}/croissant.json"}
+
+
+def mcp_summaries() -> "tuple[list[dict], list[str]]":
+    """Every published version of every shared dataset, for ``list_datasets`` and ``search_datasets``:
+    read-only, the same for every token."""
+    out = []
+    for ds in dataset_views():
+        for v in ds["versions"]:
+            if v["status"] != "published":
+                continue
+            full = version_view(ds["slug"], v["label"])
+            out.append((_summary(ds["slug"], full, full["version"]),
+                        " ".join([ds["slug"], ds["name"], ds["description"], v["label"],
+                                  full["version"]["changelog"], *(f["name"] for f in full["version"]["files"]),
+                                  *(str(x) for f in full["version"]["files"] for x in f["facets"].values()
+                                    if not isinstance(x, list))]).lower()))
+    return [s for s, _ in out], [t for _, t in out]
+
+
+def mcp_search(query: str = "", tissue: str = "") -> list[dict]:
+    summaries, texts = mcp_summaries()
+    words = [w for w in (query or "").lower().split() if w]
+    keep = []
+    for item, text in zip(summaries, texts):
+        if any(w not in text for w in words):
+            continue
+        if tissue and not any(tissue.lower() in t.lower() for t in item["tissue"]):
+            continue
+        keep.append(item)
+    return keep
+
+
+def mcp_view(ref: str) -> "dict | None":
+    """A shared version by its uuid (``urn:uuid:`` accepted), as ``get_dataset_metadata`` returns it."""
+    from .db import session_scope
+    from .models import SharedDataset, SharedDatasetVersion
+    uid = (ref or "").strip().removeprefix("urn:uuid:")
+    with session_scope() as s:
+        row = s.query(SharedDatasetVersion).filter_by(uuid=uid).one_or_none()
+        if row is None or row.status == "publishing":
+            return None
+        slug = s.get(SharedDataset, row.dataset_id).slug
+        label = row.label
+    full = version_view(slug, label)
+    doc = version_croissant(slug, label)
+    return {**_summary(slug, full, full["version"]), "croissant": doc, "provenance": [], "confidence": {},
+            "validation": {"ok": True}, "reviewed": True}

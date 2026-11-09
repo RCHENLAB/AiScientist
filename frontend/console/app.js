@@ -4144,6 +4144,9 @@ async function sendChat(e) {
     const d = state.datasets.find((x) => x.path === p) || {};
     return { path: p, name: d.name || p.split("/").pop(), role: c.roles[p] || null };
   });
+  // Shared datasets go as references (slug, version, files, role): the server resolves them once at
+  // run start and never sends a path to the page.
+  const shared_datasets = (c.shared || []).map((a) => ({ shared: a.shared, version: a.requested, files: a.files, role: a.role }));
   // DAG is the default execution model now (dependency-graph + Coordinator; no UI toggle). The
   // classic linear order is still reachable server-side via AISCIENTIST_PLANNER=linear.
   const planner = "dag";
@@ -4158,7 +4161,7 @@ async function sendChat(e) {
     // One flow for every request, with the same run options (FIXED_RUN_OPTIONS): the server routes
     // it to a literature search or to the lab, and either starts with a plan to review. `history` is
     // the conversation so far, for a line that reads it.
-    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
+    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, shared_datasets, ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
     const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
     let res = await postLab();
     // The budget hard limit (Account › API usage): "confirm" asks once, then sends the same run again.
@@ -6587,7 +6590,26 @@ async function restoreServerCards(stored, request = fetch) {
 }
 
 // Dataset mentions use the account's Files → Datasets list, and its Use attachment path.
-const datasetMention = { query: null, items: null, rows: [], index: 0, dismissed: null, request: 0, error: false };
+const datasetMention = { query: null, items: null, shared: [], rows: [], index: 0, dismissed: null, request: 0, error: false };
+
+// The @ list's Shared group: each shared dataset whole, then its files (latest version). A failure
+// here never hides the account's own datasets.
+async function sharedMentionItems() {
+  try {
+    const list = await api("GET", "/api/shared-datasets");
+    const out = [];
+    for (const ds of (list.datasets || []).filter((d) => d.latest)) {
+      out.push({ shared: true, slug: ds.slug, name: ds.name, label: ds.name, latest: ds.latest });
+      let files = [];
+      try { files = (await api("GET", `/api/shared-datasets/${encodeURIComponent(ds.slug)}?version=latest`)).version.files || []; } catch {}
+      for (const f of files) {
+        out.push({ shared: true, slug: ds.slug, name: ds.name, file: f.name, size_bytes: f.size_bytes, latest: ds.latest,
+                   label: `${ds.name} · ${f.name}` });
+      }
+    }
+    return out;
+  } catch { return []; }
+}
 
 function datasetMentionQuery(input) {
   if (input.selectionStart !== input.selectionEnd) return null;
@@ -6636,10 +6658,18 @@ function positionDatasetMentions() {
 function renderDatasetMentions() {
   const m = datasetMention, list = $("datasetMentions"), input = $("chatInput");
   if (!m.query) return;
-  m.rows = (m.items || []).filter((d) => d.name.toLowerCase().includes(m.query.text.toLowerCase()));
+  const needle = m.query.text.toLowerCase();
+  m.rows = (m.items || []).filter((d) => d.name.toLowerCase().includes(needle))
+    .concat((m.shared || []).filter((d) => d.label.toLowerCase().includes(needle)));
   if (m.items && !m.rows.length && /\s$/.test(m.query.text)) { closeDatasetMentions(); return; }
   m.index = Math.max(0, Math.min(m.index, m.rows.length - 1));
+  const firstShared = m.rows.findIndex((d) => d.shared);
   list.innerHTML = m.rows.map((d, i) => {
+    const group = i === firstShared ? '<div class="dataset-mention-group">Shared</div>' : "";
+    if (d.shared) {
+      const detail = d.file ? `Shared · ${fmtSize(d.size_bytes)} · latest (${d.latest})` : `Shared · whole dataset · latest (${d.latest})`;
+      return `${group}<div id="datasetMention-${i}" class="dataset-mention" role="option" aria-selected="${i === m.index}" data-mention-index="${i}"><strong>${escapeHtml(d.label)}</strong><small>${escapeHtml(detail)}</small></div>`;
+    }
     const from = chatLabel(d.conversation_id);
     const detail = [isFolderKind(d.kind) ? "folder" : "file", fmtSize(d.size_bytes) || "Size unknown", fmtDate(d.uploaded_at), from ? from.text : "Source chat unknown"].join(" · ");
     return `<div id="datasetMention-${i}" class="dataset-mention" role="option" aria-selected="${i === m.index}" data-mention-index="${i}"><strong>${escapeHtml(d.name)}</strong><small>${escapeHtml(detail)}</small></div>`;
@@ -6673,6 +6703,8 @@ async function updateDatasetMentions() {
     const items = (await res.json()).datasets || [];
     if (request !== m.request) return;
     m.items = items.sort((a, b) => String(b.uploaded_at || "").localeCompare(String(a.uploaded_at || "")));
+    m.shared = await sharedMentionItems();
+    if (request !== m.request) return;
   } catch {
     if (request !== m.request) return;
     m.items = []; m.error = true;
@@ -6683,12 +6715,12 @@ async function updateDatasetMentions() {
 async function selectDatasetMention(index) {
   const m = datasetMention, d = m.rows[index], input = $("chatInput"), q = m.query;
   if (!d || !q) return;
-  const name = d.name, typed = input.value.slice(q.start, q.end);
+  const name = d.shared ? d.label : d.name, typed = input.value.slice(q.start, q.end);
   closeDatasetMentions();
   // The chat's datasets are saved on the server first: one it refuses (over the per-run limit, say)
   // leaves the typed text as it is.
-  const attached = await addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes,
-                                      at: d.uploaded_at });
+  const attached = d.shared ? await attachSharedDataset(d.slug, "latest", d.file ? [d.file] : null)
+    : await addDataset({ id: d.id, name, path: d.path, kind: d.kind, size: d.size_bytes, at: d.uploaded_at });
   // Typing while the dataset was being saved moved the @word: the dataset is attached all the same.
   if (attached && input.value.slice(q.start, q.end) === typed) {
     // The caret may sit inside an @word typed earlier: the pick replaces the whole word.
@@ -6860,6 +6892,7 @@ async function bindServerPath(path) {
 // Server-backed chats keep their attachment set on the account, not in browser storage.
 function hydrateChatDatasets(c, data) {
   if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+  if (Array.isArray(data.shared_datasets)) c.shared = data.shared_datasets;
   if (!Array.isArray(data.datasets)) return;
   c.datasetsLoaded = true;
   c.bound = data.datasets.map((d) => d.path);
@@ -6871,8 +6904,10 @@ function hydrateChatDatasets(c, data) {
   saveComposer(c);
 }
 
-function datasetLimitAllows(paths) {
-  if (state.maxBoundDatasets && paths.length > state.maxBoundDatasets) {
+function datasetLimitAllows(paths, c = activeChat()) {
+  // A whole shared version is one attachment, counted with the account's own datasets.
+  const total = paths.length + ((c && c.shared) || []).length;
+  if (state.maxBoundDatasets && total > state.maxBoundDatasets) {
     toast(`Up to ${state.maxBoundDatasets} datasets per run. Remove one first.`);
     return false;
   }
@@ -6891,7 +6926,7 @@ function changeChatDatasets(c, change) {
     }
     const next = { bound: [...c.bound], roles: { ...c.roles } };
     change(next);
-    if (!datasetLimitAllows(next.bound)) return false;
+    if (!datasetLimitAllows(next.bound, c)) return false;
     try {
       if (s && s.cid) {
         if (next.bound.some((path) => !state.datasets.some((d) => d.path === path && d.id != null))) {
@@ -6901,7 +6936,7 @@ function changeChatDatasets(c, change) {
             const known = state.datasets.find((x) => x.path === d.path);
             if (known) Object.assign(known, d); else state.datasets.push(d);
           }
-          if (!datasetLimitAllows(next.bound)) return false;
+          if (!datasetLimitAllows(next.bound, c)) return false;
         }
         const datasets = next.bound.map((path) => {
           const d = state.datasets.find((x) => x.path === path);
@@ -7040,7 +7075,8 @@ function selectDataset(path) { return changeChatDatasets(activeChat(), (c) => { 
 function renderDatasetChips() {
   const host = $("datasetChips");
   if (!host) return;
-  if (!state.boundPaths.length) { host.innerHTML = '<span class="dataset-empty">No dataset selected</span>'; return; }
+  const sharedChips = sharedChipsHtml((activeChat() || {}).shared || []);
+  if (!state.boundPaths.length) { host.innerHTML = sharedChips || '<span class="dataset-empty">No dataset selected</span>'; return; }
   const primary = primaryBoundPath();
   host.innerHTML = state.boundPaths.map((path) => {
     const d = state.datasets.find((x) => x.path === path) || { name: path.split("/").pop(), path, kind: "file" };
@@ -7058,8 +7094,256 @@ function renderDatasetChips() {
       `<span class="material-symbols-outlined msym">${ico}</span>` +
       `<span class="dataset-chip-name">${escapeHtml(d.name)}${isPrimary ? " ★" : ""}</span>` + mainBtn + refBtn +
       `<button type="button" class="dataset-chip-x" data-clear-path="${escapeHtml(path)}" title="Remove this file">×</button></span>`;
+  }).join("") + sharedChips;
+}
+
+// ---- Shared datasets: attaching to the open chat (issue 100) ----
+// The chip reads "HECA · latest (v2026.11)": the dataset, what was asked for and the version that
+// means now. The browser holds references (slug, version, files), never a server path.
+function sharedChipLabel(a) {
+  const ver = a.requested === "latest" ? `latest${a.version ? ` (${a.version})` : ""}` : a.requested;
+  const what = Array.isArray(a.files) ? (a.files.length === 1 ? a.files[0] : `${a.files.length} files`) : "";
+  return [a.name || a.shared, what, ver].filter(Boolean).join(" · ") + (a.withdrawn ? " · withdrawn" : "");
+}
+function sharedChipsHtml(list) {
+  return (list || []).map((a) =>
+    `<span class="dataset-chip active shared" title="${escapeHtml(sharedChipLabel(a))}">` +
+    `<span class="material-symbols-outlined msym">${datasetIcon("folder")}</span>` +
+    `<span class="dataset-chip-name">${escapeHtml(sharedChipLabel(a))}${a.role === "primary" ? " ★" : ""}</span>` +
+    (a.role === "primary" ? '<span class="dataset-chip-role">main</span>'
+      : `<button type="button" class="dataset-chip-ref" data-main-shared="${escapeHtml(a.shared)}" title="Use as the main dataset">Make main</button>`) +
+    `<button type="button" class="dataset-chip-x" data-clear-shared="${escapeHtml(a.shared)}" title="Remove this shared dataset">×</button></span>`).join("");
+}
+// Save the chat's shared attachments (`change` edits a copy of the list). Resolves true when saved.
+function changeChatSharedDatasets(c, change) {
+  if (!c) return Promise.resolve(false);
+  const apply = async () => {
+    const s = state.sessions.find((x) => String(x.id) === String(c.sid));
+    if (!s || !s.cid) { toast("Shared datasets need a saved chat. Open or start a chat first."); return false; }
+    if (!c.datasetsLoaded) {
+      try { hydrateChatDatasets(c, await api("GET", `/api/conversations/${s.cid}`)); }
+      catch (err) { toast(`Shared datasets not saved: ${err.message}`); return false; }
+    }
+    const next = (c.shared || []).map((a) => ({ shared: a.shared, version: a.requested, files: a.files, role: a.role }));
+    change(next);
+    if (!datasetLimitAllows(c.bound, { shared: next })) return false;
+    try {
+      const data = await api("PUT", `/api/conversations/${s.cid}/shared-datasets`, { shared_datasets: next });
+      c.shared = data.shared_datasets || [];
+      if (Number.isInteger(data.max_bound_datasets)) state.maxBoundDatasets = data.max_bound_datasets;
+      if (chatVisible(c)) renderDatasetChips();
+      return true;
+    } catch (err) { toast(`Shared datasets not saved: ${err.message}`); return false; }
+  };
+  c.sharedSave = (c.sharedSave || Promise.resolve()).then(apply);
+  return c.sharedSave;
+}
+// Attach a shared dataset: the whole version (files null) or the named files; version "latest" follows
+// the newest published one, a label pins it.
+function attachSharedDataset(slug, version, files, sid) {
+  return changeChatSharedDatasets(chatOf(sid || state.activeId), (next) => {
+    const entry = { shared: slug, version: version || "latest", files: files && files.length ? files : null, role: "reference" };
+    const at = next.findIndex((a) => a.shared === slug);
+    if (at < 0) next.push(entry); else next[at] = { ...next[at], ...entry };
+  });
+}
+function makeSharedMain(slug) {
+  return changeChatSharedDatasets(activeChat(), (next) => {
+    for (const a of next) a.role = a.shared === slug ? "primary" : (a.role === "primary" ? "reference" : a.role);
+  });
+}
+function detachSharedDataset(slug) {
+  return changeChatSharedDatasets(activeChat(), (next) => {
+    const at = next.findIndex((a) => a.shared === slug);
+    if (at >= 0) next.splice(at, 1);
+  });
+}
+
+// ---- Files → Shared ----
+const sharedUi = { enabled: true, datasets: [], picked: {}, detail: {}, open: {}, roots: [], jobs: {}, form: {} };
+function sharedPicked(ds) { return sharedUi.picked[ds.slug] || "latest"; }
+function sharedVersions(ds) { return (ds.versions || []).filter((v) => v.status === "published"); }
+function sharedFilesHtml(ds, view) {
+  const files = (view && view.version && view.version.files) || [];
+  const label = view.version.label;
+  const cell = (f) => `<div class="shared-cell"><span class="muted">${escapeHtml(fmtSize(f.size_bytes))}</span>` +
+    `<button type="button" class="ghost small" data-shared-preview="${escapeHtml(f.name)}" data-slug="${escapeHtml(ds.slug)}" data-label="${escapeHtml(label)}">Preview</button></div>`;
+  const faceted = files.filter((f) => f.facets && f.facets.tissue && f.facets.modality);
+  const loose = files.filter((f) => !faceted.includes(f));
+  let html = "";
+  if (faceted.length) {
+    const modalities = [...new Set(faceted.map((f) => f.facets.modality))].sort();
+    const tissues = [...new Set(faceted.map((f) => f.facets.tissue))].sort();
+    const at = {};
+    for (const f of faceted) (at[`${f.facets.tissue}|${f.facets.modality}`] = at[`${f.facets.tissue}|${f.facets.modality}`] || []).push(f);
+    html += `<table class="shared-grid"><thead><tr><th></th>${modalities.map((m) => `<th>${escapeHtml(m)}</th>`).join("")}</tr></thead><tbody>` +
+      tissues.map((t) => `<tr><th>${escapeHtml(t)}</th>${modalities.map((m) =>
+        `<td>${(at[`${t}|${m}`] || []).map(cell).join("") || '<span class="muted">—</span>'}</td>`).join("")}</tr>`).join("") +
+      `</tbody></table>`;
+  }
+  if (loose.length) {
+    html += `<div class="shared-files">${loose.map((f) => `<div class="shared-file"><span>${escapeHtml(f.name)}</span>${cell(f)}</div>`).join("")}</div>`;
+  }
+  return html || '<div class="empty-hint">No files in this version.</div>';
+}
+function sharedPanelHtml(ds, view, which) {
+  if (!view || !view.version) return "";
+  const v = view.version;
+  if (which === "changelog") return `<div class="shared-panel"><pre>${escapeHtml(v.changelog || "No changelog.")}</pre></div>`;
+  if (which === "metadata") {
+    return `<div class="shared-panel"><div><strong>${escapeHtml(ds.name)}</strong> · ${escapeHtml(v.label)}</div>` +
+      (ds.description ? `<p>${escapeHtml(ds.description)}</p>` : "") +
+      (ds.citation ? `<p class="muted">Cite: ${escapeHtml(ds.citation)}</p>` : "") +
+      `<p class="muted"><a href="/api/shared-datasets/${encodeURIComponent(ds.slug)}/versions/${encodeURIComponent(v.label)}/croissant.json" target="_blank" rel="noopener">croissant.json</a></p>` +
+      `<p class="muted">Published ${escapeHtml(fmtDate(v.published_at))}${v.published_by ? ` by ${escapeHtml(v.published_by)}` : ""} · ` +
+      `${v.n_files} files · ${escapeHtml(fmtSize(v.size_bytes))}${v.on_hpc3 ? " · copy on HPC3 verified" : ""}</p>` +
+      (v.manifest_sha256 ? `<p class="muted">Manifest SHA-256 <code>${escapeHtml(v.manifest_sha256)}</code> · ` +
+        `<a href="/api/shared-datasets/${encodeURIComponent(ds.slug)}/versions/${encodeURIComponent(v.label)}/manifest.json" target="_blank" rel="noopener">manifest.json</a></p>` : "") +
+      `</div>`;
+  }
+  return "";
+}
+// Maintainers and admins: publish a new version as a background job, and withdraw one.
+function sharedPublishFormHtml(ds) {
+  const f = sharedUi.form[ds.slug] || {};
+  return `<div class="shared-panel shared-publish"><strong>Publish a new version of ${escapeHtml(ds.name)}</strong>` +
+    `<p class="muted">Put the version's files in one folder inside an allowed server folder${sharedUi.roots.length ? ` (${sharedUi.roots.map(escapeHtml).join(", ")})` : ""}, then name it here. ` +
+    `A published version never changes; a label is never reused.</p>` +
+    `<div class="form"><input type="text" data-pub-source maxlength="1024" placeholder="Source folder on the server" autocomplete="off" aria-label="Source folder" value="${escapeHtml(f.source || "")}" />` +
+    `<input type="text" data-pub-label maxlength="40" placeholder="Label, e.g. v2026.12" autocomplete="off" aria-label="Version label" value="${escapeHtml(f.label || "")}" />` +
+    `<textarea data-pub-changelog rows="4" placeholder="Changelog: what changed (files, annotation columns, cells) and why" aria-label="Changelog">${escapeHtml(f.changelog || "")}</textarea>` +
+    `<button type="button" class="primary small" data-shared-publish>Publish</button></div>` +
+    `<div class="shared-job" data-job-for="${escapeHtml(ds.slug)}" role="status" aria-live="polite">${sharedJobHtml(sharedUi.jobs[ds.slug])}</div></div>`;
+}
+function sharedJobHtml(job) {
+  if (!job) return "";
+  const head = job.state === "running" ? `${icon("hourglass_top")} Publishing ${escapeHtml(job.label)}…`
+    : job.state === "done" ? `${icon("check_circle")} Published ${escapeHtml(job.label)}.`
+    : `${icon("error")} ${escapeHtml(job.error || "Publishing failed.")}`;
+  return `<div>${head}</div>` + (job.lines && job.lines.length ? `<pre class="muted">${escapeHtml(job.lines.slice(-12).join("\n"))}</pre>` : "");
+}
+function paintSharedJob(slug) {
+  const el = document.querySelector(`[data-job-for="${CSS.escape(slug)}"]`);
+  if (el) el.innerHTML = sharedJobHtml(sharedUi.jobs[slug]);
+}
+async function publishShared(ds, card) {
+  const val = (sel) => (card.querySelector(sel) || {}).value || "";
+  const form = { source: val("[data-pub-source]").trim(), label: val("[data-pub-label]").trim(), changelog: val("[data-pub-changelog]") };
+  sharedUi.form[ds.slug] = form;
+  try {
+    const started = await api("POST", `/api/shared-datasets/${encodeURIComponent(ds.slug)}/publish`, form);
+    sharedUi.jobs[ds.slug] = started;
+    paintSharedJob(ds.slug);
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const job = await api("GET", `/api/shared-datasets/${encodeURIComponent(ds.slug)}/publish-jobs/${encodeURIComponent(started.job)}`);
+      sharedUi.jobs[ds.slug] = job;
+      paintSharedJob(ds.slug);
+      if (job.state !== "running") {
+        if (job.state === "done") { sharedUi.form[ds.slug] = {}; toast(`${ds.name} ${job.label} published.`); await loadShared(); }
+        return;
+      }
+    }
+  } catch (err) {
+    sharedUi.jobs[ds.slug] = { state: "error", label: form.label, error: err.message, lines: [] };
+    paintSharedJob(ds.slug);
+  }
+}
+async function withdrawShared(ds) {
+  const pick = sharedPicked(ds), label = pick === "latest" ? ds.latest : pick;
+  if (!label) { toast("There is no published version to withdraw."); return; }
+  if (!window.confirm(`Withdraw ${ds.name} ${label}? It is no longer offered. Its files stay, so chats pinned to it and earlier results still work.`)) return;
+  try {
+    await api("POST", `/api/shared-datasets/${encodeURIComponent(ds.slug)}/versions/${encodeURIComponent(label)}/withdraw`);
+    sharedUi.picked[ds.slug] = "latest";
+    toast(`${ds.name} ${label} withdrawn.`);
+    await loadShared();
+  } catch (err) { toast(`Not withdrawn: ${err.message}`); }
+}
+function renderShared() {
+  const el = $("sharedList");
+  if (!el) return;
+  if (!sharedUi.enabled) { el.innerHTML = '<div class="empty-hint">Shared datasets are not set up on this server.</div>'; return; }
+  if (!sharedUi.datasets.length) { el.innerHTML = '<div class="empty-hint">No shared datasets yet.</div>'; return; }
+  const attached = new Map(((activeChat() || {}).shared || []).map((a) => [a.shared, a]));
+  el.innerHTML = sharedUi.datasets.map((ds) => {
+    const pick = sharedPicked(ds), view = sharedUi.detail[`${ds.slug}|${pick}`];
+    const options = [`<option value="latest"${pick === "latest" ? " selected" : ""}>latest${ds.latest ? ` (${escapeHtml(ds.latest)})` : ""}</option>`]
+      .concat(sharedVersions(ds).map((v) => `<option value="${escapeHtml(v.label)}"${pick === v.label ? " selected" : ""}>${escapeHtml(v.label)}</option>`));
+    const v = view && view.version;
+    const note = attached.get(ds.slug);
+    const open = sharedUi.open[ds.slug];
+    return `<div class="card shared-card" data-slug="${escapeHtml(ds.slug)}"><div class="shared-head"><div class="card-main"><strong>${icon("folder_shared")} ${escapeHtml(ds.name)}</strong>` +
+      `<span class="muted">${escapeHtml((ds.maintainers || []).join(", ") || "No maintainer yet")} · ${v ? `${v.n_files} files · ${escapeHtml(fmtSize(v.size_bytes))}` : "…"}</span></div>` +
+      `<div class="shared-actions"><select data-shared-version aria-label="Version of ${escapeHtml(ds.name)}">${options.join("")}</select>` +
+      (note ? `<span class="muted">Attached</span>` : "") +
+      `<button type="button" class="ghost small" data-shared-use title="Attach the selected version to the open chat">Use</button>` +
+      `<button type="button" class="ghost small" data-shared-panel="metadata">Metadata</button>` +
+      `<button type="button" class="ghost small" data-shared-panel="changelog">Changelog</button>` +
+      (ds.can_publish ? `<button type="button" class="ghost small" data-shared-panel="publish">Publish new version</button>` +
+        `<button type="button" class="ghost small danger" data-shared-withdraw title="Stop offering the selected version. Its files stay, so chats pinned to it still run.">Withdraw</button>` : "") +
+      `</div></div>` +
+      (open === "publish" && ds.can_publish ? sharedPublishFormHtml(ds) : "") +
+      (open && open !== "publish" && view ? sharedPanelHtml(ds, view, open) : "") +
+      (view ? sharedFilesHtml(ds, view) : '<div class="empty-hint">Loading…</div>') + `</div>`;
   }).join("");
 }
+async function loadSharedDetail(ds, pick) {
+  const key = `${ds.slug}|${pick}`;
+  if (sharedUi.detail[key]) return;
+  try { sharedUi.detail[key] = await api("GET", `/api/shared-datasets/${encodeURIComponent(ds.slug)}?version=${encodeURIComponent(pick)}`); }
+  catch { /* the card stays on Loading… */ }
+}
+async function loadShared() {
+  try {
+    const data = await api("GET", "/api/shared-datasets");
+    sharedUi.enabled = data.enabled !== false;
+    sharedUi.datasets = data.datasets || [];
+    sharedUi.roots = data.source_roots || [];
+    sharedUi.detail = {};
+  } catch { $("sharedList").innerHTML = '<div class="empty-hint">Failed to load.</div>'; return; }
+  renderShared();
+  await Promise.all(sharedUi.datasets.map((ds) => loadSharedDetail(ds, sharedPicked(ds))));
+  renderShared();
+}
+async function onSharedClick(e) {
+  const card = e.target.closest("[data-slug].shared-card");
+  const ds = card && sharedUi.datasets.find((d) => d.slug === card.dataset.slug);
+  const pv = e.target.closest("[data-shared-preview]");
+  if (pv) {
+    const base = `/api/shared-datasets/${encodeURIComponent(pv.dataset.slug)}/versions/${encodeURIComponent(pv.dataset.label)}`;
+    openDatasetPreview(base, pv.dataset.sharedPreview, pv.dataset.sharedPreview);
+    return;
+  }
+  if (!ds) return;
+  if (e.target.closest("[data-shared-publish]")) { publishShared(ds, card); return; }
+  if (e.target.closest("[data-shared-withdraw]")) { await withdrawShared(ds); return; }
+  const panel = e.target.closest("[data-shared-panel]");
+  if (panel) {
+    sharedUi.open[ds.slug] = sharedUi.open[ds.slug] === panel.dataset.sharedPanel ? null : panel.dataset.sharedPanel;
+    renderShared();
+    return;
+  }
+  if (e.target.closest("[data-shared-use]")) {
+    const pick = sharedPicked(ds);
+    if (await attachSharedDataset(ds.slug, pick, null)) {
+      renderShared();
+      switchView("research");
+      toast(`${ds.name} (${pick === "latest" ? "latest" : pick}) attached to the chat.`);
+    }
+  }
+}
+async function onSharedChange(e) {
+  const sel = e.target.closest("[data-shared-version]");
+  const card = sel && sel.closest("[data-slug].shared-card");
+  const ds = card && sharedUi.datasets.find((d) => d.slug === card.dataset.slug);
+  if (!ds) return;
+  sharedUi.picked[ds.slug] = sel.value;
+  renderShared();
+  await loadSharedDetail(ds, sel.value);
+  renderShared();
+}
+
 
 // The composer's upload line belongs to the chat the upload was started from (issue 7). Each upload
 // has its own line; the composer shows only those of the chat on screen. Another chat's upload goes
@@ -7443,6 +7727,14 @@ function initShell() {
   }));
   $("skillRequestList").addEventListener("click", onSkillRequestClick);
   $("datasetsList").addEventListener("click", onDatasetsClick);
+  $("sharedList").addEventListener("click", onSharedClick);
+  $("sharedList").addEventListener("change", onSharedChange);
+  $("sharedList").addEventListener("input", (e) => {   // a form being typed survives a re-render
+    const card = e.target.closest("[data-slug].shared-card");
+    if (!card || !card.querySelector("[data-pub-source]")) return;
+    const v = (sel) => (card.querySelector(sel) || {}).value || "";
+    sharedUi.form[card.dataset.slug] = { source: v("[data-pub-source]"), label: v("[data-pub-label]"), changelog: v("[data-pub-changelog]") };
+  });
   $("metadataForm").addEventListener("submit", saveMetadata);
   $("metadataForm").addEventListener("change", (e) => { if (e.target.id === "mdf_human_data") mdSyncShowIf(); });
   $("metadataClose").addEventListener("click", () => $("metadataModal").classList.add("hidden"));
@@ -8107,7 +8399,7 @@ async function loadDatasets() {
 // ---- Files view: two tabs, Datasets (above) and Outputs (what the runs wrote, below) ----
 let filesTab = "datasets";
 function switchFilesTab(tab) {
-  filesTab = tab === "outputs" ? "outputs" : "datasets";
+  filesTab = tab === "outputs" || tab === "shared" ? tab : "datasets";
   document.querySelectorAll(".files-tab").forEach((b) => {
     const on = b.dataset.filesTab === filesTab;
     b.classList.toggle("active", on);
@@ -8115,10 +8407,12 @@ function switchFilesTab(tab) {
   });
   document.querySelectorAll(".files-pane").forEach((p) => p.classList.toggle("hidden", p.id !== "filesPane-" + filesTab));
   if (filesTab === "outputs") loadOutputs();
+  if (filesTab === "shared") loadShared();
 }
 function loadFiles() {
   loadDatasets();
   if (filesTab === "outputs") loadOutputs();
+  if (filesTab === "shared") loadShared();
 }
 
 // The search over a page's list: each card's data-q holds what it is found by (see sysSearchText), and
@@ -9911,6 +10205,10 @@ function init() {
     if (main) { makeMainDataset(main.dataset.mainPath); return; }
     const r = e.target.closest("[data-ref-path]");
     if (r) { toggleReference(r.dataset.refPath); return; }
+    const sx = e.target.closest("[data-clear-shared]");
+    if (sx) { detachSharedDataset(sx.dataset.clearShared); return; }
+    const sm = e.target.closest("[data-main-shared]");
+    if (sm) { makeSharedMain(sm.dataset.mainShared); return; }
     const x = e.target.closest("[data-clear-path]");
     if (x) toggleBound(x.dataset.clearPath);
   });

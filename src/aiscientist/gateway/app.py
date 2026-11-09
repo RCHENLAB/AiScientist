@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
@@ -1961,6 +1961,7 @@ try:
     from . import shared_routes  # noqa: E402
 
     app.include_router(shared_routes.router)
+    app.include_router(shared_routes.chat_router)
 except Exception as _auth_exc:  # noqa: BLE001 - missing extra must not break the console
     print(f"[auth] accounts disabled (install .[auth]): {type(_auth_exc).__name__}: {_auth_exc}")
 
@@ -3118,6 +3119,15 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
         raw.append({"path": p, "order": i,
                     "name": str(e.get("name") or p.rsplit("/", 1)[-1]),
                     "role": (str(e["role"]).strip() or None) if e.get("role") else None})
+    # Shared datasets, already resolved by /api/lab: a whole version is one entry (its folder in the
+    # store), a chosen file is one entry each. Each attachment counts once toward the limit.
+    shared = getattr(req, "_shared_resolved", None) or []
+    for att in shared:
+        for e in att["entries"]:
+            if e["path"] in seen:
+                continue
+            seen.add(e["path"])
+            raw.append({"path": e["path"], "order": len(raw), "name": e["name"], "role": att.get("role")})
     if not raw:
         dp = str(getattr(req, "dataset_path", None) or "").strip()
         if not dp:
@@ -3125,9 +3135,127 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
         raw = [{"path": dp, "order": 0, "name": dp.rsplit("/", 1)[-1], "role": None}]
     raw.sort(key=lambda d: _bound_primary_key(d["path"], d["order"], d["role"]))
     out = [{"path": d["path"], "name": d["name"], "role": d["role"]} for d in raw]
-    if len(out) > _MAX_BOUND_DATASETS:
+    if len(raw) - sum(len(a["entries"]) for a in shared) + len(shared) > _MAX_BOUND_DATASETS:
         raise HTTPException(400, f"At most {_MAX_BOUND_DATASETS} datasets per run. Remove one first.")
     return out
+
+
+async def _record_shared_inputs(conn: Connection, run_id: str, art: Path, decisions: dict,
+                                resolved: list[dict], prior: "dict | None", say_key: "Callable[..., None]") -> None:
+    """Write ``artifacts/process/inputs.json`` (the version, its manifest checksum and every file's
+    checksum each shared dataset meant for this run), keep it in ``decisions`` for the planner, and say
+    which version the run used, and when a chat that follows ``latest`` now gets a newer one."""
+    record = _shared_inputs_record(resolved)
+    decisions["shared_inputs"] = [{**r, "title": a["title"], "role": a.get("role"),
+                                   "files": [{**f, "facets": a["files"][i].get("facets") or {}}
+                                             for i, f in enumerate(r["files"])]}
+                                  for r, a in zip(record, resolved)]
+    try:
+        process = art / "process"
+        process.mkdir(parents=True, exist_ok=True)
+        (process / "inputs.json").write_text(
+            json.dumps({"shared_inputs": record}, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        print(f"[shared] inputs.json not written: {exc}")
+    before = _prior_shared_versions(conn, prior)
+    for a in resolved:
+        which = a["title"] if a["requested"] == "latest" else f"{a['title']} (pinned)"
+        line = f"📚 This run uses {which} {a['version']}"
+        if a["status"] == "withdrawn":
+            line += " (withdrawn: kept for this chat's earlier results)"
+        old = before.get(a["dataset"])
+        if a["requested"] == "latest" and old and old != a["version"]:
+            line += f". A newer version has appeared since the last run in this chat ({old}): this run read {a['version']}."
+        say_key(line)
+
+
+def _prior_shared_versions(conn: Connection, prior: "dict | None") -> dict[str, str]:
+    """The shared dataset versions the chat's previous run read (its ``process/inputs.json``), by slug."""
+    rid = str((prior or {}).get("run_id") or "")
+    if not rid or not _RUN_ID_RE.fullmatch(rid):
+        return {}
+    try:
+        data = json.loads((conn.workspace / rid / "artifacts" / "process" / "inputs.json").read_text(encoding="utf-8"))
+        return {str(r["dataset"]): str(r["version"]) for r in data.get("shared_inputs") or []}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def _resolve_shared_refs(req: "LabRequest", conn: Connection) -> list[dict]:
+    """Resolve the chat's shared-dataset references ONCE, at run start (issue 100). ``latest`` becomes
+    the label it means now and keeps meaning that for this run. A pinned version that was withdrawn
+    still resolves (the chat keeps running); a withdrawn one is never reached through ``latest``.
+    Each attachment lists its entries (``path`` in the store, the HPC3 copy's path once verified), and
+    the files with their checksums, for ``process/inputs.json``. Raises HTTPException(400) for a bad
+    reference. Server paths stay inside the gateway: nothing here goes back to the browser."""
+    from . import shared_datasets as sd
+    refs = req.shared_datasets if isinstance(req.shared_datasets, list) else []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        slug = str(ref.get("shared") or "").strip()
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        version = str(ref.get("version") or sd.LATEST).strip() or sd.LATEST
+        if sd.store_root() is None:
+            raise HTTPException(400, "Shared datasets are not enabled on this server.")
+        try:
+            found = sd.resolve(slug, version, allow_withdrawn=version != sd.LATEST,
+                               hpc_shared_root=conn.settings.shared_root or None)
+        except sd.SharedDatasetError as exc:
+            raise HTTPException(400, str(exc)) from None
+        by_name = {f["name"]: f for f in found["files"]}
+        names = ref.get("files")
+        if names is not None:
+            names = [str(n) for n in names]
+            missing = [n for n in names if n not in by_name]
+            if missing or not names:
+                raise HTTPException(400, f"{slug} {found['label']} has no file {(missing or [''])[0]!r}.")
+        root, hpc = found["server_path"], found["hpc_path"]
+        label = f"{found['name']} {found['label']}"
+        if names is None:
+            files = list(found["files"])
+            entries = [{"path": root, "name": label, "hpc": hpc, "files": [f["name"] for f in files]}]
+        else:
+            files = [by_name[n] for n in names]
+            entries = [{"path": f"{root}/{n}", "name": n, "hpc": f"{hpc}/{n}" if hpc else None, "files": []}
+                       for n in names]
+        role = str(ref.get("role") or "").strip() or None
+        out.append({"dataset": slug, "title": found["name"], "requested": version, "version": found["label"],
+                    "version_uuid": found["version_uuid"], "manifest_sha256": found["manifest_sha256"],
+                    "status": found["status"], "role": role, "whole": names is None,
+                    "entries": entries,
+                    "files": [{"name": f["name"], "size_bytes": f["size_bytes"], "sha256": f["sha256"],
+                               "facets": f.get("facets") or {}} for f in files]})
+    return out
+
+
+def _shared_inputs_record(resolved: list[dict]) -> list[dict]:
+    """``process/inputs.json`` ``shared_inputs``: what each shared dataset meant for this run."""
+    return [{"dataset": a["dataset"], "requested": a["requested"], "version": a["version"],
+             "version_uuid": a["version_uuid"], "manifest_sha256": a["manifest_sha256"],
+             "files": [{"name": f["name"], "size": f["size_bytes"], "sha256": f["sha256"]}
+                       for f in a["files"]]} for a in resolved]
+
+
+def _shared_by_path(resolved: "list[dict] | None") -> "dict[str, dict]":
+    """Each bound shared path (a version folder or a file) with the attachment and entry it came from."""
+    return {e["path"]: {**e, "attachment": a} for a in (resolved or []) for e in a["entries"]}
+
+
+def _is_shared_path(path: str) -> bool:
+    """A path inside the shared-datasets store on this host."""
+    from . import shared_datasets as sd
+    root = sd.store_root()
+    if root is None:
+        return False
+    try:
+        return Path(path).resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
 
 
 # A clinical note is prose, not data. The cap is generous for a real referral letter (~10k words) and
@@ -4843,8 +4971,11 @@ def _bindable_roots(conn: Connection) -> "tuple[Path, ...]":
     """The folders a run of this session may bind a path from and copy to HPC3: the allowlisted
     server folders and this account's own dataset folder."""
     from . import server_data as sd
+    from . import shared_datasets as shared
     own = _kept_data_root(conn)
     roots = sd.server_data_roots()
+    store = shared.store_root()       # the shared datasets' store: an allowlisted prefix (issue 100)
+    roots = roots + ((store,) if store is not None and store.is_dir() and store not in roots else ())
     return roots + ((own,) if own is not None and own.is_dir() and own not in roots else ())
 
 
@@ -4963,10 +5094,32 @@ def _display_name(entry: dict) -> str:
     return name or str(entry.get("path") or "").rstrip("/").rsplit("/", 1)[-1] or "dataset"
 
 
+def _remote_path_admitted(conn: Connection, path: str) -> bool:
+    """A dfs3b path a run may bind (issue 100). Not anything under the lab's folder, which holds every
+    member's data, but the allowlisted prefixes only: this account's own uploads and personal folder
+    (``_remote_dataset_allowed``), the session's and the retired layout's Temp folders, a session
+    folder an earlier run of this account left, and the verified HPC3 copies of the shared datasets.
+    A prefix test, so ``..`` is refused outright."""
+    if not path or ".." in str(path).split("/"):
+        return False
+    if _remote_dataset_allowed(conn, path):
+        return True
+    root = conn.settings.shared_root.rstrip("/")
+    prefixes: list[str] = []
+    if root:
+        prefixes += [hpc_layout.datasets_dir(root), hpc_layout.sessions_dir(root)]
+        try:
+            prefixes.append(_shared_dir(conn, "Temp"))
+        except ValueError:
+            pass
+    return any(path == b or path.startswith(b.rstrip("/") + "/") for b in prefixes if b)
+
+
 async def _admit_bound_paths(conn: Connection, bound: "list[dict]",
                              say_key: "Callable[..., None]",
                              emit: "Callable[..., None]",
                              refused: "list[dict] | None" = None,
+                             shared: "dict[str, dict] | None" = None,
                              ) -> "tuple[list[dict], dict[str, tuple[str, set[str]]]]":
     """Check every bound path before the run reads it, and copy server paths to HPC3 when needed.
 
@@ -4989,7 +5142,41 @@ async def _admit_bound_paths(conn: Connection, bound: "list[dict]",
     mirrors: dict[str, tuple[str, set[str]]] = {}
     for entry in bound:
         path = entry["path"]
+        info = (shared or {}).get(path)
+        if info is not None:
+            att = info["attachment"]
+            what = f"{att['title']} {att['version']}" + ("" if att["whole"] else f" · {info['name']}")
+            if _server_data_to_hpc(conn):
+                if info.get("hpc"):
+                    # The version's verified HPC3 copy is bound read-only where it is: nothing is
+                    # copied into the session's inputs/ and no storage is used.
+                    mirrors[path] = (info["hpc"], set(info.get("files") or ()))
+                    say_key(f"🔗 {what}: read in place on HPC3 (verified copy), nothing copied")
+                else:
+                    say_key(f"⚠ {what} has no verified copy on HPC3 yet, so it is copied for this "
+                            "session like other server data (slower, and removed when you disconnect)",
+                            "warning")
+                    try:
+                        mirrors[path] = await asyncio.to_thread(
+                            _sync_server_path, conn, Path(path).resolve(),
+                            sd.root_of(path, roots), say_key)
+                    except sd.ServerPathError as exc:
+                        say_key(f"⚠ Not bound: {what}: {exc}", "warning")
+                        if refused is not None:
+                            refused.append({"name": _display_name(entry),
+                                            "reason": f"it could not be copied to HPC3 ({exc})"})
+                        continue
+            admitted.append(entry)
+            continue
         if conn.executor is not None and _is_remote_dataset(conn, path):
+            if _AUTH_ENABLED and not _remote_path_admitted(conn, path):
+                emit("warning", "lab", f"Not bound: {path} is outside the folders this account may read.")
+                say_key(f"⚠ Not bound: {entry['name']} (outside your own storage and the shared "
+                        "datasets)", "warning")
+                if refused is not None:
+                    refused.append({"name": _display_name(entry),
+                                    "reason": "it is outside your own storage and the shared datasets"})
+                continue
             admitted.append(entry)
             continue
         root = sd.root_of(path, roots) if roots else None
@@ -7086,6 +7273,12 @@ class LabRequest(BaseModel):
     # every legacy ``decisions["dataset_path"]`` consumer, while the whole set is exposed as
     # ``decisions["datasets"]``. Kept SEPARATE from ``case_note`` — that is a TEXT slot, not a data file.
     datasets: list[dict] | None = None
+    # Shared datasets attached to the chat (issue 100): REFERENCES, ``{"shared": slug, "version":
+    # "latest" | label, "files": [names] | None, "role": ...}``, never a path. The gateway resolves
+    # each once at run start (``_resolve_shared_refs``) and keeps what ``latest`` meant.
+    shared_datasets: list[dict] | None = None
+    # What the references resolved to. Private: it holds server paths, so a request body can never set it.
+    _shared_resolved: "list[dict] | None" = PrivateAttr(default=None)
     # The TEXT attachment: the patient's clinical description / case note, carried as TEXT rather
     # than as a file. Its only consumer, map_phenotype_to_hpo, runs IN-PROCESS here on the gateway,
     # never inside a Slurm container. So the note needs neither a dataset row nor a container bind:
@@ -8256,6 +8449,55 @@ async def download_dataset(dataset_id: int, request: Request, file: "str | None"
     in the page; any other type is always an attachment, so a user's HTML or SVG never runs here."""
     src = await asyncio.to_thread(_dataset_source, request, dataset_id)
     return await _send_dataset(src, file, inline)
+
+
+def _shared_file_source(request: Request, slug: str, label: str, file: "str | None") -> _DatasetSource:
+    """One file of a shared dataset's version (issue 100), for any logged-in account. The version is
+    checked first (a label or ``latest``; a withdrawn one stays readable) and the file must be one its
+    manifest lists, so no other path under the store is reachable."""
+    from . import shared_datasets as sd
+    if not _AUTH_ENABLED:
+        raise _refuse("Shared datasets need accounts.", 400)
+    if _optional_user(request) is None:
+        raise _refuse("Not authenticated", 401)
+    if sd.store_root() is None:
+        raise _refuse("Shared datasets are not enabled on this server.", 404)
+    try:
+        found = sd.resolve(slug, label, allow_withdrawn=True)
+    except sd.SharedDatasetError as exc:
+        raise _refuse(str(exc), 404) from None
+    entry = next((f for f in found["files"] if f["name"] == (file or "")), None)
+    if entry is None:
+        raise _refuse("This version has no such file.", 404)
+    path = Path(found["server_path"]) / entry["name"]
+    if not path.is_file():
+        raise _refuse("This file is missing from the shared store.", 410)
+    return _DatasetSource(id=0, name=entry["name"].rsplit("/", 1)[-1], kind="file",
+                          size_bytes=int(entry["size_bytes"]), path=str(path), remote=False,
+                          is_dir=False, conn=None)
+
+
+@app.get("/api/shared-datasets/{slug}/versions/{label}/preview")
+async def preview_shared_file(slug: str, label: str, request: Request, file: "str | None" = None) -> JSONResponse:
+    """A bounded look at one file of a shared dataset's version; an ``.h5ad`` shows its structure
+    (obs and var), never its matrix. Read-only, for every account."""
+    src = await asyncio.to_thread(_shared_file_source, request, slug, label, file)
+    try:
+        body = await asyncio.wait_for(asyncio.to_thread(_dataset_preview_body, src, None), _PREVIEW_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return JSONResponse({"error": "The preview took too long. Download the file to open it."},
+                            status_code=504)
+    except OSError as exc:
+        return JSONResponse({"error": f"The file could not be read: {exc}"}, status_code=500)
+    body["dataset"].pop("id", None)
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/shared-datasets/{slug}/versions/{label}/download")
+async def download_shared_file(slug: str, label: str, request: Request, file: "str | None" = None,
+                               inline: int = 0) -> Response:
+    src = await asyncio.to_thread(_shared_file_source, request, slug, label, file)
+    return await _send_dataset(src, None, inline)
 
 
 async def _send_dataset(src: _DatasetSource, file: "str | None", inline: int) -> Response:
@@ -11161,6 +11403,10 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
     re-run-step / new study) instead of always minting a fresh study."""
     _select_bound_datasets(req)   # refuse an oversized set before scheduling any work
     conn = _owned_conn(req.connection_id, request)
+    # Shared datasets: resolved once here, so ``latest`` means the same for the whole run.
+    if req.shared_datasets:
+        req._shared_resolved = await asyncio.to_thread(_resolve_shared_refs, req, conn)
+        _select_bound_datasets(req)   # the limit again, now counting the shared attachments
     # A run needs the whole stack (SSH + GPU + a served model), and /api/connect brings those up
     # together — so "ready" is the only state a run may start from. Anything else (still
     # connecting/provisioning, errored, disconnected) is rejected rather than silently waiting.
@@ -14030,6 +14276,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # yield a one-element list holding exactly ``dataset_path`` — so everything below (which stages
         # the PRIMARY) is byte-for-byte today's behaviour. The SECONDARY files are staged after.
         bound = _select_bound_datasets(req)
+        shared_resolved = getattr(req, "_shared_resolved", None) or []
+        if shared_resolved and resume is None and saved_state is None:
+            await _record_shared_inputs(conn, run_id, art, decisions, shared_resolved, prior, say_key)
         # What rides into run_state.json beside the decisions: the dataset as the browser bound it
         # (the follow-up router compares the next message's against it), and, for a run that
         # continues an earlier one, which run and the conversation's work so far.
@@ -14076,7 +14325,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             # What the run reads, by UUID (its result's provenance), and what the owners' reviewed
             # Croissant metadata says about it (the planner's dataset notes).
             decisions["metadata_inputs"] = await asyncio.to_thread(
-                _metadata_inputs, conn, bound, prior, continues_from_dataset)
+                _metadata_inputs, conn, bound, prior, continues_from_dataset, decisions.get("shared_inputs"))
             notes = await asyncio.to_thread(_dataset_metadata_notes, conn, decisions["metadata_inputs"])
             if notes:
                 decisions["dataset_metadata"] = notes
@@ -14092,7 +14341,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # around them in silence (RCHENLAB/AiScientist issue 22).
         unusable: list[dict] = []
         if resume is None and saved_state is None and bound:
-            bound, server_mirrors = await _admit_bound_paths(conn, bound, say_key, emit, unusable)
+            bound, server_mirrors = await _admit_bound_paths(
+                conn, bound, say_key, emit, unusable, _shared_by_path(getattr(req, "_shared_resolved", None)))
             decisions["input_name"] = _display_name(bound[0]) if bound else ""
         primary_path = bound[0]["path"] if bound else None
         primary_name = _display_name(bound[0]) if bound else ""
@@ -15605,7 +15855,7 @@ def _split_front_matter(md: str) -> tuple[str, str]:
 
 
 def _metadata_inputs(conn: Connection, bound: list[dict], prior: "dict | None",
-                     continues_from_dataset: bool) -> list[dict]:
+                     continues_from_dataset: bool, shared_inputs: "list[dict] | None" = None) -> list[dict]:
     """The datasets and earlier results a run reads, by UUID, for its result's provenance
     (RCHENLAB/AiScientist issue 9): the user's datasets among the bound paths, and the earlier run's
     result when this run starts from what that one handed on. Never raises."""
@@ -15621,6 +15871,12 @@ def _metadata_inputs(conn: Connection, bound: list[dict], prior: "dict | None",
             for d in metadata_store.inputs_for_paths(conn.app_user_id, [b["path"] for b in bound]):
                 out.append({"uuid": d["uuid"], "kind": "dataset", "name": d["name"],
                             "role": roles.get(d["path"]) or None})
+        # A shared dataset is an input by its version's uuid (the result's croissant.json links it).
+        for r in shared_inputs or []:
+            if r.get("version_uuid"):
+                out.append({"uuid": r["version_uuid"], "kind": "dataset", "shared": True,
+                            "name": f"{r.get('title') or r.get('dataset')} {r.get('version')}",
+                            "role": r.get("role")})
     except Exception as exc:  # noqa: BLE001 - provenance is best-effort, never a reason to stop a run
         print(f"[metadata] inputs not resolved: {type(exc).__name__}: {exc}")
     return out
@@ -15633,6 +15889,8 @@ def _dataset_description_input(conn: Connection, bound: list[dict], continues: b
     accounts. Never raises."""
     if continues or not (_AUTH_ENABLED and conn.app_user_id and bound):
         return None
+    if _is_shared_path(bound[0]["path"]):
+        return None     # a run never writes into a shared dataset's metadata (issue 100)
     try:
         from . import metadata_store
         found = metadata_store.inputs_for_paths(conn.app_user_id, [bound[0]["path"]])

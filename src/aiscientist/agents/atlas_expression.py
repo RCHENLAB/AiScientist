@@ -81,13 +81,44 @@ def configured_atlases() -> dict[str, str]:
     return configured
 
 
+def atlases_available() -> bool:
+    """An atlas is listed in AISCIENTIST_ATLAS_FILES, or the shared-datasets store is on (a shared
+    dataset's file can be attached as the primary atlas without being listed)."""
+    return bool(configured_atlases() or os.environ.get("AISCIENTIST_SHARED_DATASETS_ROOT", "").strip())
+
+
+def shared_release(path: str) -> "str | None":
+    """``<slug>/<label>`` when ``path`` is a file the shared-datasets store lists, on the gateway host
+    (``AISCIENTIST_SHARED_DATASETS_ROOT``) or in its verified HPC3 copy
+    (``AISCIENTIST_HPC_SHARED_ROOT``/datasets): a shared atlas needs no AISCIENTIST_ATLAS_FILES entry.
+    The version is checked against the store's records, so a look-alike path is refused."""
+    path = posixpath.normpath(path or "")
+    for env, sub in (("AISCIENTIST_SHARED_DATASETS_ROOT", ""), ("AISCIENTIST_HPC_SHARED_ROOT", "datasets")):
+        base = os.environ.get(env, "").rstrip("/")
+        base = posixpath.join(base, sub) if base and sub else base
+        if not base or not path.startswith(base + "/"):
+            continue
+        parts = path[len(base) + 1:].split("/", 2)
+        if len(parts) != 3 or not all(parts):
+            continue
+        slug, label, name = parts
+        try:
+            from ..gateway import shared_datasets as sd
+            found = sd.resolve(slug, label, allow_withdrawn=True)
+        except Exception:  # noqa: BLE001 - not a shared file: fall through to the configured list
+            continue
+        if any(f["name"] == name for f in found["files"]):
+            return f"{slug}/{found['label']}"
+    return None
+
+
 def direct_call_refusal() -> str:
     """Keep raw shell access closed, including deployments with no usable atlas."""
-    if configured_atlases():
+    if atlases_available():
         from .mcp_bridge import protected_skill_tools
         return "Use the atlas bridge tools: " + ", ".join(protected_skill_tools(SKILL))
     return ("Atlas expression is not set up on this deployment: no atlas is listed in "
-            "AISCIENTIST_ATLAS_FILES.")
+            "AISCIENTIST_ATLAS_FILES and there are no shared datasets.")
 
 
 class AtlasAdapter:
@@ -112,6 +143,9 @@ class AtlasAdapter:
             version = configured.get(posixpath.normpath(source))
         else:
             source = ""
+        if not version and atlas:
+            # A shared dataset's file (issue 100), on this host or its HPC3 copy.
+            version = shared_release(atlas) or (shared_release(str(getattr(executor, "dataset_source", "") or "")))
         if not atlas.endswith(".h5ad") or not version:
             raise ValueError("Attach a primary .h5ad dataset listed in AISCIENTIST_ATLAS_FILES")
         if args.get("atlas") and posixpath.normpath(args["atlas"]) not in {

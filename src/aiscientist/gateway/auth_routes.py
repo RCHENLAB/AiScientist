@@ -899,7 +899,13 @@ def get_conversation(cid: int, request: Request) -> dict:
         ).all()
         return {"conversation": conv.public(), "messages": [m.public() for m in msgs],
                 "datasets": [d.public() for d in conv.datasets],
+                "shared_datasets": _shared_attachments(s, cid),
                 "max_bound_datasets": MAX_BOUND_DATASETS}
+
+
+def _shared_attachments(s, cid: int) -> list[dict]:
+    from . import shared_datasets as sd
+    return sd.attachment_views(s, cid)
 
 
 class ChatDatasetInput(BaseModel):
@@ -919,7 +925,7 @@ def replace_conversation_datasets(cid: int, req: ChatDatasetsPut, request: Reque
         conv = _owned_conversation(s, cid, user.id)
         s.refresh(conv, with_for_update=True)
         entries = {d.id: d for d in req.datasets}
-        if len(entries) > MAX_BOUND_DATASETS:
+        if len(entries) + len(conv.shared_datasets) > MAX_BOUND_DATASETS:
             raise HTTPException(400, f"At most {MAX_BOUND_DATASETS} datasets per run. Remove one first.")
         if any(d.role not in (None, "primary", "reference", "sample", "extra_input") for d in entries.values()):
             raise HTTPException(400, "Unknown dataset role")

@@ -307,6 +307,7 @@
             <div class="page-head"><h2>My files</h2><button id="datasetsRefresh" class="ghost small">Refresh</button></div>
             <div class="files-tabs" role="tablist" aria-label="Files">
               <button id="filesTab-datasets" class="files-tab active" type="button" role="tab" data-files-tab="datasets" aria-selected="true">Datasets</button>
+              <button id="filesTab-shared" class="files-tab" type="button" role="tab" data-files-tab="shared" aria-selected="false">Shared</button>
               <button id="filesTab-outputs" class="files-tab" type="button" role="tab" data-files-tab="outputs" aria-selected="false">Outputs</button>
             </div>
             <div id="filesPane-datasets" class="files-pane" role="tabpanel" aria-labelledby="filesTab-datasets">
@@ -333,6 +334,10 @@
               </form>
               <div id="mcpTokenShown" class="mcp-token-shown hidden"></div>
             </div>
+            </div>
+            <div id="filesPane-shared" class="files-pane hidden" role="tabpanel" aria-labelledby="filesTab-shared">
+              <p class="page-sub">Datasets the lab maintains for every account. They are read in place, never count toward your storage, and are never removed.</p>
+              <div id="sharedList" class="card-list"><div class="empty-hint">Loading…</div></div>
             </div>
             <div id="filesPane-outputs" class="files-pane hidden" role="tabpanel" aria-labelledby="filesTab-outputs">
               <p class="page-sub">What your runs wrote: the report, figures, tables and the run's record. Preview any file here, download one, or the whole run as a .zip.</p>
