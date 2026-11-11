@@ -72,7 +72,11 @@ def _write_h5ad(path):
     h5py = pytest.importorskip("h5py")
     import numpy as np
     with h5py.File(path, "w") as f:
-        f.create_dataset("X", data=np.zeros((3, 4), dtype="float32"))
+        x = f.create_group("X")                     # sparse, as in the HECA files: the shape is an attribute
+        x.attrs["encoding-type"], x.attrs["encoding-version"], x.attrs["shape"] = "csr_matrix", "0.1.0", (3, 4)
+        x.create_dataset("data", data=np.array([1.0, 2.0], dtype="float32"))
+        x.create_dataset("indices", data=np.array([0, 3], dtype="int32"))
+        x.create_dataset("indptr", data=np.array([0, 1, 1, 2], dtype="int64"))
         obs = f.create_group("obs")
         obs.create_dataset("_index", data=np.array([b"a", b"b", b"c"]))
         obs.create_dataset("celltype", data=np.array([0, 1, 1]))
@@ -116,6 +120,7 @@ def test_publish_copies_hashes_freezes_and_points_latest(env):
     iris = files["Iris_snRNA_allcells.h5ad"]["facets"]
     assert iris["tissue"] == "iris" and iris["modality"] == "snRNA"          # the maintainers' facet wins
     assert iris["n_obs"] == 3 and iris["n_vars"] == 4 and iris["obs_columns"] == ["celltype", "donor"]
+    assert iris["x_dtype"] == "float32"
     assert files["Lens_scRNA_allcells.h5ad"]["facets"] == {"tissue": "Lens", "modality": "scRNA"}
     assert "facets" not in files["README.txt"]
     sums = (folder / "SHA256SUMS").read_text().splitlines()

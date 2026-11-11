@@ -103,6 +103,12 @@ def test_every_role_and_the_scientist_go_to_the_shared_model_with_its_key(keeper
         assert c["base_url"] == "http://127.0.0.1:43943/v1" and c["api_key"] == KEY
         assert c["model"] == "deepseek-v4-flash" and c["reasoning_effort"] == "low"
     assert calls[0]["think_kwargs"] == {"enable_thinking": True} and calls[0].get("max_tokens") is None
+    # The shared server is ours: its calls carry the template switch, the effort and (lab roles) the
+    # stream, which complete_ex/chat_tools send only to a server marked local_server.
+    assert all(c["local_server"] is True for c in calls)
+    assert calls[0]["idle_timeout"] and calls[2]["think_kwargs"] == {"enable_thinking": True}
+    assert calls[2]["max_tokens"] == vllm_client.shared_scientist_max_tokens() == 16384
+    assert calls[2]["timeout"] == gw_app._SHARED_TOOL_TURN_TIMEOUT_S > 600
     assert llm.shared_endpoint is True and llm.scientist_remote is False and llm.lab_role_remote is False
     assert llm.context_window == 262144, "the configured window, when the server does not report one"
 

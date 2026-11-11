@@ -99,6 +99,17 @@ def scientist_max_tokens(default: int = 2048) -> int:
         return default
 
 
+def shared_scientist_max_tokens(default: int = 16384) -> int:
+    """Output reservation for one Scientist tool turn on the lab's shared model, which thinks before
+    it acts: ``AISCIENTIST_SHARED_LLM_SCIENTIST_MAX_TOKENS`` or 16384 (the plan A/B's stage B gave
+    each tool turn at least this much). The 2048 of a non-thinking turn would cut the reasoning off."""
+    import os
+    try:
+        return int(os.environ.get("AISCIENTIST_SHARED_LLM_SCIENTIST_MAX_TOKENS", "") or default)
+    except ValueError:
+        return default
+
+
 def _lab_remote_reasoning() -> dict | None:
     """Optional ``reasoning`` payload for REMOTE (base_url) completions — OpenRouter-style
     ``{"effort": "low"}`` — from ``AISCIENTIST_LAB_LLM_REASONING`` (JSON object). A reasoning model
@@ -436,6 +447,7 @@ def complete_ex(
     reasoning_effort: str | None = None,
     idle_timeout: float | None = None,
     think_kwargs: dict | None = None,
+    local_server: bool = False,
 ) -> tuple[str, dict]:
     """One ``/v1/chat/completions`` — the assistant text AND the provider's usage.
 
@@ -446,11 +458,17 @@ def complete_ex(
     describes the session's own served model; a call to a DIFFERENT local server (the shared
     reasoning model, see ``shared_llm``) carries that server's dialect instead.
 
-    ``idle_timeout`` (local path only) switches to STREAMING with no limit on total time: the call
-    fails only when the server sends NOTHING for that many seconds. A reasoning model streams its
+    ``idle_timeout`` (our own servers only) switches to STREAMING with no limit on total time: the
+    call fails only when the server sends NOTHING for that many seconds. A reasoning model streams its
     thinking too, so an hour of thinking never trips it, while a dead node or dropped tunnel still
     does. Without it the call is the historical non-streaming request with a total ``timeout`` —
     which is what cut a Qwen3.8 plan off at 600 s mid-thought.
+
+    ``local_server`` says that ``base_url`` is a server we run (the lab's shared model behind the
+    keeper's tunnel), not a provider's API: it then gets what the session's own tunnel gets — the
+    template switch (``think_kwargs`` only: the env describes the session's model), the effort and
+    the stream. Without it every shared-model call went out as a bare non-streaming request: no
+    thinking on a template that thinks only when asked, no effort, cut at 600 s.
 
     ``complete`` (below) is the text-only form every caller used before; this is the same request
     with the ``usage`` block kept instead of discarded. The provider returns exactly what the call
@@ -471,25 +489,28 @@ def complete_ex(
     """
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
     payload: dict = {"model": model, "messages": messages, "stream": False}
+    # A server we run takes the template switch, the effort field and the stream, whether it is the
+    # session's own tunnel or the lab's shared model reached through ``base_url``.
+    own = not base_url or local_server
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
-    if base_url and _lab_remote_reasoning():
+    if not own and _lab_remote_reasoning():
         payload["reasoning"] = _lab_remote_reasoning()
     if not think:
         # Only injected on the opt-out path so the default (orchestrator) call is byte-for-byte
         # unchanged. The phenotype mapper uses the session tunnel, never base_url, so this vLLM-only
         # chat-template kwarg never reaches an OpenRouter endpoint that wouldn't understand it.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-    elif not base_url and (think_kwargs or _think_on_kwargs()):
+    elif own and (think_kwargs or (not local_server and _think_on_kwargs())):
         # Served models whose template does NOT think by default (DeepSeek-V4 under vLLM's
         # deepseek_v4 tokenizer mode) need the opt-IN spelled out; configured per deployment.
         payload["chat_template_kwargs"] = think_kwargs or _think_on_kwargs()
     effort = (reasoning_effort or "").strip().lower() or _reasoning_effort()
-    if think and not base_url and effort in REASONING_EFFORTS:
-        # HOW HARD to think on the local path. chat_template_kwargs only toggles the trace on/off;
+    if think and own and effort in REASONING_EFFORTS:
+        # HOW HARD to think on our own servers. chat_template_kwargs only toggles the trace on/off;
         # a model served with a reasoning parser reads the strength from this field.
         payload["reasoning_effort"] = effort
-    if idle_timeout and not base_url:
+    if idle_timeout and own:
         try:
             return _complete_streaming(url, payload, model, api_key, idle_timeout)
         except GatewayError as exc:
@@ -615,6 +636,8 @@ def chat_tools(
     api_key: str | None = None,
     max_tokens: int | None = None,
     reasoning_effort: str | None = None,
+    think_kwargs: dict | None = None,
+    local_server: bool = False,
 ) -> dict:
     """One **non-streaming** ``/v1/chat/completions`` call WITH tool schemas.
 
@@ -638,6 +661,10 @@ def chat_tools(
     prompt`` — so a near-full prompt yields a *0-token* budget and a hard 400. Always
     reserving a slice keeps that from happening; the harness budgets its history to
     leave at least this much room (see ``ResearchHarness._budget_messages``).
+
+    ``local_server`` (the lab's shared model, see ``complete_ex``) sends ``think_kwargs`` and the
+    effort to a server reached by ``base_url``; the session's tunnel sends the env's
+    ``AISCIENTIST_SCIENTIST_CHAT_TEMPLATE_KWARGS`` instead.
     """
     url = f"{_endpoint(local_port, base_url)}/chat/completions"
     payload: dict = {
@@ -651,12 +678,13 @@ def chat_tools(
         max_tokens = scientist_max_tokens()      # 2048 unless AISCIENTIST_SCIENTIST_MAX_TOKENS
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
-    if not base_url and _scientist_kwargs():
-        payload["chat_template_kwargs"] = _scientist_kwargs()
+    template_kwargs = think_kwargs if local_server else (None if base_url else _scientist_kwargs())
+    if template_kwargs:
+        payload["chat_template_kwargs"] = template_kwargs
     if fmt is not None:
         payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "tool_selection", "schema": fmt}}
     effort = (reasoning_effort or "").strip().lower() or _reasoning_effort()
-    if not base_url and effort in REASONING_EFFORTS:
+    if (not base_url or local_server) and effort in REASONING_EFFORTS:
         payload["reasoning_effort"] = effort
 
     def _post(body_payload: dict) -> dict:

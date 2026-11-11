@@ -163,6 +163,8 @@ def _env_seconds(name: str, default: float) -> float:
 # How long a lab-role call on the cluster GPU may go WITHOUT A SINGLE TOKEN before it counts as dead.
 # Not a limit on thinking time: the reasoning trace streams too, so a long think keeps it alive.
 _LAB_IDLE_TIMEOUT = _env_seconds("AISCIENTIST_LAB_IDLE_TIMEOUT", 300.0)
+# One Scientist tool turn on the shared model (non-streaming, so this bounds the whole turn).
+_SHARED_TOOL_TURN_TIMEOUT_S = _env_seconds("AISCIENTIST_SHARED_LLM_TOOL_TURN_TIMEOUT", 1200.0)
 
 
 def _role_effort(role: str | None) -> str | None:
@@ -12614,7 +12616,7 @@ def _lab_llm(conn: Connection) -> "LabLLM":
                 b_used.append(b)
                 return vllm_client.complete_ex(0, b.model, messages, base_url=url, api_key=b.api_key,
                                                reasoning_effort=b.effort, think_kwargs=b.think_kwargs,
-                                               idle_timeout=_LAB_IDLE_TIMEOUT)
+                                               idle_timeout=_LAB_IDLE_TIMEOUT, local_server=True)
             try:
                 text, usage = _on_shared_endpoint(_call)
             except (GatewayError, VLLMNetworkError) as exc:
@@ -12706,8 +12708,12 @@ def _lab_llm(conn: Connection) -> "LabLLM":
 
             def _sci(b, url):
                 b_used.append(b)
+                # A thinking tool turn needs room (shared_scientist_max_tokens) and time: a long one at
+                # four conversations' share of the server's speed outlasts the 600 s default.
                 return vllm_client.chat_tools(0, b.model, messages, tools, base_url=url, api_key=b.api_key,
-                                              reasoning_effort=b.effort)
+                                              reasoning_effort=b.effort, think_kwargs=b.think_kwargs,
+                                              local_server=True, timeout=_SHARED_TOOL_TURN_TIMEOUT_S,
+                                              max_tokens=vllm_client.shared_scientist_max_tokens())
             try:
                 out = _on_shared_endpoint(_sci)
             except (GatewayError, VLLMNetworkError) as exc:
@@ -15314,8 +15320,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 literature_executor, emit), run_id, conn.settings),
             chat_fn=scientist_chat,
             count_tokens_fn=count_tokens,   # exact server-side window sensing (vLLM /tokenize)
-            # The shared model is served with a smaller window than the session GPU's Qwen.
-            config=HarnessConfig(max_model_len=_llm.context_window) if _llm.context_window else None,
+            # The shared model is served with a smaller window than the session GPU's Qwen, and its
+            # tool turns reserve more output room (they think first): the history leaves that room.
+            config=HarnessConfig(max_model_len=_llm.context_window,
+                                 output_reserve_tokens=vllm_client.shared_scientist_max_tokens())
+            if _llm.context_window else None,
         )
         # The console's multi-select skills are PINNED (mandatory) for this run; the PI still
         # auto-selects the best-fit skill ON TOP (pinned = must-have, auto augments). Resolve the

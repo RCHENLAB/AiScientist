@@ -45,12 +45,13 @@ class FakeCluster:
         self.target = None
         self.closed = False
 
-    def add(self, state="R", node="gpu-a", left="2-00:00:00", port=31000, ready=True, reason="None") -> str:
+    def add(self, state="R", node="gpu-a", left="2-00:00:00", port=31000, ready=True, reason="None",
+            comment="") -> str:
         self._next += 1
         jid = str(self._next)
         self.jobs[jid] = dict(state=state, node=node if state == "R" else "", left=left,
                               port=port if state == "R" else 0,
-                              ready=ready and state == "R", reason=reason)
+                              ready=ready and state == "R", reason=reason, comment=comment)
         return jid
 
     def _ok(self, out: str = "", status: int = 0, err: str = "") -> ExecResult:
@@ -63,7 +64,7 @@ class FakeCluster:
         if "squeue --me" in command:
             lines = [f"HOME|{HOME}"]
             if self.squeue_ok:
-                lines += [f"JOB|{j}|{d['state']}|{d['node']}|{d['left']}|{d['reason']}"
+                lines += [f"JOB|{j}|{d['state']}|{d['node']}|{d['left']}|{d['reason']}|{d.get('comment', '')}"
                           for j, d in self.jobs.items()]
             lines.append(f"RC|{0 if self.squeue_ok else 1}")
             lines += [f"PORT|{j}|{d['port']}|{'ready' if d['ready'] else ''}"
@@ -75,7 +76,8 @@ class FakeCluster:
         if "sbatch --parsable" in command:
             if self.sbatch_error:
                 return self._ok(status=1, err=self.sbatch_error)
-            return self._ok(self.add(state="PD", reason="Priority") + "\n")
+            m = re.search(r"#SBATCH --comment=(\S+)", self.submitted[-1]) if self.submitted else None
+            return self._ok(self.add(state="PD", reason="Priority", comment=m.group(1) if m else "") + "\n")
         if command.startswith("scancel "):
             for jid in command.split()[1:]:
                 self.cancelled.append(jid)
@@ -172,6 +174,123 @@ def test_one_card_gets_no_tensor_parallel_flag_and_excludes_are_written():
     assert shared_llm.gpu_count("gpu:A100") == 1
 
 
+def test_the_preflight_starts_cuda_instead_of_counting_cards():
+    # On hpc3-gpu-n54-00 NVML counts the healthy cards while cuInit fails for every job on the node.
+    for script in (shared_llm.serve_script(_settings(), HPCSettings(), HOME),
+                   shared_llm.serve_script(_strata(), HPCSettings(), HOME)):
+        assert "c.cuInit(0) == 0" in script and "cuDeviceGetCount" in script
+        assert "torch.cuda.device_count" not in script.split("NVML (nvidia-smi")[1].split("\n", 2)[2]
+        assert 'ABORT: $(hostname) exposes' in script      # the keeper's dead-node regex still matches
+
+
+# -- the strata engine (DeepSeek-V4.1-Flash at 2 bits on two cards) --------------------------------
+
+def _strata(**over) -> SharedLLMSettings:
+    root = "/dfs3b/ruic20_lab/software/AiScientist"
+    base = dict(engine="strata", model=shared_llm.STRATA_MODEL, served_name=shared_llm.STRATA_SERVED_NAME,
+                gres="gpu:RTX6000:2", cpus=4, mem_gb=24, strata_root=f"{root}/engines",
+                gguf_dir=f"{root}/models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO",
+                gguf_shared_dir=f"{root}/models/gguf/DeepSeek-V4.1-Flash-shared")
+    base.update(over)
+    return _settings(**base)
+
+
+def test_the_strata_engine_brings_its_own_defaults(monkeypatch):
+    for k in [k for k in list(__import__("os").environ) if k.startswith("AISCIENTIST_SHARED_LLM")]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("AISCIENTIST_SHARED_LLM_ENGINE", "strata")
+    hpc = HPCSettings()
+    s = SharedLLMSettings.from_env(hpc)
+    assert (s.engine, s.model, s.served_name) == ("strata", shared_llm.STRATA_MODEL, "deepseek-v4.1-flash")
+    assert (s.gres, s.cpus, s.mem_gb, s.context, s.parallel) == ("gpu:RTX6000:2", 4, 24, 131072, 4)
+    assert s.strata_root == f"{hpc.shared_root.rstrip('/')}/engines"
+    assert s.gguf_dir.endswith("/models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO")
+    # what the operator sets wins: two A100 on the paid partition
+    monkeypatch.setenv("AISCIENTIST_SHARED_LLM_GRES", "gpu:A100:2")
+    monkeypatch.setenv("AISCIENTIST_SHARED_LLM_MEM_GB", "64")
+    monkeypatch.setenv("AISCIENTIST_SHARED_LLM_CONTEXT", "131072")
+    s = SharedLLMSettings.from_env(hpc)
+    assert (s.gres, s.mem_gb, s.context) == ("gpu:A100:2", 64, 131072)
+    monkeypatch.delenv("AISCIENTIST_SHARED_LLM_ENGINE")
+    assert SharedLLMSettings.from_env(hpc).served_name == "deepseek-v4-flash"     # vllm stays the default
+    monkeypatch.setenv("AISCIENTIST_SHARED_LLM_ENGINE", "sglang")
+    with pytest.raises(ValueError):
+        SharedLLMSettings.from_env(hpc)
+
+
+def test_the_strata_script_stages_the_engram_and_serves_with_strata():
+    s = _strata()
+    script = shared_llm.serve_script(s, HPCSettings(), HOME)
+    assert "#SBATCH --gres=gpu:RTX6000:2" in script and "#SBATCH --mem=24G" in script
+    assert "#SBATCH --comment=model=deepseek-v4.1-flash" in script
+    assert "need 2" in script and "-ne 2" in script
+    assert "vllm serve" not in script and "--tensor-parallel-size" not in script
+    assert "module load gcc/11.2.0 cuda/13.0.1 python/3.10.2" in script
+    # the Engram table goes to the node's disk, the five model files stay where they are
+    assert f'cp "{s.gguf_dir}/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf" "$LOCAL/"' in script
+    for i in range(1, 6):
+        assert f"{shared_llm.STRATA_MODEL}-{i:05d}-of-00006.gguf" in script
+    assert "-00006-of-00006.gguf" not in script
+    # Strata's own pack recipe for ISTA's sets
+    assert "tools/dsv41/pack_gguf.py" in script and "--dspark-noise-token 128799 --dspark-markov-rank 256" in script
+    assert f'--engram-meta "{s.gguf_shared_dir}/UD-Q8_K_XL/' in script
+    assert "profile-2.00.bin" in script
+    assert 'serve/server.py --engine strata --config "$LOCAL/strata.json"' in script
+    assert '--host 0.0.0.0 --port "$PORT" --parallel 4' in script
+    assert '"--max-context", "131072"' in script and '"gpu": [0, 1]' in script
+    assert '"model_name": "$SERVED_NAME"' in script and '"--ssd-cache", "4"' in script
+    # ready = the model is loaded, not just the API bound
+    assert "grep -q '\"loaded\"'" in script
+    assert "\nbash -s <<'AISCIENTIST_SHARED_SERVE'" in script          # no setuid sg: it drops LD_LIBRARY_PATH
+    assert "@@" not in script
+
+
+def test_the_strata_script_keeps_the_key_out_of_the_script_and_the_command_line():
+    script = shared_llm.serve_script(_strata(), HPCSettings(), HOME)
+    assert 'export VLLM_API_KEY="$(cat "$SHARED_DIR/api.key")"' in script
+    assert "export STRATA_API_KEY=$VLLM_API_KEY" in script
+    assert "--api-key" not in script and "sk-" not in script
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "pr_review_gate.py"
+    spec = importlib.util.spec_from_file_location("pr_review_gate", path)
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+    assert not gate.contains_secret_like(script)
+
+
+def test_strata_reports_its_window_as_n_ctx(monkeypatch):
+    import io
+    import json as _json
+
+    body = {"object": "list", "data": [{"id": "deepseek-v4.1-flash", "status": {"value": "loaded"},
+                                         "meta": {"n_ctx": 262144}}]}
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(shared_llm.urllib.request, "urlopen",
+                        lambda req, timeout=0: Resp(_json.dumps(body).encode()))
+    bound = shared_llm.Binding(port=1, model="deepseek-v4.1-flash", api_key="k", effort="low", think_kwargs={})
+    assert shared_llm.served_window(bound) == 262144
+    assert shared_llm.served_window(shared_llm.Binding(port=1, model="other", api_key="k", effort="low",
+                                                       think_kwargs={})) is None
+
+
+def test_with_no_report_the_strata_window_is_the_configured_context(monkeypatch):
+    keeper = types.SimpleNamespace(settings=_strata(context=131072))
+    monkeypatch.setattr(shared_llm, "_MANAGER", keeper)
+    monkeypatch.setattr(shared_llm, "endpoint_binding", lambda: None)
+    assert shared_llm.context_window() == 131072
+
+
 # -- reading the queue ---------------------------------------------------------------------------
 
 def test_the_listing_gives_jobs_their_port_and_readiness():
@@ -257,6 +376,44 @@ def test_it_moves_to_the_newer_job_once_that_answers_and_cancels_the_old_one_aft
     keeper.step()
     assert cluster.cancelled == [old]
     assert keeper.status()["job_id"] == queued
+
+
+def test_a_queued_job_for_another_model_is_replaced_by_one_for_this_model():
+    # The settings moved to the 2-bit V4.1 on two cards while the four-card V4 job still waited.
+    cluster = FakeCluster()
+    old = cluster.add(state="PD", reason="Priority", comment="model=deepseek-v4-flash")
+    keeper = _keeper(cluster, _strata())
+    keeper.step()
+    assert cluster.cancelled == [old]
+    assert _sbatch_count(cluster) == 1
+    assert "#SBATCH --gres=gpu:RTX6000:2" in cluster.submitted[-1]
+    new = next(iter(cluster.jobs))
+    assert cluster.jobs[new]["comment"] == "model=deepseek-v4.1-flash"
+    keeper.step()                                   # its own queued job is kept
+    assert cluster.cancelled == [old] and _sbatch_count(cluster) == 1
+    assert "failed" not in keeper.status()["detail"]
+
+
+def test_a_running_job_for_another_model_is_not_served_and_goes_once_the_new_one_answers():
+    cluster = FakeCluster()
+    old = cluster.add(node="gpu-a", port=31000, left="2-12:00:00", comment="model=deepseek-v4-flash")
+    keeper = _keeper(cluster, _strata())
+    keeper.step()
+    assert keeper.binding() is None and cluster.target() is None
+    assert _sbatch_count(cluster) == 1 and cluster.cancelled == []     # nothing to serve meanwhile
+    new = next(j for j in cluster.jobs if j != old)
+    cluster.jobs[new].update(state="R", node="gpu-b", port=42000, left="3-00:00:00", ready=True)
+    keeper.step()
+    assert cluster.target() == ("gpu-b", 42000) and keeper.binding().model == "deepseek-v4.1-flash"
+    assert cluster.cancelled == [old]
+
+
+def test_jobs_without_a_comment_count_as_this_models():
+    cluster = FakeCluster()
+    jid = cluster.add(node="gpu-a", port=31000, left="2-12:00:00")          # comment ""
+    keeper = _keeper(cluster)
+    keeper.step()
+    assert keeper.status()["job_id"] == jid and cluster.cancelled == []
 
 
 def test_when_slurm_does_not_answer_nothing_is_submitted_or_cancelled():

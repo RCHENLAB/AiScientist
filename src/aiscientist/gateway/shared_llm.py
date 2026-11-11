@@ -74,6 +74,21 @@ _MULTI_CARD_ENV = (
     "NCCL_CUMEM_ENABLE=0 NCCL_P2P_DISABLE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 )
 
+# The "strata" engine: DeepSeek-V4.1-Flash-1017 at 2 bits (ISTA-DASLab's GSQ-RCO IQ2_XXS GGUF, six-shard layout:
+# five model files, the 111 GB Engram lookup table as the sixth) served by Strata (github.com/Niko1221/Strata: its
+# `strata-dsv41` engine behind `serve/server.py`). All of its experts fit two RTX PRO 6000 (HPC3 job 59392175:
+# ~147 GB), so the job asks for two cards instead of four.
+STRATA_MODEL = "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS"
+STRATA_SERVED_NAME = "deepseek-v4.1-flash"
+_STRATA_SHARDS = 5
+_STRATA_ENGRAM = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+# The two files Strata's pack recipe for ISTA's sets also reads (its setup.py `dsv41_pack_cmd`): Unsloth's metadata
+# shard, for the Engram hash parameters, and the DSpark drafter.
+_STRATA_META = "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf"
+_STRATA_DSPARK = "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+_STRATA_MODULES = "gcc/11.2.0 cuda/13.0.1 python/3.10.2"
+_ENGINES = ("vllm", "strata")
+
 
 def _flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
@@ -120,6 +135,16 @@ class SharedLLMSettings:
     # How it is called.
     reasoning_effort: str = "low"
     think_kwargs: tuple = (("enable_thinking", True),)
+    # Which server runs the model: "vllm" (serve_args, image) or "strata" (the fields below).
+    engine: str = "vllm"
+    # strata: --max-context, 131,072 as measured on 2x RTX PRO 6000 and 2x A100 (vLLM's window is in
+    # serve_args). The model reads 1,048,576; 262,144 is untested on our cards.
+    context: int = 131072
+    parallel: int = 4                  # strata: conversations at once, the gate's per-account limit
+    strata_root: str = ""              # holds strata-src/, strata-venv/, strata-dsv41-build/
+    gguf_dir: str = ""                 # the model's six GGUF shards (the sixth = the Engram file)
+    gguf_shared_dir: str = ""          # the pack's metadata shard and DSpark drafter
+    host_modules: str = _STRATA_MODULES
 
     @classmethod
     def from_env(cls, hpc: HPCSettings) -> "SharedLLMSettings":
@@ -132,22 +157,39 @@ class SharedLLMSettings:
                 think = tuple(sorted(val.items())) if isinstance(val, dict) else ()
             except json.JSONDecodeError:
                 think = cls.think_kwargs
+        engine = env("AISCIENTIST_SHARED_LLM_ENGINE", "").strip().lower() or cls.engine
+        if engine not in _ENGINES:
+            raise ValueError(f"AISCIENTIST_SHARED_LLM_ENGINE={engine!r}: use one of {', '.join(_ENGINES)}")
+        strata = engine == "strata"
+        # Two cards hold the 2-bit model; MaxMemPerCPU=6144 on free-gpu32 makes 24G four CPUs.
+        model_d, name_d = (STRATA_MODEL, STRATA_SERVED_NAME) if strata else (cls.model, cls.served_name)
+        gres_d, cpus_d, mem_d = ("gpu:RTX6000:2", 4, 24) if strata else (cls.gres, cls.cpus, cls.mem_gb)
+        root = hpc.shared_root.rstrip("/")
         return cls(
+            engine=engine,
+            context=_int_env("AISCIENTIST_SHARED_LLM_CONTEXT", cls.context),
+            parallel=_int_env("AISCIENTIST_SHARED_LLM_PARALLEL", cls.parallel),
+            strata_root=env("AISCIENTIST_SHARED_LLM_STRATA_ROOT", "").strip() or f"{root}/engines",
+            gguf_dir=env("AISCIENTIST_SHARED_LLM_GGUF_DIR", "").strip()
+            or f"{root}/models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO",
+            gguf_shared_dir=env("AISCIENTIST_SHARED_LLM_GGUF_SHARED_DIR", "").strip()
+            or f"{root}/models/gguf/DeepSeek-V4.1-Flash-shared",
+            host_modules=env("AISCIENTIST_SHARED_LLM_HOST_MODULES", cls.host_modules).strip(),
             enabled=_flag("AISCIENTIST_SHARED_LLM"),
             owner=env("AISCIENTIST_SHARED_LLM_OWNER", "").strip(),
             ssh_credential_id=env("AISCIENTIST_SHARED_LLM_SSH_CREDENTIAL", "").strip(),
             hpc_user=env("AISCIENTIST_SHARED_LLM_HPC_USER", "").strip(),
             key_path=env("AISCIENTIST_SHARED_LLM_KEY_PATH", "").strip(),
-            model=env("AISCIENTIST_SHARED_LLM_MODEL", cls.model).strip(),
-            served_name=env("AISCIENTIST_SHARED_LLM_SERVED_NAME", cls.served_name).strip(),
+            model=env("AISCIENTIST_SHARED_LLM_MODEL", "").strip() or model_d,
+            served_name=env("AISCIENTIST_SHARED_LLM_SERVED_NAME", "").strip() or name_d,
             image=env("AISCIENTIST_SHARED_LLM_IMAGE", "").strip() or hpc.vllm_image,
             serve_args=env("AISCIENTIST_SHARED_LLM_SERVE_ARGS", cls.serve_args).strip(),
             container_env=env("AISCIENTIST_SHARED_LLM_CONTAINER_ENV", cls.container_env).strip(),
             partition=env("AISCIENTIST_SHARED_LLM_PARTITION", cls.partition).strip(),
             account=env("AISCIENTIST_SHARED_LLM_ACCOUNT", "").strip(),
-            gres=env("AISCIENTIST_SHARED_LLM_GRES", cls.gres).strip(),
-            cpus=_int_env("AISCIENTIST_SHARED_LLM_CPUS", cls.cpus),
-            mem_gb=_int_env("AISCIENTIST_SHARED_LLM_MEM_GB", cls.mem_gb),
+            gres=env("AISCIENTIST_SHARED_LLM_GRES", "").strip() or gres_d,
+            cpus=_int_env("AISCIENTIST_SHARED_LLM_CPUS", cpus_d),
+            mem_gb=_int_env("AISCIENTIST_SHARED_LLM_MEM_GB", mem_d),
             time_limit=env("AISCIENTIST_SHARED_LLM_TIME_LIMIT", cls.time_limit).strip(),
             exclude=env("AISCIENTIST_SHARED_LLM_EXCLUDE", "").strip() or (hpc.exclude or ""),
             renew_lead_s=_int_env("AISCIENTIST_SHARED_LLM_RENEW_LEAD_HOURS", 48) * 3600,
@@ -194,13 +236,17 @@ export BIND_ROOT="@@BIND_ROOT@@"
 
 source /etc/profile.d/lmod.sh 2>/dev/null || true
 module load @@CONTAINER_MODULE@@ 2>/dev/null || true
-
+@@HOST_MODULE_LINE@@
 echo "AiScientist shared LLM: job $SLURM_JOB_ID on $(hostname) at $(date)"
 nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader
 
-# A dead card takes CUDA down for the whole allocation, and Slurm still hands the node out.
-NGPU=$(@@CONTAINER_BIN@@ exec --nv "$SIF" python3 -c "import torch;print(torch.cuda.device_count())" 2>/dev/null | tail -1)
-echo "preflight: torch sees ${NGPU:-0} CUDA devices (need @@NGPU@@)"
+# A dead card takes CUDA down for the whole allocation (on hpc3-gpu-n54-00, for every job on the node), and
+# Slurm still hands the node out. NVML (nvidia-smi, torch.cuda.device_count) still counts the healthy cards
+# there: only starting CUDA tells.
+NGPU=$(python3 -c "import ctypes
+c = ctypes.CDLL('libcuda.so.1'); n = ctypes.c_int()
+print(n.value if c.cuInit(0) == 0 and c.cuDeviceGetCount(ctypes.byref(n)) == 0 else 0)" 2>/dev/null | tail -1)
+echo "preflight: CUDA starts on ${NGPU:-0} devices (need @@NGPU@@)"
 if [ "${NGPU:-0}" -ne @@NGPU@@ ]; then
   echo "ABORT: $(hostname) exposes ${NGPU:-0} usable CUDA devices, not @@NGPU@@"
   exit 94
@@ -223,10 +269,10 @@ echo "AiScientist shared LLM will bind 0.0.0.0:$PORT on $(hostname)"
 export VLLM_API_KEY="$(cat "$SHARED_DIR/api.key")"
 export APPTAINERENV_VLLM_API_KEY=$VLLM_API_KEY
 
-# Mark the job ready once the server answers (/health needs no key).
+# Mark the job ready once the server answers@@READY_WHAT@@.
 (
   for _i in $(seq 1 360); do
-    if curl -sf --max-time 5 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    if @@READY_CHECK@@; then
       date +%s > "$SHARED_DIR/$SLURM_JOB_ID.ready"
       echo "AiScientist shared LLM: serving $SERVED_NAME ($(date))"
       break
@@ -235,33 +281,90 @@ export APPTAINERENV_VLLM_API_KEY=$VLLM_API_KEY
   done
 ) &
 
-@@RUNNER@@ <<'AISCIENTIST_SHARED_SERVE'
-exec @@CONTAINER_BIN@@ exec --nv --bind "$BIND_ROOT:$BIND_ROOT" \
-  --env HF_HOME="$HF_HOME" --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1@@CONTAINER_ENV@@ \
-  "$SIF" \
-  vllm serve "$MODEL" --host 0.0.0.0 --port "$PORT" --served-model-name "$SERVED_NAME" \
-    @@SERVE_ARGS@@
-AISCIENTIST_SHARED_SERVE
+@@SERVE_BLOCK@@
 status=$?
 rm -f "$SHARED_DIR/$SLURM_JOB_ID.ready"
 echo "AiScientist shared LLM: server exited with status $status ($(date))"
 exit $status
 """
 
+_VLLM_READY = ('curl -sf --max-time 5 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1', " (/health needs no key)")
+_VLLM_SERVE = r"""@@RUNNER@@ <<'AISCIENTIST_SHARED_SERVE'
+exec @@CONTAINER_BIN@@ exec --nv --bind "$BIND_ROOT:$BIND_ROOT" \
+  --env HF_HOME="$HF_HOME" --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1@@CONTAINER_ENV@@ \
+  "$SIF" \
+  vllm serve "$MODEL" --host 0.0.0.0 --port "$PORT" --served-model-name "$SERVED_NAME" \
+    @@SERVE_ARGS@@
+AISCIENTIST_SHARED_SERVE"""
+
+# Strata's API answers /health before its engine has loaded: ready = /v1/models lists the model as loaded.
+_STRATA_READY = ('curl -sf --max-time 5 -H "Authorization: Bearer $VLLM_API_KEY" '
+                 '"http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q \'"loaded"\'',
+                 " with the model loaded")
+_STRATA_SERVE = r"""@@RUNNER@@ <<'AISCIENTIST_SHARED_SERVE'
+# The Engram table is read a few rows per word, so it goes to the node's own disk (TMPDIR is the job's and
+# goes with it); the model files are read once, into the cards, where they are.
+LOCAL="${TMPDIR:-/tmp}/aiscientist-shared-$SLURM_JOB_ID"
+mkdir -p "$LOCAL" || exit 97
+for f in @@STRATA_SHARDS@@; do ln -sfn "@@GGUF_DIR@@/$f" "$LOCAL/$f"; done
+cp "@@GGUF_DIR@@/@@STRATA_ENGRAM@@" "$LOCAL/" || { echo "ABORT: could not copy the Engram table to $LOCAL"; exit 97; }
+cd "@@STRATA_ROOT@@/strata-src" || exit 97
+# Strata's pack is an index beside the files (no weights copied); its recipe for ISTA's sets is setup.py's.
+"@@STRATA_ROOT@@/strata-venv/bin/python" tools/dsv41/pack_gguf.py --model "$LOCAL" --shards @@STRATA_SHARDS@@ \
+  --engram "$LOCAL/@@STRATA_ENGRAM@@" --engram-meta "@@GGUF_SHARED_DIR@@/@@STRATA_META@@" \
+  --dspark-gguf "@@GGUF_SHARED_DIR@@/@@STRATA_DSPARK@@" --dspark-noise-token 128799 --dspark-markov-rank 256 \
+  --out "$LOCAL/pack" < /dev/null || { echo "ABORT: Strata could not pack the model"; exit 97; }
+cp data/dsv41/profile-2.00.bin "$LOCAL/pack/expert-profile.bin"
+CUDA_LIB="$(dirname "$(dirname "$(command -v nvcc)")")/lib64"
+# --dspark auto, never off (off still loads the drafter); the RAM store sized for the job, not the node.
+cat > "$LOCAL/strata.json" <<EOF
+{"exe": "@@STRATA_ROOT@@/strata-dsv41-build/strata-dsv41",
+ "args": ["--pack", "$LOCAL/pack", "--max-context", "@@CONTEXT@@", "--eos", "1", "--vision", "off",
+          "--dspark", "auto", "--dspark-conf", "0.65", "--ssd-cache", "4"],
+ "cwd": "@@STRATA_ROOT@@/strata-src", "tokenizer": "$LOCAL/pack/tokenizer", "model_name": "$SERVED_NAME",
+ "arch": "deepseek41", "log": "$SHARED_DIR/engine-$SLURM_JOB_ID.log", "lib_dirs": ["$CUDA_LIB"],
+ "engine_ready_s": 3600, "gpu": [@@GPU_LIST@@], "gpus_asked": true, "parallel": @@PARALLEL@@}
+EOF
+export STRATA_API_KEY=$VLLM_API_KEY
+exec "@@STRATA_ROOT@@/strata-venv/bin/python" serve/server.py --engine strata --config "$LOCAL/strata.json" \
+  --host 0.0.0.0 --port "$PORT" --parallel @@PARALLEL@@
+AISCIENTIST_SHARED_SERVE"""
+
 
 def serve_script(s: SharedLLMSettings, hpc: HPCSettings, home: str, exclude: str = "") -> str:
     """The sbatch script of the shared job. ``home`` is the account's absolute HPC3 home: Slurm
     does not expand ``$HOME`` in ``#SBATCH --output``."""
     n = gpu_count(s.gres)
+    strata = s.engine == "strata"
     args = s.serve_args
     if n > 1 and "--tensor-parallel-size" not in args:
         args = f"--tensor-parallel-size {n} {args}"
     account = s.account or (hpc.account or "")
-    group = hpc.lab_data_group if any(
+    # vLLM writes caches beside its weights on lab storage, so it runs under the lab group. Strata only
+    # reads there (the supplementary group is enough) and writes to $HOME and the node; and `sg` is
+    # setuid, which strips the LD_LIBRARY_PATH its Python and CUDA libraries come from.
+    group = hpc.lab_data_group if not strata and any(
         p.startswith(hpc.lab_storage) for p in (s.image, hpc.hf_home)) else ""
     bind_root = hpc.shared_root if hpc.hf_home.startswith(hpc.shared_root) else hpc.hf_home
     env = "".join(f" --env {kv}" for kv in s.container_env.split())
+    ready, ready_what = _STRATA_READY if strata else _VLLM_READY
+    shards = " ".join(f"{s.model}-{i:05d}-of-{_STRATA_SHARDS + 1:05d}.gguf" for i in range(1, _STRATA_SHARDS + 1))
     values = {
+        # first: these bring placeholders of their own
+        "SERVE_BLOCK": _STRATA_SERVE if strata else _VLLM_SERVE,
+        "READY_CHECK": ready,
+        "READY_WHAT": ready_what,
+        "HOST_MODULE_LINE": f"module load {s.host_modules} 2>/dev/null || true\n" if strata and s.host_modules else "",
+        "STRATA_ROOT": s.strata_root.rstrip("/"),
+        "GGUF_DIR": s.gguf_dir.rstrip("/"),
+        "GGUF_SHARED_DIR": s.gguf_shared_dir.rstrip("/"),
+        "STRATA_SHARDS": shards,
+        "STRATA_ENGRAM": _STRATA_ENGRAM,
+        "STRATA_META": _STRATA_META,
+        "STRATA_DSPARK": _STRATA_DSPARK,
+        "CONTEXT": str(s.context),
+        "PARALLEL": str(max(1, min(8, s.parallel))),
+        "GPU_LIST": ", ".join(str(i) for i in range(n)),
         "JOB_NAME": job_name(),
         "SHARED_DIR_NAME": remote_dir_name(),
         "PARTITION": s.partition,
@@ -299,6 +402,7 @@ class SharedJob:
     reason: str = ""
     port: int = 0
     ready: bool = False
+    comment: str = ""               # squeue %k: the script's "model=<served name>"
 
     @property
     def running(self) -> bool:
@@ -310,7 +414,7 @@ def list_command() -> str:
     their port and readiness files."""
     return (
         f'D="{remote_dir()}"; echo "HOME|$HOME"; '
-        f"squeue --me --name={job_name()} --states=R,PD,CF --noheader --format='JOB|%i|%t|%N|%L|%r'; "
+        f"squeue --me --name={job_name()} --states=R,PD,CF --noheader --format='JOB|%i|%t|%N|%L|%r|%k'; "
         'echo "RC|$?"; '
         'for f in "$D"/*.port; do [ -f "$f" ] || continue; j=$(basename "$f" .port); '
         'echo "PORT|$j|$(cat "$f" 2>/dev/null)|$([ -f "$D/$j.ready" ] && echo ready)"; done'
@@ -333,7 +437,8 @@ def parse_listing(text: str) -> tuple[str, bool, list[SharedJob]]:
             left = slurm_time_to_seconds(parts[4], default=-1) if parts[2] == "R" else -1
             rows[parts[1]] = SharedJob(job_id=parts[1], state=parts[2], node=parts[3],
                                        time_left_s=left if left >= 0 else None,
-                                       reason=parts[5] if len(parts) > 5 else "")
+                                       reason=parts[5] if len(parts) > 5 else "",
+                                       comment=parts[6] if len(parts) > 6 else "")
         elif parts[0] == "PORT" and len(parts) >= 3 and parts[2].isdigit():
             ports[parts[1]] = (int(parts[2]), len(parts) > 3 and parts[3] == "ready")
     jobs = [replace(j, port=ports.get(j.job_id, (0, False))[0],
@@ -490,6 +595,19 @@ class SharedLLM:
             self._health(now, note="Slurm did not answer (squeue failed)")
             return
 
+        # A job submitted for another model (the settings changed: a new model or engine) is not ours to
+        # wait for or serve from. A queued one goes now; a running one once the new job answers.
+        want = f"model={self.settings.served_name}"
+        other = [j for j in jobs if j.comment and j.comment != want]
+        if [j for j in other if not j.running]:
+            gone = [j.job_id for j in other if not j.running]
+            ex.exec("scancel " + " ".join(gone))
+            self._log(f"cancelled queued job(s) {', '.join(gone)}: submitted for another model")
+            if self._watching in gone:
+                self._watching = ""
+        stale = [j.job_id for j in other if j.running]
+        jobs = [j for j in jobs if j not in other]
+
         running = [j for j in jobs if j.running]
         pending = [j for j in jobs if not j.running]
         ids = {j.job_id for j in jobs}
@@ -532,6 +650,9 @@ class SharedLLM:
             if old and now - self._switched_at >= self.settings.drain_s:
                 ex.exec("scancel " + " ".join(old))
                 self._log(f"cancelled superseded job(s) {', '.join(old)}")
+            if stale:
+                ex.exec("scancel " + " ".join(stale))
+                self._log(f"cancelled job(s) {', '.join(stale)}: they serve another model")
 
         # Submit: when there is no job at all, or ahead of the running job's limit.
         if not pending:
@@ -741,8 +862,8 @@ def endpoint_binding() -> Binding | None:
 
 
 def served_window(bound: Binding, timeout: float = 5.0) -> int | None:
-    """The context window the running server reports (vLLM's ``max_model_len`` on /v1/models), or
-    None when it does not say."""
+    """The context window the running server reports on /v1/models (vLLM's ``max_model_len``,
+    Strata's ``meta.n_ctx``), or None when it does not say."""
     req = urllib.request.Request(f"http://127.0.0.1:{bound.port}/v1/models",
                                  headers={"Authorization": f"Bearer {bound.api_key}"})
     try:
@@ -751,20 +872,27 @@ def served_window(bound: Binding, timeout: float = 5.0) -> int | None:
     except (urllib.error.URLError, OSError, ValueError):
         return None
     for m in (body or {}).get("data") or []:
-        if isinstance(m, dict) and m.get("id") == bound.model and isinstance(m.get("max_model_len"), int):
-            return m["max_model_len"]
+        if not isinstance(m, dict) or m.get("id") != bound.model:
+            continue
+        meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+        for n in (m.get("max_model_len"), meta.get("n_ctx")):
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                return n
     return None
 
 
 def context_window() -> int:
     """The shared model's context window, so a session on it trims the Scientist's context to what
     the server takes: what the RUNNING server reports, because a job submitted with older flags keeps
-    its window until it is renewed; else the configured ``--max-model-len``."""
+    its window until it is renewed; else the configured one (vLLM's ``--max-model-len``, Strata's
+    ``--max-context``)."""
     bound = endpoint_binding()
     reported = served_window(bound) if bound is not None else None
     if reported:
         return reported
     manager = _MANAGER
+    if manager is not None and manager.settings.engine == "strata":
+        return manager.settings.context
     args = manager.settings.serve_args if manager is not None else _DSV4_SERVE_ARGS
     m = re.search(r"--max-model-len[ =](\d+)", args or "")
     return int(m.group(1)) if m else 262144

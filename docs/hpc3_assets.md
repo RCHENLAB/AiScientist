@@ -89,6 +89,9 @@ configuration reads them. Together they are 60 G of the directory.
 | `models/hf/hub/models--RedHatAI--Qwen3.8-27B-INT4` | 18 G | the default model of a session | `AISCIENTIST_VLLM_MODEL`, `AISCIENTIST_HF_HOME` | `scripts/hpc3_vllm_setup.sh` (`hf download` into `<root>/models/hf`) |
 | `models/hf/hub/models--QuantTrio--Qwen3.6-35B-A3B-AWQ` | 24 G | the second model of the model list | the model list | the same script with `AISCIENTIST_VLLM_MODEL` set to it |
 | `models/hf/hub/models--MJPansa--DeepSeek-V4-Flash-0731-NVFP4` | 160 G | the model of the shared reasoning-model server | `AISCIENTIST_SHARED_LLM_MODEL` (`configs/aiscientist.example.env`, section 6b) | `hf download` into `<root>/models/hf` on a compute node |
+| `models/gguf/DeepSeek-V4.1-Flash-1017-GSQ-RCO/` | 249 G | the shared server's model with `AISCIENTIST_SHARED_LLM_ENGINE=strata`: ISTA-DASLab's IQ2_XXS set (five files, 138 G) and the Engram table (111 G; the job copies it to the node's disk), linked as the set's sixth file | `AISCIENTIST_SHARED_LLM_GGUF_DIR` | `scripts/hpc3_strata_setup.sh` |
+| `models/gguf/DeepSeek-V4.1-Flash-shared/` | 8 G | Unsloth's metadata shard (the Engram hash parameters) and the DSpark drafter, which Strata's pack reads | `AISCIENTIST_SHARED_LLM_GGUF_SHARED_DIR` | `scripts/hpc3_strata_setup.sh` |
+| `engines/` | 1.6 G | Strata (`strata-src/`, its Python environment `strata-venv/`), its DeepSeek engine `strata-dsv41-build/strata-dsv41` built for sm_80 + sm_120, and the llama.cpp checkout its ggml comes from (`llama.cpp-src/`, `llama.cpp-strata-pin/`) | `AISCIENTIST_SHARED_LLM_STRATA_ROOT` | `scripts/hpc3_strata_setup.sh` |
 | `models/vlreview/` | 16 G | `Qwen/Qwen2.5-VL-7B-Instruct`, for the report review | `AISCIENTIST_VLREVIEW_MODEL_DIR` | `scripts/hpc3_vlreview_setup.sh` |
 | `models/scgpt/` | 198 M | the scGPT reference checkpoint: `best_model.pt`, `vocab.json`, `id2type.json`, `dev_train_args.yml` | `AISCIENTIST_SCGPT_MODEL_DIR` | not downloadable: a copy of the lab's trained reference model (`deploy/scgpt/README.md`) |
 | `envs/openspliceai/` | 5.1 G | a conda environment with OpenSpliceAI and PyTorch | `AISCIENTIST_SPLICEAI_BIN` | `deploy/vep/stage_annotation_dbs.sh` |
@@ -103,6 +106,7 @@ together:
 | Path | Size | What |
 |---|---|---|
 | `ollama/` | 24 G | Ollama binaries and `qwen3.6` weights. Ollama is not a serving backend of the product. |
+| `engines/llama.cpp-b12211/` | 551 M | a mainline llama.cpp build (sm_80 + sm_120) that also serves the IQ2_XXS set, kept from the engine comparison |
 | `envs/analysis-pydeps/flashinfer-*`, `envs/analysis-pydeps/fi-*` | 125 M, part of `analysis-pydeps/` | packages left by the model-serving tests |
 | `_archive_2026-10-22/` | 16 M | benchmark scripts, patch sources and job logs set aside for deletion by a storage cleanup (RCHENLAB/AiScientist issue 28). `MANIFEST.txt` lists what came from where. |
 

@@ -7180,7 +7180,8 @@ function sharedVersions(ds) { return (ds.versions || []).filter((v) => v.status 
 function sharedFilesHtml(ds, view) {
   const files = (view && view.version && view.version.files) || [];
   const label = view.version.label;
-  const cell = (f) => `<div class="shared-cell"><span class="muted">${escapeHtml(fmtSize(f.size_bytes))}</span>` +
+  const cells = (f) => (f.facets && Number.isInteger(f.facets.n_obs) ? ` · ${f.facets.n_obs.toLocaleString()} cells` : "");
+  const cell = (f) => `<div class="shared-cell"><span class="muted">${escapeHtml(fmtSize(f.size_bytes) + cells(f))}</span>` +
     `<button type="button" class="ghost small" data-shared-preview="${escapeHtml(f.name)}" data-slug="${escapeHtml(ds.slug)}" data-label="${escapeHtml(label)}">Preview</button></div>`;
   const faceted = files.filter((f) => f.facets && f.facets.tissue && f.facets.modality);
   const loose = files.filter((f) => !faceted.includes(f));

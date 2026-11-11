@@ -126,6 +126,36 @@ def test_peek_h5ad_structure_without_loading_matrices(tmp_path):
     assert any(d["name"] == "X" for d in hdf5["datasets"])
 
 
+def test_peek_h5ad_sparse_x_shape_from_attributes(tmp_path):
+    """A sparse X is a group: its shape is the group's attribute and its dtype that of X/data. Atlas
+    files are sparse, and without this their cells and genes were missing from every manifest."""
+    h5py = pytest.importorskip("h5py")
+    from aiscientist.metadata.facts import compact_peek
+
+    def write(name, attrs):
+        path = str(tmp_path / name)
+        with h5py.File(path, "w") as f:
+            x = f.create_group("X")
+            for k, v in attrs.items():
+                x.attrs[k] = v
+            x.create_dataset("data", data=[1.5, 2.5], dtype="float64")
+            x.create_dataset("indices", data=[0, 1], dtype="int32")
+            x.create_dataset("indptr", data=[0, 1, 2, 2], dtype="int64")
+        return peek_dataset(path)["hdf5"]
+
+    csr = write("csr.h5ad", {"encoding-type": "csr_matrix", "encoding-version": "0.1.0", "shape": (3, 5)})
+    assert csr["anndata"]["X"]["shape"] == [3, 5] and csr["anndata"]["X"]["dtype"] == "float64"
+    assert csr["anndata"]["X"]["encoding"] == "csr_matrix"
+    info =compact_peek({"detected_format": "h5ad", "hdf5": csr})["hdf5"]
+    assert (info["n_obs"], info["n_vars"], info["x_dtype"]) == (3, 5, "float64")
+
+    old = write("old.h5ad", {"h5sparse_format": "csr", "h5sparse_shape": (3, 5)})     # anndata < 0.7
+    assert old["anndata"]["X"]["shape"] == [3, 5] and old["anndata"]["X"]["encoding"] == "csr"
+
+    bare = write("bare.h5ad", {})                   # no shape attribute: the keys, as before
+    assert bare["anndata"]["X"] == ["data", "indices", "indptr"]
+
+
 def test_peek_hdf5_degrades_cleanly_when_h5py_absent(tmp_path, monkeypatch):
     """If h5py cannot import, the HDF5 magic is still reported and the peek notes the gap — no crash."""
     import builtins

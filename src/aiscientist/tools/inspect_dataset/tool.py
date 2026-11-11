@@ -276,13 +276,36 @@ def _peek_hdf5(path: str) -> dict[str, Any]:
             anndata = {g: list(f[g].keys())[:40] for g in ("obs", "var", "layers", "obsm", "uns")
                        if g in f and hasattr(f[g], "keys")}
             if "X" in f:
-                x = f["X"]
-                anndata["X"] = ({"shape": list(x.shape), "dtype": str(x.dtype)}
-                                if hasattr(x, "shape") else list(x.keys())[:8])
+                anndata["X"] = _anndata_x(f["X"])
             if anndata:
                 out["anndata"] = anndata
     except Exception as exc:  # noqa: BLE001 - a malformed HDF5 must not crash the peek
         out["note"] = f"HDF5 open/inspect failed: {type(exc).__name__}: {exc}"[:300]
+    return out
+
+
+def _anndata_x(x: Any) -> Any:
+    """Shape and dtype of an AnnData X. A dense X is a dataset. A sparse X is a group (data,
+    indices, indptr) whose shape is the group's ``shape`` attribute (``h5sparse_shape`` in old
+    files) and whose dtype is that of ``data``. A group without a shape attribute gives its keys."""
+    if hasattr(x, "shape"):
+        return {"shape": list(x.shape), "dtype": str(x.dtype)}
+    keys = list(x.keys())[:8]
+    shape = None
+    for attr in ("shape", "h5sparse_shape"):
+        if attr in x.attrs:
+            try:
+                shape = [int(n) for n in x.attrs[attr]]
+            except (TypeError, ValueError):
+                shape = None
+            break
+    if not shape or len(shape) != 2:
+        return keys
+    out: dict[str, Any] = {"shape": shape, "dtype": str(x["data"].dtype) if "data" in x else "",
+                           "keys": keys}
+    enc = x.attrs.get("encoding-type") or x.attrs.get("h5sparse_format")
+    if enc is not None:
+        out["encoding"] = str(_scalar(enc))
     return out
 
 

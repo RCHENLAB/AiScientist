@@ -229,3 +229,79 @@ def test_live_llm_args_follow_the_current_allocation():
                                        "model": "RedHatAI/Qwen3.8-27B-INT4"}
     conn.alloc = None                      # mid-reprovision: say nothing, keep the build-time value
     assert gw._live_llm_args(conn) == {}
+
+
+# --- the lab's shared model: a server we run, reached by base_url (2026-11-09) ---------------------
+# Every switch above was gated on "no base_url", and the shared model is always called with one: its
+# planning calls went out as {"model", "stream": false} — no thinking on a template that thinks only
+# when asked, no effort, and a 610 s DeepSeek-V4.1 plan cut at the 600 s total limit.
+
+def _serve_json(body: dict):
+    """A fake non-streaming /v1/chat/completions answering ``body``; returns (port, seen_payloads)."""
+    seen: list[dict] = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # noqa: D401 - silence
+            pass
+
+        def do_POST(self):
+            seen.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1], seen
+
+
+def test_a_shared_model_plan_streams_and_carries_the_effort_and_the_template_switch(monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", '{"session_model_switch": true}')
+    port, seen = _serve(_chunks(12), gap=0.2)
+    text, _ = vllm_client.complete_ex(0, "deepseek-v4.1-flash", [{"role": "user", "content": "plan"}],
+                                      base_url=f"http://127.0.0.1:{port}/v1", api_key="k",
+                                      reasoning_effort="low", think_kwargs={"enable_thinking": True},
+                                      idle_timeout=1.0, local_server=True)
+    assert text == "PLAN"                                  # 2.4 s of thinking against a 1 s idle limit
+    sent = seen[0]
+    assert sent["stream"] is True and sent["reasoning_effort"] == "low"
+    assert sent["chat_template_kwargs"] == {"enable_thinking": True}   # the server's own dialect
+    assert "reasoning" not in sent                         # OpenRouter's field is not for our server
+
+
+def test_a_shared_model_without_its_own_switch_gets_none_of_the_session_s(monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", '{"session_model_switch": true}')
+    port, seen = _serve(_chunks(1), gap=0.0)
+    vllm_client.complete_ex(0, "m", [{"role": "user", "content": "x"}], base_url=f"http://127.0.0.1:{port}/v1",
+                            idle_timeout=5.0, local_server=True)
+    assert "chat_template_kwargs" not in seen[0]
+
+
+def test_a_provider_api_still_gets_a_plain_request(monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_VLLM_THINK_ON_KWARGS", '{"enable_thinking": true}')
+    port, seen = _serve_json({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    text, _ = vllm_client.complete_ex(0, "m", [{"role": "user", "content": "x"}],
+                                      base_url=f"http://127.0.0.1:{port}/v1", reasoning_effort="low",
+                                      think_kwargs={"enable_thinking": True}, idle_timeout=5.0)
+    assert text == "ok"
+    assert seen[0]["stream"] is False
+    assert "chat_template_kwargs" not in seen[0] and "reasoning_effort" not in seen[0]
+
+
+def test_a_shared_model_tool_turn_carries_the_effort_and_the_template_switch(monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_SCIENTIST_CHAT_TEMPLATE_KWARGS", '{"session_model_switch": true}')
+    port, seen = _serve_json({"choices": [{"message": {"content": "", "tool_calls": []},
+                                           "finish_reason": "stop"}]})
+    url = f"http://127.0.0.1:{port}/v1"
+    vllm_client.chat_tools(0, "m", [{"role": "user", "content": "step"}], [], base_url=url, api_key="k",
+                           reasoning_effort="low", think_kwargs={"enable_thinking": True}, local_server=True,
+                           max_tokens=16384)
+    vllm_client.chat_tools(0, "m", [{"role": "user", "content": "step"}], [], base_url=url, api_key="k",
+                           reasoning_effort="low")
+    ours, provider = seen
+    assert ours["chat_template_kwargs"] == {"enable_thinking": True} and ours["reasoning_effort"] == "low"
+    assert ours["max_tokens"] == 16384
+    assert "chat_template_kwargs" not in provider and "reasoning_effort" not in provider
