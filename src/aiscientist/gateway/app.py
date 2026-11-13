@@ -6267,21 +6267,129 @@ def _live_llm_args(conn: "Connection") -> dict[str, Any]:
 
 
 def _mcp_session_model(conn: "Connection") -> Any:
-    """Resolve the session's on-cluster model at each MCP call, after GPU renewals.
-
-    Saved user endpoints use the gateway's credential proxy and per-call budget
-    guard. Exporting those credentials to a compute node would bypass that guard.
-    Keep those sessions on their existing tools until an MCP sampling relay can
-    enforce the same contract. Never substitute a deployment-wide model silently.
-    """
+    """Use the selected session model; keep saved provider keys on the gateway."""
     from ..agents.mcp_model import ModelBinding
-    if _bound_credential(conn) is not None or os.environ.get("AISCIENTIST_LLM_BASE_URL"):
-        raise ValueError("MCP model tools currently require this session's own HPC3 model; "
-                         "use the existing tools for saved API or shared-model sessions")
+    cred = _bound_credential(conn)
+    if cred is not None or os.environ.get("AISCIENTIST_LLM_BASE_URL"):
+        return _mcp_relay_binding(conn, cred)
     live = _live_llm_args(conn)
     if not live:
         return None
     return ModelBinding(endpoint=live["llm_base_url"], model=live["model"])
+
+
+def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
+    """One MCP job's metered full-chat relay, including native Claude tool calls.
+
+    Only the selected Scientist model is bound. No provider key, proxy bearer,
+    or user endpoint is placed in the HPC job's environment or result files.
+    """
+    from ..agents.mcp_model import RelayBinding
+    from ..agents.mcp_relay_worker import validate_request
+    from . import anthropic_client, llm_credentials, llm_pricing, llm_providers, llm_relay
+
+    shared = cred is not None and cred.get("builtin") == "shared"
+    model = str(cred.get("model") or (shared_llm.SharedLLMSettings().served_name if shared else "")) \
+        if cred is not None else str(os.environ.get("AISCIENTIST_LLM_MODEL") or "")
+    if not model:
+        raise ValueError("The selected model has no configured model identifier")
+    base = (cred or {}).get("base_url") or os.environ.get("AISCIENTIST_LLM_BASE_URL") or ""
+    native = cred is not None and llm_providers.transport_for(cred.get("provider"), base) == "anthropic"
+    remote = not shared and (native or _endpoint_is_off_host(base))
+    label = str((cred or {}).get("label") or (cred or {}).get("provider") or "configured API")
+    # Relay threads do not inherit ContextVars. Retain this run's billing, stop
+    # event and consent context even when another chat starts on the connection.
+    context = contextvars.copy_context()
+    bound_run = getattr(conn, "active_run", None)
+    cancelled = conn.chat_stop.is_set
+
+    def start(relay_dir: str):
+        if not hasattr(conn.executor, "open_sftp"):
+            raise ValueError("The MCP model relay needs an active HPC3 file-transfer connection")
+        if cred is not None and not shared:
+            target = llm_credentials.call_target(conn.owner, cred["id"])
+            if not target or not target[1]:
+                raise GatewayError("The selected API credential is unavailable; reconnect that endpoint.",
+                                   stage="llm_credential")
+            send_base, api_key = target
+        else:
+            send_base, api_key = base, os.environ.get("AISCIENTIST_LLM_API_KEY") or ""
+        key_use = _key_use(conn, cred) if cred is not None and not shared else None
+
+        def chat(request: dict) -> tuple[dict, dict]:
+            request = validate_request(request, model)
+            if cancelled():
+                raise GatewayError("The MCP run was stopped.", stage="shared_llm_stopped")
+            if remote:
+                _guard_lab_payload([{"content": json.dumps(message, ensure_ascii=False)}
+                                    for message in request["messages"]])
+            if key_use is not None:
+                key_use.before_call()
+            if native:
+                out = anthropic_client.relay_chat(model, request, api_key=api_key, base_url=send_base)
+            elif shared:
+                def call_shared(binding, url):
+                    if binding.model != model:
+                        raise GatewayError("The selected shared model changed; start a new run.", stage="shared_llm")
+                    return vllm_client.relay_chat(model, request, base_url=url, api_key=binding.api_key)
+                out = _shared_call(conn, call_shared)
+            else:
+                out = vllm_client.relay_chat(model, request, base_url=send_base, api_key=api_key)
+            usage = out.pop("usage", {}) or {}
+            return out, usage
+
+        def record(usage, duration_ms, error_type):
+            _record_lab_usage(conn, key_use=key_use, bound_run=bound_run, role="mcp_model", model=model,
+                              endpoint=f"{model} @ {label}", remote=remote, usage=usage,
+                              provider="anthropic" if native else ("shared" if shared else "openai"),
+                              max_tokens=None, duration_ms=duration_ms, error_type=error_type)
+
+        def price(usage):
+            if shared:
+                return 0.0
+            if usage.get("cost") is not None:
+                try:
+                    cost = float(usage["cost"])
+                    if 0 <= cost < float("inf"):
+                        return cost
+                except (TypeError, ValueError):
+                    pass
+            read = int(usage.get("cache_read_input_tokens") or 0)
+            write = int(usage.get("cache_creation_input_tokens") or 0)
+            write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+            return llm_pricing.estimate(str(usage.get("model") or model),
+                input_tokens=int(usage.get("input_tokens") if "input_tokens" in usage
+                                 else max(0, int(usage.get("prompt_tokens") or 0) - read - write)),
+                output_tokens=int(usage.get("completion_tokens") or 0),
+                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
+                cache_read_tokens=read)
+
+        class GuardedRelay(llm_relay.ModelRelay):
+            def stop(self, timeout=30.0):
+                try:
+                    return super().stop(timeout)
+                finally:
+                    if key_use is not None:
+                        key_use.close()
+
+        relay = GuardedRelay(
+            lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, None,
+            call_request=lambda request: context.copy().run(chat, request),
+            record=lambda *args: context.copy().run(record, *args), price=price,
+            max_cost_usd=None if shared else CORPUS_SCAN_MAX_COST_USD,
+            concurrency=1, poll_s=0.2, should_stop=cancelled)
+        if native:
+            conn.emit("info", "mcp", f"MCP model calls use your selected {model} through the gateway, "
+                      "with per-call usage and budget checks. Claude uses its supported sampling "
+                      "defaults; requests for thinking off use low effort.")
+        try:
+            return relay.start()
+        except Exception:
+            if key_use is not None:
+                key_use.close()
+            raise
+
+    return RelayBinding(model=model, start=start)
 
 
 class _NoServedModelExecutor:
@@ -12257,7 +12365,8 @@ def _other_endpoints() -> str:
     return "the cluster GPU or an API key" if _session_gpu_mode() == "all" else "your own API key"
 
 
-def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -> None:
+def _record_lab_usage(conn: Connection, *, key_use: Any = None,
+                      bound_run: RunState | None = None, **fields: Any) -> None:
     """Record one lab-role completion against the connection's ACTIVE run.
 
     The run_id is read at call time, not captured when ``_lab_llm`` bound the endpoint: a run mints
@@ -12270,7 +12379,7 @@ def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -
         # Read the connection defensively and INSIDE the guard: this runs on every completion, and
         # the promise above (accounting never breaks a run) is only true if reading the run id
         # cannot raise either. Offline harnesses pass a stand-in connection with neither attribute.
-        active = getattr(conn, "active_run", None)
+        active = bound_run if bound_run is not None else getattr(conn, "active_run", None)
         billed = _USAGE_RUN.get()
         if billed:
             active = None      # the report of a finished run: not the run this session has open

@@ -1050,6 +1050,10 @@ def make_run_in_environment_tool(executor: Any,
             from .mcp_analysis import setting_paths
             cache.update(gpu=_mcp_server.runs_on == "gpu:scgpt",
                          extra_ro_binds=setting_paths(_mcp_server))
+        from .mcp_model import model_files, run_with_model
+        platform_files = model_files(_mcp_model)
+        if set(platform_files) & set(skill.files):
+            return {"status": "error", "error": "skill file conflicts with the platform model relay"}
         def run():
             if skill.registry_release:
                 import tempfile
@@ -1060,11 +1064,11 @@ def make_run_in_environment_tool(executor: Any,
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_text(text, encoding="utf-8")
                         staged[rel] = str(path)
+                    staged.update(platform_files)
                     return runner(command, skill.image, workdir=workdir, cpus=cpus,
                                   mem_gb=mem_gb, time_limit=time_limit, files=staged, **cache)
             return runner(command, skill.image, workdir=workdir, cpus=cpus,
-                          mem_gb=mem_gb, time_limit=time_limit, files=files, **cache)
-        from .mcp_model import run_with_model
+                          mem_gb=mem_gb, time_limit=time_limit, files={**files, **platform_files}, **cache)
         if _mcp_model is not None and _mcp_server is None:
             return {"status": "error", "error": "model credentials require a pinned MCP call"}
         result = execute(skill, ctx, executor,

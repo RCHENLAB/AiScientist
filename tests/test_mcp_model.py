@@ -10,6 +10,31 @@ from aiscientist.agents.mcp_model import ModelBinding, prepare_model, run_with_m
 from aiscientist.agents.skills_registry import POLICY
 
 
+def test_guarded_relay_binding_has_no_provider_credentials_and_stops_on_failure(tmp_path):
+    from aiscientist.agents.mcp_model import RelayBinding, model_files
+    events = []
+    relay = SimpleNamespace(stop=lambda: events.append("stop"))
+    def start(directory):
+        events.append(directory)
+        return relay
+    executor = SimpleNamespace(work_dir=str(tmp_path), supports_skill_policy=True,
+                               mcp_model_binding=lambda: RelayBinding("selected-native-model", start))
+    values = {"PHENOTYPE_MODEL_ENDPOINT": "https://global.invalid/v1", "PHENOTYPE_MODEL": "global"}
+    bound, setup = prepare_model("phenotype-diagnosis", "map_phenotype_to_hpo", executor, values)
+    assert values == {} and "selected-native-model" in setup
+    assert bound.relay_directory.startswith(str(tmp_path) + "/.mcp-model-")
+    assert "_aisci_mcp_relay.py" in model_files(bound)
+    assert "MODEL_API_KEY_FILE" in setup and not hasattr(bound.binding, "api_key")
+    token = POLICY.set({"network": "runtime", "secret_values": {}})
+    try:
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            run_with_model(bound, executor, lambda: (_ for _ in ()).throw(RuntimeError("synthetic failure")))
+        assert events == [bound.relay_directory, "stop"]
+        assert POLICY.get()["secret_values"] == {}
+    finally:
+        POLICY.reset(token)
+
+
 def test_live_session_binding_overrides_global_without_persisting_key():
     bindings = [ModelBinding("http://node-a:1234/v1", "session-a", "synthetic-secret"),
                 ModelBinding("http://node-b:2345/v1", "session-b", "new-synthetic-secret")]

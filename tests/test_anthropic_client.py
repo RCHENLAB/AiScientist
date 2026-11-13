@@ -119,6 +119,35 @@ def _tool_call(cid, name, args):
     return {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
 
 
+def test_mcp_relay_preserves_forced_tool_call_and_selected_output_limit(fake):
+    client = fake(_final([{"type": "tool_use", "id": "use94", "name": "collect", "input": {"value": 2}}],
+                         stop="tool_use", model="claude-haiku-5-5"))
+    request = {"messages": [{"role": "user", "content": "Collect the synthetic value"}],
+               "max_tokens": 256, "temperature": 0, "reasoning_effort": "none",
+               "tools": [{"type": "function", "function": {"name": "collect", "parameters": {"type": "object"}}}],
+               "tool_choice": {"type": "function", "function": {"name": "collect"}},
+               "parallel_tool_calls": False}
+    turn = ac.relay_chat('claude-haiku-5-5', request, api_key='synthetic-test-key')
+    wire = client.requests[0][1]
+    assert wire['model'] == 'claude-haiku-5-5' and wire['max_tokens'] == 256
+    assert wire['tool_choice'] == {'type': 'tool', 'name': 'collect', 'disable_parallel_tool_use': True}
+    assert wire['output_config']['effort'] == 'low' and 'temperature' not in wire
+    assert turn['finish_reason'] == 'tool_calls'
+    assert turn['tool_calls'] == [_tool_call('use94', 'collect', {'value': 2})]
+    assert turn['usage']['completion_tokens'] == 20
+
+
+@pytest.mark.parametrize('content,valid', [('{"ok":true}', True), ('plain text', False), ('[]', False)])
+def test_mcp_relay_json_object_contract_keeps_billed_usage_on_invalid_output(fake, content, valid):
+    client = fake(_final([{'type': 'text', 'text': content}], model='claude-haiku-5-5'))
+    request = {'messages': [{'role': 'user', 'content': 'Return the synthetic result'}],
+               'max_tokens': 128, 'response_format': {'type': 'json_object'}}
+    out = ac.relay_chat('claude-haiku-5-5', request, api_key='synthetic-test-key')
+    assert ('relay_error' not in out) is valid
+    assert out['usage']['completion_tokens'] == 20
+    assert any('JSON object' in b['text'] for b in client.requests[0][1]['system'])
+
+
 # --- translation: OpenAI history -> Messages API ---------------------------------------------------
 
 

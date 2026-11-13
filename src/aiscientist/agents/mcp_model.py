@@ -1,12 +1,14 @@
 """Trusted per-call model bindings for standalone MCP workers.
 
 Only the gateway attaches ``executor.mcp_model_binding``. Planner arguments and
-run decisions never choose endpoints or credentials. User-owned API sessions must
-remain on their guarded gateway transport until a metered MCP relay exists.
+run decisions never choose endpoints or credentials. User-owned API sessions use
+the guarded gateway file relay; their provider keys never reach a compute job.
 """
 from __future__ import annotations
 
 import os
+import shlex
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -43,9 +45,22 @@ class ModelBinding:
 
 
 @dataclass(frozen=True)
+class RelayBinding:
+    """Gateway-only callback: a bound provider credential never reaches the job."""
+    model: str
+    start: Callable[[str], Any] = field(repr=False)
+
+    def __post_init__(self):
+        if (not isinstance(self.model, str) or not self.model.strip()
+                or any(c in self.model for c in "\0\n\r") or not callable(self.start)):
+            raise ValueError("invalid guarded MCP relay binding")
+
+
+@dataclass(frozen=True)
 class CallModel:
     prefix: str
-    binding: ModelBinding
+    binding: ModelBinding | RelayBinding
+    relay_directory: str = ""
 
     @property
     def secret_name(self) -> str:
@@ -83,7 +98,7 @@ def prepare_model(server: str, tool: str, executor: Any, values: dict[str, str])
         if not callable(resolver):
             raise ValueError("MCP model binding must be a trusted callback")
         binding = resolver()  # None is explicitly no session model; never switch to a global one.
-        if binding is not None and not isinstance(binding, ModelBinding):
+        if binding is not None and not isinstance(binding, (ModelBinding, RelayBinding)):
             raise ValueError("trusted MCP model callback returned an invalid binding")
     else:
         binding = _operator_binding(prefix, values)
@@ -94,10 +109,37 @@ def prepare_model(server: str, tool: str, executor: Any, values: dict[str, str])
     setup = f"unset {prefix}_MODEL_API_KEY_FILE\n"
     if binding is None:
         return None, setup + f"unset {prefix}_MODEL_ENDPOINT {prefix}_MODEL {prefix}_MODEL_API_KEY\n"
+    if isinstance(binding, RelayBinding):
+        work = str(getattr(executor, "work_dir", "") or "")
+        if not work.startswith("/") or any(c in work for c in "\0\n\r") or ".." in Path(work).parts:
+            raise ValueError("a guarded MCP relay needs an absolute executor work directory")
+        relative = ".mcp-model-" + uuid.uuid4().hex
+        model = CallModel(prefix, binding, work.rstrip("/") + "/" + relative)
+        setup += f"unset {prefix}_MODEL_ENDPOINT {prefix}_MODEL {prefix}_MODEL_API_KEY\n"
+        setup += f'''AISCI_MCP_RELAY_DIR="$AISCIENTIST_WORK/{relative}"
+python "$AISCIENTIST_SKILL_DIR/_aisci_mcp_relay.py" --directory "$AISCI_MCP_RELAY_DIR" --model {shlex.quote(binding.model)} --prefix {prefix} &
+AISCI_MCP_RELAY_PID=$!
+trap 'kill "$AISCI_MCP_RELAY_PID" 2>/dev/null || true; wait "$AISCI_MCP_RELAY_PID" 2>/dev/null || true' EXIT
+for AISCI_MCP_WAIT in $(seq 1 120); do
+  [ -f "$AISCI_MCP_RELAY_DIR/ready.env" ] && break
+  kill -0 "$AISCI_MCP_RELAY_PID" 2>/dev/null || exit 1
+  sleep 1
+done
+[ -f "$AISCI_MCP_RELAY_DIR/ready.env" ] || exit 1
+. "$AISCI_MCP_RELAY_DIR/ready.env"
+'''
+        return model, setup
     values.update({prefix + "_MODEL_ENDPOINT": binding.endpoint, prefix + "_MODEL": binding.model})
     if not binding.api_key:
         setup += f"unset {prefix}_MODEL_API_KEY\n"
     return CallModel(prefix, binding), setup
+
+
+def model_files(model: CallModel | None) -> dict[str, str]:
+    """Only platform code stages this immutable stdlib helper into the image."""
+    if model is not None and isinstance(model.binding, RelayBinding):
+        return {"_aisci_mcp_relay.py": str(Path(__file__).with_name("mcp_relay_worker.py"))}
+    return {}
 
 
 def run_with_model(model: CallModel | None, executor: Any, call: Callable[[], Any]) -> Any:
@@ -112,6 +154,16 @@ def run_with_model(model: CallModel | None, executor: Any, call: Callable[[], An
         raise ValueError("invalid private MCP model binding")
     from .skills_registry import POLICY
     policy = POLICY.get()
+    if isinstance(model.binding, RelayBinding):
+        if policy is None or policy.get("network", "none") == "none":
+            raise ValueError("the pinned skill does not declare network access for a model")
+        if not getattr(executor, "supports_skill_policy", False):
+            raise ValueError("this executor cannot protect a guarded MCP relay")
+        relay = model.binding.start(model.relay_directory)
+        try:
+            return call()
+        finally:
+            relay.stop()
     key = model.binding.api_key
     if key and (policy is None or not getattr(executor, "supports_skill_policy", False)):
         raise ValueError("this executor cannot protect a per-job MCP model credential")

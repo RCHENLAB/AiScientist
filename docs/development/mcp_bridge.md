@@ -203,10 +203,29 @@ The bridge shell-quotes their current deployment values. Reference parents are
 passed to the runner as trusted read-only mounts so sidecars work; mounting `/`
 is refused. Environment names for credentials, executable commands, interpreters,
 dataset bindings and read-root overrides are not accepted. Endpoint URLs cannot
-embed credentials or query parameters. Model keys still require the installed
-skill's declared secrets and normal `AISCIENTIST_SKILL_SECRET_<NAME>` policy;
-`settings_env` neither grants network access nor supplies a secret. The collector
-redacts declared secret values from JSON evidence as well as the returned response.
+embed credentials or query parameters. `settings_env` neither grants network
+access nor supplies a secret. Operator credentials use the existing skill policy
+and protected job-file staging; the collector redacts policy secret values from
+JSON evidence as well as the returned response.
+
+Model-backed tools resolve the selected session model once per call. A live
+user-owned cluster allocation supplies its current endpoint. A saved API key or
+shared gateway model uses `RelayBinding`: the job starts a token-protected
+loopback chat facade and exchanges private request/response files with the
+gateway. Provider credentials remain on the gateway, whose existing credential
+proxy, key guard, data-boundary check, usage accounting and stop control apply to
+every request. The requested model must match the bound session model; a global
+deployment model never silently replaces it. The worker token is only a local
+transport credential and is removed when the job exits.
+
+The relay supports text messages, JSON-object requests, function tools and their
+results, explicit tool choice, and buffered SSE responses. Unsupported API fields
+are rejected. Native Anthropic uses provider-supported sampling and reasoning
+settings, with adaptations surfaced by the gateway; JSON-object output is checked
+after completion and an invalid object is a failed request with its real usage
+still recorded. This is a bounded transport adapter, not a claim of compatibility
+with every OpenAI API option. Existing tool routes remain available while real
+same-session acceptance is completed.
 
 The collector accepts `artifact_root` only inside
 `$AISCI_DATA_DIR/<server>/<analysis_id>/`, refuses symlinks in sources and

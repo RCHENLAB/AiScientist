@@ -388,7 +388,7 @@ class AnalysisAdapter:
             setup += 'export LITERATURE_ALLOWED_ROOTS="${PHENOTYPE_ALLOWED_ROOTS:-}"\n'
         skill = get_skill(self.server.skill)
         secret_names = list(skill.requirements.get("secrets", [])) if skill else []
-        if model_binding is not None and model_binding.binding.api_key:
+        if model_binding is not None and getattr(model_binding.binding, "api_key", ""):
             secret_names = list(dict.fromkeys([*secret_names, model_binding.secret_name]))
         setup += f"export AISCI_MCP_SECRET_NAMES={shlex.quote(json.dumps(secret_names))}\n"
         setup += f"export AISCI_MCP_ANALYSIS={shlex.quote(analysis)}\n"
