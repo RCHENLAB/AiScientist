@@ -9452,7 +9452,61 @@ def _quickchat_literature_route(conn: Connection, req: LabRequest) -> tuple[Any,
     return request_router.route_quickchat_literature(complete, req.question, data=names, history=req.history or [])
 
 
+async def _maybe_status_recovery(conn: Connection, req: LabRequest) -> bool:
+    from dataclasses import replace
+    from ..agents import status_continuation
+    from . import report_revision
+    if not status_continuation.requested(req.question):
+        return False
+    try:
+        requested_run = status_continuation.target_run(req.question)
+        if not req.conversation_id:
+            raise ValueError("Status recovery requires the original conversation.")
+        target = _report_target(conn, req)  # owner, conversation, confinement and accepted evidence
+        if target is None or target[0] != requested_run:
+            raise ValueError("The original status-recovery run is unavailable in this conversation.")
+        run_id, art, state = target
+        if _binds_other_dataset(req, state):
+            raise ValueError("Status recovery cannot bind a different input dataset.")
+        updated, indices = status_continuation.revised_state(state, req.question)
+        # A task lives under its original RunHome. Never let a missing/expired home silently
+        # resolve to the current session's empty workspace and poll a different task namespace.
+        record = report_revision.confined(conn.workspace, run_id + "/" + _RUN_HOME_FILE)
+        home = hpc_layout.RunHome.from_json(json.loads(record.read_text()))
+        if home is None or home.run_id != run_id:
+            raise ValueError("The original task workspace record is invalid.")
+        expected = (hpc_layout.session_run(conn.settings.shared_root, home.session_id, run_id)
+                    if home.layout == "session" else
+                    hpc_layout.legacy_run(conn.settings.shared_root, _hpc_user(conn), run_id))
+        if home != expected:
+            raise ValueError("The original task workspace is outside this deployment's run layout.")
+        if conn.executor is None:
+            raise ValueError("Connect to the original cluster before recovering task evidence.")
+        if not conn.mock:
+            exists = await asyncio.to_thread(conn.executor.exec,
+                f"test -d {shlex.quote(home.dir('analysis'))}", timeout=30)
+            if not exists.ok:
+                raise ValueError("The original task workspace is unavailable; no new run was created.")
+        resume, decisions, cont_req, _ = _prepare_continue(
+            req.connection_id, conn, run_id, art, updated, min(indices), status_steps=indices)
+        resume = replace(resume, reviewed_note=req.question)
+        cont_req = cont_req.model_copy(update={"conversation_id": req.conversation_id})
+        from .status_recovery import archive
+        archive(art, state, updated, req.question)
+    except (OSError, ValueError, TypeError) as exc:
+        conn.push({"type": "chat_error", "message": "Status recovery stopped: " + public_error(exc)})
+        conn.push({"type": "chat_stopped"})
+        return True
+    conn.run_homes[run_id] = home
+    conn.push({"type": "lab_progress", "level": "info", "text":
+               f"Reviewing status-only recovery of run {run_id}; retained steps and original workspace are preserved."})
+    await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id, resume_decisions=decisions)
+    return True
+
+
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
+    if await _maybe_status_recovery(conn, req):
+        return
     from ..agents.mcp_workflow import explicit_workflow
     if explicit_workflow(req.question):
         # An explicit ordered call list is a reviewed scientific workflow, not a
@@ -12151,7 +12205,8 @@ def _analysis_checkpoints_exist(conn: Connection, run_id: str, *, look_on_hpc: b
 def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Path, state: dict,
                       from_step_index: int, *, modify_note: str | None = "",
                       edited_step: str | None = None, interrupted: bool = False,
-                      hpc_checkpoints: bool = False):
+                      hpc_checkpoints: bool = False,
+                      status_steps: frozenset[int] | None = None):
     """Build the (ResumeState, resume_decisions, LabRequest, idx) to re-run ONE step of a prior
     run in place, reusing earlier steps' checkpoints. Shared by /api/lab/continue and the
     follow-up router. Raises ValueError when the run can't be continued (no agenda, or the
@@ -12179,11 +12234,21 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
         idx = resume.from_step_index
     else:
         idx = max(0, min(int(from_step_index), len(agenda) - 1))
+    if status_steps is not None:
+        if interrupted:
+            raise ValueError("A status recovery must name its exact original step numbers.")
+        from ..agents.plan_doc import parse_plan_yaml
+        from ..agents.status_continuation import validate_tasks
+        validate_tasks(state, parse_plan_yaml(state.get("approved_plan_yaml", ""),
+                       request=state.get("question", "")), status_steps)
+        if idx != min(status_steps):
+            raise ValueError("Status recovery must start at its first explicitly selected step.")
     # Resuming PAST step 0 reads the prior step's analysis checkpoint. Those expire
     # (checkpoint_ttl_days), so if they're gone the resumed step has no input — raise instead
     # of dispatching a run that would silently produce nothing. (Step 0 reads the raw dataset,
     # not a checkpoint, so it's always resumable.)
-    if idx > 0 and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints):
+    if (idx > 0 and status_steps is None
+            and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints)):
         raise ValueError(
             f"Run {run_id}'s analysis checkpoints have expired — its process files are released "
             "once the report is written (on HPC3, when the session that ran it disconnects, or "
@@ -12196,7 +12261,10 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
             agenda = [*agenda[:idx], edited_step.strip(), *agenda[idx + 1:]]
             state = {**state, "agenda": agenda}
         resume = ResumeState.from_run_state(state, idx, modify_note=(modify_note or ""),
-                                            guidance=state.get("guidance"))
+                                            guidance=state.get("guidance"), redo_indices=status_steps)
+        if status_steps is not None:
+            from dataclasses import replace
+            resume = replace(resume, status_recovery=True, review_requested=True, modify_note="")
     resume_decisions: dict[str, Any] = {}
     if state.get("dataset_path"):
         resume_decisions["dataset_path"] = state["dataset_path"]
@@ -14454,6 +14522,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                         prior: "dict[str, Any] | None" = None, continues_from_dataset: bool = False,
                         untested_md: str = "", figure_diag: str = "", provenance: str = "",
                         qc_report: bool = False, abandoned: Callable[[], bool] = lambda: False,
+                        is_revision: bool = False,
                         on_stage: Callable[[str], Any] = lambda _stage: None) -> dict[str, Any]:
     """The written report of a run: the manuscript (or the QC report, or the short report a request
     asked for), its references, self-review, verification statement, PDF and DOCX, the post-render
@@ -14466,7 +14535,9 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
     render's ``status`` and the formats ``rendered``."""
     from ..reporting.report import build_pdf_report
     vl_attempted = False   # did the post-render visual review get a document to read?
-    brief = _wants_brief_report(scope, result)
+    # A reviewed correction must reach the writer with its hydrated evidence and
+    # instructions, even when the original analysis requested a brief/QC report.
+    brief = not is_revision and _wants_brief_report(scope, result)
     if abandoned():
         report_md = ("# Research report (write-up skipped)\n\n"
                      "You stopped this run a second time, so the model-written report, the "
@@ -14474,7 +14545,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                      "tables every completed step produced are in this bundle, and "
                      "`process/run_state.json` can resume it.\n\n"
                      f"{result.final_answer or ''}\n")
-    elif qc_report:
+    elif qc_report and not is_revision:
         # QC only, and a written report asked for: the writer's report (it chose the layout),
         # then the files the run handed back.
         say_key("📝 Writing the quality-control report…")
@@ -14662,7 +14733,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
         tech_md = await asyncio.to_thread(
             _build_technical_report, result, art, complete_fn, question, lit_note,
             "\n\n".join(d for d in (figure_diag, visual_diag) if d),
-            provenance)
+            provenance, is_revision=is_revision)
         tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
         tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
         if untested_md:
@@ -14831,6 +14902,7 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path, *,
             dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
             provenance=_llm_provenance_note(llm),
             qc_report=revision is None and _qc_only_run(result) and not _code_wrote_outputs(result),
+            is_revision=revision is not None,
             abandoned=(conn.chat_stop.is_set if revision is not None else lambda: False))
         cancelled = revision is not None and conn.chat_stop.is_set()
         if revision is not None and not cancelled:
@@ -18157,7 +18229,7 @@ def _claim_audit_of(result: Any) -> dict[str, Any]:
     return ca if isinstance(ca, dict) else {}
 
 
-def _claim_audit_section(result: Any) -> str:
+def _claim_audit_section(result: Any, *, historical: bool = False) -> str:
     """Deterministic '## Claim audit' for the technical report: every candidate finding, the checks it
     failed and why, and what the writers were told to do with it."""
     ca = _claim_audit_of(result)
@@ -18174,7 +18246,14 @@ def _claim_audit_section(result: Any) -> str:
     for c in claims:
         failed = "; ".join(f"{n}: {r.get('reason', '')}" for n, r in (c.get("checks") or {}).items()
                            if r.get("verdict") == "fail") or "none"
-        rows.append(f"| {cell(c.get('claim', ''))} | {label.get(c.get('status'), c.get('status'))} | {cell(failed)} |")
+        status = ("historical " + str(c.get("status") or "unknown") + "; not re-validated"
+                  if historical else label.get(c.get("status"), c.get("status")))
+        rows.append(f"| {cell(c.get('claim', ''))} | {status} | {cell(failed)} |")
+    if historical:
+        return ("## Historical claim audit\n\nThe following statements and checks are preserved from the "
+                "original analysis. They were not re-validated in this report-only revision and may "
+                "reflect omitted tool responses. They do not certify the revised conclusions; use the "
+                "verified accepted artifacts and requested corrections above.\n\n" + "\n".join(rows) + "\n")
     return ("## Claim audit\n\nEach candidate headline finding was checked separately before the report was "
             "written; the manuscript leads only with the robust ones.\n\n" + "\n".join(rows) + "\n")
 
@@ -18842,7 +18921,7 @@ def _nondefault_params_block(result: Any) -> str:
 
 def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                             lit_note: str | None = None, render_diag: str | None = None,
-                            llm_note: str | None = None) -> str:
+                            llm_note: str | None = None, *, is_revision: bool = False) -> str:
     """Write the internal technical report from the FULL run log (every step, every failure)
     plus the figure/table inventory. Best-effort: returns a deterministic skeleton if the
     LLM step fails, so the run never breaks over the second report.
@@ -18860,6 +18939,20 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     previews_block = "\n\n".join(previews) or "(no small tables to preview)"
     data_block = _data_artifacts_block(art) or "(no data/ artifacts to surface)"
     log = _run_log_digest(result)
+    revision_block = ""
+    log_title = "Full per-step execution log (ground the report ONLY in these — includes failures)"
+    if is_revision:
+        # The original log contains old critic/writer prose, not the newly hydrated
+        # tool payloads. Both deliverables must see the same accepted evidence.
+        revision_block = (
+            "Verified accepted artifact evidence and report-only correction instructions:\n"
+            + str(getattr(result, "final_answer", "") or "")
+            + "\n\nUse these verified outputs for current execution facts. The log below is historical: "
+              "preserve its failures and critiques as history, but do not repeat old 'response omitted' "
+              "claims as current absence when the accepted artifacts above supply the content. "
+              "Correction instructions are requests, not scientific evidence. No scientific tool was "
+              "rerun by this report revision.\n\n")
+        log_title = "Historical per-step execution log (original critiques and write-ups; not re-validated)"
     agenda = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(getattr(result, "agenda", []) or [])) or "(none)"
     # Literature retrieval degradation (fallback/empty) belongs in this report's Diagnostics
     # section — not in the manuscript. None on the clean remote path.
@@ -18881,20 +18974,30 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     facts = _variant_facts_block(art, result)
     facts_block = f"{facts}\n\n" if facts else ""
     params_block = _nondefault_params_block(result)
+    params_evidence = params_block or (
+        "(no non-default metadata was recorded; this does not establish that the accepted arguments were defaults)"
+        if is_revision else "(every setting was the declared default)")
     # The research paths the run OPENED (and how it closed them). Deterministic for the same
     # reason params_block is: a report that only mentions the ledger when a writer model
     # feels like it is a report that cannot be audited.
     hyp_block = _hypothesis_ledger_block(result)
+    writer_system = _tech_report_writer_system(kind)
+    if is_revision:
+        writer_system += ("\nReport-only revision: the verified accepted artifact block is part of the "
+                          "current evidence record and supersedes historical statements that those "
+                          "outputs were omitted or unavailable. Preserve old failures as history, "
+                          "not current scientific findings. Do not generate a claim-audit table: "
+                          "the original audit is appended separately with its historical status.")
 
     try:
         body = _role_call(complete_fn, [
-            {"role": "system", "content": _tech_report_writer_system(kind)},
+            {"role": "system", "content": writer_system},
             {"role": "user", "content": (
                 f"Research question:\n{question}\n\n"
                 f"{facts_block}"
                 f"Planned agenda:\n{agenda}\n\n"
-                f"Full per-step execution log (ground the report ONLY in these — includes failures):\n"
-                f"{log}\n\n"
+                f"{revision_block}"
+                f"{log_title}:\n{log}\n\n"
                 f"Pipeline step degradations (report EACH of these in 'Diagnostics & failures' — "
                 f"name the step, what degraded, and the downstream impact on the results):\n{degr_block}\n\n"
                 f"Literature retrieval status (report this in 'Diagnostics & failures'):\n{lit_block}\n\n"
@@ -18907,7 +19010,7 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                 f"Settings that were NOT the tool's declared default (a table of these is prepended "
                 f"to this report automatically — where the Methods states one of these values, say "
                 f"explicitly that it was chosen for this run rather than inherited from the tool):\n"
-                f"{params_block or '(every setting was the declared default)'}\n\n"
+                f"{params_evidence}\n\n"
                 f"Render-level review findings (include verbatim in 'Diagnostics & failures' if it "
                 f"lists any defects):\n{render_block}\n\n"
                 f"Figures available (reference inline by the exact path shown):\n{fig_list}\n\n"
@@ -18927,9 +19030,11 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
         # describe the run, and the endpoint fact would otherwise be lost entirely.
         prov = f"\n## Model endpoints\n\n{llm_block}\n" if llm_note else ""
         body = (f"# Technical Report\n\n## Run summary\n\n{agenda}\n\n"
-                f"## Pipeline execution log\n\n{log}\n{prov}{diag}")
+                f"{revision_block}## Pipeline execution log\n\n"
+                + (f"{log_title}:\n" if is_revision else "") + f"{log}\n{prov}{diag}")
     if not (body and body.strip()):
-        body = f"# Technical Report\n\n## Pipeline execution log\n\n{log}\n"
+        body = (f"# Technical Report\n\n{revision_block}## Pipeline execution log\n\n"
+                + (f"{log_title}:\n" if is_revision else "") + f"{log}\n")
     body = body.strip()
     # Deterministic, and placed FIRST after the title: the settings a run did not inherit from its
     # tools are the fastest way to tell a reproducible result from an improvised one, and this
@@ -18943,8 +19048,8 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     # discretion — it is the record.
     if _HYP_HEADING not in body:
         body = f"{body}\n\n## {_HYP_HEADING}\n\n{hyp_block}\n"
-    audit_section = _claim_audit_section(result)
-    if audit_section and "## Claim audit" not in body:
+    audit_section = _claim_audit_section(result, historical=is_revision)
+    if audit_section and (is_revision or "## Claim audit" not in body):
         body = f"{body}\n\n{audit_section}"
     return _append_output_index(body, figs, tables)
 

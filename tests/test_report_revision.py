@@ -273,6 +273,7 @@ def test_existing_report_worker_receives_accepted_artifact_view_without_rewritin
     assert '"association": false' in received[0][1].final_answer
     assert received[0][1].accepted_steps == 1 and len(received[0][1].rounds) == 1
     assert received[0][3]["qc_report"] is False
+    assert received[0][3]["is_revision"] is True
     assert received[0][3]["self_sourced"].startswith("HISTORICAL PLANNER STATEMENT")
     assert state["self_sourced"] in received[0][3]["self_sourced"]
     assert (art / "process/run_state.json").read_bytes() == original
@@ -280,6 +281,41 @@ def test_existing_report_worker_receives_accepted_artifact_view_without_rewritin
     assert json.loads((art / "process/report_job.json").read_text())["state"] == "done"
     assert "[report.md](report.md)" in (art / "report/summary.md").read_text()
     assert (folder / "prior_report/summary.md").read_text() == "historical unsupported claim"
+
+
+@pytest.mark.parametrize("revision,brief,qc,expected", [
+    (True, True, False, "writer"),
+    (True, False, True, "writer"),
+    (False, True, False, "brief"),
+    (False, False, True, "qc"),
+])
+def test_actual_report_branch_sends_revisions_to_evidence_writer_only(
+        tmp_path, monkeypatch, revision, brief, qc, expected):
+    class SelectedBranch(Exception):
+        pass
+    calls = []
+    result = SimpleNamespace(final_answer="Verified threshold500. Correction: ambient_compare is supported.")
+    def writer(synthesis, art, complete, question, actual_result):
+        calls.append(("writer", synthesis, actual_result))
+        raise SelectedBranch
+    def short(*args):
+        calls.append(("brief",))
+        raise SelectedBranch
+    def quality(*args):
+        calls.append(("qc",))
+        raise SelectedBranch
+    monkeypatch.setattr(gw, "_wants_brief_report", lambda *args: brief)
+    monkeypatch.setattr(gw, "_build_report", writer)
+    monkeypatch.setattr(gw, "_build_brief_report", short)
+    monkeypatch.setattr(gw, "_qc_report_md", quality)
+    with pytest.raises(SelectedBranch):
+        asyncio.run(gw._write_report(None, tmp_path, result, "Original brief QC request",
+            complete_fn=lambda *a: pytest.fail("The branch probe makes no model calls"),
+            report_render_fn=None, emit=lambda *a, **k: None, say_key=lambda *a, **k: None,
+            qc_report=qc, is_revision=revision))
+    assert len(calls) == 1 and calls[0][0] == expected
+    if revision:
+        assert calls[0][1] == result.final_answer and calls[0][2] is result
 
 
 def test_stopped_revision_never_calls_model_or_writer(tmp_path, monkeypatch):
@@ -439,3 +475,65 @@ def test_stop_during_writer_keeps_summary_and_reports_cancelled_consistently(tmp
     assert json.loads((folder / "revision.json").read_text())["state"] == "cancelled"
     assert gw._read_report_job(art)["state"] == "cancelled"
     assert (art / "report/summary.md").read_text() == "historical unsupported claim"
+
+
+def _hydrated_technical_result(tmp_path):
+    from aiscientist.agents.research_lab import LabResult
+    art, state = seed(tmp_path)
+    state["rounds"][0]["scientist_result"]["final_answer"] = "Old answer: body omitted; PRPF31 supported."
+    state["rounds"][0]["verdict"]["critique"] = "Could not inspect the omitted response."
+    original = copy.deepcopy(state)
+    instructions = "Report the negative association and preserve its unsupported evidence status."
+    view, _ = rr.hydrate(art, state, instructions)
+    return art, state, original, LabResult.from_dict(view), instructions
+
+
+def test_technical_revision_writer_receives_hydrated_facts_and_same_correction(tmp_path):
+    art, state, original, result, instructions = _hydrated_technical_result(tmp_path)
+    seen = []
+    def writer(messages, **kwargs):
+        seen.append(messages)
+        return "# Technical report\n\nPRPF31 association is false and unsupported."
+    report = gw._build_technical_report(result, art, writer, "synthetic test", is_revision=True)
+    assert len(seen) == 1
+    system, prompt = (m["content"] for m in seen[0])
+    assert "supersedes historical statements" in system
+    assert result.final_answer in prompt and instructions in prompt
+    assert '\"association\": false' in prompt and '\"evidence_status\": \"unsupported\"' in prompt
+    assert "Historical per-step execution log" in prompt
+    assert "Old answer: body omitted; PRPF31 supported." in prompt
+    assert "does not establish that the accepted arguments were defaults" in prompt
+    assert "## Historical claim audit" in report
+    assert "not re-validated" in report and "robust: may be headlined" not in report
+    assert "Each candidate headline finding was checked separately" not in report
+    assert state == original
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_technical_revision_fallback_preserves_verified_facts_and_history(tmp_path, empty):
+    art, state, original, result, instructions = _hydrated_technical_result(tmp_path)
+    def unavailable(*args, **kwargs):
+        if empty:
+            return ""
+        raise RuntimeError("writer unavailable")
+    report = gw._build_technical_report(result, art, unavailable, "synthetic test", is_revision=True)
+    assert result.final_answer in report and instructions in report
+    assert "Historical per-step execution log" in report
+    assert "Old answer: body omitted; PRPF31 supported." in report
+    assert "## Historical claim audit" in report and "not re-validated" in report
+    assert state == original
+
+
+def test_ordinary_technical_report_keeps_original_log_and_claim_contract(tmp_path):
+    art, state, original, result, _ = _hydrated_technical_result(tmp_path)
+    seen = []
+    def writer(messages, **kwargs):
+        seen.append(messages)
+        return "# Technical report\n\nOriginal report path."
+    report = gw._build_technical_report(result, art, writer, "synthetic test")
+    prompt = seen[0][1]["content"]
+    assert result.final_answer not in prompt
+    assert "Full per-step execution log (ground the report ONLY in these" in prompt
+    assert "## Claim audit" in report and "## Historical claim audit" not in report
+    assert "Each candidate headline finding was checked separately" in report
+    assert state == original

@@ -3824,6 +3824,7 @@ class ResumeState:
     plan_context: "dict[str, Any] | None" = None
     review_requested: bool = False
     reviewed_note: str = ""
+    status_recovery: bool = False  # verified task-only draft; always reviewed before execution
 
     @property
     def needs_plan_review(self) -> bool:
@@ -3835,6 +3836,7 @@ class ResumeState:
         return {"agenda": list(self.agenda), "rounds": [r.to_dict() for r in self.prior_rounds],
                 "from_step_index": self.from_step_index, "modify_note": self.modify_note,
                 "redo_indices": sorted(self.redo_indices) if self.redo_indices is not None else None,
+                "status_recovery": self.status_recovery, "reviewed_note": self.reviewed_note,
                 "guidance": self.guidance, "self_sourced": self.self_sourced,
                 "report_requested": self.report_requested, "plan_context": self.plan_context,
                 "approved_plan_yaml": self.approved_plan.to_yaml() if self.approved_plan else ""}
@@ -3862,7 +3864,9 @@ class ResumeState:
                    redo_indices=frozenset(redo_indices) if redo_indices is not None else None,
                    self_sourced=str(state.get("self_sourced") or ""),
                    report_requested=bool(state.get("report_requested", False)),
-                   approved_plan=approved, plan_context=copy.deepcopy(state.get("plan_context")))
+                   approved_plan=approved, plan_context=copy.deepcopy(state.get("plan_context")),
+                   status_recovery=bool(state.get("status_recovery", False)),
+                   reviewed_note=str(state.get("reviewed_note") or ""))
 
     @classmethod
     def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
@@ -4553,7 +4557,7 @@ class ResearchLab:
         if reviewing_resume and approved_plan is None and saved_plan is None:
             saved_plan = resume.approved_plan
             plan_context = resume.plan_context
-            if saved_plan_decision is None:
+            if saved_plan_decision is None and not resume.status_recovery:
                 index = resume.from_step_index
                 change = (f"Change only step {index + 1}. " + resume.modify_note
                           + f"\nRequested step text: {resume.agenda[index]}\n"
@@ -4992,6 +4996,9 @@ class ResearchLab:
             if updated is None or original is None or [s.id for s in updated.steps] != [s.id for s in original.steps]:
                 raise PlanMigrationRequired("A same-run revision must keep the plan's step order and identifiers; "
                                             "review a new study for added, removed, or reordered steps.")
+            if resume.status_recovery:
+                from .status_continuation import validate_review
+                validate_review(original, updated, resume.redo_indices or frozenset())
             if self._scope.source == "explicit_mcp":
                 self._scope = replace(self._scope, keep=tuple(s.tool for s in updated.steps if s.tool))
             elif self._scope.keep:
@@ -5004,9 +5011,11 @@ class ResearchLab:
             # job. Its complete typed call uses the same exact-call guard as explicit
             # native workflows; canonical identity comes only from the reviewed registry.
             from .tool_names import STATUS_TOOLS
-            if updated.steps and all(canonical_tool_name(s.tool) in STATUS_TOOLS for s in updated.steps):
+            status_steps = ([updated.steps[i] for i in sorted(resume.redo_indices or ())]
+                            if resume.status_recovery else updated.steps)
+            if status_steps and all(canonical_tool_name(s.tool) in STATUS_TOOLS for s in status_steps):
                 self._scope = replace(self._scope, source="explicit_mcp",
-                                      keep=tuple(s.tool for s in updated.steps if s.tool))
+                                      keep=tuple(s.tool for s in status_steps if s.tool))
             return self._run_inner(question, on_event=emit, should_cancel=should_cancel,
                 pull_injections=pull_injections, checkpoint=checkpoint,
                 decision_review=decision_review, should_compact=should_compact,
