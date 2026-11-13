@@ -9462,7 +9462,7 @@ async def _maybe_status_recovery(conn: Connection, req: LabRequest) -> bool:
         requested_run = status_continuation.target_run(req.question)
         if not req.conversation_id:
             raise ValueError("Status recovery requires the original conversation.")
-        target = _report_target(conn, req)  # owner, conversation, confinement and accepted evidence
+        target = _report_target(conn, req, allow_recovery_error=True)  # ownership and accepted evidence
         if target is None or target[0] != requested_run:
             raise ValueError("The original status-recovery run is unavailable in this conversation.")
         run_id, art, state = target
@@ -14970,7 +14970,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         art = conn.workspace / run_id / "artifacts"
         art.mkdir(parents=True, exist_ok=True)
         if saved_state is not None and saved_state.get("resume_review"):
-            resume = ResumeState.from_review_state(saved_state["resume_review"])
+            resume = ResumeState.from_review_state(
+                saved_state["resume_review"], question=str(saved_state.get("question") or ""))
 
         # Record the run in this user's history (when logged in); updated on finish. A resume
         # keeps the SAME run row (it overwrites the same bundle), so don't insert a new one.
@@ -18295,12 +18296,8 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
     # data/ artifacts (e.g. scGPT predictions) — these never appear in tables/, so surface
     # them explicitly or the model can't see a successful annotation result.
     data_block = _data_artifacts_block(art, omit_doublet_details=True) or "(no data/ artifacts to surface)"
-    rd = _result_dataset_pointer(art)
-    rd_block = (f"Result dataset delivered with this run: `{rd['name']}` ({rd.get('n_cells')} cells x "
-                f"{rd.get('n_genes')} genes; layers['counts'] = {rd.get('counts_layer')}). When the "
-                "report mentions the delivered dataset, name THIS file; the work/ checkpoints "
-                "(adata_*.h5ad) are deleted when the run is published and are never the "
-                "deliverable.\n\n") if rd else ""
+    from ..reporting.delivery import delivery_evidence
+    rd_block = delivery_evidence(art)
 
     try:
         body = _role_call(complete_fn, [
@@ -18973,6 +18970,8 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     kind = _report_task_kind(art, result)
     facts = _variant_facts_block(art, result)
     facts_block = f"{facts}\n\n" if facts else ""
+    from ..reporting.delivery import delivery_evidence
+    delivery_block = delivery_evidence(art)
     params_block = _nondefault_params_block(result)
     params_evidence = params_block or (
         "(no non-default metadata was recorded; this does not establish that the accepted arguments were defaults)"
@@ -18996,7 +18995,7 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                 f"Research question:\n{question}\n\n"
                 f"{facts_block}"
                 f"Planned agenda:\n{agenda}\n\n"
-                f"{revision_block}"
+                f"{delivery_block}{revision_block}"
                 f"{log_title}:\n{log}\n\n"
                 f"Pipeline step degradations (report EACH of these in 'Diagnostics & failures' — "
                 f"name the step, what degraded, and the downstream impact on the results):\n{degr_block}\n\n"
@@ -19030,10 +19029,10 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
         # describe the run, and the endpoint fact would otherwise be lost entirely.
         prov = f"\n## Model endpoints\n\n{llm_block}\n" if llm_note else ""
         body = (f"# Technical Report\n\n## Run summary\n\n{agenda}\n\n"
-                f"{revision_block}## Pipeline execution log\n\n"
+                f"{delivery_block}{revision_block}## Pipeline execution log\n\n"
                 + (f"{log_title}:\n" if is_revision else "") + f"{log}\n{prov}{diag}")
     if not (body and body.strip()):
-        body = (f"# Technical Report\n\n{revision_block}## Pipeline execution log\n\n"
+        body = (f"# Technical Report\n\n{delivery_block}{revision_block}## Pipeline execution log\n\n"
                 + (f"{log_title}:\n" if is_revision else "") + f"{log}\n")
     body = body.strip()
     # Deterministic, and placed FIRST after the title: the settings a run did not inherit from its
@@ -20661,7 +20660,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # Report revisions reuse the established writer and durable plan-card protocol.
-def _report_target(conn: Connection, req: LabRequest) -> "tuple[str, Path, dict] | None":
+def _report_target(conn: Connection, req: LabRequest, *, allow_recovery_error: bool = False) -> "tuple[str, Path, dict] | None":
     from . import report_revision
     match = re.search(r"\brun(?:_id)?\s*[:=]?\s*[`\"']?([a-f0-9]{12})\b", req.question, re.IGNORECASE)
     explicit = match.group(1).lower() if match else None
@@ -20685,7 +20684,8 @@ def _report_target(conn: Connection, req: LabRequest) -> "tuple[str, Path, dict]
         record = auth_routes.get_run_record(conn.app_user_id, candidate)
         if not record or (req.conversation_id and str(record.get("conversation_id")) != str(req.conversation_id)):
             raise ValueError("The report target is not a run in this account and conversation")
-        if record.get("status") not in {"done", "incomplete"}:
+        allowed_states = {"done", "incomplete"} | ({"error"} if allow_recovery_error else set())
+        if record.get("status") not in allowed_states:
             raise ValueError("The report target must be a finished run with accepted results")
     art, state = report_revision.load_target(conn.workspace, candidate, req.conversation_id)
     return candidate, art, state

@@ -211,3 +211,116 @@ def test_only_recorded_completed_tasks_qualify_for_recollection(original, state)
     original["rounds"][1]["scientist_result"]["steps"][0]["result"]["state"] = state
     with pytest.raises(ValueError, match="completed original task"):
         recovery.revised_state(original, request())
+
+
+def test_review_allows_execution_labels_regenerated_by_trusted_registry(original):
+    state, indices = recovery.revised_state(original, request())
+    plan = ResumeState.from_run_state(state, 1).approved_plan
+    assert all(not step.runs_on for step in plan.steps)  # parser deliberately ignores this field
+    displayed = replace(plan, steps=tuple(replace(step, runs_on="hpc:phenotype") for step in plan.steps))
+    recovery.validate_review(plan, displayed, indices)
+    changed = replace(displayed, steps=(displayed.steps[0],
+        replace(displayed.steps[1], settings={"analysis_id": "prior", "task_id": "other"}),
+        displayed.steps[2]))
+    with pytest.raises(ValueError, match="verified task"):
+        recovery.validate_review(plan, changed, indices)
+
+
+def test_saved_review_restores_original_question_without_trusting_yaml_request(original):
+    question = 'Original "quoted" request\nwith fixed settings {"hpo_terms": ["HP:0000662"]}'
+    original = {**original, "question": question}
+    state, indices = recovery.revised_state(original, request())
+    resume = replace(ResumeState.from_run_state(state, 1, redo_indices=indices),
+                     status_recovery=True, review_requested=True)
+    durable = json.loads(json.dumps(resume.to_review_state()))
+    assert durable["question"] == question
+    restored = ResumeState.from_review_state(durable, question=question)
+    assert restored.approved_plan.request == question
+    durable.pop("question")  # the exact old website record shape that failed after approval
+    restored = ResumeState.from_review_state(durable, question=question)
+    assert restored.approved_plan.request == question
+    with pytest.raises(ValueError, match="original saved run question"):
+        ResumeState.from_review_state(durable)
+    with pytest.raises(ValueError, match="does not match"):
+        ResumeState.from_review_state({**durable, "question": "another question"}, question=question)
+    with pytest.raises(ValueError, match="original question and step count"):
+        recovery.validate_review(restored.approved_plan,
+                                 replace(restored.approved_plan, request="another question"), indices)
+
+
+def test_error_after_review_can_recollect_same_completed_tasks_but_report_route_stays_closed(
+        tmp_path, monkeypatch, original):
+    state, indices = recovery.revised_state(original, request())
+    resume = replace(ResumeState.from_run_state(state, 1, redo_indices=indices), status_recovery=True)
+    old_review = resume.to_review_state()
+    old_review.pop("question")
+    failed = {**state, "rounds": copy.deepcopy(old_review["rounds"]), "resume_review": old_review}
+    failed.pop("approved_plan_yaml")
+    conn, _art, _home = connection(tmp_path, monkeypatch, failed)
+    monkeypatch.setattr(gw, "_AUTH_ENABLED", True)
+    conn.app_user_id = "current-account"
+    monkeypatch.setattr(gw.auth_routes, "get_run_record", lambda *_:
+                        {"status": "error", "conversation_id": "conv1"})
+    seen = []
+    async def run(_conn, req, **kwargs):
+        seen.append(kwargs)
+    monkeypatch.setattr(gw, "_run_lab", run)
+    req = gw.LabRequest(connection_id=conn.id, question=request(), conversation_id="conv1")
+    with pytest.raises(ValueError, match="finished run"):
+        gw._report_target(conn, req)
+    assert asyncio.run(gw._maybe_status_recovery(conn, req))
+    assert len(seen) == 1 and seen[0]["resume_run_id"] == RUN
+    assert seen[0]["resume"].approved_plan.request == original["question"]
+    changed = copy.deepcopy(failed)
+    changed["resume_review"]["rounds"][0]["scientist_result"]["final_answer"] = "changed"
+    with pytest.raises(ValueError, match="no longer matches"):
+        recovery.revised_state(changed, request())
+
+
+def test_durable_plan_save_reload_approve_executes_only_two_status_calls(tmp_path, original, monkeypatch):
+    from aiscientist.agents.plan_doc import parse_plan_yaml
+    from aiscientist.gateway import saved_plans
+    from aiscientist.agents import research_lab
+    locations = {server.planner_name(t["name"]): server.runs_on
+                 for server in configured_servers() for t in server.tools}
+    monkeypatch.setattr(research_lab, "_tool_runs_on", lambda name: locations.get(name, ""))
+    question = original["question"] + '\nQuoted "request" with JSON {"hpo_terms":["HP:0000662"]}'
+    original = {**original, "question": question}
+    updated, indices = recovery.revised_state(original, request())
+    resume = replace(ResumeState.from_run_state(updated, 1, redo_indices=indices),
+                     status_recovery=True, review_requested=True)
+    calls = []
+    first = status_lab(resume, calls)
+    class Paused(Exception):
+        pass
+    def review(kind, agenda):
+        assert not calls and kind == "agenda"
+        snapshot = {"question": question, "agenda": agenda, "resume_review": resume.to_review_state()}
+        (tmp_path / "run_state.json").write_text(json.dumps(snapshot))
+        saved_plans.save(tmp_path, first._plan_doc.to_yaml(), source="draft")
+        raise Paused()
+    with pytest.raises(Paused):
+        first.run(question, plan_review=review, resume=resume)
+    assert not calls
+    state = json.loads((tmp_path / "run_state.json").read_text())
+    state["resume_review"].pop("question")  # emulate an already-saved e58 review
+    restored = ResumeState.from_review_state(state["resume_review"], question=state["question"])
+    current = saved_plans.load(tmp_path)
+    saved_plans.save(tmp_path, current["yaml"], source=current["source"], state="approved")
+    approved = parse_plan_yaml(current["yaml"], request=state["question"])
+    second = status_lab(restored, calls)
+    events = []
+    result = second.run(state["question"], resume=restored, approved_plan=approved, on_event=events.append)
+    assert calls == [{"analysis_id": "prior", "task_id": "task-2"},
+                     {"analysis_id": "prior", "task_id": "task-3"}]
+    assert result.accepted_steps == 3
+    assert result.rounds[0].scientist_result == original["rounds"][0]["scientist_result"]
+    assert any(e.get("type") == "run_resumed" and e["kept"] == [1] for e in events)
+
+
+def test_legacy_untyped_review_does_not_invent_an_empty_question():
+    resume = ResumeState.from_run_state({"agenda": ["legacy step"], "rounds": []}, 0)
+    state = resume.to_review_state()
+    assert "question" not in state
+    restored = ResumeState.from_review_state(state, question="Original legacy question")
+    assert restored.approved_plan is None and restored.agenda == ["legacy step"]

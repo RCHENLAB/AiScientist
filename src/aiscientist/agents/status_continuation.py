@@ -97,7 +97,16 @@ def revised_state(state: dict, text: str) -> tuple[dict, frozenset[int]]:
     if len(text) > 20_000:
         raise ValueError("Status recovery instructions exceed the review limit.")
     target_run(text)
-    plan = parse_plan_yaml(state.get("approved_plan_yaml", ""), request=state.get("question", ""))
+    plan_yaml = state.get("approved_plan_yaml", "")
+    review = state.get("resume_review")
+    if not plan_yaml and isinstance(review, dict) and review.get("status_recovery"):
+        # A paused/failed review stores the draft in its durable resume inputs, not
+        # the top-level approved-plan slot. Only an unchanged accepted run may reuse it.
+        if (review.get("agenda") != state.get("agenda") or review.get("rounds") != state.get("rounds")
+                or ("question" in review and review["question"] != state.get("question"))):
+            raise ValueError("The saved recovery review no longer matches its original run.")
+        plan_yaml = review.get("approved_plan_yaml", "")
+    plan = parse_plan_yaml(plan_yaml, request=state.get("question", ""))
     if not plan.steps or plan.agenda() != state.get("agenda"):
         raise ValueError("Status recovery requires the original matching typed plan.")
     numbered = re.findall(r"(?m)^\s*s\d+\s*:.*$", text)
@@ -130,10 +139,11 @@ def validate_review(original: PlanDoc, updated: PlanDoc, indices: frozenset[int]
         raise ValueError("Status recovery must preserve the original question and step count.")
     for i, (old, new) in enumerate(zip(original.steps, updated.steps)):
         if i not in indices:
-            if old != new:
+            # runs_on is discarded by the parser and regenerated from the trusted registry.
+            if replace(old, runs_on="") != replace(new, runs_on=""):
                 raise ValueError("Status recovery must preserve every retained step unchanged.")
-        elif (old.id, old.tool, old.settings, old.runs_on, old.skill) != (
-                new.id, new.tool, new.settings, new.runs_on, new.skill):
+        elif (old.id, old.tool, old.settings, old.skill) != (
+                new.id, new.tool, new.settings, new.skill):
             raise ValueError("Status recovery cannot change the verified task or execution identity.")
         if i in indices:
             status_server(new.tool, new.settings)

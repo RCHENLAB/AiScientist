@@ -3833,7 +3833,9 @@ class ResumeState:
 
     def to_review_state(self) -> dict[str, Any]:
         """Durable continuation inputs while the same run waits for an edited plan."""
-        return {"agenda": list(self.agenda), "rounds": [r.to_dict() for r in self.prior_rounds],
+        return {**({"question": self.approved_plan.request}
+                   if self.approved_plan and self.approved_plan.request else {}),
+                "agenda": list(self.agenda), "rounds": [r.to_dict() for r in self.prior_rounds],
                 "from_step_index": self.from_step_index, "modify_note": self.modify_note,
                 "redo_indices": sorted(self.redo_indices) if self.redo_indices is not None else None,
                 "status_recovery": self.status_recovery, "reviewed_note": self.reviewed_note,
@@ -3842,7 +3844,15 @@ class ResumeState:
                 "approved_plan_yaml": self.approved_plan.to_yaml() if self.approved_plan else ""}
 
     @classmethod
-    def from_review_state(cls, state: dict[str, Any]) -> "ResumeState":
+    def from_review_state(cls, state: dict[str, Any], *, question: str | None = None) -> "ResumeState":
+        # The YAML editor intentionally ignores its request field. Older review records
+        # omitted question; restore it from the trusted outer saved run, never edited YAML.
+        if question is not None:
+            if "question" in state and state["question"] != question:
+                raise ValueError("The saved continuation question does not match its original run.")
+            state = {**state, "question": question}
+        if state.get("status_recovery") and not state.get("question"):
+            raise ValueError("Status recovery requires the original saved run question.")
         return replace(cls.from_run_state(state, int(state["from_step_index"]),
                                           modify_note=str(state.get("modify_note") or ""),
                                           redo_indices=state.get("redo_indices")), review_requested=True)
