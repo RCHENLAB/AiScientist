@@ -30,7 +30,11 @@ from ..sdk import HarnessTool
 # claim about biology; its markers come from here, not from a model's memory. On 2026-10-02 a
 # model-written retina panel put OPN4/NEFM/MEF2C under cones, RLBP1 under bipolar cells and
 # astrocyte markers under Muller glia, and 1,631 Muller glia ended up "Unassigned" or "ganglion".
-_REFERENCES = Path(__file__).with_name("references")
+from .._lib.marker_references import (
+    _REFERENCES as _REFERENCES,
+    available_references as available_references,
+    load_reference as _load_reference,
+)
 # The canonical check: a label stands only if one of its lineage-specific markers is clearly higher
 # in the cluster than in clusters given OTHER labels (log-normalised mean difference) and detected
 # in enough of the cluster's cells.
@@ -38,18 +42,6 @@ _CANON_MIN_DELTA = 0.5
 _CANON_MIN_FRACTION = 0.2
 # More cells than this unassigned means the labelling failed, whatever the reason.
 _MAX_UNASSIGNED_SHARE = 0.30
-
-
-def available_references() -> list[str]:
-    """The tissues a curated reference panel exists for (``reference`` values)."""
-    return sorted(p.stem for p in _REFERENCES.glob("*.json"))
-
-
-def _load_reference(name: str) -> "dict[str, Any] | None":
-    path = _REFERENCES / f"{name}.json"
-    if not path.is_file():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _norm(name: str) -> str:

@@ -65,6 +65,7 @@ def test_base_wheel_contains_registry_and_can_register_atlas(tmp_path, skill_rel
         assert "aiscientist/agents/mcp_catalog/mcp_servers.json" in archive.namelist()
         assert "aiscientist/agents/mcp_catalog/mcp/atlas-expression-exploration-0.0.3.tools.json" in archive.namelist()
         assert "aiscientist/tools/run_scanpy_qc/TOOL.md" in archive.namelist()
+        assert "aiscientist/tools/_lib/marker_references/retina.json" in archive.namelist()
 
     pending = list(info.get_all("Requires-Dist", []))
     installed = set()
@@ -104,6 +105,14 @@ from aiscientist.agents.registry import build_scientist_catalog
 from aiscientist.gateway.system_info import system_overview
 assert Path(aiscientist.__file__).is_relative_to(Path(sys.prefix))
 assert DEFAULT_CONFIG.is_relative_to(Path(sys.prefix))
+from aiscientist.tools import api
+assert 'retina' in api.available_references()
+assert api.load_marker_reference('retina')['species']
+assert api.detect_assembly('##contig=<ID=1,length=248956422>') == 'GRCh38'
+assert 'digraph workflow' in api.workflow_schematic_dot(['QC', 'Clustering'])
+query = Path('query.tsv')
+query.write_text('name\\tvalue\\nx\\t1\\n')
+assert api.peek_dataset(str(query))['readable']
 assert all(importlib.util.find_spec(name) is None for name in ('mcp', 'fastapi', 'yaml'))
 servers = load_servers()
 assert len(servers) == 1 and len(servers[0].tools) == 9
