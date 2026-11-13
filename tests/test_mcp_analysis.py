@@ -319,3 +319,16 @@ def test_scrna_refuses_unconfined_relative_inputs(tmp_path, value):
     server, = bridge.load_servers(config(tmp_path, "scrna-analysis"))
     with pytest.raises(ValueError, match="relative path inside"):
         AnalysisAdapter(server).prepare({"input": value}, SimpleNamespace())
+
+
+def test_scgpt_refactor_is_a_trusted_readonly_deployment_path(monkeypatch):
+    from types import SimpleNamespace
+    from aiscientist.agents.mcp_analysis import setting_paths, setting_values
+
+    server = SimpleNamespace(name="scgpt-annotation", settings_env=("SCGPT_REFACTOR",))
+    monkeypatch.setenv("SCGPT_REFACTOR", "/refs/scgpt-refactor")
+    assert setting_values(server) == {"SCGPT_REFACTOR": "/refs/scgpt-refactor"}
+    assert setting_paths(server) == ("/refs",)
+    monkeypatch.setenv("SCGPT_REFACTOR", "../../untrusted")
+    with pytest.raises(ValueError, match="absolute deployment path"):
+        setting_values(server)

@@ -22,6 +22,9 @@ SRC = ROOT / "src" / "aiscientist"
 PLATFORM_RELIES_ON = {
     "annotate_variants": "gateway/app.py: VCF staging and the variant executor",
     "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab.py: literature steps",
+    "diagnose_disease": "agents/mcp_model.py: trusted literature model binding for MCP diagnosis",
+    "map_phenotype_to_hpo": "agents/mcp_analysis.py, agents/mcp_model.py: case-note authority and session model",
+    "run_lirical": "agents/mcp_analysis.py: attached VCF binding for MCP phenotype ranking",
     "search_corpus": "agents/quick_chat.py, agents/research_lab.py, agents/registry.py: literature steps in a session with no served model",
     "extract_haploinsufficient_genes": "gateway/app.py: the corpus-scan line (route \"corpus\")",
     "inspect_dataset": "agents/research_lab.py: dataset triage steps",

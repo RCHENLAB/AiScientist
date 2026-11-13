@@ -24,7 +24,7 @@ PREFIXES = {
 _PATHS = {
     "cellqc": set(),
     "scrna-analysis": {"SCRNA_GENESETS_DIR"},
-    "scgpt-annotation": {"SCGPT_MODEL_DIR"},
+    "scgpt-annotation": {"SCGPT_MODEL_DIR", "SCGPT_REFACTOR"},
     "variant-annotation": {"VARIANT_" + key + suffix for key in (
         "VEP_CACHE_DIR", "VEP_CLINVAR", "REF_FASTA", "VEP_CADD_SNV", "VEP_CADD_INDELS",
         "VEP_ALPHAMISSENSE", "VEP_REVEL", "VEP_PLUGINS_DIR", "SPLICEAI_MODELS",
