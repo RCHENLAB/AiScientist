@@ -152,7 +152,7 @@ def _read_object(path: Path, limit: int) -> dict:
 def evidence_file(art: Path, relative: str, *, server: str, analysis: str,
                   task: str, operation: str, operations: set[str]) -> tuple[Path, dict]:
     """Verify current bytes against trusted ownership or the exact legacy manifest entry."""
-    direct = confined(art, relative)
+    confined(art, relative)
     parts = Path(relative).parts
     if len(parts) < 4 or parts[:3] != ("mcp", server, analysis):
         raise ValueError("The accepted full-result analysis identity is invalid")
@@ -164,7 +164,7 @@ def evidence_file(art: Path, relative: str, *, server: str, analysis: str,
         raise ValueError("The legacy artifact does not identify the accepted operation")
     # A manifest may describe an on-disk run or its downloaded package. These
     # are the only historical packaging prefixes accepted; never search by glob.
-    candidates = {relative, "extra/" + relative, "mcp/" + relative, "extra/mcp/" + relative}
+    candidates = (relative, "extra/" + relative, "mcp/" + relative, "extra/mcp/" + relative)
     owners = {}
     for prefix in ("mcp/", "extra/mcp/", "mcp/mcp/", "extra/mcp/mcp/"):
         compat = confined(art, prefix + ".compatibility.json")
@@ -175,7 +175,7 @@ def evidence_file(art: Path, relative: str, *, server: str, analysis: str,
                         raise ValueError("The full-result ownership records are ambiguous")
                     owners[name] = owner
     owner = owners.get(relative)
-    if owner is not None:
+    if relative in owners:
         if not isinstance(owner, dict) or any(owner.get(key) != expected for key, expected in (
                 ("server", server), ("analysis_id", analysis), ("task_id", task))):
             raise ValueError("The full-result owner differs from the accepted task")
@@ -195,29 +195,46 @@ def evidence_file(art: Path, relative: str, *, server: str, analysis: str,
         checksums = {}
         for entry in _read_object(manifest, 8 * 1024 * 1024).get("distribution", []):
             name, checksum = entry.get("name"), entry.get("sha256")
-            if not isinstance(name, str) or not isinstance(checksum, str) or not re.fullmatch(r"[a-f0-9]{64}", checksum):
+            if not isinstance(name, str):
                 continue
             local = name.removeprefix("extra/")
             canonical = local.removeprefix("mcp/") if local.startswith("mcp/mcp/") else local
             if canonical != relative:
                 continue
+            if not isinstance(checksum, str) or not re.fullmatch(r"[a-f0-9]{64}", checksum):
+                raise ValueError("The full-result checksum manifest has a missing or invalid checksum")
             for candidate in (name, local):
                 if candidate in checksums and checksums[candidate] != checksum:
                     raise ValueError("The full-result checksum manifest is ambiguous")
                 checksums[candidate] = checksum
     found = []
+    verified_bytes = None
     for name, checksum in checksums.items():
         path = confined(art, name)
         if path.is_file() and path.stat().st_size <= 32 * 1024 * 1024:
-            if hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != checksum:
                 raise ValueError("The full-result checksum differs from its verified manifest")
+            if verified_bytes is not None and raw != verified_bytes:
+                raise ValueError("The accepted full-result artifact has ambiguous verified copies: " + relative)
+            verified_bytes = raw
             found.append(path)
-    if direct.is_file() and direct not in found:
-        raise ValueError("The direct full-result artifact is not verified by its manifest")
-    if len(set(found)) != 1:
+    ordered = []
+    for name in candidates:
+        path = confined(art, name)
+        if path.is_file():
+            if path not in found:
+                raise ValueError("A full-result artifact copy is not verified by its manifest")
+            ordered.append(path)
+    if not ordered:
         raise ValueError("The accepted full-result artifact is missing or ambiguous: " + relative)
-    return found[0], {"operation": owner["operation"] if owner else operation,
-                      "ownership": "task" if owner else "legacy_manifest"}
+    provenance = {"operation": owner["operation"] if owner else operation,
+                  "ownership": "task" if owner else "legacy_manifest"}
+    if len(ordered) > 1:
+        # Resuming a run can retain identical legacy packaging copies. Every
+        # copy must independently verify; differing or untracked bytes fail.
+        provenance["verified_copies"] = [str(path.relative_to(art)) for path in ordered]
+    return ordered[0], provenance
 
 
 def hydrate(art: Path, state: dict, instructions: str) -> tuple[dict, dict]:

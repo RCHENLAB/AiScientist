@@ -657,6 +657,13 @@ def _verb(n: int, plural: str, singular: str) -> str:
     return singular if n == 1 else plural
 
 
+_NUMERIC_LIMITATION = (
+    "Matching numbers or candidate formulas does not verify a sentence's scientific meaning. "
+    "Coincidental matches can point to unrelated outputs. Check the source field, group, unit and "
+    "meaning before relying on a match."
+)
+
+
 # --- the statement ----------------------------------------------------------------------------
 
 def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | None" = None,
@@ -682,7 +689,7 @@ def build_verification(art: "str | Path", report_md: str, agenda: "list[str] | N
            "Every statement below comes from a check that code ran on this run's own files after the "
            "analysis: its result tables, the values its tools returned, and the final report text. "
            "None of it is a model's opinion of its own work. Where a check could not run, it says so.",
-           "", "## 1. Numbers in the report", ""]
+           "", "## 1. Numbers in the report", "", _NUMERIC_LIMITATION, ""]
     if claims:
         out.append(
             f"{len(claims)} {_verb(len(claims), 'numbers', 'number')} in the report "
@@ -748,7 +755,7 @@ def manuscript_note(summary: dict) -> str:
     if not summary:
         return ""
     bits = ["After the analysis, code checked this report against the run's own outputs; the full "
-            "statement is `report/verification.md`."]
+            "statement is `report/verification.md`.", _NUMERIC_LIMITATION]
     n = summary.get("numbers_checked") or 0
     if n:
         exact, derived, printed = (int(summary.get(k) or 0) for k in

@@ -450,8 +450,9 @@ def test_owned_nested_resumed_snapshot_uses_same_bounded_packaging_paths(tmp_pat
     assert evidence["full_results"][0]["path"] == str(nested.relative_to(art))
     assert '"association": false' in view["final_answer"]
     source.write_bytes(nested.read_bytes())
-    with pytest.raises(ValueError, match="ambiguous"):
-        rr.hydrate(art, state, "Correct report")
+    _, evidence = rr.hydrate(art, state, "Correct report")
+    assert evidence["full_results"][0]["path"] == name
+    assert evidence["full_results"][0]["verified_copies"] == [name, str(nested.relative_to(art))]
 
 
 def test_stop_during_writer_keeps_summary_and_reports_cancelled_consistently(tmp_path, monkeypatch):
@@ -537,3 +538,102 @@ def test_ordinary_technical_report_keeps_original_log_and_claim_contract(tmp_pat
     assert "## Claim audit" in report and "## Historical claim audit" not in report
     assert "Each candidate headline finding was checked separately" in report
     assert state == original
+
+
+def _legacy_packaging_copies(art, state, *, second_payload=None, verify_second=True):
+    step = state["rounds"][0]["scientist_result"]["steps"][0]
+    name = step["result"]["full_result"]
+    original = art / name
+    raw = original.read_bytes()
+    first, second = (art / "extra" / name, art / "extra/mcp" / name)
+    for path in (first, second):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    original.rename(first)
+    second.write_bytes(raw if second_payload is None else json.dumps(second_payload).encode())
+    paths = (first, second) if verify_second else (first,)
+    (art / "croissant.json").write_text(json.dumps({"distribution": [
+        {"name": str(path.relative_to(art)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in paths]}))
+    return first, second
+
+
+def test_identical_manifest_verified_legacy_copies_hydrate_without_rewriting_evidence(tmp_path):
+    art, state = seed(tmp_path)
+    first, second = _legacy_packaging_copies(art, state)
+    original_state = copy.deepcopy(state)
+    original_bytes = {path: path.read_bytes() for path in (first, second)}
+    view, evidence = rr.hydrate(art, state, "Correct report")
+    full = evidence["full_results"][0]
+    assert full["ownership"] == "legacy_manifest"
+    assert full["path"] == str(first.relative_to(art))
+    assert full["verified_copies"] == [str(path.relative_to(art)) for path in (first, second)]
+    assert '"association": false' in view["final_answer"]
+    assert state == original_state and all(path.read_bytes() == raw for path, raw in original_bytes.items())
+
+
+def test_different_individually_manifest_verified_copies_remain_ambiguous(tmp_path):
+    art, state = seed(tmp_path)
+    _legacy_packaging_copies(art, state, second_payload={"status": "ok", "literature": [{"association": True}]})
+    with pytest.raises(ValueError, match="ambiguous verified copies"):
+        rr.hydrate(art, state, "Correct report")
+
+
+def test_identical_untracked_packaging_copy_is_not_admitted(tmp_path):
+    art, state = seed(tmp_path)
+    _legacy_packaging_copies(art, state, verify_second=False)
+    with pytest.raises(ValueError, match="copy is not verified"):
+        rr.hydrate(art, state, "Correct report")
+
+
+def test_changed_copy_cannot_hide_behind_identical_manifest_entries(tmp_path):
+    art, state = seed(tmp_path)
+    _, second = _legacy_packaging_copies(art, state)
+    second.write_text('{"status":"ok","association":true}')
+    with pytest.raises(ValueError, match="checksum differs"):
+        rr.hydrate(art, state, "Correct report")
+
+
+def test_packaging_copy_symlink_is_rejected_even_for_identical_bytes(tmp_path):
+    art, state = seed(tmp_path)
+    first, second = _legacy_packaging_copies(art, state)
+    second.unlink()
+    second.symlink_to(first)
+    with pytest.raises(ValueError, match="symlinks"):
+        rr.hydrate(art, state, "Correct report")
+
+
+def test_conflicting_task_owners_cannot_be_deduplicated(tmp_path):
+    art, state = seed(tmp_path)
+    path, name, owner = task_snapshot(art, state)
+    nested = art / "extra/mcp" / name
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(path.read_bytes())
+    conflicting = {**owner, "task_id": "another-task"}
+    (art / "extra/mcp/mcp/.compatibility.json").write_text(json.dumps({"evidence": {name: conflicting}}))
+    with pytest.raises(ValueError, match="ownership records are ambiguous"):
+        rr.hydrate(art, state, "Correct report")
+
+
+@pytest.mark.parametrize("invalid_checksum", [None, "not-a-sha"])
+def test_invalid_relevant_manifest_entry_is_not_hidden_by_valid_packaging_alias(tmp_path, invalid_checksum):
+    art, state = seed(tmp_path)
+    name = state["rounds"][0]["scientist_result"]["steps"][0]["result"]["full_result"]
+    direct = art / name
+    duplicate = art / "extra" / name
+    duplicate.parent.mkdir(parents=True)
+    duplicate.write_bytes(direct.read_bytes())
+    invalid = {"name": name}
+    if invalid_checksum is not None:
+        invalid["sha256"] = invalid_checksum
+    (art / "croissant.json").write_text(json.dumps({"distribution": [invalid,
+        {"name": "extra/" + name, "sha256": hashlib.sha256(duplicate.read_bytes()).hexdigest()}]}))
+    with pytest.raises(ValueError, match="missing or invalid checksum"):
+        rr.hydrate(art, state, "Correct report")
+
+
+def test_explicit_null_owner_cannot_fall_back_to_valid_legacy_manifest(tmp_path):
+    art, state = seed(tmp_path)
+    name = state["rounds"][0]["scientist_result"]["steps"][0]["result"]["full_result"]
+    (art / "mcp/.compatibility.json").write_text(json.dumps({"evidence": {name: None}}))
+    with pytest.raises(ValueError, match="owner differs"):
+        rr.hydrate(art, state, "Correct report")
