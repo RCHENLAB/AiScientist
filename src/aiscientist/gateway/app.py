@@ -28,6 +28,7 @@ from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
 from .dataset_limits import MAX_BOUND_DATASETS as _MAX_BOUND_DATASETS
+from .. import literature_contract
 from . import cluster_models, gpu, vllm_client
 from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
 from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
@@ -10055,7 +10056,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
         user = (f"The user's question: {question}\n\nThe current spec:\n"
                 f"{json.dumps(current, indent=1, ensure_ascii=False)}\n\nThe user's note on it: {note}\n\n"
                 + _SPEC_REVISE)
-    messages = [{"role": "system", "content": _tools_api.CORPUS_SCAN_SPEC_SYSTEM}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": literature_contract.SPEC_SYSTEM}, {"role": "user", "content": user}]
     why = ""
     for _ in range(2):
         try:
@@ -10064,7 +10065,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
             raise GatewayError(f"the session's model could not be reached ({public_error(exc)})",
                                stage="corpus") from exc
         try:
-            return _tools_api.parse_corpus_scan_spec(raw), model
+            return literature_contract.parse_spec(raw), model
         except ValueError as exc:
             why = str(exc)
             messages = [*messages, {"role": "assistant", "content": str(raw or "")[:8000]},
@@ -10074,7 +10075,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
 
 
 def _spec_curation(spec: dict[str, Any]) -> "corpus_scan.Curation":
-    return corpus_scan.curation_for(spec, _tools_api.corpus_scan_spec_folder(spec))
+    return corpus_scan.curation_for(spec, literature_contract.spec_folder(spec))
 
 
 # What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
@@ -10216,7 +10217,7 @@ async def _revise_curation(conn: Connection, say: Callable[..., None], question:
     from ..agents import request_router
     if _looks_like_spec(note):
         try:
-            spec = _tools_api.parse_corpus_scan_spec(note)
+            spec = literature_contract.parse_spec(note)
         except ValueError as exc:
             say(f"⚠ That spec cannot drive the scan: {exc}. The plan is unchanged.", "warning")
             return curation, drafted_by
@@ -11835,7 +11836,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
         conn.push({"type": "run_status", "text": "🔎 Writing the search queries…"})
         queries, terms = await asyncio.to_thread(
             lit.plan_search, lambda m: complete_fn(m, role="classify"), question,
-            fallback=_tools_api.focus_literature_query)
+            fallback=literature_contract.focus_literature_query)
         if not pubmed:
             queries = []                          # the corpus is searched with the question and the words
         emit("info", "literature", ("Queries: " + "; ".join(queries) + ". " if queries else "")

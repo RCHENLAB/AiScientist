@@ -7,24 +7,51 @@ Run from any directory, for example:
 Each JSON line reports wall time and reference-PMID presence among the papers the answer
 would read (at most 12), separately for the old and new searches. This makes real network
 requests, in old/new order; timings include request latency and local processing, not an LLM.
+With AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp, run inside the published literature
+image with the read-only operator bundle documented in literature-maintenance.md.
+new_100 uses actual MCP tools/list + call, including process/transport startup.
+Legacy is retained until the deployment passes its native acceptance gate.
 The old path deliberately preserves the former metadata-only filter and scoring rule.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from functools import partial
 from pathlib import Path
+from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _literature_runtime import platform_helpers, runtime, search_publications  # noqa: E402
 
-from aiscientist.agents.literature_answer import collect_papers  # noqa: E402
-from aiscientist.tools.literature_search.tool import (  # noqa: E402
-    _EUROPEPMC, _QUERY_STOPWORDS, _WORD, _clean, _is_generic_citation,
-    focus_literature_query, search_europepmc,
+collect_papers, _contract = platform_helpers()
+focus_literature_query = _contract.focus_literature_query
+_QUERY_STOPWORDS, _WORD, _clean = _contract.QUERY_STOPWORDS, _contract._WORD, _contract._clean
+
+# Frozen eight-hit baseline: these filters deliberately remain independent of
+# the production MCP search being measured.
+_EUROPEPMC = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+_GENERIC_CITATION_PATTERNS = (
+    r"^abstracts?\b",
+    r"\babstract book\b",
+    r"\bannual meeting\b",
+    r"\bconference\b",
+    r"\bcongress\b",
+    r"\be-?posters?\b",
+    r"\bmeeting abstracts?\b",
+    r"^publication only$",
+    r"\bsupplement\b",
 )
+
+def _is_generic_citation(citation: dict[str, Any]) -> bool:
+    title = str(citation.get("title") or "").strip().lower()
+    if not title:
+        return True
+    return any(re.search(pattern, title) for pattern in _GENERIC_CITATION_PATTERNS)
 
 REFERENCE_PMIDS = ("21529959", "12906118", "35433063")
 
@@ -79,13 +106,13 @@ def measure(query: str, search) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("queries", nargs="+", help="quote each PubMed keyword query")
-    parser.add_argument("--timeout", type=float, default=20.0, help="request timeout in seconds (default: 20)")
+    parser.add_argument("--timeout", type=float, default=20.0, help="baseline HTTP timeout; native MCP allows another 60s for startup (default: 20)")
     args = parser.parse_args()
     failed = False
     for query in args.queries:
         old = measure(query, partial(old_search, timeout_s=args.timeout))
-        new = measure(query, partial(search_europepmc, timeout_s=args.timeout, abstracts=True, pubmed_only=True))
-        print(json.dumps({"query": query, "old_8": old, "new_100": new}), flush=True)
+        new = measure(query, partial(search_publications, timeout_s=args.timeout, abstracts=True, pubmed_only=True))
+        print(json.dumps({"query": query, "old_8": old, "new_100": new, "runtime": runtime()}), flush=True)
         failed |= bool(old.get("errors") or new.get("errors"))
     return int(failed)
 

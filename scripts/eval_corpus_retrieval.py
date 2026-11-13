@@ -15,11 +15,16 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from aiscientist.tools._lib.corpus import (  # noqa: E402
-    DEFAULT_EMBEDDING, TextIndex, corpus_paths, known_gene_symbols, l2, load_chunks, parse_terms,
-    sentence_transformer_embed, term_report,
-)
-from aiscientist.tools.search_corpus.tool import RANK_DEPTH, rank_passages  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _literature_runtime import Component  # noqa: E402
+
+corpus, search = Component("corpus"), Component("search")
+RANK_DEPTH = 200  # existing default, shared by both published and legacy runtimes
+
+
+def sentence_transformer_embed(*args, **kwargs):
+    return corpus.sentence_transformer_embed(*args, **kwargs)
+
 
 METHODS = ("hybrid", "dense", "bm25")
 CATEGORIES = ("gene-specific", "mechanism", "paraphrase", "exhaustive-list")
@@ -132,26 +137,26 @@ def evaluate(questions: list[dict[str, Any]], chunks: list[dict[str, Any]], vecs
                 if str(p) not in known_pmids]
     if unknown:
         raise ValueError("Labels not in the corpus snapshot: " + "; ".join(unknown[:10]))
-    index = TextIndex.of_chunks(chunks)
+    index = corpus.TextIndex.of_chunks(chunks)
     rows = []
     for q in questions:
         started = perf_counter()
-        q_vecs = l2(embed_fn(q["queries"]))
+        q_vecs = corpus.l2(embed_fn(q["queries"]))
         embedding_seconds = perf_counter() - started
         if q_vecs.shape != (len(q["queries"]), vecs.shape[1]) or not np.isfinite(q_vecs).all():
             raise ValueError("Query embedding dimensions must match corpus vectors and be finite")
         for method in METHODS:
             def retrieve(budget: int, depth: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
                 started = perf_counter()
-                picked, used = rank_passages(
+                picked, used = search.rank_passages(
                     q["queries"], chunks, vecs, q_vecs, top_k=budget, max_per_paper=max_per_paper,
-                    terms=parse_terms(q.get("terms", []), known=known_genes), index=index,
+                    terms=corpus.parse_terms(q.get("terms", []), known=known_genes), index=index,
                     known_genes=known_genes, method=method, rank_depth=depth)
                 elapsed = perf_counter() - started
                 passages = [{"pmid": str(chunks[r["idx"]]["pmid"]), "chunk": chunks[r["idx"]]["chunk"],
                              "corpus_index": r["idx"], "rank": rank, "score": r["score"], "query": r["query"]}
                             for rank, r in enumerate(picked, 1)]
-                return passages, term_report(used), elapsed
+                return passages, corpus.term_report(used), elapsed
 
             passages, terms, elapsed = retrieve(top_k, rank_depth)
             row = {"question_id": q["id"], "category": q["category"], "method": method,
@@ -204,20 +209,20 @@ def main(argv: list[str] | None = None, *, embed_fn: Callable[[list[str]], Any] 
     parser.add_argument("--output-dir", type=Path, required=True)
     for name in ("chunks", "vectors", "genes", "hf-cache"):
         parser.add_argument(f"--{name}", type=Path)
-    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING)
+    parser.add_argument("--embedding-model", default=corpus.DEFAULT_EMBEDDING)
     parser.add_argument("--deployment-revision", help="Lab-supplied deployed revision, if different from this checkout")
     parser.add_argument("--top-k", type=int, default=12)
     parser.add_argument("--max-per-paper", type=int, default=3)
     parser.add_argument("--enumeration-budget", type=int, default=200)
     parser.add_argument("--rank-depth", type=int, default=RANK_DEPTH)
     args = parser.parse_args(argv)
-    paths = corpus_paths(None)
+    paths = corpus.corpus_paths(None)
     chunks_path = args.chunks or (paths.cache / "chunks.jsonl" if paths else None)
     vectors_path = args.vectors or (chunks_path.parent / "chunk_vecs.npy" if chunks_path else None)
     if chunks_path is None or vectors_path is None:
         parser.error("Provide --chunks/--vectors or configure AISCIENTIST_PAPERQA_PAPERS")
     questions = validate_questions(json.loads(args.questions.read_text(encoding="utf-8")))
-    chunks = load_chunks(chunks_path)
+    chunks = corpus.load_chunks(chunks_path)
     vecs = np.load(vectors_path, mmap_mode="r")
     genes_path = args.genes or (paths.hgnc if paths else None)
     if genes_path is not None and not genes_path.is_file():
@@ -226,16 +231,16 @@ def main(argv: list[str] | None = None, *, embed_fn: Callable[[list[str]], Any] 
         # Never download a model during evaluation, even with explicit corpus paths.
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        from aiscientist.tools._lib import corpus  # noqa: PLC0415
-        previous_model = corpus.DEFAULT_EMBEDDING
+        module = corpus.module()
+        previous_model = module.DEFAULT_EMBEDDING
         try:
-            corpus.DEFAULT_EMBEDDING = args.embedding_model
+            module.DEFAULT_EMBEDDING = args.embedding_model
             embed_fn = sentence_transformer_embed(args.hf_cache or (paths.hf_cache if paths else None))
         finally:
-            corpus.DEFAULT_EMBEDDING = previous_model
+            module.DEFAULT_EMBEDDING = previous_model
     if embed_fn is None:
         parser.error("Embedding model unavailable locally; supply --hf-cache with the indexed model")
-    result = evaluate(questions, chunks, vecs, embed_fn, known_genes=known_gene_symbols(genes_path),
+    result = evaluate(questions, chunks, vecs, embed_fn, known_genes=corpus.known_gene_symbols(genes_path),
                       top_k=args.top_k, max_per_paper=args.max_per_paper,
                       enumeration_budget=args.enumeration_budget, rank_depth=args.rank_depth)
     repo = Path(__file__).resolve().parents[1]

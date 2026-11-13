@@ -48,16 +48,16 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "make_search_corpus_tool": ("aiscientist.tools.search_corpus.tool", "make_tool"),
     "run_search_corpus": ("aiscientist.tools.search_corpus.tool", "run_search"),
     "preload_search_corpus": ("aiscientist.tools.search_corpus.tool", "preload"),
-    "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
+    "focus_literature_query": ("aiscientist.literature_contract", "focus_literature_query"),
     "search_literature": ("aiscientist.tools.literature_search.tool", "search_europepmc"),
-    "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
+    "QUERY_STOPWORDS": ("aiscientist.literature_contract", "QUERY_STOPWORDS"),
     # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
     "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),
     # a task spec for a property the scan has no rules for: the drafting prompt, its check, and the
     # folder the scan writes that spec's tables to
-    "CORPUS_SCAN_SPEC_SYSTEM": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "SPEC_SYSTEM"),
-    "parse_corpus_scan_spec": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "parse_spec"),
-    "corpus_scan_spec_folder": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "spec_folder"),
+    "CORPUS_SCAN_SPEC_SYSTEM": ("aiscientist.literature_contract", "SPEC_SYSTEM"),
+    "parse_corpus_scan_spec": ("aiscientist.literature_contract", "parse_spec"),
+    "corpus_scan_spec_folder": ("aiscientist.literature_contract", "spec_folder"),
     # the scRNA analysis line
     "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
     # curated marker references (run_marker_annotation), also read by the report's marker-claim check

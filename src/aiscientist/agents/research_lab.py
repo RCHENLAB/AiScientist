@@ -2150,7 +2150,7 @@ def _literature_step_text(question: str) -> str:
     Otherwise the label says nothing specific rather than something wrong. (The per-query terms are
     planned from the ACCEPTED FINDINGS at run time, so nothing scientific rides on this label.)"""
     try:
-        from ..tools.api import QUERY_STOPWORDS as _QUERY_STOPWORDS, focus_literature_query
+        from ..literature_contract import QUERY_STOPWORDS as _QUERY_STOPWORDS, focus_literature_query
         query = focus_literature_query(question or "")
         toks = [w for w in query.split() if w.lower().strip("-") not in _QUERY_STOPWORDS]
     except Exception:  # noqa: BLE001 - planning guard should never break planning
@@ -2187,7 +2187,7 @@ def _literature_query(question: str, step: str, rounds: "list[LabRound]") -> str
     (top marker genes + enriched pathway terms) plus the step's topic — instead of the raw run
     question, which pollutes the query with instruction words (e.g. "finish research"). Falls back
     to a focused (question+step) only when there are no findings yet."""
-    from ..tools.api import focus_literature_query
+    from ..literature_contract import focus_literature_query
     genes: list[str] = []
     terms: list[str] = []
     for r in rounds:
@@ -2824,7 +2824,7 @@ def _parse_query_list(raw: str, max_n: int) -> list[str]:
     """Parse the planner's JSON array of query strings; sanitize each through ``focus_literature_query``
     (strips instruction/file words the model may still slip in) and dedupe. Returns [] on any parse
     failure so the caller falls back to the deterministic single query."""
-    from ..tools.api import focus_literature_query
+    from ..literature_contract import focus_literature_query
     s = (raw or "").strip()
     if s.startswith("```"):
         s = s.strip("`")
