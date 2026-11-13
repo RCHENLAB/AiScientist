@@ -230,6 +230,7 @@
               </button>
             </aside>
 
+            <div id="panelResizeLeft" class="panel-resize panel-resize-left" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize sessions panel" aria-controls="leftPanel" aria-valuemin="260" aria-valuenow="340"></div>
             <section class="panel chat-panel">
               <div class="chat-head">
                 <h2 id="chatTitle">New chat</h2>
@@ -284,12 +285,16 @@
               </form>
             </section>
 
+            <div id="panelResizeRight" class="panel-resize panel-resize-right" role="separator" tabindex="0" aria-orientation="vertical" aria-label="Resize plan and results panel" aria-controls="rightPanel" aria-valuemin="320" aria-valuenow="400"></div>
             <aside class="panel side-panel right-panel" id="rightPanel">
               <!-- Two tabs: the chat's plan (the whole plan, its settings and its YAML document,
                    drawn from state — see renderPlanPanel) and the run's results. -->
-              <div class="side-tabs" role="tablist" aria-label="Side panel">
-                <button id="sideTabPlan" class="side-tab" type="button" role="tab">Plan</button>
-                <button id="sideTabResults" class="side-tab active" type="button" role="tab">Results</button>
+              <div class="side-panel-head">
+                <div class="side-tabs" role="tablist" aria-label="Side panel">
+                  <button id="sideTabPlan" class="side-tab" type="button" role="tab">Plan</button>
+                  <button id="sideTabResults" class="side-tab active" type="button" role="tab">Results</button>
+                </div>
+                <button type="button" class="ghost small" data-panel-fullscreen="rightPanel">Full screen</button>
               </div>
               <div id="planPanel" class="plan-panel hidden" role="tabpanel"></div>
               <div id="resultsPane" role="tabpanel">
@@ -768,6 +773,7 @@
         <h2 id="filePreviewTitle">Preview</h2>
         <div class="preview-actions">
           <a id="filePreviewDownload" class="ghost small" download>⬇ Download</a>
+          <button type="button" class="ghost small" data-panel-fullscreen="filePreviewModal">Full screen</button>
           <button id="filePreviewClose" type="button" class="icon-btn" aria-label="Close">✕</button>
         </div>
       </div>
@@ -784,6 +790,7 @@
         </div>
         <div class="preview-actions">
           <a id="dsPreviewDownload" class="ghost small" download>Download</a>
+          <button type="button" class="ghost small" data-panel-fullscreen="datasetPreviewModal">Full screen</button>
           <button id="dsPreviewClose" type="button" class="icon-btn" aria-label="Close">✕</button>
         </div>
       </div>

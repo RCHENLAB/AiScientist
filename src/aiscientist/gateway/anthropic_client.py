@@ -64,8 +64,11 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 #: Effort per lab role. Opus 5.5 defaults to "medium" when none is sent, so it is always sent.
 #: Planning, critique and the write-up are where depth pays; classification is a one-word answer.
+#: "curation": the sentence readings and review of a literature curation (the retigene-rag MCP
+#: server), many short calls, validated on Haiku at low effort.
 _ROLE_EFFORT = {"plan": "high", "critic": "high", "writer": "high", "audit": "medium",
-                "classify": "low", "reason": "medium", "scientist": "medium", "chat": "low"}
+                "classify": "low", "reason": "medium", "scientist": "medium", "chat": "low",
+                "curation": "low"}
 
 _MODEL_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?(?:$|[-@])")
 

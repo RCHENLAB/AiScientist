@@ -46,6 +46,8 @@ const $ = (id) => els[id] || (els[id] = {
   },
 });
 const document = { querySelectorAll: () => [] };
+const panelWidths = {};
+const applyPanelWidths = () => {};
 const UI_KEY = "ui", COMPOSER_KEY = "composer";
 const stored = new Map(), writes = [], requests = [];
 const localStorage = {
@@ -175,6 +177,8 @@ const $ = (id) => els[id] || (els[id] = {
     toggle(c, on) { if (on === undefined) on = !this.contains(c); if (on) this.add(c); else this.remove(c); } },
 });
 const document = { querySelectorAll: () => [] };
+const panelWidths = {};
+const applyPanelWidths = () => {};
 const UI_KEY = "ui", CONN_KEY = "conn", RUNOWNER_KEY = "owners", PLANDRAFT_KEY = "draft";
 const stored = new Map([[UI_KEY, '{"left":true}'], [CONN_KEY, "conn-of-another-account"]]);
 const localStorage = { getItem: (k) => (stored.has(k) ? stored.get(k) : null),

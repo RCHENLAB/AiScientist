@@ -15,7 +15,7 @@ def _console(plan, change=None, *, action=None, messages=()):
     blocks = [
         ("function planStepParts", "function showPlanPanel"),
         ("function planSavedMessage", "function showClarify"),
-        ("async function submitPlan", "// ---- uploads"),
+        ("function finishPlanApproval", "// ---- uploads"),
         ("function msgFromServer", "// The payload to persist"),
         ("function serverMsgPayload", "async function"),
     ]

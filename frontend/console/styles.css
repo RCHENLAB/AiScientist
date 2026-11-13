@@ -89,18 +89,24 @@ body {
 
 /* ---- layout ---- */
 .layout {
-  flex: 1; display: grid; grid-template-columns: 340px minmax(0, 1fr) 400px;
+  --left-width: 340px; --right-width: 400px;
+  --left-column: var(--left-width); --right-column: var(--right-width);
+  position: relative; flex: 1; display: grid;
+  grid-template-columns: var(--left-column) minmax(420px, 1fr) var(--right-column);
   gap: 20px; padding: 22px; min-height: 0;
   transition: grid-template-columns 0.36s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.layout.collapse-left { grid-template-columns: 0px minmax(0, 1fr) 400px; }
-.layout.collapse-right { grid-template-columns: 340px minmax(0, 1fr) 0px; }
-.layout.collapse-left.collapse-right { grid-template-columns: 0px minmax(0, 1fr) 0px; }
-/* The Plan tab gives the side panel more room: a plan is prose, results are a list of files. */
-.layout.side-plan { grid-template-columns: 340px minmax(0, 1fr) 460px; }
-.layout.side-plan.collapse-left { grid-template-columns: 0px minmax(0, 1fr) 460px; }
-.layout.side-plan.collapse-right { grid-template-columns: 340px minmax(0, 1fr) 0px; }
-.layout.side-plan.collapse-left.collapse-right { grid-template-columns: 0px minmax(0, 1fr) 0px; }
+.layout.side-plan { --right-width: 460px; }
+.layout.collapse-left { --left-column: 0px; }
+.layout.collapse-right { --right-column: 0px; }
+.layout.resizing-panels { transition: none; user-select: none; }
+.panel-resize { position: absolute; top: 22px; bottom: 22px; width: 16px; z-index: 5; cursor: col-resize; touch-action: none; border-radius: 6px; }
+.panel-resize:hover, .panel-resize:focus-visible { background: var(--border); outline: 2px solid var(--accent); }
+.panel-resize-left { left: calc(22px + var(--left-width) + 2px); }
+.panel-resize-right { right: calc(22px + var(--right-width) + 2px); }
+.collapse-left .panel-resize-left, .collapse-right .panel-resize-right { display: none; }
+.layout.narrow-panels { grid-template-columns: 1fr; grid-auto-rows: minmax(280px, auto); overflow-y: auto; }
+.narrow-panels .panel-resize { display: none; }
 .side-panel { transition: opacity 0.24s ease, transform 0.3s ease, padding 0.36s; }
 .layout.collapse-left .left-panel { opacity: 0; transform: translateX(-12px); padding-left: 0; padding-right: 0; pointer-events: none; }
 .layout.collapse-right .right-panel { opacity: 0; transform: translateX(12px); padding-left: 0; padding-right: 0; pointer-events: none; }
@@ -1083,6 +1089,7 @@ button.full { width: 100%; margin-top: 6px; }
 .chat-head small { color: var(--accent); font-size: 12px; font-weight: 500; flex: none; }
 
 @media (max-width: 1100px) {
+  .panel-resize { display: none; }
   .layout, .layout.collapse-left, .layout.collapse-right { grid-template-columns: 1fr; grid-auto-rows: minmax(280px, auto); overflow-y: auto; }
   .layout.side-plan, .layout.side-plan.collapse-left, .layout.side-plan.collapse-right,
   .layout.side-plan.collapse-left.collapse-right { grid-template-columns: 1fr; }
@@ -2343,3 +2350,22 @@ button.primary .msym, button.secondary .msym {
 .shared-panel { margin-top: 12px; padding: 10px 12px; background: var(--surface-sunken); border-radius: 8px; overflow-wrap: anywhere; }
 .shared-panel pre { white-space: pre-wrap; margin: 0; font: inherit; }
 .dataset-mention-group { padding: 6px 10px 2px; color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+
+/* Full screen overrides the preview cards' usual size limits. */
+.console-fullscreen { position: fixed; inset: 0; z-index: 10000; background: var(--bg, #faf9f6); padding: 16px; display: flex; overflow: hidden; }
+.console-fullscreen > .fullscreen-content { flex: 1; min-width: 0; min-height: 0; opacity: 1; transform: none; }
+.console-fullscreen > .right-panel { display: flex; flex-direction: column; }
+.console-fullscreen .side-tabs { flex-shrink: 0; }
+.console-fullscreen .plan-panel { padding-bottom: 110px; }
+.console-fullscreen .plan-panel-card { overflow: visible; }
+.console-fullscreen .plan-panel-card > .plan-actions-row { position: fixed; bottom: 0; left: 0; right: 0; z-index: 5; background: var(--bg, #faf9f6); border-top: 1px solid var(--border); }
+.console-fullscreen > .modal { position: static; padding: 0; background: none; display: flex; }
+.console-fullscreen .modal-card, .console-fullscreen .modal-card.ds-preview-card { width: 100%; max-width: none; height: 100%; max-height: none; margin: 0; }
+.fullscreen-plan-words label { display: flex; flex-direction: column; gap: 8px; }
+.fullscreen-plan-words textarea { width: 100%; min-height: 80px; margin-bottom: 8px; }
+.side-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+.side-panel-head .side-tabs { margin-bottom: 0; }
+.side-panel-head { margin-bottom: 12px; }
+.console-fullscreen .preview-card { display: flex; flex-direction: column; }
+.console-fullscreen .preview-body { flex: 1; min-height: 0; max-height: none; }
+.console-fullscreen .preview-frame { height: 100%; }

@@ -40,6 +40,7 @@ const state = {
   planCardEl: null,            // the visible chat's live plan / clarify / decision card
   planStatusEl: null,          // the resolved plan card's status line, updated as the PI works
   planAnsweredEl: null,        // the visible chat's entry for a plan it answered (drawAnsweredPlan)
+  planReviewOwner: null,       // chat whose review temporarily opened the right panel
   planView: null,              // a saved plan opened from the chat into the side panel ({agenda, doc, status})
   planStepOpen: new Map(),     // step text -> shown in full (true) or as two lines (false), as the person left it
   sideTab: "results",         // which of the side panel's two tabs is showing: "plan" | "results"
@@ -1742,6 +1743,8 @@ function appendArtifacts(c, items, bundleUrl) {
     stickToBottom();
     renderDownloads(items, bundleUrl);
     if (!c.plan) selectSideTab("results");
+    setPanel("right", true, false);
+    state.planReviewOwner = null;
   }
 }
 
@@ -1907,6 +1910,7 @@ async function openFilePreview(url, kind, name) {
   $("filePreviewDownload").href = url;
   body.innerHTML = "Loading…";
   modal.classList.remove("hidden");
+  if (typeof panelFullscreen !== "undefined" && panelFullscreen) enterPanelFullscreen(modal);
   try {
     if (kind === "image") body.innerHTML = `<img class="preview-img" src="${url}" alt="${escapeHtml(name)}" />`;
     else if (kind === "pdf") body.innerHTML = `<iframe class="preview-frame" src="${url}"></iframe>`;
@@ -4727,6 +4731,7 @@ function planEntryHtml(agenda, doc, opts) {
   const actions = o.pending
     ? `<button class="primary" data-plan="approve"${o.dirty ? ' disabled title="Apply or reset your edit first"' : ""}>${planIcon("play_arrow")}Run this plan</button>`
       + `<button class="secondary" data-plan="open">${planIcon("right_panel_open")}<span>Open plan</span></button>`
+      + `<button class="secondary" data-plan="fullscreen">Open full screen</button>`
       + `<button class="secondary quiet" data-plan="cancel">Cancel</button>`
       + `<span class="plan-actions-hint">or reply below to change it</span>`
     : `<span class="plan-actions-status">${escapeHtml(o.status || "")}</span>`
@@ -5068,6 +5073,7 @@ function wirePlanEntry(el, c) {
   on("approve", () => submitPlan("approve", undefined, undefined, c));
   on("cancel", () => submitPlan("cancel", undefined, undefined, c));
   on("open", () => { state.planView = null; openPlanPanel(); renderPlanPanel(); });
+  on("fullscreen", () => { state.planView = null; openPlanPanel(); enterPanelFullscreen($("rightPanel")); renderPlanPanel(); });
 }
 
 // A plan this chat answered (a reply in words, an edit, a cancel, or a review the server closed):
@@ -5127,6 +5133,24 @@ function renderPlanPanel() {
   refreshPlanRevise(host, c);
   wirePlanCardEdits(host, c, view.doc);
   wirePlanEditor(host, c);
+  if (typeof panelFullscreen !== "undefined" && panelFullscreen && panelFullscreen.target.id === "rightPanel") {
+    const words = document.createElement("form");
+    words.className = "fullscreen-plan-words";
+    words.innerHTML = '<label>Revise in words<textarea aria-label="Revise plan in words" required placeholder="Describe your changes or ask a question"></textarea></label><button type="submit" class="secondary">Send to the PI</button>';
+    const input = words.querySelector("textarea");
+    input.value = c.planFullscreenWords || "";
+    input.addEventListener("input", () => { c.planFullscreenWords = input.value; });
+    words.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (text) {
+        const before = c.plan;
+        revisePlanInWords(c, text);
+        if (c.plan !== before) c.planFullscreenWords = "";
+      }
+    });
+    host.querySelector(".plan-revise").replaceChildren(words);
+  }
 }
 
 // The note under "Change it in words": shown while a setting change not applied yet would go with the words.
@@ -5204,11 +5228,16 @@ function selectSideTab(name) {
   $("sideTabPlan").classList.toggle("active", plan);
   $("sideTabResults").classList.toggle("active", !plan);
   $("layout").classList.toggle("side-plan", plan);   // a plan is prose: the panel gets more room for it
+  if (typeof applyPanelWidths === "function") applyPanelWidths();
 }
 
 // Open the side panel on the plan. Not remembered as the panel's own setting: a plan arriving must
 // not turn "results panel collapsed" into "always open" for the next visit.
 function openPlanPanel() {
+  const c = activeChat();
+  if ($("layout").classList.contains("collapse-right")) state.planReviewOwner = c;
+  // Changing chats transfers the temporary review to the plan now on screen.
+  else if (state.planReviewOwner && state.planReviewOwner !== c) state.planReviewOwner = c;
   selectSideTab("plan");
   setPanel("right", true, false);
 }
@@ -5456,6 +5485,15 @@ function revisePlanInWords(c, text) {
   submitPlan("revise", text, c.planDraftYaml || "", c);
 }
 
+function finishPlanApproval(c) {
+  if (!chatVisible(c)) return;
+  if (typeof panelFullscreen !== "undefined" && panelFullscreen && panelFullscreen.target.id === "rightPanel") exitPanelFullscreen();
+  if (state.planReviewOwner === c) {
+    state.planReviewOwner = null;
+    setPanel("right", false, false);
+  }
+}
+
 // action: "approve" | "revise" | "edit" | "cancel"; feedback only for "revise", planYaml only
 // for "edit" (the plan document as the user edited it).
 async function submitPlan(action, feedback, planYaml, c = activeChat()) {
@@ -5545,6 +5583,7 @@ async function submitPlan(action, feedback, planYaml, c = activeChat()) {
       toast(note);
       return;
     }
+    if (action === "approve") finishPlanApproval(c);
     if (action === "approve" && savedPlan) {
       c.answered = null;
       pushToSession(c.sid, savedPlan);
@@ -7549,26 +7588,187 @@ async function loadCredentials() {
 
 // ---- collapsible panels ---------------------------------------------------
 
+const panelWidths = { left: 340, right: null };
+let panelFullscreen = null;
+
+function panelDefaultWidth(side) {
+  return side === "left" ? 340 : state.sideTab === "plan" ? 460 : 400;
+}
+
+function panelWidth(side) {
+  return panelWidths[side] || panelDefaultWidth(side);
+}
+
+function panelRoom() {
+  const layout = $("layout"), css = getComputedStyle(layout);
+  return layout.clientWidth - parseFloat(css.paddingLeft || 0) - parseFloat(css.paddingRight || 0)
+    - 2 * parseFloat(css.columnGap || 0);
+}
+
+function clampPanelWidth(side, width) {
+  const other = side === "left" ? "right" : "left";
+  const min = side === "left" ? 260 : 320;
+  const otherWidth = $("layout").classList.contains(`collapse-${other}`) ? 0
+    : Math.min(panelWidth(other), Math.max(other === "left" ? 260 : 320, panelRoom() - 420 - min));
+  const max = Math.max(min, panelRoom() - 420 - otherWidth);
+  return Math.round(Math.max(min, Math.min(Number.isFinite(width) ? width : panelDefaultWidth(side), max)));
+}
+
+function applyPanelWidths() {
+  const layout = $("layout");
+  const room = panelRoom();
+  layout.classList.toggle("narrow-panels", room < 1000);
+  let left = clampPanelWidth("left", panelWidth("left"));
+  let right = clampPanelWidth("right", panelWidth("right"));
+  if (!layout.classList.contains("collapse-left") && !layout.classList.contains("collapse-right")) {
+    right = Math.max(320, Math.min(right, room - 420 - left));
+  }
+  for (const [side, width] of [["left", left], ["right", right]]) {
+    layout.style.setProperty(`--${side}-width`, `${width}px`);
+    const handle = $(side === "left" ? "panelResizeLeft" : "panelResizeRight");
+    if (handle) {
+      handle.setAttribute("aria-valuenow", String(width));
+      handle.setAttribute("aria-valuemin", side === "left" ? "260" : "320");
+      handle.setAttribute("aria-valuemax", String(clampPanelWidth(side, Number.MAX_SAFE_INTEGER)));
+    }
+  }
+}
+
+function savePanelWidths() {
+  let prefs = {};
+  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}") || {}; } catch {}
+  prefs.leftWidth = panelWidths.left;
+  prefs.rightWidth = panelWidths.right;
+  try { localStorage.setItem(UI_KEY, JSON.stringify(prefs)); } catch {}
+}
+
+function resizePanel(side, width, remember = true) {
+  panelWidths[side] = clampPanelWidth(side, width);
+  applyPanelWidths();
+  if (remember) savePanelWidths();
+}
+
+function resetPanelWidth(side) {
+  panelWidths[side] = side === "right" ? null : panelDefaultWidth(side);
+  applyPanelWidths();
+  savePanelWidths();
+}
+
 function applyUiPrefs() {
   let prefs = {};
-  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
+  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}") || {}; } catch {}
+  panelWidths.left = Number.isFinite(prefs.leftWidth) ? Math.max(260, prefs.leftWidth) : 340;
+  panelWidths.right = Number.isFinite(prefs.rightWidth) ? Math.max(320, prefs.rightWidth) : null;
   setPanel("left", prefs.left !== false);
-  setPanel("right", prefs.right === true);   // downloads/log panel collapsed by default
+  setPanel("right", prefs.right === true);
+  applyPanelWidths();
 }
 
 function setPanel(side, open, remember = true) {
   $("layout").classList.toggle(`collapse-${side}`, !open);
   $(side === "left" ? "toggleLeft" : "toggleRight").classList.toggle("active", open);
+  if (typeof applyPanelWidths === "function") applyPanelWidths();
   if (!remember) return;
+  if (side === "right") state.planReviewOwner = null;
   let prefs = {};
-  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}"); } catch {}
+  try { prefs = JSON.parse(localStorage.getItem(UI_KEY) || "{}") || {}; } catch {}
   prefs[side] = open;
   try { localStorage.setItem(UI_KEY, JSON.stringify(prefs)); } catch {}
 }
 
 function togglePanel(side) {
-  const open = $("layout").classList.contains(`collapse-${side}`); // currently collapsed → open it
+  const open = $("layout").classList.contains(`collapse-${side}`);
   setPanel(side, open);
+}
+
+function wirePanelResize() {
+  for (const side of ["left", "right"]) {
+    const handle = $(side === "left" ? "panelResizeLeft" : "panelResizeRight");
+    let drag = null;
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      drag = { x: e.clientX, width: Number(handle.getAttribute("aria-valuenow")), id: e.pointerId };
+      handle.setPointerCapture(e.pointerId);
+      $("layout").classList.add("resizing-panels");
+    });
+    handle.addEventListener("pointermove", (e) => {
+      if (drag && drag.id === e.pointerId) resizePanel(side, drag.width + (e.clientX - drag.x) * (side === "left" ? 1 : -1));
+    });
+    const stop = () => { drag = null; $("layout").classList.remove("resizing-panels"); };
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
+    handle.addEventListener("lostpointercapture", stop);
+    handle.addEventListener("dblclick", () => resetPanelWidth(side));
+    handle.addEventListener("keydown", (e) => {
+      if (!["ArrowLeft", "ArrowRight"].includes(e.key)) return;
+      e.preventDefault();
+      resizePanel(side, Number(handle.getAttribute("aria-valuenow"))
+        + (e.key === "ArrowRight" ? 1 : -1) * (side === "left" ? 1 : -1) * (e.shiftKey ? 50 : 10));
+    });
+  }
+  window.addEventListener("resize", applyPanelWidths);
+  if (typeof ResizeObserver === "function") new ResizeObserver(applyPanelWidths).observe($("layout"));
+}
+
+function enterPanelFullscreen(target) {
+  if (panelFullscreen && panelFullscreen.target === target) { exitPanelFullscreen(); return; }
+  if (panelFullscreen) exitPanelFullscreen();
+  const placeholder = document.createComment("full screen panel");
+  target.before(placeholder);
+  const shell = document.createElement("div");
+  shell.className = "console-fullscreen";
+  shell.setAttribute("role", "dialog");
+  shell.setAttribute("aria-modal", "true");
+  shell.setAttribute("aria-label", target.id === "rightPanel" ? "Plan and results" : "Preview");
+  shell.tabIndex = -1;
+  const focus = document.activeElement;
+  const inert = [...document.body.children].filter((el) => el !== target).map((el) => [el, el.inert]);
+  for (const [el] of inert) el.inert = true;
+  document.body.appendChild(shell);
+  shell.appendChild(target);
+  target.classList.add("fullscreen-content");
+  panelFullscreen = { target, placeholder, shell, focus, inert };
+  target.querySelectorAll("[data-panel-fullscreen]").forEach((b) => { b.textContent = "Exit full screen"; });
+  document.addEventListener("keydown", panelFullscreenKeydown, true);
+  document.addEventListener("focusin", panelFullscreenFocus, true);
+  (target.querySelector("[data-panel-fullscreen]") || shell).focus();
+  if (target.id === "rightPanel") renderPlanPanel();
+}
+
+function exitPanelFullscreen() {
+  if (!panelFullscreen) return;
+  const { target, placeholder, shell, focus, inert } = panelFullscreen;
+  panelFullscreen = null;
+  placeholder.replaceWith(target);
+  target.classList.remove("fullscreen-content");
+  target.querySelectorAll("[data-panel-fullscreen]").forEach((b) => { b.textContent = "Full screen"; });
+  shell.remove();
+  for (const [el, value] of inert) el.inert = value;
+  document.removeEventListener("keydown", panelFullscreenKeydown, true);
+  document.removeEventListener("focusin", panelFullscreenFocus, true);
+  if (target.id === "rightPanel") renderPlanPanel();
+  if (focus && focus.isConnected) focus.focus();
+  else $("toggleRight").focus();
+}
+
+function panelFullscreenFocus(e) {
+  if (panelFullscreen && !panelFullscreen.shell.contains(e.target)) panelFullscreen.shell.focus();
+}
+
+function panelFullscreenKeydown(e) {
+  if (!panelFullscreen) return;
+  if (e.key === "Escape") {
+    e.preventDefault(); e.stopImmediatePropagation(); exitPanelFullscreen(); return;
+  }
+  if (e.key !== "Tab") return;
+  const shell = panelFullscreen.shell;
+  const items = [...shell.querySelectorAll('button, a[href], input, textarea, select, iframe, [tabindex]')]
+    .filter((el) => !el.disabled && el.tabIndex >= 0 && el.getClientRects().length);
+  const first = items[0], last = items[items.length - 1];
+  if (!first) { e.preventDefault(); shell.focus(); }
+  else if (e.shiftKey && (document.activeElement === first || document.activeElement === shell)) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && (document.activeElement === last || document.activeElement === shell)) { e.preventDefault(); first.focus(); }
 }
 
 // ---- auth + operon-style shell (login gate, nav rail, 5 views) ------------
@@ -8946,6 +9146,7 @@ function onDatasetPreviewClick(e) {
 }
 
 function closeDatasetPreview() {
+  if (typeof panelFullscreen !== "undefined" && panelFullscreen && panelFullscreen.target.id === "datasetPreviewModal") exitPanelFullscreen();
   $("datasetPreviewModal").classList.add("hidden");
   $("dsPreviewBody").innerHTML = "";                   // stop a PDF or image that is still loading
   dsPreview.base = null;
@@ -10246,14 +10447,14 @@ function init() {
     const cell = e.target.closest("[data-url]");
     if (cell) { e.preventDefault(); openResultFile(cell.dataset.url, cell.dataset.kind, cell.dataset.name); }
   });
-  $("filePreviewClose").addEventListener("click", () => $("filePreviewModal").classList.add("hidden"));
+  $("filePreviewClose").addEventListener("click", () => { if (panelFullscreen) exitPanelFullscreen(); $("filePreviewModal").classList.add("hidden"); });
   $("dsPreviewClose").addEventListener("click", closeDatasetPreview);
   $("dsPreviewBody").addEventListener("click", onDatasetPreviewClick);
   $("datasetPreviewModal").addEventListener("click", (e) => { if (e.target.id === "datasetPreviewModal") closeDatasetPreview(); });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
   });
-  $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") $("filePreviewModal").classList.add("hidden"); });
+  $("filePreviewModal").addEventListener("click", (e) => { if (e.target.id === "filePreviewModal") { if (panelFullscreen) exitPanelFullscreen(); $("filePreviewModal").classList.add("hidden"); } });
   $("chatInput").addEventListener("keydown", (e) => { if (datasetMentionKeydown(e)) return; if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); $("chatForm").requestSubmit(); } });
   $("chatInput").addEventListener("click", updateDatasetMentions);
   $("chatInput").addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) updateDatasetMentions(); });
@@ -10293,6 +10494,8 @@ function init() {
 
   syncAuthMethod();
   applyUiPrefs();
+  wirePanelResize();
+  document.querySelectorAll("[data-panel-fullscreen]").forEach((b) => b.addEventListener("click", () => enterPanelFullscreen($(b.dataset.panelFullscreen))));
   loadSessions();
   renderSessionList();
   renderChat();
