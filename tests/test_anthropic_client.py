@@ -464,6 +464,17 @@ def test_an_anthropic_credential_runs_the_lab_roles_and_the_scientist_natively(a
     assert llm.scientist_remote is True and llm.lab_role_remote is True
 
 
+def test_a_curation_call_runs_at_low_effort_with_room_for_thinking(anthropic_cred, monkeypatch):
+    from aiscientist.gateway import app as gw_app
+    seen = []
+    monkeypatch.setattr(ac, "complete_ex", lambda model, messages, **kw: seen.append(kw) or
+                        ("{}", {"finish_reason": "stop"}))
+    llm = gw_app._lab_llm(_Conn(anthropic_cred["id"]))
+    llm.complete_fn([{"role": "user", "content": "Read this sentence."}], role="curation", max_tokens=8000)
+    assert ac.role_effort("curation") == "low"
+    assert seen[0]["effort"] == "low" and seen[0]["max_tokens"] == 32000     # 4 x 8000: thinking counts
+
+
 def test_the_harness_echoes_provider_blocks_on_the_next_request():
     from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     seen = []

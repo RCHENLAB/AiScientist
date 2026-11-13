@@ -275,6 +275,22 @@ def test_the_local_cluster_path_is_not_guarded_this_way(store, calls):
     assert len(calls) == 1
 
 
+def test_a_callers_max_tokens_replaces_the_role_ceiling_on_a_metered_endpoint(store, calls):
+    """A relayed curation reading runs to ~7k tokens: the short-role 4096 would cut it off."""
+    llm = gw_app._lab_llm(_Conn(credential_id=_cred(store)["id"]))
+    msg = [{"role": "user", "content": "Read this sentence."}]
+    llm.complete_fn(msg, role="curation")
+    llm.complete_fn(msg, role="curation", max_tokens=8000)
+    llm.complete_fn(msg, role="curation", max_tokens=10**6)
+    llm.complete_fn(msg, role="curation", max_tokens=10)
+    assert [c["max_tokens"] for c in calls] == [4096, 8000, 64000, 256]
+
+
+def test_the_cluster_gpu_gets_no_ceiling_even_when_a_caller_asks(store, calls):
+    gw_app._lab_llm(_Conn()).complete_fn([{"role": "user", "content": "q"}], role="curation", max_tokens=8000)
+    assert calls[0]["max_tokens"] is None
+
+
 # --- provenance recorded in the technical report -----------------------------
 
 

@@ -9671,13 +9671,14 @@ def _watch_llm(run: RunState | None, complete_fn: Callable[..., str],
     if getattr(complete_fn, "_run_watched", False):
         return complete_fn, scientist_chat
 
-    def watched_complete(messages, *, role: str | None = None):
+    def watched_complete(messages, *, role: str | None = None, max_tokens: int | None = None):
         mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin(role)
         outcome = "failed"
         try:
-            result = complete_fn(messages, role=role)
+            result = (complete_fn(messages, role=role, max_tokens=max_tokens) if max_tokens
+                      else complete_fn(messages, role=role))
             outcome = "success"
             return result
         except BaseException as exc:
@@ -12607,7 +12608,11 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         """One call to the shared model for a session on it: no other model to fall back on."""
         return _shared_call(conn, call)
 
-    def complete_fn(messages, *, role: str | None = None):
+    def complete_fn(messages, *, role: str | None = None, max_tokens: int | None = None):
+        """One lab-role completion. ``max_tokens``: the caller's own output ceiling, which replaces
+        the role's on a metered endpoint (a relayed prompt from an HPC3 job carries the ceiling its
+        tool needs; a curation reading runs to ~7k tokens, over the 4096 of a short role). Bounded
+        to 256..64000. The shared model and the cluster's GPU get no ceiling either way."""
         if shared_endpoint:
             started = time.monotonic()
             b_used: list = []
@@ -12640,7 +12645,8 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         # the server keeps its own default. On a per-token API the same request carried no
         # ``max_tokens`` at all — the lab computes one, but the injected ``(messages) -> str``
         # contract had nowhere to put it — which left a reasoning model free to think without bound.
-        cap = vllm_client.lab_max_tokens(role) if lab_base_url else None
+        cap = (min(max(256, int(max_tokens)), 64000) if max_tokens else vllm_client.lab_max_tokens(role)) \
+            if lab_base_url else None
         if cap and native_anthropic:
             cap = anthropic_client.lab_max_tokens(role, cap)   # thinking counts against it
 
