@@ -1,0 +1,183 @@
+[
+  {
+    "name": "run_cellqc",
+    "description": "Run CellQC on raw and filtered Cell Ranger libraries, preserving the input delivery.\n\n    Correct ambient RNA, filter counts/features/mitochondrial percentage, remove doublets,\n    and compute nuclear fraction when a BAM exists. Merge libraries by species into normalized\n    checkpoints with ambient-corrected integer counts and per-library QC tables and reports.\n    Do not run a second doublet-removal step after this tool.\n\n    dataset defaults to CELLQC_DATASET or AISCIENTIST_DATASET. Explicit dataset and extra\n    dataset_paths must be inside the server's CELLQC_READ_ROOTS. analysis_id selects this\n    server's isolated analysis folder; samples selects library IDs. Species and chemistry\n    'auto' read Cell Ranger summaries. nreaction is a caller-supplied assumption, not measured.\n    max_pct_mt=10 suits whole cells; the reference nuclei run used 5. warn_* values are\n    engineering review guards, not scientific significance thresholds.\n\n    Slurm/local return analysis_id, task_id and state; poll cellqc_job_status. Inline waits\n    and includes the original QC result, checkpoint_path, artifact_root and settings_source.\n    An unchanged completed request reuses its result; rerun forces a fresh attempt. Different\n    requests in one analysis cannot run concurrently. Inspect QC warnings before using results.\n    ",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "dataset_paths": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dataset Paths"
+        },
+        "species": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "human",
+            "mouse",
+            "macaque"
+          ],
+          "title": "Species",
+          "type": "string"
+        },
+        "max_pct_mt": {
+          "default": 10.0,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Max Pct Mt",
+          "type": "number"
+        },
+        "min_counts": {
+          "default": 500,
+          "minimum": 0,
+          "title": "Min Counts",
+          "type": "integer"
+        },
+        "min_features": {
+          "default": 300,
+          "minimum": 0,
+          "title": "Min Features",
+          "type": "integer"
+        },
+        "ambient_method": {
+          "default": "soupx",
+          "enum": [
+            "soupx",
+            "decontx",
+            "none"
+          ],
+          "title": "Ambient Method",
+          "type": "string"
+        },
+        "ambient_compare": {
+          "default": "decontx",
+          "enum": [
+            "",
+            "soupx",
+            "decontx",
+            "none"
+          ],
+          "title": "Ambient Compare",
+          "type": "string"
+        },
+        "chemistry": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "next_gem",
+            "gem_x"
+          ],
+          "title": "Chemistry",
+          "type": "string"
+        },
+        "nreaction": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "title": "Nreaction",
+          "type": "integer"
+        },
+        "doublet_decider": {
+          "default": "doubletfinder",
+          "enum": [
+            "doubletfinder",
+            "scdblfinder"
+          ],
+          "title": "Doublet Decider",
+          "type": "string"
+        },
+        "n_top_genes": {
+          "default": 2000,
+          "exclusiveMinimum": 0,
+          "title": "N Top Genes",
+          "type": "integer"
+        },
+        "seed": {
+          "default": 42,
+          "minimum": 0,
+          "title": "Seed",
+          "type": "integer"
+        },
+        "warn_ambient_frac": {
+          "default": 0.25,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Warn Ambient Frac",
+          "type": "number"
+        },
+        "warn_retained_below": {
+          "default": 0.5,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Warn Retained Below",
+          "type": "number"
+        },
+        "samples": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Samples"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_cellqcArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "cellqc_job_status",
+    "description": "Poll a CellQC task, returning execution state and its QC result when available.\n\n    COMPLETED means execution succeeded; retention, ambient and doublet warnings still need\n    review. FAILED carries the actual error. Slurm preemption uses AISCI_SLURM_FALLBACK.\n    ",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "cellqc_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

@@ -160,7 +160,14 @@ def test_real_literature_review_search_packaging_and_late_save_are_distinct(conn
         return {"status": "ok", "results": [{"title": "DDX41", "pmid": "42", "abstract": "Public abstract",
                                                "citation": "A paper", "year": "2025"}]}
 
-    monkeypatch.setattr(gw._tools_api, "search_literature", search)
+    from aiscientist.gateway import literature_mcp
+    monkeypatch.setattr(literature_mcp, "registered_server", lambda: SimpleNamespace(name="literature", settings_env=()))
+    async def build_route(conn, run, run_id, emit):
+        run.literature_mcp = SimpleNamespace(run_tool=lambda tool, args, ctx:
+            search(args["query"], args["limit"], abstracts=args["abstracts"], pubmed_only=args["pubmed_only"]))
+        run.literature_mcp_context = None
+        return run.literature_mcp
+    monkeypatch.setattr(gw, "_build_literature_mcp_route", build_route)
     from aiscientist.agents import literature_answer
     original_csv = literature_answer.papers_csv
 

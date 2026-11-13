@@ -11,9 +11,8 @@ The eye server has no GPU, so each render is shipped to shared DFS and audited b
 :func:`build_vlreview_review_fn` returns the ``review_fn(pdf_path) -> review dict`` callback the
 render↔re-render loop (:func:`aiscientist.reporting.visual_review.render_with_visual_review`) calls once
 per render pass. Each pass stages to its OWN sub-dir so a re-rendered PDF never clobbers the
-previous pass's inputs/outputs. This mirrors :mod:`aiscientist.gateway.scgpt_runner` — same remote
-substrate, invoked in the finalization pipeline instead of as an agent tool, because the PDF it
-audits only exists AFTER the research loop has finished.
+previous pass's inputs/outputs. It runs in the finalization pipeline because the PDF it audits
+only exists AFTER the research loop has finished.
 """
 
 from __future__ import annotations

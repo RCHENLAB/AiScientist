@@ -12,21 +12,22 @@ def test_overview_lists_agents_tools_capabilities_roadmap():
 
     names = {t["name"] for t in o["tools"]}
     # the real analysis line + figure + codeact are surfaced; finish (loop control) is hidden
-    assert {"run_scanpy_qc", "run_de", "run_enrichment", "make_schematic", "run_code"} <= names
+    assert {"mcp_run_scanpy_qc", "mcp_run_de", "mcp_run_enrichment", "mcp_make_schematic", "run_code"} <= names
     assert "finish" not in names
 
     by_name = {t["name"]: t for t in o["tools"]}
-    assert by_name["run_scanpy_qc"]["category"] == "analysis"
-    assert by_name["run_scanpy_qc"]["requires"] == ["scanpy"]
-    assert by_name["run_scanpy_qc"]["reads_private_data"] is True
+    assert by_name["mcp_run_scanpy_qc"]["category"] == "mcp"
+    assert by_name["mcp_run_scanpy_qc"]["requires"] == []
+    assert by_name["mcp_run_scanpy_qc"]["reads_private_data"] is True
     # A tool that runs on HPC3 is not checked against this host's modules: its job's container has
     # its software. An in-process tool is.
-    assert by_name["run_scanpy_qc"]["runs_on"] == "hpc:analysis"
-    assert by_name["run_scanpy_qc"]["available"] is None
-    assert by_name["run_scanpy_qc"]["where"] == system_info.PLACES["hpc:analysis"][0]
+    assert by_name["mcp_run_scanpy_qc"]["runs_on"] == "hpc:analysis"
+    assert by_name["mcp_run_scanpy_qc"]["available"] is None
+    assert by_name["mcp_run_scanpy_qc"]["where"] == system_info.PLACES["hpc:analysis"][0]
     assert by_name["run_code"]["runs_on"] == "sandbox"
-    ins = by_name["inspect_dataset"]
-    assert ins["runs_on"] == "inprocess" and ins["available"] == all(system_info._have(d) for d in ins["requires"])
+    ins = by_name["mcp_inspect_dataset"]
+    assert ins["runs_on"] == "image:cpu" and ins["available"] is None
+    assert "matching installed" in ins["availability_note"]
 
     # Only what this host itself uses is checked. D2 and Mermaid CLIs (never installed; chat diagrams
     # are drawn by the browser), the retired remote literature service, and paper-qa (the corpus
@@ -55,8 +56,8 @@ def test_tools_have_a_one_line_summary_and_their_full_description():
         if m is not None:
             assert t["summary"] == m.summary and t["code"] == f"src/aiscientist/tools/{m.folder.name}/"
         else:                                          # a registry tool: its description's first sentence
-            assert t["code"] == "" and t["description"].startswith(t["summary"].rstrip("…"))
-    assert tools["run_de"]["summary"] != tools["run_de"]["description"]
+            assert t["code"] == "" and t["summary"] == system_info._first_sentence(t["description"])
+    assert tools["mcp_run_de"]["summary"] != tools["mcp_run_de"]["description"]
 
 
 def test_pipelines_list_every_preset_with_a_title_and_a_summary():
@@ -116,7 +117,7 @@ def test_workflow_graph_is_consistent_and_code_derived():
     tools = [n for n in g["nodes"] if n["type"] == "tool"]
     tool_labels = {n["label"] for n in tools}
     assert "finish" not in tool_labels
-    assert {"literature_search", "make_schematic", "run_code"} <= tool_labels
+    assert {"mcp_literature_search", "mcp_make_schematic", "run_code"} <= tool_labels
     # the literature corpus place names both corpus tools, not PaperQA alone
     assert "search_corpus" in system_info.PLACES["hpc:literature"][1]
 
@@ -131,9 +132,8 @@ def test_workflow_graph_is_consistent_and_code_derived():
     # every place a manifest may name has a label of its own
     assert set(tool_catalog.RUNS_ON) <= set(system_info.PLACES)
 
-    # when scanpy is installed the analysis line is an ordered pipeline chain
-    if system_info._have("scanpy"):
-        pipe = [e for e in g["edges"] if e["type"] == "pipeline"]
-        assert any(e["source"] == "tool:run_scanpy_qc" and e["target"] == "tool:run_clustering" for e in pipe)
-        assert any(e["source"] == "tool:run_cellqc" and e["target"] == "tool:run_clustering" for e in pipe)
-        assert not any(e["source"] == "tool:run_scanpy_qc" and e["target"] == "tool:run_cellqc" for e in pipe)
+    # The image supplies scientific dependencies; gateway scanpy is irrelevant.
+    pipe = [e for e in g["edges"] if e["type"] == "pipeline"]
+    assert any(e["source"] == "tool:mcp_run_scanpy_qc" and e["target"] == "tool:mcp_run_clustering" for e in pipe)
+    assert any(e["source"] == "tool:mcp_run_cellqc" and e["target"] == "tool:mcp_run_clustering" for e in pipe)
+    assert not any(e["source"] == "tool:mcp_run_scanpy_qc" and e["target"] == "tool:mcp_run_cellqc" for e in pipe)

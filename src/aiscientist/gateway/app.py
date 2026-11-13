@@ -5724,18 +5724,6 @@ def _remote_path_status(executor: Any, path: str, *, is_dir: bool) -> "bool | No
         return None
 
 
-def _variant_offline_preflight(executor: Any, vep_image: str, cache_dir: str, clinvar: str) -> dict:
-    """Cheap HPC3 existence checks for the offline VEP stack (sif image + VEP cache dir + ClinVar VCF).
-    Returns ``{name: (path, exists?)}`` where exists? is True / False / None(unverifiable). SSH
-    round-trips, so call via ``asyncio.to_thread``. This is the check that turns a silent
-    "fell back to REST" into "clinvar_vcf NOT found on HPC3: <path>"."""
-    return {
-        "vep_image": (vep_image, _remote_path_status(executor, vep_image, is_dir=False)),
-        "cache_dir": (cache_dir, _remote_path_status(executor, cache_dir, is_dir=True)),
-        "clinvar_vcf": (clinvar, _remote_path_status(executor, clinvar, is_dir=False)),
-    }
-
-
 def _phenotype_preflight(executor: Any, lirical_image: str, data_dir: str,
                          exomiser_dir: str = "") -> dict:
     """Cheap HPC3 existence checks for the LIRICAL stack (sif image + LIRICAL data dir + the optional
@@ -6018,7 +6006,13 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
     session = _temp_base(conn)
     legacy_temp = hpc_layout.legacy_dir(shared, "Temp", user)
     uploads = hpc_layout.legacy_dir(shared, "uploads", user)
-    read_roots = tuple(r for r in (home, session, legacy_temp, uploads,
+    artifacts_dir = work_dir = ""
+    if run is not None and run.run_id:
+        analysis_dir = _run_home(conn, run.run_id).dir("analysis")
+        # Match SlurmCodeExecutor's bindings, including a continued run's recorded home.
+        work_dir = os.environ.get("AISCIENTIST_HPC_WORK") or f"{analysis_dir}/work"
+        artifacts_dir = os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{analysis_dir}/artifacts"
+    read_roots = tuple(r for r in (home, session, legacy_temp, uploads, artifacts_dir, work_dir,
                                    hpc_layout.containers_dir(shared), reference,
                                    hpc_layout.package_cache_root(shared), hpc_layout.lab_envs_dir(shared),
                                    st.scgpt_model_dir, st.vlreview_model_dir) if r)
@@ -6066,6 +6060,8 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
         workspace=HpcWorkspace(read_roots=read_roots, write_roots=write_roots),
         environments=_lab_environments(conn, run, user, shared) if (st.run_code_on_hpc or st.analysis_on_hpc) else None,
         home=home,
+        artifacts_dir=artifacts_dir,
+        work_dir=work_dir,
         worker_provider=(lambda: _ensure_session_worker(conn)) if st.worker_enabled else None,
         run_on_worker=_run_on_session_worker if st.worker_enabled else None,
         confirm=_hitl_confirm(conn, run),
@@ -6312,7 +6308,10 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
     cancelled = conn.chat_stop.is_set
 
     def start(relay_dir: str, max_cost_usd: float | None = None):
-        cap = CORPUS_SCAN_MAX_COST_USD
+        # One spending rule for every relayed job (the corpus scan, retigene-rag, these servers): the
+        # per-job ceiling, lowered to what is left of the user's budget on their own key.
+        metered = cred is not None and not shared
+        cap = _corpus_scan_cost_cap(conn)[0] if metered else CORPUS_SCAN_MAX_COST_USD
         if max_cost_usd is not None:
             if type(max_cost_usd) not in (int, float) or not 0 < max_cost_usd < float("inf"):
                 raise ValueError("MCP model cost limit must be positive and finite")
@@ -6329,7 +6328,8 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
             send_base, api_key = target
         else:
             send_base, api_key = base, os.environ.get("AISCIENTIST_LLM_API_KEY") or ""
-        key_use = _key_use(conn, cred) if cred is not None and not shared else None
+        key_use = (_key_use(conn, cred, allowance_usd=cap, allowance_calls=_CORPUS_SPIKE_CALLS)
+                   if metered else None)
 
         def chat(request: dict) -> tuple[dict, dict]:
             request = validate_request(request, model)
@@ -6360,24 +6360,7 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
                               max_tokens=None, duration_ms=duration_ms, error_type=error_type)
 
         def price(usage):
-            if shared:
-                return 0.0
-            if usage.get("cost") is not None:
-                try:
-                    cost = float(usage["cost"])
-                    if 0 <= cost < float("inf"):
-                        return cost
-                except (TypeError, ValueError):
-                    pass
-            read = int(usage.get("cache_read_input_tokens") or 0)
-            write = int(usage.get("cache_creation_input_tokens") or 0)
-            write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
-            return llm_pricing.estimate(str(usage.get("model") or model),
-                input_tokens=int(usage.get("input_tokens") if "input_tokens" in usage
-                                 else max(0, int(usage.get("prompt_tokens") or 0) - read - write)),
-                output_tokens=int(usage.get("completion_tokens") or 0),
-                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
-                cache_read_tokens=read)
+            return 0.0 if shared else _relay_usage_price(model, usage)
 
         class GuardedRelay(llm_relay.ModelRelay):
             def stop(self, timeout=30.0):
@@ -8866,8 +8849,9 @@ _FOLLOWUP_ROUTER_SYS = (
     "You route a follow-up message in a single-cell bioinformatics console. The user ALREADY "
     "completed a research run in this conversation (its report, figures and processed dataset are "
     "saved) and just sent another message. Classify what they want, choosing exactly one intent. "
-    "There is no report-editing path: a request to reword or re-render the existing report without "
-    "new analysis is a \"new_study\", because the report is only ever written from a run.\n"
+    "A report-only revision reuses accepted results and must not run scientific tools.\n"
+    "- \"report_only\": correct, rewrite, summarize or render the existing report using only "
+    "completed evidence. Do not choose this when new searches or analyses are requested.\n"
     "- \"continue\": a NEW analysis that builds on what the run produced — the next step of the "
     "same study on the same data ('now find the marker genes of each cluster', 'annotate the cell "
     "types', 'compare the two conditions in the rods', 'add pathway enrichment', 'now compare with "
@@ -8878,7 +8862,7 @@ _FOLLOWUP_ROUTER_SYS = (
     "again'). Pick the single most relevant step, copied VERBATIM from the prior agenda.\n"
     "- \"new_study\": start over — a different question that should not reuse the earlier "
     "results, a request to redo everything from the raw data, or a different dataset.\n"
-    "Return ONLY a JSON object: {\"intent\": \"continue|rerun_step|new_study\", "
+    "Return ONLY a JSON object: {\"intent\": \"continue|rerun_step|new_study|report_only\", "
     "\"step\": \"<verbatim agenda step when intent=rerun_step, else null>\", "
     "\"confidence\": <0.0-1.0>, \"reason\": \"<one short clause>\"}."
 )
@@ -8933,7 +8917,7 @@ def _parse_followup_intent(raw: Any, agenda: list[str]) -> dict | None:
     if obj is None:
         return None
     intent = str(obj.get("intent") or "").strip().lower()
-    if intent not in ("continue", "rerun_step", "new_study"):
+    if intent not in ("continue", "rerun_step", "new_study", "report_only"):
         return None
     try:
         conf = max(0.0, min(1.0, float(obj.get("confidence"))))
@@ -9455,7 +9439,70 @@ def _quickchat_literature_route(conn: Connection, req: LabRequest) -> tuple[Any,
     return request_router.route_quickchat_literature(complete, req.question, data=names, history=req.history or [])
 
 
+async def _maybe_status_recovery(conn: Connection, req: LabRequest) -> bool:
+    from dataclasses import replace
+    from ..agents import status_continuation
+    from . import report_revision
+    if not status_continuation.requested(req.question):
+        return False
+    try:
+        requested_run = status_continuation.target_run(req.question)
+        if not req.conversation_id:
+            raise ValueError("Status recovery requires the original conversation.")
+        target = _report_target(conn, req, allow_recovery_error=True)  # ownership and accepted evidence
+        if target is None or target[0] != requested_run:
+            raise ValueError("The original status-recovery run is unavailable in this conversation.")
+        run_id, art, state = target
+        if _binds_other_dataset(req, state):
+            raise ValueError("Status recovery cannot bind a different input dataset.")
+        updated, indices = status_continuation.revised_state(state, req.question)
+        # A task lives under its original RunHome. Never let a missing/expired home silently
+        # resolve to the current session's empty workspace and poll a different task namespace.
+        record = report_revision.confined(conn.workspace, run_id + "/" + _RUN_HOME_FILE)
+        home = hpc_layout.RunHome.from_json(json.loads(record.read_text()))
+        if home is None or home.run_id != run_id:
+            raise ValueError("The original task workspace record is invalid.")
+        expected = (hpc_layout.session_run(conn.settings.shared_root, home.session_id, run_id)
+                    if home.layout == "session" else
+                    hpc_layout.legacy_run(conn.settings.shared_root, _hpc_user(conn), run_id))
+        if home != expected:
+            raise ValueError("The original task workspace is outside this deployment's run layout.")
+        if conn.executor is None:
+            raise ValueError("Connect to the original cluster before recovering task evidence.")
+        if not conn.mock:
+            exists = await asyncio.to_thread(conn.executor.exec,
+                f"test -d {shlex.quote(home.dir('analysis'))}", timeout=30)
+            if not exists.ok:
+                raise ValueError("The original task workspace is unavailable; no new run was created.")
+        resume, decisions, cont_req, _ = _prepare_continue(
+            req.connection_id, conn, run_id, art, updated, min(indices), status_steps=indices)
+        resume = replace(resume, reviewed_note=req.question)
+        cont_req = cont_req.model_copy(update={"conversation_id": req.conversation_id})
+        from .status_recovery import archive
+        archive(art, state, updated, req.question)
+    except (OSError, ValueError, TypeError) as exc:
+        conn.push({"type": "chat_error", "message": "Status recovery stopped: " + public_error(exc)})
+        conn.push({"type": "chat_stopped"})
+        return True
+    conn.run_homes[run_id] = home
+    conn.push({"type": "lab_progress", "level": "info", "text":
+               f"Reviewing status-only recovery of run {run_id}; retained steps and original workspace are preserved."})
+    await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id, resume_decisions=decisions)
+    return True
+
+
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
+    if await _maybe_status_recovery(conn, req):
+        return
+    from ..agents.mcp_workflow import explicit_workflow
+    if explicit_workflow(req.question):
+        # An explicit ordered call list is a reviewed scientific workflow, not a
+        # question for the single-answer search console. It retains this session's
+        # model, cost/cancel policy and the normal plan approval before any call.
+        await _run_lab(conn, req)
+        return
+    if not _fast_path(req) and await _maybe_report_revision(conn, req):
+        return
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
@@ -9627,6 +9674,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
                   "step_index": _default_rerun_index(state)}
 
     kind = intent["intent"]
+    if kind == "report_only":
+        _show_report_revision(conn, req, (run_id, art, state))
+        return
     if kind == "new_study":
         await _run_lab(conn, req)
         return
@@ -10735,7 +10785,9 @@ def _relay_usage_price(model: str, usage: dict[str, Any]) -> "float | None":
     from . import llm_pricing
     if usage.get("cost") is not None:                          # the provider's own figure
         try:
-            return float(usage["cost"])
+            cost = float(usage["cost"])
+            if 0 <= cost < float("inf"):
+                return cost
         except (TypeError, ValueError):
             pass
     read = int(usage.get("cache_read_input_tokens") or 0)
@@ -12192,7 +12244,8 @@ def _analysis_checkpoints_exist(conn: Connection, run_id: str, *, look_on_hpc: b
 def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Path, state: dict,
                       from_step_index: int, *, modify_note: str | None = "",
                       edited_step: str | None = None, interrupted: bool = False,
-                      hpc_checkpoints: bool = False):
+                      hpc_checkpoints: bool = False,
+                      status_steps: frozenset[int] | None = None):
     """Build the (ResumeState, resume_decisions, LabRequest, idx) to re-run ONE step of a prior
     run in place, reusing earlier steps' checkpoints. Shared by /api/lab/continue and the
     follow-up router. Raises ValueError when the run can't be continued (no agenda, or the
@@ -12203,6 +12256,15 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
     ``modify_note`` and ``edited_step`` are ignored). ``hpc_checkpoints`` also looks for the
     checkpoints in the run's HPC3 workspace — an SSH round trip, so call it off the event loop."""
     from ..agents.research_lab import ResumeState
+    # The report copy is the full approved document, not the short planner hint
+    # returned by _approved_plan_text. Older checkpoints stored only agenda prose.
+    if not state.get("approved_plan_yaml"):
+        approved_path = art / "report" / "plan.yaml"
+        if approved_path.exists():
+            approved_text = approved_path.read_text(encoding="utf-8")
+            if len(approved_text) > _PLAN_YAML_MAX_CHARS:
+                raise ValueError("The approved plan is too large to restore safely; re-plan and review it.")
+            state = {**state, "approved_plan_yaml": approved_text}
     agenda = list(state.get("agenda", []))
     if not agenda:
         raise ValueError("Prior run has no agenda to continue.")
@@ -12211,11 +12273,21 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
         idx = resume.from_step_index
     else:
         idx = max(0, min(int(from_step_index), len(agenda) - 1))
+    if status_steps is not None:
+        if interrupted:
+            raise ValueError("A status recovery must name its exact original step numbers.")
+        from ..agents.plan_doc import parse_plan_yaml
+        from ..agents.status_continuation import validate_tasks
+        validate_tasks(state, parse_plan_yaml(state.get("approved_plan_yaml", ""),
+                       request=state.get("question", "")), status_steps)
+        if idx != min(status_steps):
+            raise ValueError("Status recovery must start at its first explicitly selected step.")
     # Resuming PAST step 0 reads the prior step's analysis checkpoint. Those expire
     # (checkpoint_ttl_days), so if they're gone the resumed step has no input — raise instead
     # of dispatching a run that would silently produce nothing. (Step 0 reads the raw dataset,
     # not a checkpoint, so it's always resumable.)
-    if idx > 0 and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints):
+    if (idx > 0 and status_steps is None
+            and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints)):
         raise ValueError(
             f"Run {run_id}'s analysis checkpoints have expired — its process files are released "
             "once the report is written (on HPC3, when the session that ran it disconnects, or "
@@ -12228,7 +12300,10 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
             agenda = [*agenda[:idx], edited_step.strip(), *agenda[idx + 1:]]
             state = {**state, "agenda": agenda}
         resume = ResumeState.from_run_state(state, idx, modify_note=(modify_note or ""),
-                                            guidance=state.get("guidance"))
+                                            guidance=state.get("guidance"), redo_indices=status_steps)
+        if status_steps is not None:
+            from dataclasses import replace
+            resume = replace(resume, status_recovery=True, review_requested=True, modify_note="")
     resume_decisions: dict[str, Any] = {}
     if state.get("dataset_path"):
         resume_decisions["dataset_path"] = state["dataset_path"]
@@ -12306,9 +12381,9 @@ def _find_saved_plan(conn: Connection, run_id: str | None, conversation_id: str 
 
 
 def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
-    from . import saved_plans
+    from . import saved_plans, report_revision
 
-    prompts = []
+    prompts = [report_revision.prompt(folder, record) for folder, record in report_revision.pending(conn.workspace)]
     seen = set()
     for rid, art, _current, state in _saved_plan_candidates(conn):
         cid = state.get("conversation_id")
@@ -12378,6 +12453,9 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     if carries_doc and len(req.plan_yaml or "") > _PLAN_YAML_MAX_CHARS:
         return JSONResponse({"status": "error", "detail": "The plan document is too large."},
                             status_code=413)
+    report_reply = await _report_revision_review(conn, req, action)
+    if report_reply is not None:
+        return report_reply
     # Unblock only the run this decision is FOR (its own chat), not whatever run is live on the shared
     # session. A decision that names a run that isn't active (a stale plan card from a finished run) is
     # a no-op. No identifiers (older client) → the active run.
@@ -14494,6 +14572,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                         prior: "dict[str, Any] | None" = None, continues_from_dataset: bool = False,
                         untested_md: str = "", figure_diag: str = "", provenance: str = "",
                         qc_report: bool = False, abandoned: Callable[[], bool] = lambda: False,
+                        is_revision: bool = False,
                         on_stage: Callable[[str], Any] = lambda _stage: None) -> dict[str, Any]:
     """The written report of a run: the manuscript (or the QC report, or the short report a request
     asked for), its references, self-review, verification statement, PDF and DOCX, the post-render
@@ -14506,7 +14585,9 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
     render's ``status`` and the formats ``rendered``."""
     from ..reporting.report import build_pdf_report
     vl_attempted = False   # did the post-render visual review get a document to read?
-    brief = _wants_brief_report(scope, result)
+    # A reviewed correction must reach the writer with its hydrated evidence and
+    # instructions, even when the original analysis requested a brief/QC report.
+    brief = not is_revision and _wants_brief_report(scope, result)
     if abandoned():
         report_md = ("# Research report (write-up skipped)\n\n"
                      "You stopped this run a second time, so the model-written report, the "
@@ -14514,7 +14595,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                      "tables every completed step produced are in this bundle, and "
                      "`process/run_state.json` can resume it.\n\n"
                      f"{result.final_answer or ''}\n")
-    elif qc_report:
+    elif qc_report and not is_revision:
         # QC only, and a written report asked for: the writer's report (it chose the layout),
         # then the files the run handed back.
         say_key("📝 Writing the quality-control report…")
@@ -14702,7 +14783,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
         tech_md = await asyncio.to_thread(
             _build_technical_report, result, art, complete_fn, question, lit_note,
             "\n\n".join(d for d in (figure_diag, visual_diag) if d),
-            provenance)
+            provenance, is_revision=is_revision)
         tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
         tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
         if untested_md:
@@ -14830,7 +14911,8 @@ def start_report_job(user: Any, run_id: str) -> "dict[str, Any]":
     return report_job_status(owner, run_id)
 
 
-async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) -> None:
+async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path, *,
+                      revision: "tuple[Path, dict] | None" = None) -> None:
     """The report of a finished run, rebuilt from its folder: :func:`_write_report` as at the end
     of a run, its model calls billed to that run. Records the outcome in process/report_job.json."""
     log: "list[str]" = []
@@ -14848,6 +14930,13 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) ->
         from ..agents.research_lab import LabResult
         from ..agents.scope import RunScope, read_scope
         state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+        if revision is not None:
+            from . import report_revision
+            revision_folder, revision_record = revision
+            report_revision.archive_report(art, revision_folder)
+            state, grounding = report_revision.hydrate(art, state, revision_record["instructions"])
+            from .saved_plans import _write
+            _write(revision_folder / "grounding.json", json.dumps(grounding, indent=2))
         result = LabResult.from_dict(state)
         question = str(state.get("question") or result.question or "")
         saved_scope = (state.get("plan_context") or {}).get("scope")
@@ -14862,8 +14951,21 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) ->
             scope=scope, self_sourced=str(state.get("self_sourced") or ""),
             dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
             provenance=_llm_provenance_note(llm),
-            qc_report=_qc_only_run(result) and not _code_wrote_outputs(result))
-        rec.update(state="done", rendered=done.get("rendered") or [], render_status=done.get("status"))
+            qc_report=revision is None and _qc_only_run(result) and not _code_wrote_outputs(result),
+            is_revision=revision is not None,
+            abandoned=(conn.chat_stop.is_set if revision is not None else lambda: False))
+        cancelled = revision is not None and conn.chat_stop.is_set()
+        if revision is not None and not cancelled:
+            # The old summary is preserved in prior_report; the current bundle
+            # must not present it as a second, contradictory latest report.
+            revised = report_revision.confined(art, "report/report.md")
+            if not revised.is_file():
+                raise ValueError("The report writer did not produce the revised report")
+            _write(report_revision.confined(art, "report/summary.md"),
+                   "# Revised report\n\nThe current corrected report is [report.md](report.md). "
+                   "The original summary is preserved in the report revision history.\n")
+        rec.update(state="cancelled" if cancelled else "done", rendered=done.get("rendered") or [],
+                   render_status=done.get("status"))
     except Exception as exc:  # noqa: BLE001 - said in report_status, never raised into the gateway
         traceback.print_exc()
         rec.update(state="error", error=f"{type(exc).__name__}: {exc}"[:500])
@@ -14910,13 +15012,16 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
     try:
         from ..agents.registry import build_scientist_catalog
         from ..agents.research_harness import HarnessConfig, HarnessContext, ResearchHarness
-        from ..agents.research_lab import LabConfig, ResearchLab
+        from ..agents.research_lab import LabConfig, ResearchLab, ResumeState
         from ..tools.api import run_dataset_smoke_analysis
         from ..reporting.research_bundle import write_process_artifacts
         from ..tools.api import render_workflow_schematic
 
         art = conn.workspace / run_id / "artifacts"
         art.mkdir(parents=True, exist_ok=True)
+        if saved_state is not None and saved_state.get("resume_review"):
+            resume = ResumeState.from_review_state(
+                saved_state["resume_review"], question=str(saved_state.get("question") or ""))
 
         # Record the run in this user's history (when logged in); updated on finish. A resume
         # keeps the SAME run row (it overwrites the same bundle), so don't insert a new one.
@@ -15216,16 +15321,6 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if conn.executor is not None and not conn.mock:
             await asyncio.to_thread(_resolve_run_home, conn, run_id)
         code_executor = await _build_code_executor(conn, run, run_id, decisions, art, emit)
-        # scGPT per-cell annotation runs as a GPU batch job on HPC3 (Route C). Wire its
-        # runner only for a LIVE session (a real SSH executor) — in mock/offline mode the
-        # tool stays present but reports not-enabled (the mock host has no batch lifecycle).
-        scgpt_runner = None
-        if conn.executor is not None and not conn.mock:
-            from .scgpt_runner import build_scgpt_runner
-            scgpt_runner = build_scgpt_runner(
-                conn.executor, conn.settings, cluster_user_dir=_temp_base(conn),
-                run_dir=lambda rid: _run_home(conn, rid).dir("scgpt"),
-            )
         # Opt-in: run the scanpy analysis line (QC/clustering/DE/enrichment) as CPU Slurm batch jobs
         # on HPC3, reading the dataset on dfs3b in place. The dataset is used in place if it already
         # lives on dfs3b (uploads_on_hpc), else staged up once. Checkpoints accumulate in the dfs3b
@@ -15321,312 +15416,20 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("warning", "lab", "The earlier run's dataset carries no processing record, so it "
                                    "is treated as a plain input.")
 
-        # Opt-in: run VCF variant annotation OFFLINE on HPC3 (bcftools PASS-filter -> vep --offline
-        # --cache --fork over a local cache -> stream-parse), so a WGS-size VCF is handled without the
-        # REST tool's whole-file-in-memory read / 500-variant cap / rate limits. Falls back to REST on
-        # failure. EVERY branch below is logged AND persisted to process/variant_offline_diagnostics.log
-        # so a silent "fell back to REST" is never a mystery: you see the flag state, the resolved paths,
-        # and whether the sif / cache / ClinVar actually exist on HPC3.
-        variant_executor = None
+        # The native variant service owns annotation and reference validation.
+        # Preserve header-authoritative assembly selection for it and LIRICAL.
         st = conn.settings
         _ds_name = str(decisions.get("hpc_primary") or decisions.get("dataset_path") or "")
         _is_vcf = _ds_name.lower().endswith((".vcf", ".vcf.gz"))
-        _vdiag: list[str] = []
-
-        def _vlog(level: str, msg: str) -> None:
-            _vdiag.append(f"[{level}] {msg}")
-            emit(level, "lab", msg)
-
-        # Genome build: start from the configured default, then OVERRIDE it with the build read from the
-        # VCF header when detectable. The uploaded VCF is often hg19/GRCh37; annotating those coordinates
-        # against the .env-default GRCh38 cache runs cleanly but mis-assigns the gene at ~90% of sites
-        # (empirically verified), so we route to the matching cache/ClinVar rather than trust the flag.
         _assembly = str(st.vep_assembly)
         if _is_vcf:
             _detected = await asyncio.to_thread(_detect_vcf_assembly, conn, decisions)
-            if _detected and _detected.lower() != _assembly.lower():
-                _vlog("info", f"Variant assembly: VCF header indicates {_detected} — overriding the "
-                              f"configured {_assembly} so the matching VEP cache/ClinVar is used.")
+            if _detected:
                 _assembly = _detected
-            elif not _detected:
-                _vlog("info", f"Variant assembly: build not detectable from the VCF header; using the "
-                              f"configured default {_assembly}.")
+            emit("info", "lab", f"Native variant annotation uses {_assembly}; "
+                 + ("assembly read from the VCF header." if _detected else "configured fallback assembly."))
         decisions["mcp_variant_assembly"] = "GRCh37" if _assembly.lower() in ("grch37", "hg19") else "GRCh38"
         _grch37 = _assembly.lower() in ("grch37", "hg19")
-        _cache_dir = st.vep_cache_dir_grch37 if _grch37 else st.vep_cache_dir_grch38
-        _clinvar = st.vep_clinvar_grch37 if _grch37 else st.vep_clinvar_grch38
-
-        if _is_vcf or st.variant_on_hpc:
-            _vlog("info",
-                  f"Variant-annotation config: AISCIENTIST_VARIANT_ON_HPC="
-                  f"{'ON' if st.variant_on_hpc else 'OFF'}; vep_image={st.vep_image}; "
-                  f"cache={_cache_dir}; clinvar={_clinvar}; assembly={_assembly}; "
-                  f"executor={'yes' if conn.executor is not None else 'NONE'}; mock={conn.mock}; "
-                  f"dataset={'vcf' if _is_vcf else (_ds_name or 'none')}.")
-
-        # WHY the offline line is / isn't wired — say it out loud, per condition.
-        if not st.variant_on_hpc:
-            if _is_vcf:
-                _vlog("warning",
-                      "Offline VEP line OFF: AISCIENTIST_VARIANT_ON_HPC is not set to 1/true/yes/on in the "
-                      "deployment .env. The VEP_* sif/cache paths ALONE do not enable it — that flag IS the "
-                      "switch. Annotating via the capped REST path.")
-        elif conn.executor is None or conn.mock:
-            _vlog("warning",
-                  f"Offline VEP line requested but not runnable this run: "
-                  f"executor={'NONE' if conn.executor is None else 'ok'}, mock={conn.mock}. Using REST.")
-        else:
-            # Flag ON + live executor: PREFLIGHT the sif + cache + ClinVar on HPC3 before wiring, so a
-            # wrong/un-staged path is reported HERE instead of as a mystery Slurm-job failure later.
-            checks = await asyncio.to_thread(
-                _variant_offline_preflight, conn.executor, st.vep_image, _cache_dir, _clinvar)
-            for name, (path, ok) in checks.items():
-                if not path:
-                    _vlog("warning", f"Offline VEP: {name} is not configured (empty path in .env).")
-                elif ok is False:
-                    _vlog("warning",
-                          f"Offline VEP: {name} NOT found on HPC3: {path} — the VEP job would fail and fall "
-                          f"back to REST. Stage it (deploy/vep/build_and_stage.sh) or fix the .env path.")
-                elif ok is None:
-                    _vlog("warning", f"Offline VEP: could NOT verify {name} on HPC3 ({path}) — SSH check failed.")
-                else:
-                    _vlog("info", f"Offline VEP: {name} present on HPC3 ({path}).")
-            try:
-                v_pysrc = await asyncio.to_thread(_sync_aiscientist_source_to_hpc, conn)
-            except Exception as exc:  # noqa: BLE001
-                _vlog("warning", f"Offline VEP disabled: couldn't stage the tools to dfs3b ({exc}). Using REST.")
-                v_pysrc = None
-            if v_pysrc:
-                remote_ws = _run_home(conn, run_id).dir("variant")
-                conn.executor.exec(f"mkdir -p {shlex.quote(remote_ws)}")
-                if decisions.get("hpc_primary"):
-                    remote_ds = decisions["hpc_primary"]           # dfs3b VCF — annotated in place
-                elif decisions.get("dataset_path"):
-                    remote_ds = f"{remote_ws}/{Path(decisions['dataset_path']).name}"
-                    await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], remote_ds)
-                else:
-                    remote_ds = None
-                if remote_ds is None:
-                    _vlog("warning", "Offline VEP: no dataset path resolved (no hpc_primary / dataset_path) — "
-                                     "the job would have no VCF to annotate.")
-
-                def _variant_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-                    from ..tools.api import annotate_variants_rest
-                    return annotate_variants_rest(args, ctx)
-
-                def _variant_on_fallback(reason: str) -> None:
-                    # Fires the moment the offline VEP job degrades to REST — logs the VERBATIM reason
-                    # (Slurm error tail / "no live HPC connection") AND appends it to the diagnostics file.
-                    msg = ("Offline VEP job did NOT complete — fell back to REST (capped at 500 variants). "
-                           f"Reason: {reason}")
-                    emit("warning", "lab", msg)
-                    try:
-                        _pd = art / "process"
-                        _pd.mkdir(parents=True, exist_ok=True)
-                        with (_pd / "variant_offline_diagnostics.log").open("a", encoding="utf-8") as fh:
-                            fh.write(f"[warning] {msg}\n")
-                    except OSError:
-                        pass
-
-                # Predictor plugins (CADD/AlphaMissense/REVEL + MANE/HGVS + norm) — opt-in, and now
-                # PER-BUILD rather than GRCh38-only. Predictor data is build-specific: handing a GRCh38
-                # file to a GRCh37 run is not just useless but unsafe (tabix looks up by coordinate, so
-                # a position present in both builds with the same ref/alt returns a DIFFERENT variant's
-                # score). So resolve every path for THIS assembly and let the existence check in
-                # ``vep_plugin_flags`` drop whatever is not staged for it — a GRCh37 run gets CADD
-                # (staged, 80 GB) and simply no AlphaMissense/REVEL, instead of the whole panel being
-                # switched off. Inject the paths so they resolve INSIDE vep.sif, and bind each file's
-                # parent dir RO (--containall hides everything not bound; a dir bind also exposes the
-                # .tbi/.fai).
-                #
-                # ``_ref_fasta`` is resolved OUT here, not inside the plugin block, because THREE
-                # separate features gate on it — `bcftools norm`, VEP `--hgvs`, and SpliceAI — and the
-                # last two must still work when the predictor plugins are switched off.
-                _b37 = _assembly == "GRCh37"
-                # The GRCh37 reference is UCSC hg19, NOT Ensembl GRCh37: the lab's GATK VCFs are
-                # chr-prefixed with a 16571 bp chrM (hg19), while Ensembl GRCh37 uses bare `1` and a
-                # 16569 bp chrM. Mixing them makes `bcftools norm -f` fail to match contigs, so the
-                # staged file is a verified-identical copy of the lab's own hg19 (93/93 contigs match a
-                # real WGS VCF's header). Empty ⇒ that build has no reference ⇒ norm/HGVS/SpliceAI stay
-                # OFF for it rather than left-aligning against the wrong genome.
-                _ref_fasta = st.vep_ref_fasta_grch37 if _b37 else st.vep_ref_fasta
-                if _ref_fasta and not os.path.exists(_ref_fasta):
-                    _vlog("warning", f"Reference FASTA for {_assembly} is configured but missing "
-                                     f"({_ref_fasta}) — normalization, HGVS naming and SpliceAI will be "
-                                     "SKIPPED for this run.")
-                    _ref_fasta = ""
-                _plugin_args: dict = {}
-                _plugin_binds: tuple = ()
-                if st.vep_plugins_enabled and _assembly in ("GRCh38", "GRCh37"):
-                    _cadd_snv = st.vep_cadd_snv_grch37 if _b37 else st.vep_cadd_snv
-                    _cadd_indels = st.vep_cadd_indels_grch37 if _b37 else st.vep_cadd_indels
-                    _alphamissense = st.vep_alphamissense_grch37 if _b37 else st.vep_alphamissense
-                    _revel = st.vep_revel_grch37 if _b37 else st.vep_revel
-                    _pf = (_cadd_snv, _cadd_indels, _alphamissense, _revel, _ref_fasta)
-                    _dirs = {os.path.dirname(f) for f in _pf if f}
-                    if st.vep_plugins_dir:
-                        _dirs.add(st.vep_plugins_dir)
-                    _plugin_binds = tuple(sorted(d for d in _dirs if d))
-                    _plugin_args = {"plugins_enabled": True, "plugins_dir": st.vep_plugins_dir,
-                                    "cadd_snv": _cadd_snv, "cadd_indels": _cadd_indels,
-                                    "alphamissense": _alphamissense, "revel": _revel,
-                                    "ref_fasta": _ref_fasta}
-                    _staged = [n for n, p in (("CADD", _cadd_snv), ("AlphaMissense", _alphamissense),
-                                              ("REVEL", _revel)) if p and os.path.exists(p)]
-                    # Name what actually runs for THIS build, so a blank predictor column is traceable
-                    # to "not staged for this assembly" rather than looking like a silent failure.
-                    _vlog("info", f"VEP predictor plugins ENABLED for {_assembly}: "
-                                  f"{', '.join(_staged) if _staged else 'none staged for this build'}"
-                                  f"{' + normalization/HGVS' if _ref_fasta else ''}.")
-                # SpliceAI (OpenSpliceAI) — a separate conda-env binary run FROM INSIDE vep.sif (its
-                # conda-forge python runs under the container's glibc; validated on HPC3). Bind the env
-                # root + model dir + the ref-FASTA dir (RO — the .fai is present so pyfaidx never
-                # rebuilds); the ref FASTA is also what norm/HGVS use.
-                #
-                # Gated on what it ACTUALLY needs (a reference FASTA for this build) rather than on
-                # `_assembly == "GRCh38"`. The old assembly check was a proxy for "only GRCh38 has a
-                # FASTA", and it silently outlived that fact. The annotation side already handled both
-                # builds — `vcf_offline._SPLICEAI_ASSEMBLY` maps GRCh37 → openspliceai's built-in
-                # `grch37` annotation — so the FASTA was the only real blocker.
-                _spliceai_args: dict = {}
-                _spliceai_binds: tuple = ()
-                if st.spliceai_enabled and st.spliceai_bin and _ref_fasta:
-                    _env_root = os.path.dirname(os.path.dirname(st.spliceai_bin))   # .../envs/openspliceai
-                    _spliceai_binds = tuple(sorted({d for d in (
-                        _env_root, st.spliceai_models, os.path.dirname(_ref_fasta)) if d}))
-                    _spliceai_args = {"spliceai_enabled": True, "spliceai_bin": st.spliceai_bin,
-                                      "spliceai_models": st.spliceai_models,
-                                      "spliceai_max_variants": st.spliceai_max_variants,
-                                      "ref_fasta": _ref_fasta}   # SpliceAI needs the ref FASTA
-                    _cap = (f"cap {st.spliceai_max_variants}" if st.spliceai_max_variants else "no cap")
-                    _vlog("info", f"SpliceAI (OpenSpliceAI) ENABLED for {_assembly} — splice-disruption "
-                                  f"scoring on the post-filter set ({_cap}).")
-                elif st.spliceai_enabled and st.spliceai_bin and not _ref_fasta:
-                    # Loud, not silent: SpliceAI is switched ON in the environment but cannot run for
-                    # this build. A blank splice column must never read as "no splice effect found".
-                    _vlog("warning", f"SpliceAI is enabled but no reference FASTA is staged for "
-                                     f"{_assembly} — splice scoring SKIPPED (columns will be blank).")
-                # Deterministic IRD defaults (no longer dependent on the model choosing to pass them):
-                #  - PRE-VEP region restriction: `regions_bed` (the IRD capture panel) — bcftools cuts
-                #    the VCF to these regions BEFORE VEP, so VEP annotates a tiny fraction (the compute
-                #    saving; ~45-60 min → minutes on a WGS VCF);
-                #  - known-gene-first: the default gene panel as `genes` (a POST-VEP precise filter — it
-                #    does NOT save annotation time, so `regions_bed` is preferred for scoping/speed);
-                #  - rarity floor: the lab's base `max_pop_af` (e.g. 0.005) so common variants drop.
-                # All ride in inject_args, so a caller-supplied value overrides them. A panel-load
-                # hiccup must never break the run.
-                _ird_defaults: dict = {}
-                _regions_binds: tuple = ()
-                if st.default_regions_bed:
-                    _ird_defaults["regions_bed"] = st.default_regions_bed
-                    _rd = os.path.dirname(st.default_regions_bed)
-                    if _rd:
-                        _regions_binds = (_rd,)
-                    _vlog("info", "Pre-VEP region restriction ENABLED (regions_bed="
-                                  f"{os.path.basename(st.default_regions_bed)}) — bcftools restricts "
-                                  "BEFORE VEP, the annotation-time saving. A caller regions_bed overrides.")
-                if st.default_gene_panel:
-                    try:
-                        from ..tools.api import load_gene_panel
-                        _panel_genes = load_gene_panel(st.default_gene_panel)
-                        _ird_defaults["genes"] = _panel_genes
-                        _vlog("info", f"Known-gene panel '{st.default_gene_panel}' applied by default "
-                                      f"({len(_panel_genes)} genes; known-gene-first). A caller-supplied "
-                                      "gene list overrides it.")
-                    except Exception as exc:  # noqa: BLE001 - a panel miss must not abort the study
-                        _vlog("warning", f"Default gene panel '{st.default_gene_panel}' not loaded "
-                                         f"({type(exc).__name__}: {exc}); annotating genome-wide.")
-                if st.default_max_pop_af and st.default_max_pop_af > 0:
-                    _ird_defaults["max_pop_af"] = st.default_max_pop_af
-                    _vlog("info", f"Default rarity filter max_pop_af={st.default_max_pop_af} applied "
-                                  "(a caller-supplied max_pop_af overrides it).")
-                # IRD annotation layers (HGMD / retina-exon / ATAC / dbscSNV) — bind each reference
-                # file's DIR into vep.sif and inject the paths so the tool tabixes them on the reduced
-                # set. Gated (OFF by default); a layer with an empty path is skipped by the tool.
-                _ird_anno_args: dict = {}
-                _ird_anno_binds: tuple = ()
-                if st.ird_annotate_enabled:
-                    _ird_paths = {k: v for k, v in (
-                        ("hgmd_path", st.ird_hgmd), ("dbscsnv_template", st.ird_dbscsnv),
-                        ("retina_bed", st.ird_retina_exons), ("atac_path", st.ird_atac)) if v}
-                    if _ird_paths:
-                        _ird_anno_args = {"ird_annotate": True, **_ird_paths}
-                        _ird_anno_binds = tuple(sorted({
-                            os.path.dirname(v.replace("{chrom}", "chr1")) for v in _ird_paths.values()
-                            if os.path.dirname(v.replace("{chrom}", "chr1"))}))
-                        _vlog("info", f"IRD annotation layers ENABLED ({', '.join(sorted(_ird_paths))}).")
-                from .slurm_analysis import SlurmAnalysisExecutor
-                variant_executor = SlurmAnalysisExecutor(
-                    remote=conn.executor, container_image=st.vep_image,
-                    remote_workspace=remote_ws, remote_dataset=remote_ds,
-                    local_workspace=conn.workspace / run_id, source_dir=v_pysrc,
-                    entrypoint=f"python3 -m {_tools_api.VARIANT_ENTRYPOINT}",   # vep.sif is Ubuntu (python3)
-                    # Scratch (args/result/log + its rw bind target) MUST live on dfs3b, NOT $HOME:
-                    # vep.sif ships /data as a symlink to /opt/vep/.vep (VEP's read-only cache mount),
-                    # so bind-mounting a $HOME (=/data/homezvol*/...) scratch resolves through that
-                    # symlink into the RO cache and the runtime dies at container creation with
-                    # "destination ... doesn't exist in container" (exit 127, ~1s) — which is exactly
-                    # what silently killed every offline annotate_variants job. A /dfs3b path has no
-                    # such symlink so the tmpfs overlay creates it cleanly (same as the workspace bind).
-                    job_prefix="bioagent_variant",
-                    scratch_dir=_scratch_dir(conn, "variant", run_id=run_id),
-                    # Bind the ClinVar .tbi index alongside its .vcf.gz: VEP's --custom does a Tabix
-                    # lookup that needs the index right next to the bgzip, and --containall hides every
-                    # host path that isn't an explicit bind — without this VEP dies with "Couldn't find
-                    # index for file ...clinvar_*.vcf.gz".
-                    extra_ro_binds=tuple(dict.fromkeys(
-                        tuple(p for p in (_cache_dir, _clinvar,
-                                          f"{_clinvar}.tbi" if _clinvar else "") if p)
-                        + _plugin_binds + _spliceai_binds + _ird_anno_binds
-                        + _regions_binds)),   # + IRD reference dirs + the pre-VEP regions BED dir
-                    inject_args={"cache_dir": _cache_dir, "clinvar_vcf": _clinvar,
-                                 "assembly": _assembly, "fork": st.vep_fork,
-                                 **_ird_defaults, **_plugin_args, **_spliceai_args,
-                                 **_ird_anno_args},
-                    mem_gb=st.run_code_mem_gb, cpus=st.vep_fork, partition=st.cpu_partition,
-                    # time_limit is the SBATCH --time; the gateway job-wait (run_timeout_s) auto-derives
-                    # from it (SlurmAnalysisExecutor default), so a healthy ~30-60 min WGS VEP job is
-                    # never scancelled early — Slurm's own --time is the ceiling, completion returns at once.
-                    account=st.cpu_account or "", time_limit=st.vep_time_limit,
-                    container_module=st.container_module, container_bin=st.container_bin,
-                    local_fallback=_variant_local_fallback, on_fallback=_variant_on_fallback,
-                    should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight VEP job
-                    # Idempotent within the run: if a later step re-invokes annotate_variants with the
-                    # SAME inputs, reuse this run's result instead of re-submitting the ~45-min WGS VEP
-                    # job and overwriting the tables (the "model keeps re-annotating" loop that both
-                    # wasted compute AND clobbered the good result with a degraded repeat).
-                    memoize_result=True,
-                    # Gateway-AUTHORITATIVE args the model cannot override: the assembly detected from the
-                    # VCF header (a model passing assembly=GRCh38 on a GRCh37 file makes VEP fail on a
-                    # cache-assembly mismatch → wrong genes), and max_variants=0 so the offline path
-                    # annotates the WHOLE WGS VCF (a model-supplied cap like max_variants=5000 silently
-                    # truncated a 4.9M-variant study to the first 5000 = chrM+chr1-start, a wrong cohort).
-                    force_args={"assembly": _assembly, "max_variants": 0},
-                )
-                if any(ok is False for _, (p, ok) in checks.items() if p):
-                    _vlog("warning", "Offline VEP wired BUT a required path is missing above — expect a "
-                                     "fallback to REST. Fix the path(s) + rerun for true whole-VCF annotation.")
-                else:
-                    _vlog("info", f"VCF annotation runs OFFLINE on HPC3 (VEP {_assembly}, "
-                                  f"--fork {st.vep_fork}, --mem={st.run_code_mem_gb}G).")
-
-        # Final REST-cap warning for a VCF run that did NOT wire the offline line (any reason above).
-        if variant_executor is None and _is_vcf:
-            _vlog("warning",
-                  "VCF annotation will use the REST path — capped at the FIRST 500 variants. Enable + fix "
-                  "the offline line (AISCIENTIST_VARIANT_ON_HPC=1 + staged sif/cache) to annotate every "
-                  "variant; otherwise all counts/distributions describe only the first 500.")
-
-        # Persist the full diagnostic trail to the bundle (downloadable), even after the run log scrolls.
-        if _vdiag:
-            try:
-                _pdir = art / "process"
-                _pdir.mkdir(parents=True, exist_ok=True)
-                (_pdir / "variant_offline_diagnostics.log").write_text(
-                    "# Offline VEP (variant annotation) wiring diagnostics\n\n" + "\n".join(_vdiag) + "\n",
-                    encoding="utf-8")
-            except OSError:
-                pass
 
         # Opt-in: phenotype -> disease DIFFERENTIAL DIAGNOSIS on HPC3 (LIRICAL). DOWNSTREAM of the variant
         # line: the model calls run_lirical with the patient's HPO terms; when a VCF is loaded it scores
@@ -15724,9 +15527,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         scientist = ResearchHarness(
             catalog=instrument_catalog(await _prepare_session_roster(
                 conn,
-                build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
+                build_scientist_catalog(code_executor=code_executor,
                                         analysis_executor=analysis_executor,
-                                        variant_executor=variant_executor,
                                         phenotype_executor=phenotype_executor,
                                         literature_executor=literature_executor,
                                         hpc_shell=_build_hpc_shell(conn, run)),
@@ -16017,9 +15819,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 plan_context=lab_obj.plan_context, lab_config=config,
                 later=lab_obj.later, prior_work=lab_obj.config.prior_work,
                 prior=prior, continues_from_dataset=continues_from_dataset)
+            previous_rounds = []
+            if resume is not None:
+                session_meta["resume_review"] = resume.to_review_state()
+                previous_rounds = [r.to_dict() for r in resume.prior_rounds]
             snapshot = SimpleNamespace(to_dict=lambda: {
-                "question": req.question, "agenda": agenda, "rounds": [],
-                "accepted_steps": 0, "converged": False, "final_answer": ""})
+                "question": req.question, "agenda": agenda, "rounds": previous_rounds,
+                "accepted_steps": len(previous_rounds), "converged": False, "final_answer": ""})
             _write_run_state(art, snapshot, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, protocols=lab_obj.protocols,
                              self_sourced=lab_obj.self_sourced, extra=session_meta, strict=True)
@@ -16068,7 +15874,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # HITL mode gating. Bypass (autonomous) forces BOTH gates off — no plan review, no
         # decision-point pauses — so the loop runs end-to-end; Stop + mid-run notes still apply.
         # Manual (default) keeps plan review (when plan_mode) and DAG decision-point pauses.
-        want_plan_review = (resume is None and req.plan_mode and not req.autonomous)
+        want_plan_review = ((resume is None and req.plan_mode and not req.autonomous)
+                            or (resume is not None and resume.needs_plan_review))
         # Decision points now fire on BOTH planners in manual mode: the DAG path pauses per-node, and
         # the linear path asks a deterministic plan-time fork (labels vs re-cluster) — previously the
         # linear path never surfaced a decision, so a labeled dataset was silently auto-decided.
@@ -16091,6 +15898,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             could re-enter the loop to use them. Now an interrupted run is continuable from its last
             completed step via the SAME /api/lab/continue path a user-requested re-run uses.
             ``lab_obj.guidance`` is read live because the PI resolves it during run()."""
+            session_meta.update(plan_context=lab_obj.plan_context,
+                                approved_plan_yaml=lab_obj.approved_plan_yaml)
+            session_meta.pop("resume_review", None)
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
             _remember_planned_run(conn, run)
@@ -16467,7 +16277,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         traceback.print_exc()
         conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
         conn.push({"type": "chat_error",
-                   "message": public_error(exc) + _resume_hint(locals().get("art"))})
+                   "message": public_error(exc) + ("" if getattr(exc, "requires_replan", False)
+                                                  else _resume_hint(locals().get("art")))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():
@@ -17068,21 +16879,116 @@ def _data_artifacts_block(art: Path, *, omit_doublet_details: bool = False) -> s
     return "\n\n".join(blocks)
 
 
-def _annotate_variants_result(result: Any) -> "dict[str, Any] | None":
-    """The AUTHORITATIVE ``annotate_variants`` tool RESULT from the run — the tool's own numbers
-    (n_pass/n_nonpass, n_pathogenic, n_high_priority, truncated, distributions), NOT the model's
-    prose or a model-written summary JSON. Returns the last ok annotate_variants result, or None
-    (⇒ not a variant run). This is what binds the report's counts to ground truth."""
+def _annotate_variants_result(result: Any, art: "Path | None" = None) -> "dict[str, Any] | None":
+    """Last successful variant result, recovering bounded MCP counts from owned artifacts.
+
+    A model-written summary is never sufficient. Collected JSON must match the latest native
+    task's ownership record and SHA-256; unavailable evidence leaves its counts unknown.
+    """
+    import hashlib
+    from ..agents.tool_names import canonical_tool_name
+
+    def read_json(relative: str, limit: int) -> "tuple[dict, str] | None":
+        if art is None or not isinstance(relative, str):
+            return None
+        parts = relative.split("/")
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            return None
+        root = Path(art)
+        if root.is_symlink():
+            return None
+        path = root
+        try:
+            for part in parts:
+                path = path / part
+                if path.is_symlink():
+                    return None
+            if not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+                return None
+            with path.open("rb") as stream:
+                raw = stream.read(limit + 1)
+            if len(raw) > limit:
+                return None
+            value = json.loads(raw)
+            return (value, hashlib.sha256(raw).hexdigest()) if isinstance(value, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def collected_counts(res: dict) -> dict:
+        identity = {key: res.get(key) for key in ("analysis_id", "task_id")}
+        if not all(isinstance(value, str) and value for value in identity.values()):
+            return {}
+        record = read_json("mcp/.compatibility.json", 4 * 1024 * 1024)
+        if record is None:
+            return {}
+        owners = record[0]
+        current = owners.get("current")
+        files = owners.get("files")
+        if (not isinstance(current, dict) or current.get("variant-annotation") != identity
+                or not isinstance(files, dict)):
+            return {}
+
+        def owned(relative: str, limit: int) -> "dict | None":
+            owner = files.get(relative)
+            if not isinstance(owner, dict):
+                return None
+            if any(owner.get(key) != value for key, value in
+                   {"server": "variant-annotation", **identity}.items()):
+                return None
+            digest = owner.get("sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                return None
+            payload = read_json(relative, limit)
+            return payload[0] if payload is not None and payload[1] == digest else None
+
+        summary = owned("data/annotated_results_summary.json", 4 * 1024 * 1024)
+        if summary is not None:
+            fields = {"total_variants": "n_variants", "consequence_distribution": "by_consequence",
+                      "impact_distribution": "by_impact",
+                      "clinical_significance_distribution": "by_clinical_significance",
+                      "n_pathogenic_clinvar": "n_pathogenic",
+                      "n_rare_variants_af_lt_0.1": "n_rare",
+                      "n_high_priority_rare_deleterious": "n_high_priority"}
+            recovered = {target: summary[source] for source, target in fields.items() if source in summary}
+            if recovered:
+                return recovered
+        # A namespaced result is eligible only when its collector also recorded ownership and
+        # a checksum. Historical collectors omit this entry; a pathname alone is not evidence.
+        full = res.get("full_result")
+        expected = f"mcp/variant-annotation/{identity['analysis_id']}/annotate_variants.json"
+        if full != expected:
+            return {}
+        payload = owned(full, 16 * 1024 * 1024)
+        if payload is None or payload.get("status") != "ok" or payload.get("tool") != "annotate_variants":
+            return {}
+        fields = {"n_variants", "n_input_variants", "n_pass", "n_nonpass", "n_annotated",
+                  "n_pathogenic", "n_high_priority", "n_rare", "by_consequence", "by_impact",
+                  "by_clinical_significance", "truncated"}
+        return {key: value for key, value in payload.items() if key in fields}
+
     best: "dict[str, Any] | None" = None
     for r in getattr(result, "rounds", []) or []:
         rd = r.to_dict() if hasattr(r, "to_dict") else r
         sr = (rd.get("scientist_result") if isinstance(rd, dict) else {}) or {}
         for step in sr.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "annotate_variants":
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "annotate_variants":
                 continue
             res = step.get("result")
-            if isinstance(res, dict) and res.get("status") == "ok" and "by_consequence" in res:
-                best = res
+            if not isinstance(res, dict) or res.get("status") != "ok":
+                continue
+            if step.get("tool") == "annotate_variants":
+                if "by_consequence" in res:
+                    best = res
+                continue
+            identity = res.get("mcp")
+            if not isinstance(identity, dict) or identity.get("name") != "variant-annotation":
+                continue
+            native = res.get("result") if isinstance(res.get("result"), dict) else res
+            if native.get("status", "ok") != "ok" or native.get("state", "COMPLETED") != "COMPLETED":
+                continue
+            best = {"status": "ok", **native}
+            if native.get("response_omitted") or "by_consequence" not in native:
+                best.update(collected_counts(native))
     return best
 
 
@@ -17148,24 +17054,33 @@ def _variant_facts_block(art: Path, result: Any) -> str:
     fabricate numbers — this is what kills the '165 high-priority' / '6 vs 12 citations' hallucinations.
     When annotation itself failed, falls back to the PASS-filter summary so the real variant/PASS counts
     still reach the report. Returns '' for a non-variant run with no filter summary either."""
-    res = _annotate_variants_result(result)
+    res = _annotate_variants_result(result, art)
     if not res:
         return _variant_filter_summary_facts(art)
     lines = ["AUTHORITATIVE COUNTS (computed by the tools — state these EXACT numbers; do NOT invent, "
              "infer, or restate different values):"]
-    lines.append(f"- variants annotated: {res.get('n_input_variants', '?')}")
+    def count(key: str) -> Any:
+        value = res.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else "unknown"
+
+    annotated = count("n_variants") if "n_variants" in res else count("n_input_variants")
+    lines.append(f"- variants annotated: {annotated}")
     if "n_pass" in res:
-        npass, nnon = res.get("n_pass"), res.get("n_nonpass")
-        allpass = " (all records PASS)" if not nnon else ""
+        npass, nnon = count("n_pass"), count("n_nonpass")
+        allpass = " (all records PASS)" if nnon == 0 else ""
         lines.append(f"- FILTER: {npass} PASS, {nnon} non-PASS{allpass} — do NOT write 'all PASS' when "
                      f"non-PASS > 0")
     if res.get("truncated"):
         lines.append(f"- TRUNCATED: only the first {res.get('n_annotated', res.get('n_input_variants'))} "
                      f"variants were annotated (cap reached); the counts describe that slice, not the "
                      f"whole VCF — report this as a limitation")
-    lines.append(f"- ClinVar Pathogenic/Likely-Pathogenic: {res.get('n_pathogenic', 0)}")
-    lines.append(f"- high-priority shortlist: {res.get('n_high_priority', 0)}")
-    lines.append(f"- rare variants (below AF cutoff): {res.get('n_rare', '?')}")
+    elif res.get("response_omitted") and "truncated" not in res:
+        lines.append("- Annotation coverage/truncation: unknown in the bounded response. These counts "
+                     "do not establish whole-VCF coverage; consult the complete tool evidence before "
+                     "claiming the entire file was annotated.")
+    lines.append(f"- ClinVar Pathogenic/Likely-Pathogenic: {count('n_pathogenic')}")
+    lines.append(f"- high-priority shortlist: {count('n_high_priority')}")
+    lines.append(f"- rare variants (below AF cutoff): {count('n_rare')}")
     bc = res.get("by_clinical_significance") or {}
     if bc:
         lines.append("- clinical-significance distribution: " + ", ".join(f"{k}={v}" for k, v in bc.items()))
@@ -18365,7 +18280,7 @@ def _claim_audit_of(result: Any) -> dict[str, Any]:
     return ca if isinstance(ca, dict) else {}
 
 
-def _claim_audit_section(result: Any) -> str:
+def _claim_audit_section(result: Any, *, historical: bool = False) -> str:
     """Deterministic '## Claim audit' for the technical report: every candidate finding, the checks it
     failed and why, and what the writers were told to do with it."""
     ca = _claim_audit_of(result)
@@ -18382,7 +18297,14 @@ def _claim_audit_section(result: Any) -> str:
     for c in claims:
         failed = "; ".join(f"{n}: {r.get('reason', '')}" for n, r in (c.get("checks") or {}).items()
                            if r.get("verdict") == "fail") or "none"
-        rows.append(f"| {cell(c.get('claim', ''))} | {label.get(c.get('status'), c.get('status'))} | {cell(failed)} |")
+        status = ("historical " + str(c.get("status") or "unknown") + "; not re-validated"
+                  if historical else label.get(c.get("status"), c.get("status")))
+        rows.append(f"| {cell(c.get('claim', ''))} | {status} | {cell(failed)} |")
+    if historical:
+        return ("## Historical claim audit\n\nThe following statements and checks are preserved from the "
+                "original analysis. They were not re-validated in this report-only revision and may "
+                "reflect omitted tool responses. They do not certify the revised conclusions; use the "
+                "verified accepted artifacts and requested corrections above.\n\n" + "\n".join(rows) + "\n")
     return ("## Claim audit\n\nEach candidate headline finding was checked separately before the report was "
             "written; the manuscript leads only with the robust ones.\n\n" + "\n".join(rows) + "\n")
 
@@ -18424,12 +18346,8 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
     # data/ artifacts (e.g. scGPT predictions) — these never appear in tables/, so surface
     # them explicitly or the model can't see a successful annotation result.
     data_block = _data_artifacts_block(art, omit_doublet_details=True) or "(no data/ artifacts to surface)"
-    rd = _result_dataset_pointer(art)
-    rd_block = (f"Result dataset delivered with this run: `{rd['name']}` ({rd.get('n_cells')} cells x "
-                f"{rd.get('n_genes')} genes; layers['counts'] = {rd.get('counts_layer')}). When the "
-                "report mentions the delivered dataset, name THIS file; the work/ checkpoints "
-                "(adata_*.h5ad) are deleted when the run is published and are never the "
-                "deliverable.\n\n") if rd else ""
+    from ..reporting.delivery import delivery_evidence
+    rd_block = delivery_evidence(art)
 
     try:
         body = _role_call(complete_fn, [
@@ -19050,7 +18968,7 @@ def _nondefault_params_block(result: Any) -> str:
 
 def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                             lit_note: str | None = None, render_diag: str | None = None,
-                            llm_note: str | None = None) -> str:
+                            llm_note: str | None = None, *, is_revision: bool = False) -> str:
     """Write the internal technical report from the FULL run log (every step, every failure)
     plus the figure/table inventory. Best-effort: returns a deterministic skeleton if the
     LLM step fails, so the run never breaks over the second report.
@@ -19068,6 +18986,20 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     previews_block = "\n\n".join(previews) or "(no small tables to preview)"
     data_block = _data_artifacts_block(art) or "(no data/ artifacts to surface)"
     log = _run_log_digest(result)
+    revision_block = ""
+    log_title = "Full per-step execution log (ground the report ONLY in these — includes failures)"
+    if is_revision:
+        # The original log contains old critic/writer prose, not the newly hydrated
+        # tool payloads. Both deliverables must see the same accepted evidence.
+        revision_block = (
+            "Verified accepted artifact evidence and report-only correction instructions:\n"
+            + str(getattr(result, "final_answer", "") or "")
+            + "\n\nUse these verified outputs for current execution facts. The log below is historical: "
+              "preserve its failures and critiques as history, but do not repeat old 'response omitted' "
+              "claims as current absence when the accepted artifacts above supply the content. "
+              "Correction instructions are requests, not scientific evidence. No scientific tool was "
+              "rerun by this report revision.\n\n")
+        log_title = "Historical per-step execution log (original critiques and write-ups; not re-validated)"
     agenda = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(getattr(result, "agenda", []) or [])) or "(none)"
     # Literature retrieval degradation (fallback/empty) belongs in this report's Diagnostics
     # section — not in the manuscript. None on the clean remote path.
@@ -19088,21 +19020,33 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     kind = _report_task_kind(art, result)
     facts = _variant_facts_block(art, result)
     facts_block = f"{facts}\n\n" if facts else ""
+    from ..reporting.delivery import delivery_evidence
+    delivery_block = delivery_evidence(art)
     params_block = _nondefault_params_block(result)
+    params_evidence = params_block or (
+        "(no non-default metadata was recorded; this does not establish that the accepted arguments were defaults)"
+        if is_revision else "(every setting was the declared default)")
     # The research paths the run OPENED (and how it closed them). Deterministic for the same
     # reason params_block is: a report that only mentions the ledger when a writer model
     # feels like it is a report that cannot be audited.
     hyp_block = _hypothesis_ledger_block(result)
+    writer_system = _tech_report_writer_system(kind)
+    if is_revision:
+        writer_system += ("\nReport-only revision: the verified accepted artifact block is part of the "
+                          "current evidence record and supersedes historical statements that those "
+                          "outputs were omitted or unavailable. Preserve old failures as history, "
+                          "not current scientific findings. Do not generate a claim-audit table: "
+                          "the original audit is appended separately with its historical status.")
 
     try:
         body = _role_call(complete_fn, [
-            {"role": "system", "content": _tech_report_writer_system(kind)},
+            {"role": "system", "content": writer_system},
             {"role": "user", "content": (
                 f"Research question:\n{question}\n\n"
                 f"{facts_block}"
                 f"Planned agenda:\n{agenda}\n\n"
-                f"Full per-step execution log (ground the report ONLY in these — includes failures):\n"
-                f"{log}\n\n"
+                f"{delivery_block}{revision_block}"
+                f"{log_title}:\n{log}\n\n"
                 f"Pipeline step degradations (report EACH of these in 'Diagnostics & failures' — "
                 f"name the step, what degraded, and the downstream impact on the results):\n{degr_block}\n\n"
                 f"Literature retrieval status (report this in 'Diagnostics & failures'):\n{lit_block}\n\n"
@@ -19115,7 +19059,7 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                 f"Settings that were NOT the tool's declared default (a table of these is prepended "
                 f"to this report automatically — where the Methods states one of these values, say "
                 f"explicitly that it was chosen for this run rather than inherited from the tool):\n"
-                f"{params_block or '(every setting was the declared default)'}\n\n"
+                f"{params_evidence}\n\n"
                 f"Render-level review findings (include verbatim in 'Diagnostics & failures' if it "
                 f"lists any defects):\n{render_block}\n\n"
                 f"Figures available (reference inline by the exact path shown):\n{fig_list}\n\n"
@@ -19135,9 +19079,11 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
         # describe the run, and the endpoint fact would otherwise be lost entirely.
         prov = f"\n## Model endpoints\n\n{llm_block}\n" if llm_note else ""
         body = (f"# Technical Report\n\n## Run summary\n\n{agenda}\n\n"
-                f"## Pipeline execution log\n\n{log}\n{prov}{diag}")
+                f"{delivery_block}{revision_block}## Pipeline execution log\n\n"
+                + (f"{log_title}:\n" if is_revision else "") + f"{log}\n{prov}{diag}")
     if not (body and body.strip()):
-        body = f"# Technical Report\n\n## Pipeline execution log\n\n{log}\n"
+        body = (f"# Technical Report\n\n{delivery_block}{revision_block}## Pipeline execution log\n\n"
+                + (f"{log_title}:\n" if is_revision else "") + f"{log}\n")
     body = body.strip()
     # Deterministic, and placed FIRST after the title: the settings a run did not inherit from its
     # tools are the fastest way to tell a reproducible result from an improvised one, and this
@@ -19151,8 +19097,8 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     # discretion — it is the record.
     if _HYP_HEADING not in body:
         body = f"{body}\n\n## {_HYP_HEADING}\n\n{hyp_block}\n"
-    audit_section = _claim_audit_section(result)
-    if audit_section and "## Claim audit" not in body:
+    audit_section = _claim_audit_section(result, historical=is_revision)
+    if audit_section and (is_revision or "## Claim audit" not in body):
         body = f"{body}\n\n{audit_section}"
     return _append_output_index(body, figs, tables)
 
@@ -19386,6 +19332,7 @@ def _references_from_accepted_deep_literature(
     No DOI/PMID gate here (unlike the Europe PMC path): the corpus is curated, so every citation
     string names a paper physically in the index — provenance is guaranteed by the corpus itself.
     Nothing is fabricated; only citation strings the tool actually returned are formatted."""
+    from ..agents.tool_names import canonical_tool_name
     rounds = getattr(lab_result, "rounds", None)
     if isinstance(lab_result, dict):
         rounds = lab_result.get("rounds", rounds)
@@ -19399,7 +19346,7 @@ def _references_from_accepted_deep_literature(
             continue
         scientist_result = _round_scientist_result(round_obj)
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") not in ("deep_literature", "search_corpus") \
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) not in ("deep_literature", "search_corpus") \
                     or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
@@ -19437,6 +19384,7 @@ def _references_from_accepted_literature_search(
     only accepted DOI/PMID-backed results from that step; it does not run a report-time fallback
     search.
     """
+    from ..agents.tool_names import canonical_tool_name
     rounds = getattr(lab_result, "rounds", None)
     if isinstance(lab_result, dict):
         rounds = lab_result.get("rounds", rounds)
@@ -19453,7 +19401,7 @@ def _references_from_accepted_literature_search(
         mentioned_dois.update(_normalise_doi(m.group(0)) for m in _DOI_RE.finditer(final_answer))
         mentioned_pmids.update(m.group(1) for m in _PMID_RE.finditer(final_answer))
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "literature_search" or not step.get("ok"):
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "literature_search" or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
             query = str(result.get("query") or (step.get("args") or {}).get("query") or "").strip()
@@ -19565,18 +19513,27 @@ def _write_capability_log(art: Path, result: Any, conn: "Connection",
 
         scg = _scan_tool_invocation(result, "scgpt_annotate")
         if scg is None:
-            lines.append(
-                "- scGPT annotation: NOT INVOKED this run (no scgpt_annotate step ran). "
-                + (f"Available (live session); image={getattr(st, 'scgpt_image', '?')}."
-                   if live else "Not available (mock/offline session — no HPC3 batch lifecycle)."))
+            from ..agents.mcp_bridge import configured_servers
+            server = next((item for item in configured_servers()
+                           if item.name == "scgpt-annotation" and item.adapter == "analysis"
+                           and any(tool["name"] == "scgpt_annotate" for tool in item.tools)), None)
+            availability = (
+                f"MCP catalog configured; image={server.image}. Runtime availability is checked at invocation."
+                if live and server is not None else
+                "Not configured in the MCP catalog." if live else
+                "Not available (mock/offline session — no HPC3 batch lifecycle).")
+            lines.append("- scGPT annotation: NOT INVOKED this run (no scgpt_annotate step ran). "
+                         + availability)
         else:
             status = str(scg.get("status", "unknown"))
             if status == "ok":
                 tail = f" n_cells={scg.get('n_cells')} predictions={scg.get('predictions_csv')}"
             else:
                 tail = f" — {scg.get('note') or scg.get('error') or ''}".rstrip()
-            lines.append(f"- scGPT annotation: INVOKED, status={status}.{tail} "
-                         "(job log fetched to process/scgpt_job.log when the job ran)")
+            identity = scg.get("mcp") or {}
+            if identity.get("name") == "scgpt-annotation":
+                tail += f" MCP version={identity.get('version')} image={identity.get('image')}."
+            lines.append(f"- scGPT annotation: INVOKED, status={status}.{tail}")
 
         if not getattr(st, "vlreview_enabled", False):
             lines.append("- VL render review: DISABLED (AISCIENTIST_VLREVIEW_ENABLED not set).")
@@ -20748,6 +20705,167 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Slurm job names on this deployment start with {prefix!r}.")
     uvicorn.run("aiscientist.gateway.app:app", host=args.host, port=args.port, reload=args.reload)
     return 0
+
+
+
+
+# Report revisions reuse the established writer and durable plan-card protocol.
+def _report_target(conn: Connection, req: LabRequest, *, allow_recovery_error: bool = False) -> "tuple[str, Path, dict] | None":
+    from . import report_revision
+    match = re.search(r"\brun(?:_id)?\s*[:=]?\s*[`\"']?([a-f0-9]{12})\b", req.question, re.IGNORECASE)
+    explicit = match.group(1).lower() if match else None
+
+    def accepted(run_id: str) -> bool:
+        try:
+            report_revision.load_target(conn.workspace, run_id, req.conversation_id)
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+
+    if explicit:
+        candidate = explicit
+    elif _AUTH_ENABLED and conn.app_user_id and req.conversation_id:
+        candidate = auth_routes.latest_run_id_for_conversation(conn.app_user_id, req.conversation_id, accept=accepted)
+    else:
+        candidate = (_conversation_last_run(conn, req.conversation_id) if req.conversation_id else conn.last_run_id)
+    if not candidate or (not explicit and not accepted(candidate)):
+        return None
+    if _AUTH_ENABLED and conn.app_user_id:
+        record = auth_routes.get_run_record(conn.app_user_id, candidate)
+        if not record or (req.conversation_id and str(record.get("conversation_id")) != str(req.conversation_id)):
+            raise ValueError("The report target is not a run in this account and conversation")
+        allowed_states = {"done", "incomplete"} | ({"error"} if allow_recovery_error else set())
+        if record.get("status") not in allowed_states:
+            raise ValueError("The report target must be a finished run with accepted results")
+    art, state = report_revision.load_target(conn.workspace, candidate, req.conversation_id)
+    return candidate, art, state
+
+
+def _show_report_revision(conn: Connection, req: LabRequest, target: tuple[str, Path, dict]) -> None:
+    from . import report_revision
+    run_id, art, _state = target
+    folder = report_revision.create(art, run_id, req.conversation_id, req.question)
+    conn.push(report_revision.prompt(folder))
+    conn.push({"type": "chat_stopped", "awaiting_plan": True, "run_id": run_id,
+               "conversation_id": req.conversation_id})
+
+
+async def _maybe_report_revision(conn: Connection, req: LabRequest) -> bool:
+    if not re.search(r"report|summary|write.?up|报告|总结", req.question, re.IGNORECASE):
+        return False
+    explicit_only = bool(re.search(
+        r"only.{0,35}(?:report|summary)|(?:report|summary).{0,35}only|只.{0,15}(?:报告|总结)",
+        req.question, re.IGNORECASE))
+    try:
+        target = _report_target(conn, req)
+        if target is None:
+            if explicit_only:
+                raise ValueError("No accepted source run was found in this conversation. Name its run ID; no new analysis was started.")
+            return False
+        intent = None
+        if _model_ready(conn):
+            complete_fn, *_ = _lab_llm(conn)
+            intent = await asyncio.to_thread(_classify_followup, complete_fn, target[2], req.question)
+        if not intent or intent["confidence"] < FOLLOWUP_CONFIDENCE or intent["intent"] != "report_only":
+            if explicit_only:
+                raise ValueError("The selected model could not confirm this report-only correction. Reconnect it or clarify the request; no new analysis was started.")
+            return False
+        _show_report_revision(conn, req, target)
+    except (OSError, ValueError) as exc:
+        conn.push({"type": "chat_error", "message": str(exc)})
+    return True
+
+
+async def _report_revision_review(conn: Connection, req: PlanReviewRequest, action: str) -> "JSONResponse | None":
+    from . import report_revision
+    if not req.run_id and not req.conversation_id:
+        return None
+    matches = [(folder, record) for folder, record in report_revision.pending(conn.workspace)
+               if (not req.run_id or record["run_id"] == req.run_id)
+               and (not req.conversation_id or record.get("conversation_id") == req.conversation_id)]
+    if not matches:
+        return None
+    folder, record = matches[0]
+    try:
+        # Revalidate owner/conversation and accepted source state at approval, including after restart.
+        check = LabRequest(connection_id=conn.id, conversation_id=record.get("conversation_id"),
+                           question="Revise report only for run " + record["run_id"])
+        target = _report_target(conn, check)
+        if target is None:
+            raise ValueError("The report's accepted source run is unavailable")
+        if action == "approve":
+            current_job = _read_report_job(target[1])
+            if (current_job.get("state") == "running"
+                    and time.time() - float(current_job.get("started", 0) or 0) <= _REPORT_JOB_STALE_S):
+                return JSONResponse({"error": "This run already has a report writer running."}, status_code=409)
+            import hashlib
+            source = (target[1] / "process/run_state.json").read_bytes()
+            if hashlib.sha256(source).hexdigest() != record["source_state_sha256"]:
+                raise ValueError("The source run changed after this report review; cancel and review a new revision.")
+            if not _model_ready(conn) or conn.status != "ready" or conn.executor is None:
+                return JSONResponse({"error": "Connect the selected session model before writing this report."}, status_code=409)
+            refused = _run_slot_refusal(conn, record.get("conversation_id")) or _budget_refusal(conn, req.budget_ack, req.tz)
+            if refused is not None:
+                return refused
+        record = report_revision.decide(folder, action, feedback=req.feedback or "", plan_yaml=req.plan_yaml or "")
+        if action in {"edit", "revise"}:
+            conn.push(report_revision.prompt(folder, record))
+        else:
+            conn.push({"type": "plan_done", "run_id": record["run_id"],
+                       "conversation_id": record.get("conversation_id")})
+        if action == "approve":
+            run = conn.begin_run(record.get("conversation_id"), run_id=record["run_id"])
+            _note_budget_choice(run, req)
+            run.kind = "report"
+            run.running = True
+            asyncio.create_task(_run_report_revision(conn, run, target[1], folder, record))
+        return JSONResponse({"status": "ok", "action": action, "run_id": record["run_id"]})
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+async def _run_report_revision(conn: Connection, run: RunState, art: Path, folder: Path, record: dict) -> None:
+    from . import report_revision
+    run_id = record["run_id"]
+    try:
+        conn.push({"type": "chat_start"}, run=run)
+        conn.push({"type": "lab_progress", "level": "info",
+                   "text": "Revising this run's report from accepted artifacts; no scientific tools will run."}, run=run)
+        _write_report_job(art, {"run_id": run_id, "state": "running", "started": time.time(), "log": [],
+                                "revision_id": record["revision_id"]})
+        if run.chat_stop.is_set():
+            record.update(state="cancelled", finished_at=datetime.now(timezone.utc).isoformat())
+            report_revision._write_record(folder, record)
+            _write_report_job(art, {"run_id": run_id, "state": "cancelled", "log": [],
+                "revision_id": record["revision_id"], "finished_at": record["finished_at"]})
+            conn.push({"type": "chat_stopped"}, run=run)
+            return
+        await _report_job(conn, conn.owner, run_id, art, revision=(folder, record))
+        status = report_job_status(conn.owner, run_id)
+        record["state"] = "cancelled" if run.chat_stop.is_set() else status["state"]
+        record["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report_revision._write_record(folder, record)
+        if record["state"] == "done":
+            conn.push({"type": "chat_token", "token": "Updated the report for run " + run_id
+                       + ". Its accepted scientific results and original state were preserved. "
+                       + "[Open the revised report](/api/file/" + conn.owner + "/" + run_id + "/report/report.md)"}, run=run)
+            conn.push({"type": "artifacts", "items": [{"name": Path(f["path"]).name, "kind": "report",
+                       "url": f["url"]} for f in status["files"]],
+                       "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"}, run=run)
+            conn.push({"type": "chat_done"}, run=run)
+        elif record["state"] == "cancelled":
+            conn.push({"type": "chat_stopped"}, run=run)
+        else:
+            conn.push({"type": "chat_error", "message": status.get("error") or "The report revision failed."}, run=run)
+    except Exception as exc:  # a failed write must keep its durable review and source evidence
+        record.update(state="error", error=public_error(exc), finished_at=datetime.now(timezone.utc).isoformat())
+        report_revision._write_record(folder, record)
+        _write_report_job(art, {"run_id": run_id, "state": "error", "error": public_error(exc),
+            "revision_id": record["revision_id"], "finished_at": record["finished_at"], "log": []})
+        conn.push({"type": "chat_error", "message": public_error(exc)}, run=run)
+    finally:
+        run.running = False
+        conn.end_run(run)
 
 
 if __name__ == "__main__":

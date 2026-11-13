@@ -341,7 +341,11 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                 if not isinstance(args, dict):
                     return {"status": "error", "error": "MCP arguments must be an object"}
                 if s.adapter == "analysis":
-                    args = a.authoritative(args, ctx, e["name"], executor)
+                    try:
+                        args = a.authoritative(args, ctx, e["name"], executor)
+                    except (ValueError, TypeError, KeyError, OSError) as exc:
+                        return {**a.failure({"status": "error", "error": f"Invalid MCP deployment settings: {exc}"}),
+                                "mcp": s.identity()}
                 error = next(v.iter_errors(args), None)
                 if error is not None:
                     return {"status": "error", "error": "Invalid MCP arguments: " + error.message}

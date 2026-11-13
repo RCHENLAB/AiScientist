@@ -1,32 +1,32 @@
 ---
 name: phenotype_variant_diagnosis
 description: Diagnose a rare-disease CASE — a VCF **plus** the patient's clinical description (free text, any language) — by reconciling two independent tracks: the prioritised variant shortlist (VEP/ClinVar/predictors) and a phenotype-driven per-disease differential (HPO → LIRICAL post-test probability). Use ONLY when the case's phenotype/symptoms/diagnosis are actually given; a VCF alone is the variant_annotation protocol.
-tools: annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
+tools: mcp_annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
 data_type: variants
 outputs:
   - path: tables/variant_annotation.tsv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: One row per annotated variant with gene, location, rsID, consequence, impact, ClinVar significance, gnomAD allele frequency, SIFT and PolyPhen, and predictor scores where they are configured.
     required: true
   - path: tables/variant_consequence_distribution.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: Number and percentage of annotated variants per functional consequence.
     required: true
   - path: tables/variant_clinical_significance.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: Number and percentage of annotated variants per ClinVar clinical significance, with not_in_clinvar for variants ClinVar does not list.
     required: true
   - path: tables/clinvar_pathogenic_variants.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: The ClinVar pathogenic and likely pathogenic variants with gene, position, rsID and significance, a header only when there are none.
     required: false
   - path: tables/high_priority_variants.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: Rare variants not in ClinVar that are high impact, predicted deleterious or IRD-flagged, ranked, at most 50, a header only when there are none.
     required: false
   - path: phenotype/lirical*.tsv
@@ -63,17 +63,17 @@ worse than no differential at all. `run_lirical` will refuse an empty phenotype;
 
 ## The two tracks (they are INDEPENDENT — do not make one wait on the other)
 
-`run_lirical` does **not** consume `annotate_variants`' output: in genotype-aware mode it scores the raw
+`run_lirical` does **not** consume `mcp_annotate_variants`' output: in genotype-aware mode it scores the raw
 VCF itself via its own Exomiser database. So the tracks are parallel and only meet at the reconcile step.
 Plan them as distinct agenda steps:
 
-### Track A — variants (`annotate_variants`)
+### Track A — variants (`mcp_annotate_variants`)
 Follow the `variant_annotation` protocol's approach; the essentials, not restated in full here:
 1. **QC the callset** (`vcf_qc_stats` skill) — Ti/Tv, call rate; a flagged callset caveats everything after.
 2. **Known genes FIRST + drop common variants** — restrict to the disease-gene panel (`genes` /
    `regions_bed`) and set `max_pop_af=0.01`. STATE the panel and the cutoff. Expand genome-wide only if
    the in-panel search is negative.
-3. **Annotate** — assembly is auto-detected from the VCF header; `annotate_variants` normalizes
+3. **Annotate** — assembly is auto-detected from the VCF header; `mcp_annotate_variants` normalizes
    internally (do NOT plan a separate normalize step). Report `execution_mode`.
 4. **Prioritise** — lead with the `high_priority_variants` shortlist the tool already wrote. Report from
    its tables; do not hand-roll `run_code` to re-derive them.

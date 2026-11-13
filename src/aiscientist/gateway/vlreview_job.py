@@ -12,8 +12,7 @@ a **separate, on-demand, short-lived batch job** (Route C, exactly like scGPT):
 - NOT a second *persistent* GPU (which would hold a scarce card for the whole session).
 
 The review is one-shot: load Qwen2.5-VL -> rasterize the pdf -> audit each page -> write
-``review.json`` -> exit, releasing the GPU. That is the same shape as
-:mod:`aiscientist.gateway.scgpt_job`, so this module is a thin, GPU-flavoured wrapper over the
+``review.json`` -> exit, releasing the GPU. This module is a thin GPU wrapper over the
 :mod:`aiscientist.gateway.slurm_job` batch engine. Everything goes through the
 ``RemoteExecutor`` protocol, so the whole lifecycle runs offline against a scripted fake in
 tests — no real Slurm, no GPU.

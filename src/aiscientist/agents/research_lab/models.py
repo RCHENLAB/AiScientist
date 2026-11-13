@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable
 from ...reporting.qc_summary import qc_result_summary
+from ..plan_doc import PlanDoc
 from ..tool_names import canonical_tool_name
 from ..scope import QC_ONLY_TOOLS, qc_only_run
 from ..preset_pipelines import PresetPipeline
@@ -476,6 +478,42 @@ class ResumeState:
     redo_indices: "frozenset[int] | None" = None   # None = evaluate; else the exact 0-based set to re-run
     self_sourced: str = ""
     report_requested: bool = False   # the plan had a write_report step, kept out of ``agenda`` (#102)
+    approved_plan: "PlanDoc | None" = None
+    plan_context: "dict[str, Any] | None" = None
+    review_requested: bool = False
+    reviewed_note: str = ""
+    status_recovery: bool = False  # verified task-only draft; always reviewed before execution
+
+    @property
+    def needs_plan_review(self) -> bool:
+        return self.approved_plan is not None and (self.review_requested or bool(self.modify_note.strip())
+            or any(self.approved_plan.step_for(step) is None for step in self.agenda))
+
+    def to_review_state(self) -> dict[str, Any]:
+        """Durable continuation inputs while the same run waits for an edited plan."""
+        return {**({"question": self.approved_plan.request}
+                   if self.approved_plan and self.approved_plan.request else {}),
+                "agenda": list(self.agenda), "rounds": [r.to_dict() for r in self.prior_rounds],
+                "from_step_index": self.from_step_index, "modify_note": self.modify_note,
+                "redo_indices": sorted(self.redo_indices) if self.redo_indices is not None else None,
+                "status_recovery": self.status_recovery, "reviewed_note": self.reviewed_note,
+                "guidance": self.guidance, "self_sourced": self.self_sourced,
+                "report_requested": self.report_requested, "plan_context": self.plan_context,
+                "approved_plan_yaml": self.approved_plan.to_yaml() if self.approved_plan else ""}
+
+    @classmethod
+    def from_review_state(cls, state: dict[str, Any], *, question: str | None = None) -> "ResumeState":
+        # The YAML editor intentionally ignores its request field. Older review records
+        # omitted question; restore it from the trusted outer saved run, never edited YAML.
+        if question is not None:
+            if "question" in state and state["question"] != question:
+                raise ValueError("The saved continuation question does not match its original run.")
+            state = {**state, "question": question}
+        if state.get("status_recovery") and not state.get("question"):
+            raise ValueError("Status recovery requires the original saved run question.")
+        return replace(cls.from_run_state(state, int(state["from_step_index"]),
+                                          modify_note=str(state.get("modify_note") or ""),
+                                          redo_indices=state.get("redo_indices")), review_requested=True)
 
     @classmethod
     def from_run_state(cls, state: dict[str, Any], from_step_index: int, *, modify_note: str = "",
@@ -486,11 +524,17 @@ class ResumeState:
         re-run it (see :meth:`ResearchLab._evaluate_redo_indices`)."""
         rounds = [LabRound.from_dict(r) for r in state.get("rounds", [])]
         kept = [r for r in rounds if r.verdict.verdict == "accept"]
+        from ..plan_doc import parse_plan_yaml
+        approved = (parse_plan_yaml(state["approved_plan_yaml"], request=str(state.get("question", "")))
+                    if state.get("approved_plan_yaml") else None)
         return cls(list(state.get("agenda", [])), kept, int(from_step_index),
                    modify_note=modify_note, guidance=guidance or state.get("guidance"),
                    redo_indices=frozenset(redo_indices) if redo_indices is not None else None,
                    self_sourced=str(state.get("self_sourced") or ""),
-                   report_requested=bool(state.get("report_requested", False)))
+                   report_requested=bool(state.get("report_requested", False)),
+                   approved_plan=approved, plan_context=copy.deepcopy(state.get("plan_context")),
+                   status_recovery=bool(state.get("status_recovery", False)),
+                   reviewed_note=str(state.get("reviewed_note") or ""))
 
     @classmethod
     def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
@@ -506,7 +550,8 @@ class ResumeState:
                              "there is nothing left to continue. Re-run a chosen step instead.")
         return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
                    redo_indices=frozenset(todo), self_sourced=resume.self_sourced,
-                   report_requested=resume.report_requested)
+                   report_requested=resume.report_requested, approved_plan=resume.approved_plan,
+                   plan_context=resume.plan_context)
 
 
 def _from_fields(cls: Any, data: "dict[str, Any]") -> Any:

@@ -27,8 +27,8 @@ LOG = logging.getLogger(__name__)
 LOCK = threading.RLock()
 
 # HPCSettings field -> the line of the session that runs its jobs in that image.
-IMAGE_LINES = (("analysis", "analysis_image"), ("report", "report_image"), ("variants", "vep_image"),
-               ("phenotype", "lirical_image"), ("scgpt", "scgpt_image"), ("report_review", "vlreview_image"),
+IMAGE_LINES = (("analysis", "analysis_image"), ("report", "report_image"),
+               ("phenotype", "lirical_image"), ("report_review", "vlreview_image"),
                ("model_server", "vllm_image"))
 
 

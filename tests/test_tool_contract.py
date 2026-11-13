@@ -14,13 +14,17 @@ import re
 from pathlib import Path
 
 from aiscientist.tools import catalog
+from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG, load_servers
+from aiscientist.agents.tool_names import canonical_tool_name
+
+NATIVE_NAMES = {server.planner_name(tool["name"]) for server in load_servers(DEFAULT_CONFIG) for tool in server.tools}
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "aiscientist"
 
 # Domain tools the platform's own code names as exact string literals, and where.
 PLATFORM_RELIES_ON = {
-    "annotate_variants": "gateway/app.py: VCF staging and the variant executor",
+    "annotate_variants": "agents/mcp_analysis.py: native variant VCF and assembly binding",
     "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab/: literature steps",
     "diagnose_disease": "agents/mcp_model.py: trusted literature model binding for MCP diagnosis",
     "map_phenotype_to_hpo": "agents/mcp_analysis.py, agents/mcp_model.py: case-note authority and session model",
@@ -42,7 +46,7 @@ PLATFORM_RELIES_ON = {
     "run_marker_annotation": "agents/scope.py: the plain word 'annotation' in a user's limit",
     "run_pseudobulk_de": "agents/research_lab/: DE producers",
     "run_scanpy_qc": "gateway/app.py, agents/research_lab/: QC steps",
-    "scgpt_annotate": "gateway/app.py, gateway/scgpt_runner.py, agents/research_lab/: scGPT steps",
+    "scgpt_annotate": "gateway/app.py, agents/tool_names.py: native MCP scGPT result reporting",
 }
 
 PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",
@@ -62,7 +66,7 @@ def _platform_literals() -> set[str]:
 
 
 def test_every_tool_the_platform_names_exists():
-    missing = set(PLATFORM_RELIES_ON) - set(catalog.names())
+    missing = set(PLATFORM_RELIES_ON) - (set(catalog.names()) | {canonical_tool_name(name) for name in NATIVE_NAMES})
     assert not missing, (f"the platform keys logic on {sorted(missing)}, which no tool folder provides; "
                          "rename the references or restore the tools")
 
@@ -73,7 +77,7 @@ def test_the_platform_declares_every_tool_name_it_uses():
                             "PLATFORM_RELIES_ON so a rename in the tools package is caught")
 
 
-_TOOLISH = re.compile(r"`((?:run|make|map|annotate|diagnose|inspect|deep|literature|scgpt|read|search|describe)"
+_TOOLISH = re.compile(r"`((?:mcp|run|make|map|annotate|diagnose|inspect|deep|literature|scgpt|read|search|describe)"
                       r"_[a-z0-9_]+)(?:\(|`)")
 
 
@@ -107,7 +111,7 @@ def test_pipelines_name_only_tools_that_exist():
 
     # A pipeline's own name is a legitimate thing for these documents to mention (`scgpt_annotation`
     # is a pipeline, not a misspelt `scgpt_annotate`).
-    known = set(catalog.names()) | PLATFORM_TOOLS | set(PIPELINES) | set(NAMED_SKILLS)
+    known = set(catalog.names()) | NATIVE_NAMES | PLATFORM_TOOLS | set(PIPELINES) | set(NAMED_SKILLS)
     bad = [f"{path}: `{name}`" for path in _pipelines_dir().rglob("*.md")
            for name in toolish_names(path.read_text(encoding="utf-8")) if name not in known]
     assert not bad, "pipelines name tools that do not exist:\n" + "\n".join(sorted(set(bad)))

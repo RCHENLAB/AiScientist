@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from aiscientist.gateway import scgpt_job, vlreview_job, worker
+from aiscientist.gateway import vlreview_job, worker
 from aiscientist.gateway.settings import SHARED_ROOT, HPCSettings
 from aiscientist.gateway.slurm_analysis import SlurmAnalysisExecutor
 from aiscientist.gateway.slurm_job import SlurmJobSpec
@@ -33,7 +33,7 @@ from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 GATEWAY_DIR = Path(worker.__file__).parent
 
 # Every job line the gateway starts on HPC3, by the name of its directory under Temp/<user>/scratch/.
-JOB_LINES = {"analysis", "runcode", "variant", "phenotype", "paperqa", "report", "worker"}
+JOB_LINES = {"analysis", "runcode", "phenotype", "paperqa", "report", "worker"}
 
 
 # --- no default: a caller that names no directory does not get the home directory ---------------
@@ -109,7 +109,7 @@ def test_the_report_renderer_the_gateway_builds_writes_under_temp(tmp_path):
     assert fn.scratch_dir == f"{SHARED_ROOT}/sessions/{conn.id}/jobs/report"
 
 
-# --- scGPT and the render review: the script goes beside the job's log --------------------------
+# --- the render review: the script goes beside the job's log --------------------------
 
 
 class _Submitted(Exception):
@@ -121,22 +121,6 @@ def _capture(seen: list):
         seen.append(spec)
         raise _Submitted
     return run_batch_job
-
-
-OUT = f"{SHARED_ROOT}/Temp/tester/scgpt/run1/out"
-
-
-def test_the_scgpt_script_is_written_in_the_runs_output_directory(monkeypatch):
-    seen: list[SlurmJobSpec] = []
-    monkeypatch.setattr(scgpt_job, "run_batch_job", _capture(seen))
-    with pytest.raises(_Submitted):
-        scgpt_job.run_scgpt_inference(
-            types.SimpleNamespace(username="tester"), HPCSettings(),
-            input_h5ad=f"{SHARED_ROOT}/Temp/tester/scgpt/run1/query.h5ad", model_dir="/dfs/model",
-            out_dir=OUT)
-    (spec,) = seen
-    assert spec.submit_dir == OUT
-    assert f"#SBATCH --output={OUT}/{spec.job_name}-%j.log" in spec.script
 
 
 def test_the_render_review_script_is_written_in_its_output_directory(monkeypatch):

@@ -1,0 +1,87 @@
+[
+  {
+    "name": "inspect_dataset",
+    "description": "Skim an uploaded file of any type and return deterministic peek evidence plus a description:\nVCF assembly/sample IDs, HDF5 tree, table columns or an unknown/binary descriptor. Only a bounded\nhead is read, never the whole matrix. An explicitly configured model may summarize that evidence;\notherwise the original deterministic fallback is returned. Do not invent facts beyond it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "default": "",
+          "description": "Admitted server-side file; omit to use the bound dataset.",
+          "title": "Path",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "inspect_datasetArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "make_schematic",
+    "description": "Render a conceptual workflow, pathway or mechanism as a PNG from auditable Graphviz DOT text.\nA deterministic renderer draws the figure. Use analysis tools for data plots. Example:\ndigraph { QC -> Clustering -> \"DE per cluster\" -> Enrichment }. External file/image references\nare refused; output always stays in this analysis's artifacts/figures directory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "description": "The diagram in Graphviz DOT.",
+          "title": "Source",
+          "type": "string"
+        },
+        "basename": {
+          "default": "schematic",
+          "description": "Short name for the figure file.",
+          "title": "Basename",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "title": "make_schematicArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "data_utilities_job_status",
+    "description": "Poll an inspection or schematic task. COMPLETED includes its original structured result;\nFAILED includes the error. A missing Graphviz dependency is never a successful figure.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "data_utilities_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

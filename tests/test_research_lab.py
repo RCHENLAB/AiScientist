@@ -2566,7 +2566,7 @@ def test_pipeline_loader_reads_tools():
     from aiscientist.agents.presets import PRESETS, get_preset
 
     p = get_preset("scgpt_annotation")
-    assert "scgpt_annotate" in p.tools                      # tools: frontmatter parsed
+    assert "mcp_scgpt_annotate" in p.tools                      # tools: frontmatter parsed
     # The CodeAct templates a pipeline names are skills of the pinned release
     # (tests/test_pinned_release.py checks that they resolve).
     assert "differential_expression" in PRESETS and "gene_signature_scoring" in PRESETS

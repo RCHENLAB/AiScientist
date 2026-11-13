@@ -571,7 +571,7 @@ class SlurmAnalysisExecutor:
         )
         # Bind the dataset's PARENT DIRECTORY, never the bare file: a file bind FATALs with
         # "destination ... doesn't exist in container" when that path is absent from the image
-        # (scgpt_job binds dirname() for the same reason). And when the dataset already lives
+        # And when the dataset already lives
         # under the rw-bound workspace, skip the extra bind entirely - the workspace bind
         # already exposes it, and a duplicate ro/rw bind of the same tree can conflict.
         def _outside_ws(path: str) -> str:

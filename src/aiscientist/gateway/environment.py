@@ -86,14 +86,18 @@ def tool_index(catalog: list[Any] | None = None) -> list[dict[str, Any]]:
         if t.name == "finish":               # loop control, not a research capability
             continue
         requires = list(getattr(t, "requires", ()) or ())
+        declaration = isinstance(t, system_info._ConfiguredMCPTool)
         out.append({
             "name": t.name,
             "category": getattr(t, "category", "general"),
             "purpose": _first_sentence(getattr(t, "description", "")),
             "source": _source_of(getattr(t, "executor", None)),
             "requires": requires,
-            "available": all(system_info._have(d) for d in requires),
-            "enabled": bool(getattr(t, "enabled", True)),
+            "available": None if declaration else all(system_info._have(d) for d in requires),
+            "enabled": False if declaration else bool(getattr(t, "enabled", True)),
+            **({"mcp": t.server.identity(), "entrypoint": t.server.entrypoint,
+                "availability_note": "Needs an authorized session, pinned skill image and compute executor."}
+               if declaration else {}),
         })
     out.sort(key=lambda x: (x["category"], x["name"]))
     return out
@@ -140,7 +144,6 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
         _remote("container", "Analysis image (run_code, scanpy line)", settings.analysis_image,
                 "Fixed at build time and read-only. A package it lacks is resolved into the shared "
                 "cache below, not installed into the image."),
-        _remote("container", "scGPT image", settings.scgpt_image),
         _remote("model", "scGPT weights + vocabulary + label map", settings.scgpt_model_dir,
                 "best_model.pt, vocab.json, id2type.json, dev_train_args.yml. scgpt_annotate binds "
                 "this read-only into its GPU job. HUMAN RETINA reference: a human-symbol vocabulary "
@@ -235,8 +238,9 @@ def render_markdown(manifest: dict[str, Any]) -> str:
               "`source` is where the function actually lives, so a tool can be found without grepping.",
               "", "| tool | what it does | source | available |", "|---|---|---|---|"]
     for t in manifest["tools"]:
-        ok = "yes" if t["available"] and t["enabled"] else "**no**"
-        src = f"`{t['source']}`" if t["source"] else "—"
+        ok = "session required" if "mcp" in t else "yes" if t["available"] and t["enabled"] else "**no**"
+        src = (f"native image `{t['mcp']['image']}`" if "mcp" in t else
+               f"`{t['source']}`" if t["source"] else "—")
         lines.append(f"| `{t['name']}` | {t['purpose']} | {src} | {ok} |")
     lines.append("")
 
@@ -268,6 +272,11 @@ def render_for_agent(manifest: dict[str, Any], section: str = "all") -> str:
     if section in ("all", "tools"):
         out.append("TOOLS (name | source | available)")
         for t in manifest["tools"]:
-            flag = "" if (t["available"] and t["enabled"]) else "  [UNAVAILABLE in this deployment]"
-            out.append(f"  {t['name']} | {t['source'] or '?'}{flag}")
+            if "mcp" in t:
+                out.append(f"  {t['name']} | native image {t['mcp']['image']} | "
+                           "DECLARED; SESSION AVAILABILITY NOT CHECKED")
+                out.append(f"      {t['availability_note']}")
+            else:
+                flag = "" if (t["available"] and t["enabled"]) else "  [UNAVAILABLE in this deployment]"
+                out.append(f"  {t['name']} | {t['source'] or '?'}{flag}")
     return "\n".join(out)

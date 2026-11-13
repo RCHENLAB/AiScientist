@@ -1,0 +1,189 @@
+[
+  {
+    "name": "map_phenotype_to_hpo",
+    "description": "Map free clinical text to the bundled HPO closed set. No model: conservative lexical mapping; ambiguous negation/family history returns needs_llm mode. Pass observed/excluded HPO IDs to downstream tools.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "description": "Clinical description of this patient's observed/absent findings.",
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        },
+        "k": {
+          "default": 8,
+          "maximum": 30,
+          "minimum": 1,
+          "title": "K",
+          "type": "integer"
+        },
+        "analysis_id": {
+          "default": "default",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "map_phenotype_to_hpoArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_lirical",
+    "description": "Rank diseases with LIRICAL using grounded observed/excluded HPO terms. If a VCF and matching server Exomiser reference exist, score genotype-aware; otherwise phenotype-only. Returns original calibrated probabilities, artifacts and job IDs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "hpo_terms": {
+          "description": "Observed HPO IDs from map_phenotype_to_hpo.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Hpo Terms",
+          "type": "array"
+        },
+        "excluded_hpo": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Hpo",
+          "type": "array"
+        },
+        "sample_id": {
+          "default": "sample-1",
+          "title": "Sample Id",
+          "type": "string"
+        },
+        "vcf_path": {
+          "default": "",
+          "title": "Vcf Path",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hpo_terms"
+      ],
+      "title": "run_liricalArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "diagnose_disease",
+    "description": "Adjudicate LIRICAL and retrieved literature into one differential. The server's literature MCP connection can rescue uncurated candidate genes and flag contradictions. Evidence grades and ranking scores never overwrite LIRICAL probabilities; missing evidence remains ungraded.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "hpo_terms": {
+          "description": "Observed grounded HPO IDs.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Hpo Terms",
+          "type": "array"
+        },
+        "excluded_hpo": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Hpo",
+          "type": "array"
+        },
+        "candidate_genes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Candidate Genes",
+          "type": "array"
+        },
+        "max_literature_queries": {
+          "default": 6,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Max Literature Queries",
+          "type": "integer"
+        },
+        "sample_id": {
+          "default": "sample-1",
+          "title": "Sample Id",
+          "type": "string"
+        },
+        "vcf_path": {
+          "default": "",
+          "title": "Vcf Path",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hpo_terms"
+      ],
+      "title": "diagnose_diseaseArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "phenotype_job_status",
+    "description": "Read the durable state and original result of one phenotype task, including failed jobs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$",
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "phenotype_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

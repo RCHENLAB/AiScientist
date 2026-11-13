@@ -6,14 +6,31 @@ MCP or analysis packages. Registration reads local configuration and schemas; it
 does not start a server, discover tools over the network, or download a catalog.
 
 This client bridge implements the transport for [issue #94](https://github.com/RCHENLAB/AiScientist/issues/94).
-Atlas expression remains the released default. The seven analysis adapters can be
-activated by a reviewed deployment registry after their release images and schemas
-are pinned; no unreleased image digest is invented or enabled by default. The
-existing application tools remain available. CPU, GPU and `inprocess` declarations
+The default registry includes Atlas and the seven released analysis servers below.
+Registration still requires the matching installed skill and an appropriate executor.
+CPU, GPU and `inprocess` declarations
 use the pinned image executor and the skill's policy; `AISCI_EXECUTOR=inline` makes
 the server finish in that allocation. This does not import server code on the
-gateway or start nested Slurm jobs. MCP sampling and authenticated HTTP transport
-are not implemented.
+gateway or start nested Slurm jobs. Model-backed tools use the selected session's
+model through trusted runtime settings and the guarded relay described below.
+The server transport is stdio; authenticated remote MCP HTTP is not implemented.
+
+| Server | Package version | Replaced scientific tools |
+| --- | --- | ---: |
+| `scrna-analysis` | `0.0.5` | 11 |
+| `cellqc` | `0.0.5` | 1 |
+| `literature` | `0.0.4` | 4 |
+| `variant-annotation` | `0.0.2` | 1 |
+| `phenotype-diagnosis` | `0.0.4` | 3 |
+| `scgpt-annotation` | `0.0.3` | 1 |
+| `data-utilities` | `0.0.2` | 2 |
+
+The seven releases are published in `liujs123456/aiscientist-mcp` and paired with
+`liujs123456/aiscientist-skills` `v0.2.5`. The registry records the exact OCI digest,
+schema checksum and resource policy for every server; version tags alone are
+never executed. Atlas retains its upstream `0.0.3` pin. Changing the release
+owner during upstream promotion requires reviewing actual published assets and
+updating both the server registry and skills release together.
 
 ## Registry and tool schemas
 
@@ -211,7 +228,7 @@ Transport and registration are generic; `AtlasAdapter` in
 `agents/mcp_analysis.py` is the trusted adapter for `cellqc`, `scrna-analysis`,
 `scgpt-annotation`, `variant-annotation`, `phenotype-diagnosis`, `literature` and
 `data-utilities`. These names cannot use the generic adapter. Their planner prefix
-must begin with `mcp_`, so `mcp_run_cellqc` can coexist with the legacy `run_cellqc`.
+must begin with `mcp_`, such as `mcp_run_cellqc`.
 Wire names remain unchanged. Atlas's behavior and default pin are unchanged.
 
 Inputs come from the executor's bound dataset, dataset folder and attached input
@@ -267,8 +284,7 @@ are rejected. Native Anthropic uses provider-supported sampling and reasoning
 settings, with adaptations surfaced by the gateway; JSON-object output is checked
 after completion and an invalid object is a failed request with its real usage
 still recorded. This is a bounded transport adapter, not a claim of compatibility
-with every OpenAI API option. Existing tool routes remain available while real
-same-session acceptance is completed.
+with every OpenAI API option.
 
 The collector accepts `artifact_root` only inside
 `$AISCI_DATA_DIR/<server>/<analysis_id>/`, refuses symlinks in sources and
@@ -279,13 +295,22 @@ from that same analysis into `AISCIENTIST_WORK`. Failed results do not publish n
 checkpoints. This is the bridge's only cross-server checkpoint handoff; arbitrary
 returned paths are never followed.
 
-`mcp/<server>/<analysis_id>/<tool>.json` retains the full JSON evidence. A server's
+Task-bearing calls retain full JSON evidence at
+`mcp/<server>/<analysis_id>/tasks/<task_id>/<tool>.json`. Polling one task cannot
+replace another task's evidence. A managed `<operation>.json` alias may advance
+on a new scientific call; a status call refreshes only the alias already owned
+by that same task. Untracked historical files are preserved. A server's
 own `full_result` is read only when it identifies regular JSON within the same
 analysis. Paths in the returned data and evidence are rewritten to artifact-relative
-paths, checkpoint filenames or redacted attachment/server labels. Oversized responses
-are bounded to 14,000 serialized characters with a `full_result` link. Flat domain
-fields support existing downstream tools, while the complete bounded domain object
-also appears under `result`; execution status and provenance remain protected.
+paths, checkpoint filenames or redacted attachment/server labels. Scientific prose
+such as `(LCA3)/Retinitis` is preserved; a slash alone is not evidence of a server path.
+Oversized responses retain a bounded view of scientific outcomes and a `full_result`
+link. The adapter first removes duplicate flat fields and excess artifact navigation
+before shortening evidence. A shortened view explicitly records omissions; missing
+rows are not evidence of absence. Literature previews retain returned answers and
+source identifiers, and phenotype previews preserve negative association findings.
+Execution status and provenance remain protected. CellQC parameter declarations
+identify supported fields separately from the values actually used by a completed task.
 A server `status=error`, failed state or MCP error cannot become `status=ok` merely
 because the containing process exited successfully.
 
@@ -296,6 +321,15 @@ completed task cannot replace current report files or checkpoints. Namespaced
 evidence remains available independently. Failed results do not replace those
 successful compatibility outputs.
 
+An explicit report-only follow-up can revise a finished run without rerunning
+scientific tools. The normal plan review shows one `write_report` step targeting
+the original run. Its durable review and prior report live under
+`process/report_revisions/<revision_id>/`; the scientific plan and accepted run
+state remain unchanged. The writer verifies each accepted full-result artifact's
+task identity and checksum before constructing its report view. Historical
+truncated claims are re-evaluated against those results. The session's selected
+model, budget and cancellation controls also govern this revision.
+
 CellQC's `result_directory` is separately confined and recursively inventoried.
 Every regular file, including per-library matrices, is copied to the run's
 `result/cellqc/`; links, traversal and special files are refused before publication.
@@ -303,8 +337,10 @@ The gateway's internal `data/cellqc_result.json` is rebuilt from that real inven
 and the verified run-local destination, enabling the existing ZIP, save and stage-out
 flows. Only this internal pointer retains the destination's absolute path; public
 MCP evidence uses relative paths. Nested result paths retain their directory structure
-in downloads and saved datasets. Temporary copies stay under `work/`, outside the
-stage-out result tree.
+in downloads and saved datasets. Atomic export staging and rollback directories stay
+on the result filesystem so separate Apptainer bind mounts do not cause cross-device
+renames. Incomplete internal directories prevent stage-out rather than appearing as
+valid scientific results.
 
 ## Dedicated literature routes and local retrieval
 
@@ -388,3 +424,42 @@ uv run --isolated --no-project \
   --server 'python -m aiscientist_mcp.atlas_expression_exploration.server' \
   > /tmp/atlas-tools.json
 ```
+
+### Explicit ordered workflows
+
+A request such as `Run exactly these registered MCP tool calls in this order`,
+followed by numbered `` `mcp_tool_name` {"argument": "value"} `` entries, is treated
+as a structured plan input. Every name must belong to a configured analysis
+adapter, every JSON object must be complete and unambiguous, and the live tool's
+full input schema validates it before review. Unavailable tools fail planning.
+This applies to the registered literature pipeline and other analysis servers;
+ordinary literature questions still use the search/curation console.
+
+The plan document stores all supplied settings directly, including nested arrays,
+objects and multiline source code. The normal plan card still permits approval,
+edits and cancellation. It does not add analyses or a report step to this literal
+call list. During execution the approved settings are the complete argument
+object: omitted fields retain server defaults, the model cannot add `rerun` or
+change an omitted scientific setting, and another scientific tool is refused for
+that step. Read-only metadata/status checks remain available. The session's
+selected model, resource, billing, budget and cancellation paths are unchanged.
+# Saved plans across tool retirement
+
+Restoring a saved plan does not rename retired scientific tools automatically. A
+pending step that names an unavailable migrated tool requires a replacement plan
+and normal review. The error names a replacement only when the reviewed analysis
+server registers that exact wire identity and its public name is in the live
+catalog. Completed historical steps can still be reused without reinstalling the
+old implementation. Their original settings and evidence remain unchanged.
+
+Continuations restore the complete approved YAML document and planning context,
+including nested JSON arguments and explicit workflow scope. Changing a typed
+step through the existing re-run flow opens the normal editable plan card in the
+same run before execution. The waiting card also saves the continuation's prior
+rounds, so a gateway restart does not turn that review into a new analysis. On
+approval, the reviewed tool and settings replace the old step's pins, while the
+change reason still informs downstream dependency selection. A reviewed plan
+containing only registered job-status calls uses the exact-call guard and cannot
+launch a new scientific job. Prose-only historical continuations retain their
+existing behavior. Added, removed or reordered steps require a newly reviewed
+study rather than silently changing continuation indices.

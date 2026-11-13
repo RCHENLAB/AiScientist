@@ -12,7 +12,9 @@
       "tools_file": "mcp/atlas-expression-exploration-0.0.3.tools.json",
       "tools_sha256": "069f629e1056c37b57d3e6173d6b257200c4cc8b70782b128fa6a6111fcb0020",
       "adapter": "atlas-expression",
-      "aliases": {"write_report": "atlas_write_report"},
+      "aliases": {
+        "write_report": "atlas_write_report"
+      },
       "timeout": 15000,
       "resources": {
         "resolve_genes": [
@@ -56,6 +58,393 @@
           "00:30:00"
         ]
       }
+    },
+    {
+      "name": "scrna-analysis",
+      "version": "0.0.5",
+      "release_tag": "scrna-analysis-v0.0.5",
+      "image": "docker://ghcr.io/liujs123456/mcp-scrna-analysis@sha256:6bf03b30e2c9a3af6043eef1751518494ae59b728cb175faf003ecab697b7afa",
+      "entrypoint": "scrna-analysis-mcp",
+      "skill": "analyze-scrna-with-mcp",
+      "runs_on": "hpc:analysis",
+      "tools_file": "mcp/scrna-analysis-0.0.5.tools.json",
+      "tools_sha256": "cc3186da0106a47b04464e389e597165ea0574f7314ad6388961e9ade170dd9f",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "run_scanpy_qc": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_clustering": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_de": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_enrichment": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_depth_matched_de": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_gsea_prerank": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_doublet_detection": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_integration": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_pseudobulk_de": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_composition": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "run_marker_annotation": [
+          8,
+          48,
+          "01:00:00"
+        ],
+        "scrna_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "SCRNA_GENESETS_DIR"
+      ]
+    },
+    {
+      "name": "cellqc",
+      "version": "0.0.5",
+      "release_tag": "cellqc-v0.0.5",
+      "image": "docker://ghcr.io/liujs123456/mcp-cellqc@sha256:c9e83a362e6bc7a10609d76d53861f5ac59fade870e262d86aba8399d4c724e1",
+      "entrypoint": "cellqc-mcp",
+      "skill": "qc-cellranger-with-mcp",
+      "runs_on": "hpc:analysis",
+      "tools_file": "mcp/cellqc-0.0.5.tools.json",
+      "tools_sha256": "349f4d867f01690da693f45356aeb9df69ac11797feedc8f8cf4476bc29b3c18",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "run_cellqc": [
+          16,
+          80,
+          "02:00:00"
+        ],
+        "cellqc_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": []
+    },
+    {
+      "name": "literature",
+      "version": "0.0.4",
+      "release_tag": "literature-v0.0.4",
+      "image": "docker://ghcr.io/liujs123456/mcp-literature@sha256:ea3d66b0b7bc6f217da5dd78e1fd16ae018cea780e45728a097fbaa306fd12e7",
+      "entrypoint": "literature-mcp",
+      "skill": "read-evidence-with-mcp",
+      "runs_on": "hpc:literature",
+      "tools_file": "mcp/literature-0.0.4.tools.json",
+      "tools_sha256": "1e9ed327be26a46a33774b5fe47388f612642af05eba6042a13ecec84441be0f",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "literature_search": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "search_corpus": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "deep_literature": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "extract_haploinsufficient_genes": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "literature_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "LITERATURE_AGENT_TIMEOUT",
+        "LITERATURE_ANSWER_LENGTH",
+        "LITERATURE_CACHE_DIR",
+        "LITERATURE_CONCURRENCY",
+        "LITERATURE_CORPUS_ROOT",
+        "LITERATURE_EMBEDDING",
+        "LITERATURE_EVIDENCE_K",
+        "LITERATURE_HF_CACHE",
+        "LITERATURE_HGNC",
+        "LITERATURE_INDEX_DIR",
+        "LITERATURE_INDEX_NAME",
+        "LITERATURE_LLM_TIMEOUT",
+        "LITERATURE_MANIFEST",
+        "LITERATURE_MAX_SOURCES",
+        "LITERATURE_MODEL",
+        "LITERATURE_MODEL_ENDPOINT",
+        "LITERATURE_MODEL_MAX_TOKENS",
+        "LITERATURE_MODEL_TIMEOUT",
+        "LITERATURE_PAPERS",
+        "LITERATURE_REASONING_EFFORT",
+        "LITERATURE_SEARCH_COUNT",
+        "LITERATURE_SUMMARY_REASONING_EFFORT",
+        "LITERATURE_TEMPERATURE"
+      ]
+    },
+    {
+      "name": "variant-annotation",
+      "version": "0.0.2",
+      "release_tag": "variant-annotation-v0.0.2",
+      "image": "docker://ghcr.io/liujs123456/mcp-variant-annotation@sha256:92c875d268b8f89054860cedd13dcbd5b53498e9321868180e9e56a2b56eb388",
+      "entrypoint": "variant-annotation-mcp",
+      "skill": "annotate-vcf-with-mcp",
+      "runs_on": "hpc:variant",
+      "tools_file": "mcp/variant-annotation-0.0.2.tools.json",
+      "tools_sha256": "6151ae2c2f104849193f273a0c69d623762f3c776e209b3a07fbb1e28bc6e6d1",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "annotate_variants": [
+          4,
+          16,
+          "01:00:00"
+        ],
+        "variant_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "VARIANT_ALLOW_REST",
+        "VARIANT_DEFAULT_GENE_PANEL",
+        "VARIANT_DEFAULT_MAX_POP_AF",
+        "VARIANT_DEFAULT_REGIONS_BED",
+        "VARIANT_IRD_ANNOTATE",
+        "VARIANT_IRD_ATAC",
+        "VARIANT_IRD_ATAC_GRCH37",
+        "VARIANT_IRD_ATAC_GRCH38",
+        "VARIANT_IRD_DBSCSNV",
+        "VARIANT_IRD_DBSCSNV_GRCH37",
+        "VARIANT_IRD_DBSCSNV_GRCH38",
+        "VARIANT_IRD_HGMD",
+        "VARIANT_IRD_HGMD_GRCH37",
+        "VARIANT_IRD_HGMD_GRCH38",
+        "VARIANT_IRD_RETINA_EXONS",
+        "VARIANT_IRD_RETINA_EXONS_GRCH37",
+        "VARIANT_IRD_RETINA_EXONS_GRCH38",
+        "VARIANT_REF_FASTA",
+        "VARIANT_REF_FASTA_GRCH37",
+        "VARIANT_REF_FASTA_GRCH38",
+        "VARIANT_SPLICEAI",
+        "VARIANT_SPLICEAI_BIN",
+        "VARIANT_SPLICEAI_MAX_VARIANTS",
+        "VARIANT_SPLICEAI_MODELS",
+        "VARIANT_SPLICEAI_MODELS_GRCH37",
+        "VARIANT_SPLICEAI_MODELS_GRCH38",
+        "VARIANT_VEP_ALPHAMISSENSE",
+        "VARIANT_VEP_ALPHAMISSENSE_GRCH37",
+        "VARIANT_VEP_ALPHAMISSENSE_GRCH38",
+        "VARIANT_VEP_CACHE_DIR",
+        "VARIANT_VEP_CACHE_DIR_GRCH37",
+        "VARIANT_VEP_CACHE_DIR_GRCH38",
+        "VARIANT_VEP_CADD_INDELS",
+        "VARIANT_VEP_CADD_INDELS_GRCH37",
+        "VARIANT_VEP_CADD_INDELS_GRCH38",
+        "VARIANT_VEP_CADD_SNV",
+        "VARIANT_VEP_CADD_SNV_GRCH37",
+        "VARIANT_VEP_CADD_SNV_GRCH38",
+        "VARIANT_VEP_CLINVAR",
+        "VARIANT_VEP_CLINVAR_GRCH37",
+        "VARIANT_VEP_CLINVAR_GRCH38",
+        "VARIANT_VEP_FORK",
+        "VARIANT_VEP_PLUGINS",
+        "VARIANT_VEP_PLUGINS_DIR",
+        "VARIANT_VEP_PLUGINS_DIR_GRCH37",
+        "VARIANT_VEP_PLUGINS_DIR_GRCH38",
+        "VARIANT_VEP_REVEL",
+        "VARIANT_VEP_REVEL_GRCH37",
+        "VARIANT_VEP_REVEL_GRCH38"
+      ]
+    },
+    {
+      "name": "phenotype-diagnosis",
+      "version": "0.0.4",
+      "release_tag": "phenotype-diagnosis-v0.0.4",
+      "image": "docker://ghcr.io/liujs123456/mcp-phenotype-diagnosis@sha256:10af1539b9d86ebe6e33fa39506b9c58630c5c8bbec5eacaaab16894b656803b",
+      "entrypoint": "phenotype-diagnosis-mcp",
+      "skill": "rank-phenotype-differentials-with-mcp",
+      "runs_on": "hpc:phenotype",
+      "tools_file": "mcp/phenotype-diagnosis-0.0.4.tools.json",
+      "tools_sha256": "7f73f5992a8ef098d255cc5ede073212346844e7dfc6f03ad78ccea050136e23",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "map_phenotype_to_hpo": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "run_lirical": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "diagnose_disease": [
+          4,
+          24,
+          "01:00:00"
+        ],
+        "phenotype_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "LIRICAL_ASSEMBLY",
+        "LIRICAL_DATA_DIR",
+        "LIRICAL_EXOMISER_HG19",
+        "LIRICAL_EXOMISER_HG38",
+        "LIRICAL_TIMEOUT",
+        "LITERATURE_AGENT_TIMEOUT",
+        "LITERATURE_ANSWER_LENGTH",
+        "LITERATURE_CACHE_DIR",
+        "LITERATURE_CONCURRENCY",
+        "LITERATURE_CORPUS_ROOT",
+        "LITERATURE_EMBEDDING",
+        "LITERATURE_EVIDENCE_K",
+        "LITERATURE_HF_CACHE",
+        "LITERATURE_HGNC",
+        "LITERATURE_INDEX_DIR",
+        "LITERATURE_INDEX_NAME",
+        "LITERATURE_LLM_TIMEOUT",
+        "LITERATURE_MANIFEST",
+        "LITERATURE_MAX_SOURCES",
+        "LITERATURE_MODEL",
+        "LITERATURE_MODEL_ENDPOINT",
+        "LITERATURE_MODEL_MAX_TOKENS",
+        "LITERATURE_MODEL_TIMEOUT",
+        "LITERATURE_PAPERS",
+        "LITERATURE_REASONING_EFFORT",
+        "LITERATURE_SEARCH_COUNT",
+        "LITERATURE_SUMMARY_REASONING_EFFORT",
+        "LITERATURE_TEMPERATURE",
+        "PHENOTYPE_HPO_LEXICON",
+        "PHENOTYPE_LITERATURE_TIMEOUT",
+        "PHENOTYPE_MODEL",
+        "PHENOTYPE_MODEL_ENDPOINT",
+        "PHENOTYPE_MODEL_MAX_TOKENS",
+        "PHENOTYPE_MODEL_TIMEOUT"
+      ]
+    },
+    {
+      "name": "scgpt-annotation",
+      "version": "0.0.3",
+      "release_tag": "scgpt-annotation-v0.0.3",
+      "image": "docker://ghcr.io/liujs123456/mcp-scgpt-annotation@sha256:1133d106342831e9d6cd7fc5961e38eb2043142852219105bac269065213b2d5",
+      "entrypoint": "scgpt-annotation-mcp",
+      "skill": "annotate-cells-with-scgpt-mcp",
+      "runs_on": "gpu:scgpt",
+      "tools_file": "mcp/scgpt-annotation-0.0.3.tools.json",
+      "tools_sha256": "de3b7d71a27ab7c83f81b08bb849a1122d9307365ece4bc8b0c5d3849ac90103",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "scgpt_annotate": [
+          4,
+          48,
+          "01:00:00"
+        ],
+        "scgpt_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "SCGPT_MODEL_DIR",
+        "SCGPT_REFACTOR"
+      ]
+    },
+    {
+      "name": "data-utilities",
+      "version": "0.0.2",
+      "release_tag": "data-utilities-v0.0.2",
+      "image": "docker://ghcr.io/liujs123456/mcp-data-utilities@sha256:dd89779ffa9d42597d7dc3d856a2cf71fb8d0552e1e778713092ffdc09aa951c",
+      "entrypoint": "data-utilities-mcp",
+      "skill": "inspect-data-and-draw-schematics-with-mcp",
+      "runs_on": "inprocess",
+      "tools_file": "mcp/data-utilities-0.0.2.tools.json",
+      "tools_sha256": "4ba96a4f44fa0449db0c602719079cd69768ad1479fbb0a4d415fa5af96537d9",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "inspect_dataset": [
+          2,
+          8,
+          "00:30:00"
+        ],
+        "make_schematic": [
+          2,
+          8,
+          "00:30:00"
+        ],
+        "data_utilities_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "DATA_UTILITIES_MODEL",
+        "DATA_UTILITIES_MODEL_ENDPOINT",
+        "DATA_UTILITIES_MODEL_TIMEOUT"
+      ]
     }
   ]
 }

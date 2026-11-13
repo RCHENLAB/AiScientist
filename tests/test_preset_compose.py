@@ -35,7 +35,12 @@ def test_every_pipeline_declares_real_tools():
     """A pipeline's ``tools:`` frontmatter is surfaced on the System page as the capability boundary it
     composes. Nothing resolves those names at load time, so a typo would silently advertise a tool that
     does not exist — and the PI would plan a step around it."""
+    from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG, load_servers
+    # This is a declaration contract. Runtime catalogs correctly omit an MCP
+    # tool when no pinned skill or cluster executor is installed in this test.
     catalog = {t.name for t in build_scientist_catalog()}
+    catalog |= {server.planner_name(tool["name"]) for server in load_servers(DEFAULT_CONFIG)
+                for tool in server.tools}
     unknown = {k: [t for t in p.tools if t not in catalog] for k, p in PIPELINES.items()}
     assert {k: v for k, v in unknown.items() if v} == {}
 
@@ -50,7 +55,7 @@ def test_phenotype_pipeline_is_the_vcf_plus_case_path():
     the phenotype tools on top. The two must stay distinguishable to the router by description alone."""
     p = get_pipeline("phenotype_variant_diagnosis")
     assert p.data_type == "variants"                       # so a scanpy pinned pipeline is dropped on it
-    assert {"map_phenotype_to_hpo", "run_lirical", "annotate_variants"} <= set(p.tools)
+    assert {"map_phenotype_to_hpo", "run_lirical", "mcp_annotate_variants"} <= set(p.tools)
     # the precondition a router / PI must be able to read off the one-liner
     assert "only when" in p.label.lower() or "only if" in p.label.lower()
 
@@ -137,13 +142,14 @@ def test_the_deterministic_content_route_still_reports_the_gap():
     assert picked and picked[0]["unavailable_tools"] == ["scgpt_annotate"]
 
 
-def test_a_tool_is_enabled_by_default_and_scgpt_reports_its_own_state():
-    from aiscientist.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
+def test_tool_availability_remains_an_explicit_catalog_property():
+    from aiscientist.agents.research_harness import HarnessTool
 
-    # Present either way — the roster stays honest about what exists — but not usable without a
-    # live GPU session, which is exactly the distinction pipeline routing needs.
-    assert make_scgpt_annotate_tool(None).enabled is False
-    assert make_scgpt_annotate_tool(lambda args, ctx: {"status": "ok"}).enabled is True
+    tool = HarnessTool(name="example", description="", parameters={}, executor=lambda args, ctx: {})
+    assert tool.enabled is True
+    disabled = HarnessTool(name="example", description="", parameters={},
+                           executor=lambda args, ctx: {}, enabled=False)
+    assert disabled.enabled is False
 
 
 # --- the provenance gate must stay two-sided ----------------------------------------------

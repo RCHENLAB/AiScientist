@@ -5,6 +5,7 @@ settings. The collector is stdlib-only Python executed inside the pinned image.
 """
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import PurePosixPath
 import re
@@ -13,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .mcp_bridge import PreparedCall, READ_RESULT
+from .mcp_result_summary import project_result
 
 PREFIXES = {
     "cellqc": "CELLQC", "scrna-analysis": "SCRNA", "scgpt-annotation": "SCGPT",
@@ -20,7 +22,7 @@ PREFIXES = {
     "literature": "LITERATURE", "data-utilities": "DATA_UTILITIES",
 }
 # Settings are names, never registry values. Credentials continue through skill
-# policy; neither arbitrary environment forwarding nor executable overrides exist.
+# policy; model arguments cannot select environment variables or executables.
 _PATHS = {
     "cellqc": set(),
     "scrna-analysis": {"SCRNA_GENESETS_DIR"},
@@ -29,7 +31,7 @@ _PATHS = {
         "VEP_CACHE_DIR", "VEP_CLINVAR", "REF_FASTA", "VEP_CADD_SNV", "VEP_CADD_INDELS",
         "VEP_ALPHAMISSENSE", "VEP_REVEL", "VEP_PLUGINS_DIR", "SPLICEAI_MODELS",
         "IRD_HGMD", "IRD_RETINA_EXONS", "IRD_ATAC", "IRD_DBSCSNV")
-        for suffix in ("", "_GRCH37", "_GRCH38")},
+        for suffix in ("", "_GRCH37", "_GRCH38")} | {"VARIANT_DEFAULT_REGIONS_BED", "VARIANT_SPLICEAI_BIN"},
     "phenotype-diagnosis": {"LIRICAL_DATA_DIR", "LIRICAL_EXOMISER_HG19", "LIRICAL_EXOMISER_HG38",
                             "PHENOTYPE_HPO_LEXICON"},
     "literature": {"LITERATURE_CORPUS_ROOT", "LITERATURE_PAPERS", "LITERATURE_CACHE_DIR",
@@ -39,14 +41,16 @@ _PATHS = {
 _VALUES = {
     "cellqc": set(), "scrna-analysis": set(), "scgpt-annotation": set(),
     "variant-annotation": {"VARIANT_ALLOW_REST", "VARIANT_VEP_FORK", "VARIANT_SPLICEAI_MAX_VARIANTS",
-                           "VARIANT_SPLICEAI", "VARIANT_IRD_ANNOTATE", "VARIANT_VEP_PLUGINS"},
+                           "VARIANT_SPLICEAI", "VARIANT_IRD_ANNOTATE", "VARIANT_VEP_PLUGINS",
+                           "VARIANT_DEFAULT_GENE_PANEL", "VARIANT_DEFAULT_MAX_POP_AF"},
     "phenotype-diagnosis": {"LIRICAL_ASSEMBLY", "LIRICAL_TIMEOUT", "PHENOTYPE_MODEL_ENDPOINT",
                             "PHENOTYPE_MODEL", "PHENOTYPE_MODEL_TIMEOUT", "PHENOTYPE_MODEL_MAX_TOKENS",
                             "PHENOTYPE_LITERATURE_TIMEOUT"},
     "literature": {"LITERATURE_MODEL_ENDPOINT", "LITERATURE_MODEL", "LITERATURE_MODEL_TIMEOUT",
                    "LITERATURE_EMBEDDING", "LITERATURE_INDEX_NAME", "LITERATURE_REASONING_EFFORT",
                    "LITERATURE_SUMMARY_REASONING_EFFORT", "LITERATURE_ANSWER_LENGTH", "LITERATURE_MODEL_MAX_TOKENS",
-                   "LITERATURE_EVIDENCE_K", "LITERATURE_MAX_SOURCES", "LITERATURE_SEARCH_COUNT", "LITERATURE_CONCURRENCY"},
+                   "LITERATURE_EVIDENCE_K", "LITERATURE_MAX_SOURCES", "LITERATURE_SEARCH_COUNT", "LITERATURE_CONCURRENCY",
+                   "LITERATURE_TEMPERATURE", "LITERATURE_LLM_TIMEOUT", "LITERATURE_AGENT_TIMEOUT"},
     "data-utilities": {"DATA_UTILITIES_MODEL_ENDPOINT", "DATA_UTILITIES_MODEL", "DATA_UTILITIES_MODEL_TIMEOUT"},
 }
 
@@ -64,10 +68,25 @@ def validate_settings(server: str, names: Any) -> None:
 
 def setting_values(server) -> dict[str, str]:
     validate_settings(server.name, server.settings_env)
+    defaults = {}
+    if server.name == "variant-annotation":
+        from .variant_settings import deployment_values
+        defaults = deployment_values()
+    elif server.name == "scgpt-annotation":
+        from ..gateway.settings import HPCSettings
+        defaults = {"SCGPT_MODEL_DIR": HPCSettings.from_env().scgpt_model_dir}
+    elif server.name == "scrna-analysis":
+        # Only an explicit administrator setting carries over. Never infer an
+        # Eye Server package path as a path available on the compute host.
+        defaults = {"SCRNA_GENESETS_DIR": os.environ.get("AISCIENTIST_GENESETS_DIR", "")}
     values = {}
     for name in server.settings_env:
-        value = os.environ.get(name, "")
+        value = os.environ.get(name, defaults.get(name, ""))
         if not value:
+            if server.name == "scrna-analysis" and name in os.environ:
+                values[name] = ""  # explicit native setting disables the legacy fallback
+            if server.name == "variant-annotation" and (name in defaults or name in os.environ):
+                values[name] = ""  # an explicitly empty assembly-specific setting blocks base fallback
             continue
         if any(ch in value for ch in ("\x00", "\n", "\r")):
             raise ValueError(f"Invalid deployment setting {name}")
@@ -91,8 +110,12 @@ def setting_paths(server) -> tuple[str, ...]:
     """
     paths = []
     for name, value in setting_values(server).items():
-        if name in _PATHS[server.name]:
+        if name in _PATHS[server.name] and value:
             parent = str(PurePosixPath(value).parent)
+            if name == "VARIANT_SPLICEAI_BIN":
+                # Administrator-managed SpliceAI needs its bin and lib trees;
+                # model arguments cannot select this executable or mount.
+                parent = str(PurePosixPath(value).parent.parent)
             if parent == "/":
                 raise ValueError(f"{name} cannot require mounting the filesystem root")
             paths.append(parent)
@@ -113,14 +136,38 @@ AISCI_MCP_ROOTS
 export AISCI_MCP_READ_ROOTS
 '''
 
-COLLECT = READ_RESULT + r'''
+# A path token begins at a string or after an opening delimiter, not after
+# arbitrary punctuation in scientific names (for example "(LCA3)/Retinitis").
+# A standalone slash is prose, not a path. Exact secrets and known output roots
+# are handled separately before this final unrecognized-path filter.
+_PATH_TOKEN = r'''[^\s"'<>{},;)\]]+'''
+_PATH_ROOTS = r"(?:dfs[0-9][A-Za-z0-9]*|data|home|Users|private|tmp|var|opt|etc|usr|mnt|scratch|srv|run|proc|sys|root|work)"
+_SERVER_PATH_PATTERN = (
+    # An absolute value, or a quoted/assigned path, provides direct path evidence.
+    rf'''(?:^|(?<=["'=]))/(?!/){_PATH_TOKEN}'''
+    # In prose require a known filesystem root or multiple path segments.
+    # "phenotype /genotype" and "(condition) / comparison" remain scientific text.
+    rf'''|(?<![^\s:(\[])/(?!/)(?:{_PATH_ROOTS}(?=/|$|[\s"'<>{{}},;)\]])(?:/{_PATH_TOKEN})?|[^/\s"'<>{{}},;)\]]+/{_PATH_TOKEN})'''
+)
+
+COLLECT = (READ_RESULT + "\n" + inspect.getsource(project_result)
+           + "\nSERVER_PATH_PATTERN = " + repr(_SERVER_PATH_PATTERN)) + r'''
 import fcntl, hashlib, re, shutil, stat, tempfile
 server = os.environ["AISCI_MCP_SERVER"]
 analysis = os.environ["AISCI_MCP_ANALYSIS"]
+wire_tool = os.environ["AISCI_MCP_TOOL"]
+status_call = wire_tool.endswith("_job_status")
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", analysis):
     raise ValueError("invalid analysis identifier")
 if result.get("analysis_id", analysis) != analysis:
     raise ValueError("server returned another analysis identifier")
+requested_task = os.environ.get("AISCI_MCP_REQUEST_TASK", "")
+if status_call and result.get("task_id") != requested_task:
+    raise ValueError("server returned another task identifier")
+returned_task = result.get("task_id", "")
+if returned_task and (not isinstance(returned_task, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", returned_task)):
+    raise ValueError("server returned an invalid task identifier")
 def configured_root(name):
     root = Path(os.environ[name])
     if not root.is_absolute() or root.is_symlink():
@@ -159,6 +206,21 @@ def checked(path, root, directory=False, exists=True):
 # Check ancestors too: a symlinked server/analysis must never redirect copying.
 checked(base, data, directory=True, exists=False)
 checked(dest, artifacts, directory=True, exists=False)
+operations = json.loads(os.environ.get("AISCI_MCP_OPERATIONS", "[]"))
+operation = wire_tool if not status_call and wire_tool in operations else None
+if status_call:
+    # The payload's free-form `tool` field is scientific data, never authority
+    # to select an operation alias. Read the confined native request instead.
+    request_file = checked(base / "jobs" / requested_task / "request.json", base, exists=False)
+    if request_file.is_file():
+        request_record = json.loads(request_file.read_text())
+        if not isinstance(request_record, dict):
+            raise ValueError("native request metadata must be a JSON object")
+        declared = request_record.get("operation", request_record.get("tool"))
+        if declared is None and server == "cellqc":
+            declared = "run_cellqc"
+        if declared in operations:
+            operation = declared
 if not work.is_dir():
     raise ValueError("run checkpoint directory is unavailable")
 if os.environ.get("AISCI_MCP_CASE_NOTE") == "1" and "text_source" in result:
@@ -209,6 +271,9 @@ if not isinstance(compat, dict) or not isinstance(compat.get("files"), dict) or 
 checkpoint_owners = compat.setdefault("checkpoints", {})
 if not isinstance(checkpoint_owners, dict):
     raise ValueError("invalid checkpoint compatibility record")
+evidence_owners = compat.setdefault("evidence", {})
+if not isinstance(evidence_owners, dict):
+    raise ValueError("invalid evidence compatibility record")
 identity = {"analysis_id": analysis, "task_id": result.get("task_id", "")}
 previous = compat["current"].get(server)
 handoff = successful and (not os.environ["AISCI_MCP_TOOL"].endswith("_job_status")
@@ -319,11 +384,15 @@ if checkpoints and server == "cellqc":
 # A server may bound its own response before transport. Preserve that full JSON
 # too, but only if it is a regular JSON file inside this analysis.
 full_server = None
+source_result_sha256 = None
 if result.get("full_result"):
     source = checked(result["full_result"], base)
     if source.suffix != ".json":
         raise ValueError("full_result must identify JSON evidence")
     full_server = json.loads(source.read_text())
+    if not isinstance(full_server, dict):
+        raise ValueError("full_result must contain a JSON object")
+    source_result_sha256 = checksum(source)
 
 dest.mkdir(parents=True, exist_ok=True)
 for source, target in copies:
@@ -340,8 +409,10 @@ for source, target in copies:
 
 if full_target is not None:
     full_target.parent.mkdir(parents=True, exist_ok=True)
-    # Interrupted copies are machinery, not deliverables for stage_out's result/ walk.
-    staging = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-", dir=work))
+    # work/ and result/ are separate Apptainer bind mounts. Both publication
+    # renames must stay inside result/, even when their host files share a disk.
+    # stage_out refuses these internal directories if publication is interrupted.
+    staging = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-", dir=full_target.parent))
     backup = None
     try:
         for source, name, _ in full_tree:
@@ -349,7 +420,7 @@ if full_target is not None:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
         if full_target.exists():
-            backup = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-old-", dir=work))
+            backup = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-old-", dir=full_target.parent))
             backup.rmdir()
             os.replace(full_target, backup)
         try:
@@ -390,7 +461,7 @@ def clean(value):
                 value = value.replace(path, replacement)
         # Absolute paths elsewhere in server messages/settings are evidence
         # metadata, not permission to expose or copy that host location.
-        value = re.sub(r"(?<![\w:/])/(?!/)[^\s\"'<>{},;]*", "[server path]", value)
+        value = re.sub(SERVER_PATH_PATTERN, "[server path]", value)
     return value
 result = clean(result)
 def write_json(target, value):
@@ -437,22 +508,39 @@ if checkpoints:
     result["checkpoint_path"] = Path(primary).name
     result["checkpoint"] = Path(primary).name
     result["exported_checkpoints"] = list(dict.fromkeys(path.name for path in checkpoints))
-full_name = os.environ["AISCI_MCP_TOOL"] + ".json"
+if full_server is not None:
+    # The server may already have truncated its transport preview. Project the
+    # confined full scientific result, not that preview's first few citations.
+    # Live status/identity wins over a stored result from an earlier attempt.
+    envelope = {key: result[key] for key in (
+        "status", "state", "analysis_id", "task_id", "job_id", "elapsed_s", "note", "error",
+        "isError", "is_error", "checkpoint", "checkpoint_path", "exported_checkpoints",
+        "cellqc_result", "result_directory") if key in result}
+    result = {**clean(full_server), **envelope, "source_result_sha256": source_result_sha256}
+    result.pop("response_omitted", None)
+full_name = ((Path("tasks") / returned_task / (wire_tool + ".json")).as_posix()
+             if returned_task else wire_tool + ".json")
 full = dest / full_name
 checked(full, artifacts, exists=False)
-evidence = clean(full_server) if full_server is not None else result
-fd, temp = tempfile.mkstemp(prefix=".mcp-result-", dir=dest)
-try:
-    with os.fdopen(fd, "w") as stream:
-        json.dump(evidence, stream, ensure_ascii=False, allow_nan=False)
-    os.replace(temp, full)
-finally:
-    if os.path.exists(temp):
-        os.unlink(temp)
+write_json(full, result)
+evidence_owner = {"server": server, **identity, "operation": operation, "sha256": checksum(full)}
+evidence_owners[(relative / full_name).as_posix()] = evidence_owner
+if operation is not None and successful:
+    canonical_rel = (relative / (operation + ".json")).as_posix()
+    canonical = checked(artifacts / canonical_rel, artifacts, exists=False)
+    owner = evidence_owners.get(canonical_rel)
+    # A new scientific call can advance its managed operation alias; a status
+    # call can only refresh the same task. Untracked legacy files stay intact.
+    tracked = (isinstance(owner, dict) and canonical.is_file()
+               and checksum(canonical) == owner.get("sha256")
+               and all(owner.get(key) == evidence_owner[key] for key in ("server", "analysis_id", "operation")))
+    if (not canonical.exists() or (tracked and (not status_call or owner.get("task_id") == returned_task))):
+        write_json(canonical, result)
+        evidence_owners[canonical_rel] = {**evidence_owner, "sha256": checksum(canonical)}
+write_json(compat_path, compat)
 result["full_result"] = (relative / full_name).as_posix()
 if len(json.dumps(result)) > 14000:
-    result = {key: result[key] for key in ("status", "state", "analysis_id", "task_id", "job_id",
-              "checkpoint", "checkpoint_path", "exported_checkpoints", "full_result") if key in result}
+    result = project_result(server, result)
     result["response_omitted"] = True
     if failed:
         result["error"] = "MCP analysis failed; inspect full_result for the complete evidence"
@@ -484,6 +572,8 @@ class AnalysisAdapter:
                 if dataset.lower().endswith((".vcf", ".vcf.gz")):
                     args["vcf_path"] = dataset
         if self.server.name == "variant-annotation" and tool == "annotate_variants":
+            from .variant_settings import default_arguments
+            args = {**default_arguments(setting_values(self.server), args), **args}
             assembly = decisions.get("mcp_variant_assembly")
             if assembly in {"GRCh37", "GRCh38"}:
                 args["assembly"] = assembly
@@ -499,6 +589,10 @@ class AnalysisAdapter:
         analysis = args.get("analysis_id", "default")
         if not isinstance(analysis, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", analysis):
             raise ValueError("analysis_id must be a simple identifier")
+        task = args.get("task_id", "") if tool.endswith("_job_status") else ""
+        if tool.endswith("_job_status") and (not isinstance(task, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", task)):
+            raise ValueError("task_id must be a simple identifier")
         dataset = str(getattr(executor, "dataset_path", "") or "")
         root = str(getattr(executor, "dataset_root", "") or "")
         inputs = [row for row in (getattr(executor, "inputs", ()) or ()) if isinstance(row, dict) and row.get("path")]
@@ -517,8 +611,12 @@ class AnalysisAdapter:
                 raise ValueError("input path must identify exactly one attached dataset or input")
             return matches.pop()
 
+        values = setting_values(self.server)
+        trusted_bed = values.get("VARIANT_DEFAULT_REGIONS_BED", "") if self.server.name == "variant-annotation" else ""
         for key in ("dataset", "vcf_path", "regions_bed", "path"):
             if args.get(key):
+                if key == "regions_bed" and trusted_bed and args[key] == trusted_bed:
+                    continue  # exact administrator reference, mounted by setting_paths()
                 args[key] = bind(args[key])
                 if key == "dataset" and args[key] in {dataset, root}:
                     args.pop(key)  # container's executor-owned DATASET/ROOT is authoritative
@@ -540,13 +638,14 @@ class AnalysisAdapter:
                     or not re.fullmatch(r"[A-Za-z0-9_.*?\[\]-]+\.(?:h5ad|rnk)", parts[-1])):
                 raise ValueError("input must be a filename or a relative path inside work/ or artifacts/")
         prefix = PREFIXES[self.server.name]
-        values = setting_values(self.server)
         from .mcp_model import prepare_model
         model_binding, model_setup = prepare_model(self.server.name, tool, executor, values, arguments=args)
         setup = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in values.items())
         setup += model_setup
         setup += BOUND_SETUP
         setup += f'export {prefix}_DATASET="${{AISCIENTIST_DATASET:-}}" {prefix}_READ_ROOTS="$AISCI_MCP_READ_ROOTS"\n'
+        if trusted_bed:
+            setup += f'export VARIANT_READ_ROOTS="$AISCI_MCP_READ_ROOTS"{shlex.quote(":" + trusted_bed)}\n'
         if self.server.name == "cellqc":
             setup += 'export CELLQC_DATASET="${AISCIENTIST_DATASET_ROOT:-${AISCIENTIST_DATASET:-}}"\n'
         if self.server.name == "scrna-analysis":
@@ -564,6 +663,9 @@ class AnalysisAdapter:
             secret_names = list(dict.fromkeys([*secret_names, model_binding.secret_name]))
         setup += f"export AISCI_MCP_SECRET_NAMES={shlex.quote(json.dumps(secret_names))}\n"
         setup += f"export AISCI_MCP_ANALYSIS={shlex.quote(analysis)}\n"
+        setup += f"export AISCI_MCP_REQUEST_TASK={shlex.quote(task)}\n"
+        operations = [entry["name"] for entry in self.server.tools if not entry["name"].endswith("_job_status")]
+        setup += f"export AISCI_MCP_OPERATIONS={shlex.quote(json.dumps(operations))}\n"
         case_note = (self.server.name == "phenotype-diagnosis" and tool == "map_phenotype_to_hpo"
                      and bool((getattr(ctx, "decisions", None) or {}).get("case_note")))
         setup += f"export AISCI_MCP_CASE_NOTE={int(case_note)}\n"
@@ -575,7 +677,7 @@ class AnalysisAdapter:
         # must not expose host locations either; skill policy already redacts keys.
         def clean(value):
             if isinstance(value, str):
-                return re.sub(r"(?<![\w:/])/(?!/)[^\s\"'<>{},;]*", "[server path]", value)
+                return re.sub(_SERVER_PATH_PATTERN, "[server path]", value)
             if isinstance(value, list):
                 return [clean(item) for item in value]
             if isinstance(value, dict):
@@ -597,17 +699,51 @@ class AnalysisAdapter:
         if self.server.name == "phenotype-diagnosis" and (getattr(ctx, "decisions", None) or {}).get("case_note"):
             if "text_source" in result:
                 response["text_source"] = result["text_source"] = "attached_case_note"
+        if self.server.name == "cellqc":
+            declaration = next((entry for entry in self.server.tools if entry["name"] == "run_cellqc"), None)
+            if declaration is not None:
+                response["parameter_schema"] = {
+                    "tool": self.server.planner_name("run_cellqc"),
+                    "sha256": self.server.tools_sha256,
+                    "declared_parameters": sorted(declaration["inputSchema"].get("properties", {})),
+                    "note": "Supported parameters, not evidence of the values used by a completed task.",
+                }
         # The public flat compatibility fields and nested evidence may duplicate
         # rows. Bound the complete response as well, leaving room for MCP identity.
         import json
         if len(json.dumps(response)) > 12500:
-            summary = {key: result[key] for key in ("state", "analysis_id", "task_id", "job_id", "full_result",
-                       "checkpoint", "checkpoint_path", "exported_checkpoints") if key in result}
-            summary["response_omitted"] = True
-            response = {**summary, **{key: response[key] for key in
-                        ("status", "returncode", "provenance", "environment", "execution_mode", "skill")
-                        if key in response}, "result": summary}
-            if result.get("status") == "error":
-                response["error"] = "MCP analysis failed; inspect full_result for the complete evidence"
-            response["artifacts"] = out.get("artifacts", [])[:50]
+            metadata = {key: response[key] for key in
+                        ("status", "returncode", "slurm_state", "slurm_job_id", "slurm_node", "node",
+                         "provenance", "environment", "execution_mode", "skill", "parameter_schema") if key in response}
+            error = response.get("error")
+            if metadata.get("status") == "error":
+                metadata["error"] = (str(error)[:1500] if error else
+                                     "MCP analysis failed; inspect full_result for the complete evidence")
+            # First remove duplicate flat rows and optional artifact listings.
+            # A 9KB native result often fits intact once it is no longer repeated.
+            flat = project_result(self.server.name, result, 2200)
+            response = {**flat, **metadata, "result": result, "response_compacted": True}
+            if not result.get("response_omitted"):
+                response["response_summary"]["scope"] = "flat_compatibility_fields"
+                response["response_summary"]["note"] = "The complete native response is retained in result."
+            if len(json.dumps(response)) > 12500:
+                summary = project_result(self.server.name, result, 4500)
+                summary["response_omitted"] = True
+                response = {**summary, **metadata, "result": summary, "response_compacted": True}
+                if len(json.dumps(response)) > 12500:
+                    # Unicode escaping can expand a byte-bounded preview. Keep
+                    # one nested copy plus the small compatibility view in that case.
+                    flat = project_result(self.server.name, summary, 1400)
+                    response = {**flat, **metadata, "result": summary, "response_compacted": True}
+            # Artifact paths are optional navigation, never a reason to discard
+            # scientific evidence. Every artifact remains in the full manifest.
+            response["artifacts"] = []
+            paths = out.get("artifacts", [])
+            for path in paths[:50]:
+                response["artifacts"].append(path)
+                if len(json.dumps(response)) > 12450:
+                    response["artifacts"].pop()
+                    break
+            if len(response["artifacts"]) < len(paths):
+                response["artifacts_omitted"] = True
         return response

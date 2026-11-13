@@ -1,7 +1,7 @@
 ---
 name: variant_annotation
 description: Interpret a VCF's variants (germline/somatic, WGS/WES) — gene + functional consequence (Ensembl VEP), ClinVar pathogenicity, gnomAD frequency, deleteriousness (CADD/REVEL/AlphaMissense) + splice disruption (SpliceAI), then prioritise. Rare-disease known-gene-first (IRD). Offline, WGS-scale.
-tools: annotate_variants, run_code, literature_search
+tools: mcp_annotate_variants, run_code, literature_search
 ---
 
 # Variant Annotation & Prioritisation Protocol
@@ -45,15 +45,15 @@ tiers the survivors by **inheritance model** — the lab's IRD protocol, reprodu
 | # | Step | Tool / skill | 🔬 Key agent-chosen params | Output |
 |---|------|--------------|----------------------------|--------|
 | 1 | **QC the callset** | `vcf_qc_stats` (run_code) | `SEQ_TYPE` = WGS \| WES | `vcf_qc_summary.csv` |
-| 2 | **Normalise** *(internal to Step 4 — not a separate agenda step)* | inside `annotate_variants` | — (uses the ref FASTA) | left-aligned input to VEP |
-| 3 | **Narrow: panel (before VEP) + drop-common** | `annotate_variants` | `regions_bed` / `genes`, `max_pop_af` | in-panel rare set |
-| 4 | **Annotate** (VEP + ClinVar + gnomAD + predictors + **IRD layers**) | `annotate_variants` | 🧭 `assembly` auto-detected (GRCh37 fallback) | `variant_annotation.tsv` + 5 tables |
+| 2 | **Normalise** *(internal to Step 4 — not a separate agenda step)* | inside `mcp_annotate_variants` | — (uses the ref FASTA) | left-aligned input to VEP |
+| 3 | **Narrow: panel (before VEP) + drop-common** | `mcp_annotate_variants` | `regions_bed` / `genes`, `max_pop_af` | in-panel rare set |
+| 4 | **Annotate** (VEP + ClinVar + gnomAD + predictors + **IRD layers**) | `mcp_annotate_variants` | 🧭 `assembly` auto-detected (GRCh37 fallback) | `variant_annotation.tsv` + 5 tables |
 | 5 | **Summarise the landscape** | *(report from Step 4 tables)* | — | consequence / impact dists |
-| 6 | **Prioritise + tier by disease model** | `annotate_variants` (built-in) + `clinical_variant_prioritization` | dominant/recessive/X AF thresholds | `high_priority_variants.csv` + `Disease_Model` |
+| 6 | **Prioritise + tier by disease model** | `mcp_annotate_variants` (built-in) + `clinical_variant_prioritization` | dominant/recessive/X AF thresholds | `high_priority_variants.csv` + `Disease_Model` |
 | 7 | **Literature context** | `literature_search` | gene + phenotype query | citations |
 
 > Plan these as **distinct agenda steps** — a real variant study is not one "annotate" call. The heavy
-> compute lives inside `annotate_variants` (Step 4); Steps 5–6 **report from the tables it already wrote**
+> compute lives inside `mcp_annotate_variants` (Step 4); Steps 5–6 **report from the tables it already wrote**
 > (never hand-roll `run_code` to re-derive them). **Plan no other report-writing step:**
 > a written report is one `write_report` step, last, planned only when the request asks for it.
 
@@ -77,7 +77,7 @@ if** the in-panel search is negative — and say so when you do.
 **What.** Compute Ti/Tv, Het/Hom, SNP/indel/multiallelic counts and call rate, and flag anything
 outside the expected WGS/WES band **before** interpreting individual variants.
 
-**Why.** `annotate_variants` reports the PASS/non-PASS split but *nothing* about callset quality. A low
+**Why.** `mcp_annotate_variants` reports the PASS/non-PASS split but *nothing* about callset quality. A low
 Ti/Tv or an off-range Het/Hom means the downstream tables describe a noisy callset (excess false
 positives, contamination, a sample swap) — the report must carry that caveat (→ Diagnostics, not the
 manuscript conclusions).
@@ -105,7 +105,7 @@ are framed as lower-confidence (not silently trusted).
 <details>
 <summary><b>Step 2 · Normalise the VCF</b> — <i>done INSIDE Step 4 on the offline path; not a separate step</i></summary>
 
-> **Not a separate agenda step (offline path).** `annotate_variants` runs `bcftools norm` itself inside
+> **Not a separate agenda step (offline path).** `mcp_annotate_variants` runs `bcftools norm` itself inside
 > `vep.sif` before VEP, so you do **not** plan a standalone normalise step. It also can't run as its own
 > `run_code` step — that sandbox (`analysis.sif`) has no bcftools and no reference-FASTA bind. Shown here
 > for auditability: this is the normalisation the tool applies for you.
@@ -163,7 +163,7 @@ genome-wide.) The default panel + rarity floor can be set once as deploy default
 <details>
 <summary><b>Step 4 · Annotate</b> — offline VEP + ClinVar + gnomAD + predictors + IRD layers</summary>
 
-**What.** Run `annotate_variants` on the normalised, panel-restricted VCF. Per variant you get: the
+**What.** Run `mcp_annotate_variants` on the normalised, panel-restricted VCF. Per variant you get: the
 gene, the **MANE-Select** transcript + **HGVS** `c.`/`p.` name, the most-severe consequence, VEP impact,
 **SIFT/PolyPhen** and (as staged) **CADD / REVEL / AlphaMissense** + **SpliceAI** splice scores, the max
 **gnomAD/1000G** population AF, and the **ClinVar** significance with review-status stars. On the IRD
@@ -269,7 +269,7 @@ evidence of benignity — say so.
 ClinVar calls PLUS the **rare** (max pop AF < 0.1%) variants that are high-impact (frameshift,
 stop-gained, splice), predicted deleterious by any predictor, OR splice-disrupting. For each: gene,
 location, rsID, the score(s) that flagged it, the ClinVar condition. Then **TIER** each by **inheritance
-model**, which `annotate_variants` now assigns per gene deterministically (a `Disease_Model` column):
+model**, which `mcp_annotate_variants` now assigns per gene deterministically (a `Disease_Model` column):
 
 | Model | Rule | Effect on ranking |
 |---|---|---|
@@ -315,7 +315,7 @@ via `literature_search` to ground the interpretation.
 
 ## Grounding & honesty (applies to every step)
 
-Report ONLY genes, consequences, impacts, rsIDs and clinical significances that `annotate_variants`
+Report ONLY genes, consequences, impacts, rsIDs and clinical significances that `mcp_annotate_variants`
 actually returned — never invent one. ClinVar significance is reported verbatim (`pathogenic`,
 `likely_pathogenic`, `uncertain_significance`); do not upgrade "uncertain". Always state the **genome
 assembly**, the **`execution_mode`**, and the **number of variants annotated vs skipped**. Frame

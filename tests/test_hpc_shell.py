@@ -14,6 +14,9 @@ here are the ones that make a near-complete shell safe to hand an agent on a SHA
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -292,6 +295,104 @@ def test_read_text_is_byte_capped_and_says_so():
     remote.files[f"{HOME}/big.txt"] = b"x" * 5000
     out = _shell(remote).read_text(f"{HOME}/big.txt", max_bytes=100)
     assert out["truncated"] is True and out["bytes_returned"] == 100
+
+
+class LocalReadRemote:
+    """Real metadata commands/files, with the production missing-file transfer contract."""
+
+    def exec(self, command, timeout=60):
+        if command.startswith("readlink -f "):
+            path = shlex.split(command)[2]
+            return ExecResult(command, 0, str(Path(path).resolve()), "")
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+        return ExecResult(command, result.returncode, result.stdout, result.stderr)
+
+    def remote_size(self, path):
+        return Path(path).stat().st_size if Path(path).is_file() else 0
+
+    def read_bytes(self, path, max_bytes=None):
+        if not Path(path).is_file():
+            return b""
+        with Path(path).open("rb") as stream:
+            return stream.read(max_bytes)
+
+
+def _local_bound_shell(tmp_path):
+    home, artifacts, work = (tmp_path / name for name in ("ssh home", "run artifacts", "run work"))
+    for path in (home, artifacts, work):
+        path.mkdir()
+    return HpcShell(remote=LocalReadRemote(), home=str(home), artifacts_dir=str(artifacts),
+                    work_dir=str(work), workspace=HpcWorkspace(read_roots=(str(tmp_path),)))
+
+
+def test_mcp_full_result_path_reads_bound_artifacts_without_home_fallback(tmp_path):
+    shell = _local_bound_shell(tmp_path)
+    relative = "mcp/phenotype-diagnosis/case-1/map/full_result.json"
+    for root, content in ((shell.home, b"wrong home file"), (shell.artifacts_dir, b"x" * 70_000)):
+        file = Path(root) / relative
+        file.parent.mkdir(parents=True)
+        file.write_bytes(content)
+    tool = next(t for t in hs.hpc_shell_catalog(shell) if t.name == "read_text")
+    result = tool.executor({"path": relative}, None)
+    assert result["path"] == str(Path(shell.artifacts_dir) / relative)
+    assert result["size_bytes"] == 70_000 and result["bytes_returned"] == hs.MAX_READ_BYTES
+    assert result["text"] == "x" * hs.MAX_READ_BYTES and result["truncated"]
+
+
+@pytest.mark.parametrize("given,root,relative", [
+    ("artifacts/mcp/result.json", "artifacts_dir", "mcp/result.json"),
+    ("$AISCIENTIST_ARTIFACTS/mcp/result.json", "artifacts_dir", "mcp/result.json"),
+    ("${AISCIENTIST_ARTIFACTS}/mcp/result.json", "artifacts_dir", "mcp/result.json"),
+    ("work/adata_qc.h5ad", "work_dir", "adata_qc.h5ad"),
+    ("$AISCIENTIST_WORK/adata_qc.h5ad", "work_dir", "adata_qc.h5ad"),
+    ("${AISCIENTIST_WORK}/adata_qc.h5ad", "work_dir", "adata_qc.h5ad"),
+    ("~/notes.txt", "home", "notes.txt"),
+])
+def test_read_aliases_use_explicit_run_bindings(tmp_path, given, root, relative):
+    shell = _local_bound_shell(tmp_path)
+    expected = str(Path(getattr(shell, root)) / relative)
+    assert shell._read_path(given) == expected
+    assert shell._read_path(expected) == expected
+
+
+def test_missing_file_is_an_error_but_real_empty_file_is_readable(tmp_path):
+    shell = _local_bound_shell(tmp_path)
+    empty = Path(shell.artifacts_dir) / "empty.txt"
+    empty.touch()
+    tool = next(t for t in hs.hpc_shell_catalog(shell) if t.name == "read_text")
+    missing = tool.executor({"path": "missing.txt"}, None)
+    assert missing["status"] == "error" and "does not exist" in missing["error"]
+    result = tool.executor({"path": "empty.txt"}, None)
+    assert result["size_bytes"] == result["bytes_returned"] == 0 and result["text"] == ""
+
+
+def test_bound_paths_still_reject_symlink_escape_and_unknown_run_binding(tmp_path):
+    shell = _local_bound_shell(tmp_path)
+    (Path(shell.artifacts_dir) / "outside").symlink_to("/etc")
+    with pytest.raises(HpcShellError, match="outside the areas"):
+        shell.read_text("outside/passwd")
+    with pytest.raises(HpcShellError, match="not bound"):
+        _shell().read_text("$AISCIENTIST_ARTIFACTS/mcp/result.json")
+
+
+@pytest.mark.parametrize("failed_stat", [False, True])
+def test_failed_transfer_cannot_report_successful_empty_read(tmp_path, monkeypatch, failed_stat):
+    shell = _local_bound_shell(tmp_path)
+    (Path(shell.artifacts_dir) / "result.json").write_text("actual result")
+    monkeypatch.setattr(shell.remote, "read_bytes", lambda *args, **kwargs: b"")
+    if failed_stat:
+        monkeypatch.setattr(shell.remote, "remote_size", lambda path: 0)
+    tool = next(t for t in hs.hpc_shell_catalog(shell) if t.name == "read_text")
+    result = tool.executor({"path": "result.json"}, None)
+    assert result["status"] == "error"
+    assert ("Could not stat" if failed_stat else "Incomplete read") in result["error"]
+
+
+def test_failed_tail_is_an_error():
+    remote = FakeRemote([(r"^tail ", "", "Permission denied", 1)])
+    remote.files[f"{HOME}/log"] = b"x" * 100
+    with pytest.raises(HpcShellError, match="Could not read"):
+        _shell(remote).read_text("~/log", max_bytes=10, tail=True)
 
 
 def test_find_files_is_bounded_in_depth_and_count():

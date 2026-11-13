@@ -15,7 +15,8 @@ for completion → collect output). Everything goes through the ``RemoteExecutor
 whole flow runs offline against a scripted fake in tests — no real Slurm, no SSH.
 
 Isolation & data safety come from the same Apptainer contract the scGPT job already uses: the
-dataset is bind-mounted **read-only**, only work/artifacts are writable, and ``--containall`` hides
+dataset is bind-mounted **read-only**, work/artifacts (plus their result sibling for environment
+calls) are explicitly writable, and ``--containall`` hides
 every other host path. Network access follows :func:`~aiscientist.agents.sandbox.sandbox_network_enabled`
 — ON by default (Jin Li 2026-07-08: prioritize effectiveness), toggled off with
 ``AISCIENTIST_SANDBOX_NETWORK=0`` (which restores ``--net --network none``).
@@ -45,7 +46,7 @@ also documented in the ``run`` skill::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from ..agents.sandbox import input_env, sandbox_network_enabled
@@ -446,7 +447,23 @@ class SlurmCodeExecutor:
         binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
                                      *self._input_binds(), *env_paths, *extra_ro, *extra_ro_binds)
                          if p)
-        binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch, cache_dir) if p)
+        # Complete CellQC matrices are published beside work/artifacts, outside the small
+        # artifact mirror. Bind that exact trusted sibling for environment calls; otherwise
+        # a site without an implicit DFS bind silently loses it with the container overlay.
+        result_dir = ""
+        if kind == "env" and self.work_dir and self.artifacts_dir:
+            work, artifacts = PurePosixPath(self.work_dir), PurePosixPath(self.artifacts_dir)
+            if (work.is_absolute() and artifacts.is_absolute() and work.parent == artifacts.parent
+                    and work.parent != PurePosixPath("/") and ".." not in work.parent.parts):
+                result_dir = str(work.parent / "result")
+                if any(ch in result_dir for ch in ":,\x00\n\r"):
+                    raise SlurmJobError("invalid trusted result directory")
+                quoted = shlex_quote(result_dir)
+                made = self.remote.exec(f"mkdir -p {quoted} && test -d {quoted} && test ! -L {quoted}")
+                if not made.ok:
+                    raise SlurmJobError("cannot prepare the run's result directory", detail=made.stderr)
+        binds_rw = tuple(dict.fromkeys(p for p in
+                         (self.work_dir, self.artifacts_dir, result_dir, scratch, cache_dir) if p))
         from ..agents.skills_registry import POLICY, network_allowed
         policy = POLICY.get()
         gpu = bool(policy and policy["gpu"]) if gpu is None else gpu

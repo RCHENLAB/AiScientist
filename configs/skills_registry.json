@@ -1,6 +1,11 @@
 {
-  "release_tag": "v0.2.0",
-  "allowed_tiers": ["core", "verified", "community"],
+  "release_tag": "v0.2.5",
+  "allowed_tiers": [
+    "core",
+    "verified",
+    "community"
+  ],
   "releases_root": "skills/releases",
-  "current": "skills/current"
+  "current": "skills/current",
+  "repository": "liujs123456/aiscientist-skills"
 }

@@ -87,9 +87,8 @@ def _router(executors: dict[str, Any]) -> Callable[[Any, "HarnessTool"], "Harnes
     return route
 
 
-def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
+def build_scientist_catalog(code_executor: Any = None,
                             analysis_executor: Any = None,
-                            variant_executor: Any = None,
                             phenotype_executor: Any = None,
                             literature_executor: Any = None,
                             hpc_shell: Any = None) -> list["HarnessTool"]:
@@ -98,18 +97,13 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     no-scanpy fallback).
 
     The four executors are the HPC3 job lines (``SlurmAnalysisExecutor``s) the gateway built for
-    this session: ``analysis_executor`` runs the scanpy line in analysis.sif, ``variant_executor``
-    offline VEP (the REST path stays the in-process fallback for small VCFs), ``phenotype_executor``
+    this session: ``analysis_executor`` runs the retained analysis worker, ``phenotype_executor``
     LIRICAL, ``literature_executor`` PaperQA. A tool goes to the one its manifest names.
 
     A manifest that says ``research: false`` is left out: that tool runs only from its own console
     line (the corpus scan is an hour-long job the user starts, with a workspace of its own), so
     the PI cannot plan it and the Scientist cannot call it. The line reaches it by name through
     its executor, not through this catalog.
-
-    ``scgpt_runner`` is the gateway-injected remote executor for the scGPT GPU batch job; the
-    ``scgpt_annotate`` tool is always present (it self-reports not-enabled without one, so the System
-    page can list it), like ``run_code`` without a sandbox.
 
     ``diagnose_disease`` composes ``run_lirical`` and ``deep_literature``; the catalog binds it to
     their ROUTED executors, after routing, so the adjudicated differential uses HPC3 exactly when the
@@ -119,10 +113,10 @@ def build_scientist_catalog(code_executor: Any = None, scgpt_runner: Any = None,
     from .research_harness import default_catalog
     from .research_lab import make_run_code_tool, make_run_in_environment_tool
 
-    executors = {"hpc:analysis": analysis_executor, "hpc:variant": variant_executor,
+    executors = {"hpc:analysis": analysis_executor,
                  "hpc:phenotype": phenotype_executor, "hpc:literature": literature_executor}
     catalog: list[HarnessTool] = list(default_catalog())                  # finish + smoke QC/DE
-    catalog += tool_catalog.build_tools({"scgpt_runner": scgpt_runner}, where=lambda m: m.research,
+    catalog += tool_catalog.build_tools(where=lambda m: m.research,
                                         route=_router(executors))
     # A failed snippet that lacked a program gets the HPC3 module that provides it (hpc/modules.py).
     note = ((lambda text: hpc_shell.missing_software_note(text, "run_code")) if hpc_shell is not None else None)

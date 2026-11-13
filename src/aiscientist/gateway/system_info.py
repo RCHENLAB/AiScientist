@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import shutil
+from dataclasses import dataclass
 from typing import Any
 
 # The agents of a research run. ``role`` is the ``role=`` of their model calls (``MODEL_ROLES``),
@@ -147,11 +148,36 @@ def _have(dep: str) -> bool:
         return False
 
 
-def _full_catalog() -> list[Any]:
-    """The exact catalog the live Scientist is built from — the SAME registry _run_lab uses."""
-    from ..agents.registry import build_scientist_catalog
+@dataclass(frozen=True)
+class _ConfiguredMCPTool:
+    """Display-only declaration. It deliberately has no executable callback."""
+    name: str
+    description: str
+    server: Any
+    category: str = "mcp"
+    requires: tuple[str, ...] = ()
+    reads_private_data: bool = True
 
-    return build_scientist_catalog()
+
+def _full_catalog() -> list[Any]:
+    """Platform capabilities plus reviewed MCP declarations, without session authorization.
+
+    The System endpoint has no executor or session policy. A configured image is
+    therefore inventory, never proof that a particular user's session may run it.
+    Actual dispatch still goes through build_scientist_catalog's complete gates.
+    """
+    from ..agents.registry import build_scientist_catalog
+    from ..agents.mcp_bridge import configured_servers
+
+    out = list(build_scientist_catalog())
+    names = {tool.name for tool in out}
+    for server in configured_servers():
+        for entry in server.tools:
+            name = server.planner_name(entry["name"])
+            if name not in names:
+                out.append(_ConfiguredMCPTool(name, f"MCP {server.name}: {entry['description']}", server))
+                names.add(name)
+    return out
 
 
 def capabilities() -> dict[str, bool]:
@@ -176,13 +202,15 @@ PLACES: dict[str, tuple[str, str]] = {
     "inprocess": ("Gateway (in process)",
                   "Runs inside the gateway on the Eye Server: quick reads, lookups and figures."),
     "hpc:analysis": ("HPC3 · analysis (Slurm)",
-                     "One Slurm job per call in analysis.sif: the scRNA-seq line (scanpy, CellQC)."),
-    "hpc:variant": ("HPC3 · variants (VEP)", "Offline VEP with its cache, in vep.sif."),
-    "hpc:phenotype": ("HPC3 · phenotype (LIRICAL)", "LIRICAL phenotype-to-disease ranking, in lirical.sif."),
+                     "scRNA and CellQC calls in their separately pinned MCP images."),
+    "hpc:variant": ("HPC3 · variants (VEP)", "VEP with its references in the pinned variant MCP image."),
+    "hpc:phenotype": ("HPC3 · phenotype (LIRICAL)", "Phenotype ranking in the pinned phenotype MCP image."),
     "hpc:literature": ("HPC3 · literature corpus",
-                       "The lab's PubMedBERT-indexed paper corpus, in paperqa.sif: search_corpus returns "
-                       "the matching passages with no model on HPC3; deep_literature answers with "
-                       "PaperQA2, calling the session's served model."),
+                       "The pinned literature MCP image: search_corpus retrieves indexed passages; "
+                       "deep_literature answers with PaperQA2 and the session's selected model."),
+    "hpc:atlas-expression": ("HPC3 · atlas expression", "The pinned Atlas MCP image and approved atlas inputs."),
+    "image:cpu": ("Contained CPU runtime", "A pinned MCP image in the session's compute environment; "
+                  "its inprocess declaration does not import scientific code into the gateway."),
     "gpu:scgpt": ("HPC3 GPU · scGPT", "A short GPU batch job per annotation."),
     "sandbox": ("HPC3 · code sandbox (Slurm)",
                 "run_code: Python the Scientist writes, run as a Slurm job next to the data."),
@@ -206,6 +234,8 @@ MODEL_ROLES: dict[str, str] = {
 def _tool_place(t: Any) -> str:
     from ..tools import catalog as tool_catalog
 
+    if isinstance(t, _ConfiguredMCPTool):
+        return "image:cpu" if t.server.runs_on == "inprocess" else t.server.runs_on
     m = tool_catalog.manifest(t.name)
     if m is not None:
         return m.runs_on
@@ -216,7 +246,7 @@ def _tool_available(t: Any, place: str) -> bool | None:
     """Whether this host can run the tool. Only an in-process tool runs here: a tool that runs on
     HPC3 has its software in its job's container, so the gateway's own modules say nothing about it
     (None: not checked here)."""
-    if place != "inprocess":
+    if isinstance(t, _ConfiguredMCPTool) or place != "inprocess":
         return None
     return all(_have(dep) for dep in t.requires)
 
@@ -300,18 +330,23 @@ def workflow_graph() -> dict[str, Any]:
              requires=list(t.requires), reads_private_data=t.reads_private_data,
              available=_tool_available(t, place))
 
-    # The scanpy analysis line is an ORDERED pipeline (real "Run AFTER" dependencies).
-    from ..tools.api import scrna_catalog
-
-    names = [t.name for t in scrna_catalog()]
-    chain = [f"tool:{n}" for n in _scrna_chain(names)]
+    # Preserve the scientific line's declared catalog order without importing
+    # retired scientific modules. Status tools are controls, not pipeline stages.
+    from ..agents.tool_names import canonical_tool_name
+    native = [t for t in tools if isinstance(t, _ConfiguredMCPTool)
+              and t.server.name in {"scrna-analysis", "cellqc"}
+              and not canonical_tool_name(t.name).endswith("_job_status")]
+    public_names = {canonical_tool_name(t.name): t.name for t in native}
+    names = list(public_names)
+    chain = [f"tool:{public_names[n]}" for n in _scrna_chain(names)]
     for a, b in zip(chain, chain[1:]):
         edge(a, b, "then", "pipeline")
     for primary, alts in _SCRNA_ALTERNATIVES.items():
-        nxt = chain[chain.index(f"tool:{primary}") + 1] if f"tool:{primary}" in chain[:-1] else None
+        primary_id = f"tool:{public_names.get(primary, primary)}"
+        nxt = chain[chain.index(primary_id) + 1] if primary_id in chain[:-1] else None
         for alt in alts:
             if nxt and alt in names:
-                edge(f"tool:{alt}", nxt, "then", "pipeline")    # an alternative feeds the same step
+                edge(f"tool:{public_names[alt]}", nxt, "then", "pipeline")
 
     return {"nodes": nodes, "edges": edges}
 
@@ -339,6 +374,10 @@ def system_overview() -> dict[str, Any]:
             "runs_on": place,
             "where": PLACES.get(place, (place, ""))[0],
             "available": _tool_available(t, place),
+            **({"configured": True, "mcp": t.server.identity(),
+                "availability_note": "Configured capability. Requires a connected image executor "
+                                     "and the matching installed, allowed skill in this session."}
+               if isinstance(t, _ConfiguredMCPTool) else {}),
         })
     tools.sort(key=lambda x: (x["category"], x["name"]))
     from ..agents.research_lab import DEFAULT_SPECIALISTS

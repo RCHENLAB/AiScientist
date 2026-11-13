@@ -35,7 +35,7 @@ code change.
 | `report.sif` | 444 M | report rendering (pandoc, XeLaTeX) | `AISCIENTIST_REPORT_IMAGE` | `deploy/report/build_and_stage.sh` |
 | `vep.sif` | 230 M | offline Ensembl VEP release 112 and bcftools; OpenSpliceAI is executed inside it | `AISCIENTIST_VEP_IMAGE` | `deploy/vep/build_and_stage.sh` |
 | `lirical.sif` | 129 M | LIRICAL, phenotype to disease ranking | `AISCIENTIST_LIRICAL_IMAGE` | `deploy/lirical/build_and_stage.sh` |
-| `scgpt.sif` | 3.9 G | scGPT per-cell annotation, on a GPU | `AISCIENTIST_SCGPT_IMAGE` | `deploy/scgpt/build_and_stage.sh` |
+| `mcp-scgpt-annotation` | release-specific | scGPT per-cell annotation, on a GPU | pinned MCP catalog | released MCP image; external assets in `deploy/scgpt/README.md` |
 | `vlreview.sif` | 3.6 G | the vision model that reviews the rendered report | `AISCIENTIST_VLREVIEW_IMAGE` | `scripts/hpc3_vlreview_setup.sh` with `deploy/vlreview/` |
 | `cellqc-0.3.6_4509649d69.sif` | 1.0 G | `run_cellqc` and the standalone CellQC skill: CellQC 0.3.6, Python 3.12, R with DoubletFinder | `image:` in `run_cellqc/TOOL.md` | automatic, see below |
 | `rockylinux_9.7.20251123.sif` | 83 M | the agent's `run_shell` sandbox: the compute nodes' OS (Rocky Linux 9.7), with RCIC's modules and the host's `/usr` mounted read-only | `SHELL_IMAGE_REF` in `hpc/shell.py` | automatic: pulled on the session's CPU worker on first use (`docker://rockylinux/rockylinux:9.7.20251123`) |

@@ -34,20 +34,13 @@ RUNS_ON_TEXT = {
         "As a Slurm CPU job inside `analysis.sif` on HPC3, through the analysis line's job entry "
         "point `python -m aiscientist.tools.scrna_cli`, reading and writing the run's `work/` and "
         "`artifacts/` on dfs3b. When the session has no HPC3 executor it runs in the gateway process."),
-    "hpc:variant": (
-        "As a Slurm job inside `vep.sif` on HPC3 (offline VEP with a local cache), through "
-        "`python -m aiscientist.tools.variant_cli`. Small VCFs, or a session without HPC3, use the "
-        "Ensembl REST API from the gateway instead (capped at a few hundred variants)."),
     "hpc:phenotype": (
         "As a Slurm job inside `lirical.sif` on HPC3, through `python -m aiscientist.tools.phenotype_cli`. "
         "Without HPC3 it returns `not_installed` rather than a guess."),
     "hpc:literature": (
         "As a Slurm job inside `paperqa.sif` on HPC3 (the PubMedBERT index lives on dfs3b), through "
         "`python -m aiscientist.tools.paperqa_cli`."),
-    "gpu:scgpt": (
-        "As a GPU Slurm job inside `scgpt.sif`, through the runner the gateway injects "
-        "(`gateway/scgpt_runner.py`). Without a GPU session it stays listed but reports that it is "
-        "not enabled."),
+
 }
 
 INDEX_HEAD = """# Tools
@@ -74,7 +67,7 @@ Shared code: `_lib/` (helpers more than one tool of a line uses; private to this
 analysis line's `preflight` step), `run_deps.py` (per-run dependency installs inside a job).
 Contract and doors: `sdk.py` (the tool record and context), `catalog.py` (discovery from
 `TOOL.md`), `api.py` (everything else the platform may use). Job entry points, one per HPC3
-image: `scrna_cli.py`, `variant_cli.py`, `phenotype_cli.py`, `paperqa_cli.py`.
+image: `scrna_cli.py`, `phenotype_cli.py`, `paperqa_cli.py`.
 
 ## Adding a tool
 

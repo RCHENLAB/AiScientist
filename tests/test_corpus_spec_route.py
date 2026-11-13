@@ -10,6 +10,8 @@ Offline: the model, the job and the user's decisions are scripted.
 """
 from __future__ import annotations
 
+from native_literature_fixtures import bind_route
+
 import asyncio
 import csv
 import json
@@ -24,7 +26,7 @@ from aiscientist.agents import request_router as rr  # noqa: E402
 from aiscientist.gateway import app as gw_app  # noqa: E402
 from aiscientist.gateway import corpus_scan  # noqa: E402
 from aiscientist.gateway.settings import HPCSettings  # noqa: E402
-from aiscientist.tools.extract_haploinsufficient_genes import tool as T  # noqa: E402
+from aiscientist import literature_contract as T  # noqa: E402
 
 QUESTION = "Which genes do the RetiGene papers report as acting through a dominant-negative effect?"
 HI_QUESTION = "What are haploinsufficient genes in RetiGene papers?"
@@ -195,7 +197,7 @@ def _wire(monkeypatch, decisions, model):
         jobs.append(_Job(c.workspace / run_id))
         return jobs[-1]
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor", build)
+    bind_route(monkeypatch, build)
     shown: list[str] = []
     script = list(decisions)
 
@@ -330,14 +332,21 @@ def test_a_fact_about_the_retigene_papers_is_no_curation(monkeypatch):
 def test_a_kept_scan_is_keyed_by_the_spec(tmp_path, monkeypatch):
     conn = types.SimpleNamespace(executor=object(), mock=False)
     monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_PAPERS", "/dfs/retigene/papers")
+    from aiscientist.gateway import literature_mcp
+    from aiscientist.agents import mcp_analysis
+    from aiscientist.agents.mcp_model import ModelBinding
+    bind_route(monkeypatch, lambda **kw: None)
+    monkeypatch.setattr(mcp_analysis, "setting_values", lambda _: {"LITERATURE_CORPUS_ROOT": "/dfs/retigene"})
+    monkeypatch.setattr(gw_app, "_mcp_session_model", lambda _: ModelBinding("http://model.invalid/v1", "claude-haiku-5-5"))
     monkeypatch.setattr(corpus_scan, "corpus_fingerprint", lambda *a, **k: {"root": "/dfs/retigene"})
     monkeypatch.setattr(gw_app, "_corpus_scan_model", lambda c: "claude-haiku-5-5")
     spec = T.parse_spec(_spec())
     built_in = gw_app._corpus_scan_identity(conn)
     one, again = gw_app._corpus_scan_identity(conn, spec), gw_app._corpus_scan_identity(conn, dict(spec))
     other = gw_app._corpus_scan_identity(conn, T.parse_spec(_spec(target="Something else")))
-    assert built_in[1]["rules"] == T.rules_digest() and one[1]["rules"] == T.rules_digest(spec)
+    server = literature_mcp.registered_server()
+    assert built_in[1]["rules"] == literature_mcp.rules_identity(server)
+    assert one[1]["rules"] == literature_mcp.rules_identity(server, spec)
     assert len({built_in[0], one[0], other[0]}) == 3 and one[0] == again[0]
 
 

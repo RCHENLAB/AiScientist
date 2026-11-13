@@ -96,7 +96,14 @@ def _wire(monkeypatch, model, decisions, *, hits=None):
             for i in range(1, 4)]
         return {"status": "ok", "results": rows}
 
-    monkeypatch.setattr(gw_app._tools_api, "search_literature", search)
+    from aiscientist.gateway import literature_mcp
+    monkeypatch.setattr(literature_mcp, "registered_server", lambda: SimpleNamespace(name="literature", settings_env=()))
+    async def build_route(conn, run, run_id, emit):
+        run.literature_mcp = SimpleNamespace(run_tool=lambda tool, args, ctx:
+            search(args["query"], args["limit"], abstracts=args["abstracts"], pubmed_only=args["pubmed_only"]))
+        run.literature_mcp_context = None
+        return run.literature_mcp
+    monkeypatch.setattr(gw_app, "_build_literature_mcp_route", build_route)
     shown: list[str] = []
     script = list(decisions)
 

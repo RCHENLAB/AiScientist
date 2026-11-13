@@ -152,29 +152,27 @@ def test_split_top_level_ignores_commas_inside_brackets_and_quotes():
 
 
 # --- an injected implementation must be reachable ------------------------------------------
-#
-# read_tool_source returned the DISPATCHER for any tool the gateway injects an executor into.
-# For scgpt_annotate that wrapper is four lines of "is there a runner? call it" and everything a
-# reviewer would check -- reference, preprocessing, bind mounts -- is in the runner. Run
-# 3c5fbc8608a7's scGPT step was written to verify those before inference, read the source, got the
-# wrapper, reported "lookup of its injected runner failed", and withheld inference. Correct
-# behaviour on what it could see, and the capability was lost to what it could not.
+# Keep this platform contract independent of any retired scientific tool implementation.
 
 def _catalog_with_injected_runner():
-    from aiscientist.tools.scgpt_annotate.tool import make_scgpt_annotate_tool
+    from aiscientist.agents.research_harness import HarnessTool
 
     def runner(args, ctx):
         """SENTINEL_BODY — the injected implementation."""
         return {"status": "ok"}
 
-    return [make_scgpt_annotate_tool(runner)], runner
+    def dispatch(args, ctx):
+        return runner(args, ctx)
+
+    return [HarnessTool(name="injected_example", description="Injected callable example",
+                        parameters={"type": "object", "properties": {}}, executor=dispatch)], runner
 
 
 def test_the_tool_body_names_what_it_delegates_to():
     from aiscientist.agents.tool_source import make_tool_source_tool
 
     cat, _ = _catalog_with_injected_runner()
-    out = make_tool_source_tool(lambda: cat).executor({"tool": "scgpt_annotate"}, None)
+    out = make_tool_source_tool(lambda: cat).executor({"tool": "injected_example"}, None)
     assert "runner" in out["dispatches_to"], "the dispatcher does not say what it dispatches to"
     assert "SENTINEL_BODY" not in out["source"]          # the wrapper, as before
 
@@ -184,7 +182,7 @@ def test_the_injected_implementation_can_be_fetched_as_a_symbol():
 
     cat, _ = _catalog_with_injected_runner()
     out = make_tool_source_tool(lambda: cat).executor(
-        {"tool": "scgpt_annotate", "symbol": "runner"}, None)
+        {"tool": "injected_example", "symbol": "runner"}, None)
     assert "error" not in out, out
     assert "SENTINEL_BODY" in out["source"], "fetching the runner did not return the runner"
 
@@ -194,7 +192,7 @@ def test_an_unknown_symbol_still_errors_and_now_points_at_the_way_in():
 
     cat, _ = _catalog_with_injected_runner()
     out = make_tool_source_tool(lambda: cat).executor(
-        {"tool": "scgpt_annotate", "symbol": "no_such_thing"}, None)
+        {"tool": "injected_example", "symbol": "no_such_thing"}, None)
     assert "error" in out
     assert "runner" in out.get("injected", {}), "the error does not name what IS reachable"
 
@@ -237,7 +235,7 @@ def _routed_catalog():
     from aiscientist.agents.registry import build_scientist_catalog
 
     lines = {k: _RecordingLine() for k in
-             ("analysis_executor", "variant_executor", "phenotype_executor", "literature_executor")}
+             ("analysis_executor", "phenotype_executor", "literature_executor")}
     return build_scientist_catalog(**lines), lines
 
 

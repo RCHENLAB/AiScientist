@@ -43,7 +43,7 @@ class AnalysisRunner(LocalCommandRunner):
 
 def config(root, server="cellqc", tool="run_cellqc", *, settings=(), schema=None, **overrides):
     schema = schema or {"type": "object", "properties": {
-        "analysis_id": {"type": "string"}, "dataset": {"type": "string"},
+        "analysis_id": {"type": "string"}, "task_id": {"type": "string"}, "dataset": {"type": "string"},
         "dataset_paths": {"type": "array", "items": {"type": "string"}},
         "input": {"type": "string"}, "model_dir": {"type": "string"}}, "additionalProperties": False}
     return write_config(root, entries=[{"name": tool, "description": "Run analysis.", "inputSchema": schema}],
@@ -230,7 +230,7 @@ def test_polling_an_old_completed_task_does_not_replace_current_report_aliases(a
     (output / "work/adata_qc.h5ad").write_bytes(b"historical checkpoint")
     value["task_id"] = "older-task"
     runner.fixture.write_text(json.dumps(value))
-    assert make("cellqc", "cellqc_job_status").executor({}, ctx)["status"] == "ok"
+    assert make("cellqc", "cellqc_job_status").executor({"task_id": "older-task"}, ctx)["status"] == "ok"
     assert (runner.artifacts / "tables/qc.csv").read_text() == current
     assert (runner.checkpoints / "adata_qc.h5ad").read_bytes() == b"real fixture checkpoint bytes"
 
@@ -249,6 +249,45 @@ def test_cellqc_rerun_replaces_complete_tree_and_discards_stale_files(analysis_b
     pointer = json.loads((runner.artifacts / "data/cellqc_result.json").read_text())
     assert "report.html" not in {f["name"] for f in pointer["files"]}
     assert pointer["mcp_provenance"]["task_id"] == "rerun"
+
+
+def test_complete_result_publication_and_rollback_stay_on_result_mount(analysis_bridge):
+    """Execute the generated collector with work/result mounted as different devices."""
+    runner, ctx, make = analysis_bridge
+    value, output, files = full_cellqc_result(runner)
+    hook = runner.root / "mount simulation"
+    hook.mkdir()
+    recorded = hook / "renames.jsonl"
+    result_root = runner.artifacts.parent / "result"
+    (hook / "sitecustomize.py").write_text(f'''
+import errno, json, os
+from pathlib import Path
+original = os.replace
+result_root = Path({str(result_root)!r})
+def replace(source, target, *args, **kwargs):
+    source, target = Path(source), Path(target)
+    if source.is_dir() and (source.is_relative_to(result_root) or target.is_relative_to(result_root)):
+        with open({str(recorded)!r}, "a") as stream:
+            stream.write(json.dumps([str(source), str(target)]) + "\\n")
+        if source.parent != result_root or target.parent != result_root:
+            raise OSError(errno.EXDEV, "separate Apptainer bind mounts")
+    return original(source, target, *args, **kwargs)
+os.replace = replace
+''')
+    runner.extra_env["PYTHONPATH"] = str(hook)
+    tool = make()
+    assert tool.executor({}, ctx)["status"] == "ok"
+    (output / "result/cellqc/report.html").unlink()
+    (output / "artifacts/result/report.html").unlink()
+    value["task_id"] = "rerun"
+    runner.fixture.write_text(json.dumps(value))
+    assert tool.executor({}, ctx)["status"] == "ok"
+    assert (result_root / "cellqc/mouse/library.h5ad").read_bytes() == files["mouse/library.h5ad"]
+    assert not (result_root / "cellqc/report.html").exists()
+    renames = [json.loads(line) for line in recorded.read_text().splitlines()]
+    assert len(renames) == 3  # first publish, prior-tree backup, replacement publish
+    assert all(Path(source).parent == Path(target).parent == result_root for source, target in renames)
+    assert not list(result_root.glob(".mcp-cellqc-*"))
 
 
 def test_alias_ownership_prevents_cross_server_cleanup(analysis_bridge):
@@ -337,6 +376,7 @@ def test_server_failure_cannot_become_execution_success(analysis_bridge, state, 
     result = make().executor({}, ctx)
     assert result["status"] == "error", result
     assert result["response_omitted"] is True
+    assert result["error"] and len(result["error"]) <= 1500
     assert len(json.dumps(result["result"])) <= 14000
     assert not (runner.checkpoints / "adata_qc.h5ad").exists()
     assert "details" in (runner.artifacts / result["full_result"]).read_text()
@@ -354,6 +394,25 @@ def test_bounded_result_preserves_complete_json(analysis_bridge):
     assert len(json.dumps(result["result"])) <= 14000
     evidence = json.loads((runner.artifacts / result["full_result"]).read_text())
     assert len(evidence["rows"]) == 8000 and evidence["host"] == "[server path]"
+
+
+def test_bounded_result_preserves_authoritative_slurm_metadata(analysis_bridge, monkeypatch):
+    runner, ctx, make = analysis_bridge
+    value, _ = fixture_result(runner)
+    value["note"] = "large evidence " * 3000
+    runner.fixture.write_text(json.dumps(value))
+    original = runner.run_in_image
+
+    def run(*args, **kwargs):
+        return original(*args, **kwargs) | {"slurm_state": "COMPLETED", "slurm_job_id": "59539880",
+                                          "node": "compute-node", "execution_mode": "hpc_slurm_image"}
+
+    monkeypatch.setattr(runner, "run_in_image", run)
+    result = make().executor({}, ctx)
+    assert result["response_omitted"] is True
+    assert result["slurm_state"] == "COMPLETED" and result["slurm_job_id"] == "59539880"
+    assert result["node"] == "compute-node" and result["returncode"] == 0
+    assert len(json.dumps(result)) <= 14000
 
 
 @pytest.mark.parametrize("server", sorted(PREFIXES))
@@ -389,7 +448,7 @@ def test_settings_are_quoted_and_only_deployment_values_are_forwarded(analysis_b
     value = str(runner.root / "references with spaces" / "cache")
     monkeypatch.setenv("VARIANT_VEP_CACHE_DIR_GRCH38", value)
     fixture_result(runner, "variant-annotation")
-    result = make("variant-annotation", "variant_job_status", settings=["VARIANT_VEP_CACHE_DIR_GRCH38"]).executor({}, ctx)
+    result = make("variant-annotation", "variant_job_status", settings=["VARIANT_VEP_CACHE_DIR_GRCH38"]).executor({"task_id": "task-one"}, ctx)
     assert result["status"] == "ok", result
     assert json.loads(runner.capture.read_text())["env"]["VARIANT_VEP_CACHE_DIR_GRCH38"] == value
     assert runner.calls[-1][1]["extra_ro_binds"] == (str(Path(value).parent),)
@@ -427,8 +486,9 @@ def test_complete_public_response_is_bounded_before_transport(analysis_bridge):
     value["rows"] = ["0123456789"] * 700
     runner.fixture.write_text(json.dumps(value))
     result = make().executor({}, ctx)
-    assert result["status"] == "ok" and result["response_omitted"] is True
+    assert result["status"] == "ok" and result["response_compacted"] is True
     assert len(json.dumps(result)) <= 14000
+    assert len(result["result"]["rows"]) == 700
     assert len(json.loads((runner.artifacts / result["full_result"]).read_text())["rows"]) == 700
 
 
@@ -489,5 +549,252 @@ def test_scgpt_refactor_is_a_trusted_readonly_deployment_path(monkeypatch):
     assert setting_values(server) == {"SCGPT_REFACTOR": "/refs/scgpt-refactor"}
     assert setting_paths(server) == ("/refs",)
     monkeypatch.setenv("SCGPT_REFACTOR", "../../untrusted")
+    with pytest.raises(ValueError, match="absolute deployment path"):
+        setting_values(server)
+
+
+def test_invalid_used_variant_default_returns_a_structured_error(analysis_bridge, monkeypatch):
+    runner, ctx, make = analysis_bridge
+    monkeypatch.setenv("VARIANT_DEFAULT_GENE_PANEL", "missing-panel")
+    tool = make("variant-annotation", "annotate_variants", settings=["VARIANT_DEFAULT_GENE_PANEL"])
+    result = tool.executor({}, ctx)
+    assert result["status"] == "error" and "deployment settings" in result["error"]
+    assert result["mcp"]["name"] == "variant-annotation"
+    assert not runner.capture.exists()
+
+
+@pytest.mark.parametrize("padding", [7000, 25000])
+def test_cellqc_status_keeps_executed_science_through_both_bounds(analysis_bridge, padding):
+    runner, ctx, make = analysis_bridge
+    value, _ = fixture_result(runner)
+    value.update(thresholds={"min_counts": 500, "min_features": 300, "max_pct_mt": 5.0},
+                 ambient={"applied": "soupx", "compared": "decontx"},
+                 n_libraries=2, cells_before=120, cells_after=90,
+                 checkpoints={"mouse": {"cells": 60, "genes": 200},
+                              "human": {"cells": 30, "genes": 300}},
+                 warnings=["Human library retained only 32%; inspect the mitochondrial threshold."],
+                 libraries=[{"sample": "mouse_A", "species": "mouse", "cells_after_doublets": 60},
+                            {"sample": "human_B", "species": "human", "cells_after_doublets": 30}],
+                 diagnostics="d" * padding)
+    runner.fixture.write_text(json.dumps(value))
+    result = make(tool="cellqc_job_status").executor({"task_id": "task-one"}, ctx)
+    assert result["status"] == "ok", result
+    assert len(json.dumps(result)) <= 14000
+    native = result["result"]
+    assert native["thresholds"] == value["thresholds"]
+    assert native["ambient"] == value["ambient"]
+    assert native["cells_after"] == 90 and native["n_libraries"] == 2
+    assert native["checkpoints"] == value["checkpoints"]
+    assert native["warnings"] == value["warnings"]
+    assert "seed" not in native  # the status result does not echo the original seed
+    if padding == 7000:
+        assert native["diagnostics"] == value["diagnostics"]
+        assert "response_omitted" not in native
+    else:
+        assert native["response_omitted"] is True
+        assert native["response_summary"]["complete"] is False
+    complete = json.loads((runner.artifacts / result["full_result"]).read_text())
+    assert complete["diagnostics"] == value["diagnostics"]
+    assert complete["thresholds"] == native["thresholds"]
+
+
+def test_cellqc_schema_support_does_not_invent_executed_defaults(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    schema = {"type": "object", "properties": {
+        "ambient_compare": {"type": "string", "default": "decontx", "enum": ["", "soupx", "decontx", "none"]},
+        "seed": {"type": "integer", "default": 42}}, "additionalProperties": False}
+    value, _ = fixture_result(runner)
+    value.update(ambient={"applied": "soupx", "compared": "decontx"}, diagnostics="x" * 20000)
+    runner.fixture.write_text(json.dumps(value))
+    result = make(schema=schema).executor({}, ctx)
+    declaration = result["parameter_schema"]
+    assert declaration["declared_parameters"] == ["ambient_compare", "seed"]
+    assert declaration["sha256"] == result["mcp"]["tools_sha256"]
+    assert declaration["tool"] == "mcp_run_cellqc"
+    assert "seed" not in result and "seed" not in result["result"]
+
+
+def test_collector_preserves_scientific_slashes_and_redacts_real_paths(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, _ = fixture_result(runner)
+    labels = ["Leber congenital amaurosis-3 (LCA3)/Retinitis pigmentosa",
+              "Deletion syndrome (Velocardiofacial / DiGeorge syndrome)",
+              "phenotype /genotype pairing", "affected / unaffected"]
+    value.update(diseases=labels, source_url="https://example.org/retina/phenotypes",
+                 error_detail='File "/home/private/source.py", input=/dfs3b/private/input.vcf; read (/tmp/result.json)',
+                 private_reference="/private/reference.vcf")
+    runner.fixture.write_text(json.dumps(value))
+    result = make().executor({}, ctx)
+    assert result["diseases"] == labels
+    assert result["source_url"] == value["source_url"]
+    assert result["private_reference"] == "[server path]"
+    assert "/home/private" not in result["error_detail"] and "/dfs3b" not in result["error_detail"]
+    assert "/tmp" not in result["error_detail"]
+    full = json.loads((runner.artifacts / result["full_result"]).read_text())
+    assert full["diseases"] == labels and full["private_reference"] == "[server path]"
+    adapter = AnalysisAdapter(bridge.configured_servers()[0])
+    failed = adapter.failure({"status": "error", "stderr": value["error_detail"], "labels": labels})
+    assert failed["labels"] == labels and failed["stderr"] == result["error_detail"]
+
+
+@pytest.mark.parametrize("server", ["cellqc", "literature", "phenotype-diagnosis"])
+def test_semantic_preview_and_navigation_remain_within_wire_limit(analysis_bridge, server):
+    runner, ctx, make = analysis_bridge
+    value, _ = fixture_result(runner, server)
+    value.update(thresholds={"max_pct_mt": 5}, ambient={"applied": "soupx", "compared": "decontx"},
+                 warnings=["表型" * 2000] * 8, answer="Retinal evidence. " + "表型" * 10000,
+                 contexts=[{"pmid": "12345", "citation": "Verified source", "text": "表型" * 10000}],
+                 literature=[{"gene": "GENE1", "association": False, "evidence_status": "unsupported"}],
+                 n_candidates=8621, top={"gene": "", "posttest_prob": 0.4287, "agreement": "lirical_only"})
+    runner.fixture.write_text(json.dumps(value))
+    result = make(server).executor({}, ctx)
+    assert result["status"] == "ok", result
+    assert len(json.dumps(result)) <= 14000
+    assert result["result"]["full_result"] == result["full_result"]
+    if server == "cellqc":
+        assert result["result"]["thresholds"] == value["thresholds"]
+    if server == "phenotype-diagnosis":
+        assert result["result"]["literature"][0]["association"] is False
+    if server == "literature":
+        assert result["result"]["answer"].startswith("Retinal evidence.")
+
+
+
+def _phenotype_catalog(runner, monkeypatch):
+    schema = {"type": "object", "properties": {"task_id": {"type": "string"}}, "additionalProperties": False}
+    cfg = write_config(runner.root.parent, entries=[{"name": name, "description": "Read fixture evidence.",
+        "inputSchema": schema} for name in ("run_lirical", "diagnose_disease", "phenotype_job_status")],
+        overrides={"name": "phenotype-diagnosis", "release_tag": "phenotype-diagnosis-v1.2.3",
+                   "prefix": "mcp_", "adapter": "analysis", "entrypoint": "phenotype-diagnosis-mcp", "resources": {}})
+    monkeypatch.setenv("AISCIENTIST_MCP_CONFIG", str(cfg))
+    return {tool.name: tool for tool in build(runner)}
+
+
+def test_two_status_snapshots_keep_distinct_full_evidence_and_untracked_history(analysis_bridge, monkeypatch):
+    runner, ctx, _ = analysis_bridge
+    catalog = _phenotype_catalog(runner, monkeypatch)
+    value, output = fixture_result(runner, "phenotype-diagnosis")
+    dest = runner.artifacts / "mcp/phenotype-diagnosis/default"
+    dest.mkdir(parents=True)
+    old = dest / "run_lirical.json"
+    old.write_text('{"historical": "untracked original evidence"}')
+    original = old.read_bytes()
+    responses = []
+    for task, operation, n in (("task-one", "run_lirical", 8621), ("task-two", "diagnose_disease", 8)):
+        request = output.parent.parent / task / "request.json"
+        request.parent.mkdir(exist_ok=True)
+        request.write_text(json.dumps({"operation": operation}))
+        value.update(task_id=task, tool="untrusted_free_payload_name", n_candidates=n)
+        runner.fixture.write_text(json.dumps(value))
+        responses.append(catalog["mcp_phenotype_job_status"].executor({"task_id": task}, ctx))
+    assert all(r["status"] == "ok" for r in responses), responses
+    assert responses[0]["full_result"] != responses[1]["full_result"]
+    for response, count in zip(responses, (8621, 8)):
+        full = json.loads((runner.artifacts / response["full_result"]).read_text())
+        assert full["n_candidates"] == count and full["task_id"] == response["task_id"]
+    assert old.read_bytes() == original
+    ownership = json.loads((runner.artifacts / "mcp/.compatibility.json").read_text())["evidence"]
+    assert ownership[responses[0]["full_result"]]["operation"] == "run_lirical"
+    assert ownership[responses[1]["full_result"]]["operation"] == "diagnose_disease"
+    assert not (dest / "untrusted_free_payload_name.json").exists()
+
+
+def test_status_task_mismatch_fails_before_artifact_copy(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    fixture_result(runner)
+    result = make(tool="cellqc_job_status").executor({"task_id": "different-task"}, ctx)
+    assert result["status"] == "error" and "another task identifier" in json.dumps(result)
+    assert not (runner.artifacts / "mcp/cellqc").exists()
+    assert not (runner.checkpoints / "adata_qc.h5ad").exists()
+
+
+@pytest.mark.parametrize("live_state", ["COMPLETED", "FAILED"])
+def test_projection_reads_all_eight_original_passages_and_live_failure_wins(analysis_bridge, monkeypatch, live_state):
+    runner, ctx, _ = analysis_bridge
+    catalog = _phenotype_catalog(runner, monkeypatch)
+    value, output = fixture_result(runner, "phenotype-diagnosis")
+    source = output.parent / "result.json"
+    scientific = {"status": "ok", "tool": "diagnose_disease", "n_candidates": 8621,
+        "literature": [{"association": False, "evidence_status": "unsupported",
+                        "evidence": [{"source_id": str(i), "quote": "full passage " * 1000} for i in range(8)]}],
+        "differential": [{"disease_name": "Condition", "rank": i} for i in range(8621)]}
+    source.write_text(json.dumps(scientific))
+    (output.parent / "request.json").write_text(json.dumps({"operation": "diagnose_disease"}))
+    value.update(full_result=str(source), state=live_state, status="ok" if live_state == "COMPLETED" else "error",
+                 literature=[{"association": False, "evidence_status": "unsupported", "evidence": [{}] * 5}],
+                 response_omitted=True)
+    if live_state == "FAILED":
+        value["error"] = "actual live allocation failed"
+    runner.fixture.write_text(json.dumps(value))
+    result = catalog["mcp_phenotype_job_status"].executor({"task_id": "task-one"}, ctx)
+    assert result["status"] == ("ok" if live_state == "COMPLETED" else "error"), result
+    assert result["result"]["literature"][0]["evidence_count"] == 8
+    assert result["result"]["literature"][0]["association"] is False
+    full = json.loads((runner.artifacts / result["full_result"]).read_text())
+    assert len(full["literature"][0]["evidence"]) == 8 and len(full["differential"]) == 8621
+    assert full["state"] == live_state and full["status"] == result["status"]
+    if live_state == "FAILED":
+        assert full["error"] == "actual live allocation failed" and result["error"]
+
+
+def test_status_refreshes_only_matching_managed_operation_alias(analysis_bridge, monkeypatch):
+    runner, ctx, _ = analysis_bridge
+    catalog = _phenotype_catalog(runner, monkeypatch)
+    value, output = fixture_result(runner, "phenotype-diagnosis")
+    first = catalog["mcp_run_lirical"].executor({}, ctx)
+    assert first["status"] == "ok"
+    canonical = runner.artifacts / "mcp/phenotype-diagnosis/default/run_lirical.json"
+    first_snapshot = runner.artifacts / first["full_result"]
+    first_bytes = first_snapshot.read_bytes()
+    (output.parent / "request.json").write_text(json.dumps({"operation": "run_lirical"}))
+    value["n_candidates"] = 8621
+    runner.fixture.write_text(json.dumps(value))
+    result = catalog["mcp_phenotype_job_status"].executor({"task_id": "task-one"}, ctx)
+    assert result["status"] == "ok"
+    assert json.loads(canonical.read_text())["n_candidates"] == 8621
+    managed = canonical.read_bytes()
+    other = output.parent.parent / "other-task"
+    other.mkdir()
+    (other / "request.json").write_text(json.dumps({"operation": "run_lirical"}))
+    value.update(task_id="other-task", n_candidates=1)
+    runner.fixture.write_text(json.dumps(value))
+    result = catalog["mcp_phenotype_job_status"].executor({"task_id": "other-task"}, ctx)
+    assert result["status"] == "ok" and result["result"]["n_candidates"] == 1
+    assert canonical.read_bytes() == managed
+    assert first_snapshot.read_bytes() == first_bytes
+
+
+
+def test_primary_calls_have_immutable_task_paths_when_operation_alias_advances(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, _ = fixture_result(runner)
+    tool = make()
+    first = tool.executor({}, ctx)
+    first_file = runner.artifacts / first["full_result"]
+    original = first_file.read_bytes()
+    value.update(task_id="second-task", cells_after=70)
+    runner.fixture.write_text(json.dumps(value))
+    second = tool.executor({}, ctx)
+    assert first["full_result"] != second["full_result"]
+    assert first_file.read_bytes() == original
+    canonical = runner.artifacts / "mcp/cellqc/default/run_cellqc.json"
+    assert json.loads(canonical.read_text())["task_id"] == "second-task"
+    assert json.loads((runner.artifacts / second["full_result"]).read_text())["cells_after"] == 70
+
+
+def test_scrna_reference_settings_preserve_explicit_operator_paths(monkeypatch):
+    from types import SimpleNamespace
+    from aiscientist.agents.mcp_analysis import setting_paths, setting_values
+    server = SimpleNamespace(name="scrna-analysis", settings_env=("SCRNA_GENESETS_DIR",))
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", "/cluster/reference/legacy")
+    monkeypatch.delenv("SCRNA_GENESETS_DIR", raising=False)
+    assert setting_values(server) == {"SCRNA_GENESETS_DIR": "/cluster/reference/legacy"}
+    assert setting_paths(server) == ("/cluster/reference",)
+    monkeypatch.setenv("SCRNA_GENESETS_DIR", "/cluster/native/genesets")
+    assert setting_values(server) == {"SCRNA_GENESETS_DIR": "/cluster/native/genesets"}
+    monkeypatch.setenv("SCRNA_GENESETS_DIR", "")
+    assert setting_values(server) == {"SCRNA_GENESETS_DIR": ""} and setting_paths(server) == ()
+    monkeypatch.delenv("SCRNA_GENESETS_DIR")
+    monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", "relative/legacy")
     with pytest.raises(ValueError, match="absolute deployment path"):
         setting_values(server)

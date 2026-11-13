@@ -341,6 +341,10 @@ def read_scope(question: str, tools: "dict[str, str]",
     not turn into tools. Never raises: an unreadable reply is "no limit"."""
     names = frozenset(n for n in tools if n != "finish")
     brief = bool(_BRIEF_REPORT.search(question or ""))
+    from .mcp_workflow import explicit_workflow
+    explicit = explicit_workflow(question)
+    if explicit:
+        return RunScope(tuple(dict.fromkeys(call.name for call in explicit)), (), brief, "explicit_mcp")
     keep, exclude = _by_rules(question, names)
     # Naming CellQC and asking for its result is the whole request, not an invitation to analyse it.
     if not (keep or exclude) and _METHOD_RESULT.fullmatch(question or ""):

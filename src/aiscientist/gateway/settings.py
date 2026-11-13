@@ -235,20 +235,9 @@ class HPCSettings:
     container_bin: str = "apptainer"
     container_module: str = "apptainer/1.4.5"
 
-    # --- scGPT per-cell annotation (GPU batch job, NOT a persistent server) -----
-    # scGPT is a gene/expression transformer (not an LLM); we run its one-shot
-    # reference-based annotation inference as a short-lived gpu:1 batch job via
-    # scgpt_job.run_scgpt_inference, fully contained in this .sif. scgpt/torch live
-    # ONLY in the image — never in the gateway's Python env. The image bundles the
-    # scGPT_refactor step-2 code; ``scgpt_entrypoint`` is the in-container command,
-    # given --input/--model/--out by the engine.
-    scgpt_image: str = f"{SHARED_ROOT}/containers/scgpt.sif"
-    # In-container CLI (deploy/scgpt/run_infer.py): runs the full reference flow
-    # (step1 preprocess + step2 inference) given --input/--model/--out and writes
-    # predictions.csv to --out.
-    scgpt_entrypoint: str = "python /opt/scgpt/run_infer.py"
-    # Reference model dir on shared DFS (best_model.pt, vocab.json, id2type.json,
-    # dev_train_args.yml), bound read-only into the job. Staged by deploy/scgpt/build_and_stage.sh.
+    # --- Native MCP scGPT annotation assets ----------------------------------
+    # The pinned scgpt-annotation MCP catalog selects the image and command.
+    # Reference weights remain an operator-managed read-only asset; see deploy/scgpt/README.md.
     scgpt_model_dir: str = f"{SHARED_ROOT}/models/scgpt"
     # scGPT inference is a short annotation job that runs fine on ANY card — keep it on gpu:1 so it
     # is NOT pinned to the (scarcer) A100 the LLM reserves. Decoupled from the main `gres`.
@@ -377,18 +366,8 @@ class HPCSettings:
     report_on_hpc: bool = False
     report_image: str = f"{SHARED_ROOT}/containers/report.sif"
 
-    # --- VCF variant annotation runs OFFLINE on HPC3 (opt-in) -------------------
-    # Off: annotate_variants uses the public Ensembl VEP REST API on the eyeserver — fine for a small
-    # VCF but it reads the whole file into memory, caps at 500 variants, and is rate-limited, so it
-    # can't scale to a WGS-size VCF. Set AISCIENTIST_VARIANT_ON_HPC=1 to run the OFFLINE line
-    # (bcftools PASS-filter -> `vep --offline --cache --fork` over a local cache -> stream-parse) as a
-    # Apptainer-contained CPU batch job on HPC3, reading the VCF on dfs3b in place. No network is
-    # needed at run time (the cache is bind-mounted) — the analysis container now allows network
-    # on-demand (AISCIENTIST_SANDBOX_NETWORK, default on) but the offline line doesn't use it. Reuses
-    # SlurmAnalysisExecutor + cpu_partition/cpu_account/run_code_mem_gb. Falls
-    # back to the REST path in-process on failure (small VCFs still work when HPC is unavailable).
-    variant_on_hpc: bool = False
-    vep_image: str = f"{SHARED_ROOT}/containers/vep.sif"
+    # Native VEP MCP reference settings. Existing AISCIENTIST_* values remain
+    # supported; explicit VARIANT_* deployment values override them.
     # VEP cache + ClinVar VCF per assembly, staged on dfs3b by deploy/vep/build_and_stage.sh. The
     # cache is a bind-mounted local directory (offline); ClinVar is added via VEP --custom so the
     # offline path reproduces the REST tool's pathogenicity output.
@@ -466,7 +445,6 @@ class HPCSettings:
     spliceai_max_variants: int = 0          # 0 = NO cap (default); set >0 as an optional safety valve
     #                                         to skip SpliceAI if the post-filter set is still huge
     vep_fork: int = 8                       # VEP --fork width == cpus-per-task on the CPU node
-    vep_time_limit: str = "04:00:00"        # a WGS VCF forks through in ~30-60 min; request generous
     #                                         headroom — a batch job frees the node the instant its
     #                                         script exits and the gateway job-wait auto-tracks this
     #                                         --time, so a long request costs nothing for a normal run.
@@ -610,8 +588,6 @@ class HPCSettings:
             vllm_extra_args=os.environ.get("AISCIENTIST_VLLM_EXTRA_ARGS", cls.vllm_extra_args),
             container_bin=os.environ.get("AISCIENTIST_CONTAINER_BIN", cls.container_bin),
             container_module=os.environ.get("AISCIENTIST_CONTAINER_MODULE", cls.container_module),
-            scgpt_image=os.environ.get("AISCIENTIST_SCGPT_IMAGE", cls.scgpt_image),
-            scgpt_entrypoint=os.environ.get("AISCIENTIST_SCGPT_ENTRYPOINT", cls.scgpt_entrypoint),
             scgpt_model_dir=os.environ.get("AISCIENTIST_SCGPT_MODEL_DIR", cls.scgpt_model_dir),
             vlreview_enabled=(os.environ.get("AISCIENTIST_VLREVIEW_ENABLED", "").strip().lower()
                               in ("1", "true", "yes", "on")),
@@ -661,9 +637,6 @@ class HPCSettings:
                                                cls.worker_idle_timeout_s)),
             worker_startup_timeout_s=_int("AISCIENTIST_WORKER_STARTUP_TIMEOUT_S", cls.worker_startup_timeout_s),
             worker_command_timeout_s=_int("AISCIENTIST_WORKER_COMMAND_TIMEOUT_S", cls.worker_command_timeout_s),
-            variant_on_hpc=(os.environ.get("AISCIENTIST_VARIANT_ON_HPC", "").strip().lower()
-                            in ("1", "true", "yes", "on")),
-            vep_image=os.environ.get("AISCIENTIST_VEP_IMAGE", cls.vep_image),
             vep_cache_dir_grch38=os.environ.get("AISCIENTIST_VEP_CACHE_DIR_GRCH38", cls.vep_cache_dir_grch38),
             vep_cache_dir_grch37=os.environ.get("AISCIENTIST_VEP_CACHE_DIR_GRCH37", cls.vep_cache_dir_grch37),
             vep_clinvar_grch38=os.environ.get("AISCIENTIST_VEP_CLINVAR_GRCH38", cls.vep_clinvar_grch38),
@@ -697,7 +670,6 @@ class HPCSettings:
             spliceai_models=os.environ.get("AISCIENTIST_SPLICEAI_MODELS", cls.spliceai_models),
             spliceai_max_variants=_int("AISCIENTIST_SPLICEAI_MAX_VARIANTS", cls.spliceai_max_variants),
             vep_fork=_int("AISCIENTIST_VEP_FORK", cls.vep_fork),
-            vep_time_limit=os.environ.get("AISCIENTIST_VEP_TIME_LIMIT", cls.vep_time_limit),
             phenotype_on_hpc=(os.environ.get("AISCIENTIST_PHENOTYPE_ON_HPC", "").strip().lower()
                               in ("1", "true", "yes", "on")),
             lirical_image=os.environ.get("AISCIENTIST_LIRICAL_IMAGE", cls.lirical_image),

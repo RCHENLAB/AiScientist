@@ -127,8 +127,8 @@ def test_an_absent_release_is_an_empty_library_and_says_how_to_install_it(tmp_pa
     (local / "SKILL.md").write_text("---\nname: example\n---\nLocal guidance")
     assert registry.load(sk._load_from) == {}
     assert sk._load_skills() == {}
-    assert "Pinned skills release v0.2.0 is not installed" in caplog.text
-    assert (f"gh release download v0.2.0 -R lijinbio/aiscientist-skills -D {tmp_path / 'absent' / '0.2.0'}"
+    assert "Pinned skills release v0.2.5 is not installed" in caplog.text
+    assert (f"gh release download v0.2.5 -R liujs123456/aiscientist-skills -D {tmp_path / 'absent' / '0.2.5'}"
             in caplog.text)
 
 

@@ -364,7 +364,11 @@ def test_the_append_indirection_actually_prevents_a_hijack(tmp_path):
 
     probe = ("import json, pyranges;"
              "print(pyranges.VALUE, getattr(json, 'ORIGIN', 'STDLIB'))")
-    script = pc.cache_preamble(str(root), "fakeimg") + f"\n{sys.executable} -c {probe!r}\n"
+    import shlex
+    # The cache key and the executed interpreter must describe the same job.
+    # A login shell on macOS otherwise substitutes Homebrew's unrelated Python.
+    script = (f"export PATH={shlex.quote(os.path.dirname(sys.executable))}:$PATH\n"
+              + pc.cache_preamble(str(root), "fakeimg") + f"\n{shlex.quote(sys.executable)} -c {probe!r}\n")
     got = subprocess.run(["bash", "-lc", script], capture_output=True, text=True, timeout=120)
 
     assert got.stdout.strip() == "from-shared-cache STDLIB", got.stderr

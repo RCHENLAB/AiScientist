@@ -1,7 +1,7 @@
 ---
 name: scgpt_annotation
 description: scGPT foundation-model per-cell annotation for a .h5ad — transfers reference cell-type labels + calibrated confidence to every cell, AND independently cross-validates ANY existing celltype/majorclass labels the data already carries. Use for scGPT / .sif / foundation-model annotation, per-cell labelling, OR an independent second-opinion check of a dataset's existing cell-type labels.
-tools: scgpt_annotate, run_scanpy_qc, run_clustering, run_de, run_code
+tools: mcp_scgpt_annotate, run_scanpy_qc, run_clustering, run_de, run_code
 ---
 
 # scGPT Per-Cell Annotation & Cross-Validation Protocol
@@ -19,7 +19,7 @@ not ground truth**.
 |---|---|
 | **Input** | one AnnData `.h5ad` (scRNA-seq query), passed **as-is** — may already carry a `celltype` / `majorclass` label column |
 | **Output** | `data/scgpt_predictions.csv` (per-cell label + confidence, **one row per RAW-upload cell, indexed by barcode**) + an independent Leiden clustering + cross-validation tables + figures |
-| **Engine** | **scGPT** — a pretrained gene/expression transformer — run via `scgpt_annotate` as a **short-lived GPU Apptainer batch job** (the scGPT `.sif` image); the scanpy structure/figure steps (`run_scanpy_qc` / `run_clustering` / `run_de` / `run_code`) run separately |
+| **Engine** | **scGPT** — a pretrained gene/expression transformer — run via `mcp_scgpt_annotate` as a **short-lived GPU Apptainer batch job** (the scGPT `.sif` image); the scanpy structure/figure steps (`run_scanpy_qc` / `run_clustering` / `run_de` / `run_code`) run separately |
 | **Not for** | marker-based cluster naming *without* a foundation model (use the `celltype_annotation` skill), or any non-`.h5ad` query |
 
 > **How to read the "parameters" in each step.** Two kinds of knob feed this pipeline, and this
@@ -40,7 +40,7 @@ not ground truth**.
 
 | # | Step | Tool / skill | 🔬 Key agent-chosen params | Output |
 |---|------|--------------|----------------------------|--------|
-| 1 | **Annotate every cell (scGPT)** | `scgpt_annotate` | none — pass the query **as-is** (no pre-norm/HVG) | `data/scgpt_predictions.csv` |
+| 1 | **Annotate every cell (scGPT)** | `mcp_scgpt_annotate` | none — pass the query **as-is** (no pre-norm/HVG) | `data/scgpt_predictions.csv` |
 | 2 | **QC the dataset** *(for the independent yardstick, not for scGPT)* | `run_scanpy_qc` | QC thresholds *(agent-chosen)* | filtered analysis `adata` |
 | 3 | **Cluster independently** | `run_clustering` | neighbors / Leiden resolution / UMAP *(agent-chosen)* | Leiden clusters + UMAP |
 | 4 | **Marker genes per cluster** | `run_de` | DE grouping *(agent-chosen)* | per-cluster markers |
@@ -49,7 +49,7 @@ not ground truth**.
 
 > Plan these as **distinct agenda steps**. Step 1 is the annotation; Steps 2–4 build a **data-driven
 > structure that does NOT depend on the scGPT labels**; Steps 5–6 **check** scGPT against that
-> structure. **Do NOT normalize / HVG / log1p the data before Step 1** — `scgpt_annotate` preprocesses
+> structure. **Do NOT normalize / HVG / log1p the data before Step 1** — `mcp_scgpt_annotate` preprocesses
 > internally. **Plan no other report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
 ### The two jobs — transfer AND independent cross-validation (why the extra steps)
@@ -75,7 +75,7 @@ hypothesis to validate, never as ground truth.
 <details open>
 <summary><b>Step 1 · Annotate every cell with scGPT</b> — the primary per-cell label + confidence</summary>
 
-**What.** Run `scgpt_annotate` on the loaded `.h5ad`, passed **as-is**. It transfers a reference-atlas
+**What.** Run `mcp_scgpt_annotate` on the loaded `.h5ad`, passed **as-is**. It transfers a reference-atlas
 cell-type label + a **data-calibrated confidence** to **EVERY** cell of the RAW upload and writes
 `data/scgpt_predictions.csv` — **one row per RAW-upload cell, indexed by the original barcode**
 (columns `index`, `predictions`, `confidence`).
@@ -86,12 +86,12 @@ names) for cells that may be unlabelled, and serves as the independent second op
 are already labelled.
 
 **🔬 Agent-chosen:** none for the call itself — **pass the query as-is.** Do **NOT** normalize / HVG /
-log1p beforehand: `scgpt_annotate` preprocesses internally (gene-vocabulary alignment, HVG, log1p) on
+log1p beforehand: `mcp_scgpt_annotate` preprocesses internally (gene-vocabulary alignment, HVG, log1p) on
 the GPU job, and pre-processing it yourself corrupts that alignment.
 
 **What runs** — the tool call (heavy lifting is inside the GPU job, not a shell command you write):
 ```
-scgpt_annotate( <the loaded .h5ad, passed as-is — no pre-norm / no HVG / no log1p> )
+mcp_scgpt_annotate( <the loaded .h5ad, passed as-is — no pre-norm / no HVG / no log1p> )
 # → data/scgpt_predictions.csv   columns: index (ORIGINAL barcode), predictions, confidence
 #   one row per RAW-upload cell (BEFORE any QC filtering in Step 2)
 ```
@@ -104,7 +104,7 @@ distribution is reported (from the tool, not fabricated) · the query was **not*
 before the call · a `not_enabled` / `error` result is surfaced honestly, not papered over with invented
 labels.
 
-<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 1) + `src/aiscientist/tools/scgpt_annotate/tool.py`</sub>
+<sub>Source: `preset_pipelines/scgpt_annotation/SKILL.md` (step 1) + `src/aiscientist/tools/mcp_scgpt_annotate/tool.py`</sub>
 </details>
 
 <details>
@@ -251,7 +251,7 @@ never fabricate them. State the label-transfer caveats honestly: the taxonomy is
 fine-tuning** on this query, and **query-vs-reference differences** shift calibration. Treat scGPT
 labels as a **strong hypothesis to validate**, not ground truth, and read them **together** with the
 independent Leiden structure and (when present) the existing `celltype`/`majorclass` labels. If
-`scgpt_annotate` is **not enabled** (no GPU / image) or errors, **say so and fall back to the
+`mcp_scgpt_annotate` is **not enabled** (no GPU / image) or errors, **say so and fall back to the
 marker-based path** (the `celltype_annotation` skill) rather than inventing labels. **Plan no other report-writing step:**
 a written report is one `write_report` step, last, planned only when the request asks for it.
 

@@ -141,7 +141,7 @@ preflight() {
   local n
   n="$(ls "$APP"/src/aiscientist/tools/genesets/*.gmt 2>/dev/null | wc -l | tr -d ' ')"
   [ "$n" -gt 0 ] && ok "$n gene-set libraries to copy to data/reference/genesets/" \
-    || warn "no gene sets in app/: enrichment will have none (scripts/fetch_genesets.py)"
+    || warn "no legacy gene sets in app/: configure compute-host SCRNA_GENESETS_DIR using aiscientist-mcp/scripts/fetch_genesets.py"
   local skills_tag skills_root
   skills_tag="$(sed -n 's/.*"release_tag"[^"]*"v\([^"]*\)".*/\1/p' "$APP/configs/skills_registry.json" 2>/dev/null)"
   skills_root="$(env_value SKILLS_REGISTRY_RELEASES_ROOT "$envf")"; skills_root="${skills_root:-$ROOT/skills/releases}"

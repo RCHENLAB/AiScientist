@@ -64,7 +64,7 @@ PACKAGE = __name__.rsplit(".", 1)[0]          # "aiscientist.tools"
 
 # Where a tool's executor runs. ``inprocess``: in the gateway process. ``hpc:<line>``: as a Slurm
 # job on HPC3 through that line's executor (the platform falls back in-process when it has none).
-# ``gpu:scgpt``: through a runner the platform injects (``needs: [scgpt_runner=scgpt_runner]``).
+# ``gpu:scgpt`` remains valid for pinned MCP server resource profiles.
 RUNS_ON = ("inprocess", "hpc:analysis", "hpc:variant", "hpc:phenotype", "hpc:literature", "gpu:scgpt")
 CATEGORIES = ("qc", "analysis", "annotation", "literature", "figure")
 _REQUIRED = ("name", "summary", "category", "runs_on", "order")
@@ -307,7 +307,7 @@ SKILL_ARG = "_skill"
 
 def build(m: ToolManifest, deps: dict[str, Any] | None = None) -> HarnessTool:
     """Call the tool's factory with what its manifest ``needs``. ``deps`` maps a source name
-    (``scgpt_runner``, ``tool:run_lirical``, ...) to the object to inject; a missing one is passed
+    (``tool:run_lirical``, ...) to the object to inject; a missing one is passed
     as ``None`` (every factory degrades to an honest not-enabled result without it)."""
     deps = deps or {}
     tool = m.factory()(**{kw: deps.get(src) for kw, src in m.injected()})
