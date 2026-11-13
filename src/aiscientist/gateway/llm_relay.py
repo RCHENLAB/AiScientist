@@ -299,9 +299,9 @@ class ModelRelay:
                 self.stats.cost_usd += float(cost or 0)
                 if relay_error:
                     self.stats.failed += 1
-            if relay_error:
-                return {"error": relay_error, "kind": "model"}
             keep = {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "model") if k in usage}
+            if relay_error:
+                return {"error": relay_error, "kind": "model", "usage": keep, "cost_usd": cost}
             if self._call_request is not None:
                 return {"turn": turn, "usage": keep, "cost_usd": cost}
             return {"text": text, "usage": keep, "cost_usd": cost}

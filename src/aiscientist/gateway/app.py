@@ -6284,6 +6284,7 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
     Only the selected Scientist model is bound. No provider key, proxy bearer,
     or user endpoint is placed in the HPC job's environment or result files.
     """
+    import hashlib
     from ..agents.mcp_model import RelayBinding
     from ..agents.mcp_relay_worker import validate_request
     from . import anthropic_client, llm_credentials, llm_pricing, llm_providers, llm_relay
@@ -6293,17 +6294,30 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
         if cred is not None else str(os.environ.get("AISCIENTIST_LLM_MODEL") or "")
     if not model:
         raise ValueError("The selected model has no configured model identifier")
-    base = (cred or {}).get("base_url") or os.environ.get("AISCIENTIST_LLM_BASE_URL") or ""
+    base = str(cred.get("base_url") or "") if cred is not None \
+        else str(os.environ.get("AISCIENTIST_LLM_BASE_URL") or "")
     native = cred is not None and llm_providers.transport_for(cred.get("provider"), base) == "anthropic"
+    priced = shared or llm_pricing.rates_for(model) is not None
     remote = not shared and (native or _endpoint_is_off_host(base))
     label = str((cred or {}).get("label") or (cred or {}).get("provider") or "configured API")
+    identity = hashlib.sha256(json.dumps({
+        "credential_id": (cred or {}).get("id", ""), "provider": (cred or {}).get("provider", "openai"),
+        "base_url": base, "model": model, "shared": shared,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     # Relay threads do not inherit ContextVars. Retain this run's billing, stop
     # event and consent context even when another chat starts on the connection.
     context = contextvars.copy_context()
     bound_run = getattr(conn, "active_run", None)
     cancelled = conn.chat_stop.is_set
 
-    def start(relay_dir: str):
+    def start(relay_dir: str, max_cost_usd: float | None = None):
+        cap = CORPUS_SCAN_MAX_COST_USD
+        if max_cost_usd is not None:
+            if type(max_cost_usd) not in (int, float) or not 0 < max_cost_usd < float("inf"):
+                raise ValueError("MCP model cost limit must be positive and finite")
+            if not priced:
+                raise ValueError("The selected model has no configured price; a cost limit cannot be estimated")
+            cap = min(cap, max_cost_usd)
         if not hasattr(conn.executor, "open_sftp"):
             raise ValueError("The MCP model relay needs an active HPC3 file-transfer connection")
         if cred is not None and not shared:
@@ -6376,7 +6390,7 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
             lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, None,
             call_request=lambda request: context.copy().run(chat, request),
             record=lambda *args: context.copy().run(record, *args), price=price,
-            max_cost_usd=None if shared else CORPUS_SCAN_MAX_COST_USD,
+            max_cost_usd=None if shared else cap,
             concurrency=1, poll_s=0.2, should_stop=cancelled)
         if native:
             conn.emit("info", "mcp", f"MCP model calls use your selected {model} through the gateway, "
@@ -6389,7 +6403,7 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
                 key_use.close()
             raise
 
-    return RelayBinding(model=model, start=start)
+    return RelayBinding(model=model, start=start, priced=priced, identity=identity)
 
 
 class _NoServedModelExecutor:

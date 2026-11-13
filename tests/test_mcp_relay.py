@@ -69,6 +69,7 @@ def test_text_json_roundtrip_preserves_model_options_usage_and_private_files(tmp
             result = json.load(response)
         assert json.loads(result["choices"][0]["message"]["content"]) == {"ok": True}
         assert result["usage"]["completion_tokens"] == 4
+        assert result["aiscientist_usage"] == {"version": 1, "billed": True, "cost_usd": 0.02}
         assert seen[0]["model"] == MODEL and seen[0]["max_tokens"] == 100
         assert seen[0]["reasoning_effort"] == "none" and seen[0]["temperature"] == 0
         assert "chat_template_kwargs" not in seen[0]
@@ -161,6 +162,9 @@ def test_invalid_json_model_reply_records_real_usage_once(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as exc:
             request(server, body(response_format={"type": "json_object"}))
         assert exc.value.code == 502
+        error = json.load(exc.value)
+        assert error["aiscientist_usage"] == {"version": 1, "billed": True, "cost_usd": 0.02}
+        assert error["usage"]["completion_tokens"] == 3
         assert relay.stats.calls == relay.stats.failed == 1
         assert relay.stats.cost_usd == 0.02 and len(records) == 1
         assert records[0][0]["completion_tokens"] == 3 and records[0][2] == "model"

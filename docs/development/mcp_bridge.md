@@ -218,6 +218,16 @@ every request. The requested model must match the bound session model; a global
 deployment model never silently replaces it. The worker token is only a local
 transport credential and is removed when the job exits.
 
+The gateway also supplies a stable hashed model identity, so a fresh local relay
+port does not invalidate an existing analysis. For a model with known pricing,
+the trusted relay declares its usage protocol. Extraction receives the gateway's
+token usage and per-call cost estimate, feeds the original pilot projection, and
+stops if that projection exceeds `max_cost_usd`. The worker and gateway check the
+running spend before each serialized call; the gateway also applies its configured
+ceiling. A request already in flight can cross the threshold. Missing prices or
+lost accounting stop subsequent priced calls, with unknown cost reported as null.
+Unpriced endpoints continue to reject a positive cost cap.
+
 The relay supports text messages, JSON-object requests, function tools and their
 results, explicit tool choice, and buffered SSE responses. Unsupported API fields
 are rejected. Native Anthropic uses provider-supported sampling and reasoning

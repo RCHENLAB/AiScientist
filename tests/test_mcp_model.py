@@ -35,6 +35,28 @@ def test_guarded_relay_binding_has_no_provider_credentials_and_stops_on_failure(
         POLICY.reset(token)
 
 
+def test_extraction_budget_only_binds_to_known_price_relay(tmp_path):
+    from aiscientist.agents.mcp_model import RelayBinding
+    starts = []
+    def start(directory, max_cost_usd=None):
+        starts.append((directory, max_cost_usd))
+        return SimpleNamespace(stop=lambda: None)
+    executor = SimpleNamespace(work_dir=str(tmp_path), supports_skill_policy=True,
+                               mcp_model_binding=lambda: RelayBinding("priced-model", start, priced=True))
+    bound, setup = prepare_model("literature", "extract_haploinsufficient_genes", executor, {},
+                                  arguments={"max_cost_usd": 0.5})
+    assert "--priced" in setup and bound.max_cost_usd == 0.5
+    token = POLICY.set({"network": "runtime", "secret_values": {}})
+    try:
+        assert run_with_model(bound, executor, lambda: "ok") == "ok"
+    finally:
+        POLICY.reset(token)
+    assert starts == [(bound.relay_directory, 0.5)]
+    executor.mcp_model_binding = lambda: RelayBinding("unpriced-model", start)
+    with pytest.raises(ValueError, match="no known price"):
+        prepare_model("literature", "extract_haploinsufficient_genes", executor, {}, arguments={"max_cost_usd": 0.5})
+
+
 def test_live_session_binding_overrides_global_without_persisting_key():
     bindings = [ModelBinding("http://node-a:1234/v1", "session-a", "synthetic-secret"),
                 ModelBinding("http://node-b:2345/v1", "session-b", "new-synthetic-secret")]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import hashlib
 import json
 import os
 import re
@@ -199,9 +200,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             return self._json(400, {"error": {"message": str(exc)}})
         try:
             reply = self.server.exchange(body)
+            accounting = ({"version": 1, "cost_usd": reply.get("cost_usd"), "billed": True}
+                          if "usage" in reply else None)
             if reply.get("error"):
                 return self._json(403 if reply.get("kind") == "stop" else 502,
-                                  {"error": {"message": reply["error"], "type": reply.get("kind")}})
+                                  {"error": {"message": reply["error"], "type": reply.get("kind")},
+                                   **({"aiscientist_usage": accounting, "usage": reply["usage"]} if accounting else {})})
             turn = reply["turn"]
             content, calls = turn.get("content"), turn.get("tool_calls") or []
             if content is not None and not isinstance(content, str):
@@ -215,12 +219,14 @@ class RelayHandler(BaseHTTPRequestHandler):
                       "choices": [{"index": 0, "message": message,
                                    "finish_reason": turn.get("finish_reason") or ("tool_calls" if calls else "stop")}],
                       "usage": reply.get("usage", {})}
+            if accounting:
+                result["aiscientist_usage"] = accounting
             if raw.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                chunk = {k: v for k, v in result.items() if k not in {"choices", "usage"}}
+                chunk = {k: v for k, v in result.items() if k not in {"choices", "usage", "aiscientist_usage"}}
                 chunk["object"] = "chat.completion.chunk"
                 delta = dict(message)
                 if calls:
@@ -242,12 +248,18 @@ def main():
     parser.add_argument("--directory", required=True, type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--prefix", required=True, choices=("LITERATURE", "PHENOTYPE", "DATA_UTILITIES"))
+    parser.add_argument("--priced", action="store_true")
+    parser.add_argument("--identity", default="")
     args = parser.parse_args()
     os.umask(0o077)
     server = RelayServer(args.directory, args.model)
     endpoint = f"http://127.0.0.1:{server.server_port}/v1"
     values = {args.prefix + "_MODEL_ENDPOINT": endpoint, args.prefix + "_MODEL": args.model,
-              args.prefix + "_MODEL_API_KEY_FILE": str(args.directory / "token")}
+              args.prefix + "_MODEL_API_KEY_FILE": str(args.directory / "token"),
+              args.prefix + "_MODEL_RELAY_PROTOCOL": "aisci-relay-v1",
+              args.prefix + "_MODEL_IDENTITY": args.identity or hashlib.sha256(args.model.encode()).hexdigest()}
+    if args.priced:
+        values[args.prefix + "_MODEL_USAGE_PROTOCOL"] = "aisci-relay-v1"
     ready = args.directory / "ready.env"
     temporary = ready.with_suffix(".tmp")
     temporary.write_text("".join(f"export {key}={shlex.quote(value)}\n" for key, value in values.items()))

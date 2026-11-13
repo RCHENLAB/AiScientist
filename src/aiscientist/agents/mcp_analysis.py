@@ -370,7 +370,7 @@ class AnalysisAdapter:
         prefix = PREFIXES[self.server.name]
         values = setting_values(self.server)
         from .mcp_model import prepare_model
-        model_binding, model_setup = prepare_model(self.server.name, tool, executor, values)
+        model_binding, model_setup = prepare_model(self.server.name, tool, executor, values, arguments=args)
         setup = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in values.items())
         setup += model_setup
         setup += BOUND_SETUP

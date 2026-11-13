@@ -66,7 +66,9 @@ def test_native_relay_guards_and_meters_selected_model_without_exporting_key(mon
     monkeypatch.setattr(anthropic_client, 'relay_chat', native)
     binding = app._mcp_session_model(conn)
     assert 'synthetic-secret' not in repr(binding)
-    relay = binding.start(str(tmp_path))
+    assert binding.priced is True
+    relay = binding.start(str(tmp_path), max_cost_usd=0.5)
+    assert relay._cap == 0.5
     request = {'model': 'claude-haiku-5-5', 'messages': [{'role': 'user', 'content': 'Synthetic test'}],
                'max_tokens': 64, 'response_format': {'type': 'json_object'}}
     reply = relay._reply(request)
@@ -118,3 +120,14 @@ def test_missing_credential_creates_no_guard_or_relay(monkeypatch, tmp_path):
                            executor=SimpleNamespace(open_sftp=lambda: None))
     with pytest.raises(GatewayError, match='credential is unavailable'):
         app._mcp_session_model(conn).start(str(tmp_path))
+
+
+def test_unpriced_endpoint_cannot_claim_a_cost_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv('AISCIENTIST_LLM_BASE_URL', 'https://example.test/v1')
+    monkeypatch.setenv('AISCIENTIST_LLM_MODEL', 'unpriced-synthetic-model')
+    monkeypatch.setattr(app, '_bound_credential', lambda c: None)
+    conn = SimpleNamespace(chat_stop=threading.Event(), executor=SimpleNamespace(open_sftp=lambda: None))
+    binding = app._mcp_session_model(conn)
+    assert binding.priced is False
+    with pytest.raises(ValueError, match='no configured price'):
+        binding.start(str(tmp_path), max_cost_usd=1)

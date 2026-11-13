@@ -7,6 +7,8 @@ the guarded gateway file relay; their provider keys never reach a compute job.
 from __future__ import annotations
 
 import os
+import hashlib
+import re
 import shlex
 import uuid
 from dataclasses import dataclass, field
@@ -48,12 +50,16 @@ class ModelBinding:
 class RelayBinding:
     """Gateway-only callback: a bound provider credential never reaches the job."""
     model: str
-    start: Callable[[str], Any] = field(repr=False)
+    start: Callable[..., Any] = field(repr=False)
+    priced: bool = False
+    identity: str = ""
 
     def __post_init__(self):
         if (not isinstance(self.model, str) or not self.model.strip()
                 or any(c in self.model for c in "\0\n\r") or not callable(self.start)):
             raise ValueError("invalid guarded MCP relay binding")
+        if self.identity and not re.fullmatch(r"[a-f0-9]{64}", self.identity):
+            raise ValueError("invalid guarded MCP model identity")
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,7 @@ class CallModel:
     prefix: str
     binding: ModelBinding | RelayBinding
     relay_directory: str = ""
+    max_cost_usd: float | None = None
 
     @property
     def secret_name(self) -> str:
@@ -84,7 +91,8 @@ def _operator_binding(prefix: str, values: dict[str, str]) -> ModelBinding | Non
     return ModelBinding(endpoint.rstrip("/"), model, key, os.environ.get(prefix + "_MODEL_PROTOCOL", "openai"))
 
 
-def prepare_model(server: str, tool: str, executor: Any, values: dict[str, str]) -> tuple[CallModel | None, str]:
+def prepare_model(server: str, tool: str, executor: Any, values: dict[str, str],
+                  arguments: dict | None = None) -> tuple[CallModel | None, str]:
     """Resolve once per tool call; return only public shell setup and private metadata."""
     selected = _MODEL_TOOLS.get(server)
     if server == "phenotype-diagnosis" and tool == "diagnose_disease":
@@ -106,7 +114,7 @@ def prepare_model(server: str, tool: str, executor: Any, values: dict[str, str])
     values.pop(prefix + "_MODEL", None)
     # The gateway credential-file path is not meaningful inside an HPC container.
     # Credentials instead arrive through POLICY and its 0600 per-job secret file.
-    setup = f"unset {prefix}_MODEL_API_KEY_FILE\n"
+    setup = f"unset {prefix}_MODEL_API_KEY_FILE {prefix}_MODEL_USAGE_PROTOCOL {prefix}_MODEL_RELAY_PROTOCOL {prefix}_MODEL_IDENTITY\n"
     if binding is None:
         return None, setup + f"unset {prefix}_MODEL_ENDPOINT {prefix}_MODEL {prefix}_MODEL_API_KEY\n"
     if isinstance(binding, RelayBinding):
@@ -114,10 +122,14 @@ def prepare_model(server: str, tool: str, executor: Any, values: dict[str, str])
         if not work.startswith("/") or any(c in work for c in "\0\n\r") or ".." in Path(work).parts:
             raise ValueError("a guarded MCP relay needs an absolute executor work directory")
         relative = ".mcp-model-" + uuid.uuid4().hex
-        model = CallModel(prefix, binding, work.rstrip("/") + "/" + relative)
+        cap = float((arguments or {}).get("max_cost_usd") or 0) if tool == "extract_haploinsufficient_genes" else 0
+        if cap > 0 and not binding.priced:
+            raise ValueError("the selected model has no known price; a positive max_cost_usd cannot be enforced")
+        model = CallModel(prefix, binding, work.rstrip("/") + "/" + relative, cap if cap > 0 else None)
+        identity = binding.identity or hashlib.sha256(binding.model.encode()).hexdigest()
         setup += f"unset {prefix}_MODEL_ENDPOINT {prefix}_MODEL {prefix}_MODEL_API_KEY\n"
         setup += f'''AISCI_MCP_RELAY_DIR="$AISCIENTIST_WORK/{relative}"
-python "$AISCIENTIST_SKILL_DIR/_aisci_mcp_relay.py" --directory "$AISCI_MCP_RELAY_DIR" --model {shlex.quote(binding.model)} --prefix {prefix} &
+python "$AISCIENTIST_SKILL_DIR/_aisci_mcp_relay.py" --directory "$AISCI_MCP_RELAY_DIR" --model {shlex.quote(binding.model)} --identity {identity} --prefix {prefix}{' --priced' if binding.priced else ''} &
 AISCI_MCP_RELAY_PID=$!
 trap 'kill "$AISCI_MCP_RELAY_PID" 2>/dev/null || true; wait "$AISCI_MCP_RELAY_PID" 2>/dev/null || true' EXIT
 for AISCI_MCP_WAIT in $(seq 1 120); do
@@ -159,7 +171,7 @@ def run_with_model(model: CallModel | None, executor: Any, call: Callable[[], An
             raise ValueError("the pinned skill does not declare network access for a model")
         if not getattr(executor, "supports_skill_policy", False):
             raise ValueError("this executor cannot protect a guarded MCP relay")
-        relay = model.binding.start(model.relay_directory)
+        relay = model.binding.start(model.relay_directory, max_cost_usd=model.max_cost_usd) if model.max_cost_usd else model.binding.start(model.relay_directory)
         try:
             return call()
         finally:
