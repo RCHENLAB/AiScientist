@@ -41,8 +41,8 @@ def test_openai_relay_preserves_tool_choice_token_limit_and_usage():
                'max_tokens': 65, 'tools': [{'type': 'function', 'function': {'name': 'collect', 'parameters': {}}}],
                'tool_choice': 'required', 'parallel_tool_calls': False, 'temperature': 0}
     with server(Handler) as endpoint:
-        out = vllm_client.relay_chat('selected', request, base_url=endpoint+'/v1', api_key='test-only-bearer')
-    assert received[0][:2] == ('/v1/chat/completions', 'Bearer test-only-bearer')
+        out = vllm_client.relay_chat('selected', request, base_url=endpoint+'/v1', api_key='example-bearer')
+    assert received[0][:2] == ('/v1/chat/completions', 'Bearer example-bearer')
     assert received[0][2] == {**request, 'stream': False}
     assert out['tool_calls'] == [call] and out['finish_reason'] == 'tool_calls'
     assert out['usage']['completion_tokens'] == 3
@@ -69,5 +69,5 @@ def test_openai_relay_does_not_forward_bearer_to_redirect_destination():
         with server(Redirect) as endpoint:
             with pytest.raises(GatewayError):
                 vllm_client.relay_chat('selected', {'messages': [{'role': 'user', 'content': 'Test'}],
-                    'max_tokens': 10}, base_url=endpoint, api_key='test-only-bearer')
+                    'max_tokens': 10}, base_url=endpoint, api_key='example-bearer')
     assert reached == []
