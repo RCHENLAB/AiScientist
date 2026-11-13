@@ -114,7 +114,7 @@ export AISCI_MCP_READ_ROOTS
 '''
 
 COLLECT = READ_RESULT + r'''
-import re, shutil, stat, tempfile
+import fcntl, hashlib, re, shutil, stat, tempfile
 server = os.environ["AISCI_MCP_SERVER"]
 analysis = os.environ["AISCI_MCP_ANALYSIS"]
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", analysis):
@@ -169,10 +169,13 @@ failed = (str(result.get("status", "ok")).lower() not in {"ok", "empty", "succes
 if failed:
     result["status"] = "error"
     result.setdefault("error", "MCP analysis did not complete successfully")
+successful = (not failed and result.get("status") in {"ok", "empty", "success"}
+              and str(result.get("state", "")).upper() in {"", "COMPLETED"})
 
 # Validate the complete copy plan before creating any deliverable. Never follow
 # symlinks, including ones that happen to point back inside the analysis.
 copies, mapping, file_aliases = [], {}, {}
+artifact_files = {}
 source_root = result.get("artifact_root")
 if source_root:
     source_root = checked(source_root, base, directory=True)
@@ -188,13 +191,105 @@ if source_root:
         checked(target, artifacts, exists=False)
         copies.append((path, target))
         rel = path.relative_to(source_root).as_posix()
+        artifact_files[rel] = path
         file_aliases[rel] = (relative / rel).as_posix()
         file_aliases["artifacts/" + rel] = (relative / rel).as_posix()
     mapping[str(source_root)] = relative.as_posix()
 
+# Existing report builders read these canonical paths. Keep the namespaced
+# copy authoritative and publish only the current successful analysis there.
+# Ownership plus checksums allow a rerun to retire its own stale aliases without
+# deleting a later tool's output or a file the user has since edited.
+compat_path = checked(artifacts / "mcp" / ".compatibility.json", artifacts, exists=False)
+compat_lock = checked(work / ".mcp-artifact.lock", work, exists=False).open("a")
+fcntl.flock(compat_lock, fcntl.LOCK_EX)
+compat = json.loads(compat_path.read_text()) if compat_path.is_file() else {"files": {}, "current": {}}
+if not isinstance(compat, dict) or not isinstance(compat.get("files"), dict) or not isinstance(compat.get("current"), dict):
+    raise ValueError("invalid artifact compatibility record")
+checkpoint_owners = compat.setdefault("checkpoints", {})
+if not isinstance(checkpoint_owners, dict):
+    raise ValueError("invalid checkpoint compatibility record")
+identity = {"analysis_id": analysis, "task_id": result.get("task_id", "")}
+previous = compat["current"].get(server)
+handoff = successful and (not os.environ["AISCI_MCP_TOOL"].endswith("_job_status")
+                         or previous is None or previous == identity)
+publish = handoff and source_root is not None
+def alias_name(value):
+    p = Path(value)
+    return (not p.is_absolute() and len(p.parts) > 1
+            and p.parts[0] in {"tables", "figures", "data", "result"}
+            and all(part not in {".", ".."} and not part.startswith(".")
+                    and not re.search(r"[\\\x00-\x1f]", part) for part in p.parts))
+def checksum(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+aliases = {}
+if publish:
+    for rel, source in artifact_files.items():
+        if alias_name(rel) and (not rel.startswith("result/") or server == "cellqc"):
+            if rel == "data/cellqc_result.json":
+                continue  # Built below from the actual complete output tree.
+            # Other servers cannot replace CellQC's gateway pointer.
+            target = checked(artifacts / rel, artifacts, exists=False)
+            copies.append((source, target))
+            aliases[rel] = target
+
+# Complete matrices belong in the run's result/ tree, outside the automatically
+# downloaded artifact bundle. The source pointer grants no authority: inventory
+# every regular file ourselves and derive its published path from trusted roots.
+full_tree, full_target, cellqc_pointer = [], None, None
+if publish and server == "cellqc" and result.get("result_directory"):
+    source = checked(result["result_directory"], base, directory=True)
+    if work.parent != artifacts.parent:
+        raise ValueError("run work and artifact roots must share their result directory")
+    run_root = artifacts.parent
+    full_target = checked(run_root / "result" / "cellqc", run_root, directory=True, exists=False)
+    for path in sorted(source.rglob("*")):
+        checked(path, base, directory=path.is_dir())
+        if path.is_dir():
+            continue
+        name = path.relative_to(source).as_posix()
+        if (not stat.S_ISREG(path.stat().st_mode)
+                or any(part.startswith(".") or re.search(r"[\\\x00-\x1f]", part) for part in Path(name).parts)):
+            raise ValueError("CellQC results must contain regular files with safe relative names")
+        full_tree.append((path, name, path.stat().st_size))
+    if not full_tree:
+        raise ValueError("CellQC complete result directory is empty")
+    source_pointer = artifact_files.get("data/cellqc_result.json")
+    metadata = json.loads(source_pointer.read_text()) if source_pointer else {}
+    if not isinstance(metadata, dict):
+        raise ValueError("CellQC result metadata must be an object")
+    cellqc_pointer = {
+        "path": str(full_target),
+        "files": [{"name": name, "size": size} for _, name, size in full_tree],
+        "size_bytes": sum(size for _, _, size in full_tree),
+        "libraries": metadata.get("libraries", []),
+        "matrices": [name for _, name, _ in full_tree if name.endswith(".h5ad")],
+        "in_bundle": "result/",
+        "not_in_bundle": [name for _, name, _ in full_tree if "result/" + name not in artifact_files],
+        "created_at": metadata.get("created_at"), "saved_to": None,
+        "mcp_provenance": {"server": server, **identity},
+    }
+    target = checked(artifacts / "data" / "cellqc_result.json", artifacts, exists=False)
+    aliases["data/cellqc_result.json"] = target
+    mapping[str(source)] = "result/cellqc"
+
+stale = []
+if publish:
+    for rel, owner in compat["files"].items():
+        if not alias_name(rel) or not isinstance(owner, dict):
+            raise ValueError("invalid compatibility artifact name or owner")
+        target = checked(artifacts / rel, artifacts, exists=False)
+        if owner.get("server") == server and rel not in aliases:
+            if target.is_file() and checksum(target) == owner.get("sha256"):
+                stale.append(target)
+
 checkpoints = []
 primary = result.get("checkpoint_path")
-if primary and not failed:
+if primary and handoff:
     primary = checked(primary, base)
     checkpoints.append(primary)
     values = result.get("checkpoints", {})
@@ -211,6 +306,16 @@ for source in checkpoints:
     target = checked(work / source.name, work, exists=False)
     copies.append((source, target))
     mapping[str(source)] = source.name
+stale_checkpoints = []
+if checkpoints and server == "cellqc":
+    current_names = {path.name for path in checkpoints}
+    for name, owner in checkpoint_owners.items():
+        if not re.fullmatch(r"adata_[A-Za-z0-9_.-]+\.h5ad", name) or not isinstance(owner, dict):
+            raise ValueError("invalid checkpoint compatibility owner")
+        target = checked(work / name, work, exists=False)
+        if owner.get("server") == server and name not in current_names:
+            if target.is_file() and checksum(target) == owner.get("sha256"):
+                stale_checkpoints.append(target)
 # A server may bound its own response before transport. Preserve that full JSON
 # too, but only if it is a regular JSON file inside this analysis.
 full_server = None
@@ -232,6 +337,33 @@ for source, target in copies:
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+if full_target is not None:
+    full_target.parent.mkdir(parents=True, exist_ok=True)
+    # Interrupted copies are machinery, not deliverables for stage_out's result/ walk.
+    staging = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-", dir=work))
+    backup = None
+    try:
+        for source, name, _ in full_tree:
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        if full_target.exists():
+            backup = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-old-", dir=work))
+            backup.rmdir()
+            os.replace(full_target, backup)
+        try:
+            os.replace(staging, full_target)
+        except BaseException:
+            if backup is not None:
+                os.replace(backup, full_target)
+                backup = None
+            raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup is not None:
+            shutil.rmtree(backup)
 
 secret_names = json.loads(os.environ.get("AISCI_MCP_SECRET_NAMES", "[]"))
 secrets = [os.environ.get(name, "") for name in secret_names]
@@ -261,6 +393,46 @@ def clean(value):
         value = re.sub(r"(?<![\w:/])/(?!/)[^\s\"'<>{},;]*", "[server path]", value)
     return value
 result = clean(result)
+def write_json(target, value):
+    checked(target, artifacts, exists=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".mcp-json-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, ensure_ascii=False, allow_nan=False)
+        os.replace(temp, target)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+if cellqc_pointer is not None:
+    # Only the gateway's internal pointer keeps this verified run-local path.
+    # The public MCP result/evidence use a relative path and sanitized metadata.
+    public_pointer = clean(cellqc_pointer)
+    public_pointer["path"] = "result/cellqc"
+    cellqc_pointer = {**public_pointer, "path": str(full_target)}
+    write_json(aliases["data/cellqc_result.json"], cellqc_pointer)
+    write_json(dest / "data" / "cellqc_result.json", public_pointer)
+    result["cellqc_result"] = public_pointer
+    result["result_directory"] = "result/cellqc"
+elif server == "cellqc" and "data/cellqc_result.json" in artifact_files:
+    # Historical/failed evidence must not expose its original worker directory.
+    pointer = json.loads(artifact_files["data/cellqc_result.json"].read_text())
+    write_json(dest / "data" / "cellqc_result.json", clean(pointer))
+if publish:
+    for target in stale:
+        target.unlink()
+    compat["files"] = {rel: owner for rel, owner in compat["files"].items()
+                       if owner.get("server") != server}
+    compat["files"].update({rel: {"server": server, **identity, "sha256": checksum(target)}
+                            for rel, target in aliases.items()})
+    compat["current"][server] = identity
+    if checkpoints:
+        for target in stale_checkpoints:
+            target.unlink()
+            checkpoint_owners.pop(target.name, None)
+        checkpoint_owners.update({source.name: {"server": server, **identity, "sha256": checksum(work / source.name)}
+                                  for source in checkpoints})
+    write_json(compat_path, compat)
 if checkpoints:
     result["checkpoint_path"] = Path(primary).name
     result["checkpoint"] = Path(primary).name

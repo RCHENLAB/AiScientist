@@ -75,3 +75,10 @@ def test_curated_reference_copy_preserves_the_existing_resource():
     legacy = Path(tool.__file__).with_name("references") / "retina.json"
     assert shared.read_bytes() == legacy.read_bytes()
     assert tool._load_reference("retina") == marker_references.load_reference("retina")
+
+
+def test_cellranger_profiler_reads_the_packaged_shared_markers():
+    from aiscientist.tools._lib import cellranger, marker_references
+
+    assert cellranger._MARKER_REFERENCES == marker_references._REFERENCES
+    assert "curated retina reference" in cellranger.tissue_hint(["RHO", "GNAT1", "PDE6B", "NRL"])

@@ -256,6 +256,69 @@ also appears under `result`; execution status and provenance remain protected.
 A server `status=error`, failed state or MCP error cannot become `status=ok` merely
 because the containing process exited successfully.
 
+Successful current outputs also populate the existing `tables/`, `figures/` and
+`data/` report paths with real copies. A per-run ownership record tracks their
+checksums: a rerun removes only its own unchanged stale copies, and polling an older
+completed task cannot replace current report files or checkpoints. Namespaced
+evidence remains available independently. Failed results do not replace those
+successful compatibility outputs.
+
+CellQC's `result_directory` is separately confined and recursively inventoried.
+Every regular file, including per-library matrices, is copied to the run's
+`result/cellqc/`; links, traversal and special files are refused before publication.
+The gateway's internal `data/cellqc_result.json` is rebuilt from that real inventory
+and the verified run-local destination, enabling the existing ZIP, save and stage-out
+flows. Only this internal pointer retains the destination's absolute path; public
+MCP evidence uses relative paths. Nested result paths retain their directory structure
+in downloads and saved datasets. Temporary copies stay under `work/`, outside the
+stage-out result tree.
+
+## Dedicated literature routes and local retrieval
+
+When a literature server is registered, the console's corpus curation and PubMed
+answer routes use that same MCP image through `gateway/literature_mcp.py`. They
+retain their plan/spec review, public-corpus cache, cancellation, curation tables,
+and download layout. The selected session model is used for extraction, including
+native Anthropic, the lab's shared model, or the session's existing cluster model.
+No second GPU/model is provisioned implicitly. Paid scans pass the remaining cost
+cap without rounding a small positive amount to zero. Failed pilots are recovered
+through the same analysis's status tool so their measured spend and stop reason
+remain available; a failed scan does not publish or cache completed tables.
+PubMed and corpus retrieval use separate analysis identifiers because they run
+concurrently. The complete synced JSON is read only from the expected tool and
+analysis under this run's artifacts. Unregistered deployments keep their existing
+routes during the migration acceptance period.
+
+The local corpus mirror can use the published server without an HPC connection:
+
+```bash
+AISCIENTIST_LOCAL_CORPUS_MCP=docker
+AISCIENTIST_LOCAL_CORPUS_ROOT=/srv/corpus/retigene
+```
+
+This is opt-in. The service user must already have Docker access, and an operator
+must pre-pull the exact literature image digest in `AISCIENTIST_MCP_CONFIG`.
+The installed skill must bind that same image. The root contains the versioned
+`current/mechanism_cache/`, manifest and `hf_cache/` used by the existing mirror;
+flat mirrors also work. A cache-only mirror need not contain the source PDFs.
+The local runner invokes only `search_corpus`, verifies the actual stdio schema
+against the reviewed snapshot, and uses the image's native MCP client/server.
+It imports no scientific server code into the gateway.
+
+The container has no network, credentials, home or Docker socket mount. Its root
+filesystem and corpus/model mounts are read-only; only a private run directory
+and bounded `/tmp` are writable. It runs as the service user's numeric UID with
+2 CPUs, 8 GiB memory, 128 PIDs and a 10-minute timeout. Cancellation removes its
+uniquely named container. The existing mirror-freshness check still decides when
+HPC retrieval is preferred. The legacy local implementation remains available
+when this option is unset, pending complete tool retirement.
+
+The published literature 0.0.3 digest was exercised on the Eye Server using its
+existing public mirror and offline PubMedBERT: live schema verification and a
+PRPF31 retrieval returned two passages in 19.12 seconds with network disabled.
+An in-flight cancellation left no owned container. This validates local retrieval,
+not a generative model or a complete corpus extraction.
+
 ## Exporting and reviewing a catalog
 
 The released common 0.0.2 CLI's `tools` command omits input schemas.

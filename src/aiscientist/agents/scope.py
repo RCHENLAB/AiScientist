@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
 from .loop_utils import safe_json_loads
+from .tool_names import STATUS_TOOLS, canonical_tool_name
 
 # Tools that can do anything; a limit to named analyses does not include them unless it names them.
 GENERIC_TOOLS = frozenset({"run_code", "run_shell", "run_in_environment"})
@@ -38,7 +39,7 @@ NOT_AN_ANALYSIS = frozenset({
     "finish", "inspect_dataset", "read_tool_source", "describe_environment", "search_skills",
     "read_skill_reference", "list_dir", "stat_path", "find_files", "read_text", "disk_usage",
     "find_software", "request_environment",
-    "run_code", "run_shell", "run_in_environment"})
+    "run_code", "run_shell", "run_in_environment"}) | STATUS_TOOLS
 
 
 def tools_that_ran(rounds: Any) -> "list[str]":
@@ -93,7 +94,7 @@ def qc_only(tools: "Iterable[str]") -> bool:
     Such a run is answered in the chat with the QC tool's own numbers — no research report, no
     model-written synthesis (Yijun, 2026-10-16, on run 6275df1213ab: a one-step CellQC run needs a
     short chat reply with the data, not a report)."""
-    analyses = [t for t in tools if t not in NOT_AN_ANALYSIS]
+    analyses = [canonical_tool_name(t) for t in tools if canonical_tool_name(t) not in NOT_AN_ANALYSIS]
     return bool(analyses) and all(t in QC_ONLY_TOOLS for t in analyses)
 
 
@@ -241,7 +242,10 @@ class RunScope:
         return not self.keep or tool in self.keep
 
     def allows_literature(self) -> bool:
-        return any(self.allows(t) for t in LITERATURE_TOOLS)
+        if self.keep:
+            return any(canonical_tool_name(t) in LITERATURE_TOOLS and self.allows(t) for t in self.keep)
+        excluded = {canonical_tool_name(t) for t in self.exclude}
+        return bool(LITERATURE_TOOLS - excluded)
 
     def filter(self, agenda: "list[str]",
                primary_tool: "Callable[[str], str | None]") -> "tuple[list[str], list[str]]":
@@ -306,7 +310,8 @@ def _mentioned(clause: str, tool_names: "frozenset[str]", keep: bool) -> "list[s
             found.append(name)
     for pattern, keeps, excludes in _WORDS:
         if re.search(pattern, low, re.IGNORECASE):
-            found += [t for t in (keeps if keep else excludes) if t in tool_names]
+            wanted = keeps if keep else excludes
+            found += [t for original in wanted for t in sorted(tool_names) if canonical_tool_name(t) == original]
     return list(dict.fromkeys(found))
 
 
@@ -338,8 +343,8 @@ def read_scope(question: str, tools: "dict[str, str]",
     brief = bool(_BRIEF_REPORT.search(question or ""))
     keep, exclude = _by_rules(question, names)
     # Naming CellQC and asking for its result is the whole request, not an invitation to analyse it.
-    if not (keep or exclude) and "run_cellqc" in names and _METHOD_RESULT.fullmatch(question or ""):
-        keep = ["run_cellqc"]
+    if not (keep or exclude) and _METHOD_RESULT.fullmatch(question or ""):
+        keep = sorted(name for name in names if canonical_tool_name(name) == "run_cellqc")
     if keep or exclude:
         return RunScope(tuple(keep), tuple(exclude), brief, "rules")
     if complete is None or not _LIMIT_CUE.search(question or ""):

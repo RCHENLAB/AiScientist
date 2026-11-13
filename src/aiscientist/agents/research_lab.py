@@ -67,6 +67,7 @@ from .plan_doc import (
     split_step,
     sync_plan,
 )
+from .tool_names import canonical_tool_name
 from .scope import (QC_ONLY_TOOLS, RunScope, qc_only_run, read_scope, rules_out_report,
                     wants_written_report)
 from .marker_claims import check_marker_claims
@@ -1220,7 +1221,7 @@ _ALTERNATIVES_SYSTEM = (
 
 
 def _node_resources(node: TaskNode) -> set[str]:
-    if _is_literature_step(node.goal) or (node.suggested_tool in _READ_ONLY_TOOLS):
+    if _is_literature_step(node.goal) or (canonical_tool_name(node.suggested_tool) in _READ_ONLY_TOOLS):
         return set()                          # external/read-only: no shared mutable resource
     return {"__analysis__", *node.produces, *node.consumes}
 
@@ -1452,7 +1453,7 @@ def _is_literature_step(step: str) -> bool:
     """
     declared = _declared_tools(step)
     if declared:
-        return bool(declared & _LITERATURE_TOOLS)
+        return bool({canonical_tool_name(name) for name in declared} & _LITERATURE_TOOLS)
     # No tool named: judge the step by its HEADLINE (the bold title, else the first clause), not by
     # every word of its body. A tool-less analysis step routinely MENTIONS literature or a reference
     # in passing — "Reconcile transferred and original annotations … reference taxonomy …" and
@@ -1670,7 +1671,7 @@ def _is_de_producer_step(step: str) -> bool:
         return False
     tool = _primary_tool(step)
     if tool and tool not in _GENERIC_TOOLS:
-        return tool in _DE_PRODUCER_TOOLS
+        return canonical_tool_name(tool) in _DE_PRODUCER_TOOLS
     if _is_enrichment_step(step):
         return False
     return bool(_DE_PRODUCER_RE.search((step or "").replace("_", " ")))
@@ -1689,7 +1690,7 @@ def _is_enrichment_step(step: str) -> bool:
     # nothing produced a DE table, so the run lost its markers and its labels.
     tool = _primary_tool(step)
     if tool and tool not in _GENERIC_TOOLS:
-        return tool in _ENRICHMENT_TOOLS
+        return canonical_tool_name(tool) in _ENRICHMENT_TOOLS
     return bool(_ENRICHMENT_STEP_RE.search((step or "").replace("_", " ")))
 
 
@@ -3304,8 +3305,7 @@ def _missing_analysis_family(issues: "list[str]") -> "tuple[str, ...] | None":
 
 def _names_tool(agenda: "list[str]", tools: "tuple[str, ...]") -> bool:
     """Does any step name one of ``tools``?  (Steps quote tools in backticks.)"""
-    text = "\n".join(agenda)
-    return any(re.search(r"`%s`" % re.escape(t), text) for t in tools)
+    return any(canonical_tool_name(name) in tools for step in agenda for name in _declared_tools(step))
 
 
 def retick_tools(steps: "list[str]", names: "Iterable[str]") -> "list[str]":
@@ -3705,7 +3705,7 @@ def _stopped_round_answer(rnd: LabRound) -> str:
         return str(rnd.scientist_result.get("final_answer") or "(no answer)")
     summaries = []
     for step in rnd.scientist_result.get("steps") or []:
-        if not isinstance(step, dict) or step.get("tool") not in QC_ONLY_TOOLS:
+        if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) not in QC_ONLY_TOOLS:
             continue
         result = step.get("result")
         if step_succeeded(step) and isinstance(result, dict):
@@ -6357,7 +6357,7 @@ class ResearchLab:
         for step in steps or ():
             if not isinstance(step, dict) or not step.get("ok"):
                 continue
-            if step.get("tool") not in _LITERATURE_TOOLS:
+            if canonical_tool_name(step.get("tool")) not in _LITERATURE_TOOLS:
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
             for citation in (result.get("results") or result.get("citations") or ()):
@@ -6392,7 +6392,7 @@ class ResearchLab:
 
         Falls back to plain completions when no tool-capable Scientist is wired (offline tests), so
         the meeting always works."""
-        tools = [t for t in getattr(self.scientist, "catalog", []) if t.name in _MEETING_TOOLS]
+        tools = [t for t in getattr(self.scientist, "catalog", []) if canonical_tool_name(t.name) in _MEETING_TOOLS]
         if not tools or not self.config.meeting_tools:
             return self._complete_concurrent(msg_lists)
 
@@ -8352,7 +8352,11 @@ class ResearchLab:
         # Literature grounding: prefer deep_literature (PaperQA over the lab's indexed corpus on
         # HPC3); fall back to literature_search (Europe PMC) ONLY when the corpus tool isn't wired
         # (dev / no-HPC), so behaviour never regresses where deep_literature can't run.
-        if _is_literature_step(step):
+        primary = _primary_tool(plan_step if plan_step is not None else step)
+        native_tool = canonical_tool_name(primary) != str(primary or "")
+        # An explicitly approved MCP call keeps its own schema, dispatch and provenance.
+        # The historical forced-literature path below selects only legacy tools.
+        if _is_literature_step(step) and not native_tool:
             deep_tool = next((t for t in self.scientist.catalog if t.name == "deep_literature"), None)
             lit_tool = next((t for t in self.scientist.catalog if t.name == "literature_search"), None)
             corpus_tool = next((t for t in self.scientist.catalog if t.name == "search_corpus"), None)

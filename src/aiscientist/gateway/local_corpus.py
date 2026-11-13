@@ -221,6 +221,9 @@ def run_local_search(args: dict[str, Any], ctx: Any = None) -> dict[str, Any] | 
 
 def make_local_tool() -> Any:
     """Return a ready local tool, or None. Model loading belongs in a worker thread."""
+    from . import local_literature_mcp
+    if local_literature_mcp.enabled():
+        return local_literature_mcp.make_tool()
     if not has_local_index():
         return None
     try:

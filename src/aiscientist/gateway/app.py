@@ -9647,7 +9647,10 @@ _RAW_INPUT_TOOLS = re.compile(r"`(?:run_scanpy_qc|run_cellqc|run_doublet_detecti
 
 def _reads_raw_input(step: str) -> bool:
     """A step that works on the input as delivered — QC, ambient correction, doublet removal."""
-    return bool(_RAW_INPUT_TOOLS.search(str(step or "")))
+    from ..agents.tool_names import canonical_tool_name
+    names = re.findall(r"`([A-Za-z_][A-Za-z0-9_-]*)(?:\s*\([^`]*\))?`", str(step or ""))
+    return any(canonical_tool_name(name) in {"run_scanpy_qc", "run_cellqc", "run_doublet_detection"}
+               for name in names)
 
 
 def _plain_step_title(step: str) -> str:
@@ -9877,17 +9880,33 @@ def _corpus_scan_identity(conn: Connection, spec: "dict[str, Any] | None" = None
     HPC3, the scan's rules (the built-in ones, or a task spec's, ``spec``) and its model
     (``corpus_scan.scan_key``). None without the literature line, a live HPC3 session or a corpus
     text cache: nothing is reused or kept then."""
+    from .literature_mcp import registered_server, rules_identity
+    server = registered_server()
     papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not papers
+    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
+    if server is not None:
+        from ..agents.mcp_analysis import setting_values
+        settings = setting_values(server)
+        root = settings.get("LITERATURE_CORPUS_ROOT", "").rstrip("/")
+        papers = settings.get("LITERATURE_PAPERS") or (root + "/papers" if root else "")
+        manifest = settings.get("LITERATURE_MANIFEST") or (root + "/paperqa_manifest.csv" if root else "")
+    if ((server is None and not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC")) or not papers
             or conn.executor is None or conn.mock):
         return None
-    fp = corpus_scan.corpus_fingerprint(conn.executor, papers,
-                                        os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", ""))
+    fp = corpus_scan.corpus_fingerprint(conn.executor, papers, manifest)
     if fp is None:
         return None
-    rules = _tools_api.corpus_scan_rules_digest(spec)
+    rules = rules_identity(server, spec) if server else _tools_api.corpus_scan_rules_digest(spec)
     model = _corpus_scan_model(conn)
-    return corpus_scan.scan_key(fp, rules, model), {"corpus": fp, "rules": rules, "model": model}
+    model_key = model
+    if server is not None:
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            return None
+        model_key = getattr(binding, "identity", "") or json.dumps(
+            {"model": binding.model, "endpoint": getattr(binding, "endpoint", ""),
+             "protocol": getattr(binding, "protocol", "openai")}, sort_keys=True)
+    return corpus_scan.scan_key(fp, rules, model_key), {"corpus": fp, "rules": rules, "model": model}
 
 
 def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
@@ -9908,6 +9927,10 @@ def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
 
 def _corpus_scan_model(conn: Connection) -> str:
     """The model a scan by this session reads with: the session's API model, else the GPU job's."""
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        binding = _mcp_session_model(conn)
+        return str(binding.model if binding is not None else conn.selected_model)
     api = _corpus_scan_api(conn)
     return api["model"] if api else corpus_scan.scan_model(conn.settings)
 
@@ -10067,6 +10090,27 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
         day = str(stored.meta.get("stored_at") or "")[:10]
         return (f"at once, from the scan of the RetiGene papers kept{' on ' + day if day else ''} (they have "
                 "not changed since): no job and no model cost")
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        from ..agents.mcp_model import RelayBinding
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            return "the selected session model must be connected before the scan can run"
+        text = (f"with your selected model {binding.model}, through the registered literature MCP; "
+                "retrieval runs as a CPU job on HPC3, with time depending on the queue and passages read")
+        if isinstance(binding, RelayBinding):
+            credential = _bound_credential(conn)
+            if credential is not None and credential.get("builtin") == "shared":
+                return text + "; the lab's shared model has no API credit charge"
+            if not binding.priced:
+                return text + "; scanning is unavailable until the selected model has known pricing for its spending cap"
+            try:
+                cap, why = _corpus_scan_cost_cap(conn)
+            except GatewayError as exc:
+                return text + ". " + exc.message
+            return text + (f"; a pilot first estimates the full scan cost, and subsequent model calls stop at "
+                           f"the ${cap:.2f} cap ({why}); one in-flight call can cross that threshold")
+        return text + "; it uses the session's existing cluster model and no API credit"
     if api:
         from . import llm_pricing
         model = str(api["model"])
@@ -10286,7 +10330,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
 
     art = conn.workspace / run_id / "artifacts"
     api = _corpus_scan_api(conn)
-    model = api["model"] if api else corpus_scan.scan_model(conn.settings)
+    model = _corpus_scan_model(conn)
     question = str(req.question or "").strip()
     recorded = False
     cur, drafted_by = corpus_scan.HAPLOINSUFFICIENCY, ""
@@ -10401,6 +10445,87 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
         conn.end_run(run)
 
 
+async def _build_literature_mcp_route(conn: Connection, run: RunState, run_id: str,
+                                    emit: Callable[..., None]) -> Any:
+    """One registered literature executor and context per console run."""
+    from .literature_mcp import build_literature_route, registered_server
+    if registered_server() is None:
+        return None
+    if getattr(run, "literature_mcp_ready", False):
+        return getattr(run, "literature_mcp", None)
+    from ..agents.research_harness import HarnessContext
+    art = conn.workspace / run_id / "artifacts"
+    executor = await _build_code_executor(conn, run, run_id, {}, art, emit)
+    run.literature_mcp = build_literature_route(executor, art, should_cancel=run.chat_stop.is_set)
+    run.literature_mcp_context = HarnessContext(
+        decisions={}, workspace=conn.workspace / run_id, model=conn.selected_model,
+        llm_is_remote=bool(_corpus_scan_api(conn)), read_roots=_tool_read_roots(conn))
+    run.literature_mcp_ready = True
+    return run.literature_mcp
+
+
+async def _corpus_scan_via_mcp(conn: Connection, run: RunState, run_id: str,
+                              ident: "tuple[str, dict[str, Any]] | None",
+                              say: Callable[..., None], emit: Callable[..., None],
+                              curation: "corpus_scan.Curation") -> "dict[str, Any] | None":
+    """Run the registered image with this session's selected, guarded model."""
+    key = ident[0] if ident else ""
+    if key and key in _CORPUS_SCANS_RUNNING:
+        raise GatewayError("A scan of this corpus with the selected model is already running "
+                           f"(run {_CORPUS_SCANS_RUNNING[key]}).", stage="corpus")
+    if key:
+        _CORPUS_SCANS_RUNNING[key] = run_id
+    try:
+        route = await _build_literature_mcp_route(conn, run, run_id, emit)
+        if route is None:
+            raise GatewayError("The registered literature MCP needs its pinned image and an available "
+                               "HPC3 executor for this run.", stage="corpus")
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            raise GatewayError("The selected session model is unavailable; reconnect it before scanning.",
+                               stage="corpus")
+        from ..agents.mcp_model import RelayBinding
+        args = _corpus_scan_args(curation)
+        model = binding.model
+        cap_words = ""
+        if isinstance(binding, RelayBinding):
+            credential = _bound_credential(conn)
+            shared = credential is not None and credential.get("builtin") == "shared"
+            if not shared:
+                if not binding.priced:
+                    raise GatewayError("The selected model has no known price, so the corpus scan's "
+                                       "cost ceiling cannot be enforced.", stage="corpus")
+                cap, why = _corpus_scan_cost_cap(conn)
+                args["max_cost_usd"] = cap
+                cap_words = f" The pilot estimates total cost first; the spending cap is ${cap:.2f} ({why})."
+        say(f"📚 Scanning the RetiGene papers for {_curation_what(curation)} with your selected model "
+            f"**{model}**, through the registered literature MCP on HPC3." + cap_words)
+        emit("step", "corpus", f"Registered literature MCP: {CORPUS_TOOL}, selected model {model}.")
+        result = await asyncio.to_thread(route.run_tool, CORPUS_TOOL, args, run.literature_mcp_context)
+        if result.get("model_unreachable") and not run.chat_stop.is_set():
+            say("⚠ The selected model stopped answering; retrying once from the saved scan judgments.", "warning")
+            result = await asyncio.to_thread(route.run_tool, CORPUS_TOOL, args, run.literature_mcp_context)
+        if run.chat_stop.is_set() or result.get("status") == "cancelled":
+            conn.push({"type": "chat_stopped"})
+            return None
+        usage = result.get("api_usage") or {}
+        cost = usage.get("cost_usd")
+        spent = f" Measured model cost: ${cost:.4f}." if isinstance(cost, (int, float)) else ""
+        if result.get("status") != "ok":
+            raise GatewayError("The RetiGene corpus scan did not finish: "
+                               + str(result.get("error") or result.get("status")) + spent,
+                               stage="corpus", detail=json.dumps(result, default=str)[:2000])
+        if usage:
+            result["api_usage"] = {"model": model, **usage}
+        await asyncio.to_thread(route.stage_scan_tables, result, curation.subdir)
+        await _keep_corpus_scan(conn, run_id, result, emit, curation)
+        return result
+    finally:
+        if key and _CORPUS_SCANS_RUNNING.get(key) == run_id:
+            _CORPUS_SCANS_RUNNING.pop(key, None)
+        _push_usage(conn, run, run.conversation_id, run_id)
+
+
 async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
                                   ident: "tuple[str, dict[str, Any]] | None",
                                   say: Callable[..., None], emit: Callable[..., None],
@@ -10409,6 +10534,9 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
     """Run the scan as one job with its own GPU and model, keep its tables, and return its result
     (None when the user stopped it). ``curation``: what it collects; a task spec's goes to the tool
     as its ``spec``. Raises ``GatewayError`` when it cannot run or does not finish."""
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        return await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, curation)
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
@@ -10573,6 +10701,9 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
     made with the user's key, recorded against the user's usage and capped by the budget left. The
     job reads about 1% of the passages first (the tool's pilot) and stops if they fail or if their
     cost projects past the cap. Returns the result (None when stopped); raises ``GatewayError``."""
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        return await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, curation)
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
@@ -11352,6 +11483,13 @@ def _literature_corpus_on_hpc(conn: Connection) -> bool:
     """Whether this session reaches the corpus on HPC3: the literature line is set up for HPC3 and
     the session has a live HPC3 connection (what ``_build_literature_executor`` and the corpus scan
     need). Cheap, so the event loop may call it."""
+    from .literature_mcp import registered_server
+    server = registered_server()
+    if server is not None:
+        from ..agents.mcp_analysis import setting_values
+        values = setting_values(server)
+        return bool((values.get("LITERATURE_CORPUS_ROOT") or values.get("LITERATURE_PAPERS"))
+                    and conn.executor is not None and not conn.mock)
     return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
                 and conn.executor is not None and not conn.mock)
 
@@ -11374,6 +11512,20 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
     from ..agents.research_harness import HarnessContext
     from ..agents import literature_answer as lit
     from .local_corpus import make_local_tool, stale
+    from .literature_mcp import registered_server
+    registered = registered_server() is not None
+    run = getattr(conn, "active_run", None)
+    route = getattr(run, "literature_mcp", None)
+
+    def remote(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        if route is not None:
+            return route.run_tool(lit.CORPUS_TOOL, {"analysis_id": "corpus", **args}, ctx)
+        if registered:
+            return {"status": "error", "error": "The registered literature MCP is unavailable in this run"}
+        executor = _build_literature_executor(conn)
+        if executor is not None:
+            return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
+        return {"status": "error", "error": "The RetiGene corpus copy could not be searched and HPC3 is unavailable"}
     local = make_local_tool()
     if local is not None:
         local_run = local.executor
@@ -11384,17 +11536,22 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
             out = None if stale(None if conn.mock else conn.executor) else local_run(args, ctx)
             if out is not None:
                 return out
-            executor = _build_literature_executor(conn)
-            if executor is not None:
-                return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
-            return {"status": "error", "error": "The RetiGene corpus copy on this server could not be "
-                                                "searched, and HPC3 is not reachable from this session."}
+            return remote(args, ctx)
 
         from dataclasses import replace
         local = replace(local, executor=retrieve)
         ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
                              tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
+        ctx.should_cancel = run.chat_stop.is_set if run is not None else (lambda: False)
         return local, ctx
+    if registered:
+        if route is None:
+            return None
+        from dataclasses import replace
+        tool = route.tools.get(lit.CORPUS_TOOL)
+        if tool is None:
+            return None
+        return replace(tool, name=lit.CORPUS_TOOL, executor=remote), run.literature_mcp_context
     try:
         executor = _build_literature_executor(conn)
     except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
@@ -11457,7 +11614,14 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
             run.monitor.observe({"type": "tool_start", "tool": lit.TOOL})
         conn.push({"type": "run_status", "text": f"🔎 PubMed: {query}"})
         conn.push({"type": "chat_thinking", "token": f"→ {lit.TOOL}({json.dumps({'query': query})})\n"})
-        out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
+        from .literature_mcp import registered_server
+        if registered_server() is not None:
+            route = getattr(run, "literature_mcp", None)
+            out = (route.run_tool(lit.TOOL, {"query": query, "limit": limit, "abstracts": True,
+                                          "pubmed_only": True, "analysis_id": "pubmed"}, run.literature_mcp_context)
+                   if route is not None else {"status": "error", "error": "The registered literature MCP is unavailable"})
+        else:
+            out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
         ok = isinstance(out, dict) and out.get("status") == "ok"
         n = len(out.get("results") or []) if ok else 0
         if run.monitor is not None:
@@ -11662,6 +11826,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_run_start failed: {exc}")
         _watch_stage(run, "literature")
+        await _build_literature_mcp_route(conn, run, run_id, emit)
         llm = _lab_llm(conn)
         complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
         emit("step", "literature", f"Literature search (model: {llm.model})."
@@ -17048,12 +17213,13 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
     This is separate from _QC_TOOLS: a later doublet step must not replace the overall CellQC
     outcome, per-library QC or warnings. Predictions alone never establish a removed count.
     """
+    from ..agents.tool_names import canonical_tool_name
     chosen = None
     for rnd in reversed(list(getattr(result, "rounds", None) or [])):
         accepted = _round_field(_round_field(rnd, "verdict"), "verdict") == "accept"
         steps = (_round_field(rnd, "scientist_result") or {}).get("steps") or []
         for step in reversed(steps):
-            if not isinstance(step, dict) or step.get("tool") != "run_doublet_detection" \
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "run_doublet_detection" \
                     or step.get("ok") is False:
                 continue
             record = step.get("result")
@@ -17069,13 +17235,13 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
             else:
                 continue
             if chosen is None or accepted:
-                chosen = removed
+                chosen = (removed, str(step["tool"]))
             break
         else:
             continue
         if accepted:
             break
-    return [f"run_doublet_detection: Doublets removed: {chosen:,}."] if chosen is not None else []
+    return [f"{chosen[1]}: Doublets removed: {chosen[0]:,}."] if chosen is not None else []
 
 
 def _removal_stated(body: str, line: str) -> bool:
@@ -17285,7 +17451,8 @@ def _brief_scope_line(scope: Any, ran: "list[str]", qc_only: bool) -> str:
     ran only run_cellqc, and its report said "As requested (only run_cellqc, run_scanpy_qc,
     run_doublet_detection)"."""
     from ..agents.scope import NOT_AN_ANALYSIS, QC_ONLY_TOOLS
-    keep = [str(t) for t in (getattr(scope, "keep", None) or ())]
+    from ..agents.tool_names import canonical_tool_name
+    keep = [canonical_tool_name(t) for t in (getattr(scope, "keep", None) or ())]
     tools = ", ".join(f"`{t}`" for t in ran)
     if qc_only:
         asked = (any(t in QC_ONLY_TOOLS for t in keep)
@@ -17342,7 +17509,8 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     by_code = _code_wrote_outputs(result)
     if answer and by_code:
         return _analysis_brief_md(answer, art, question, result)
-    ran = [t for t in _tools_that_ran(result) if t not in NOT_AN_ANALYSIS]
+    from ..agents.tool_names import canonical_tool_name
+    ran = [t for t in _tools_that_ran(result) if canonical_tool_name(t) not in NOT_AN_ANALYSIS]
     qc_only = _qc_only_run(result) and not by_code
     try:
         dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
@@ -17608,11 +17776,12 @@ def _round_field(rnd: Any, key: str) -> Any:
 
 def _round_qc(rnd: Any) -> "tuple[str, dict] | None":
     """The round's completed QC call, ``(tool, result)``, or None."""
+    from ..agents.tool_names import canonical_tool_name
     for st in ((_round_field(rnd, "scientist_result") or {}).get("steps") or []):
         r = st.get("result") if isinstance(st, dict) else None
-        if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
+        if (isinstance(r, dict) and canonical_tool_name(st.get("tool")) in _QC_TOOLS and r.get("status") == "ok"
                 and r.get("cells_before") is not None):
-            return str(st["tool"]), r
+            return canonical_tool_name(st["tool"]), r
     return None
 
 
@@ -19270,11 +19439,12 @@ def _scan_tool_invocation(result: Any, tool_name: str) -> "dict[str, Any] | None
     say whether an optional step (scGPT) actually ran and how it ended."""
     if result is None:
         return None
+    from ..agents.tool_names import canonical_tool_name
     last: "dict[str, Any] | None" = None
     for r in getattr(result, "rounds", []) or []:
-        sr = getattr(r, "scientist_result", None) or {}
+        sr = _round_field(r, "scientist_result") or {}
         for s in (sr.get("steps") or []):
-            if s.get("tool") == tool_name:
+            if canonical_tool_name(s.get("tool")) == canonical_tool_name(tool_name):
                 res = s.get("result")
                 last = res if isinstance(res, dict) else {"status": s.get("status") or "unknown"}
     return last
@@ -19518,6 +19688,9 @@ _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za
 # folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
 # is a name; it is only ever joined to the directory for SFTP, never given to a shell.
 _CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
+# Complete MCP result trees may have subdirectories. Every segment keeps the
+# original filename policy; absolute paths, dot segments and empty segments fail.
+_CELLQC_REL_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}(?:/(?!\.)[^/\\\x00-\x1f]{1,255})*")
 _RESULT_KINDS = ("dataset", "cellqc", "tables", "literature")
 # A literature run's tables (issue 20), saved as one folder. The record is in the run's folder, outside
 # ``artifacts/``, so it is neither a result file nor in the bundle (like the curation's, issue 46).
@@ -19712,7 +19885,8 @@ def _saved_result_files(owner: str, run_id: str, rec: dict, folder: bool) -> "tu
     files = []
     for f in rec.get("files") or []:
         fname = str(f.get("name") or "")
-        if not _CELLQC_FILE_RE.fullmatch(fname):
+        pattern = _CELLQC_FILE_RE if rec.get("kind") == "literature" else _CELLQC_REL_RE
+        if not pattern.fullmatch(fname):
             continue
         copy = (CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "literature" / fname
                 if rec.get("kind") == "literature" else copies / fname)
@@ -20238,7 +20412,7 @@ async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Respon
     rec = _read_pointer(_result_pointer_path(owner, run_id, "cellqc"))
     files = [(str(f.get("name") or ""), int(f.get("size") or 0))
              for f in ((rec or {}).get("files") or []) if isinstance(f, dict)]
-    files = [(n, s) for n, s in files if _CELLQC_FILE_RE.fullmatch(n)]
+    files = [(n, s) for n, s in files if _CELLQC_REL_RE.fullmatch(n)]
     if rec is None or not files:
         return JSONResponse({"error": "This run kept no CellQC result directory."}, status_code=404)
     on_hpc = rec.get("location") == "hpc3"
@@ -20267,7 +20441,17 @@ async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Respon
         if not base.is_dir():
             return JSONResponse({"error": "CellQC's result directory is no longer on the server."},
                                 status_code=410)
-        files = [(n, (base / n).stat().st_size) for n, _ in files if (base / n).is_file()]
+        def regular_result(name: str) -> bool:
+            path = base
+            if path.is_symlink():
+                return False
+            for part in name.split("/"):
+                path = path / part
+                if path.is_symlink():
+                    return False
+            return path.is_file()
+
+        files = [(n, (base / n).stat().st_size) for n, _ in files if regular_result(n)]
 
         def opener(name: str) -> Callable[[], Any]:
             return lambda: _local_blocks(base / name)

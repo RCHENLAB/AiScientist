@@ -128,6 +128,165 @@ sys.stdout.write('''))
     assert json.loads(runner.capture.read_text())["env"]["SCRNA_CHECKPOINT_ROOT"] == str(runner.checkpoints)
 
 
+def full_cellqc_result(runner):
+    value, output = fixture_result(runner)
+    full = output / "result" / "cellqc"
+    (full / "mouse").mkdir(parents=True)
+    files = {"metrics.csv": b"sampleid,cells\nmouse,90\n",
+             "mouse/library.h5ad": b"complete library matrix", "report.html": b"<html>QC</html>"}
+    for name, content in files.items():
+        (full / name).write_bytes(content)
+    artifacts = output / "artifacts"
+    (artifacts / "data").mkdir()
+    (artifacts / "result").mkdir()
+    (artifacts / "result" / "report.html").write_bytes(files["report.html"])
+    (artifacts / "tables" / "cellqc_metrics.csv").write_bytes(files["metrics.csv"])
+    (artifacts / "data" / "cellqc_result.json").write_text(json.dumps({
+        "path": "/untrusted/pointer/path", "files": [{"name": "fake.h5ad", "size": 999}],
+        "libraries": ["mouse"], "created_at": "2026-11-12T00:00:00Z"}))
+    value["result_directory"] = str(full)
+    runner.fixture.write_text(json.dumps(value))
+    return value, output, files
+
+
+def test_complete_cellqc_results_and_real_gateway_pointer_are_published(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, _, files = full_cellqc_result(runner)
+    result = make().executor({}, ctx)
+    assert result["status"] == "ok", result
+    root = runner.artifacts.parent / "result" / "cellqc"
+    assert {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()} == files
+    pointer = json.loads((runner.artifacts / "data/cellqc_result.json").read_text())
+    assert pointer["path"] == str(root)
+    assert pointer["files"] == [{"name": name, "size": len(files[name])} for name in sorted(files)]
+    assert pointer["size_bytes"] == sum(map(len, files.values()))
+    assert pointer["matrices"] == ["mouse/library.h5ad"]
+    assert (runner.artifacts / "tables/cellqc_metrics.csv").read_bytes() == files["metrics.csv"]
+    assert (runner.artifacts / "result/report.html").read_bytes() == files["report.html"]
+    public = json.loads((runner.artifacts / "mcp/cellqc/default/data/cellqc_result.json").read_text())
+    assert public["path"] == "result/cellqc" and str(runner.root) not in json.dumps(public)
+    assert result["result_directory"] == "result/cellqc"
+    assert str(runner.root) not in json.dumps(result)
+    assert value["result_directory"] not in (runner.artifacts / result["full_result"]).read_text()
+
+
+@pytest.mark.parametrize("mutation", ["source_link", "nested_link", "target_link", "outside"])
+def test_complete_result_confinement_is_checked_before_any_copy(analysis_bridge, mutation):
+    runner, ctx, make = analysis_bridge
+    value, output, _ = full_cellqc_result(runner)
+    outside = runner.root / "outside"
+    outside.mkdir()
+    (outside / "private").write_bytes(b"unrelated")
+    full = output / "result/cellqc"
+    if mutation == "source_link":
+        alias = output / "linked_results"
+        alias.symlink_to(full, target_is_directory=True)
+        value["result_directory"] = str(alias)
+    elif mutation == "nested_link":
+        (full / "mouse" / "secret").symlink_to(outside / "private")
+    elif mutation == "target_link":
+        (runner.artifacts.parent / "result").symlink_to(outside, target_is_directory=True)
+    else:
+        value["result_directory"] = str(outside)
+    runner.fixture.write_text(json.dumps(value))
+    result = make().executor({}, ctx)
+    assert result["status"] == "error", result
+    assert not (runner.artifacts / "tables/cellqc_metrics.csv").exists()
+    assert not (runner.checkpoints / "adata_qc.h5ad").exists()
+    assert (outside / "private").read_bytes() == b"unrelated"
+
+
+def test_report_aliases_track_success_without_erasing_other_tools_or_user_changes(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, output = fixture_result(runner, "scrna-analysis")
+    tables = output / "artifacts/tables"
+    for name in ("old.csv", "user.csv"):
+        (tables / name).write_text("old\n")
+    assert make("scrna-analysis", "run_clustering").executor({}, ctx)["status"] == "ok"
+    (runner.artifacts / "tables/user.csv").write_text("user edited\n")
+    (runner.artifacts / "tables/unrelated.csv").write_text("other tool\n")
+    (tables / "old.csv").unlink()
+    (tables / "user.csv").unlink()
+    value["task_id"] = "second"
+    runner.fixture.write_text(json.dumps(value))
+    assert make("scrna-analysis", "run_clustering").executor({}, ctx)["status"] == "ok"
+    assert not (runner.artifacts / "tables/old.csv").exists()
+    assert (runner.artifacts / "tables/user.csv").read_text() == "user edited\n"
+    assert (runner.artifacts / "tables/unrelated.csv").read_text() == "other tool\n"
+    current = (runner.artifacts / "tables/qc.csv").read_text()
+    (tables / "qc.csv").write_text("failed run\n")
+    value.update(state="FAILED", status="error")
+    runner.fixture.write_text(json.dumps(value))
+    assert make("scrna-analysis", "run_clustering").executor({}, ctx)["status"] == "error"
+    assert (runner.artifacts / "tables/qc.csv").read_text() == current
+
+
+def test_polling_an_old_completed_task_does_not_replace_current_report_aliases(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, output = fixture_result(runner)
+    assert make().executor({}, ctx)["status"] == "ok"
+    current = (runner.artifacts / "tables/qc.csv").read_text()
+    (output / "artifacts/tables/qc.csv").write_text("historical task\n")
+    (output / "work/adata_qc.h5ad").write_bytes(b"historical checkpoint")
+    value["task_id"] = "older-task"
+    runner.fixture.write_text(json.dumps(value))
+    assert make("cellqc", "cellqc_job_status").executor({}, ctx)["status"] == "ok"
+    assert (runner.artifacts / "tables/qc.csv").read_text() == current
+    assert (runner.checkpoints / "adata_qc.h5ad").read_bytes() == b"real fixture checkpoint bytes"
+
+
+def test_cellqc_rerun_replaces_complete_tree_and_discards_stale_files(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, output, _ = full_cellqc_result(runner)
+    assert make().executor({}, ctx)["status"] == "ok"
+    (output / "result/cellqc/report.html").unlink()
+    (output / "artifacts/result/report.html").unlink()
+    value["task_id"] = "rerun"
+    runner.fixture.write_text(json.dumps(value))
+    assert make().executor({}, ctx)["status"] == "ok"
+    assert not (runner.artifacts.parent / "result/cellqc/report.html").exists()
+    assert not (runner.artifacts / "result/report.html").exists()
+    pointer = json.loads((runner.artifacts / "data/cellqc_result.json").read_text())
+    assert "report.html" not in {f["name"] for f in pointer["files"]}
+    assert pointer["mcp_provenance"]["task_id"] == "rerun"
+
+
+def test_alias_ownership_prevents_cross_server_cleanup(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    cellqc, output = fixture_result(runner)
+    assert make().executor({}, ctx)["status"] == "ok"
+    _, scrna = fixture_result(runner, "scrna-analysis")
+    (scrna / "artifacts/tables/qc.csv").write_text("latest scRNA table\n")
+    assert make("scrna-analysis", "run_clustering").executor({}, ctx)["status"] == "ok"
+    (output / "artifacts/tables/qc.csv").unlink()
+    cellqc["task_id"] = "new-qc"
+    runner.fixture.write_text(json.dumps(cellqc))
+    assert make().executor({}, ctx)["status"] == "ok"
+    assert (runner.artifacts / "tables/qc.csv").read_text() == "latest scRNA table\n"
+    # Read-only metadata without an artifact tree also leaves published results intact.
+    runner.fixture.write_text(json.dumps({"status": "ok", "analysis_id": "default"}))
+    assert make("scrna-analysis", "describe").executor({}, ctx)["status"] == "ok"
+    assert (runner.artifacts / "tables/qc.csv").read_text() == "latest scRNA table\n"
+
+
+def test_cellqc_species_rerun_retires_only_unchanged_owned_checkpoints(analysis_bridge):
+    runner, ctx, make = analysis_bridge
+    value, output = fixture_result(runner)
+    for species in ("human", "mouse"):
+        (output / "work" / f"adata_qc.{species}.h5ad").write_bytes(species.encode())
+    value["checkpoints"] = {s: {"checkpoint": f"adata_qc.{s}.h5ad"} for s in ("human", "mouse")}
+    runner.fixture.write_text(json.dumps(value))
+    assert make().executor({}, ctx)["status"] == "ok"
+    # Keep a user-owned variant while dropping the previous run's absent species.
+    (runner.checkpoints / "adata_user.h5ad").write_bytes(b"user variant")
+    value.update(task_id="mouse-only", checkpoints={"mouse": {"checkpoint": "adata_qc.mouse.h5ad"}})
+    runner.fixture.write_text(json.dumps(value))
+    assert make().executor({}, ctx)["status"] == "ok"
+    assert not (runner.checkpoints / "adata_qc.human.h5ad").exists()
+    assert (runner.checkpoints / "adata_qc.mouse.h5ad").read_bytes() == b"mouse"
+    assert (runner.checkpoints / "adata_user.h5ad").read_bytes() == b"user variant"
+
+
 @pytest.mark.parametrize("mutation", ["outside", "other_analysis", "root_symlink", "nested_symlink", "checkpoint_symlink", "dest_symlink", "checkpoint_escape"])
 def test_collector_rejects_unsafe_file_sources_and_destinations(analysis_bridge, mutation):
     runner, ctx, make = analysis_bridge

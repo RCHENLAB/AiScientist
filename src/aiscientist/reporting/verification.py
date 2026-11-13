@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..agents.tool_names import canonical_tool_name
+
 # A table larger than this contributes its first rows and column extremes only, and is not searched
 # for derived numbers: a 5,000-row DE table holds a near match for almost any decimal.
 _BIG_TABLE_VALUES = 150
@@ -526,7 +528,7 @@ def labels_section(art: Path) -> "tuple[list[str], dict]":
 def qc_section(rounds: "list[Any]") -> "tuple[list[str], dict]":
     qc = None
     for _, st in _steps(rounds):
-        if st.get("tool") in ("run_cellqc", "run_scanpy_qc") and isinstance(st.get("result"), dict) \
+        if canonical_tool_name(st.get("tool")) in ("run_cellqc", "run_scanpy_qc") and isinstance(st.get("result"), dict) \
                 and st["result"].get("status") == "ok":
             qc = (st["tool"], st["result"])
     if qc is None:
