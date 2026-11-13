@@ -6,7 +6,6 @@ import pytest
 
 from aiscientist.agents.research_harness import HarnessContext
 from aiscientist.agents.research_lab import CriticVerdict, LabConfig, LabRound, ResearchLab
-from aiscientist.tools.run_cellqc.tool import make_tool
 
 
 @pytest.mark.parametrize("qc_only", [True, False])
@@ -59,13 +58,6 @@ def test_synthesis_writer_receives_default_qc_policy_without_losing_audit_data(m
     assert cellqc == original
 
 
-def test_cellqc_catalog_description_leads_with_qc_outcome_and_detail_location():
-    description = make_tool().description
-    assert "doublets removed" in description
-    assert "technical details" in description
-    assert "download" in description
-    assert "second opinion" not in description
-    assert "DoubletFinder" not in description and "scDblFinder" not in description
 
 
 @pytest.mark.parametrize("args", [{}, {"doublet_decider": "scdblfinder"}])

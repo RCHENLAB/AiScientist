@@ -4,7 +4,7 @@ Curated skills come only from the pinned aiscientist-skills release (``configs/s
 which is installed on the server and not in git. A test never reads an installed release:
 ``skill_release`` publishes one from skill folders the test writes, the way the registry's release
 workflow does, and points the loader at it. ``tests/fixtures/skills/`` holds the skills several
-test files share (the CellQC skill ``run_cellqc`` reads its environment and settings from).
+test files share (the CellQC skill ``mcp_run_cellqc`` reads its environment and settings from).
 """
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def skill_release(tmp_path, monkeypatch):
 
 @pytest.fixture
 def cellqc_release(skill_release):
-    """A release holding the fixture CellQC skill, the one ``run_cellqc`` names in its TOOL.md."""
+    """A release holding the fixture CellQC skill, the one ``mcp_run_cellqc`` names in its TOOL.md."""
     return skill_release(FIXTURE_SKILLS)
 
 
@@ -135,7 +135,7 @@ def lab_gateway(tmp_path, monkeypatch):
         system = messages[0]["content"]
         models.append(system)
         if "Principal Investigator of a bioinformatics lab" in system:
-            return json.dumps({"agenda": ["Filter cells with `run_scanpy_qc` at max_pct_mt 20."]})
+            return json.dumps({"agenda": ["Filter cells with `mcp_run_scanpy_qc` at max_pct_mt 20."]})
         if "filling in a form" in system:
             return '[{"step":1,"settings":{"max_pct_mt":20}}]'
         if "scientific Critic" in system:
@@ -147,14 +147,14 @@ def lab_gateway(tmp_path, monkeypatch):
     def scientist_chat(messages, tools, **kwargs):
         done = any(m.get("role") == "tool" for m in messages)
         return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
-            "name": "finish" if done else "run_scanpy_qc",
+            "name": "finish" if done else "mcp_run_scanpy_qc",
             "arguments": json.dumps({"answer": "done"} if done else {"max_pct_mt": 5})}}]}
 
     def tool(args, ctx):
         calls.append(dict(args))
         return {"status": "ok"}
 
-    catalog = [HarnessTool("run_scanpy_qc", "Filter cells", {"type": "object", "properties": {
+    catalog = [HarnessTool("mcp_run_scanpy_qc", "Filter cells", {"type": "object", "properties": {
         "max_pct_mt": {"type": "number"}, "min_genes": {"type": "integer"}}}, tool)]
     monkeypatch.setattr(registry, "build_scientist_catalog", lambda **kw: catalog)
     # The step classifier caches the catalog's names; this one-tool catalog must not outlive the test.
@@ -207,3 +207,11 @@ def lab_gateway(tmp_path, monkeypatch):
         conn.loop.close()
     gw._SAVED_PLAN_TASKS.clear()
     research_lab._known_tool_names.cache_clear()
+
+@pytest.fixture(autouse=True)
+def fresh_planner_catalog():
+    """A test may replace the registry or its env; its cached name set cannot leak."""
+    from aiscientist.agents.research_lab import _known_tool_names
+    _known_tool_names.cache_clear()
+    yield
+    _known_tool_names.cache_clear()

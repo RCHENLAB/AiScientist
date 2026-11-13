@@ -1,8 +1,6 @@
 """Eye Server retrieval and index synchronisation, without network or a GPU."""
 import json
-import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -21,80 +19,17 @@ def index(tmp_path, monkeypatch):
     (root / "manifest.csv").write_text("doc_id,title,citation\n123,PRPF31 paper,Smith 2020\n")
     monkeypatch.setenv("AISCIENTIST_DATA_ROOT", str(tmp_path))
     monkeypatch.delenv("AISCIENTIST_LOCAL_CORPUS_ROOT", raising=False)
-    monkeypatch.setattr(lc, "_EMBEDDERS", {})
-    monkeypatch.setattr(lc, "_LOAD_FAILURES", {})
     return root
 
 
-def test_offline_cpu_model_is_loaded_once_and_result_matches_tool_contract(index, monkeypatch):
-    calls = []
-
-    class Model:
-        def __init__(self, name, **kwargs):
-            calls.append((name, kwargs))
-
-        def encode(self, texts, **kwargs):
-            return [[1., 0.] for _ in texts]
-
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
-    before = dict(__import__("os").environ)
-    tool = lc.make_local_tool()
-    out = tool.executor({"queries": ["What does PRPF31 cause?"]}, None)
-    again = lc.run_local_search({"queries": ["PRPF31 disease"]})
-    assert len(calls) == 1
-    assert calls[0][1]["local_files_only"] is True
-    assert calls[0][1]["device"] == "cpu"
-    assert dict(__import__("os").environ) == before
-    assert out["status"] == again["status"] == "ok"
-    assert out["contexts"][0]["text"] == "PRPF31 causes disease."
-    assert out["contexts"][0]["page"] == 6
-    assert out["contexts"][0]["citation"] == "Smith 2020"
-    assert out["raw_data_to_llm"] is False
 
 
-def test_missing_model_or_index_requests_hpc_fallback(index, monkeypatch):
-    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
-    assert lc.make_local_tool() is None
-    assert lc.run_local_search({"queries": ["PRPF31"]}) is None
-    (index / "mechanism_cache" / "chunk_vecs.npy").unlink()
-    assert not lc.has_local_index()
-    assert lc.run_local_search({"queries": ["PRPF31"]}) is None
 
 
-def test_explicit_local_root_and_broken_index_fall_back(index, monkeypatch):
-    monkeypatch.setenv("AISCIENTIST_LOCAL_CORPUS_ROOT", str(index))
-    monkeypatch.setenv("AISCIENTIST_DATA_ROOT", "unused")
-    monkeypatch.setattr(lc, "_embedder", lambda root: lambda texts: [[1., 0.]])
-    (index / "mechanism_cache" / "chunks.jsonl").write_text("broken json")
-    assert lc.has_local_index()
-    assert lc.run_local_search({"queries": ["PRPF31"]}) is None
 
 
-def test_failed_model_load_is_cached_until_retry_window(index, monkeypatch):
-    attempts = []
-    now = [100.0]
-
-    class MissingModel:
-        def __init__(self, *args, **kwargs):
-            attempts.append(now[0])
-            raise OSError("offline model is missing")
-
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=MissingModel))
-    monkeypatch.setattr(lc.time, "monotonic", lambda: now[0])
-    assert lc.make_local_tool() is None
-    assert lc.make_local_tool() is None
-    assert len(attempts) == 1
-    now[0] += lc._LOAD_RETRY_S + 1
-    assert lc.make_local_tool() is None
-    assert len(attempts) == 2
 
 
-def test_vectors_for_another_index_are_not_searched_and_never_re_embedded(index, monkeypatch):
-    np = pytest.importorskip("numpy")
-    np.save(index / "mechanism_cache" / "chunk_vecs.npy", np.zeros((3, 2), dtype="float32"))
-    monkeypatch.setattr(lc, "_embedder",
-                        lambda root: lambda texts: pytest.fail(f"embedded {len(texts)} texts"))
-    assert lc.run_local_search({"queries": ["PRPF31"]}) is None    # the HPC3 fallback answers
 
 
 def _fingerprint(index, **override):
@@ -162,156 +97,34 @@ def test_staleness_is_read_from_hpc3_at_most_once_per_interval(index, monkeypatc
     assert lc.stale(object()) == []
 
 
-def test_the_copy_text_is_built_once_per_version(index, monkeypatch):
-    from aiscientist.tools.search_corpus import tool as search_tool
-
-    monkeypatch.setattr(lc, "_TEXT", {})
-    monkeypatch.setattr(lc, "_embedder", lambda root: lambda texts: [[1., 0.] for _ in texts])
-    built = []
-    real = search_tool.preload
-
-    def preload(paths):
-        built.append(paths.cache)
-        return real(paths)
-
-    monkeypatch.setattr(lc, "preload_search_corpus", preload)
-    first = lc.run_local_search({"queries": ["PRPF31 disease"]})
-    second = lc.run_local_search({"queries": ["What does PRPF31 cause?"]})
-    assert first["status"] == second["status"] == "ok" and len(built) == 1
-    assert second["contexts"][0]["text"] == "PRPF31 causes disease."
-    # A new version of the copy (here: the same folder rewritten) is loaded again.
-    (index / "mechanism_cache" / "chunks.jsonl").write_text(json.dumps({
-        "pmid": "123", "page": 7, "chunk": 0, "text": "PRPF31 haploinsufficiency."}) + "\n")
-    third = lc.run_local_search({"queries": ["PRPF31"]})
-    assert len(built) == 2 and third["contexts"][0]["page"] == 7
 
 
-def test_the_word_index_memo_stays_bounded(monkeypatch):
-    from aiscientist.tools._lib.corpus import TextIndex, parse_terms
-
-    idx = TextIndex(["alpha beta", "beta gamma"])
-    monkeypatch.setattr(TextIndex, "MEMO_MAX", 3)
-    for word in ("alpha", "beta", "gamma", "delta", "alpha"):
-        idx.counts(parse_terms([word])[0])
-        assert len(idx._counts) <= 3
-    assert idx.counts(parse_terms(["beta"])[0]) == {0: 1, 1: 1}
 
 
-def test_real_local_search_separates_cold_load_and_search_timings(index, tmp_path, monkeypatch):
-    from aiscientist.gateway import run_monitor, run_timing
-
-    clock = [100.0]
-    monkeypatch.setattr(run_timing.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(lc, "_TEXT", {})
-    original_preload = lc.preload_search_corpus
-    original_search = lc.run_search_corpus
-
-    class Model:
-        def __init__(self, *args, **kwargs):
-            clock[0] += 9
-
-        def encode(self, texts, **kwargs):
-            return [[1., 0.] for _ in texts]
-
-    def preload(paths):
-        clock[0] += 4
-        return original_preload(paths)
-
-    def search(*args, **kwargs):
-        clock[0] += 3
-        return original_search(*args, **kwargs)
-
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
-    monkeypatch.setattr(lc, "preload_search_corpus", preload)
-    monkeypatch.setattr(lc, "run_search_corpus", search)
-    monitor = run_monitor.RunMonitor(run_id="corpus-run")
-    path = tmp_path / "timing.jsonl"
-    monitor.bind_timing(path)
-    with run_monitor.bind_monitor(monitor):
-        tool = lc.make_local_tool()
-        assert tool.executor({"queries": ["PRPF31"]}, None)["status"] == "ok"
-        assert tool.executor({"queries": ["PRPF31"]}, None)["status"] == "ok"
-    spans = run_monitor.read_timing(path)["spans"]
-    assert [(s["stage"], s["metadata"]["source"], s["duration_seconds"]) for s in spans] == [
-        ("corpus_load", "local_embedder", 9), ("corpus_load", "local_text", 4),
-        ("corpus_search", "local_index", 3), ("corpus_search", "local_index", 3)]
-    assert {s["outcome"] for s in spans} == {"success"}
-    assert {s["category"] for s in spans} == {"processing"}
-    assert "PRPF31" not in path.read_text()     # no query text in the timing journal
 
 
-def test_failed_local_embedder_load_keeps_failure_before_hpc_fallback(index, tmp_path, monkeypatch):
-    from aiscientist.gateway import run_monitor
-
-    class MissingModel:
-        def __init__(self, *args, **kwargs):
-            raise OSError("sensitive path to a missing offline model")
-
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=MissingModel))
-    monitor = run_monitor.RunMonitor(run_id="corpus-fallback")
-    path = tmp_path / "timing.jsonl"
-    monitor.bind_timing(path)
-    with run_monitor.bind_monitor(monitor):
-        assert lc.make_local_tool() is None
-    spans = run_monitor.read_timing(path)["spans"]
-    assert len(spans) == 1 and spans[0]["outcome"] == "failed"
-    assert spans[0]["stage"] == "corpus_load"
-    assert "sensitive" not in path.read_text()
 
 
-def test_shared_embedder_loader_and_waiter_keep_separate_run_timelines(index, tmp_path, monkeypatch):
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-    from aiscientist.gateway import run_monitor
 
-    previous_monitor = run_monitor.current_monitor()
 
-    entered, contended, release = threading.Event(), threading.Event(), threading.Event()
-
-    class Lock:
-        def __init__(self):
-            self.lock = threading.Lock()
-
-        def acquire(self, blocking=True):
-            got = self.lock.acquire(blocking=blocking)
-            if not got:
-                contended.set()
-            return got
-
-        def release(self):
-            self.lock.release()
-
-    class Model:
-        def __init__(self, *args, **kwargs):
-            entered.set()
-            assert release.wait(5)
-
-        def encode(self, texts, **kwargs):
-            return [[1., 0.] for _ in texts]
-
-    monkeypatch.setattr(lc, "_LOCK", Lock())
-    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(SentenceTransformer=Model))
-    first, second = (run_monitor.RunMonitor(run_id=ident) for ident in ("loader", "waiter"))
-    paths = [tmp_path / "loader.jsonl", tmp_path / "waiter.jsonl"]
-    first.bind_timing(paths[0])
-    second.bind_timing(paths[1])
-
-    def load(monitor):
-        with run_monitor.bind_monitor(monitor):
-            return lc.make_local_tool()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        loader = pool.submit(load, first)
-        assert entered.wait(5)
-        waiter = pool.submit(load, second)
-        try:
-            assert contended.wait(5)
-        finally:
-            release.set()
-        assert loader.result(5) is not None and waiter.result(5) is not None
-    loaded, waited = [run_monitor.read_timing(p) for p in paths]
-    assert loaded["run_id"] == "loader" and waited["run_id"] == "waiter"
-    assert [s["stage"] for s in loaded["spans"]] == ["corpus_load"]
-    assert [s["stage"] for s in waited["spans"]] == ["corpus_wait"]
-    assert waited["spans"][0]["category"] == "observation"
-    assert run_monitor.current_monitor() is previous_monitor
+def test_vector_transfer_check_uses_only_bounded_metadata(tmp_path, monkeypatch):
+    import builtins
+    import struct
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    header = repr({"descr": "<f4", "fortran_order": False, "shape": (2, 3)}).encode() + b"\n"
+    (cache / "chunk_vecs.npy").write_bytes(b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header)) + header + b"\0" * 24)
+    (cache / "chunks.jsonl").write_text('{}\n{}\n')
+    original = builtins.__import__
+    def blocked(name, *args, **kwargs):
+        if name == "numpy":
+            raise AssertionError("gateway metadata check imported NumPy")
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    assert lc.vectors_match_chunks(cache)
+    (cache / "chunks.jsonl").write_text('{}\n')
+    assert not lc.vectors_match_chunks(cache)
+    path = cache / "chunk_vecs.npy"
+    path.write_bytes(path.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="Truncated"):
+        lc.vectors_match_chunks(cache)

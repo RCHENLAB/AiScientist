@@ -27,7 +27,7 @@ def skills_release() -> dict[str, Any]:
     try:
         cfg = skills_registry.config()
         root = skills_registry.release_dir(cfg)
-        out: dict[str, Any] = {"tag": cfg["release_tag"], "installed": root.is_dir()}
+        out: dict[str, Any] = {"tag": cfg["release_tag"], "repository": cfg["repository"], "installed": root.is_dir()}
     except (OSError, ValueError, KeyError) as exc:
         return {"tag": None, "installed": False, "error": str(exc)}
     if cfg["pinned_tag"] != cfg["release_tag"]:

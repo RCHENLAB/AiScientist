@@ -1,7 +1,7 @@
 """Final-report reference formatting.
 
 This module deliberately does **not** retrieve literature. Literature retrieval belongs to
-``tools.literature_search`` and should happen as an explicit, accepted lab step. The final report
+the registered native literature tool and should happen as an explicit, accepted lab step. The final report
 stage only formats and inserts citations produced by that step. If no accepted citation exists,
 the manuscript says so honestly instead of performing a hidden fallback search.
 """

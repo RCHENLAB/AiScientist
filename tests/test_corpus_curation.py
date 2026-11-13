@@ -16,6 +16,8 @@ about the concept, still go to the literature line.
 """
 from __future__ import annotations
 
+from native_literature_fixtures import bind_route
+
 import asyncio
 import csv
 import json
@@ -359,8 +361,8 @@ def _wire(monkeypatch, decisions, *, papers=PAPERS):
         jobs.append(_ScanJob(c.workspace / run_id))
         return jobs[-1]
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor", build)
-    monkeypatch.setattr(gw_app._tools_api, "search_literature",
+    bind_route(monkeypatch, build)
+    monkeypatch.setattr(gw_app, "_literature_search_logged",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("PubMed searched")))
     shown: list[str] = []
     script = list(decisions)
@@ -387,7 +389,7 @@ def test_the_issue_question_gets_a_curation_plan_then_the_tables_and_an_answer_f
     # The plan: one curation step over the RetiGene corpus, no PubMed, with the time it takes.
     ((stage, step),) = w.shown
     assert stage == "corpus" and step.startswith("**RetiGene curation**")
-    assert "PubMed is not searched" in step and "about 2 hours on a GPU of its own" in step
+    assert "PubMed is not searched" in step and "with your selected model qwen" in step
     # The model only said that it asks for a list (of a curation built in), and routed nothing else.
     assert corpus_scan.CURATION_GENES in step and w.model.asked == [CORPUS_ASKED]
     assert [j.calls for j in w.jobs] == [["extract_haploinsufficient_genes"]]
@@ -772,12 +774,16 @@ def test_a_kept_scan_is_planned_as_instant_and_needs_no_job(tmp_path, monkeypatc
 
 def test_on_an_api_key_the_plan_says_the_model_the_time_and_the_cap(tmp_path, monkeypatch):
     conn = _conn(tmp_path)
-    monkeypatch.setattr(gw_app, "_corpus_scan_api", lambda c: {"model": "claude-haiku-5-5"})
+    bind_route(monkeypatch, lambda **kw: None)
+    from aiscientist.agents.mcp_model import RelayBinding
+    monkeypatch.setattr(gw_app, "_mcp_session_model", lambda c:
+        RelayBinding("claude-haiku-5-5", start=lambda *a: None, priced=True))
+    monkeypatch.setattr(gw_app, "_bound_credential", lambda c: {"id": "fixture-key"})
     monkeypatch.setattr(gw_app, "_corpus_scan_cost_cap", lambda c: (20.0, "the $20.00 per-scan ceiling"))
     words = gw_app._curation_time_words(conn, None, {"model": "claude-haiku-5-5"})
-    assert "with your API model claude-haiku-5-5, on your key" in words and "about 10 minutes" in words
-    assert "it stops at $20.00 (the $20.00 per-scan ceiling)" in words and "larger model" not in words
-    assert "a larger model takes longer" in gw_app._curation_time_words(conn, None, {"model": "claude-sonnet-5-5"})
+    assert "with your selected model claude-haiku-5-5" in words and "CPU job" in words
+    assert "the $20.00 cap" in words and "one in-flight call can cross" in words
+    assert "GPU of its own" not in words and "pilot first" in words
 
     def spent(c):
         raise gw_app.GatewayError("Your API budget for this cycle is used up ($9.00 spent).", stage="corpus")

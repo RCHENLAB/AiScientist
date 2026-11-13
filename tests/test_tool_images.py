@@ -162,9 +162,9 @@ def _sbatch_scripts(hpc) -> str:
 
 
 def test_a_tool_with_its_own_image_runs_in_it_with_its_resources(cellqc_release):
-    m = tool_skills.job_environment(catalog.manifest("run_cellqc"))   # from the skill it names
+    m = tool_skills.job_environment(catalog.manifest("demo_tool"))   # from the skill it names
     hpc = FakeHPC(present=True)
-    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {}, ctx=None)
+    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("demo_tool", {}, ctx=None)
     assert out["status"] == "ok"
     joined = _sbatch_scripts(hpc)
     assert f"/dfs/c/{image_sif_name(m['image'])}" in joined
@@ -180,11 +180,11 @@ def test_a_tool_with_its_own_image_runs_in_it_with_its_resources(cellqc_release)
 def test_the_image_is_provisioned_once_on_first_use(cellqc_release):
     hpc = FakeHPC(present=False)
     ex = _executor(hpc, dataset_root="/dfs/up/cohort")
-    ex.run_tool("run_cellqc", {}, ctx=None)
-    ex.run_tool("run_cellqc", {}, ctx=None)
+    ex.run_tool("demo_tool", {}, ctx=None)
+    ex.run_tool("demo_tool", {}, ctx=None)
     image_jobs = [c for c in hpc.cmds if c.startswith("sbatch") and "_image_" in c]
     assert len(image_jobs) == 1
-    assert any("build --sandbox" in c for c in hpc.cmds)   # run_cellqc's image is a bioconda: build
+    assert any("build --sandbox" in c for c in hpc.cmds)   # demo_tool's image is a bioconda: build
 
 
 def test_a_failed_provisioning_is_an_error_not_a_run_in_the_wrong_image(cellqc_release):
@@ -195,31 +195,19 @@ def test_a_failed_provisioning_is_an_error_not_a_run_in_the_wrong_image(cellqc_r
             return out
 
     hpc = NeverThere(present=False)
-    out = _executor(hpc).run_tool("run_cellqc", {}, ctx=None)
+    out = _executor(hpc).run_tool("demo_tool", {}, ctx=None)
     assert out["status"] == "error" and "could not provision" in out["error"]
-    assert not any("--tool run_cellqc" in c for c in hpc.cmds)
+    assert not any("--tool demo_tool" in c for c in hpc.cmds)
 
 
 def test_line_tools_keep_the_line_image_resources_and_deps():
     hpc = FakeHPC()
-    _executor(hpc).run_tool("run_clustering", {}, ctx=None)
+    _executor(hpc).run_tool("preflight", {}, ctx=None)
     joined = _sbatch_scripts(hpc)
     assert "/dfs/c/analysis.sif" in joined and "--cpus-per-task=8" in joined
     assert "/dfs/pydeps" in joined and "--dataset-root" not in joined
 
 
-def test_scrna_cli_hands_the_folder_root_to_the_tool(monkeypatch):
-    from aiscientist.tools import scrna_cli
-    seen = {}
-
-    def fake_tools(only=None):
-        seen["only"] = only
-        return {"run_cellqc": lambda args, ctx: {"status": "ok", "root": ctx.decisions.get("dataset_root")}}
-
-    monkeypatch.setattr(scrna_cli, "_analysis_tools", fake_tools)
-    out = scrna_cli.run_tool("run_cellqc", "/ws", "/up/S1/f.h5", {}, dataset_root="/up/S1")
-    assert out["root"] == "/up/S1" and seen["only"] == "run_cellqc"
-    assert json.dumps(out)
 
 
 def test_every_bound_folder_is_bound_and_handed_to_the_job(cellqc_release):
@@ -229,7 +217,7 @@ def test_every_bound_folder_is_bound_and_handed_to_the_job(cellqc_release):
     folders = ({"name": "Sample3_GSM5676874", "path": "/dfs/tmp/s/aaa/original"},
                {"name": "Sample1_WT", "path": "/dfs/tmp/s/bbb/original"})
     out = _executor(hpc, dataset_root="/dfs/tmp/s/aaa/original",
-                    input_folders=folders).run_tool("run_cellqc", {}, ctx=None)
+                    input_folders=folders).run_tool("demo_tool", {}, ctx=None)
     assert out["status"] == "ok"
     joined = _sbatch_scripts(hpc)
     assert joined.count("-B /dfs/tmp/s/aaa/original:/dfs/tmp/s/aaa/original:ro") == 1   # bound once
@@ -237,19 +225,6 @@ def test_every_bound_folder_is_bound_and_handed_to_the_job(cellqc_release):
     assert "--input-folders" in joined and '"name": "Sample1_WT"' in joined
 
 
-def test_scrna_cli_hands_every_bound_folder_to_the_tool(monkeypatch, capsys):
-    from aiscientist.tools import scrna_cli
-
-    monkeypatch.setattr(scrna_cli, "_analysis_tools", lambda only=None: {
-        "run_cellqc": lambda args, ctx: {"status": "ok",
-                                         "folders": ctx.decisions.get("input_folders"),
-                                         "root": ctx.decisions.get("dataset_root")}})
-    folders = [{"name": "Sample3_GSM5676874", "path": "/up/a"}, {"name": "Sample1_WT", "path": "/up/b"}]
-    assert scrna_cli.main(["--tool", "run_cellqc", "--workspace", "/ws", "--dataset-root", "/up/a",
-                           "--input-folders", json.dumps(folders)]) == 0
-    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(scrna_cli.RESULT_MARKER))
-    out = json.loads(line[len(scrna_cli.RESULT_MARKER):])
-    assert out["folders"] == folders and out["root"] == "/up/a"
 
 
 # -- a tool that runs a registry skill's method (TOOL.md ``skill:``, issue #42) -------------------
@@ -265,9 +240,9 @@ def _fake_skill(**kw):
     return Skill(**{**base, **kw})
 
 
-def test_run_cellqc_names_its_skill_and_repeats_none_of_its_environment(cellqc_release):
+def test_demo_tool_names_its_skill_and_repeats_none_of_its_environment(cellqc_release):
     from aiscientist.agents.skills import get_skill, refresh_skills
-    m = catalog.manifest("run_cellqc")
+    m = catalog.manifest("demo_tool")
     assert m.skill == _CELLQC_SKILL
     assert (m.image, m.cpus, m.mem_gb, m.time_limit) == ("", 0, 0, "")
     refresh_skills()
@@ -293,7 +268,7 @@ def test_changing_the_skill_changes_the_job_without_editing_the_tool(tmp_path, m
     monkeypatch.setattr(tool_skills, "tool_skill", lambda m: _fake_skill())
     hpc = FakeHPC(present=True)
     ctx = HarnessContext(decisions={}, workspace=tmp_path)
-    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {"min_counts": 700}, ctx=ctx)
+    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("demo_tool", {"min_counts": 700}, ctx=ctx)
     assert out["status"] == "ok"
     joined = _sbatch_scripts(hpc)
     assert f"/dfs/c/{image_sif_name('bioconda:cellqc=0.3.6 python=3.12')}" in joined
@@ -317,7 +292,7 @@ def test_a_tool_whose_skill_cannot_be_used_is_an_error_and_submits_nothing(monke
         raise tool_skills.ToolSkillError(f"{m.name} runs skill {m.skill!r}, which is not installed")
     monkeypatch.setattr(tool_skills, "tool_skill", missing)
     hpc = FakeHPC(present=True)
-    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("run_cellqc", {}, ctx=None)
+    out = _executor(hpc, dataset_root="/dfs/up/cohort").run_tool("demo_tool", {}, ctx=None)
     assert out["status"] == "error" and "not installed" in out["error"]
     assert not any(c.startswith("sbatch") for c in hpc.cmds)
 
@@ -325,6 +300,20 @@ def test_a_tool_whose_skill_cannot_be_used_is_an_error_and_submits_nothing(monke
 def test_plan_estimates_take_the_resources_from_the_skill(monkeypatch):
     from aiscientist.gateway import estimates
     monkeypatch.setattr(tool_skills, "tool_skill", lambda m: _fake_skill(cpus=12, mem_gb=48))
-    steps = estimates.profile("run_cellqc")["steps"]
+    steps = estimates.profile("demo_tool")["steps"]
     assert steps and all(s["cpus"] == 12 and s["mem_gb"] == 48 for s in steps)
     assert all("minutes" in s for s in steps)             # the timings stay in resource_profile.json
+
+@pytest.fixture(autouse=True)
+def declared_job_fixture(tmp_path, monkeypatch):
+    """The manifest protocol remains tested with an actual temporary plugin declaration."""
+    parent = tmp_path / "declared"
+    parent.mkdir()
+    folder = _manifest(parent, f"skill: {_CELLQC_SKILL}\n")
+    (folder / "resource_profile.json").write_text(json.dumps({"unit": "cells", "baseline": 10000,
+        "steps": [{"name": "process", "minutes": 2}]}))
+    declared = load_manifest(folder)
+    lookup = catalog.manifest
+    monkeypatch.setattr(catalog, "manifest", lambda name: declared if name == "demo_tool" else lookup(name))
+    profiles = catalog.resource_profile
+    monkeypatch.setattr(catalog, "resource_profile", lambda name: json.loads((folder / "resource_profile.json").read_text()) if name == "demo_tool" else profiles(name))

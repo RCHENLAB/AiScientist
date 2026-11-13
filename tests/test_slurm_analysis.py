@@ -339,22 +339,12 @@ def test_container_start_failure_surfaces_sbatch_job_log():
     assert "produced no result" not in out["error"]        # the real cause replaced the blind fallback
 
 
-def test_registry_routes_only_real_analysis_tools():
+def test_registry_exposes_no_retired_analysis_dispatch():
     from aiscientist.agents.registry import build_scientist_catalog
+    names = {t.name for t in build_scientist_catalog()}
+    assert not {"run_scanpy_qc", "run_de", "run_clustering"} & names
+    assert {"finish", "run_code"} <= names
 
-    class AE:
-        def __init__(self): self.calls = []
-        def run_tool(self, name, args, ctx):
-            self.calls.append(name)
-            return {"status": "ok", "routed": name}
-
-    ae = AE()
-    tools = {t.name: t for t in build_scientist_catalog(analysis_executor=ae)}
-    out = tools["run_scanpy_qc"].executor({"min_genes": 1}, None)
-    assert out == {"status": "ok", "routed": "run_scanpy_qc"}
-    assert ae.calls == ["run_scanpy_qc"]
-    # a non-analysis tool (literature search) is NOT routed through the executor
-    assert "run_scanpy_qc" in tools and "literature_search" in tools
 
 
 def test_run_tool_cancel_returns_cancelled_without_fallback(monkeypatch):
@@ -522,7 +512,8 @@ def test_release_removes_the_runs_install_and_only_that():
 
 def test_the_install_step_is_not_a_tool_the_model_can_call():
     from aiscientist.tools import scrna_cli
-    assert scrna_cli.INSTALL_DEPENDENCY not in scrna_cli._analysis_tools()
+    from aiscientist.agents.registry import build_scientist_catalog
+    assert scrna_cli.INSTALL_DEPENDENCY not in {t.name for t in build_scientist_catalog()}
 
 
 # --- live args: an endpoint that moves mid-run -----------------------------------------------

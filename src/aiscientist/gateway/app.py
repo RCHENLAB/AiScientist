@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import dataclasses
 import functools
 import json
 import mimetypes
@@ -28,9 +27,8 @@ from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
 from .dataset_limits import MAX_BOUND_DATASETS as _MAX_BOUND_DATASETS
+from .. import literature_contract
 from . import cluster_models, gpu, vllm_client
-from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
-from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
 from ..tools import sdk as _tools_sdk   # the tool contract (here: what a tool may read on this host)
 # The endpoint-locality test lives with the data-boundary guard it feeds (a privacy decision,
 # and testable without the web stack). Aliased so every call site reads the same as before.
@@ -3386,7 +3384,20 @@ def _record_input_layout(decisions: dict, layout: "dict | None",
     dr = decisions.setdefault("dataset_result", {})
     if isinstance(dr, dict):
         dr["cellranger_layout"] = layout
-        dr["input_layout_hint"] = cellranger_layout_hint(layout)
+        from ..agents.mcp_bridge import configured_servers
+        from ..agents.tool_names import canonical_tool_name
+        registered = {canonical_tool_name(server.planner_name(entry["name"])):
+                      server.planner_name(entry["name"])
+                      for server in configured_servers() if server.adapter == "analysis"
+                      for entry in server.tools}
+        hint = cellranger_layout_hint(layout)
+        methods = {"run_cellqc": "CellQC", "run_scanpy_qc": "matrix QC",
+                   "run_doublet_detection": "doublet detection"}
+        for name, method in methods.items():
+            actual = registered.get(name)
+            hint = hint.replace(f"`{name}`", f"`{actual}`" if actual else
+                                f"{method} (native service not configured)")
+        dr["input_layout_hint"] = hint
         if dr.get("tenx_h5") and any(lib.get("matrix") == dr["tenx_h5"] for lib in layout["libraries"]):
             # The hint states the primary matrix's facts with the rest of the delivery's: once is enough.
             dr["note"] = "the primary file is one of this delivery's filtered matrices (read above)"
@@ -5723,31 +5734,7 @@ def _remote_path_status(executor: Any, path: str, *, is_dir: bool) -> "bool | No
         return None
 
 
-def _variant_offline_preflight(executor: Any, vep_image: str, cache_dir: str, clinvar: str) -> dict:
-    """Cheap HPC3 existence checks for the offline VEP stack (sif image + VEP cache dir + ClinVar VCF).
-    Returns ``{name: (path, exists?)}`` where exists? is True / False / None(unverifiable). SSH
-    round-trips, so call via ``asyncio.to_thread``. This is the check that turns a silent
-    "fell back to REST" into "clinvar_vcf NOT found on HPC3: <path>"."""
-    return {
-        "vep_image": (vep_image, _remote_path_status(executor, vep_image, is_dir=False)),
-        "cache_dir": (cache_dir, _remote_path_status(executor, cache_dir, is_dir=True)),
-        "clinvar_vcf": (clinvar, _remote_path_status(executor, clinvar, is_dir=False)),
-    }
 
-
-def _phenotype_preflight(executor: Any, lirical_image: str, data_dir: str,
-                         exomiser_dir: str = "") -> dict:
-    """Cheap HPC3 existence checks for the LIRICAL stack (sif image + LIRICAL data dir + the optional
-    Exomiser data dir for genotype-aware scoring). Returns ``{name: (path, exists?)}`` with exists? =
-    True / False / None(unverifiable). SSH round-trips, so call via ``asyncio.to_thread``. Turns a silent
-    ``not_installed`` into ``lirical_data_dir NOT found on HPC3: <path>``."""
-    checks = {
-        "lirical_image": (lirical_image, _remote_path_status(executor, lirical_image, is_dir=False)),
-        "lirical_data_dir": (data_dir, _remote_path_status(executor, data_dir, is_dir=True)),
-    }
-    if exomiser_dir:   # only when genotype-aware is configured (else phenotype-only needs no Exomiser)
-        checks["exomiser_dir"] = (exomiser_dir, _remote_path_status(executor, exomiser_dir, is_dir=True))
-    return checks
 
 
 def _detect_vcf_assembly(conn: "Connection", decisions: dict) -> str:
@@ -6017,7 +6004,13 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
     session = _temp_base(conn)
     legacy_temp = hpc_layout.legacy_dir(shared, "Temp", user)
     uploads = hpc_layout.legacy_dir(shared, "uploads", user)
-    read_roots = tuple(r for r in (home, session, legacy_temp, uploads,
+    artifacts_dir = work_dir = ""
+    if run is not None and run.run_id:
+        analysis_dir = _run_home(conn, run.run_id).dir("analysis")
+        # Match SlurmCodeExecutor's bindings, including a continued run's recorded home.
+        work_dir = os.environ.get("AISCIENTIST_HPC_WORK") or f"{analysis_dir}/work"
+        artifacts_dir = os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{analysis_dir}/artifacts"
+    read_roots = tuple(r for r in (home, session, legacy_temp, uploads, artifacts_dir, work_dir,
                                    hpc_layout.containers_dir(shared), reference,
                                    hpc_layout.package_cache_root(shared), hpc_layout.lab_envs_dir(shared),
                                    st.scgpt_model_dir, st.vlreview_model_dir) if r)
@@ -6065,6 +6058,8 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
         workspace=HpcWorkspace(read_roots=read_roots, write_roots=write_roots),
         environments=_lab_environments(conn, run, user, shared) if (st.run_code_on_hpc or st.analysis_on_hpc) else None,
         home=home,
+        artifacts_dir=artifacts_dir,
+        work_dir=work_dir,
         worker_provider=(lambda: _ensure_session_worker(conn)) if st.worker_enabled else None,
         run_on_worker=_run_on_session_worker if st.worker_enabled else None,
         confirm=_hitl_confirm(conn, run),
@@ -6266,194 +6261,162 @@ def _live_llm_args(conn: "Connection") -> dict[str, Any]:
     return {"llm_base_url": f"http://{alloc.node}:{alloc.port}/v1", "model": conn.selected_model}
 
 
-class _NoServedModelExecutor:
-    """The literature line of a session with no served model (the user's own API key). A tool whose
-    HPC3 job calls the served model (manifest ``served_model``) answers ``dependency_missing`` at once
-    instead of submitting a Slurm job that cannot reach a model. The roster already leaves those tools
-    out (``registry.session_catalog``); this covers a composite bound to one of them, such as
-    ``diagnose_disease``, which composes ``deep_literature`` and degrades to its LIRICAL track.
-    A tool whose job brings its own GPU (manifest ``own_gpu``, the corpus scan) is refused here too:
-    it runs only through its own executor (``_build_literature_executor(own_gpu=True)``)."""
-
-    def __init__(self, inner: Any) -> None:
-        self._inner = inner
-        self._needs_model = frozenset(m.name for m in _tools_catalog.manifests() if m.served_model)
-        self._own_gpu = frozenset(m.name for m in _tools_catalog.manifests() if m.own_gpu)
-
-    def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
-        if tool in self._needs_model:
-            return {"status": "dependency_missing", "dependency": "served-model",
-                    "note": f"{tool} calls the model a session serves on an HPC3 GPU, and this session "
-                            "has no GPU allocation."}
-        if tool in self._own_gpu:
-            return {"status": "dependency_missing", "dependency": "own-gpu-job",
-                    "note": f"{tool} runs as a job with a GPU and a model of its own (the RetiGene "
-                            "corpus scan), not on this literature line."}
-        return self._inner.run_tool(tool, args, ctx)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
+def _mcp_session_model(conn: "Connection") -> Any:
+    """Use the selected session model; keep saved provider keys on the gateway."""
+    from ..agents.mcp_model import ModelBinding
+    cred = _bound_credential(conn)
+    if cred is not None or os.environ.get("AISCIENTIST_LLM_BASE_URL"):
+        return _mcp_relay_binding(conn, cred)
+    live = _live_llm_args(conn)
+    if not live:
+        return None
+    return ModelBinding(endpoint=live["llm_base_url"], model=live["model"])
 
 
-def _build_literature_executor(conn: "Connection", run_id: str | None = None, *,
-                               own_gpu: bool = False, relay: "dict[str, Any] | None" = None) -> Any:
-    """Offload the literature tools (deep_literature, extract_haploinsufficient_genes) to HPC3
-    (paperqa.sif), or None to keep them disabled. With ``run_id`` the job gets that run's own
-    workspace (``Temp/<user>/corpus/<run_id>`` on dfs3b, ``<workspace>/<run_id>`` locally), so its
-    artifacts are synced back under the run and show up in the run's files; without it (the chat
-    path) the shared ``Temp/<user>/paperqa`` dir is used as before.
+def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
+    """One MCP job's metered full-chat relay, including native Claude tool calls.
 
-    ``own_gpu`` (the corpus scan): each job runs on a GPU of its own on the paid partition and
-    starts its own model there (``gateway/corpus_scan.py``), so it needs no allocation of the
-    session and never calls the session's model.
-
-    PaperQA cannot run in-process on the eyeserver: the PubMedBERT index lives on /dfs3b, which the
-    gateway can't read in place. When AISCIENTIST_PAPERQA_ON_HPC is set (and there is a live SSH session
-    + a GPU serve job whose node hosts Qwen), run paperqa_cli inside paperqa.sif on HPC3, reaching the
-    served Qwen at the GPU node's own host:port (the offload branch in paperqa_search._local_endpoint).
-    Returns None (deep_literature simply absent) whenever anything required is missing — so the
-    feature is fully OPT-IN and its absence never changes existing behaviour.
+    Only the selected Scientist model is bound. No provider key, proxy bearer,
+    or user endpoint is placed in the HPC job's environment or result files.
     """
-    st = conn.settings
-    image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "")
-    # Opt-in guard: build the executor ONLY when the feature is enabled AND a live HPC3 session
-    # exists — else return None so the literature tools are simply absent. A session with no GPU
-    # allocation (the user's own API key) still gets the executor: ``search_corpus`` runs there
-    # without a model. The tools whose manifest says ``served_model`` are left out of that session's
-    # roster (``registry.session_catalog``), and the job gets no model endpoint.
-    if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not image
-            or conn.executor is None or conn.mock):
-        return None
-    retigene = os.environ.get("AISCIENTIST_PAPERQA_ROOT", "")
-    index_dir = os.environ.get("AISCIENTIST_PAPERQA_INDEX_DIR", "")
-    papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
-    embedding = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", "st-NeuML/pubmedbert-base-embeddings")
-    index_name = os.environ.get("AISCIENTIST_PAPERQA_INDEX_NAME", "retigene_full_pubmedbert")
-    try:
-        pysrc = _sync_aiscientist_source_to_hpc(conn)   # live AiScientist src, bound + PYTHONPATH'd in-sif
-    except Exception:  # noqa: BLE001 - HPC sync failed → feature simply absent this run
-        return None
-    if not pysrc:
-        return None
-    # vllm serves --host 0.0.0.0, so any HPC3 node reaches Qwen at the GPU node's own host:port.
-    # Without an allocation nothing is injected: no job on HPC3 gets a model endpoint or an API key.
-    served = ({"model": conn.selected_model, "llm_base_url": f"http://{conn.alloc.node}:{conn.alloc.port}/v1"}
-              if conn.alloc is not None else {})
-    if own_gpu:
-        # The job's own model, reached on the node's loopback (the URL is set inside the job, once
-        # the port is known): no endpoint of the session goes in.
-        served = {"model": corpus_scan.scan_model(st)}
-        window = max(60, int(st.corpus_scan_queue_window_s))
-        gpu_job: dict[str, Any] = {
-            "partition": st.corpus_scan_partition, "account": st.corpus_scan_account or "",
-            "gres": st.corpus_scan_gres, "constraint": st.corpus_scan_constraint,
-            "exclude": st.exclude or "", "network": True, "job_prefix": "bioagent_corpusscan",
-            # The paid queue can hold a card back for hours: wait in windows the chat hears about.
-            "startup_timeout_s": window,
-            "queue_windows": max(1, -(-int(st.corpus_scan_queue_wait_s) // window)),   # ceil
-            "queue_progress": True,
-            "job_prelude": lambda name, scratch, res_f: corpus_scan.vllm_prelude(
-                st, name=name, scratch=scratch, res_f=res_f),
-            "live_args": None,
-        }
+    import hashlib
+    from ..agents.mcp_model import RelayBinding
+    from ..agents.mcp_relay_worker import validate_request
+    from . import anthropic_client, llm_credentials, llm_pricing, llm_providers, llm_relay
 
-    def _lit_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-        return {"status": "dependency_missing", "dependency": "paperqa-hpc",
-                "note": "deep_literature unavailable this run (HPC down or paperqa.sif not staged)."}
+    shared = cred is not None and cred.get("builtin") == "shared"
+    model = str(cred.get("model") or (shared_llm.SharedLLMSettings().served_name if shared else "")) \
+        if cred is not None else str(os.environ.get("AISCIENTIST_LLM_MODEL") or "")
+    if not model:
+        raise ValueError("The selected model has no configured model identifier")
+    base = str(cred.get("base_url") or "") if cred is not None \
+        else str(os.environ.get("AISCIENTIST_LLM_BASE_URL") or "")
+    native = cred is not None and llm_providers.transport_for(cred.get("provider"), base) == "anthropic"
+    priced = shared or llm_pricing.rates_for(model) is not None
+    remote = not shared and (native or _endpoint_is_off_host(base))
+    label = str((cred or {}).get("label") or (cred or {}).get("provider") or "configured API")
+    identity = hashlib.sha256(json.dumps({
+        "credential_id": (cred or {}).get("id", ""), "provider": (cred or {}).get("provider", "openai"),
+        "base_url": base, "model": model, "shared": shared,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    # Relay threads do not inherit ContextVars. Retain this run's billing, stop
+    # event and consent context even when another chat starts on the connection.
+    context = contextvars.copy_context()
+    bound_run = getattr(conn, "active_run", None)
+    cancelled = conn.chat_stop.is_set
 
-    # Retrieval-breadth / determinism / LLM-budget overrides, passed as ARGS rather than env: the
-    # paperqa .sif runs with --containall, so the eyeserver's environment never reaches the job.
-    # Unset keys are dropped so paperqa_search's in-code defaults stay authoritative — .env only
-    # overrides.
-    tuning = {key: val for key, val in (
-        ("search_count", os.environ.get("AISCIENTIST_PAPERQA_SEARCH_COUNT", "")),
-        ("evidence_k", os.environ.get("AISCIENTIST_PAPERQA_EVIDENCE_K", "")),
-        ("max_sources", os.environ.get("AISCIENTIST_PAPERQA_MAX_SOURCES", "")),
-        ("answer_length", os.environ.get("AISCIENTIST_PAPERQA_ANSWER_LENGTH", "")),
-        ("concurrency", os.environ.get("AISCIENTIST_PAPERQA_CONCURRENCY", "")),
-        ("temperature", os.environ.get("AISCIENTIST_PAPERQA_TEMPERATURE", "")),
-        ("llm_timeout", os.environ.get("AISCIENTIST_PAPERQA_LLM_TIMEOUT", "")),
-        ("reasoning_effort", os.environ.get("AISCIENTIST_PAPERQA_REASONING_EFFORT", "")),
-        ("summary_reasoning_effort", os.environ.get("AISCIENTIST_PAPERQA_SUMMARY_REASONING_EFFORT", "")),
-        ("agent_timeout", os.environ.get("AISCIENTIST_PAPERQA_AGENT_TIMEOUT", "")),
-    ) if val}
-    from .slurm_analysis import SlurmAnalysisExecutor
-    ro_binds = tuple(dict.fromkeys(p for p in (
-        retigene, papers, (os.path.dirname(manifest) if manifest else "")) if p))
-    executor = SlurmAnalysisExecutor(
-        remote=conn.executor, container_image=image,
-        remote_workspace=(_run_home(conn, run_id).dir("corpus") if run_id else f"{_temp_base(conn)}/paperqa"),
-        local_workspace=(conn.workspace / run_id if run_id else conn.workspace), source_dir=pysrc,
-        entrypoint=(
-            f"export HF_HOME={retigene}/hf_cache HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; "
-            f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
-            if retigene else f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
-        ),
-        job_prefix="bioagent_paperqa",
-        scratch_dir=_scratch_dir(conn, "paperqa", run_id=run_id),
-        extra_ro_binds=ro_binds,
-        extra_rw_binds=(index_dir,) if index_dir else (),
-        # Deploy config the model never sends — merged into the tool-call args before the job runs, so
-        # paperqa_cli builds the ctx (Qwen endpoint) and points PaperQA at the pre-built /dfs3b index.
-        inject_args={**served,
-                     "embedding": embedding, "papers": papers, "index_dir": index_dir,
-                     "index_name": index_name, "manifest": manifest, **tuning},
-        # The endpoint is re-read at every job: the serve job can be replaced mid-run on another
-        # node and port (its time limit, a dead node), and the build-time URL then points at nothing.
-        live_args=lambda: _live_llm_args(conn),
-        mem_gb=st.run_code_mem_gb, cpus=st.run_code_cpus, partition=st.cpu_partition,
-        account=st.cpu_account or "", time_limit=st.run_code_time_limit,
-        container_module=st.container_module, container_bin=st.container_bin,
-        local_fallback=_lit_local_fallback,
-        should_cancel=conn.chat_stop.is_set,
-    )
-    if own_gpu:
-        return dataclasses.replace(executor, **gpu_job)
-    if relay is not None:
-        # The corpus scan on the user's own API model (``_corpus_scan_via_relay``): a CPU job whose
-        # model calls come back to this server (``gateway/llm_relay.py``), so neither an endpoint of
-        # the session nor a key goes in — only the model's name and the relay folder.
-        base = {k: v for k, v in executor.inject_args.items() if k not in ("model", "llm_base_url", "tunnel_port")}
-        return dataclasses.replace(executor, inject_args={**base, **relay}, live_args=None,
-                                   job_prefix="bioagent_corpusscan")
-    return executor if conn.alloc is not None else _NoServedModelExecutor(executor)
-
-
-def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
-                    emit: Callable[[str, str, str], None]) -> list:
-    """The tools this run is offered: ``catalog`` minus what the session cannot run
-    (``registry.session_catalog``), with one console line when PaperQA on HPC3 is configured but
-    this session cannot use it. The usual case is a session on the user's own API key: no GPU
-    allocation, so no served model for the PaperQA job to call."""
-    from ..agents.registry import session_catalog
-
-    roster = session_catalog(catalog, literature_executor=literature_executor,
-                             served_model=conn.alloc is not None)
-    from .local_corpus import has_local_index
-    if has_local_index():
-        corpus = _literature_corpus_tool(conn)
-        if corpus is not None:
-            roster = [t for t in roster if t.name != "search_corpus"] + [corpus[0]]
-    if len(roster) < len(catalog) and os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
-        no_gpu = conn.executor is not None and not conn.mock and conn.alloc is None
-        names = {t.name for t in roster}
-        if no_gpu and "search_corpus" in names:
-            emit("info", "lab", "`deep_literature` needs the model a session serves on a GPU, and this session "
-                                "has none: literature steps use `search_corpus` (the RetiGene corpus, "
-                                "retrieval only; the session's model writes the answer).")
+    def start(relay_dir: str, max_cost_usd: float | None = None):
+        cap = CORPUS_SCAN_MAX_COST_USD
+        if max_cost_usd is not None:
+            if type(max_cost_usd) not in (int, float) or not 0 < max_cost_usd < float("inf"):
+                raise ValueError("MCP model cost limit must be positive and finite")
+            if not priced:
+                raise ValueError("The selected model has no configured price; a cost limit cannot be estimated")
+            cap = min(cap, max_cost_usd)
+        if not hasattr(conn.executor, "open_sftp"):
+            raise ValueError("The MCP model relay needs an active HPC3 file-transfer connection")
+        if cred is not None and not shared:
+            target = llm_credentials.call_target(conn.owner, cred["id"])
+            if not target or not target[1]:
+                raise GatewayError("The selected API credential is unavailable; reconnect that endpoint.",
+                                   stage="llm_credential")
+            send_base, api_key = target
         else:
-            why = ("its HPC3 job calls the model a session serves on a GPU, and this session has no GPU "
-                   "allocation" if no_gpu else "its HPC3 job line could not be set up")
-            emit("info", "lab", f"`deep_literature` (the RetiGene corpus) is not available in this run: "
-                                f"{why}. Literature steps use `literature_search` (Europe PMC).")
-    return roster
+            send_base, api_key = base, os.environ.get("AISCIENTIST_LLM_API_KEY") or ""
+        key_use = _key_use(conn, cred) if cred is not None and not shared else None
+
+        def chat(request: dict) -> tuple[dict, dict]:
+            request = validate_request(request, model)
+            if cancelled():
+                raise GatewayError("The MCP run was stopped.", stage="shared_llm_stopped")
+            if remote:
+                _guard_lab_payload([{"content": json.dumps(message, ensure_ascii=False)}
+                                    for message in request["messages"]])
+            if key_use is not None:
+                key_use.before_call()
+            if native:
+                out = anthropic_client.relay_chat(model, request, api_key=api_key, base_url=send_base)
+            elif shared:
+                def call_shared(binding, url):
+                    if binding.model != model:
+                        raise GatewayError("The selected shared model changed; start a new run.", stage="shared_llm")
+                    return vllm_client.relay_chat(model, request, base_url=url, api_key=binding.api_key)
+                out = _shared_call(conn, call_shared)
+            else:
+                out = vllm_client.relay_chat(model, request, base_url=send_base, api_key=api_key)
+            usage = out.pop("usage", {}) or {}
+            return out, usage
+
+        def record(usage, duration_ms, error_type):
+            _record_lab_usage(conn, key_use=key_use, bound_run=bound_run, role="mcp_model", model=model,
+                              endpoint=f"{model} @ {label}", remote=remote, usage=usage,
+                              provider="anthropic" if native else ("shared" if shared else "openai"),
+                              max_tokens=None, duration_ms=duration_ms, error_type=error_type)
+
+        def price(usage):
+            if shared:
+                return 0.0
+            if usage.get("cost") is not None:
+                try:
+                    cost = float(usage["cost"])
+                    if 0 <= cost < float("inf"):
+                        return cost
+                except (TypeError, ValueError):
+                    pass
+            read = int(usage.get("cache_read_input_tokens") or 0)
+            write = int(usage.get("cache_creation_input_tokens") or 0)
+            write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+            return llm_pricing.estimate(str(usage.get("model") or model),
+                input_tokens=int(usage.get("input_tokens") if "input_tokens" in usage
+                                 else max(0, int(usage.get("prompt_tokens") or 0) - read - write)),
+                output_tokens=int(usage.get("completion_tokens") or 0),
+                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
+                cache_read_tokens=read)
+
+        class GuardedRelay(llm_relay.ModelRelay):
+            def stop(self, timeout=30.0):
+                try:
+                    return super().stop(timeout)
+                finally:
+                    if key_use is not None:
+                        key_use.close()
+
+        relay = GuardedRelay(
+            lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, None,
+            call_request=lambda request: context.copy().run(chat, request),
+            record=lambda *args: context.copy().run(record, *args), price=price,
+            max_cost_usd=None if shared else cap,
+            concurrency=1, poll_s=0.2, should_stop=cancelled)
+        if native:
+            conn.emit("info", "mcp", f"MCP model calls use your selected {model} through the gateway, "
+                      "with per-call usage and budget checks. Claude uses its supported sampling "
+                      "defaults; requests for thinking off use low effort.")
+        try:
+            return relay.start()
+        except Exception:
+            if key_use is not None:
+                key_use.close()
+            raise
+
+    return RelayBinding(model=model, start=start, priced=priced, identity=identity)
 
 
-async def _prepare_session_roster(conn: "Connection", catalog: list, literature_executor: Any,
+
+
+
+
+
+
+def _session_roster(conn: "Connection", catalog: list,
+                    emit: Callable[[str, str, str], None]) -> list:
+    """Keep the platform roster; registered MCP tools are attached by the run bridge."""
+    return list(catalog)
+
+
+async def _prepare_session_roster(conn: "Connection", catalog: list,
                                   emit: Callable[[str, str, str], None]) -> list:
-    """Prepare the local embedding model away from the run's event loop."""
-    return await asyncio.to_thread(_session_roster, conn, catalog, literature_executor, emit)
+    """Prepare this session's platform roster away from the event loop."""
+    return await asyncio.to_thread(_session_roster, conn, catalog, emit)
 
 
 def _active_conn_for_user(user) -> Connection | None:
@@ -8725,8 +8688,9 @@ _FOLLOWUP_ROUTER_SYS = (
     "You route a follow-up message in a single-cell bioinformatics console. The user ALREADY "
     "completed a research run in this conversation (its report, figures and processed dataset are "
     "saved) and just sent another message. Classify what they want, choosing exactly one intent. "
-    "There is no report-editing path: a request to reword or re-render the existing report without "
-    "new analysis is a \"new_study\", because the report is only ever written from a run.\n"
+    "A report-only revision reuses accepted results and must not run scientific tools.\n"
+    "- \"report_only\": correct, rewrite, summarize or render the existing report using only "
+    "completed evidence. Do not choose this when new searches or analyses are requested.\n"
     "- \"continue\": a NEW analysis that builds on what the run produced — the next step of the "
     "same study on the same data ('now find the marker genes of each cluster', 'annotate the cell "
     "types', 'compare the two conditions in the rods', 'add pathway enrichment', 'now compare with "
@@ -8737,7 +8701,7 @@ _FOLLOWUP_ROUTER_SYS = (
     "again'). Pick the single most relevant step, copied VERBATIM from the prior agenda.\n"
     "- \"new_study\": start over — a different question that should not reuse the earlier "
     "results, a request to redo everything from the raw data, or a different dataset.\n"
-    "Return ONLY a JSON object: {\"intent\": \"continue|rerun_step|new_study\", "
+    "Return ONLY a JSON object: {\"intent\": \"continue|rerun_step|new_study|report_only\", "
     "\"step\": \"<verbatim agenda step when intent=rerun_step, else null>\", "
     "\"confidence\": <0.0-1.0>, \"reason\": \"<one short clause>\"}."
 )
@@ -8792,7 +8756,7 @@ def _parse_followup_intent(raw: Any, agenda: list[str]) -> dict | None:
     if obj is None:
         return None
     intent = str(obj.get("intent") or "").strip().lower()
-    if intent not in ("continue", "rerun_step", "new_study"):
+    if intent not in ("continue", "rerun_step", "new_study", "report_only"):
         return None
     try:
         conf = max(0.0, min(1.0, float(obj.get("confidence"))))
@@ -9300,46 +9264,125 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
             conn.end_run(current)
 
 
+def _quickchat_literature_route(conn: Connection, req: LabRequest) -> tuple[Any, str]:
+    """Ask only the ready selected model; a classifier never provisions compute."""
+    from ..agents import request_router
+    complete = None
+    if _model_ready(conn):
+        try:
+            selected = _lab_llm(conn).complete_fn
+            complete = lambda messages: selected(messages, role="classify")  # noqa: E731
+        except Exception:  # the guarded deterministic fallback leaves plain chat available
+            complete = None
+    names = [str(item.get("name") or "") for item in _select_bound_datasets(req)]
+    return request_router.route_quickchat_literature(complete, req.question, data=names, history=req.history or [])
+
+
+async def _maybe_status_recovery(conn: Connection, req: LabRequest) -> bool:
+    from dataclasses import replace
+    from ..agents import status_continuation
+    from . import report_revision
+    if not status_continuation.requested(req.question):
+        return False
+    try:
+        requested_run = status_continuation.target_run(req.question)
+        if not req.conversation_id:
+            raise ValueError("Status recovery requires the original conversation.")
+        target = _report_target(conn, req, allow_recovery_error=True)  # ownership and accepted evidence
+        if target is None or target[0] != requested_run:
+            raise ValueError("The original status-recovery run is unavailable in this conversation.")
+        run_id, art, state = target
+        if _binds_other_dataset(req, state):
+            raise ValueError("Status recovery cannot bind a different input dataset.")
+        updated, indices = status_continuation.revised_state(state, req.question)
+        # A task lives under its original RunHome. Never let a missing/expired home silently
+        # resolve to the current session's empty workspace and poll a different task namespace.
+        record = report_revision.confined(conn.workspace, run_id + "/" + _RUN_HOME_FILE)
+        home = hpc_layout.RunHome.from_json(json.loads(record.read_text()))
+        if home is None or home.run_id != run_id:
+            raise ValueError("The original task workspace record is invalid.")
+        expected = (hpc_layout.session_run(conn.settings.shared_root, home.session_id, run_id)
+                    if home.layout == "session" else
+                    hpc_layout.legacy_run(conn.settings.shared_root, _hpc_user(conn), run_id))
+        if home != expected:
+            raise ValueError("The original task workspace is outside this deployment's run layout.")
+        if conn.executor is None:
+            raise ValueError("Connect to the original cluster before recovering task evidence.")
+        if not conn.mock:
+            exists = await asyncio.to_thread(conn.executor.exec,
+                f"test -d {shlex.quote(home.dir('analysis'))}", timeout=30)
+            if not exists.ok:
+                raise ValueError("The original task workspace is unavailable; no new run was created.")
+        resume, decisions, cont_req, _ = _prepare_continue(
+            req.connection_id, conn, run_id, art, updated, min(indices), status_steps=indices)
+        resume = replace(resume, reviewed_note=req.question)
+        cont_req = cont_req.model_copy(update={"conversation_id": req.conversation_id})
+        from .status_recovery import archive
+        archive(art, state, updated, req.question)
+    except (OSError, ValueError, TypeError) as exc:
+        conn.push({"type": "chat_error", "message": "Status recovery stopped: " + public_error(exc)})
+        conn.push({"type": "chat_stopped"})
+        return True
+    conn.run_homes[run_id] = home
+    conn.push({"type": "lab_progress", "level": "info", "text":
+               f"Reviewing status-only recovery of run {run_id}; retained steps and original workspace are preserved."})
+    await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id, resume_decisions=decisions)
+    return True
+
+
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
+    if await _maybe_status_recovery(conn, req):
+        return
+    from ..agents.mcp_workflow import explicit_workflow
+    if explicit_workflow(req.question):
+        # An explicit ordered call list is a reviewed scientific workflow, not a
+        # question for the single-answer search console. It retains this session's
+        # model, cost/cancel policy and the normal plan approval before any call.
+        await _run_lab(conn, req)
+        return
+    if not _fast_path(req) and await _maybe_report_revision(conn, req):
+        return
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
     # message reach it would route a question into a report edit.
+    chat_literature_route = None
+    chat_literature_handoff = False
     if _fast_path(req):
-        if corpus_scan.asks_for_gene_list(req.question):
-            # "What are haploinsufficient genes?": the complete answer is the corpus scan's table,
-            # and a kept scan of this corpus answers it at once, whatever model the session uses.
-            stored = await asyncio.to_thread(_stored_corpus_scan, conn)
-            if stored is not None:
-                await _run_corpus_scan(conn, req, stored=stored)
+        from .literature_mcp import registered_server
+        native_literature = registered_server() is not None
+        if native_literature:
+            candidate, question = await asyncio.to_thread(_quickchat_literature_route, conn, req)
+            run = conn._context_run() or conn.active_run
+            if run is not None and run.chat_stop.is_set():
+                conn.push({"type": "chat_stopped"})
                 return
-            if await asyncio.to_thread(_literature_corpus_available, conn):
-                await _run_gene_table(conn, req)
-                return
-            if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
-                conn.push({"type": "lab_progress", "level": "info", "text": (
-                    "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
-                    "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
-                    "about the RetiGene papers by name for the complete table.")})
-        await _run_quick_chat(conn, req)
-        return
+            if candidate.literature:
+                chat_literature_route = candidate
+                chat_literature_handoff = True
+                req = req.model_copy(update={"route": "auto", "question": question})
+                conn.emit("info", "route", "This chat question needs published evidence; continuing with "
+                          "the literature plan and this session's selected model.")
+        if not chat_literature_handoff:
+            await _run_quick_chat(conn, req)
+            return
     if _corpus_path(req):
         await _run_corpus_scan(conn, req)
         return
     # The chat's last analysis stopped part-way (an error, Stop, a restart): a message that carries on
     # picks it up where it stopped, with its question and approved plan; any other message goes on
     # below as it would have.
-    stopped = _stopped_run_target(conn, req)
+    stopped = None if chat_literature_handoff else _stopped_run_target(conn, req)
     if stopped is not None:
         s_run_id, s_art, s_state, s_resume = stopped
         if await _carries_on_stopped_run(conn, req, s_state, s_resume.from_step_index + 1,
                                          len(s_state.get("agenda") or [])):
             await _resume_stopped_run(conn, req, s_run_id, s_art, s_state)
             return
-    target = _followup_target(conn, req)
+    target = None if chat_literature_handoff else _followup_target(conn, req)
     # Nothing to attach a follow-up to, so this message would mint a FRESH run. Refuse to do that for
     # a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
-    if target is None and await asyncio.to_thread(_starts_no_study, conn, req):
+    if not chat_literature_handoff and target is None and await asyncio.to_thread(_starts_no_study, conn, req):
         conn.push({"type": "lab_progress",
                    "text": "💬 That reads as a reply, not a request — nothing was started. "
                            "There's no previous run in this chat to answer about (a cancelled "
@@ -9367,6 +9410,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         if handoff is None:
             return
         curation_offered = True
+        chat_literature_route = None  # the user changed the curation plan; route the new request
         req = req.model_copy(update={"question": handoff})
         _next = _begin_routed_run(conn, req.conversation_id)
         _note_budget_choice(_next, req)
@@ -9378,7 +9422,8 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # changed the request again.
     while True:
         prior_request = str(target[2].get("question") or "") if target else ""
-        route = await asyncio.to_thread(_route_request, conn, req, prior_request)
+        route = chat_literature_route or await asyncio.to_thread(_route_request, conn, req, prior_request)
+        chat_literature_route = None
         conn.emit("info", "route", f"Routed to {route.route} ({route.source}, confidence "
                                    f"{route.confidence:.2f}): {route.reason or '-'}")
         if not route.literature:
@@ -9453,6 +9498,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
                   "step_index": _default_rerun_index(state)}
 
     kind = intent["intent"]
+    if kind == "report_only":
+        _show_report_revision(conn, req, (run_id, art, state))
+        return
     if kind == "new_study":
         await _run_lab(conn, req)
         return
@@ -9507,7 +9555,10 @@ _RAW_INPUT_TOOLS = re.compile(r"`(?:run_scanpy_qc|run_cellqc|run_doublet_detecti
 
 def _reads_raw_input(step: str) -> bool:
     """A step that works on the input as delivered — QC, ambient correction, doublet removal."""
-    return bool(_RAW_INPUT_TOOLS.search(str(step or "")))
+    from ..agents.tool_names import canonical_tool_name
+    names = re.findall(r"`([A-Za-z_][A-Za-z0-9_-]*)(?:\s*\([^`]*\))?`", str(step or ""))
+    return any(canonical_tool_name(name) in {"run_scanpy_qc", "run_cellqc", "run_doublet_detection"}
+               for name in names)
 
 
 def _plain_step_title(step: str) -> str:
@@ -9726,37 +9777,45 @@ def _corpus_path(req: LabRequest) -> bool:
 CORPUS_TOOL = "extract_haploinsufficient_genes"
 SPEC_FILE = "task_spec.json"   # a task spec's curation keeps the spec it read with, beside its tables
 CORPUS_MAX_ATTEMPTS = 3      # submissions of the job per run: the first plus two resumes after its model died
-# (A job that never left the queue is submitted again separately: settings.corpus_scan_queue_retries.)
+# The registered native runner owns queue and task status; this bounds model-recovery retries.
 # One scan per corpus at a time: the key of each scan in progress (corpus_scan.scan_key) -> its run.
 _CORPUS_SCANS_RUNNING: dict[str, str] = {}
 
 
 def _corpus_scan_identity(conn: Connection, spec: "dict[str, Any] | None" = None,
                           ) -> "tuple[str, dict[str, Any]] | None":
-    """``(key, what it is made of)`` for a scan this session would make now: the corpus as it is on
-    HPC3, the scan's rules (the built-in ones, or a task spec's, ``spec``) and its model
-    (``corpus_scan.scan_key``). None without the literature line, a live HPC3 session or a corpus
-    text cache: nothing is reused or kept then."""
-    papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not papers
-            or conn.executor is None or conn.mock):
+    """Fingerprint a native scan's public corpus, rules, and selected model identity."""
+    from .literature_mcp import registered_server, rules_identity
+    from ..agents.mcp_analysis import setting_values
+    server = registered_server()
+    if server is None or conn.executor is None or conn.mock:
         return None
-    fp = corpus_scan.corpus_fingerprint(conn.executor, papers,
-                                        os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", ""))
-    if fp is None:
+    settings = setting_values(server)
+    root = settings.get("LITERATURE_CORPUS_ROOT", "").rstrip("/")
+    papers = settings.get("LITERATURE_PAPERS") or (root + "/papers" if root else "")
+    manifest = settings.get("LITERATURE_MANIFEST") or (root + "/paperqa_manifest.csv" if root else "")
+    if not papers:
         return None
-    rules = _tools_api.corpus_scan_rules_digest(spec)
-    model = _corpus_scan_model(conn)
-    return corpus_scan.scan_key(fp, rules, model), {"corpus": fp, "rules": rules, "model": model}
+    fp = corpus_scan.corpus_fingerprint(conn.executor, papers, manifest)
+    binding = _mcp_session_model(conn)
+    if fp is None or binding is None:
+        return None
+    rules = rules_identity(server, spec)
+    model_key = getattr(binding, "identity", "") or json.dumps(
+        {"model": binding.model, "endpoint": getattr(binding, "endpoint", ""),
+         "protocol": getattr(binding, "protocol", "openai")}, sort_keys=True)
+    return corpus_scan.scan_key(fp, rules, model_key), {"corpus": fp, "rules": rules, "model": binding.model}
 
 
 def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
-    """The session's own API model when it runs on one (a saved key, not the cluster GPU and not the
-    lab's shared model): ``{"cred", "model", "base_url", "native_anthropic"}``, else None. The scan
-    then reads with that model, through ``_corpus_scan_via_relay``, on the user's bill."""
+    """Return the session API model metadata used by corpus-scan UI and billing previews.
+
+    Scientific calls use the selected model through the guarded native MCP binding.
+    Shared and cluster models are resolved by that binding, not by this metadata helper.
+    """
     try:
         cred = _session_credential(conn)
-    except Exception:  # noqa: BLE001 - the store unreadable: fall back to the GPU path
+    except Exception:  # noqa: BLE001 - an unreadable store provides no preview metadata
         return None
     if cred is None or cred.get("builtin") or not cred.get("model"):
         return None
@@ -9767,9 +9826,9 @@ def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
 
 
 def _corpus_scan_model(conn: Connection) -> str:
-    """The model a scan by this session reads with: the session's API model, else the GPU job's."""
-    api = _corpus_scan_api(conn)
-    return api["model"] if api else corpus_scan.scan_model(conn.settings)
+    """The selected session model; native scans never allocate another model."""
+    binding = _mcp_session_model(conn)
+    return str(binding.model if binding is not None else conn.selected_model)
 
 
 def _stored_corpus_scan(conn: Connection) -> "corpus_scan.StoredScan | None":
@@ -9778,14 +9837,7 @@ def _stored_corpus_scan(conn: Connection) -> "corpus_scan.StoredScan | None":
     return corpus_scan.load(ident[0]) if ident else None
 
 
-def _vllm_log_tail(conn: Connection, path: str) -> str:
-    """The end of the scan job's model log, for the error a run shows when the model never came up."""
-    if not path or conn.executor is None:
-        return ""
-    try:
-        return conn.executor.read_bytes(path).decode("utf-8", errors="replace")[-1500:]
-    except Exception:  # noqa: BLE001 - the log is a diagnostic, not a requirement
-        return ""
+
 
 
 def _corpus_curation(conn: Connection, question: str, *, with_context: bool = False) -> Any:
@@ -9892,7 +9944,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
         user = (f"The user's question: {question}\n\nThe current spec:\n"
                 f"{json.dumps(current, indent=1, ensure_ascii=False)}\n\nThe user's note on it: {note}\n\n"
                 + _SPEC_REVISE)
-    messages = [{"role": "system", "content": _tools_api.CORPUS_SCAN_SPEC_SYSTEM}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": literature_contract.SPEC_SYSTEM}, {"role": "user", "content": user}]
     why = ""
     for _ in range(2):
         try:
@@ -9901,7 +9953,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
             raise GatewayError(f"the session's model could not be reached ({public_error(exc)})",
                                stage="corpus") from exc
         try:
-            return _tools_api.parse_corpus_scan_spec(raw), model
+            return literature_contract.parse_spec(raw), model
         except ValueError as exc:
             why = str(exc)
             messages = [*messages, {"role": "assistant", "content": str(raw or "")[:8000]},
@@ -9911,7 +9963,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
 
 
 def _spec_curation(spec: dict[str, Any]) -> "corpus_scan.Curation":
-    return corpus_scan.curation_for(spec, _tools_api.corpus_scan_spec_folder(spec))
+    return corpus_scan.curation_for(spec, literature_contract.spec_folder(spec))
 
 
 # What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
@@ -9927,23 +9979,28 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
         day = str(stored.meta.get("stored_at") or "")[:10]
         return (f"at once, from the scan of the RetiGene papers kept{' on ' + day if day else ''} (they have "
                 "not changed since): no job and no model cost")
-    if api:
-        from . import llm_pricing
-        model = str(api["model"])
-        est = llm_pricing.estimate(model, **_API_SCAN_TOKENS)
-        try:
-            cap, why = _corpus_scan_cost_cap(conn)
-            limit = (f"; it stops at ${cap:.2f} ({why}), and reads about 1% of the passages first to check "
-                     "the cost")
-        except GatewayError as exc:
-            limit = f". {exc.message}"
-        return (f"with your API model {model}, on your key: it reads about 1,500 passages, which took Claude "
-                "Haiku about 10 minutes" + ("" if "haiku" in model.lower() else " (a larger model takes longer)")
-                + (f", for an estimated ${est:.2f}" if est is not None else "") + limit)
-    wait = _duration_words(conn.settings.corpus_scan_queue_wait_s)
-    return ("about 2 hours on a GPU of its own (an A100; about 4 hours on an A30) on the lab's paid partition, "
-            f"plus the wait for a free card (often minutes; after {wait} without one it is submitted again), "
-            "and no API cost. The tables are kept, so the next request about the RetiGene papers is answered at once")
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        from ..agents.mcp_model import RelayBinding
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            return "the selected session model must be connected before the scan can run"
+        text = (f"with your selected model {binding.model}, through the registered literature MCP; "
+                "retrieval runs as a CPU job on HPC3, with time depending on the queue and passages read")
+        if isinstance(binding, RelayBinding):
+            credential = _bound_credential(conn)
+            if credential is not None and credential.get("builtin") == "shared":
+                return text + "; the lab's shared model has no API credit charge"
+            if not binding.priced:
+                return text + "; scanning is unavailable until the selected model has known pricing for its spending cap"
+            try:
+                cap, why = _corpus_scan_cost_cap(conn)
+            except GatewayError as exc:
+                return text + ". " + exc.message
+            return text + (f"; a pilot first estimates the full scan cost, and subsequent model calls stop at "
+                           f"the ${cap:.2f} cap ({why}); one in-flight call can cross that threshold")
+        return text + "; it uses the session's existing cluster model and no API credit"
+    return "the registered literature MCP must be configured before the scan can run"
 
 
 async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callable[..., None],
@@ -10032,7 +10089,7 @@ async def _revise_curation(conn: Connection, say: Callable[..., None], question:
     from ..agents import request_router
     if _looks_like_spec(note):
         try:
-            spec = _tools_api.parse_corpus_scan_spec(note)
+            spec = literature_contract.parse_spec(note)
         except ValueError as exc:
             say(f"⚠ That spec cannot drive the scan: {exc}. The plan is unchanged.", "warning")
             return curation, drafted_by
@@ -10111,9 +10168,8 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
     """The haploinsufficient genes of the indexed corpus, curated: two tables (one row per gene with
     its claim, one per sentence) and a chat answer written from them. A scan of the corpus as it is
     now, if one is kept (``stored``, else looked up here), answers at once; otherwise
-    ``extract_haploinsufficient_genes`` runs as ONE HPC3 job with a GPU and a model of its own
-    (``gateway/corpus_scan.py``), or on the session's own API model, and its tables are kept for the
-    next request.
+    ``extract_haploinsufficient_genes`` runs through the registered MCP with the selected
+    session model, and its tables are kept for the next request.
 
     ``review``: the console's route for a list question about the RetiGene papers (issue 46,
     ``_corpus_curation``). The plan card shows the curation and how long it takes, and nothing runs
@@ -10146,7 +10202,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
 
     art = conn.workspace / run_id / "artifacts"
     api = _corpus_scan_api(conn)
-    model = api["model"] if api else corpus_scan.scan_model(conn.settings)
+    model = _corpus_scan_model(conn)
     question = str(req.question or "").strip()
     recorded = False
     cur, drafted_by = corpus_scan.HAPLOINSUFFICIENCY, ""
@@ -10192,8 +10248,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             await asyncio.to_thread(corpus_scan.copy_into, stored, art)
             result = stored.result
         else:
-            result = await (_corpus_scan_via_relay(conn, run, run_id, ident, say, emit, api, cur) if api
-                            else _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit, cur))
+            result = await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, cur)
             if result is None:                   # stopped
                 return None
         tables = art / cur.subdir
@@ -10261,89 +10316,88 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
         conn.end_run(run)
 
 
-async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
-                                  ident: "tuple[str, dict[str, Any]] | None",
-                                  say: Callable[..., None], emit: Callable[..., None],
-                                  curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
-                                  ) -> "dict[str, Any] | None":
-    """Run the scan as one job with its own GPU and model, keep its tables, and return its result
-    (None when the user stopped it). ``curation``: what it collects; a task spec's goes to the tool
-    as its ``spec``. Raises ``GatewayError`` when it cannot run or does not finish."""
+async def _build_literature_mcp_route(conn: Connection, run: RunState, run_id: str,
+                                    emit: Callable[..., None]) -> Any:
+    """One registered literature executor and context per console run."""
+    from .literature_mcp import build_literature_route, registered_server
+    if registered_server() is None or conn.executor is None or conn.mock:
+        return None
+    if getattr(run, "literature_mcp_ready", False):
+        return getattr(run, "literature_mcp", None)
+    from ..agents.research_harness import HarnessContext
+    art = conn.workspace / run_id / "artifacts"
+    executor = await _build_code_executor(conn, run, run_id, {}, art, emit)
+    run.literature_mcp = build_literature_route(executor, art, should_cancel=run.chat_stop.is_set)
+    run.literature_mcp_context = HarnessContext(
+        decisions={}, workspace=conn.workspace / run_id, model=conn.selected_model,
+        llm_is_remote=bool(_corpus_scan_api(conn)), read_roots=_tool_read_roots(conn))
+    run.literature_mcp_ready = True
+    return run.literature_mcp
+
+
+async def _corpus_scan_via_mcp(conn: Connection, run: RunState, run_id: str,
+                              ident: "tuple[str, dict[str, Any]] | None",
+                              say: Callable[..., None], emit: Callable[..., None],
+                              curation: "corpus_scan.Curation") -> "dict[str, Any] | None":
+    """Run the registered image with this session's selected, guarded model."""
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
-        raise GatewayError(
-            f"A scan of the RetiGene corpus is already running (run {_CORPUS_SCANS_RUNNING[key]}). Its tables "
-            "are kept when it finishes: ask again then, and they are shown at once.", stage="corpus")
-    executor = _build_literature_executor(conn, run_id=run_id, own_gpu=True)
-    if executor is None:
-        raise GatewayError(
-            "The RetiGene corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
-            "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
-            "nothing was started.", stage="corpus")
-    executor.notify = lambda level, message: emit(level, "corpus", message)
-    from ..agents.research_harness import HarnessContext
-    model = corpus_scan.scan_model(conn.settings)
-    ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
-                         llm_is_remote=False, read_roots=_tool_read_roots(conn))
-    st = conn.settings
-    emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} on its own GPU ({st.corpus_scan_partition} "
-                           f"{st.corpus_scan_gres}, model {model}).")
-    say(f"📚 Scanning all the RetiGene papers for {_curation_what(curation)} — one "
-        "HPC3 job with a GPU of its own (an A30 or A100 on the lab's paid partition): it starts the "
-        "scan's model, which writes search requests, reads the passages they retrieve and quotes "
-        "the papers; every quote is checked against its paper, then the card is freed. The paid queue "
-        "can add a wait before the job starts; the tables are kept, so the next request about the "
-        "RetiGene papers is answered at once.")
+        raise GatewayError("A scan of this corpus with the selected model is already running "
+                           f"(run {_CORPUS_SCANS_RUNNING[key]}).", stage="corpus")
     if key:
         _CORPUS_SCANS_RUNNING[key] = run_id
-    wait = _duration_words(getattr(executor, "startup_timeout_s", 600) * getattr(executor, "queue_windows", 3))
-    queue_retries = max(0, int(st.corpus_scan_queue_retries))
     try:
-        # Two ways the job is submitted again, each a retry of this one step, never a failed run
-        # while a retry is left:
-        # - it never got a card (the paid queue was full for the whole wait): nothing ran;
-        # - its model died mid-scan (out of memory, a lost node): the tool returns model_unreachable
-        #   with what it read so far, and the rerun resumes from the kept replies in the run's work
-        #   dir, so nothing is read twice.
-        result: dict[str, Any] = {}
-        resumes = requeues = 0
-        while True:
-            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
-            if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
-                conn.push({"type": "chat_stopped"})
-                return None
-            if result.get("queue_timeout") and requeues < queue_retries:
-                requeues += 1
-                why = f" (Slurm: {result.get('slurm_reason')})" if result.get("slurm_reason") else ""
-                say(f"⚠ No GPU card became free on the paid partition within {wait}{why}. The job never "
-                    f"started, so nothing ran. Submitting it again — retry {requeues} of {queue_retries}.",
-                    "warning")
-                continue
-            if result.get("model_unreachable") and resumes < CORPUS_MAX_ATTEMPTS - 1:
-                resumes += 1
-                say(f"⚠ The scan's model went away mid-scan ({result.get('n_judged', 0)} of "
-                    f"{result.get('n_passages', '?')} passages read so far). Submitting the job "
-                    f"again; it resumes where it stopped — attempt {resumes + 1} of {CORPUS_MAX_ATTEMPTS}.",
-                    "warning")
-                continue
-            break
+        route = await _build_literature_mcp_route(conn, run, run_id, emit)
+        if route is None:
+            raise GatewayError("The registered literature MCP needs its pinned image and an available "
+                               "HPC3 executor for this run.", stage="corpus")
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            raise GatewayError("The selected session model is unavailable; reconnect it before scanning.",
+                               stage="corpus")
+        from ..agents.mcp_model import RelayBinding
+        args = _corpus_scan_args(curation)
+        model = binding.model
+        cap_words = ""
+        if isinstance(binding, RelayBinding):
+            credential = _bound_credential(conn)
+            shared = credential is not None and credential.get("builtin") == "shared"
+            if not shared:
+                if not binding.priced:
+                    raise GatewayError("The selected model has no known price, so the corpus scan's "
+                                       "cost ceiling cannot be enforced.", stage="corpus")
+                cap, why = _corpus_scan_cost_cap(conn)
+                args["max_cost_usd"] = cap
+                cap_words = f" The pilot estimates total cost first; the spending cap is ${cap:.2f} ({why})."
+        say(f"📚 Scanning the RetiGene papers for {_curation_what(curation)} with your selected model "
+            f"**{model}**, through the registered literature MCP on HPC3." + cap_words)
+        emit("step", "corpus", f"Registered literature MCP: {CORPUS_TOOL}, selected model {model}.")
+        result = await asyncio.to_thread(route.run_tool, CORPUS_TOOL, args, run.literature_mcp_context)
+        if result.get("model_unreachable") and not run.chat_stop.is_set():
+            say("⚠ The selected model stopped answering; retrying once from the saved scan judgments.", "warning")
+            result = await asyncio.to_thread(route.run_tool, CORPUS_TOOL, args, run.literature_mcp_context)
+        if run.chat_stop.is_set() or result.get("status") == "cancelled":
+            conn.push({"type": "chat_stopped"})
+            return None
+        usage = result.get("api_usage") or {}
+        cost = usage.get("cost_usd")
+        spent = f" Measured model cost: ${cost:.4f}." if isinstance(cost, (int, float)) else ""
+        if result.get("status") != "ok":
+            raise GatewayError("The RetiGene corpus scan did not finish: "
+                               + str(result.get("error") or result.get("status")) + spent,
+                               stage="corpus", detail=json.dumps(result, default=str)[:2000])
+        if usage:
+            result["api_usage"] = {"model": model, **usage}
+        await asyncio.to_thread(route.stage_scan_tables, result, curation.subdir)
+        await _keep_corpus_scan(conn, run_id, result, emit, curation)
+        return result
     finally:
-        if key:
+        if key and _CORPUS_SCANS_RUNNING.get(key) == run_id:
             _CORPUS_SCANS_RUNNING.pop(key, None)
-    if result.get("queue_timeout"):
-        why = f"; Slurm's reason: {result.get('slurm_reason')}" if result.get("slurm_reason") else ""
-        raise GatewayError(
-            f"The RetiGene corpus scan could not start: no GPU card became free on the paid partition in "
-            f"{requeues + 1} waits of {wait}{why}. The job never ran, so nothing was lost. Ask "
-            "again later to try once more.", stage="corpus",
-            detail=json.dumps(result, default=str)[:2000])
-    if str(result.get("status") or "") != "ok":
-        msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
-        tail = await asyncio.to_thread(_vllm_log_tail, conn, str(result.get("vllm_log") or ""))
-        raise GatewayError(f"The RetiGene corpus scan did not finish: {msg}", stage="corpus",
-                           detail=(tail or json.dumps(result, default=str))[:2000])
-    await _keep_corpus_scan(conn, run_id, result, emit, curation)
-    return result
+        _push_usage(conn, run, run.conversation_id, run_id)
+
+
+
 
 
 def _corpus_scan_args(curation: "corpus_scan.Curation") -> dict[str, Any]:
@@ -10422,137 +10476,7 @@ def _corpus_scan_cost_cap(conn: Connection) -> tuple[float, str]:
     return cap, why
 
 
-async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
-                                 ident: "tuple[str, dict[str, Any]] | None",
-                                 say: Callable[..., None], emit: Callable[..., None],
-                                 api: dict[str, Any],
-                                 curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
-                                 ) -> "dict[str, Any] | None":
-    """The scan on the session's own API model. One CPU job on HPC3 retrieves the passages and
-    builds the tables; every model call it needs comes back here (``gateway/llm_relay.py``) and is
-    made with the user's key, recorded against the user's usage and capped by the budget left. The
-    job reads about 1% of the passages first (the tool's pilot) and stops if they fail or if their
-    cost projects past the cap. Returns the result (None when stopped); raises ``GatewayError``."""
-    key = ident[0] if ident else ""
-    if key and key in _CORPUS_SCANS_RUNNING:
-        raise GatewayError(
-            f"A scan of the RetiGene corpus with this model is already running (run {_CORPUS_SCANS_RUNNING[key]}). "
-            "Its tables are kept when it finishes: ask again then.", stage="corpus")
-    cap, cap_why = _corpus_scan_cost_cap(conn)
-    from . import anthropic_client, auth_routes, llm_credentials, llm_pricing, llm_relay
-    cred, model, base_url, native = api["cred"], api["model"], api["base_url"], api["native_anthropic"]
-    target = llm_credentials.call_target(conn.owner, cred["id"])
-    if not target:
-        raise GatewayError(
-            f"The API key for “{cred.get('label') or 'this endpoint'}” could not be read. Re-enter it "
-            "under API endpoints, or switch this session back to the cluster GPU.", stage="llm_credential")
-    # Where the calls are sent (the key's address, or the key service's proxy) and with what; the
-    # usage record keeps naming the key's own address (``endpoint`` below).
-    send_base, api_key = target
-    remote_ws = _run_home(conn, run_id).dir("corpus")
-    relay_dir = f"{remote_ws}/work/relay"
-    executor = _build_literature_executor(
-        conn, run_id=run_id, relay={"model": model, "llm_relay_dir": relay_dir, "max_cost_usd": round(cap, 4)})
-    if executor is None or not hasattr(conn.executor, "open_sftp"):
-        raise GatewayError(
-            "The RetiGene corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
-            "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
-            "nothing was started.", stage="corpus")
-    executor.notify = lambda level, message: emit(level, "corpus", message)
-    provider = "anthropic" if native else "openai"
-    endpoint = "anthropic" if native else (base_url or "API")
 
-    # Checked before each relayed call like any run on the key; the scan's own cap is its allowance
-    # in the spike check (a scan the user started and capped is not misuse).
-    key_use = _key_use(conn, cred, allowance_usd=cap, allowance_calls=_CORPUS_SPIKE_CALLS)
-
-    def call(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str, dict[str, Any]]:
-        key_use.before_call()
-        if native:
-            # Only the rules are shared between calls (the passages all differ): cache those alone.
-            return anthropic_client.complete_ex(model, messages, api_key=api_key, base_url=send_base,
-                                                max_tokens=max_tokens,
-                                                effort=anthropic_client.role_effort("corpus_scan"),
-                                                cache="system")
-        return vllm_client.complete_ex(0, model, messages, base_url=send_base, api_key=api_key,
-                                       max_tokens=max_tokens)
-
-    def price(usage: dict[str, Any]) -> "float | None":
-        if usage.get("cost") is not None:                      # the provider's own figure
-            try:
-                return float(usage["cost"])
-            except (TypeError, ValueError):
-                pass
-        read = int(usage.get("cache_read_input_tokens") or 0)
-        write = int(usage.get("cache_creation_input_tokens") or 0)
-        write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
-        uncached = int(usage.get("input_tokens") if "input_tokens" in usage
-                       else max(0, int(usage.get("prompt_tokens") or 0) - read - write))
-        return llm_pricing.estimate(str(usage.get("model") or model), input_tokens=uncached,
-                                    output_tokens=int(usage.get("completion_tokens") or 0),
-                                    cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
-                                    cache_read_tokens=read)
-
-    pushed = {"n": 0}
-
-    def record(usage: "dict[str, Any] | None", duration_ms: int, error_type: "str | None") -> None:
-        try:
-            auth_routes.record_llm_call(run_id=run_id, user_id=getattr(conn, "app_user_id", None),
-                                        conversation_id=run.conversation_id, step="RetiGene corpus scan",
-                                        provider=provider, role="corpus_scan", model=model, endpoint=endpoint,
-                                        remote=True, usage=usage, max_tokens=None, duration_ms=duration_ms,
-                                        error_type=error_type, key_fp=key_use.fingerprint)
-            pushed["n"] += 1
-            if pushed["n"] % 25 == 1:          # the chat header's counter, not on every call
-                _push_usage(conn, run, run.conversation_id, run_id)
-        except Exception as exc:  # noqa: BLE001 - accounting never breaks a scan
-            print(f"[corpus] call not recorded: {exc}")
-        key_use.after_call()
-
-    relay = llm_relay.ModelRelay(
-        lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, call, price=price, record=record,
-        max_cost_usd=cap, concurrency=16, poll_s=1.0, should_stop=run.chat_stop.is_set,
-        log=lambda s: print(f"[corpus] {s}"))
-    from ..agents.research_harness import HarnessContext
-    ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
-                         llm_is_remote=True, read_roots=_tool_read_roots(conn))
-    emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} with your API model {model} (a CPU job on HPC3; "
-                           f"the model calls are made here, at most ${cap:.2f}: {cap_why}).")
-    say(f"📚 Scanning all the RetiGene papers for {_curation_what(curation)} with your "
-        f"API model **{model}**, on your key. One HPC3 job (CPU only) retrieves the passages; this server "
-        f"makes every model call and records it in your API usage. It reads about 1% of the passages "
-        f"first and stops there if they fail or if they project a cost above ${cap:.2f} ({cap_why}).")
-    if key:
-        _CORPUS_SCANS_RUNNING[key] = run_id
-    relay.start()
-    try:
-        result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
-        if (result.get("model_unreachable") and not run.chat_stop.is_set()
-                and not relay.stats.stopped):
-            say(f"⚠ The model stopped answering mid-scan ({result.get('n_judged', 0)} of "
-                f"{result.get('n_passages', '?')} passages read). Submitting the job once more; it "
-                "resumes where it stopped.", "warning")
-            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
-    finally:
-        stats = relay.stop()
-        key_use.close()
-        if key:
-            _CORPUS_SCANS_RUNNING.pop(key, None)
-        _push_usage(conn, run, run.conversation_id, run_id)
-    usage = {"model": model, **stats.public()}
-    result["api_usage"] = usage
-    spent = f"${usage['cost_usd']:.4f} on your key ({usage['calls']} model calls)"
-    if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
-        say(f"Stopped. {spent} so far.")
-        conn.push({"type": "chat_stopped"})
-        return None
-    if str(result.get("status") or "") != "ok":
-        msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
-        raise GatewayError(f"The RetiGene corpus scan did not finish: {msg} Spent: {spent}.", stage="corpus",
-                           detail=json.dumps(result, default=str)[:2000])
-    emit("info", "corpus", f"RetiGene corpus scan model cost: {spent}.")
-    await _keep_corpus_scan(conn, run_id, result, emit, curation)
-    return result
 
 
 def _duration_words(seconds: float) -> str:
@@ -10917,82 +10841,6 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
     return count_tokens, summarize
 
 
-async def _run_gene_table(conn: Connection, req: LabRequest) -> None:
-    """A passage-grounded table when no complete scan has been kept."""
-    import csv
-    from ..agents import corpus_answer
-
-    run = conn.active_run or conn.begin_run(req.conversation_id)
-    run.kind = "literature"
-    run_id = run.run_id or uuid4().hex[:12]
-    conn.bind_run_id(run, run_id)
-    run.running = True
-    run.chat_stop.clear()
-    run.hard_stop.clear()
-    _watch_run(conn, run, req)
-    conn.push({"type": "chat_start"})
-    art = conn.workspace / run_id / "artifacts"
-    notice = ("From a search of the RetiGene corpus (the passages nearest to the question), not from "
-              "every paper. Ask about the RetiGene papers by name for the complete table.")
-    conn.push({"type": "lab_progress", "level": "info", "text": notice})
-    status, summary = "cancelled", "Stopped by the user"
-    try:
-        if _AUTH_ENABLED and conn.app_user_id:
-            try:
-                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
-                                             conversation_id=run.conversation_id)
-            except Exception as exc:  # noqa: BLE001 - history is best-effort
-                print(f"[auth] record_run_start failed: {exc}")
-        corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
-        out = (await asyncio.to_thread(_literature_corpus_logged, conn, run, corpus, req.question, [])
-               if corpus is not None else {"status": "error", "error": "The RetiGene corpus cannot be searched from this session."})
-        contexts = out.get("contexts", []) if out.get("status") == "ok" else []
-        rows = []
-        if contexts and not run.chat_stop.is_set():
-            llm = await asyncio.to_thread(_lab_llm, conn)
-            raw = await asyncio.to_thread(llm.complete_fn,
-                                          corpus_answer.gene_table_messages(req.question, contexts),
-                                          role="literature")
-            rows = corpus_answer.verify_gene_table(str(raw or ""), contexts)
-        if run.chat_stop.is_set():
-            conn.push({"type": "chat_stopped"})
-            return
-        folder = art / "literature"
-        folder.mkdir(parents=True, exist_ok=True)
-        with (folder / "genes.csv").open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["gene", "evidence", "citation"])
-            writer.writeheader()
-            writer.writerows({key: row[key] for key in writer.fieldnames} for row in rows)
-        def cell(value: str) -> str:
-            return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
-        answer = notice + "\n\n| gene | evidence (short verbatim quote) | citation |\n|---|---|---|\n"
-        answer += "\n".join("| " + " | ".join(cell(row[k]) for k in ("gene", "evidence", "citation"))
-                            + " |" for row in rows)
-        if not rows:
-            answer += ("\n\nThe RetiGene passages this search returned do not answer this with verified "
-                       "gene evidence.")
-            if out.get("error"):
-                answer += " " + str(out["error"])
-        (art / "report").mkdir(parents=True, exist_ok=True)
-        (art / "report" / "summary.md").write_text(answer, encoding="utf-8")
-        conn.push({"type": "chat_token", "token": answer})
-        await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [])
-        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
-        items = [{"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
-                  "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
-                 for p in sorted(art.rglob("*")) if p.is_file()]
-        conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
-        status, summary = "done", f"{len(rows)} genes (RetiGene corpus search)"
-        conn.push({"type": "chat_done"})
-    except Exception as exc:  # noqa: BLE001 - report the failed run to the chat
-        status, summary = ("cancelled", "Stopped by the user") if run.chat_stop.is_set() else ("failed", str(exc))
-        conn.push({"type": "chat_error", "message": public_error(exc)})
-    finally:
-        try:
-            _finish_run_record(conn, run_id, status, str(art) if status != "cancelled" else None, summary)
-        finally:
-            run.running = False
-            conn.end_run(run)
 
 
 async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
@@ -11053,13 +10901,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             key_use = _key_use(conn, cred)
         emit("step", "chat", f"Fast chat turn (model: {model}).")
 
-        tools = build_quickchat_catalog(
-            literature_executor=_build_literature_executor(conn), served_model=conn.alloc is not None)
-        from .local_corpus import has_local_index
-        if has_local_index():
-            corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
-            if corpus is not None:
-                tools = [t for t in tools if t.name != "search_corpus"] + [corpus[0]]
+        tools = build_quickchat_catalog()
         # The case note reaches map_phenotype_to_hpo the same way it does on the research path
         # (via ctx.decisions), so attaching a note and asking a question in chat still works.
         decisions: dict[str, Any] = {}
@@ -11209,10 +11051,14 @@ def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: s
 
 
 def _literature_corpus_on_hpc(conn: Connection) -> bool:
-    """Whether this session reaches the corpus on HPC3: the literature line is set up for HPC3 and
-    the session has a live HPC3 connection (what ``_build_literature_executor`` and the corpus scan
-    need). Cheap, so the event loop may call it."""
-    return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
+    """Whether the registered native corpus is reachable through this session's HPC executor."""
+    from .literature_mcp import registered_server
+    from ..agents.mcp_analysis import setting_values
+    server = registered_server()
+    if server is None:
+        return False
+    values = setting_values(server)
+    return bool((values.get("LITERATURE_CORPUS_ROOT") or values.get("LITERATURE_PAPERS"))
                 and conn.executor is not None and not conn.mock)
 
 
@@ -11230,10 +11076,20 @@ def _literature_corpus_available(conn: Connection) -> bool:
 
 def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
     """Local ``search_corpus`` with HPC3 fallback, and its context; None if neither is ready."""
-    from ..agents.registry import build_quickchat_catalog
     from ..agents.research_harness import HarnessContext
     from ..agents import literature_answer as lit
     from .local_corpus import make_local_tool, stale
+    from .literature_mcp import registered_server
+    registered = registered_server() is not None
+    run = getattr(conn, "active_run", None)
+    route = getattr(run, "literature_mcp", None)
+
+    def remote(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        if route is not None:
+            return route.run_tool(lit.CORPUS_TOOL, {"analysis_id": "corpus", **args}, ctx)
+        if registered:
+            return {"status": "error", "error": "The registered literature MCP is unavailable in this run"}
+        return {"status": "error", "error": "The RetiGene corpus copy could not be searched and HPC3 is unavailable"}
     local = make_local_tool()
     if local is not None:
         local_run = local.executor
@@ -11242,33 +11098,27 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
             # A copy that is not the HPC3 index (papers added and the copy not updated yet) is
             # skipped: the search then runs on HPC3, which has the new papers.
             out = None if stale(None if conn.mock else conn.executor) else local_run(args, ctx)
-            if out is not None:
+            if isinstance(out, dict) and out.get("status") in {"ok", "cancelled"}:
                 return out
-            executor = _build_literature_executor(conn)
-            if executor is not None:
-                return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
-            return {"status": "error", "error": "The RetiGene corpus copy on this server could not be "
-                                                "searched, and HPC3 is not reachable from this session."}
+            if route is None and isinstance(out, dict):
+                return out
+            return remote(args, ctx)
 
         from dataclasses import replace
         local = replace(local, executor=retrieve)
         ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
                              tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
+        ctx.should_cancel = run.chat_stop.is_set if run is not None else (lambda: False)
         return local, ctx
-    try:
-        executor = _build_literature_executor(conn)
-    except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
-        print(f"[literature] corpus executor failed: {type(exc).__name__}: {exc}")
-        return None
-    if executor is None:
-        return None
-    tools = build_quickchat_catalog(literature_executor=executor, served_model=conn.alloc is not None)
-    tool = next((t for t in tools if getattr(t, "name", "") == lit.CORPUS_TOOL), None)
-    if tool is None:
-        return None
-    ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
-                         tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
-    return tool, ctx
+    if registered:
+        if route is None:
+            return None
+        from dataclasses import replace
+        tool = route.tools.get(lit.CORPUS_TOOL)
+        if tool is None:
+            return None
+        return replace(tool, executor=remote), run.literature_mcp_context
+    return None
 
 
 def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[Any, Any]", question: str,
@@ -11317,7 +11167,22 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
             run.monitor.observe({"type": "tool_start", "tool": lit.TOOL})
         conn.push({"type": "run_status", "text": f"🔎 PubMed: {query}"})
         conn.push({"type": "chat_thinking", "token": f"→ {lit.TOOL}({json.dumps({'query': query})})\n"})
-        out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
+        from .literature_mcp import registered_server
+        if registered_server() is not None:
+            route = getattr(run, "literature_mcp", None)
+            out = (route.run_tool(lit.TOOL, {"query": query, "limit": limit, "abstracts": True,
+                                          "pubmed_only": True, "analysis_id": "pubmed"}, run.literature_mcp_context)
+                   if route is not None else {"status": "error", "error": "The registered literature MCP is unavailable"})
+        else:
+            out = {"status": "error", "error": "The literature MCP is not registered"}
+        if getattr(run, "literature_mcp", None) is None:
+            from .local_literature_mcp import make_public_tool
+            from ..agents.research_harness import HarnessContext
+            local = make_public_tool(should_cancel=run.chat_stop.is_set)
+            if local is not None:
+                context = HarnessContext(decisions={}, workspace=conn.workspace / run.run_id)
+                out = local.executor({"query": query, "limit": limit, "abstracts": True,
+                                      "pubmed_only": True}, context)
         ok = isinstance(out, dict) and out.get("status") == "ok"
         n = len(out.get("results") or []) if ok else 0
         if run.monitor is not None:
@@ -11522,6 +11387,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_run_start failed: {exc}")
         _watch_stage(run, "literature")
+        await _build_literature_mcp_route(conn, run, run_id, emit)
         llm = _lab_llm(conn)
         complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
         emit("step", "literature", f"Literature search (model: {llm.model})."
@@ -11530,7 +11396,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
         conn.push({"type": "run_status", "text": "🔎 Writing the search queries…"})
         queries, terms = await asyncio.to_thread(
             lit.plan_search, lambda m: complete_fn(m, role="classify"), question,
-            fallback=_tools_api.focus_literature_query)
+            fallback=literature_contract.focus_literature_query)
         if not pubmed:
             queries = []                          # the corpus is searched with the question and the words
         emit("info", "literature", ("Queries: " + "; ".join(queries) + ". " if queries else "")
@@ -11800,7 +11666,8 @@ def _analysis_checkpoints_exist(conn: Connection, run_id: str, *, look_on_hpc: b
 def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Path, state: dict,
                       from_step_index: int, *, modify_note: str | None = "",
                       edited_step: str | None = None, interrupted: bool = False,
-                      hpc_checkpoints: bool = False):
+                      hpc_checkpoints: bool = False,
+                      status_steps: frozenset[int] | None = None):
     """Build the (ResumeState, resume_decisions, LabRequest, idx) to re-run ONE step of a prior
     run in place, reusing earlier steps' checkpoints. Shared by /api/lab/continue and the
     follow-up router. Raises ValueError when the run can't be continued (no agenda, or the
@@ -11811,6 +11678,15 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
     ``modify_note`` and ``edited_step`` are ignored). ``hpc_checkpoints`` also looks for the
     checkpoints in the run's HPC3 workspace — an SSH round trip, so call it off the event loop."""
     from ..agents.research_lab import ResumeState
+    # The report copy is the full approved document, not the short planner hint
+    # returned by _approved_plan_text. Older checkpoints stored only agenda prose.
+    if not state.get("approved_plan_yaml"):
+        approved_path = art / "report" / "plan.yaml"
+        if approved_path.exists():
+            approved_text = approved_path.read_text(encoding="utf-8")
+            if len(approved_text) > _PLAN_YAML_MAX_CHARS:
+                raise ValueError("The approved plan is too large to restore safely; re-plan and review it.")
+            state = {**state, "approved_plan_yaml": approved_text}
     agenda = list(state.get("agenda", []))
     if not agenda:
         raise ValueError("Prior run has no agenda to continue.")
@@ -11819,11 +11695,21 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
         idx = resume.from_step_index
     else:
         idx = max(0, min(int(from_step_index), len(agenda) - 1))
+    if status_steps is not None:
+        if interrupted:
+            raise ValueError("A status recovery must name its exact original step numbers.")
+        from ..agents.plan_doc import parse_plan_yaml
+        from ..agents.status_continuation import validate_tasks
+        validate_tasks(state, parse_plan_yaml(state.get("approved_plan_yaml", ""),
+                       request=state.get("question", "")), status_steps)
+        if idx != min(status_steps):
+            raise ValueError("Status recovery must start at its first explicitly selected step.")
     # Resuming PAST step 0 reads the prior step's analysis checkpoint. Those expire
     # (checkpoint_ttl_days), so if they're gone the resumed step has no input — raise instead
     # of dispatching a run that would silently produce nothing. (Step 0 reads the raw dataset,
     # not a checkpoint, so it's always resumable.)
-    if idx > 0 and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints):
+    if (idx > 0 and status_steps is None
+            and not _analysis_checkpoints_exist(conn, run_id, look_on_hpc=hpc_checkpoints)):
         raise ValueError(
             f"Run {run_id}'s analysis checkpoints have expired — its process files are released "
             "once the report is written (on HPC3, when the session that ran it disconnects, or "
@@ -11836,7 +11722,10 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
             agenda = [*agenda[:idx], edited_step.strip(), *agenda[idx + 1:]]
             state = {**state, "agenda": agenda}
         resume = ResumeState.from_run_state(state, idx, modify_note=(modify_note or ""),
-                                            guidance=state.get("guidance"))
+                                            guidance=state.get("guidance"), redo_indices=status_steps)
+        if status_steps is not None:
+            from dataclasses import replace
+            resume = replace(resume, status_recovery=True, review_requested=True, modify_note="")
     resume_decisions: dict[str, Any] = {}
     if state.get("dataset_path"):
         resume_decisions["dataset_path"] = state["dataset_path"]
@@ -11914,9 +11803,9 @@ def _find_saved_plan(conn: Connection, run_id: str | None, conversation_id: str 
 
 
 def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
-    from . import saved_plans
+    from . import saved_plans, report_revision
 
-    prompts = []
+    prompts = [report_revision.prompt(folder, record) for folder, record in report_revision.pending(conn.workspace)]
     seen = set()
     for rid, art, _current, state in _saved_plan_candidates(conn):
         cid = state.get("conversation_id")
@@ -11986,6 +11875,9 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     if carries_doc and len(req.plan_yaml or "") > _PLAN_YAML_MAX_CHARS:
         return JSONResponse({"status": "error", "detail": "The plan document is too large."},
                             status_code=413)
+    report_reply = await _report_revision_review(conn, req, action)
+    if report_reply is not None:
+        return report_reply
     # Unblock only the run this decision is FOR (its own chat), not whatever run is live on the shared
     # session. A decision that names a run that isn't active (a stale plan card from a finished run) is
     # a no-op. No identifiers (older client) → the active run.
@@ -12239,7 +12131,8 @@ def _other_endpoints() -> str:
     return "the cluster GPU or an API key" if _session_gpu_mode() == "all" else "your own API key"
 
 
-def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -> None:
+def _record_lab_usage(conn: Connection, *, key_use: Any = None,
+                      bound_run: RunState | None = None, **fields: Any) -> None:
     """Record one lab-role completion against the connection's ACTIVE run.
 
     The run_id is read at call time, not captured when ``_lab_llm`` bound the endpoint: a run mints
@@ -12252,7 +12145,7 @@ def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -
         # Read the connection defensively and INSIDE the guard: this runs on every completion, and
         # the promise above (accounting never breaks a run) is only true if reading the run id
         # cannot raise either. Offline harnesses pass a stand-in connection with neither attribute.
-        active = getattr(conn, "active_run", None)
+        active = bound_run if bound_run is not None else getattr(conn, "active_run", None)
         billed = _USAGE_RUN.get()
         if billed:
             active = None      # the report of a finished run: not the run this session has open
@@ -13651,6 +13544,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         account=st.cpu_account or "", time_limit=st.run_code_time_limit,
         container_module=st.container_module, container_bin=st.container_bin,
         # None with accounts on: a failed job is then a failed call, never a run on this host.
+        gpu_partition=st.partition, gpu_account=st.account or "", gpu_gres=st.scgpt_gres,
         local_fallback=sandbox, job_store=job_store, owner=owner,
         should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight run_code job
         # The lab-SHARED package cache: a snippet can import anything a member has
@@ -13667,6 +13561,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         notify=lambda level, message: emit(level, "lab", message),
         inputs=tuple(rc_inputs),
     )
+    code_executor.mcp_model_binding = lambda: _mcp_session_model(conn)
     emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
     # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
     # than letting it die on ModuleNotFoundError mid-step. Transparent when nothing is
@@ -14088,6 +13983,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                         prior: "dict[str, Any] | None" = None, continues_from_dataset: bool = False,
                         untested_md: str = "", figure_diag: str = "", provenance: str = "",
                         qc_report: bool = False, abandoned: Callable[[], bool] = lambda: False,
+                        is_revision: bool = False,
                         on_stage: Callable[[str], Any] = lambda _stage: None) -> dict[str, Any]:
     """The written report of a run: the manuscript (or the QC report, or the short report a request
     asked for), its references, self-review, verification statement, PDF and DOCX, the post-render
@@ -14100,7 +13996,9 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
     render's ``status`` and the formats ``rendered``."""
     from ..reporting.report import build_pdf_report
     vl_attempted = False   # did the post-render visual review get a document to read?
-    brief = _wants_brief_report(scope, result)
+    # A reviewed correction must reach the writer with its hydrated evidence and
+    # instructions, even when the original analysis requested a brief/QC report.
+    brief = not is_revision and _wants_brief_report(scope, result)
     if abandoned():
         report_md = ("# Research report (write-up skipped)\n\n"
                      "You stopped this run a second time, so the model-written report, the "
@@ -14108,7 +14006,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                      "tables every completed step produced are in this bundle, and "
                      "`process/run_state.json` can resume it.\n\n"
                      f"{result.final_answer or ''}\n")
-    elif qc_report:
+    elif qc_report and not is_revision:
         # QC only, and a written report asked for: the writer's report (it chose the layout),
         # then the files the run handed back.
         say_key("📝 Writing the quality-control report…")
@@ -14296,7 +14194,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
         tech_md = await asyncio.to_thread(
             _build_technical_report, result, art, complete_fn, question, lit_note,
             "\n\n".join(d for d in (figure_diag, visual_diag) if d),
-            provenance)
+            provenance, is_revision=is_revision)
         tech_md = _drop_strip_embeds(tech_md, art, emit, "technical report")
         tech_title, tech_md = _promote_doc_title(tech_md, "AiScientist Technical Report")
         if untested_md:
@@ -14424,7 +14322,8 @@ def start_report_job(user: Any, run_id: str) -> "dict[str, Any]":
     return report_job_status(owner, run_id)
 
 
-async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) -> None:
+async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path, *,
+                      revision: "tuple[Path, dict] | None" = None) -> None:
     """The report of a finished run, rebuilt from its folder: :func:`_write_report` as at the end
     of a run, its model calls billed to that run. Records the outcome in process/report_job.json."""
     log: "list[str]" = []
@@ -14442,6 +14341,13 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) ->
         from ..agents.research_lab import LabResult
         from ..agents.scope import RunScope, read_scope
         state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+        if revision is not None:
+            from . import report_revision
+            revision_folder, revision_record = revision
+            report_revision.archive_report(art, revision_folder)
+            state, grounding = report_revision.hydrate(art, state, revision_record["instructions"])
+            from .saved_plans import _write
+            _write(revision_folder / "grounding.json", json.dumps(grounding, indent=2))
         result = LabResult.from_dict(state)
         question = str(state.get("question") or result.question or "")
         saved_scope = (state.get("plan_context") or {}).get("scope")
@@ -14456,8 +14362,21 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) ->
             scope=scope, self_sourced=str(state.get("self_sourced") or ""),
             dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
             provenance=_llm_provenance_note(llm),
-            qc_report=_qc_only_run(result) and not _code_wrote_outputs(result))
-        rec.update(state="done", rendered=done.get("rendered") or [], render_status=done.get("status"))
+            qc_report=revision is None and _qc_only_run(result) and not _code_wrote_outputs(result),
+            is_revision=revision is not None,
+            abandoned=(conn.chat_stop.is_set if revision is not None else lambda: False))
+        cancelled = revision is not None and conn.chat_stop.is_set()
+        if revision is not None and not cancelled:
+            # The old summary is preserved in prior_report; the current bundle
+            # must not present it as a second, contradictory latest report.
+            revised = report_revision.confined(art, "report/report.md")
+            if not revised.is_file():
+                raise ValueError("The report writer did not produce the revised report")
+            _write(report_revision.confined(art, "report/summary.md"),
+                   "# Revised report\n\nThe current corrected report is [report.md](report.md). "
+                   "The original summary is preserved in the report revision history.\n")
+        rec.update(state="cancelled" if cancelled else "done", rendered=done.get("rendered") or [],
+                   render_status=done.get("status"))
     except Exception as exc:  # noqa: BLE001 - said in report_status, never raised into the gateway
         traceback.print_exc()
         rec.update(state="error", error=f"{type(exc).__name__}: {exc}"[:500])
@@ -14504,13 +14423,16 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
     try:
         from ..agents.registry import build_scientist_catalog
         from ..agents.research_harness import HarnessConfig, HarnessContext, ResearchHarness
-        from ..agents.research_lab import LabConfig, ResearchLab
+        from ..agents.research_lab import LabConfig, ResearchLab, ResumeState
         from ..tools.api import run_dataset_smoke_analysis
         from ..reporting.research_bundle import write_process_artifacts
         from ..tools.api import render_workflow_schematic
 
         art = conn.workspace / run_id / "artifacts"
         art.mkdir(parents=True, exist_ok=True)
+        if saved_state is not None and saved_state.get("resume_review"):
+            resume = ResumeState.from_review_state(
+                saved_state["resume_review"], question=str(saved_state.get("question") or ""))
 
         # Record the run in this user's history (when logged in); updated on finish. A resume
         # keeps the SAME run row (it overwrites the same bundle), so don't insert a new one.
@@ -14810,16 +14732,6 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if conn.executor is not None and not conn.mock:
             await asyncio.to_thread(_resolve_run_home, conn, run_id)
         code_executor = await _build_code_executor(conn, run, run_id, decisions, art, emit)
-        # scGPT per-cell annotation runs as a GPU batch job on HPC3 (Route C). Wire its
-        # runner only for a LIVE session (a real SSH executor) — in mock/offline mode the
-        # tool stays present but reports not-enabled (the mock host has no batch lifecycle).
-        scgpt_runner = None
-        if conn.executor is not None and not conn.mock:
-            from .scgpt_runner import build_scgpt_runner
-            scgpt_runner = build_scgpt_runner(
-                conn.executor, conn.settings, cluster_user_dir=_temp_base(conn),
-                run_dir=lambda rid: _run_home(conn, rid).dir("scgpt"),
-            )
         # Opt-in: run the scanpy analysis line (QC/clustering/DE/enrichment) as CPU Slurm batch jobs
         # on HPC3, reading the dataset on dfs3b in place. The dataset is used in place if it already
         # lives on dfs3b (uploads_on_hpc), else staged up once. Checkpoints accumulate in the dfs3b
@@ -14915,395 +14827,19 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("warning", "lab", "The earlier run's dataset carries no processing record, so it "
                                    "is treated as a plain input.")
 
-        # Opt-in: run VCF variant annotation OFFLINE on HPC3 (bcftools PASS-filter -> vep --offline
-        # --cache --fork over a local cache -> stream-parse), so a WGS-size VCF is handled without the
-        # REST tool's whole-file-in-memory read / 500-variant cap / rate limits. Falls back to REST on
-        # failure. EVERY branch below is logged AND persisted to process/variant_offline_diagnostics.log
-        # so a silent "fell back to REST" is never a mystery: you see the flag state, the resolved paths,
-        # and whether the sif / cache / ClinVar actually exist on HPC3.
-        variant_executor = None
+        # The native variant service owns annotation and reference validation.
+        # Preserve header-authoritative assembly selection for it and LIRICAL.
         st = conn.settings
         _ds_name = str(decisions.get("hpc_primary") or decisions.get("dataset_path") or "")
         _is_vcf = _ds_name.lower().endswith((".vcf", ".vcf.gz"))
-        _vdiag: list[str] = []
-
-        def _vlog(level: str, msg: str) -> None:
-            _vdiag.append(f"[{level}] {msg}")
-            emit(level, "lab", msg)
-
-        # Genome build: start from the configured default, then OVERRIDE it with the build read from the
-        # VCF header when detectable. The uploaded VCF is often hg19/GRCh37; annotating those coordinates
-        # against the .env-default GRCh38 cache runs cleanly but mis-assigns the gene at ~90% of sites
-        # (empirically verified), so we route to the matching cache/ClinVar rather than trust the flag.
         _assembly = str(st.vep_assembly)
         if _is_vcf:
             _detected = await asyncio.to_thread(_detect_vcf_assembly, conn, decisions)
-            if _detected and _detected.lower() != _assembly.lower():
-                _vlog("info", f"Variant assembly: VCF header indicates {_detected} — overriding the "
-                              f"configured {_assembly} so the matching VEP cache/ClinVar is used.")
+            if _detected:
                 _assembly = _detected
-            elif not _detected:
-                _vlog("info", f"Variant assembly: build not detectable from the VCF header; using the "
-                              f"configured default {_assembly}.")
-        _grch37 = _assembly.lower() in ("grch37", "hg19")
-        _cache_dir = st.vep_cache_dir_grch37 if _grch37 else st.vep_cache_dir_grch38
-        _clinvar = st.vep_clinvar_grch37 if _grch37 else st.vep_clinvar_grch38
-
-        if _is_vcf or st.variant_on_hpc:
-            _vlog("info",
-                  f"Variant-annotation config: AISCIENTIST_VARIANT_ON_HPC="
-                  f"{'ON' if st.variant_on_hpc else 'OFF'}; vep_image={st.vep_image}; "
-                  f"cache={_cache_dir}; clinvar={_clinvar}; assembly={_assembly}; "
-                  f"executor={'yes' if conn.executor is not None else 'NONE'}; mock={conn.mock}; "
-                  f"dataset={'vcf' if _is_vcf else (_ds_name or 'none')}.")
-
-        # WHY the offline line is / isn't wired — say it out loud, per condition.
-        if not st.variant_on_hpc:
-            if _is_vcf:
-                _vlog("warning",
-                      "Offline VEP line OFF: AISCIENTIST_VARIANT_ON_HPC is not set to 1/true/yes/on in the "
-                      "deployment .env. The VEP_* sif/cache paths ALONE do not enable it — that flag IS the "
-                      "switch. Annotating via the capped REST path.")
-        elif conn.executor is None or conn.mock:
-            _vlog("warning",
-                  f"Offline VEP line requested but not runnable this run: "
-                  f"executor={'NONE' if conn.executor is None else 'ok'}, mock={conn.mock}. Using REST.")
-        else:
-            # Flag ON + live executor: PREFLIGHT the sif + cache + ClinVar on HPC3 before wiring, so a
-            # wrong/un-staged path is reported HERE instead of as a mystery Slurm-job failure later.
-            checks = await asyncio.to_thread(
-                _variant_offline_preflight, conn.executor, st.vep_image, _cache_dir, _clinvar)
-            for name, (path, ok) in checks.items():
-                if not path:
-                    _vlog("warning", f"Offline VEP: {name} is not configured (empty path in .env).")
-                elif ok is False:
-                    _vlog("warning",
-                          f"Offline VEP: {name} NOT found on HPC3: {path} — the VEP job would fail and fall "
-                          f"back to REST. Stage it (deploy/vep/build_and_stage.sh) or fix the .env path.")
-                elif ok is None:
-                    _vlog("warning", f"Offline VEP: could NOT verify {name} on HPC3 ({path}) — SSH check failed.")
-                else:
-                    _vlog("info", f"Offline VEP: {name} present on HPC3 ({path}).")
-            try:
-                v_pysrc = await asyncio.to_thread(_sync_aiscientist_source_to_hpc, conn)
-            except Exception as exc:  # noqa: BLE001
-                _vlog("warning", f"Offline VEP disabled: couldn't stage the tools to dfs3b ({exc}). Using REST.")
-                v_pysrc = None
-            if v_pysrc:
-                remote_ws = _run_home(conn, run_id).dir("variant")
-                conn.executor.exec(f"mkdir -p {shlex.quote(remote_ws)}")
-                if decisions.get("hpc_primary"):
-                    remote_ds = decisions["hpc_primary"]           # dfs3b VCF — annotated in place
-                elif decisions.get("dataset_path"):
-                    remote_ds = f"{remote_ws}/{Path(decisions['dataset_path']).name}"
-                    await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], remote_ds)
-                else:
-                    remote_ds = None
-                if remote_ds is None:
-                    _vlog("warning", "Offline VEP: no dataset path resolved (no hpc_primary / dataset_path) — "
-                                     "the job would have no VCF to annotate.")
-
-                def _variant_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-                    from ..tools.api import annotate_variants_rest
-                    return annotate_variants_rest(args, ctx)
-
-                def _variant_on_fallback(reason: str) -> None:
-                    # Fires the moment the offline VEP job degrades to REST — logs the VERBATIM reason
-                    # (Slurm error tail / "no live HPC connection") AND appends it to the diagnostics file.
-                    msg = ("Offline VEP job did NOT complete — fell back to REST (capped at 500 variants). "
-                           f"Reason: {reason}")
-                    emit("warning", "lab", msg)
-                    try:
-                        _pd = art / "process"
-                        _pd.mkdir(parents=True, exist_ok=True)
-                        with (_pd / "variant_offline_diagnostics.log").open("a", encoding="utf-8") as fh:
-                            fh.write(f"[warning] {msg}\n")
-                    except OSError:
-                        pass
-
-                # Predictor plugins (CADD/AlphaMissense/REVEL + MANE/HGVS + norm) — opt-in, and now
-                # PER-BUILD rather than GRCh38-only. Predictor data is build-specific: handing a GRCh38
-                # file to a GRCh37 run is not just useless but unsafe (tabix looks up by coordinate, so
-                # a position present in both builds with the same ref/alt returns a DIFFERENT variant's
-                # score). So resolve every path for THIS assembly and let the existence check in
-                # ``vep_plugin_flags`` drop whatever is not staged for it — a GRCh37 run gets CADD
-                # (staged, 80 GB) and simply no AlphaMissense/REVEL, instead of the whole panel being
-                # switched off. Inject the paths so they resolve INSIDE vep.sif, and bind each file's
-                # parent dir RO (--containall hides everything not bound; a dir bind also exposes the
-                # .tbi/.fai).
-                #
-                # ``_ref_fasta`` is resolved OUT here, not inside the plugin block, because THREE
-                # separate features gate on it — `bcftools norm`, VEP `--hgvs`, and SpliceAI — and the
-                # last two must still work when the predictor plugins are switched off.
-                _b37 = _assembly == "GRCh37"
-                # The GRCh37 reference is UCSC hg19, NOT Ensembl GRCh37: the lab's GATK VCFs are
-                # chr-prefixed with a 16571 bp chrM (hg19), while Ensembl GRCh37 uses bare `1` and a
-                # 16569 bp chrM. Mixing them makes `bcftools norm -f` fail to match contigs, so the
-                # staged file is a verified-identical copy of the lab's own hg19 (93/93 contigs match a
-                # real WGS VCF's header). Empty ⇒ that build has no reference ⇒ norm/HGVS/SpliceAI stay
-                # OFF for it rather than left-aligning against the wrong genome.
-                _ref_fasta = st.vep_ref_fasta_grch37 if _b37 else st.vep_ref_fasta
-                if _ref_fasta and not os.path.exists(_ref_fasta):
-                    _vlog("warning", f"Reference FASTA for {_assembly} is configured but missing "
-                                     f"({_ref_fasta}) — normalization, HGVS naming and SpliceAI will be "
-                                     "SKIPPED for this run.")
-                    _ref_fasta = ""
-                _plugin_args: dict = {}
-                _plugin_binds: tuple = ()
-                if st.vep_plugins_enabled and _assembly in ("GRCh38", "GRCh37"):
-                    _cadd_snv = st.vep_cadd_snv_grch37 if _b37 else st.vep_cadd_snv
-                    _cadd_indels = st.vep_cadd_indels_grch37 if _b37 else st.vep_cadd_indels
-                    _alphamissense = st.vep_alphamissense_grch37 if _b37 else st.vep_alphamissense
-                    _revel = st.vep_revel_grch37 if _b37 else st.vep_revel
-                    _pf = (_cadd_snv, _cadd_indels, _alphamissense, _revel, _ref_fasta)
-                    _dirs = {os.path.dirname(f) for f in _pf if f}
-                    if st.vep_plugins_dir:
-                        _dirs.add(st.vep_plugins_dir)
-                    _plugin_binds = tuple(sorted(d for d in _dirs if d))
-                    _plugin_args = {"plugins_enabled": True, "plugins_dir": st.vep_plugins_dir,
-                                    "cadd_snv": _cadd_snv, "cadd_indels": _cadd_indels,
-                                    "alphamissense": _alphamissense, "revel": _revel,
-                                    "ref_fasta": _ref_fasta}
-                    _staged = [n for n, p in (("CADD", _cadd_snv), ("AlphaMissense", _alphamissense),
-                                              ("REVEL", _revel)) if p and os.path.exists(p)]
-                    # Name what actually runs for THIS build, so a blank predictor column is traceable
-                    # to "not staged for this assembly" rather than looking like a silent failure.
-                    _vlog("info", f"VEP predictor plugins ENABLED for {_assembly}: "
-                                  f"{', '.join(_staged) if _staged else 'none staged for this build'}"
-                                  f"{' + normalization/HGVS' if _ref_fasta else ''}.")
-                # SpliceAI (OpenSpliceAI) — a separate conda-env binary run FROM INSIDE vep.sif (its
-                # conda-forge python runs under the container's glibc; validated on HPC3). Bind the env
-                # root + model dir + the ref-FASTA dir (RO — the .fai is present so pyfaidx never
-                # rebuilds); the ref FASTA is also what norm/HGVS use.
-                #
-                # Gated on what it ACTUALLY needs (a reference FASTA for this build) rather than on
-                # `_assembly == "GRCh38"`. The old assembly check was a proxy for "only GRCh38 has a
-                # FASTA", and it silently outlived that fact. The annotation side already handled both
-                # builds — `vcf_offline._SPLICEAI_ASSEMBLY` maps GRCh37 → openspliceai's built-in
-                # `grch37` annotation — so the FASTA was the only real blocker.
-                _spliceai_args: dict = {}
-                _spliceai_binds: tuple = ()
-                if st.spliceai_enabled and st.spliceai_bin and _ref_fasta:
-                    _env_root = os.path.dirname(os.path.dirname(st.spliceai_bin))   # .../envs/openspliceai
-                    _spliceai_binds = tuple(sorted({d for d in (
-                        _env_root, st.spliceai_models, os.path.dirname(_ref_fasta)) if d}))
-                    _spliceai_args = {"spliceai_enabled": True, "spliceai_bin": st.spliceai_bin,
-                                      "spliceai_models": st.spliceai_models,
-                                      "spliceai_max_variants": st.spliceai_max_variants,
-                                      "ref_fasta": _ref_fasta}   # SpliceAI needs the ref FASTA
-                    _cap = (f"cap {st.spliceai_max_variants}" if st.spliceai_max_variants else "no cap")
-                    _vlog("info", f"SpliceAI (OpenSpliceAI) ENABLED for {_assembly} — splice-disruption "
-                                  f"scoring on the post-filter set ({_cap}).")
-                elif st.spliceai_enabled and st.spliceai_bin and not _ref_fasta:
-                    # Loud, not silent: SpliceAI is switched ON in the environment but cannot run for
-                    # this build. A blank splice column must never read as "no splice effect found".
-                    _vlog("warning", f"SpliceAI is enabled but no reference FASTA is staged for "
-                                     f"{_assembly} — splice scoring SKIPPED (columns will be blank).")
-                # Deterministic IRD defaults (no longer dependent on the model choosing to pass them):
-                #  - PRE-VEP region restriction: `regions_bed` (the IRD capture panel) — bcftools cuts
-                #    the VCF to these regions BEFORE VEP, so VEP annotates a tiny fraction (the compute
-                #    saving; ~45-60 min → minutes on a WGS VCF);
-                #  - known-gene-first: the default gene panel as `genes` (a POST-VEP precise filter — it
-                #    does NOT save annotation time, so `regions_bed` is preferred for scoping/speed);
-                #  - rarity floor: the lab's base `max_pop_af` (e.g. 0.005) so common variants drop.
-                # All ride in inject_args, so a caller-supplied value overrides them. A panel-load
-                # hiccup must never break the run.
-                _ird_defaults: dict = {}
-                _regions_binds: tuple = ()
-                if st.default_regions_bed:
-                    _ird_defaults["regions_bed"] = st.default_regions_bed
-                    _rd = os.path.dirname(st.default_regions_bed)
-                    if _rd:
-                        _regions_binds = (_rd,)
-                    _vlog("info", "Pre-VEP region restriction ENABLED (regions_bed="
-                                  f"{os.path.basename(st.default_regions_bed)}) — bcftools restricts "
-                                  "BEFORE VEP, the annotation-time saving. A caller regions_bed overrides.")
-                if st.default_gene_panel:
-                    try:
-                        from ..tools.api import load_gene_panel
-                        _panel_genes = load_gene_panel(st.default_gene_panel)
-                        _ird_defaults["genes"] = _panel_genes
-                        _vlog("info", f"Known-gene panel '{st.default_gene_panel}' applied by default "
-                                      f"({len(_panel_genes)} genes; known-gene-first). A caller-supplied "
-                                      "gene list overrides it.")
-                    except Exception as exc:  # noqa: BLE001 - a panel miss must not abort the study
-                        _vlog("warning", f"Default gene panel '{st.default_gene_panel}' not loaded "
-                                         f"({type(exc).__name__}: {exc}); annotating genome-wide.")
-                if st.default_max_pop_af and st.default_max_pop_af > 0:
-                    _ird_defaults["max_pop_af"] = st.default_max_pop_af
-                    _vlog("info", f"Default rarity filter max_pop_af={st.default_max_pop_af} applied "
-                                  "(a caller-supplied max_pop_af overrides it).")
-                # IRD annotation layers (HGMD / retina-exon / ATAC / dbscSNV) — bind each reference
-                # file's DIR into vep.sif and inject the paths so the tool tabixes them on the reduced
-                # set. Gated (OFF by default); a layer with an empty path is skipped by the tool.
-                _ird_anno_args: dict = {}
-                _ird_anno_binds: tuple = ()
-                if st.ird_annotate_enabled:
-                    _ird_paths = {k: v for k, v in (
-                        ("hgmd_path", st.ird_hgmd), ("dbscsnv_template", st.ird_dbscsnv),
-                        ("retina_bed", st.ird_retina_exons), ("atac_path", st.ird_atac)) if v}
-                    if _ird_paths:
-                        _ird_anno_args = {"ird_annotate": True, **_ird_paths}
-                        _ird_anno_binds = tuple(sorted({
-                            os.path.dirname(v.replace("{chrom}", "chr1")) for v in _ird_paths.values()
-                            if os.path.dirname(v.replace("{chrom}", "chr1"))}))
-                        _vlog("info", f"IRD annotation layers ENABLED ({', '.join(sorted(_ird_paths))}).")
-                from .slurm_analysis import SlurmAnalysisExecutor
-                variant_executor = SlurmAnalysisExecutor(
-                    remote=conn.executor, container_image=st.vep_image,
-                    remote_workspace=remote_ws, remote_dataset=remote_ds,
-                    local_workspace=conn.workspace / run_id, source_dir=v_pysrc,
-                    entrypoint=f"python3 -m {_tools_api.VARIANT_ENTRYPOINT}",   # vep.sif is Ubuntu (python3)
-                    # Scratch (args/result/log + its rw bind target) MUST live on dfs3b, NOT $HOME:
-                    # vep.sif ships /data as a symlink to /opt/vep/.vep (VEP's read-only cache mount),
-                    # so bind-mounting a $HOME (=/data/homezvol*/...) scratch resolves through that
-                    # symlink into the RO cache and the runtime dies at container creation with
-                    # "destination ... doesn't exist in container" (exit 127, ~1s) — which is exactly
-                    # what silently killed every offline annotate_variants job. A /dfs3b path has no
-                    # such symlink so the tmpfs overlay creates it cleanly (same as the workspace bind).
-                    job_prefix="bioagent_variant",
-                    scratch_dir=_scratch_dir(conn, "variant", run_id=run_id),
-                    # Bind the ClinVar .tbi index alongside its .vcf.gz: VEP's --custom does a Tabix
-                    # lookup that needs the index right next to the bgzip, and --containall hides every
-                    # host path that isn't an explicit bind — without this VEP dies with "Couldn't find
-                    # index for file ...clinvar_*.vcf.gz".
-                    extra_ro_binds=tuple(dict.fromkeys(
-                        tuple(p for p in (_cache_dir, _clinvar,
-                                          f"{_clinvar}.tbi" if _clinvar else "") if p)
-                        + _plugin_binds + _spliceai_binds + _ird_anno_binds
-                        + _regions_binds)),   # + IRD reference dirs + the pre-VEP regions BED dir
-                    inject_args={"cache_dir": _cache_dir, "clinvar_vcf": _clinvar,
-                                 "assembly": _assembly, "fork": st.vep_fork,
-                                 **_ird_defaults, **_plugin_args, **_spliceai_args,
-                                 **_ird_anno_args},
-                    mem_gb=st.run_code_mem_gb, cpus=st.vep_fork, partition=st.cpu_partition,
-                    # time_limit is the SBATCH --time; the gateway job-wait (run_timeout_s) auto-derives
-                    # from it (SlurmAnalysisExecutor default), so a healthy ~30-60 min WGS VEP job is
-                    # never scancelled early — Slurm's own --time is the ceiling, completion returns at once.
-                    account=st.cpu_account or "", time_limit=st.vep_time_limit,
-                    container_module=st.container_module, container_bin=st.container_bin,
-                    local_fallback=_variant_local_fallback, on_fallback=_variant_on_fallback,
-                    should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight VEP job
-                    # Idempotent within the run: if a later step re-invokes annotate_variants with the
-                    # SAME inputs, reuse this run's result instead of re-submitting the ~45-min WGS VEP
-                    # job and overwriting the tables (the "model keeps re-annotating" loop that both
-                    # wasted compute AND clobbered the good result with a degraded repeat).
-                    memoize_result=True,
-                    # Gateway-AUTHORITATIVE args the model cannot override: the assembly detected from the
-                    # VCF header (a model passing assembly=GRCh38 on a GRCh37 file makes VEP fail on a
-                    # cache-assembly mismatch → wrong genes), and max_variants=0 so the offline path
-                    # annotates the WHOLE WGS VCF (a model-supplied cap like max_variants=5000 silently
-                    # truncated a 4.9M-variant study to the first 5000 = chrM+chr1-start, a wrong cohort).
-                    force_args={"assembly": _assembly, "max_variants": 0},
-                )
-                if any(ok is False for _, (p, ok) in checks.items() if p):
-                    _vlog("warning", "Offline VEP wired BUT a required path is missing above — expect a "
-                                     "fallback to REST. Fix the path(s) + rerun for true whole-VCF annotation.")
-                else:
-                    _vlog("info", f"VCF annotation runs OFFLINE on HPC3 (VEP {_assembly}, "
-                                  f"--fork {st.vep_fork}, --mem={st.run_code_mem_gb}G).")
-
-        # Final REST-cap warning for a VCF run that did NOT wire the offline line (any reason above).
-        if variant_executor is None and _is_vcf:
-            _vlog("warning",
-                  "VCF annotation will use the REST path — capped at the FIRST 500 variants. Enable + fix "
-                  "the offline line (AISCIENTIST_VARIANT_ON_HPC=1 + staged sif/cache) to annotate every "
-                  "variant; otherwise all counts/distributions describe only the first 500.")
-
-        # Persist the full diagnostic trail to the bundle (downloadable), even after the run log scrolls.
-        if _vdiag:
-            try:
-                _pdir = art / "process"
-                _pdir.mkdir(parents=True, exist_ok=True)
-                (_pdir / "variant_offline_diagnostics.log").write_text(
-                    "# Offline VEP (variant annotation) wiring diagnostics\n\n" + "\n".join(_vdiag) + "\n",
-                    encoding="utf-8")
-            except OSError:
-                pass
-
-        # Opt-in: phenotype -> disease DIFFERENTIAL DIAGNOSIS on HPC3 (LIRICAL). DOWNSTREAM of the variant
-        # line: the model calls run_lirical with the patient's HPO terms; when a VCF is loaded it scores
-        # GENOTYPE-AWARE (variants sharpen the ranking), else PHENOTYPE-ONLY. Gated by
-        # AISCIENTIST_PHENOTYPE_ON_HPC; when off/unstaged the tool reports not_installed and the run continues
-        # without the differential. Mirrors the variant line's wiring (deploy/lirical/build_and_stage.sh).
-        phenotype_executor = None
-        if st.phenotype_on_hpc:
-            # Genotype-aware needs the assembly-matched Exomiser dir; reuse the build detected above.
-            _p_exo = st.lirical_exomiser_hg19 if _grch37 else st.lirical_exomiser_hg38
-            if conn.executor is None or conn.mock:
-                emit("warning", "lab",
-                     f"Phenotype (LIRICAL) line requested but not runnable this run: "
-                     f"executor={'NONE' if conn.executor is None else 'ok'}, mock={conn.mock}.")
-            else:
-                _p_checks = await asyncio.to_thread(
-                    _phenotype_preflight, conn.executor, st.lirical_image, st.lirical_data_dir, _p_exo)
-                for name, (path, ok) in _p_checks.items():
-                    if not path:
-                        emit("warning", "lab", f"LIRICAL: {name} is not configured (empty path in .env).")
-                    elif ok is False:
-                        emit("warning", "lab",
-                             f"LIRICAL: {name} NOT found on HPC3: {path} — the phenotype step would report "
-                             "not_installed. Stage it (deploy/lirical/build_and_stage.sh).")
-                    elif ok is None:
-                        emit("warning", "lab",
-                             f"LIRICAL: could NOT verify {name} on HPC3 ({path}) — SSH check failed.")
-                    else:
-                        emit("info", "lab", f"LIRICAL: {name} present on HPC3 ({path}).")
-                try:
-                    p_pysrc = await asyncio.to_thread(_sync_aiscientist_source_to_hpc, conn)
-                except Exception as exc:  # noqa: BLE001
-                    emit("warning", "lab", f"Phenotype line disabled: couldn't stage the tools to dfs3b "
-                                           f"({exc}).")
-                    p_pysrc = None
-                if p_pysrc:
-                    p_remote_ws = _run_home(conn, run_id).dir("phenotype")
-                    conn.executor.exec(f"mkdir -p {shlex.quote(p_remote_ws)}")
-                    # The VCF is OPTIONAL (phenotype-only works without it). Reuse the dfs3b copy the run
-                    # already resolved; only stage a local dataset if it isn't a VCF (then None -> phenotype-only).
-                    if decisions.get("hpc_primary") and _is_vcf:
-                        p_remote_ds = decisions["hpc_primary"]      # dfs3b VCF — scored in place
-                    elif decisions.get("dataset_path") and _is_vcf:
-                        p_remote_ds = f"{p_remote_ws}/{Path(decisions['dataset_path']).name}"
-                        await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], p_remote_ds)
-                    else:
-                        p_remote_ds = None                          # no VCF -> phenotype-only differential
-
-                    def _phenotype_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-                        # No LIRICAL on the eyeserver: a clean not_installed (never a hard error) so the
-                        # run continues without the differential, same as the gated in-process default.
-                        return {"status": "not_installed", "candidates": [],
-                                "note": "LIRICAL unavailable this run (HPC down or not staged)."}
-
-                    _exo_binds = tuple(d for d in (st.lirical_exomiser_hg19, st.lirical_exomiser_hg38) if d)
-                    from .slurm_analysis import SlurmAnalysisExecutor
-                    phenotype_executor = SlurmAnalysisExecutor(
-                        remote=conn.executor, container_image=st.lirical_image,
-                        remote_workspace=p_remote_ws, remote_dataset=p_remote_ds,
-                        local_workspace=conn.workspace / run_id, source_dir=p_pysrc,
-                        entrypoint=f"python3 -m {_tools_api.PHENOTYPE_ENTRYPOINT}",   # lirical.sif has python3
-                        job_prefix="bioagent_phenotype",
-                        scratch_dir=_scratch_dir(conn, "phenotype", run_id=run_id),
-                        # Bind the LIRICAL data dir + the Exomiser data dir(s) read-only (--containall hides
-                        # everything not bound); a dir bind exposes the .mv.db / .ser files inside.
-                        extra_ro_binds=tuple(dict.fromkeys((st.lirical_data_dir, *_exo_binds))),
-                        # Deploy config the model never sends — injected so it resolves inside lirical.sif.
-                        inject_args={"data_dir": st.lirical_data_dir,
-                                     "exomiser_hg19": st.lirical_exomiser_hg19,
-                                     "exomiser_hg38": st.lirical_exomiser_hg38,
-                                     "assembly": _assembly},
-                        mem_gb=st.lirical_mem_gb, cpus=st.lirical_cpus, partition=st.cpu_partition,
-                        account=st.cpu_account or "", time_limit=st.lirical_time_limit,
-                        container_module=st.container_module, container_bin=st.container_bin,
-                        local_fallback=_phenotype_local_fallback,
-                        should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight LIRICAL job
-                        memoize_result=True,   # deterministic for the same HPO+VCF — don't re-run in a step loop
-                    )
-                    if any(ok is False for _, (p, ok) in _p_checks.items() if p):
-                        emit("warning", "lab", "LIRICAL wired BUT a required path is missing above — the "
-                                               "phenotype step will report not_installed. Fix the path(s).")
-                    else:
-                        _mode = "genotype-aware" if p_remote_ds else "phenotype-only"
-                        emit("info", "lab", f"Phenotype differential runs on HPC3 (LIRICAL, {_mode}).")
+            emit("info", "lab", f"Native variant annotation uses {_assembly}; "
+                 + ("assembly read from the VCF header." if _detected else "configured fallback assembly."))
+        decisions["mcp_variant_assembly"] = "GRCh37" if _assembly.lower() in ("grch37", "hg19") else "GRCh38"
 
         # Opt-in: render the report (pandoc/xelatex) as an HPC3 CPU job so texlive stays off the
         # eyeserver. Passed to build_pdf_report as render_fn; its local fallback starts TeX only
@@ -15311,19 +14847,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         report_render_fn = _build_report_render_fn(conn, run_id)
         if getattr(report_render_fn, "remote", None) is not None:
             emit("info", "lab", "Report rendering runs on HPC3 (CPU Slurm, pandoc/xelatex).")
-        literature_executor = _build_literature_executor(conn)
         from .estimates import estimate_plan, instrument_catalog, run_usage, save_estimate
 
         scientist = ResearchHarness(
             catalog=instrument_catalog(await _prepare_session_roster(
                 conn,
-                build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
-                                        analysis_executor=analysis_executor,
-                                        variant_executor=variant_executor,
-                                        phenotype_executor=phenotype_executor,
-                                        literature_executor=literature_executor,
+                build_scientist_catalog(code_executor=code_executor,
                                         hpc_shell=_build_hpc_shell(conn, run)),
-                literature_executor, emit), run_id, conn.settings),
+                emit), run_id, conn.settings),
             chat_fn=scientist_chat,
             count_tokens_fn=count_tokens,   # exact server-side window sensing (vLLM /tokenize)
             # The shared model is served with a smaller window than the session GPU's Qwen, and its
@@ -15610,9 +15141,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 plan_context=lab_obj.plan_context, lab_config=config,
                 later=lab_obj.later, prior_work=lab_obj.config.prior_work,
                 prior=prior, continues_from_dataset=continues_from_dataset)
+            previous_rounds = []
+            if resume is not None:
+                session_meta["resume_review"] = resume.to_review_state()
+                previous_rounds = [r.to_dict() for r in resume.prior_rounds]
             snapshot = SimpleNamespace(to_dict=lambda: {
-                "question": req.question, "agenda": agenda, "rounds": [],
-                "accepted_steps": 0, "converged": False, "final_answer": ""})
+                "question": req.question, "agenda": agenda, "rounds": previous_rounds,
+                "accepted_steps": len(previous_rounds), "converged": False, "final_answer": ""})
             _write_run_state(art, snapshot, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, protocols=lab_obj.protocols,
                              self_sourced=lab_obj.self_sourced, extra=session_meta, strict=True)
@@ -15661,7 +15196,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # HITL mode gating. Bypass (autonomous) forces BOTH gates off — no plan review, no
         # decision-point pauses — so the loop runs end-to-end; Stop + mid-run notes still apply.
         # Manual (default) keeps plan review (when plan_mode) and DAG decision-point pauses.
-        want_plan_review = (resume is None and req.plan_mode and not req.autonomous)
+        want_plan_review = ((resume is None and req.plan_mode and not req.autonomous)
+                            or (resume is not None and resume.needs_plan_review))
         # Decision points now fire on BOTH planners in manual mode: the DAG path pauses per-node, and
         # the linear path asks a deterministic plan-time fork (labels vs re-cluster) — previously the
         # linear path never surfaced a decision, so a labeled dataset was silently auto-decided.
@@ -15684,6 +15220,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             could re-enter the loop to use them. Now an interrupted run is continuable from its last
             completed step via the SAME /api/lab/continue path a user-requested re-run uses.
             ``lab_obj.guidance`` is read live because the PI resolves it during run()."""
+            session_meta.update(plan_context=lab_obj.plan_context,
+                                approved_plan_yaml=lab_obj.approved_plan_yaml)
+            session_meta.pop("resume_review", None)
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
             _remember_planned_run(conn, run)
@@ -16060,7 +15599,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         traceback.print_exc()
         conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
         conn.push({"type": "chat_error",
-                   "message": public_error(exc) + _resume_hint(locals().get("art"))})
+                   "message": public_error(exc) + ("" if getattr(exc, "requires_replan", False)
+                                                  else _resume_hint(locals().get("art")))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():
@@ -16661,21 +16201,116 @@ def _data_artifacts_block(art: Path, *, omit_doublet_details: bool = False) -> s
     return "\n\n".join(blocks)
 
 
-def _annotate_variants_result(result: Any) -> "dict[str, Any] | None":
-    """The AUTHORITATIVE ``annotate_variants`` tool RESULT from the run — the tool's own numbers
-    (n_pass/n_nonpass, n_pathogenic, n_high_priority, truncated, distributions), NOT the model's
-    prose or a model-written summary JSON. Returns the last ok annotate_variants result, or None
-    (⇒ not a variant run). This is what binds the report's counts to ground truth."""
+def _annotate_variants_result(result: Any, art: "Path | None" = None) -> "dict[str, Any] | None":
+    """Last successful variant result, recovering bounded MCP counts from owned artifacts.
+
+    A model-written summary is never sufficient. Collected JSON must match the latest native
+    task's ownership record and SHA-256; unavailable evidence leaves its counts unknown.
+    """
+    import hashlib
+    from ..agents.tool_names import canonical_tool_name
+
+    def read_json(relative: str, limit: int) -> "tuple[dict, str] | None":
+        if art is None or not isinstance(relative, str):
+            return None
+        parts = relative.split("/")
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            return None
+        root = Path(art)
+        if root.is_symlink():
+            return None
+        path = root
+        try:
+            for part in parts:
+                path = path / part
+                if path.is_symlink():
+                    return None
+            if not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+                return None
+            with path.open("rb") as stream:
+                raw = stream.read(limit + 1)
+            if len(raw) > limit:
+                return None
+            value = json.loads(raw)
+            return (value, hashlib.sha256(raw).hexdigest()) if isinstance(value, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def collected_counts(res: dict) -> dict:
+        identity = {key: res.get(key) for key in ("analysis_id", "task_id")}
+        if not all(isinstance(value, str) and value for value in identity.values()):
+            return {}
+        record = read_json("mcp/.compatibility.json", 4 * 1024 * 1024)
+        if record is None:
+            return {}
+        owners = record[0]
+        current = owners.get("current")
+        files = owners.get("files")
+        if (not isinstance(current, dict) or current.get("variant-annotation") != identity
+                or not isinstance(files, dict)):
+            return {}
+
+        def owned(relative: str, limit: int) -> "dict | None":
+            owner = files.get(relative)
+            if not isinstance(owner, dict):
+                return None
+            if any(owner.get(key) != value for key, value in
+                   {"server": "variant-annotation", **identity}.items()):
+                return None
+            digest = owner.get("sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                return None
+            payload = read_json(relative, limit)
+            return payload[0] if payload is not None and payload[1] == digest else None
+
+        summary = owned("data/annotated_results_summary.json", 4 * 1024 * 1024)
+        if summary is not None:
+            fields = {"total_variants": "n_variants", "consequence_distribution": "by_consequence",
+                      "impact_distribution": "by_impact",
+                      "clinical_significance_distribution": "by_clinical_significance",
+                      "n_pathogenic_clinvar": "n_pathogenic",
+                      "n_rare_variants_af_lt_0.1": "n_rare",
+                      "n_high_priority_rare_deleterious": "n_high_priority"}
+            recovered = {target: summary[source] for source, target in fields.items() if source in summary}
+            if recovered:
+                return recovered
+        # A namespaced result is eligible only when its collector also recorded ownership and
+        # a checksum. Historical collectors omit this entry; a pathname alone is not evidence.
+        full = res.get("full_result")
+        expected = f"mcp/variant-annotation/{identity['analysis_id']}/annotate_variants.json"
+        if full != expected:
+            return {}
+        payload = owned(full, 16 * 1024 * 1024)
+        if payload is None or payload.get("status") != "ok" or payload.get("tool") != "annotate_variants":
+            return {}
+        fields = {"n_variants", "n_input_variants", "n_pass", "n_nonpass", "n_annotated",
+                  "n_pathogenic", "n_high_priority", "n_rare", "by_consequence", "by_impact",
+                  "by_clinical_significance", "truncated"}
+        return {key: value for key, value in payload.items() if key in fields}
+
     best: "dict[str, Any] | None" = None
     for r in getattr(result, "rounds", []) or []:
         rd = r.to_dict() if hasattr(r, "to_dict") else r
         sr = (rd.get("scientist_result") if isinstance(rd, dict) else {}) or {}
         for step in sr.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "annotate_variants":
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "annotate_variants":
                 continue
             res = step.get("result")
-            if isinstance(res, dict) and res.get("status") == "ok" and "by_consequence" in res:
-                best = res
+            if not isinstance(res, dict) or res.get("status") != "ok":
+                continue
+            if step.get("tool") == "annotate_variants":
+                if "by_consequence" in res:
+                    best = res
+                continue
+            identity = res.get("mcp")
+            if not isinstance(identity, dict) or identity.get("name") != "variant-annotation":
+                continue
+            native = res.get("result") if isinstance(res.get("result"), dict) else res
+            if native.get("status", "ok") != "ok" or native.get("state", "COMPLETED") != "COMPLETED":
+                continue
+            best = {"status": "ok", **native}
+            if native.get("response_omitted") or "by_consequence" not in native:
+                best.update(collected_counts(native))
     return best
 
 
@@ -16741,24 +16376,33 @@ def _variant_facts_block(art: Path, result: Any) -> str:
     fabricate numbers — this is what kills the '165 high-priority' / '6 vs 12 citations' hallucinations.
     When annotation itself failed, falls back to the PASS-filter summary so the real variant/PASS counts
     still reach the report. Returns '' for a non-variant run with no filter summary either."""
-    res = _annotate_variants_result(result)
+    res = _annotate_variants_result(result, art)
     if not res:
         return _variant_filter_summary_facts(art)
     lines = ["AUTHORITATIVE COUNTS (computed by the tools — state these EXACT numbers; do NOT invent, "
              "infer, or restate different values):"]
-    lines.append(f"- variants annotated: {res.get('n_input_variants', '?')}")
+    def count(key: str) -> Any:
+        value = res.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else "unknown"
+
+    annotated = count("n_variants") if "n_variants" in res else count("n_input_variants")
+    lines.append(f"- variants annotated: {annotated}")
     if "n_pass" in res:
-        npass, nnon = res.get("n_pass"), res.get("n_nonpass")
-        allpass = " (all records PASS)" if not nnon else ""
+        npass, nnon = count("n_pass"), count("n_nonpass")
+        allpass = " (all records PASS)" if nnon == 0 else ""
         lines.append(f"- FILTER: {npass} PASS, {nnon} non-PASS{allpass} — do NOT write 'all PASS' when "
                      f"non-PASS > 0")
     if res.get("truncated"):
         lines.append(f"- TRUNCATED: only the first {res.get('n_annotated', res.get('n_input_variants'))} "
                      f"variants were annotated (cap reached); the counts describe that slice, not the "
                      f"whole VCF — report this as a limitation")
-    lines.append(f"- ClinVar Pathogenic/Likely-Pathogenic: {res.get('n_pathogenic', 0)}")
-    lines.append(f"- high-priority shortlist: {res.get('n_high_priority', 0)}")
-    lines.append(f"- rare variants (below AF cutoff): {res.get('n_rare', '?')}")
+    elif res.get("response_omitted") and "truncated" not in res:
+        lines.append("- Annotation coverage/truncation: unknown in the bounded response. These counts "
+                     "do not establish whole-VCF coverage; consult the complete tool evidence before "
+                     "claiming the entire file was annotated.")
+    lines.append(f"- ClinVar Pathogenic/Likely-Pathogenic: {count('n_pathogenic')}")
+    lines.append(f"- high-priority shortlist: {count('n_high_priority')}")
+    lines.append(f"- rare variants (below AF cutoff): {count('n_rare')}")
     bc = res.get("by_clinical_significance") or {}
     if bc:
         lines.append("- clinical-significance distribution: " + ", ".join(f"{k}={v}" for k, v in bc.items()))
@@ -16904,12 +16548,13 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
     This is separate from _QC_TOOLS: a later doublet step must not replace the overall CellQC
     outcome, per-library QC or warnings. Predictions alone never establish a removed count.
     """
+    from ..agents.tool_names import canonical_tool_name
     chosen = None
     for rnd in reversed(list(getattr(result, "rounds", None) or [])):
         accepted = _round_field(_round_field(rnd, "verdict"), "verdict") == "accept"
         steps = (_round_field(rnd, "scientist_result") or {}).get("steps") or []
         for step in reversed(steps):
-            if not isinstance(step, dict) or step.get("tool") != "run_doublet_detection" \
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "run_doublet_detection" \
                     or step.get("ok") is False:
                 continue
             record = step.get("result")
@@ -16925,13 +16570,13 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
             else:
                 continue
             if chosen is None or accepted:
-                chosen = removed
+                chosen = (removed, str(step["tool"]))
             break
         else:
             continue
         if accepted:
             break
-    return [f"run_doublet_detection: Doublets removed: {chosen:,}."] if chosen is not None else []
+    return [f"{chosen[1]}: Doublets removed: {chosen[0]:,}."] if chosen is not None else []
 
 
 def _removal_stated(body: str, line: str) -> bool:
@@ -17141,7 +16786,8 @@ def _brief_scope_line(scope: Any, ran: "list[str]", qc_only: bool) -> str:
     ran only run_cellqc, and its report said "As requested (only run_cellqc, run_scanpy_qc,
     run_doublet_detection)"."""
     from ..agents.scope import NOT_AN_ANALYSIS, QC_ONLY_TOOLS
-    keep = [str(t) for t in (getattr(scope, "keep", None) or ())]
+    from ..agents.tool_names import canonical_tool_name
+    keep = [canonical_tool_name(t) for t in (getattr(scope, "keep", None) or ())]
     tools = ", ".join(f"`{t}`" for t in ran)
     if qc_only:
         asked = (any(t in QC_ONLY_TOOLS for t in keep)
@@ -17198,7 +16844,8 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     by_code = _code_wrote_outputs(result)
     if answer and by_code:
         return _analysis_brief_md(answer, art, question, result)
-    ran = [t for t in _tools_that_ran(result) if t not in NOT_AN_ANALYSIS]
+    from ..agents.tool_names import canonical_tool_name
+    ran = [t for t in _tools_that_ran(result) if canonical_tool_name(t) not in NOT_AN_ANALYSIS]
     qc_only = _qc_only_run(result) and not by_code
     try:
         dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
@@ -17464,11 +17111,12 @@ def _round_field(rnd: Any, key: str) -> Any:
 
 def _round_qc(rnd: Any) -> "tuple[str, dict] | None":
     """The round's completed QC call, ``(tool, result)``, or None."""
+    from ..agents.tool_names import canonical_tool_name
     for st in ((_round_field(rnd, "scientist_result") or {}).get("steps") or []):
         r = st.get("result") if isinstance(st, dict) else None
-        if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
+        if (isinstance(r, dict) and canonical_tool_name(st.get("tool")) in _QC_TOOLS and r.get("status") == "ok"
                 and r.get("cells_before") is not None):
-            return str(st["tool"]), r
+            return canonical_tool_name(st["tool"]), r
     return None
 
 
@@ -17954,7 +17602,7 @@ def _claim_audit_of(result: Any) -> dict[str, Any]:
     return ca if isinstance(ca, dict) else {}
 
 
-def _claim_audit_section(result: Any) -> str:
+def _claim_audit_section(result: Any, *, historical: bool = False) -> str:
     """Deterministic '## Claim audit' for the technical report: every candidate finding, the checks it
     failed and why, and what the writers were told to do with it."""
     ca = _claim_audit_of(result)
@@ -17971,7 +17619,14 @@ def _claim_audit_section(result: Any) -> str:
     for c in claims:
         failed = "; ".join(f"{n}: {r.get('reason', '')}" for n, r in (c.get("checks") or {}).items()
                            if r.get("verdict") == "fail") or "none"
-        rows.append(f"| {cell(c.get('claim', ''))} | {label.get(c.get('status'), c.get('status'))} | {cell(failed)} |")
+        status = ("historical " + str(c.get("status") or "unknown") + "; not re-validated"
+                  if historical else label.get(c.get("status"), c.get("status")))
+        rows.append(f"| {cell(c.get('claim', ''))} | {status} | {cell(failed)} |")
+    if historical:
+        return ("## Historical claim audit\n\nThe following statements and checks are preserved from the "
+                "original analysis. They were not re-validated in this report-only revision and may "
+                "reflect omitted tool responses. They do not certify the revised conclusions; use the "
+                "verified accepted artifacts and requested corrections above.\n\n" + "\n".join(rows) + "\n")
     return ("## Claim audit\n\nEach candidate headline finding was checked separately before the report was "
             "written; the manuscript leads only with the robust ones.\n\n" + "\n".join(rows) + "\n")
 
@@ -18013,12 +17668,8 @@ def _build_report(synthesis: str, art: Path, complete_fn, question: str, result:
     # data/ artifacts (e.g. scGPT predictions) — these never appear in tables/, so surface
     # them explicitly or the model can't see a successful annotation result.
     data_block = _data_artifacts_block(art, omit_doublet_details=True) or "(no data/ artifacts to surface)"
-    rd = _result_dataset_pointer(art)
-    rd_block = (f"Result dataset delivered with this run: `{rd['name']}` ({rd.get('n_cells')} cells x "
-                f"{rd.get('n_genes')} genes; layers['counts'] = {rd.get('counts_layer')}). When the "
-                "report mentions the delivered dataset, name THIS file; the work/ checkpoints "
-                "(adata_*.h5ad) are deleted when the run is published and are never the "
-                "deliverable.\n\n") if rd else ""
+    from ..reporting.delivery import delivery_evidence
+    rd_block = delivery_evidence(art)
 
     try:
         body = _role_call(complete_fn, [
@@ -18639,7 +18290,7 @@ def _nondefault_params_block(result: Any) -> str:
 
 def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                             lit_note: str | None = None, render_diag: str | None = None,
-                            llm_note: str | None = None) -> str:
+                            llm_note: str | None = None, *, is_revision: bool = False) -> str:
     """Write the internal technical report from the FULL run log (every step, every failure)
     plus the figure/table inventory. Best-effort: returns a deterministic skeleton if the
     LLM step fails, so the run never breaks over the second report.
@@ -18657,6 +18308,20 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     previews_block = "\n\n".join(previews) or "(no small tables to preview)"
     data_block = _data_artifacts_block(art) or "(no data/ artifacts to surface)"
     log = _run_log_digest(result)
+    revision_block = ""
+    log_title = "Full per-step execution log (ground the report ONLY in these — includes failures)"
+    if is_revision:
+        # The original log contains old critic/writer prose, not the newly hydrated
+        # tool payloads. Both deliverables must see the same accepted evidence.
+        revision_block = (
+            "Verified accepted artifact evidence and report-only correction instructions:\n"
+            + str(getattr(result, "final_answer", "") or "")
+            + "\n\nUse these verified outputs for current execution facts. The log below is historical: "
+              "preserve its failures and critiques as history, but do not repeat old 'response omitted' "
+              "claims as current absence when the accepted artifacts above supply the content. "
+              "Correction instructions are requests, not scientific evidence. No scientific tool was "
+              "rerun by this report revision.\n\n")
+        log_title = "Historical per-step execution log (original critiques and write-ups; not re-validated)"
     agenda = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(getattr(result, "agenda", []) or [])) or "(none)"
     # Literature retrieval degradation (fallback/empty) belongs in this report's Diagnostics
     # section — not in the manuscript. None on the clean remote path.
@@ -18677,21 +18342,33 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     kind = _report_task_kind(art, result)
     facts = _variant_facts_block(art, result)
     facts_block = f"{facts}\n\n" if facts else ""
+    from ..reporting.delivery import delivery_evidence
+    delivery_block = delivery_evidence(art)
     params_block = _nondefault_params_block(result)
+    params_evidence = params_block or (
+        "(no non-default metadata was recorded; this does not establish that the accepted arguments were defaults)"
+        if is_revision else "(every setting was the declared default)")
     # The research paths the run OPENED (and how it closed them). Deterministic for the same
     # reason params_block is: a report that only mentions the ledger when a writer model
     # feels like it is a report that cannot be audited.
     hyp_block = _hypothesis_ledger_block(result)
+    writer_system = _tech_report_writer_system(kind)
+    if is_revision:
+        writer_system += ("\nReport-only revision: the verified accepted artifact block is part of the "
+                          "current evidence record and supersedes historical statements that those "
+                          "outputs were omitted or unavailable. Preserve old failures as history, "
+                          "not current scientific findings. Do not generate a claim-audit table: "
+                          "the original audit is appended separately with its historical status.")
 
     try:
         body = _role_call(complete_fn, [
-            {"role": "system", "content": _tech_report_writer_system(kind)},
+            {"role": "system", "content": writer_system},
             {"role": "user", "content": (
                 f"Research question:\n{question}\n\n"
                 f"{facts_block}"
                 f"Planned agenda:\n{agenda}\n\n"
-                f"Full per-step execution log (ground the report ONLY in these — includes failures):\n"
-                f"{log}\n\n"
+                f"{delivery_block}{revision_block}"
+                f"{log_title}:\n{log}\n\n"
                 f"Pipeline step degradations (report EACH of these in 'Diagnostics & failures' — "
                 f"name the step, what degraded, and the downstream impact on the results):\n{degr_block}\n\n"
                 f"Literature retrieval status (report this in 'Diagnostics & failures'):\n{lit_block}\n\n"
@@ -18704,7 +18381,7 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
                 f"Settings that were NOT the tool's declared default (a table of these is prepended "
                 f"to this report automatically — where the Methods states one of these values, say "
                 f"explicitly that it was chosen for this run rather than inherited from the tool):\n"
-                f"{params_block or '(every setting was the declared default)'}\n\n"
+                f"{params_evidence}\n\n"
                 f"Render-level review findings (include verbatim in 'Diagnostics & failures' if it "
                 f"lists any defects):\n{render_block}\n\n"
                 f"Figures available (reference inline by the exact path shown):\n{fig_list}\n\n"
@@ -18724,9 +18401,11 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
         # describe the run, and the endpoint fact would otherwise be lost entirely.
         prov = f"\n## Model endpoints\n\n{llm_block}\n" if llm_note else ""
         body = (f"# Technical Report\n\n## Run summary\n\n{agenda}\n\n"
-                f"## Pipeline execution log\n\n{log}\n{prov}{diag}")
+                f"{delivery_block}{revision_block}## Pipeline execution log\n\n"
+                + (f"{log_title}:\n" if is_revision else "") + f"{log}\n{prov}{diag}")
     if not (body and body.strip()):
-        body = f"# Technical Report\n\n## Pipeline execution log\n\n{log}\n"
+        body = (f"# Technical Report\n\n{delivery_block}{revision_block}## Pipeline execution log\n\n"
+                + (f"{log_title}:\n" if is_revision else "") + f"{log}\n")
     body = body.strip()
     # Deterministic, and placed FIRST after the title: the settings a run did not inherit from its
     # tools are the fastest way to tell a reproducible result from an improvised one, and this
@@ -18740,8 +18419,8 @@ def _build_technical_report(result: Any, art: Path, complete_fn, question: str,
     # discretion — it is the record.
     if _HYP_HEADING not in body:
         body = f"{body}\n\n## {_HYP_HEADING}\n\n{hyp_block}\n"
-    audit_section = _claim_audit_section(result)
-    if audit_section and "## Claim audit" not in body:
+    audit_section = _claim_audit_section(result, historical=is_revision)
+    if audit_section and (is_revision or "## Claim audit" not in body):
         body = f"{body}\n\n{audit_section}"
     return _append_output_index(body, figs, tables)
 
@@ -18975,6 +18654,7 @@ def _references_from_accepted_deep_literature(
     No DOI/PMID gate here (unlike the Europe PMC path): the corpus is curated, so every citation
     string names a paper physically in the index — provenance is guaranteed by the corpus itself.
     Nothing is fabricated; only citation strings the tool actually returned are formatted."""
+    from ..agents.tool_names import canonical_tool_name
     rounds = getattr(lab_result, "rounds", None)
     if isinstance(lab_result, dict):
         rounds = lab_result.get("rounds", rounds)
@@ -18988,7 +18668,7 @@ def _references_from_accepted_deep_literature(
             continue
         scientist_result = _round_scientist_result(round_obj)
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") not in ("deep_literature", "search_corpus") \
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) not in ("deep_literature", "search_corpus") \
                     or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
@@ -19026,6 +18706,7 @@ def _references_from_accepted_literature_search(
     only accepted DOI/PMID-backed results from that step; it does not run a report-time fallback
     search.
     """
+    from ..agents.tool_names import canonical_tool_name
     rounds = getattr(lab_result, "rounds", None)
     if isinstance(lab_result, dict):
         rounds = lab_result.get("rounds", rounds)
@@ -19042,7 +18723,7 @@ def _references_from_accepted_literature_search(
         mentioned_dois.update(_normalise_doi(m.group(0)) for m in _DOI_RE.finditer(final_answer))
         mentioned_pmids.update(m.group(1) for m in _PMID_RE.finditer(final_answer))
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "literature_search" or not step.get("ok"):
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "literature_search" or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
             query = str(result.get("query") or (step.get("args") or {}).get("query") or "").strip()
@@ -19126,11 +18807,12 @@ def _scan_tool_invocation(result: Any, tool_name: str) -> "dict[str, Any] | None
     say whether an optional step (scGPT) actually ran and how it ended."""
     if result is None:
         return None
+    from ..agents.tool_names import canonical_tool_name
     last: "dict[str, Any] | None" = None
     for r in getattr(result, "rounds", []) or []:
-        sr = getattr(r, "scientist_result", None) or {}
+        sr = _round_field(r, "scientist_result") or {}
         for s in (sr.get("steps") or []):
-            if s.get("tool") == tool_name:
+            if canonical_tool_name(s.get("tool")) == canonical_tool_name(tool_name):
                 res = s.get("result")
                 last = res if isinstance(res, dict) else {"status": s.get("status") or "unknown"}
     return last
@@ -19153,18 +18835,27 @@ def _write_capability_log(art: Path, result: Any, conn: "Connection",
 
         scg = _scan_tool_invocation(result, "scgpt_annotate")
         if scg is None:
-            lines.append(
-                "- scGPT annotation: NOT INVOKED this run (no scgpt_annotate step ran). "
-                + (f"Available (live session); image={getattr(st, 'scgpt_image', '?')}."
-                   if live else "Not available (mock/offline session — no HPC3 batch lifecycle)."))
+            from ..agents.mcp_bridge import configured_servers
+            server = next((item for item in configured_servers()
+                           if item.name == "scgpt-annotation" and item.adapter == "analysis"
+                           and any(tool["name"] == "scgpt_annotate" for tool in item.tools)), None)
+            availability = (
+                f"MCP catalog configured; image={server.image}. Runtime availability is checked at invocation."
+                if live and server is not None else
+                "Not configured in the MCP catalog." if live else
+                "Not available (mock/offline session — no HPC3 batch lifecycle).")
+            lines.append("- scGPT annotation: NOT INVOKED this run (no scgpt_annotate step ran). "
+                         + availability)
         else:
             status = str(scg.get("status", "unknown"))
             if status == "ok":
                 tail = f" n_cells={scg.get('n_cells')} predictions={scg.get('predictions_csv')}"
             else:
                 tail = f" — {scg.get('note') or scg.get('error') or ''}".rstrip()
-            lines.append(f"- scGPT annotation: INVOKED, status={status}.{tail} "
-                         "(job log fetched to process/scgpt_job.log when the job ran)")
+            identity = scg.get("mcp") or {}
+            if identity.get("name") == "scgpt-annotation":
+                tail += f" MCP version={identity.get('version')} image={identity.get('image')}."
+            lines.append(f"- scGPT annotation: INVOKED, status={status}.{tail}")
 
         if not getattr(st, "vlreview_enabled", False):
             lines.append("- VL render review: DISABLED (AISCIENTIST_VLREVIEW_ENABLED not set).")
@@ -19374,6 +19065,9 @@ _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za
 # folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
 # is a name; it is only ever joined to the directory for SFTP, never given to a shell.
 _CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
+# Complete MCP result trees may have subdirectories. Every segment keeps the
+# original filename policy; absolute paths, dot segments and empty segments fail.
+_CELLQC_REL_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}(?:/(?!\.)[^/\\\x00-\x1f]{1,255})*")
 _RESULT_KINDS = ("dataset", "cellqc", "tables", "literature")
 # A literature run's tables (issue 20), saved as one folder. The record is in the run's folder, outside
 # ``artifacts/``, so it is neither a result file nor in the bundle (like the curation's, issue 46).
@@ -19568,7 +19262,8 @@ def _saved_result_files(owner: str, run_id: str, rec: dict, folder: bool) -> "tu
     files = []
     for f in rec.get("files") or []:
         fname = str(f.get("name") or "")
-        if not _CELLQC_FILE_RE.fullmatch(fname):
+        pattern = _CELLQC_FILE_RE if rec.get("kind") == "literature" else _CELLQC_REL_RE
+        if not pattern.fullmatch(fname):
             continue
         copy = (CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "literature" / fname
                 if rec.get("kind") == "literature" else copies / fname)
@@ -20094,7 +19789,7 @@ async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Respon
     rec = _read_pointer(_result_pointer_path(owner, run_id, "cellqc"))
     files = [(str(f.get("name") or ""), int(f.get("size") or 0))
              for f in ((rec or {}).get("files") or []) if isinstance(f, dict)]
-    files = [(n, s) for n, s in files if _CELLQC_FILE_RE.fullmatch(n)]
+    files = [(n, s) for n, s in files if _CELLQC_REL_RE.fullmatch(n)]
     if rec is None or not files:
         return JSONResponse({"error": "This run kept no CellQC result directory."}, status_code=404)
     on_hpc = rec.get("location") == "hpc3"
@@ -20123,7 +19818,17 @@ async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Respon
         if not base.is_dir():
             return JSONResponse({"error": "CellQC's result directory is no longer on the server."},
                                 status_code=410)
-        files = [(n, (base / n).stat().st_size) for n, _ in files if (base / n).is_file()]
+        def regular_result(name: str) -> bool:
+            path = base
+            if path.is_symlink():
+                return False
+            for part in name.split("/"):
+                path = path / part
+                if path.is_symlink():
+                    return False
+            return path.is_file()
+
+        files = [(n, (base / n).stat().st_size) for n, _ in files if regular_result(n)]
 
         def opener(name: str) -> Callable[[], Any]:
             return lambda: _local_blocks(base / name)
@@ -20322,6 +20027,167 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Slurm job names on this deployment start with {prefix!r}.")
     uvicorn.run("aiscientist.gateway.app:app", host=args.host, port=args.port, reload=args.reload)
     return 0
+
+
+
+
+# Report revisions reuse the established writer and durable plan-card protocol.
+def _report_target(conn: Connection, req: LabRequest, *, allow_recovery_error: bool = False) -> "tuple[str, Path, dict] | None":
+    from . import report_revision
+    match = re.search(r"\brun(?:_id)?\s*[:=]?\s*[`\"']?([a-f0-9]{12})\b", req.question, re.IGNORECASE)
+    explicit = match.group(1).lower() if match else None
+
+    def accepted(run_id: str) -> bool:
+        try:
+            report_revision.load_target(conn.workspace, run_id, req.conversation_id)
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+
+    if explicit:
+        candidate = explicit
+    elif _AUTH_ENABLED and conn.app_user_id and req.conversation_id:
+        candidate = auth_routes.latest_run_id_for_conversation(conn.app_user_id, req.conversation_id, accept=accepted)
+    else:
+        candidate = (_conversation_last_run(conn, req.conversation_id) if req.conversation_id else conn.last_run_id)
+    if not candidate or (not explicit and not accepted(candidate)):
+        return None
+    if _AUTH_ENABLED and conn.app_user_id:
+        record = auth_routes.get_run_record(conn.app_user_id, candidate)
+        if not record or (req.conversation_id and str(record.get("conversation_id")) != str(req.conversation_id)):
+            raise ValueError("The report target is not a run in this account and conversation")
+        allowed_states = {"done", "incomplete"} | ({"error"} if allow_recovery_error else set())
+        if record.get("status") not in allowed_states:
+            raise ValueError("The report target must be a finished run with accepted results")
+    art, state = report_revision.load_target(conn.workspace, candidate, req.conversation_id)
+    return candidate, art, state
+
+
+def _show_report_revision(conn: Connection, req: LabRequest, target: tuple[str, Path, dict]) -> None:
+    from . import report_revision
+    run_id, art, _state = target
+    folder = report_revision.create(art, run_id, req.conversation_id, req.question)
+    conn.push(report_revision.prompt(folder))
+    conn.push({"type": "chat_stopped", "awaiting_plan": True, "run_id": run_id,
+               "conversation_id": req.conversation_id})
+
+
+async def _maybe_report_revision(conn: Connection, req: LabRequest) -> bool:
+    if not re.search(r"report|summary|write.?up|报告|总结", req.question, re.IGNORECASE):
+        return False
+    explicit_only = bool(re.search(
+        r"only.{0,35}(?:report|summary)|(?:report|summary).{0,35}only|只.{0,15}(?:报告|总结)",
+        req.question, re.IGNORECASE))
+    try:
+        target = _report_target(conn, req)
+        if target is None:
+            if explicit_only:
+                raise ValueError("No accepted source run was found in this conversation. Name its run ID; no new analysis was started.")
+            return False
+        intent = None
+        if _model_ready(conn):
+            complete_fn, *_ = _lab_llm(conn)
+            intent = await asyncio.to_thread(_classify_followup, complete_fn, target[2], req.question)
+        if not intent or intent["confidence"] < FOLLOWUP_CONFIDENCE or intent["intent"] != "report_only":
+            if explicit_only:
+                raise ValueError("The selected model could not confirm this report-only correction. Reconnect it or clarify the request; no new analysis was started.")
+            return False
+        _show_report_revision(conn, req, target)
+    except (OSError, ValueError) as exc:
+        conn.push({"type": "chat_error", "message": str(exc)})
+    return True
+
+
+async def _report_revision_review(conn: Connection, req: PlanReviewRequest, action: str) -> "JSONResponse | None":
+    from . import report_revision
+    if not req.run_id and not req.conversation_id:
+        return None
+    matches = [(folder, record) for folder, record in report_revision.pending(conn.workspace)
+               if (not req.run_id or record["run_id"] == req.run_id)
+               and (not req.conversation_id or record.get("conversation_id") == req.conversation_id)]
+    if not matches:
+        return None
+    folder, record = matches[0]
+    try:
+        # Revalidate owner/conversation and accepted source state at approval, including after restart.
+        check = LabRequest(connection_id=conn.id, conversation_id=record.get("conversation_id"),
+                           question="Revise report only for run " + record["run_id"])
+        target = _report_target(conn, check)
+        if target is None:
+            raise ValueError("The report's accepted source run is unavailable")
+        if action == "approve":
+            current_job = _read_report_job(target[1])
+            if (current_job.get("state") == "running"
+                    and time.time() - float(current_job.get("started", 0) or 0) <= _REPORT_JOB_STALE_S):
+                return JSONResponse({"error": "This run already has a report writer running."}, status_code=409)
+            import hashlib
+            source = (target[1] / "process/run_state.json").read_bytes()
+            if hashlib.sha256(source).hexdigest() != record["source_state_sha256"]:
+                raise ValueError("The source run changed after this report review; cancel and review a new revision.")
+            if not _model_ready(conn) or conn.status != "ready" or conn.executor is None:
+                return JSONResponse({"error": "Connect the selected session model before writing this report."}, status_code=409)
+            refused = _run_slot_refusal(conn, record.get("conversation_id")) or _budget_refusal(conn, req.budget_ack, req.tz)
+            if refused is not None:
+                return refused
+        record = report_revision.decide(folder, action, feedback=req.feedback or "", plan_yaml=req.plan_yaml or "")
+        if action in {"edit", "revise"}:
+            conn.push(report_revision.prompt(folder, record))
+        else:
+            conn.push({"type": "plan_done", "run_id": record["run_id"],
+                       "conversation_id": record.get("conversation_id")})
+        if action == "approve":
+            run = conn.begin_run(record.get("conversation_id"), run_id=record["run_id"])
+            _note_budget_choice(run, req)
+            run.kind = "report"
+            run.running = True
+            asyncio.create_task(_run_report_revision(conn, run, target[1], folder, record))
+        return JSONResponse({"status": "ok", "action": action, "run_id": record["run_id"]})
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+async def _run_report_revision(conn: Connection, run: RunState, art: Path, folder: Path, record: dict) -> None:
+    from . import report_revision
+    run_id = record["run_id"]
+    try:
+        conn.push({"type": "chat_start"}, run=run)
+        conn.push({"type": "lab_progress", "level": "info",
+                   "text": "Revising this run's report from accepted artifacts; no scientific tools will run."}, run=run)
+        _write_report_job(art, {"run_id": run_id, "state": "running", "started": time.time(), "log": [],
+                                "revision_id": record["revision_id"]})
+        if run.chat_stop.is_set():
+            record.update(state="cancelled", finished_at=datetime.now(timezone.utc).isoformat())
+            report_revision._write_record(folder, record)
+            _write_report_job(art, {"run_id": run_id, "state": "cancelled", "log": [],
+                "revision_id": record["revision_id"], "finished_at": record["finished_at"]})
+            conn.push({"type": "chat_stopped"}, run=run)
+            return
+        await _report_job(conn, conn.owner, run_id, art, revision=(folder, record))
+        status = report_job_status(conn.owner, run_id)
+        record["state"] = "cancelled" if run.chat_stop.is_set() else status["state"]
+        record["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report_revision._write_record(folder, record)
+        if record["state"] == "done":
+            conn.push({"type": "chat_token", "token": "Updated the report for run " + run_id
+                       + ". Its accepted scientific results and original state were preserved. "
+                       + "[Open the revised report](/api/file/" + conn.owner + "/" + run_id + "/report/report.md)"}, run=run)
+            conn.push({"type": "artifacts", "items": [{"name": Path(f["path"]).name, "kind": "report",
+                       "url": f["url"]} for f in status["files"]],
+                       "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"}, run=run)
+            conn.push({"type": "chat_done"}, run=run)
+        elif record["state"] == "cancelled":
+            conn.push({"type": "chat_stopped"}, run=run)
+        else:
+            conn.push({"type": "chat_error", "message": status.get("error") or "The report revision failed."}, run=run)
+    except Exception as exc:  # a failed write must keep its durable review and source evidence
+        record.update(state="error", error=public_error(exc), finished_at=datetime.now(timezone.utc).isoformat())
+        report_revision._write_record(folder, record)
+        _write_report_job(art, {"run_id": run_id, "state": "error", "error": public_error(exc),
+            "revision_id": record["revision_id"], "finished_at": record["finished_at"], "log": []})
+        conn.push({"type": "chat_error", "message": public_error(exc)}, run=run)
+    finally:
+        run.running = False
+        conn.end_run(run)
 
 
 if __name__ == "__main__":

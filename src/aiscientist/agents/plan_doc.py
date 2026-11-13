@@ -34,6 +34,7 @@ Pure data and helpers — no model call, no I/O — like :mod:`aiscientist.agent
 from __future__ import annotations
 
 import json
+import math
 import re
 import textwrap
 from dataclasses import dataclass, field
@@ -218,7 +219,8 @@ def _scalar(value: Any, *, in_list: bool = False) -> str:
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_scalar(v, in_list=True) for v in value) + "]"
     if isinstance(value, Mapping):
-        return json.dumps(value, ensure_ascii=False, default=str)   # JSON is valid YAML flow syntax
+        return "{" + ", ".join(json.dumps(str(k), ensure_ascii=False) + ": " + _scalar(v, in_list=True)
+                                for k, v in value.items()) + "}"
     s = str(value)
     return s if _plain_ok(s, in_list=in_list) else json.dumps(s, ensure_ascii=False)
 
@@ -260,7 +262,22 @@ def dump_plan_yaml(doc: PlanDoc) -> str:
 # --- YAML: reading ---------------------------------------------------------------------------------
 
 _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
-_SETTING_VALUE_TYPES = (str, int, float, bool, type(None))
+def _json_setting(value: Any, *, depth: int = 0, budget: list[int] | None = None) -> bool:
+    """The bounded JSON values a native tool can accept, including nested arguments."""
+    budget = [10000] if budget is None else budget
+    budget[0] -= 1
+    if depth > 32 or budget[0] < 0:
+        return False
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_json_setting(v, depth=depth + 1, budget=budget) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_setting(v, depth=depth + 1, budget=budget)
+                   for k, v in value.items())
+    return False
 
 
 def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
@@ -320,12 +337,11 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
                 problems.append(f"Step {n} has unreadable settings. Ask for a revised plan.")
             else:
                 for key, value in settings_raw.items():
-                    ok = isinstance(value, _SETTING_VALUE_TYPES) or (
-                        isinstance(value, list)
-                        and all(isinstance(v, _SETTING_VALUE_TYPES) for v in value))
+                    ok = isinstance(key, str) and _json_setting(value)
                     if not ok:
-                        problems.append(f"Step {n}: setting `{key}` needs text, a number, true/false, "
-                                        "no value, or a list of these.")
+                        problems.append(f"Step {n}: setting `{key}` needs a text key and a bounded "
+                                        "JSON value (text, a finite number, true/false, null, "
+                                        "or nested arrays/objects).")
                     else:
                         settings[str(key)] = value
         if settings and not tool:

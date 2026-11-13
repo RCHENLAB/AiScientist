@@ -36,11 +36,11 @@ folder, with its own virtual environment, and `app/current` names the one that r
 
 | Path | What |
 |---|---|
-| `/data/aiscientist/app/releases/<tag>/` | one app release: the package's runtime files (the operator scripts in `scripts/` included), its own venv in `.venv/`, links to `config/.env` and `skills/`, and the gene sets copied from `data/reference/genesets/`. Read-only once installed. The newest 5 are kept |
+| `/data/aiscientist/app/releases/<tag>/` | one app release: the package's runtime files (the operator scripts in `scripts/` included), its own venv in `.venv/`, links to `config/.env` and `skills/`. Scientific reference libraries remain outside the release. Read-only once installed. The newest 5 are kept |
 | `/data/aiscientist/app/current`, `app/previous` | links to the running release and to the one before it. `app/previous` exists once a second release has been switched to |
 | `/data/aiscientist/app/held` | tags the deploy timer never installs: one rolled back from, or one whose health check failed |
 | `/data/aiscientist/config/` | mode 0700: `.env`, the app's settings and secrets ([Configuration](#configuration)); `deploy.env`, the deploy's own settings; the encrypted backups of the credential stores |
-| `/data/aiscientist/data/` | `AISCIENTIST_DATA_ROOT`, the users' data ([`docs/dataset_storage.md`](../docs/dataset_storage.md)): `users/<account>/datasets/<uuid>/`, uploads in progress under `temp/<account>/` (an unfinished browser upload is removed 24 hours after its last write, `AISCIENTIST_UPLOAD_TTL_SECONDS`), each run's outputs under `analysis_results/<UCInetID>/<run_id>/` (`AISCIENTIST_RESULTS_DIR`), `corpus_scans/`, `exports/`, `reference/genesets/` (the gene-set libraries, not in git, that each release copies), and `reference/retigene/`: the copy of the RetiGene index that literature searches read, written by `scripts/update_corpus_index.py` (see the `search_corpus` tool's documentation) |
+| `/data/aiscientist/data/` | `AISCIENTIST_DATA_ROOT`, the users' data ([`docs/dataset_storage.md`](../docs/dataset_storage.md)): `users/<account>/datasets/<uuid>/`, uploads in progress under `temp/<account>/` (an unfinished browser upload is removed 24 hours after its last write, `AISCIENTIST_UPLOAD_TTL_SECONDS`), each run's outputs under `analysis_results/<UCInetID>/<run_id>/` (`AISCIENTIST_RESULTS_DIR`), `corpus_scans/`, `exports/`, `reference/genesets/` (preserved gene-set reference libraries, not copied into app releases), and `reference/retigene/`: the copy of the RetiGene index that literature searches read, written by `scripts/update_corpus_index.py` (see the `search_corpus` tool's documentation) |
 | `/data/aiscientist/state/` | `AISCIENTIST_STATE_DIR`, mode 0700: the session secret (`session_secret`), the users' saved SSH keys (`ssh_creds/`) and LLM API keys (`llm_creds/`) with the master key that encrypts them (`llm_key.master`), the model list once an admin has saved it, `induced_skills/` (`AISCIENTIST_INDUCED_SKILLS_DIR`: skills learned from runs, with their review file), and `skill_requests/` (one 0600 JSON file per run that needed code the AI wrote, read in Admin → Skill requests) |
 | `/data/aiscientist/skills/releases/<version>/` | the curated skills: releases of aiscientist-skills, installed and checked by [`deploy_skills.sh`](deploy_skills.sh), read-only. `skills/current` names the one the app reads; without it, the tag `configs/skills_registry.json` pins (found through `AISCIENTIST_SKILLS_REGISTRY_RELEASES_ROOT`). An app release never ships or deletes them. Without one there are no curated skills |
 | `/data/aiscientist/logs/` | `deploy.log`: one line per install, switch, rollback, refusal and prune. The units write to the journal |
@@ -136,17 +136,21 @@ downgrade: a release that finds the database at a revision it does not ship leav
 
 **A new Python dependency** is a change to `pyproject.toml` and to `requirements.lock`
 (`scripts/lock_requirements.sh`, after `pip install uv`), then a release. A large one weighs on every
-release's venv: `sentence-transformers` for a local embedding model brings PyTorch, about 2 GB more
-per release.
+release's venv. Scientific embedding/ranking packages belong in the published MCP images, not a gateway extra.
 
 ### Skills releases
 
-A skills release is a tag of [`lijinbio/aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills)
+A skills release is a tag of the repository pinned in `configs/skills_registry.json`
 whose GitHub Release holds `catalog.json`, the skills zip and `SHA256SUMS`.
+The migration pins the published
+[`liujs123456/aiscientist-skills` v0.2.5](https://github.com/liujs123456/aiscientist-skills/releases/tag/v0.2.5)
+and its exact MCP image digests. These are fork releases; promotion to upstream
+requires publishing and reviewing the corresponding upstream assets, not changing
+a tag in place.
 [`deploy_skills.sh`](deploy_skills.sh) installs one, as the service account:
 
 ```bash
-deploy_skills.sh v0.2.0       # download, check, install into skills/releases/0.2.0/, switch skills/current
+deploy_skills.sh v0.2.5       # download, check, install into skills/releases/0.2.5/, switch skills/current
 deploy_skills.sh --rollback   # back to skills/previous; the release rolled back from is held
 deploy_skills.sh --list
 ```
@@ -157,6 +161,16 @@ library again when `skills/current` changes, without a restart, and the script w
 `/health` reports the new release, or switches back. The deploy timer installs the release
 `config/deploy.env` pins (`AISCIENTIST_SKILLS_TAG`), else the one the running app release pins in
 `configs/skills_registry.json`. A skills release needs no app release.
+
+The repository is also a deployment pin. Set `AISCIENTIST_SKILLS_REPO=owner/repository`
+for both the service and deploy environment to use a reviewed fork. Otherwise the
+optional `repository` in `configs/skills_registry.json` applies, with
+`lijinbio/aiscientist-skills` as the default. Only GitHub owner/repository names are
+accepted. The loader's install advice and release information report the selected
+repository; `<version>.install.json` records where the deployment fetched it.
+A cached version whose repository/tag differs, or whose install provenance is
+missing, is refused by the deploy script. Use a separate install root when testing
+another repository's same version; an existing immutable release is not replaced.
 
 ### The staging site
 
@@ -249,8 +263,7 @@ public server needs at least:
 `config/deploy.env` holds the settings of `deploy_release.sh` and `deploy_skills.sh`, described at
 the top of [`deploy_release.sh`](deploy_release.sh): `AISCIENTIST_APP_TAG` and
 `AISCIENTIST_SKILLS_TAG` pin a release, and `AISCIENTIST_EXTRAS` names the pip extras of each
-release's venv. The Eye Server sets the default extras plus `corpus`, which adds CPU PyTorch and
-`sentence-transformers` on top of the lock for its copy of the RetiGene index.
+release's venv. The former `literature` and `corpus` extras are retired. Configure the pinned native MCP runtime and, optionally, restricted local Docker lookup instead; the gateway does not install PyTorch or an embedding model. See `paperqa/README.md`.
 
 **Session secret.** It signs every sign-in cookie, so whoever can read it can sign in as any
 account, an admin's included. It is not a setting in `config/.env`: with `AISCIENTIST_STATE_DIR`
@@ -445,9 +458,14 @@ scripts/sync_deploy.sh               # copy, pip install -e, restart, health che
 | `--delete` | files removed from the repository should be removed on the server too. `.env`, the databases, the virtual environment, `runs/`, the credential stores, the gene-set libraries and the skills release are never deleted. |
 
 The script copies the working tree (runtime files only), so deploy a clean checkout of the commit
-you mean. `app/.deployed_sha` names the commit that was copied. The gene sets
-(`src/aiscientist/tools/genesets/*.gmt`) are not in git (`scripts/fetch_genesets.py` downloads
-them); a checkout without them leaves the server's copies as they are.
+you mean. `app/.deployed_sha` names the commit that was copied. Historical gene-set
+files are preserved by the layout migration, but new app releases do not contain
+scientific libraries. Use `aiscientist-mcp/scripts/fetch_genesets.py` to maintain
+external libraries and set `SCRNA_GENESETS_DIR` to their absolute path on the
+execution host. An existing explicit `AISCIENTIST_GENESETS_DIR` is accepted when
+the native setting is unset. An Eye Server path is not automatically available
+on HPC3: stage references on the cluster and configure that compute-host path.
+No reference data is deleted or automatically downloaded during an app deploy.
 
 [`scripts/deploy_interactive.sh`](../scripts/deploy_interactive.sh) does the same with password
 prompts, for an operator without an SSH key on the server. It refuses a server on the release

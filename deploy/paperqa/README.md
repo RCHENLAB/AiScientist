@@ -1,180 +1,23 @@
-# PaperQA embedding on HPC3
+# Native literature runtime and corpus deployment
 
-Build the PaperQA retrieval index for the full RetiGene corpus (~1741 PDFs) on
-RCIC **HPC3**, as a CPU Slurm job. The embedding model is a **local
-sentence-transformers** model, so paper text never leaves UCI and no cloud API
-is called.
+The app uses the independently published [literature MCP](https://github.com/liujs123456/aiscientist-mcp/tree/main/packages/literature), pinned by its MCP catalog and matching instruction skill. PaperQA, embedding models and retrieval/extraction implementations are in that runtime. The app keeps corpus transfer/versioning, selected-model credentials and budget enforcement, plan review, curation specifications, result caches and publication.
 
-- Indexer: `scripts/build_paperqa_directory_index.py`
-- Manifest builder: `scripts/build_retigene_paperqa_manifest.py`
-- Slurm job: `deploy/paperqa/embed_corpus.slurm`
-- Default model: `st-NeuML/pubmedbert-base-embeddings` (biomedical PubMedBERT, 768-dim).
-  Per advisor, go straight to this domain model — not the small MiniLM pilot. The query
-  tool (`tools/paperqa_search.py`) must use the same model or retrieval breaks.
+## HPC deployment
 
-## Decision: embed *on* HPC3 (not locally, then upload)
+Configure `LITERATURE_CORPUS_ROOT`, `LITERATURE_PAPERS`, `LITERATURE_MANIFEST`, `LITERATURE_CACHE_DIR`, `LITERATURE_HF_CACHE` and, when needed, `LITERATURE_INDEX_DIR` / `LITERATURE_EMBEDDING` in trusted server settings. Roots are read-only in an analysis; native job data belongs to the isolated run. The gateway stages the catalog's immutable image on an authorized compute allocation. It does not bind application scientific tools into that image.
 
-The embedding is a local ST model = pure compute, and PaperQA runs its QA on
-HPC3, so the index is built where it will be used. Data (PDFs + index) moves by
-`rsync`; only code/config moves through git.
+Corpus scans use the selected session model through the guarded gateway relay (including supported native Anthropic text/JSON/tool requests) or the session's existing cluster endpoint. API credentials stay on the gateway. The pilot and each subsequent paid call enforce the approved cap; one already-started call may cross it. An unpriced standalone endpoint cannot claim a positive spending cap. The app does not provision a replacement GPU model for a scan.
 
-## Layout on HPC3
+## Local retrieval without HPC
 
-Everything lives under the lab DFS. Replace `$USER` with your HPC3 username.
+Operators may pre-pull the same reviewed Docker digest and set `AISCIENTIST_LOCAL_CORPUS_MCP=docker` for offline corpus retrieval. Set `AISCIENTIST_LOCAL_CORPUS_ROOT` to the public corpus mirror containing `current`/`versions` (or a flat cache) and `hf_cache`. The container has read-only corpus/model mounts, no network, a private temporary output mount, and fixed CPU/memory/process limits. The app does not import scientific packages or load an embedding model in its process.
 
-```
-/dfs3b/ruic20_lab/$USER/
-  BioAgentPrototype/                 # this repo (git clone / rsync of the code)
-  retigene/
-    papers/                          # the 1741 PDFs
-    paperqa_manifest.csv             # 9-col PaperQA manifest
-    hf_cache/                        # Hugging Face model cache (persists)
-    index_pubmedbert/                    # <- the built index (output)
-```
+Public Europe PMC lookup is a separate opt-in: `AISCIENTIST_LOCAL_PUBLIC_LITERATURE_MCP=docker`. This fixed native command allows outbound networking for `literature_search`, mounts no corpus or model cache, and inherits no model key or endpoint override. It supports the ordinary cited literature conversation using the session's selected gateway model. Plain chat needs no HPC. Deployment must already permit this service account to use Docker; this code does not change permissions or mount the Docker socket.
 
-## One-time setup
+## Maintenance
 
-### 1. Python environment (login node)
+`AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp` is the only runtime. `scripts/update_corpus_index.py --rebuild` stages the small operator bundle into the published literature image; its reference roots must be configured explicitly. Set `AISCIENTIST_CORPUS_MAINTENANCE_IMAGE` to an immutable Docker URI or a verified absolute SIF to override the catalog for operator work. The transfer/check/rollback paths retain the original corpus versioning and no longer require app `corpus` or `literature` extras.
 
-```bash
-module load anaconda/2024.06
-conda create -y -n paperqa python=3.12
-source activate paperqa
-pip install "paper-qa[local,pymupdf]>=5"   # sentence-transformers + the pymupdf PDF reader
-# pymupdf matters: paper-qa's default pypdf reader crashes the whole index build on some
-# malformed PDFs (old Nature Genetics files: "More than one /FontFile found"). paper-qa
-# auto-prefers pymupdf when installed. Verify with:
-#   python -c "from paperqa.settings import get_default_pdf_parser; print(get_default_pdf_parser().__module__)"
-```
+Manifest preparation/download helpers remain in this app. Scientific maintenance commands `build_paperqa_directory_index.py`, `query_paperqa_index.py` and `peek_paperqa_embeddings.py` now live in the native repository's `scripts/`. Run them inside the published runtime with that scripts directory mounted read-only. `embed_corpus.slurm` shows the offline CPU index-build command; supply the scheduler account and partition explicitly. Use the same embedding model for build and retrieval.
 
-### 2. Get the code + corpus onto HPC3
-
-From your Mac (repo root). The manifest is generated locally first:
-
-```bash
-# a) build the full-corpus PaperQA manifest (writes paperqa_manifest.csv)
-python scripts/build_retigene_paperqa_manifest.py \
-  --priority-manifest output/retigene_papers/journal_priority/retigene_priority_manifest.csv \
-  --papers            output/retigene_papers/journal_priority/papers_priority \
-  --out               output/retigene_papers/journal_priority/paperqa_manifest.csv
-
-# NOTE the host: RCIC (2026-08-06) forbids rsync/SFTP/rclone/wget on the login nodes and asks
-# that ALL transfers go through access-hpc3.rcic.uci.edu. It mounts the same /dfs3b and $HOME,
-# so only the hostname changes. (Its restricted shell allows rsync/wget/curl but not bash — run
-# commands on hpc3.rcic.uci.edu as usual, just not the transfers.)
-
-# b) code (small)
-rsync -av --exclude output --exclude .venv --exclude .git \
-  ./ $USER@access-hpc3.rcic.uci.edu:/dfs3b/ruic20_lab/$USER/BioAgentPrototype/
-
-# c) corpus (~3.6 GB of PDFs + the manifest)
-rsync -av \
-  output/retigene_papers/journal_priority/papers_priority/ \
-  $USER@access-hpc3.rcic.uci.edu:/dfs3b/ruic20_lab/$USER/retigene/papers/
-rsync -av \
-  output/retigene_papers/journal_priority/paperqa_manifest.csv \
-  $USER@access-hpc3.rcic.uci.edu:/dfs3b/ruic20_lab/$USER/retigene/paperqa_manifest.csv
-```
-
-### 3. Pre-stage the embedding weights
-
-Compute nodes have outbound egress (verified 2026-07-08), so fetch the weights inside a job
-rather than on a login node — RCIC counts this as both compute and a download.
-
-```bash
-srun -p standard -A ruic20_lab -c 2 --mem=8G -t 01:00:00 --pty /bin/bash -i
-source activate paperqa
-export HF_HOME=/dfs3b/ruic20_lab/$USER/retigene/hf_cache
-python - <<'PY'
-from sentence_transformers import SentenceTransformer
-SentenceTransformer("NeuML/pubmedbert-base-embeddings")
-print("model cached")
-PY
-```
-
-## Run the embedding job
-
-```bash
-cd /dfs3b/ruic20_lab/$USER/BioAgentPrototype
-sbatch deploy/paperqa/embed_corpus.slurm
-squeue -u $USER            # watch it
-tail -f retigene_embed-*.log
-```
-
-Runtime is roughly tens of minutes to a couple of hours on 8 CPUs for ~1741
-PDFs (PDF parsing dominates, not the embedding). Paths/model can be overridden
-without editing the file:
-
-```bash
-sbatch --export=ALL,BASE=/dfs3b/ruic20_lab/$USER/retigene,\
-EMBEDDING=st-NeuML/pubmedbert-base-embeddings,INDEX_DIR=/dfs3b/ruic20_lab/$USER/retigene/index_pubmedbert \
-  deploy/paperqa/embed_corpus.slurm
-```
-
-## Verify
-
-The job prints a JSON report with `indexed_file_count` (expect ~1741). Then a
-quick retrieval smoke test (no cloud LLM):
-
-```bash
-source activate paperqa
-python scripts/query_paperqa_index.py "CRB1 retinitis pigmentosa" \
-  --papers    /dfs3b/ruic20_lab/$USER/retigene/papers \
-  --manifest  /dfs3b/ruic20_lab/$USER/retigene/paperqa_manifest.csv \
-  --index-dir /dfs3b/ruic20_lab/$USER/retigene/index_pubmedbert \
-  --embedding st-NeuML/pubmedbert-base-embeddings \
-  --name retigene_full_pubmedbert            # returns matching documents
-```
-
-Record the embedding model name alongside the index — a different model means a
-different vector space and the index must be rebuilt.
-
-## Notes
-
-- **Offline:** `HF_HUB_OFFLINE=1` is set in the job so a misconfigured run fails
-  fast instead of silently hitting the network. Unset it for the very first run
-  if you skipped step 3.
-- **No cloud LLM:** the indexer routes any accidental LLM call to a dead local
-  endpoint; a misconfigured run fails locally rather than calling a cloud model.
-- **GPU:** PubMedBERT runs on CPU (slower than MiniLM but fine for this corpus). If you
-  later want a GPU to speed it up, switch to a `gpu` partition with `--gres=gpu:1` and add
-  `--account`/`--partition` accordingly; the model auto-uses CUDA if present.
-
-## Retrieval-only path (`search_corpus`)
-
-A session with no GPU allocation (the user's own API key) has no served model for `deep_literature`.
-`search_corpus` runs in the same `paperqa.sif` job line without one: it reads
-`<corpus-root>/mechanism_cache/{chunks.jsonl,chunk_vecs.npy}` and the offline `hf_cache` (PubMedBERT on
-CPU), and returns the matching passages. The job needs 2 CPUs and 8 GB, no GPU, and is given no model
-endpoint or API key; the session's model writes the queries and the answer, and the gateway removes any
-citation or quotation the passages do not support. The text cache is rebuilt by hand with
-`scripts/build_mechanism_cache.py` when papers are added.
-
-## Corpus scan (`extract_haploinsufficient_genes`)
-
-The corpus scan (asked for with `route: "corpus"` on `/api/lab`; the console has no control for it)
-has a language model write search requests and read every passage they retrieve, so its job brings
-its own: one Slurm job on the paid `gpu` partition (`AISCIENTIST_CORPUS_SCAN_PARTITION`,
-account `AISCIENTIST_CORPUS_SCAN_ACCOUNT`, default `ruic20_lab_gpu`) with `gpu:1` and the node
-feature `nvme`, so it takes the first free A30 or A100 and never a V100
-(`AISCIENTIST_CORPUS_SCAN_GRES`, `AISCIENTIST_CORPUS_SCAN_CONSTRAINT`). The partition bills every
-card the same; an A100 reads about twice as fast as an A30. The default model fits an A30 only with its image and video encoders
-off and at most 16 requests at once, the default of `AISCIENTIST_CORPUS_SCAN_VLLM_ARGS`. The job
-starts vLLM from
-`<root>/containers/vllm-0.28.0.sif` with the weights in `<root>/hf` on the node's `127.0.0.1`
-(model `AISCIENTIST_CORPUS_SCAN_MODEL`, default the cluster sessions' model; window
-`AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN`, default 16384), runs the scan in `paperqa.sif` against
-it, and exits, which frees the card. The session's own model is never called, so a session on the
-shared model or on an API key can run it.
-
-The paid queue can hold a card back for hours. The job keeps its place in it for up to
-`AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S` (default 7200), and the chat hears where it stands (Slurm's
-reason and expected start) every `AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S` (default 1800). A job
-that never gets a card is submitted again, up to `AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES` times
-(default 2), before the run ends with a message that nothing ran.
-
-A finished scan is kept on the gateway host under `<AISCIENTIST_DATA_ROOT>/corpus_scans/<key>/`,
-where the key covers the corpus (the manifest's hash, the size and time of the text cache and the
-HGNC table), the scan's rules and the model. The next request for the same corpus is answered from
-it without a job; adding papers (a new manifest and text cache) changes the key. Deleting a key's
-folder makes the next request scan again.
+Final-image validation and historical limitations are recorded in the native package README and `docs/development/issue94_validation.md`; a protocol pass alone does not establish report grounding or exhaustive corpus coverage.

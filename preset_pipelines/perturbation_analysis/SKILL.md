@@ -1,32 +1,32 @@
 ---
 name: perturbation_analysis
 description: Analyze a pooled CRISPR / Perturb-seq screen — rank which perturbations change the transcriptome, then per-perturbation DE vs the non-targeting control
-tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, run_code, literature_search
+tools: mcp_run_scanpy_qc, mcp_run_cellqc, mcp_run_clustering, mcp_run_de, mcp_run_enrichment, run_code, mcp_literature_search
 data_type: scrna
 outputs:
   - path: figures/umap_clusters.png
     kind: figure
-    tool: run_clustering
+    tool: mcp_run_clustering
     description: UMAP of the cells coloured by Leiden cluster.
     required: true
   - path: tables/de_*_all.csv
     kind: table
-    tool: run_de
+    tool: mcp_run_de
     description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
     required: true
   - path: figures/volcano_*.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
     required: false
   - path: figures/dotplot__markers.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
     required: false
   - path: tables/enrichment_*.csv
     kind: table
-    tool: run_enrichment
+    tool: mcp_run_enrichment
     description: Over-representation results per group, split into up- and down-regulated halves for a contrast, with term, gene-set library, adjusted p-value, combined score and overlap.
     required: true
 ---
@@ -64,9 +64,9 @@ category values are given at planning time) and infer:
 
 ## Ordered plan
 
-1. **QC** (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
+1. **QC** (`mcp_run_scanpy_qc` for one matrix; `mcp_run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor QC columns already in the data. Do NOT drop the control cells.
-2. **Embedding** (`run_clustering`): compute PCA/neighbors/UMAP. The PCA embedding is what the
+2. **Embedding** (`mcp_run_clustering`): compute PCA/neighbors/UMAP. The PCA embedding is what the
    effect-size ranking (step 4) measures distances in; a UMAP colored by perturbation is a useful
    overview figure. (Leiden clusters themselves are secondary here — the grouping of interest is the
    perturbation label, not de-novo clusters.)
@@ -88,7 +88,7 @@ category values are given at planning time) and infer:
 6. **Per-perturbation differential expression vs the control** (`run_code`, adapt
    `perturbation_de_vs_control.py`). For each perturbation **with a real effect and enough cells**,
    run perturbation-vs-non-targeting-control DE (scanpy `rank_genes_groups` with an explicit
-   `reference` = the control level, looped over perturbations). `run_de` is per-cluster one-vs-rest,
+   `reference` = the control level, looped over perturbations). `mcp_run_de` is per-cluster one-vs-rest,
    so it does NOT do this shared-reference comparison — use the template. **Sanity check:** a bona-fide
    knockout should show its OWN target gene **down** in its DE — report that self-knockdown as a
    positive control, and flag guides where the target does NOT drop.
@@ -96,13 +96,13 @@ category values are given at planning time) and infer:
    (`adata[mask]`), never `.copy()` every group or hold all subsets at once — an over-budget loop is
    OOM-killed on the local sandbox (`returncode == -9`). Prefer `AISCIENTIST_RUN_CODE_ON_HPC=1`
    (see `deploy/analysis/README.md`) for a real `--mem` cap on large screens.
-7. **(Optional) Pathway enrichment per strong perturbation** (`run_enrichment`): on the up-/down-gene
+7. **(Optional) Pathway enrichment per strong perturbation** (`mcp_run_enrichment`): on the up-/down-gene
    sets of each perturbation with a substantial DE result. Send gene SYMBOLS only.
 8. **(Optional) Group perturbations by transcriptional effect.** Perturbations with correlated DE
    signatures (or small pairwise E-distance) likely act in a **shared pathway / module** — the
    `perturbation_edistance.py` template can also emit a pairwise perturbation×perturbation E-distance
    matrix for this. Frame shared modules as hypotheses.
-9. **(Optional) Literature context** (`literature_search`): for the strongest hits, pull real
+9. **(Optional) Literature context** (`mcp_literature_search`): for the strongest hits, pull real
    citations linking the perturbed gene to the observed program. Cite only what the tool returns.
 
 Plan no other report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.

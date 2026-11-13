@@ -13,10 +13,9 @@ import zlib
 
 import pytest
 
-from aiscientist.tools.inspect_dataset.tool import (
+from aiscientist.tools._lib.dataset_inspection import (
     describe_dataset,
     inspect_dataset,
-    make_inspect_dataset_tool,
     peek_dataset,
 )
 
@@ -343,38 +342,12 @@ def test_inspect_dataset_combines_peek_and_description(tmp_path):
     assert out["raw_data_to_llm"] is False
 
 
-def test_tool_schema_and_metadata_follow_the_pattern():
-    tool = make_inspect_dataset_tool()
-    assert tool.name == "inspect_dataset"
-    fn = tool.schema()["function"]
-    assert fn["name"] == "inspect_dataset" and fn["description"]
-    assert "path" in fn["parameters"]["properties"]
-    assert tool.reads_private_data is True
-    assert isinstance(tool.requires, tuple)
 
 
-def test_tool_runs_without_a_served_model(tmp_path):
-    """ctx with no tunnel_port (tests, or a session before the GPU is up) -> peek + deterministic
-    description, not a crash and not an LLM call."""
-    tool = make_inspect_dataset_tool()
-    path = _write(tmp_path, "case.vcf", _VCF)
-    out = tool.executor({"path": path}, _Ctx(tunnel_port=None, workspace=tmp_path))
-    assert out["status"] == "ok"
-    assert out["description"]["source"] == "deterministic"
-    assert out["peek"]["vcf"]["assembly"] == "GRCh37"
 
 
-def test_tool_reads_bound_dataset_when_no_path_arg(tmp_path):
-    path = _write(tmp_path, "bound.vcf", _VCF)
-    tool = make_inspect_dataset_tool()
-    out = tool.executor({}, _Ctx(tunnel_port=None, decisions={"dataset_path": path}))
-    assert out["peek"]["name"] == "bound.vcf"
 
 
-def test_tool_errors_without_any_path():
-    out = make_inspect_dataset_tool().executor({}, _Ctx(tunnel_port=None))
-    assert out["status"] == "error"
-    assert "path" in out["error"]
 
 
 def test_hdf5_array_attributes_of_bytes_come_back_as_text():
@@ -382,7 +355,7 @@ def test_hdf5_array_attributes_of_bytes_come_back_as_text():
     # whole lab run when the result was serialised for the model (2026-10-02).
     import json
     import numpy as np
-    from aiscientist.tools.inspect_dataset.tool import _scalar
+    from aiscientist.tools._lib.dataset_inspection import _scalar
     out = _scalar(np.array([b"GSE188280_GSM5676874_0715_Macula_Retina"]))
     assert out == ["GSE188280_GSM5676874_0715_Macula_Retina"]
     assert _scalar(np.array([[b"a", b"b"]])) == [["a", "b"]]

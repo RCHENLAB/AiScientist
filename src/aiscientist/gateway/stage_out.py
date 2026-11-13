@@ -99,6 +99,9 @@ def list_remote_files(ex: Any, root: str) -> "list[tuple[str, int]]":
         clean = safe_rel(rel)
         if clean is None or not size.isdigit():
             raise OSError(f"unexpected file name in {root}: {rel!r}")
+        if clean.split("/", 1)[0].startswith(".mcp-cellqc-"):
+            raise OSError("CellQC result publication is incomplete; collect the completed task again "
+                          "before exporting this run. The remote results are retained.")
         out.append((clean, int(size)))
     return sorted(out)
 

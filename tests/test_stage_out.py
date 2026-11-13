@@ -119,6 +119,20 @@ def _hpc_run(tmp_path: Path, run_id: str = "run1", *, at: "str | Path | None" = 
     return run
 
 
+@pytest.mark.parametrize("directory", [".mcp-cellqc-pending", ".mcp-cellqc-old-backup"])
+def test_interrupted_cellqc_publication_is_not_exported_as_a_result(tmp_path, directory):
+    remote = _hpc_run(tmp_path)
+    pending = remote / "result" / directory
+    pending.mkdir()
+    (pending / "matrix.h5ad").write_bytes(b"unfinished publication")
+    local = tmp_path / "gateway"
+    ex = _HPC()
+    result = stage_out.stage_out_run(ex, ex.pull, run_id="run1", run_dir=local, remote_run=str(remote))
+    assert result["status"] == "failed" and "publication is incomplete" in result["error"]
+    assert not (local / "result").exists() and not (local / "stage_out.json").exists()
+    assert (remote / "result/cellqc/lib1/lib1.h5ad").is_file()
+
+
 def _server_run(tmp_path: Path, hpc_run: Path, run_id: str = "run1", *, saved: "dict | None" = None) -> Path:
     """The run's folder on the server with its records of what it handed on (on HPC3)."""
     run_dir = tmp_path / "runs" / "tester" / run_id

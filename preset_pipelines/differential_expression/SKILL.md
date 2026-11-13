@@ -2,37 +2,37 @@
 name: differential_expression
 version: 2
 description: Compare an experimental condition vs control (e.g. KO vs WT) per cell type, with pathway interpretation (v2 — pseudobulk when replicates exist, and honest about it when they don't)
-tools: run_scanpy_qc, run_cellqc, run_clustering, run_de, run_pseudobulk_de, run_depth_matched_de, run_composition, run_enrichment, run_gsea_prerank, deep_literature, run_code
+tools: mcp_run_scanpy_qc, mcp_run_cellqc, mcp_run_clustering, mcp_run_de, mcp_run_pseudobulk_de, mcp_run_depth_matched_de, mcp_run_composition, mcp_run_enrichment, mcp_run_gsea_prerank, mcp_deep_literature, run_code
 data_type: scrna
 outputs:
   - path: tables/de_*_all.csv
     kind: table
-    tool: run_de
+    tool: mcp_run_de
     description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
     required: true
   - path: figures/volcano_*.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
     required: false
   - path: figures/dotplot__markers.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
     required: false
   - path: tables/pseudobulk_all.csv
     kind: table
-    tool: run_pseudobulk_de
+    tool: mcp_run_pseudobulk_de
     description: Pseudobulk condition contrast tested across samples, one row per gene and cell type with log2 fold change, p-value, adjusted p-value and test statistic, the top 500 genes of each tested cell type.
     required: true
   - path: tables/composition*.csv
     kind: table
-    tool: run_composition
+    tool: mcp_run_composition
     description: Cell-type proportions, pooled when no sample column is given, otherwise per sample, plus per condition and a centred-log-ratio test between the arms when each arm has at least two samples.
     required: true
   - path: tables/enrichment_*.csv
     kind: table
-    tool: run_enrichment
+    tool: mcp_run_enrichment
     description: Over-representation results per group, split into up- and down-regulated halves for a contrast, with term, gene-set library, adjusted p-value, combined score and overlap.
     required: true
 ---
@@ -49,12 +49,12 @@ genes** was made different between the arms:
 
 | test | called significant (padj<0.05) |
 |---|---|
-| `run_de`, Wilcoxon over cells | **310 of 400 (78%)** |
-| `run_pseudobulk_de`, over donors | 0 (and it ranked the true gene #1) |
+| `mcp_run_de`, Wilcoxon over cells | **310 of 400 (78%)** |
+| `mcp_run_pseudobulk_de`, over donors | 0 (and it ranked the true gene #1) |
 
-So: **use `run_pseudobulk_de` for a condition contrast whenever the data has ≥2 samples per
-arm.** `run_de` at its default (`reference="rest"`) is for markers — one cluster versus the rest
-within a sample — which is what it is valid for. `run_de` can also run a real cell-level contrast
+So: **use `mcp_run_pseudobulk_de` for a condition contrast whenever the data has ≥2 samples per
+arm.** `mcp_run_de` at its default (`reference="rest"`) is for markers — one cluster versus the rest
+within a sample — which is what it is valid for. `mcp_run_de` can also run a real cell-level contrast
 (`reference=<control level>`, `stratify_by=<cell-type column>`), but that inherits the
 pseudoreplication above: use it only when there are no replicates, and label it as an exploratory
 ranking rather than differential expression.
@@ -71,7 +71,7 @@ The dataset profile gives you the median counts per cell for each arm. **Compare
 plan.** If they differ by more than ~1.3x, the plan MUST contain a depth-matched check, because
 with one library per arm there is no replication that could separate depth from biology.
 
-`run_depth_matched_de` is that check as a deterministic tool: within each cell type it down-samples
+`mcp_run_depth_matched_de` is that check as a deterministic tool: within each cell type it down-samples
 the deeper arm quantile by quantile until the per-cell UMI distributions match (never up-sampling),
 re-runs the SAME contrast, and Spearman-correlates the original ranking against the matched one,
 separately per direction. High rho = not an artefact. Rho near zero = depth decided the ranking.
@@ -105,7 +105,7 @@ obs columns + their category values are given to you at planning time) and infer
 3. **The cell-type stratification.** If obs already has a cell-type / cluster label column
    (`majorclass`, `celltype`, a predicted-label column), REUSE it — run the comparison
    SEPARATELY WITHIN EACH cell type. Do NOT re-cluster or re-annotate from scratch. Only if no
-   label column exists do you `run_clustering` first and compare across clusters.
+   label column exists do you `mcp_run_clustering` first and compare across clusters.
 
 So the default study for a dataset with a 2-group condition column + existing cell-type labels is:
 **"condition vs control differential expression within each major cell type, then pathway
@@ -135,7 +135,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
      - **Not counts.** Any negative or non-integer value, row sums that do not reproduce the
        stored totals, or a differently-scaled representation present. Then say so and drop the
        count-dependent steps — never recover counts by exponentiating, rounding, or renaming.
-     Count-based tests (`run_pseudobulk_de`, `run_depth_matched_de`) need the first ruling; say
+     Count-based tests (`mcp_run_pseudobulk_de`, `mcp_run_depth_matched_de`) need the first ruling; say
      which one you applied and which representation supports which operation.
    * *The decision rule.* Name the primary estimand, the unit of replication, the minimum cells
      per arm per cell type, and the effect-size gate — and write them down NOW, while no DE
@@ -144,7 +144,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
      relaxed until it passes. Most of these numbers already have defaults in the Parameters
      table below — this step is about COMMITTING to them (and to any change, with its reason)
      before the results can influence the choice.
-1. **QC** (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
+1. **QC** (`mcp_run_scanpy_qc` for one matrix; `mcp_run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter, normalize + log1p (+ HVG). Report counts.
    Honor any QC columns already in the data (e.g. `percent.mt`, doublet calls).
 2. **Define the comparison** from the profile (above): name the condition column, the two groups,
    the reference group, and the cell-type column you will stratify by. If labels already exist,
@@ -153,7 +153,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    First find the SAMPLE column (donor / animal / library / `orig.ident`), which is usually a
    different column from the condition. Then:
 
-   - **≥2 samples per arm → `run_pseudobulk_de`** with `sample_key`, `condition_key`, and
+   - **≥2 samples per arm → `mcp_run_pseudobulk_de`** with `sample_key`, `condition_key`, and
      `group_key` = the cell-type column. It aggregates counts per sample, tests across
      samples, and returns `skipped_groups` for any cell type without enough samples. Report
      those skips — "we could not test this cell type" is a finding about the study.
@@ -168,14 +168,14 @@ enrichment on the changed genes"** — plan that without waiting for the user to
      step: there are no donors to aggregate over and the step cannot execute. Either state plainly
      that the comparison is DESCRIPTIVE — effect sizes and ranked genes only, no inferential claim,
      because nothing in the data separates the condition from the individual — or, if a cell-level
-     ranking is still wanted, run `run_de(groupby=<condition column>, reference=<control level>,
+     ranking is still wanted, run `mcp_run_de(groupby=<condition column>, reference=<control level>,
      stratify_by=<cell-type column>)` and label it as exploratory ranking, not differential
      expression. Say the unit of replication in the plan itself, so the reader sees it before the
      result rather than after.
    - Skip / flag any cell type with too few cells in either group. Both tools do this for you
      and return `skipped_groups` — carry that into the report.
 
-   **Never hand-write this contrast in `run_code` when a tool covers it.** `run_de` with
+   **Never hand-write this contrast in `run_code` when a tool covers it.** `mcp_run_de` with
    `reference` + `stratify_by` IS the stratified condition-vs-control comparison; leaving
    `reference` at its default silently gives one-vs-rest MARKERS instead, which look like a DEG
    table and are not one. A dataset that already carries labels needs QC only — do not add a
@@ -189,27 +189,27 @@ enrichment on the changed genes"** — plan that without waiting for the user to
    `de_<cell-type column>_all.csv` + `_universe.txt` writes — step 4 discovers DE results by
    exactly those names.
 
-3b. **Composition** (`run_composition`): whether cell-type PROPORTIONS shift between the arms is
+3b. **Composition** (`mcp_run_composition`): whether cell-type PROPORTIONS shift between the arms is
    a different question from which genes change, and is often the more visible effect. Same
    replication rule — it needs ≥2 samples per arm to test, and reports proportions without a
    test otherwise.
-4. **Pathway interpretation per cell type**: `run_enrichment` (ORA on the changed genes, tested
-   against the real universe) and `run_gsea_prerank` (over the whole ranking, signed NES).
+4. **Pathway interpretation per cell type**: `mcp_run_enrichment` (ORA on the changed genes, tested
+   against the real universe) and `mcp_run_gsea_prerank` (over the whole ranking, signed NES).
    **Name the gene-set libraries in the step** — the defaults are `GO_Biological_Process_2023`,
    `Reactome_2022` and `MSigDB_Hallmark_2020` (KEGG is deliberately not a default: its GMT
    redistribution is licence-restricted). "Run pathway enrichment" without naming a library leaves
    the executor to choose one, which is the PI's call, not the executor's. They
    use different inputs and different nulls — do NOT require them to agree, and keep null
    results. Call both with **no `genes` argument**: step 3 wrote `tables/de_<key>_all.csv`
-   (`de_pseudobulk_<cell-type column>_all.csv` from `run_pseudobulk_de`, which they prefer when a
-   cell-level `run_de` table exists too) and they find it, run ORA per cell type, and split each
+   (`de_pseudobulk_<cell-type column>_all.csv` from `mcp_run_pseudobulk_de`, which they prefer when a
+   cell-level `mcp_run_de` table exists too) and they find it, run ORA per cell type, and split each
    into its up- and down-regulated halves.
    Pasting a pooled gene list collapses every cell type into one `input` group and drops the
    tested-universe background, which inflates every p-value. Check the result: `background_source`
    must be `tested_universe`, not `constant_fallback`.
 5. **Cross-cell-type synthesis.** Find genes changed in the SAME direction across ≥2 cell types
    (a shared / pan-tissue signature) vs cell-type-specific changes.
-5b. **Literature grounding** (`deep_literature`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+5b. **Literature grounding** (`mcp_deep_literature`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
    When it is planned: after the DE and pathway results exist, ground
    the surviving findings in published work. The query is built from what the analysis ACCEPTED —
    the actual genes, cell types and pathways — not from the user's original question, so this step
@@ -222,7 +222,7 @@ enrichment on the changed genes"** — plan that without waiting for the user to
 ## When this protocol and the question disagree
 
 A researcher can ask for something this protocol advises against — most often by naming a tool and
-its arguments directly ("run `run_de` with groupby=<condition>"). Do NOT silently pick one and
+its arguments directly ("run `mcp_run_de` with groupby=<condition>"). Do NOT silently pick one and
 proceed, and do NOT silently plan both and let them contradict each other in the same plan.
 
 Do this instead: **follow the request**, and in the same plan say — in its `self_sourced` disclosure —
@@ -241,7 +241,7 @@ Leave a parameter alone unless the dataset gives you a reason to change it; when
 say so and say why in the plan's `self_sourced` disclosure, because a number chosen for one run reads
 exactly like a protocol-mandated one once it reaches a Methods section.
 
-**`run_scanpy_qc`**
+**`mcp_run_scanpy_qc`**
 
 | parameter | default | what it does |
 | --- | --- | --- |
@@ -253,7 +253,7 @@ exactly like a protocol-mandated one once it reaches a Methods section.
 | `mito_prefix` | `"MT-"` | the name prefix that marks a mitochondrial gene, matched without regard to case, so the default also covers mouse 'mt-'. It is the only way `max_pct_mt` knows which genes to count: a dataset whose genes match nothing gets no mitochondrial filter at all |
 | `gene_symbols_key` | `""` | a `var` column holding gene SYMBOLS, for data whose gene names are Ensembl IDs (cellxgene files keep the symbols in `feature_name`). The mitochondrial prefix is then matched against that column. Empty = match the gene names themselves |
 
-**`run_clustering`**
+**`mcp_run_clustering`**
 
 | parameter | default | what it does |
 | --- | --- | --- |
@@ -266,7 +266,7 @@ exactly like a protocol-mandated one once it reaches a Methods section.
 | `stability_min` | `0.9` | minimum adjusted Rand index a resolution must clear to be called stable |
 | `max_sweep_cells` | `20000` | cap on the cells used for the stability sweep |
 
-**`run_de`**
+**`mcp_run_de`**
 
 | parameter | default | what it does |
 | --- | --- | --- |
@@ -282,7 +282,7 @@ exactly like a protocol-mandated one once it reaches a Methods section.
 | `lfc` | `0.25` | minimum abs log2 fold-change for calling a gene significant — applied together with `padj`, and drawn as the volcano's vertical line. 0.25 is the single-cell convention (Seurat's FindMarkers threshold); 1.0 is a bulk-RNA habit and hides most real single-cell effects |
 | `force` | `false` | run a pooled per-cell test across a CONDITION column anyway. The result is pseudoreplicated and must be reported as non-inferential |
 
-**`run_pseudobulk_de`**
+**`mcp_run_pseudobulk_de`**
 
 | parameter | default | what it does |
 | --- | --- | --- |
@@ -291,13 +291,13 @@ exactly like a protocol-mandated one once it reaches a Methods section.
 | `min_count` | `10` | a gene must reach this many summed counts in at least as many samples as the smaller arm, or it is not tested (edgeR filterByExpr's rule of thumb). Genes nobody detected cannot be tested — they only inflate the BH denominator |
 | `padj` | `0.05` | adjusted-p (Benjamini-Hochberg) cutoff used to count significant genes |
 
-**`run_enrichment`**
+**`mcp_run_enrichment`**
 
 | parameter | default | what it does |
 | --- | --- | --- |
 | `top_n_genes` | `0` | optional cap on how many genes enter the over-representation test. 0 means no cap — use every gene passing the thresholds below, which is the standard way ORA is run. Set it only to deliberately shorten a very long list, and say that you did |
 | `top_n_terms` | `10` | how many enriched terms to report per group |
-| `padj` | `0.05` | adjusted-p cutoff a DE gene must clear to enter the test — the same Benjamini-Hochberg cutoff run_de applies |
+| `padj` | `0.05` | adjusted-p cutoff a DE gene must clear to enter the test — the same Benjamini-Hochberg cutoff mcp_run_de applies |
 | `lfc` | `0.25` | minimum |log2 fold-change| a DE gene must clear to enter the test. Pairing an effect-size floor with the p-value cutoff is what keeps a list of thousands of barely-changed genes from returning only large generic terms; 0.25 is the single-cell convention |
 
 ## Grounding
@@ -307,12 +307,13 @@ claim in the DE / enrichment statistics the tools returned — never fabricate g
 or pathways. State the reference group and any cell types skipped for low cell count. Frame biology
 as hypotheses to validate, not established fact.
 
-**Pathway analysis: use `run_enrichment` / `run_gsea_prerank` when the design supports them, and
+**Pathway analysis: use `mcp_run_enrichment` / `mcp_run_gsea_prerank` when the design supports them, and
 when it does not, still take the gene sets from disk.** Both tools read `.gmt` libraries that are
-ALREADY ON DISK next to the tools — GO_Biological_Process_2023, Reactome_2022, MSigDB_Hallmark_2020
-(`AISCIENTIST_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
-consume `run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
-replication forbids exactly those p-values and therefore often skips `run_de` entirely, which
+configured by the operator under `SCRNA_GENESETS_DIR` — for example GO_Biological_Process_2023,
+Reactome_2022 and MSigDB_Hallmark_2020 — offline, no download, no network. Confirm the required
+local GMT files are available; report a missing library without inventing results or downloading it. But both also
+consume `mcp_run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
+replication forbids exactly those p-values and therefore often skips `mcp_run_de` entirely, which
 leaves both tools unusable through no fault of the plan. That is NOT a reason to go to the network:
 run 3c5fbc8608a7 hand-rolled a p-value-free pathway score, went looking for a collection to fetch,
 hit the confirmation guarding downloads from non-allowlisted hosts, was declined, and recorded

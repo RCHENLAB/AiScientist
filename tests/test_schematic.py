@@ -21,7 +21,7 @@ import zlib
 
 import pytest
 
-from aiscientist.tools.make_schematic import tool as schematic
+from aiscientist.tools._lib import schematics as schematic
 
 needs_dot = pytest.mark.skipif(shutil.which("dot") is None, reason="graphviz not installed")
 
@@ -219,36 +219,3 @@ def test_the_production_strip_is_gone(tmp_path):
              "**Ambient rod-leak audit** \u2014 " + "Using the normalised checkpoint. " * 16]
     out = schematic.render_workflow_schematic(steps, tmp_path, title="Research workflow")
     assert out["per_row"] == 1 and out["width"] < 700 and out["height"] > out["width"]
-
-
-def test_make_schematic_tool_renders_into_figure_gallery(tmp_path, monkeypatch):
-    monkeypatch.setattr(schematic.shutil, "which", lambda _n: "/usr/bin/dot")
-    monkeypatch.setattr(schematic.subprocess, "run",
-                        lambda cmd, **k: (open(cmd[cmd.index("-o") + 1], "wb").write(b"PNG"),
-                                          types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
-    tool = schematic.make_schematic_tool()
-    assert tool.name == "make_schematic" and tool.reads_private_data is False
-    ctx = types.SimpleNamespace(workspace=tmp_path)
-    out = tool.executor({"source": "digraph { A -> B }", "basename": "path/way!"}, ctx)
-    assert out["status"] == "ok"
-    # lands under artifacts/figures with a sanitized, namespaced filename
-    assert out["figure"].startswith("figures/schematic_pathway")
-    assert (tmp_path / "artifacts" / "figures").is_dir()
-
-
-def test_make_schematic_draws_dot_only(tmp_path):
-    """D2 and Mermaid were offered once, but neither binary was ever on the gateway: every such call
-    failed. The model is now offered DOT alone, and an old caller asking for another engine is told
-    to write DOT instead of getting a dependency error."""
-    tool = schematic.make_schematic_tool()
-    assert "engine" not in tool.parameters["properties"]
-    for engine in ("d2", "mermaid"):
-        out = tool.executor({"source": "a -> b", "engine": engine}, types.SimpleNamespace(workspace=tmp_path))
-        assert out["status"] == "error" and "Graphviz DOT" in out["error"]
-    assert not (tmp_path / "artifacts").exists()                  # nothing was written
-
-
-def test_make_schematic_tool_rejects_empty_source(tmp_path):
-    tool = schematic.make_schematic_tool()
-    out = tool.executor({"source": "  "}, types.SimpleNamespace(workspace=tmp_path))
-    assert out["status"] == "error"

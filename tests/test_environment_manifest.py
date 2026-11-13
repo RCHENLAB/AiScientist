@@ -34,9 +34,14 @@ def test_every_tool_resolves_to_a_real_source_location():
     locations at all — which looks fine until you try to use it."""
     tools = tool_index()
     assert tools, "the catalog is empty"
-    unresolved = [t["name"] for t in tools if not t["source"]]
+    unresolved = [t["name"] for t in tools if not t["source"] and "mcp" not in t]
     assert not unresolved, f"no source location for: {unresolved}"
     for t in tools:
+        if "mcp" in t:
+            assert t["source"] == "" and t["available"] is None and not t["enabled"]
+            assert "@sha256:" in t["mcp"]["image"] and t["entrypoint"]
+            assert "authorized session" in t["availability_note"]
+            continue
         path, _, line = t["source"].rpartition(":")
         assert (REPO / path).is_file(), f"{t['name']} -> {path} does not exist"
         assert int(line) > 0
@@ -44,24 +49,21 @@ def test_every_tool_resolves_to_a_real_source_location():
 
 
 def test_an_hpc_routed_tool_is_located_at_its_own_tool_py():
-    """A tool routed to HPC3 is registered with the registry's dispatcher as its executor; its
-    location must still be the tool's own folder, not agents/registry.py."""
-    from aiscientist.agents.registry import _HPC_ANALYSIS_TOOLS, build_scientist_catalog
+    from aiscientist.agents.registry import _route_to_executor
+    from aiscientist.tools.sdk import HarnessTool
+    from native_tool_fixtures import _executor
+    from types import SimpleNamespace
+    original = HarnessTool("fixture_job", "A test-only HPC callable", {}, _executor("fixture_job"))
+    routed = _route_to_executor(original, SimpleNamespace(run_tool=lambda *args: {}), (original.name,))
+    tool = tool_index([routed])[0]
+    assert tool["source"].startswith("tests/native_tool_fixtures.py:")
+    assert "registry.py" not in tool["source"]
 
-    class _Line:
-        def run_tool(self, name, args, ctx):
-            return {}
-
-    tools = {t["name"]: t for t in tool_index(build_scientist_catalog(analysis_executor=_Line()))}
-    assert tools["run_enrichment"]["source"].startswith("src/aiscientist/tools/run_enrichment/tool.py:")
-    wrong = {n: tools[n]["source"] for n in _HPC_ANALYSIS_TOOLS
-             if n in tools and not tools[n]["source"].startswith(f"src/aiscientist/tools/{n}/")}
-    assert not wrong, wrong
 
 def test_the_gene_sets_that_caused_the_failure_are_in_the_inventory():
     items = {a["label"]: a for a in asset_inventory()}
     gmt = next(a for k, a in items.items() if "Gene-set" in k)
-    assert gmt["where"] == "gateway"
+    assert gmt["where"] == "hpc3"
     # The note must state the two facts the pathway step lacked: they are read offline, and a
     # hand-computed summary should use these same files instead of fetching a collection.
     note = " ".join(gmt["note"].split())
@@ -79,7 +81,6 @@ def test_model_and_container_paths_come_from_the_live_settings():
     assert st.scgpt_model_dir in paths
     assert st.vlreview_model_dir in paths
     assert st.analysis_image in paths
-    assert st.scgpt_image in paths
 
 
 def test_readability_reflects_the_sessions_roots_not_a_guess():
@@ -91,7 +92,7 @@ def test_readability_reflects_the_sessions_roots_not_a_guess():
     # that made the scGPT step withhold inference.
     m = environment_manifest(st, read_roots=(f"{shared}/containers",), write_roots=())
     by_path = {a["path"]: a for a in m["assets"]}
-    assert by_path[st.scgpt_image]["agent_readable"] is True
+    assert by_path[st.analysis_image]["agent_readable"] is True
     assert by_path[st.scgpt_model_dir]["agent_readable"] is False
 
     text = render_for_agent(m, "assets")
@@ -119,7 +120,7 @@ def test_agent_rendering_is_non_empty_for_every_section(section):
 
 def test_the_markdown_carries_the_tool_locations():
     md = render_markdown(environment_manifest())
-    assert "src/aiscientist/tools/run_de/tool.py:" in md
+    assert "src/aiscientist/agents/research_lab.py:" in md
     assert "regenerate it" in md            # the doc says not to hand-edit it
     assert "| tool | what it does | source | available |" in md
 
@@ -134,3 +135,13 @@ def test_describe_environment_is_offered_to_the_scientist():
     # The description has to say WHEN to call it, or a step that needs it will not think to.
     desc = " ".join(tool.description.split())
     assert "before downloading anything that might already be on disk" in desc
+
+
+def test_native_inventory_reports_a_pin_and_requires_session_authorization():
+    manifest = environment_manifest()
+    tool = next(t for t in manifest["tools"] if t["name"] == "mcp_run_scanpy_qc")
+    assert not tool["enabled"] and tool["available"] is None and not tool["source"]
+    text = render_for_agent(manifest, "tools")
+    assert tool["mcp"]["image"] in text
+    assert "DECLARED; SESSION AVAILABILITY NOT CHECKED" in text
+    assert "session required" in render_markdown(manifest)

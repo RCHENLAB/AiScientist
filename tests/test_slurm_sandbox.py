@@ -7,6 +7,8 @@ from ``cat``. No real Slurm, no SSH.
 
 from __future__ import annotations
 
+import pytest
+
 from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 from aiscientist.gateway.executor import ExecResult
 
@@ -343,12 +345,84 @@ class _ScriptHPC(FakeHPC):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.scripts: list[str] = []
+        self.commands: list[str] = []
 
     def exec(self, command, timeout=60.0):
+        self.commands.append(command)
         # main runs containers with apptainer since 2026-10-09; older settings still say singularity
         if "apptainer" in command or "singularity" in command:
             self.scripts.append(command)
         return super().exec(command, timeout)
+
+
+def test_environment_complete_results_are_explicitly_persisted_without_site_binds():
+    hpc = _ScriptHPC({".out": "", ".err": "", ".rc": "0\n"})
+    executor = _executor(hpc)
+    result = executor.run_command("python -m aiscientist_mcp.cellqc.server", workdir="env/qc-cellranger-with-mcp")
+    assert result["status"] == "ok"
+    script = "\n".join(hpc.scripts)
+    # The source is under the existing work bind; publication is on the exact sibling bind.
+    assert "-B /dfs/lab/run/work:/dfs/lab/run/work" in script
+    assert "-B /dfs/lab/run/result:/dfs/lab/run/result" in script
+    assert "-B /dfs/lab/run:/dfs/lab/run" not in script
+    assert "-B /dfs/lab:/dfs/lab" not in script
+    prepare = next(cmd for cmd in hpc.commands if cmd.startswith("mkdir -p /dfs/lab/run/result"))
+    assert "test -d /dfs/lab/run/result && test ! -L /dfs/lab/run/result" in prepare
+    assert hpc.commands.index(prepare) < next(i for i, cmd in enumerate(hpc.commands) if cmd.startswith("sbatch"))
+    assert "AISCIENTIST_ENV_DIR=/dfs/lab/run/work/env/qc-cellranger-with-mcp" in script
+
+
+@pytest.mark.parametrize("work,artifacts", [
+    ("/work", "/artifacts"),
+    ("/dfs/run-one/work", "/dfs/run-two/artifacts"),
+    ("relative/work", "relative/artifacts"),
+    ("/dfs/../run/work", "/dfs/../run/artifacts"),
+])
+def test_result_binding_never_guesses_a_parent_for_unrelated_or_root_paths(work, artifacts):
+    hpc = _ScriptHPC({".out": "", ".err": "", ".rc": "0\n"})
+    executor = SlurmCodeExecutor(remote=hpc, container_image="/img.sif", scratch_dir=SCRATCH,
+                                work_dir=work, artifacts_dir=artifacts, startup_timeout_s=5,
+                                run_timeout_s=5)
+    assert executor.run_command("true", workdir="env/example")["status"] == "ok"
+    assert not any("/result" in cmd for cmd in hpc.commands)
+
+
+def test_unavailable_or_linked_result_directory_fails_before_submitting():
+    class RefusedResult(_ScriptHPC):
+        def exec(self, command, timeout=60.0):
+            if command.startswith("mkdir -p /dfs/lab/run/result"):
+                return ExecResult(command, 1, "", "result directory unavailable or a symlink")
+            return super().exec(command, timeout)
+
+    hpc = RefusedResult({".rc": "0\n"})
+    result = _executor(hpc).run_command("true", workdir="env/example")
+    assert result["status"] == "error" and "result directory" in result["error"]
+    assert hpc.submits == []
+
+
+def test_real_result_symlink_is_refused_before_any_job(tmp_path):
+    import subprocess
+    from shlex import quote
+
+    run = tmp_path / "run"
+    run.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (run / "result").symlink_to(outside, target_is_directory=True)
+
+    class MetadataHPC(_ScriptHPC):
+        def exec(self, command, timeout=60.0):
+            if command.startswith(f"mkdir -p {quote(str(run / 'result'))}"):
+                completed = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+                return ExecResult(command, completed.returncode, completed.stdout, completed.stderr)
+            return super().exec(command, timeout)
+
+    hpc = MetadataHPC({".rc": "0\n"})
+    executor = SlurmCodeExecutor(remote=hpc, container_image="/img.sif", scratch_dir=SCRATCH,
+                                work_dir=str(run / "work"), artifacts_dir=str(run / "artifacts"))
+    result = executor.run_command("true", workdir="env/example")
+    assert result["status"] == "error" and hpc.submits == []
+    assert (run / "result").is_symlink() and list(outside.iterdir()) == []
 
 
 def test_other_bound_files_are_bound_read_only_and_exported():

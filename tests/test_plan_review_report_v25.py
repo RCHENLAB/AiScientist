@@ -28,18 +28,18 @@ from aiscientist.agents.research_lab import (
     resolve_plan_reference,
     stale_downstream_settings,
 )
-from aiscientist.agents.registry import build_scientist_catalog
+from native_tool_fixtures import fixture_catalog
 
 
 # The plan the report ran nearly everything against: a real production draft, verbatim in shape.
 BASE_PLAN = [
-    "**QC & normalization** — Assess each cell's quality with `run_scanpy_qc`, filtering at "
+    "**QC & normalization** — Assess each cell's quality with `mcp_run_scanpy_qc`, filtering at "
     "percent.mt > 10 and keeping the top 2000 highly-variable genes.",
     "**Differential expression per majorclass** — Contrast DDX41 versus WT within each cell type "
-    'using `run_de(stratify_by="majorclass", reference="WT", padj=0.05)`.',
-    "**Pathway enrichment** — Test the significant genes with `run_enrichment(padj=0.05)` against "
+    'using `mcp_run_de(stratify_by="majorclass", reference="WT", padj=0.05)`.',
+    "**Pathway enrichment** — Test the significant genes with `mcp_run_enrichment(padj=0.05)` against "
     "the measured universe.",
-    "**Coordinated pathway shifts (GSEA)** — Walk the full ranking with `run_gsea_prerank`.",
+    "**Coordinated pathway shifts (GSEA)** — Walk the full ranking with `mcp_run_gsea_prerank`.",
 ]
 
 
@@ -73,34 +73,34 @@ def test_stripping_the_ordinal_leaves_real_prose_alone(text):
 # "计划中出现未注册的工具名与非法参数值" — in a revision AND in a plan nobody had edited.
 
 def test_the_three_production_tooling_defects_are_caught_before_approval():
-    catalog = build_scientist_catalog(code_executor=None)
+    catalog = fixture_catalog()
     agenda = [
         # From a C-group baseline plan that had NEVER been revised.
         "Compare DDX41 versus WT within each majorclass using `run_scanpy_de` (Wilcoxon).",
         # From B7, the in-place revision path.
         'Aggregate with run_pseudobulk(groupby="sampleid", groupby_col="majorclass") then '
-        'compare with run_de(groupby="sampleid", reference="WT", method="DESeq2").',
+        'compare with mcp_run_de(groupby="sampleid", reference="WT", method="DESeq2").',
     ]
     fixed, findings = check_plan_tooling(agenda, catalog)
     by_kind = {(f["kind"], f["tool"]): f["detail"] for f in findings}
 
     # Names with exactly one obvious referent are corrected, and the correction is announced.
-    assert by_kind[("renamed", "run_scanpy_de")] == "run_de"
-    assert by_kind[("renamed", "run_pseudobulk")] == "run_pseudobulk_de"
-    assert "`run_de`" in fixed[0] and "run_scanpy_de" not in fixed[0]
+    assert by_kind[("renamed", "run_scanpy_de")] == "mcp_run_de"
+    assert by_kind[("renamed", "run_pseudobulk")] == "mcp_run_pseudobulk_de"
+    assert "`mcp_run_de`" in fixed[0] and "run_scanpy_de" not in fixed[0]
 
     # An invented argument name is reported against the tool that does not declare it.
-    assert ("unknown_param", "run_pseudobulk_de") in by_kind
+    assert "groupby_col" in by_kind[("bad_value", "mcp_run_pseudobulk_de")]
 
     # A value outside the closed set — scanpy has no DESeq2 backend, so this could only fail at
     # run time, after the reviewer had committed the compute.
-    assert "DESeq2" in by_kind[("bad_value", "run_de")]
-    assert "wilcoxon" in by_kind[("bad_value", "run_de")]
+    assert "DESeq2" in by_kind[("bad_value", "mcp_run_de")]
+    assert "wilcoxon" in by_kind[("bad_value", "mcp_run_de")]
 
 
 def test_a_correct_plan_produces_no_tooling_findings():
     """The check must be silent on a good plan, or its warnings stop being read."""
-    _, findings = check_plan_tooling(BASE_PLAN, build_scientist_catalog(code_executor=None))
+    _, findings = check_plan_tooling(BASE_PLAN, fixture_catalog())
     assert findings == []
 
 
@@ -169,7 +169,7 @@ def test_a_redraft_reports_the_steps_and_numbers_it_changed_on_its_own():
         BASE_PLAN[0],
         BASE_PLAN[1],
         # same step, reworded, with padj quietly moved
-        "**Pathway enrichment** — Test the significant genes with `run_enrichment(padj=0.01)` "
+        "**Pathway enrichment** — Test the significant genes with `mcp_run_enrichment(padj=0.01)` "
         "against the measured universe.",
         # the GSEA step is gone
     ]
@@ -288,7 +288,7 @@ def test_a_packaging_step_whose_verb_is_innocent_is_still_pruned():
     """Live run 2, step 8 of 8. The busywork guard keys on a VERB, and this plan opened with
     "Generate" — which is also how a real analysis step opens — so nothing fired. It then ran 8
     run_code turns over 54 s and wrote two summary CSVs, while every figure it promised was
-    already on disk: `run_de` writes the volcanoes and `run_enrichment` writes the bar plots. The
+    already on disk: `mcp_run_de` writes the volcanoes and `mcp_run_enrichment` writes the bar plots. The
     reliable signal is the stated PURPOSE — no genuine analysis step exists in order to be put in
     the report."""
     from aiscientist.agents.research_lab import _is_report_busywork
@@ -306,17 +306,17 @@ def test_a_packaging_step_whose_verb_is_innocent_is_still_pruned():
 @pytest.mark.parametrize("step", [
     # Every analysis step from the two live plans that mentions figures, tables or reporting.
     "**Clustering & UMAP** — Group the cells into transcriptionally distinct populations with "
-    "`run_clustering` and lay them out on a 2-D map, so the major cell types present in the "
+    "`mcp_run_clustering` and lay them out on a 2-D map, so the major cell types present in the "
     "tissue can be seen, separated, and counted.",
     "**Cell-type composition shift** — Assess whether the relative abundance of each major cell "
-    "class differs between conditions with `run_composition`, computing the proportion of cells "
+    "class differs between conditions with `mcp_run_composition`, computing the proportion of cells "
     "assigned to each `majorclass` level. The tool will report the observed proportions and "
     "centered-log-ratio (CLR) values but will not perform a formal statistical test.",
     "**Cross-cell-type synthesis** — Identify a shared pan-tissue transcriptional signature by "
     "running `run_code` to extract the DE tables across all tested cell types. Output the shared "
     "gene lists to `tables/shared_deg_up.csv` and `tables/shared_deg_down.csv`.",
     "**Exploratory expression ranking per major cell type** — Rank genes by their differential "
-    "expression using `run_de` in contrast mode. Report the gene rankings, direction, and effect "
+    "expression using `mcp_run_de` in contrast mode. Report the gene rankings, direction, and effect "
     "sizes for the remaining major cell types.",
 ])
 def test_real_analysis_steps_that_mention_figures_or_tables_survive(step):

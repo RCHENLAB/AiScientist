@@ -37,21 +37,11 @@ images:
     source: deploy/report/report.def
     sha256: 5c2d3a7bc7cfb358a27043532f9513587962538d3ccf279c7fdfd69633a4299f
     used_by: [report rendering]
-  vep:
-    path: containers/vep.sif
-    source: deploy/vep/
-    sha256: 235bae1c5543613594c79411235da4ebe7b2646aa9da52cca9b1cc58cc35faab
-    used_by: [variant annotation]
   lirical:
     path: containers/lirical.sif
     source: deploy/lirical/lirical.def
     sha256: e7bfca20424114475c9d64a6bffe7480ceadf29b9bf002d3d1bd92b26685a2f8
     used_by: [phenotype ranking]
-  scgpt:
-    path: containers/scgpt.sif
-    source: deploy/scgpt/scgpt.def
-    sha256: 1eec84afa56f6c38a11de788c0f9c003e579b9a1861e9872100dff1241f27dbc
-    used_by: [scGPT annotation]
   vlreview:
     path: containers/vlreview.sif
     source: deploy/vlreview/

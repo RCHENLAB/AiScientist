@@ -1,0 +1,58 @@
+[
+  {
+    "name": "scgpt_annotate",
+    "description": "Transfer per-cell labels and confidence from an approved pretrained reference atlas using the\nvalidated scGPT harness on a GPU. This is a gene-expression transformer, not an LLM or marker\nnaming. A mouse query may use case-folded human gene names: that assumption is reported.\nIn the prior mouse-retina validation, neuronal labels agreed better than glia and vascular\nlabels; check those classes against independent markers. No model is downloaded or invented.\nSlurm/local returns a task to poll; inline returns when the caller's GPU allocation finishes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "model_dir": {
+          "default": "",
+          "description": "Approved reference model directory; empty uses SCGPT_MODEL_DIR.",
+          "title": "Model Dir",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "description": "Query .h5ad inside SCGPT_READ_ROOTS; empty uses SCGPT_DATASET.",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "scgpt_annotateArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "scgpt_job_status",
+    "description": "Poll GPU annotation. COMPLETED includes predictions_csv, label counts and species provenance;\nFAILED includes the error. Do not describe a queued, failed or missing task as an annotation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "scgpt_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

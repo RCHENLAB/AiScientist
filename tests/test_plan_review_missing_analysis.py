@@ -15,10 +15,10 @@ DE_MISSING = ("MISSING PRIMARY ANALYSIS: The plan lacks a step to perform the ac
 # The draft the guard exists for. It names four analysis tools — which is why an earlier version of
 # this check, asking only whether ANY analysis tool was named, never fired once.
 DRAFT_WITHOUT_DE = [
-    "**QC & normalization** — run `run_scanpy_qc` to filter cells.",
-    "**Depth-matched check** — run `run_depth_matched_de` because the arms differ 1.6x.",
-    "**Composition** — run `run_composition` for per-class proportions.",
-    "**Pathway interpretation** — run `run_enrichment` and `run_gsea_prerank` on the DE tables.",
+    "**QC & normalization** — run `mcp_run_scanpy_qc` to filter cells.",
+    "**Depth-matched check** — run `mcp_run_depth_matched_de` because the arms differ 1.6x.",
+    "**Composition** — run `mcp_run_composition` for per-class proportions.",
+    "**Pathway interpretation** — run `mcp_run_enrichment` and `mcp_run_gsea_prerank` on the DE tables.",
 ]
 
 
@@ -29,7 +29,7 @@ def test_a_missing_de_step_resolves_to_the_de_tool_family():
 def test_the_draft_that_motivated_this_does_not_satisfy_the_family():
     family = _missing_analysis_family([DE_MISSING])
     assert family is not None
-    # It names run_scanpy_qc / run_depth_matched_de / run_composition / run_enrichment ...
+    # It names mcp_run_scanpy_qc / mcp_run_depth_matched_de / mcp_run_composition / mcp_run_enrichment ...
     assert _names_tool(DRAFT_WITHOUT_DE, ("run_scanpy_qc", "run_composition"))
     # ... and still fails the family the Critic actually asked for. This is the whole point.
     assert not _names_tool(DRAFT_WITHOUT_DE, family)
@@ -38,7 +38,7 @@ def test_the_draft_that_motivated_this_does_not_satisfy_the_family():
 def test_adding_the_de_step_satisfies_it():
     family = _missing_analysis_family([DE_MISSING])
     fixed = DRAFT_WITHOUT_DE + [
-        "**Per-cell-type contrast** — run `run_de` with groupby='sampleid', reference='WT'.",
+        "**Per-cell-type contrast** — run `mcp_run_de` with groupby='sampleid', reference='WT'.",
     ]
     assert _names_tool(fixed, family)
 
@@ -47,7 +47,7 @@ def test_a_complaint_about_an_existing_step_is_not_a_missing_analysis():
     """Narrowness matters more than coverage here: a false positive burns an extra PI call on
     every review, and 'should also report X' is the commonest shape of Critic prose."""
     for benign in ("The DE step should also report effect sizes.",
-                   "Step 3 names run_de but does not state the reference level.",
+                   "Step 3 names mcp_run_de but does not state the reference level.",
                    "The enrichment step should name its gene-set library."):
         assert _missing_analysis_family([benign]) is None
 

@@ -266,6 +266,8 @@ class HpcShell:
     confirm: Callable[[ConfirmRequest], bool] | None = None
     emit: Callable[..., None] | None = None
     home: str = ""
+    artifacts_dir: str = ""                      # trusted per-run bindings, never model parameters
+    work_dir: str = ""
     command_timeout_s: int = 900
     fetch_allowlist: tuple[str, ...] = DEFAULT_FETCH_ALLOWLIST
     max_fetch_mb: int = 2048
@@ -318,7 +320,26 @@ class HpcShell:
         return res
 
     def _read_path(self, path: str) -> str:
-        p = self.workspace.resolve(path, self.home)
+        value = (path or "").strip()
+        base = self.home
+        if not value.startswith(("/", "~")):
+            # MCP results deliberately return artifact-relative paths. Resolve them against
+            # the same run as the tool call, not the SSH account's home or an existence guess.
+            base = self.artifacts_dir or self.home
+            for name, root in (("AISCIENTIST_ARTIFACTS", self.artifacts_dir),
+                               ("AISCIENTIST_WORK", self.work_dir)):
+                for prefix in (f"${name}", "${" + name + "}"):
+                    if value == prefix or value.startswith(prefix + "/"):
+                        if not root:
+                            raise HpcShellError(f"{name} is not bound to an active run.")
+                        value = root + value[len(prefix):]
+                        break
+            if not value.startswith("/"):
+                for prefix, root in (("artifacts", self.artifacts_dir), ("work", self.work_dir)):
+                    if root and (value == prefix or value.startswith(prefix + "/")):
+                        value = root + value[len(prefix):]
+                        break
+        p = self.workspace.resolve(value, base)
         if not self.workspace.can_read(p):
             raise HpcShellError(
                 f"{p} is outside the areas this session may read. Readable: "
@@ -384,26 +405,46 @@ class HpcShell:
 
     def read_text(self, path: str, max_bytes: int = MAX_READ_BYTES,
                   tail: bool = False) -> dict[str, Any]:
-        """Read a file's head or tail over SFTP — no shell involved at all.
+        """Read a file's head over SFTP, or a bounded tail over the login channel.
 
         Going through the transfer channel rather than ``cat`` means reading a file is not a
         login-node process at all, and it reuses the executor's existing size/truncation handling.
         """
         p = self._read_path(path)
         self._realpath_guard(p, write=False)
+        # RemoteExecutor's transfer helpers intentionally map missing/unreadable files to
+        # zero/empty bytes. Distinguish that from a real empty file before using those helpers.
+        readable = self._login(f"test -f {shlex.quote(p)} && test -r {shlex.quote(p)}", timeout=20)
+        if getattr(readable, "exit_status", 1) != 0:
+            raise HpcShellError(f"{p} does not exist or is not a readable regular file.")
         cap = max(1, min(int(max_bytes or MAX_READ_BYTES), MAX_READ_BYTES))
         try:
             size = int(self.remote.remote_size(p))
         except Exception as exc:  # noqa: BLE001 - report the path, not a stack trace
             raise HpcShellError(f"Could not stat {p}: {exc}") from exc
+        if size == 0:
+            # A failed transfer-side stat also returns zero. Confirm emptiness through the
+            # metadata channel, rather than turning an unavailable SFTP mount into success.
+            empty = self._login(
+                f"test -f {shlex.quote(p)} && test -r {shlex.quote(p)} && test ! -s {shlex.quote(p)}",
+                timeout=20)
+            if getattr(empty, "exit_status", 1) != 0:
+                raise HpcShellError(f"Could not stat {p} through the transfer channel; retry the read.")
 
         if tail and size > cap:
             # tail needs a byte offset the SFTP helper does not expose, so this one case uses the
             # login node — still metadata-class work on a bounded read.
             res = self._login(f"tail -c {cap} {shlex.quote(p)}", timeout=60)
+            if getattr(res, "exit_status", 1) != 0:
+                raise HpcShellError(f"Could not read {p}: {_clip(res.stderr, 1000)}")
             text, truncated = res.stdout, True
         else:
-            raw = self.remote.read_bytes(p, max_bytes=cap)
+            try:
+                raw = self.remote.read_bytes(p, max_bytes=cap)
+            except Exception as exc:  # noqa: BLE001
+                raise HpcShellError(f"Could not read {p}: {exc}") from exc
+            if len(raw) < min(size, cap):
+                raise HpcShellError(f"Incomplete read of {p}; the file changed or the transfer failed. Retry the read.")
             text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
             truncated = size > cap
         return {"path": p, "size_bytes": size, "truncated": truncated,
@@ -694,6 +735,12 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
     if shell is None:
         return []
 
+    path_description = (
+        "Path on HPC3. In an active run, relative paths (including mcp/...) are relative to "
+        "that run's artifacts. Use work/... or $AISCIENTIST_WORK/... for checkpoints; "
+        "artifacts/... and $AISCIENTIST_ARTIFACTS/... are also accepted. Absolute and ~/ paths retain their meaning."
+    )
+
     def _str(a, k, d=""):
         v = a.get(k, d)
         return v if isinstance(v, str) else ("" if v is None else str(v))
@@ -720,7 +767,7 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
                          "(login-node metadata read, no Slurm queue). Use this to find out what "
                          "files actually exist before assuming a path."),
             parameters={"type": "object", "properties": {
-                "path": {"type": "string", "description": "Absolute path or ~-relative path on HPC3."},
+                "path": {"type": "string", "description": path_description},
                 "max_entries": {"type": "integer", "description": "Cap on entries returned (default 200)."},
             }, "required": ["path"]},
             executor=_ok(lambda a, _c: shell.list_dir(_str(a, "path"), _int(a, "max_entries", 200))),
@@ -730,7 +777,7 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
             name="stat_path",
             description="Does a path exist on HPC3, and is it a file or a directory? Returns size, owner, mode, mtime.",
             parameters={"type": "object", "properties": {
-                "path": {"type": "string"}}, "required": ["path"]},
+                "path": {"type": "string", "description": path_description}}, "required": ["path"]},
             executor=_ok(lambda a, _c: shell.stat_path(_str(a, "path"))),
             category="filesystem",
         ),
@@ -740,7 +787,7 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
                          "and result count. Use it to locate VCFs, h5ad files, or sample sheets "
                          "without guessing paths."),
             parameters={"type": "object", "properties": {
-                "root": {"type": "string"},
+                "root": {"type": "string", "description": path_description},
                 "pattern": {"type": "string", "description": "Glob such as '*.vcf.gz' (default '*')."},
                 "max_depth": {"type": "integer", "description": "1-8, default 4."},
                 "max_results": {"type": "integer", "description": "Default 100."},
@@ -755,7 +802,7 @@ def hpc_shell_catalog(shell: HpcShell | None) -> list[HarnessTool]:
             description=("Read the head (or tail) of a text file on HPC3 — a VCF header, a log, a "
                          "sample sheet, a README. Bounded in bytes; not for large matrices."),
             parameters={"type": "object", "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "description": path_description},
                 "max_bytes": {"type": "integer", "description": f"Default and maximum {MAX_READ_BYTES}."},
                 "tail": {"type": "boolean", "description": "Read the END of the file instead of the start."},
             }, "required": ["path"]},

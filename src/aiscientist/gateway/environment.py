@@ -86,14 +86,18 @@ def tool_index(catalog: list[Any] | None = None) -> list[dict[str, Any]]:
         if t.name == "finish":               # loop control, not a research capability
             continue
         requires = list(getattr(t, "requires", ()) or ())
+        declaration = isinstance(t, system_info._ConfiguredMCPTool)
         out.append({
             "name": t.name,
             "category": getattr(t, "category", "general"),
             "purpose": _first_sentence(getattr(t, "description", "")),
             "source": _source_of(getattr(t, "executor", None)),
             "requires": requires,
-            "available": all(system_info._have(d) for d in requires),
-            "enabled": bool(getattr(t, "enabled", True)),
+            "available": None if declaration else all(system_info._have(d) for d in requires),
+            "enabled": False if declaration else bool(getattr(t, "enabled", True)),
+            **({"mcp": t.server.identity(), "entrypoint": t.server.entrypoint,
+                "availability_note": "Needs an authorized session, pinned skill image and compute executor."}
+               if declaration else {}),
         })
     out.sort(key=lambda x: (x["category"], x["name"]))
     return out
@@ -129,18 +133,18 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
     from ..tools.api import genesets_dir as _genesets_dir
 
     gmt_dir = _genesets_dir()
-    gmts = sorted(p.name for p in gmt_dir.glob("*.gmt")) if gmt_dir.is_dir() else []
     items = [
-        _local("gene_sets", "Gene-set libraries (.gmt) for run_enrichment / run_gsea_prerank",
-               gmt_dir,
-               "Read OFFLINE by the enrichment tools — no network, no Enrichr API. Present: "
-               + (", ".join(gmts) if gmts else "NONE — run scripts/fetch_genesets.py")
-               + ". AISCIENTIST_GENESETS_DIR overrides this location. A pathway summary computed by "
-                 "hand should read these same files rather than fetch a collection."),
-        _remote("container", "Analysis image (run_code, scanpy line)", settings.analysis_image,
+        _remote("gene_sets", "Gene-set libraries (.gmt) for native enrichment",
+                str(gmt_dir) if gmt_dir is not None else "",
+                "Read OFFLINE by the native enrichment tools — no network, no Enrichr API. "
+                + ("Operator-configured SCRNA_GENESETS_DIR (legacy AISCIENTIST_GENESETS_DIR accepted); "
+                   "remote contents are not inspected by the gateway. " if gmt_dir is not None else
+                   "Not configured: set SCRNA_GENESETS_DIR to the read-only HPC reference directory. ")
+                + "A hand-computed summary should use these same files rather than fetch a collection. "
+                  "The gene-set fetch script belongs to the aiscientist-mcp repository."),
+        _remote("container", "CodeAct and platform worker image", settings.analysis_image,
                 "Fixed at build time and read-only. A package it lacks is resolved into the shared "
                 "cache below, not installed into the image."),
-        _remote("container", "scGPT image", settings.scgpt_image),
         _remote("model", "scGPT weights + vocabulary + label map", settings.scgpt_model_dir,
                 "best_model.pt, vocab.json, id2type.json, dev_train_args.yml. scgpt_annotate binds "
                 "this read-only into its GPU job. HUMAN RETINA reference: a human-symbol vocabulary "
@@ -157,12 +161,6 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
                 "generated sitecustomize."),
         _remote("reference", "Lab reference data (VEP caches, LIRICAL data, SpliceAI models)",
                 f"{settings.lab_storage.rstrip('/')}/software/reference"),
-        _remote("gene_sets", "Gene-set libraries (.gmt), the copy HPC3 jobs can read",
-                f"{settings.shared_root.rstrip('/')}/sessions/<session>/app/aiscientist/tools/genesets",
-                "The same files as the gateway copy, synced with the live source for analysis jobs. "
-                "They list human (upper-case) symbols: run_enrichment / run_gsea_prerank matched "
-                "mouse genes in past runs, but code that reads a .gmt directly must upper-case "
-                "mouse symbols first."),
         _remote("workspace", "This session's folder (removed when the session ends, after its "
                              "results are copied to the server)",
                 f"{settings.shared_root.rstrip('/')}/sessions/<session>"),
@@ -235,8 +233,9 @@ def render_markdown(manifest: dict[str, Any]) -> str:
               "`source` is where the function actually lives, so a tool can be found without grepping.",
               "", "| tool | what it does | source | available |", "|---|---|---|---|"]
     for t in manifest["tools"]:
-        ok = "yes" if t["available"] and t["enabled"] else "**no**"
-        src = f"`{t['source']}`" if t["source"] else "—"
+        ok = "session required" if "mcp" in t else "yes" if t["available"] and t["enabled"] else "**no**"
+        src = (f"native image `{t['mcp']['image']}`" if "mcp" in t else
+               f"`{t['source']}`" if t["source"] else "—")
         lines.append(f"| `{t['name']}` | {t['purpose']} | {src} | {ok} |")
     lines.append("")
 
@@ -268,6 +267,11 @@ def render_for_agent(manifest: dict[str, Any], section: str = "all") -> str:
     if section in ("all", "tools"):
         out.append("TOOLS (name | source | available)")
         for t in manifest["tools"]:
-            flag = "" if (t["available"] and t["enabled"]) else "  [UNAVAILABLE in this deployment]"
-            out.append(f"  {t['name']} | {t['source'] or '?'}{flag}")
+            if "mcp" in t:
+                out.append(f"  {t['name']} | native image {t['mcp']['image']} | "
+                           "DECLARED; SESSION AVAILABILITY NOT CHECKED")
+                out.append(f"      {t['availability_note']}")
+            else:
+                flag = "" if (t["available"] and t["enabled"]) else "  [UNAVAILABLE in this deployment]"
+                out.append(f"  {t['name']} | {t['source'] or '?'}{flag}")
     return "\n".join(out)

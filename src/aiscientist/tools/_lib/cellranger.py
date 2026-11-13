@@ -394,8 +394,8 @@ def _species(libs: "list[dict[str, Any]]") -> str:
     return found.pop() if len(found) == 1 and "" not in found else ""
 
 
-# The curated marker references live with the annotation tool; read as data, never imported.
-_MARKER_REFERENCES = Path(__file__).resolve().parents[1] / "run_marker_annotation" / "references"
+# The curated marker references are packaged shared data, independent of the annotation tool.
+_MARKER_REFERENCES = Path(__file__).with_name("marker_references")
 
 
 def tissue_hint(top_genes: "list[str]") -> str:

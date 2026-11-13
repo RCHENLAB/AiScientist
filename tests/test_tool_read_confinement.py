@@ -1,7 +1,6 @@
 """A tool that reads files on the gateway reads only what the run may read (``tools.sdk.confine_read``).
 
-``inspect_dataset`` and the REST path of ``annotate_variants`` run on the gateway and take a path from
-the model. Before this guard either one read any file the gateway's user could read, including the
+``inspect_dataset`` runs on the gateway and takes a path from the model. Before this guard either one read any file the gateway's user could read, including the
 API-key store and its master key, and ``inspect_dataset`` returned the head of the file to the model.
 """
 
@@ -14,8 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from aiscientist.tools import sdk
-from aiscientist.tools.annotate_variants.tool import make_variant_annotation_tool
-from aiscientist.tools.inspect_dataset.tool import make_inspect_dataset_tool
 
 _VCF = "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n17\t100\t.\tG\tA\t.\tPASS\t.\n"
 
@@ -149,65 +146,11 @@ def test_inspect_dataset_cannot_read_the_api_key_store(tmp_path, monkeypatch):
     ws.mkdir(parents=True)
     bound = ws / "data.vcf"
     bound.write_text(_VCF)
-    tool = make_inspect_dataset_tool()
-    for ctx in (_ctx(ws, {"dataset_path": str(bound)}), _ctx(ws)):
+    for ctx in (_ctx(ws, {"dataset_path": str(bound)}), _ctx(ws), _ctx(tmp_path)):
         for asked in (state / "llm_key.master", key_file, state / "llm_creds" / "bob" / "index.json"):
-            out = tool.executor({"path": str(asked)}, ctx)
-            text = json.dumps(out)
-            assert out["status"] == "error", out
-            assert master not in text and ciphertext[:40] not in text and fake_key not in text
-    # A deployment whose run root contains the state dir is still refused (the private paths).
-    out = tool.executor({"path": str(state / "llm_key.master")}, _ctx(tmp_path))
-    assert out["status"] == "error" and master not in json.dumps(out)
+            path, why = sdk.confine_read(str(asked), ctx)
+            assert path is None
+            assert master not in why and ciphertext[:40] not in why and fake_key not in why
 
 
 # --- inspect_dataset ---------------------------------------------------------------------------
-
-
-def test_inspect_dataset_reads_a_run_file_and_an_upload(layout):
-    tool = make_inspect_dataset_tool()
-    ctx = _ctx(layout.ws, {"dataset_path": str(layout.shared / "bound.vcf")}, (layout.uploads,))
-    assert tool.executor({"path": "work/made.vcf"}, ctx)["peek"]["name"] == "made.vcf"
-    assert tool.executor({"path": str(layout.uploads / "notes.csv")}, ctx)["peek"]["name"] == "notes.csv"
-    assert tool.executor({}, ctx)["peek"]["name"] == "bound.vcf"
-
-
-def test_inspect_dataset_refuses_an_outside_file_instead_of_reading_the_bound_one(layout):
-    tool = make_inspect_dataset_tool()
-    ctx = _ctx(layout.ws, {"dataset_path": str(layout.shared / "bound.vcf")}, (layout.uploads,))
-    out = tool.executor({"path": str(layout.secret)}, ctx)
-    assert out["status"] == "error" and "outside this run" in out["error"]
-    assert "TOP-SECRET-VALUE" not in json.dumps(out)
-
-
-def test_inspect_dataset_still_falls_back_to_the_bound_dataset_for_an_hpc3_path(layout):
-    tool = make_inspect_dataset_tool()
-    ctx = _ctx(layout.ws, {"dataset_path": str(layout.shared / "bound.vcf")})
-    out = tool.executor({"path": "/dfs3b/ruic20_lab/uploads/alice/x.vcf"}, ctx)
-    assert out["status"] == "ok" and out["peek"]["name"] == "bound.vcf"
-
-
-# --- annotate_variants (REST, in-process) ------------------------------------------------------
-
-
-def test_annotate_variants_refuses_a_vcf_outside_the_run(layout, monkeypatch):
-    import aiscientist.tools.annotate_variants.tool as va
-
-    monkeypatch.setattr(va, "vep_annotate", lambda variants, **k: [])
-    tool = make_variant_annotation_tool()
-    ctx = _ctx(layout.ws, read_roots=(layout.uploads,))
-    out = tool.executor({"vcf_path": str(layout.secret)}, ctx)
-    assert out["status"] == "error" and "outside this run" in out["error"]
-    assert "TOP-SECRET-VALUE" not in json.dumps(out)
-
-
-def test_annotate_variants_reads_a_run_vcf_and_inline_text(layout, monkeypatch):
-    import aiscientist.tools.annotate_variants.tool as va
-
-    seen = []
-    monkeypatch.setattr(va, "vep_annotate", lambda variants, **k: seen.append(len(variants)) or [])
-    tool = make_variant_annotation_tool()
-    ctx = _ctx(layout.ws)
-    tool.executor({"vcf_path": "work/made.vcf"}, ctx)
-    tool.executor({"vcf_path": _VCF}, ctx)                       # raw VCF text, not a path
-    assert seen == [1, 1]

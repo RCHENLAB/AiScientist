@@ -12,7 +12,7 @@ driven by a `RemoteExecutor` mock — no cluster in CI). This folder is the **im
 The local `CodeSandbox` (eyeserver) runs snippets as an **uncapped** subprocess → a memory-heavy
 snippet gets OOM-killed (`returncode -9`). On HPC3, CPU/RAM are ~unlimited and `#SBATCH --mem` is a
 **real cgroup cap**. `SlurmCodeExecutor` submits each snippet as a contained CPU batch job in this
-image. It is CPU-only (scanpy/pandas/gseapy) — **no GPU/torch** (that's `scgpt.sif`).
+image. It is CPU-only (scanpy/pandas/gseapy) — **no GPU/torch** (native scGPT runs in its pinned MCP image).
 
 ## Build & stage (3 steps)
 
@@ -58,3 +58,13 @@ run time, `run_code` falls back to the local sandbox automatically.
 The pinned packages in `analysis.def` mirror the `analysis` extra in `pyproject.toml` (plus
 `scikit-misc`, `igraph`, `psutil`). When you bump one, bump the other so a snippet behaves the same
 locally and on HPC3.
+
+
+## Retained platform worker
+
+This image also runs `python -m aiscientist.tools.worker_cli` for dataset metadata preflight,
+per-run dependency installation, and AnnData export/adopt. The old `scrna_cli` module is a thin
+compatibility entry point for those platform operations only. It rejects retired scientific
+tool names. The eleven scRNA tools, CellQC, inspection, and schematic tool execute in their
+separately pinned MCP service images. This build recipe remains for user CodeAct snippets and
+platform I/O; its optional scientific libraries are not an alternative tool dispatcher.

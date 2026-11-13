@@ -76,7 +76,6 @@ snapshot before then.
 
 | Script | What it is for | Runs on | Changes |
 |---|---|---|---|
-| `build_hpo_lexicon.py` | Build the bundled HPO lexicon (`hpo_lexicon.tsv.gz`) from the official `hp.json` for the free-text → HPO mapper. | laptop | the bundled lexicon |
 | `fetch_genesets.py` | Download the GMT gene-set libraries the offline enrichment tools read. | a machine with internet | the gene-set directory |
 | `h5ad_to_csv.py` | Turn an `.h5ad` into the cells-as-rows CSV (a `condition` column plus gene columns) that the older smoke QC + DE path reads. | gateway or laptop | the output CSV |
 | `generate_upload_test_data.py` | Generate large upload test fixtures (single file, folder, archive) outside the repository. | laptop | the output directory |
@@ -97,14 +96,13 @@ what the unit tests cannot. They start no HPC3 jobs unless stated.
 | `probe_plan_quality.py` | Planning quality against the DDX41 run, with the served model. |
 | `probe_tool_audit.py` | Whether the model finds a tool's defect once it can read the tool's source. |
 | `probe_relay.py` | Helper for the probes: posts prepared chat completions to a vLLM on an HPC3 node, from inside HPC3. |
-| `hpo_mapper_smoke.py` | Free-text → HPO mapping with a real model: translation, negation, family history. |
 | `biomni_local_smoke.py` | Biomni A1 against a local model, without the data lake. Historical. |
 | `measure_pubmed_depth.py` | The PubMed search (`literature_search`) against live Europe PMC, no model: for each query, the papers kept, the time, and whether three reference papers on RDH5 fundus albipunctatus are among them, for the former 8-hit search and the current 100-hit ranking. |
 
 ## RetiGene literature corpus (PaperQA)
 
 Building and querying the PDF corpus behind the RetiGene haploinsufficiency task and `deep_literature`.
-They run on a laptop with the UCI network or on HPC3 (the PaperQA and cache steps inside `paperqa.sif`),
+They run on a laptop with the UCI network or on HPC3 (the scientific index/cache steps inside the pinned native literature image),
 and write only into the corpus directories and manifests they are given.
 
 | Script | Step |
@@ -124,9 +122,7 @@ and write only into the corpus directories and manifests they are given.
 | `audit_retigene_selected_pdfs.py` | Audit every selected PDF for completeness, identity and provenance. |
 | `build_retigene_paperqa_manifest.py` | Turn the priority manifest into the PaperQA metadata manifest. |
 | `refresh_paperqa_manifest_authors.py` | Refresh the manifest's citations with full author lists. |
-| `build_paperqa_directory_index.py` | Build the PaperQA embedding index for the corpus. |
-| `query_paperqa_index.py` | Ask the index a question. |
-| `build_mechanism_cache.py` | Extract page text and chunk vectors for `search_corpus` and `extract_haploinsufficient_genes`; `--replace` builds beside the index and puts it in place. |
+| `build_mechanism_cache.py` | Thin transport shim for the explicitly configured native MCP cache builder. |
 | `update_corpus_index.py` | On the Eye Server: rebuild the index on HPC3 when papers were added (`--rebuild`), copy it to the Eye Server, check the copy (`--check`), or switch back (`--rollback`). |
 | `sync_corpus_index.py` | Copy an index from any source into a copy's folder, as a new version made current in one step. |
 
@@ -135,3 +131,9 @@ and write only into the corpus directories and manifests they are given.
 Start it with a docstring (or comment block) that says what it is for, how to run it, where it runs
 and what it changes, then add a row to the right table here. Never put a credential in a script or
 its examples; use a placeholder such as `<password>` and read secrets from the environment.
+
+## Native literature maintenance
+
+`build_mechanism_cache.py` and `eval_corpus_retrieval.py` are thin operator entry points. Set `AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS` to the absolute, non-symlink `scripts` directory of an explicitly reviewed [aiscientist-mcp checkout](https://github.com/liujs123456/aiscientist-mcp/tree/main/scripts). They do not contain embedding or ranking algorithms. Run them inside the matching published literature image. `update_corpus_index.py --rebuild` stages the fixed external cache builder with a SHA-256 manifest and binds the native reference roots; it does not install server packages in the gateway. `AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp` is the only supported runtime, and the image comes from the registered pinned server or `AISCIENTIST_CORPUS_MAINTENANCE_IMAGE`. Missing external scripts fail explicitly before submitting compute.
+
+PaperQA directory-index creation/query/embedding inspection, HPO lexicon refresh, and retrieval evaluation algorithms live in that MCP repository. The application retains downloads, reference transfer, manifest preparation, run ownership and publication.

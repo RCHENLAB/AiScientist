@@ -14,14 +14,14 @@ from aiscientist.agents.research_harness import HarnessContext, HarnessTool, Res
 from aiscientist.agents.research_lab import LabConfig, ResearchLab, _primary_tool
 from aiscientist.agents.scope import LITERATURE_TOOLS, RunScope, read_scope
 
-_NAMES = ["run_cellqc", "run_scanpy_qc", "run_doublet_detection", "run_clustering", "run_de",
-          "run_pseudobulk_de", "run_depth_matched_de", "run_enrichment", "run_gsea_prerank",
-          "run_marker_annotation", "scgpt_annotate", "run_composition", "run_integration",
-          "deep_literature", "search_corpus", "literature_search", "run_code", "inspect_dataset"]
+_NAMES = ["mcp_run_cellqc", "mcp_run_scanpy_qc", "mcp_run_doublet_detection", "mcp_run_clustering", "mcp_run_de",
+          "mcp_run_pseudobulk_de", "mcp_run_depth_matched_de", "mcp_run_enrichment", "mcp_run_gsea_prerank",
+          "mcp_run_marker_annotation", "scgpt_annotate", "mcp_run_composition", "mcp_run_integration",
+          "deep_literature", "search_corpus", "literature_search", "run_code", "mcp_inspect_dataset"]
 _TOOLS = {n: f"{n} tool" for n in _NAMES}
 
-_QC_ONLY_ZH = ("只做 QC：用 run_cellqc 对这个 Cell Ranger 文件夹做质控并输出结果矩阵，"
-               "不做 run_de、enrichment、聚类和注释，报告尽量简短，不需要完整报告")
+_QC_ONLY_ZH = ("只做 QC：用 mcp_run_cellqc 对这个 Cell Ranger 文件夹做质控并输出结果矩阵，"
+               "不做 mcp_run_de、enrichment、聚类和注释，报告尽量简短，不需要完整报告")
 
 
 def test_an_explicit_limit_is_read_without_asking_the_model():
@@ -30,14 +30,14 @@ def test_an_explicit_limit_is_read_without_asking_the_model():
 
     s = read_scope(_QC_ONLY_ZH, _TOOLS, never)
     assert s.source == "rules" and s.brief_report
-    assert "run_cellqc" in s.keep and "run_clustering" not in s.keep
-    assert {"run_de", "run_enrichment", "run_gsea_prerank", "run_clustering",
-            "run_marker_annotation"} <= set(s.exclude)
+    assert "mcp_run_cellqc" in s.keep and "mcp_run_clustering" not in s.keep
+    assert {"mcp_run_de", "mcp_run_enrichment", "mcp_run_gsea_prerank", "mcp_run_clustering",
+            "mcp_run_marker_annotation"} <= set(s.exclude)
 
-    s = read_scope("Only run run_cellqc on this delivery and give me the result dataset. "
+    s = read_scope("Only run mcp_run_cellqc on this delivery and give me the result dataset. "
                    "No DE, no enrichment, no literature. A brief report is enough.", _TOOLS, never)
-    assert s.keep == ("run_cellqc",) and s.brief_report and not s.allows_literature()
-    assert not s.allows("run_de") and s.allows("run_cellqc") and not s.allows("run_code")
+    assert s.keep == ("mcp_run_cellqc",) and s.brief_report and not s.allows_literature()
+    assert not s.allows("mcp_run_de") and s.allows("mcp_run_cellqc") and not s.allows("run_code")
 
 
 @pytest.mark.parametrize("question", [
@@ -54,16 +54,16 @@ def test_a_question_about_biology_is_not_a_limit(question):
     "Do cellqc quality controll and give me a result.",
     "Do cellqc quality control and give me a result.",
     "Please run CellQC and return the result dataset.",
-    "Run run_cellqc and show me its results!",
+    "Run mcp_run_cellqc and show me its results!",
 ])
 def test_a_named_method_and_its_result_are_limited_to_that_tool(question):
     def never(_messages):
         raise AssertionError("the whole request is read by the rules")
 
     scope = read_scope(question, _TOOLS, never)
-    assert scope.keep == ("run_cellqc",) and scope.source == "rules"
+    assert scope.keep == ("mcp_run_cellqc",) and scope.source == "rules"
     assert not scope.allows("run_code") and not scope.allows_literature()
-    assert not read_scope(question, {"run_de": "DE"}, never).limited
+    assert not read_scope(question, {"mcp_run_de": "DE"}, never).limited
 
 
 @pytest.mark.parametrize("question", [
@@ -79,26 +79,26 @@ def test_asking_for_more_than_a_methods_result_does_not_limit_the_run(question):
 
 def test_an_exclusion_keeps_the_rest_and_keep_wins_over_exclude():
     s = read_scope("What changes between DDX41 and WT retina? Do not run enrichment.", _TOOLS)
-    assert s.exclude == ("run_enrichment", "run_gsea_prerank") and not s.keep
-    assert s.allows("run_de") and s.allows(None) and not s.allows("run_enrichment")
+    assert s.exclude == ("mcp_run_enrichment", "mcp_run_gsea_prerank") and not s.keep
+    assert s.allows("mcp_run_de") and s.allows(None) and not s.allows("mcp_run_enrichment")
     # "only annotation" needs clusters; ruling annotation out does not rule clustering out.
     s = read_scope("只做 QC 和细胞注释，不做差异表达和富集", _TOOLS)
-    assert {"run_cellqc", "run_clustering", "run_marker_annotation"} <= set(s.keep)
-    assert "run_de" in s.exclude and "run_clustering" not in s.exclude
+    assert {"mcp_run_cellqc", "mcp_run_clustering", "mcp_run_marker_annotation"} <= set(s.keep)
+    assert "mcp_run_de" in s.exclude and "mcp_run_clustering" not in s.exclude
 
 
 def test_a_reference_the_analysis_runs_against_is_not_literature():
     # "reference" here is mostly an analysis input: an atlas, a genome, a panel, a control group.
     s = read_scope("Only annotate the clusters with the retina reference.", _TOOLS)
-    assert s.keep == ("run_clustering", "run_marker_annotation", "scgpt_annotate")
+    assert s.keep == ("mcp_run_clustering", "mcp_run_marker_annotation", "scgpt_annotate")
     assert not s.allows_literature()
     s = read_scope("Only align to the reference genome", _TOOLS)
     assert not LITERATURE_TOOLS & set(s.keep + s.exclude)
     # The plural, followed by what it is a reference OF, is still an input.
-    assert read_scope("Only integrate with the references datasets", _TOOLS).keep == ("run_integration",)
+    assert read_scope("Only integrate with the references datasets", _TOOLS).keep == ("mcp_run_integration",)
     # ...and a reference named where something else is ruled out does not rule literature out.
     s = read_scope("What changes in the KO? Skip integration with the reference atlas.", _TOOLS)
-    assert s.exclude == ("run_integration",) and s.allows_literature()
+    assert s.exclude == ("mcp_run_integration",) and s.allows_literature()
 
 
 @pytest.mark.parametrize("question", [
@@ -115,7 +115,7 @@ def test_ruling_literature_out_still_excludes_its_tools(question):
 
 def test_asking_for_literature_by_name_still_keeps_its_tools():
     s = read_scope("only QC and literature", _TOOLS)
-    assert LITERATURE_TOOLS <= set(s.keep) and "run_cellqc" in s.keep and not s.allows("run_de")
+    assert LITERATURE_TOOLS <= set(s.keep) and "mcp_run_cellqc" in s.keep and not s.allows("mcp_run_de")
     assert LITERATURE_TOOLS <= set(read_scope("Just run QC and add references", _TOOLS).keep)
 
 
@@ -124,10 +124,10 @@ def test_looser_wording_asks_the_model_and_checks_its_answer_against_the_catalog
 
     def model(messages):
         asked.append(messages)
-        return json.dumps({"keep": ["run_cellqc", "run_magic"], "exclude": [], "brief_report": True})
+        return json.dumps({"keep": ["mcp_run_cellqc", "run_magic"], "exclude": [], "brief_report": True})
 
     s = read_scope("I don't care about anything beyond cleaning the matrix", _TOOLS, model)
-    assert asked and s.keep == ("run_cellqc",) and s.brief_report and s.source == "model"
+    assert asked and s.keep == ("mcp_run_cellqc",) and s.brief_report and s.source == "model"
     # No limiting word at all: the model is not asked.
     asked.clear()
     assert not read_scope("Compare KO and WT per cell type", _TOOLS, model).limited and not asked
@@ -137,22 +137,22 @@ def test_looser_wording_asks_the_model_and_checks_its_answer_against_the_catalog
 
 
 def test_filter_never_empties_a_plan():
-    plan = ["**QC** — run `run_cellqc` on the folder.", "**Clusters** — `run_clustering`.",
-            "**Markers** — `run_de` per cluster.", "A step that names no tool."]
-    kept, dropped = RunScope(keep=("run_cellqc",)).filter(plan, _primary_tool)
+    plan = ["**QC** — run `mcp_run_cellqc` on the folder.", "**Clusters** — `mcp_run_clustering`.",
+            "**Markers** — `mcp_run_de` per cluster.", "A step that names no tool."]
+    kept, dropped = RunScope(keep=("mcp_run_cellqc",)).filter(plan, _primary_tool)
     assert kept == plan[:1] and len(dropped) == 3
-    kept, dropped = RunScope(exclude=("run_de",)).filter(plan, _primary_tool)
+    kept, dropped = RunScope(exclude=("mcp_run_de",)).filter(plan, _primary_tool)
     assert kept == [plan[0], plan[1], plan[3]] and dropped == [plan[2]]
     # Nothing in the plan matches the limit: return it whole rather than nothing.
-    kept, dropped = RunScope(keep=("run_integration",)).filter(plan, _primary_tool)
+    kept, dropped = RunScope(keep=("mcp_run_integration",)).filter(plan, _primary_tool)
     assert kept == plan and dropped == []
 
 
 def test_scope_survives_a_round_trip_and_describes_itself():
-    s = RunScope(("run_cellqc",), ("run_de",), True, "rules")
+    s = RunScope(("mcp_run_cellqc",), ("mcp_run_de",), True, "rules")
     assert RunScope.from_dict(s.to_dict()) == s
-    assert s.describe() == "only run_cellqc; not run_de; brief report"
-    assert "binding" in s.prompt_block() and "`run_cellqc`" in s.prompt_block()
+    assert s.describe() == "only mcp_run_cellqc; not mcp_run_de; brief report"
+    assert "binding" in s.prompt_block() and "`mcp_run_cellqc`" in s.prompt_block()
     assert RunScope().prompt_block() == "" and not RunScope.from_dict(None).limited
 
 
@@ -163,11 +163,11 @@ def _tool(name):
                        lambda _a, _c: {"status": "ok"}, category="analysis")
 
 
-_FULL_PLAN = ["**QC** — Quality-control the delivery with `run_cellqc`.",
-              "**Clustering** — Cluster with `run_clustering`.",
-              "**Markers** — Marker genes with `run_de`.",
-              "**ORA** — Pathways with `run_enrichment`.",
-              "**Annotation** — Label clusters with `run_marker_annotation`.",
+_FULL_PLAN = ["**QC** — Quality-control the delivery with `mcp_run_cellqc`.",
+              "**Clustering** — Cluster with `mcp_run_clustering`.",
+              "**Markers** — Marker genes with `mcp_run_de`.",
+              "**ORA** — Pathways with `mcp_run_enrichment`.",
+              "**Annotation** — Label clusters with `mcp_run_marker_annotation`.",
               "**Literature** — Ground it with `deep_literature`."]
 
 
@@ -241,7 +241,7 @@ def test_the_plans_nothing_to_disclose_line_is_not_a_step_left_out(written):
         return "{}"
 
     lab = _lab(complete)
-    lab._scope = RunScope(keep=("run_cellqc",))
+    lab._scope = RunScope(keep=("mcp_run_cellqc",))
     events = []
     kind, agenda = lab._pi_plan("Do cellqc quality controll and give me a result.", events.append)
     assert kind == "agenda" and agenda == _FULL_PLAN[:1]
@@ -249,7 +249,7 @@ def test_the_plans_nothing_to_disclose_line_is_not_a_step_left_out(written):
     assert lab.self_sourced.lower().startswith("none")
     # A step that only opens with the word is still a step.
     from aiscientist.agents.research_lab import _split_self_sourced
-    step = "None of the libraries is filtered yet: run `run_cellqc` on each."
+    step = "None of the libraries is filtered yet: run `mcp_run_cellqc` on each."
     assert _split_self_sourced([step]) == ([step], "")
 
 
@@ -268,7 +268,7 @@ def test_the_feed_names_each_step_the_limit_left_out_and_is_silent_on_none():
 
 def test_a_limited_run_does_not_grow_new_steps():
     lab = _lab(lambda _m: "{}", hypothesis_driven=True)
-    lab._scope = RunScope(keep=("run_cellqc",))
+    lab._scope = RunScope(keep=("mcp_run_cellqc",))
     assert lab._explore_after_step("q", "step", None, {}, [], [], lambda _e: None) == []
 
 
@@ -277,7 +277,7 @@ def test_a_limited_run_does_not_grow_new_steps():
 @pytest.mark.parametrize("question, wanted", [
     ("Do only cellqc quality controll part and generate the report and result to me", True),
     ("Run CellQC on the uploaded sample to generate quality control report.", True),
-    ("只做 QC：用 run_cellqc 对这个 Cell Ranger 文件夹做质控，输出结果矩阵。报告尽量简短，不需要完整报告。", True),
+    ("只做 QC：用 mcp_run_cellqc 对这个 Cell Ranger 文件夹做质控，输出结果矩阵。报告尽量简短，不需要完整报告。", True),
     ("只做质控并写一份书面报告", True),
     ("QC only and write a short PDF", True),
     ("Only run CellQC, no report needed", False),

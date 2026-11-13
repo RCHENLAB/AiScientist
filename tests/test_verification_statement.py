@@ -169,3 +169,18 @@ def test_a_change_stated_in_the_sentence_is_derived_and_random_count_pairs_are_n
     assert "(2,842 − 2,872) ÷ 2,872 × 100, both stated in the sentence" in md
     assert "23 / n_cells ÷ 4 / n_cells" not in md
     assert "total of n_cells" in md                     # 560 / 2,597: a column total is fine
+
+
+def test_numeric_coincidence_remains_visible_without_claiming_semantic_validation(tmp_path):
+    # Same failure pattern as the actual HECA report: a marker percentage can
+    # match arithmetic on unrelated depth-check counters. Do not relabel it PASS.
+    rounds = [{"step": "Depth check", "verdict": {"verdict": "accept"}, "scientist_result": {
+        "steps": [{"tool": "mcp_run_depth_matched_de", "result": {"status": "ok",
+            "n_preserved": 1, "n_inverted": 0, "n_against_depth": 2, "n_genes_depth_robust": 40}}]}}]
+    md, summary = build_verification(tmp_path, "ARR3 was detected in 2.3% of cells.", rounds=rounds)
+    assert summary["numbers_derived"] == 1  # unchanged algorithm, not a corrected scientific match
+    assert "n_preserved" in md and "ARR3" in md
+    for text in (md, manuscript_note(summary)):
+        assert "does not verify a sentence's scientific meaning" in text
+        assert "Coincidental matches can point to unrelated outputs" in text
+        assert "source field, group, unit and meaning" in text

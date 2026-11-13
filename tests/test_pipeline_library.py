@@ -11,10 +11,11 @@ from pathlib import Path
 from aiscientist.agents.preset_pipelines import _pipelines_dir
 from aiscientist.agents.skills import _parse_front_matter
 from aiscientist.tools import catalog
+from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG, load_servers
 
 # Read from where the platform reads them ($AISCIENTIST_PIPELINES_DIR or preset_pipelines/).
 PIPELINES_DIR = _pipelines_dir()
-PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",
+PLATFORM_TOOLS = {"finish", "mcp_run_scanpy_qc", "mcp_run_de", "run_code", "describe_environment",
                   "search_skills", "read_skill_reference", "read_tool_source",
                   "list_dir", "stat_path", "find_files", "read_text", "disk_usage", "run_shell",
                   "fetch_url", "install_package"}
@@ -26,6 +27,8 @@ def _folders(root: Path) -> list[Path]:
 
 def test_every_pipeline_has_its_protocol_and_names_only_real_tools():
     known = set(catalog.names()) | PLATFORM_TOOLS
+    known |= {server.planner_name(tool["name"]) for server in load_servers(DEFAULT_CONFIG)
+              for tool in server.tools}
     for folder in _folders(PIPELINES_DIR):
         assert (folder / "SKILL.md").is_file() and (folder / "PROTOCOL.md").is_file(), folder.name
         meta, _body = _parse_front_matter((folder / "SKILL.md").read_text(encoding="utf-8"))

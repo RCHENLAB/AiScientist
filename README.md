@@ -112,13 +112,12 @@ does not set the low end.
 SLURM uses allocation accounting where available; other measurements use wall time and
 requested resources and remain rough. Run API records expose `compute_usage`.
 
-Tools may declare `resource_profile.json` beside `TOOL.md`: `unit` (`samples`, `cells`, `gb`),
-`baseline`, and `steps`, each with `name`, requested `cpus`, `gpus`, `mem_gb` and a two-value
-`minutes` range. See `src/aiscientist/tools/run_cellqc/resource_profile.json`. Dataset metadata
-supplies the sample count, cell count or GB for scaling; Cell Ranger library counts are inferred.
-A tool without a profile has no estimate ("no estimate yet") until it has run successfully once;
-from then on its runs give the estimate, scaled by cell count. A total that leaves such steps
-out is marked partial.
+Native MCP calls record measured usage under their registered tool names. Their job resource
+requests are declared in the reviewed MCP catalog; those requests alone are not timing estimates.
+A tool without a timing profile has no estimate ("no estimate yet") until it has run successfully
+once; from then on its runs give the estimate, scaled by cell count. Dataset metadata supplies
+the sample count, cell count or GB for scaling; Cell Ranger library counts are inferred.
+A total that leaves unestimated steps out is marked partial.
 
 ## Repository layout
 

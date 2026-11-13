@@ -5,7 +5,7 @@ release:
     sudo -u aiscientist /data/aiscientist/app/current/.venv/bin/python \\
         /data/aiscientist/app/current/scripts/update_corpus_index.py [--rebuild] [--check]
 
-1. ``--rebuild``: one CPU Slurm job on HPC3, inside ``paperqa.sif``, extracts and embeds the papers
+1. ``--rebuild``: one CPU Slurm job on HPC3, inside the pinned native literature image, extracts and embeds the papers
    added to the corpus since the last build (``build_mechanism_cache.py --replace``) and puts the new
    index in place, keeping the previous one as ``mechanism_cache.prev``. Nothing changes when no
    paper was added.
@@ -18,7 +18,7 @@ release:
 missing. ``--rollback`` makes the previous version of the copy current again.
 
 Settings come from the ``.env`` beside ``scripts/``, in a release the link to ``config/.env``: the
-corpus (``AISCIENTIST_PAPERQA_PAPERS``, ``_MANIFEST``, ``_IMAGE``), HPC3 (host, transfer host, CPU
+corpus (``AISCIENTIST_PAPERQA_PAPERS``, ``_MANIFEST``; image from the MCP catalog or ``AISCIENTIST_CORPUS_MAINTENANCE_IMAGE``)), HPC3 (host, transfer host, CPU
 partition and account, Apptainer module) and the copy's root (``AISCIENTIST_LOCAL_CORPUS_ROOT``,
 default ``<data root>/reference/retigene``). The HPC3 login
 is ``--hpc-user`` with ``--ssh-key``, by default the shared model server's (the saved key of
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import tarfile
 import tempfile
@@ -38,8 +39,19 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "scripts"))
 
 from aiscientist.gateway import corpus_index, local_corpus  # noqa: E402
+
+MAINTENANCE_RUNTIME_ENV = "AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME"
+
+
+def maintenance_runtime() -> str:
+    mode = os.environ.get(MAINTENANCE_RUNTIME_ENV, "mcp")
+    if mode != "mcp":
+        raise SystemExit(f"{MAINTENANCE_RUNTIME_ENV} must be mcp; the legacy scientific runtime has been retired")
+    return mode
+
 
 JOB_CPUS, JOB_MEM_GB, JOB_TIME = 8, 32, "04:00:00"
 
@@ -56,7 +68,19 @@ def corpus_settings(hpc_root: str = "") -> tuple[str, str, str, str]:
         raise SystemExit("No corpus on HPC3: set AISCIENTIST_PAPERQA_PAPERS or pass --hpc-root.")
     papers = papers if papers and not hpc_root else f"{root}/papers"
     manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "") if not hpc_root else ""
-    image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "") or f"{root}/paperqa.sif"
+    if maintenance_runtime() == "mcp":
+        image = os.environ.get("AISCIENTIST_CORPUS_MAINTENANCE_IMAGE", "")
+        if not image:
+            from aiscientist.gateway.literature_mcp import registered_server
+            server = registered_server()
+            image = server.image if server else ""
+        if not image:
+            raise SystemExit("Native corpus maintenance needs a registered literature image or "
+                             "AISCIENTIST_CORPUS_MAINTENANCE_IMAGE.")
+        pinned = re.fullmatch(r"docker://[^\s]+@sha256:[a-f0-9]{64}", image)
+        local_sif = image.startswith("/") and image.endswith(".sif") and not any(c in image for c in "\r\n\0")
+        if not (pinned or local_sif):
+            raise SystemExit("Native corpus maintenance requires a digest-pinned Docker URI or an absolute verified SIF path.")
     return root, papers, manifest or f"{root}/paperqa_manifest.csv", image
 
 
@@ -75,13 +99,26 @@ def identity(user: str, key: str, hpc: Any) -> tuple[str, str]:
 
 
 def pack_code(out: Path) -> None:
-    """The code the build job runs: the aiscientist package and the build script."""
-    def skip(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-        return None if "__pycache__" in info.name or info.name.endswith(".pyc") else info
+    """Stage only operator scripts; the published image contains its scientific runtime."""
+    import hashlib
+    import io
+    import json
+    from _literature_runtime import operator_script
 
+    native = operator_script("build_mechanism_cache")
+    data = native.read_bytes()
     with tarfile.open(out, "w:gz") as tar:
-        tar.add(REPO / "src" / "aiscientist", arcname="src/aiscientist", filter=skip)
+        tar.add(REPO / "scripts" / "_literature_runtime.py", arcname="scripts/_literature_runtime.py")
         tar.add(REPO / "scripts" / "build_mechanism_cache.py", arcname="scripts/build_mechanism_cache.py")
+        info = tarfile.TarInfo("native_scripts/build_mechanism_cache.py")
+        info.size = len(data)
+        info.mode = 0o444
+        tar.addfile(info, io.BytesIO(data))
+        record = json.dumps({"operator": "build_mechanism_cache.py", "sha256": hashlib.sha256(data).hexdigest()}).encode()
+        info = tarfile.TarInfo("native_scripts/manifest.json")
+        info.size = len(record)
+        info.mode = 0o444
+        tar.addfile(info, io.BytesIO(record))
 
 
 def rebuild(ex: Any, hpc: Any, user: str, root: str, papers: str, manifest: str, image: str) -> dict[str, Any]:
@@ -100,7 +137,7 @@ def rebuild(ex: Any, hpc: Any, user: str, root: str, papers: str, manifest: str,
     script = build_analysis_script(
         job, corpus_index.rebuild_inner_command(stage=stage, archive=f"{stage}/code.tgz", image=image,
                                                 root=root, papers=papers, manifest=manifest,
-                                                container_bin=hpc.container_bin),
+                                                container_bin=hpc.container_bin, runtime=maintenance_runtime()),
         partition=hpc.cpu_partition, account=hpc.cpu_account or "", cpus=JOB_CPUS, mem_gb=JOB_MEM_GB,
         time_limit=JOB_TIME, container_module=hpc.container_module, log_dir=stage)
     _say(f"Rebuilding the index on HPC3 ({root}): Slurm job {job}, log in {stage}")

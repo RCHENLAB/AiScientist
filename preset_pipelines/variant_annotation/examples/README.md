@@ -6,7 +6,7 @@ rarity + **ClinVar pathogenicity**, and the clinically-actionable `high_priority
 
 Coordinates + reference alleles were pulled from **Ensembl GRCh38** (so VEP maps them cleanly), and
 the whole file was validated against the **live Ensembl VEP REST** through this skill's
-`annotate_variants` tool (see "Expected result" below).
+`mcp_annotate_variants` tool (see "Expected result" below).
 
 ## The 8 variants
 
@@ -29,7 +29,7 @@ So the set exercises every branch: clean actionable pathogenics, a pathogenic-bu
 - **Console:** upload `demo_variants.vcf` via the Data menu (the uploader accepts `.vcf`/`.vcf.gz`),
   then ask e.g. *"annotate these variants and flag the clinically actionable ones."* The planner
   routes a VCF to the `variant_annotation` workflow (not the scRNA line).
-- **Ad-hoc / tests:** pass the path directly to the tool — `annotate_variants(vcf_path=".../demo_variants.vcf", assembly="GRCh38")`.
+- **Ad-hoc / tests:** pass the path directly to the tool — `mcp_annotate_variants(vcf_path=".../demo_variants.vcf", assembly="GRCh38")`.
 
 Needs network (VEP/ClinVar are REST calls) → runs on the local sandbox, **not** the network-off HPC3
 analysis container.

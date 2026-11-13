@@ -50,8 +50,7 @@
 # aiscientist.service), AISCIENTIST_HOST (default: the --host the installed unit passes, else
 # 127.0.0.1), AISCIENTIST_PORT (8800), AISCIENTIST_KEYS_SERVICE (default aiscientist-keys.service;
 # none = this site has no key service to restart, as on the staging site), AISCIENTIST_EXTRAS
-# (pip extras, default gateway,auth,anthropic,langgraph,analysis; add corpus for the Eye Server copy
-# of the RetiGene index, which installs CPU torch from AISCIENTIST_TORCH_INDEX first),
+# (pip extras; scientific dependencies live in independently pinned MCP images),
 # AISCIENTIST_PYTHON (python3; its version must be the one requirements.lock was made for),
 # AISCIENTIST_CHANNEL (stable or prerelease, above), AISCIENTIST_ENV_FILE (default
 # $AISCIENTIST_ROOT/config/.env),
@@ -88,7 +87,6 @@ RESTART_CMD="${AISCIENTIST_RESTART_CMD:-sudo -n systemctl restart $SERVICE}"
 KEYS_SERVICE="${AISCIENTIST_KEYS_SERVICE:-aiscientist-keys.service}"
 KEYS_RESTART_CMD="${AISCIENTIST_KEYS_RESTART_CMD:-sudo -n systemctl restart $KEYS_SERVICE}"
 ENV_FILE="${AISCIENTIST_ENV_FILE:-$ROOT/config/.env}"
-GENESETS_SRC="${AISCIENTIST_GENESETS_DIR_SRC:-$ROOT/data/reference/genesets}"
 READONLY="${AISCIENTIST_RELEASE_READONLY:-1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -333,12 +331,6 @@ pip_install() {
     "$PYTHON" -m venv "$venv"
   fi
   export PIP_DISABLE_PIP_VERSION_CHECK=1
-  local corpus=""
-  [[ ",$EXTRAS," == *",corpus,"* ]] && corpus=1
-  if [ -n "$corpus" ]; then
-    # The corpus extra embeds on this server's CPU: CPU torch first, or pip pulls the CUDA build.
-    "$venv/bin/pip" install -q torch --index-url "${AISCIENTIST_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
-  fi
   if [ -f "$dest/requirements.lock" ]; then
     # The lock is made for one Python version (its header names it); another would resolve differently.
     local want have
@@ -349,8 +341,6 @@ pip_install() {
     echo "==> pip install --require-hashes -r requirements.lock (Python $have)"
     "$venv/bin/pip" install -q --require-hashes -r "$dest/requirements.lock"
     "$venv/bin/pip" install -q --no-deps --no-build-isolation -e "$dest"
-    # requirements.lock covers the default extras only; the corpus extra comes on top of it.
-    [ -z "$corpus" ] || "$venv/bin/pip" install -q -e "$dest[corpus]"
   else
     echo "==> pip install -e $dest[$EXTRAS] (this package has no requirements.lock)"
     "$venv/bin/pip" install -q -U pip
@@ -399,13 +389,9 @@ prepare_release() {
     mkdir -p "$dest/skills"
     ln -sfn "$ROOT/skills/releases" "$dest/skills/releases"
     ln -sfn "$ROOT/skills/current" "$dest/skills/current"
-    # The gene sets are not in git; real copies, because the app tars its package for HPC3 jobs.
-    if compgen -G "$GENESETS_SRC/*.gmt" >/dev/null; then
-      mkdir -p "$dest/src/aiscientist/tools/genesets"
-      cp -p "$GENESETS_SRC"/*.gmt "$dest/src/aiscientist/tools/genesets/"
-    else
-      echo "WARNING: no gene sets in $GENESETS_SRC: enrichment has no libraries (scripts/fetch_genesets.py)" >&2
-    fi
+    # Gene libraries are external scientific references. The native scRNA MCP
+    # receives the administrator's compute-host SCRNA_GENESETS_DIR as a read-only
+    # mount; installing an app release neither copies nor deletes those assets.
     pip_install "$dest"
     "$dest/.venv/bin/python" -m compileall -q "$dest/src" >/dev/null 2>&1 || true
     touch "$dest/.installed"

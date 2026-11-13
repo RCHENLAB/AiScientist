@@ -46,6 +46,40 @@ def checksums(root):
         for p in sorted(root.iterdir()) if p.is_file() and p.name != "SHA256SUMS"))
 
 
+def test_repository_pin_config_environment_install_advice_and_status(release, tmp_path, monkeypatch):
+    config = {"repository": "example/configured-skills", "release_tag": "v0.1.0",
+              "releases_root": str(release.parent), "allowed_tiers": ["core"]}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_CONFIG", str(path))
+    monkeypatch.delenv("AISCIENTIST_SKILLS_REPO", raising=False)
+    assert registry.config()["repository"] == "example/configured-skills"
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REPO", "liujs123456/aiscientist-skills")
+    assert "-R liujs123456/aiscientist-skills" in registry.install_command(registry.config())
+    assert registry.load(sk._load_from)
+    assert registry.STATUS["repository"] == "liujs123456/aiscientist-skills"
+    from aiscientist.gateway.release_info import skills_release
+    assert skills_release()["repository"] == "liujs123456/aiscientist-skills"
+
+
+@pytest.mark.parametrize("value", ["https://github.com/owner/repo", "owner/repo/extra", "owner/repo?token=x",
+                                  "owner/repo;echo", "-option/repo", "bad--owner/repo", "owner/..", "owner/repo\n"])
+def test_invalid_registry_repository_is_refused(monkeypatch, value):
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REPO", value)
+    with pytest.raises(ValueError, match="owner/repository"):
+        registry.config()
+
+
+def test_cached_repository_mismatch_is_not_loaded(release, monkeypatch):
+    metadata = release.parent / (release.name + ".install.json")
+    metadata.write_text(json.dumps({"repository": "another/skills", "tag": "v0.1.0"}))
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REPO", "liujs123456/aiscientist-skills")
+    with pytest.raises(ValueError, match="differs from the configured pin"):
+        registry.load(sk._load_from)
+    metadata.write_text(json.dumps({"repository": "LIUJS123456/AiScientist-Skills", "tag": "v0.1.0"}))
+    assert registry.load(sk._load_from)
+
+
 def test_checksum_ok_catalog_metadata_and_tiers(release, monkeypatch):
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified")
     lib = registry.load(sk._load_from)
@@ -93,8 +127,8 @@ def test_an_absent_release_is_an_empty_library_and_says_how_to_install_it(tmp_pa
     (local / "SKILL.md").write_text("---\nname: example\n---\nLocal guidance")
     assert registry.load(sk._load_from) == {}
     assert sk._load_skills() == {}
-    assert "Pinned skills release v0.2.0 is not installed" in caplog.text
-    assert (f"gh release download v0.2.0 -R lijinbio/aiscientist-skills -D {tmp_path / 'absent' / '0.2.0'}"
+    assert "Pinned skills release v0.2.5 is not installed" in caplog.text
+    assert (f"gh release download v0.2.5 -R liujs123456/aiscientist-skills -D {tmp_path / 'absent' / '0.2.5'}"
             in caplog.text)
 
 

@@ -1194,6 +1194,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="after merging REF into the split branch, rebuild the split modules from REF's "
                         "old files and re-point imports the merge brought in")
     a = ap.parse_args(argv)
+    if a.apply or a.regenerate_from:
+        ap.error("Historical tool-folder refactor is retired after issue #94. Native scientific "
+                 "implementations live in aiscientist-mcp; do not recreate deleted app tools.")
     if a.regenerate_from:
         regenerate(a.regenerate_from)
         return 0

@@ -34,6 +34,7 @@ chat are all injectable (no GPU/LLM needed for tests).
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import re
@@ -67,6 +68,7 @@ from .plan_doc import (
     split_step,
     sync_plan,
 )
+from .tool_names import canonical_tool_name
 from .scope import (QC_ONLY_TOOLS, RunScope, qc_only_run, read_scope, rules_out_report,
                     wants_written_report)
 from .marker_claims import check_marker_claims
@@ -1003,7 +1005,7 @@ def make_run_in_environment_tool(executor: Any,
 
     def _exec(args: dict[str, Any], ctx: HarnessContext, *,
               _mcp_server: Any = None, _resources: tuple | None = None,
-              _tool_cache: bool = False) -> dict[str, Any]:
+              _tool_cache: bool = False, _mcp_model: Any = None) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
         from .skills import SKILLS, get_skill, refresh_skills
@@ -1044,6 +1046,16 @@ def make_run_in_environment_tool(executor: Any,
         # the model cannot set them.
         cpus, mem_gb, time_limit = _resources or (skill.cpus, skill.mem_gb, skill.time_limit)
         cache = {"tool_cache": True} if _tool_cache else {}
+        if _mcp_server is not None:
+            # Only the pinned registry selects placement/reference mounts. These options
+            # are absent from the planner's tool schema and cannot come from its arguments.
+            from .mcp_analysis import setting_paths
+            cache.update(gpu=_mcp_server.runs_on == "gpu:scgpt",
+                         extra_ro_binds=setting_paths(_mcp_server))
+        from .mcp_model import model_files, run_with_model
+        platform_files = model_files(_mcp_model)
+        if set(platform_files) & set(skill.files):
+            return {"status": "error", "error": "skill file conflicts with the platform model relay"}
         def run():
             if skill.registry_release:
                 import tempfile
@@ -1054,11 +1066,16 @@ def make_run_in_environment_tool(executor: Any,
                         path.parent.mkdir(parents=True, exist_ok=True)
                         path.write_text(text, encoding="utf-8")
                         staged[rel] = str(path)
+                    staged.update(platform_files)
                     return runner(command, skill.image, workdir=workdir, cpus=cpus,
                                   mem_gb=mem_gb, time_limit=time_limit, files=staged, **cache)
             return runner(command, skill.image, workdir=workdir, cpus=cpus,
-                          mem_gb=mem_gb, time_limit=time_limit, files=files, **cache)
-        result = execute(skill, ctx, executor, run, "run_in_environment", code=command)
+                          mem_gb=mem_gb, time_limit=time_limit, files={**files, **platform_files}, **cache)
+        if _mcp_model is not None and _mcp_server is None:
+            return {"status": "error", "error": "model credentials require a pinned MCP call"}
+        result = execute(skill, ctx, executor,
+                         lambda: run_with_model(_mcp_model, executor, run),
+                         "run_in_environment", code=command)
         if isinstance(result, dict):
             result["skill"] = skill.name
             result["provenance"] = {
@@ -1205,7 +1222,7 @@ _ALTERNATIVES_SYSTEM = (
 
 
 def _node_resources(node: TaskNode) -> set[str]:
-    if _is_literature_step(node.goal) or (node.suggested_tool in _READ_ONLY_TOOLS):
+    if _is_literature_step(node.goal) or (canonical_tool_name(node.suggested_tool) in _READ_ONLY_TOOLS):
         return set()                          # external/read-only: no shared mutable resource
     return {"__analysis__", *node.produces, *node.consumes}
 
@@ -1367,6 +1384,9 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
             if not raw.startswith("run_"):
                 continue                      # retain the legacy typo policy, using complete names
             target = _TOOL_NAME_FIXES.get(raw.lower())
+            if target and target not in schemas:
+                matches = [name for name in schemas if canonical_tool_name(name) == target]
+                target = matches[0] if len(matches) == 1 else None
             if target and target in schemas:
                 text = re.sub(NAME_LEFT + re.escape(raw) + NAME_RIGHT, target, text)
                 findings.append({"kind": "renamed", "tool": raw, "detail": target})
@@ -1437,7 +1457,7 @@ def _is_literature_step(step: str) -> bool:
     """
     declared = _declared_tools(step)
     if declared:
-        return bool(declared & _LITERATURE_TOOLS)
+        return bool({canonical_tool_name(name) for name in declared} & _LITERATURE_TOOLS)
     # No tool named: judge the step by its HEADLINE (the bold title, else the first clause), not by
     # every word of its body. A tool-less analysis step routinely MENTIONS literature or a reference
     # in passing — "Reconcile transferred and original annotations … reference taxonomy …" and
@@ -1655,7 +1675,7 @@ def _is_de_producer_step(step: str) -> bool:
         return False
     tool = _primary_tool(step)
     if tool and tool not in _GENERIC_TOOLS:
-        return tool in _DE_PRODUCER_TOOLS
+        return canonical_tool_name(tool) in _DE_PRODUCER_TOOLS
     if _is_enrichment_step(step):
         return False
     return bool(_DE_PRODUCER_RE.search((step or "").replace("_", " ")))
@@ -1674,7 +1694,7 @@ def _is_enrichment_step(step: str) -> bool:
     # nothing produced a DE table, so the run lost its markers and its labels.
     tool = _primary_tool(step)
     if tool and tool not in _GENERIC_TOOLS:
-        return tool in _ENRICHMENT_TOOLS
+        return canonical_tool_name(tool) in _ENRICHMENT_TOOLS
     return bool(_ENRICHMENT_STEP_RE.search((step or "").replace("_", " ")))
 
 
@@ -2134,7 +2154,7 @@ def _literature_step_text(question: str) -> str:
     Otherwise the label says nothing specific rather than something wrong. (The per-query terms are
     planned from the ACCEPTED FINDINGS at run time, so nothing scientific rides on this label.)"""
     try:
-        from ..tools.api import QUERY_STOPWORDS as _QUERY_STOPWORDS, focus_literature_query
+        from ..literature_contract import QUERY_STOPWORDS as _QUERY_STOPWORDS, focus_literature_query
         query = focus_literature_query(question or "")
         toks = [w for w in query.split() if w.lower().strip("-") not in _QUERY_STOPWORDS]
     except Exception:  # noqa: BLE001 - planning guard should never break planning
@@ -2171,7 +2191,7 @@ def _literature_query(question: str, step: str, rounds: "list[LabRound]") -> str
     (top marker genes + enriched pathway terms) plus the step's topic — instead of the raw run
     question, which pollutes the query with instruction words (e.g. "finish research"). Falls back
     to a focused (question+step) only when there are no findings yet."""
-    from ..tools.api import focus_literature_query
+    from ..literature_contract import focus_literature_query
     genes: list[str] = []
     terms: list[str] = []
     for r in rounds:
@@ -2808,7 +2828,7 @@ def _parse_query_list(raw: str, max_n: int) -> list[str]:
     """Parse the planner's JSON array of query strings; sanitize each through ``focus_literature_query``
     (strips instruction/file words the model may still slip in) and dedupe. Returns [] on any parse
     failure so the caller falls back to the deterministic single query."""
-    from ..tools.api import focus_literature_query
+    from ..literature_contract import focus_literature_query
     s = (raw or "").strip()
     if s.startswith("```"):
         s = s.strip("`")
@@ -3289,8 +3309,7 @@ def _missing_analysis_family(issues: "list[str]") -> "tuple[str, ...] | None":
 
 def _names_tool(agenda: "list[str]", tools: "tuple[str, ...]") -> bool:
     """Does any step name one of ``tools``?  (Steps quote tools in backticks.)"""
-    text = "\n".join(agenda)
-    return any(re.search(r"`%s`" % re.escape(t), text) for t in tools)
+    return any(canonical_tool_name(name) in tools for step in agenda for name in _declared_tools(step))
 
 
 def retick_tools(steps: "list[str]", names: "Iterable[str]") -> "list[str]":
@@ -3690,7 +3709,7 @@ def _stopped_round_answer(rnd: LabRound) -> str:
         return str(rnd.scientist_result.get("final_answer") or "(no answer)")
     summaries = []
     for step in rnd.scientist_result.get("steps") or []:
-        if not isinstance(step, dict) or step.get("tool") not in QC_ONLY_TOOLS:
+        if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) not in QC_ONLY_TOOLS:
             continue
         result = step.get("result")
         if step_succeeded(step) and isinstance(result, dict):
@@ -3804,6 +3823,42 @@ class ResumeState:
     redo_indices: "frozenset[int] | None" = None   # None = evaluate; else the exact 0-based set to re-run
     self_sourced: str = ""
     report_requested: bool = False   # the plan had a write_report step, kept out of ``agenda`` (#102)
+    approved_plan: "PlanDoc | None" = None
+    plan_context: "dict[str, Any] | None" = None
+    review_requested: bool = False
+    reviewed_note: str = ""
+    status_recovery: bool = False  # verified task-only draft; always reviewed before execution
+
+    @property
+    def needs_plan_review(self) -> bool:
+        return self.approved_plan is not None and (self.review_requested or bool(self.modify_note.strip())
+            or any(self.approved_plan.step_for(step) is None for step in self.agenda))
+
+    def to_review_state(self) -> dict[str, Any]:
+        """Durable continuation inputs while the same run waits for an edited plan."""
+        return {**({"question": self.approved_plan.request}
+                   if self.approved_plan and self.approved_plan.request else {}),
+                "agenda": list(self.agenda), "rounds": [r.to_dict() for r in self.prior_rounds],
+                "from_step_index": self.from_step_index, "modify_note": self.modify_note,
+                "redo_indices": sorted(self.redo_indices) if self.redo_indices is not None else None,
+                "status_recovery": self.status_recovery, "reviewed_note": self.reviewed_note,
+                "guidance": self.guidance, "self_sourced": self.self_sourced,
+                "report_requested": self.report_requested, "plan_context": self.plan_context,
+                "approved_plan_yaml": self.approved_plan.to_yaml() if self.approved_plan else ""}
+
+    @classmethod
+    def from_review_state(cls, state: dict[str, Any], *, question: str | None = None) -> "ResumeState":
+        # The YAML editor intentionally ignores its request field. Older review records
+        # omitted question; restore it from the trusted outer saved run, never edited YAML.
+        if question is not None:
+            if "question" in state and state["question"] != question:
+                raise ValueError("The saved continuation question does not match its original run.")
+            state = {**state, "question": question}
+        if state.get("status_recovery") and not state.get("question"):
+            raise ValueError("Status recovery requires the original saved run question.")
+        return replace(cls.from_run_state(state, int(state["from_step_index"]),
+                                          modify_note=str(state.get("modify_note") or ""),
+                                          redo_indices=state.get("redo_indices")), review_requested=True)
 
     @classmethod
     def from_run_state(cls, state: dict[str, Any], from_step_index: int, *, modify_note: str = "",
@@ -3814,11 +3869,17 @@ class ResumeState:
         re-run it (see :meth:`ResearchLab._evaluate_redo_indices`)."""
         rounds = [LabRound.from_dict(r) for r in state.get("rounds", [])]
         kept = [r for r in rounds if r.verdict.verdict == "accept"]
+        from .plan_doc import parse_plan_yaml
+        approved = (parse_plan_yaml(state["approved_plan_yaml"], request=str(state.get("question", "")))
+                    if state.get("approved_plan_yaml") else None)
         return cls(list(state.get("agenda", [])), kept, int(from_step_index),
                    modify_note=modify_note, guidance=guidance or state.get("guidance"),
                    redo_indices=frozenset(redo_indices) if redo_indices is not None else None,
                    self_sourced=str(state.get("self_sourced") or ""),
-                   report_requested=bool(state.get("report_requested", False)))
+                   report_requested=bool(state.get("report_requested", False)),
+                   approved_plan=approved, plan_context=copy.deepcopy(state.get("plan_context")),
+                   status_recovery=bool(state.get("status_recovery", False)),
+                   reviewed_note=str(state.get("reviewed_note") or ""))
 
     @classmethod
     def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
@@ -3834,7 +3895,8 @@ class ResumeState:
                              "there is nothing left to continue. Re-run a chosen step instead.")
         return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
                    redo_indices=frozenset(todo), self_sourced=resume.self_sourced,
-                   report_requested=resume.report_requested)
+                   report_requested=resume.report_requested, approved_plan=resume.approved_plan,
+                   plan_context=resume.plan_context)
 
 
 # --- plan revision: patch ONE step instead of re-drafting the whole plan -----------------------
@@ -3897,6 +3959,10 @@ def _describe_param(name: str, spec: "dict[str, Any]") -> str:
 
 def _tool_runs_on(tool: str) -> str:
     """Where a tool's manifest says it runs (``hpc:analysis``, ``inprocess``, …); "" if unknown."""
+    from .mcp_bridge import configured_servers
+    for server in configured_servers():
+        if any(server.planner_name(entry["name"]) == tool for entry in server.tools):
+            return getattr(server, "runs_on", "")
     try:
         from ..tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
@@ -3924,6 +3990,8 @@ def _tool_skill(tool: str) -> "Skill | None":
 
 def _tool_ends_step(tool: str) -> bool:
     """Whether a tool's manifest says one successful call is its whole step (``ends_step``)."""
+    if tool.startswith("mcp_") and canonical_tool_name(tool) == "run_cellqc":
+        return True
     try:
         from ..tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
@@ -3937,7 +4005,10 @@ def _planner_tool_description(tool: HarnessTool) -> str:
     from ..tools.catalog import manifest
     found = manifest(tool.name)
     props = (tool.parameters or {}).get("properties", {})
-    defaults = [_describe_param(n, props[n]) for n in (found.planner_defaults if found else ())
+    names = (found.planner_defaults if found else
+             ("min_counts", "min_features", "max_pct_mt") if tool.name.startswith("mcp_")
+             and canonical_tool_name(tool.name) == "run_cellqc" else ())
+    defaults = [_describe_param(n, props[n]) for n in names
                 if n in props and "default" in props[n]]
     return tool.description + (" Declared defaults: " + "; ".join(defaults) if defaults else "")
 
@@ -4504,18 +4575,50 @@ class ResearchLab:
         self._checkpoint = checkpoint
         self._decision_review = decision_review
         self._proposed_steps, self._step_asks_unanswered = [], False
+        reviewing_resume = resume is not None and resume.needs_plan_review
+        if reviewing_resume and approved_plan is None and saved_plan is None:
+            saved_plan = resume.approved_plan
+            plan_context = resume.plan_context
+            if saved_plan_decision is None and not resume.status_recovery:
+                index = resume.from_step_index
+                change = (f"Change only step {index + 1}. " + resume.modify_note
+                          + f"\nRequested step text: {resume.agenda[index]}\n"
+                          + "Keep every other step and its settings unchanged. Present the changed "
+                            "tool and settings for human review before any execution.")
+                saved_plan_decision = {"action": "revise", "feedback": change}
         restored = approved_plan is not None or saved_plan is not None or saved_plan_kind != "agenda"
         if saved_plan is not None and approved_plan is not None:
             raise ValueError("Provide saved_plan or approved_plan, not both")
-        if resume is not None and restored:
+        if resume is not None and restored and not reviewing_resume:
             raise ValueError("A saved plan cannot also resume completed rounds")
+        if reviewing_resume and approved_plan is None and plan_review is None:
+            from .mcp_plan_migration import PlanMigrationRequired
+            raise PlanMigrationRequired("This changed saved plan needs the normal plan review before execution.")
         self._skipped_steps = []
+
+        def check_restored(agenda: list[str]) -> None:
+            from .mcp_plan_migration import assert_plan_available
+            indices = None
+            if reviewing_resume:
+                done = _rounds_by_agenda_index(agenda, resume.prior_rounds)
+                indices = (set(resume.redo_indices) if resume.redo_indices is not None
+                           else set(range(resume.from_step_index, len(agenda))))
+                indices |= {i for i in range(len(agenda)) if i not in done}
+            assert_plan_available(agenda, self.scientist.catalog,
+                                  plan=self._approved_plan or self._plan_doc, indices=indices)
 
         # A2 continuation: re-enter the SAME state machine without re-planning. Skip skill/mode/PI
         # planning, reuse the prior agenda + accepted rounds, and re-execute from the changed step
         # onward. The kept steps' analysis checkpoints (work/adata_*.h5ad) are reused off disk.
-        if resume is not None:
+        if resume is not None and not reviewing_resume:
+            from .mcp_plan_migration import assert_plan_available, assert_resume_document
+
             self._planning = False
+            if resume.plan_context is not None:
+                self._restore_plan_context(resume.plan_context)
+            if resume.approved_plan is not None:
+                self.config = replace(self.config, plan_yaml=True)
+                self._plan_doc = self._approved_plan = resume.approved_plan
             if resume.guidance is not None:
                 self._guidance = resume.guidance
             if resume.self_sourced and not self._self_sourced:
@@ -4527,20 +4630,26 @@ class ResearchLab:
             # Decide which downstream steps actually depend on the change and must be re-run; the
             # rest (e.g. an independent literature step) are reused. Explicit set wins; else evaluate.
             redo = set(resume.redo_indices) | {k} if resume.redo_indices is not None \
-                else self._evaluate_redo_indices(agenda, k, resume.modify_note, resume.prior_rounds, emit)
+                else self._evaluate_redo_indices(agenda, k, resume.modify_note or resume.reviewed_note,
+                                                resume.prior_rounds, emit)
             # Reuse the prior accepted round for every step NOT being re-run (by 0-based index); any
             # step without a reusable round falls into the re-run set so nothing is silently skipped.
             kept_by_index = {i: r for i, r in _rounds_by_agenda_index(agenda, resume.prior_rounds).items()
                              if i not in redo}
             redo_indices = frozenset(i for i in range(len(agenda))
                                      if i in redo or i not in kept_by_index)
+            assert_plan_available(agenda, self.scientist.catalog, plan=resume.approved_plan,
+                                  indices=redo_indices)
+            assert_resume_document(agenda, resume.approved_plan, redo_indices, resume.modify_note)
             emit({"type": "run_resumed", "agenda": len(agenda), "from_step": k + 1,
                   "redo": sorted(i + 1 for i in redo_indices),
                   "kept": sorted(i + 1 for i in kept_by_index)})
             return self._run_loop(
                 question, agenda, emit, should_cancel, pull_injections,
                 exec_roster=self.config.specialists, exec_multi=self.config.multi_specialist,
-                redo_indices=redo_indices, kept_by_index=kept_by_index, seed_notes=resume.modify_note)
+                redo_indices=redo_indices, kept_by_index=kept_by_index,
+                seed_notes=resume.modify_note or resume.reviewed_note,
+                decision_review=decision_review, should_compact=should_compact)
 
         self._human_failure_asks = 0
         def _cancelled_before_plan() -> "LabResult | None":
@@ -4561,6 +4670,7 @@ class ResearchLab:
             exec_roster = self._team or self.config.specialists
             exec_multi = True if self._mode == "team" else self.config.multi_specialist
             if approved_plan is not None:
+                check_restored(list(payload))
                 self._approve_plan_document(emit)
                 plan_review = None
         else:
@@ -4727,6 +4837,8 @@ class ResearchLab:
                 # the decision they had already made. Inside the loop, so a revision that
                 # introduces a bad name is caught on the same terms as the first draft.
                 if kind == "agenda" and saved_plan_decision is None:
+                    if restored:
+                        check_restored(list(payload))
                     payload = self._check_plan_tooling(list(payload), emit, reported_tooling)
                     self._present_plan_document(question, list(payload), emit)
                     if pending_cutoffs is not None:
@@ -4895,6 +5007,43 @@ class ResearchLab:
             # plan would post a second identical "📋 Plan ready" card in plan mode.
         else:
             agenda = payload if kind == "agenda" else [question]
+
+        if restored:
+            check_restored(list(agenda))
+
+        if reviewing_resume:
+            from .mcp_plan_migration import PlanMigrationRequired
+            updated = self._approved_plan or self._plan_doc
+            original = resume.approved_plan
+            if updated is None or original is None or [s.id for s in updated.steps] != [s.id for s in original.steps]:
+                raise PlanMigrationRequired("A same-run revision must keep the plan's step order and identifiers; "
+                                            "review a new study for added, removed, or reordered steps.")
+            if resume.status_recovery:
+                from .status_continuation import validate_review
+                validate_review(original, updated, resume.redo_indices or frozenset())
+            if self._scope.source == "explicit_mcp":
+                self._scope = replace(self._scope, keep=tuple(s.tool for s in updated.steps if s.tool))
+            elif self._scope.keep:
+                changed = {name: new.tool for old, new in zip(original.steps, updated.steps)
+                           if old.tool != new.tool and new.tool
+                           for name in (old.tool, canonical_tool_name(old.tool))}
+                self._scope = replace(self._scope, keep=tuple(dict.fromkeys(
+                    changed.get(name, name) for name in self._scope.keep)))
+            # A reviewed status-only recovery must not launch a replacement scientific
+            # job. Its complete typed call uses the same exact-call guard as explicit
+            # native workflows; canonical identity comes only from the reviewed registry.
+            from .tool_names import STATUS_TOOLS
+            status_steps = ([updated.steps[i] for i in sorted(resume.redo_indices or ())]
+                            if resume.status_recovery else updated.steps)
+            if status_steps and all(canonical_tool_name(s.tool) in STATUS_TOOLS for s in status_steps):
+                self._scope = replace(self._scope, source="explicit_mcp",
+                                      keep=tuple(s.tool for s in status_steps if s.tool))
+            return self._run_inner(question, on_event=emit, should_cancel=should_cancel,
+                pull_injections=pull_injections, checkpoint=checkpoint,
+                decision_review=decision_review, should_compact=should_compact,
+                resume=replace(resume, agenda=updated.agenda(), approved_plan=updated,
+                               plan_context=self.plan_context, modify_note="", review_requested=False,
+                               reviewed_note=resume.modify_note or resume.reviewed_note))
 
         # PI↔Critic PLAN-TIME review (before any step runs) — the plan-time complement to the per-step
         # meetings: catch an incoherent plan (orphan de-novo clustering never reconciled with provided
@@ -6342,7 +6491,7 @@ class ResearchLab:
         for step in steps or ():
             if not isinstance(step, dict) or not step.get("ok"):
                 continue
-            if step.get("tool") not in _LITERATURE_TOOLS:
+            if canonical_tool_name(step.get("tool")) not in _LITERATURE_TOOLS:
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
             for citation in (result.get("results") or result.get("citations") or ()):
@@ -6377,7 +6526,7 @@ class ResearchLab:
 
         Falls back to plain completions when no tool-capable Scientist is wired (offline tests), so
         the meeting always works."""
-        tools = [t for t in getattr(self.scientist, "catalog", []) if t.name in _MEETING_TOOLS]
+        tools = [t for t in getattr(self.scientist, "catalog", []) if canonical_tool_name(t.name) in _MEETING_TOOLS]
         if not tools or not self.config.meeting_tools:
             return self._complete_concurrent(msg_lists)
 
@@ -6591,6 +6740,10 @@ class ResearchLab:
         """A stratified condition-vs-control `run_de` step written from the dataset profile, or ""
         when the profile shows no condition column to contrast. Used ONLY to repair a plan that
         schedules enrichment with nothing producing a DE table."""
+        de_tool = next((tool.name for tool in self.scientist.catalog
+                        if canonical_tool_name(tool.name) == "run_de"), "")
+        if not de_tool:
+            return ""
         dr = (self.ctx.decisions or {}).get("dataset_result") or {}
         cats = dr.get("obs_categoricals") if isinstance(dr, dict) else None
         if not isinstance(cats, dict):
@@ -6613,7 +6766,7 @@ class ResearchLab:
                    cond_levels[0] if cond_levels else "<control level>")
         strat = (f", separately within each `{ct}` cell type (stratify_by='{ct}')" if ct else "")
         return (f"**Condition contrast** — Compare the levels of `{cond}` against the reference "
-                f"'{ref}' with `run_de` (Wilcoxon rank-sum, reference='{ref}'{strat}), testing "
+                f"'{ref}' with `{de_tool}` (Wilcoxon rank-sum, reference='{ref}'{strat}), testing "
                 f"only genes detected in >=10% of either arm's cells and calling a gene changed at "
                 f"adjusted p < 0.05 with |log2FC| >= 0.25. This produces the ranked DE tables the "
                 f"enrichment step below reads.")
@@ -7007,7 +7160,7 @@ class ResearchLab:
         together = {str(d) for d in ((layout or {}).get("datasets") or [])} if isinstance(layout, dict) else set()
         lines = ["Attached files (the profile above describes the PRIMARY only; run_code reads the "
                  "others through AISCIENTIST_INPUTS, and the other tools read only the primary"
-                 + ("; `run_cellqc` reads the Cell Ranger libraries of every attached folder "
+                 + ("; the registered CellQC tool reads the Cell Ranger libraries of every attached folder "
                     "marked SAMPLE FOLDER, with the primary's" if len(together) > 1 else "") + "):"]
         for r in records:
             role = str(r.get("role") or "").strip()
@@ -7579,7 +7732,9 @@ class ResearchLab:
         if self._approved_plan is None:
             return {}
         found = self._approved_plan.step_for(step)
-        if found is None or not found.tool or not found.settings:
+        if found is None or not found.tool:
+            return {}
+        if not found.settings and self._scope.source != "explicit_mcp":
             return {}
         return {found.tool: dict(found.settings)}
 
@@ -7677,6 +7832,24 @@ class ResearchLab:
         every earlier note and re-applying those to an agenda that already carries them would
         undo the user's own earlier revisions."""
         emit({"type": "planning"})   # heartbeat: drafting takes 20-60s and used to render nothing
+        if not feedback and not latest_feedback and not prior_agenda:
+            from .mcp_workflow import explicit_workflow, validated_agenda
+            explicit = explicit_workflow(question)
+            if explicit:
+                try:
+                    agenda = validated_agenda(explicit, list(self.scientist.catalog))
+                except ValueError as exc:
+                    return "failed", str(exc)
+                self.config = replace(self.config, plan_yaml=True)
+                self._plan_doc = PlanDoc(request=question, steps=tuple(
+                    PlanStep(id=f"s{i}", text=text, tool=call.name, settings=copy.deepcopy(call.arguments),
+                             runs_on=_tool_runs_on(call.name))
+                    for i, (call, text) in enumerate(zip(explicit, agenda), 1)))
+                self._self_sourced = "The researcher supplied the ordered tool calls and all stated settings."
+                self._save_plan_reply(json.dumps({"source": "explicit_mcp", "agenda": agenda}))
+                emit({"type": "pi_agenda", "agenda": agenda, "source": "explicit_mcp"})
+                return "agenda", agenda
+
         # A small edit to an existing plan is a PATCH, not a re-plan. Only when the model says the
         # request needs more than one step changed do we fall through to the full redraft below.
         request = (latest_feedback or feedback).strip()
@@ -8337,7 +8510,11 @@ class ResearchLab:
         # Literature grounding: prefer deep_literature (PaperQA over the lab's indexed corpus on
         # HPC3); fall back to literature_search (Europe PMC) ONLY when the corpus tool isn't wired
         # (dev / no-HPC), so behaviour never regresses where deep_literature can't run.
-        if _is_literature_step(step):
+        primary = _primary_tool(plan_step if plan_step is not None else step)
+        native_tool = canonical_tool_name(primary) != str(primary or "")
+        # An explicitly approved MCP call keeps its own schema, dispatch and provenance.
+        # The historical forced-literature path below selects only legacy tools.
+        if _is_literature_step(step) and not native_tool:
             deep_tool = next((t for t in self.scientist.catalog if t.name == "deep_literature"), None)
             lit_tool = next((t for t in self.scientist.catalog if t.name == "literature_search"), None)
             corpus_tool = next((t for t in self.scientist.catalog if t.name == "search_corpus"), None)
@@ -8463,13 +8640,16 @@ class ResearchLab:
                 "`search_skills(query)` ranks them by keyword:\n" + skill_manifest()
             )
         pinned = self._pinned_settings(plan_step if plan_step is not None else step)
+        exact = self._scope.source == "explicit_mcp" and bool(pinned)
         if pinned:
             parts.append(
                 "Settings the researcher approved with the plan: " + "; ".join(
                     f"`{tool}` — " + ", ".join(f"{k}={json.dumps(v)}" for k, v in settings.items())
                     for tool, settings in pinned.items())
-                + ". These values are applied to the call whatever you send; every other argument "
-                "is yours to choose. If a result shows one of them is wrong for this data, say so in "
+                + (". These are the complete approved arguments; omitted fields keep server defaults. "
+                   "No other scientific tool may run in this step. " if exact else
+                   ". These values are applied to the call whatever you send; every other argument is yours to choose. ")
+                + "If a result shows one of them is wrong for this data, say so in "
                 "your answer — changing an approved value is the researcher's decision.")
         parts.append("Execute THIS step with the tools, then call `finish` with what you found for this step.")
         brief = "\n\n".join(parts)
@@ -8482,6 +8662,8 @@ class ResearchLab:
         # Passed only when there is something to pin, so a scientist that predates the argument
         # (a test double, an older harness) is called exactly as before.
         pin_kwargs: dict[str, Any] = {"pinned_args": pinned} if pinned else {}
+        if exact:
+            pin_kwargs.update(exact_args=True, planned_tools=list(pinned))
         if "planned_tools" in inspect.signature(self.scientist.run).parameters:
             approved_step = plan_step if plan_step is not None else step
             planned = set(_declared_tools(approved_step))
@@ -8519,7 +8701,7 @@ class ResearchLab:
             # step: one exploratory run_code, two failed ones, run_enrichment never called). Never
             # applied to a step that stopped for a cancel, an error budget or a step limit — those are
             # not "forgot to call it".
-            named = {n for n in _BACKTICK_TOOL_RE.findall(step or "")}
+            named = set(_declared_tools(step))
             catalog = {t.name for t in getattr(self.scientist, "catalog", [])}
             named &= catalog
             called = {str(st.get("tool")) for st in (result.steps or [])}
@@ -9082,6 +9264,12 @@ class ResearchLab:
         The Critic flags orphan/circular/incoherent steps and proposes a revision; the PI (owns the
         plan) finalizes. ``never worse than the draft``: any empty/oversized/garbled revision falls back
         to the original. No-op returning the draft unless ``config.plan_review`` (and 2+ steps)."""
+        from .mcp_workflow import explicit_workflow
+        explicit = explicit_workflow(question)
+        if explicit and agenda == [call.step(i) for i, call in enumerate(explicit, 1)]:
+            emit({"type": "plan_review_preserved", "source": "explicit_mcp",
+                  "reason": "The researcher supplied exact calls; schema checks and human review remain."})
+            return agenda
         if not self.config.plan_review or len(agenda) < 2:
             return agenda
         profile = self._dataset_context()

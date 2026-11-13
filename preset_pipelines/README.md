@@ -39,7 +39,7 @@ data_type: scrna        # or: variants. Leave it out for a protocol that fits an
 outputs:                # the deliverables of its tool steps, each named with the tool that writes it
   - path: tables/de_*_all.csv
     kind: table         # table, figure, h5ad, json, report_section or folder
-    tool: run_de
+    tool: mcp_run_de
     description: One row per gene and group with log2 fold change and adjusted p-value.
     required: true      # true only when the tool always writes it on success
 ---

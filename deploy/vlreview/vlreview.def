@@ -11,7 +11,7 @@ From: pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 #   - NOT co-located on Qwen's vLLM GPU (that server claims most VRAM), and
 #   - NOT a second *persistent* GPU (which would hold a scarce card for the whole session).
 # It loads once, reviews the rendered pages, writes review.json, and exits — releasing the
-# GPU. Same shape as deploy/scgpt/scgpt.def and gateway/scgpt_job.py.
+# GPU. Dispatched through gateway/vlreview_job.py.
 #
 # Build ON HPC3 (macOS cannot build .sif). The reference MODEL WEIGHTS are NOT baked in —
 # they are bind-mounted read-only at run time (--model), so this image stays small and

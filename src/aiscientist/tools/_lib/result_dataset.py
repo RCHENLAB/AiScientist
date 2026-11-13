@@ -283,7 +283,7 @@ def _export_checkpoint(workspace: "str | Path", name: str, meta: "dict[str, Any]
         "name": name, "path": str(out), "size_bytes": size,
         "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
         "X": "log-normalised expression, all genes that passed QC (sparse)",
-        "layers": sorted(adata.layers.keys()),
+        "layers": sorted(str(key) for key in adata.layers.keys() if key is not None),
         "counts_layer": str(adata.uns.get("counts_layer") or "integer counts kept by the QC step"), "obs_columns": [str(c) for c in adata.obs.columns],
         "obsm": sorted(adata.obsm.keys()), "checkpoints": used, "notes": notes,
         "created_at": provenance["created_at"], "saved_to": None,
@@ -380,7 +380,7 @@ def adopt(workspace: "str | Path", source: "str | Path") -> "dict[str, Any]":
         "label_key": label_key, "n_labels": levels(label_key),
         "obs_columns": [str(c) for c in adata.obs.columns],
         "obsm": sorted(str(k) for k in adata.obsm.keys()),
-        "layers": sorted(str(k) for k in adata.layers.keys()),
+        "layers": sorted(str(k) for k in adata.layers.keys() if k is not None),
         "counts_layer": str(adata.uns.get("counts_layer") or ""),
     }
     summary = (f"started from {src.name}: {adata.n_obs} cells x {adata.n_vars} genes"
