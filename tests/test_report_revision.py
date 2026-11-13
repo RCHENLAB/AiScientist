@@ -75,6 +75,32 @@ def test_hydration_preserves_false_evidence_and_downgrades_stale_claim_only_in_c
     assert len(evidence["full_results"][0]["sha256"]) == 64
 
 
+def test_report_only_footer_identifies_original_planner_errors_as_historical(tmp_path):
+    from aiscientist.agents import own_choices
+    art, state = seed(tmp_path)
+    old = "The parameter ambient_compare is not declared. ORA and GSEA both used top100 genes."
+    state["self_sourced"] = old
+    before = copy.deepcopy(state)
+    view, _ = rr.hydrate(art, state, "Correct the parameter and GSEA descriptions")
+    # The real deterministic footer runs after model review; an instruction to
+    # the writer alone cannot prevent it from repeating the old statement.
+    final = own_choices.add_section("# Revised report\n\nGSEA used1502 genes.", view["self_sourced"])
+    assert "HISTORICAL PLANNER STATEMENT" in final
+    assert "not a verified description of the executed analysis" in final
+    assert final.index("HISTORICAL PLANNER STATEMENT") < final.index(old)
+    assert old in final and state == before
+
+
+@pytest.mark.parametrize("disclosure", [None, "", "none — all choices came from the request"])
+def test_report_only_does_not_invent_a_historical_disclosure(tmp_path, disclosure):
+    from aiscientist.agents import own_choices
+    art, state = seed(tmp_path)
+    state["self_sourced"] = disclosure
+    view, _ = rr.hydrate(art, state, "Correct report")
+    assert view["self_sourced"] == disclosure
+    assert own_choices.add_section("# Report", view["self_sourced"]) == "# Report"
+
+
 @pytest.mark.parametrize("relative", ["../outside.json", "/tmp/outside.json", "mcp/link/data.json"])
 def test_hydration_rejects_path_escape_and_symlinks(tmp_path, relative):
     art, _ = seed(tmp_path)
@@ -227,6 +253,8 @@ def test_source_changed_since_review_requires_new_review(tmp_path, monkeypatch):
 def test_existing_report_worker_receives_accepted_artifact_view_without_rewriting_state(tmp_path, monkeypatch):
     import threading
     art, state = seed(tmp_path)
+    state["self_sourced"] = "The parameter ambient_compare is not declared."
+    (art / "process/run_state.json").write_text(json.dumps(state))
     folder = rr.create(art, RID, "chat1", "Correct negative evidence")
     record = rr.decide(folder, "approve")
     original = (art / "process/run_state.json").read_bytes()
@@ -245,6 +273,8 @@ def test_existing_report_worker_receives_accepted_artifact_view_without_rewritin
     assert '"association": false' in received[0][1].final_answer
     assert received[0][1].accepted_steps == 1 and len(received[0][1].rounds) == 1
     assert received[0][3]["qc_report"] is False
+    assert received[0][3]["self_sourced"].startswith("HISTORICAL PLANNER STATEMENT")
+    assert state["self_sourced"] in received[0][3]["self_sourced"]
     assert (art / "process/run_state.json").read_bytes() == original
     assert json.loads((folder / "grounding.json").read_text())["scientific_calls"] == 0
     assert json.loads((art / "process/report_job.json").read_text())["state"] == "done"

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from ..agents.plan_doc import PlanDoc, PlanStep, parse_plan_yaml
 from ..agents.mcp_result_summary import project_result
+from ..agents import own_choices
 from . import saved_plans
 
 _ID = re.compile(r"[a-f0-9]{12}\Z")
@@ -224,6 +225,15 @@ def hydrate(art: Path, state: dict, instructions: str) -> tuple[dict, dict]:
     if not has_accepted_results(state):
         raise ValueError("A report revision requires accepted results")
     view = copy.deepcopy(state)
+    disclosure = str(view.get("self_sourced") or "")
+    if own_choices.disclosed(disclosure):
+        # The report writer appends this field after model review. Keep the old
+        # statement for audit without presenting its unverified claims as facts.
+        view["self_sourced"] = (
+            "HISTORICAL PLANNER STATEMENT — retained only as historical evidence. "
+            "It may contain errors and is not a verified description of the executed analysis. "
+            "Use the accepted tool results and corrections in this revised report for execution facts. "
+            "Original statement: " + disclosure)
     evidence = []
     synthesis = []
     refreshed_steps = set()
