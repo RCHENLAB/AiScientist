@@ -60,7 +60,7 @@ def test_the_library_follows_a_switch_of_the_link_without_a_restart(two_releases
     sk.refresh_skills()
     assert "beta" in sk.SKILLS and "alpha" not in sk.SKILLS
     assert sk.SKILLS["beta"].registry_release == "v0.2.0"
-    assert registry.STATUS == {"tag": "v0.2.0", "skills": 1, "error": None}
+    assert registry.STATUS == {"tag": "v0.2.0", "repository": "lijinbio/aiscientist-skills", "skills": 1, "error": None}
 
     _point(current, str(releases / "0.1.0"))          # a rollback is the same switch
     assert sk.refresh_skills() is True

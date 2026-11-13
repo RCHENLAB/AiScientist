@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import tempfile
 import threading
@@ -38,8 +39,17 @@ _SCOPES = itertools.count()
 
 # What the last load found: the release tag it read and how many curated skills it gave, or the
 # error that refused it. /health reports it, so deploy/deploy_skills.sh can see the switch take.
-STATUS: dict = {"tag": None, "skills": 0, "error": None}
+STATUS: dict = {"tag": None, "repository": None, "skills": 0, "error": None}
 _VERSION_RE = r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?"
+
+
+def validate_repository(value: str) -> str:
+    """A GitHub owner/repository slug, never a URL or command-line option."""
+    pattern = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}"
+    if (not isinstance(value, str) or not re.fullmatch(pattern, value)
+            or "--" in value.split("/", 1)[0] or value.rsplit("/", 1)[-1] in {".", ".."}):
+        raise ValueError("skills repository must be a GitHub owner/repository name")
+    return value
 
 
 def config() -> dict:
@@ -49,6 +59,7 @@ def config() -> dict:
     path = Path(os.environ.get("AISCIENTIST_SKILLS_REGISTRY_CONFIG",
                                ROOT / "configs/skills_registry.json"))
     cfg = json.loads(path.read_text(encoding="utf-8"))
+    cfg["repository"] = validate_repository(os.environ.get("AISCIENTIST_SKILLS_REPO", cfg.get("repository", REGISTRY_REPO)))
     for key in ("release_tag", "releases_root", "allowed_tiers", "current"):
         value = os.environ.get("AISCIENTIST_SKILLS_REGISTRY_" + key.upper())
         if value is not None:
@@ -79,6 +90,21 @@ def config() -> dict:
 
 def release_dir(cfg: dict) -> Path:
     return cfg.get("release_path") or cfg["releases_root"] / cfg["release_tag"][1:]
+
+
+def check_repository(root: Path, repository: str) -> None:
+    """Refuse a known cached origin mismatch; manual checksum installs remain valid."""
+    metadata = root.parent / (root.name + ".install.json")
+    if metadata.is_symlink():
+        raise ValueError("skills install provenance cannot be a symlink")
+    if not metadata.exists():
+        return
+    installed = json.loads(metadata.read_text(encoding="utf-8"))
+    if not isinstance(installed, dict):
+        raise ValueError("skills install provenance must be a JSON object")
+    origin = validate_repository(installed.get("repository"))
+    if origin.casefold() != repository.casefold() or installed.get("tag") != "v" + root.name:
+        raise ValueError("installed skills repository/tag differs from the configured pin; use a separate releases root")
 
 
 def safe_path(root: Path, name: str) -> Path:
@@ -146,20 +172,23 @@ def _extract(archive: Path, dest: Path) -> None:
 
 def install_command(cfg: dict) -> str:
     """The one line that installs the pinned release where the loader reads it."""
-    return f"gh release download {cfg['release_tag']} -R {REGISTRY_REPO} -D {release_dir(cfg)}"
+    repository = validate_repository(cfg.get("repository", REGISTRY_REPO))
+    return f"gh release download {cfg['release_tag']} -R {repository} -D {shlex.quote(str(release_dir(cfg)))}"
 
 
 def load(load_from) -> dict:
     """The curated skills of the pinned release. An absent release is an empty library, said in the
     log with the command that installs it; an installed release that fails a check raises."""
-    STATUS.update(tag=None, skills=0, error=None)
+    STATUS.update(tag=None, repository=None, skills=0, error=None)
     cfg = config()
+    STATUS["repository"] = cfg["repository"]
     root = release_dir(cfg)
     if not root.exists():
         LOG.warning("Pinned skills release %s is not installed at %s: no curated skills are loaded. "
                     "Install it with: %s", cfg["release_tag"], root, install_command(cfg))
         STATUS["error"] = f"release {cfg['release_tag']} is not installed"
         return {}
+    check_repository(root, cfg["repository"])
     checked = check_release(root, cfg["release_tag"])
     catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
     out = {}

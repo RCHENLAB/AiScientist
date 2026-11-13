@@ -38,7 +38,6 @@ if [ -f "$DEPLOY_ENV" ]; then
   done < "$DEPLOY_ENV"
 fi
 
-SKILLS_REPO="${AISCIENTIST_SKILLS_REPO:-lijinbio/aiscientist-skills}"
 SERVICE="${AISCIENTIST_SERVICE:-aiscientist.service}"
 PORT="${AISCIENTIST_PORT:-8800}"
 HEALTH_TIMEOUT="${AISCIENTIST_HEALTH_TIMEOUT:-30}"
@@ -55,6 +54,37 @@ TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 
 die() { echo "ERROR: $*" >&2; log "error: $*"; exit 1; }
 log() { mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null && echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) skills $*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+# Match the offline loader: an explicit environment pin wins over the app's
+# repository setting. One owner/repo slug is shared by download and provenance.
+REPO_PY="$CHECK_PY"
+[ -x "$REPO_PY" ] || REPO_PY=python3
+SKILLS_REPO="${AISCIENTIST_SKILLS_REPO-lijinbio/aiscientist-skills}"
+REGISTRY_CONFIG="${AISCIENTIST_SKILLS_REGISTRY_CONFIG:-$ROOT/app/current/configs/skills_registry.json}"
+if [ -z "${AISCIENTIST_SKILLS_REPO+x}" ] && [ -f "$REGISTRY_CONFIG" ]; then
+  SKILLS_REPO="$("$REPO_PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("repository", "lijinbio/aiscientist-skills"))' "$REGISTRY_CONFIG")" \
+    || die "could not read the skills repository pin"
+fi
+REPO_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}$'
+[[ "$SKILLS_REPO" =~ $REPO_RE ]] && [[ "${SKILLS_REPO%%/*}" != *--* ]] \
+  && [[ "${SKILLS_REPO#*/}" != . && "${SKILLS_REPO#*/}" != .. ]] \
+  || die "skills repository must be a GitHub owner/repository name"
+
+check_cached_repository() {
+  "$REPO_PY" -c 'import json, pathlib, sys
+root, expected = pathlib.Path(sys.argv[1]), sys.argv[2]
+metadata = root.parent / (root.name + ".install.json")
+try:
+    if metadata.is_symlink():
+        raise ValueError("repository provenance cannot be a symlink")
+    row = json.loads(metadata.read_text())
+    if str(row.get("repository", "")).casefold() != expected.casefold() or row.get("tag") != "v" + root.name:
+        raise ValueError("cached repository/tag differs from the configured pin")
+except (OSError, ValueError, TypeError, AttributeError) as exc:
+    print("refused cached skills: " + str(exc), file=sys.stderr)
+    sys.exit(1)' "$1" "$SKILLS_REPO" \
+    || die "cached skills origin is missing or mismatched; use a separate install root"
+}
 
 lock() {
   mkdir -p "$RELEASES"
@@ -126,6 +156,7 @@ install_release() {
   local dest="$RELEASES/$version"
   [[ "$tag" =~ $TAG_RE ]] || die "tag must look like v1.2.3 (got '$tag')"
   if [ -d "$dest" ]; then
+    check_cached_repository "$dest"
     echo "==> skills $tag is installed already; checking it again"
     check_release "$dest" "$tag" || die "the installed skills release $tag fails its check: remove $dest and deploy it again"
     return 0
@@ -196,6 +227,7 @@ rollback() {
   local prev cur
   prev="$(target_of "$PREVIOUS")"; cur="$(target_of "$CURRENT")"
   [ -n "$prev" ] && [ -d "$RELEASES/$prev" ] || die "no previous skills release to roll back to"
+  check_cached_repository "$RELEASES/$prev"
   echo "==> rolling back skills v$cur -> v$prev"
   switch_to "$CURRENT" "releases/$prev"
   [ -z "$cur" ] || { switch_to "$PREVIOUS" "releases/$cur"; hold "v$cur"; }
