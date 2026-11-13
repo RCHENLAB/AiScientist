@@ -1,0 +1,815 @@
+[
+  {
+    "name": "run_scanpy_qc",
+    "description": "REAL scanpy QC on the uploaded single-cell dataset: per-cell metrics, cell/gene filtering, normalization, log1p, and HVG selection. Writes QC violin/scatter figures and a checkpoint. Returns pre/post cell-gene counts and the thresholds used. Run this FIRST on a single matrix; for a folder of 10x Cell Ranger outputs (raw + filtered matrices) use run_cellqc instead.\n\n# run_scanpy_qc\n\nThe first step of the single-cell line. It computes per-cell quality metrics (genes detected, total counts, mitochondrial share), removes low-quality cells and rarely detected genes by the declared thresholds, normalises and log-transforms the counts, and selects highly variable genes. Every later scRNA tool reads the checkpoint it writes.\n\n## When the agent uses it\n\n- First, on a single-cell matrix: `.h5ad`, a 10x `.h5` or `filtered_feature_bc_matrix/` folder, loom, or a text matrix.\n- On a subset or merge that a `run_code` step saved, through `input`.\n\n## When the agent does NOT use it\n\n- The bound dataset is a folder of 10x Cell Ranger outputs with raw AND filtered matrices: use\n  `run_cellqc`, which corrects ambient RNA from the raw matrix and QCs every library. This tool\n  reads one filtered matrix and cannot correct ambient RNA. The gateway flags such a folder in the\n  data profile (`\u26a0 INPUT is a 10x Cell Ranger delivery \u2026`).\n- After `run_cellqc`: it already wrote the filtered, normalised checkpoint. Running this tool on top\n  would filter a second time with different thresholds.\n- On a dataset an earlier run handed on (`<input>.processed.<time>.<run>.h5ad`, recognised by its\n  `uns[\"aiscientist\"]` record). It is already filtered and log-normalised, so the tool refuses it:\n  QC there would filter on log values and normalise twice. The gateway has already written such a\n  file back as this run's checkpoints (`_lib/result_dataset.adopt`), so the next tool reads it\n  directly. Tests: `tests/test_session_continuation.py`.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `min_genes` | integer | `200` | drop a cell detecting fewer genes than this \u2014 an empty droplet or a dying cell |\n| `min_cells` | integer | `3` | drop a gene detected in fewer cells than this \u2014 too sparse to support any test |\n| `max_pct_mt` | number | `10.0` | drop a cell whose reads are more than this percent mitochondrial (a stressed or lysed cell). 10 is the common working threshold for tissue; the Seurat and scanpy tutorials use 5 for PBMC, and single NUCLEI need far less (1-5) because a nucleus should carry almost no mitochondrial signal. Raise it only for a tissue known to be mitochondria-rich, and say so |\n| `n_top_genes` | integer | `2000` | how many highly-variable genes to keep for the embedding \u2014 more genes carry more structure and more noise. 2000 is Seurat's default and the usual starting point |\n| `warn_removed_pct` | number | `50.0` | warn when QC discards more than this percent of cells. An ENGINEERING guard, not a literature threshold: losing half a dataset usually means a threshold is wrong for this tissue, and it should be checked before the result is used |\n| `mito_prefix` | string | `'MT-'` | the name prefix that marks a mitochondrial gene, matched without regard to case, so the default also covers mouse 'mt-'. It is the only way `max_pct_mt` knows which genes to count: a dataset whose genes match nothing gets no mitochondrial filter at all |\n| `gene_symbols_key` | string | `''` | a `var` column holding gene SYMBOLS, for data whose gene names are Ensembl IDs (cellxgene files keep the symbols in `feature_name`). The mitochondrial prefix is then matched against that column. Empty = match the gene names themselves |\n| `input` | string | `''` | an .h5ad to QC INSTEAD of the bound dataset \u2014 e.g. a subset or merge a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the bound dataset. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `work/adata_qc.h5ad`, the checkpoint the rest of the line reads. The raw counts are kept in `layers[\"counts\"]` for the tools that need them (doublets, pseudobulk, depth matching).\n- Figures in `artifacts/figures/`: QC violins, genes-vs-counts and mitochondrial scatter plots, the highly-variable-gene plot.\n- Result: cells and genes before and after, the thresholds used, `warnings` (for example more than `warn_removed_pct` of cells removed, or no gene matched `mito_prefix`), and `read_from`.\n\n\n## Known limits\n\n- Thresholds are fixed numbers for the whole run, not adaptive per sample. Single-nucleus data needs a much lower `max_pct_mt` than the tissue default.\n- Mitochondrial genes are found by name prefix. Data whose gene names are Ensembl IDs needs `gene_symbols_key`, or it gets no mitochondrial filter at all.\n- It loads the whole matrix into memory inside the job.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "min_genes": {
+          "default": 200,
+          "description": "drop a cell detecting fewer genes than this \u2014 an empty droplet or a dying cell",
+          "title": "Min Genes",
+          "type": "integer"
+        },
+        "min_cells": {
+          "default": 3,
+          "description": "drop a gene detected in fewer cells than this \u2014 too sparse to support any test",
+          "title": "Min Cells",
+          "type": "integer"
+        },
+        "max_pct_mt": {
+          "default": 10.0,
+          "description": "drop a cell whose reads are more than this percent mitochondrial (a stressed or lysed cell). 10 is the common working threshold for tissue; the Seurat and scanpy tutorials use 5 for PBMC, and single NUCLEI need far less (1-5) because a nucleus should carry almost no mitochondrial signal. Raise it only for a tissue known to be mitochondria-rich, and say so",
+          "title": "Max Pct Mt",
+          "type": "number"
+        },
+        "n_top_genes": {
+          "default": 2000,
+          "description": "how many highly-variable genes to keep for the embedding \u2014 more genes carry more structure and more noise. 2000 is Seurat's default and the usual starting point",
+          "title": "N Top Genes",
+          "type": "integer"
+        },
+        "warn_removed_pct": {
+          "default": 50.0,
+          "description": "warn when QC discards more than this percent of cells. An ENGINEERING guard, not a literature threshold: losing half a dataset usually means a threshold is wrong for this tissue, and it should be checked before the result is used",
+          "title": "Warn Removed Pct",
+          "type": "number"
+        },
+        "mito_prefix": {
+          "default": "MT-",
+          "description": "the name prefix that marks a mitochondrial gene, matched without regard to case, so the default also covers mouse 'mt-'. It is the only way `max_pct_mt` knows which genes to count: a dataset whose genes match nothing gets no mitochondrial filter at all",
+          "title": "Mito Prefix",
+          "type": "string"
+        },
+        "gene_symbols_key": {
+          "default": "",
+          "description": "a `var` column holding gene SYMBOLS, for data whose gene names are Ensembl IDs (cellxgene files keep the symbols in `feature_name`). The mitochondrial prefix is then matched against that column. Empty = match the gene names themselves",
+          "title": "Gene Symbols Key",
+          "type": "string"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to QC INSTEAD of the bound dataset \u2014 e.g. a subset or merge a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the bound dataset.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_scanpy_qcArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_clustering",
+    "description": "PCA \u2192 neighbors \u2192 Leiden clustering \u2192 UMAP on the QC'd data. Writes a UMAP figure and returns cluster count + sizes. Run AFTER run_scanpy_qc. Set `select_resolution: true` to CHOOSE the Leiden resolution by bootstrap stability instead of accepting the 1.0 default: each candidate resolution is re-clustered over resampled subsets and scored by adjusted Rand index against the full-data partition, and the FINEST resolution still clearing `stability_min` wins. Prefer this whenever cell-type labels will be assigned from the clusters \u2014 every label inherits the partition, so an unexamined resolution is an unexamined assumption in every label. It costs n_bootstrap \u00d7 len(resolution_candidates) re-clusterings, so it is opt-in; the sweep itself is capped at `max_sweep_cells`.\n\n# run_clustering\n\nGroups cells into clusters for data that carries no cell-type labels: PCA on the highly variable genes, a nearest-neighbour graph, Leiden clustering and a UMAP layout for display. With `select_resolution` it re-clusters resampled subsets at each candidate resolution and keeps the most stable one (adjusted Rand index) instead of accepting the default 1.0.\n\n## When the agent uses it\n\n- After `run_scanpy_qc` (and `run_doublet_detection` / `run_integration` when used), only when the data has no labels to reuse.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `resolution` | number | `1.0` | Leiden granularity: higher splits the cells into more, smaller clusters |\n| `n_pcs` | integer | `30` | principal components fed into the neighbourhood graph |\n| `n_neighbors` | integer | `15` | neighbours per cell in that graph \u2014 larger gives smoother, coarser structure |\n| `select_resolution` | boolean | `False` | choose the resolution by bootstrap stability instead of accepting the default |\n| `n_bootstrap` | integer | `10` | resampling rounds per candidate resolution when selecting one |\n| `subsample_frac` | number | `0.8` | fraction of cells per bootstrap round |\n| `stability_min` | number | `0.9` | minimum adjusted Rand index a resolution must clear to be called stable |\n| `max_sweep_cells` | integer | `20000` | cap on the cells used for the stability sweep |\n| `resolution_candidates` | array of number | \u2014 | resolutions to try when select_resolution is on |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `work/adata_clustered.h5ad` and `artifacts/figures/umap_clusters.png`; `tables/resolution_sweep.csv` when a resolution was selected.\n- Result: `n_clusters`, cluster sizes, `resolution_source` (`default`, `explicit` or `bootstrap_stability`), and warnings, for example when the data already has a cell-type column or the partition collapsed to one cluster.\n\n\n## Known limits\n\n- Cluster numbers are not cell types. Naming them is `run_marker_annotation` or `scgpt_annotate`.\n- Without `select_resolution` it uses scanpy's `leidenalg` backend, which iterates to convergence; scanpy warns that igraph will become the default. With `select_resolution`, the sweep and the final partition use igraph's two-pass Leiden (`flavor=\"igraph\", n_iterations=2`, undirected), reported as `params.leiden_flavor`. The sweep is about 88 Leiden calls, and leidenalg took 50-56 s per call at resolution 1-2 on 16,750 cells against 0.7 s for igraph, which pushed the sweep into the job's 1-hour limit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "resolution": {
+          "default": 1.0,
+          "description": "Leiden granularity: higher splits the cells into more, smaller clusters",
+          "title": "Resolution",
+          "type": "number"
+        },
+        "n_pcs": {
+          "default": 30,
+          "description": "principal components fed into the neighbourhood graph",
+          "title": "N Pcs",
+          "type": "integer"
+        },
+        "n_neighbors": {
+          "default": 15,
+          "description": "neighbours per cell in that graph \u2014 larger gives smoother, coarser structure",
+          "title": "N Neighbors",
+          "type": "integer"
+        },
+        "select_resolution": {
+          "default": false,
+          "description": "choose the resolution by bootstrap stability instead of accepting the default",
+          "title": "Select Resolution",
+          "type": "boolean"
+        },
+        "n_bootstrap": {
+          "default": 10,
+          "description": "resampling rounds per candidate resolution when selecting one",
+          "title": "N Bootstrap",
+          "type": "integer"
+        },
+        "subsample_frac": {
+          "default": 0.8,
+          "description": "fraction of cells per bootstrap round",
+          "title": "Subsample Frac",
+          "type": "number"
+        },
+        "stability_min": {
+          "default": 0.9,
+          "description": "minimum adjusted Rand index a resolution must clear to be called stable",
+          "title": "Stability Min",
+          "type": "number"
+        },
+        "max_sweep_cells": {
+          "default": 20000,
+          "description": "cap on the cells used for the stability sweep",
+          "title": "Max Sweep Cells",
+          "type": "integer"
+        },
+        "resolution_candidates": {
+          "description": "resolutions to try when select_resolution is on",
+          "items": {
+            "type": "number"
+          },
+          "title": "Resolution Candidates",
+          "type": "array"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_clusteringArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_de",
+    "description": "Differential expression via rank_genes_groups (Wilcoxon), in EITHER of two shapes. (1) MARKERS (default): each level of `groupby` vs the rest \u2014 'what defines this cluster'. (2) CONTRAST: pass `reference` (the CONTROL level of `groupby`, e.g. \"WT\") to compare condition vs control instead of vs rest; add `stratify_by` (an EXISTING cell-type label column) to run that contrast SEPARATELY WITHIN EACH CELL TYPE. Use (2) for a KO-vs-WT / disease-vs-control DEG study whose arms have fewer than 2 replicate samples each; with >=2 samples per arm use run_pseudobulk_de instead \u2014 (2) treats cells as independent, so its p-values are pseudoreplicated. Either way do NOT hand-write the contrast in run_code, and do NOT re-cluster a dataset that already has labels. Reads `adata_clustered.h5ad` if present, otherwise `adata_qc.h5ad`, so a labeled dataset needs run_scanpy_qc ONLY (run_clustering is for unlabeled data). Writes `work/adata_de.h5ad` and CSV tables `tables/de_<key>_all.csv` (+ one per group), where <key> is `stratify_by` when stratified, else `groupby`. The tables have EXACTLY these columns: `group,gene,log2fc,pval,pval_adj,score` \u2014 if you ever read a DE table in run_code, use THOSE names (NOT Seurat-style `gene_name`/`p_val_adj`/`avg_log2FC`). A contrast also writes a volcano per group and reports `significant_by_group` (up/down counts) plus `skipped_groups` (cell types with too few cells in an arm \u2014 report those as not covered). `n_genes` caps rows per group, PER DIRECTION for a contrast.\n\n# run_de\n\nTests genes for expression differences with scanpy's `rank_genes_groups` (Wilcoxon by default). In marker mode each level of `groupby` is compared with all other cells. Given `reference` it compares a condition with a control, and adding `stratify_by` repeats that contrast separately within each cell type, listing the cell types it had to skip.\n\n## When the agent uses it\n\n- Markers per cluster after clustering.\n- KO vs WT or disease vs control per cell type on labelled data, with no re-clustering.\n- When the design has replicate samples, the replicate-aware comparison is `run_pseudobulk_de`; `run_de` treats cells as independent, and its result carries an `inference` label that says so.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `groupby` | string | `'leiden'` | the obs column whose levels are compared |\n| `method` | string (`wilcoxon`, `t-test`, `t-test_overestim_var`, `logreg`) | `'wilcoxon'` | the rank test rank_genes_groups uses |\n| `n_genes` | integer | `50` | rows kept per group \u2014 per DIRECTION when it is a contrast |\n| `reference` | string | `'rest'` | the baseline level. 'rest' gives one-vs-rest MARKERS; a named level (e.g. 'WT') gives a real condition-vs-control contrast |\n| `stratify_by` | string | `''` | an EXISTING cell-type column \u2014 runs the contrast separately within each cell type instead of pooling them |\n| `min_cells` | integer | `30` | a group with fewer cells than this in either arm is skipped. 30 is the usual rule-of-thumb floor for the rank test's normal approximation \u2014 an ENGINEERING guard, not a literature threshold |\n| `min_pct` | number | `0.1` | a gene must be detected in at least this fraction of the cells of one of the two populations compared, or it is not tested at all (Seurat FindMarkers' min.pct). Without it most genes enter the test undetected \u2014 on the DDX41 retina object 2/3 did \u2014 which triples the BH denominator and floods the ranking with divide-by-zero fold-changes above 2^20. 0 disables |\n| `tie_correct` | boolean | `True` | tie-correct the Wilcoxon normal approximation. A single-cell matrix is ~90% zeros, so ties dominate every comparison; scanpy's default (False) is anti-conservative on sparse data |\n| `padj` | number | `0.05` | adjusted-p (Benjamini-Hochberg) cutoff for calling a gene significant |\n| `lfc` | number | `0.25` | minimum \\|log2 fold-change\\| for calling a gene significant \u2014 applied together with `padj`, and drawn as the volcano's vertical line. 0.25 is the single-cell convention (Seurat's FindMarkers threshold); 1.0 is a bulk-RNA habit and hides most real single-cell effects |\n| `force` | boolean | `False` | run a pooled per-cell test across a CONDITION column anyway. The result is pseudoreplicated and must be reported as non-inferential |\n| `groups` | array of string | \u2014 | restrict the comparison to these levels of groupby |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `work/adata_de.h5ad`.\n- Tables: `tables/de_<key>_all.csv` with exactly the columns `group,gene,log2fc,pval,pval_adj,score`, one CSV per group, `de_<key>_universe.txt` (the tested genes, which `run_enrichment` uses as its background), `rank_<key>_*.rnk` (for `run_gsea_prerank`), `de_<key>_inference.json`, written on every run, so the design (`mode`: `contrast` or `markers`) and the inference label travel with the tables, and `de_<key>_significance.json` (the true significant counts per group, and whether the per-group tables are complete or a top-`n_genes` view) so `run_enrichment` can tell a top-N from the significant set.\n- Figures: a marker dotplot; in a contrast, one volcano per group.\n- Result: `significant_by_group` (true counts in both shapes; for markers the tables are the top `n_genes` by score, and `table_truncation_note` says so), `skipped_groups`, `cells_by_group_and_arm`, `inference`, `warnings`.\n\n\n## Known limits\n\n- A cell-level test. With few donors its p-values are pseudoreplicated; the result says so, and later steps must not report them as inferential.\n- `n_genes` caps the rows per group (per direction in a contrast).\n- `method` is one of scanpy's backends; DESeq2 lives in `run_pseudobulk_de`.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "groupby": {
+          "default": "leiden",
+          "description": "the obs column whose levels are compared",
+          "title": "Groupby",
+          "type": "string"
+        },
+        "method": {
+          "default": "wilcoxon",
+          "description": "the rank test rank_genes_groups uses",
+          "enum": [
+            "wilcoxon",
+            "t-test",
+            "t-test_overestim_var",
+            "logreg"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "n_genes": {
+          "default": 50,
+          "description": "rows kept per group \u2014 per DIRECTION when it is a contrast",
+          "title": "N Genes",
+          "type": "integer"
+        },
+        "reference": {
+          "default": "rest",
+          "description": "the baseline level. 'rest' gives one-vs-rest MARKERS; a named level (e.g. 'WT') gives a real condition-vs-control contrast",
+          "title": "Reference",
+          "type": "string"
+        },
+        "stratify_by": {
+          "default": "",
+          "description": "an EXISTING cell-type column \u2014 runs the contrast separately within each cell type instead of pooling them",
+          "title": "Stratify By",
+          "type": "string"
+        },
+        "min_cells": {
+          "default": 30,
+          "description": "a group with fewer cells than this in either arm is skipped. 30 is the usual rule-of-thumb floor for the rank test's normal approximation \u2014 an ENGINEERING guard, not a literature threshold",
+          "title": "Min Cells",
+          "type": "integer"
+        },
+        "min_pct": {
+          "default": 0.1,
+          "description": "a gene must be detected in at least this fraction of the cells of one of the two populations compared, or it is not tested at all (Seurat FindMarkers' min.pct). Without it most genes enter the test undetected \u2014 on the DDX41 retina object 2/3 did \u2014 which triples the BH denominator and floods the ranking with divide-by-zero fold-changes above 2^20. 0 disables",
+          "title": "Min Pct",
+          "type": "number"
+        },
+        "tie_correct": {
+          "default": true,
+          "description": "tie-correct the Wilcoxon normal approximation. A single-cell matrix is ~90% zeros, so ties dominate every comparison; scanpy's default (False) is anti-conservative on sparse data",
+          "title": "Tie Correct",
+          "type": "boolean"
+        },
+        "padj": {
+          "default": 0.05,
+          "description": "adjusted-p (Benjamini-Hochberg) cutoff for calling a gene significant",
+          "title": "Padj",
+          "type": "number"
+        },
+        "lfc": {
+          "default": 0.25,
+          "description": "minimum |log2 fold-change| for calling a gene significant \u2014 applied together with `padj`, and drawn as the volcano's vertical line. 0.25 is the single-cell convention (Seurat's FindMarkers threshold); 1.0 is a bulk-RNA habit and hides most real single-cell effects",
+          "title": "Lfc",
+          "type": "number"
+        },
+        "force": {
+          "default": false,
+          "description": "run a pooled per-cell test across a CONDITION column anyway. The result is pseudoreplicated and must be reported as non-inferential",
+          "title": "Force",
+          "type": "boolean"
+        },
+        "groups": {
+          "description": "restrict the comparison to these levels of groupby",
+          "items": {
+            "type": "string"
+          },
+          "title": "Groups",
+          "type": "array"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_deArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_enrichment",
+    "description": "Over-representation / pathway enrichment \u2014 OFFLINE ORA against LOCAL gene-set (.gmt) files (gseapy.enrich), NOT the Enrichr web API (the analysis host has no network). Automatically reads the top DE genes from this run's DE table (`tables/de_<groupby>_all.csv`, e.g. de_majorclass_all.csv) and runs ORA PER GROUP, writing one enrichment table + bar plot per cell class and returning the top enriched terms per group. Do NOT pass a pooled `genes` list \u2014 that collapses every class into a single 'input' group and loses the per-class pathway biology. Run AFTER run_de; it picks up whatever key run_de used (annotated classes preferred over raw leiden). When the DE table is a CONTRAST (it carries both up- and down-regulated significant genes) each group is split into '<group> (up)' and '<group> (down)' and enriched separately, so a down-regulated programme cannot be cancelled out by an up-regulated one; `split_direction: false` disables that. `gene_sets` are library names resolved to local .gmt files (default GO_Biological_Process_2023 / Reactome_2022 / MSigDB_Hallmark_2020). \n\n# run_enrichment\n\nAsks which pathways and GO terms the genes from a DE step over-represent, with gseapy's `enrich` against local `.gmt` libraries (no Enrichr web call: the analysis jobs have no network). The background is the set of genes the DE step tested, read from its `de_<key>_universe.txt`.\n\n## When the agent uses it\n\n- After `run_de` or `run_pseudobulk_de`. Called without `genes`, it finds the DE tables itself, per group.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `top_n_genes` | integer | `0` | optional cap on how many genes enter the over-representation test. 0 means no cap \u2014 use every gene passing the thresholds below, which is the standard way ORA is run. Set it only to deliberately shorten a very long list, and say that you did |\n| `top_n_terms` | integer | `10` | how many enriched terms to report per group |\n| `padj` | number | `0.05` | adjusted-p cutoff a DE gene must clear to enter the test \u2014 the same Benjamini-Hochberg cutoff run_de applies |\n| `lfc` | number | `0.25` | minimum \\|log2 fold-change\\| a DE gene must clear to enter the test. Pairing an effect-size floor with the p-value cutoff is what keeps a list of thousands of barely-changed genes from returning only large generic terms; 0.25 is the single-cell convention |\n| `gene_sets` | array of string | \u2014 | local gene-set libraries to test against |\n| `background` | integer | \u2014 | ORA background size; omit to use the tested universe |\n| `split_direction` | boolean | \u2014 | test up- and down-regulated genes separately |\n| `groupby` | string | \u2014 | which DE table to read, by the key in its file name tables/de_<groupby>_all.csv: the column run_de grouped by (e.g. leiden, majorclass), or the `de_key` run_pseudobulk_de returned (pseudobulk_<group_key>), not the `group` column inside the table; omit to find the table automatically, a replicated pseudobulk test first |\n| `genes` | array of string | \u2014 | explicit gene list; omit so the DE tables are found instead |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `tables/enrichment_<key>.csv` per group and bar plots in `figures/enrichment_<key>.png`.\n- Result: the top terms per group, `background_size`, `background_source`, `warnings`, the DE step's `inference` label, and `de_table_read`, the DE table the input came from.\n\nWith no `groupby` the DE table is chosen in this order: a `run_pseudobulk_de` result (`de_pseudobulk_<key>_all.csv`, a replicated test), then an annotated grouping, then `leiden`. Each group's genes come from its own complete table (`de_<key>_<group>.csv`; a group named `all` is `de_<key>_all_group.csv`).\n\n\n## Known limits\n\n- Only the libraries in `tools/genesets/` exist (`describe_environment` lists them). The `.gmt` files are not in git; deploys keep them in place.\n- A cut list throws away ranking information; `run_gsea_prerank` is the whole-ranking complement.\n- Marker tables from `run_de` are the top `n_genes` per group, so on large data every row passes the gate and the input is that top-N, not the significant set. The result then says so in `warnings` and `selection.upstream_table`, with the true counts from `de_<key>_significance.json` (or, for older runs, inferred from every row passing).\n- Without per-group DE tables it falls back to one pooled list and a fixed 20,000-gene background, which inflates p-values; the result warns when that happens.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "top_n_genes": {
+          "default": 0,
+          "description": "optional cap on how many genes enter the over-representation test. 0 means no cap \u2014 use every gene passing the thresholds below, which is the standard way ORA is run. Set it only to deliberately shorten a very long list, and say that you did",
+          "title": "Top N Genes",
+          "type": "integer"
+        },
+        "top_n_terms": {
+          "default": 10,
+          "description": "how many enriched terms to report per group",
+          "title": "Top N Terms",
+          "type": "integer"
+        },
+        "padj": {
+          "default": 0.05,
+          "description": "adjusted-p cutoff a DE gene must clear to enter the test \u2014 the same Benjamini-Hochberg cutoff run_de applies",
+          "title": "Padj",
+          "type": "number"
+        },
+        "lfc": {
+          "default": 0.25,
+          "description": "minimum |log2 fold-change| a DE gene must clear to enter the test. Pairing an effect-size floor with the p-value cutoff is what keeps a list of thousands of barely-changed genes from returning only large generic terms; 0.25 is the single-cell convention",
+          "title": "Lfc",
+          "type": "number"
+        },
+        "gene_sets": {
+          "description": "local gene-set libraries to test against",
+          "items": {
+            "type": "string"
+          },
+          "title": "Gene Sets",
+          "type": "array"
+        },
+        "background": {
+          "description": "ORA background size; omit to use the tested universe",
+          "title": "Background",
+          "type": "integer"
+        },
+        "split_direction": {
+          "description": "test up- and down-regulated genes separately",
+          "title": "Split Direction",
+          "type": "boolean"
+        },
+        "groupby": {
+          "description": "which DE table to read, by the key in its file name tables/de_<groupby>_all.csv: the column run_de grouped by (e.g. leiden, majorclass), or the `de_key` run_pseudobulk_de returned (pseudobulk_<group_key>), not the `group` column inside the table; omit to find the table automatically, a replicated pseudobulk test first",
+          "title": "Groupby",
+          "type": "string"
+        },
+        "genes": {
+          "description": "explicit gene list; omit so the DE tables are found instead",
+          "items": {
+            "type": "string"
+          },
+          "title": "Genes",
+          "type": "array"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_enrichmentArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_depth_matched_de",
+    "description": "Separate biology from sequencing depth. When the two arms differ in reads per cell, every ranking inherits that bias \u2014 a gene detected in more cells because more molecules were sampled looks up-regulated, and abundant-transcript pathways (translation, ribosome, RNA metabolism) move together in the deeper arm. This down-samples the deeper arm within each cell type until the per-cell UMI distributions match, re-runs the SAME Wilcoxon contrast, and Spearman-correlates the original ranking against the depth-matched one PER DIRECTION. Use it whenever the dataset profile flags a depth imbalance, and always before interpreting a pan-cell-type signature. It returns the per-direction verdict itself, so no later step needs to re-derive it: each (cell type, direction) is labelled `with_depth` (UP in the deeper arm, what depth can manufacture) or `against_depth`. With the gradient: rho >= 0.5 = preserved; rho < 0 = the ranking INVERTS once depth is equalised, a detection artefact that must not be reported as regulation; and the `depth_robust` column of `tables/depth_matched_genes.csv` marks the genes that kept their sign and >= 80% of their Wilcoxon z \u2014 the credible with-gradient set. Against the gradient the verdict is `against_depth_untestable`: depth cannot have produced those genes and this check cannot confirm them either, so their rho is NOT evidence and must not be used as a filter. Reads the raw `counts` layer run_scanpy_qc stores, and writes `tables/depth_matched_summary.csv`, `tables/depth_matched_genes.csv` and a figure. Do NOT hand-write this as run_code: correlating per-gene fold-changes against a single median library size is not a computable operation.\n\n# run_depth_matched_de\n\nChecks whether a DE result survives equal sequencing depth. It randomly removes reads from the deeper arm until both arms match, re-runs the same gene comparison, and reports how much of the original ordering survives (Spearman correlation) and which genes keep their place.\n\n## When the agent uses it\n\n- After `run_de`, when the arms differ in depth (the dataset profile reports the per-arm depth), and before a global up or down shift is read as biology.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `groupby` | string | `'sampleid'` | the obs column holding the experimental CONDITION |\n| `reference` | string | `''` | the CONTROL level of `groupby` (e.g. 'WT'). Required \u2014 the check is a two-level contrast |\n| `stratify_by` | string | `''` | the CELL-TYPE column; the check runs separately within each type, because depth imbalance differs per type and a pooled answer hides it |\n| `n_genes` | integer | `100` | how many top-ranked genes per direction enter the comparison. Deep enough that the correlation is not driven by three genes, shallow enough to stay the list a reader would actually look at |\n| `min_cells` | integer | `30` | skip a cell type with fewer cells than this in either arm \u2014 the usual floor for the rank test's normal approximation |\n| `seed` | integer | `0` | random seed for the down-sampling, so the check reproduces |\n| `min_ratio` | number | `1.05` | skip a cell type whose arms already differ by less than this ratio in median library size \u2014 there is no imbalance to correct |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `tables/depth_matched_genes.csv`, `tables/depth_matched_summary.csv` and `figures/depth_matched_correlation.png`.\n- Result: the correlation, a verdict per group, the depth-robust genes, `skipped_groups`, `warnings`.\n\n\n## Known limits\n\n- One seeded downsample per call. A low correlation says the original ordering depended on depth; it does not say which individual genes are artefacts.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "groupby": {
+          "default": "sampleid",
+          "description": "the obs column holding the experimental CONDITION",
+          "title": "Groupby",
+          "type": "string"
+        },
+        "reference": {
+          "default": "",
+          "description": "the CONTROL level of `groupby` (e.g. 'WT'). Required \u2014 the check is a two-level contrast",
+          "title": "Reference",
+          "type": "string"
+        },
+        "stratify_by": {
+          "default": "",
+          "description": "the CELL-TYPE column; the check runs separately within each type, because depth imbalance differs per type and a pooled answer hides it",
+          "title": "Stratify By",
+          "type": "string"
+        },
+        "n_genes": {
+          "default": 100,
+          "description": "how many top-ranked genes per direction enter the comparison. Deep enough that the correlation is not driven by three genes, shallow enough to stay the list a reader would actually look at",
+          "title": "N Genes",
+          "type": "integer"
+        },
+        "min_cells": {
+          "default": 30,
+          "description": "skip a cell type with fewer cells than this in either arm \u2014 the usual floor for the rank test's normal approximation",
+          "title": "Min Cells",
+          "type": "integer"
+        },
+        "seed": {
+          "default": 0,
+          "description": "random seed for the down-sampling, so the check reproduces",
+          "title": "Seed",
+          "type": "integer"
+        },
+        "min_ratio": {
+          "default": 1.05,
+          "description": "skip a cell type whose arms already differ by less than this ratio in median library size \u2014 there is no imbalance to correct",
+          "title": "Min Ratio",
+          "type": "number"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_depth_matched_deArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_gsea_prerank",
+    "description": "Preranked GSEA (gseapy.prerank) over the COMPLETE ranked gene list per group \u2014 OFFLINE, against the same local .gmt files as run_enrichment. Reads the `tables/rank_<groupby>_<group>.rnk` files run_de writes (every tested gene, ranked by Wilcoxon z), so it detects coordinated shifts that no per-gene cutoff would keep, and returns a SIGNED NES (positive = up in that group) plus FDR and leading-edge genes. Writes `tables/gsea_<group>.csv` per group. Run AFTER run_de. This is a COMPLEMENT to run_enrichment, not a replacement: ORA thresholds a top-N list, GSEA walks the whole ranking, and the two use different null hypotheses \u2014 do NOT treat disagreement between them as an error, and do NOT drop a group because nothing passed FDR (report the null result).\n\n# run_gsea_prerank\n\nRuns gseapy's preranked GSEA on the complete ranked gene list of each group (the `.rnk` files `run_de` and `run_pseudobulk_de` write), so it detects coordinated shifts that no per-gene cutoff would keep. It reports a signed NES (positive means up in that group), FDR and the leading-edge genes.\n\n## When the agent uses it\n\n- After `run_de` or `run_pseudobulk_de`, as a complement to `run_enrichment`: the two use different null hypotheses, so disagreement between them is not an error. With no `groupby` it ranks a `run_pseudobulk_de` result first (a replicated test), then an annotated grouping, then `leiden`, and reads exactly the groups that result's index names.\n- On ranked lists a `run_code` step wrote, through `input`.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `gene_sets` | array of string | \u2014 |  |\n| `groupby` | string | \u2014 | which ranked lists to read, by the key in tables/rank_<groupby>_<group>.rnk: the column run_de grouped by, or the `de_key` run_pseudobulk_de returned; omit to choose automatically, a replicated pseudobulk test first |\n| `top_n_terms` | integer | \u2014 |  |\n| `min_size` | integer | \u2014 |  |\n| `max_size` | integer | \u2014 |  |\n| `permutations` | integer | \u2014 |  |\n| `fdr_max` | number | \u2014 |  |\n| `seed` | integer | \u2014 |  |\n| `input` | string | `''` | ranked gene list(s) to test INSTEAD of the rank files run_de wrote \u2014 a .rnk file (gene<TAB>score per line) or a file-name pattern such as `my_rank_*.rnk`, inside this run's work/ or artifacts/ directory. Each file is one group, named by its file stem, ranked by the score as given. Empty = run_de's rank files. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `tables/gsea_<group>.csv` per group.\n- Result: the top terms per group, and the permutations, seed and gene-set size bounds used.\n\n\n## Known limits\n\n- Permutation-based and seeded; few permutations or small libraries give coarse FDR values.\n- A group where nothing passes FDR is a null result to report, not a group to drop.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "gene_sets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Gene Sets",
+          "type": "array"
+        },
+        "groupby": {
+          "description": "which ranked lists to read, by the key in tables/rank_<groupby>_<group>.rnk: the column run_de grouped by, or the `de_key` run_pseudobulk_de returned; omit to choose automatically, a replicated pseudobulk test first",
+          "title": "Groupby",
+          "type": "string"
+        },
+        "top_n_terms": {
+          "title": "Top N Terms",
+          "type": "integer"
+        },
+        "min_size": {
+          "title": "Min Size",
+          "type": "integer"
+        },
+        "max_size": {
+          "title": "Max Size",
+          "type": "integer"
+        },
+        "permutations": {
+          "title": "Permutations",
+          "type": "integer"
+        },
+        "fdr_max": {
+          "title": "Fdr Max",
+          "type": "number"
+        },
+        "seed": {
+          "title": "Seed",
+          "type": "integer"
+        },
+        "input": {
+          "default": "",
+          "description": "ranked gene list(s) to test INSTEAD of the rank files run_de wrote \u2014 a .rnk file (gene<TAB>score per line) or a file-name pattern such as `my_rank_*.rnk`, inside this run's work/ or artifacts/ directory. Each file is one group, named by its file stem, ranked by the score as given. Empty = run_de's rank files.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_gsea_prerankArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_doublet_detection",
+    "description": "Scrublet doublet scoring on raw counts, run AFTER run_scanpy_qc and BEFORE run_clustering. Two cells in one droplet express both parents' programmes and form an 'intermediate' cluster that reads as a novel transitional cell type \u2014 this is how a single-cell analysis invents a population. Filters predicted doublets by default (`filter: false` to annotate only) and returns the rate; a rate above ~20% usually means the threshold, not the biology.\n\n# run_doublet_detection\n\nRuns Scrublet on the raw counts after QC and before clustering. Two cells in one droplet express both parents' programmes and can form an intermediate cluster that reads as a new cell type; this step removes them (or, with `filter: false`, only marks them).\n\n## When the agent uses it\n\n- After `run_scanpy_qc`, before `run_clustering`.\n\n## When the agent does NOT use it\n\n- After `run_cellqc`: DoubletFinder and scDblFinder have already called the doublets and the decider's\n  were removed. If obs already holds doublet calls (`doubletfinder_class`, `scdblfinder_class`,\n  `predicted_doublet`) the tool returns `skipped` without running Scrublet, unless `force: true`.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `expected_doublet_rate` | number | `0.06` | prior doublet rate handed to the detector \u2014 roughly the ~0.8% per 1,000 cells that 10x Genomics quotes, so 0.06 suits a ~8,000-cell lane. Set it from YOUR loading, not from this default |\n| `flag_rate_above` | number | `0.2` | warn when the detected doublet fraction exceeds this. An ENGINEERING guard, not a literature threshold: it exists to catch a mis-set expected rate or an overloaded lane, and a run above it is a prompt to check the loading, not a finding |\n| `filter` | boolean | \u2014 | remove the predicted doublets (default) or only annotate them |\n| `batch_key` | string | \u2014 | obs column to simulate doublets within, per batch |\n| `threshold` | number | \u2014 | explicit score cutoff; omit to let scrublet choose one |\n| `force` | boolean | \u2014 | score again even though obs already holds doublet calls (from run_cellqc or an earlier run); off by default |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. Doublets are scored and filtered IN PLACE, in that file. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- Updates `work/adata_qc.h5ad` in place (filtered or annotated) and writes `tables/doublet_summary.csv`.\n- Result: `doublet_rate`, cells before and after.\n\n\n## Known limits\n\n- Scrublet needs scikit-image, which `analysis.sif` lacks. The job installs it into the run's own workspace when it is reported missing (`run_deps.py`) and removes it after publish.\n- A rate above about 20% usually means the threshold, not the biology. `batch_key` simulates doublets within each batch.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "expected_doublet_rate": {
+          "default": 0.06,
+          "description": "prior doublet rate handed to the detector \u2014 roughly the ~0.8% per 1,000 cells that 10x Genomics quotes, so 0.06 suits a ~8,000-cell lane. Set it from YOUR loading, not from this default",
+          "title": "Expected Doublet Rate",
+          "type": "number"
+        },
+        "flag_rate_above": {
+          "default": 0.2,
+          "description": "warn when the detected doublet fraction exceeds this. An ENGINEERING guard, not a literature threshold: it exists to catch a mis-set expected rate or an overloaded lane, and a run above it is a prompt to check the loading, not a finding",
+          "title": "Flag Rate Above",
+          "type": "number"
+        },
+        "filter": {
+          "description": "remove the predicted doublets (default) or only annotate them",
+          "title": "Filter",
+          "type": "boolean"
+        },
+        "batch_key": {
+          "description": "obs column to simulate doublets within, per batch",
+          "title": "Batch Key",
+          "type": "string"
+        },
+        "threshold": {
+          "description": "explicit score cutoff; omit to let scrublet choose one",
+          "title": "Threshold",
+          "type": "number"
+        },
+        "force": {
+          "description": "score again even though obs already holds doublet calls (from run_cellqc or an earlier run); off by default",
+          "title": "Force",
+          "type": "boolean"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. Doublets are scored and filtered IN PLACE, in that file.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_doublet_detectionArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_integration",
+    "description": "Correct sample/donor/batch effects before clustering. REQUIRED whenever the object holds more than one sample: without it the cells cluster by donor and every cell-type label downstream is really a donor label, with no visible symptom. `batch_key` names the obs column. Omitted method or auto preserves the deployed ComBat default; Harmony is available only when explicitly requested; the method that ACTUALLY ran is returned as `method_used`. Writes adata_integrated.h5ad and reports batch silhouette before/after \u2014 it must DROP, and a warning is returned if it does not.\n\n# run_integration\n\nRemoves systematic differences between samples or batches so that cells group by cell type rather than by library. Omitted method or auto uses ComBat to preserve the deployed default; set method=\"harmony\" explicitly to use bundled Harmony. It and measures the batch silhouette before and after.\n\n## When the agent uses it\n\n- Before clustering, whenever the object holds more than one sample; without it cells can cluster by donor, and every downstream label is really a donor label.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `batch_key` | string | \u2014 |  |\n| `method` | string (`auto`, `harmony`, `combat`) | \u2014 | omitted/auto uses ComBat; Harmony requires explicit selection |\n| `n_pcs` | integer | \u2014 |  |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `work/adata_integrated.h5ad` and `tables/integration_batches.csv`.\n- Result: `method_used` (the method that actually ran), batch silhouette before and after, and a warning when it did not drop.\n\n\n## Known limits\n\n- ComBat corrects the expression values themselves, Harmony only the embedding; check `method_used` before comparing results across runs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "batch_key": {
+          "title": "Batch Key",
+          "type": "string"
+        },
+        "method": {
+          "description": "Omitted or auto preserves the deployed ComBat default. Set harmony explicitly to use bundled Harmony. The result records requested/effective methods and method_used.",
+          "enum": [
+            "auto",
+            "harmony",
+            "combat"
+          ],
+          "title": "Method",
+          "type": "string"
+        },
+        "n_pcs": {
+          "title": "N Pcs",
+          "type": "integer"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_integrationArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_pseudobulk_de",
+    "description": "Differential expression BETWEEN CONDITIONS, aggregated to one profile per sample. Use this \u2014 NOT run_de \u2014 whenever the contrast is a condition (disease vs control, treated vs untreated). run_de tests over cells, and cells from one donor are not independent replicates of that donor's condition, so its p-values are pseudoreplicated and nearly every gene comes out significant. Sums raw counts per `sample_key`, optionally within each `group_key` cell type, then filters untestably-low genes and runs DESeq2 (negative-binomial Wald, via pydeseq2; Welch t on log2 CPM as a LOUD fallback) + BH. REFUSES a group with fewer than 2 samples per arm and reports it in `skipped_groups` rather than falling back to the cell-level test. Writes `tables/de_pseudobulk_<group_key>_all.csv` (+ one complete table per group, the tested universe and per-group .rnk files), never run_de's file names, so run_enrichment and run_gsea_prerank pick the result up with NO `genes` argument (they prefer this replicated test over a cell-level one; `groupby=\"pseudobulk_<group_key>\"` names it) \u2014 do not paste a gene list into them.\n\n# run_pseudobulk_de\n\nSums each sample's raw counts into one profile per sample (per cell type when grouped), then tests conditions across samples with DESeq2 (pydeseq2). This is the comparison that treats the animal or donor, not the cell, as the unit of replication.\n\n## When the agent uses it\n\n- For any condition contrast whose design has replicate samples per arm, instead of reading `run_de`'s cell-level p-values as inference.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `min_cells_per_sample` | integer | `10` | a sample contributing fewer cells than this to a cell type is dropped from that cell type's test |\n| `min_samples_per_condition` | integer | `2` | refuse to test an arm backed by fewer samples than this \u2014 below it there is no replication and no valid p-value. 2 is the COMPUTABILITY floor, not a recommendation: the single-cell DE literature (Squair et al. 2021) asks for >=3 replicates per arm, and a 2-vs-2 result should be reported as underpowered |\n| `min_count` | integer | `10` | a gene must reach this many summed counts in at least as many samples as the smaller arm, or it is not tested (edgeR filterByExpr's rule of thumb). Genes nobody detected cannot be tested \u2014 they only inflate the BH denominator |\n| `padj` | number | `0.05` | adjusted-p (Benjamini-Hochberg) cutoff used to count significant genes |\n| `sample_key` | string | \u2014 | obs column holding the sample / donor / library id |\n| `condition_key` | string | \u2014 | obs column holding the experimental condition |\n| `group_key` | string | \u2014 | cell-type column to test within, one test per cell type |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. It must carry the raw counts in layers['counts'], as run_scanpy_qc's checkpoint does. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `tables/pseudobulk_all.csv` and `tables/pseudobulk_<group>.csv` (the first 2,000 genes of each group by p-value).\n- The hand-off files `run_enrichment` and `run_gsea_prerank` read, under the tool's own key `pseudobulk_<group_key>` (`pseudobulk` without a group key), so they never write over a `run_de` result of the same column: `de_pseudobulk_<group_key>_all.csv`, one complete table per group (`de_pseudobulk_<group_key>_<group>.csv`, every tested gene), the tested universe, `rank_pseudobulk_<group_key>_<group>.rnk` and the slug index, and the two labels `run_de` also writes: `de_pseudobulk_<group_key>_inference.json` (`inference: replicated`) and `de_pseudobulk_<group_key>_significance.json` (complete per-group tables, significant counts per group).\n- Result: per-group counts, the test used, `skipped_groups`, `warnings`, and `de_key`: the key `run_enrichment` and `run_gsea_prerank` take as `groupby`. With no `groupby` they prefer this replicated test over a cell-level `run_de` table.\n\n\n## Known limits\n\n- It refuses an arm with too few samples to support a test.\n- Without pydeseq2 (provided on HPC3 through `AISCIENTIST_HPC_PYDEPS`) it falls back to Welch's t-test on log2 CPM and labels the result as a fallback.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "min_cells_per_sample": {
+          "default": 10,
+          "description": "a sample contributing fewer cells than this to a cell type is dropped from that cell type's test",
+          "title": "Min Cells Per Sample",
+          "type": "integer"
+        },
+        "min_samples_per_condition": {
+          "default": 2,
+          "description": "refuse to test an arm backed by fewer samples than this \u2014 below it there is no replication and no valid p-value. 2 is the COMPUTABILITY floor, not a recommendation: the single-cell DE literature (Squair et al. 2021) asks for >=3 replicates per arm, and a 2-vs-2 result should be reported as underpowered",
+          "title": "Min Samples Per Condition",
+          "type": "integer"
+        },
+        "min_count": {
+          "default": 10,
+          "description": "a gene must reach this many summed counts in at least as many samples as the smaller arm, or it is not tested (edgeR filterByExpr's rule of thumb). Genes nobody detected cannot be tested \u2014 they only inflate the BH denominator",
+          "title": "Min Count",
+          "type": "integer"
+        },
+        "padj": {
+          "default": 0.05,
+          "description": "adjusted-p (Benjamini-Hochberg) cutoff used to count significant genes",
+          "title": "Padj",
+          "type": "number"
+        },
+        "sample_key": {
+          "description": "obs column holding the sample / donor / library id",
+          "title": "Sample Key",
+          "type": "string"
+        },
+        "condition_key": {
+          "description": "obs column holding the experimental condition",
+          "title": "Condition Key",
+          "type": "string"
+        },
+        "group_key": {
+          "description": "cell-type column to test within, one test per cell type",
+          "title": "Group Key",
+          "type": "string"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. It must carry the raw counts in layers['counts'], as run_scanpy_qc's checkpoint does.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_pseudobulk_deArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_composition",
+    "description": "Cell-type proportions per sample and how they shift between conditions \u2014 'which populations expand or shrink'. With `sample_key` + `condition_key` it tests on centered-log-ratio values (proportions sum to 1, so testing them raw makes every population look coupled) and needs >=2 samples per arm, otherwise it reports proportions without a test. Returns the compositional caveat with the result.\n\n# run_composition\n\nCounts what fraction of each sample's cells belongs to each cell type and compares those proportions between conditions: whether a population expanded or shrank, as opposed to whether its genes changed.\n\n## When the agent uses it\n\n- In a condition study, usually as the first analysis after QC on labelled data.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `group_key` | string | \u2014 |  |\n| `sample_key` | string | \u2014 |  |\n| `condition_key` | string | \u2014 |  |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `tables/composition.csv`, `tables/composition_by_sample.csv`, `tables/composition_by_condition.csv` and `tables/composition_test.csv`.\n\n\n## Known limits\n\n- Proportions are compositional: one population growing shrinks every other share, so a single shift can look like several.\n- The test needs replicate samples per arm; with one sample per arm it can describe, not test.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "group_key": {
+          "title": "Group Key",
+          "type": "string"
+        },
+        "sample_key": {
+          "title": "Sample Key",
+          "type": "string"
+        },
+        "condition_key": {
+          "title": "Condition Key",
+          "type": "string"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_compositionArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "run_marker_annotation",
+    "description": "Assign a cell type to each cluster from marker genes. For a tissue with a curated reference (retina) pass `reference` and NO panel: the curated markers are used, in the object's species. Otherwise give a `panel` ({cell type: [symbols]}) with `discriminators` ({cell type: [2-4 lineage-SPECIFIC symbols]}); a panel whose types match a reference uses the reference automatically. Signature scores give a first-pass z-argmax; the final label comes from RAW marker expression, assigned only when that lineage's discriminators dominate AND at least one of them (one of its DEFINING markers, where the reference names them) is enriched in the cluster versus other lineages; otherwise 'Unassigned'. Returns which clusters the raw check CORRECTED, which are unassigned and why (mixed / weak / withdrawn, with each cluster's own top marker genes), labelled clusters led by another lineage's genes, and warnings (e.g. a lineage every sample of the tissue contains is missing); all belong in the report. Describe an unassigned cluster by its top markers, not by a guessed name. Writes the UMAP coloured by assigned cell type and a dot plot of the deciding markers by cell type itself: no separate figure step is needed for them.\n\n# run_marker_annotation\n\nScores each cluster against a marker panel (`{cell type: [gene symbols]}`), sharpened by a few lineage-specific `discriminators`, and assigns the best-scoring cell type. A cluster without a clear winner stays `Unassigned` instead of being pushed into the nearest label.\n\n**The markers come from a curated reference when one exists for the tissue** (`references/<tissue>.json`; today `retina`, human and mouse symbols). Pass `reference: \"retina\"` and no panel. With the default `reference: \"auto\"`, a model-written panel whose cell types match a reference (three or more) is replaced by the reference's definitions, and any gene the model put under one lineage that is another lineage's specific marker is dropped with a warning. `reference: \"none\"` does not opt out of this: run 4de7ab04a239 (2026-10-08) passed `none` with a panel whose names and genes were crossed (\"Cone photoreceptor\" = Rho/Nrl/Cnga1) and 8,132 rods came out cones; the reference is applied and the contradictions are listed in `reference.caller_panel_contradictions`. This exists because a model-written retina panel (2026-10-02) put OPN4/NEFM/MEF2C under cones, RLBP1 under bipolar cells and astrocyte markers under Muller glia: 1,631 Muller glia were labelled \"Unassigned\" or \"ganglion\" and the Critic accepted it.\n\nTwo checks run after the labels are assigned:\n\n- **Canonical markers.** A label stands only if one of its lineage-specific markers is enriched in the cluster (mean log-normalised expression at least 0.5 above clusters given other labels, detected in at least 20% of the cluster's cells). Where the reference names `defining` markers for a lineage (retina: RLBP1 for Muller glia, PAX2 for astrocytes), one of those must be the enriched one: GLUL or GFAP alone is shared with other glia and ocular epithelia. Otherwise the label is withdrawn (`withdrawn_label`) and the cluster is `Unassigned`. Run f3b8268c4fd4 called a 27-cell Best2/Cldn2/Slc13a4 cluster Muller glia on GLUL alone.\n- **Why a cluster is unassigned.** `unassigned_reason` is `mixed` (two lineages' markers both present: doublets, ambient RNA, or a type the panel lacks; the evidence names both), `weak` (no lineage's markers reach the minimum) or `withdrawn`. Every cluster carries `top_markers`, its own most distinguishing genes (run_de's marker test when the checkpoint has it), so an unassigned cluster is described by what it expresses.\n- **Another lineage's genes on top.** When another lineage's marker outranks every marker of a cluster's own label among its top genes (run f3b8268c4fd4: a Rod photoreceptor cluster led by Nefm/Nefl), the cluster gets `top_markers_of_other_lineages` and a warning: possible doublets or a mixed cluster.\n- **Plausibility.** A lineage every sample of the tissue contains (retina: Muller glia) that no cluster received is a warning, with how often its markers are detected; no photoreceptor, bipolar or amacrine cluster at all is another.\n\n## When the agent uses it\n\n- After `run_clustering` (and ideally `run_de`), to name the clusters. For retina, pass `reference: \"retina\"`.\n\n## When the agent does NOT use it\n\n- To discover cell types nobody expects: a reference only finds the lineages it lists. Report unassigned clusters as such.\n- With a hand-written panel for a tissue that has a reference: the reference replaces it anyway.\n\n## Inputs\n\n<!-- generated:parameters -->\n| Parameter | Type | Default | Meaning |\n|---|---|---|---|\n| `reference` | string (`auto`, `none`, `retina`) | \u2014 | curated marker reference for the tissue; 'auto' (default) applies one when your panel's cell types match it. 'none' is for a tissue without one: a panel naming three or more of a reference's cell types uses the reference whatever is passed |\n| `panel` | object | \u2014 |  |\n| `discriminators` | object | \u2014 |  |\n| `cluster_key` | string | \u2014 |  |\n| `min_discriminator_mean` | number | \u2014 |  |\n| `dominance_ratio` | number | \u2014 |  |\n| `input` | string | `''` | an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint. |\n<!-- /generated:parameters -->\n\n## Outputs\n\n- `work/adata_annotated.h5ad`.\n- `tables/cluster_cell_types.csv` and `.json` (label, evidence, `unassigned_reason`, `top_markers`, `top_markers_of_other_lineages` per cluster), `tables/celltype_scores_by_cluster.csv`, `tables/celltype_composition.csv`.\n- In the result: `unassigned_detail` (reason, evidence and top markers of each unassigned cluster).\n- `figures/umap_cell_types.png` (when the checkpoint has a UMAP) and `figures/dotplot__cell_type_markers.png` (the deciding markers by assigned cell type). Written by the tool, so a plan needs no figure step for them.\n\n\n## Known limits\n\n- Only as good as the panel: a cell type that is missing from it cannot be found.\n- Report `Unassigned` clusters as such; do not rename them by hand to complete the picture.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "reference": {
+          "description": "curated marker reference for the tissue; 'auto' (default) applies one when your panel's cell types match it. 'none' is for a tissue without one: a panel naming three or more of a reference's cell types uses the reference whatever is passed",
+          "enum": [
+            "auto",
+            "none",
+            "retina"
+          ],
+          "title": "Reference",
+          "type": "string"
+        },
+        "panel": {
+          "additionalProperties": true,
+          "title": "Panel",
+          "type": "object"
+        },
+        "discriminators": {
+          "additionalProperties": true,
+          "title": "Discriminators",
+          "type": "object"
+        },
+        "cluster_key": {
+          "title": "Cluster Key",
+          "type": "string"
+        },
+        "min_discriminator_mean": {
+          "title": "Min Discriminator Mean",
+          "type": "number"
+        },
+        "dominance_ratio": {
+          "title": "Dominance Ratio",
+          "type": "number"
+        },
+        "input": {
+          "default": "",
+          "description": "an .h5ad to read INSTEAD of the checkpoint the previous tool wrote \u2014 e.g. one a run_code step saved in AISCIENTIST_WORK. A file name or a path inside this run's work/ or artifacts/ directory; nothing outside the run is read. Empty = the usual checkpoint. To feed a variant of an upstream result to the next tool, save it under a NEW name and pass it here \u2014 never overwrite a tool's checkpoint.",
+          "title": "Input",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "dataset": {
+          "default": "",
+          "title": "Dataset",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "run_marker_annotationArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "scrna_job_status",
+    "description": "Poll an analysis task and return its scientific result once completed; FAILED includes its error. Never start a dependent step before COMPLETED.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "scrna_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

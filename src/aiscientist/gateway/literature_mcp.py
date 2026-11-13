@@ -88,17 +88,21 @@ class LiteratureRoute:
             return dict(out)
         result = dict(preview)
         if preview.get("full_result"):
-            expected = f"mcp/literature/{analysis}/{tool}.json"
-            if preview["full_result"] != expected:
-                raise ValueError("literature evidence belongs to another tool or analysis")
+            canonical = f"mcp/literature/{analysis}/{tool}.json"
+            task = preview.get("task_id")
+            snapshot = (f"mcp/literature/{analysis}/tasks/{_identifier(task)}/{tool}.json" if task else None)
+            expected = preview["full_result"]
+            if expected not in {canonical, snapshot}:
+                raise ValueError("literature evidence belongs to another tool, task or analysis")
             source = _confined(self.artifacts, expected)
             if source.stat().st_size > _MAX_RESULT_BYTES:
                 raise ValueError("literature evidence exceeds the console read limit")
             full = json.loads(source.read_text(encoding="utf-8"))
             if not isinstance(full, dict):
                 raise ValueError("literature evidence must be a JSON object")
-            if full.get("analysis_id", analysis) != analysis:
-                raise ValueError("literature evidence belongs to another analysis")
+            if (full.get("analysis_id", analysis) != analysis
+                    or (expected == snapshot and (full.get("analysis_id") != analysis or full.get("task_id") != task))):
+                raise ValueError("literature evidence belongs to another task or analysis")
             result = {**full, **{key: preview[key] for key in
                       ("analysis_id", "task_id", "job_id", "state", "full_result") if key in preview}}
         result.update({key: out[key] for key in _TRANSPORT_FIELDS if key in out})

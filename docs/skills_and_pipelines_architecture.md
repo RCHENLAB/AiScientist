@@ -212,10 +212,12 @@ the reason logged, and the skill still loads as guidance.
 
 ### The pinned registry release
 
-`configs/skills_registry.json` pins a registry release tag, `v0.2.0`. A branch name such as `main`
+`configs/skills_registry.json` pins `liujs123456/aiscientist-skills` release `v0.2.5`,
+the published migration release paired with the seven analysis MCP image pins.
+A branch name such as `main`
 is refused. The config also lists the tiers to load (`core`, `verified` and `community`)
 and the releases root. Community remains enabled using the existing tier mechanism:
-`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.0 and is not promoted
+`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.5 and is not promoted
 locally. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
 Updating skills means changing the tag and installing the release.
 
@@ -237,8 +239,8 @@ The folder is outside git (`.gitignore`), and an app release never ships or dele
 server `deploy/deploy_skills.sh` installs it; a development checkout that needs skills downloads it:
 
 ```bash
-gh release download v0.2.0 -R lijinbio/aiscientist-skills -D skills/releases/0.2.0
-(cd skills/releases/0.2.0 && sha256sum -c SHA256SUMS)   # leave the zip packed
+gh release download v0.2.5 -R liujs123456/aiscientist-skills -D skills/releases/0.2.5
+(cd skills/releases/0.2.5 && sha256sum -c SHA256SUMS)   # leave the zip packed
 ```
 
 The loader checks `SHA256SUMS` against `catalog.json`, the bundle or every skill zip, and every
@@ -375,8 +377,8 @@ cannot run.
 
 ## Atlas expression MCP bridge
 
-The v0.2.0 bundle SHA-256 is
-`6ce775b9ddde52982e7a905c430b8e55db3543e2f5d0b6f8524068105e818e2a`.
+The v0.2.5 bundle SHA-256 is
+`afaac0c9b77a421e075ecc52c610a53563cd2f2dcd9d9d75e42889c4255cd1e6`.
 Install the three release assets and verify `SHA256SUMS` as above. The loader
 continues to verify the entire release before exposing skills; no analysis code
 or unverified copy of the skill is bundled into AiScientist.

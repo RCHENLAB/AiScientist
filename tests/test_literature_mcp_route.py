@@ -171,3 +171,21 @@ def test_bridge_still_rejects_unknown_parameters(literature):
     actual = adapter.run_tool("literature_search", {"query": "PRPF31", "endpoint": "https://example.test"}, ctx)
     assert actual["status"] == "error" and "Invalid MCP arguments" in actual["error"]
     assert not runner.calls
+
+
+def test_console_reads_matching_task_snapshot_and_rejects_task_substitution(literature):
+    adapter, runner, ctx = literature
+    relative = f"mcp/literature/default/tasks/{TASK}/literature_search.json"
+    target = adapter.artifacts / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    value = {"status": "ok", "analysis_id": "default", "task_id": TASK, "results": [{"pmid": "1"}]}
+    target.write_text(json.dumps(value))
+    envelope = {"status": "ok", "result": {"full_result": relative, "analysis_id": "default", "task_id": TASK}}
+    assert adapter._result(envelope, "literature_search", "default")["results"] == value["results"]
+    value["task_id"] = "different-task"
+    target.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="another task"):
+        adapter._result(envelope, "literature_search", "default")
+    envelope["result"]["full_result"] = relative.replace(TASK, "another-task")
+    with pytest.raises(ValueError, match="another tool, task"):
+        adapter._result(envelope, "literature_search", "default")

@@ -8075,7 +8075,8 @@ function sysToolItem(t) {
     body: `<div class="sys-k">What the model is told</div><div class="sys-md">${renderMarkdown(t.description)}</div>` +
       sysKv([["Runs on", escapeHtml(t.where || t.runs_on || "")], ["Category", escapeHtml(t.category || "")],
              ["Needs", (t.requires || []).map(escapeHtml).join(", ")],
-             ["Here", typeof t.available === "boolean" ? (t.available ? "available on this server" : "not installed on this server") : ""],
+             ["Availability", t.availability_note ? escapeHtml(t.availability_note) :
+               (typeof t.available === "boolean" ? (t.available ? "available on this server" : "not installed on this server") : "")],
              ["Code", t.code ? sysCode(t.code) : ""]]),
     text: sysSearchText([t.name, t.summary, t.description, t.category, t.where, t.runs_on, ...(t.requires || []),
                          t.reads_private_data ? "private data" : ""]),

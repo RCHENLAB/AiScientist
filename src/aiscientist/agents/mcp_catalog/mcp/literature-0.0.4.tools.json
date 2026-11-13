@@ -1,0 +1,386 @@
+[
+  {
+    "name": "literature_search",
+    "description": "Search Europe PMC for real biomedical citations. Sends the query to this public service;\n    no language model is called. Returns ranked papers with title, authors, year, DOI and PMID.\n\n# literature_search\n\nSearch Europe PMC using focused biomedical keyword queries, with no API key or language model. Returns real citations with title, authors, year, journal, DOI, PMID and URL. `abstracts=true` includes bounded plain-text abstracts; `pubmed_only=true` restricts results to PubMed records. `limit` is 1-25, default 8.\n\nThe original query focusing, generic-poster filtering and IDF-weighted title/abstract relevance ranking are preserved. Only cite returned identifiers. This tool sends its query to the configured Europe PMC-compatible endpoint, defaulting to the public service. Empty queries and HTTP failures return failed tasks with diagnostics.\n\nUse `analysis_id` for the output workspace and poll `literature_job_status` when asynchronous. For local corpus passages use `search_corpus`; for a synthesized answer with evidence use `deep_literature`.\n",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "minLength": 1,
+          "title": "Query",
+          "type": "string"
+        },
+        "limit": {
+          "default": 8,
+          "maximum": 25,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "pubmed_only": {
+          "default": false,
+          "title": "Pubmed Only",
+          "type": "boolean"
+        },
+        "abstracts": {
+          "default": false,
+          "title": "Abstracts",
+          "type": "boolean"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "literature_searchArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "search_corpus",
+    "description": "Retrieve verbatim passages from the configured corpus, with PMID, page and citation.\n    Hybrid BM25 and local PubMedBERT retrieval; no language model or external embedding call.\n\n# search_corpus\n\nRetrieve verbatim passages from the configured read-only corpus without calling a language model. Accepts 1-6 `queries`, `top_k` 1-30 (default 12), `max_per_paper` (default 3), optional exact `terms` (up to 12), and optional `pmids` to restrict papers.\n\nThe original hybrid ranking combines local PubMedBERT cosine similarity and BM25 over question words, preserves a share of semantic matches, boosts exact gene-symbol matches and alternates across questions. `terms` are checked against the corpus, with diagnostics for missing terms. Returned contexts carry text, PMID, page, citation, source metadata, ranking score, cosine and the query that retrieved them. No passage is synthesized.\n\nRequires prebuilt `mechanism_cache/chunks.jsonl` and local embedding weights. `LITERATURE_HF_CACHE` accepts an HF_HOME containing `hub/` or the hub itself. No runtime model download is attempted. Missing vectors may be computed in memory; the shared cache is never rewritten. No matches is a failed lookup, not evidence that a biomedical association is false. Refreshing corpus indexes is a separate administrator operation.\n\nResults and durable jobs stay in this analysis workspace. The caller may send returned passages to its chosen answer model; this tool itself does no generation.\n",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 6,
+          "minItems": 1,
+          "title": "Queries",
+          "type": "array"
+        },
+        "top_k": {
+          "default": 12,
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Top K",
+          "type": "integer"
+        },
+        "max_per_paper": {
+          "default": 3,
+          "maximum": 30,
+          "minimum": 1,
+          "title": "Max Per Paper",
+          "type": "integer"
+        },
+        "terms": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 12,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Terms"
+        },
+        "pmids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pmids"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queries"
+      ],
+      "title": "search_corpusArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "deep_literature",
+    "description": "Answer a focused question with PaperQA over the configured corpus and prebuilt index.\n    Uses only LITERATURE_MODEL_ENDPOINT / LITERATURE_MODEL; reports empty evidence as failure.\n\n# deep_literature\n\nAnswer one focused `question` with PaperQA's search, evidence gathering and synthesis over the prebuilt local corpus index. Ask a complete biomedical question rather than a bag of identifiers. Returns the answer, supporting contexts/citations and retrieval diagnostics. Zero contexts or no generated answer is a failed lookup.\n\nAll model roles use the explicit server `LITERATURE_MODEL_ENDPOINT` and `LITERATURE_MODEL`; there is no public model fallback. Configure `LITERATURE_MODEL_API_KEY_FILE` if needed. Embeddings remain local (`st-` sentence-transformers weights). PaperQA may make bibliographic metadata network requests. Model/protocol parameters are not tool arguments.\n\nThe shared corpus index is read-only and index synchronization is disabled. Mutable answer files live under the current analysis workspace. Evidence breadth, concurrency, answer length and model timeouts are administrator settings described in the package README. The default deterministic PaperQA agent preserves the original search/gather/answer workflow.\n\nUse `analysis_id` to isolate questions/workflows and poll `literature_job_status` for asynchronous execution. To curate a gene list across corpus passages use `extract_haploinsufficient_genes`; one RAG answer is not a whole-corpus scan.\n",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "minLength": 1,
+          "title": "Question",
+          "type": "string"
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "title": "deep_literatureArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "extract_haploinsufficient_genes",
+    "description": "Curate genes explicitly reported as haploinsufficient in retinal disease. Preserve the\n    two retrieval rounds, exact-quote verification, HGNC normalization, review flags, pilot\n    and resumable judgments. Writes genes.csv, hits.csv and requests.csv under this analysis.\n    A spec can define another curation target. Model credentials are server settings only.\n    A positive max_cost_usd requires an operator-configured priced model relay.\n    The pilot estimates total cost; subsequent calls stop at the spending cap.\n\n# extract_haploinsufficient_genes\n\nCurate genes reported as haploinsufficient in retinal disease from the configured corpus. The original pipeline is retained: model-written retrieval questions, local embedding/BM25 retrieval, keyword and exact-term rounds, per-passage JSON judgments, gene-directed follow-up, optional unread-passage checking, exact-quote verification, HGNC normalization, evidence flags and review tables. A statement is kept only when its quoted text can be found in the cited passage. A mechanism assertion and an experimental dosage measurement remain distinct.\n\nThe tool writes `genes.csv`, `hits.csv`, and `requests.csv` plus durable requests/judgments in its analysis workspace. Tables carry PMIDs, verbatim quotes, source pages, evidence classes, classification/verification flags and gene-normalization diagnostics. Inspect review flags and source quotes before using a candidate list. A bounded smoke run demonstrates execution, not exhaustive recall or scientific completeness.\n\nThe schema exposes retrieval settings (`n_requests`, `k_per_request`, `keyword_round`, `term_round`, `max_term_passages`, `k_per_gene`), output controls (`max_quotes_per_gene`), parallelism (`concurrency`), smoke-test cap (`max_passages`, zero means all), pilot settings, unread checks, optional `pmids` and optional `spec`. A pilot detects failed or unparsable model replies before the full pass. A positive `max_cost_usd` requires an operator-configured priced relay. Its measured usage feeds the pilot cost projection, and both worker and gateway stop subsequent calls at the cap. An in-flight provider request may cross the threshold. Unpriced endpoints cannot accept a positive cap.\n\nTo curate another property, provide the complete typed `spec` object:\n\n```json\n{\n  \"target\": \"the property to curate\",\n  \"definition\": \"what qualifies, phrased precisely\",\n  \"counts_when\": [\"an explicit qualifying statement in a retrieved passage\"],\n  \"does_not_count\": [\"a gene mention without the qualifying assertion\"],\n  \"classes\": [\"a supported evidence class\"],\n  \"scope\": \"the relevant disease or biological context\",\n  \"requests\": [\"a focused retrieval question\"],\n  \"terms\": [\"an exact phrase to read in full\"]\n}\n```\n\nThe spec definition/rules become the reading prompt; its questions and exact terms drive retrieval. Unknown spec fields are rejected. Without a spec, the original haploinsufficiency rules apply. Model endpoint/name/key are explicit server settings, never tool arguments. Shared corpus paths remain read-only; missing text extraction writes only to this analysis. Reuse an analysis after a recoverable interruption to resume stored judgments; use a new analysis ID when changing corpus/model identity.\n",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "CurationSpec": {
+          "additionalProperties": false,
+          "properties": {
+            "target": {
+              "title": "Target",
+              "type": "string"
+            },
+            "definition": {
+              "title": "Definition",
+              "type": "string"
+            },
+            "counts_when": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Counts When",
+              "type": "array"
+            },
+            "does_not_count": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Does Not Count",
+              "type": "array"
+            },
+            "classes": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Classes",
+              "type": "array"
+            },
+            "scope": {
+              "title": "Scope",
+              "type": "string"
+            },
+            "requests": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Requests",
+              "type": "array"
+            },
+            "terms": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Terms",
+              "type": "array"
+            }
+          },
+          "required": [
+            "target",
+            "definition",
+            "counts_when",
+            "does_not_count",
+            "classes",
+            "scope",
+            "requests",
+            "terms"
+          ],
+          "title": "CurationSpec",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "n_requests": {
+          "default": 16,
+          "minimum": 1,
+          "title": "N Requests",
+          "type": "integer"
+        },
+        "k_per_request": {
+          "default": 50,
+          "minimum": 1,
+          "title": "K Per Request",
+          "type": "integer"
+        },
+        "keyword_round": {
+          "default": 1,
+          "enum": [
+            0,
+            1
+          ],
+          "title": "Keyword Round",
+          "type": "integer"
+        },
+        "term_round": {
+          "default": 1,
+          "enum": [
+            0,
+            1
+          ],
+          "title": "Term Round",
+          "type": "integer"
+        },
+        "max_term_passages": {
+          "default": 300,
+          "minimum": 0,
+          "title": "Max Term Passages",
+          "type": "integer"
+        },
+        "k_per_gene": {
+          "default": 15,
+          "minimum": 0,
+          "title": "K Per Gene",
+          "type": "integer"
+        },
+        "max_quotes_per_gene": {
+          "default": 3,
+          "minimum": 1,
+          "title": "Max Quotes Per Gene",
+          "type": "integer"
+        },
+        "concurrency": {
+          "default": 16,
+          "minimum": 1,
+          "title": "Concurrency",
+          "type": "integer"
+        },
+        "max_passages": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Max Passages",
+          "type": "integer"
+        },
+        "pilot_fraction": {
+          "default": 0.01,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Pilot Fraction",
+          "type": "number"
+        },
+        "max_cost_usd": {
+          "default": 0.0,
+          "minimum": 0,
+          "title": "Max Cost Usd",
+          "type": "number"
+        },
+        "check_unread": {
+          "anyOf": [
+            {
+              "enum": [
+                0,
+                1
+              ],
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check Unread"
+        },
+        "max_unread_passages": {
+          "default": 600,
+          "minimum": 0,
+          "title": "Max Unread Passages",
+          "type": "integer"
+        },
+        "pmids": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pmids"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CurationSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "extract_haploinsufficient_genesArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "literature_job_status",
+    "description": "Poll a submitted literature task. COMPLETED includes its original result; FAILED\n    keeps the error and any partial result. No new analysis is started by polling.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "literature_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

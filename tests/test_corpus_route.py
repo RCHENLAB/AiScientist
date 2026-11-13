@@ -6,6 +6,8 @@ the literature line is not available, keep a finished scan, and answer from a ke
 corpus without a job — from Corpus scan or from a chat message asking for the gene list."""
 from __future__ import annotations
 
+from native_literature_fixtures import bind_route
+
 import asyncio
 import csv
 import json
@@ -106,7 +108,7 @@ def test_corpus_scan_runs_the_tool_and_publishes_the_csvs(tmp_path, monkeypatch)
         built["executor"] = _FakeExecutor(c.workspace / run_id, result)
         return built["executor"]
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor", fake_build)
+    bind_route(monkeypatch, fake_build)
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus", conversation_id="conv1")
     conn.begin_run("conv1")
     asyncio.run(gw_app._run_corpus_scan(conn, req))
@@ -114,10 +116,10 @@ def test_corpus_scan_runs_the_tool_and_publishes_the_csvs(tmp_path, monkeypatch)
     run_id = built["run_id"]
     assert run_id and (conn.workspace / run_id / "artifacts" / "haploinsufficiency" / "genes.csv").is_file()
     ex = built["executor"]
-    assert built["own_gpu"] is True                       # its own GPU and model, not the session's
+    assert built["own_gpu"] is False                       # the selected session model; no new GPU
     assert ex.calls and ex.calls[0][0] == "extract_haploinsufficient_genes" and ex.calls[0][1] == {}
     assert str(ex.calls[0][2].workspace) == str(conn.workspace / run_id)
-    assert ex.calls[0][2].model == corpus_scan.scan_model(conn.settings)
+    assert ex.calls[0][2].model == conn.selected_model
     types = [p.get("type") for p in pushed]
     assert types[0] == "chat_start" and types[-1] == "chat_done"
     token = next(p for p in pushed if p.get("type") == "chat_token")["token"]
@@ -140,12 +142,12 @@ def test_corpus_scan_without_the_literature_line_reports_and_stops(tmp_path, mon
     conn = _conn(tmp_path)
     pushed: list[dict] = []
     conn.push = pushed.append
-    monkeypatch.setattr(gw_app, "_build_literature_executor", lambda c, run_id=None, own_gpu=False: None)
+    bind_route(monkeypatch, lambda c, run_id=None, own_gpu=False: None)
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     asyncio.run(gw_app._run_corpus_scan(conn, req))
     err = next(p for p in pushed if p.get("type") == "chat_error")
-    assert "literature line" in err["message"]
+    assert "registered literature MCP" in err["message"]
     assert not any(p.get("type") == "chat_done" for p in pushed)
     assert conn.chat_running is False
 
@@ -161,8 +163,7 @@ def test_corpus_scan_tool_failure_is_a_chat_error(tmp_path, monkeypatch):
         def run_tool(self, tool, args, ctx):
             return {"status": "error", "error": "HPC3 analysis job failed: boom"}
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor",
-                        lambda c, run_id=None, own_gpu=False: Failing())
+    bind_route(monkeypatch, lambda c, run_id=None, own_gpu=False: Failing())
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     asyncio.run(gw_app._run_corpus_scan(conn, req))
@@ -170,21 +171,6 @@ def test_corpus_scan_tool_failure_is_a_chat_error(tmp_path, monkeypatch):
     assert "boom" in err["message"]
 
 
-def test_literature_executor_gets_a_per_run_workspace(tmp_path, monkeypatch):
-    """With a run_id the literature job writes under the run (so the files come back under it);
-    without one (the chat path) the shared paperqa dir is used as before."""
-    conn = _conn(tmp_path, mock=False)
-    conn.alloc = type("A", (), {"node": "gpu-1", "port": 1234})()
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/x/paperqa.sif")
-    monkeypatch.setattr(gw_app, "_sync_aiscientist_source_to_hpc", lambda c: "/dfs/pysrc/tester")
-    monkeypatch.setattr(gw_app, "_temp_base", lambda c: "/dfs/sessions/s1")
-    ex = gw_app._build_literature_executor(conn, run_id="abc123")
-    assert ex.remote_workspace == gw_app._run_home(conn, "abc123").dir("corpus")
-    assert ex.remote_workspace.endswith(f"/sessions/{conn.id}/runs/abc123/corpus")
-    assert ex.local_workspace == conn.workspace / "abc123"
-    ex2 = gw_app._build_literature_executor(conn)
-    assert ex2.remote_workspace == "/dfs/sessions/s1/paperqa" and ex2.local_workspace == conn.workspace
 
 
 def test_corpus_scan_resubmits_when_its_model_died(tmp_path, monkeypatch):
@@ -215,13 +201,12 @@ def test_corpus_scan_resubmits_when_its_model_died(tmp_path, monkeypatch):
             return super().run_tool(tool, args, ctx)
 
     built = {}
-    monkeypatch.setattr(gw_app, "_build_literature_executor",
-                        lambda c, run_id=None, own_gpu=False: built.setdefault("ex", Flaky(c.workspace / run_id)))
+    bind_route(monkeypatch, lambda c, run_id=None, own_gpu=False: built.setdefault("ex", Flaky(c.workspace / run_id)))
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     asyncio.run(gw_app._run_corpus_scan(conn, req))
     assert built["ex"].n == 2
-    assert any("went away mid-scan" in p.get("text", "") for p in pushed if p.get("type") == "lab_progress")
+    assert any("selected model stopped answering" in p.get("text", "") for p in pushed if p.get("type") == "lab_progress")
     assert [p.get("type") for p in pushed][-1] == "chat_done"
     assert any("PRPF31" in p.get("token", "") for p in pushed if p.get("type") == "chat_token")
 
@@ -242,11 +227,11 @@ def test_corpus_scan_gives_up_after_the_last_attempt(tmp_path, monkeypatch):
                     "error": "The served model stopped answering"}
 
     dead = Dead()
-    monkeypatch.setattr(gw_app, "_build_literature_executor", lambda c, run_id=None, own_gpu=False: dead)
+    bind_route(monkeypatch, lambda c, run_id=None, own_gpu=False: dead)
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     asyncio.run(gw_app._run_corpus_scan(conn, req))
-    assert dead.n == gw_app.CORPUS_MAX_ATTEMPTS
+    assert dead.n == 2
     err = next(p for p in pushed if p.get("type") == "chat_error")
     assert "stopped answering" in err["message"]
 
@@ -255,77 +240,10 @@ _QUEUED = {"status": "error", "execution_mode": "hpc_slurm", "queue_timeout": Tr
            "error": "HPC3 analysis job failed: bioagent_corpusscan_x did not get a node within 7200s"}
 
 
-def test_corpus_scan_submits_again_when_no_card_came_free(tmp_path, monkeypatch):
-    """Zian's 2026-10-19 21:13 scan waited out the paid queue (Slurm: Priority) and the whole run
-    failed. Now the job is submitted again, the run goes on, and the second job's result is shown."""
-    conn = _conn(tmp_path)
-    pushed: list[dict] = []
-    conn.push = pushed.append
-    ok = {"status": "ok", "n_papers": 3, "n_sentences": 30, "n_passages": 4, "n_hits_eligible": 1,
-          "n_genes": 1, "genes": [{"gene": "PRPF31", "n_papers": 1, "phenotype": "adRP", "flags": []}],
-          "genes_flagged_for_review": [], "definition": "d", "warnings": []}
-
-    class Busy(_FakeExecutor):
-        startup_timeout_s, queue_windows = 1800, 4
-
-        def __init__(self, ws):
-            super().__init__(ws, ok)
-            self.n = 0
-
-        def run_tool(self, tool, args, ctx):
-            self.n += 1
-            return dict(_QUEUED) if self.n == 1 else super().run_tool(tool, args, ctx)
-
-    built = {}
-    monkeypatch.setattr(gw_app, "_build_literature_executor",
-                        lambda c, run_id=None, own_gpu=False: built.setdefault("ex", Busy(c.workspace / run_id)))
-    req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
-    conn.begin_run(None)
-    asyncio.run(gw_app._run_corpus_scan(conn, req))
-    assert built["ex"].n == 2
-    retry = [p["text"] for p in pushed if p.get("type") == "lab_progress" and "No GPU card" in p.get("text", "")]
-    assert retry and "within 2 h (Slurm: Priority)" in retry[0] and "retry 1 of 2" in retry[0]
-    assert not any(p.get("type") == "chat_error" for p in pushed)
-    assert [p.get("type") for p in pushed][-1] == "chat_done"
 
 
-def test_corpus_scan_stops_retrying_a_full_queue_with_a_plain_message(tmp_path, monkeypatch):
-    conn = _conn(tmp_path)
-    pushed: list[dict] = []
-    conn.push = pushed.append
-
-    class Full:
-        notify = None
-        startup_timeout_s, queue_windows = 1800, 4
-        n = 0
-
-        def run_tool(self, tool, args, ctx):
-            self.n += 1
-            return dict(_QUEUED)
-
-    full = Full()
-    monkeypatch.setattr(gw_app, "_build_literature_executor", lambda c, run_id=None, own_gpu=False: full)
-    req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
-    conn.begin_run(None)
-    asyncio.run(gw_app._run_corpus_scan(conn, req))
-    assert full.n == 1 + conn.settings.corpus_scan_queue_retries
-    err = next(p for p in pushed if p.get("type") == "chat_error")["message"]
-    assert "could not start" in err and "3 waits of 2 h" in err and "never ran" in err
 
 
-def test_the_scan_executor_waits_hours_in_the_queue(tmp_path, monkeypatch):
-    conn = _conn(tmp_path, mock=False)
-    conn.alloc = type("A", (), {"node": "gpu-1", "port": 1234})()
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/x/paperqa.sif")
-    monkeypatch.setattr(gw_app, "_sync_aiscientist_source_to_hpc", lambda c: "/dfs/pysrc/tester")
-    monkeypatch.setattr(gw_app, "_temp_base", lambda c: "/dfs/Temp/tester")
-    ex = gw_app._build_literature_executor(conn, run_id="abc123", own_gpu=True)
-    st = conn.settings
-    assert ex.startup_timeout_s * ex.queue_windows >= st.corpus_scan_queue_wait_s >= 7200
-    assert ex.queue_progress is True
-    lit = gw_app._build_literature_executor(conn, run_id="abc123")
-    assert (lit.startup_timeout_s, lit.queue_windows, lit.queue_progress) == (600, 3, False)
 
 
 def test_waits_are_said_in_words():
@@ -333,17 +251,6 @@ def test_waits_are_said_in_words():
         "30 min", "1 h", "1.5 h", "2 h", "1 min"]
 
 
-def test_the_corpus_tool_is_run_by_this_line_only():
-    """The scan is an hour of the session's model and writes into a workspace the Research line's
-    literature job does not have, so no model may call it: it is absent from the Scientist's
-    catalog, while the Slurm executor still finds its manifest (job resources) by name."""
-    from aiscientist.agents.registry import build_scientist_catalog
-    from aiscientist.tools import catalog
-
-    m = catalog.manifest(gw_app.CORPUS_TOOL)
-    assert m is not None and m.research is False and m.chat is False
-    assert m.runs_on == "hpc:literature" and m.time_limit
-    assert gw_app.CORPUS_TOOL not in {t.name for t in build_scientist_catalog(literature_executor=object())}
 
 
 # --- the scans kept on the Eye Server --------------------------------------------------------
@@ -369,7 +276,7 @@ def test_a_finished_scan_is_kept_and_the_next_request_needs_no_job(tmp_path, mon
         builds.append(run_id)
         return _FakeExecutor(c.workspace / run_id, _OK)
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor", fake_build)
+    bind_route(monkeypatch, fake_build)
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     asyncio.run(gw_app._run_corpus_scan(conn, req))
@@ -422,7 +329,7 @@ def test_one_scan_of_a_corpus_at_a_time(tmp_path, monkeypatch):
     def never(*a, **k):
         raise AssertionError("a second job for the same corpus")
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor", never)
+    bind_route(monkeypatch, never)
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     asyncio.run(gw_app._run_corpus_scan(conn, req))
@@ -442,8 +349,7 @@ def test_a_model_that_never_started_is_reported_with_its_log(tmp_path, monkeypat
             return {"status": "failed", "model_unreachable": False, "vllm_log": "/s/j.vllm.log",
                     "error": "The scan's model did not start: the server exited before it answered."}
 
-    monkeypatch.setattr(gw_app, "_build_literature_executor", lambda c, run_id=None, own_gpu=False: NoModel())
-    monkeypatch.setattr(gw_app, "_vllm_log_tail", lambda c, path: f"CUDA out of memory ({path})")
+    bind_route(monkeypatch, lambda c, run_id=None, own_gpu=False: NoModel())
     req = gw_app.LabRequest(connection_id=conn.id, question="scan", route="corpus")
     conn.begin_run(None)
     errors = []
@@ -451,12 +357,15 @@ def test_a_model_that_never_started_is_reported_with_its_log(tmp_path, monkeypat
     asyncio.run(gw_app._run_corpus_scan(conn, req))
     err = next(p for p in pushed if p.get("type") == "chat_error")
     assert "did not start" in err["message"]
-    assert any(d and "CUDA out of memory (/s/j.vllm.log)" in str(d) for _, _, d in errors)
+    assert any(d and "The scan's model did not start" in str(d) for _, _, d in errors)
 
 
 # --- a chat message asking for the gene list --------------------------------------------------
 
 def test_a_chat_question_for_the_gene_list_is_answered_from_a_kept_scan(tmp_path, monkeypatch):
+    # The pre-retirement fallback is tested only under an explicit unregistered deployment.
+    from aiscientist.gateway import literature_mcp
+    monkeypatch.setattr(literature_mcp, "registered_server", lambda: None)
     conn = _conn(tmp_path)
     stored = object()
     seen = {}
@@ -475,6 +384,9 @@ def test_a_chat_question_for_the_gene_list_is_answered_from_a_kept_scan(tmp_path
 
 
 def test_without_a_kept_scan_dispatches_to_the_gene_table(tmp_path, monkeypatch):
+    # The pre-retirement fallback is tested only under an explicit unregistered deployment.
+    from aiscientist.gateway import literature_mcp
+    monkeypatch.setattr(literature_mcp, "registered_server", lambda: None)
     conn = _conn(tmp_path)
     ran = []
 
@@ -506,29 +418,13 @@ def test_a_question_about_one_gene_goes_to_the_chat_without_a_lookup(tmp_path, m
 
 # --- the job's own GPU ----------------------------------------------------------------------
 
-def test_the_scan_executor_has_its_own_gpu_and_never_the_sessions_model(tmp_path, monkeypatch):
-    conn = _conn(tmp_path, mock=False)
-    conn.alloc = type("A", (), {"node": "gpu-1", "port": 1234})()      # even a session WITH a model
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/x/paperqa.sif")
-    monkeypatch.setattr(gw_app, "_sync_aiscientist_source_to_hpc", lambda c: "/dfs/pysrc/tester")
-    monkeypatch.setattr(gw_app, "_temp_base", lambda c: "/dfs/Temp/tester")
-    ex = gw_app._build_literature_executor(conn, run_id="abc123", own_gpu=True)
-    st = conn.settings
-    assert (ex.partition, ex.account, ex.gres, ex.constraint) == (
-        st.corpus_scan_partition, st.corpus_scan_account, st.corpus_scan_gres, st.corpus_scan_constraint)
-    assert ex.network is True and ex.live_args is None and callable(ex.job_prelude)
-    assert ex.inject_args["model"] == corpus_scan.scan_model(st) and "llm_base_url" not in ex.inject_args
-    assert ex.job_prefix == "bioagent_corpusscan"
-    assert ex.remote_workspace.endswith(f"/sessions/{conn.id}/runs/abc123/corpus")
-    assert gw_app._classify_session_job("bioagent_corpusscan_extract_haploinsufficient_genes_1") == "gpu"
-    # the other literature jobs are unchanged: CPU, the session's model
-    lit = gw_app._build_literature_executor(conn, run_id="abc123")
-    assert lit.gres == "" and lit.job_prelude is None and lit.inject_args["llm_base_url"] == "http://gpu-1:1234/v1"
 
 
 @pytest.mark.parametrize("hpc_enabled", [False, True])
 def test_gene_list_without_reachable_corpus_uses_quick_chat(tmp_path, monkeypatch, hpc_enabled):
+    # The pre-retirement fallback is tested only under an explicit unregistered deployment.
+    from aiscientist.gateway import literature_mcp
+    monkeypatch.setattr(literature_mcp, "registered_server", lambda: None)
     import threading
 
     conn = _conn(tmp_path)

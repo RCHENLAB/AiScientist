@@ -8862,8 +8862,9 @@ _FOLLOWUP_ROUTER_SYS = (
     "You route a follow-up message in a single-cell bioinformatics console. The user ALREADY "
     "completed a research run in this conversation (its report, figures and processed dataset are "
     "saved) and just sent another message. Classify what they want, choosing exactly one intent. "
-    "There is no report-editing path: a request to reword or re-render the existing report without "
-    "new analysis is a \"new_study\", because the report is only ever written from a run.\n"
+    "A report-only revision reuses accepted results and must not run scientific tools.\n"
+    "- \"report_only\": correct, rewrite, summarize or render the existing report using only "
+    "completed evidence. Do not choose this when new searches or analyses are requested.\n"
     "- \"continue\": a NEW analysis that builds on what the run produced — the next step of the "
     "same study on the same data ('now find the marker genes of each cluster', 'annotate the cell "
     "types', 'compare the two conditions in the rods', 'add pathway enrichment', 'now compare with "
@@ -8874,7 +8875,7 @@ _FOLLOWUP_ROUTER_SYS = (
     "again'). Pick the single most relevant step, copied VERBATIM from the prior agenda.\n"
     "- \"new_study\": start over — a different question that should not reuse the earlier "
     "results, a request to redo everything from the raw data, or a different dataset.\n"
-    "Return ONLY a JSON object: {\"intent\": \"continue|rerun_step|new_study\", "
+    "Return ONLY a JSON object: {\"intent\": \"continue|rerun_step|new_study|report_only\", "
     "\"step\": \"<verbatim agenda step when intent=rerun_step, else null>\", "
     "\"confidence\": <0.0-1.0>, \"reason\": \"<one short clause>\"}."
 )
@@ -8929,7 +8930,7 @@ def _parse_followup_intent(raw: Any, agenda: list[str]) -> dict | None:
     if obj is None:
         return None
     intent = str(obj.get("intent") or "").strip().lower()
-    if intent not in ("continue", "rerun_step", "new_study"):
+    if intent not in ("continue", "rerun_step", "new_study", "report_only"):
         return None
     try:
         conf = max(0.0, min(1.0, float(obj.get("confidence"))))
@@ -9459,6 +9460,8 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         # model, cost/cancel policy and the normal plan approval before any call.
         await _run_lab(conn, req)
         return
+    if not _fast_path(req) and await _maybe_report_revision(conn, req):
+        return
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
@@ -9630,6 +9633,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
                   "step_index": _default_rerun_index(state)}
 
     kind = intent["intent"]
+    if kind == "report_only":
+        _show_report_revision(conn, req, (run_id, art, state))
+        return
     if kind == "new_study":
         await _run_lab(conn, req)
         return
@@ -12268,9 +12274,9 @@ def _find_saved_plan(conn: Connection, run_id: str | None, conversation_id: str 
 
 
 def _saved_plan_replays(conn: Connection) -> list[dict[str, Any]]:
-    from . import saved_plans
+    from . import saved_plans, report_revision
 
-    prompts = []
+    prompts = [report_revision.prompt(folder, record) for folder, record in report_revision.pending(conn.workspace)]
     seen = set()
     for rid, art, _current, state in _saved_plan_candidates(conn):
         cid = state.get("conversation_id")
@@ -12340,6 +12346,9 @@ async def lab_plan_review(req: PlanReviewRequest, request: Request) -> JSONRespo
     if carries_doc and len(req.plan_yaml or "") > _PLAN_YAML_MAX_CHARS:
         return JSONResponse({"status": "error", "detail": "The plan document is too large."},
                             status_code=413)
+    report_reply = await _report_revision_review(conn, req, action)
+    if report_reply is not None:
+        return report_reply
     # Unblock only the run this decision is FOR (its own chat), not whatever run is live on the shared
     # session. A decision that names a run that isn't active (a stale plan card from a finished run) is
     # a no-op. No identifiers (older client) → the active run.
@@ -14781,7 +14790,8 @@ def start_report_job(user: Any, run_id: str) -> "dict[str, Any]":
     return report_job_status(owner, run_id)
 
 
-async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) -> None:
+async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path, *,
+                      revision: "tuple[Path, dict] | None" = None) -> None:
     """The report of a finished run, rebuilt from its folder: :func:`_write_report` as at the end
     of a run, its model calls billed to that run. Records the outcome in process/report_job.json."""
     log: "list[str]" = []
@@ -14799,6 +14809,13 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) ->
         from ..agents.research_lab import LabResult
         from ..agents.scope import RunScope, read_scope
         state = json.loads((art / "process" / "run_state.json").read_text(encoding="utf-8"))
+        if revision is not None:
+            from . import report_revision
+            revision_folder, revision_record = revision
+            report_revision.archive_report(art, revision_folder)
+            state, grounding = report_revision.hydrate(art, state, revision_record["instructions"])
+            from .saved_plans import _write
+            _write(revision_folder / "grounding.json", json.dumps(grounding, indent=2))
         result = LabResult.from_dict(state)
         question = str(state.get("question") or result.question or "")
         saved_scope = (state.get("plan_context") or {}).get("scope")
@@ -14813,8 +14830,20 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path) ->
             scope=scope, self_sourced=str(state.get("self_sourced") or ""),
             dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
             provenance=_llm_provenance_note(llm),
-            qc_report=_qc_only_run(result) and not _code_wrote_outputs(result))
-        rec.update(state="done", rendered=done.get("rendered") or [], render_status=done.get("status"))
+            qc_report=revision is None and _qc_only_run(result) and not _code_wrote_outputs(result),
+            abandoned=(conn.chat_stop.is_set if revision is not None else lambda: False))
+        cancelled = revision is not None and conn.chat_stop.is_set()
+        if revision is not None and not cancelled:
+            # The old summary is preserved in prior_report; the current bundle
+            # must not present it as a second, contradictory latest report.
+            revised = report_revision.confined(art, "report/report.md")
+            if not revised.is_file():
+                raise ValueError("The report writer did not produce the revised report")
+            _write(report_revision.confined(art, "report/summary.md"),
+                   "# Revised report\n\nThe current corrected report is [report.md](report.md). "
+                   "The original summary is preserved in the report revision history.\n")
+        rec.update(state="cancelled" if cancelled else "done", rendered=done.get("rendered") or [],
+                   render_status=done.get("status"))
     except Exception as exc:  # noqa: BLE001 - said in report_status, never raised into the gateway
         traceback.print_exc()
         rec.update(state="error", error=f"{type(exc).__name__}: {exc}"[:500])
@@ -19149,6 +19178,7 @@ def _references_from_accepted_deep_literature(
     No DOI/PMID gate here (unlike the Europe PMC path): the corpus is curated, so every citation
     string names a paper physically in the index — provenance is guaranteed by the corpus itself.
     Nothing is fabricated; only citation strings the tool actually returned are formatted."""
+    from ..agents.tool_names import canonical_tool_name
     rounds = getattr(lab_result, "rounds", None)
     if isinstance(lab_result, dict):
         rounds = lab_result.get("rounds", rounds)
@@ -19162,7 +19192,7 @@ def _references_from_accepted_deep_literature(
             continue
         scientist_result = _round_scientist_result(round_obj)
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") not in ("deep_literature", "search_corpus") \
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) not in ("deep_literature", "search_corpus") \
                     or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
@@ -19200,6 +19230,7 @@ def _references_from_accepted_literature_search(
     only accepted DOI/PMID-backed results from that step; it does not run a report-time fallback
     search.
     """
+    from ..agents.tool_names import canonical_tool_name
     rounds = getattr(lab_result, "rounds", None)
     if isinstance(lab_result, dict):
         rounds = lab_result.get("rounds", rounds)
@@ -19216,7 +19247,7 @@ def _references_from_accepted_literature_search(
         mentioned_dois.update(_normalise_doi(m.group(0)) for m in _DOI_RE.finditer(final_answer))
         mentioned_pmids.update(m.group(1) for m in _PMID_RE.finditer(final_answer))
         for step in scientist_result.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "literature_search" or not step.get("ok"):
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "literature_search" or not step.get("ok"):
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
             query = str(result.get("query") or (step.get("args") or {}).get("query") or "").strip()
@@ -20520,6 +20551,166 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Slurm job names on this deployment start with {prefix!r}.")
     uvicorn.run("aiscientist.gateway.app:app", host=args.host, port=args.port, reload=args.reload)
     return 0
+
+
+
+
+# Report revisions reuse the established writer and durable plan-card protocol.
+def _report_target(conn: Connection, req: LabRequest) -> "tuple[str, Path, dict] | None":
+    from . import report_revision
+    match = re.search(r"\brun(?:_id)?\s*[:=]?\s*[`\"']?([a-f0-9]{12})\b", req.question, re.IGNORECASE)
+    explicit = match.group(1).lower() if match else None
+
+    def accepted(run_id: str) -> bool:
+        try:
+            report_revision.load_target(conn.workspace, run_id, req.conversation_id)
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+
+    if explicit:
+        candidate = explicit
+    elif _AUTH_ENABLED and conn.app_user_id and req.conversation_id:
+        candidate = auth_routes.latest_run_id_for_conversation(conn.app_user_id, req.conversation_id, accept=accepted)
+    else:
+        candidate = (_conversation_last_run(conn, req.conversation_id) if req.conversation_id else conn.last_run_id)
+    if not candidate or (not explicit and not accepted(candidate)):
+        return None
+    if _AUTH_ENABLED and conn.app_user_id:
+        record = auth_routes.get_run_record(conn.app_user_id, candidate)
+        if not record or (req.conversation_id and str(record.get("conversation_id")) != str(req.conversation_id)):
+            raise ValueError("The report target is not a run in this account and conversation")
+        if record.get("status") not in {"done", "incomplete"}:
+            raise ValueError("The report target must be a finished run with accepted results")
+    art, state = report_revision.load_target(conn.workspace, candidate, req.conversation_id)
+    return candidate, art, state
+
+
+def _show_report_revision(conn: Connection, req: LabRequest, target: tuple[str, Path, dict]) -> None:
+    from . import report_revision
+    run_id, art, _state = target
+    folder = report_revision.create(art, run_id, req.conversation_id, req.question)
+    conn.push(report_revision.prompt(folder))
+    conn.push({"type": "chat_stopped", "awaiting_plan": True, "run_id": run_id,
+               "conversation_id": req.conversation_id})
+
+
+async def _maybe_report_revision(conn: Connection, req: LabRequest) -> bool:
+    if not re.search(r"report|summary|write.?up|报告|总结", req.question, re.IGNORECASE):
+        return False
+    explicit_only = bool(re.search(
+        r"only.{0,35}(?:report|summary)|(?:report|summary).{0,35}only|只.{0,15}(?:报告|总结)",
+        req.question, re.IGNORECASE))
+    try:
+        target = _report_target(conn, req)
+        if target is None:
+            if explicit_only:
+                raise ValueError("No accepted source run was found in this conversation. Name its run ID; no new analysis was started.")
+            return False
+        intent = None
+        if _model_ready(conn):
+            complete_fn, *_ = _lab_llm(conn)
+            intent = await asyncio.to_thread(_classify_followup, complete_fn, target[2], req.question)
+        if not intent or intent["confidence"] < FOLLOWUP_CONFIDENCE or intent["intent"] != "report_only":
+            if explicit_only:
+                raise ValueError("The selected model could not confirm this report-only correction. Reconnect it or clarify the request; no new analysis was started.")
+            return False
+        _show_report_revision(conn, req, target)
+    except (OSError, ValueError) as exc:
+        conn.push({"type": "chat_error", "message": str(exc)})
+    return True
+
+
+async def _report_revision_review(conn: Connection, req: PlanReviewRequest, action: str) -> "JSONResponse | None":
+    from . import report_revision
+    if not req.run_id and not req.conversation_id:
+        return None
+    matches = [(folder, record) for folder, record in report_revision.pending(conn.workspace)
+               if (not req.run_id or record["run_id"] == req.run_id)
+               and (not req.conversation_id or record.get("conversation_id") == req.conversation_id)]
+    if not matches:
+        return None
+    folder, record = matches[0]
+    try:
+        # Revalidate owner/conversation and accepted source state at approval, including after restart.
+        check = LabRequest(connection_id=conn.id, conversation_id=record.get("conversation_id"),
+                           question="Revise report only for run " + record["run_id"])
+        target = _report_target(conn, check)
+        if target is None:
+            raise ValueError("The report's accepted source run is unavailable")
+        if action == "approve":
+            current_job = _read_report_job(target[1])
+            if (current_job.get("state") == "running"
+                    and time.time() - float(current_job.get("started", 0) or 0) <= _REPORT_JOB_STALE_S):
+                return JSONResponse({"error": "This run already has a report writer running."}, status_code=409)
+            import hashlib
+            source = (target[1] / "process/run_state.json").read_bytes()
+            if hashlib.sha256(source).hexdigest() != record["source_state_sha256"]:
+                raise ValueError("The source run changed after this report review; cancel and review a new revision.")
+            if not _model_ready(conn) or conn.status != "ready" or conn.executor is None:
+                return JSONResponse({"error": "Connect the selected session model before writing this report."}, status_code=409)
+            refused = _run_slot_refusal(conn, record.get("conversation_id")) or _budget_refusal(conn, req.budget_ack, req.tz)
+            if refused is not None:
+                return refused
+        record = report_revision.decide(folder, action, feedback=req.feedback or "", plan_yaml=req.plan_yaml or "")
+        if action in {"edit", "revise"}:
+            conn.push(report_revision.prompt(folder, record))
+        else:
+            conn.push({"type": "plan_done", "run_id": record["run_id"],
+                       "conversation_id": record.get("conversation_id")})
+        if action == "approve":
+            run = conn.begin_run(record.get("conversation_id"), run_id=record["run_id"])
+            _note_budget_choice(run, req)
+            run.kind = "report"
+            run.running = True
+            asyncio.create_task(_run_report_revision(conn, run, target[1], folder, record))
+        return JSONResponse({"status": "ok", "action": action, "run_id": record["run_id"]})
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+async def _run_report_revision(conn: Connection, run: RunState, art: Path, folder: Path, record: dict) -> None:
+    from . import report_revision
+    run_id = record["run_id"]
+    try:
+        conn.push({"type": "chat_start"}, run=run)
+        conn.push({"type": "lab_progress", "level": "info",
+                   "text": "Revising this run's report from accepted artifacts; no scientific tools will run."}, run=run)
+        _write_report_job(art, {"run_id": run_id, "state": "running", "started": time.time(), "log": [],
+                                "revision_id": record["revision_id"]})
+        if run.chat_stop.is_set():
+            record.update(state="cancelled", finished_at=datetime.now(timezone.utc).isoformat())
+            report_revision._write_record(folder, record)
+            _write_report_job(art, {"run_id": run_id, "state": "cancelled", "log": [],
+                "revision_id": record["revision_id"], "finished_at": record["finished_at"]})
+            conn.push({"type": "chat_stopped"}, run=run)
+            return
+        await _report_job(conn, conn.owner, run_id, art, revision=(folder, record))
+        status = report_job_status(conn.owner, run_id)
+        record["state"] = "cancelled" if run.chat_stop.is_set() else status["state"]
+        record["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report_revision._write_record(folder, record)
+        if record["state"] == "done":
+            conn.push({"type": "chat_token", "token": "Updated the report for run " + run_id
+                       + ". Its accepted scientific results and original state were preserved. "
+                       + "[Open the revised report](/api/file/" + conn.owner + "/" + run_id + "/report/report.md)"}, run=run)
+            conn.push({"type": "artifacts", "items": [{"name": Path(f["path"]).name, "kind": "report",
+                       "url": f["url"]} for f in status["files"]],
+                       "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"}, run=run)
+            conn.push({"type": "chat_done"}, run=run)
+        elif record["state"] == "cancelled":
+            conn.push({"type": "chat_stopped"}, run=run)
+        else:
+            conn.push({"type": "chat_error", "message": status.get("error") or "The report revision failed."}, run=run)
+    except Exception as exc:  # a failed write must keep its durable review and source evidence
+        record.update(state="error", error=public_error(exc), finished_at=datetime.now(timezone.utc).isoformat())
+        report_revision._write_record(folder, record)
+        _write_report_job(art, {"run_id": run_id, "state": "error", "error": public_error(exc),
+            "revision_id": record["revision_id"], "finished_at": record["finished_at"], "log": []})
+        conn.push({"type": "chat_error", "message": public_error(exc)}, run=run)
+    finally:
+        run.running = False
+        conn.end_run(run)
 
 
 if __name__ == "__main__":

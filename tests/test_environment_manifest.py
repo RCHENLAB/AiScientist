@@ -34,9 +34,14 @@ def test_every_tool_resolves_to_a_real_source_location():
     locations at all — which looks fine until you try to use it."""
     tools = tool_index()
     assert tools, "the catalog is empty"
-    unresolved = [t["name"] for t in tools if not t["source"]]
+    unresolved = [t["name"] for t in tools if not t["source"] and "mcp" not in t]
     assert not unresolved, f"no source location for: {unresolved}"
     for t in tools:
+        if "mcp" in t:
+            assert t["source"] == "" and t["available"] is None and not t["enabled"]
+            assert "@sha256:" in t["mcp"]["image"] and t["entrypoint"]
+            assert "authorized session" in t["availability_note"]
+            continue
         path, _, line = t["source"].rpartition(":")
         assert (REPO / path).is_file(), f"{t['name']} -> {path} does not exist"
         assert int(line) > 0
@@ -133,3 +138,13 @@ def test_describe_environment_is_offered_to_the_scientist():
     # The description has to say WHEN to call it, or a step that needs it will not think to.
     desc = " ".join(tool.description.split())
     assert "before downloading anything that might already be on disk" in desc
+
+
+def test_native_inventory_reports_a_pin_and_requires_session_authorization():
+    manifest = environment_manifest()
+    tool = next(t for t in manifest["tools"] if t["name"] == "mcp_run_scanpy_qc")
+    assert not tool["enabled"] and tool["available"] is None and not tool["source"]
+    text = render_for_agent(manifest, "tools")
+    assert tool["mcp"]["image"] in text
+    assert "DECLARED; SESSION AVAILABILITY NOT CHECKED" in text
+    assert "session required" in render_markdown(manifest)

@@ -12,7 +12,6 @@ import pytest
 pytest.importorskip("fastapi")
 
 from aiscientist.gateway import app as gw_app  # noqa: E402
-from aiscientist.gateway import corpus_scan  # noqa: E402
 
 
 def _conn(credential):
@@ -31,10 +30,17 @@ def _conn(credential):
 ])
 def test_only_a_session_on_its_own_key_scans_with_its_api_model(monkeypatch, credential, expected):
     monkeypatch.setattr(gw_app, "_session_credential", lambda conn: credential)
+    from aiscientist.agents.mcp_model import ModelBinding, RelayBinding
+    from aiscientist.gateway import literature_mcp
+    monkeypatch.setattr(literature_mcp, "registered_server", lambda: object())
+    selected = credential["model"] if credential else "session-cluster-model"
+    binding = (RelayBinding(selected, lambda *a: None, priced=True) if credential
+               else ModelBinding("http://selected-model.invalid/v1", selected))
+    monkeypatch.setattr(gw_app, "_mcp_session_model", lambda _: binding)
     api = gw_app._corpus_scan_api(_conn(credential))
     if expected is None:
         assert api is None
-        assert gw_app._corpus_scan_model(_conn(credential)) == corpus_scan.scan_model(_conn(None).settings)
+        assert gw_app._corpus_scan_model(_conn(credential)) == selected
     else:
         assert {k: api[k] for k in expected} == expected and api["cred"] is credential
         # The kept scan is keyed by the model, so a Haiku scan never answers for the GPU's model.

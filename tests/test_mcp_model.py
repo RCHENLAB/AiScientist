@@ -156,7 +156,8 @@ def test_analysis_setup_includes_dynamic_key_for_full_result_redaction(monkeypat
     from aiscientist.agents.mcp_analysis import AnalysisAdapter
     from aiscientist.agents import skills
     monkeypatch.setattr(skills, "get_skill", lambda _: SimpleNamespace(requirements={"secrets": []}))
-    server = SimpleNamespace(name="literature", settings_env=(), skill="literature")
+    server = SimpleNamespace(name="literature", settings_env=(), skill="literature",
+                             tools=[{"name": "deep_literature"}])
     executor = SimpleNamespace(mcp_model_binding=lambda: ModelBinding("http://node:1234/v1", "model", "synthetic-secret"))
     prepared = AnalysisAdapter(server).prepare({"question": "PRPF31?"}, executor, tool="deep_literature")
     assert "LITERATURE_MODEL_API_KEY" in prepared.setup
@@ -185,7 +186,8 @@ def test_diagnosis_corpus_settings_admit_no_executable_override(monkeypatch):
     from aiscientist.agents import skills
     monkeypatch.setattr(skills, "get_skill", lambda _: SimpleNamespace(requirements={"secrets": []}))
     monkeypatch.setenv("LITERATURE_CORPUS_ROOT", "/refs/retigene")
-    server = SimpleNamespace(name="phenotype-diagnosis", settings_env=("LITERATURE_CORPUS_ROOT",), skill="phenotype")
+    server = SimpleNamespace(name="phenotype-diagnosis", settings_env=("LITERATURE_CORPUS_ROOT",), skill="phenotype",
+                             tools=[{"name": "diagnose_disease"}])
     prepared = AnalysisAdapter(server).prepare({"hpo_terms": ["HP:0000662"]}, SimpleNamespace(), tool="diagnose_disease")
     assert "export LITERATURE_CORPUS_ROOT=/refs/retigene" in prepared.setup
     assert 'LITERATURE_ALLOWED_ROOTS="${PHENOTYPE_ALLOWED_ROOTS:-}"' in prepared.setup

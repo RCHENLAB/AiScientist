@@ -313,8 +313,8 @@ def test_a_release_is_installed_from_its_lock_migrated_and_made_read_only(server
     assert f"pip install -q --require-hashes -r {rel}/requirements.lock" in calls
     assert f"pip install -q --no-deps --no-build-isolation -e {rel}" in calls
     assert f"migrate {rel}" in calls
-    assert (rel / "src/aiscientist/tools/genesets/Reactome_2022.gmt").read_text().startswith("PATHWAY")
-    assert not (rel / "src/aiscientist/tools/genesets/Reactome_2022.gmt").is_symlink()
+    assert not (rel / "src/aiscientist/tools/genesets/Reactome_2022.gmt").exists()
+    assert (server.root / "data/reference/genesets/Reactome_2022.gmt").read_text() == "PATHWAY\tdesc\tGENE1\tGENE2\n"
     assert os.readlink(rel / "skills" / "current") == str(server.root / "skills" / "current")
     assert not os.access(rel / "VERSION", os.W_OK) and not os.access(rel / "src", os.W_OK)
 

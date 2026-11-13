@@ -88,7 +88,6 @@ RESTART_CMD="${AISCIENTIST_RESTART_CMD:-sudo -n systemctl restart $SERVICE}"
 KEYS_SERVICE="${AISCIENTIST_KEYS_SERVICE:-aiscientist-keys.service}"
 KEYS_RESTART_CMD="${AISCIENTIST_KEYS_RESTART_CMD:-sudo -n systemctl restart $KEYS_SERVICE}"
 ENV_FILE="${AISCIENTIST_ENV_FILE:-$ROOT/config/.env}"
-GENESETS_SRC="${AISCIENTIST_GENESETS_DIR_SRC:-$ROOT/data/reference/genesets}"
 READONLY="${AISCIENTIST_RELEASE_READONLY:-1}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -399,13 +398,9 @@ prepare_release() {
     mkdir -p "$dest/skills"
     ln -sfn "$ROOT/skills/releases" "$dest/skills/releases"
     ln -sfn "$ROOT/skills/current" "$dest/skills/current"
-    # The gene sets are not in git; real copies, because the app tars its package for HPC3 jobs.
-    if compgen -G "$GENESETS_SRC/*.gmt" >/dev/null; then
-      mkdir -p "$dest/src/aiscientist/tools/genesets"
-      cp -p "$GENESETS_SRC"/*.gmt "$dest/src/aiscientist/tools/genesets/"
-    else
-      echo "WARNING: no gene sets in $GENESETS_SRC: enrichment has no libraries (scripts/fetch_genesets.py)" >&2
-    fi
+    # Gene libraries are external scientific references. The native scRNA MCP
+    # receives the administrator's compute-host SCRNA_GENESETS_DIR as a read-only
+    # mount; installing an app release neither copies nor deletes those assets.
     pip_install "$dest"
     "$dest/.venv/bin/python" -m compileall -q "$dest/src" >/dev/null 2>&1 || true
     touch "$dest/.installed"
