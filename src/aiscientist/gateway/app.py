@@ -9441,46 +9441,77 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
             conn.end_run(current)
 
 
+def _quickchat_literature_route(conn: Connection, req: LabRequest) -> tuple[Any, str]:
+    """Ask only the ready selected model; a classifier never provisions compute."""
+    from ..agents import request_router
+    complete = None
+    if _model_ready(conn):
+        try:
+            selected = _lab_llm(conn).complete_fn
+            complete = lambda messages: selected(messages, role="classify")  # noqa: E731
+        except Exception:  # the guarded deterministic fallback leaves plain chat available
+            complete = None
+    names = [str(item.get("name") or "") for item in _select_bound_datasets(req)]
+    return request_router.route_quickchat_literature(complete, req.question, data=names, history=req.history or [])
+
+
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
     # message reach it would route a question into a report edit.
+    chat_literature_route = None
+    chat_literature_handoff = False
     if _fast_path(req):
-        if corpus_scan.asks_for_gene_list(req.question):
-            # "What are haploinsufficient genes?": the complete answer is the corpus scan's table,
-            # and a kept scan of this corpus answers it at once, whatever model the session uses.
-            stored = await asyncio.to_thread(_stored_corpus_scan, conn)
-            if stored is not None:
-                await _run_corpus_scan(conn, req, stored=stored)
+        from .literature_mcp import registered_server
+        native_literature = registered_server() is not None
+        if native_literature:
+            candidate, question = await asyncio.to_thread(_quickchat_literature_route, conn, req)
+            run = conn._context_run() or conn.active_run
+            if run is not None and run.chat_stop.is_set():
+                conn.push({"type": "chat_stopped"})
                 return
-            if await asyncio.to_thread(_literature_corpus_available, conn):
-                await _run_gene_table(conn, req)
-                return
-            if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
-                conn.push({"type": "lab_progress", "level": "info", "text": (
-                    "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
-                    "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
-                    "about the RetiGene papers by name for the complete table.")})
-        await _run_quick_chat(conn, req)
-        return
+            if candidate.literature:
+                chat_literature_route = candidate
+                chat_literature_handoff = True
+                req = req.model_copy(update={"route": "auto", "question": question})
+                conn.emit("info", "route", "This chat question needs published evidence; continuing with "
+                          "the literature plan and this session's selected model.")
+        if not chat_literature_handoff:
+            if not native_literature and corpus_scan.asks_for_gene_list(req.question):
+                # "What are haploinsufficient genes?": the complete answer is the corpus scan's table,
+                # and a kept scan of this corpus answers it at once, whatever model the session uses.
+                stored = await asyncio.to_thread(_stored_corpus_scan, conn)
+                if stored is not None:
+                    await _run_corpus_scan(conn, req, stored=stored)
+                    return
+                if await asyncio.to_thread(_literature_corpus_available, conn):
+                    await _run_gene_table(conn, req)
+                    return
+                if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
+                    conn.push({"type": "lab_progress", "level": "info", "text": (
+                        "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
+                        "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
+                        "about the RetiGene papers by name for the complete table.")})
+            await _run_quick_chat(conn, req)
+            return
     if _corpus_path(req):
         await _run_corpus_scan(conn, req)
         return
     # The chat's last analysis stopped part-way (an error, Stop, a restart): a message that carries on
     # picks it up where it stopped, with its question and approved plan; any other message goes on
     # below as it would have.
-    stopped = _stopped_run_target(conn, req)
+    stopped = None if chat_literature_handoff else _stopped_run_target(conn, req)
     if stopped is not None:
         s_run_id, s_art, s_state, s_resume = stopped
         if await _carries_on_stopped_run(conn, req, s_state, s_resume.from_step_index + 1,
                                          len(s_state.get("agenda") or [])):
             await _resume_stopped_run(conn, req, s_run_id, s_art, s_state)
             return
-    target = _followup_target(conn, req)
+    target = None if chat_literature_handoff else _followup_target(conn, req)
     # Nothing to attach a follow-up to, so this message would mint a FRESH run. Refuse to do that for
     # a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
-    if target is None and await asyncio.to_thread(_starts_no_study, conn, req):
+    if not chat_literature_handoff and target is None and await asyncio.to_thread(_starts_no_study, conn, req):
         conn.push({"type": "lab_progress",
                    "text": "💬 That reads as a reply, not a request — nothing was started. "
                            "There's no previous run in this chat to answer about (a cancelled "
@@ -9508,6 +9539,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         if handoff is None:
             return
         curation_offered = True
+        chat_literature_route = None  # the user changed the curation plan; route the new request
         req = req.model_copy(update={"question": handoff})
         _next = _begin_routed_run(conn, req.conversation_id)
         _note_budget_choice(_next, req)
@@ -9519,7 +9551,8 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # changed the request again.
     while True:
         prior_request = str(target[2].get("question") or "") if target else ""
-        route = await asyncio.to_thread(_route_request, conn, req, prior_request)
+        route = chat_literature_route or await asyncio.to_thread(_route_request, conn, req, prior_request)
+        chat_literature_route = None
         conn.emit("info", "route", f"Routed to {route.route} ({route.source}, confidence "
                                    f"{route.confidence:.2f}): {route.reason or '-'}")
         if not route.literature:
@@ -11325,10 +11358,13 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             key_use = _key_use(conn, cred)
         emit("step", "chat", f"Fast chat turn (model: {model}).")
 
+        from .literature_mcp import registered_server
+        native_literature = registered_server() is not None
         tools = build_quickchat_catalog(
-            literature_executor=_build_literature_executor(conn), served_model=conn.alloc is not None)
+            literature_executor=None if native_literature else _build_literature_executor(conn),
+            served_model=conn.alloc is not None, exclude_literature=native_literature)
         from .local_corpus import has_local_index
-        if has_local_index():
+        if not native_literature and has_local_index():
             corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
             if corpus is not None:
                 tools = [t for t in tools if t.name != "search_corpus"] + [corpus[0]]
