@@ -1,7 +1,7 @@
 ---
 name: phenotype_variant_diagnosis
 description: Diagnose a rare-disease CASE — a VCF **plus** the patient's clinical description (free text, any language) — by reconciling two independent tracks: the prioritised variant shortlist (VEP/ClinVar/predictors) and a phenotype-driven per-disease differential (HPO → LIRICAL post-test probability). Use ONLY when the case's phenotype/symptoms/diagnosis are actually given; a VCF alone is the variant_annotation protocol.
-tools: annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
+tools: mcp_annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
 data_type: variants
 ---
 
@@ -75,16 +75,16 @@ Hearing is normal — no history of hearing loss. No ataxia. No polydactyly.
 | # | Step | Track | Tool / skill | 🔬 Key agent-chosen params | Output |
 |---|------|-------|--------------|----------------------------|--------|
 | 1 | **QC the callset** | A | `vcf_qc_stats` (run_code) | `SEQ_TYPE` = WGS \| WES | `vcf_qc_summary.csv` |
-| 2 | **Narrow: panel + drop-common** | A | `annotate_variants` | `genes` / `regions_bed`, `max_pop_af` | in-panel rare set |
-| 3 | **Annotate** | A | `annotate_variants` | 🧭 `assembly` auto-detected | `variant_annotation.tsv` + tables |
-| 4 | **Prioritise** | A | `annotate_variants` (built-in) | disease-model AF thresholds | `high_priority_variants.csv` |
+| 2 | **Narrow: panel + drop-common** | A | `mcp_annotate_variants` | `genes` / `regions_bed`, `max_pop_af` | in-panel rare set |
+| 3 | **Annotate** | A | `mcp_annotate_variants` | 🧭 `assembly` auto-detected | `variant_annotation.tsv` + tables |
+| 4 | **Prioritise** | A | `mcp_annotate_variants` (built-in) | disease-model AF thresholds | `high_priority_variants.csv` |
 | 5 | **Free text → HPO** | B | `map_phenotype_to_hpo` | the clinical text, **verbatim** | `observed` + `excluded` HPO IDs |
 | 6 | **Per-disease differential** | B | `run_lirical` | `hpo_terms`, `excluded_hpo` | ranked diseases + post-test prob |
 | 7 | **Reconcile** | A×B | *(report from 4 + 6)* | — | the actual answer |
 | 8 | **Literature context** | — | `literature_search` | gene + phenotype query | citations |
 
 > **Tracks A and B are INDEPENDENT — do not make one wait on the other.** `run_lirical` does *not*
-> consume `annotate_variants`' output: in genotype-aware mode it scores the raw VCF itself through its
+> consume `mcp_annotate_variants`' output: in genotype-aware mode it scores the raw VCF itself through its
 > own Exomiser database. Plan them as distinct agenda steps that meet only at Step 7. **Plan no other
 > report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
 
@@ -115,7 +115,7 @@ Follow [`variant_annotation/PROTOCOL.md`](../variant_annotation/PROTOCOL.md); th
 1. **QC the callset** — Ti/Tv, call rate. A flagged callset caveats everything downstream.
 2. **Known genes FIRST + drop common** — restrict to the disease-gene panel (`genes` / `regions_bed`),
    set `max_pop_af=0.01`. **State the panel and the cutoff.** Expand genome-wide only if in-panel is negative.
-3. **Annotate** — assembly is auto-detected; `annotate_variants` normalises internally (do **not** plan a
+3. **Annotate** — assembly is auto-detected; `mcp_annotate_variants` normalises internally (do **not** plan a
    separate normalise step). Report `execution_mode`.
 4. **Prioritise** — lead with the `high_priority_variants` shortlist the tool already wrote. Report from
    its tables; do not hand-roll `run_code` to re-derive them.

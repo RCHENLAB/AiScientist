@@ -251,6 +251,45 @@ def test_cellqc_rerun_replaces_complete_tree_and_discards_stale_files(analysis_b
     assert pointer["mcp_provenance"]["task_id"] == "rerun"
 
 
+def test_complete_result_publication_and_rollback_stay_on_result_mount(analysis_bridge):
+    """Execute the generated collector with work/result mounted as different devices."""
+    runner, ctx, make = analysis_bridge
+    value, output, files = full_cellqc_result(runner)
+    hook = runner.root / "mount simulation"
+    hook.mkdir()
+    recorded = hook / "renames.jsonl"
+    result_root = runner.artifacts.parent / "result"
+    (hook / "sitecustomize.py").write_text(f'''
+import errno, json, os
+from pathlib import Path
+original = os.replace
+result_root = Path({str(result_root)!r})
+def replace(source, target, *args, **kwargs):
+    source, target = Path(source), Path(target)
+    if source.is_dir() and (source.is_relative_to(result_root) or target.is_relative_to(result_root)):
+        with open({str(recorded)!r}, "a") as stream:
+            stream.write(json.dumps([str(source), str(target)]) + "\\n")
+        if source.parent != result_root or target.parent != result_root:
+            raise OSError(errno.EXDEV, "separate Apptainer bind mounts")
+    return original(source, target, *args, **kwargs)
+os.replace = replace
+''')
+    runner.extra_env["PYTHONPATH"] = str(hook)
+    tool = make()
+    assert tool.executor({}, ctx)["status"] == "ok"
+    (output / "result/cellqc/report.html").unlink()
+    (output / "artifacts/result/report.html").unlink()
+    value["task_id"] = "rerun"
+    runner.fixture.write_text(json.dumps(value))
+    assert tool.executor({}, ctx)["status"] == "ok"
+    assert (result_root / "cellqc/mouse/library.h5ad").read_bytes() == files["mouse/library.h5ad"]
+    assert not (result_root / "cellqc/report.html").exists()
+    renames = [json.loads(line) for line in recorded.read_text().splitlines()]
+    assert len(renames) == 3  # first publish, prior-tree backup, replacement publish
+    assert all(Path(source).parent == Path(target).parent == result_root for source, target in renames)
+    assert not list(result_root.glob(".mcp-cellqc-*"))
+
+
 def test_alias_ownership_prevents_cross_server_cleanup(analysis_bridge):
     runner, ctx, make = analysis_bridge
     cellqc, output = fixture_result(runner)
@@ -337,6 +376,7 @@ def test_server_failure_cannot_become_execution_success(analysis_bridge, state, 
     result = make().executor({}, ctx)
     assert result["status"] == "error", result
     assert result["response_omitted"] is True
+    assert result["error"] and len(result["error"]) <= 1500
     assert len(json.dumps(result["result"])) <= 14000
     assert not (runner.checkpoints / "adata_qc.h5ad").exists()
     assert "details" in (runner.artifacts / result["full_result"]).read_text()
@@ -354,6 +394,25 @@ def test_bounded_result_preserves_complete_json(analysis_bridge):
     assert len(json.dumps(result["result"])) <= 14000
     evidence = json.loads((runner.artifacts / result["full_result"]).read_text())
     assert len(evidence["rows"]) == 8000 and evidence["host"] == "[server path]"
+
+
+def test_bounded_result_preserves_authoritative_slurm_metadata(analysis_bridge, monkeypatch):
+    runner, ctx, make = analysis_bridge
+    value, _ = fixture_result(runner)
+    value["note"] = "large evidence " * 3000
+    runner.fixture.write_text(json.dumps(value))
+    original = runner.run_in_image
+
+    def run(*args, **kwargs):
+        return original(*args, **kwargs) | {"slurm_state": "COMPLETED", "slurm_job_id": "59539880",
+                                          "node": "compute-node", "execution_mode": "hpc_slurm_image"}
+
+    monkeypatch.setattr(runner, "run_in_image", run)
+    result = make().executor({}, ctx)
+    assert result["response_omitted"] is True
+    assert result["slurm_state"] == "COMPLETED" and result["slurm_job_id"] == "59539880"
+    assert result["node"] == "compute-node" and result["returncode"] == 0
+    assert len(json.dumps(result)) <= 14000
 
 
 @pytest.mark.parametrize("server", sorted(PREFIXES))
@@ -491,3 +550,13 @@ def test_scgpt_refactor_is_a_trusted_readonly_deployment_path(monkeypatch):
     monkeypatch.setenv("SCGPT_REFACTOR", "../../untrusted")
     with pytest.raises(ValueError, match="absolute deployment path"):
         setting_values(server)
+
+
+def test_invalid_used_variant_default_returns_a_structured_error(analysis_bridge, monkeypatch):
+    runner, ctx, make = analysis_bridge
+    monkeypatch.setenv("VARIANT_DEFAULT_GENE_PANEL", "missing-panel")
+    tool = make("variant-annotation", "annotate_variants", settings=["VARIANT_DEFAULT_GENE_PANEL"])
+    result = tool.executor({}, ctx)
+    assert result["status"] == "error" and "deployment settings" in result["error"]
+    assert result["mcp"]["name"] == "variant-annotation"
+    assert not runner.capture.exists()

@@ -18,7 +18,7 @@ from aiscientist.gateway.app import _scan_tool_invocation, _write_capability_log
 
 def _conn(*, live=True, vl=False):
     return types.SimpleNamespace(
-        settings=types.SimpleNamespace(vlreview_enabled=vl, scgpt_image="/dfs3b/x/scgpt.sif"),
+        settings=types.SimpleNamespace(vlreview_enabled=vl),
         executor=(object() if live else None), mock=False)
 
 
@@ -91,3 +91,43 @@ def test_capability_log_does_not_claim_a_vl_review_that_never_started(tmp_path):
     txt = (tmp_path / "process" / "capabilities.log").read_text()
     assert "VL render review: NOT RUN (no full report was rendered this run)." in txt
     assert "read clean" not in txt
+
+
+def test_native_scgpt_capability_records_actual_pin(tmp_path, monkeypatch):
+    from aiscientist.agents import mcp_bridge
+
+    server = types.SimpleNamespace(
+        name="scgpt-annotation", adapter="analysis", image="docker://example@sha256:" + "a" * 64,
+        tools=({"name": "scgpt_annotate"},), planner_name=lambda wire: "mcp_" + wire)
+    monkeypatch.setattr(mcp_bridge, "configured_servers", lambda: (server,))
+    result = _result([{"tool": "mcp_scgpt_annotate", "result": {
+        "status": "ok", "n_cells": 480, "predictions_csv": "data/scgpt_predictions.csv",
+        "mcp": {"name": server.name, "version": "0.0.3", "image": server.image}}}])
+    _write_capability_log(tmp_path, result, _conn(), lambda *a: None)
+    text = (tmp_path / "process" / "capabilities.log").read_text()
+    assert "INVOKED, status=ok" in text and "n_cells=480" in text
+    assert "MCP version=0.0.3" in text and server.image in text
+    assert "scgpt_job.log" not in text
+
+
+def test_missing_scgpt_catalog_does_not_claim_live_session_is_sufficient(tmp_path, monkeypatch):
+    from aiscientist.agents import mcp_bridge
+
+    monkeypatch.setattr(mcp_bridge, "configured_servers", lambda: ())
+    _write_capability_log(tmp_path, _result([]), _conn(), lambda *a: None)
+    text = (tmp_path / "process" / "capabilities.log").read_text()
+    assert "Not configured in the MCP catalog" in text
+    assert "Available (live session)" not in text
+
+
+def test_uninvoked_native_scgpt_reports_registration_without_claiming_availability(tmp_path, monkeypatch):
+    from aiscientist.agents import mcp_bridge
+
+    server = types.SimpleNamespace(
+        name="scgpt-annotation", adapter="analysis", image="docker://example@sha256:" + "a" * 64,
+        tools=({"name": "scgpt_annotate"},))
+    monkeypatch.setattr(mcp_bridge, "configured_servers", lambda: (server,))
+    _write_capability_log(tmp_path, _result([]), _conn(), lambda *a: None)
+    text = (tmp_path / "process" / "capabilities.log").read_text()
+    assert "NOT INVOKED" in text and server.image in text
+    assert "Runtime availability is checked at invocation" in text

@@ -25,6 +25,7 @@ offline in tests with scripted tool calls; the default calls ``gateway.vllm_clie
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -321,7 +322,8 @@ class ResearchHarness:
             should_cancel: Callable[[], bool] | None = None,
             untrusted_text: str | None = None, extra_steps: int = 0,
             pinned_args: "dict[str, dict[str, Any]] | None" = None,
-            planned_tools: "list[str] | None" = None) -> HarnessResult:
+            planned_tools: "list[str] | None" = None,
+            exact_args: bool = False) -> HarnessResult:
         emit: EventFn = on_event or (lambda _event: None)
         steps: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -363,7 +365,14 @@ class ResearchHarness:
             emit({"type": "note", "reason": "raw table data allowed into the prompt — endpoint is the local tunneled Qwen (no data leaves UCI)."})
 
         chat = self._resolve_chat(ctx)
-        tool_schemas = [tool.schema() for tool in self.catalog]
+        allowed = None
+        if exact_args:
+            from .tool_names import STATUS_TOOLS, canonical_tool_name
+            metadata = {"finish", "read_text", "stat_path", "list_dir", "find_files", "disk_usage",
+                        "describe_environment", "read_tool_source", "read_skill_reference", "search_skills"}
+            allowed = set(pinned_args or {}) | metadata | {
+                tool.name for tool in self.catalog if canonical_tool_name(tool.name) in STATUS_TOOLS}
+        tool_schemas = [tool.schema() for tool in self.catalog if allowed is None or tool.name in allowed]
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": _HARNESS_SYSTEM},
             {"role": "user", "content": brief},
@@ -461,7 +470,17 @@ class ResearchHarness:
                     if should_cancel is not None and should_cancel():
                         stop_reason = "cancelled"
                         break
+                    requested_name = ((call or {}).get("function") or {}).get("name")
+                    if exact_args and requested_name in (pinned_args or {}):
+                        # The approved JSON is the entire call, including omissions. This also
+                        # avoids requiring the model to re-emit large source strings verbatim.
+                        call = {**call, "function": {**call["function"],
+                                "arguments": copy.deepcopy(pinned_args[requested_name])}}
+                        emit({"type": "plan_exact_arguments_applied", "tool": requested_name})
                     name, args, validation_error = self._validate_call(call)
+                    if allowed is not None and name not in allowed:
+                        validation_error = "tool is outside this explicitly approved step"
+
                     if validation_error:
                         bad_calls += 1
                         errors.append({"tool": name, "error": validation_error})

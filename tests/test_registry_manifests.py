@@ -57,7 +57,7 @@ def test_hpc_routing_follows_runs_on(cellqc_release):     # run_cellqc runs the 
             seen.append((self.line, name))
             return {"status": "ok"}
 
-    lines = {"analysis_executor": "hpc:analysis", "variant_executor": "hpc:variant",
+    lines = {"analysis_executor": "hpc:analysis",
              "phenotype_executor": "hpc:phenotype", "literature_executor": "hpc:literature"}
     cat = {t.name: t for t in build_scientist_catalog(**{k: _Line(v) for k, v in lines.items()})}
     for m in catalog.manifests():

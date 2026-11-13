@@ -1,12 +1,12 @@
 ---
 name: scgpt_annotation
 description: scGPT foundation-model per-cell annotation for a .h5ad — transfers reference cell-type labels + calibrated confidence to every cell, AND independently cross-validates ANY existing celltype/majorclass labels the data already carries. Use for scGPT / .sif / foundation-model annotation, per-cell labelling, OR an independent second-opinion check of a dataset's existing cell-type labels.
-tools: scgpt_annotate, run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, literature_search, run_code
+tools: mcp_scgpt_annotate, run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, literature_search, run_code
 data_type: scrna
 outputs:
   - path: data/scgpt_predictions.csv
     kind: table
-    tool: scgpt_annotate
+    tool: mcp_scgpt_annotate
     description: The scGPT cell-type label and confidence for every cell of the uploaded matrix, indexed by the original cell barcode.
     required: true
   - path: figures/umap_clusters.png
@@ -55,7 +55,7 @@ strong hypothesis to validate, not ground truth.
 naming without a foundation model (use the `celltype_annotation` skill instead).
 
 Adapt parameters to THIS dataset; plan ordered steps that:
-1. Run `scgpt_annotate` for a per-cell label + confidence for EVERY cell (the primary annotation). It preprocesses internally (gene-vocabulary alignment, HVG, log1p) on a GPU batch job, so do NOT normalize/HVG the data yourself beforehand — pass the query as-is. It writes `data/scgpt_predictions.csv` — **one row per RAW-upload cell, indexed by the original cell barcode** (columns `index, predictions, confidence`).
+1. Run `mcp_scgpt_annotate` for a per-cell label + confidence for EVERY cell (the primary annotation). It preprocesses internally (gene-vocabulary alignment, HVG, log1p) on a GPU batch job, so do NOT normalize/HVG the data yourself beforehand — pass the query as-is. It writes `data/scgpt_predictions.csv` — **one row per RAW-upload cell, indexed by the original cell barcode** (columns `index, predictions, confidence`).
 1b. **Establish what the matrix IS, and the rules** (`run_code`) — read-only, and before the QC
    step below. scGPT (step 1) preprocesses internally from the raw upload, so this audits the
    object for everything AFTER it. Two outputs, written as tables the later steps read back:
@@ -79,7 +79,7 @@ Adapt parameters to THIS dataset; plan ordered steps that:
      - **Not counts.** Any negative or non-integer value, row sums that do not reproduce the
        stored totals, or a differently-scaled representation present. Then say so and drop the
        count-dependent steps — never recover counts by exponentiating, rounding, or renaming.
-     State which representation supports which operation and which ruling you applied. `scgpt_annotate`
+     State which representation supports which operation and which ruling you applied. `mcp_scgpt_annotate`
      preprocesses the raw upload itself, so the first ruling is what lets it run at all.
    * *The decision rule.* Name the minimum support per label (cells per group), the confidence
      handling, and the crosswalk rule for comparing a reference taxonomy against the existing
@@ -134,5 +134,5 @@ is not validation of either. Report the populations where they disagree; that is
 
 State the label-transfer caveats honestly (reference-bounded taxonomy, no fine-tuning, query-vs-
 reference differences). Do not fabricate cell types, gene names, confidences, or numbers a tool did
-not return. If `scgpt_annotate` is not enabled (no GPU/image) or errors, say so and fall back to the
+not return. If `mcp_scgpt_annotate` is not enabled (no GPU/image) or errors, say so and fall back to the
 marker-based path (see the `celltype_annotation` skill) rather than inventing labels.

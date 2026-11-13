@@ -12,7 +12,9 @@
       "tools_file": "mcp/atlas-expression-exploration-0.0.3.tools.json",
       "tools_sha256": "069f629e1056c37b57d3e6173d6b257200c4cc8b70782b128fa6a6111fcb0020",
       "adapter": "atlas-expression",
-      "aliases": {"write_report": "atlas_write_report"},
+      "aliases": {
+        "write_report": "atlas_write_report"
+      },
       "timeout": 15000,
       "resources": {
         "resolve_genes": [
@@ -56,6 +58,113 @@
           "00:30:00"
         ]
       }
+    },
+    {
+      "name": "variant-annotation",
+      "version": "0.0.2",
+      "release_tag": "variant-annotation-v0.0.2",
+      "image": "docker://ghcr.io/liujs123456/mcp-variant-annotation@sha256:92c875d268b8f89054860cedd13dcbd5b53498e9321868180e9e56a2b56eb388",
+      "entrypoint": "variant-annotation-mcp",
+      "skill": "annotate-vcf-with-mcp",
+      "runs_on": "hpc:variant",
+      "tools_file": "mcp/variant-annotation-0.0.2.tools.json",
+      "tools_sha256": "6151ae2c2f104849193f273a0c69d623762f3c776e209b3a07fbb1e28bc6e6d1",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "annotate_variants": [
+          4,
+          16,
+          "01:00:00"
+        ],
+        "variant_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "VARIANT_ALLOW_REST",
+        "VARIANT_DEFAULT_GENE_PANEL",
+        "VARIANT_DEFAULT_MAX_POP_AF",
+        "VARIANT_DEFAULT_REGIONS_BED",
+        "VARIANT_IRD_ANNOTATE",
+        "VARIANT_IRD_ATAC",
+        "VARIANT_IRD_ATAC_GRCH37",
+        "VARIANT_IRD_ATAC_GRCH38",
+        "VARIANT_IRD_DBSCSNV",
+        "VARIANT_IRD_DBSCSNV_GRCH37",
+        "VARIANT_IRD_DBSCSNV_GRCH38",
+        "VARIANT_IRD_HGMD",
+        "VARIANT_IRD_HGMD_GRCH37",
+        "VARIANT_IRD_HGMD_GRCH38",
+        "VARIANT_IRD_RETINA_EXONS",
+        "VARIANT_IRD_RETINA_EXONS_GRCH37",
+        "VARIANT_IRD_RETINA_EXONS_GRCH38",
+        "VARIANT_REF_FASTA",
+        "VARIANT_REF_FASTA_GRCH37",
+        "VARIANT_REF_FASTA_GRCH38",
+        "VARIANT_SPLICEAI",
+        "VARIANT_SPLICEAI_BIN",
+        "VARIANT_SPLICEAI_MAX_VARIANTS",
+        "VARIANT_SPLICEAI_MODELS",
+        "VARIANT_SPLICEAI_MODELS_GRCH37",
+        "VARIANT_SPLICEAI_MODELS_GRCH38",
+        "VARIANT_VEP_ALPHAMISSENSE",
+        "VARIANT_VEP_ALPHAMISSENSE_GRCH37",
+        "VARIANT_VEP_ALPHAMISSENSE_GRCH38",
+        "VARIANT_VEP_CACHE_DIR",
+        "VARIANT_VEP_CACHE_DIR_GRCH37",
+        "VARIANT_VEP_CACHE_DIR_GRCH38",
+        "VARIANT_VEP_CADD_INDELS",
+        "VARIANT_VEP_CADD_INDELS_GRCH37",
+        "VARIANT_VEP_CADD_INDELS_GRCH38",
+        "VARIANT_VEP_CADD_SNV",
+        "VARIANT_VEP_CADD_SNV_GRCH37",
+        "VARIANT_VEP_CADD_SNV_GRCH38",
+        "VARIANT_VEP_CLINVAR",
+        "VARIANT_VEP_CLINVAR_GRCH37",
+        "VARIANT_VEP_CLINVAR_GRCH38",
+        "VARIANT_VEP_FORK",
+        "VARIANT_VEP_PLUGINS",
+        "VARIANT_VEP_PLUGINS_DIR",
+        "VARIANT_VEP_PLUGINS_DIR_GRCH37",
+        "VARIANT_VEP_PLUGINS_DIR_GRCH38",
+        "VARIANT_VEP_REVEL",
+        "VARIANT_VEP_REVEL_GRCH37",
+        "VARIANT_VEP_REVEL_GRCH38"
+      ]
+    },
+    {
+      "name": "scgpt-annotation",
+      "version": "0.0.3",
+      "release_tag": "scgpt-annotation-v0.0.3",
+      "image": "docker://ghcr.io/liujs123456/mcp-scgpt-annotation@sha256:1133d106342831e9d6cd7fc5961e38eb2043142852219105bac269065213b2d5",
+      "entrypoint": "scgpt-annotation-mcp",
+      "skill": "annotate-cells-with-scgpt-mcp",
+      "runs_on": "gpu:scgpt",
+      "tools_file": "mcp/scgpt-annotation-0.0.3.tools.json",
+      "tools_sha256": "de3b7d71a27ab7c83f81b08bb849a1122d9307365ece4bc8b0c5d3849ac90103",
+      "adapter": "analysis",
+      "prefix": "mcp_",
+      "timeout": 15000,
+      "resources": {
+        "scgpt_annotate": [
+          4,
+          48,
+          "01:00:00"
+        ],
+        "scgpt_job_status": [
+          1,
+          4,
+          "00:15:00"
+        ]
+      },
+      "settings_env": [
+        "SCGPT_MODEL_DIR",
+        "SCGPT_REFACTOR"
+      ]
     }
   ]
 }

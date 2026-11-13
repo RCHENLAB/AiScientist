@@ -20,7 +20,7 @@ PREFIXES = {
     "literature": "LITERATURE", "data-utilities": "DATA_UTILITIES",
 }
 # Settings are names, never registry values. Credentials continue through skill
-# policy; neither arbitrary environment forwarding nor executable overrides exist.
+# policy; model arguments cannot select environment variables or executables.
 _PATHS = {
     "cellqc": set(),
     "scrna-analysis": {"SCRNA_GENESETS_DIR"},
@@ -29,7 +29,7 @@ _PATHS = {
         "VEP_CACHE_DIR", "VEP_CLINVAR", "REF_FASTA", "VEP_CADD_SNV", "VEP_CADD_INDELS",
         "VEP_ALPHAMISSENSE", "VEP_REVEL", "VEP_PLUGINS_DIR", "SPLICEAI_MODELS",
         "IRD_HGMD", "IRD_RETINA_EXONS", "IRD_ATAC", "IRD_DBSCSNV")
-        for suffix in ("", "_GRCH37", "_GRCH38")},
+        for suffix in ("", "_GRCH37", "_GRCH38")} | {"VARIANT_DEFAULT_REGIONS_BED", "VARIANT_SPLICEAI_BIN"},
     "phenotype-diagnosis": {"LIRICAL_DATA_DIR", "LIRICAL_EXOMISER_HG19", "LIRICAL_EXOMISER_HG38",
                             "PHENOTYPE_HPO_LEXICON"},
     "literature": {"LITERATURE_CORPUS_ROOT", "LITERATURE_PAPERS", "LITERATURE_CACHE_DIR",
@@ -39,7 +39,8 @@ _PATHS = {
 _VALUES = {
     "cellqc": set(), "scrna-analysis": set(), "scgpt-annotation": set(),
     "variant-annotation": {"VARIANT_ALLOW_REST", "VARIANT_VEP_FORK", "VARIANT_SPLICEAI_MAX_VARIANTS",
-                           "VARIANT_SPLICEAI", "VARIANT_IRD_ANNOTATE", "VARIANT_VEP_PLUGINS"},
+                           "VARIANT_SPLICEAI", "VARIANT_IRD_ANNOTATE", "VARIANT_VEP_PLUGINS",
+                           "VARIANT_DEFAULT_GENE_PANEL", "VARIANT_DEFAULT_MAX_POP_AF"},
     "phenotype-diagnosis": {"LIRICAL_ASSEMBLY", "LIRICAL_TIMEOUT", "PHENOTYPE_MODEL_ENDPOINT",
                             "PHENOTYPE_MODEL", "PHENOTYPE_MODEL_TIMEOUT", "PHENOTYPE_MODEL_MAX_TOKENS",
                             "PHENOTYPE_LITERATURE_TIMEOUT"},
@@ -64,10 +65,19 @@ def validate_settings(server: str, names: Any) -> None:
 
 def setting_values(server) -> dict[str, str]:
     validate_settings(server.name, server.settings_env)
+    defaults = {}
+    if server.name == "variant-annotation":
+        from .variant_settings import deployment_values
+        defaults = deployment_values()
+    elif server.name == "scgpt-annotation":
+        from ..gateway.settings import HPCSettings
+        defaults = {"SCGPT_MODEL_DIR": HPCSettings.from_env().scgpt_model_dir}
     values = {}
     for name in server.settings_env:
-        value = os.environ.get(name, "")
+        value = os.environ.get(name, defaults.get(name, ""))
         if not value:
+            if server.name == "variant-annotation" and (name in defaults or name in os.environ):
+                values[name] = ""  # an explicitly empty assembly-specific setting blocks base fallback
             continue
         if any(ch in value for ch in ("\x00", "\n", "\r")):
             raise ValueError(f"Invalid deployment setting {name}")
@@ -91,8 +101,12 @@ def setting_paths(server) -> tuple[str, ...]:
     """
     paths = []
     for name, value in setting_values(server).items():
-        if name in _PATHS[server.name]:
+        if name in _PATHS[server.name] and value:
             parent = str(PurePosixPath(value).parent)
+            if name == "VARIANT_SPLICEAI_BIN":
+                # Administrator-managed SpliceAI needs its bin and lib trees;
+                # model arguments cannot select this executable or mount.
+                parent = str(PurePosixPath(value).parent.parent)
             if parent == "/":
                 raise ValueError(f"{name} cannot require mounting the filesystem root")
             paths.append(parent)
@@ -340,8 +354,10 @@ for source, target in copies:
 
 if full_target is not None:
     full_target.parent.mkdir(parents=True, exist_ok=True)
-    # Interrupted copies are machinery, not deliverables for stage_out's result/ walk.
-    staging = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-", dir=work))
+    # work/ and result/ are separate Apptainer bind mounts. Both publication
+    # renames must stay inside result/, even when their host files share a disk.
+    # stage_out refuses these internal directories if publication is interrupted.
+    staging = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-", dir=full_target.parent))
     backup = None
     try:
         for source, name, _ in full_tree:
@@ -349,7 +365,7 @@ if full_target is not None:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
         if full_target.exists():
-            backup = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-old-", dir=work))
+            backup = Path(tempfile.mkdtemp(prefix=".mcp-cellqc-old-", dir=full_target.parent))
             backup.rmdir()
             os.replace(full_target, backup)
         try:
@@ -484,6 +500,8 @@ class AnalysisAdapter:
                 if dataset.lower().endswith((".vcf", ".vcf.gz")):
                     args["vcf_path"] = dataset
         if self.server.name == "variant-annotation" and tool == "annotate_variants":
+            from .variant_settings import default_arguments
+            args = {**default_arguments(setting_values(self.server), args), **args}
             assembly = decisions.get("mcp_variant_assembly")
             if assembly in {"GRCh37", "GRCh38"}:
                 args["assembly"] = assembly
@@ -517,8 +535,12 @@ class AnalysisAdapter:
                 raise ValueError("input path must identify exactly one attached dataset or input")
             return matches.pop()
 
+        values = setting_values(self.server)
+        trusted_bed = values.get("VARIANT_DEFAULT_REGIONS_BED", "") if self.server.name == "variant-annotation" else ""
         for key in ("dataset", "vcf_path", "regions_bed", "path"):
             if args.get(key):
+                if key == "regions_bed" and trusted_bed and args[key] == trusted_bed:
+                    continue  # exact administrator reference, mounted by setting_paths()
                 args[key] = bind(args[key])
                 if key == "dataset" and args[key] in {dataset, root}:
                     args.pop(key)  # container's executor-owned DATASET/ROOT is authoritative
@@ -540,13 +562,14 @@ class AnalysisAdapter:
                     or not re.fullmatch(r"[A-Za-z0-9_.*?\[\]-]+\.(?:h5ad|rnk)", parts[-1])):
                 raise ValueError("input must be a filename or a relative path inside work/ or artifacts/")
         prefix = PREFIXES[self.server.name]
-        values = setting_values(self.server)
         from .mcp_model import prepare_model
         model_binding, model_setup = prepare_model(self.server.name, tool, executor, values, arguments=args)
         setup = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in values.items())
         setup += model_setup
         setup += BOUND_SETUP
         setup += f'export {prefix}_DATASET="${{AISCIENTIST_DATASET:-}}" {prefix}_READ_ROOTS="$AISCI_MCP_READ_ROOTS"\n'
+        if trusted_bed:
+            setup += f'export VARIANT_READ_ROOTS="$AISCI_MCP_READ_ROOTS"{shlex.quote(":" + trusted_bed)}\n'
         if self.server.name == "cellqc":
             setup += 'export CELLQC_DATASET="${AISCIENTIST_DATASET_ROOT:-${AISCIENTIST_DATASET:-}}"\n'
         if self.server.name == "scrna-analysis":
@@ -604,10 +627,13 @@ class AnalysisAdapter:
             summary = {key: result[key] for key in ("state", "analysis_id", "task_id", "job_id", "full_result",
                        "checkpoint", "checkpoint_path", "exported_checkpoints") if key in result}
             summary["response_omitted"] = True
-            response = {**summary, **{key: response[key] for key in
-                        ("status", "returncode", "provenance", "environment", "execution_mode", "skill")
-                        if key in response}, "result": summary}
-            if result.get("status") == "error":
-                response["error"] = "MCP analysis failed; inspect full_result for the complete evidence"
+            metadata = {key: response[key] for key in
+                        ("status", "returncode", "slurm_state", "slurm_job_id", "slurm_node", "node",
+                         "provenance", "environment", "execution_mode", "skill") if key in response}
+            error = response.get("error")
+            response = {**summary, **metadata, "result": summary}
+            if response.get("status") == "error":
+                response["error"] = (str(error)[:1500] if error else
+                                     "MCP analysis failed; inspect full_result for the complete evidence")
             response["artifacts"] = out.get("artifacts", [])[:50]
         return response

@@ -5724,18 +5724,6 @@ def _remote_path_status(executor: Any, path: str, *, is_dir: bool) -> "bool | No
         return None
 
 
-def _variant_offline_preflight(executor: Any, vep_image: str, cache_dir: str, clinvar: str) -> dict:
-    """Cheap HPC3 existence checks for the offline VEP stack (sif image + VEP cache dir + ClinVar VCF).
-    Returns ``{name: (path, exists?)}`` where exists? is True / False / None(unverifiable). SSH
-    round-trips, so call via ``asyncio.to_thread``. This is the check that turns a silent
-    "fell back to REST" into "clinvar_vcf NOT found on HPC3: <path>"."""
-    return {
-        "vep_image": (vep_image, _remote_path_status(executor, vep_image, is_dir=False)),
-        "cache_dir": (cache_dir, _remote_path_status(executor, cache_dir, is_dir=True)),
-        "clinvar_vcf": (clinvar, _remote_path_status(executor, clinvar, is_dir=False)),
-    }
-
-
 def _phenotype_preflight(executor: Any, lirical_image: str, data_dir: str,
                          exomiser_dir: str = "") -> dict:
     """Cheap HPC3 existence checks for the LIRICAL stack (sif image + LIRICAL data dir + the optional
@@ -6018,7 +6006,13 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
     session = _temp_base(conn)
     legacy_temp = hpc_layout.legacy_dir(shared, "Temp", user)
     uploads = hpc_layout.legacy_dir(shared, "uploads", user)
-    read_roots = tuple(r for r in (home, session, legacy_temp, uploads,
+    artifacts_dir = work_dir = ""
+    if run is not None and run.run_id:
+        analysis_dir = _run_home(conn, run.run_id).dir("analysis")
+        # Match SlurmCodeExecutor's bindings, including a continued run's recorded home.
+        work_dir = os.environ.get("AISCIENTIST_HPC_WORK") or f"{analysis_dir}/work"
+        artifacts_dir = os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{analysis_dir}/artifacts"
+    read_roots = tuple(r for r in (home, session, legacy_temp, uploads, artifacts_dir, work_dir,
                                    hpc_layout.containers_dir(shared), reference,
                                    hpc_layout.package_cache_root(shared), hpc_layout.lab_envs_dir(shared),
                                    st.scgpt_model_dir, st.vlreview_model_dir) if r)
@@ -6066,6 +6060,8 @@ def _build_hpc_shell(conn: "Connection", run: "RunState | None") -> Any:
         workspace=HpcWorkspace(read_roots=read_roots, write_roots=write_roots),
         environments=_lab_environments(conn, run, user, shared) if (st.run_code_on_hpc or st.analysis_on_hpc) else None,
         home=home,
+        artifacts_dir=artifacts_dir,
+        work_dir=work_dir,
         worker_provider=(lambda: _ensure_session_worker(conn)) if st.worker_enabled else None,
         run_on_worker=_run_on_session_worker if st.worker_enabled else None,
         confirm=_hitl_confirm(conn, run),
@@ -9456,6 +9452,13 @@ def _quickchat_literature_route(conn: Connection, req: LabRequest) -> tuple[Any,
 
 
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
+    from ..agents.mcp_workflow import explicit_workflow
+    if explicit_workflow(req.question):
+        # An explicit ordered call list is a reviewed scientific workflow, not a
+        # question for the single-answer search console. It retains this session's
+        # model, cost/cancel policy and the normal plan approval before any call.
+        await _run_lab(conn, req)
+        return
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
@@ -12153,6 +12156,15 @@ def _prepare_continue(connection_id: str, conn: Connection, run_id: str, art: Pa
     ``modify_note`` and ``edited_step`` are ignored). ``hpc_checkpoints`` also looks for the
     checkpoints in the run's HPC3 workspace — an SSH round trip, so call it off the event loop."""
     from ..agents.research_lab import ResumeState
+    # The report copy is the full approved document, not the short planner hint
+    # returned by _approved_plan_text. Older checkpoints stored only agenda prose.
+    if not state.get("approved_plan_yaml"):
+        approved_path = art / "report" / "plan.yaml"
+        if approved_path.exists():
+            approved_text = approved_path.read_text(encoding="utf-8")
+            if len(approved_text) > _PLAN_YAML_MAX_CHARS:
+                raise ValueError("The approved plan is too large to restore safely; re-plan and review it.")
+            state = {**state, "approved_plan_yaml": approved_text}
     agenda = list(state.get("agenda", []))
     if not agenda:
         raise ValueError("Prior run has no agenda to continue.")
@@ -14849,13 +14861,15 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
     try:
         from ..agents.registry import build_scientist_catalog
         from ..agents.research_harness import HarnessConfig, HarnessContext, ResearchHarness
-        from ..agents.research_lab import LabConfig, ResearchLab
+        from ..agents.research_lab import LabConfig, ResearchLab, ResumeState
         from ..tools.api import run_dataset_smoke_analysis
         from ..reporting.research_bundle import write_process_artifacts
         from ..tools.api import render_workflow_schematic
 
         art = conn.workspace / run_id / "artifacts"
         art.mkdir(parents=True, exist_ok=True)
+        if saved_state is not None and saved_state.get("resume_review"):
+            resume = ResumeState.from_review_state(saved_state["resume_review"])
 
         # Record the run in this user's history (when logged in); updated on finish. A resume
         # keeps the SAME run row (it overwrites the same bundle), so don't insert a new one.
@@ -15155,16 +15169,6 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if conn.executor is not None and not conn.mock:
             await asyncio.to_thread(_resolve_run_home, conn, run_id)
         code_executor = await _build_code_executor(conn, run, run_id, decisions, art, emit)
-        # scGPT per-cell annotation runs as a GPU batch job on HPC3 (Route C). Wire its
-        # runner only for a LIVE session (a real SSH executor) — in mock/offline mode the
-        # tool stays present but reports not-enabled (the mock host has no batch lifecycle).
-        scgpt_runner = None
-        if conn.executor is not None and not conn.mock:
-            from .scgpt_runner import build_scgpt_runner
-            scgpt_runner = build_scgpt_runner(
-                conn.executor, conn.settings, cluster_user_dir=_temp_base(conn),
-                run_dir=lambda rid: _run_home(conn, rid).dir("scgpt"),
-            )
         # Opt-in: run the scanpy analysis line (QC/clustering/DE/enrichment) as CPU Slurm batch jobs
         # on HPC3, reading the dataset on dfs3b in place. The dataset is used in place if it already
         # lives on dfs3b (uploads_on_hpc), else staged up once. Checkpoints accumulate in the dfs3b
@@ -15260,312 +15264,20 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("warning", "lab", "The earlier run's dataset carries no processing record, so it "
                                    "is treated as a plain input.")
 
-        # Opt-in: run VCF variant annotation OFFLINE on HPC3 (bcftools PASS-filter -> vep --offline
-        # --cache --fork over a local cache -> stream-parse), so a WGS-size VCF is handled without the
-        # REST tool's whole-file-in-memory read / 500-variant cap / rate limits. Falls back to REST on
-        # failure. EVERY branch below is logged AND persisted to process/variant_offline_diagnostics.log
-        # so a silent "fell back to REST" is never a mystery: you see the flag state, the resolved paths,
-        # and whether the sif / cache / ClinVar actually exist on HPC3.
-        variant_executor = None
+        # The native variant service owns annotation and reference validation.
+        # Preserve header-authoritative assembly selection for it and LIRICAL.
         st = conn.settings
         _ds_name = str(decisions.get("hpc_primary") or decisions.get("dataset_path") or "")
         _is_vcf = _ds_name.lower().endswith((".vcf", ".vcf.gz"))
-        _vdiag: list[str] = []
-
-        def _vlog(level: str, msg: str) -> None:
-            _vdiag.append(f"[{level}] {msg}")
-            emit(level, "lab", msg)
-
-        # Genome build: start from the configured default, then OVERRIDE it with the build read from the
-        # VCF header when detectable. The uploaded VCF is often hg19/GRCh37; annotating those coordinates
-        # against the .env-default GRCh38 cache runs cleanly but mis-assigns the gene at ~90% of sites
-        # (empirically verified), so we route to the matching cache/ClinVar rather than trust the flag.
         _assembly = str(st.vep_assembly)
         if _is_vcf:
             _detected = await asyncio.to_thread(_detect_vcf_assembly, conn, decisions)
-            if _detected and _detected.lower() != _assembly.lower():
-                _vlog("info", f"Variant assembly: VCF header indicates {_detected} — overriding the "
-                              f"configured {_assembly} so the matching VEP cache/ClinVar is used.")
+            if _detected:
                 _assembly = _detected
-            elif not _detected:
-                _vlog("info", f"Variant assembly: build not detectable from the VCF header; using the "
-                              f"configured default {_assembly}.")
+            emit("info", "lab", f"Native variant annotation uses {_assembly}; "
+                 + ("assembly read from the VCF header." if _detected else "configured fallback assembly."))
         decisions["mcp_variant_assembly"] = "GRCh37" if _assembly.lower() in ("grch37", "hg19") else "GRCh38"
         _grch37 = _assembly.lower() in ("grch37", "hg19")
-        _cache_dir = st.vep_cache_dir_grch37 if _grch37 else st.vep_cache_dir_grch38
-        _clinvar = st.vep_clinvar_grch37 if _grch37 else st.vep_clinvar_grch38
-
-        if _is_vcf or st.variant_on_hpc:
-            _vlog("info",
-                  f"Variant-annotation config: AISCIENTIST_VARIANT_ON_HPC="
-                  f"{'ON' if st.variant_on_hpc else 'OFF'}; vep_image={st.vep_image}; "
-                  f"cache={_cache_dir}; clinvar={_clinvar}; assembly={_assembly}; "
-                  f"executor={'yes' if conn.executor is not None else 'NONE'}; mock={conn.mock}; "
-                  f"dataset={'vcf' if _is_vcf else (_ds_name or 'none')}.")
-
-        # WHY the offline line is / isn't wired — say it out loud, per condition.
-        if not st.variant_on_hpc:
-            if _is_vcf:
-                _vlog("warning",
-                      "Offline VEP line OFF: AISCIENTIST_VARIANT_ON_HPC is not set to 1/true/yes/on in the "
-                      "deployment .env. The VEP_* sif/cache paths ALONE do not enable it — that flag IS the "
-                      "switch. Annotating via the capped REST path.")
-        elif conn.executor is None or conn.mock:
-            _vlog("warning",
-                  f"Offline VEP line requested but not runnable this run: "
-                  f"executor={'NONE' if conn.executor is None else 'ok'}, mock={conn.mock}. Using REST.")
-        else:
-            # Flag ON + live executor: PREFLIGHT the sif + cache + ClinVar on HPC3 before wiring, so a
-            # wrong/un-staged path is reported HERE instead of as a mystery Slurm-job failure later.
-            checks = await asyncio.to_thread(
-                _variant_offline_preflight, conn.executor, st.vep_image, _cache_dir, _clinvar)
-            for name, (path, ok) in checks.items():
-                if not path:
-                    _vlog("warning", f"Offline VEP: {name} is not configured (empty path in .env).")
-                elif ok is False:
-                    _vlog("warning",
-                          f"Offline VEP: {name} NOT found on HPC3: {path} — the VEP job would fail and fall "
-                          f"back to REST. Stage it (deploy/vep/build_and_stage.sh) or fix the .env path.")
-                elif ok is None:
-                    _vlog("warning", f"Offline VEP: could NOT verify {name} on HPC3 ({path}) — SSH check failed.")
-                else:
-                    _vlog("info", f"Offline VEP: {name} present on HPC3 ({path}).")
-            try:
-                v_pysrc = await asyncio.to_thread(_sync_aiscientist_source_to_hpc, conn)
-            except Exception as exc:  # noqa: BLE001
-                _vlog("warning", f"Offline VEP disabled: couldn't stage the tools to dfs3b ({exc}). Using REST.")
-                v_pysrc = None
-            if v_pysrc:
-                remote_ws = _run_home(conn, run_id).dir("variant")
-                conn.executor.exec(f"mkdir -p {shlex.quote(remote_ws)}")
-                if decisions.get("hpc_primary"):
-                    remote_ds = decisions["hpc_primary"]           # dfs3b VCF — annotated in place
-                elif decisions.get("dataset_path"):
-                    remote_ds = f"{remote_ws}/{Path(decisions['dataset_path']).name}"
-                    await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], remote_ds)
-                else:
-                    remote_ds = None
-                if remote_ds is None:
-                    _vlog("warning", "Offline VEP: no dataset path resolved (no hpc_primary / dataset_path) — "
-                                     "the job would have no VCF to annotate.")
-
-                def _variant_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-                    from ..tools.api import annotate_variants_rest
-                    return annotate_variants_rest(args, ctx)
-
-                def _variant_on_fallback(reason: str) -> None:
-                    # Fires the moment the offline VEP job degrades to REST — logs the VERBATIM reason
-                    # (Slurm error tail / "no live HPC connection") AND appends it to the diagnostics file.
-                    msg = ("Offline VEP job did NOT complete — fell back to REST (capped at 500 variants). "
-                           f"Reason: {reason}")
-                    emit("warning", "lab", msg)
-                    try:
-                        _pd = art / "process"
-                        _pd.mkdir(parents=True, exist_ok=True)
-                        with (_pd / "variant_offline_diagnostics.log").open("a", encoding="utf-8") as fh:
-                            fh.write(f"[warning] {msg}\n")
-                    except OSError:
-                        pass
-
-                # Predictor plugins (CADD/AlphaMissense/REVEL + MANE/HGVS + norm) — opt-in, and now
-                # PER-BUILD rather than GRCh38-only. Predictor data is build-specific: handing a GRCh38
-                # file to a GRCh37 run is not just useless but unsafe (tabix looks up by coordinate, so
-                # a position present in both builds with the same ref/alt returns a DIFFERENT variant's
-                # score). So resolve every path for THIS assembly and let the existence check in
-                # ``vep_plugin_flags`` drop whatever is not staged for it — a GRCh37 run gets CADD
-                # (staged, 80 GB) and simply no AlphaMissense/REVEL, instead of the whole panel being
-                # switched off. Inject the paths so they resolve INSIDE vep.sif, and bind each file's
-                # parent dir RO (--containall hides everything not bound; a dir bind also exposes the
-                # .tbi/.fai).
-                #
-                # ``_ref_fasta`` is resolved OUT here, not inside the plugin block, because THREE
-                # separate features gate on it — `bcftools norm`, VEP `--hgvs`, and SpliceAI — and the
-                # last two must still work when the predictor plugins are switched off.
-                _b37 = _assembly == "GRCh37"
-                # The GRCh37 reference is UCSC hg19, NOT Ensembl GRCh37: the lab's GATK VCFs are
-                # chr-prefixed with a 16571 bp chrM (hg19), while Ensembl GRCh37 uses bare `1` and a
-                # 16569 bp chrM. Mixing them makes `bcftools norm -f` fail to match contigs, so the
-                # staged file is a verified-identical copy of the lab's own hg19 (93/93 contigs match a
-                # real WGS VCF's header). Empty ⇒ that build has no reference ⇒ norm/HGVS/SpliceAI stay
-                # OFF for it rather than left-aligning against the wrong genome.
-                _ref_fasta = st.vep_ref_fasta_grch37 if _b37 else st.vep_ref_fasta
-                if _ref_fasta and not os.path.exists(_ref_fasta):
-                    _vlog("warning", f"Reference FASTA for {_assembly} is configured but missing "
-                                     f"({_ref_fasta}) — normalization, HGVS naming and SpliceAI will be "
-                                     "SKIPPED for this run.")
-                    _ref_fasta = ""
-                _plugin_args: dict = {}
-                _plugin_binds: tuple = ()
-                if st.vep_plugins_enabled and _assembly in ("GRCh38", "GRCh37"):
-                    _cadd_snv = st.vep_cadd_snv_grch37 if _b37 else st.vep_cadd_snv
-                    _cadd_indels = st.vep_cadd_indels_grch37 if _b37 else st.vep_cadd_indels
-                    _alphamissense = st.vep_alphamissense_grch37 if _b37 else st.vep_alphamissense
-                    _revel = st.vep_revel_grch37 if _b37 else st.vep_revel
-                    _pf = (_cadd_snv, _cadd_indels, _alphamissense, _revel, _ref_fasta)
-                    _dirs = {os.path.dirname(f) for f in _pf if f}
-                    if st.vep_plugins_dir:
-                        _dirs.add(st.vep_plugins_dir)
-                    _plugin_binds = tuple(sorted(d for d in _dirs if d))
-                    _plugin_args = {"plugins_enabled": True, "plugins_dir": st.vep_plugins_dir,
-                                    "cadd_snv": _cadd_snv, "cadd_indels": _cadd_indels,
-                                    "alphamissense": _alphamissense, "revel": _revel,
-                                    "ref_fasta": _ref_fasta}
-                    _staged = [n for n, p in (("CADD", _cadd_snv), ("AlphaMissense", _alphamissense),
-                                              ("REVEL", _revel)) if p and os.path.exists(p)]
-                    # Name what actually runs for THIS build, so a blank predictor column is traceable
-                    # to "not staged for this assembly" rather than looking like a silent failure.
-                    _vlog("info", f"VEP predictor plugins ENABLED for {_assembly}: "
-                                  f"{', '.join(_staged) if _staged else 'none staged for this build'}"
-                                  f"{' + normalization/HGVS' if _ref_fasta else ''}.")
-                # SpliceAI (OpenSpliceAI) — a separate conda-env binary run FROM INSIDE vep.sif (its
-                # conda-forge python runs under the container's glibc; validated on HPC3). Bind the env
-                # root + model dir + the ref-FASTA dir (RO — the .fai is present so pyfaidx never
-                # rebuilds); the ref FASTA is also what norm/HGVS use.
-                #
-                # Gated on what it ACTUALLY needs (a reference FASTA for this build) rather than on
-                # `_assembly == "GRCh38"`. The old assembly check was a proxy for "only GRCh38 has a
-                # FASTA", and it silently outlived that fact. The annotation side already handled both
-                # builds — `vcf_offline._SPLICEAI_ASSEMBLY` maps GRCh37 → openspliceai's built-in
-                # `grch37` annotation — so the FASTA was the only real blocker.
-                _spliceai_args: dict = {}
-                _spliceai_binds: tuple = ()
-                if st.spliceai_enabled and st.spliceai_bin and _ref_fasta:
-                    _env_root = os.path.dirname(os.path.dirname(st.spliceai_bin))   # .../envs/openspliceai
-                    _spliceai_binds = tuple(sorted({d for d in (
-                        _env_root, st.spliceai_models, os.path.dirname(_ref_fasta)) if d}))
-                    _spliceai_args = {"spliceai_enabled": True, "spliceai_bin": st.spliceai_bin,
-                                      "spliceai_models": st.spliceai_models,
-                                      "spliceai_max_variants": st.spliceai_max_variants,
-                                      "ref_fasta": _ref_fasta}   # SpliceAI needs the ref FASTA
-                    _cap = (f"cap {st.spliceai_max_variants}" if st.spliceai_max_variants else "no cap")
-                    _vlog("info", f"SpliceAI (OpenSpliceAI) ENABLED for {_assembly} — splice-disruption "
-                                  f"scoring on the post-filter set ({_cap}).")
-                elif st.spliceai_enabled and st.spliceai_bin and not _ref_fasta:
-                    # Loud, not silent: SpliceAI is switched ON in the environment but cannot run for
-                    # this build. A blank splice column must never read as "no splice effect found".
-                    _vlog("warning", f"SpliceAI is enabled but no reference FASTA is staged for "
-                                     f"{_assembly} — splice scoring SKIPPED (columns will be blank).")
-                # Deterministic IRD defaults (no longer dependent on the model choosing to pass them):
-                #  - PRE-VEP region restriction: `regions_bed` (the IRD capture panel) — bcftools cuts
-                #    the VCF to these regions BEFORE VEP, so VEP annotates a tiny fraction (the compute
-                #    saving; ~45-60 min → minutes on a WGS VCF);
-                #  - known-gene-first: the default gene panel as `genes` (a POST-VEP precise filter — it
-                #    does NOT save annotation time, so `regions_bed` is preferred for scoping/speed);
-                #  - rarity floor: the lab's base `max_pop_af` (e.g. 0.005) so common variants drop.
-                # All ride in inject_args, so a caller-supplied value overrides them. A panel-load
-                # hiccup must never break the run.
-                _ird_defaults: dict = {}
-                _regions_binds: tuple = ()
-                if st.default_regions_bed:
-                    _ird_defaults["regions_bed"] = st.default_regions_bed
-                    _rd = os.path.dirname(st.default_regions_bed)
-                    if _rd:
-                        _regions_binds = (_rd,)
-                    _vlog("info", "Pre-VEP region restriction ENABLED (regions_bed="
-                                  f"{os.path.basename(st.default_regions_bed)}) — bcftools restricts "
-                                  "BEFORE VEP, the annotation-time saving. A caller regions_bed overrides.")
-                if st.default_gene_panel:
-                    try:
-                        from ..tools.api import load_gene_panel
-                        _panel_genes = load_gene_panel(st.default_gene_panel)
-                        _ird_defaults["genes"] = _panel_genes
-                        _vlog("info", f"Known-gene panel '{st.default_gene_panel}' applied by default "
-                                      f"({len(_panel_genes)} genes; known-gene-first). A caller-supplied "
-                                      "gene list overrides it.")
-                    except Exception as exc:  # noqa: BLE001 - a panel miss must not abort the study
-                        _vlog("warning", f"Default gene panel '{st.default_gene_panel}' not loaded "
-                                         f"({type(exc).__name__}: {exc}); annotating genome-wide.")
-                if st.default_max_pop_af and st.default_max_pop_af > 0:
-                    _ird_defaults["max_pop_af"] = st.default_max_pop_af
-                    _vlog("info", f"Default rarity filter max_pop_af={st.default_max_pop_af} applied "
-                                  "(a caller-supplied max_pop_af overrides it).")
-                # IRD annotation layers (HGMD / retina-exon / ATAC / dbscSNV) — bind each reference
-                # file's DIR into vep.sif and inject the paths so the tool tabixes them on the reduced
-                # set. Gated (OFF by default); a layer with an empty path is skipped by the tool.
-                _ird_anno_args: dict = {}
-                _ird_anno_binds: tuple = ()
-                if st.ird_annotate_enabled:
-                    _ird_paths = {k: v for k, v in (
-                        ("hgmd_path", st.ird_hgmd), ("dbscsnv_template", st.ird_dbscsnv),
-                        ("retina_bed", st.ird_retina_exons), ("atac_path", st.ird_atac)) if v}
-                    if _ird_paths:
-                        _ird_anno_args = {"ird_annotate": True, **_ird_paths}
-                        _ird_anno_binds = tuple(sorted({
-                            os.path.dirname(v.replace("{chrom}", "chr1")) for v in _ird_paths.values()
-                            if os.path.dirname(v.replace("{chrom}", "chr1"))}))
-                        _vlog("info", f"IRD annotation layers ENABLED ({', '.join(sorted(_ird_paths))}).")
-                from .slurm_analysis import SlurmAnalysisExecutor
-                variant_executor = SlurmAnalysisExecutor(
-                    remote=conn.executor, container_image=st.vep_image,
-                    remote_workspace=remote_ws, remote_dataset=remote_ds,
-                    local_workspace=conn.workspace / run_id, source_dir=v_pysrc,
-                    entrypoint=f"python3 -m {_tools_api.VARIANT_ENTRYPOINT}",   # vep.sif is Ubuntu (python3)
-                    # Scratch (args/result/log + its rw bind target) MUST live on dfs3b, NOT $HOME:
-                    # vep.sif ships /data as a symlink to /opt/vep/.vep (VEP's read-only cache mount),
-                    # so bind-mounting a $HOME (=/data/homezvol*/...) scratch resolves through that
-                    # symlink into the RO cache and the runtime dies at container creation with
-                    # "destination ... doesn't exist in container" (exit 127, ~1s) — which is exactly
-                    # what silently killed every offline annotate_variants job. A /dfs3b path has no
-                    # such symlink so the tmpfs overlay creates it cleanly (same as the workspace bind).
-                    job_prefix="bioagent_variant",
-                    scratch_dir=_scratch_dir(conn, "variant", run_id=run_id),
-                    # Bind the ClinVar .tbi index alongside its .vcf.gz: VEP's --custom does a Tabix
-                    # lookup that needs the index right next to the bgzip, and --containall hides every
-                    # host path that isn't an explicit bind — without this VEP dies with "Couldn't find
-                    # index for file ...clinvar_*.vcf.gz".
-                    extra_ro_binds=tuple(dict.fromkeys(
-                        tuple(p for p in (_cache_dir, _clinvar,
-                                          f"{_clinvar}.tbi" if _clinvar else "") if p)
-                        + _plugin_binds + _spliceai_binds + _ird_anno_binds
-                        + _regions_binds)),   # + IRD reference dirs + the pre-VEP regions BED dir
-                    inject_args={"cache_dir": _cache_dir, "clinvar_vcf": _clinvar,
-                                 "assembly": _assembly, "fork": st.vep_fork,
-                                 **_ird_defaults, **_plugin_args, **_spliceai_args,
-                                 **_ird_anno_args},
-                    mem_gb=st.run_code_mem_gb, cpus=st.vep_fork, partition=st.cpu_partition,
-                    # time_limit is the SBATCH --time; the gateway job-wait (run_timeout_s) auto-derives
-                    # from it (SlurmAnalysisExecutor default), so a healthy ~30-60 min WGS VEP job is
-                    # never scancelled early — Slurm's own --time is the ceiling, completion returns at once.
-                    account=st.cpu_account or "", time_limit=st.vep_time_limit,
-                    container_module=st.container_module, container_bin=st.container_bin,
-                    local_fallback=_variant_local_fallback, on_fallback=_variant_on_fallback,
-                    should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight VEP job
-                    # Idempotent within the run: if a later step re-invokes annotate_variants with the
-                    # SAME inputs, reuse this run's result instead of re-submitting the ~45-min WGS VEP
-                    # job and overwriting the tables (the "model keeps re-annotating" loop that both
-                    # wasted compute AND clobbered the good result with a degraded repeat).
-                    memoize_result=True,
-                    # Gateway-AUTHORITATIVE args the model cannot override: the assembly detected from the
-                    # VCF header (a model passing assembly=GRCh38 on a GRCh37 file makes VEP fail on a
-                    # cache-assembly mismatch → wrong genes), and max_variants=0 so the offline path
-                    # annotates the WHOLE WGS VCF (a model-supplied cap like max_variants=5000 silently
-                    # truncated a 4.9M-variant study to the first 5000 = chrM+chr1-start, a wrong cohort).
-                    force_args={"assembly": _assembly, "max_variants": 0},
-                )
-                if any(ok is False for _, (p, ok) in checks.items() if p):
-                    _vlog("warning", "Offline VEP wired BUT a required path is missing above — expect a "
-                                     "fallback to REST. Fix the path(s) + rerun for true whole-VCF annotation.")
-                else:
-                    _vlog("info", f"VCF annotation runs OFFLINE on HPC3 (VEP {_assembly}, "
-                                  f"--fork {st.vep_fork}, --mem={st.run_code_mem_gb}G).")
-
-        # Final REST-cap warning for a VCF run that did NOT wire the offline line (any reason above).
-        if variant_executor is None and _is_vcf:
-            _vlog("warning",
-                  "VCF annotation will use the REST path — capped at the FIRST 500 variants. Enable + fix "
-                  "the offline line (AISCIENTIST_VARIANT_ON_HPC=1 + staged sif/cache) to annotate every "
-                  "variant; otherwise all counts/distributions describe only the first 500.")
-
-        # Persist the full diagnostic trail to the bundle (downloadable), even after the run log scrolls.
-        if _vdiag:
-            try:
-                _pdir = art / "process"
-                _pdir.mkdir(parents=True, exist_ok=True)
-                (_pdir / "variant_offline_diagnostics.log").write_text(
-                    "# Offline VEP (variant annotation) wiring diagnostics\n\n" + "\n".join(_vdiag) + "\n",
-                    encoding="utf-8")
-            except OSError:
-                pass
 
         # Opt-in: phenotype -> disease DIFFERENTIAL DIAGNOSIS on HPC3 (LIRICAL). DOWNSTREAM of the variant
         # line: the model calls run_lirical with the patient's HPO terms; when a VCF is loaded it scores
@@ -15663,9 +15375,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         scientist = ResearchHarness(
             catalog=instrument_catalog(await _prepare_session_roster(
                 conn,
-                build_scientist_catalog(code_executor=code_executor, scgpt_runner=scgpt_runner,
+                build_scientist_catalog(code_executor=code_executor,
                                         analysis_executor=analysis_executor,
-                                        variant_executor=variant_executor,
                                         phenotype_executor=phenotype_executor,
                                         literature_executor=literature_executor,
                                         hpc_shell=_build_hpc_shell(conn, run)),
@@ -15956,9 +15667,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 plan_context=lab_obj.plan_context, lab_config=config,
                 later=lab_obj.later, prior_work=lab_obj.config.prior_work,
                 prior=prior, continues_from_dataset=continues_from_dataset)
+            previous_rounds = []
+            if resume is not None:
+                session_meta["resume_review"] = resume.to_review_state()
+                previous_rounds = [r.to_dict() for r in resume.prior_rounds]
             snapshot = SimpleNamespace(to_dict=lambda: {
-                "question": req.question, "agenda": agenda, "rounds": [],
-                "accepted_steps": 0, "converged": False, "final_answer": ""})
+                "question": req.question, "agenda": agenda, "rounds": previous_rounds,
+                "accepted_steps": len(previous_rounds), "converged": False, "final_answer": ""})
             _write_run_state(art, snapshot, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, protocols=lab_obj.protocols,
                              self_sourced=lab_obj.self_sourced, extra=session_meta, strict=True)
@@ -16007,7 +15722,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # HITL mode gating. Bypass (autonomous) forces BOTH gates off — no plan review, no
         # decision-point pauses — so the loop runs end-to-end; Stop + mid-run notes still apply.
         # Manual (default) keeps plan review (when plan_mode) and DAG decision-point pauses.
-        want_plan_review = (resume is None and req.plan_mode and not req.autonomous)
+        want_plan_review = ((resume is None and req.plan_mode and not req.autonomous)
+                            or (resume is not None and resume.needs_plan_review))
         # Decision points now fire on BOTH planners in manual mode: the DAG path pauses per-node, and
         # the linear path asks a deterministic plan-time fork (labels vs re-cluster) — previously the
         # linear path never surfaced a decision, so a labeled dataset was silently auto-decided.
@@ -16030,6 +15746,9 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             could re-enter the loop to use them. Now an interrupted run is continuable from its last
             completed step via the SAME /api/lab/continue path a user-requested re-run uses.
             ``lab_obj.guidance`` is read live because the PI resolves it during run()."""
+            session_meta.update(plan_context=lab_obj.plan_context,
+                                approved_plan_yaml=lab_obj.approved_plan_yaml)
+            session_meta.pop("resume_review", None)
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
             _remember_planned_run(conn, run)
@@ -16406,7 +16125,8 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         traceback.print_exc()
         conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
         conn.push({"type": "chat_error",
-                   "message": public_error(exc) + _resume_hint(locals().get("art"))})
+                   "message": public_error(exc) + ("" if getattr(exc, "requires_replan", False)
+                                                  else _resume_hint(locals().get("art")))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():
@@ -17007,21 +16727,116 @@ def _data_artifacts_block(art: Path, *, omit_doublet_details: bool = False) -> s
     return "\n\n".join(blocks)
 
 
-def _annotate_variants_result(result: Any) -> "dict[str, Any] | None":
-    """The AUTHORITATIVE ``annotate_variants`` tool RESULT from the run — the tool's own numbers
-    (n_pass/n_nonpass, n_pathogenic, n_high_priority, truncated, distributions), NOT the model's
-    prose or a model-written summary JSON. Returns the last ok annotate_variants result, or None
-    (⇒ not a variant run). This is what binds the report's counts to ground truth."""
+def _annotate_variants_result(result: Any, art: "Path | None" = None) -> "dict[str, Any] | None":
+    """Last successful variant result, recovering bounded MCP counts from owned artifacts.
+
+    A model-written summary is never sufficient. Collected JSON must match the latest native
+    task's ownership record and SHA-256; unavailable evidence leaves its counts unknown.
+    """
+    import hashlib
+    from ..agents.tool_names import canonical_tool_name
+
+    def read_json(relative: str, limit: int) -> "tuple[dict, str] | None":
+        if art is None or not isinstance(relative, str):
+            return None
+        parts = relative.split("/")
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            return None
+        root = Path(art)
+        if root.is_symlink():
+            return None
+        path = root
+        try:
+            for part in parts:
+                path = path / part
+                if path.is_symlink():
+                    return None
+            if not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+                return None
+            with path.open("rb") as stream:
+                raw = stream.read(limit + 1)
+            if len(raw) > limit:
+                return None
+            value = json.loads(raw)
+            return (value, hashlib.sha256(raw).hexdigest()) if isinstance(value, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def collected_counts(res: dict) -> dict:
+        identity = {key: res.get(key) for key in ("analysis_id", "task_id")}
+        if not all(isinstance(value, str) and value for value in identity.values()):
+            return {}
+        record = read_json("mcp/.compatibility.json", 4 * 1024 * 1024)
+        if record is None:
+            return {}
+        owners = record[0]
+        current = owners.get("current")
+        files = owners.get("files")
+        if (not isinstance(current, dict) or current.get("variant-annotation") != identity
+                or not isinstance(files, dict)):
+            return {}
+
+        def owned(relative: str, limit: int) -> "dict | None":
+            owner = files.get(relative)
+            if not isinstance(owner, dict):
+                return None
+            if any(owner.get(key) != value for key, value in
+                   {"server": "variant-annotation", **identity}.items()):
+                return None
+            digest = owner.get("sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                return None
+            payload = read_json(relative, limit)
+            return payload[0] if payload is not None and payload[1] == digest else None
+
+        summary = owned("data/annotated_results_summary.json", 4 * 1024 * 1024)
+        if summary is not None:
+            fields = {"total_variants": "n_variants", "consequence_distribution": "by_consequence",
+                      "impact_distribution": "by_impact",
+                      "clinical_significance_distribution": "by_clinical_significance",
+                      "n_pathogenic_clinvar": "n_pathogenic",
+                      "n_rare_variants_af_lt_0.1": "n_rare",
+                      "n_high_priority_rare_deleterious": "n_high_priority"}
+            recovered = {target: summary[source] for source, target in fields.items() if source in summary}
+            if recovered:
+                return recovered
+        # A namespaced result is eligible only when its collector also recorded ownership and
+        # a checksum. Historical collectors omit this entry; a pathname alone is not evidence.
+        full = res.get("full_result")
+        expected = f"mcp/variant-annotation/{identity['analysis_id']}/annotate_variants.json"
+        if full != expected:
+            return {}
+        payload = owned(full, 16 * 1024 * 1024)
+        if payload is None or payload.get("status") != "ok" or payload.get("tool") != "annotate_variants":
+            return {}
+        fields = {"n_variants", "n_input_variants", "n_pass", "n_nonpass", "n_annotated",
+                  "n_pathogenic", "n_high_priority", "n_rare", "by_consequence", "by_impact",
+                  "by_clinical_significance", "truncated"}
+        return {key: value for key, value in payload.items() if key in fields}
+
     best: "dict[str, Any] | None" = None
     for r in getattr(result, "rounds", []) or []:
         rd = r.to_dict() if hasattr(r, "to_dict") else r
         sr = (rd.get("scientist_result") if isinstance(rd, dict) else {}) or {}
         for step in sr.get("steps") or []:
-            if not isinstance(step, dict) or step.get("tool") != "annotate_variants":
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "annotate_variants":
                 continue
             res = step.get("result")
-            if isinstance(res, dict) and res.get("status") == "ok" and "by_consequence" in res:
-                best = res
+            if not isinstance(res, dict) or res.get("status") != "ok":
+                continue
+            if step.get("tool") == "annotate_variants":
+                if "by_consequence" in res:
+                    best = res
+                continue
+            identity = res.get("mcp")
+            if not isinstance(identity, dict) or identity.get("name") != "variant-annotation":
+                continue
+            native = res.get("result") if isinstance(res.get("result"), dict) else res
+            if native.get("status", "ok") != "ok" or native.get("state", "COMPLETED") != "COMPLETED":
+                continue
+            best = {"status": "ok", **native}
+            if native.get("response_omitted") or "by_consequence" not in native:
+                best.update(collected_counts(native))
     return best
 
 
@@ -17087,24 +16902,33 @@ def _variant_facts_block(art: Path, result: Any) -> str:
     fabricate numbers — this is what kills the '165 high-priority' / '6 vs 12 citations' hallucinations.
     When annotation itself failed, falls back to the PASS-filter summary so the real variant/PASS counts
     still reach the report. Returns '' for a non-variant run with no filter summary either."""
-    res = _annotate_variants_result(result)
+    res = _annotate_variants_result(result, art)
     if not res:
         return _variant_filter_summary_facts(art)
     lines = ["AUTHORITATIVE COUNTS (computed by the tools — state these EXACT numbers; do NOT invent, "
              "infer, or restate different values):"]
-    lines.append(f"- variants annotated: {res.get('n_input_variants', '?')}")
+    def count(key: str) -> Any:
+        value = res.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else "unknown"
+
+    annotated = count("n_variants") if "n_variants" in res else count("n_input_variants")
+    lines.append(f"- variants annotated: {annotated}")
     if "n_pass" in res:
-        npass, nnon = res.get("n_pass"), res.get("n_nonpass")
-        allpass = " (all records PASS)" if not nnon else ""
+        npass, nnon = count("n_pass"), count("n_nonpass")
+        allpass = " (all records PASS)" if nnon == 0 else ""
         lines.append(f"- FILTER: {npass} PASS, {nnon} non-PASS{allpass} — do NOT write 'all PASS' when "
                      f"non-PASS > 0")
     if res.get("truncated"):
         lines.append(f"- TRUNCATED: only the first {res.get('n_annotated', res.get('n_input_variants'))} "
                      f"variants were annotated (cap reached); the counts describe that slice, not the "
                      f"whole VCF — report this as a limitation")
-    lines.append(f"- ClinVar Pathogenic/Likely-Pathogenic: {res.get('n_pathogenic', 0)}")
-    lines.append(f"- high-priority shortlist: {res.get('n_high_priority', 0)}")
-    lines.append(f"- rare variants (below AF cutoff): {res.get('n_rare', '?')}")
+    elif res.get("response_omitted") and "truncated" not in res:
+        lines.append("- Annotation coverage/truncation: unknown in the bounded response. These counts "
+                     "do not establish whole-VCF coverage; consult the complete tool evidence before "
+                     "claiming the entire file was annotated.")
+    lines.append(f"- ClinVar Pathogenic/Likely-Pathogenic: {count('n_pathogenic')}")
+    lines.append(f"- high-priority shortlist: {count('n_high_priority')}")
+    lines.append(f"- rare variants (below AF cutoff): {count('n_rare')}")
     bc = res.get("by_clinical_significance") or {}
     if bc:
         lines.append("- clinical-significance distribution: " + ", ".join(f"{k}={v}" for k, v in bc.items()))
@@ -19504,18 +19328,27 @@ def _write_capability_log(art: Path, result: Any, conn: "Connection",
 
         scg = _scan_tool_invocation(result, "scgpt_annotate")
         if scg is None:
-            lines.append(
-                "- scGPT annotation: NOT INVOKED this run (no scgpt_annotate step ran). "
-                + (f"Available (live session); image={getattr(st, 'scgpt_image', '?')}."
-                   if live else "Not available (mock/offline session — no HPC3 batch lifecycle)."))
+            from ..agents.mcp_bridge import configured_servers
+            server = next((item for item in configured_servers()
+                           if item.name == "scgpt-annotation" and item.adapter == "analysis"
+                           and any(tool["name"] == "scgpt_annotate" for tool in item.tools)), None)
+            availability = (
+                f"MCP catalog configured; image={server.image}. Runtime availability is checked at invocation."
+                if live and server is not None else
+                "Not configured in the MCP catalog." if live else
+                "Not available (mock/offline session — no HPC3 batch lifecycle).")
+            lines.append("- scGPT annotation: NOT INVOKED this run (no scgpt_annotate step ran). "
+                         + availability)
         else:
             status = str(scg.get("status", "unknown"))
             if status == "ok":
                 tail = f" n_cells={scg.get('n_cells')} predictions={scg.get('predictions_csv')}"
             else:
                 tail = f" — {scg.get('note') or scg.get('error') or ''}".rstrip()
-            lines.append(f"- scGPT annotation: INVOKED, status={status}.{tail} "
-                         "(job log fetched to process/scgpt_job.log when the job ran)")
+            identity = scg.get("mcp") or {}
+            if identity.get("name") == "scgpt-annotation":
+                tail += f" MCP version={identity.get('version')} image={identity.get('image')}."
+            lines.append(f"- scGPT annotation: INVOKED, status={status}.{tail}")
 
         if not getattr(st, "vlreview_enabled", False):
             lines.append("- VL render review: DISABLED (AISCIENTIST_VLREVIEW_ENABLED not set).")

@@ -79,7 +79,6 @@ def test_model_and_container_paths_come_from_the_live_settings():
     assert st.scgpt_model_dir in paths
     assert st.vlreview_model_dir in paths
     assert st.analysis_image in paths
-    assert st.scgpt_image in paths
 
 
 def test_readability_reflects_the_sessions_roots_not_a_guess():
@@ -91,7 +90,7 @@ def test_readability_reflects_the_sessions_roots_not_a_guess():
     # that made the scGPT step withhold inference.
     m = environment_manifest(st, read_roots=(f"{shared}/containers",), write_roots=())
     by_path = {a["path"]: a for a in m["assets"]}
-    assert by_path[st.scgpt_image]["agent_readable"] is True
+    assert by_path[st.analysis_image]["agent_readable"] is True
     assert by_path[st.scgpt_model_dir]["agent_readable"] is False
 
     text = render_for_agent(m, "assets")

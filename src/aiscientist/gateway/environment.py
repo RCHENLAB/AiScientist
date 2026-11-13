@@ -140,7 +140,6 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
         _remote("container", "Analysis image (run_code, scanpy line)", settings.analysis_image,
                 "Fixed at build time and read-only. A package it lacks is resolved into the shared "
                 "cache below, not installed into the image."),
-        _remote("container", "scGPT image", settings.scgpt_image),
         _remote("model", "scGPT weights + vocabulary + label map", settings.scgpt_model_dir,
                 "best_model.pt, vocab.json, id2type.json, dev_train_args.yml. scgpt_annotate binds "
                 "this read-only into its GPU job. HUMAN RETINA reference: a human-symbol vocabulary "

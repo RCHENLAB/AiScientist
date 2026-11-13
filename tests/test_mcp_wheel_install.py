@@ -115,7 +115,8 @@ query.write_text('name\\tvalue\\nx\\t1\\n')
 assert api.peek_dataset(str(query))['readable']
 assert all(importlib.util.find_spec(name) is None for name in ('mcp', 'fastapi', 'yaml'))
 servers = load_servers()
-assert len(servers) == 1 and len(servers[0].tools) == 9
+assert {server.name for server in servers} >= {'atlas-expression-exploration', 'variant-annotation', 'scgpt-annotation'}
+assert len(servers[0].tools) == 9
 plain = {tool.name for tool in build_scientist_catalog()}
 assert 'run_scanpy_qc' in plain and 'resolve_genes' not in plain
 assert any(tool['name'] == 'run_scanpy_qc' for tool in system_overview()['tools'])

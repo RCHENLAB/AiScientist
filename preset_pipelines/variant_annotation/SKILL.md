@@ -1,32 +1,32 @@
 ---
 name: variant_annotation
 description: Interpret a VCF's variants (germline/somatic, WGS/WES) — gene + functional consequence (Ensembl VEP), ClinVar pathogenicity, gnomAD frequency, deleteriousness (CADD/REVEL/AlphaMissense) + splice disruption (SpliceAI), then prioritise. Rare-disease known-gene-first (IRD). Offline, WGS-scale.
-tools: annotate_variants, run_code, literature_search
+tools: mcp_annotate_variants, run_code, literature_search
 data_type: variants
 outputs:
   - path: tables/variant_annotation.tsv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: One row per annotated variant with gene, location, rsID, consequence, impact, ClinVar significance, gnomAD allele frequency, SIFT and PolyPhen, and predictor scores where they are configured.
     required: true
   - path: tables/variant_consequence_distribution.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: Number and percentage of annotated variants per functional consequence.
     required: true
   - path: tables/variant_clinical_significance.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: Number and percentage of annotated variants per ClinVar clinical significance, with not_in_clinvar for variants ClinVar does not list.
     required: true
   - path: tables/clinvar_pathogenic_variants.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: The ClinVar pathogenic and likely pathogenic variants with gene, position, rsID and significance, a header only when there are none.
     required: false
   - path: tables/high_priority_variants.csv
     kind: table
-    tool: annotate_variants
+    tool: mcp_annotate_variants
     description: Rare variants not in ClinVar that are high impact, predicted deleterious or IRD-flagged, ranked, at most 50, a header only when there are none.
     required: false
 ---
@@ -36,7 +36,7 @@ Germline/somatic **variant annotation** protocol. Use when the input is a **VCF*
 gene they hit, predicted impact, and **clinical significance (ClinVar pathogenicity)** — rather than
 single-cell expression. NOT for scRNA-seq (use the annotation / DE pipelines for that).
 
-Annotation is done by the curated `annotate_variants` tool, so you do NOT write your own VEP/HTTP
+Annotation is done by the curated `mcp_annotate_variants` tool, so you do NOT write your own VEP/HTTP
 code for the core step. It has two execution modes behind the SAME interface — you don't choose, the
 gateway routes:
 
@@ -47,7 +47,7 @@ gateway routes:
   local sandbox — capped at a few hundred variants and rate-limited, fine for a small panel VCF but
   NOT a WGS one.
 
-**No post-processing code needed — the tool does it.** `annotate_variants` writes the COMPLETE
+**No post-processing code needed — the tool does it.** `mcp_annotate_variants` writes the COMPLETE
 per-variant table (`tables/variant_annotation.tsv`) AND the five standard deliverable tables itself:
 consequence / impact / clinical-significance distributions, `clinvar_pathogenic_variants.csv`, and the
 rare-unclassified `high_priority_variants.csv` shortlist (their names are in the result's
@@ -64,7 +64,7 @@ For an inherited-disease study (e.g. inherited retinal disease, IRD), the causal
 usually in a KNOWN disease gene — so narrow aggressively before interpreting (Rui Chen's protocol):
 
 1. **Known genes FIRST.** Restrict to the study's known disease-gene panel — pass the gene list as
-   `annotate_variants`' `genes`, or a panel BED as `regions_bed` (the offline line restricts BEFORE VEP,
+   `mcp_annotate_variants`' `genes`, or a panel BED as `regions_bed` (the offline line restricts BEFORE VEP,
    a big compute saving on a WGS VCF). Look in those genes' exons AND introns. Expand to the whole
    genome ONLY if the known-gene search is negative.
 2. **Drop common variants.** Set `max_pop_af=0.01` so any variant with gnomAD population AF > 1% is
@@ -77,8 +77,8 @@ expanding to the whole genome.
 ## Ordered plan (plan these as DISTINCT agenda steps — a real variant study is not one "annotate" call)
 
 Plan the phases below as SEPARATE steps; do NOT collapse them into a single annotate step — EXCEPT
-normalization (step 2), which `annotate_variants` performs INTERNALLY on the offline path, so it is NOT
-a separate agenda step there (see step 2). The heavy compute lives inside `annotate_variants` (step 4),
+normalization (step 2), which `mcp_annotate_variants` performs INTERNALLY on the offline path, so it is NOT
+a separate agenda step there (see step 2). The heavy compute lives inside `mcp_annotate_variants` (step 4),
 so steps 5–6 REPORT from the tables it already wrote — never hand-roll `run_code` to re-derive those
 tables, and never add another report-writing step (a written report is one `write_report` step, last, planned only when the request asks for it).
 The QC (step 1) and known-gene / AF narrowing (step 3) pre-analysis is what makes the annotation
@@ -88,9 +88,9 @@ trustworthy and focused; skipping those is how a variant study silently ships wr
    SNP/indel/multiallelic counts, call rate, flagged against WGS/WES expected ranges. Report Ti/Tv up
    front; a flagged callset means everything downstream describes lower-confidence data (route that
    caveat to Diagnostics). Always worth doing — cheap, and it says whether the calls are trustworthy.
-2. **Normalization — done INSIDE `annotate_variants`; do NOT plan a separate normalize step (offline
+2. **Normalization — done INSIDE `mcp_annotate_variants`; do NOT plan a separate normalize step (offline
    path).** Splitting multiallelics + **left-aligning indels** matters (a non-left-aligned indel silently
-   FAILS to match ClinVar/gnomAD → falsely `not_in_clinvar`), but on the offline path `annotate_variants`
+   FAILS to match ClinVar/gnomAD → falsely `not_in_clinvar`), but on the offline path `mcp_annotate_variants`
    already runs `bcftools norm -m-any -f REF` in `vep.sif` (which has bcftools) before VEP — so a separate
    step is redundant. It also CANNOT run as its own `run_code` step: `run_code` executes in `analysis.sif`,
    which has no `bcftools` and no reference-FASTA bind, so the `normalize_vcf` template exits and the model
@@ -101,11 +101,11 @@ trustworthy and focused; skipping those is how a variant study silently ships wr
    sandbox.)
 3. **Narrow to the disease genes + drop common variants** (rare-disease / IRD DEFAULT — Rui Chen's
    protocol, see the strategy section above). Restrict to the study's known disease-gene panel
-   (`annotate_variants`' `genes`, or a panel BED via `regions_bed` — the offline line restricts BEFORE
+   (`mcp_annotate_variants`' `genes`, or a panel BED via `regions_bed` — the offline line restricts BEFORE
    VEP, a big WGS compute saving) AND set `max_pop_af=0.01` (drop gnomAD AF > 1%; novel variants kept).
    STATE the panel + AF cutoff. Expand to the whole genome ONLY if the in-panel search is negative. (For
    a general, non-Mendelian VCF with no candidate-gene prior, skip the panel and annotate genome-wide.)
-4. **Annotate** (`annotate_variants`): pass the (panel-restricted per step 3) VCF. The **assembly is
+4. **Annotate** (`mcp_annotate_variants`): pass the (panel-restricted per step 3) VCF. The **assembly is
    auto-detected from the VCF header** (chr1 contig length → GRCh37 vs GRCh38; the gateway overrides the
    configured default per run) — you normally don't set it. Most eye/IRD datasets are **GRCh37/hg19**,
    which is also the fallback when the header is silent; pass `assembly` explicitly only to correct a
@@ -148,7 +148,7 @@ queries. Population-scale storage only; skip for a single VCF.
 
 ## Grounding
 
-Report ONLY consequences, genes, impacts, and clinical significances that `annotate_variants`
+Report ONLY consequences, genes, impacts, and clinical significances that `mcp_annotate_variants`
 actually returned — never invent a gene, a consequence, an rsID, or a pathogenicity call. ClinVar
 significance is reported verbatim (e.g. `pathogenic`, `likely_pathogenic`, `uncertain_significance`);
 do not upgrade "uncertain" to "pathogenic". State the genome assembly, the `execution_mode`, and the

@@ -20,7 +20,6 @@ import pytest
 
 from aiscientist.gateway import gpu, hpc_gc, hpc_originals, shared_llm, storage_delete, worker
 from aiscientist.gateway.executor import ExecResult
-from aiscientist.gateway.scgpt_job import scgpt_job_name
 from aiscientist.gateway.settings import HPCSettings, slurm_job_name, slurm_job_prefix
 from aiscientist.gateway.shared_llm import SharedLLMSettings
 from aiscientist.gateway.slurm_analysis import SlurmAnalysisExecutor
@@ -133,7 +132,6 @@ def test_empty_prefix_keeps_todays_job_names(production, gw):
     assert slurm_job_prefix() == ""
     assert gpu.job_name("alice") == "bioagent-vllm-alice"
     assert worker.job_name("alice") == "aiscientist-worker-alice"
-    assert scgpt_job_name("alice") == "bioagent-scgpt-alice"
     assert vlreview_job_name("alice") == "bioagent-vlreview-alice"
     assert shared_llm.job_name() == "aiscientist-llm-shared"
     assert shared_llm.remote_dir() == "$HOME/.bioagent/shared-llm"
@@ -170,12 +168,12 @@ def test_empty_prefix_keeps_todays_scripts_and_queries(production):
 
 def test_prefix_starts_every_created_name(staging, gw):
     names = [
-        gpu.job_name("alice"), worker.job_name("alice"), scgpt_job_name("alice"),
+        gpu.job_name("alice"), worker.job_name("alice"),
         vlreview_job_name("alice"), shared_llm.job_name(),
         storage_delete.job_spec("true", "alice", "/l.log", "/s", partition="standard").job_name,
         hpc_originals.job_spec("true", "alice", "/l.log", "/s", partition="standard").job_name,
     ]
-    assert names == ["stg-bioagent-vllm-alice", "stg-aiscientist-worker-alice", "stg-bioagent-scgpt-alice",
+    assert names == ["stg-bioagent-vllm-alice", "stg-aiscientist-worker-alice",
                      "stg-bioagent-vlreview-alice", "stg-aiscientist-llm-shared",
                      "stg-aiscientist-delete-alice", "stg-aiscientist-originals-alice"]
     assert "#SBATCH --job-name=stg-bioagent-vllm-alice\n" in gpu._serve_script(HPCSettings(), "alice")

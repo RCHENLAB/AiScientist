@@ -14,7 +14,7 @@ and back. Five operations, and nothing about storage:
 the jobs, ``hpc_gc`` for the cleanup. It wraps the functions the gateway already used and changes
 none of them. The gateway reaches HPC3 through it for a session's data movement and housekeeping
 (``app._compute``); the tool job lines (``slurm_analysis``, ``slurm_sandbox``, ``slurm_report``,
-``scgpt_job``, ``vlreview_job``) still build and supervise their own Slurm jobs with
+``vlreview_job``) still build and supervise their own Slurm jobs with
 ``slurm_job.run_batch_job``. A second backend implements :class:`ComputeBackend` and is returned by
 ``app._compute`` for the sessions it serves; where data is stored does not change.
 """

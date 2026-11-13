@@ -74,6 +74,43 @@ def test_worker_tools_are_absent_when_the_worker_is_disabled(tmp_path, monkeypat
     assert gw_app._build_hpc_shell(c, None).worker_provider is None
 
 
+def test_shell_binds_each_run_and_preserves_a_resumed_run_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("AISCIENTIST_HPC_WORK", raising=False)
+    monkeypatch.delenv("AISCIENTIST_HPC_ARTIFACTS", raising=False)
+    c = _conn(tmp_path, monkeypatch, run_code_on_hpc=False, analysis_on_hpc=False)
+    first = c.begin_run("first")
+    c.bind_run_id(first, "run-first")
+    second = c.begin_run("second")
+    c.bind_run_id(second, "run-second")
+    # Continued runs keep their original session home, rather than the new connection's home.
+    c.run_homes[first.run_id] = gw_app.hpc_layout.session_run(c.settings.shared_root, "old-session", first.run_id)
+    one, two = (gw_app._build_hpc_shell(c, run) for run in (first, second))
+    for run, shell in ((first, one), (second, two)):
+        analysis = gw_app._run_home(c, run.run_id).dir("analysis")
+        assert shell.artifacts_dir == f"{analysis}/artifacts"
+        assert shell.work_dir == f"{analysis}/work"
+        assert shell._read_path("mcp/result.json") == f"{analysis}/artifacts/mcp/result.json"
+        assert shell.workspace.can_read(shell.artifacts_dir)
+    assert one.artifacts_dir != two.artifacts_dir
+    assert "old-session" in one.artifacts_dir
+    assert one.workspace.write_roots == two.workspace.write_roots
+    unbound = gw_app._build_hpc_shell(c, None)
+    assert unbound.artifacts_dir == unbound.work_dir == ""
+
+
+def test_shell_uses_same_operator_path_overrides_as_slurm_runner(tmp_path, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_HPC_WORK", "/operator/run/work")
+    monkeypatch.setenv("AISCIENTIST_HPC_ARTIFACTS", "/operator/run/artifacts")
+    c = _conn(tmp_path, monkeypatch, run_code_on_hpc=False, analysis_on_hpc=False)
+    run = c.begin_run("first")
+    c.bind_run_id(run, "run-first")
+    shell = gw_app._build_hpc_shell(c, run)
+    assert shell.work_dir == "/operator/run/work"
+    assert shell._read_path("mcp/result.json") == "/operator/run/artifacts/mcp/result.json"
+    assert shell.workspace.can_read("/operator/run/work/adata_qc.h5ad")
+    assert not shell.workspace.can_write("/operator/run/work/adata_qc.h5ad")
+
+
 # --- the HITL channel --------------------------------------------------------
 
 

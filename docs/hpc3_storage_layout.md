@@ -123,7 +123,8 @@ never share a file name. What belongs to no run goes to the session's own `jobs/
 | PaperQA literature | `runs/<run_id>/jobs/paperqa/` (in a chat with no run: `jobs/paperqa/`) |
 | report rendering (pandoc / xelatex), including the staged `render_<n>.tgz` | `runs/<run_id>/jobs/report/` |
 | the session's CPU worker (holder script, log, heartbeat) | `jobs/worker/` |
-| scGPT annotation, render review | beside their output: `runs/<run_id>/scgpt/out/`, `runs/<run_id>/vlreview/pass<n>/out/` |
+| scGPT annotation | native MCP task workspace; exported predictions in the run's `artifacts/data/` and `artifacts/mcp/scgpt-annotation/` |
+| render review | beside its output: `runs/<run_id>/vlreview/pass<n>/out/` |
 
 The gateway takes each of these from one function (`app._scratch_dir`), and the job classes have
 no default directory: a job line that names none fails when it is built instead of writing

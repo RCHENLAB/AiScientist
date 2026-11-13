@@ -1,0 +1,118 @@
+[
+  {
+    "name": "annotate_variants",
+    "description": "Annotate a VCF with consequence, gene, impact, population frequency and ClinVar significance.\n\n    vcf_path defaults to VARIANT_DATASET/AISCIENTIST_DATASET. Explicit VCF and regions_bed files\n    must be inside VARIANT_READ_ROOTS. Offline VEP uses server-configured release-112 reference\n    caches, ClinVar and optional predictors; model arguments cannot change those paths/resources.\n    pass_only keeps FILTER=PASS or '.'. max_variants=0 keeps all offline rows; a positive cap\n    limits returned annotation rows after VEP. max_pop_af=0 and empty genes disable those filters.\n    regions_bed and sample restrict the offline VCF before VEP; they are unavailable in REST mode.\n\n    REST sends variant loci/alleles to Ensembl and requires VARIANT_ALLOW_REST=1. It defaults to\n    500 variants when max_variants=0 and reports truncation and full-file PASS/non-PASS counts.\n    Offline supports human GRCh37/GRCh38; REST species must be an Ensembl species identifier.\n\n    Slurm/local return analysis_id/task_id/state; poll variant_job_status. Inline waits and\n    returns counts, bounded findings and complete table/full_result paths. Repeated unchanged\n    calls reuse the current result; rerun creates a separate attempt. Clinical labels are the\n    source annotations, not a diagnosis. Review missing predictors and QC before interpretation.\n    ",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "default": "default",
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "vcf_path": {
+          "default": "",
+          "title": "Vcf Path",
+          "type": "string"
+        },
+        "assembly": {
+          "default": "GRCh38",
+          "enum": [
+            "GRCh38",
+            "GRCh37"
+          ],
+          "title": "Assembly",
+          "type": "string"
+        },
+        "species": {
+          "default": "human",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Species",
+          "type": "string"
+        },
+        "mode": {
+          "default": "offline",
+          "enum": [
+            "offline",
+            "rest"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "pass_only": {
+          "default": true,
+          "title": "Pass Only",
+          "type": "boolean"
+        },
+        "max_variants": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Max Variants",
+          "type": "integer"
+        },
+        "max_pop_af": {
+          "default": 0.0,
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Max Pop Af",
+          "type": "number"
+        },
+        "genes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Genes"
+        },
+        "regions_bed": {
+          "default": "",
+          "title": "Regions Bed",
+          "type": "string"
+        },
+        "sample": {
+          "default": "",
+          "title": "Sample",
+          "type": "string"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "title": "annotate_variantsArguments",
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "variant_job_status",
+    "description": "Poll a variant annotation task; completed jobs include bounded results and full evidence paths.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "analysis_id": {
+          "title": "Analysis Id",
+          "type": "string"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "analysis_id",
+        "task_id"
+      ],
+      "title": "variant_job_statusArguments",
+      "additionalProperties": false
+    }
+  }
+]

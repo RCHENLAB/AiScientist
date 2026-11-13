@@ -355,3 +355,42 @@ uv run --isolated --no-project \
   --server 'python -m aiscientist_mcp.atlas_expression_exploration.server' \
   > /tmp/atlas-tools.json
 ```
+
+### Explicit ordered workflows
+
+A request such as `Run exactly these registered MCP tool calls in this order`,
+followed by numbered `` `mcp_tool_name` {"argument": "value"} `` entries, is treated
+as a structured plan input. Every name must belong to a configured analysis
+adapter, every JSON object must be complete and unambiguous, and the live tool's
+full input schema validates it before review. Unavailable tools fail planning.
+This applies to the registered literature pipeline and other analysis servers;
+ordinary literature questions still use the search/curation console.
+
+The plan document stores all supplied settings directly, including nested arrays,
+objects and multiline source code. The normal plan card still permits approval,
+edits and cancellation. It does not add analyses or a report step to this literal
+call list. During execution the approved settings are the complete argument
+object: omitted fields retain server defaults, the model cannot add `rerun` or
+change an omitted scientific setting, and another scientific tool is refused for
+that step. Read-only metadata/status checks remain available. The session's
+selected model, resource, billing, budget and cancellation paths are unchanged.
+# Saved plans across tool retirement
+
+Restoring a saved plan does not rename retired scientific tools automatically. A
+pending step that names an unavailable migrated tool requires a replacement plan
+and normal review. The error names a replacement only when the reviewed analysis
+server registers that exact wire identity and its public name is in the live
+catalog. Completed historical steps can still be reused without reinstalling the
+old implementation. Their original settings and evidence remain unchanged.
+
+Continuations restore the complete approved YAML document and planning context,
+including nested JSON arguments and explicit workflow scope. Changing a typed
+step through the existing re-run flow opens the normal editable plan card in the
+same run before execution. The waiting card also saves the continuation's prior
+rounds, so a gateway restart does not turn that review into a new analysis. On
+approval, the reviewed tool and settings replace the old step's pins, while the
+change reason still informs downstream dependency selection. A reviewed plan
+containing only registered job-status calls uses the exact-call guard and cannot
+launch a new scientific job. Prose-only historical continuations retain their
+existing behavior. Added, removed or reordered steps require a newly reviewed
+study rather than silently changing continuation indices.

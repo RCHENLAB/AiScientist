@@ -20,7 +20,6 @@ from typing import Any
 
 # Job entry points, run as ``python -m <module>`` inside each HPC3 image.
 ANALYSIS_ENTRYPOINT = "aiscientist.tools.scrna_cli"        # analysis.sif: the scRNA tool line
-VARIANT_ENTRYPOINT = "aiscientist.tools.variant_cli"       # vep.sif: annotate_variants (offline VEP)
 PHENOTYPE_ENTRYPOINT = "aiscientist.tools.phenotype_cli"   # lirical.sif: run_lirical
 LITERATURE_ENTRYPOINT = "aiscientist.tools.paperqa_cli"    # paperqa.sif: deep_literature
 
@@ -36,7 +35,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "peek_dataset": ("aiscientist.tools._lib.dataset_inspection", "peek_dataset"),
     # variants (annotate_variants)
     "detect_assembly": ("aiscientist.tools._lib.variant_assembly", "detect_assembly"),
-    "annotate_variants_rest": ("aiscientist.tools.annotate_variants.tool", "annotate_variants_rest"),
     "load_gene_panel": ("aiscientist.tools.gene_panels", "load_gene_panel"),
     # figures (make_schematic), also used for the report's workflow figure
     "render_dot": ("aiscientist.tools._lib.schematics", "render_dot"),
@@ -101,11 +99,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "make_phenotype_differential_tool": ("aiscientist.tools.run_lirical.tool", "make_phenotype_differential_tool"),
     "make_diagnose_disease_tool": ("aiscientist.tools.diagnose_disease.tool", "make_diagnose_disease_tool"),
     "make_schematic_tool": ("aiscientist.tools.make_schematic.tool", "make_schematic_tool"),
-    "make_variant_annotation_tool": ("aiscientist.tools.annotate_variants.tool", "make_variant_annotation_tool"),
-    "make_scgpt_annotate_tool": ("aiscientist.tools.scgpt_annotate.tool", "make_scgpt_annotate_tool"),
 }
 
-__all__ = sorted([*_EXPORTS, "ANALYSIS_ENTRYPOINT", "VARIANT_ENTRYPOINT", "PHENOTYPE_ENTRYPOINT",
+__all__ = sorted([*_EXPORTS, "ANALYSIS_ENTRYPOINT", "PHENOTYPE_ENTRYPOINT",
                   "LITERATURE_ENTRYPOINT"])
 
 
