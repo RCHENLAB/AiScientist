@@ -102,6 +102,9 @@ class SlurmCodeExecutor:
     cpus: int = 8
     partition: str = "standard"
     account: str = ""
+    gpu_partition: str = "gpu"
+    gpu_account: str = ""
+    gpu_gres: str = "gpu:1"
     time_limit: str = "01:00:00"
     container_module: str = ""
     container_bin: str = "apptainer"
@@ -198,7 +201,8 @@ class SlurmCodeExecutor:
     def run_in_image(self, command: str, image: str, *, workdir: str, cpus: int = 0,
                      mem_gb: int = 0, time_limit: str = "",
                      files: "dict[str, str] | None" = None,
-                     tool_cache: bool = False) -> dict[str, object]:
+                     tool_cache: bool = False, gpu: bool | None = None,
+                     extra_ro_binds: tuple[str, ...] = ()) -> dict[str, object]:
         """Run a SHELL ``command`` inside container ``image`` (a skill's declared environment) as a
         Slurm job, with the same data contract as a snippet: the dataset read-only, work/artifacts
         writable, the AISCIENTIST_* variables set.
@@ -213,6 +217,8 @@ class SlurmCodeExecutor:
         command = (command or "").strip()
         if not command:
             return {"status": "error", "error": "no command provided"}
+        if any(not p.startswith("/") or any(c in p for c in ":,\n\r") for p in extra_ro_binds):
+            return {"status": "error", "error": "invalid trusted MCP reference path"}
         if self.remote is None:
             return {"status": "not_enabled", "note": "needs a live HPC3 session"}
         if (image and not self.images_dir) or not self.work_dir:
@@ -241,6 +247,7 @@ class SlurmCodeExecutor:
             out = self._submit(command, kind="env", runner="bash", image=sif, cpus=cpus,
                                mem_gb=int(mem_gb or self.mem_gb), time_limit=time_limit,
                                cwd=wd, extra_exports=exports, package_cache=False, cache_dir=cache,
+                               gpu=gpu, extra_ro_binds=extra_ro_binds,
                                run_timeout_s=slurm_time_to_seconds(time_limit) + 600)
         except JobCancelled:
             return {"status": "cancelled", "error": "Run cancelled by the user.",
@@ -376,7 +383,8 @@ class SlurmCodeExecutor:
     def _submit_job(self, source: str, *, kind: str, runner: str, image: str, cpus: int, mem_gb: int,
                 time_limit: str, run_timeout_s: int, cwd: str = "",
                 extra_exports: "dict[str, str] | None" = None,
-                package_cache: bool = False, secret_file: str = "", cache_dir: str = "") -> dict[str, object]:
+                package_cache: bool = False, secret_file: str = "", cache_dir: str = "",
+                gpu: bool | None = None, extra_ro_binds: tuple[str, ...] = ()) -> dict[str, object]:
         """Stage ``source`` as a script, run it with ``runner`` inside ``image`` as a contained Slurm
         job, and collect stdout/stderr/exit code plus the artifacts it wrote."""
         self._counter += 1
@@ -430,12 +438,14 @@ class SlurmCodeExecutor:
         inside_root = bool(root and self.dataset_path
                            and str(self.dataset_path).startswith(root + "/"))
         binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
-                                     *self._input_binds(), *env_paths)
+                                     *self._input_binds(), *env_paths, *extra_ro_binds)
                          if p)
         binds_rw = tuple(p for p in (self.work_dir, self.artifacts_dir, scratch, cache_dir) if p)
         from ..agents.skills_registry import POLICY, network_allowed
         policy = POLICY.get()
-        gpu = bool(policy and policy["gpu"])
+        gpu = bool(policy and policy["gpu"]) if gpu is None else gpu
+        if gpu and policy and not policy["gpu"]:
+            raise SlurmJobError("the pinned skill does not declare GPU access")
         network = network_allowed(policy, sandbox_network_enabled())
         inner = container_exec(
             image, inner_payload,
@@ -443,8 +453,9 @@ class SlurmCodeExecutor:
             container_bin=self.container_bin, cleanenv=bool(policy),
         )
         script = build_analysis_script(
-            name, inner, partition=self.partition, cpus=cpus, mem_gb=mem_gb,
-            time_limit=time_limit, account=self.account, gres="gpu:1" if gpu else "",
+            name, inner, partition=self.gpu_partition if gpu else self.partition, cpus=cpus, mem_gb=mem_gb,
+            time_limit=time_limit, account=self.gpu_account if gpu else self.account,
+            gres=self.gpu_gres if gpu else "",
             container_module=self.container_module, log_dir=scratch,
         )
         spec = SlurmJobSpec(script=script, job_name=name, submit_dir=scratch)

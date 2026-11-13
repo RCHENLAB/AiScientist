@@ -6266,6 +6266,24 @@ def _live_llm_args(conn: "Connection") -> dict[str, Any]:
     return {"llm_base_url": f"http://{alloc.node}:{alloc.port}/v1", "model": conn.selected_model}
 
 
+def _mcp_session_model(conn: "Connection") -> Any:
+    """Resolve the session's on-cluster model at each MCP call, after GPU renewals.
+
+    Saved user endpoints use the gateway's credential proxy and per-call budget
+    guard. Exporting those credentials to a compute node would bypass that guard.
+    Keep those sessions on their existing tools until an MCP sampling relay can
+    enforce the same contract. Never substitute a deployment-wide model silently.
+    """
+    from ..agents.mcp_model import ModelBinding
+    if _bound_credential(conn) is not None or os.environ.get("AISCIENTIST_LLM_BASE_URL"):
+        raise ValueError("MCP model tools currently require this session's own HPC3 model; "
+                         "use the existing tools for saved API or shared-model sessions")
+    live = _live_llm_args(conn)
+    if not live:
+        return None
+    return ModelBinding(endpoint=live["llm_base_url"], model=live["model"])
+
+
 class _NoServedModelExecutor:
     """The literature line of a session with no served model (the user's own API key). A tool whose
     HPC3 job calls the served model (manifest ``served_model``) answers ``dependency_missing`` at once
@@ -13645,6 +13663,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         account=st.cpu_account or "", time_limit=st.run_code_time_limit,
         container_module=st.container_module, container_bin=st.container_bin,
         # None with accounts on: a failed job is then a failed call, never a run on this host.
+        gpu_partition=st.partition, gpu_account=st.account or "", gpu_gres=st.scgpt_gres,
         local_fallback=sandbox, job_store=job_store, owner=owner,
         should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight run_code job
         # The lab-SHARED package cache: a snippet can import anything a member has
@@ -13661,6 +13680,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         notify=lambda level, message: emit(level, "lab", message),
         inputs=tuple(rc_inputs),
     )
+    code_executor.mcp_model_binding = lambda: _mcp_session_model(conn)
     emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
     # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
     # than letting it die on ModuleNotFoundError mid-step. Transparent when nothing is
@@ -14939,6 +14959,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             elif not _detected:
                 _vlog("info", f"Variant assembly: build not detectable from the VCF header; using the "
                               f"configured default {_assembly}.")
+        decisions["mcp_variant_assembly"] = "GRCh37" if _assembly.lower() in ("grch37", "hg19") else "GRCh38"
         _grch37 = _assembly.lower() in ("grch37", "hg19")
         _cache_dir = st.vep_cache_dir_grch37 if _grch37 else st.vep_cache_dir_grch38
         _clinvar = st.vep_clinvar_grch37 if _grch37 else st.vep_clinvar_grch38

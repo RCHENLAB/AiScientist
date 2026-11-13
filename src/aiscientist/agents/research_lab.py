@@ -1003,7 +1003,7 @@ def make_run_in_environment_tool(executor: Any,
 
     def _exec(args: dict[str, Any], ctx: HarnessContext, *,
               _mcp_server: Any = None, _resources: tuple | None = None,
-              _tool_cache: bool = False) -> dict[str, Any]:
+              _tool_cache: bool = False, _mcp_model: Any = None) -> dict[str, Any]:
         import hashlib
         from pathlib import Path as _Path
         from .skills import SKILLS, get_skill, refresh_skills
@@ -1044,6 +1044,12 @@ def make_run_in_environment_tool(executor: Any,
         # the model cannot set them.
         cpus, mem_gb, time_limit = _resources or (skill.cpus, skill.mem_gb, skill.time_limit)
         cache = {"tool_cache": True} if _tool_cache else {}
+        if _mcp_server is not None:
+            # Only the pinned registry selects placement/reference mounts. These options
+            # are absent from the planner's tool schema and cannot come from its arguments.
+            from .mcp_analysis import setting_paths
+            cache.update(gpu=_mcp_server.runs_on == "gpu:scgpt",
+                         extra_ro_binds=setting_paths(_mcp_server))
         def run():
             if skill.registry_release:
                 import tempfile
@@ -1058,7 +1064,12 @@ def make_run_in_environment_tool(executor: Any,
                                   mem_gb=mem_gb, time_limit=time_limit, files=staged, **cache)
             return runner(command, skill.image, workdir=workdir, cpus=cpus,
                           mem_gb=mem_gb, time_limit=time_limit, files=files, **cache)
-        result = execute(skill, ctx, executor, run, "run_in_environment", code=command)
+        from .mcp_model import run_with_model
+        if _mcp_model is not None and _mcp_server is None:
+            return {"status": "error", "error": "model credentials require a pinned MCP call"}
+        result = execute(skill, ctx, executor,
+                         lambda: run_with_model(_mcp_model, executor, run),
+                         "run_in_environment", code=command)
         if isinstance(result, dict):
             result["skill"] = skill.name
             result["provenance"] = {

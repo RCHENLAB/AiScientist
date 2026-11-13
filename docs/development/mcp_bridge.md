@@ -5,11 +5,15 @@ calls them through the server image's `aiscientist-mcp` CLI. The gateway needs n
 MCP or analysis packages. Registration reads local configuration and schemas; it
 does not start a server, discover tools over the network, or download a catalog.
 
-This is the first-stage client bridge for [issue #94](https://github.com/RCHENLAB/AiScientist/issues/94).
-Atlas expression uses it; the existing 23 application tools and their images remain
-in place. The supported execution path is a CPU image job through
-`run_in_environment`. GPU routing, `inprocess` servers, sampling, model endpoint
-settings and an authenticated HTTP transport are not implemented by this bridge.
+This client bridge implements the transport for [issue #94](https://github.com/RCHENLAB/AiScientist/issues/94).
+Atlas expression remains the released default. The seven analysis adapters can be
+activated by a reviewed deployment registry after their release images and schemas
+are pinned; no unreleased image digest is invented or enabled by default. The
+existing application tools remain available. CPU, GPU and `inprocess` declarations
+use the pinned image executor and the skill's policy; `AISCI_EXECUTOR=inline` makes
+the server finish in that allocation. This does not import server code on the
+gateway or start nested Slurm jobs. MCP sampling and authenticated HTTP transport
+are not implemented.
 
 ## Registry and tool schemas
 
@@ -31,13 +35,14 @@ shell entry point stays closed. A deployment can set
 | `image` | A `docker://` image reference with a full SHA-256 digest. Tags alone are refused. |
 | `entrypoint` | A single executable name, such as `atlas-expression-exploration-mcp`; no shell command or arguments. |
 | `skill` | Installed, allowed skill that supplies the existing environment and access policy. One server per skill binding. |
-| `runs_on` | Currently accepts only `hpc:<name>` CPU image jobs. This is not a GPU or partition selector. |
+| `runs_on` | `hpc:<name>` and `inprocess` use the contained CPU image runner; `gpu:scgpt` selects its configured GPU allocation. The model cannot select a partition or account. |
 | `tools_file` | Relative path to a tool snapshot confined to the registry directory. |
 | `tools_sha256` | SHA-256 of the exact snapshot bytes, checked before registration. |
-| `adapter` | Optional: `json` by default, or the built-in `atlas-expression` adapter for the Atlas server. |
+| `adapter` | `json` by default; `atlas-expression` is required for Atlas, and `analysis` is required for the seven known analysis servers. |
 | `prefix` | Optional prefix added to planner tool names; the original name is sent to MCP. Default: empty. |
 | `aliases` | Optional original-name to planner-name mapping, applied before `prefix`. Wire names and resource keys remain unchanged. |
 | `timeout` | Optional CLI call timeout in seconds, from 1 to 86400. Default: 15000. |
+| `settings_env` | Optional list of approved nonsecret deployment environment names for an analysis server. Values come from the gateway deployment, never from model arguments or registry values. |
 | `resources` | Optional mapping from original tool name to `[cpus, mem_gb, time_limit]`. Omitted tools inherit the skill's resources. |
 
 Each snapshot is a JSON array of `{name, description, inputSchema}` objects.
@@ -53,7 +58,7 @@ or prefix. MCP tool-to-skill bindings also supply the installed skill's
 The planner gets the catalog description and a copy of the original input schema.
 The generic bridge preserves its semantics, including `dependentSchemas`, branches
 and permissive additional properties. Atlas retains its existing domain restriction
-on unknown arguments. Calls are validated against the complete schema before
+on unknown arguments; analysis adapters also reject unknown arguments. Calls are validated against the complete schema before
 scheduling, including required arguments and types.
 
 The planner's parameter list is the schema's top-level `properties`. Plan settings
@@ -87,7 +92,7 @@ Atlas. Its server and skill binding must use the Atlas adapter, so configuration
 cannot replace its dataset checks with the generic JSON adapter.
 
 The bridge constructs the command from trusted configuration and shell-quotes the
-tool's JSON arguments. The existing executor owns the CPU Slurm job, image
+tool's JSON arguments. The existing executor owns the allocation, image
 provisioning, dataset mounts, artifact transfer and the skill's declared network,
 secret and other access restrictions. The bridge does not add gateway fallback or
 permit the model to override job resources.
@@ -167,6 +172,60 @@ Transport and registration are generic; `AtlasAdapter` in
   Paths under the server's output root are rewritten to `gene_expression/...`.
   `gene_expression/mcp_result.json` holds the response without report Markdown,
   is replaced each call, and supplies evidence for other oversized results.
+
+## Analysis bindings and outputs
+
+`agents/mcp_analysis.py` is the trusted adapter for `cellqc`, `scrna-analysis`,
+`scgpt-annotation`, `variant-annotation`, `phenotype-diagnosis`, `literature` and
+`data-utilities`. These names cannot use the generic adapter. Their planner prefix
+must begin with `mcp_`, so `mcp_run_cellqc` can coexist with the legacy `run_cellqc`.
+Wire names remain unchanged. Atlas's behavior and default pin are unchanged.
+
+Inputs come from the executor's bound dataset, dataset folder and attached input
+records. An explicit `dataset`, `dataset_paths`, `path`, `vcf_path` or `regions_bed`
+must identify an exact attachment (path or unique attached name); the bridge never
+accepts a new host path from the model. The server's `<PREFIX>_DATASET` and
+`<PREFIX>_READ_ROOTS` are derived from the mounted `AISCIENTIST_*` bindings. CellQC
+uses the bound folder root so raw and filtered matrices remain available together.
+scRNA's `input` is a run-local AnnData or ranking filename.
+`SCRNA_CHECKPOINT_ROOT=$AISCIENTIST_WORK` allows its worker to import the preceding
+CellQC checkpoint. A changed upstream QC handoff requires a new scRNA `analysis_id`;
+the server records imported checkpoint identities and refuses stale reuse. The attached clinical case note overrides a model-provided
+phenotype mapping text. The app's detected `mcp_variant_assembly` overrides variant
+assembly arguments, and offline annotation retains the whole-VCF `max_variants=0`
+contract.
+
+External references and models are deployment settings. `settings_env` admits only
+explicit server-specific names listed in `mcp_analysis.py`, such as
+`VARIANT_VEP_CACHE_DIR_GRCH38`, `SCGPT_MODEL_DIR`, `SCRNA_GENESETS_DIR`,
+`LIRICAL_DATA_DIR`, `LITERATURE_CORPUS_ROOT` and `LITERATURE_MODEL_ENDPOINT`.
+The bridge shell-quotes their current deployment values. Reference parents are
+passed to the runner as trusted read-only mounts so sidecars work; mounting `/`
+is refused. Environment names for credentials, executable commands, interpreters,
+dataset bindings and read-root overrides are not accepted. Endpoint URLs cannot
+embed credentials or query parameters. Model keys still require the installed
+skill's declared secrets and normal `AISCIENTIST_SKILL_SECRET_<NAME>` policy;
+`settings_env` neither grants network access nor supplies a secret. The collector
+redacts declared secret values from JSON evidence as well as the returned response.
+
+The collector accepts `artifact_root` only inside
+`$AISCI_DATA_DIR/<server>/<analysis_id>/`, refuses symlinks in sources and
+destinations, and copies its regular files to
+`$AISCIENTIST_ARTIFACTS/mcp/<server>/<analysis_id>/`. An explicit `checkpoint_path`
+and CellQC's multi-species `checkpoints` may copy only regular `adata_*.h5ad` files
+from that same analysis into `AISCIENTIST_WORK`. Failed results do not publish new
+checkpoints. This is the bridge's only cross-server checkpoint handoff; arbitrary
+returned paths are never followed.
+
+`mcp/<server>/<analysis_id>/<tool>.json` retains the full JSON evidence. A server's
+own `full_result` is read only when it identifies regular JSON within the same
+analysis. Paths in the returned data and evidence are rewritten to artifact-relative
+paths, checkpoint filenames or redacted attachment/server labels. Oversized responses
+are bounded to 14,000 serialized characters with a `full_result` link. Flat domain
+fields support existing downstream tools, while the complete bounded domain object
+also appears under `result`; execution status and provenance remain protected.
+A server `status=error`, failed state or MCP error cannot become `status=ok` merely
+because the containing process exited successfully.
 
 ## Exporting and reviewing a catalog
 
