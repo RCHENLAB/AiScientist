@@ -158,6 +158,16 @@ library again when `skills/current` changes, without a restart, and the script w
 `config/deploy.env` pins (`AISCIENTIST_SKILLS_TAG`), else the one the running app release pins in
 `configs/skills_registry.json`. A skills release needs no app release.
 
+The repository is also a deployment pin. Set `AISCIENTIST_SKILLS_REPO=owner/repository`
+for both the service and deploy environment to use a reviewed fork. Otherwise the
+optional `repository` in `configs/skills_registry.json` applies, with
+`lijinbio/aiscientist-skills` as the default. Only GitHub owner/repository names are
+accepted. The loader's install advice and release information report the selected
+repository; `<version>.install.json` records where the deployment fetched it.
+A cached version whose repository/tag differs, or whose install provenance is
+missing, is refused by the deploy script. Use a separate install root when testing
+another repository's same version; an existing immutable release is not replaced.
+
 ### The staging site
 
 A second site on the same server installs every pre-release, so a version is used before the

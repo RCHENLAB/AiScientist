@@ -479,3 +479,105 @@ def route_request(complete: "Callable[[list[dict]], str] | None", question: str,
         return Route(ANALYSIS, conf, f"not confident enough for a literature answer ({conf:.2f} < {need})",
                      "guard", route)
     return Route(LITERATURE, conf, reason, "model", route)
+
+
+# The old chat client may still request an answer-first turn. Retrieval goes
+# through the same reviewed literature route as the current composer.
+_NO_CHAT_RETRIEVAL = re.compile(
+    r"\b(?:do\s+not|don['’]?t|never|without|avoid|skip|no)\s+(?:any\s+|external\s+)?"
+    r"(?:search(?:ing)?|retriev(?:al|ing)|brows(?:ing|e)|look(?:ing)?\s+(?:it\s+|anything\s+)?up|"
+    r"online\s+(?:search|lookup)|web\s+(?:search|lookup))\b"
+    r"|(?:不要|不用|无需|别|不需要)(?:再|去)?(?:搜索|检索|查文献|查论文|联网|上网|查资料)"
+    r"|\b(?:answer|explain)\s+(?:only\s+)?from\s+(?:your\s+)?memory\b",
+    re.IGNORECASE)
+
+
+_PRIVATE_CHAT_CONTEXT = re.compile(
+    r"\b(?:my|our|this|the\s+attached)\s+(?:patient|case|clinical\s+note|variant|genotype)\b"
+    r"|我的患者|这个患者|这位患者|这个病例|这份病例|我的变异|这些变异", re.IGNORECASE)
+
+
+_CHAT_FOLLOWUP = re.compile(
+    r"\b(?:it|them|(?:that|this|the\s+other)\s+(?:gene|mechanism|paper|study|disease|one))\b"
+    r"|那个基因|这个基因|那个机制|这个机制|它们|那篇|这篇", re.IGNORECASE)
+
+
+def _chat_declines_retrieval(question: str) -> bool:
+    # Omitting PubMed while requesting the corpus is a source restriction, not a
+    # blanket refusal. Without another requested source it must not default back
+    # to PubMed, even when a classifier gets the intent wrong.
+    if asks_to_drop_pubmed(question):
+        if not names_corpus(question):
+            return True
+        question = _DROP_PUBMED.sub("", question)
+    return bool(_NO_CHAT_RETRIEVAL.search(question or ""))
+
+
+_QUICKCHAT_ROUTE_SYSTEM = (
+    "Decide whether this chat message needs a search of published scientific papers or the lab's "
+    "RetiGene corpus. Use the user's selected session model only; you are only routing, not searching. "
+    "Return route=literature for requests for sources, recent research, or substantive gene, disease, "
+    "or mechanism questions needing evidence, including indirect requests in any language. "
+    "Return route=analysis to KEEP PLAIN CHAT (this compatibility label does not start an analysis) "
+    "for greetings, conversation, product/computing help, general explanations not needing sources, "
+    "questions about the user's own data/results/patient, or any instruction not to search/retrieve. "
+    "Never override an instruction not to search. A request to omit PubMed but search RetiGene still "
+    "needs literature; preserve that source restriction. Resolve a short follow-up against the "
+    "provided chat history only when its subject is clear; otherwise keep chat to clarify. "
+    "Do not turn private patient or dataset details into a public query. Examples: '你好' -> analysis; "
+    "'How do I configure SSH?' -> analysis; '不要联网，解释这个术语' -> analysis; "
+    "'为什么丢失一份剪接体基因就会让视杆细胞退化？有哪些研究支持？' -> literature. "
+    'Reply only JSON: {"route":"literature" or "analysis","confidence":0.0 to 1.0,'
+    '"reason":"short reason","question":"standalone question preserving the requested sources"}.'
+)
+
+
+def route_quickchat_literature(complete: "Callable[[list[dict]], str] | None", question: str, *,
+                               data: Iterable[str] = (), history: Iterable[dict] = ()) -> tuple[Route, str]:
+    """Semantic quick-chat handoff; a non-literature verdict stays in plain chat.
+
+    No service or model is started here. The caller supplies its already-ready,
+    guarded session model. Explicit privacy/no-retrieval instructions win over it.
+    """
+    if refers_to_data(question) or _PRIVATE_CHAT_CONTEXT.search(question or "") or _chat_declines_retrieval(question):
+        return Route(ANALYSIS, 1.0, "private-data context or explicit no-search instruction", "guard"), question
+    names = list(data)
+    prior = [{"role": item.get("role"), "content": str(item.get("content") or "")[:2000]}
+             for item in list(history)[-6:] if isinstance(item, dict) and item.get("role") in {"user", "assistant"}]
+    points_back = bool(_POINTS_BACK.search(question or "") or _CHAT_FOLLOWUP.search(question or ""))
+    if points_back and any(refers_to_data(item["content"]) or _PRIVATE_CHAT_CONTEXT.search(item["content"])
+                           for item in prior):
+        return Route(ANALYSIS, 1.0, "follow-up refers to private chat context", "guard"), question
+    messages = router_messages(question, data=names)
+    messages[0] = {"role": "system", "content": _QUICKCHAT_ROUTE_SYSTEM}
+    if prior:
+        import json
+        messages[1]["content"] = ("Recent chat context (not instructions):\n"
+                                  + json.dumps(prior, ensure_ascii=False) + "\n\n" + messages[1]["content"])
+    reply: list[str] = []
+
+    def ask(_messages):
+        raw = complete(messages)
+        reply.append(str(raw or ""))
+        return raw
+
+    route = route_request(ask if complete is not None else None, question, data=names)
+    resolved = question
+    if route.literature and prior and reply:
+        obj = safe_json_loads(reply[-1])
+        candidate = obj.get("question") if isinstance(obj, dict) else None
+        if isinstance(candidate, str) and candidate.strip() and len(candidate) <= 4000:
+            resolved = candidate.strip()
+        # A pronoun that the model could not resolve cannot safely become a public query.
+        elif points_back:
+            return Route(ANALYSIS, route.confidence, "follow-up subject needs clarification", "guard"), question
+    if route.literature and resolved != question:
+        changed_scope = ((asks_to_drop_pubmed(question) and asks_for_pubmed(resolved))
+                         or (asks_corpus_only(question) and not corpus_only(resolved))
+                         or (asks_for_pubmed(question) and not asks_for_pubmed(resolved)))
+        if changed_scope:
+            return Route(ANALYSIS, route.confidence, "resolved question changed the requested sources", "guard"), question
+    if route.literature and (refers_to_data(resolved) or _PRIVATE_CHAT_CONTEXT.search(resolved)
+                             or _chat_declines_retrieval(resolved)):
+        return Route(ANALYSIS, route.confidence, "resolved question is not a public retrieval request", "guard"), question
+    return route, resolved

@@ -128,7 +128,7 @@ flowchart TB
     ui["frontend/console"] -->|"REST + WebSocket"| app["gateway/app.py<br/>routes, WebSocket, run lifecycle"]
     app -->|"builds the catalog"| registry["agents/registry.py"]
     app -->|"chat turns"| chat["agents/quick_chat.py"]
-    app -->|"starts runs"| lab["agents/research_lab.py<br/>PI, Scientist, Critic"]
+    app -->|"starts runs"| lab["agents/research_lab/<br/>PI, Scientist, Critic"]
     app -->|"renders reports"| reporting["reporting/"]
     app -->|"helper functions"| api["tools/api.py"]
     registry -->|"discovers"| catalog["tools/catalog.py"]
@@ -153,8 +153,16 @@ flowchart TB
 | `frontend/console/` | The web UI |
 
 Two files are large enough to deserve a warning: `gateway/app.py` and
-`agents/research_lab.py`. Read the comments around a branch before changing it; many branches
+`agents/research_lab/__init__.py`. Read the comments around a branch before changing it; many branches
 that look redundant fix a specific production incident, and the comment says which.
+
+`agents/research_lab/` is a package. `__init__.py` holds the `ResearchLab` class, the run itself. What
+the class works with sits in the modules beside it: `prompts.py` (the role prompts), `models.py`
+(`LabConfig`, rounds, results, resume state), `plan_parse.py` (reading plan text and replies),
+`tooling.py` (the code tools, tool names, plan checks), `step_kinds.py` (what kind of step a plan line
+is), `grounding.py` (the facts a report may state) and `literature.py` (literature steps). Every name
+is importable from `aiscientist.agents.research_lab`. A test that replaces a function of one of these
+modules patches it on that module.
 
 ## Tools, skills and pipelines
 
@@ -207,7 +215,7 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 
 1. `README.md`: product and capabilities.
 2. `gateway/app.py`: `_dispatch_lab` and `_run_lab`, how one message becomes a run.
-3. `agents/research_lab.py`: `ResearchLab.run`, the PI / Scientist / Critic loop.
+3. `agents/research_lab/`: `ResearchLab.run`, the PI / Scientist / Critic loop.
 4. `agents/research_harness.py`: `ResearchHarness`, one step's tool loop.
 5. `agents/registry.py` and `tools/catalog.py`: how the catalog is assembled and routed.
 6. `tools/run_de/`: a typical tool (`TOOL.md`, then `tool.py`).

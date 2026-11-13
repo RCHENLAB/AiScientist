@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import tarfile
 import tempfile
@@ -40,6 +41,16 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 from aiscientist.gateway import corpus_index, local_corpus  # noqa: E402
+
+MAINTENANCE_RUNTIME_ENV = "AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME"
+
+
+def maintenance_runtime() -> str:
+    mode = os.environ.get(MAINTENANCE_RUNTIME_ENV, "legacy")
+    if mode not in {"mcp", "legacy"}:
+        raise SystemExit(f"{MAINTENANCE_RUNTIME_ENV} must be mcp or legacy")
+    return mode
+
 
 JOB_CPUS, JOB_MEM_GB, JOB_TIME = 8, 32, "04:00:00"
 
@@ -56,7 +67,21 @@ def corpus_settings(hpc_root: str = "") -> tuple[str, str, str, str]:
         raise SystemExit("No corpus on HPC3: set AISCIENTIST_PAPERQA_PAPERS or pass --hpc-root.")
     papers = papers if papers and not hpc_root else f"{root}/papers"
     manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "") if not hpc_root else ""
-    image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "") or f"{root}/paperqa.sif"
+    if maintenance_runtime() == "mcp":
+        image = os.environ.get("AISCIENTIST_CORPUS_MAINTENANCE_IMAGE", "")
+        if not image:
+            from aiscientist.gateway.literature_mcp import registered_server
+            server = registered_server()
+            image = server.image if server else ""
+        if not image:
+            raise SystemExit("Native corpus maintenance needs a registered literature image or "
+                             "AISCIENTIST_CORPUS_MAINTENANCE_IMAGE.")
+        pinned = re.fullmatch(r"docker://[^\s]+@sha256:[a-f0-9]{64}", image)
+        local_sif = image.startswith("/") and image.endswith(".sif") and not any(c in image for c in "\r\n\0")
+        if not (pinned or local_sif):
+            raise SystemExit("Native corpus maintenance requires a digest-pinned Docker URI or an absolute verified SIF path.")
+    else:
+        image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "") or f"{root}/paperqa.sif"
     return root, papers, manifest or f"{root}/paperqa_manifest.csv", image
 
 
@@ -75,12 +100,14 @@ def identity(user: str, key: str, hpc: Any) -> tuple[str, str]:
 
 
 def pack_code(out: Path) -> None:
-    """The code the build job runs: the aiscientist package and the build script."""
+    """Native jobs stage only operator scripts; legacy jobs also carry the app tools."""
     def skip(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
         return None if "__pycache__" in info.name or info.name.endswith(".pyc") else info
 
     with tarfile.open(out, "w:gz") as tar:
-        tar.add(REPO / "src" / "aiscientist", arcname="src/aiscientist", filter=skip)
+        if maintenance_runtime() == "legacy":
+            tar.add(REPO / "src" / "aiscientist", arcname="src/aiscientist", filter=skip)
+        tar.add(REPO / "scripts" / "_literature_runtime.py", arcname="scripts/_literature_runtime.py")
         tar.add(REPO / "scripts" / "build_mechanism_cache.py", arcname="scripts/build_mechanism_cache.py")
 
 
@@ -100,7 +127,7 @@ def rebuild(ex: Any, hpc: Any, user: str, root: str, papers: str, manifest: str,
     script = build_analysis_script(
         job, corpus_index.rebuild_inner_command(stage=stage, archive=f"{stage}/code.tgz", image=image,
                                                 root=root, papers=papers, manifest=manifest,
-                                                container_bin=hpc.container_bin),
+                                                container_bin=hpc.container_bin, runtime=maintenance_runtime()),
         partition=hpc.cpu_partition, account=hpc.cpu_account or "", cpus=JOB_CPUS, mem_gb=JOB_MEM_GB,
         time_limit=JOB_TIME, container_module=hpc.container_module, log_dir=stage)
     _say(f"Rebuilding the index on HPC3 ({root}): Slurm job {job}, log in {stage}")

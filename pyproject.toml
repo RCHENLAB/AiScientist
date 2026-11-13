@@ -100,7 +100,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.setuptools.package-data]
-aiscientist = ["agents/mcp_catalog/*.json", "agents/mcp_catalog/mcp/*.json", "tools/*/TOOL.md"]
+aiscientist = ["agents/mcp_catalog/*.json", "agents/mcp_catalog/mcp/*.json", "tools/*/TOOL.md", "tools/_lib/marker_references/*.json"]
 
 [tool.ruff]
 target-version = "py310"

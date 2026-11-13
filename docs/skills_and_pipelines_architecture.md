@@ -93,7 +93,7 @@ A skill without `outputs` works as before: nothing is checked and nothing is sho
 ### Declared exploration
 
 After a step is accepted, the PI may read its result and propose a hypothesis with a step that
-tests it (`_explore_after_step` in `agents/research_lab.py`). The proposed step runs only if the
+tests it (`_explore_after_step` in `agents/research_lab/`). The proposed step runs only if the
 user approves it. This happens only after a step that uses a skill declaring it:
 
 ```yaml
@@ -218,6 +218,17 @@ and the releases root. Community remains enabled using the existing tier mechani
 `explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.0 and is not promoted
 locally. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
 Updating skills means changing the tag and installing the release.
+
+An optional `repository` pins the GitHub source (default
+`lijinbio/aiscientist-skills`). Its environment override is `AISCIENTIST_SKILLS_REPO`,
+shared with the deploy script. A reviewed fork's tag therefore resolves to that
+fork, and the runtime's release information includes the repository. Repository
+names are validated as owner/repository slugs; URLs and shell syntax are refused.
+When deployment provenance exists beside the installed release, the loader checks
+its repository and tag before loading assets. The deploy script requires matching
+provenance before reusing a cached version, preventing a same-version fork switch
+from silently reusing the old source. Manual checksum-verified development
+installs without a deployment record remain supported.
 
 `agents/skills_registry.py` reads `skills/releases/<version>/`, which holds the release's three
 assets as published: `aiscientist-skills-<version>.zip` (every skill folder at its catalog `path`),

@@ -5,11 +5,15 @@ calls them through the server image's `aiscientist-mcp` CLI. The gateway needs n
 MCP or analysis packages. Registration reads local configuration and schemas; it
 does not start a server, discover tools over the network, or download a catalog.
 
-This is the first-stage client bridge for [issue #94](https://github.com/RCHENLAB/AiScientist/issues/94).
-Atlas expression uses it; the existing 23 application tools and their images remain
-in place. The supported execution path is a CPU image job through
-`run_in_environment`. GPU routing, `inprocess` servers, sampling, model endpoint
-settings and an authenticated HTTP transport are not implemented by this bridge.
+This client bridge implements the transport for [issue #94](https://github.com/RCHENLAB/AiScientist/issues/94).
+Atlas expression remains the released default. The seven analysis adapters can be
+activated by a reviewed deployment registry after their release images and schemas
+are pinned; no unreleased image digest is invented or enabled by default. The
+existing application tools remain available. CPU, GPU and `inprocess` declarations
+use the pinned image executor and the skill's policy; `AISCI_EXECUTOR=inline` makes
+the server finish in that allocation. This does not import server code on the
+gateway or start nested Slurm jobs. MCP sampling and authenticated HTTP transport
+are not implemented.
 
 ## Registry and tool schemas
 
@@ -31,13 +35,14 @@ shell entry point stays closed. A deployment can set
 | `image` | A `docker://` image reference with a full SHA-256 digest. Tags alone are refused. |
 | `entrypoint` | A single executable name, such as `atlas-expression-exploration-mcp`; no shell command or arguments. |
 | `skill` | Installed, allowed skill that supplies the existing environment and access policy. One server per skill binding. |
-| `runs_on` | Currently accepts only `hpc:<name>` CPU image jobs. This is not a GPU or partition selector. |
+| `runs_on` | `hpc:<name>` and `inprocess` use the contained CPU image runner; `gpu:scgpt` selects its configured GPU allocation. The model cannot select a partition or account. |
 | `tools_file` | Relative path to a tool snapshot confined to the registry directory. |
 | `tools_sha256` | SHA-256 of the exact snapshot bytes, checked before registration. |
-| `adapter` | Optional: `json` by default, or the built-in `atlas-expression` adapter for the Atlas server. |
+| `adapter` | `json` by default; `atlas-expression` is required for Atlas, `retigene` for retigene-rag, and `analysis` for the seven known analysis servers. |
 | `prefix` | Optional prefix added to planner tool names; the original name is sent to MCP. Default: empty. |
 | `aliases` | Optional original-name to planner-name mapping, applied before `prefix`. Wire names and resource keys remain unchanged. |
 | `timeout` | Optional CLI call timeout in seconds, from 1 to 86400. Default: 15000. |
+| `settings_env` | Optional list of approved nonsecret deployment environment names for an analysis server. Values come from the gateway deployment, never from model arguments or registry values. |
 | `resources` | Optional mapping from original tool name to `[cpus, mem_gb, time_limit]`. Omitted tools inherit the skill's resources. |
 
 Each snapshot is a JSON array of `{name, description, inputSchema}` objects.
@@ -53,7 +58,7 @@ or prefix. MCP tool-to-skill bindings also supply the installed skill's
 The planner gets the catalog description and a copy of the original input schema.
 The generic bridge preserves its semantics, including `dependentSchemas`, branches
 and permissive additional properties. Atlas retains its existing domain restriction
-on unknown arguments. Calls are validated against the complete schema before
+on unknown arguments; analysis adapters also reject unknown arguments. Calls are validated against the complete schema before
 scheduling, including required arguments and types.
 
 The planner's parameter list is the schema's top-level `properties`. Plan settings
@@ -84,10 +89,12 @@ call time after refreshing skills. Direct model calls to `run_in_environment` fo
 a registry-bound skill are refused and directed to its typed MCP tools.
 Atlas's direct shell entry remains forbidden even if a custom registry omits
 Atlas. Its server and skill binding must use the Atlas adapter, so configuration
-cannot replace its dataset checks with the generic JSON adapter.
+cannot replace its dataset checks with the generic JSON adapter. The same holds for
+retigene-rag and its skill `query-retigene-papers-with-aiscientist-mcp`, which must
+use the `retigene` adapter.
 
 The bridge constructs the command from trusted configuration and shell-quotes the
-tool's JSON arguments. The existing executor owns the CPU Slurm job, image
+tool's JSON arguments. The existing executor owns the allocation, image
 provisioning, dataset mounts, artifact transfer and the skill's declared network,
 secret and other access restrictions. The bridge does not add gateway fallback or
 permit the model to override job resources.
@@ -110,7 +117,38 @@ status, artifact metadata and provenance. It writes the full result to
 A result exceeding 14,000 serialized characters is replaced in the transport
 response by `response_omitted` and `full_result`. Arbitrary file paths returned by
 a server are not followed or copied by this adapter. Servers with other
-deliverables need an application-owned adapter.
+deliverables need an application-owned adapter. Such an adapter may also bind
+folders the deployment names read-only into the job, and run something for the
+job's duration; the model can set neither.
+
+## retigene-rag
+
+The `retigene` adapter (`agents/retigene.py`) serves the RetiGene papers' search and
+curation tools. The registry does not list retigene-rag yet: a row needs the released
+image digest and its tools snapshot.
+
+- **Index.** `AISCIENTIST_RETIGENE_INDEX` names the index's HPC3 folder
+  (`mechanism_cache/sentences.jsonl`, `chunks.jsonl`, `chunk_vecs.npy`, `manifest.csv`,
+  `hgnc_complete_set.txt`). It is bound read-only into every call's job. Without it,
+  the tools are not offered.
+- **Model.** `submit_curation` reads with the session's own model. The job writes each
+  prompt to a folder under the run's work directory (`RETIGENE_PROVIDER=relay`). For the
+  job's duration, the gateway answers each prompt with the session's lab-role completion,
+  role `curation` (`gateway/mcp_model_relay.py`). That covers the user's API key, the lab's
+  shared model and the session's GPU. Each call is recorded in the user's usage as any lab
+  call is. On a user's key, the curation's `max_cost_usd` and the relay's cap are what is
+  left of their budget, and a spike allowance is announced for the key while the job runs.
+  No key and no model address enters the job.
+- **Cache.** Model replies are kept in the user's tool cache
+  (`$AISCIENTIST_TOOL_CACHE/retigene-rag/cache`), so a question asked again reads nothing
+  twice.
+- **Outputs.** The collector copies a curation's `genes.csv`, `sentences.csv` and
+  `report.md` to `artifacts/retigene/<curation_id>/` and names every server path by where
+  the run keeps it.
+- **Bounds.** `search_sentences` pages are at most 40 lines, `get_evidence` at most 20 rows
+  and `get_genes` at most 100 rows. A longer result is trimmed to fit the transport bound,
+  says how much was left out, and is kept whole in `artifacts/retigene/<tool>.json`.
+- **Reference.** `evaluate` scores only against the bundled curator reference.
 
 Every call the server answers records the server name, package version, release tag, image
 digest, schema checksum and `runs_on` in the run manifest's `mcp_servers` list. Refused calls
@@ -167,6 +205,152 @@ Transport and registration are generic; `AtlasAdapter` in
   Paths under the server's output root are rewritten to `gene_expression/...`.
   `gene_expression/mcp_result.json` holds the response without report Markdown,
   is replaced each call, and supplies evidence for other oversized results.
+
+## Analysis bindings and outputs
+
+`agents/mcp_analysis.py` is the trusted adapter for `cellqc`, `scrna-analysis`,
+`scgpt-annotation`, `variant-annotation`, `phenotype-diagnosis`, `literature` and
+`data-utilities`. These names cannot use the generic adapter. Their planner prefix
+must begin with `mcp_`, so `mcp_run_cellqc` can coexist with the legacy `run_cellqc`.
+Wire names remain unchanged. Atlas's behavior and default pin are unchanged.
+
+Inputs come from the executor's bound dataset, dataset folder and attached input
+records. An explicit `dataset`, `dataset_paths`, `path`, `vcf_path` or `regions_bed`
+must identify an exact attachment (path or unique attached name); the bridge never
+accepts a new host path from the model. The server's `<PREFIX>_DATASET` and
+`<PREFIX>_READ_ROOTS` are derived from the mounted `AISCIENTIST_*` bindings. CellQC
+uses the bound folder root so raw and filtered matrices remain available together.
+scRNA's `input` is a run-local AnnData or ranking filename.
+`SCRNA_CHECKPOINT_ROOT=$AISCIENTIST_WORK` allows its worker to import the preceding
+CellQC checkpoint. A changed upstream QC handoff requires a new scRNA `analysis_id`;
+the server records imported checkpoint identities and refuses stale reuse. The attached clinical case note overrides a model-provided
+phenotype mapping text. The app's detected `mcp_variant_assembly` overrides variant
+assembly arguments, and offline annotation retains the whole-VCF `max_variants=0`
+contract.
+
+External references and models are deployment settings. `settings_env` admits only
+explicit server-specific names listed in `mcp_analysis.py`, such as
+`VARIANT_VEP_CACHE_DIR_GRCH38`, `SCGPT_MODEL_DIR`, `SCRNA_GENESETS_DIR`,
+`LIRICAL_DATA_DIR`, `LITERATURE_CORPUS_ROOT` and `LITERATURE_MODEL_ENDPOINT`.
+The bridge shell-quotes their current deployment values. Reference parents are
+passed to the runner as trusted read-only mounts so sidecars work; mounting `/`
+is refused. Environment names for credentials, executable commands, interpreters,
+dataset bindings and read-root overrides are not accepted. Endpoint URLs cannot
+embed credentials or query parameters. `settings_env` neither grants network
+access nor supplies a secret. Operator credentials use the existing skill policy
+and protected job-file staging; the collector redacts policy secret values from
+JSON evidence as well as the returned response.
+
+Model-backed tools resolve the selected session model once per call. A live
+user-owned cluster allocation supplies its current endpoint. A saved API key or
+shared gateway model uses `RelayBinding`: the job starts a token-protected
+loopback chat facade and exchanges private request/response files with the
+gateway. Provider credentials remain on the gateway, whose existing credential
+proxy, key guard, data-boundary check, usage accounting and stop control apply to
+every request. The requested model must match the bound session model; a global
+deployment model never silently replaces it. The worker token is only a local
+transport credential and is removed when the job exits.
+
+The gateway also supplies a stable hashed model identity, so a fresh local relay
+port does not invalidate an existing analysis. For a model with known pricing,
+the trusted relay declares its usage protocol. Extraction receives the gateway's
+token usage and per-call cost estimate, feeds the original pilot projection, and
+stops if that projection exceeds `max_cost_usd`. The worker and gateway check the
+running spend before each serialized call; the gateway also applies its configured
+ceiling. A request already in flight can cross the threshold. Missing prices or
+lost accounting stop subsequent priced calls, with unknown cost reported as null.
+Unpriced endpoints continue to reject a positive cost cap.
+
+The relay supports text messages, JSON-object requests, function tools and their
+results, explicit tool choice, and buffered SSE responses. Unsupported API fields
+are rejected. Native Anthropic uses provider-supported sampling and reasoning
+settings, with adaptations surfaced by the gateway; JSON-object output is checked
+after completion and an invalid object is a failed request with its real usage
+still recorded. This is a bounded transport adapter, not a claim of compatibility
+with every OpenAI API option. Existing tool routes remain available while real
+same-session acceptance is completed.
+
+The collector accepts `artifact_root` only inside
+`$AISCI_DATA_DIR/<server>/<analysis_id>/`, refuses symlinks in sources and
+destinations, and copies its regular files to
+`$AISCIENTIST_ARTIFACTS/mcp/<server>/<analysis_id>/`. An explicit `checkpoint_path`
+and CellQC's multi-species `checkpoints` may copy only regular `adata_*.h5ad` files
+from that same analysis into `AISCIENTIST_WORK`. Failed results do not publish new
+checkpoints. This is the bridge's only cross-server checkpoint handoff; arbitrary
+returned paths are never followed.
+
+`mcp/<server>/<analysis_id>/<tool>.json` retains the full JSON evidence. A server's
+own `full_result` is read only when it identifies regular JSON within the same
+analysis. Paths in the returned data and evidence are rewritten to artifact-relative
+paths, checkpoint filenames or redacted attachment/server labels. Oversized responses
+are bounded to 14,000 serialized characters with a `full_result` link. Flat domain
+fields support existing downstream tools, while the complete bounded domain object
+also appears under `result`; execution status and provenance remain protected.
+A server `status=error`, failed state or MCP error cannot become `status=ok` merely
+because the containing process exited successfully.
+
+Successful current outputs also populate the existing `tables/`, `figures/` and
+`data/` report paths with real copies. A per-run ownership record tracks their
+checksums: a rerun removes only its own unchanged stale copies, and polling an older
+completed task cannot replace current report files or checkpoints. Namespaced
+evidence remains available independently. Failed results do not replace those
+successful compatibility outputs.
+
+CellQC's `result_directory` is separately confined and recursively inventoried.
+Every regular file, including per-library matrices, is copied to the run's
+`result/cellqc/`; links, traversal and special files are refused before publication.
+The gateway's internal `data/cellqc_result.json` is rebuilt from that real inventory
+and the verified run-local destination, enabling the existing ZIP, save and stage-out
+flows. Only this internal pointer retains the destination's absolute path; public
+MCP evidence uses relative paths. Nested result paths retain their directory structure
+in downloads and saved datasets. Temporary copies stay under `work/`, outside the
+stage-out result tree.
+
+## Dedicated literature routes and local retrieval
+
+When a literature server is registered, the console's corpus curation and PubMed
+answer routes use that same MCP image through `gateway/literature_mcp.py`. They
+retain their plan/spec review, public-corpus cache, cancellation, curation tables,
+and download layout. The selected session model is used for extraction, including
+native Anthropic, the lab's shared model, or the session's existing cluster model.
+No second GPU/model is provisioned implicitly. Paid scans pass the remaining cost
+cap without rounding a small positive amount to zero. Failed pilots are recovered
+through the same analysis's status tool so their measured spend and stop reason
+remain available; a failed scan does not publish or cache completed tables.
+PubMed and corpus retrieval use separate analysis identifiers because they run
+concurrently. The complete synced JSON is read only from the expected tool and
+analysis under this run's artifacts. Unregistered deployments keep their existing
+routes during the migration acceptance period.
+
+The local corpus mirror can use the published server without an HPC connection:
+
+```bash
+AISCIENTIST_LOCAL_CORPUS_MCP=docker
+AISCIENTIST_LOCAL_CORPUS_ROOT=/srv/corpus/retigene
+```
+
+This is opt-in. The service user must already have Docker access, and an operator
+must pre-pull the exact literature image digest in `AISCIENTIST_MCP_CONFIG`.
+The installed skill must bind that same image. The root contains the versioned
+`current/mechanism_cache/`, manifest and `hf_cache/` used by the existing mirror;
+flat mirrors also work. A cache-only mirror need not contain the source PDFs.
+The local runner invokes only `search_corpus`, verifies the actual stdio schema
+against the reviewed snapshot, and uses the image's native MCP client/server.
+It imports no scientific server code into the gateway.
+
+The container has no network, credentials, home or Docker socket mount. Its root
+filesystem and corpus/model mounts are read-only; only a private run directory
+and bounded `/tmp` are writable. It runs as the service user's numeric UID with
+2 CPUs, 8 GiB memory, 128 PIDs and a 10-minute timeout. Cancellation removes its
+uniquely named container. The existing mirror-freshness check still decides when
+HPC retrieval is preferred. The legacy local implementation remains available
+when this option is unset, pending complete tool retirement.
+
+The published literature 0.0.3 digest was exercised on the Eye Server using its
+existing public mirror and offline PubMedBERT: live schema verification and a
+PRPF31 retrieval returned two passages in 19.12 seconds with network disabled.
+An in-flight cancellation left no owned container. This validates local retrieval,
+not a generative model or a complete corpus extraction.
 
 ## Exporting and reviewing a catalog
 

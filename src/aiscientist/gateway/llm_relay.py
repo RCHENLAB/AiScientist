@@ -18,9 +18,12 @@ side's own retries), anything else fails that one prompt, which the job retries.
 from __future__ import annotations
 
 import json
+import os
 import posixpath
+import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,8 +61,10 @@ class LocalFS:
     def write_atomic(self, path: str, data: bytes) -> None:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(f".{p.name}.tmp")
-        tmp.write_bytes(data)
+        tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+        with tmp.open("xb") as file:
+            os.chmod(tmp, 0o600)
+            file.write(data)
         tmp.replace(p)
 
     def remove(self, path: str) -> None:
@@ -90,8 +95,9 @@ class SFTPFS:
             return fh.read()
 
     def write_atomic(self, path: str, data: bytes) -> None:
-        tmp = posixpath.join(posixpath.dirname(path), f".{posixpath.basename(path)}.tmp")
+        tmp = posixpath.join(posixpath.dirname(path), f".{posixpath.basename(path)}.{uuid.uuid4().hex}.tmp")
         with self._sftp.open(tmp, "wb") as fh:
+            self._sftp.chmod(tmp, 0o600)
             fh.write(data)
         try:
             self._sftp.posix_rename(tmp, path)
@@ -153,7 +159,8 @@ class ModelRelay:
     prompt is answered with a ``stop``. ``should_stop``: the run was stopped."""
 
     def __init__(self, fs_factory: Callable[[], RelayFS], relay_dir: str,
-                 call: Callable[[list[dict[str, Any]], int], tuple[str, dict[str, Any]]], *,
+                 call: Callable[[list[dict[str, Any]], int], tuple[str, dict[str, Any]]] | None = None, *,
+                 call_request: Callable[[dict[str, Any]], tuple[dict[str, Any], dict[str, Any]]] | None = None,
                  price: Callable[[dict[str, Any]], float | None] = lambda u: None,
                  record: Callable[[dict[str, Any] | None, int, str | None], None] | None = None,
                  max_cost_usd: float | None = None, concurrency: int = 8, poll_s: float = 1.0,
@@ -163,7 +170,9 @@ class ModelRelay:
         self._fs_factory = fs_factory
         self._req = posixpath.join(relay_dir, REQ)
         self._resp = posixpath.join(relay_dir, RESP)
-        self._call, self._price, self._record = call, price, record
+        if (call is None) == (call_request is None):
+            raise ValueError("supply exactly one model relay callback")
+        self._call, self._call_request, self._price, self._record = call, call_request, price, record
         self._cap = max_cost_usd if max_cost_usd and max_cost_usd > 0 else None
         self._concurrency = max(1, int(concurrency))
         self._poll, self._should_stop, self._log, self._sleep = poll_s, should_stop, log, sleep
@@ -219,7 +228,7 @@ class ModelRelay:
                     self._halt.wait(min(10.0, self._poll * 5))
                     continue
                 for name in names:
-                    if not name.endswith(".json") or name.startswith("."):
+                    if not re.fullmatch(r"[A-Za-z0-9_-]+\.json", name):
                         continue
                     with self._lock:
                         if name in self._inflight:
@@ -266,7 +275,10 @@ class ModelRelay:
         for attempt in range(len(_RETRY_WAITS) + 1):
             t0 = time.time()
             try:
-                text, usage = self._call(messages, max_tokens)
+                if self._call_request is not None:
+                    turn, usage = self._call_request(req)
+                else:
+                    text, usage = self._call(messages, max_tokens)
             except Exception as exc:  # noqa: BLE001 - classified below
                 cause, err = cause_of(exc), str(getattr(exc, "message", "") or exc)[:300]
                 if self._record is not None and cause != "refused":
@@ -277,14 +289,21 @@ class ModelRelay:
                 break
             usage = dict(usage or {})
             cost = self._price(usage)
+            relay_error = str(turn.get("relay_error") or "") if self._call_request is not None else ""
             if self._record is not None:
-                self._record(usage, int((time.time() - t0) * 1000), None)
+                self._record(usage, int((time.time() - t0) * 1000), "model" if relay_error else None)
             with self._lock:
                 self.stats.calls += 1
                 self.stats.input_tokens += int(usage.get("prompt_tokens") or 0)
                 self.stats.output_tokens += int(usage.get("completion_tokens") or 0)
                 self.stats.cost_usd += float(cost or 0)
+                if relay_error:
+                    self.stats.failed += 1
             keep = {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "model") if k in usage}
+            if relay_error:
+                return {"error": relay_error, "kind": "model", "usage": keep, "cost_usd": cost}
+            if self._call_request is not None:
+                return {"turn": turn, "usage": keep, "cost_usd": cost}
             return {"text": text, "usage": keep, "cost_usd": cost}
         with self._lock:
             self.stats.failed += 1

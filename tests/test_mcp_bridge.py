@@ -128,7 +128,7 @@ def test_invalid_arguments_are_rejected_before_a_job(registry, args):
     {"image": "docker://ghcr.io/example/mcp-table-check:1.2.3"},
     {"tools_sha256": "b" * 64}, {"tools_file": "../tools.json"},
     {"tools_file": "/tmp/tools.json"}, {"entrypoint": "server; touch nope"},
-    {"runs_on": "gpu:scgpt"}, {"runs_on": "inprocess"},
+    {"runs_on": "gpu:arbitrary"}, {"runs_on": "inprocess:arbitrary"},
     {"resources": {"other": [1, 1, "00:01:00"]}},
     {"resources": {"check": [True, 1, "00:01:00"]}},
     {"aliases": []}, {"aliases": {"check": "bad;name"}}, {"aliases": {"other": "unused"}},

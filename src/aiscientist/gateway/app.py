@@ -28,6 +28,7 @@ from starlette.background import BackgroundTask
 
 from ..core.config import load_project_env
 from .dataset_limits import MAX_BOUND_DATASETS as _MAX_BOUND_DATASETS
+from .. import literature_contract
 from . import cluster_models, gpu, vllm_client
 from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
 from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
@@ -6266,6 +6267,146 @@ def _live_llm_args(conn: "Connection") -> dict[str, Any]:
     return {"llm_base_url": f"http://{alloc.node}:{alloc.port}/v1", "model": conn.selected_model}
 
 
+def _mcp_session_model(conn: "Connection") -> Any:
+    """Use the selected session model; keep saved provider keys on the gateway."""
+    from ..agents.mcp_model import ModelBinding
+    cred = _bound_credential(conn)
+    if cred is not None or os.environ.get("AISCIENTIST_LLM_BASE_URL"):
+        return _mcp_relay_binding(conn, cred)
+    live = _live_llm_args(conn)
+    if not live:
+        return None
+    return ModelBinding(endpoint=live["llm_base_url"], model=live["model"])
+
+
+def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
+    """One MCP job's metered full-chat relay, including native Claude tool calls.
+
+    Only the selected Scientist model is bound. No provider key, proxy bearer,
+    or user endpoint is placed in the HPC job's environment or result files.
+    """
+    import hashlib
+    from ..agents.mcp_model import RelayBinding
+    from ..agents.mcp_relay_worker import validate_request
+    from . import anthropic_client, llm_credentials, llm_pricing, llm_providers, llm_relay
+
+    shared = cred is not None and cred.get("builtin") == "shared"
+    model = str(cred.get("model") or (shared_llm.SharedLLMSettings().served_name if shared else "")) \
+        if cred is not None else str(os.environ.get("AISCIENTIST_LLM_MODEL") or "")
+    if not model:
+        raise ValueError("The selected model has no configured model identifier")
+    base = str(cred.get("base_url") or "") if cred is not None \
+        else str(os.environ.get("AISCIENTIST_LLM_BASE_URL") or "")
+    native = cred is not None and llm_providers.transport_for(cred.get("provider"), base) == "anthropic"
+    priced = shared or llm_pricing.rates_for(model) is not None
+    remote = not shared and (native or _endpoint_is_off_host(base))
+    label = str((cred or {}).get("label") or (cred or {}).get("provider") or "configured API")
+    identity = hashlib.sha256(json.dumps({
+        "credential_id": (cred or {}).get("id", ""), "provider": (cred or {}).get("provider", "openai"),
+        "base_url": base, "model": model, "shared": shared,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    # Relay threads do not inherit ContextVars. Retain this run's billing, stop
+    # event and consent context even when another chat starts on the connection.
+    context = contextvars.copy_context()
+    bound_run = getattr(conn, "active_run", None)
+    cancelled = conn.chat_stop.is_set
+
+    def start(relay_dir: str, max_cost_usd: float | None = None):
+        cap = CORPUS_SCAN_MAX_COST_USD
+        if max_cost_usd is not None:
+            if type(max_cost_usd) not in (int, float) or not 0 < max_cost_usd < float("inf"):
+                raise ValueError("MCP model cost limit must be positive and finite")
+            if not priced:
+                raise ValueError("The selected model has no configured price; a cost limit cannot be estimated")
+            cap = min(cap, max_cost_usd)
+        if not hasattr(conn.executor, "open_sftp"):
+            raise ValueError("The MCP model relay needs an active HPC3 file-transfer connection")
+        if cred is not None and not shared:
+            target = llm_credentials.call_target(conn.owner, cred["id"])
+            if not target or not target[1]:
+                raise GatewayError("The selected API credential is unavailable; reconnect that endpoint.",
+                                   stage="llm_credential")
+            send_base, api_key = target
+        else:
+            send_base, api_key = base, os.environ.get("AISCIENTIST_LLM_API_KEY") or ""
+        key_use = _key_use(conn, cred) if cred is not None and not shared else None
+
+        def chat(request: dict) -> tuple[dict, dict]:
+            request = validate_request(request, model)
+            if cancelled():
+                raise GatewayError("The MCP run was stopped.", stage="shared_llm_stopped")
+            if remote:
+                _guard_lab_payload([{"content": json.dumps(message, ensure_ascii=False)}
+                                    for message in request["messages"]])
+            if key_use is not None:
+                key_use.before_call()
+            if native:
+                out = anthropic_client.relay_chat(model, request, api_key=api_key, base_url=send_base)
+            elif shared:
+                def call_shared(binding, url):
+                    if binding.model != model:
+                        raise GatewayError("The selected shared model changed; start a new run.", stage="shared_llm")
+                    return vllm_client.relay_chat(model, request, base_url=url, api_key=binding.api_key)
+                out = _shared_call(conn, call_shared)
+            else:
+                out = vllm_client.relay_chat(model, request, base_url=send_base, api_key=api_key)
+            usage = out.pop("usage", {}) or {}
+            return out, usage
+
+        def record(usage, duration_ms, error_type):
+            _record_lab_usage(conn, key_use=key_use, bound_run=bound_run, role="mcp_model", model=model,
+                              endpoint=f"{model} @ {label}", remote=remote, usage=usage,
+                              provider="anthropic" if native else ("shared" if shared else "openai"),
+                              max_tokens=None, duration_ms=duration_ms, error_type=error_type)
+
+        def price(usage):
+            if shared:
+                return 0.0
+            if usage.get("cost") is not None:
+                try:
+                    cost = float(usage["cost"])
+                    if 0 <= cost < float("inf"):
+                        return cost
+                except (TypeError, ValueError):
+                    pass
+            read = int(usage.get("cache_read_input_tokens") or 0)
+            write = int(usage.get("cache_creation_input_tokens") or 0)
+            write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+            return llm_pricing.estimate(str(usage.get("model") or model),
+                input_tokens=int(usage.get("input_tokens") if "input_tokens" in usage
+                                 else max(0, int(usage.get("prompt_tokens") or 0) - read - write)),
+                output_tokens=int(usage.get("completion_tokens") or 0),
+                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
+                cache_read_tokens=read)
+
+        class GuardedRelay(llm_relay.ModelRelay):
+            def stop(self, timeout=30.0):
+                try:
+                    return super().stop(timeout)
+                finally:
+                    if key_use is not None:
+                        key_use.close()
+
+        relay = GuardedRelay(
+            lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, None,
+            call_request=lambda request: context.copy().run(chat, request),
+            record=lambda *args: context.copy().run(record, *args), price=price,
+            max_cost_usd=None if shared else cap,
+            concurrency=1, poll_s=0.2, should_stop=cancelled)
+        if native:
+            conn.emit("info", "mcp", f"MCP model calls use your selected {model} through the gateway, "
+                      "with per-call usage and budget checks. Claude uses its supported sampling "
+                      "defaults; requests for thinking off use low effort.")
+        try:
+            return relay.start()
+        except Exception:
+            if key_use is not None:
+                key_use.close()
+            raise
+
+    return RelayBinding(model=model, start=start, priced=priced, identity=identity)
+
+
 class _NoServedModelExecutor:
     """The literature line of a session with no served model (the user's own API key). A tool whose
     HPC3 job calls the served model (manifest ``served_model``) answers ``dependency_missing`` at once
@@ -9300,46 +9441,77 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
             conn.end_run(current)
 
 
+def _quickchat_literature_route(conn: Connection, req: LabRequest) -> tuple[Any, str]:
+    """Ask only the ready selected model; a classifier never provisions compute."""
+    from ..agents import request_router
+    complete = None
+    if _model_ready(conn):
+        try:
+            selected = _lab_llm(conn).complete_fn
+            complete = lambda messages: selected(messages, role="classify")  # noqa: E731
+        except Exception:  # the guarded deterministic fallback leaves plain chat available
+            complete = None
+    names = [str(item.get("name") or "") for item in _select_bound_datasets(req)]
+    return request_router.route_quickchat_literature(complete, req.question, data=names, history=req.history or [])
+
+
 async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # Axis B, checked FIRST: the fast path is a different engine, not a lab variant. In particular it
     # must skip the follow-up router below — that router only knows three intents, all of which
     # ("edit the report", "re-run a step", "new study") are research-path outcomes, so letting a chat
     # message reach it would route a question into a report edit.
+    chat_literature_route = None
+    chat_literature_handoff = False
     if _fast_path(req):
-        if corpus_scan.asks_for_gene_list(req.question):
-            # "What are haploinsufficient genes?": the complete answer is the corpus scan's table,
-            # and a kept scan of this corpus answers it at once, whatever model the session uses.
-            stored = await asyncio.to_thread(_stored_corpus_scan, conn)
-            if stored is not None:
-                await _run_corpus_scan(conn, req, stored=stored)
+        from .literature_mcp import registered_server
+        native_literature = registered_server() is not None
+        if native_literature:
+            candidate, question = await asyncio.to_thread(_quickchat_literature_route, conn, req)
+            run = conn._context_run() or conn.active_run
+            if run is not None and run.chat_stop.is_set():
+                conn.push({"type": "chat_stopped"})
                 return
-            if await asyncio.to_thread(_literature_corpus_available, conn):
-                await _run_gene_table(conn, req)
-                return
-            if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
-                conn.push({"type": "lab_progress", "level": "info", "text": (
-                    "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
-                    "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
-                    "about the RetiGene papers by name for the complete table.")})
-        await _run_quick_chat(conn, req)
-        return
+            if candidate.literature:
+                chat_literature_route = candidate
+                chat_literature_handoff = True
+                req = req.model_copy(update={"route": "auto", "question": question})
+                conn.emit("info", "route", "This chat question needs published evidence; continuing with "
+                          "the literature plan and this session's selected model.")
+        if not chat_literature_handoff:
+            if not native_literature and corpus_scan.asks_for_gene_list(req.question):
+                # "What are haploinsufficient genes?": the complete answer is the corpus scan's table,
+                # and a kept scan of this corpus answers it at once, whatever model the session uses.
+                stored = await asyncio.to_thread(_stored_corpus_scan, conn)
+                if stored is not None:
+                    await _run_corpus_scan(conn, req, stored=stored)
+                    return
+                if await asyncio.to_thread(_literature_corpus_available, conn):
+                    await _run_gene_table(conn, req)
+                    return
+                if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
+                    conn.push({"type": "lab_progress", "level": "info", "text": (
+                        "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
+                        "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
+                        "about the RetiGene papers by name for the complete table.")})
+            await _run_quick_chat(conn, req)
+            return
     if _corpus_path(req):
         await _run_corpus_scan(conn, req)
         return
     # The chat's last analysis stopped part-way (an error, Stop, a restart): a message that carries on
     # picks it up where it stopped, with its question and approved plan; any other message goes on
     # below as it would have.
-    stopped = _stopped_run_target(conn, req)
+    stopped = None if chat_literature_handoff else _stopped_run_target(conn, req)
     if stopped is not None:
         s_run_id, s_art, s_state, s_resume = stopped
         if await _carries_on_stopped_run(conn, req, s_state, s_resume.from_step_index + 1,
                                          len(s_state.get("agenda") or [])):
             await _resume_stopped_run(conn, req, s_run_id, s_art, s_state)
             return
-    target = _followup_target(conn, req)
+    target = None if chat_literature_handoff else _followup_target(conn, req)
     # Nothing to attach a follow-up to, so this message would mint a FRESH run. Refuse to do that for
     # a bare conversational turn (see _CONVERSATIONAL_TURN) — say so and wait.
-    if target is None and await asyncio.to_thread(_starts_no_study, conn, req):
+    if not chat_literature_handoff and target is None and await asyncio.to_thread(_starts_no_study, conn, req):
         conn.push({"type": "lab_progress",
                    "text": "💬 That reads as a reply, not a request — nothing was started. "
                            "There's no previous run in this chat to answer about (a cancelled "
@@ -9367,6 +9539,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         if handoff is None:
             return
         curation_offered = True
+        chat_literature_route = None  # the user changed the curation plan; route the new request
         req = req.model_copy(update={"question": handoff})
         _next = _begin_routed_run(conn, req.conversation_id)
         _note_budget_choice(_next, req)
@@ -9378,7 +9551,8 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # changed the request again.
     while True:
         prior_request = str(target[2].get("question") or "") if target else ""
-        route = await asyncio.to_thread(_route_request, conn, req, prior_request)
+        route = chat_literature_route or await asyncio.to_thread(_route_request, conn, req, prior_request)
+        chat_literature_route = None
         conn.emit("info", "route", f"Routed to {route.route} ({route.source}, confidence "
                                    f"{route.confidence:.2f}): {route.reason or '-'}")
         if not route.literature:
@@ -9507,7 +9681,10 @@ _RAW_INPUT_TOOLS = re.compile(r"`(?:run_scanpy_qc|run_cellqc|run_doublet_detecti
 
 def _reads_raw_input(step: str) -> bool:
     """A step that works on the input as delivered — QC, ambient correction, doublet removal."""
-    return bool(_RAW_INPUT_TOOLS.search(str(step or "")))
+    from ..agents.tool_names import canonical_tool_name
+    names = re.findall(r"`([A-Za-z_][A-Za-z0-9_-]*)(?:\s*\([^`]*\))?`", str(step or ""))
+    return any(canonical_tool_name(name) in {"run_scanpy_qc", "run_cellqc", "run_doublet_detection"}
+               for name in names)
 
 
 def _plain_step_title(step: str) -> str:
@@ -9671,14 +9848,19 @@ def _watch_llm(run: RunState | None, complete_fn: Callable[..., str],
     if getattr(complete_fn, "_run_watched", False):
         return complete_fn, scientist_chat
 
-    def watched_complete(messages, *, role: str | None = None, max_tokens: int | None = None):
+    def watched_complete(messages, *, role: str | None = None, max_tokens: int | None = None,
+                         usage_out: dict | None = None):
         mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin(role)
         outcome = "failed"
         try:
-            result = (complete_fn(messages, role=role, max_tokens=max_tokens) if max_tokens
-                      else complete_fn(messages, role=role))
+            extra: dict[str, Any] = {}
+            if max_tokens:
+                extra["max_tokens"] = max_tokens
+            if usage_out is not None:
+                extra["usage_out"] = usage_out
+            result = complete_fn(messages, role=role, **extra)
             outcome = "success"
             return result
         except BaseException as exc:
@@ -9737,17 +9919,33 @@ def _corpus_scan_identity(conn: Connection, spec: "dict[str, Any] | None" = None
     HPC3, the scan's rules (the built-in ones, or a task spec's, ``spec``) and its model
     (``corpus_scan.scan_key``). None without the literature line, a live HPC3 session or a corpus
     text cache: nothing is reused or kept then."""
+    from .literature_mcp import registered_server, rules_identity
+    server = registered_server()
     papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not papers
+    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
+    if server is not None:
+        from ..agents.mcp_analysis import setting_values
+        settings = setting_values(server)
+        root = settings.get("LITERATURE_CORPUS_ROOT", "").rstrip("/")
+        papers = settings.get("LITERATURE_PAPERS") or (root + "/papers" if root else "")
+        manifest = settings.get("LITERATURE_MANIFEST") or (root + "/paperqa_manifest.csv" if root else "")
+    if ((server is None and not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC")) or not papers
             or conn.executor is None or conn.mock):
         return None
-    fp = corpus_scan.corpus_fingerprint(conn.executor, papers,
-                                        os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", ""))
+    fp = corpus_scan.corpus_fingerprint(conn.executor, papers, manifest)
     if fp is None:
         return None
-    rules = _tools_api.corpus_scan_rules_digest(spec)
+    rules = rules_identity(server, spec) if server else _tools_api.corpus_scan_rules_digest(spec)
     model = _corpus_scan_model(conn)
-    return corpus_scan.scan_key(fp, rules, model), {"corpus": fp, "rules": rules, "model": model}
+    model_key = model
+    if server is not None:
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            return None
+        model_key = getattr(binding, "identity", "") or json.dumps(
+            {"model": binding.model, "endpoint": getattr(binding, "endpoint", ""),
+             "protocol": getattr(binding, "protocol", "openai")}, sort_keys=True)
+    return corpus_scan.scan_key(fp, rules, model_key), {"corpus": fp, "rules": rules, "model": model}
 
 
 def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
@@ -9768,6 +9966,10 @@ def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
 
 def _corpus_scan_model(conn: Connection) -> str:
     """The model a scan by this session reads with: the session's API model, else the GPU job's."""
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        binding = _mcp_session_model(conn)
+        return str(binding.model if binding is not None else conn.selected_model)
     api = _corpus_scan_api(conn)
     return api["model"] if api else corpus_scan.scan_model(conn.settings)
 
@@ -9892,7 +10094,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
         user = (f"The user's question: {question}\n\nThe current spec:\n"
                 f"{json.dumps(current, indent=1, ensure_ascii=False)}\n\nThe user's note on it: {note}\n\n"
                 + _SPEC_REVISE)
-    messages = [{"role": "system", "content": _tools_api.CORPUS_SCAN_SPEC_SYSTEM}, {"role": "user", "content": user}]
+    messages = [{"role": "system", "content": literature_contract.SPEC_SYSTEM}, {"role": "user", "content": user}]
     why = ""
     for _ in range(2):
         try:
@@ -9901,7 +10103,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
             raise GatewayError(f"the session's model could not be reached ({public_error(exc)})",
                                stage="corpus") from exc
         try:
-            return _tools_api.parse_corpus_scan_spec(raw), model
+            return literature_contract.parse_spec(raw), model
         except ValueError as exc:
             why = str(exc)
             messages = [*messages, {"role": "assistant", "content": str(raw or "")[:8000]},
@@ -9911,7 +10113,7 @@ def _draft_corpus_spec(conn: Connection, question: str, *, current: "dict[str, A
 
 
 def _spec_curation(spec: dict[str, Any]) -> "corpus_scan.Curation":
-    return corpus_scan.curation_for(spec, _tools_api.corpus_scan_spec_folder(spec))
+    return corpus_scan.curation_for(spec, literature_contract.spec_folder(spec))
 
 
 # What one scan on an API model took (2026-10-20, Claude Haiku 5.5 through the relay): 1,531 passages,
@@ -9927,6 +10129,27 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
         day = str(stored.meta.get("stored_at") or "")[:10]
         return (f"at once, from the scan of the RetiGene papers kept{' on ' + day if day else ''} (they have "
                 "not changed since): no job and no model cost")
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        from ..agents.mcp_model import RelayBinding
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            return "the selected session model must be connected before the scan can run"
+        text = (f"with your selected model {binding.model}, through the registered literature MCP; "
+                "retrieval runs as a CPU job on HPC3, with time depending on the queue and passages read")
+        if isinstance(binding, RelayBinding):
+            credential = _bound_credential(conn)
+            if credential is not None and credential.get("builtin") == "shared":
+                return text + "; the lab's shared model has no API credit charge"
+            if not binding.priced:
+                return text + "; scanning is unavailable until the selected model has known pricing for its spending cap"
+            try:
+                cap, why = _corpus_scan_cost_cap(conn)
+            except GatewayError as exc:
+                return text + ". " + exc.message
+            return text + (f"; a pilot first estimates the full scan cost, and subsequent model calls stop at "
+                           f"the ${cap:.2f} cap ({why}); one in-flight call can cross that threshold")
+        return text + "; it uses the session's existing cluster model and no API credit"
     if api:
         from . import llm_pricing
         model = str(api["model"])
@@ -10032,7 +10255,7 @@ async def _revise_curation(conn: Connection, say: Callable[..., None], question:
     from ..agents import request_router
     if _looks_like_spec(note):
         try:
-            spec = _tools_api.parse_corpus_scan_spec(note)
+            spec = literature_contract.parse_spec(note)
         except ValueError as exc:
             say(f"⚠ That spec cannot drive the scan: {exc}. The plan is unchanged.", "warning")
             return curation, drafted_by
@@ -10146,7 +10369,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
 
     art = conn.workspace / run_id / "artifacts"
     api = _corpus_scan_api(conn)
-    model = api["model"] if api else corpus_scan.scan_model(conn.settings)
+    model = _corpus_scan_model(conn)
     question = str(req.question or "").strip()
     recorded = False
     cur, drafted_by = corpus_scan.HAPLOINSUFFICIENCY, ""
@@ -10261,6 +10484,87 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
         conn.end_run(run)
 
 
+async def _build_literature_mcp_route(conn: Connection, run: RunState, run_id: str,
+                                    emit: Callable[..., None]) -> Any:
+    """One registered literature executor and context per console run."""
+    from .literature_mcp import build_literature_route, registered_server
+    if registered_server() is None:
+        return None
+    if getattr(run, "literature_mcp_ready", False):
+        return getattr(run, "literature_mcp", None)
+    from ..agents.research_harness import HarnessContext
+    art = conn.workspace / run_id / "artifacts"
+    executor = await _build_code_executor(conn, run, run_id, {}, art, emit)
+    run.literature_mcp = build_literature_route(executor, art, should_cancel=run.chat_stop.is_set)
+    run.literature_mcp_context = HarnessContext(
+        decisions={}, workspace=conn.workspace / run_id, model=conn.selected_model,
+        llm_is_remote=bool(_corpus_scan_api(conn)), read_roots=_tool_read_roots(conn))
+    run.literature_mcp_ready = True
+    return run.literature_mcp
+
+
+async def _corpus_scan_via_mcp(conn: Connection, run: RunState, run_id: str,
+                              ident: "tuple[str, dict[str, Any]] | None",
+                              say: Callable[..., None], emit: Callable[..., None],
+                              curation: "corpus_scan.Curation") -> "dict[str, Any] | None":
+    """Run the registered image with this session's selected, guarded model."""
+    key = ident[0] if ident else ""
+    if key and key in _CORPUS_SCANS_RUNNING:
+        raise GatewayError("A scan of this corpus with the selected model is already running "
+                           f"(run {_CORPUS_SCANS_RUNNING[key]}).", stage="corpus")
+    if key:
+        _CORPUS_SCANS_RUNNING[key] = run_id
+    try:
+        route = await _build_literature_mcp_route(conn, run, run_id, emit)
+        if route is None:
+            raise GatewayError("The registered literature MCP needs its pinned image and an available "
+                               "HPC3 executor for this run.", stage="corpus")
+        binding = _mcp_session_model(conn)
+        if binding is None:
+            raise GatewayError("The selected session model is unavailable; reconnect it before scanning.",
+                               stage="corpus")
+        from ..agents.mcp_model import RelayBinding
+        args = _corpus_scan_args(curation)
+        model = binding.model
+        cap_words = ""
+        if isinstance(binding, RelayBinding):
+            credential = _bound_credential(conn)
+            shared = credential is not None and credential.get("builtin") == "shared"
+            if not shared:
+                if not binding.priced:
+                    raise GatewayError("The selected model has no known price, so the corpus scan's "
+                                       "cost ceiling cannot be enforced.", stage="corpus")
+                cap, why = _corpus_scan_cost_cap(conn)
+                args["max_cost_usd"] = cap
+                cap_words = f" The pilot estimates total cost first; the spending cap is ${cap:.2f} ({why})."
+        say(f"📚 Scanning the RetiGene papers for {_curation_what(curation)} with your selected model "
+            f"**{model}**, through the registered literature MCP on HPC3." + cap_words)
+        emit("step", "corpus", f"Registered literature MCP: {CORPUS_TOOL}, selected model {model}.")
+        result = await asyncio.to_thread(route.run_tool, CORPUS_TOOL, args, run.literature_mcp_context)
+        if result.get("model_unreachable") and not run.chat_stop.is_set():
+            say("⚠ The selected model stopped answering; retrying once from the saved scan judgments.", "warning")
+            result = await asyncio.to_thread(route.run_tool, CORPUS_TOOL, args, run.literature_mcp_context)
+        if run.chat_stop.is_set() or result.get("status") == "cancelled":
+            conn.push({"type": "chat_stopped"})
+            return None
+        usage = result.get("api_usage") or {}
+        cost = usage.get("cost_usd")
+        spent = f" Measured model cost: ${cost:.4f}." if isinstance(cost, (int, float)) else ""
+        if result.get("status") != "ok":
+            raise GatewayError("The RetiGene corpus scan did not finish: "
+                               + str(result.get("error") or result.get("status")) + spent,
+                               stage="corpus", detail=json.dumps(result, default=str)[:2000])
+        if usage:
+            result["api_usage"] = {"model": model, **usage}
+        await asyncio.to_thread(route.stage_scan_tables, result, curation.subdir)
+        await _keep_corpus_scan(conn, run_id, result, emit, curation)
+        return result
+    finally:
+        if key and _CORPUS_SCANS_RUNNING.get(key) == run_id:
+            _CORPUS_SCANS_RUNNING.pop(key, None)
+        _push_usage(conn, run, run.conversation_id, run_id)
+
+
 async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
                                   ident: "tuple[str, dict[str, Any]] | None",
                                   say: Callable[..., None], emit: Callable[..., None],
@@ -10269,6 +10573,9 @@ async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
     """Run the scan as one job with its own GPU and model, keep its tables, and return its result
     (None when the user stopped it). ``curation``: what it collects; a task spec's goes to the tool
     as its ``spec``. Raises ``GatewayError`` when it cannot run or does not finish."""
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        return await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, curation)
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
@@ -10422,6 +10729,64 @@ def _corpus_scan_cost_cap(conn: Connection) -> tuple[float, str]:
     return cap, why
 
 
+def _relay_usage_price(model: str, usage: dict[str, Any]) -> "float | None":
+    """USD for one relayed reply: the provider's own figure when it gives one, else the price table
+    for its tokens (cache reads and writes apart)."""
+    from . import llm_pricing
+    if usage.get("cost") is not None:                          # the provider's own figure
+        try:
+            return float(usage["cost"])
+        except (TypeError, ValueError):
+            pass
+    read = int(usage.get("cache_read_input_tokens") or 0)
+    write = int(usage.get("cache_creation_input_tokens") or 0)
+    write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+    uncached = int(usage.get("input_tokens") if "input_tokens" in usage
+                   else max(0, int(usage.get("prompt_tokens") or 0) - read - write))
+    return llm_pricing.estimate(str(usage.get("model") or model), input_tokens=uncached,
+                                output_tokens=int(usage.get("completion_tokens") or 0),
+                                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
+                                cache_read_tokens=read)
+
+
+def _retigene_relay_binding(conn: Connection) -> Any:
+    """The session's model as an MCP server's relayed calls read with it (``mcp_model_relay.Binding``):
+    its lab-role completion, its name and prices, and on a user's own key the spending cap (what is left
+    of their budget, as for the corpus scan) and the spike allowance. Raises ``GatewayError`` when the
+    session has no model ready (a cold GPU session is not woken for this) or no budget left."""
+    from . import llm_pricing, mcp_model_relay
+    if not _model_ready(conn):
+        raise GatewayError(
+            "This session's model is not running, so the curation has no model to read with. Start the "
+            "session's model, or choose your API key or the shared model for this session, and ask again.",
+            stage="mcp_relay")
+    llm = _lab_llm(conn)
+    cred = _bound_credential(conn)
+    metered = cred is not None and not cred.get("builtin")
+    if not metered:                                   # the lab's shared model, or the session's GPU: free
+        return mcp_model_relay.Binding(complete=llm.complete_fn, model=str(llm.model), metered=False)
+    model = str(cred.get("lab_model") or cred.get("model") or llm.model)
+    cap, _why = _corpus_scan_cost_cap(conn)
+    rates = llm_pricing.rates_for(model) or {}
+    return mcp_model_relay.Binding(
+        complete=llm.complete_fn, model=model, metered=True,
+        rates=(float(rates.get("input") or 0), float(rates.get("output") or 0)), cap=cap,
+        price=lambda usage: _relay_usage_price(model, usage),
+        allowance=lambda usd: _key_use(conn, cred, allowance_usd=usd, allowance_calls=_CORPUS_SPIKE_CALLS))
+
+
+def _mcp_model_relay(conn: Connection, run: "RunState | None", work_dir: str) -> Any:
+    """The executor's ``model_relay`` for this run's MCP calls (``mcp_model_relay.SessionModelRelay``),
+    or None when the session has no SFTP channel to answer through."""
+    if conn.executor is None or not hasattr(conn.executor, "open_sftp") or not work_dir:
+        return None
+    from . import llm_relay, mcp_model_relay
+    stop = run.chat_stop.is_set if run is not None else conn.chat_stop.is_set
+    return mcp_model_relay.SessionModelRelay(
+        lambda: _retigene_relay_binding(conn), lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), work_dir,
+        should_stop=stop, log=lambda s: print(f"[mcp-relay] {s}"))
+
+
 async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
                                  ident: "tuple[str, dict[str, Any]] | None",
                                  say: Callable[..., None], emit: Callable[..., None],
@@ -10433,13 +10798,16 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
     made with the user's key, recorded against the user's usage and capped by the budget left. The
     job reads about 1% of the passages first (the tool's pilot) and stops if they fail or if their
     cost projects past the cap. Returns the result (None when stopped); raises ``GatewayError``."""
+    from .literature_mcp import registered_server
+    if registered_server() is not None:
+        return await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, curation)
     key = ident[0] if ident else ""
     if key and key in _CORPUS_SCANS_RUNNING:
         raise GatewayError(
             f"A scan of the RetiGene corpus with this model is already running (run {_CORPUS_SCANS_RUNNING[key]}). "
             "Its tables are kept when it finishes: ask again then.", stage="corpus")
     cap, cap_why = _corpus_scan_cost_cap(conn)
-    from . import anthropic_client, auth_routes, llm_credentials, llm_pricing, llm_relay
+    from . import anthropic_client, auth_routes, llm_credentials, llm_relay
     cred, model, base_url, native = api["cred"], api["model"], api["base_url"], api["native_anthropic"]
     target = llm_credentials.call_target(conn.owner, cred["id"])
     if not target:
@@ -10478,20 +10846,7 @@ async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
                                        max_tokens=max_tokens)
 
     def price(usage: dict[str, Any]) -> "float | None":
-        if usage.get("cost") is not None:                      # the provider's own figure
-            try:
-                return float(usage["cost"])
-            except (TypeError, ValueError):
-                pass
-        read = int(usage.get("cache_read_input_tokens") or 0)
-        write = int(usage.get("cache_creation_input_tokens") or 0)
-        write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
-        uncached = int(usage.get("input_tokens") if "input_tokens" in usage
-                       else max(0, int(usage.get("prompt_tokens") or 0) - read - write))
-        return llm_pricing.estimate(str(usage.get("model") or model), input_tokens=uncached,
-                                    output_tokens=int(usage.get("completion_tokens") or 0),
-                                    cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
-                                    cache_read_tokens=read)
+        return _relay_usage_price(model, usage)
 
     pushed = {"n": 0}
 
@@ -11053,10 +11408,13 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             key_use = _key_use(conn, cred)
         emit("step", "chat", f"Fast chat turn (model: {model}).")
 
+        from .literature_mcp import registered_server
+        native_literature = registered_server() is not None
         tools = build_quickchat_catalog(
-            literature_executor=_build_literature_executor(conn), served_model=conn.alloc is not None)
+            literature_executor=None if native_literature else _build_literature_executor(conn),
+            served_model=conn.alloc is not None, exclude_literature=native_literature)
         from .local_corpus import has_local_index
-        if has_local_index():
+        if not native_literature and has_local_index():
             corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
             if corpus is not None:
                 tools = [t for t in tools if t.name != "search_corpus"] + [corpus[0]]
@@ -11212,6 +11570,13 @@ def _literature_corpus_on_hpc(conn: Connection) -> bool:
     """Whether this session reaches the corpus on HPC3: the literature line is set up for HPC3 and
     the session has a live HPC3 connection (what ``_build_literature_executor`` and the corpus scan
     need). Cheap, so the event loop may call it."""
+    from .literature_mcp import registered_server
+    server = registered_server()
+    if server is not None:
+        from ..agents.mcp_analysis import setting_values
+        values = setting_values(server)
+        return bool((values.get("LITERATURE_CORPUS_ROOT") or values.get("LITERATURE_PAPERS"))
+                    and conn.executor is not None and not conn.mock)
     return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
                 and conn.executor is not None and not conn.mock)
 
@@ -11234,6 +11599,20 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
     from ..agents.research_harness import HarnessContext
     from ..agents import literature_answer as lit
     from .local_corpus import make_local_tool, stale
+    from .literature_mcp import registered_server
+    registered = registered_server() is not None
+    run = getattr(conn, "active_run", None)
+    route = getattr(run, "literature_mcp", None)
+
+    def remote(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
+        if route is not None:
+            return route.run_tool(lit.CORPUS_TOOL, {"analysis_id": "corpus", **args}, ctx)
+        if registered:
+            return {"status": "error", "error": "The registered literature MCP is unavailable in this run"}
+        executor = _build_literature_executor(conn)
+        if executor is not None:
+            return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
+        return {"status": "error", "error": "The RetiGene corpus copy could not be searched and HPC3 is unavailable"}
     local = make_local_tool()
     if local is not None:
         local_run = local.executor
@@ -11244,17 +11623,22 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
             out = None if stale(None if conn.mock else conn.executor) else local_run(args, ctx)
             if out is not None:
                 return out
-            executor = _build_literature_executor(conn)
-            if executor is not None:
-                return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
-            return {"status": "error", "error": "The RetiGene corpus copy on this server could not be "
-                                                "searched, and HPC3 is not reachable from this session."}
+            return remote(args, ctx)
 
         from dataclasses import replace
         local = replace(local, executor=retrieve)
         ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
                              tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
+        ctx.should_cancel = run.chat_stop.is_set if run is not None else (lambda: False)
         return local, ctx
+    if registered:
+        if route is None:
+            return None
+        from dataclasses import replace
+        tool = route.tools.get(lit.CORPUS_TOOL)
+        if tool is None:
+            return None
+        return replace(tool, name=lit.CORPUS_TOOL, executor=remote), run.literature_mcp_context
     try:
         executor = _build_literature_executor(conn)
     except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
@@ -11317,7 +11701,14 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
             run.monitor.observe({"type": "tool_start", "tool": lit.TOOL})
         conn.push({"type": "run_status", "text": f"🔎 PubMed: {query}"})
         conn.push({"type": "chat_thinking", "token": f"→ {lit.TOOL}({json.dumps({'query': query})})\n"})
-        out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
+        from .literature_mcp import registered_server
+        if registered_server() is not None:
+            route = getattr(run, "literature_mcp", None)
+            out = (route.run_tool(lit.TOOL, {"query": query, "limit": limit, "abstracts": True,
+                                          "pubmed_only": True, "analysis_id": "pubmed"}, run.literature_mcp_context)
+                   if route is not None else {"status": "error", "error": "The registered literature MCP is unavailable"})
+        else:
+            out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
         ok = isinstance(out, dict) and out.get("status") == "ok"
         n = len(out.get("results") or []) if ok else 0
         if run.monitor is not None:
@@ -11522,6 +11913,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
             except Exception as exc:  # noqa: BLE001 - history is best-effort
                 print(f"[auth] record_run_start failed: {exc}")
         _watch_stage(run, "literature")
+        await _build_literature_mcp_route(conn, run, run_id, emit)
         llm = _lab_llm(conn)
         complete_fn, _scientist = _watch_llm(run, llm.complete_fn, llm.scientist_chat)
         emit("step", "literature", f"Literature search (model: {llm.model})."
@@ -11530,7 +11922,7 @@ async def _run_literature(conn: Connection, req: LabRequest, route: Any = None, 
         conn.push({"type": "run_status", "text": "🔎 Writing the search queries…"})
         queries, terms = await asyncio.to_thread(
             lit.plan_search, lambda m: complete_fn(m, role="classify"), question,
-            fallback=_tools_api.focus_literature_query)
+            fallback=literature_contract.focus_literature_query)
         if not pubmed:
             queries = []                          # the corpus is searched with the question and the words
         emit("info", "literature", ("Queries: " + "; ".join(queries) + ". " if queries else "")
@@ -12239,7 +12631,8 @@ def _other_endpoints() -> str:
     return "the cluster GPU or an API key" if _session_gpu_mode() == "all" else "your own API key"
 
 
-def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -> None:
+def _record_lab_usage(conn: Connection, *, key_use: Any = None,
+                      bound_run: RunState | None = None, **fields: Any) -> None:
     """Record one lab-role completion against the connection's ACTIVE run.
 
     The run_id is read at call time, not captured when ``_lab_llm`` bound the endpoint: a run mints
@@ -12252,7 +12645,7 @@ def _record_lab_usage(conn: Connection, *, key_use: Any = None, **fields: Any) -
         # Read the connection defensively and INSIDE the guard: this runs on every completion, and
         # the promise above (accounting never breaks a run) is only true if reading the run id
         # cannot raise either. Offline harnesses pass a stand-in connection with neither attribute.
-        active = getattr(conn, "active_run", None)
+        active = bound_run if bound_run is not None else getattr(conn, "active_run", None)
         billed = _USAGE_RUN.get()
         if billed:
             active = None      # the report of a finished run: not the run this session has open
@@ -12608,11 +13001,14 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         """One call to the shared model for a session on it: no other model to fall back on."""
         return _shared_call(conn, call)
 
-    def complete_fn(messages, *, role: str | None = None, max_tokens: int | None = None):
+    def complete_fn(messages, *, role: str | None = None, max_tokens: int | None = None,
+                    usage_out: dict | None = None):
         """One lab-role completion. ``max_tokens``: the caller's own output ceiling, which replaces
         the role's on a metered endpoint (a relayed prompt from an HPC3 job carries the ceiling its
         tool needs; a curation reading runs to ~7k tokens, over the 4096 of a short role). Bounded
-        to 256..64000. The shared model and the cluster's GPU get no ceiling either way."""
+        to 256..64000. The shared model and the cluster's GPU get no ceiling either way.
+        ``usage_out``: filled with the call's usage (tokens, and the model's name), for a caller that
+        prices the reply itself (``mcp_model_relay``); the call is recorded here either way."""
         if shared_endpoint:
             started = time.monotonic()
             b_used: list = []
@@ -12634,6 +13030,8 @@ def _lab_llm(conn: Connection) -> "LabLLM":
             _record_lab_usage(conn, key_use=key_use, role=role or "reason", model=b_used[0].model, endpoint=b_used[0].label,
                               remote=False, usage=usage, max_tokens=None, provider="shared",
                               duration_ms=int((time.monotonic() - started) * 1000))
+            if usage_out is not None:
+                usage_out.update(dict(usage or {}), model=b_used[0].model)
             return text
         # A remote endpoint has no tunnel to heal, so it skips the recovery wrap. Keyed on
         # lab_base_url being set rather than on it differing from base_url: with a saved
@@ -12705,6 +13103,8 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         _record_lab_usage(conn, key_use=key_use, role=role or "reason", model=lab_model, endpoint=lab_label,
                           remote=lab_remote, usage=usage, max_tokens=cap, provider=lab_provider,
                           duration_ms=int((time.monotonic() - started) * 1000))
+        if usage_out is not None:
+            usage_out.update(dict(usage or {}), model=lab_model)
         return text
 
     def scientist_chat(messages, tools):
@@ -13631,6 +14031,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         emit("warning", "lab", f"run_code-on-HPC3 workspace setup failed ({exc}); "
                                "run_code uses the local sandbox this run.")
         return sandbox
+    rc_work = os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work"
     code_executor: Any = SlurmCodeExecutor(
         remote=conn.executor,
         container_image=st.analysis_image,
@@ -13641,7 +14042,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         # The server file a per-session copy above was made from (None for an HPC3 upload).
         dataset_source=(decisions.get("server_primary") if not os.environ.get("AISCIENTIST_HPC_DATASET")
                         and rc_remote_ds == decisions.get("hpc_primary") else None),
-        work_dir=os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work",
+        work_dir=rc_work,
         artifacts_dir=os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{rc_remote_ws}/artifacts",
         local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
         # dfs3b scratch, OFF $HOME — Slurm does not expand $HOME in #SBATCH --output, which
@@ -13651,6 +14052,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         account=st.cpu_account or "", time_limit=st.run_code_time_limit,
         container_module=st.container_module, container_bin=st.container_bin,
         # None with accounts on: a failed job is then a failed call, never a run on this host.
+        gpu_partition=st.partition, gpu_account=st.account or "", gpu_gres=st.scgpt_gres,
         local_fallback=sandbox, job_store=job_store, owner=owner,
         should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight run_code job
         # The lab-SHARED package cache: a snippet can import anything a member has
@@ -13666,7 +14068,11 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         tool_cache_dir=_tool_cache_dir(conn),
         notify=lambda level, message: emit(level, "lab", message),
         inputs=tuple(rc_inputs),
+        # An MCP server that reads with a model (retigene-rag's curation) reads with this session's,
+        # its prompts answered from here (mcp_model_relay).
+        model_relay=_mcp_model_relay(conn, run, rc_work),
     )
+    code_executor.mcp_model_binding = lambda: _mcp_session_model(conn)
     emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
     # Resolve a snippet's missing imports BEFORE it runs, in one confirmation, rather
     # than letting it die on ModuleNotFoundError mid-step. Transparent when nothing is
@@ -14945,6 +15351,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             elif not _detected:
                 _vlog("info", f"Variant assembly: build not detectable from the VCF header; using the "
                               f"configured default {_assembly}.")
+        decisions["mcp_variant_assembly"] = "GRCh37" if _assembly.lower() in ("grch37", "hg19") else "GRCh38"
         _grch37 = _assembly.lower() in ("grch37", "hg19")
         _cache_dir = st.vep_cache_dir_grch37 if _grch37 else st.vep_cache_dir_grch38
         _clinvar = st.vep_clinvar_grch37 if _grch37 else st.vep_clinvar_grch38
@@ -16904,12 +17311,13 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
     This is separate from _QC_TOOLS: a later doublet step must not replace the overall CellQC
     outcome, per-library QC or warnings. Predictions alone never establish a removed count.
     """
+    from ..agents.tool_names import canonical_tool_name
     chosen = None
     for rnd in reversed(list(getattr(result, "rounds", None) or [])):
         accepted = _round_field(_round_field(rnd, "verdict"), "verdict") == "accept"
         steps = (_round_field(rnd, "scientist_result") or {}).get("steps") or []
         for step in reversed(steps):
-            if not isinstance(step, dict) or step.get("tool") != "run_doublet_detection" \
+            if not isinstance(step, dict) or canonical_tool_name(step.get("tool")) != "run_doublet_detection" \
                     or step.get("ok") is False:
                 continue
             record = step.get("result")
@@ -16925,13 +17333,13 @@ def _standalone_doublet_lines(result: Any) -> list[str]:
             else:
                 continue
             if chosen is None or accepted:
-                chosen = removed
+                chosen = (removed, str(step["tool"]))
             break
         else:
             continue
         if accepted:
             break
-    return [f"run_doublet_detection: Doublets removed: {chosen:,}."] if chosen is not None else []
+    return [f"{chosen[1]}: Doublets removed: {chosen[0]:,}."] if chosen is not None else []
 
 
 def _removal_stated(body: str, line: str) -> bool:
@@ -17141,7 +17549,8 @@ def _brief_scope_line(scope: Any, ran: "list[str]", qc_only: bool) -> str:
     ran only run_cellqc, and its report said "As requested (only run_cellqc, run_scanpy_qc,
     run_doublet_detection)"."""
     from ..agents.scope import NOT_AN_ANALYSIS, QC_ONLY_TOOLS
-    keep = [str(t) for t in (getattr(scope, "keep", None) or ())]
+    from ..agents.tool_names import canonical_tool_name
+    keep = [canonical_tool_name(t) for t in (getattr(scope, "keep", None) or ())]
     tools = ", ".join(f"`{t}`" for t in ran)
     if qc_only:
         asked = (any(t in QC_ONLY_TOOLS for t in keep)
@@ -17198,7 +17607,8 @@ def _build_brief_report(art: Path, question: str, result: Any, scope: Any = None
     by_code = _code_wrote_outputs(result)
     if answer and by_code:
         return _analysis_brief_md(answer, art, question, result)
-    ran = [t for t in _tools_that_ran(result) if t not in NOT_AN_ANALYSIS]
+    from ..agents.tool_names import canonical_tool_name
+    ran = [t for t in _tools_that_ran(result) if canonical_tool_name(t) not in NOT_AN_ANALYSIS]
     qc_only = _qc_only_run(result) and not by_code
     try:
         dr = json.loads((art / "data" / "dataset_results.json").read_text(encoding="utf-8"))
@@ -17464,11 +17874,12 @@ def _round_field(rnd: Any, key: str) -> Any:
 
 def _round_qc(rnd: Any) -> "tuple[str, dict] | None":
     """The round's completed QC call, ``(tool, result)``, or None."""
+    from ..agents.tool_names import canonical_tool_name
     for st in ((_round_field(rnd, "scientist_result") or {}).get("steps") or []):
         r = st.get("result") if isinstance(st, dict) else None
-        if (isinstance(r, dict) and st.get("tool") in _QC_TOOLS and r.get("status") == "ok"
+        if (isinstance(r, dict) and canonical_tool_name(st.get("tool")) in _QC_TOOLS and r.get("status") == "ok"
                 and r.get("cells_before") is not None):
-            return str(st["tool"]), r
+            return canonical_tool_name(st["tool"]), r
     return None
 
 
@@ -19126,11 +19537,12 @@ def _scan_tool_invocation(result: Any, tool_name: str) -> "dict[str, Any] | None
     say whether an optional step (scGPT) actually ran and how it ended."""
     if result is None:
         return None
+    from ..agents.tool_names import canonical_tool_name
     last: "dict[str, Any] | None" = None
     for r in getattr(result, "rounds", []) or []:
-        sr = getattr(r, "scientist_result", None) or {}
+        sr = _round_field(r, "scientist_result") or {}
         for s in (sr.get("steps") or []):
-            if s.get("tool") == tool_name:
+            if canonical_tool_name(s.get("tool")) == canonical_tool_name(tool_name):
                 res = s.get("result")
                 last = res if isinstance(res, dict) else {"status": s.get("status") or "unknown"}
     return last
@@ -19374,6 +19786,9 @@ _CELLQC_NAME_RE = re.compile(r"[A-Za-z0-9._-]+\.cellqc\.[0-9]{8}-[0-9]{4}\.[A-Za
 # folder can be "Sample3 (1)", so everything but a separator, a control character or a leading dot
 # is a name; it is only ever joined to the directory for SFTP, never given to a shell.
 _CELLQC_FILE_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}")
+# Complete MCP result trees may have subdirectories. Every segment keeps the
+# original filename policy; absolute paths, dot segments and empty segments fail.
+_CELLQC_REL_RE = re.compile(r"(?!\.)[^/\\\x00-\x1f]{1,255}(?:/(?!\.)[^/\\\x00-\x1f]{1,255})*")
 _RESULT_KINDS = ("dataset", "cellqc", "tables", "literature")
 # A literature run's tables (issue 20), saved as one folder. The record is in the run's folder, outside
 # ``artifacts/``, so it is neither a result file nor in the bundle (like the curation's, issue 46).
@@ -19568,7 +19983,8 @@ def _saved_result_files(owner: str, run_id: str, rec: dict, folder: bool) -> "tu
     files = []
     for f in rec.get("files") or []:
         fname = str(f.get("name") or "")
-        if not _CELLQC_FILE_RE.fullmatch(fname):
+        pattern = _CELLQC_FILE_RE if rec.get("kind") == "literature" else _CELLQC_REL_RE
+        if not pattern.fullmatch(fname):
             continue
         copy = (CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "literature" / fname
                 if rec.get("kind") == "literature" else copies / fname)
@@ -20094,7 +20510,7 @@ async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Respon
     rec = _read_pointer(_result_pointer_path(owner, run_id, "cellqc"))
     files = [(str(f.get("name") or ""), int(f.get("size") or 0))
              for f in ((rec or {}).get("files") or []) if isinstance(f, dict)]
-    files = [(n, s) for n, s in files if _CELLQC_FILE_RE.fullmatch(n)]
+    files = [(n, s) for n, s in files if _CELLQC_REL_RE.fullmatch(n)]
     if rec is None or not files:
         return JSONResponse({"error": "This run kept no CellQC result directory."}, status_code=404)
     on_hpc = rec.get("location") == "hpc3"
@@ -20123,7 +20539,17 @@ async def get_cellqc_result(owner: str, run_id: str, request: Request) -> Respon
         if not base.is_dir():
             return JSONResponse({"error": "CellQC's result directory is no longer on the server."},
                                 status_code=410)
-        files = [(n, (base / n).stat().st_size) for n, _ in files if (base / n).is_file()]
+        def regular_result(name: str) -> bool:
+            path = base
+            if path.is_symlink():
+                return False
+            for part in name.split("/"):
+                path = path / part
+                if path.is_symlink():
+                    return False
+            return path.is_file()
+
+        files = [(n, (base / n).stat().st_size) for n, _ in files if regular_result(n)]
 
         def opener(name: str) -> Callable[[], Any]:
             return lambda: _local_blocks(base / name)

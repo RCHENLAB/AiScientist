@@ -252,7 +252,8 @@ def _make_describe_environment_tool(hpc_shell: Any = None) -> "HarnessTool":
 #     ```mermaid fence and the browser renders it (Feature B). The two are complementary, and the
 #     schematic tool is untouched on the research path.
 # ``deep_literature`` is the one chat tool that runs on HPC3 (its index is on /dfs3b).
-def build_quickchat_catalog(literature_executor: Any = None, served_model: bool = True) -> list["HarnessTool"]:
+def build_quickchat_catalog(literature_executor: Any = None, served_model: bool = True, *,
+                            exclude_literature: bool = False) -> list["HarnessTool"]:
     """The tools the answer-first chat loop may call: the ``chat: true`` manifests, built from the
     SAME factories as the research catalog (so a tool is never defined twice and cannot drift
     between paths).
@@ -263,6 +264,9 @@ def build_quickchat_catalog(literature_executor: Any = None, served_model: bool 
     executors = {"hpc:literature": literature_executor}
 
     def wanted(m: Any) -> bool:
+        if exclude_literature and m.name in {"literature_search", "deep_literature", "search_corpus",
+                                            "extract_haploinsufficient_genes"}:
+            return False
         if m.served_model and not served_model:
             return False
         return m.chat and (not m.runs_on.startswith("hpc:") or executors.get(m.runs_on) is not None)

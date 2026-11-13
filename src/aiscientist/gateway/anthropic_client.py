@@ -594,6 +594,56 @@ def chat_tools(model: str, messages: list[dict], tools: list[dict], *, api_key: 
     return _turn(final, model)
 
 
+def relay_chat(model: str, request: dict, *, api_key: str, base_url: str | None = None,
+               timeout: float = _TIMEOUT) -> dict:
+    """A validated MCP chat request through the normal native provider transport.
+
+    Modern Claude models use provider sampling defaults and effort rather than the
+    worker's Qwen temperature/thinking switches. JSON-object mode is instructed
+    and checked locally; this is not a JSON-Schema constrained-decoding claim.
+    Tool choices and complete tool-call messages retain their native semantics.
+    """
+    messages = list(request["messages"])
+    object_mode = (request.get("response_format") or {}).get("type") == "json_object"
+    if object_mode:
+        messages = [{"role": "system", "content": "Return one valid JSON object only, without Markdown fences."}, *messages]
+    system, msgs = to_anthropic(messages)
+    effort = request.get("reasoning_effort") or role_effort("scientist")
+    if effort in {"none", "off", "minimal"}:
+        effort = "low"
+    if effort not in EFFORTS:
+        raise ValueError("Unsupported reasoning effort for the selected native model")
+    tools = request.get("tools") or []
+    kwargs, betas = _prepare(model=model, system=system, messages=msgs,
+                             max_tokens=request["max_tokens"], effort=effort,
+                             tools=tools_to_anthropic(tools), binding=bool(tools))
+    choice = request.get("tool_choice")
+    if choice is not None:
+        if isinstance(choice, dict):
+            kwargs["tool_choice"] = {"type": "tool", "name": choice["function"]["name"]}
+        else:
+            kwargs["tool_choice"] = {"type": {"required": "any"}.get(choice, choice)}
+    if "parallel_tool_calls" in request and tools:
+        kwargs.setdefault("tool_choice", {"type": "auto"})["disable_parallel_tool_use"] = not request["parallel_tool_calls"]
+    # Haiku 5.5 and the current adaptive models reject sampling parameters.
+    # https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+    if "temperature" in request and not _modern(model):
+        kwargs["temperature"] = request["temperature"]
+    final = _final(_client(api_key, base_url, timeout), kwargs, betas, api_key)
+    _check_refusal(final)
+    turn = _turn(final, model)
+    if object_mode and not turn["tool_calls"] and turn["finish_reason"] != "length":
+        try:
+            value = json.loads(turn["content"])
+            if not isinstance(value, dict):
+                raise ValueError
+        except (TypeError, ValueError):
+            # The provider call still incurred usage; record it before surfacing
+            # the invalid-format error to the worker.
+            turn["relay_error"] = "The selected model did not return the requested JSON object"
+    return turn
+
+
 def chat_tools_stream(model: str, messages: list[dict], tools: list[dict], *, api_key: str,
                       base_url: str | None = None, max_tokens: int = 16000,
                       effort: str | None = None, timeout: float = _TIMEOUT) -> Iterator[tuple[str, Any]]:

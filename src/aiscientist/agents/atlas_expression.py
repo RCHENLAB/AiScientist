@@ -134,7 +134,7 @@ class AtlasAdapter:
             "Uses the attached atlas read in place; outputs appear in gene_expression/. "
             "The outer Slurm job owns scheduling; submit_query uses inline and returns when complete.")
 
-    def prepare(self, args: dict, executor: Any) -> PreparedCall:
+    def prepare(self, args: dict, executor: Any, *, tool: str = "") -> PreparedCall:
         atlas = str(getattr(executor, "dataset_path", "") or "")
         source = str(getattr(executor, "dataset_source", "") or "")
         configured = configured_atlases()

@@ -20,11 +20,11 @@ AGENTS = [
     {"name": "Principal Investigator", "role": "plan",
      "description": "Reads the request's scope and the dataset profile, picks the matching pipeline and "
                     "drafts the plan as a task graph; revises it when you ask.",
-     "where": "agents/research_lab.py"},
+     "where": "agents/research_lab/"},
     {"name": "Critic", "role": "critic",
      "description": "Reviews the plan before you see it, then accepts each step's result or sends it back; "
                     "a deterministic guard refuses to accept a failed or empty run.",
-     "where": "agents/research_lab.py"},
+     "where": "agents/research_lab/"},
     {"name": "Scientist", "role": "scientist",
      "description": "Runs each step in the persona of the specialist it needs: calls the curated tools or "
                     "writes and runs code. The scheduler runs steps whose inputs are ready side by side.",
@@ -36,7 +36,7 @@ AGENTS = [
     {"name": "Writer", "role": "writer",
      "description": "Writes the report from the accepted steps only; the draft is then self-reviewed and "
                     "every number is traced to the run's tables.",
-     "where": "agents/research_lab.py"},
+     "where": "agents/research_lab/"},
 ]
 
 # Interchangeable first steps of the scanpy line: each writes the checkpoint the rest of the line
@@ -270,7 +270,7 @@ def workflow_graph() -> dict[str, Any]:
          description="Carries out one step at a time in the persona of the specialist it needs: calls "
                      "the tools below, or writes and runs code. Independent steps may run side by side.",
          specialists=[{"name": s.name, "persona": s.persona} for s in DEFAULT_SPECIALISTS])
-    node("critic", "Critic", "agent", where="agents/research_lab.py",
+    node("critic", "Critic", "agent", where="agents/research_lab/",
          description="Accepts a step's result or sends it back with what to fix; a deterministic guard "
                      "refuses to accept a failed or empty run.")
     node("model", "Model", "agent", where="gateway/app.py",

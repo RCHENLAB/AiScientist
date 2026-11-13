@@ -717,6 +717,43 @@ def chat_tools(
     return out
 
 
+def relay_chat(model: str, request: dict, *, base_url: str, api_key: str | None = None,
+               timeout: float = 600.0) -> dict:
+    """Forward a validated full MCP chat request to its bound OpenAI-compatible API.
+
+    Unlike the ordinary Scientist helper this preserves explicit tool_choice and
+    JSON-object mode, and returns usage even when the content is empty.
+    """
+    payload = {key: request[key] for key in ("messages", "max_tokens", "tools", "tool_choice",
+               "response_format", "temperature", "reasoning_effort", "parallel_tool_calls") if key in request}
+    payload.update(model=model, stream=False)
+    payload["messages"] = _wire_messages(payload["messages"])
+    req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions",
+                                 data=json.dumps(payload, allow_nan=False).encode(),
+                                 headers=_headers(api_key), method="POST")
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None  # An endpoint redirect must never carry the saved bearer elsewhere.
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(req, timeout=timeout) as response:  # noqa: S310 - trusted session endpoint
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise _http_error("MCP model relay", exc, api_key) from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise VLLMNetworkError("Network error during MCP model relay.", stage="vllm_chat") from exc
+    if isinstance(body, dict) and body.get("error"):
+        raise _provider_error("MCP model relay", body["error"], api_key)
+    try:
+        choice = body["choices"][0]
+        message = choice["message"]
+        return {"content": message.get("content"), "tool_calls": message.get("tool_calls") or [],
+                "finish_reason": choice.get("finish_reason") or "",
+                "usage": {**(body.get("usage") or {}), "model": body.get("model") or model}}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        raise GatewayError("Model relay received an invalid chat response.", stage="vllm_chat") from None
+
+
 def _tokenize_root(local_port: int, base_url: str | None) -> str | None:
     """Root for vLLM's ``/tokenize`` (it lives at the server ROOT, not under ``/v1``).
     Returns None for a non-vLLM ``base_url`` (e.g. OpenRouter) — exact server-side

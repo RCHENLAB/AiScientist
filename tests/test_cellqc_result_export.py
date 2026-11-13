@@ -110,6 +110,55 @@ def test_the_download_is_cellqcs_result_directory_complete_and_nothing_else(tmp_
     assert _unzip(r) == {f"result/{name}": body for name, body in FILES.items()}
 
 
+def test_native_mcp_collector_outputs_stamp_download_and_save_normally(tmp_path, gw, monkeypatch, skill_release):
+    from aiscientist.agents.research_harness import HarnessContext
+    from test_mcp_analysis import AnalysisRunner, config, full_cellqc_result
+    from test_mcp_bridge import build, write_skill
+
+    source = tmp_path / "skills"
+    write_skill(source)
+    skill_release(source)
+    runner = AnalysisRunner(tmp_path / "yijus12" / "run7")
+    runner.artifacts = runner.root / "artifacts"
+    runner.artifacts.mkdir()
+    runner.checkpoints = runner.root / "work"
+    runner.checkpoints.mkdir()
+    runner.work_dir = str(runner.checkpoints)
+    monkeypatch.setenv("AISCIENTIST_MCP_CONFIG", str(config(tmp_path)))
+    _, _, files = full_cellqc_result(runner)
+    assert build(runner)[0].executor({}, HarnessContext(workspace=runner.root))["status"] == "ok"
+
+    rec = gw._stamp_cellqc_result(_run_conn(tmp_path), "run7", {"input_name": "mouse"}, False,
+                                  lambda *args: None)
+    assert rec["path"] == str(runner.root / "result/cellqc") and rec["location"] == "gateway"
+    assert _unzip(_client(gw).get("/api/cellqc-result/yijus12/run7")) == {
+        "result/" + name: content for name, content in files.items()}
+    recorded = []
+    monkeypatch.setattr(gw.auth_routes, "dataset_path_recorded", lambda uid, path: False)
+    monkeypatch.setattr(gw.auth_routes, "record_dataset", lambda *args, **kwargs: recorded.append(kwargs) or 77)
+    saved = _client(gw).post("/api/result-datasets/run7/save?what=cellqc")
+    assert saved.status_code == 200 and saved.json()["dataset_id"] == 77
+    assert {f["path"] for f in recorded[0]["files"]} == set(files)
+    assert _unzip(_client(gw).get("/api/cellqc-result/yijus12/run7")) == {
+        "result/" + name: content for name, content in files.items()}
+
+
+def test_nested_download_paths_cannot_escape_or_follow_links(tmp_path, gw):
+    full = _seed_local(tmp_path, "yijus12", "run7")
+    outside = tmp_path / "private"
+    outside.write_bytes(b"must not download")
+    (full / "nested").mkdir()
+    (full / "nested/allowed.txt").write_bytes(b"published")
+    (full / "nested/linked.txt").symlink_to(outside)
+    pointer = tmp_path / "yijus12/run7/artifacts/data/cellqc_result.json"
+    record = json.loads(pointer.read_text())
+    record["files"] = [{"name": name, "size": 1} for name in
+                       ("nested/allowed.txt", "nested/linked.txt", "../private", "nested/../../private",
+                        "/private", "nested//allowed.txt", "nested/./allowed.txt", "nested/.hidden")]
+    pointer.write_text(json.dumps(record))
+    assert _unzip(_client(gw).get("/api/cellqc-result/yijus12/run7")) == {"result/nested/allowed.txt": b"published"}
+
+
 def test_an_hpc3_runs_directory_is_streamed_from_hpc3_not_stored_here(tmp_path, gw, monkeypatch):
     root = f"{HPC_TEMP}/analysis/run7/result/cellqc"
     hpc = _Hpc(root)

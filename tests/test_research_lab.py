@@ -139,8 +139,8 @@ def test_plan_mode_streams_the_reviewed_agenda_once():
 def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatch):
     # The catalog is pinned so the steps' backticked names are read the same with or without the
     # analysis extras installed (without them the catalog cannot be built).
-    import aiscientist.agents.research_lab as rl
-    monkeypatch.setattr(rl, "_known_tool_names",
+    from aiscientist.agents.research_lab import tooling
+    monkeypatch.setattr(tooling, "_known_tool_names",
                         lambda: frozenset({"run_cellqc", "run_de", "run_code", "run_qc"}))
     first_call = {}
 

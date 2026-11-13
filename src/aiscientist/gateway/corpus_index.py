@@ -252,15 +252,23 @@ REBUILD_MARKER = "AISCIENTIST_INDEX_BUILD "
 
 
 def rebuild_inner_command(*, stage: str, archive: str, image: str, root: str, papers: str, manifest: str,
-                          container_bin: str = "apptainer") -> str:
+                          container_bin: str = "apptainer", runtime: str = "legacy") -> str:
     """The job's command: unpack the staged code, then ``build_mechanism_cache.py --replace``
-    inside ``paperqa.sif``, which builds beside the index and puts the result in place."""
+    inside the selected image, building beside the index before putting it in place."""
     from .slurm_job import container_exec
 
+    if runtime not in {"mcp", "legacy"}:
+        raise ValueError("corpus maintenance runtime must be mcp or legacy")
     binds_ro = tuple(dict.fromkeys(p for p in (stage, papers, os.path.dirname(manifest))
                                    if p and not (p + "/").startswith(root.rstrip("/") + "/")))
     hf = f"{root.rstrip('/')}/hf_cache"
-    inner = (f"env HF_HOME={shlex.quote(hf)} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
+    native_paths = ""
+    if runtime == "mcp":
+        roots = os.pathsep.join(dict.fromkeys(p for p in (root, papers, os.path.dirname(manifest)) if p))
+        native_paths = (f"LITERATURE_CORPUS_ROOT={shlex.quote(root)} "
+                        f"LITERATURE_ALLOWED_ROOTS={shlex.quote(roots)} ")
+    inner = (f"env AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME={runtime} "
+             + native_paths + f"HF_HOME={shlex.quote(hf)} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
              f"python3 {shlex.quote(stage + '/scripts/build_mechanism_cache.py')} --replace "
              f"--papers {shlex.quote(papers)} --manifest {shlex.quote(manifest)}")
     return (f"tar xzf {shlex.quote(archive)} -C {shlex.quote(stage)}\n"

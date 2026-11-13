@@ -19,7 +19,7 @@ def test_skills_release_follows_pinned_registry(tmp_path, monkeypatch):
     cfg.write_text('{"release_tag": "v1.2.3", "allowed_tiers": ["core"], "releases_root": "%s"}' % tmp_path)
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_CONFIG", str(cfg))
     monkeypatch.setattr(skills_registry, "STATUS", {"tag": None, "skills": 0, "error": None})
-    assert release_info.skills_release() == {"tag": "v1.2.3", "installed": False}
+    assert release_info.skills_release() == {"tag": "v1.2.3", "repository": "lijinbio/aiscientist-skills", "installed": False}
     (tmp_path / "1.2.3").mkdir()
     assert release_info.skills_release()["installed"] is True
 
@@ -38,7 +38,7 @@ def test_skills_release_follows_the_current_link(tmp_path, monkeypatch):
                    '"current": "%s"}' % (releases, tmp_path / "skills" / "current"))
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_CONFIG", str(cfg))
     monkeypatch.setattr(skills_registry, "STATUS", {"tag": "v1.3.0", "skills": 4, "error": None})
-    assert release_info.skills_release() == {"tag": "v1.3.0", "installed": True, "pinned": "v1.2.3",
+    assert release_info.skills_release() == {"tag": "v1.3.0", "repository": "lijinbio/aiscientist-skills", "installed": True, "pinned": "v1.2.3",
                                              "sha": "d" * 40, "loaded": "v1.3.0", "skills": 4}
 
 

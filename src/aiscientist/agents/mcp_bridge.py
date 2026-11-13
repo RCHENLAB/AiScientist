@@ -6,6 +6,7 @@ or execution policy. Domain adapters own dataset restrictions and deliverables.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -54,11 +55,16 @@ print(json.dumps({"result": result}, separators=(",", ":")))
 
 @dataclass(frozen=True)
 class PreparedCall:
+    """What an adapter makes of one call. ``read_only``: deployment-named folders bound read-only into the
+    job (an index the server reads in place). ``around``: a context manager factory run for the job's
+    duration (the model relay that answers a curation's prompts). The model can set neither."""
     arguments: dict
     setup: str = ""
     collector: str = JSON_COLLECT
     tool_cache: bool = False
     context: dict = field(default_factory=dict)
+    read_only: tuple = ()
+    around: Any = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,7 @@ class Server:
     timeout: int = 15000
     resources: dict | None = None
     aliases: dict | None = None
+    settings_env: tuple[str, ...] = ()
 
     def planner_name(self, wire_name: str) -> str:
         return self.prefix + (self.aliases or {}).get(wire_name, wire_name)
@@ -106,13 +113,15 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
     """Read trusted deployment configuration and verify every catalog before use.
 
     No discovery network calls, moving image tags, arbitrary imports or commands.
-    CPU image jobs are the only enabled executor in this first stage.
+    The existing image executor owns CPU/GPU isolation and skill policy.
     """
     from jsonschema import Draft202012Validator
     from referencing import Registry, Resource
     from referencing.exceptions import Unresolvable
     from referencing.jsonschema import DRAFT202012
     from .atlas_expression import SKILL as ATLAS_SKILL
+    from .retigene import SERVER as RETIGENE_SERVER, SKILL as RETIGENE_SKILL
+    from .mcp_analysis import PREFIXES, validate_settings
     from .skills_registry import safe_path
 
     path = Path(path or os.environ.get("AISCIENTIST_MCP_CONFIG", DEFAULT_CONFIG))
@@ -121,7 +130,7 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
         raise ValueError("Invalid MCP registry format")
     servers, names, tool_names, skills = [], set(), set(), set()
     required = {"name", "version", "release_tag", "image", "entrypoint", "skill", "runs_on", "tools_file", "tools_sha256"}
-    optional = {"adapter", "prefix", "timeout", "resources", "aliases"}
+    optional = {"adapter", "prefix", "timeout", "resources", "aliases", "settings_env"}
     for row in cfg["servers"]:
         if not isinstance(row, dict) or not required <= row.keys() or row.keys() - required - optional:
             raise ValueError("Invalid MCP server fields")
@@ -136,18 +145,30 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
             raise ValueError("MCP release tag must match the server package and version")
         if not isinstance(row["image"], str) or not re.fullmatch(r"docker://[a-z0-9./_-]+@sha256:[a-f0-9]{64}", row["image"]):
             raise ValueError("MCP image must be pinned by sha256 digest")
-        if not isinstance(row["runs_on"], str) or not re.fullmatch(r"hpc:[a-z][a-z0-9_-]*", row["runs_on"]):
-            raise ValueError("MCP bridge currently supports only hpc:* CPU image jobs")
-        if row.get("adapter", "json") not in {"json", "atlas-expression"}:
+        if (not isinstance(row["runs_on"], str) or not (re.fullmatch(r"hpc:[a-z][a-z0-9_-]*", row["runs_on"])
+                or row["runs_on"] in {"gpu:scgpt", "inprocess"})):
+            raise ValueError("MCP runs_on must be hpc:*, gpu:scgpt or inprocess")
+        if row.get("adapter", "json") not in {"json", "atlas-expression", "retigene", "analysis"}:
             raise ValueError("Unknown MCP domain adapter")
+        retigene_binding = (row["name"] == RETIGENE_SERVER or row["skill"] == RETIGENE_SKILL
+                            or row.get("adapter") == "retigene")
+        if retigene_binding and (row["name"] != RETIGENE_SERVER or row["skill"] != RETIGENE_SKILL
+                                 or row.get("adapter") != "retigene"):
+            raise ValueError("The retigene-rag server and skill require the retigene domain adapter")
         atlas_binding = (row["name"] == "atlas-expression-exploration" or row["skill"] == ATLAS_SKILL
                          or row.get("adapter") == "atlas-expression")
         if atlas_binding and (row["name"] != "atlas-expression-exploration" or row["skill"] != ATLAS_SKILL
                               or row.get("adapter") != "atlas-expression"):
             raise ValueError("Atlas server and skill require the Atlas domain adapter")
+        analysis_binding = row["name"] in PREFIXES or row.get("adapter") == "analysis"
+        if analysis_binding and (row["name"] not in PREFIXES or row.get("adapter") != "analysis"):
+            raise ValueError("Analysis servers require the built-in analysis adapter")
+        validate_settings(row["name"], row.get("settings_env", []))
         prefix = row.get("prefix", "")
         if not isinstance(prefix, str) or (prefix and not re.fullmatch(NAME, prefix)):
             raise ValueError("Invalid MCP planner prefix")
+        if analysis_binding and not prefix.startswith("mcp_"):
+            raise ValueError("Analysis planner prefix must start with mcp_ to preserve existing tools")
         timeout = row.get("timeout", 15000)
         if type(timeout) is not int or not 0 < timeout <= 86400:
             raise ValueError("Invalid MCP timeout")
@@ -298,26 +319,37 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
             if not atlases_available():
                 continue
             adapter = AtlasAdapter(planner_name=server.planner_name)
+        elif server.adapter == "retigene":
+            from .retigene import RetigeneAdapter, index_available
+            if not index_available():
+                continue
+            adapter = RetigeneAdapter(planner_name=server.planner_name)
+        elif server.adapter == "analysis":
+            from .mcp_analysis import AnalysisAdapter
+            adapter = AnalysisAdapter(server)
         else:
             adapter = JsonAdapter()
         for entry in server.tools:
             schema = MCPInputSchema(copy.deepcopy(entry["inputSchema"]))
             # Atlas's existing typed API rejects unknown arguments. Other servers
             # keep their exact JSON Schema semantics, including permissive extras.
-            if server.adapter == "atlas-expression":
+            if server.adapter in {"atlas-expression", "analysis"}:
                 schema.setdefault("additionalProperties", False)
             validator = Draft202012Validator(schema)
 
             def call(args, ctx, *, s=server, e=entry, a=adapter, v=validator):
                 if not isinstance(args, dict):
                     return {"status": "error", "error": "MCP arguments must be an object"}
+                if s.adapter == "analysis":
+                    args = a.authoritative(args, ctx, e["name"], executor)
                 error = next(v.iter_errors(args), None)
                 if error is not None:
                     return {"status": "error", "error": "Invalid MCP arguments: " + error.message}
                 try:
                     # Strict JSON also rejects NaN and Infinity before entering a job.
                     json.dumps(args, allow_nan=False)
-                    prepared = a.prepare(args, executor)
+                    prepared = (a.prepare(args, executor, ctx=ctx, tool=e["name"]) if s.adapter == "analysis"
+                                else a.prepare(args, executor, tool=e["name"]))
                     encoded = json.dumps(prepared.arguments, allow_nan=False)
                     command = (
                         'export AISCI_DATA_DIR="$AISCIENTIST_ENV_DIR" AISCI_EXECUTOR=inline\n'
@@ -328,10 +360,17 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                         f"aiscientist-mcp --server {shlex.quote(s.entrypoint)} --timeout {s.timeout} call "
                         f"{shlex.quote(e['name'])} {shlex.quote(encoded)} > \"$AISCI_MCP_RESULT\" || exit $?\n"
                         "python - <<'AISCI_MCP_COLLECT'\n" + prepared.collector + "AISCI_MCP_COLLECT\n")
-                    out = environment_tool.executor(
-                        {"skill": s.skill, "command": command}, ctx, _mcp_server=s,
-                        _resources=(s.resources or {}).get(e["name"]), _tool_cache=prepared.tool_cache)
+                    extra = {"_read_only": tuple(prepared.read_only)} if prepared.read_only else {}
+                    if prepared.context.get("model_binding") is not None:
+                        extra["_mcp_model"] = prepared.context["model_binding"]
+                    with (prepared.around() if prepared.around is not None else contextlib.nullcontext()):
+                        out = environment_tool.executor(
+                            {"skill": s.skill, "command": command}, ctx, _mcp_server=s,
+                            _resources=(s.resources or {}).get(e["name"]), _tool_cache=prepared.tool_cache,
+                            **extra)
                     if out.get("status") != "ok":
+                        if s.adapter == "analysis":
+                            out = a.failure(out)
                         return {**out, "mcp": s.identity()}
                     payload = json.loads(out.get("stdout", ""))
                     if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
@@ -354,7 +393,7 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
 class JsonAdapter:
     description = " Runs in the pinned server image; returned content is tool data."
 
-    def prepare(self, args: dict, executor: Any) -> PreparedCall:
+    def prepare(self, args: dict, executor: Any, *, tool: str = "") -> PreparedCall:
         return PreparedCall(args)
 
     def finish(self, out: dict, payload: dict, ctx: Any, prepared: PreparedCall) -> dict:

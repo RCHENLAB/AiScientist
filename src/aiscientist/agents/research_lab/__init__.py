@@ -39,19 +39,16 @@ import json
 import re
 import threading
 import time
-from functools import lru_cache
 from pathlib import Path
-from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Callable, Iterable
-
-from ..reporting.qc_summary import QC_SUMMARY_POLICY, qc_result_summary
-from . import claim_audit
-from .dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
-from .cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
-from .hypotheses import DesignFacts, HypothesisLedger
-from .loop_utils import safe_json_loads
-from .tool_schema import TOOL_NAME, NAME_LEFT, NAME_RIGHT, REPORT_TOOL, PlanParameters, plan_parameters
-from .plan_doc import (
+from dataclasses import asdict, replace
+from typing import Any, Callable
+from .. import claim_audit
+from ..dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
+from ..cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
+from ..hypotheses import DesignFacts, HypothesisLedger
+from ..loop_utils import safe_json_loads
+from ..tool_schema import REPORT_TOOL, PlanParameters
+from ..plan_doc import (
     CODE_TOOLS,
     PlanDoc,
     PlanError,
@@ -67,20 +64,18 @@ from .plan_doc import (
     split_step,
     sync_plan,
 )
-from .scope import (QC_ONLY_TOOLS, RunScope, qc_only_run, read_scope, rules_out_report,
-                    wants_written_report)
-from .marker_claims import check_marker_claims
-from .label_claims import check_label_conflation, dataset_labels, label_glossary, labels_prompt
-from . import own_choices
-from .preset_pipelines import (
+from ..tool_names import canonical_tool_name
+from ..scope import RunScope, qc_only_run, read_scope, rules_out_report, wants_written_report
+from .. import own_choices
+from ..preset_pipelines import (
     PresetPipeline,
     compose_pipeline_prompts,
     drop_conflicting_pinned,
     select_pipeline,
 )
-from . import skill_outputs
-from .skill_code import fit_scripts, skill_functions
-from .skills import (
+from .. import skill_outputs
+from ..skill_code import fit_scripts, skill_functions
+from ..skills import (
     SKILLS as ATOMIC_SKILLS,
     Skill,
     declares,
@@ -94,14 +89,12 @@ from .skills import (
     skills_named_in,
     superseded_names,
 )
-from .step_numbers import contrast_arms, describe_count_mismatches, find_count_mismatches
-from .tool_source import make_tool_source_tool
-from .research_harness import (
+from ..step_numbers import describe_count_mismatches, find_count_mismatches
+from ..tool_source import make_tool_source_tool
+from ..research_harness import (
     EventFn,
-    HarnessConfig,
     HarnessContext,
     HarnessResult,
-    HarnessTool,
     ResearchHarness,
     _CHARS_PER_TOKEN,
     _msg_tokens,
@@ -110,6 +103,226 @@ from .research_harness import (
     step_succeeded,
     tool_result_outcome,
 )
+
+# The package's modules. Every name they define is importable from here.
+from .prompts import (  # noqa: F401
+    _ALTERNATIVES_SYSTEM,
+    _CLAIM_SYSTEM,
+    _COMPARISON_ROUTE_SYSTEM,
+    _COORDINATOR_SYSTEM,
+    _CRITIC_SYSTEM,
+    _DAG_STRUCTURE_SYSTEM,
+    _DEEP_LIT_QUESTION_SYSTEM,
+    _EXPLORE_SYSTEM,
+    _LIT_QUERY_SYSTEM,
+    _MEETING_CRITIC_SYSTEM,
+    _MEETING_SYNTH_SYSTEM,
+    _MODE_ROUTE_SYSTEM,
+    _NEXT_CYCLE_SYSTEM,
+    _PI_SYSTEM,
+    _PLAN_AUTHOR_STEP_SYSTEM,
+    _PLAN_BIND_SYSTEM,
+    _PLAN_FAILED_MESSAGE,
+    _PLAN_PATCH_SYSTEM,
+    _PLAN_QA_SYSTEM,
+    _PLAN_REFORMAT,
+    _PLAN_REVIEW_CRITIC_SYSTEM,
+    _PLAN_REVIEW_PI_SYSTEM,
+    _PLAN_REVISE_SYSTEM,
+    _PLAN_SKILLS_HEADER,
+    _PLAN_SKILLS_SYSTEM,
+    _POSTSTEP_PI_SYSTEM,
+    _PREFLIGHT_GATE_SYSTEM,
+    _PREFLIGHT_PI_SYSTEM,
+    _QC_REPORT_NOTE,
+    _RESUME_EVAL_SYSTEM,
+    _SYNTH_SYSTEM,
+    _TEAM_FORM_SYSTEM,
+    plan_skills_block,
+)
+from .models import (  # noqa: F401
+    CRITIC_SCORE_BANDS,
+    CodeExecutor,
+    CriticVerdict,
+    DEFAULT_SPECIALISTS,
+    GENERALIST,
+    LabConfig,
+    LabResult,
+    LabRoleFn,
+    LabRound,
+    PreflightDecision,
+    ResumeState,
+    Specialist,
+    _from_fields,
+    _parse_team,
+    _rounds_by_agenda_index,
+    _route_specialist,
+    _stopped_round_answer,
+    critic_score_band,
+)
+from .plan_parse import (  # noqa: F401
+    MAX_LATER,
+    NEW_STEP_ASK_SECONDS,
+    _APPROVAL_WORDS,
+    _BARE_DISCLOSURE_RE,
+    _CHANGE_VERBS,
+    _NOISE_REPLY_RE,
+    _PROPOSAL_OPENERS,
+    _PURE_INTERROGATIVES,
+    _PURE_INTERROGATIVES_ZH,
+    _QUESTION_ANYWHERE,
+    _QUESTION_MARKS,
+    _QUESTION_OPENERS,
+    _SELF_SOURCED_PREFIX,
+    _SETTING_RE,
+    _STEP_ORDINAL_RE,
+    _close_unterminated_json,
+    _drop_question_echo,
+    _hand_edit_note,
+    _node_step_text,
+    _norm_step,
+    _parse_agenda,
+    _parse_plan,
+    _parse_plan_extras,
+    _parse_plan_patch,
+    _parse_query_list,
+    _parse_self_sourced,
+    _parse_verdict,
+    _settings_in,
+    _similarity,
+    _split_self_sourced,
+    _step_title,
+    _strip_step_ordinal,
+    classify_plan_reply,
+    diff_plans,
+    is_noise_reply,
+    stale_downstream_settings,
+)
+from .tooling import (  # noqa: F401
+    _ANY_TOOL_CALL_RE,
+    _BACKTICK_NAME_RE,
+    _BACKTICK_TOOL_RE,
+    _KWARG_RE,
+    _TOOL_NAME_FIXES,
+    _declared_tools,
+    _describe_param,
+    _env_arg,
+    _known_tool_names,
+    _names_tool,
+    _planner_tool_description,
+    _primary_tool,
+    _tool_ends_step,
+    _tool_runs_on,
+    _tool_schemas,
+    _tool_skill,
+    check_plan_tooling,
+    make_run_code_tool,
+    make_run_in_environment_tool,
+    plan_tool_contracts,
+    retick_tools,
+)
+from .step_kinds import (  # noqa: F401
+    REPORT_STEP,
+    _ADD_INTENT_RE,
+    _ANALYSIS_FAMILIES,
+    _ASK_VERBS,
+    _CELLTYPE_COL_RE,
+    _CLUSTERING_STEP_RE,
+    _CLUSTER_COLS,
+    _COMPARISON_CUE,
+    _DE_PRODUCER_RE,
+    _DE_PRODUCER_TOOLS,
+    _ENRICHMENT_STEP_RE,
+    _ENRICHMENT_TOOLS,
+    _GENERIC_TOOLS,
+    _KEEP_CUE_RE,
+    _LITERATURE_HEADLINE_RE,
+    _LITERATURE_STEP_RE,
+    _LITERATURE_TOOLS,
+    _LITERATURE_ZH_RE,
+    _LOW_PRIORITY_FOR_LITERATURE_RE,
+    _MISSING_WORDS,
+    _NEGATED_CLUSTERING_RE,
+    _NEGATION,
+    _PLAN_CUT_RE,
+    _PLAN_TOPICS,
+    _QC_COL_RE,
+    _READBACK_TARGET_RE,
+    _READBACK_VERB_RE,
+    _READ_ONLY_TOOLS,
+    _REMOVAL_AFTER_RE,
+    _REMOVAL_CUE_RE,
+    _REPORT_BUSYWORK_RE,
+    _REPORT_TOOL_LINE,
+    _REQUESTS_LITERATURE_RE,
+    _WISH_CLAUSE_SPLIT_RE,
+    _annotated_without_contrast,
+    _clusters_de_novo,
+    _concurrency_safe,
+    _contrast_columns,
+    _dataset_mode_rule,
+    _is_de_producer_step,
+    _is_definite_reference,
+    _is_enrichment_step,
+    _is_label_fork,
+    _is_literature_step,
+    _is_readback_step,
+    _is_report_busywork,
+    _is_report_step,
+    _literature_step_wanted,
+    _literature_wish,
+    _looks_like_celltype_col,
+    _looks_like_qc_col,
+    _missing_analysis_family,
+    _node_resources,
+    _plan_has_clustering,
+    _requests_literature,
+    _step_headline,
+    _topics_named,
+    handed_on_note,
+    resolve_plan_reference,
+)
+from .grounding import (  # noqa: F401
+    _ASSEMBLY_CANON,
+    _COUNT_RE,
+    _COVERAGE_RE,
+    _FACT_DIST_KEYS,
+    _FACT_KEYS,
+    _PRE_QC_RE,
+    _annotated_cell_types,
+    _assign_evidence,
+    _class_labels,
+    _collect_facts,
+    _grounding_facts,
+    _grounding_vocab,
+    _label_reference,
+    _marker_reference,
+    _methods_performed,
+    _round_feedback,
+    _swap_to_tested,
+    _term_label,
+    _tested_counts,
+    _tool_classes,
+    _uncovered_groups,
+    correct_coverage_counts,
+    pre_qc_counts,
+    resolve_evidence,
+    verify_report_facts,
+)
+from .literature import (  # noqa: F401
+    MAX_LISTED_CITATIONS,
+    _CANNOT_ANSWER,
+    _ENTITY_TOKEN_RE,
+    _LITERATURE_GENERIC,
+    _LITERATURE_NOT_ENTITIES,
+    _deep_literature_fallback_question,
+    _ensure_literature_agenda,
+    _literature_answer,
+    _literature_findings_digest,
+    _literature_query,
+    _literature_step_text,
+)
+
 
 def _call_with_role(fn: "Callable[..., str]", messages: list[dict[str, Any]], role: str) -> str:
     """Call an injected ``complete_fn``, passing ``role`` only to one that accepts it.
@@ -129,1048 +342,6 @@ def _call_with_role(fn: "Callable[..., str]", messages: list[dict[str, Any]], ro
     return fn(messages, role=role) if accepts_role else fn(messages)
 
 
-# complete_fn(messages) -> assistant text. Plain reasoning turns for PI/Critic.
-LabRoleFn = Callable[[list[dict[str, Any]]], str]
-# code_executor(code) -> result dict. Runs a CodeAct snippet (sandbox on the server).
-CodeExecutor = Callable[[str], dict[str, Any]]
-
-
-_PI_SYSTEM = (
-    "You are the Principal Investigator of a bioinformatics lab. Given a request AND the list of "
-    "tools your scientist can actually run, plan the CONCRETE, ORDERED steps that deliver what the "
-    "request asks for — and nothing beyond it. "
-    "THE REQUEST SETS HOW MUCH IS PLANNED; THE DATA SETS HOW IT IS DONE. First name, to yourself, "
-    "what the request asks to be delivered (a quality-controlled matrix, cell-type labels, a "
-    "comparison between two groups, enriched pathways, ...). Then plan (1) the steps that deliver "
-    "it, and (2) a PREREQUISITE only when a requested step cannot run without it and the data does "
-    "not already carry its result: clusters before marker genes, QC before clustering — but not "
-    "when the dataset, or the earlier work of this conversation, already provides them. Do NOT add "
-    "an analysis because the dataset could support it, because a protocol lists it, or to make the "
-    "study look thorough: an enrichment, composition, literature, sensitivity or robustness step "
-    "nobody asked for stays out of the plan. The user works in a conversation — after seeing these "
-    "results they ask for the next analysis, and it starts from this run's processed dataset — so "
-    "a short plan loses nothing, while a long one makes them wait for, and read, work they did "
-    "not request. "
-    "A request for THE WHOLE ANALYSIS ('analyse this dataset', 'a full analysis', 'what does this "
-    "data show', or a protocol the user named) asks for the standard pipeline for this kind of "
-    "data: plan every stage of the research-path guidance when one is given (with none, for "
-    "single-cell expression data that is QC, clustering, marker genes and cell-type annotation, "
-    "plus the comparison between conditions when the design has them), each real analysis as "
-    "its own step — never compress or merge analyses to make that list shorter, and never drop a "
-    "stage the design needs (the comparison a two-condition design calls for, annotation "
-    "validation, DE). A request that NAMES the analyses it wants ('run QC and annotate the cell "
-    "types', 'compare KO with WT in the rods') asks for exactly those: the guidance is then a "
-    "reference for HOW to do the stages you plan, not a list of stages to include. Say which it "
-    "was in `breadth`: \"whole\" or \"specific\". In `later`, list up to 4 analyses you left out "
-    "because the request did not ask for them, each as ONE short sentence the user could send as "
-    "their next message; leave it empty when there are none. "
-    "THE USER'S OWN LIMITS COME FIRST: when the request says to do only certain analyses, or not to "
-    "run certain ones, plan exactly that — a limit the user set is not an omission to repair. "
-    "Never pad the plan with a step the data cannot give meaning to (see profile rule (d) on "
-    "enrichment without a contrast). "
-    "Each step must be ACHIEVABLE WITH THE AVAILABLE TOOLS (do not plan steps the tools cannot do; if a tool is "
-    "limited, scope the step to what it returns). RULES: each step is ONE tool's worth of work — do "
-    "NOT combine multiple analyses into one step (e.g. don't say 'run DE AND enrichment AND make a "
-    "report'). Every step must be performed by one of the listed pipeline tools — do NOT plan steps "
-    "that write your own scripts to reproduce what a tool already does. "
-    "LITERATURE IS A SEPARATE STEP, PLANNED ONLY WHEN THE USER ASKS FOR IT: when the request itself "
-    "asks for literature, published background, references or citations, you MUST reserve one "
-    "agenda step for `deep_literature` near the end, using focused biomedical terms from the "
-    "question and findings, IN ADDITION to the analysis steps. In every other case — a whole "
-    "analysis included, and whatever the guidance lists — do NOT plan a literature step: name it "
-    "in `later` instead. The word 'report' is not such a request. "
-    "A WRITTEN REPORT IS ALSO A STEP OF ITS OWN, PLANNED ONLY WHEN ASKED FOR: when the request asks "
-    "for a written report (a report, write-up, manuscript, PDF or DOCX), plan ONE `write_report` step, "
-    "LAST; otherwise plan none, and the run answers in the chat. Do NOT add any other step that "
-    "writes, renders, packages, zips, organizes, exports, or duplicates a report/document/archive "
-    "(no .docx/.pdf/.html/.zip, no 'compile the report', no 'bundle the outputs'): the tools write "
-    "the figures and tables, and the downloadable bundle is assembled automatically when the run "
-    "finishes, so any such step is wasted, duplicate work. Plan ONLY the analysis, plus that one "
-    "report step when it is asked for. "
-    "USE THE DATASET PROFILE when one is given (cell/gene counts + the dataset's obs/metadata "
-    "columns, with category values when few): plan around the data's ACTUAL design, not a generic "
-    "template. (a) When the request is for the whole analysis, or asks about the groups, and a "
-    "column looks like an experimental CONDITION/group — genotype, treatment, timepoint, knockout "
-    "vs wild-type, etc. — with 2+ categories (e.g. a 'sampleid' with values like KO and WT), plan "
-    "a step that COMPARES the groups (differential expression / abundance between conditions); do "
-    "NOT settle for a condition-agnostic descriptive atlas when the design is clearly comparative. "
-    "For a request that names other analyses, that comparison goes in `later`. (b) If a column already holds cell-type or cluster ANNOTATIONS "
-    "(e.g. celltype, majorclass, a predicted-label column), REUSE it — validate it against markers "
-    "— rather than planning fully de-novo clustering + annotation from scratch. (c) Only reference "
-    "columns that actually exist in the profile; never invent metadata. (d) If the data has NO "
-    "experimental contrast — one sample/condition, i.e. every non-annotation obs column holds a "
-    "single value — AND already carries cell-type labels, there is no differential question to "
-    "answer: a whole-analysis request gets ONLY QC, a canonical-marker/UMAP check that VALIDATES "
-    "the existing annotation, and a short descriptive summary. Do NOT plan pathway/GO enrichment or discovery-style DE in that "
-    "case — enriching a known cell type's own identity markers is circular (it just restates the "
-    "cell type's definition), and de-novo re-clustering to re-derive existing labels is redundant. "
-    "START EVERY STEP WITH A SHORT BOLD TITLE: `**<2-6 word action title>** — <the full step "
-    "text>`. The title names the analysis (e.g. **QC & normalization**, **Stratified DDX41 vs WT "
-    "contrast**, **Pathway enrichment per cell type**); the em-dash and the detailed prose follow "
-    "on the same line. A reviewer scans the titles to see the pipeline's shape, then reads the "
-    "prose of the steps they care about — a wall of ten dense paragraphs with no headings cannot "
-    "be scanned at all. "
-    "WRITE EACH STEP FOR A RESEARCHER TO READ, IN PLAIN SCIENTIFIC ENGLISH — a complete, self-"
-    "contained sentence describing the ANALYSIS and what it reveals biologically: the action, what "
-    "it is performed on, its scientific purpose, and what the reader learns or what it produces "
-    "(cell populations, marker genes, enriched pathways, condition differences). "
-    "NAME THE METHOD, AND SAY WHAT IT DOES. A researcher approving this plan does not read code, "
-    "and this is the only place they can see what the code is about to do to their data — so a "
-    "step that says 'assess differential expression' and silently means a per-cell Wilcoxon test "
-    "across an experimental condition is a plan they cannot review. Brevity is NOT the goal here; "
-    "a step that is short but unreviewable has failed. Every step that runs a tool must give, in "
-    "prose, all four of:\n"
-    "  (a) the TOOL, in backticks — `run_pseudobulk_de`;\n"
-    "  (b) the OPERATION it performs on the data, concretely enough to picture — 'sums each "
-    "sample's raw counts into one profile per animal, then tests those profiles against each "
-    "other', not 'performs differential expression';\n"
-    "  (c) the UNIT the statistics are computed over, whenever a test is involved — cells, "
-    "samples, donors — because that single word is the difference between a valid p-value and a "
-    "pseudoreplicated one, and it is invisible in a tool name;\n"
-    "  (d) the KEY SETTINGS WITH THEIR NUMBERS and what each number does — 'keeping cells that "
-    "detect at least 200 genes and whose reads are under 10% mitochondrial (a stressed or dying "
-    "cell exceeds that)'. State the value you will actually use, including when it is the tool's "
-    "default: a reader cannot tell a default from a choice unless the plan says the number. Do "
-    "NOT invent a value to look precise — if you have no reason to change a setting, use the "
-    "default and say what it is. Write the numbers into the sentence rather than as keyword "
-    "arguments or code (say '10% mitochondrial', not `max_pct_mt=10`), and never put file paths "
-    "in a step. "
-    "The example below shows ONLY the writing STYLE and level of detail — ADAPT "
-    "the real steps to THIS request and dataset (apply the rules above); do NOT copy it "
-    "verbatim or treat it as a fixed pipeline. It answers a WHOLE-analysis request ('analyse "
-    "this dataset, with literature context') on an unprocessed single-sample matrix; for the "
-    "request 'run QC and cluster the cells' on the same data the reply would hold only its "
-    "first two steps, with `breadth` \"specific\" and `later` naming the marker and "
-    "enrichment analyses in a sentence each. "
-    'Reply with ONLY a JSON object {"breadth": "whole" | "specific", "agenda": [step '
-    'strings], "self_sourced": "<one disclosure string>", "later": [one-sentence suggestions]}, e.g. '
-    '{"breadth": "whole", "agenda": ['
-    '"**QC & normalization** — Measure each cell\'s quality with `run_scanpy_qc` and remove the ones that cannot support an '
-    'analysis: cells detecting fewer than 200 genes (empty droplets and dying cells) and cells whose '
-    'reads are more than 10% mitochondrial (stressed or lysed), plus genes seen in fewer than 3 '
-    'cells. Normalize and log-transform what remains so later comparisons reflect biology rather '
-    'than sequencing depth, and report how many cells and genes survived.", '
-    '"**Clustering & UMAP** — Group the cells into transcriptionally distinct populations with `run_clustering` and lay them '
-    'out on a 2-D map, so the major cell types present in the tissue can be seen, separated, and '
-    'counted; the clustering granularity is left at the tool default.", '
-    '"**Marker genes per population** — Identify the genes that mark each population using `run_de` in marker mode: a Wilcoxon '
-    'rank-sum test comparing every cell of one population against all remaining cells, keeping the '
-    '50 strongest per population at an adjusted p-value below 0.05 (Benjamini-Hochberg). Because '
-    'the comparison is between groups of cells drawn from the same sample, the cell is a legitimate '
-    'unit here. This establishes the molecular identity of each cell type.", '
-    # The example is copied verbatim into real plans, so a stale number here becomes a stale number
-    # in production. It used to say "testing the top 100", which stayed in plan cards after
-    # `run_enrichment`'s cap was removed (default `top_n_genes=0`): the plan promised an arbitrary
-    # truncation the tool no longer performs, and a top-N of a per-cell-type list is not comparable
-    # across cell types anyway, since each has a different number of significant genes.
-    '"**Pathway enrichment** — Determine with `run_enrichment` which biological pathways and Gene Ontology terms are '
-    'over-represented among each population\'s marker genes, testing EVERY gene that passes the '
-    'significance thresholds (adjusted p below 0.05 and |log2 fold-change| at least 0.25) rather '
-    'than an arbitrary top-N of them, against the set of '
-    'genes actually measured in this experiment rather than a generic genome-wide background, which '
-    'would inflate every p-value. This turns gene lists into interpretable biology.", '
-    '"**Literature grounding** — Search the published literature with `deep_literature` for the key genes and pathways found '
-    'above and attach real, DOI-backed citations that support the biological interpretation."'
-    '], "self_sourced": "<every choice in this plan that came from your own judgement, or none — '
-    'every choice in this plan comes from the guidance and the dataset profile.>", "later": []}. '
-    "DECLARE WHAT THE PROTOCOL DID NOT COVER. A research protocol cannot anticipate every dataset, "
-    "so going beyond it is expected and often correct — but it must be VISIBLE, because a reader "
-    "otherwise cannot tell a protocol-mandated choice from one you made. Write in `self_sourced` "
-    "ONE plain-language string that lists every decision in this plan that came from YOUR OWN "
-    "judgement rather than from the guidance or the dataset profile: a threshold you chose and why "
-    "that value, a method the guidance did not name, a step you added or dropped, and any place "
-    "where the guidance did not fit this dataset and you departed from it — say which and why. If "
-    "the question itself asked for something the guidance advises against, say THAT here "
-    "explicitly: name the conflict, say which you followed, and what it costs. Write `none — every "
-    "choice in this plan comes from the guidance and the dataset profile.` when that is genuinely "
-    "true. This is a DISCLOSURE, not an analysis step: it runs nothing, so it never goes in "
-    "`agenda`.\n"
-    "CLARIFY (optional): if — and only if — the user prompt explicitly allows you to ask, AND the "
-    "request is GENUINELY ambiguous in a way that would materially change the plan (not a trivial "
-    "detail), you MAY instead return "
-    '{"clarify": [{"question": "<one focused question>", "options": ["<concrete choice>", "..."]}]} '
-    "with 1-3 questions, each offering 2-4 concrete options. The user can always type a custom answer, "
-    "so do not add an 'other' option yourself. Prefer drafting a sensible default plan over asking; "
-    "never ask about formatting/packaging (those are automatic)."
-)
-
-# The skill library goes into every plan the PI drafts, next to the tools. Before this the PI planned
-# from one preset pipeline and the tools alone; a skill reached a run only when the Scientist went
-# looking for one mid-step, or when the user ticked it in the console.
-_PLAN_SKILLS_HEADER = (
-    "Skills the scientist can also use: vetted code templates it reads, adapts to this dataset and "
-    "runs with `run_code`, for analyses the tools above do not cover. When a step needs one, plan it "
-    "as a `run_code` step that applies the skill and name the skill in backticks, e.g. \"apply "
-    "skill `pairwise_de` with `run_code` to ...\". Prefer a tool whenever one covers the step; never "
-    "plan a skill that only repeats what a tool does. Describe a skill's method only as its line below "
-    "states it: if the line does not name the algorithm, say the step uses the skill's template and "
-    "do not name a different one.")
-
-
-def plan_skills_block(query: str, skills: "dict[str, Skill] | None" = None,
-                      limit: "int | None" = None) -> str:
-    """The planning prompt's skill section for ``query`` (the question plus the dataset profile);
-    '' when the library is empty. See :func:`~aiscientist.agents.skills.plan_skill_lines`."""
-    lines, left_out = plan_skill_lines(query, skills, limit)
-    if not lines:
-        return ""
-    tail = (f"\n({left_out} more skills exist; the scientist can find them with `search_skills`.)"
-            if left_out else "")
-    return _PLAN_SKILLS_HEADER + "\n" + "\n".join(lines) + tail
-
-
-_CRITIC_SYSTEM = (
-    "You are a rigorous scientific Critic. You are given the research question, the current step, "
-    "and the scientist's tool-execution results — the ACTUAL structured outputs each tool returned "
-    "(``tool_results``: status, artifact paths, counts, etc.), plus any tool errors. Judge the step "
-    "against those REAL outputs, not just the scientist's prose: a step that produced a valid artifact "
-    "(a predictions file, figures, computed metrics) should be ACCEPTED even if the write-up is terse, "
-    "and a transient error that a later retry recovered from is not a failure. Each tool result also "
-    "carries ``evidence``: the on-disk artifact paths (figures, tables, result files) it actually wrote, "
-    "and a top-level ``evidence`` array unions them for the whole step. Ground your verdict in that "
-    "evidence — a concrete factual claim (a gene, a count, a figure) that NO evidence artifact backs is "
-    "unsupported and should NOT be accepted on prose alone. When you state a COUNT (genes, cells, "
-    "clusters, enriched terms), read it from an explicit count field (e.g. ``de_rows_by_group``, "
-    "``n_genes_per_group``, ``n_groups``) or the cited table — NEVER from the length of a ``top_*`` or "
-    "other preview list, which is a capped sample, not the total. "
-    "WHERE DID THE NUMBER COME FROM? A threshold that decided this result must be traceable to "
-    "one of: the tool's DECLARED default, the research protocol, or an explicit choice made for "
-    "this run (the step brief and the tool results state which). A number with none of those is "
-    "not wrong, but it is unaccounted for, and a result that turns on it cannot be scored above "
-    "0.8 until the write-up says so — because 'we filtered at 10%' reads identically whether 10 "
-    "was the field's convention or something invented in the moment. You have `read_tool_source` "
-    "for exactly this: it returns a tool's body plus every default it applies, with what each one "
-    "means. Use it when a threshold decided the headline number and you cannot see where it came "
-    "from — not on every step, and not to second-guess a conventional value. Say in the critique "
-    "which number you could not account for. "
-    "The ``score`` is a GRADED 0.0–1.0 measure of how strong THIS step's result is — NOT a restatement "
-    "of the verdict — so two accepted steps must differ when their evidence differs. Anchor it to these "
-    "bands and do NOT default to 1.0: "
-    "0.95–1.0 = goal fully met, every quantitative claim tied to an evidence artifact, nothing left to "
-    "improve; "
-    "0.8–0.95 = solid, usable result but a minor claim is thin/under-explained or a small sub-goal is "
-    "unmet; "
-    "0.6–0.8 = usable result that only partially meets the goal, or a material claim rests on prose with "
-    "no backing artifact (accept, but say what is unsupported); "
-    "below 0.6 = no usable result, the step goal was not met, or a claim is contradicted by the tool "
-    "results — use \"revise\". Reserve a score above 0.9 for a step you cannot suggest an improvement to. "
-    'Reply with ONLY a JSON object: {"verdict": "accept" | "revise", "score": <0.0-1.0>, "critique": '
-    '"<what is missing or wrong, and what to do next>"}. Use "revise" only if NO usable result was '
-    "produced, the step goal was not met, or a claim is contradicted by the tool results. Whenever you "
-    "score below 0.95, the critique MUST name the specific gap that kept it from full marks. Be specific "
-    "so the scientist can fix it."
-)
-
-_SYNTH_SYSTEM = (
-    "You are the Principal Investigator writing the final research report. Ground the report ONLY in "
-    "the accepted step results provided. Do NOT invent numbers, gene symbols, statistics, pathway or "
-    "enrichment terms, or cell-type labels — if a pathway, marker, or cell type is not in the "
-    "results, it does not exist for this report. Use the cell-class labels EXACTLY as given; never "
-    "rename, merge, or expand one label into a different or additional cell type. "
-    "DESCRIBE ONLY METHODS THAT WERE ACTUALLY PERFORMED — the Methods and Results may mention only the "
-    "analyses that appear in the accepted step results below. Do NOT describe, name, or reference any "
-    "tool, algorithm, software, model, or analysis that was not run (e.g. do NOT mention foundation-"
-    "model annotation such as scGPT, multi-omics integration such as MOFA+/DIABLO, RNA velocity, "
-    "trajectory inference, or batch integration unless it appears in the accepted steps), and NEVER "
-    "write that a method was 'planned', 'attempted', or 'did not execute' — a method that was not run "
-    "is simply omitted. Inventing an un-run method, even as a failed attempt, is fabrication. "
-    "When a step reported nothing (enrichment found no terms, no citations, etc.), say so plainly "
-    "rather than filling the gap with plausible-sounding biology. "
-    "Report EXECUTION PARAMETERS — the genome assembly/build, filter thresholds, the PASS vs non-PASS "
-    "counts, the number of variants/cells annotated — from the accepted TOOL RESULTS, NOT from the plan "
-    "or agenda text: the plan states INTENDED parameters, but a tool may have auto-corrected them (e.g. "
-    "the variant annotation reads the VCF's real genome build from its header and may OVERRIDE the "
-    "planned assembly — state the assembly and execution_mode the result reports, never the plan's). "
-    "Never state a PASS/non-PASS split, an allele-frequency cutoff, or a total the results do not show — "
-    "do NOT write 'all PASS' or '0 non-PASS' unless the results report zero non-PASS. "
-    "State limitations honestly and frame conclusions as hypotheses to validate. "
-    + QC_SUMMARY_POLICY
-)
-
-# A run that only did quality control and whose request asks for a written report: what that report
-# is for. Its layout and length are the writer's to choose.
-_QC_REPORT_NOTE = (
-    "This run did quality control only, and the request asks for a written report. Write a "
-    "quality-control report for the person who asked: what was run on which data, the numbers the QC "
-    "step reported (cells in and kept, why cells were removed, a concise count of doublets removed, "
-    "ambient RNA, mitochondrial content), material QC warnings following the default QC "
-    "presentation policy, and what was handed back. Use tables where they help. No "
-    "biological interpretation, no literature, no Discussion and no hypotheses: nothing beyond QC "
-    "was run. The layout and length are yours to choose.\n"
-)
-
-# Axis B — PI-autonomous skill selection. Researchers do not know which protocol they
-# need; the PI reads the skill library's one-line descriptions and picks one itself. The
-# chosen skill's body then STEERS planning (it does not bypass the PI). Wording is kept
-# distinct from the PI/Critic system prompts so offline test routers can tell them apart.
-# --- DAG planner (feat/dag-planner) ------------------------------------------
-# Structure an already-drafted flat agenda into a dependency DAG: for each step, which EARLIER
-# steps it directly consumes. This changes ONLY execution ordering/scoping — the agenda text the
-# user reviewed in plan mode is unchanged.
-_DAG_STRUCTURE_SYSTEM = (
-    "You are structuring an ordered analysis plan into a dependency DAG. You are given steps with "
-    "ids (s1, s2, …). For EACH step, list which EARLIER steps it DIRECTLY depends on — i.e. it "
-    "consumes that step's output/checkpoint (the data matrix, the clustering, a DE table, "
-    "annotations). A step usually depends only on the step that produced the data it reads, NOT on "
-    "every earlier step. Steps that are independent of each other (e.g. a literature search vs a "
-    "differential-expression analysis) must NOT depend on each other. "
-    "ALSO flag genuine METHODOLOGICAL FORKS as human decision points: set \"decision\": true and "
-    "provide 2-4 short \"options\" ONLY for a step where a human should choose the approach because "
-    "the choice materially changes the result and there is no single obvious answer — e.g. the "
-    "dataset already carries cell-type labels (analyze by existing labels vs re-cluster de-novo), "
-    "clustering resolution / granularity, or which contrasts to run. Do NOT flag routine steps (QC, "
-    "running a standard tool) — most steps are NOT decisions. Do NOT flag a step whose text already "
-    "says which approach to take (e.g. 'reuse the existing labels, do not re-cluster'): the plan was "
-    "reviewed, so that choice is made. Do NOT flag the labels-vs-re-cluster fork when no step "
-    "clusters the cells de-novo. Reply with ONLY a JSON array covering "
-    'every id, e.g. [{"id": "s1", "depends_on": []}, {"id": "s2", "depends_on": ["s1"], '
-    '"decision": true, "options": ["Use existing majorclass labels", "Re-cluster de-novo", "Both"]}, '
-    '{"id": "s3", "depends_on": ["s2"]}, {"id": "s4", "depends_on": ["s2"]}]. Do not change the steps.'
-)
-
-# When several tasks are READY (dependencies met), the Coordinator picks which to run next — this
-# is where the system stops being a fixed pipeline and an agent chooses the path through the graph.
-_COORDINATOR_SYSTEM = (
-    "You are the Coordinator scheduling a research workflow. Several tasks are READY (all their "
-    "dependencies are already done). Choose the ONE most useful task to run next, given the research "
-    "goal and what is already done — e.g. finish the core analysis chain before optional/background "
-    "tasks. Reply with ONLY a JSON object naming a ready task id, e.g. {\"next\": \"s3\"}."
-)
-
-# Real multi-agent: instead of routing a task by keyword, the team's experts CLAIM the task whose
-# expertise fits best — the agents decide who does what.
-_CLAIM_SYSTEM = (
-    "You are assigning the next task to ONE member of a research team. Given the task and each "
-    "member's expertise, choose the SINGLE best-fit member to carry it out. Prefer the most specific "
-    "relevant expertise; use a generalist only when nothing fits. Reply with ONLY a JSON object naming "
-    "the member by number, e.g. {\"member\": 2}."
-)
-
-
-def _node_step_text(node: TaskNode) -> str:
-    """The scoped brief for one DAG node: the goal PLUS explicit reuse/produce hints so the Scientist
-    does ONLY this task and reuses upstream checkpoints instead of recomputing them (the structural
-    cure for the 'step 1 runs the whole pipeline' / double-QC failure modes)."""
-    parts = [node.goal]
-    if node.consumes:
-        parts.append("Reuse these existing inputs/checkpoints as-is (do NOT recompute them): "
-                     + ", ".join(node.consumes) + ".")
-    if node.produces:
-        parts.append("This task is expected to produce: " + ", ".join(node.produces) + ".")
-    if node.suggested_tool:
-        parts.append(f"Suggested tool: {node.suggested_tool} (use it if it fits the task).")
-    parts.append("Do ONLY this task — earlier tasks already ran and their outputs exist; do not "
-                 "repeat or re-run them.")
-    return " ".join(parts)
-
-
-# A step's own ordinal, echoed back into its text. The plan reaches the PI NUMBERED
-# ("1. **QC & normalization** — …") on the patch path and in the Critic's read-back, and the model
-# copies that "1. " prefix into the step it hands back. Nothing stripped it, so the stored step
-# became "1. **QC …** — …" while its neighbours stayed "**Title** — …" — and the console's step
-# renderer, which reads a step's title off a LEADING ``**bold**``, fell through to its untitled
-# branch: the reviewer got a bare "1" heading followed by raw markdown, for exactly the step they
-# had just asked to change. Measured in Ziyao's plan_mode_report_v2_5 as 6/6 on the in-place
-# revision path and 0/4 on add/delete, which never round-trips a numbered plan. Stripped at the
-# SOURCE so every consumer — the plan card, the progress feed, plan.md, and the agenda the
-# Scientist executes — sees ONE step shape.
-_STEP_ORDINAL_RE = re.compile(r"^\(?\d{1,2}[.)、]\s+")
-
-
-def _strip_step_ordinal(text: str) -> str:
-    """Drop a leading numeric list marker ("3. ", "3) ", "(3) ") from one step's text.
-
-    Deliberately narrow. A separator AND a following space are both required, so prose that opens
-    with a number keeps it — "0.25 is the single-cell convention" and "2,000 highly-variable genes"
-    both survive — and a prefix that is real CONTENT rather than a list marker ("Step 3: …") is left
-    for the model to own."""
-    return _STEP_ORDINAL_RE.sub("", (text or "").strip(), count=1).strip()
-
-
-def _parse_agenda(raw: str, max_steps: int) -> list[str] | None:
-    """Parse the PI's step list from a JSON array (tolerating code fences, a
-    surrounding sentence, or a ``{"steps": [...]}`` / ``{"agenda": [...]}`` object)."""
-    s = raw.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        if s.lower().startswith("json"):
-            s = s[4:].strip()
-    parsed: Any = None
-    try:
-        parsed = json.loads(s)
-    except json.JSONDecodeError:
-        m = re.search(r"\[.*\]", s, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                parsed = None
-    if isinstance(parsed, dict):
-        parsed = parsed.get("steps") or parsed.get("agenda")
-    if isinstance(parsed, list) and parsed:
-        steps = [s for s in (_strip_step_ordinal(str(x)) for x in parsed) if s]
-        return steps[:max_steps] or None
-    return None
-
-
-# The PI's disclosure of what it decided on its OWN knowledge rather than from the research-path
-# guidance or the dataset profile. The draft prompt asks for it as the reply's `self_sourced` field
-# (`_parse_self_sourced`). It used to be the agenda's last string, prefixed `SELF-SOURCED:`; with
-# `later` after `agenda`, models wrote it after `later`, outside the array, and the reply was not
-# JSON (prod run 74873590ca7b on Haiku 5.5, and DSV4 on HPC3). The prefixed string is still split
-# off wherever it appears, for replies in the old form.
-_SELF_SOURCED_PREFIX = "SELF-SOURCED:"
-
-
-def _parse_self_sourced(raw: str) -> str:
-    """The ``self_sourced`` field of the PI's planning reply, ``''`` when it has none. A list of
-    strings is joined, and a ``SELF-SOURCED:`` prefix the model repeated inside it is dropped."""
-    obj = _parse_verdict(raw or "")
-    value = obj.get("self_sourced") if isinstance(obj, dict) else None
-    if isinstance(value, list):
-        value = " ".join(v for v in value if isinstance(v, str))
-    if not isinstance(value, str):
-        return ""
-    text = " ".join(value.split())
-    bare = text.lstrip("*-# ").strip()
-    if bare.upper().startswith(_SELF_SOURCED_PREFIX):
-        text = bare[len(_SELF_SOURCED_PREFIX):].lstrip("* ").strip()
-    if text.startswith("<") and text.endswith(">"):
-        return ""            # the prompt's placeholder, copied instead of filled in
-    return text
-
-
-# Telling a QUESTION about the plan from a REQUEST to change it. Plan mode had three actions —
-# approve / revise / cancel — so anything a reviewer typed became "revise": asking "why is step 3 a
-# Wilcoxon test?" did not get an answer, it triggered a re-plan. And a whole-plan redraft damages
-# the steps nobody mentioned (measured: 100% of trials silently lost an unmentioned step), so the
-# cost of asking a question was losing part of the plan.
-#
-# Deterministic first, and biased toward QUESTION on purpose. The two errors are not symmetric:
-# reading a change request as a question wastes one exchange, while reading a question as a change
-# request rewrites work the reviewer never asked to touch.
-_QUESTION_MARKS = ("?", "？")
-# English fronts its question words, so matching at the START is right and avoids catching
-# "use wilcoxon, and tell me what it does".
-_QUESTION_OPENERS = (
-    "why", "what", "what's", "whats", "how", "how's", "which", "who", "where", "when",
-    "is ", "are ", "does ", "do ", "did ", "can ", "could ", "should ", "will ", "would ",
-    "explain", "tell me",
-)
-# Chinese does not: the question word sits mid-sentence ("第3步为什么用 Wilcoxon"), and a
-# startswith rule sent exactly that reply down the re-plan path.
-_QUESTION_ANYWHERE = (
-    "为什么", "为啥", "怎么", "如何", "哪个", "哪些", "是不是", "能不能", "会不会",
-    "有没有", "多少", "解释", "说明一下", "讲一下", "什么意思", "是什么", "干什么", "做什么",
-    "到底", "了什么", "过什么", "算什么", "指什么",
-)
-_CHANGE_VERBS = (
-    "change", "use ", "add ", "remove", "delete", "drop ", "replace", "instead", "rerun",
-    "re-run", "swap", "set ", "make it", "don't", "do not", "skip ", "merge", "split",
-    "改", "换", "加上", "加一", "删", "去掉", "不要", "改成", "换成", "增加", "移除", "跳过",
-)
-# The change verbs are checked first, which is right for "could you use 0.5 instead?" and wrong for
-# "why do you use wilcoxon here?" — the same verb, one a request and one a question ABOUT the
-# request's subject. These openers cannot front a request in either language, so they settle it
-# before the verb scan: asking why a step removes cells must not be read as "remove that step".
-# The modal openers ("could you", "can you", "should we") deliberately stay behind the verb scan,
-# because those DO front polite requests.
-_PURE_INTERROGATIVES = (
-    "why", "what", "what's", "whats", "how", "how's", "which", "who", "where", "when",
-    "explain", "tell me",
-)
-# ...except when the interrogative fronts a PROPOSAL rather than a question.
-_PROPOSAL_OPENERS = ("how about", "what about")
-_PURE_INTERROGATIVES_ZH = ("为什么", "为啥")
-
-
-def classify_plan_reply(text: str) -> str:
-    """``"question"`` or ``"change"`` for a reviewer's reply in plan mode.
-
-    Pure and deterministic so the common cases never cost a model call, and so the rule is
-    testable. A reply carrying a change verb is a change even if it is phrased as a question
-    ("could you use 0.5 instead?"); everything else that looks interrogative is a question;
-    anything left over is a change, since a bare imperative ("stratify by majorclass") is the
-    normal way to ask for one."""
-    t = (text or "").strip()
-    if not t:
-        return "change"
-    low = t.lower()
-    if ((low.startswith(_PURE_INTERROGATIVES) and not low.startswith(_PROPOSAL_OPENERS))
-            or any(z in t for z in _PURE_INTERROGATIVES_ZH)):
-        return "question"
-    if low.startswith(_PROPOSAL_OPENERS):
-        return "change"      # "how about 0.5" proposes one; it does not ask about one
-    if any(v in low for v in _CHANGE_VERBS):
-        return "change"
-    if (t.endswith(_QUESTION_MARKS) or low.startswith(_QUESTION_OPENERS)
-            or any(m in t for m in _QUESTION_ANYWHERE)):
-        return "question"
-    return "change"
-
-
-_PLAN_QA_SYSTEM = (
-    "You are the Principal Investigator, answering a researcher's question about the analysis plan "
-    "you just proposed. They are deciding whether to approve it. ANSWER THE QUESTION — do not "
-    "rewrite, re-propose, or re-list the plan, and do not treat the question as a request to change "
-    "anything. Ground the answer in the plan, the research-path guidance and the dataset profile "
-    "you are given; where the answer is a methodological one, say plainly what the method does and "
-    "why it suits (or does not suit) THIS dataset, including the unit the statistics run over. If "
-    "the honest answer is that the plan has a weakness, say so and name the change that would fix "
-    "it — but do not make the change; the researcher decides. If the question cannot be answered "
-    "from what you have, say what is missing. A few clear sentences; no headings, no preamble."
-)
-
-
-# The prompt's "nothing to disclose" sentence, written into the agenda without the prefix: "none —
-# every choice in this plan comes from the guidance and the dataset profile." It ran nothing and named
-# no tool, so a scope limit dropped it as a step, and the feed said "Left out 1 step(s) your request
-# ruled out: none" (RCHENLAB/AiScientist issue 75, the #56 re-test's A2). "None of the …" stays a step.
-_BARE_DISCLOSURE_RE = re.compile(
-    r"^none\b\s*(?:[—–:;.,-]|$)|^every choice in this plan comes from the guidance", re.IGNORECASE)
-
-
-def _split_self_sourced(steps: "list[str]") -> "tuple[list[str], str]":
-    """Separate the ``SELF-SOURCED:`` disclosure from the executable agenda.
-
-    Returns ``(agenda, disclosure_text)``. The disclosure is a statement about the plan, not work
-    to run — left in the agenda it would be dispatched to the Scientist as a step. Empty string
-    when the PI made no disclosure. Tolerates the prefix appearing on any line, since models put it
-    first about as often as last, and the prompt's "none — every choice …" sentence put in the
-    agenda without it."""
-    agenda: list[str] = []
-    notes: list[str] = []
-    for s in steps:
-        t = (s or "").strip().lstrip("*-# ").strip()
-        bare = re.sub(r"[*`]", "", t).strip()
-        if t.upper().startswith(_SELF_SOURCED_PREFIX):
-            body = t[len(_SELF_SOURCED_PREFIX):].strip()
-            if body:
-                notes.append(body)
-        elif _BARE_DISCLOSURE_RE.match(bare):
-            notes.append(bare)
-        else:
-            agenda.append(s)
-    return agenda, " ".join(notes).strip()
-
-
-def _drop_question_echo(steps: "list[str]", question: str) -> "tuple[list[str], list[str]]":
-    """Remove agenda items that are just the research question (or a trivial restatement of it)
-    echoed back as a "step". Seen in production (run 97dfc89dc5aa): the PI's reply led with the
-    question as item 1; it parsed as a step, could never be executed, failed three rounds and
-    raised a decision card. Deterministic: an item is an echo when, after stripping markdown and
-    punctuation, it equals the question or is a near-copy (>=90% of its words are the question's
-    words and it adds none of its own beyond three). Returns (kept, dropped)."""
-    import string
-
-    def _norm_words(text: str) -> list[str]:
-        t = re.sub(r"[*_`#]", " ", text.lower())
-        t = t.translate(str.maketrans("", "", string.punctuation))
-        return t.split()
-
-    qw = _norm_words(question)
-    qset = set(qw)
-    kept: list[str] = []
-    dropped: list[str] = []
-    for step in steps:
-        w = _norm_words(step)
-        if not w:
-            dropped.append(step)
-            continue
-        wset = set(w)
-        covers_question = sum(1 for x in qset if x in wset) >= 0.9 * max(1, len(qset))
-        extra = sum(1 for x in w if x not in qset)
-        # An echo RESTATES the question: it contains essentially the whole question and adds
-        # almost nothing. A short legitimate step whose words happen to appear in the question
-        # ("Annotate the cells") covers only part of it and is kept.
-        if w == qw or (covers_question and extra <= 3 and len(w) <= len(qw) + 3):
-            dropped.append(step)
-            continue
-        kept.append(step)
-    # Never empty the agenda: a plan that was ONLY an echo falls back to the raw list.
-    return (kept, dropped) if kept else (steps, [])
-
-
-def _parse_plan(raw: str, max_steps: int, allow_clarify: bool) -> tuple[str, Any] | None:
-    """Parse the PI's planning reply into ``("agenda", [steps])`` or, when ``allow_clarify``
-    and the PI asked, ``("clarify", [{"question", "options"}])``. Returns ``None`` if neither
-    can be recovered (the caller falls back to a trivial agenda)."""
-    s = raw.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        if s.lower().startswith("json"):
-            s = s[4:].strip()
-    parsed: Any = None
-    try:
-        parsed = json.loads(s)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", s, re.DOTALL) or re.search(r"\[.*\]", s, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                parsed = None
-
-    if allow_clarify and isinstance(parsed, dict) and isinstance(parsed.get("clarify"), list):
-        questions = []
-        for q in parsed["clarify"][:3]:
-            if not isinstance(q, dict):
-                continue
-            text = str(q.get("question", "")).strip()
-            options = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()][:4]
-            if text and options:
-                questions.append({"question": text, "options": options})
-        if questions:
-            return ("clarify", questions)
-
-    agenda = _parse_agenda(raw, max_steps)
-    if agenda:
-        return ("agenda", agenda)
-    return None
-
-
-#: How many "ask for this next" suggestions a plan may carry. They are shown to the user, not run.
-MAX_LATER = 4
-#: How long a proposed step waits for the user's answer. No answer is a no.
-NEW_STEP_ASK_SECONDS = 300
-# What counts as "yes, add it" when the user types instead of clicking. Anything else is a no.
-_APPROVAL_WORDS = ("add", "yes", "approve", "ok", "sure", "加", "可以", "同意", "批准", "好", "行")
-
-
-def _step_title(step: str) -> str:
-    """``**QC & normalization** — Measure…`` → ``QC & normalization``."""
-    text = str(step or "").strip()
-    return (text.split(" — ")[0].replace("**", "").strip() or text)[:90]
-
-
-def _parse_plan_extras(raw: str) -> "tuple[str, list[str]]":
-    """``(breadth, later)`` from the PI's planning reply: how much the request asked for
-    (``"whole"`` / ``"specific"``, ``""`` when the reply does not say) and the analyses it left
-    out because nobody asked for them. Both are optional, so a reply that is only
-    ``{"agenda": [...]}`` — or not an object at all — parses exactly as it did before."""
-    obj = _parse_verdict(raw or "")
-    if not isinstance(obj, dict):
-        return "", []
-    breadth = str(obj.get("breadth") or "").strip().lower()
-    breadth = breadth if breadth in ("whole", "specific") else ""
-    later: list[str] = []
-    items = obj.get("later")
-    for item in (items if isinstance(items, list) else []):
-        text = " ".join(str(item or "").split())
-        if text and text.lower() not in {x.lower() for x in later}:
-            later.append(text[:240])
-        if len(later) >= MAX_LATER:
-            break
-    return breadth, later
-
-
-def _parse_verdict(raw: str) -> dict[str, Any] | None:
-    """Parse the Critic's JSON object, tolerating a chatty/thinking model that wraps
-    the ``{...}`` in prose or code fences (safe_json_loads needs the whole string to
-    be JSON; this extracts the first object block as a fallback)."""
-    parsed = safe_json_loads(raw)
-    if parsed is None:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                parsed = None
-    if parsed is None:
-        parsed = _close_unterminated_json(raw)
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _close_unterminated_json(raw: str) -> "dict[str, Any] | None":
-    """A JSON object whose only fault is missing closing brackets — the model stopped after the
-    last complete value. Measured on the plan review of an 18-step DDX41 plan: the Critic's ~15k-
-    character reply (issues + a verbatim revised agenda) ended ``…"]`` without the final ``}``, the
-    parse failed, and the review fell through as "no issues" with five correct ones in the text.
-
-    Only that case is repaired: the text must open with ``{`` and must NOT end inside a string. A
-    reply cut mid-string is left unparsed — closing it would invent the end of a step's text."""
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        text = text[4:].strip() if text.lower().startswith("json") else text
-    start = text.find("{")
-    if start < 0:
-        return None
-    text = text[start:]
-    stack: list[str] = []
-    in_string = escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        elif ch == '"':
-            in_string = True
-        elif ch in "{[":
-            stack.append("}" if ch == "{" else "]")
-        elif ch in "}]":
-            if not stack or stack.pop() != ch:
-                return None
-    if in_string or not stack:
-        return None
-    try:
-        parsed = json.loads(text.rstrip().rstrip(",") + "".join(reversed(stack)))
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _env_arg(args: dict[str, Any]) -> str:
-    env = args.get("environment") or ""
-    return ",".join(str(e) for e in env) if isinstance(env, list) else str(env).strip()
-
-
-def make_run_code_tool(executor: CodeExecutor | None,
-                       software_note: "Callable[[str], list[dict]] | None" = None,
-                       environments: "Callable[[str], list] | None" = None) -> HarnessTool:
-    """The hybrid CodeAct tool: the Scientist can write-and-run Python when the
-    curated tools don't cover a step. Execution is delegated to ``executor`` (a
-    sandboxed runtime on the server); without one it returns a clear 'not enabled'
-    rather than running arbitrary code in-process.
-
-    ``software_note(output)``: for a failed snippet, the programs or R packages it lacked and the
-    HPC3 module that provides each (``HpcShell.missing_software_note``), so the model runs the
-    module with run_shell instead of rewriting the method (docs/environments/README.md §4).
-
-    ``environments(ids)``: the published lab environments ``environment=`` names
-    (``HpcShell.resolve_environments``), mounted read-only into the snippet's job with their bin/ first
-    on PATH (``hpc/environments.py``). None when lab environments are off: the parameter is then refused."""
-
-    def _exec(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
-        code = str(args.get("code", "")).strip()
-        if not code:
-            return {"status": "error", "error": "no code provided"}
-        if executor is None:
-            return {
-                "status": "not_enabled",
-                "note": "Code execution is not enabled for this run (needs a sandboxed CodeAct runtime).",
-            }
-        # Provenance stamp (reproducibility): inject a deterministic seed, time the run, and
-        # attach a CodeProvenance record to the result so it flows into the step/round/report
-        # unchanged. We hash the ORIGINAL snippet (not the seed-prefixed one that actually ran).
-        from . import provenance as _prov
-
-        seed = _prov.resolve_seed() if _prov.seeding_enabled() else None
-        to_run = (_prov.seed_preamble(seed) + code) if seed is not None else code
-        started_at, t0 = _prov.now_iso(), _prov.perf_now()
-        from .skills_registry import active_skill, execute
-        try:
-            skill = active_skill(ctx, str(args.get("skill") or ""))
-        except ValueError as exc:
-            return {"status": "error", "error": str(exc)}
-        refs: list = []
-        wanted = _env_arg(args)
-        if wanted:
-            if environments is None:
-                return {"status": "error", "error": "Lab environments are not enabled in this session."}
-            try:
-                refs = environments(wanted)
-            except Exception as exc:  # noqa: BLE001 - the model reads the reason
-                return {"status": "error", "error": str(exc)}
-            if any(getattr(r, "kind", "") == "image" for r in refs):
-                return {"status": "error", "error": ("A container-image environment runs with "
-                                                     "run_in_environment(environment=..., command=...).")}
-        from ..hpc.environments import using
-        with using(refs):
-            result = execute(skill, ctx, executor, lambda: executor(to_run), "run_code", code=code)
-        duration_ms = int((_prov.perf_now() - t0) * 1000)
-        if isinstance(result, dict):
-            try:
-                result["provenance"] = _prov.build_code_provenance(
-                    code=code, seed=seed, executor=executor, ctx=ctx,
-                    result=result, started_at=started_at, duration_ms=duration_ms,
-                ).to_dict()
-            except Exception:  # provenance must never break a run
-                pass
-            # A max/mean printed from the first N rows reads like the file's own (runs 74873590ca7b,
-            # 7f2955e8e834: ".raw max" of 300 nuclei). Say so on the result, before the answer is written.
-            try:
-                from .sampled_stats import annotate
-                annotate(result, code)
-            except Exception:  # a reading aid must never break a run
-                pass
-            if software_note is not None and str(result.get("status") or "") not in ("ok", "success"):
-                try:
-                    text = "\n".join(str(result.get(k) or "") for k in ("error", "stderr", "stdout"))
-                    note = software_note(text)
-                    if note:
-                        result["missing_software"] = note
-                except Exception:  # a reading aid must never break a run
-                    pass
-        return result
-
-    from .sandbox import build_run_code_context
-
-    description = (
-        "Write and run a short Python snippet (CodeAct) for custom ANALYSIS the other tools do not "
-        "cover — scanpy/pandas/numpy etc. Read the dataset from the env var AISCIENTIST_DATASET, the "
-        "run's checkpoints from AISCIENTIST_WORK, and write new figures/tables under AISCIENTIST_ARTIFACTS "
-        "(use os.environ). Returns stdout / a result dict. Set a headless backend (matplotlib Agg). "
-        # This used to say "pip install of analysis packages is fine if a step needs one", which
-        # was measured to be false AND actively harmful: inside the sandbox pip can report success
-        # while the very next import still fails (the user-site dir did not exist at interpreter
-        # start, so it is not on sys.path), and nothing survives to the next step anyway. Missing
-        # imports are now detected by parsing this code BEFORE it runs and resolved once.
-        "Just import what you need: the imports in your code are checked before it runs, and "
-        "anything missing is offered to the user for a one-time install into the lab-shared "
-        "package area. Do NOT pip-install from inside the snippet (it does not persist and can "
-        "silently half-work), and do NOT hand-write a replacement for a library you were denied. "
-        "A program this Python image lacks (an R script, a command-line tool such as bedtools or STAR) "
-        "may be one of HPC3's software modules: call find_software('<name>') and run it with run_shell "
-        "(`module load ...`), on files you write to AISCIENTIST_WORK. Software no module has can be built "
-        "as a lab environment with request_environment (when that tool is offered); pass its id as "
-        "`environment` here and its programs (Rscript, mosdepth, ...) are on PATH for subprocess calls. "
-        "STRICT: use this ONLY for analysis (compute figures into figures/, tables into tables/). Do "
-        "NOT write or render a report or document (no .docx/.pdf/.html, no python-docx/reportlab/"
-        "pandoc), and do NOT zip/package/export the outputs: the downloadable bundle of everything "
-        "under AISCIENTIST_ARTIFACTS is created AUTOMATICALLY when the run finishes, and a written "
-        "report comes only from the plan's own `write_report` step. Building your own report or "
-        "archive is duplicate work and will be discarded."
-    )
-    # Append the LIVE execution-environment context (real paths, obs schema, CWD + memory caveats)
-    # so the model stops guessing column names / relative paths / working directory — the largest,
-    # most repetitive class of run_code failures. Static for the run → computed once here.
-    description += build_run_code_context(executor)
-
-    return HarnessTool(
-        name="run_code",
-        description=description,
-        parameters={"type": "object", "properties": {"code": {"type": "string"},
-                    "skill": {"type": "string", "description": "Skill being applied; defaults to the last skill read."},
-                    "environment": {"type": "string", "description": (
-                        "Optional lab environment id(s) (request_environment / find_software), comma-separated: "
-                        "mounted read-only, programs first on PATH.")}},
-                    "required": ["code"]},
-        executor=_exec,
-        reads_private_data=False, category="codeact",
-    )
-
-
-def make_run_in_environment_tool(executor: Any,
-                                 environments: "Callable[[str], list] | None" = None) -> "HarnessTool | None":
-    """``run_in_environment`` — run a skill's shell commands inside the environment its SKILL.md
-    declares (``image:``), as a Slurm job on HPC3. None when ``executor`` cannot run images (no HPC
-    session), so a local run's roster does not list a tool that cannot work.
-
-    This is what lets a skill that needs its own software stack (an R/Snakemake pipeline such as
-    CellQC) work with no wrapper tool: the platform builds its declared image once for the lab, and the agent follows the skill's commands here. Only a skill's DECLARED image can be used —
-    the agent never names an image itself, so what runs is what the skill's author pinned.
-
-    ``environments(ids)`` (``HpcShell.resolve_environments``): with ``environment=`` instead of a
-    skill, the command runs in a lab environment the user approved (``request_environment``): a
-    container-image one in its image, a package one in run_code's image with the environment mounted
-    read-only and first on PATH."""
-    runner = getattr(executor, "run_in_image", None)
-    if not callable(runner):
-        return None
-
-    def _exec_env(wanted_env: str, command: str) -> dict[str, Any]:
-        import hashlib
-        if environments is None:
-            return {"status": "error", "error": "Lab environments are not enabled in this session."}
-        if not command:
-            return {"status": "error", "error": "no command provided"}
-        try:
-            refs = environments(wanted_env)
-        except Exception as exc:  # noqa: BLE001 - the model reads the reason
-            return {"status": "error", "error": str(exc)}
-        images = [r for r in refs if getattr(r, "kind", "") == "image"]
-        if images and len(refs) > 1:
-            return {"status": "error", "error": "A container-image environment cannot be combined with others."}
-        workdir = "env/" + re.sub(r"[^\w.\-]", "_", "+".join(r.id for r in refs))[:120]
-        if images:
-            result = runner(command, images[0].image, workdir=workdir)
-        else:
-            from ..hpc.environments import using
-            run_command = getattr(executor, "run_command", None)
-            if not callable(run_command):
-                return {"status": "not_enabled", "note": "this session cannot run batch jobs with an environment"}
-            with using(refs):
-                result = run_command(command, workdir=workdir)
-        if isinstance(result, dict):
-            result["environments"] = [r.id for r in refs]
-            result["provenance"] = {"environments": [r.id for r in refs],
-                                    "command_sha256": hashlib.sha256(command.encode()).hexdigest()[:16]}
-        return result
-
-    def _exec(args: dict[str, Any], ctx: HarnessContext, *,
-              _mcp_server: Any = None, _resources: tuple | None = None,
-              _tool_cache: bool = False) -> dict[str, Any]:
-        import hashlib
-        from pathlib import Path as _Path
-        from .skills import SKILLS, get_skill, refresh_skills
-        wanted_env = _env_arg(args)
-        command = str(args.get("command") or "").strip()
-        if wanted_env and not str(args.get("skill") or "").strip():
-            return _exec_env(wanted_env, command)
-        refresh_skills()
-        wanted = str(args.get("skill") or "").strip()
-        with_env = sorted(s.name for s in list(SKILLS.values()) if s.image)
-        skill = get_skill(wanted) or next(
-            (s for s in list(SKILLS.values()) if s.name.lower() == wanted.lower()), None)
-        if skill is None:
-            return {"status": "error", "error": f"no skill named {wanted!r}. Skills that declare an "
-                                                f"environment: {with_env or 'none'}"}
-        from .mcp_bridge import protected_skill_tools
-        from .atlas_expression import SKILL as ATLAS_SKILL, direct_call_refusal
-        protected = protected_skill_tools(skill.name)
-        if protected and _mcp_server is None:
-            message = (direct_call_refusal() if skill.name == ATLAS_SKILL
-                       else "Use the MCP bridge tools: " + ", ".join(protected))
-            return {"status": "error", "error": message}
-        if _mcp_server is not None and (skill.name != _mcp_server.skill or skill.image != _mcp_server.image):
-            return {"status": "error", "error": "MCP pinned image differs from the installed skill image"}
-        if not skill.image:
-            why = f" ({skill.env_problem})" if skill.env_problem else ""
-            return {"status": "error",
-                    "error": f"skill {skill.name!r} declares no environment{why}: use run_code or "
-                             f"the typed tools. Skills that declare one: {with_env or 'none'}"}
-        if not command:
-            return {"status": "error", "error": "no command provided"}
-        folder = _Path(skill.folder) if skill.folder else None
-        files = {rel: str(folder / rel) for rel in skill.files
-                 if folder is not None and (folder / rel).is_file()}
-        workdir = "env/" + re.sub(r"[^\w.\-]", "_", skill.name)
-        from .skills_registry import execute
-        # Platform callers select resources and the user's tool cache; neither is in the schema, so
-        # the model cannot set them.
-        cpus, mem_gb, time_limit = _resources or (skill.cpus, skill.mem_gb, skill.time_limit)
-        cache = {"tool_cache": True} if _tool_cache else {}
-        def run():
-            if skill.registry_release:
-                import tempfile
-                with tempfile.TemporaryDirectory(prefix="aiscientist-skill-run-") as temp:
-                    staged = {}
-                    for rel, text in skill.files.items():
-                        path = _Path(temp) / rel
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text(text, encoding="utf-8")
-                        staged[rel] = str(path)
-                    return runner(command, skill.image, workdir=workdir, cpus=cpus,
-                                  mem_gb=mem_gb, time_limit=time_limit, files=staged, **cache)
-            return runner(command, skill.image, workdir=workdir, cpus=cpus,
-                          mem_gb=mem_gb, time_limit=time_limit, files=files, **cache)
-        result = execute(skill, ctx, executor, run, "run_in_environment", code=command)
-        if isinstance(result, dict):
-            result["skill"] = skill.name
-            result["provenance"] = {
-                "skill": skill.name, "image": skill.image,
-                "command_sha256": hashlib.sha256(command.encode()).hexdigest()[:16]}
-        return result
-
-    from .skills import SKILLS, refresh_skills
-    refresh_skills()
-    declared = [f"  - {s.name}: {s.image}" for s in sorted(SKILLS.values(), key=lambda s: s.name)
-                if s.image]
-    description = (
-        "Run SHELL commands inside the software environment a SKILL declares (the `image:` in its "
-        "SKILL.md), as a CPU Slurm job on HPC3. Use it to follow a skill whose steps are "
-        "command-line programs that no tool in this catalog runs (e.g. an R/Snakemake pipeline): "
-        "read the skill first (read_skill_reference), then send its commands here, adapted to this "
-        "run's paths. The environment already has the software: do NOT install anything, and skip "
-        "the skill's own installation steps. Inside the job: the working directory, also "
-        "$AISCIENTIST_ENV_DIR, is this skill's own directory and persists across calls in this run "
-        "(put a pipeline's intermediate output there); $AISCIENTIST_DATASET_ROOT is the bound "
-        "dataset folder, READ-ONLY (link or copy what a pipeline must write next to); "
-        "$AISCIENTIST_DATASET is the primary file in it; $AISCIENTIST_WORK holds the run's "
-        "checkpoints (the analysis tools read adata_qc.h5ad there after QC); write deliverables "
-        "under $AISCIENTIST_ARTIFACTS (tables/, figures/, or a folder named after the pipeline); "
-        "$AISCIENTIST_SKILL_DIR has the skill's bundled files; $AISCIENTIST_JOB_CPUS is the CPU "
-        "count. CPUs, memory and time come from the skill. The first use of an environment builds "
-        "it once for the whole lab, which can take 10-30 minutes. Returns the exit code, the tails "
-        "of stdout/stderr, and the files written under $AISCIENTIST_ARTIFACTS.")
-    if environments is not None:
-        description += (
-            " Or pass `environment` (an id from request_environment or find_software) instead of `skill` to "
-            "run the commands as a batch job in that lab environment (its programs first on PATH; 8 CPUs, the "
-            "run_code memory cap): for a program that needs more time or memory than run_shell gives.")
-    if declared:
-        description += "\nSkills that declare an environment:\n" + "\n".join(declared)
-    properties = {
-        "skill": {"type": "string", "description": "the skill whose environment to use"},
-        "command": {"type": "string", "description": "bash to run in it (several lines are fine)"}}
-    if environments is not None:
-        properties["environment"] = {"type": "string", "description": (
-            "a lab environment id, instead of a skill")}
-    return HarnessTool(
-        name="run_in_environment",
-        description=description,
-        parameters={"type": "object", "properties": properties,
-                    "required": ["command"] if environments is not None else ["skill", "command"]},
-        executor=_exec,
-        reads_private_data=False, category="codeact",
-    )
-
-
-@dataclass(frozen=True)
-class Specialist:
-    """A domain-expert persona the Scientist adopts for a step (Virtual-Lab style:
-    different agenda steps are handled by different specialists)."""
-
-    name: str
-    persona: str                     # system addendum prepended to the Scientist brief
-    keywords: tuple[str, ...] = ()   # route a step to this specialist by its wording
-
-
-DEFAULT_SPECIALISTS: tuple[Specialist, ...] = (
-    Specialist(
-        "QC & preprocessing specialist",
-        "You specialize in single-cell QC and preprocessing: cell/gene filtering, mitochondrial "
-        "content, normalization, and highly-variable-gene selection. Be rigorous about thresholds "
-        "and report exactly what was filtered and why.",
-        ("qc", "quality", "filter", "mito", "normal", "preprocess", "hvg", "doublet"),
-    ),
-    Specialist(
-        "Clustering & cell-type specialist",
-        "You specialize in dimensionality reduction, clustering (Leiden/UMAP) and identifying marker "
-        "genes / candidate cell types. Treat every cell-type assignment as a hypothesis to validate.",
-        ("cluster", "umap", "leiden", "marker", "cell type", "celltype", "annotat",
-         "differential", "subpopulation", "pca"),
-    ),
-    Specialist(
-        "Pathway & enrichment specialist",
-        "You specialize in pathway / GO enrichment (GSEA/ORA) and biological interpretation of gene "
-        "sets. Ground every pathway claim in the enrichment statistics the tools return.",
-        ("enrich", "pathway", "gsea", "ora", "kegg", "reactome", "ontology", "interpret", "function"),
-    ),
-)
-
-GENERALIST = Specialist(
-    "Generalist bioinformatician",
-    "You are a careful generalist: use the available tools, ground every claim in their outputs, "
-    "and never invent numbers or gene symbols.",
-)
-
-
-def _route_specialist(step: str, roster: tuple[Specialist, ...]) -> Specialist:
-    """Pick the specialist whose expertise best matches the step (most keyword hits);
-    fall back to the generalist when nothing matches. Deterministic + testable."""
-    s = step.lower()
-    best_score, best = 0, GENERALIST
-    for sp in roster:
-        score = sum(1 for k in sp.keywords if k in s)
-        if score > best_score:
-            best_score, best = score, sp
-    return best
-
-
-# --- concurrency safety (DAG scheduler) --------------------------------------
-# Two ready nodes may run CONCURRENTLY only if their mutable footprints are disjoint. The scanpy
-# analysis line shares BOTH the on-disk checkpoint chain (adata_qc/clustered/de.h5ad) AND scanpy's
-# process-global state (sc.settings.figdir) — so every analysis/code node carries an "__analysis__"
-# sentinel and no two of them can overlap. A literature/background node touches no checkpoint and no
-# scanpy state (it reads accepted findings in-memory + hits an external API), so its footprint is
-# empty and it CAN run alongside the analysis chain. This is the conservative default: anything not
-# clearly independent stays sequential.
-_READ_ONLY_TOOLS = frozenset({"literature_search", "deep_literature", "search_corpus", "make_schematic"})
 # How many times a single hard-failed node may raise a "retry / skip / abort" fork before it just
 # force-advances — bounds the retry loop so a persistently-failing step can never hang the run.
 _MAX_FAILURE_FORKS = 2
@@ -1183,2176 +354,9 @@ _MAX_FAILURE_FORKS = 2
 # a run that has already shown it cannot answer it.
 _MAX_HUMAN_FAILURE_ASKS = 3
 
-# On a hard failure, instead of a generic retry/skip, the LLM proposes CONCRETE alternative approaches
-# for THIS step — the replacement options a human picks from (manual) or the agent auto-applies (bypass).
-_ALTERNATIVES_SYSTEM = (
-    "A single step in a research plan FAILED. Given the step, WHY it failed (the Critic's reason), the "
-    "tools available, and the accepted upstream findings, propose 2-4 CONCRETE, DISTINCT alternative "
-    "ways to accomplish THIS step — a different parameter, a different tool, a different method, or "
-    "reusing an existing input. Each option is a SHORT imperative phrase a scientist can act on "
-    "(e.g. 'Lower the Leiden resolution to 0.5', 'Use the existing cell-type labels instead of "
-    "re-clustering', 'Reduce highly-variable genes to 2000', 'Aggregate to pseudobulk before the test'). "
-    "Do NOT change the research GOAL — only change HOW this one step is done. "
-    "NEVER propose a hand-rolled Python reimplementation of an operation that genuinely requires a "
-    "specialized binary plus reference data — e.g. left-aligning indels / normalizing a VCF without "
-    "bcftools and the reference genome, or read realignment without the aligner. A pure-Python 'manual' "
-    "version silently produces WRONG results, which is worse than not running the step. For those, only "
-    "offer an alternative that uses the correct tool where it is actually available, or prefer skipping "
-    "and letting a downstream step that performs the operation cover it. "
-    "Order them best-first. If the step genuinely cannot be salvaged, return fewer (or an empty array). "
-    "Reply with ONLY a JSON array of short strings."
-)
-
-
-def _node_resources(node: TaskNode) -> set[str]:
-    if _is_literature_step(node.goal) or (node.suggested_tool in _READ_ONLY_TOOLS):
-        return set()                          # external/read-only: no shared mutable resource
-    return {"__analysis__", *node.produces, *node.consumes}
-
-
-def _concurrency_safe(a: TaskNode, b: TaskNode) -> bool:
-    """True when nodes ``a`` and ``b`` can safely run at the same time (disjoint footprints)."""
-    return _node_resources(a).isdisjoint(_node_resources(b))
-
-
-# A tool named in backticks. The optional argument list matters: the PI is INSTRUCTED to write
-# "the TOOL in backticks … and the key settings with their numbers", which it does as
-# `run_de(stratify_by="majorclass", reference="WT")` — and the old pattern, which required the
-# closing backtick immediately after the name, matched none of those. Every guard that asks "does
-# this step name a real analysis tool?" therefore saw NO tool on exactly the steps that specified
-# one most precisely; see the literature-routing guard in _is_literature_step for what that cost.
-_BACKTICK_TOOL_RE = re.compile(r"`(run_[A-Za-z0-9_]+)(?:\s*\([^`]*\))?`")   # case-tolerant: `run_wilcoxon_DE`
-
-# The same shapes, but for ANY tool name rather than the ``run_`` family. Nine of the catalog's
-# twenty-two tools do not start with ``run_`` — ``scgpt_annotate``, ``annotate_variants``,
-# ``map_phenotype_to_hpo``, ``diagnose_disease``, ``inspect_dataset`` among them — and every guard
-# built on the ``run_`` patterns above was blind to exactly those. That is not cosmetic: the guard
-# in _is_literature_step exists to stop a step being routed to the literature path on a stray word,
-# and a step reading "Run `scgpt_annotate` … to request reference-transferred labels" hit the word
-# `reference`, showed the guard NO tool, and was routed to literature — four literature_search calls,
-# scgpt_annotate never invoked, and (literature steps do not retry) silently force-advanced.
-# Backticks also hold obs column names (`majorclass`, `sampleid`), so a bare identifier is NOT
-# evidence of a tool: candidates are intersected with the real catalog below.
-_BACKTICK_NAME_RE = re.compile(r"`(" + TOOL_NAME + r")(?:\s*\([^`]*\))?`")
-_ANY_TOOL_CALL_RE = re.compile(NAME_LEFT + "(" + TOOL_NAME + ")" + NAME_RIGHT + r"\s*\(([^)]*)\)")
-
-#: Tools whose presence MAKES a step a literature step. The catalog's real names — the historical
-#: set named ``run_literature``/``run_paperqa``, neither of which the Scientist catalog serves, so
-#: once the guard could see tool names at all a genuine ``literature_search`` step would have been
-#: classified as NOT-literature. Kept together to make that pairing impossible to miss.
-_LITERATURE_TOOLS = frozenset({
-    "literature_search", "deep_literature", "search_corpus", "run_literature", "run_paperqa",
-    "run_paperqa_search",
-})
-
-
-@lru_cache(maxsize=1)
-def _known_tool_names() -> frozenset[str]:
-    """Every tool name the Scientist catalog actually serves.
-
-    Deferred + cached: the registry pulls the whole tool tree, and this is consulted per step.
-    An empty set on failure degrades to the ``run_`` prefix test below, i.e. exactly the previous
-    behaviour — a classifier must never be the reason a run cannot start.
-    """
-    try:
-        from .registry import build_scientist_catalog
-        # run_in_environment is only built for a live HPC3 session, so the bare catalog lacks it;
-        # a step that names it must still be recognised as that tool's step.
-        from .mcp_bridge import configured_tool_names
-        # The gateway owns the report step; it is not a Scientist catalog tool.
-        return (frozenset(t.name for t in build_scientist_catalog())
-                | {"run_in_environment", REPORT_TOOL} | configured_tool_names())
-    except Exception:  # noqa: BLE001 - classification degrades, it does not fail
-        return frozenset()
-
-
-def _declared_tools(step: str) -> frozenset[str]:
-    """The tools a step DECLARES — the structured fact in an otherwise prose plan.
-
-    The PI is instructed to name the tool in backticks (``Run `run_de(reference="WT")` …``), so the
-    declaration is reliable where the surrounding prose is not. Candidates are intersected with the
-    real catalog so a backticked obs column (`majorclass`) is never mistaken for a tool; when the
-    catalog cannot be read we fall back to the ``run_`` family, which is what this used to see.
-    """
-    text = step or ""
-    candidates = set(_BACKTICK_NAME_RE.findall(text)) | {
-        m.group(1) for m in _ANY_TOOL_CALL_RE.finditer(text)}
-    known = _known_tool_names()
-    if known:
-        return frozenset(c for c in candidates if c in known)
-    return frozenset(c for c in candidates if c.startswith("run_"))
-
-
-# ---------------------------------------------------------------------------
-# Plan-time tool checking (deterministic; runs BEFORE the reviewer sees the plan)
-#
-# A plan is a promise about which tools will run with which settings, and until now nothing checked
-# that the promise could be kept. Three of these reached production plan cards, unmarked, and would
-# each have failed only after approval — with the reviewer's compute already committed:
-#
-#   `run_scanpy_de`  — in a plan NOBODY had edited; the tool is `run_de`
-#   `run_pseudobulk(groupby_col=…)`  — the tool is `run_pseudobulk_de`, and `groupby_col` is invented
-#   `run_de(method="DESeq2")`        — `method` goes straight to scanpy, which has no DESeq2 backend
-#
-# This is not a knowledge gap in the model: the SAME model, on the redraft path in the same test
-# session, wrote `run_pseudobulk_de(sample_key=…, condition_key=…, group_key=…)` correctly and
-# predicted its guard would trip. What was missing was the check. (Ziyao, plan_mode_report_v2_5,
-# B-3.) So: catch it here, name the real tool where the intent is unambiguous, and put anything
-# still unresolved in front of the human while approving is still a choice.
-#
-# The name→name corrections are only for cases where ONE registered tool is the obvious referent —
-# never a guess between two. Everything else is reported, not rewritten.
-_TOOL_NAME_FIXES = {
-    "run_scanpy_de": "run_de",
-    "run_scanpy_diffexp": "run_de",
-    "run_de_scanpy": "run_de",
-    "run_rank_genes_groups": "run_de",
-    "run_wilcoxon_de": "run_de",
-    "run_pseudobulk": "run_pseudobulk_de",
-    "run_pseudobulk_deseq2": "run_pseudobulk_de",
-    "run_scanpy_clustering": "run_clustering",
-    "run_leiden": "run_clustering",
-    "run_leiden_clustering": "run_clustering",
-    "run_qc_scanpy": "run_scanpy_qc",
-    "run_scanpy_quality_control": "run_scanpy_qc",
-    "run_ora": "run_enrichment",
-    "run_enrichr": "run_enrichment",
-    "run_gsea": "run_gsea_prerank",
-    "run_gseapy_prerank": "run_gsea_prerank",
-    "run_doublet": "run_doublet_detection",
-    "run_scrublet": "run_doublet_detection",
-    "run_composition_analysis": "run_composition",
-}
-
-# ``run_de(groupby="sampleid", method="DESeq2")`` — the call as a plan writes it. Only the argument
-# NAMES and any quoted/bare literal values are read; nothing is executed and nothing is inferred
-# from a call the regex cannot parse.
-_KWARG_RE = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.\-]+))""")
-
-
-def _tool_schemas(catalog: "list[Any]") -> "dict[str, dict[str, Any]]":
-    """``{tool name: JSON-schema properties}`` for every tool in the catalog."""
-    out: dict[str, dict[str, Any]] = {REPORT_TOOL: {}}
-    for tool in catalog or ():
-        name = getattr(tool, "name", None)
-        if name:
-            out[str(name)] = plan_parameters(getattr(tool, "parameters", None) or {})
-    return out
-
-
-def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list[str], list[dict[str, Any]]]":
-    """``(agenda with unambiguous tool-name typos corrected, list of remaining findings)``.
-
-    Pure and deterministic — no model call — so it fires on every plan, on every path, and is
-    testable without a GPU. Each finding is ``{kind, tool, detail}`` where ``kind`` is one of:
-
-    * ``renamed``       — a name was corrected to the registered tool it obviously meant
-    * ``unknown_tool``  — no such tool, and no single obvious referent
-    * ``unknown_param`` — the tool exists but does not declare that argument
-    * ``bad_value``     — the argument's value is outside the closed set the schema declares
-
-    An empty ``catalog`` yields no findings: a caller with no tools cannot judge, and inventing
-    findings from an unknown registry would be worse than silence."""
-    if not catalog:
-        return list(agenda), []
-    schemas = _tool_schemas(catalog)
-    findings: list[dict[str, Any]] = []
-    fixed: list[str] = []
-    for step in agenda:
-        text = str(step)
-        # 1. Names. Correct the unambiguous ones in place; report the rest.
-        for raw in set(_BACKTICK_NAME_RE.findall(text)) | {m.group(1) for m in _ANY_TOOL_CALL_RE.finditer(text)}:
-            if raw in schemas or raw == REPORT_TOOL or get_skill(raw) is not None:
-                continue                      # a tool, the report step, or a skill applied with run_code
-            if not raw.startswith("run_"):
-                continue                      # retain the legacy typo policy, using complete names
-            target = _TOOL_NAME_FIXES.get(raw.lower())
-            if target and target in schemas:
-                text = re.sub(NAME_LEFT + re.escape(raw) + NAME_RIGHT, target, text)
-                findings.append({"kind": "renamed", "tool": raw, "detail": target})
-            else:
-                findings.append({"kind": "unknown_tool", "tool": raw, "detail": ""})
-        # 2. Arguments — checked against the (possibly corrected) name's own schema.
-        for call in _ANY_TOOL_CALL_RE.finditer(text):
-            name, args = call.group(1), call.group(2)
-            props = schemas.get(name)
-            if props is None:
-                continue                      # unknown tools are handled above
-            if isinstance(props, PlanParameters):
-                doc = PlanDoc(request="", steps=(PlanStep(id="check", text=text, tool=name,
-                              settings=call_settings(text, name, json_literals=True)),))
-                _, errors = check_plan(doc, {name: props})
-                findings.extend({"kind": "bad_value", "tool": name, "detail": f["detail"]} for f in errors)
-                continue
-            if not props or not name.startswith("run_"):
-                continue                      # preserve the legacy non-MCP prose check's scope
-            for kw in _KWARG_RE.finditer(args):
-                key = kw.group(1)
-                value = next((g for g in kw.groups()[1:] if g is not None), "")
-                spec = props.get(key)
-                if spec is None:
-                    findings.append({"kind": "unknown_param", "tool": name, "detail": key})
-                    continue
-                allowed = spec.get("enum")
-                if allowed and value and value not in allowed:
-                    findings.append({"kind": "bad_value", "tool": name,
-                                     "detail": f"{key}={value!r}; allowed: {', '.join(map(str, allowed))}"})
-        fixed.append(text)
-    return fixed, findings
-
-_LITERATURE_STEP_RE = re.compile(
-    # `references?` must not fire on the `reference=` ARGUMENT of run_de — a step reading
-    # `run_de(reference="WT")` was being classified as a literature step and routed to the
-    # literature fast path, which is how the plan's central contrast goes missing.
-    r"\b(literature|references?(?!\s*[=:])|citations?|published papers?|paper search)\b"
-    r"|\b(?:published|biomedical|biological|scientific|literature)\s+background\b"
-    r"|\bliterature\s+context\b|\bbiological\s+context\b|\bbiological\s+interpretation\b",
-    re.I,
-)
-# "references" in the plural only, and not the things an analysis is run AGAINST: "annotate with
-# the retina reference" and "align to the reference genome" are not requests for citations.
-_REQUESTS_LITERATURE_RE = re.compile(
-    r"\b(literature|citations?|published papers?|paper search|bibliography)\b"
-    r"|\breferences\b(?!\s+(?:genomes?|atlas(?:es)?|datasets?|panels?|markers?|samples?))"
-    r"|\b(?:published|biomedical|biological|scientific|literature)\s+background\b"
-    r"|\bliterature\s+context\b|\bbiological\s+context\b|\bbiological\s+interpretation\b",
-    re.I,
-)
-_LOW_PRIORITY_FOR_LITERATURE_RE = re.compile(
-    r"\b(enrich|enrichment|pathway|annotat|assign|label|marker genes per cluster|markers per cluster)\b",
-    re.I,
-)
-
-#judging whether is literature step
-def _is_literature_step(step: str) -> bool:
-    """Is this step a literature search? Decided by the TOOL it declares, not by its prose.
-
-    A step's role is a structured fact the planner already produces — the tool name — and reading it
-    from the prose instead is what kept going wrong. The word ``reference`` is unavoidable in this
-    domain (reference genome, reference allele, reference atlas, reference-transferred labels), and
-    the phrase list below treats it as a literature signal; a DE step "…to guide biological
-    interpretation" trips the list the same way. Both were real production failures. So: a step that
-    declares a tool IS that tool's kind of step, full stop; the phrase list is the fallback for a
-    step that names no tool at all, which is the only case where prose is the only evidence there is.
-    """
-    declared = _declared_tools(step)
-    if declared:
-        return bool(declared & _LITERATURE_TOOLS)
-    # No tool named: judge the step by its HEADLINE (the bold title, else the first clause), not by
-    # every word of its body. A tool-less analysis step routinely MENTIONS literature or a reference
-    # in passing — "Reconcile transferred and original annotations … reference taxonomy …" and
-    # "Reconcile evidence and generate the final report … literature context …" were both sent to
-    # the literature path in run 3c5fbc8608a7 (rounds 12, 24) — while a real literature step says so
-    # in its title ("Ground provisional mechanisms in literature"). And in the headline a singular
-    # "reference" is an analysis word (reference atlas / genome / labels), so only the plural counts.
-    headline = _step_headline(step).replace("_", " ")
-    return bool(_LITERATURE_HEADLINE_RE.search(headline))
-
-
-_LITERATURE_HEADLINE_RE = re.compile(
-    r"\b(literature|references(?!\s*[=:])|citations?|published papers?|paper search|pubmed|europe\s*pmc)\b"
-    r"|\b(?:published|biomedical|biological|scientific|literature)\s+background\b"
-    r"|\bliterature\s+context\b|\bbiological\s+context\b|\bbiological\s+interpretation\b",
-    re.I,
-)
-
-
-def _step_headline(step: str) -> str:
-    """A step's title: the leading ``**bold**`` span the planner writes, else its first clause."""
-    text = (step or "").strip()
-    m = re.match(r"\*\*(.+?)\*\*", text)
-    if m:
-        return m.group(1)
-    return re.split(r"(?<=[.;:!?])\s|\s[\u2014\u2013]\s|\s-\s", text, maxsplit=1)[0]
-
-#judging whether user is asking for literature
-def _requests_literature(*texts: str | None) -> bool:
-    return _literature_wish(*texts) is True
-
-
-# What a sentence SAYS about literature, not only whether it names it. A mention used to count as
-# a request whatever the sentence said, so in plan review "also discard the literature" put back
-# the step it asked to remove (prod run 1e887ed2bf8e). Chinese is read too: users type it.
-_LITERATURE_ZH_RE = re.compile(r"文献|引文|引用")
-_WISH_CLAUSE_SPLIT_RE = re.compile(r"[,;.!?，；。！？\n]+|\bbut\b|\bthen\b|但是?|然后|另外")
-_NEGATION = (r"(?:(?:do|does|did|should|would|could|will|can|must|need)\s+)?not|\w+n['’]t|never"
-             r"|no\s+need\s+to")
-# The verbs that ask for a step: those of ``_ADD_INTENT_RE``, and the ones that keep it or ask for
-# what it produces ("give me references", "ground it in the literature").
-_ASK_VERBS = (r"add|insert|include|append|introduce|keep|restore|cite|ground|search|find|review"
-              r"|provide|give|attach|want|need")
-_REMOVAL_CUE_RE = re.compile(
-    # A negation takes its verb with it ("don't add", "no need to include"), so that verb is not
-    # then read as a request of its own. Not across "and": "don't skip QC and cite the literature".
-    r"\b(?:" + _NEGATION + r")\s+(?:(?!and\b|or\b)\w+\s+){0,4}?"
-    r"(?:" + _ASK_VERBS + r"|run|do|plan|use|perform)\b"
-    r"|\b(?:" + _NEGATION + r"|remov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|drop(?:s|ped|ping)?"
-    r"|discard(?:s|ed|ing)?|skip(?:s|ped|ping)?|omit(?:s|ted|ting)?|exclud(?:e|es|ed|ing)"
-    r"|scrap|ditch|get\s+rid\s+of|take\s+out|leave\s+out|cut|without|no\s+need|no|instead\s+of"
-    r"|rather\s+than)\b"
-    r"|不(?:再)?(?:需要|要|用|做|加|跑|含|包括|保留|搜|查|进行|执行|必)|无需|无须|没必要"
-    r"|别(?:做|跑|加|搜|查|要|用)|去掉|去除|删|移除|取消|跳过|省略|拿掉|砍掉",
-    re.I)
-_KEEP_CUE_RE = re.compile(
-    r"\b(?:" + _ASK_VERBS + r"|also\s+run|also\s+do|put\s+back|bring\s+back)\b"
-    r"|加上|加一|增加|新增|添加|再跑|也跑|保留|加入|加回|补上|恢复",
-    re.I)
-# The removal said AFTER the thing it removes: "the literature step is not needed", "文献去掉".
-_REMOVAL_AFTER_RE = re.compile(
-    r"(?:\bnot|\bno\s+longer|n['’]t)\s+(?:\w+\s+)?(?:needed|necessary|required|wanted|relevant|useful)\b"
-    r"|\bunnecessary\b"
-    r"|\b(?:can|could|should|may|must)\s+(?:go|be\s+(?:removed|dropped|deleted|skipped|omitted|"
-    r"discarded|excluded|cut))\b"
-    r"|^\W*(?:steps?|search|part|section|review|grounding)?\W*(?:too\W+|also\W+)?"
-    r"(?:remove|delete|drop|discard|skip|omit|out|off|gone|no)\b"
-    r"|不(?:再)?(?:需要|要|用|做|加|跑|保留|搜|查|必)|无需|无须|没必要|别(?:做|跑|加|搜|查|要)"
-    r"|去掉|去除|删|移除|取消|跳过|省略|拿掉|砍掉|算了|免了",
-    re.I)
-# A plan-review note that asks for something to go: a removal, or a narrowing / replacing /
-# shortening of the plan ("only keep step 1", "replace step 3", "make it simpler", "只保留第一步").
-_PLAN_CUT_RE = re.compile(
-    _REMOVAL_CUE_RE.pattern
-    + r"|\b(?:only|just|nothing\s+(?:else|more)|replac(?:e|es|ed|ing)|instead|swap(?:s|ped|ping)?"
-      r"|simpl(?:er|ify|ified)|short(?:er|en|ened)|fewer|less|reduc(?:e|es|ed|ing)|trim(?:med)?"
-      r"|minimal|merg(?:e|es|ed|ing))\b"
-      r"|只|仅|换成|改成|替换|简化|精简|减少|缩短|合并",
-    re.I)
-
-
-def _literature_wish(*texts: str | None) -> "bool | None":
-    """What the user's own words LAST said about literature: ``True`` asked for it, ``False`` asked
-    for none, ``None`` never mentioned it. ``texts`` are read in order (the question, then the
-    review notes), clause by clause, so a later sentence overrules an earlier one.
-
-    Within a clause the cue nearest BEFORE the mention decides ("remove GSEA and add a literature
-    step" asks for one; "don't add references" does not); with no cue before it, a removal said
-    after it does ("文献步骤不要了"); a plain mention is a request. When the two readings are
-    close this leans to ``False``: not forcing a step costs the user one more message, forcing one
-    they declined is the failure this replaces."""
-    wish: "bool | None" = None
-    for text in texts:
-        for clause in _WISH_CLAUSE_SPLIT_RE.split(text or ""):
-            mention = _REQUESTS_LITERATURE_RE.search(clause) or _LITERATURE_ZH_RE.search(clause)
-            if not mention:
-                continue
-            before = clause[:mention.start()]
-            cut = max((m.end() for m in _REMOVAL_CUE_RE.finditer(before)), default=-1)
-            keep = max((m.start() for m in _KEEP_CUE_RE.finditer(before)), default=-1)
-            if cut >= 0 or keep >= 0:
-                # A keep cue AFTER the last removal cue. Strictly after: Chinese writes the
-                # negation against its verb ("不要保留文献"), which is one removal, not a keep.
-                wish = keep > cut
-            else:
-                wish = not _REMOVAL_AFTER_RE.search(clause[mention.end():])
-    return wish
-
-
-def _literature_step_wanted(agenda: list[str], *, question: str, feedback: str,
-                            prior_agenda: "list[str] | None", latest_feedback: str) -> bool:
-    """Should the guard make sure ``agenda`` has a literature step?
-
-    A first draft follows the user's words. A revision is judged against the plan the user just
-    reviewed, because that plan is what their note is about: a literature step it did not have is
-    added only when the note asks for one, and one it had is put back only when the note asked
-    for nothing to go. "Remove step 2", "only keep 1 … discard all other step" and "只保留第一步"
-    name no literature, and the redraft dropping the literature step is the user's request, not a
-    slip to repair."""
-    said = _literature_wish(question, feedback)
-    note = (latest_feedback or feedback or "").strip()
-    if prior_agenda is None or not note:
-        return said is True
-    if any(_is_literature_step(s) for s in agenda):
-        return said is True              # planned already; only duplicates are left to collapse
-    if any(_is_literature_step(s) for s in prior_agenda):
-        return said is not False and not _PLAN_CUT_RE.search(note)
-    return _literature_wish(note) is True
-
-#if the 5 steps are full kick out ... in priority
-# obs columns that carry an EXISTING cell-type annotation (as opposed to de-novo cluster labels
-# like leiden/louvain, or non-biological metadata like donor/age/sex). When one is present the PI
-# should ground marker/enrichment analysis in it, not in raw cluster numbers.
-_CELLTYPE_COL_RE = re.compile(
-    r"(?i)^(cell[_.]?type|major[_.]?class|sub[_.]?class|cell[_.]?class|cell[_.]?ontology"
-    r"(?:[_.]?class)?|cell[_.]?label|celltype[_.]?annotation|annotation|predicted[_.]?label|"
-    r"cell[_.]?identity)s?$"
-)
-
-
-def _looks_like_celltype_col(name: str) -> bool:
-    return bool(_CELLTYPE_COL_RE.match(str(name or "").strip()))
-
-
-# Per-cell QC / doublet bookkeeping. Low-cardinality like a design column and completely unlike one
-# in meaning: `DF.classifications` holding the single value "Singlet" says the doublets were already
-# removed, not that the study has one arm. Excluded from the replication summary so the columns that
-# actually define the experiment are the only ones counted there.
-_QC_COL_RE = re.compile(
-    r"(?i)^(df[_.]?classification|doublet|scrublet|is[_.]?doublet|pann|percent[_.]?mt|pct[_.]?"
-    r"counts?[_.]?mt|n[_.]?count|n[_.]?feature|nuclear[_.]?fraction|qc[_.]?)\w*s?$"
-)
-
-
-def _looks_like_qc_col(name: str) -> bool:
-    return bool(_QC_COL_RE.match(str(name or "").strip()))
-
-
-# A step whose ENTIRE action is to re-read what an earlier step already wrote to disk. It produces
-# no new knowledge, and it costs a step: a production plan spent one of six on "Parse the generated
-# DE tables to extract and report the exact tabular output", which the DE step had already
-# returned. Deliberately much narrower than ``_is_report_busywork`` (which matches a bare "report"
-# and would delete the perfectly good "…and report how many cells remain"): BOTH a read-back verb
-# AND a reference to previously-produced output are required.
-_READBACK_VERB_RE = re.compile(
-    r"\b(parse|re-?read|tabulate|collate|transcribe|extract and report|report the exact"
-    r"|report exactly|read out)\b", re.I)
-_READBACK_TARGET_RE = re.compile(
-    r"\b(generated|produced|resulting|existing|saved|written|output|above|previous|prior)\b"
-    r"[^.]{0,40}?\b(tables?|results?|csvs?|files?|outputs?|statistics)\b", re.I)
-
-
-def _is_readback_step(step: str) -> bool:
-    s = (step or "").replace("_", " ")
-    return bool(_READBACK_VERB_RE.search(s) and _READBACK_TARGET_RE.search(s))
-
-
-# A pathway/GO/ORA enrichment step (as opposed to a marker-DE step, which is kept for annotation
-# validation). Used to deterministically drop enrichment when the dataset has no experimental
-# contrast — enriching a known cell type's identity markers is circular ("meaningless enrichment").
-_ENRICHMENT_STEP_RE = re.compile(
-    r"\b(enrich(?:ment|ed|es|ing)?|over[-\s]?represent(?:ation|ed|s|ing)?|pathway|gene[-\s]?ontology"
-    r"|reactome|gsea|gene[-\s]?set[-\s]?enrichment|msigdb|hallmark gene set)\b",
-    re.I,
-)
-
-
-# A step that PRODUCES a differential-expression table — what run_enrichment / run_gsea_prerank read.
-_DE_PRODUCER_RE = re.compile(
-    r"\b(run[_ ]de\b|run[_ ]pseudobulk[_ ]de|rank[_ ]genes[_ ]groups|differential(?:ly)?[- ]"
-    r"express|marker genes?|pseudobulk|wilcoxon|deseq2?|DEGs?)\b", re.I)
-
-
-_ENRICHMENT_TOOLS = frozenset({"run_enrichment", "run_gsea_prerank"})
-_DE_PRODUCER_TOOLS = frozenset({"run_de", "run_pseudobulk_de", "run_depth_matched_de"})
-# Tools that can do anything: naming one says nothing about what the step is, so its prose decides.
-_GENERIC_TOOLS = frozenset({"run_code", "run_shell", "run_in_environment"})
-
-
-def _primary_tool(step: str) -> "str | None":
-    """The tool a step itself runs: the FIRST catalog tool it names. Later names are usually what it
-    reads or feeds ("…ranked by Wilcoxon z, from `run_de`'s ranking files"), not what it runs."""
-    text = step or ""
-    declared = _declared_tools(text)
-    first: "tuple[int, str] | None" = None
-    for rx in (_BACKTICK_NAME_RE, _ANY_TOOL_CALL_RE):
-        for m in rx.finditer(text):
-            if m.group(1) in declared and (first is None or m.start() < first[0]):
-                first = (m.start(), m.group(1))
-    return first[1] if first else None
-
-
-def _is_de_producer_step(step: str) -> bool:
-    if _is_literature_step(step):
-        return False
-    tool = _primary_tool(step)
-    if tool and tool not in _GENERIC_TOOLS:
-        return tool in _DE_PRODUCER_TOOLS
-    if _is_enrichment_step(step):
-        return False
-    return bool(_DE_PRODUCER_RE.search((step or "").replace("_", " ")))
-
-
-def _is_enrichment_step(step: str) -> bool:
-    # A literature / biological-interpretation step may MENTION "enriched pathways" without BEING an
-    # enrichment-analysis step — never classify those as enrichment, so they survive the no-contrast
-    # prune (only the actual ORA/pathway analysis step should be dropped).
-    if _is_literature_step(step):
-        return False
-    # A step that names its tool is that tool's step, whatever its prose says. On 2026-10-03 the
-    # prose test called four steps of one plan "enrichment" and dropped them: the marker-DE step (it
-    # said what its markers would feed: "pathway"), ORA, GSEA, and the cell-type annotation step
-    # ("a label is assigned only when a marker is ENRICHED in the cluster"). With the DE step gone
-    # nothing produced a DE table, so the run lost its markers and its labels.
-    tool = _primary_tool(step)
-    if tool and tool not in _GENERIC_TOOLS:
-        return tool in _ENRICHMENT_TOOLS
-    return bool(_ENRICHMENT_STEP_RE.search((step or "").replace("_", " ")))
-
-
-# Report/packaging busywork the PI is already told never to plan (the tools write the figures and
-# tables, the bundle is assembled when the run finishes, and a written report is the plan's own
-# ``write_report`` step, which ``_is_report_step`` sets apart first). Re-checked DETERMINISTICALLY for a
-# step proposed mid-run by exploration, where no plan-time review will catch it.
-_REPORT_BUSYWORK_RE = re.compile(
-    r"\b(write|writing|render|rendering|compile|compiling|assemble|assembling|package|packaging"
-    r"|bundle|bundling|zip|export|exporting|organi[sz]e|organi[sz]ing)\b[^.]{0,40}"
-    r"\b(report|manuscript|document|archive|deliverable|outputs?|figures? and tables?)\b"
-    r"|\b(\.docx|\.pdf|\.html|\.zip)\b"
-    # PURE-TRANSPORT verbs (export/package/bundle/zip/organize — never write/render, which a real
-    # analysis step legitimately does to a summary table) aimed at what the tools already write:
-    # "Export all computed DE tables … to the artifacts directory for automatic report assembly"
-    # reached a plan card. Everything computed is already in artifacts/; the step is a slot for
-    # nothing.
-    r"|\b(export|exporting|package|packaging|bundle|bundling|zip|organi[sz]e|organi[sz]ing)\b"
-    r"[^.]{0,60}\b(artifacts?(?: director(?:y|ies)| folder)?|tables?|results?|metrics)\b"
-    # The step's stated PURPOSE, when its verb is an innocent one. Both branches above key on a
-    # verb, and a live Qwen3.6 plan (2026-08-19, run 2) opened with "Generate" — which is also how
-    # a real analysis step opens — so nothing fired on:
-    #   "**Figures & tables** — Generate the visual summaries required FOR THE REPORT … volcano
-    #    plots … heatmaps … enrichment bar plots … for automatic inclusion in the final PDF+DOCX
-    #    report."
-    # It ran: 8 run_code turns, 54 seconds, and produced two summary CSVs. Every figure it promised
-    # was already on disk — `run_de` writes the volcanoes (_volcano) and `run_enrichment` writes the
-    # bar plots — so the step re-made what the tools had already made and displaced a real analysis.
-    # A purpose clause is the reliable signal: no genuine analysis step exists in order to be put
-    # in the report. (The dotted-extension branch above missed it too: "PDF+DOCX" has no dots.)
-    r"|\bfor\s+(?:automatic\s+)?inclusion\s+in\s+the\b"
-    r"|\b(?:required|needed)\s+for\s+the\s+(?:final\s+)?(?:report|manuscript|deliverable)\b"
-    r"|\b(?:pdf|docx|html)\s*[+/&]\s*(?:pdf|docx|html)\b",
-    re.I,
-)
-
-
-def _is_report_busywork(step: str) -> bool:
-    from .mcp_bridge import configured_tool_names
-    if not (_declared_tools(step) & _GENERIC_TOOLS) and _primary_tool(step) in configured_tool_names():
-        return False  # a typed domain output (e.g. Atlas report.md) is an actual tool operation
-    return bool(_REPORT_BUSYWORK_RE.search((step or "").replace("_", " ")))
-
-
-# The written report is a step of its own, planned only when asked for (RCHENLAB/AiScientist#102):
-# the request asks for a written report, or a skill the plan uses declares ``writes-report``. The
-# Scientist never runs it; the lab hands it to the gateway, which writes the report after the analysis
-# (``write_report``, also an MCP tool for a finished run). Without the step a run ends with its answer
-# in the chat.
-REPORT_STEP = ("**Written report** — Write the methods and results report from the accepted results "
-               "with `write_report`: the manuscript with its references and verification statement, as "
-               "PDF and DOCX. It runs after the analysis steps.")
-
-
-def _is_report_step(step: str) -> bool:
-    """A step the plan gives to ``write_report`` (it names the tool)."""
-    return REPORT_TOOL in _declared_tools(step or "")
-
-
-# The planner's line for it, beside the catalog's tools.
-_REPORT_TOOL_LINE = (
-    f"- {REPORT_TOOL}: the run's written report (the methods and results manuscript with its "
-    "references and verification statement, as PDF and DOCX), written from the accepted results "
-    "after the analysis. Plan it only when the request asks for a written report, as the LAST step.")
-
-
-def _norm_step(step: str) -> str:
-    """Bag-of-words key for "is this the same step?". Used to stop exploration re-adding a step the
-    plan already has under slightly different wording — the model's most common failure mode."""
-    return " ".join(re.findall(r"[a-z0-9]+", (step or "").lower()))
-
-
-# ---------------------------------------------------------------------------
-# Resolving what a change request POINTS AT, before anything acts on it.
-#
-# Two measured failures, opposite in direction and neither of them announced (Ziyao,
-# plan_mode_report_v2_5, B-5 and B-6):
-#
-#   "use resolution 0.5 for the clustering step" — sent to a plan with NO clustering step. Instead
-#   of saying so, the redraft INVENTED one, complete with an `n_pcs=30, n_neighbors=15` the user had
-#   never mentioned, wedged at position 2, consumed by nothing downstream. Asked the same thing as a
-#   QUESTION ("how do I change the resolution?") the system answered correctly that the plan does
-#   not cluster — so the two paths held different beliefs about the same plan.
-#
-#   "drop the enrichment step" — singular — sent to a plan with TWO (`run_enrichment` and
-#   `run_gsea_prerank`). Both were deleted. The mirror case, "could you use padj 0.01 instead?" with
-#   padj in two steps, changed exactly one. Delete took the maximum reading, modify took the
-#   minimum, and neither said a choice had been made.
-#
-# One rule covers both: work out which steps the request names, and when the answer is "none" or
-# "more than one", ask rather than act. Deterministic — a clarify that was not needed costs one
-# exchange, while acting on the wrong reading costs the plan.
-# Each topic pairs the words a REQUEST uses for it with the test for whether a PLAN STEP is one.
-# The two are deliberately different jobs, and conflating them produced false alarms both ways:
-# a step reading "…`run_enrichment` on the DE table" MENTIONS differential expression without being
-# a DE step, and a user who says "the enrichment step" means either of ORA and GSEA — which is
-# exactly why naming one of two is ambiguous. The step-side tests are the predicates the rest of
-# the planner already uses, so a topic cannot drift from what the pruning guards believe.
-_PLAN_TOPICS: "dict[str, tuple[re.Pattern[str], Callable[[str], bool]]]" = {
-    "clustering": (
-        re.compile(r"\b(cluster\w*|leiden|louvain|resolution)\b", re.I),
-        lambda s: bool(_CLUSTERING_STEP_RE.search(s.replace("_", " ")))),
-    "pathway enrichment": (
-        re.compile(r"\b(enrichment|enrich\w*|ora|over.?representation|go terms?)\b", re.I),
-        _is_enrichment_step),
-    "GSEA": (
-        re.compile(r"\b(gsea|prerank|pre.?ranked)\b", re.I),
-        lambda s: bool(re.search(r"\b(gsea|prerank)\b", s.replace("_", " "), re.I))),
-    "QC": (
-        re.compile(r"\b(qc|quality control|percent\.?mt|mitochondrial)\b", re.I),
-        # "CellQC" / `run_cellqc` is a QC step too: without it, "raise the mitochondrial limit to 20 and
-        # cluster at 0.8" on a CellQC plan was told the plan has no QC step.
-        lambda s: bool(re.search(r"\b(qc|quality control|scanpy qc|cellqc)\b", s.replace("_", " "), re.I))),
-    "differential expression": (
-        re.compile(r"\b(differential expression|de|wilcoxon|rank.?genes)\b", re.I),
-        _is_de_producer_step),
-    "pseudobulk": (
-        re.compile(r"\b(pseudobulk|pseudo.?bulk|deseq2?|edger)\b", re.I),
-        lambda s: bool(re.search(r"\b(pseudobulk|deseq2?)\b", s.replace("_", " "), re.I))),
-    "doublet detection": (
-        re.compile(r"\b(doublets?|scrublet)\b", re.I),
-        lambda s: bool(re.search(r"\b(doublets?|scrublet)\b", s.replace("_", " "), re.I))),
-    "composition": (
-        re.compile(r"\b(composition|proportions?|abundance)\b", re.I),
-        lambda s: bool(re.search(r"\b(composition|proportions?|abundance)\b", s.replace("_", " "), re.I))),
-    "batch integration": (
-        re.compile(r"\b(integration|batch correct\w*|harmony|combat)\b", re.I),
-        lambda s: bool(re.search(r"\b(integration|batch correct\w*|harmony|combat)\b", s.replace("_", " "), re.I))),
-    "literature": (
-        re.compile(r"\b(literature|papers?|citations?|pubmed)\b", re.I),
-        _is_literature_step),
-}
-
-# An ADD is allowed to name something the plan does not have yet — that is what adding means. Only
-# requests that point at an EXISTING step are checked for existence.
-_ADD_INTENT_RE = re.compile(
-    r"\b(add|insert|include|append|introduce|also run|also do|also add)\b"
-    r"|加上|加一|增加|新增|添加|再跑|也跑", re.I)
-def _is_definite_reference(request: str, word: str) -> bool:
-    """True when ``word`` appears in ``request`` as a reference to an EXISTING step.
-
-    A bare mention is not enough: "compare the arms with a wilcoxon test" names a method, while
-    "the wilcoxon step" names a step the speaker believes is already in the plan. Only the second
-    is checked for existence — the first is just how a new step gets described."""
-    w = re.escape(word)
-    return bool(
-        # "the clustering step", "that enrichment analysis", "this DE step"
-        re.search(rf"\b(?:the|that|this)\s+(?:\w+\s+){{0,3}}{w}\b", request, re.I)
-        # "clustering step", "enrichment step" — the noun "step" makes it definite on its own
-        or re.search(rf"\b{w}(?:\s+\w+){{0,2}}\s+步骤?\b|\b{w}(?:\s+\w+){{0,2}}\s+step\b", request, re.I)
-        # "for the clustering", "in the DE", "from the enrichment"
-        or re.search(rf"\b(?:for|in|from|of|on)\s+the\s+(?:\w+\s+){{0,3}}{w}\b", request, re.I)
-    )
-
-
-def _topics_named(request: str) -> "list[str]":
-    """Plan topics the request refers to DEFINITELY (see :func:`_is_definite_reference`)."""
-    named: list[str] = []
-    for topic, (words, _) in _PLAN_TOPICS.items():
-        if any(_is_definite_reference(request, m.group(0)) for m in words.finditer(request or "")):
-            named.append(topic)
-    return named
-
-
-# Input carrying no change request. "hmm" was sent to the PI as a revision and came back with the
-# ORA step's padj quietly moved from 0.05 to 0.01 — a statistical threshold changed by a filler
-# word, with nothing on screen to say it had happened (report v2_5, B-4). A redraft is destructive
-# by nature (measured: it damages steps nobody mentioned in 100% of trials), so it needs an actual
-# instruction to justify it.
-_NOISE_REPLY_RE = re.compile(
-    r"^(?:hmm+|hm+|uh+|um+|er+|ah+|oh+|ok(?:ay)?|k|yeah?|yep|yes|no|nope|sure|fine|right|"
-    r"thanks?|thank you|ty|cool|nice|good|great|\.{1,3}|\?+|!+|"
-    r"嗯+|额+|呃+|哦+|噢+|好+的?|行|是|对|不|没有|谢谢|可以)$",
-    re.I)
-
-
-def is_noise_reply(text: str) -> bool:
-    """True when a reviewer's reply asks for nothing — empty, punctuation, or a bare interjection.
-
-    Only whole-string matches count: "ok, drop the GSEA step" is an instruction that happens to
-    start with "ok", and must not be swallowed here."""
-    t = (text or "").strip().strip(",.;:!?，。；：！？ ")
-    return not t or bool(_NOISE_REPLY_RE.match(t))
-
-
-# ``padj=0.05`` and ``padj 0.05`` / ``padj of 0.05`` — how plans state a setting either way.
-_SETTING_RE = re.compile(
-    r"\b([a-z_][a-z0-9_]{2,})\s*(?:=|:|\bof\b|\bto\b)?\s*[\"']?(-?\d+(?:\.\d+)?)[\"']?", re.I)
-
-
-def _settings_in(step: str) -> "dict[str, str]":
-    """``{parameter: value}`` for the numeric settings a step states."""
-    return {m.group(1).lower(): m.group(2) for m in _SETTING_RE.finditer(step or "")}
-
-
-def _similarity(a: str, b: str) -> float:
-    """Token-overlap (Jaccard) between two steps — "is this the same step, reworded?"."""
-    ta, tb = set(_norm_step(a).split()), set(_norm_step(b).split())
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
-def diff_plans(before: "list[str]", after: "list[str]") -> "dict[str, list[Any]]":
-    """What a redraft actually did: ``{"dropped", "added", "changed"}``.
-
-    A whole-plan redraft is the one revision path that rewrites steps the reviewer never mentioned.
-    Measured on three production redrafts: "also run GSEA and add a literature review step" deleted
-    two unrelated steps and added a tool nobody asked for; "make the whole plan simpler" deleted the
-    cross-cell-type synthesis; "hmm" moved a significance threshold. None of the three was reported
-    anywhere in the console, so the only way to find out was to diff two plans by eye — which is
-    what this does instead, deterministically, so the reviewer can accept or reject the collateral
-    with the same look they give the plan (report v2_5, B-4).
-
-    Steps are matched by token overlap, so a reworded step counts as the SAME step (its settings are
-    then compared) rather than as one deletion plus one addition."""
-    unmatched = list(range(len(after)))
-    dropped: list[str] = []
-    changed: list[dict[str, str]] = []
-    for step in before:
-        best, score = None, 0.45          # below this, two steps are different work, not a rewording
-        for j in unmatched:
-            if (s := _similarity(step, after[j])) > score:
-                best, score = j, s
-        if best is None:
-            dropped.append(step)
-            continue
-        unmatched.remove(best)
-        old_settings, new_settings = _settings_in(step), _settings_in(after[best])
-        for key, old in old_settings.items():
-            new = new_settings.get(key)
-            if new is not None and new != old:
-                changed.append({"step": after[best], "param": key, "before": old, "after": new})
-    return {"dropped": dropped, "added": [after[j] for j in unmatched], "changed": changed}
-
-
-def stale_downstream_settings(agenda: "list[str]", step_index: int,
-                              param: str, old: str, new: str) -> "list[int]":
-    """1-based steps AFTER ``step_index`` that still state ``param`` at its pre-change value.
-
-    Changing a threshold in one step does not change the step that consumes its output. Asked to
-    use ``padj 0.01``, the revision changed the DE step and left the ORA step below it saying it
-    filters input genes at ``padj=0.05`` — while reading a table that by then contained only genes
-    at padj<0.01. The plan contradicted itself, on paper, in front of the reviewer, and nothing
-    said so (report v2_5, B-7). Reported rather than auto-propagated: whether the downstream number
-    should follow is a methodological choice, and the reviewer is right there."""
-    if old == new:
-        return []
-    return [i + 1 for i, step in enumerate(agenda)
-            if i > step_index and _settings_in(str(step)).get(param.lower()) == old]
-
-
-def resolve_plan_reference(request: str, agenda: "list[str]") -> "tuple[str, str, list[int]]":
-    """``(verdict, topic, 1-based step numbers)`` for what a change request points at.
-
-    ``verdict`` is ``"ok"`` (act on it), ``"missing"`` (the plan has no such step) or
-    ``"ambiguous"`` (it has more than one, and the request named only one). ``"ok"`` is also the
-    answer for a request that names nothing in particular — most requests — so this only ever
-    interrupts when it has something specific to say."""
-    if not request or not agenda or _ADD_INTENT_RE.search(request):
-        return "ok", "", []
-    for topic in _topics_named(request):
-        is_step = _PLAN_TOPICS[topic][1]
-        hits = [i + 1 for i, s in enumerate(agenda) if is_step(str(s))]
-        if not hits:
-            return "missing", topic, []
-        if len(hits) > 1:
-            return "ambiguous", topic, hits
-    return "ok", "", []
-
-
-# A step that clusters the cells de-novo (Leiden/Louvain). Used to detect the "analyze by existing
-# labels vs re-cluster de-novo" methodological fork when the dataset already carries cell-type labels.
-_CLUSTERING_STEP_RE = re.compile(r"\b(clusters?|clustering|clustered|leiden|louvain)\b", re.I)
-# A step that says NOT to cluster is the plan deciding the fork, not a clustering step. Read as one,
-# "reuse them and do not re-cluster" (the `\b` before "cluster" matches after the hyphen) raised
-# "use the labels or re-cluster?" about the very step that had answered it (run f107bcf7b660).
-_NEGATED_CLUSTERING_RE = re.compile(
-    r"\b(?:do\s+not|don'?t|does\s+not|never|no|not|without|rather\s+than|instead\s+of|avoid(?:ing)?|"
-    r"skip(?:ping)?)\s+(?:\w+\s+){0,3}?(?:de[-\s]?novo\s+)?(?:re-?)?"
-    r"(?:clusters?|clustering|clustered|leiden|louvain)"
-    r"(?:\s+(?:clusters?|clustering|clustered|leiden|louvain))*\b", re.I)
-
-
-def _clusters_de_novo(step: str) -> bool:
-    """True when a step CLUSTERS the cells de-novo, and not merely when it says not to."""
-    text = _NEGATED_CLUSTERING_RE.sub(" ", (step or "").replace("_", " "))
-    return bool(_CLUSTERING_STEP_RE.search(text))
-
-
-def _plan_has_clustering(agenda: "list[str]") -> bool:
-    return any(_clusters_de_novo(str(s)) for s in agenda)
-
-
-def _is_label_fork(options: "Any") -> bool:
-    """Whether a decision's options are the 'existing labels vs re-cluster' fork."""
-    text = " ".join(str(o) for o in (options or ())).lower()
-    return "label" in text and "cluster" in text
-
-
-_CLUSTER_COLS = ("leiden", "louvain", "cluster", "clusters", "seurat_clusters")
-
-
-def handed_on_note(dr: "dict[str, Any] | None") -> str:
-    """The planning note for a dataset an earlier run handed on (profile key ``handed_on``), or ''.
-
-    Such a file is already filtered and log-normalised and carries that run's clusters and labels.
-    Nothing said so, and nothing about the file looks unusual, so a plan for it opened with QC and
-    normalisation again — on log values, with no symptom."""
-    rec = dr.get("handed_on") if isinstance(dr, dict) else None
-    if not isinstance(rec, dict) or not rec.get("processed"):
-        return ""
-    cats = dr.get("obs_categoricals") if isinstance(dr.get("obs_categoricals"), dict) else {}
-    cols = [*cats, *[str(k) for k in (dr.get("obs_keys") or [])]]
-    clusters = next((c for c in cols if c in _CLUSTER_COLS), None)
-    labels = next((c for c in cols if _looks_like_celltype_col(c)), None)
-    counts = str(rec.get("counts_layer") or "integer counts")
-    has = ["quality-controlled and log-normalised expression (do not filter or normalise again)"]
-    if "counts" in (rec.get("layers") or []):
-        has.append(f"the counts in layers['counts'] ({counts})")
-    if clusters:
-        has.append(f"clusters in `{clusters}`")
-    if labels:
-        has.append(f"cell-type labels in `{labels}`")
-    if "X_umap" in (rec.get("obsm") or []):
-        has.append("a UMAP embedding")
-    run = str(rec.get("run_id") or "").strip()
-    return ("⚠ THIS DATASET IS THE PROCESSED OUTPUT OF AN EARLIER RUN"
-            + (f" (run {run})" if run else "") + ". It carries: " + "; ".join(has) + ". It is "
-            "already in place as this run's checkpoint, so `run_de`, `run_marker_annotation`, "
-            "`run_composition` and `run_clustering` read it directly. Do NOT plan QC, doublet "
-            "removal, normalisation or a matrix-provenance step (QC cannot be redone from this "
-            "file: it holds only the cells the earlier QC kept), and do not plan clustering or "
-            "annotation again unless the request asks to redo them. Tables and figures of the "
-            "earlier run are in its own report; a step that needs a table (enrichment needs a DE "
-            "table) must have the step that computes it in THIS plan.")
-
-
-def _contrast_columns(dr: "dict[str, Any] | None") -> "list[tuple[str, list[str]]]":
-    """The obs columns the mode rule reads as an experimental contrast, with up to three of their
-    values: a non-QC, non-label column with 2-3 levels."""
-    if not isinstance(dr, dict):
-        return []
-    cats = dr.get("obs_categoricals") or {}
-    if not isinstance(cats, dict):
-        return []
-    return [(str(c), [str(v) for v in (info.get("values") or [])][:3])
-            for c, info in cats.items()
-            if isinstance(info, dict) and isinstance(info.get("n"), int) and 2 <= info["n"] <= 3
-            and not _looks_like_celltype_col(c) and not _looks_like_qc_col(c)]
-
-
-def _dataset_mode_rule(dr: "dict[str, Any] | None") -> str:
-    """``"team"`` / ``"single"`` when the dataset profile settles it, else ``""``.
-
-    team   — an experimental CONTRAST (a non-QC, non-label obs column with 2-3 levels) is present:
-             the dataset can carry a comparative study, and comparative single-cell design is where
-             a statistician, a biologist and a data expert disagree productively (unit of
-             replication, composition confounding, stratification). Whether THIS request asks for a
-             comparison is :meth:`ResearchLab._route_mode`'s question.
-    single — cell-type labels present but NO contrast: a descriptive atlas; nothing to debate.
-    ""     — no profile, or a profile with neither (a VCF, a folder, an unlabelled object): defer.
-    """
-    if not isinstance(dr, dict):
-        return ""
-    cats = dr.get("obs_categoricals") or {}
-    if not isinstance(cats, dict) or not cats:
-        return ""
-    has_labels = any(_looks_like_celltype_col(c) for c in cats)
-    if _contrast_columns(dr):
-        return "team"
-    if has_labels:
-        return "single"
-    return ""
-
-
-# A comparison asked for in so many words. On a dataset with a contrast it keeps the design meeting
-# without asking the model; a request without one is asked about (``_COMPARISON_ROUTE_SYSTEM``).
-_COMPARISON_CUE = re.compile(
-    r"\b(?:compar\w*|versus|vs\.?|contrast\w*|differs?|differed|differen(?:ce|ces|tial|tially)|"
-    r"DEGs?|DE|changes?|changed|changing|up-?regulat\w*|down-?regulat\w*|effects?\s+of|"
-    r"impact\s+of|loss\s+of|knock-?outs?|mutants?|treat\w*)\b"
-    r"|比较|对比|差异|区别|变化|上调|下调|影响|敲除|突变",
-    re.IGNORECASE)
-
-_COMPARISON_ROUTE_SYSTEM = (
-    "You read one request sent to a single-cell analysis console, before its analysis is planned. "
-    "The user message lists how the dataset groups its cells or samples. Decide what the request "
-    "asks for:\n"
-    '- "compare": a difference between such groups (conditions, genotypes, regions, time points, '
-    "treatments, donor attributes): what changes, what differs, what is up or down, the effect of "
-    "one on another, or a test between them. A question about a mutation, a disease or a "
-    "treatment in a dataset that has the matching groups is a comparison even when it does not "
-    "say 'compare'.\n"
-    '- "describe": what the data shows without contrasting those groups: where genes are '
-    "expressed, which cells express them, what the cell types are, quality control, clustering, "
-    "or showing values across cell types.\n"
-    'When unsure, answer "compare". Return ONLY JSON: {"asks": "compare|describe", '
-    '"confidence": <0.0-1.0>}.'
-)
 
 #: Below this a "describe" answer keeps the design meeting.
 _DESCRIBE_CONFIDENCE = 0.6
-
-
-def _annotated_without_contrast(dr: "dict[str, Any] | None") -> bool:
-    """True when the dataset ALREADY carries a cell-type annotation column AND has NO experimental
-    contrast — no non-annotation obs column with 2+ categories (a single sample / condition). In that
-    regime there is no differential question, so pathway/GO enrichment on a cell type's own identity
-    markers is circular (it just restates the cell type's definition) and should not be planned."""
-    if not isinstance(dr, dict):
-        return False
-    cats = dr.get("obs_categoricals") or {}
-    if not isinstance(cats, dict):
-        return False
-    universe = {**cats, **{k: {} for k in (dr.get("obs_keys") or [])}}
-    annotated = any(_looks_like_celltype_col(c) for c in universe)
-    has_contrast = any(
-        isinstance(info, dict) and isinstance(info.get("n"), int) and info["n"] >= 2
-        and not _looks_like_celltype_col(c)
-        for c, info in cats.items()
-    )
-    return annotated and not has_contrast
-
-
-# Tokens that look like biological ENTITIES: gene/protein symbols (DDX41, Trp53, ABCA4), cell types
-# spelled as symbols (RGC, MG), pathway/complex names. Case-sensitive on purpose — an all-caps or
-# Capitalized-plus-digit token in a question is almost always a symbol; a plain lowercase word is
-# almost always instruction.
-_ENTITY_TOKEN_RE = re.compile(r"\b(?:[A-Z][A-Za-z0-9-]{1,}\d[A-Za-z0-9-]*|[A-Z]{2,}[A-Za-z0-9-]*|[A-Z][a-z]{2,}\d+[a-z0-9]*)\b")
-_LITERATURE_GENERIC = "Literature search for the key genes and pathways found"
-# All-caps tokens that are METHOD / FORMAT names, not biology. Kept separate from the literature
-# tool's stopword set because that set is lowercase-keyed and this one guards the symbol regex.
-_LITERATURE_NOT_ENTITIES = {
-    "WT", "KO", "DE", "QC", "PCA", "UMAP", "GO", "RNA", "DNA", "PDF", "CSV", "OK", "AND", "OR",
-    "THE", "PLEASE", "TODO", "VCF", "VEP", "PASS", "GRCH37", "GRCH38", "HG19", "HG38", "BAM",
-    "FASTQ", "H5AD", "TSV", "JSON", "API", "REST", "HPC", "GPU", "CPU", "LLM", "AI", "ORA", "GSEA",
-    "FDR", "BH", "HVG", "MT", "SNP", "SNV", "INDEL", "CNV", "SV", "CADD", "REVEL", "SPLICEAI",
-    "CLINVAR", "GNOMAD", "OMIM", "HPO", "ACMG", "DOI", "PMID", "PUBMED", "SCVI", "SCGPT",
-    "SEURAT", "SCANPY", "DESEQ2", "EDGER", "LIMMA", "IRD", "WGS", "WES",
-    "ONLY", "NOT", "DO", "MUST", "NEVER", "ALWAYS", "ALL", "ANY", "EACH", "EVERY", "TRUE",
-    "FALSE", "NONE", "NULL", "NOTE", "TBD", "IMPORTANT", "REQUIRED", "STRICTLY", "EXACT",
-    "EXACTLY", "FIRST", "LAST", "BEFORE", "AFTER", "WITH", "WITHOUT", "USE", "USING", "RUN",
-    "SEE", "ABOVE", "BELOW", "THIS", "THAT", "THESE", "THOSE", "FROM", "INTO", "ONTO", "PER",
-}
-
-
-def _literature_step_text(question: str) -> str:
-    """The literature step's LABEL: the question's biological SUBJECT, or a clean generic form.
-
-    The old builder printed whatever survived the stopword filter — for a real question ("This
-    dataset has 3 donors — please run pseudobulk…") that was the residue "has donors", for a
-    Chinese question the sentence with a token punched out of its middle, for "help me analyze…"
-    the single word "help". Every one reached a production plan card. The rule now: the focused
-    query is used ONLY if it still reads as a subject — it names an entity symbol (DDX41, Abca4) or
-    a real biological word (retina, knockout, glia), and it is not a leftover of function words.
-    Otherwise the label says nothing specific rather than something wrong. (The per-query terms are
-    planned from the ACCEPTED FINDINGS at run time, so nothing scientific rides on this label.)"""
-    try:
-        from ..tools.api import QUERY_STOPWORDS as _QUERY_STOPWORDS, focus_literature_query
-        query = focus_literature_query(question or "")
-        toks = [w for w in query.split() if w.lower().strip("-") not in _QUERY_STOPWORDS]
-    except Exception:  # noqa: BLE001 - planning guard should never break planning
-        toks = []
-    # Drop CJK-bearing tokens: a Chinese sentence minus one word is not a subject, it is damage.
-    toks = [t for t in toks if not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", t)]
-    # Drop method / format all-caps tokens, question words, and bare function words that the
-    # focus filter leaves behind between two content tokens ("What in Rod cells in DDX41").
-    _junk = {"what", "which", "how", "why", "when", "where", "who", "in", "of", "on", "at", "to",
-             "by", "vs", "and", "or", "the", "a", "an", "is", "are", "does", "do", "did", "there",
-             "this", "that", "these", "those", "it", "its", "with", "between", "among", "for",
-             "they", "them", "we", "you", "me", "my", "our", "change", "changed", "changes",
-             "changing", "differ", "differs", "differed", "different", "differences", "affect",
-             "affected", "affects", "types", "type", "cells", "cell", "please", "help", "run"}
-    toks = [t for t in toks if t.strip("-").upper() not in _LITERATURE_NOT_ENTITIES
-            and t.lower().strip("-?.,;:") not in _junk]
-    toks = [t.strip("?.,;:") for t in toks if t.strip("?.,;:")]
-    entities = [t for t in toks if _ENTITY_TOKEN_RE.fullmatch(t.strip("-"))]
-    # A biological content word: lowercase, >= 5 letters, not a function/instruction residue.
-    # ("has", "help", "run", "for", "me" all fail the length gate; "retina", "knockout", "glia"
-    # passes on the entity-adjacency below.)
-    content = [t for t in toks if t.islower() and len(t.strip("-")) >= 5]
-    if not entities and not content:
-        return _LITERATURE_GENERIC
-    if not entities and len(content) < 2 and len(toks) <= 2:
-        # one lonely lowercase word with nothing around it ("donors") is residue, not a subject
-        return _LITERATURE_GENERIC
-    label = " ".join(toks[:6])
-    return f"Literature search for {label}"
-
-
-def _literature_query(question: str, step: str, rounds: "list[LabRound]") -> str:
-    """Build a FOCUSED Europe PMC query for a literature-grounding step from the ACCEPTED findings
-    (top marker genes + enriched pathway terms) plus the step's topic — instead of the raw run
-    question, which pollutes the query with instruction words (e.g. "finish research"). Falls back
-    to a focused (question+step) only when there are no findings yet."""
-    from ..tools.api import focus_literature_query
-    genes: list[str] = []
-    terms: list[str] = []
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result") if isinstance(s.get("result"), dict) else {}
-            for lst in (res.get("top_genes_by_group") or {}).values():
-                for g in (lst or [])[:3]:
-                    if g and g not in genes:
-                        genes.append(g)
-            for lst in (res.get("top_terms_by_group") or {}).values():
-                for t in (lst or [])[:1]:
-                    label = _term_label(t)
-                    if label and label not in terms:
-                        terms.append(label)
-            # Variant-annotation results carry their genes as a list of variant dicts (not the scanpy
-            # top_genes_by_group map) — pull the pathogenic / high-priority variant genes so a VCF
-            # run's query is the REAL genes, not a garbled fallback from the raw question.
-            for key in ("pathogenic_variants", "high_priority_variants"):
-                for v in (res.get(key) or []):
-                    g = v.get("gene") if isinstance(v, dict) else None
-                    if g and g not in genes:
-                        genes.append(g)
-    # Keep the query BROAD: Europe PMC ANDs every term, so a long mash-up returns nothing. One pathway
-    # term + a few genes is already at the edge of useful.
-    bits: list[str] = []
-    if terms:
-        bits.append(terms[0])
-    if genes:
-        bits.append(" ".join(genes[:3]))
-    q = " ".join(bits).strip()
-    if q:
-        return q
-    # No findings yet → the QUESTION's biological subject first (the step now carries the PI's own
-    # wording — "Summarize findings with literature context" — which names no biology), then the
-    # step, then both. Only used pre-findings; once we HAVE genes, question words just pollute it.
-    subj = _literature_step_text(question)
-    if subj != _LITERATURE_GENERIC:
-        return subj[len("Literature search for "):]
-    return focus_literature_query(step) or focus_literature_query(f"{question} {step}") or step
-
-
-# The LLM query planner reads the accepted findings and writes SEVERAL distinct literature
-# queries, each targeting a different angle — instead of one generic keyword string.
-_LIT_QUERY_SYSTEM = (
-    "You are composing search queries for Europe PMC (a biomedical literature database) to find "
-    "REAL published papers that ground a single-cell study's findings. Given the research question "
-    "and the study's ACCEPTED findings (marker genes and enriched pathways, per cell class), write "
-    "2-5 DISTINCT keyword queries, EACH targeting a DIFFERENT angle — e.g. one per major cell class, "
-    "one per key enriched pathway or biological process, one for the disease or tissue context. "
-    "CRITICAL: Europe PMC treats a query as free text and ANDs every term together, so each extra "
-    "keyword SHRINKS the results — a query of 5+ specific terms (e.g. several gene symbols at once) "
-    "usually returns ZERO papers. Keep each query BROAD: 2-4 keywords, combining at MOST ONE gene "
-    "symbol with a cell type / pathway / tissue term (or no gene at all). NO instruction words, NO "
-    "file names, NO boolean operators, NO quotes. "
-    'Reply with ONLY a JSON array of query strings, e.g. '
-    '["rod photoreceptor phototransduction retina", "RHO retinal degeneration", '
-    '"amacrine cell synaptic signaling", "Müller glia retina"].'
-)
-
-
-# deep_literature (PaperQA) answers a QUESTION; it was handed the Europe PMC keyword string. Run
-# f3b8268c4fd4's step asked for "the established single-cell marker profile and expected cell-type
-# composition of the inferred tissue", and the corpus was asked "Regulation Of Voltage-Gated Calcium
-# Channel Activity (GO:1901385) Malat1 Rpgrip1 Cadm2" — it said "I cannot answer", and the report went
-# out with no references.
-_DEEP_LIT_QUESTION_SYSTEM = (
-    "You write the ONE question a literature corpus (PaperQA over published papers) will answer to "
-    "ground a study's interpretation. Read the study request, the literature step's brief and the "
-    "accepted findings, and write a single self-contained scientific question in plain English (one "
-    "or two sentences, at most 60 words) about the biology the brief asks to check. Name the tissue "
-    "and species and the cell types, marker genes or pathways the findings are about. No tool names, "
-    "file names, statistics jargon or instructions. Reply with the question only."
-)
-# Citations listed under a corpus-grounded answer. These are the papers the CHECKED answer already
-# cites, so cutting them drops references the answer makes: a step whose plan pinned a larger
-# ``search_corpus`` top_k read more than twelve passages and still listed twelve
-# (RCHENLAB/AiScientist issue 60, review of PR #135). The ceiling is ``search_corpus``'s own.
-MAX_LISTED_CITATIONS = 30
-
-# PaperQA's own refusal, at the start of its answer ("I cannot answer.", "I cannot answer this
-# question due to having no papers").
-_CANNOT_ANSWER = re.compile(r"^\s*(?:I\s+)?(?:cannot|can't|am unable to) answer\b", re.IGNORECASE)
-
-
-def _deep_literature_fallback_question(step: str) -> str:
-    """The step brief as a plain question when no model writes one: title and markup stripped."""
-    text = re.sub(r"^\s*\*\*[^*]+\*\*\s*[—–:-]\s*", "", step or "")
-    text = re.sub(r"`[^`]*`", "", text)
-    text = re.sub(r"\s+", " ", text.replace("*", "")).strip()
-    sentences = re.split(r"(?<=[.?!])\s+", text)
-    body = " ".join(sentences[:2])[:400].strip()
-    return f"What does the published literature say about the following: {body}" if body else ""
-
-
-def _annotated_cell_types(rounds: "list[LabRound]") -> list[str]:
-    """The cell-type labels an accepted annotation step assigned (Unassigned left out)."""
-    found: list[str] = []
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result") if isinstance(s.get("result"), dict) else {}
-            for lab in (res.get("labels") or {}).values() if isinstance(res.get("labels"), dict) else []:
-                if lab and lab != "Unassigned" and lab not in found:
-                    found.append(str(lab))
-    return found
-
-
-def _tool_classes(rounds: "list[LabRound]") -> "list[str]":
-    """The group labels the accepted steps' packaged tools reported results for."""
-    classes: list[str] = []
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result") if isinstance(s.get("result"), dict) else {}
-            for key in ("top_genes_by_group", "top_terms_by_group"):
-                for grp in (res.get(key) or {}):
-                    if grp and str(grp) not in classes:
-                        classes.append(str(grp))
-    return classes
-
-
-def _class_labels(rounds: "list[LabRound]",
-                  dataset_result: "dict[str, Any] | None") -> "tuple[str, list[str]]":
-    """``(label column, labels)``: the dataset profile's label column and its levels, then any other
-    group a packaged tool reported. A run whose steps are all ``run_code`` has no tool groups, and
-    run 74873590ca7b's writer was given no labels at all; its answer called MG "Microglia-associated"
-    in a dataset where Microglia is another class."""
-    column, labels = dataset_labels(dataset_result)
-    return column, list(dict.fromkeys([*labels, *_tool_classes(rounds)]))
-
-
-def _label_reference(rounds: "list[LabRound]",
-                     dataset_result: "dict[str, Any] | None") -> "dict[str, Any] | None":
-    """The curated reference that may spell a label out: the one an accepted ``run_marker_annotation``
-    step used, else the one the dataset profile's tissue hint names (``tissue_hint`` writes "markers
-    in the curated <name> reference"). None when neither applies: then no label is expanded."""
-    ref = _marker_reference(rounds)
-    if ref is not None:
-        return ref
-    hint = str((dataset_result or {}).get("tissue_hint") or "") if isinstance(dataset_result, dict) else ""
-    m = re.search(r"\bcurated (\S+) reference\b", hint)
-    if not m:
-        return None
-    from ..tools.api import available_references, load_marker_reference
-    try:
-        return load_marker_reference(m.group(1)) if m.group(1) in available_references() else None
-    except (OSError, ValueError):      # an unreadable reference expands nothing; it never costs the report
-        return None
-
-
-def _grounding_vocab(rounds: "list[LabRound]", dataset_result: "dict[str, Any] | None" = None,
-                     reference: "dict[str, Any] | None" = None) -> str:
-    """A CLOSED vocabulary the report writer must stay within — the exact cell-class labels and the
-    exact enriched pathway terms the tools actually produced. Injected into the synthesize prompt so
-    the model cannot invent pathways (e.g. an EMT/ECM term that never appeared in the enrichment
-    table) or expand a class label into a different cell type (e.g. 'MG' -> 'Müller/ganglion').
-    The labels include the dataset profile's label column (``dataset_result``), and a label may be
-    spelled out only as the curated ``reference`` spells it (``label_claims.labels_prompt``).
-    Empty string when there is nothing to pin (the system prompt still forbids invention)."""
-    column, profile_labels = dataset_labels(dataset_result)
-    classes = list(dict.fromkeys([*profile_labels, *_tool_classes(rounds)]))
-    terms: list[str] = []
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result") if isinstance(s.get("result"), dict) else {}
-            for lst in (res.get("top_terms_by_group") or {}).values():
-                for t in (lst or []):
-                    if t and str(t) not in terms:
-                        terms.append(str(t))
-    if not classes and not terms:
-        return ""
-    lines = ["Grounding vocabulary — stay STRICTLY within these; introduce nothing outside them:"]
-    if classes:
-        lines.append(
-            "- Cell-class labels present in the data (use verbatim; do NOT rename, merge, split, or "
-            "expand a single label into a different or additional cell type): " + ", ".join(classes) + "."
-        )
-        lines += labels_prompt(column, classes, label_glossary(classes, reference),
-                               str((reference or {}).get("tissue") or ""))
-    if terms:
-        lines.append(
-            "- Enriched pathway/term names ACTUALLY found (name enriched pathways ONLY from this list; "
-            "a pathway not listed here was NOT enriched — do not present it as a finding): "
-            + "; ".join(terms[:40]) + "."
-        )
-    return "\n".join(lines)
-
-
-def _methods_performed(rounds: "list[LabRound]") -> str:
-    """A CLOSED allowlist of the analyses/tools ACTUALLY executed in accepted steps, so the report's
-    Methods cannot describe a technique that never ran (scGPT, multi-omics, trajectory, …) — not even
-    as 'planned but failed'. Complements _grounding_vocab (which pins labels/terms). '' when empty."""
-    tools: list[str] = []
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            tl = s.get("tool")
-            if tl and str(tl) not in tools and str(tl) != "finish":
-                tools.append(str(tl))
-    if not tools:
-        return ""
-    return (
-        "Tools/analyses ACTUALLY executed (the Methods/Results may describe ONLY analyses among these; "
-        "do NOT mention any other tool, model, or technique, and never describe one as planned/attempted/"
-        "failed): " + ", ".join(tools) + "."
-    )
-
-
-# The AUTHORITATIVE scalar figures the tools reported — whitelisted keys (+ common variants), pulled
-# recursively so nested blocks like ``variant_filters`` are covered.
-_FACT_KEYS = frozenset({
-    "assembly", "execution_mode", "normalized",
-    "n_input_variants", "n_input", "n_kept", "n_dropped_common_af", "n_dropped_off_panel",
-    "max_pop_af", "gene_panel_size", "total_variants", "n_pathogenic", "n_pathogenic_clinvar",
-    "n_high_priority_rare_deleterious",
-    "n_pass", "n_nonpass", "n_filtered", "n_records", "n_snps", "n_indels", "n_multiallelic",
-    "n_samples", "ti_tv", "ti_tv_ratio", "het_hom", "het_hom_ratio", "call_rate",
-    "n_cells", "n_genes", "n_clusters", "n_de_genes", "resolution",
-})
-_FACT_DIST_KEYS = ("by_impact", "by_consequence", "by_clinical_significance",
-                   "impact_distribution", "consequence_distribution", "clinical_significance_distribution")
-
-
-def _collect_facts(rounds: "list[LabRound]") -> "tuple[dict[str, Any], dict[str, dict]]":
-    """Recursively pull the whitelisted authoritative figures (scalars) + category distributions from the
-    ACCEPTED step results (nested blocks like ``variant_filters`` included). Shared by the synthesize
-    grounding block and the post-report fact-check."""
-    facts: dict[str, Any] = {}
-    dists: dict[str, dict] = {}
-
-    def _walk(obj: Any, depth: int = 0) -> None:
-        if depth > 4 or not isinstance(obj, dict):
-            return
-        for k, v in obj.items():
-            if k in _FACT_KEYS and isinstance(v, (int, float, str, bool)):
-                facts[str(k)] = v                     # a later accepted step wins on a key clash
-            elif k in _FACT_DIST_KEYS and isinstance(v, dict) and v:
-                dists[str(k)] = v
-            elif isinstance(v, dict):
-                _walk(v, depth + 1)
-
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            _walk(s.get("result"))
-    return facts, dists
-
-
-def resolve_evidence(paths: "list[str]", workspace: "Path | None") -> "tuple[list[str], list[str]]":
-    """Split claimed artifact paths into (present on disk, missing). Deterministic — no model.
-
-    ``evidence_pointers`` is called in four places and NOTHING ever checked that the files it names
-    exist. So a tool could report a figure it never wrote and the Critic would ground its verdict on
-    it: ``run_de`` returned ``figures/rank_genes_groups_leiden_de.png`` hardcoded, which resolves to
-    nothing whenever the DE was grouped by anything other than ``leiden`` — a dangling evidence
-    pointer that survived in production until it was read by hand.
-
-    This is the cheapest member of the class of defects that matter here: the tool SUCCEEDS, the
-    system contract holds, and only an independent check against the filesystem reveals it. Reports
-    rather than judges — see ``_critic`` for why the verdict is not flipped on this alone."""
-    if workspace is None:
-        return list(paths), []
-    art = Path(workspace) / "artifacts"
-    present, missing = [], []
-    for p in paths:
-        rel = str(p).strip()
-        if not rel:
-            continue
-        if Path(rel).is_absolute():
-            # An absolute path is checked HERE, on the gateway host — but the HPC3 shell tools
-            # (list_dir / read_text / stat_path / find_files) return the dfs3b paths they looked
-            # at, and analysis jobs run there too. Those paths never exist on the eyeserver, so
-            # every step that used the shell was told ALL its evidence was missing (a production
-            # ORA step scored 0.0 for it while its tables sat right there in artifacts/). Map a
-            # remote artifact to its local mirror by its artifacts/-relative suffix; treat any
-            # other remote path as unverifiable from here — neither present nor missing.
-            if "/artifacts/" in rel:
-                mirror = art / rel.split("/artifacts/", 1)[1]
-                (present if mirror.exists() else missing).append(rel)
-                continue
-            if Path(rel).exists():
-                present.append(rel)
-            elif rel.startswith(("/dfs3b/", "/pub/", "/data/homezvol", "/tmp/", "/scratch/")):
-                continue                              # lives on the cluster; not checkable here
-            else:
-                missing.append(rel)
-            continue
-        (present if (art / rel).exists() else missing).append(rel)
-    return present, missing
-
-
-def _uncovered_groups(rounds: "list[LabRound]") -> "dict[str, str]":
-    """Groups a step REFUSED to analyse, and why — e.g. cell types with too few cells in one arm.
-
-    This is a RESULT, not a degradation: "we could not test this cell type" is part of what the
-    study found, and a report that omits it implies a coverage it does not have. The DEG protocol
-    requires stating it, but nothing carried it to the writer: ``_collect_facts`` only recurses into
-    dicts, and both producers emit a LIST (``run_de``) or a flat dict (``run_pseudobulk_de``) of
-    skips, so on the lab's real Ddx41 data 5 of 12 cell types went untested and the grounding block
-    never mentioned it.
-
-    Handles both shapes. Returns {group: reason}, empty when everything was covered."""
-    out: dict[str, str] = {}
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result")
-            if not isinstance(res, dict):
-                continue
-            skipped = res.get("skipped_groups")
-            if isinstance(skipped, dict):                       # run_pseudobulk_de: {label: reason}
-                for label, reason in skipped.items():
-                    out[str(label)] = str(reason)[:200]
-            elif isinstance(skipped, list):                     # run_de: [{group, n_*, reason}]
-                # Name the ARMS, not the roles. "condition=7, reference=27" leaves the writer to work
-                # out which arm is which; run 8847d521ba32's report has three of its five unequal
-                # skipped pairs backwards.
-                arms = contrast_arms(res)
-                for item in skipped:
-                    if not isinstance(item, dict) or not item.get("group"):
-                        continue
-                    if arms and "n_condition" in item and "n_reference" in item:
-                        counts = (f"cells after QC: {arms[0]}={item['n_condition']}, "
-                                  f"{arms[1]}={item['n_reference']}")
-                    else:
-                        counts = ", ".join(
-                            f"{k.replace('n_', '')}={item[k]}" for k in ("n_condition", "n_reference")
-                            if k in item)
-                    reason = str(item.get("reason", "not analysed"))[:160]
-                    out[str(item["group"])] = f"{reason}{f' ({counts})' if counts else ''}"
-    return out
-
-
-def _tested_counts(rounds: "list[LabRound]") -> "dict[str, dict[str, int]]":
-    """Cells per group and arm AFTER QC, as the tools counted them: ``cells_by_group_and_arm`` (run_de,
-    run_composition) and a contrast's ``skipped_groups``. These are the numbers a cell floor was
-    applied to. The dataset profile counts the uploaded file before QC; in run f3731e0b7136 QC removed
-    30% of nuclei, so Endothelial went from 7 / 27 in the file to 5 / 22 in the analysis."""
-    out: dict[str, dict[str, int]] = {}
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result")
-            if not isinstance(res, dict):
-                continue
-            table = res.get("cells_by_group_and_arm")
-            if isinstance(table, dict):
-                for group, per in table.items():
-                    if isinstance(per, dict) and per:
-                        out[str(group)] = {str(a): int(n) for a, n in per.items()
-                                           if isinstance(n, (int, float)) and not isinstance(n, bool)}
-            arms = contrast_arms(res)
-            skipped = res.get("skipped_groups")
-            if arms and isinstance(skipped, list):
-                for item in skipped:
-                    if (isinstance(item, dict) and item.get("group")
-                            and isinstance(item.get("n_condition"), int)
-                            and isinstance(item.get("n_reference"), int)):
-                        out[str(item["group"])] = {arms[0]: item["n_condition"],
-                                                   arms[1]: item["n_reference"]}
-    return out
-
-
-def pre_qc_counts(dataset_result: "dict[str, Any] | None") -> "dict[str, dict[str, int]]":
-    """Cells per label and arm IN THE UPLOADED FILE (the dataset profile), before any QC."""
-    dba = (dataset_result or {}).get("design_by_arm") if isinstance(dataset_result, dict) else None
-    table = (dba or {}).get("cells_by_label_and_arm") if isinstance(dba, dict) else None
-    return {str(k): dict(v) for k, v in (table or {}).items() if isinstance(v, dict)}
-
-
-# A statement about coverage — which groups were tested, and why some were not. The only kind of
-# sentence correct_coverage_counts may touch: elsewhere a report may rightly quote the uploaded file.
-_COVERAGE_RE = re.compile(
-    r"floor|below|too few|fewer than|not covered|not analy[sz]ed|not tested|untested|excluded|"
-    r"skipped|insufficient|underpowered|could not be (?:tested|analy[sz]ed)|no primary", re.I)
-_PRE_QC_RE = re.compile(r"before QC|pre-?QC|prior to QC|uploaded|raw (?:file|data|object|counts?)", re.I)
-_COUNT_RE = re.compile(r"(?<![\w.,])\d{1,3}(?:,\d{3})*(?![\w.,]*\d)")
-
-
-def _swap_to_tested(window: str, pre: "dict[str, int]", tested: "dict[str, int]") -> "tuple[str, bool]":
-    """Replace the uploaded-file counts in ``window`` with the counts the analysis tested. Only a
-    number EQUAL to the group's pre-QC count for its arm is touched, so a correct number never is."""
-    arms = [a for a in tested if a in pre and pre[a] != tested[a]]
-    if not arms:
-        return window, False
-    edits: dict[tuple[int, int], str] = {}
-    for a in [a for a in tested if a in pre]:
-        esc = re.escape(a)
-        for pat in (rf"(?<![\w.,])(\d{{1,3}}(?:,\d{{3}})*)\s*{esc}\b",                 # "7 DDX41"
-                    rf"\b{esc}\b(?:\s+arm)?\s*(?:=|:|\()?\s*(\d{{1,3}}(?:,\d{{3}})*)(?![\w.,]*\d)"):  # "WT=27", "WT arm (24"
-            for m in re.finditer(pat, window):
-                n = int(m.group(1).replace(",", ""))
-                if n == pre[a] and pre[a] != tested[a]:
-                    edits[m.span(1)] = str(tested[a])
-    if not edits and len(tested) == 2 and all(a in pre for a in tested):
-        # A bare pair, "HC (5 / 11)": the two arms in whichever order the pre-QC values sit.
-        nums = list(_COUNT_RE.finditer(window))[:2]
-        if len(nums) == 2:
-            got = [int(m.group(0).replace(",", "")) for m in nums]
-            a, b = list(tested)
-            for first, second in ((a, b), (b, a)):
-                if got == [pre[first], pre[second]] and [pre[first], pre[second]] != [tested[first], tested[second]]:
-                    edits = {nums[0].span(): str(tested[first]), nums[1].span(): str(tested[second])}
-                    break
-    if not edits:
-        return window, False
-    out = window
-    for (s, e), new in sorted(edits.items(), reverse=True):
-        out = out[:s] + new + out[e:]
-    return out, out != window
-
-
-def correct_coverage_counts(md: str, uncovered: "dict[str, str] | Any",
-                            tested: "dict[str, dict[str, int]]",
-                            pre: "dict[str, dict[str, int]]") -> "tuple[str, list[str]]":
-    """Put the tested (post-QC) counts back into the report's coverage statements.
-
-    Run f3731e0b7136's manuscript said "Endothelial (7 DDX41 / 27 WT) … had both arms below the
-    30-cell floor"; the analysis had tested 5 / 22. 7 / 27 were the uploaded file's counts, which the
-    writers had been handed as authoritative. For each group the analysis refused, a count next to its
-    name in a coverage sentence that equals its pre-QC count (and not its tested one) is replaced. A
-    sentence that says it is describing the file before QC is left alone. Returns (md, issues)."""
-    issues: list[str] = []
-    groups = [g for g in (uncovered or {}) if g in tested and g in pre
-              and any(pre[g].get(a) != n for a, n in tested[g].items() if a in pre[g])]
-    if not groups or not md:
-        return md, issues
-    names = sorted({*map(str, pre), *map(str, tested)}, key=len, reverse=True)
-    any_group = re.compile("|".join(rf"\b{re.escape(n)}\b" for n in names))
-    for g in groups:
-        pos, fixed = 0, False
-        pattern = re.compile(rf"\b{re.escape(g)}\b")
-        while True:
-            m = pattern.search(md, pos)
-            if not m:
-                break
-            s_start = max(md.rfind(". ", 0, m.start()), md.rfind("\n", 0, m.start())) + 1
-            s_end_candidates = [i for i in (md.find(". ", m.end()), md.find("\n", m.end())) if i != -1]
-            s_end = min(s_end_candidates) if s_end_candidates else len(md)
-            sentence = md[s_start:s_end]
-            end = min(s_end, m.end() + 100)
-            nxt = any_group.search(md, m.end(), end)
-            if nxt:
-                end = nxt.start()
-            if _COVERAGE_RE.search(sentence) and not _PRE_QC_RE.search(sentence):
-                new, changed = _swap_to_tested(md[m.end():end], pre[g], tested[g])
-                if changed:
-                    md = md[:m.end()] + new + md[end:]
-                    end = m.end() + len(new)
-                    fixed = True
-            pos = end
-        if fixed:
-            issues.append(
-                f"coverage counts: the report gave '{g}' the uploaded file's counts "
-                f"({', '.join(f'{a} {n}' for a, n in pre[g].items())}); the analysis tested "
-                f"{', '.join(f'{a} {n}' for a, n in tested[g].items())} after QC — corrected.")
-    return md, issues
-
-
-def _grounding_facts(rounds: "list[LabRound]") -> str:
-    """A CLOSED set of the AUTHORITATIVE figures the tools reported — genome assembly, execution mode,
-    PASS/non-PASS + variant/cell counts, thresholds, ratios, and category distributions — injected into
-    the synthesize prompt so the report cannot invent a number, echo the plan's ASSUMED assembly over the
-    one actually used, or write "0 non-PASS" when the result says otherwise. "" when nothing quantitative
-    was produced. Complements _grounding_vocab (labels/terms) + _methods_performed (tools)."""
-    facts, dists = _collect_facts(rounds)
-    uncovered = _uncovered_groups(rounds)
-    if not facts and not dists and not uncovered:
-        return ""
-    lines = [
-        "Authoritative figures — every number, count, ratio, threshold, genome assembly, and execution "
-        "mode in the report MUST match these EXACTLY. Do NOT state a figure that is not here, do NOT round "
-        "or infer one, and do NOT echo the plan's assumed value (e.g. its genome assembly) over these. "
-        "Never write 'all PASS' or '0 non-PASS' unless a non-PASS count of 0 appears here:",
-    ]
-    lines += [f"- {k} = {v}" for k, v in facts.items()]
-    for k, d in dists.items():
-        pairs = ", ".join(f"{kk}: {vv}" for kk, vv in list(d.items())[:20])
-        lines.append(f"- {k}: {pairs}")
-    if uncovered:
-        # Coverage is a RESULT. Without this the writer sees results for 7 cell types, has no way
-        # to know 5 more exist and were refused, and writes a manuscript that reads as though the
-        # analysis covered the dataset.
-        lines.append(
-            "NOT ANALYSED — these groups were REFUSED by the analysis and have NO results. The "
-            "report MUST state that they were not covered and why, MUST NOT present any finding "
-            "for them, and MUST NOT describe the analysis as covering all groups. The cell counts "
-            "in brackets are AFTER QC, the numbers the cell floor was applied to; quote THESE. The "
-            "dataset profile and the plan count the uploaded file before QC, so their per-group "
-            "numbers are larger and are not what the analysis tested:")
-        lines += [f"- {g}: {why}" for g, why in list(uncovered.items())[:20]]
-    return "\n".join(lines)
-
-
-_ASSEMBLY_CANON = {"grch38": "GRCh38", "hg38": "GRCh38", "grch37": "GRCh37", "hg19": "GRCh37"}
-
-
-def verify_report_facts(report_md: str, facts: "dict[str, Any]",
-                        uncovered: "dict[str, str] | None" = None, *,
-                        tested_counts: "dict[str, dict[str, int]] | None" = None,
-                        pre_counts: "dict[str, dict[str, int]] | None" = None,
-                        marker_reference: "dict[str, Any] | None" = None,
-                        class_labels: "list[str] | None" = None, label_column: str = "",
-                        label_reference: "dict[str, Any] | None" = None) -> "tuple[str, list[str]]":
-    """The GUARANTEE layer: a deterministic post-generation fact-check of the manuscript against the
-    authoritative figures, so a fabrication that slipped past the grounding prompt is caught regardless of
-    whether the LLM obeyed it. Corrects two UNAMBIGUOUS cases in place — a wrong genome assembly (the
-    report named a build other than the one actually used), and a '0/no/zero non-PASS' claim when the QC
-    reported non-PASS records — and returns ``(corrected_md, issues)``. It only swaps those tokens/numbers;
-    the prose edits are removing a sentence that calls a gene a marker of a lineage the run's curated
-    ``marker_reference`` gives to another (``marker_claims``), and removing another class's name from a
-    class label (``label_claims``: "Microglia-associated (MG)" -> "MG" when Microglia is one of
-    ``class_labels``). ``issues`` are for the technical-report Diagnostics."""
-    import re
-    md = report_md or ""
-    issues: list[str] = []
-
-    # 1. Genome assembly — the report must name the build ACTUALLY used, not the plan's assumption.
-    auth = _ASSEMBLY_CANON.get(str(facts.get("assembly") or "").strip().lower())
-    if auth:
-        for token in ("GRCh38", "GRCh37", "hg38", "hg19"):
-            if _ASSEMBLY_CANON.get(token.lower()) == auth:
-                continue                                  # this token already IS the right build
-            pat = re.compile(rf"\b{re.escape(token)}\b", re.IGNORECASE)
-            hits = pat.findall(md)
-            if hits:
-                md = pat.sub(auth, md)
-                issues.append(f"assembly: report stated '{token}' but the annotation used {auth} — "
-                              f"corrected {len(hits)} mention(s).")
-
-    # 2. PASS / non-PASS — a '0/no/zero non-PASS' claim when non-PASS records exist is a fabrication.
-    nonpass = facts.get("n_nonpass")
-    if nonpass is None:
-        nonpass = facts.get("n_filtered")
-    if isinstance(nonpass, (int, float)) and not isinstance(nonpass, bool) and nonpass > 0:
-        pat = re.compile(r"\b(?:0|zero|no)\s+non-?PASS\b", re.IGNORECASE)
-        if pat.search(md):
-            md = pat.sub(f"{int(nonpass):,} non-PASS", md)
-            issues.append(f"pass-split: report claimed 0/no non-PASS but {int(nonpass):,} records are "
-                          f"non-PASS — corrected.")
-
-    # 3. Coverage — groups the analysis REFUSED must not vanish from the write-up. Audited, not
-    # rewritten: the grounding block already instructs the writer to state them, and inventing the
-    # sentence here would put prose in the manuscript that no model wrote. An unmentioned group is
-    # therefore reported as an issue so the Diagnostics show whether the instruction was obeyed.
-    for group in (uncovered or {}):
-        if not re.search(rf"\b{re.escape(str(group))}\b", md):
-            issues.append(
-                f"coverage: '{group}' was NOT analysed (too few cells) but the report never mentions "
-                "it — the manuscript reads as though every group was covered.")
-    # 4. Coverage counts — a refused group described with the uploaded file's counts, not the tested ones.
-    md, count_issues = correct_coverage_counts(md, uncovered or {}, tested_counts or {}, pre_counts or {})
-    issues += count_issues
-    # 5. Marker claims — "RLBP1 is a canonical rod photoreceptor marker" (run c57071e7dc94) when the
-    # curated reference the annotation used lists RLBP1 under Muller glia: the sentence is removed.
-    md, marker_issues = check_marker_claims(md, marker_reference)
-    issues += marker_issues
-    # 6. Class labels — one class written under another class's name (run 74873590ca7b: "Microglia-
-    # associated (MG) nuclei" in a dataset whose `majorclass` has both MG and Microglia).
-    md, label_issues = check_label_conflation(md, class_labels or [], label_reference, label_column)
-    issues += label_issues
-    return md, issues
-
-
-def _marker_reference(rounds: "list[LabRound]") -> "dict[str, Any] | None":
-    """The curated marker reference (tissue JSON) an accepted ``run_marker_annotation`` step used."""
-    from ..tools.api import available_references, load_marker_reference
-    names = set(available_references())
-    for r in reversed(rounds):
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            ref = s.get("result", {}).get("reference") if isinstance(s.get("result"), dict) else None
-            if isinstance(ref, dict) and ref.get("name") in names:
-                return load_marker_reference(ref["name"])
-    return None
-
-
-def _term_label(t: Any) -> str:
-    """A pathway term as text. ``run_enrichment`` lists plain strings; ``run_gsea_prerank`` lists
-    ``{"term", "gene_set", "nes", "fdr", "direction"}`` dicts. Every consumer that joined these
-    as strings raised on the dict shape — and one of them (the literature digest) sat outside its
-    caller's try, so the whole literature step degraded to searching for the pasted step brief."""
-    if isinstance(t, dict):
-        return str(t.get("term") or t.get("name") or t.get("Term") or "").strip()
-    return str(t or "").strip()
-
-
-def _literature_findings_digest(rounds: "list[LabRound]") -> str:
-    """A compact per-cell-class digest of accepted findings (top markers + enriched pathways) that
-    the LLM query planner turns into several angle-specific literature queries. Empty when there are
-    no structured findings yet (planner then falls back to the question/step)."""
-    genes_by: dict[str, list[str]] = {}
-    terms_by: dict[str, list[str]] = {}
-    for r in rounds:
-        if r.verdict.verdict != "accept":
-            continue
-        for s in r.scientist_result.get("steps", []):
-            res = s.get("result") if isinstance(s.get("result"), dict) else {}
-            for grp, lst in (res.get("top_genes_by_group") or {}).items():
-                bucket = genes_by.setdefault(str(grp), [])
-                for g in (lst or [])[:5]:
-                    if g and g not in bucket:
-                        bucket.append(g)
-            for grp, lst in (res.get("top_terms_by_group") or {}).items():
-                bucket = terms_by.setdefault(str(grp), [])
-                for t in (lst or [])[:2]:
-                    label = _term_label(t)
-                    if label and label not in bucket:
-                        bucket.append(label)
-    lines: list[str] = []
-    for grp in dict.fromkeys([*genes_by, *terms_by]):
-        parts: list[str] = []
-        if genes_by.get(grp):
-            parts.append("markers " + ", ".join(genes_by[grp][:5]))
-        if terms_by.get(grp):
-            parts.append("pathways " + ", ".join(terms_by[grp][:2]))
-        if parts:
-            lines.append(f"- {grp}: " + "; ".join(parts))
-    return "\n".join(lines)
-
-
-def _parse_query_list(raw: str, max_n: int) -> list[str]:
-    """Parse the planner's JSON array of query strings; sanitize each through ``focus_literature_query``
-    (strips instruction/file words the model may still slip in) and dedupe. Returns [] on any parse
-    failure so the caller falls back to the deterministic single query."""
-    from ..tools.api import focus_literature_query
-    s = (raw or "").strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        if s.lower().startswith("json"):
-            s = s[4:].strip()
-    parsed: Any = None
-    try:
-        parsed = json.loads(s)
-    except json.JSONDecodeError:
-        m = re.search(r"\[.*\]", s, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                parsed = None
-    if not isinstance(parsed, list):
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in parsed:
-        if not isinstance(item, str):
-            continue
-        q = focus_literature_query(item).strip()
-        if not q or q.lower() in seen:
-            continue
-        seen.add(q.lower())
-        out.append(q)
-        if len(out) >= max(1, max_n):
-            break
-    return out
-
-
-# If the user requested literature support:
-# 1. If the literature_search tool is unavailable, leave the agenda unchanged.
-# 2. If the agenda already contains literature-related steps, collapse them into one canonical step.
-# 3. If the agenda has room, append the literature step.
-# 4. If the agenda is full, replace a lower-priority step with the literature step.
-def _ensure_literature_agenda(
-    agenda: list[str],
-    *,
-    question: str,
-    guidance: str | None,
-    feedback: str,
-    max_steps: int,
-    has_literature_tool: bool,
-    author: "Callable[[str], str] | None" = None,
-    prior_agenda: "list[str] | None" = None,
-    latest_feedback: str = "",
-) -> list[str]:
-    """Deterministically preserve a literature step when the user requested one.
-
-    The guard decides THAT the step exists. WHAT it says comes from ``author`` (the PI writing one
-    step from the full question + dataset profile) when one is wired; the string template
-    ``_literature_step_text`` is only the offline fallback. A PI-written literature step that is
-    already in the plan is kept as written — it is not replaced by anything.
-
-    Whether the user requested one is :func:`_literature_step_wanted`: their own words, and on a
-    revision the plan they reviewed (``prior_agenda``) and the note they just typed
-    (``latest_feedback``). ``guidance`` is not read: a protocol names literature, or a "reference
-    panel", in every pipeline, which says nothing about what this user asked for."""
-    if not has_literature_tool or not _literature_step_wanted(
-            agenda, question=question, feedback=feedback,
-            prior_agenda=prior_agenda, latest_feedback=latest_feedback):
-        return agenda
-    existing_lit = [existing for existing in agenda if _is_literature_step(existing)]
-    if existing_lit:
-        # Keep the PI's own wording; only collapse duplicates. Of several, keep the most
-        # informative one (a bare tool name like "literature_search" loses to a real sentence);
-        # a step that is ONLY a tool name is not a step, so fall back to the label for it.
-        keep = max(existing_lit, key=len)
-        if len(keep.strip()) < 30:
-            keep = author(_literature_step_text(question)) if author is not None \
-                else _literature_step_text(question)
-        deduped: list[str] = []
-        inserted = False
-        for existing in agenda:
-            if _is_literature_step(existing):
-                if not inserted:
-                    deduped.append(keep)
-                    inserted = True
-                continue
-            deduped.append(existing)
-        return deduped[:max_steps]
-    # A step the redraft lost goes back as the user reviewed it, not as a newly written one.
-    reviewed = max((s for s in prior_agenda or [] if _is_literature_step(s)), key=len, default="")
-    fallback = _literature_step_text(question)
-    step = reviewed or (author(fallback) if author is not None else fallback)
-    if len(agenda) < max_steps:
-        return [*agenda, step]
-    if not agenda:
-        return [step]
-    replace_idx = len(agenda) - 1
-    for idx in range(len(agenda) - 1, -1, -1):
-        if _LOW_PRIORITY_FOR_LITERATURE_RE.search(agenda[idx]):
-            replace_idx = idx
-            break
-    out = list(agenda)
-    out[replace_idx] = step
-    return out
-
-# Summarize the literature_search result into a DOI/PMID-backed answer that the Critic can accept
-# and the final References section can reuse.
-def _literature_answer(query: "str | list[str]", result: dict[str, Any]) -> str:
-    queries = [query] if isinstance(query, str) else [q for q in (query or []) if q]
-    disp = " | ".join(queries) or "(none)"
-    noun = "query" if len(queries) <= 1 else "queries"
-    citations = [
-        c for c in (result.get("results") or [])
-        if isinstance(c, dict) and (c.get("doi") or c.get("pmid"))
-    ]
-    if not citations:
-        return (
-            f"No DOI/PMID-backed literature citations were returned for {noun} `{disp}`. "
-            "State this limitation in the report rather than inventing references."
-        )
-    lines = [
-        f"Literature search {noun}: `{disp}`",
-        "",
-        "DOI/PMID-backed citations found (merged, de-duplicated across queries):",
-    ]
-    for i, c in enumerate(citations[:12], 1):
-        lines.append(f"{i}. {c.get('citation') or c.get('title')}")
-    return "\n".join(lines)
-
-
-# --- Axis A: Virtual-Lab team mode (dynamic team + multi-agent meetings) ------
-# A "team meeting" runs several expert agents that EACH keep an INDEPENDENT context (their
-# own persona, never the other experts' raw turns) so the perspectives stay diverse, plus a
-# first-class Scientific Critic and a PI synthesis — the Virtual-Lab structure. Execution
-# still runs the REAL tools via the per-step Scientist loop; the meetings wrap it to DESIGN
-# the approach and INTERPRET the results from multiple angles. Independent context here is
-# in-run only; persistent per-agent memory (the Lab Archive) is Axis C, deferred.
-
-_MODE_ROUTE_SYSTEM = (
-    "You are the PI deciding HOW to run a request. Reply with ONLY 'team' or 'single'. Choose "
-    "'team' (a multi-expert Virtual Lab) for open-ended, interpretation-heavy, or multi-"
-    "disciplinary research questions; choose 'single' for a routine single-pipeline task (e.g. "
-    "run a specific tool, a standard annotation) where one scientist suffices."
-)
-
-_TEAM_FORM_SYSTEM = (
-    "You are the Principal Investigator assembling a small expert team for a research question. "
-    "Reply with ONLY a JSON array of 2-4 experts, each "
-    '{"title": "...", "expertise": "...", "goal": "..."}. Choose COMPLEMENTARY, specific '
-    "expertises that fit THIS question (e.g. a single-cell biologist, a statistician, a disease-"
-    "domain expert). Do NOT include the PI or the Critic themselves."
-)
-
-#: The Critic's score bands, as ONE piece of data — the console shows what a score MEANS instead of
-#: a bare number, and it must be the same meaning the Critic was given. The prompt above states the
-#: bands in prose (a model reads prose, not a table); ``test_critic_score_bands`` asserts every
-#: boundary here still appears in ``_CRITIC_SYSTEM``, so the two cannot drift apart silently.
-#: English, deliberately: this is the model's own rubric wording, and translating it would put a
-#: second, slightly different rubric in front of the reader.
-CRITIC_SCORE_BANDS: tuple[tuple[float, str], ...] = (
-    (0.95, "goal fully met; every quantitative claim tied to an evidence artifact"),
-    (0.80, "solid, usable result; a minor claim is thin or a small sub-goal is unmet"),
-    (0.60, "partially meets the goal, or a material claim rests on prose with no backing artifact"),
-    (0.00, "no usable result, goal not met, or a claim contradicted by the tool results"),
-)
-
-
-def critic_score_band(score: "float | int | None") -> str:
-    """The rubric band a Critic score falls in, as the Critic itself was told to apply it.
-
-    A bare "quality 0.76" is unreadable without the rubric, and the rubric lived only inside a
-    prompt string. Returns "" for a missing/non-numeric score rather than inventing a band.
-    """
-    if not isinstance(score, (int, float)) or isinstance(score, bool):
-        return ""
-    for floor, label in CRITIC_SCORE_BANDS:
-        if score >= floor:
-            return label
-    return CRITIC_SCORE_BANDS[-1][1]
-
-
-_MEETING_CRITIC_SYSTEM = (
-    "You are the team's Scientific Critic in a meeting. Given the topic and the experts' "
-    "contributions, judge how sound and complete the team's CURRENT thinking is, and point out "
-    "the most important flaws, missing considerations, unsupported claims, and risks — specific "
-    "and constructive. Reply with ONLY a JSON object: "
-    '{"score": <0.0-1.0 = how ready the team\'s thinking is to act on>, '
-    '"critique": "<the specific issues and what to address in the next round>"}.'
-)
-
-# --- PI↔Critic step meetings (docs/pi_critic_meeting_protocol.md) -------------
-# Two bounded PI↔Critic exchanges wrapped around each step. The Critic challenges; the PI (who owns
-# the plan) adjudicates. This is the model-judgment layer; deterministic guards remain the floor.
-_PREFLIGHT_GATE_SYSTEM = (
-    "You are the Scientific Critic in a PRE-FLIGHT review with the PI, held BEFORE a step runs. You are "
-    "given the research question, the WHOLE plan (each step tagged done / current / remaining), the "
-    "findings ALREADY accepted (with their artifacts), the dataset profile, and the ONE step about to "
-    "execute. Decide whether running it AS WRITTEN is scientifically justified right now, challenging "
-    "it on four axes: (1) NECESSITY — does its output feed the research question or a remaining step, "
-    "or is it orphan work nothing consumes? (2) REDUNDANCY — is it already covered by an accepted step "
-    "or an existing checkpoint? (3) PRECONDITION — are its methodological preconditions met? e.g. "
-    "pathway/GO enrichment or discovery differential expression needs a real experimental CONTRAST "
-    "(2+ conditions), not a single annotated sample; a per-cluster claim needs the clusters reconciled "
-    "against any provided labels. (4) ALTITUDE — is the granularity right? Reply with ONLY a JSON "
-    'object: {"action": "proceed" | "amend" | "skip", "reason": "<one sentence>", '
-    '"amendment": "<if amend: the concrete change to fold into the step\'s brief; else empty>"}. '
-    'Use "skip" ONLY for a genuinely circular, redundant, or unfounded step — most steps proceed. '
-    "The PI makes the final call and may overrule you."
-)
-_PREFLIGHT_PI_SYSTEM = (
-    "You are the Principal Investigator adjudicating a PRE-FLIGHT objection the Critic raised about the "
-    "next step, before it runs. You are given the step, the plan, the accepted findings, the dataset "
-    "profile, and the Critic's proposed action + reason. You OWN the plan and have the final call: keep "
-    "the step, fold in an amendment, or drop it. Only drop a step you agree is circular, redundant, or "
-    'unfounded — when in doubt, keep it. Reply with ONLY a JSON object: {"action": "proceed" | "amend" '
-    '| "skip", "reason": "<one sentence>", "amendment": "<if amend: the concrete change to the step\'s '
-    'brief; else empty>"}.'
-)
-_POSTSTEP_PI_SYSTEM = (
-    "You are the Principal Investigator reviewing a step that JUST completed, to keep the remaining plan "
-    "honest. You are given the step, the Critic's verdict, what the step produced (answer + artifacts), "
-    "the findings accepted so far, and the REMAINING planned steps (verbatim). State whether this step "
-    "CHANGED the picture, and whether any remaining step is now UNNECESSARY — already answered, or only "
-    "justified by a branch that did not pan out. Reply with ONLY a JSON object: "
-    '{"contribution": "new" | "confirmed" | "nothing", '
-    '"prune": ["<verbatim remaining step to drop>", ...], "reason": "<one sentence>"}. '
-    "Prune CONSERVATIVELY — only steps clearly made moot; usually the list is empty."
-)
-# The EXPLORATION turn — the only place in the system where the plan can GROW. Everything else
-# (pre-flight gate, post-step review, plan review) can at best leave the plan unchanged, so without
-# this a result that contradicts the plan's premise has nowhere to go: the run keeps executing the
-# agenda it drafted before it had seen any data. The prompt is written to make "no new path" the
-# cheap default answer, because a false positive here spends real GPU hours on noise.
-_EXPLORE_SYSTEM = (
-    "You are the Principal Investigator, reading a step that JUST completed, to decide whether its "
-    "result opened a research path the CURRENT PLAN DOES NOT COVER. This is how the lab discovers "
-    "something it did not set out to find — and also how it wastes a day of compute if you are "
-    "undisciplined. THE DEFAULT ANSWER IS 'NOTHING NEW': empty lists are the normal reply, and you "
-    "must return them whenever the result merely CONFIRMS what the plan expected, is a routine "
-    "quality/summary output, or is only 'interesting' without contradicting anything.\n"
-    "Propose a new path ONLY when the result is genuinely SURPRISING with respect to the plan: it "
-    "contradicts the premise a planned step rests on, a signal appears in a population/condition "
-    "nobody planned to look at, or two accepted findings are mutually inconsistent.\n"
-    "A HYPOTHESIS MUST BE FALSIFIABLE. State it as a claim about the biology (not about the data "
-    "processing), give the observation you would EXPECT IF IT IS TRUE, and give a test whose outcome "
-    "would DISTINGUISH it from the obvious competing explanation — including the boring one "
-    "(a technical artefact, ambient RNA, doublets, batch, coverage). 'Investigate X further', "
-    "'characterise Y in more detail', and 'validate the results' are NOT hypotheses; reject them.\n"
-    "Each proposed step must: be achievable with the LISTED TOOLS; be ONE tool's worth of work; NOT "
-    "duplicate or restate any step already in the plan (the verbatim plan is given — check it); and "
-    "actually test one of your hypotheses. Never propose a step that writes, renders, packages, or "
-    "exports a report/figure bundle: the bundle is assembled at the end of the run, and a written "
-    "report is a step the user asks for, never one you add. "
-    "Write each step in plain scientific English for a researcher to read — the action, what it is "
-    "performed on, and what it would show — NAMING the tool it runs in backticks, matching the "
-    "style of the existing plan. No bare keyword arguments, no code, no file paths.\n"
-    "EVERY hypothesis must name the RIVAL explanation it is competing with and the DISCRIMINATOR "
-    "that separates them. A claim with no alternative cannot be tested, only narrated: the first "
-    "run with this loop enabled produced one hypothesis ('the shifts are a depth artefact'), had "
-    "nothing to compare it against, and marked it supported on a prediction its own design "
-    "guaranteed — while the real signal sat in its tables. So: `rival` is the OTHER explanation "
-    "that would produce the same observation (if your hypothesis is the technical one, the rival "
-    "is the biological one, and vice versa), and `discriminator` says which outcome favours yours "
-    "and which favours the rival. A discriminator whose outcome is fixed by the study design — a "
-    "between-arm p-value when there is one sample per arm, say — is not a discriminator, because "
-    "both explanations predict the same result; discriminate on effect DIRECTION, cell-type "
-    "SPECIFICITY, or an orthogonal measurement instead.\n"
-    "You are ALSO given the hypotheses still OPEN from earlier steps, each WITH its rival. If THIS "
-    "step's result bears on one, adjudicate it by saying which side it favoured: 'hypothesis', "
-    "'rival', or 'neither', with one sentence of evidence taken from THIS result. Do not adjudicate "
-    "a hypothesis this result says nothing about, and do not re-propose one already in the list.\n"
-    "Reply with ONLY a JSON object: "
-    '{"surprise": "<one sentence: what was unexpected, or exactly \'nothing\'>", '
-    '"hypotheses": [{"statement": "...", "prediction": "...", "test": "...", '
-    '"rival": "<the competing explanation>", '
-    '"discriminator": "<outcome X favours the hypothesis; outcome Y favours the rival>"}], '
-    '"new_steps": [{"step": "<plain-English step>", "hypothesis": "<verbatim statement it tests>"}], '
-    '"resolve": [{"hypothesis": "<verbatim OPEN statement or its id>", '
-    '"favoured": "hypothesis|rival|neither", "evidence": "<one sentence from this result>"}]}. '
-    "At most 2 hypotheses and 2 new steps per step."
-)
-# Planning a FOLLOW-UP cycle. Different judgement from the first plan: cycle 1 is planned blind (the
-# question + the dataset profile), this one is planned against what the data actually said — so the
-# only steps worth writing are ones the first cycle's RESULTS made worth writing.
-_NEXT_CYCLE_SYSTEM = (
-    "You are the Principal Investigator deciding whether to run ANOTHER cycle of analysis, and what "
-    "it should contain. The previous cycle(s) are finished; you are given the research question, "
-    "every step already performed WITH its result, the hypothesis ledger (each hypothesis with its "
-    "status: open, supported, refuted, or inconclusive), the dataset profile, and the tools.\n"
-    "STOPPING IS A LEGITIMATE AND COMMON ANSWER. Stop when the research question has been answered "
-    "as far as this dataset allows, when the only open hypotheses need data or tools you do not "
-    "have, or when a further cycle would just re-describe what is already known. Do NOT invent a "
-    "cycle to look busy — a study that stops when it has run out of answerable questions is a good "
-    "study.\n"
-    "Continue ONLY when there is a CONCRETE question the previous cycles RAISED but did not settle "
-    "— typically an OPEN hypothesis with a discriminating test that the available tools can "
-    "actually run, or a result that changed what the right analysis is. The new plan must be work "
-    "the FIRST cycle could not have known to do: do NOT repeat, re-run, or lightly reword a step "
-    "already performed (they are listed verbatim — check), and do NOT re-run an upstream stage "
-    "whose checkpoint already exists.\n"
-    "Every step must be achievable with the listed tools, be ONE tool's worth of work, and be "
-    "written in plain scientific English for a researcher — the action, what it is performed on, "
-    "and what it reveals — NAMING the tool it runs in backticks, with no bare keyword arguments, "
-    "no code, and no file paths. Never plan a step "
-    "that writes, renders, packages, or exports a report: a written report is the `write_report` "
-    "step of the first plan, run once all cycles finish, and only when the user asked for it.\n"
-    "Reply with ONLY a JSON object: "
-    '{"continue": true|false, "reason": "<one sentence: what this cycle would settle, or why the '
-    'study should stop>", "agenda": ["<step>", ...]}. '
-    'With "continue": false, return an empty agenda.'
-)
-_PLAN_REVIEW_CRITIC_SYSTEM = (
-    "You are the Scientific Critic reviewing a DRAFT analysis plan with the PI, BEFORE any step runs. "
-    "When `user_scope` is given, the user limited this run on purpose: an analysis it rules out is "
-    "NOT a gap — do not flag its absence and do not add it in a revision. "
-    "`request_breadth`, when given, is how much the user asked for — \"whole\" (the whole analysis "
-    "of this dataset) or \"specific\" (the analyses the request names); `earlier_work`, when "
-    "given, is what this conversation's earlier run already did and what the dataset it handed on "
-    "carries. "
-    "You are given the research question, the dataset profile, the ordered draft agenda, and "
-    "`tools_named_in_plan` — what each tool the plan names computes and returns, in the words "
-    "the tool's own contract uses. "
-    "USE YOUR OWN KNOWLEDGE OF SINGLE-CELL AND GENOMICS METHOD, not only the protocol you were "
-    "handed: a plan can follow a protocol's wording and still be scientifically incoherent, and "
-    "catching that is exactly your job. Judge the plan AS A WHOLE, not step by step:\n"
-    "(1) NECESSARY — a step is an orphan only when NOTHING consumes its output AND the request does "
-    "not ask for it. A step that only re-reads, parses, tabulates or restates what an earlier step "
-    "already produced is not an analysis step; it produces no new knowledge and must be dropped. "
-    "The same goes for re-RENDERING: volcano plots and per-group DEG tables are produced "
-    "automatically by the tools that computed them, and a written report only by a `write_report` "
-    "step the request asked for (leave that one in place), so a step that exists to draw or "
-    "compile those again is duplicate work — but do NOT flag a step merely because it names no "
-    "existing tool: writing an ad-hoc analysis (via `run_code`) that the toolset lacks is allowed "
-    "when it adds real scientific value. Two misses to learn from: a plan spent a whole `run_code` "
-    "step re-reading obs columns the DATASET PROFILE already states (the condition column, the "
-    "cell-type column, the per-arm cell counts, the number of replicate levels) — the profile is "
-    "an earlier step's output for this purpose; and a 'figures and tables' step re-drew the "
-    "volcano plots and enrichment heatmaps that run_de and run_enrichment already write to "
-    "figures/, which is the re-RENDERING case above wearing a different name. "
-    "Re-DERIVING is the same waste: read `tools_named_in_plan`, and when a `run_code` step "
-    "recomputes a verdict, label or table a named tool already returns, merge it into the step "
-    "that runs that tool. The miss: a step re-applied a per-direction depth rule and a rho "
-    "filter to run_depth_matched_de's tables, when that tool already labels each direction and "
-    "marks its depth-robust genes — and applied the rule backwards. Likewise a step that repeats "
-    "another step's operation on a subset under a new name (keeping only the reference arm's "
-    "cells inside the other arm's depth range IS depth matching, whatever the step calls it). "
-    "Name the tool and the output the step duplicates; that is a reason ON THIS DATA. "
-    "A LITERATURE STEP IS NEVER A GAP: it is a separate step, planned only when the user asks for "
-    "literature, references or citations — do not add one in any other case, whole analysis "
-    "included, and do not flag its absence. "
-    "THE REQUEST SETS THE BREADTH, THE DATA DOES NOT. The plan was drafted to deliver what the "
-    "request asks for, plus the prerequisites those steps cannot run without. For a SPECIFIC "
-    "request an analysis the request did not ask for is NOT a gap: do not add composition, "
-    "enrichment, stratification or sensitivity steps because the dataset would support "
-    "them — the user asks for those in a later message, which starts from this run's results — "
-    "and a step in the draft that delivers nothing the request asked for, and whose output no "
-    "requested step reads, is out of scope: say so and drop it. What you must still protect is a "
-    "PREREQUISITE: the QC, clustering or labels a requested step reads, when neither the profile "
-    "nor `earlier_work` shows the data already carries them, stay in the plan although the request "
-    "never mentions them — measured on this prompt, an earlier wording cut a sound plan by "
-    "calling its QC step an 'orphan relative to the research question'. For a WHOLE-analysis "
-    "request (or when `request_breadth` is absent) the standard is the pipeline this kind of data "
-    "warrants: quality control, the comparison the design calls for and pathway interpretation "
-    "stay when the dataset's design supports them. In both cases drop a step only when you can "
-    "name what makes it redundant or impossible ON THIS DATA (it recomputes a column the profile "
-    "already carries; it needs replicates the profile shows do not exist; `earlier_work` already "
-    "did it), or outside the request and not a prerequisite of anything inside it.\n"
-    "(2) COHERENT — do any two steps CONTRADICT each other? If a later step's justification says the "
-    "earlier step's method is invalid (e.g. step 5 aggregates to samples 'instead of treating cells "
-    "as independent replicates' while step 3 does exactly that and its output is still reported), the "
-    "plan cannot be run as written: say which of the two is the real analysis and drop or relabel the "
-    "other. Likewise if the plan re-clusters de-novo AND the data already carries cell-type labels, "
-    "reconcile them or drop the clustering — anonymous cluster IDs that no later step maps back to "
-    "the labels are dead weight.\n"
-    "(3) THE DATA SUPPORTS IT — check every column a step depends on against the PROFILE, and say so "
-    "when it is missing. A step that aggregates 'per donor' when no donor/sample column exists in the "
-    "profile cannot execute; pathway/GO enrichment or discovery-style DE needs a real experimental "
-    "contrast (2+ conditions), not a single annotated sample. State the UNIT OF REPLICATION the plan "
-    "implies (how many samples per arm, read off the profile) and flag any step whose statistics "
-    "assume more replication than the data has.\n"
-    "(4) USES WHAT IS ALREADY THERE — if the profile shows existing cell-type labels, QC columns, "
-    "doublet calls or an integrated embedding, a step that recomputes them from scratch is waste and "
-    "usually worse than what it replaces. Say which existing column the step should use instead.\n"
-    "(5) LEGIBLE — each step should name the tool it runs, so a researcher can see which test is "
-    "about to be applied. Flag a step whose method cannot be identified from its text.\n"
-    "(6) COMPUTABLE — read every operation a step specifies and ask whether it can actually be "
-    "computed from the things it names. The failure to catch: a step proposed correlating each "
-    "gene's log fold-change against the between-arm MEDIAN library size — a per-gene vector "
-    "against a single number, which has no second variable and cannot be computed. It reached "
-    "execution and failed three times. Watch for correlating or regressing something per-gene or "
-    "per-cell against a per-GROUP summary; testing an effect with no contrast; comparing a "
-    "quantity to itself; and any 'flag genes that correlate with <a scalar>'. Name the "
-    "computable operation the step should perform instead — for depth imbalance that is "
-    "`run_depth_matched_de` (down-sample the deeper arm, re-rank, correlate the two RANKINGS).\n"
-    "(7) THE OUTPUTS ARE PRODUCED — every figure, table or quantity a step promises must be "
-    "computed by some step in the plan. The failure to catch: a figures step promised a "
-    "cell-type composition chart while no step ran a composition analysis at all, so the plan "
-    "committed to showing a number nothing calculated. Either add the step that computes it "
-    "(here `run_composition`) or drop the promise.\n"
-    "(8) THE DESCRIPTION MATCHES THE TOOL — when a step names a tool, its prose must describe "
-    "what that tool actually does: check it against `tools_named_in_plan`, not against memory. "
-    "The failure to catch: a step said preranked GSEA would return "
-    "scores 'based on log2FC ranks' when `run_gsea_prerank` ranks on the Wilcoxon z-score, and "
-    "the same sentence claimed both. A wrong description is copied verbatim into the paper's "
-    "Methods, where nobody can check it against the code.\n"
-    "(10) THE PRIMARY ANALYSIS IS PRESENT — before critiquing what IS written, name the analysis "
-    "the REQUEST is asking for (for a whole-analysis request, the one the protocol is built "
-    "around), and check the plan actually contains it. Every "
-    "other rule here judges the steps that exist; this one is about the step that is missing, "
-    "which nothing downstream can notice. The failure to catch: a differential-expression plan "
-    "arrived with QC, a depth-matched check, composition and two enrichment steps — and no DE "
-    "step at all. The enrichment steps read a DE table no step wrote. It passed this review "
-    "unflagged, twice. If the primary analysis is absent, that is the issue to report, and the "
-    "revision must ADD it.\n"
-    "(9) LITERATURE STEPS ASK, THEY DO NOT ASSERT — a step that searches the literature must "
-    "phrase its questions without asserting the biology it is about to look up. The failure to "
-    "catch: a step described DDX41 as 'a DEAD-box helicase (BRR2) in the U4/U6 snRNP complex'. "
-    "BRR2 is a different protein of a different family, and that false premise would have steered "
-    "every query and every citation that came back. Strip factual claims about a gene, protein or "
-    "complex out of the query and let the retrieved papers supply them.\n"
-    "Reply with "
-    'ONLY a JSON object: {"issues": ["<specific problem>", ...], "revised_agenda": ["<step>", ...]}. '
-    "YOUR revised_agenda MUST FIX WHAT YOUR OWN issues REPORT. The two fields are one answer, not "
-    "two: an issue that says a step is missing and a revised_agenda that still lacks it is "
-    "self-contradictory, and the reader downstream sees only the agenda. Measured: reviewing "
-    "drafts whose DE step was missing, this review named the omission correctly every time and "
-    "then returned an agenda without the DE step in three of four attempts. Before you answer, "
-    "re-read your issues list against your revised_agenda and make them agree.\n"
-    "``revised_agenda`` is your proposed corrected plan — add the missing analysis step where one is "
-    "needed (not a step that only reconciles or re-checks other steps' results: the claim audit "
-    "before the write-up does that), drop orphan/circular/contradictory steps, keep the other step "
-    "text verbatim; return the ORIGINAL agenda unchanged if it is already sound.\n"
-    "WEIGH ADDING AND DROPPING DIFFERENTLY. The two mistakes do not cost the same: a step you "
-    "wrongly drop is gone silently — no later step reports its absence, and the result simply "
-    "lacks an analysis nobody sees was missing — while a step you wrongly keep costs some compute "
-    "and is visible in the output where a reader can discount it. So hold a drop to the higher "
-    "bar: say which specific thing makes it redundant or impossible ON THIS DATA, or that it "
-    "delivers nothing the request asked for and no remaining step reads its output. An ADD is held "
-    "to the same bar from the other side: add a step only for an analysis the request asks for "
-    "that no step computes, or for a prerequisite a planned step cannot run without — never "
-    "because the dataset would support one more analysis. Measured on this prompt: reviewing two "
-    "drafts that were missing their DE step, this review added nothing and removed the "
-    "composition step from both. Dropping nothing is a perfectly good review; a shorter agenda is "
-    "not the goal, and neither is a longer one. The PI makes the final call."
-)
-# The Critic writes its issues in prose, so "did it report a missing analysis, and WHICH one"
-# are both text questions. The family matters: a first version of this asked only whether the
-# agenda named *any* analysis tool, and every draft it was meant to catch named run_scanpy_qc,
-# run_composition and run_enrichment — just not the DE step the Critic was complaining about — so
-# the guard never fired once. Resolve the issue to a tool FAMILY and check for that family.
-# NB: no trailing \b — the truncated stems ("never comput") must still match "never computed",
-# and a \b after "comput" demands a boundary that "computed" does not have. The leading \b stays.
-_MISSING_WORDS = re.compile(
-    r"\b(missing|absent|lacks?|lacking|no\s+\S+\s+step|no step|never comput|not comput|"
-    r"nothing comput|does not comput)", re.I)
-# Ordered: the first family whose words appear in the issue is the one the Critic means.
-_ANALYSIS_FAMILIES: "tuple[tuple[Any, tuple[str, ...]], ...]" = (
-    (re.compile(r"\b(differential expression|\bDE\b|contrast|fold[- ]change|pseudobulk)\b", re.I),
-     ("run_de", "run_pseudobulk_de")),
-    (re.compile(r"\b(composition|proportion|abundance)\b", re.I), ("run_composition",)),
-    (re.compile(r"\b(enrichment|pathway|GSEA|ORA)\b", re.I), ("run_enrichment", "run_gsea_prerank")),
-    (re.compile(r"\b(clustering|cluster|annotation|cell[- ]type label)\b", re.I),
-     ("run_clustering", "scgpt_annotate")),
-    (re.compile(r"\b(quality control|\bQC\b|filtering)\b", re.I), ("run_scanpy_qc", "run_cellqc")),
-    (re.compile(r"\b(depth|library size|down-?sampl)\b", re.I), ("run_depth_matched_de",)),
-)
-
-
-def _missing_analysis_family(issues: "list[str]") -> "tuple[str, ...] | None":
-    """The tool family a Critic issue says is ABSENT, or None if none does.
-
-    Narrow on purpose: the issue must say something is missing AND name an analysis, so
-    "the DE step should also report effect sizes" does not trip it.
-    """
-    for issue in issues:
-        if not _MISSING_WORDS.search(issue):
-            continue
-        for pattern, tools in _ANALYSIS_FAMILIES:
-            if pattern.search(issue):
-                return tools
-    return None
-
-
-def _names_tool(agenda: "list[str]", tools: "tuple[str, ...]") -> bool:
-    """Does any step name one of ``tools``?  (Steps quote tools in backticks.)"""
-    text = "\n".join(agenda)
-    return any(re.search(r"`%s`" % re.escape(t), text) for t in tools)
-
-
-def retick_tools(steps: "list[str]", names: "Iterable[str]") -> "list[str]":
-    """``steps`` with the backticks put back around tool names written bare.
-
-    Every consumer of a plan finds a step's tool by its backticks: the scope filter, the tooling
-    check, the plan review's contracts, the DAG's node kinds. The PI's finalising turn rewrites
-    steps and sometimes writes ``run run_scanpy_qc`` without them (measured 2026-10-12: one of
-    fifteen reviewed plans, all three of its steps), after which the plan names no tool at all as
-    far as the code can tell. Only names with an underscore or hyphen are restored, so no ordinary word is
-    ever quoted; a longer name is never split (``run_de`` inside ``run_depth_matched_de``)."""
-    wanted = sorted({n for n in names if "_" in n or "-" in n}, key=len, reverse=True)
-    if not wanted:
-        return list(steps)
-    bare = re.compile(r"(?<![`\w-])(" + "|".join(re.escape(n) for n in wanted) + r")(?![`\w-])")
-    return [bare.sub(r"`\1`", step) for step in steps]
-
-
-def plan_tool_contracts(agenda: "list[str]", catalog: "list[Any]") -> "dict[str, str]":
-    """``{tool name: what the model is told it does}`` for every catalog tool the agenda names.
-
-    The plan review judges redundancy ("this step recomputes what a tool already returns") and
-    fidelity ("the step describes the tool wrongly"), and both are questions about the tool, not
-    the plan. Only the tools the plan names are sent: they are the ones a step can duplicate or
-    misdescribe, and the whole catalog would bury them."""
-    text = "\n".join(agenda)
-    return {t.name: str(getattr(t, "description", "") or "")
-            for t in catalog
-            if t.name != "finish" and re.search(r"`%s`" % re.escape(t.name), text)}
-
-
-_PLAN_REVIEW_PI_SYSTEM = (
-    "You are the Principal Investigator finalizing the analysis plan after the Critic reviewed it, "
-    "BEFORE any step runs. You OWN the plan. When `user_scope` is given, the user limited this run "
-    "on purpose: the final agenda stays inside it. `request_breadth` (\"whole\" analysis, or the "
-    "\"specific\" analyses the request names) and `earlier_work` (what this conversation already "
-    "did) say how much is being asked for: the final agenda delivers the request and the "
-    "prerequisites it cannot run without, and adds no analysis the request did not ask for. "
-    "You are given the question, the dataset profile, the draft "
-    "agenda, and the Critic's issues + proposed revision. Decide the FINAL agenda: adopt the fixes you "
-    "agree with, keep steps you still want, never drop a step you believe is needed — but DO remove a "
-    "genuinely orphan, circular, or redundant step. Do NOT put back, in its place, a 'reconciliation', "
-    "'cross-check' or 'claim gate' step that re-reads other steps' results: before the report is "
-    "written, a claim audit checks every candidate conclusion against the design (depth gap, "
-    "replication) and the artifacts, so such a step duplicates it. Add a step only for a requested "
-    "analysis, or a prerequisite of one, that no step computes. "
-    'Reply with ONLY a JSON object: {"final_agenda": ["<step>", ...], "reason": "<one sentence>"}.'
-)
-
-_MEETING_SYNTH_SYSTEM = (
-    "You are the Principal Investigator synthesizing a team meeting. The members were given "
-    "DIFFERENT slices of the evidence on purpose, so where they disagree the disagreement is a "
-    "RESULT, not noise to be smoothed away — and an unresolved question is a more useful output "
-    "than a consensus that was never earned. Write two sections, grounded ONLY in what was "
-    "actually said:\n"
-    "AGREED — the decisions the team genuinely converged on, each with the reason.\n"
-    "UNRESOLVED — every substantive disagreement: WHO holds which position, what evidence each "
-    "cites, and WHAT WOULD SETTLE IT (the specific check, table, or figure). If a member said its "
-    "view was partial, say what it could not see.\n"
-    "Leave UNRESOLVED empty ONLY if there was genuinely no disagreement. Never invent agreement, "
-    "never invent data, and never resolve a disagreement by picking a side the evidence does not."
-)
 
 
 # Tools a MEETING expert may call. A whitelist, never a blacklist: a meeting must not be able to
@@ -3360,586 +364,6 @@ _MEETING_SYNTH_SYSTEM = (
 # chain. These three only READ — the data file, and the published literature — which is exactly
 # what lets one expert hold evidence the others do not.
 _MEETING_TOOLS = frozenset({"inspect_dataset", "literature_search", "deep_literature", "search_corpus"})
-
-
-def _assign_evidence(experts: "tuple[Specialist, ...]",
-                     rounds: "list[LabRound]") -> "list[str]":
-    """Give each expert a DIFFERENT slice of the accepted findings — one block per expert.
-
-    Without this, every member of a "team" sees the identical prompt and differs only by a persona
-    string, so their disagreement is drawn from one posterior: it is self-consistency sampling
-    wearing name tags, not a team. Disagreement between agents that examined DIFFERENT evidence is
-    information; disagreement between agents that read the same paragraph is sampling noise.
-
-    Findings are dealt round-robin so each expert owns a comparable share, and each is told the
-    others hold the rest — an expert that does not know its view is partial reports it as the whole
-    picture. Empty (no accepted findings yet, i.e. the design meeting) returns blank blocks, and the
-    asymmetry there comes from the tools instead."""
-    n = max(1, len(experts))
-    accepted = [r for r in rounds if r.verdict.verdict == "accept"]
-    if not accepted:
-        return [""] * n
-
-    def _line(r: "LabRound") -> str:
-        res = r.scientist_result or {}
-        answer = str(res.get("final_answer") or "").strip() or "(no write-up)"
-        ev: list[str] = []
-        for s in res.get("steps", []) or []:
-            ev += [p for p in evidence_pointers(s.get("result")) if p not in ev]
-        tail = f"\n   evidence on disk: {', '.join(ev[:6])}" if ev else ""
-        return f"- Step {r.step_index}: {r.step}\n   result: {answer[:600]}{tail}"
-
-    blocks: list[str] = []
-    for i in range(n):
-        mine = accepted[i::n]
-        others = len(accepted) - len(mine)
-        if not mine:
-            blocks.append(
-                "YOUR ASSIGNED EVIDENCE: none — the findings were shared among the other members. "
-                "Contribute from your expertise and interrogate what they report; do not invent "
-                "results you were not given.")
-            continue
-        head = (f"YOUR ASSIGNED EVIDENCE — you are the member responsible for these "
-                f"{len(mine)} finding(s). The other {others} finding(s) were assigned to OTHER "
-                "members, so your view is deliberately PARTIAL:")
-        foot = ("\nReport what YOUR evidence actually shows — read the artifacts above with your "
-                "tools if the write-up is thin or you doubt it. Say plainly where your evidence "
-                "may CONTRADICT what another member is likely to report, and what would settle it. "
-                "Do NOT claim anything about findings you were not assigned.")
-        blocks.append(head + "\n" + "\n".join(_line(r) for r in mine) + foot)
-    return blocks
-
-
-def _parse_team(raw: str, max_n: int) -> list[Specialist]:
-    """Parse the PI's team JSON into Specialist personas (independent-context experts).
-    Tolerates code fences / a surrounding sentence; returns [] on failure (caller falls back)."""
-    s = raw.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        if s.lower().startswith("json"):
-            s = s[4:].strip()
-    parsed: Any = None
-    try:
-        parsed = json.loads(s)
-    except json.JSONDecodeError:
-        m = re.search(r"\[.*\]", s, re.DOTALL)
-        if m:
-            try:
-                parsed = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                parsed = None
-    out: list[Specialist] = []
-    if isinstance(parsed, list):
-        for e in parsed[:max_n]:
-            if not isinstance(e, dict):
-                continue
-            title = str(e.get("title") or "").strip()
-            expertise = str(e.get("expertise") or "").strip()
-            goal = str(e.get("goal") or "").strip()
-            if not title:
-                continue
-            persona = expertise + (f" Your goal: {goal}" if goal else "")
-            kws = tuple(set(re.findall(r"[a-z]{4,}", (title + " " + expertise).lower())))
-            out.append(Specialist(title, persona or "Domain expert.", kws))
-    return out
-
-
-def _round_feedback(score: float, critique: str) -> str:
-    """Score-driven instruction for the NEXT round's experts: the challenge is conditioned on
-    the Critic's ACTUAL assessment (not a blanket 'disagree'). Low score -> push back hard;
-    mid -> address concerns + challenge weak claims; high -> consolidate (the meeting also ends
-    early before reaching here when the score clears ``meeting_accept_score``)."""
-    if score < 0.5:
-        return (f"\n\nThe Critic found serious problems (score {score:.2f}): {critique}\n"
-                "Reconsider your position and push back HARD where the evidence is weak — do NOT just agree.")
-    if score < 0.8:
-        return (f"\n\nThe Critic raised concerns (score {score:.2f}): {critique}\n"
-                "Address these specifically and challenge any claim you find unsupported.")
-    return (f"\n\nThe Critic was largely satisfied (score {score:.2f}) but noted: {critique}\n"
-            "Consolidate and tighten — refine only what materially matters. A high score is NOT a "
-            "reason to drop a disagreement you still hold: if your evidence still conflicts with "
-            "the synthesis, say so and name what would settle it.")
-
-
-@dataclass(frozen=True)
-class LabConfig:
-    # None (default) = derive the round budget from the agenda so EVERY planned step gets to run.
-    # Each step is still capped at ``max_revisions`` retries (force-advance), so total work is
-    # inherently bounded by len(agenda)×(1+max_revisions) — no step is ever starved. An explicit
-    # int is a hard cap (used by tests, or a cloud override via AISCIENTIST_MAX_ROUNDS).
-    max_rounds: int | None = None
-    # Runaway guard on PI agenda length — NOT a planning budget. The PI plans as many steps as the
-    # analysis genuinely needs (a thorough study is commonly 6-12 and up to ~20 is fine); this only
-    # stops a hallucinated/pathological plan. Tunable via AISCIENTIST_MAX_STEPS.
-    max_steps: int = 20
-    max_revisions: int = 2              # revisions on one step before force-advancing
-    # A step the plan did not contain (exploration proposes one after a surprising result) is run
-    # only after the user approves it. Nobody to ask — bypass mode, a resumed run, an earlier
-    # proposal left unanswered — means it is NOT run; it is listed for the user to ask for.
-    # False restores the unattended behaviour (the step is added without asking): an operator's
-    # choice for autonomous campaigns, AISCIENTIST_NEW_STEPS_AUTO=1.
-    new_steps_need_approval: bool = True
-    # What this conversation's earlier run(s) already did, when this run CONTINUES one: the steps,
-    # their findings and what the dataset handed on carries (gateway ``_prior_work_block``). Shown
-    # to the PI and the plan review so the new plan adds to that work instead of repeating it.
-    prior_work: str = ""
-    # Planner/scheduler. "linear" = the flat-agenda _run_loop (default, unchanged). "dag" =
-    # structure the agenda into a dependency DAG and run it with the ready-set scheduler +
-    # Coordinator (_run_dag): data-driven ordering, structural task reuse, scoped node briefs.
-    # Branch feat/dag-planner — opt-in until proven, so main/prod stay on the linear loop.
-    # "langgraph" = the SAME DAG executed by a LangGraph StateGraph (agents/lab_graph.py): the
-    # graph owns nodes/edges/state/checkpointing, every node still runs through _run_one_node.
-    # Requires the optional `langgraph` package; opt-in and not yet at parity with "dag" (no
-    # Coordinator ordering, no mid-run agenda growth) — see ResearchLab._run_langgraph.
-    planner: str = "linear"
-    # Real multi-agent (DAG only): the team's experts CLAIM each ready node by expertise fit (an LLM
-    # decides who does what) instead of deterministic keyword routing. Off = keyword routing.
-    multi_agent: bool = False
-    # DAG concurrency: max nodes run at once. 1 = sequential (default, unchanged). >1 lets the
-    # scheduler co-run ONLY nodes with disjoint footprints (see _concurrency_safe) — in practice an
-    # independent literature/background branch runs alongside the sequential analysis chain; two
-    # analysis nodes never overlap (shared checkpoints + scanpy global state). Decision nodes run solo.
-    max_concurrency: int = 1
-    # Per-agent evolving memory (Axis C — docs/agent_memory_design.md). Off = no memory (today's
-    # behaviour). On: each expert reads its PRIVATE lessons/episodes into its brief before acting,
-    # writes an episode after, and reflects (distils lessons) at end of run — cross-run learning with
-    # frozen weights. ``agent_memory_dir`` is the PERSISTENT root (outside any per-run workspace, so
-    # memory survives across runs); None disables even when the flag is on.
-    agent_memory: bool = False
-    agent_memory_dir: str | None = None
-    # Literature grounding: the model reads the accepted findings and writes several DISTINCT
-    # Europe PMC queries (per cell class / per pathway / disease mechanism) instead of one generic
-    # keyword mash-up. Cap the count so a literature step stays a handful of fast searches.
-    max_literature_queries: int = 4
-    multi_specialist: bool = True       # route each step to a domain specialist persona
-    specialists: tuple[Specialist, ...] = DEFAULT_SPECIALISTS
-    # Axis A — execution mode. "single" = one Scientist per step (the default loop, unchanged).
-    # "team" = Virtual-Lab multi-agent: the PI forms a team, a team meeting DESIGNS the approach
-    # and (after execution) INTERPRETS the results. Experts give diverse independent takes in
-    # round 1, then COLLABORATE across rounds by building on the PI's shared synthesis (not each
-    # other's raw turns, so they stay batchable). "auto" = the PI routes single vs team itself.
-    mode: str = "single"
-    team_size: int = 3                  # max experts the PI forms in team mode
-    # Default 2 so collaboration actually happens: round 1 = diverse independent takes, round 2 =
-    # experts BUILD ON the PI's shared synthesis + the Critic's score-driven feedback. A meeting
-    # ends early (before using all rounds) once the Critic's score clears meeting_accept_score, so
-    # easy topics stay cheap and contested ones get more deliberation — A100-adaptive.
-    meeting_rounds: int = 2
-    meeting_accept_score: float = 0.85  # Critic meeting-score that ends a meeting early (converged)
-    # A100 limit: one vLLM serves the whole team, so the experts in a meeting are issued
-    # CONCURRENTLY and vLLM's continuous batching runs them together on the single GPU. This
-    # caps in-flight requests so a big team can't blow the KV-cache pool. Tune to the card.
-    max_meeting_concurrency: int = 4
-    # Meeting experts may call READ-ONLY tools (_MEETING_TOOLS) instead of only talking, so an
-    # expert can verify its assigned evidence or fetch outside evidence the others lack. Costs
-    # extra turns per expert; off falls back to plain completions.
-    meeting_tools: bool = True
-    meeting_tool_calls: int = 4          # tool turns one expert may spend per meeting round
-    # PI↔Critic step meetings (docs/pi_critic_meeting_protocol.md). Two bounded PI↔Critic exchanges
-    # wrapped around each step: a PRE-FLIGHT necessity/reasonableness gate before the Scientist runs
-    # (skip a circular/redundant/unfounded step, or amend its brief) and a POST-STEP contribution
-    # review after the Critic (prune remaining steps a completed step made moot). A deterministic
-    # floor (enrichment without a contrast) hard-skips regardless of the models. Off = today's loop.
-    # Fully enacted on the linear planner; the DAG planner enacts amend + the floor only (a model
-    # "skip"/downstream-prune there needs the scheduler's dependency-aware replan — see the doc).
-    step_meetings: bool = False
-    # PI↔Critic review of the WHOLE draft agenda, BEFORE any step runs — split OUT of
-    # ``step_meetings`` and defaulted ON, because it was the only layer that could catch an
-    # incoherent plan and it was never reachable in production: the gateway never set
-    # ``step_meetings``, so the review existed solely for tests while real runs went straight from
-    # a one-shot draft to execution. A production plan then re-clustered a dataset that already
-    # carried 11 expert cell-type labels, planned a pseudobulk step against data with no donor
-    # column, and contradicted itself between steps 3 and 5 — every one of which is on this
-    # Critic's checklist. It costs two completions per run (one Critic, one PI, and the PI round is
-    # skipped when the Critic finds nothing), which is cheap against a whole run spent on a plan
-    # that could not have worked. Env kill-switch: AISCIENTIST_PLAN_REVIEW=0.
-    plan_review: bool = True
-    # The plan as a YAML DOCUMENT (agents/plan_doc.py) beside the prose agenda: every step carries
-    # the tool it runs and the settings the plan fixes, the researcher may edit the document itself
-    # (applied by code, no model call), an approved setting is passed to the tool as written, and
-    # the finished run is read back against the approved plan. Off = the prose agenda alone: nothing
-    # binds a tool to the number on the plan card. The gateway turns it on unless AISCIENTIST_PLAN_YAML=0.
-    plan_yaml: bool = False
-    # Hypothesis-driven exploration — the ONLY path by which the plan GROWS mid-run. Off = today's
-    # behaviour exactly: the agenda drafted before any data is seen can be skipped/amended/pruned but
-    # never extended, so the run can only ever execute the paths it started with. On: after a step is
-    # ACCEPTED the PI reads its result against the whole plan and, if the result genuinely contradicts
-    # the plan's premise, records a FALSIFIABLE hypothesis (statement + prediction + discriminating
-    # test) and appends the step(s) that test it — each one still passing the pre-flight gate, the
-    # Critic, and ``max_steps`` before it costs anything. Later steps adjudicate the open hypotheses,
-    # so the ledger closes the loop instead of just generating work. See ``agents/hypotheses.py``.
-    # On is the operator's permission, not a default for every step: a step is explored only when a
-    # skill it uses declares ``exploration`` in its SKILL.md metadata (``_explores_after``, #102).
-    hypothesis_driven: bool = False
-    # Hard cap on steps ADDED by exploration across the whole run (``max_steps`` still caps the total
-    # plan length). This is the runaway guard: without it a model that finds everything surprising
-    # can extend the plan every time it finishes a step and the run never terminates. Widened from 6
-    # once the economics were corrected: on the lab's own free GPUs the binding constraint should be
-    # whether the plan still coheres (``max_steps``, the pre-flight gate, the Critic), not a small
-    # cash-flavoured number. Tunable via AISCIENTIST_MAX_NEW_STEPS.
-    max_new_steps: int = 16
-    # Multi-CYCLE campaign. 1 (default) = today's behaviour exactly: plan once, execute, write up.
-    # >1 = after a cycle finishes, the PI re-plans the next one FROM WHAT THE DATA SAID (open
-    # hypotheses, accepted findings), and the manuscript is written once over every cycle's rounds.
-    # Complementary to ``hypothesis_driven``, not a replacement: exploration reacts to one step
-    # inside a cycle, a cycle re-plans wholesale. Bounded by max_cycles plus the deterministic
-    # "nothing left to chase" / "no progress" exits in ``_run_campaign``.
-    max_cycles: int = 1
-    # Skill INDUCTION (agents/skill_induction.py): at the end of a run, generalize an accepted
-    # ``run_code`` procedure into a reusable ``SKILL.md`` + ``reference.py`` that later runs can
-    # find and adapt. Off = the library only ever holds hand-authored skills (today's behaviour).
-    # Requires ``induced_skills_dir``: induced skills are written OUTSIDE the repo, and with no
-    # directory configured there is nowhere safe to put them, so the flag alone does nothing.
-    skill_induction: bool = False
-    induced_skills_dir: str | None = None
-    max_induced_skills: int = 2         # per run — a library of near-duplicates is worse than none
-    # The gateway's id for this run: an induced skill records it as ``origin_run``, so its review
-    # and the run's skill request (gateway/skill_requests.py) point at each other.
-    run_id: str = ""
-    # Run-scope context management (agents/context_budget.py). The Scientist's brief carries every
-    # accepted finding, so that prefix grows linearly and a long run ends up paying for its own
-    # history until the per-step trimmer starts discarding real work. On: the run MEASURES that
-    # carried block against its share of the served window and compacts it — deterministically
-    # decided, model used only to write the digest, evidence pointers re-attached mechanically.
-    # Off = today's behaviour (the per-step trimmer still runs; nothing measures the run scope).
-    context_management: bool = False
-    compact_keep_recent: int = 3        # most recent accepted steps always kept verbatim
-    scientist: HarnessConfig = field(default_factory=HarnessConfig)
-    # Output room (in tokens) GUARANTEED for a single-shot PI/Critic/synthesize reply. The
-    # window (``scientist.max_model_len``) caps prompt+output together; when the prompt is
-    # small the reply may use everything left over (so a long manuscript is not capped), but
-    # we never let it drop below this — truncating an oversized prompt instead. Generous by
-    # default because the synthesize node writes the full manuscript.
-    reply_reserve_tokens: int = 8192
-    # Optional pre-selected research-path guidance. STEERS the PI's planning (the PI
-    # still drafts the agenda + plan mode still lets the user edit it) — it does not
-    # bypass the PI. None = let the PI auto-select a skill (below), else free planning.
-    preset_prompt: str | None = None
-    # Axis B — PI-autonomous skill selection. When no ``preset_prompt`` is given (the user
-    # did not force a path), the PI reads the skill library's descriptions and picks the
-    # best-matching research protocol itself; its body becomes the planning guidance. An
-    # explicit ``preset_prompt`` always wins (the gateway dropdown = optional override).
-    auto_select_skill: bool = True
-    skill_library: "tuple[PresetPipeline, ...] | None" = None  # None -> load from preset_pipelines/
-    # User-PINNED preset pipelines (the console's pipeline multi-select): MANDATORY for this run.
-    # auto_select_skill still runs and ADDS the PI's best-fit pipeline on top (pinned are must-have).
-    pinned_skills: "tuple[PresetPipeline, ...]" = ()
-    # User-REQUIRED atomic skills (the console's skill multi-select): names from the skill
-    # library the run MUST apply. Unlike the global on-demand manifest, these are mandatory.
-    required_skills: "tuple[str, ...]" = ()
-
-
-@dataclass(frozen=True)
-class CriticVerdict:
-    verdict: str   # "accept" | "revise"
-    score: float
-    critique: str
-    reviewed: bool = True
-    # The check of the step's declared outputs (skill_outputs.py), when it had any: what was
-    # expected, from which skill or pipeline, and what was found. The report's Diagnostics read it.
-    outputs: "dict[str, Any] | None" = None
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "CriticVerdict":
-        outputs = d.get("outputs")
-        return cls(str(d.get("verdict", "revise")), float(d.get("score", 0.0)),
-                   str(d.get("critique", "")), bool(d.get("reviewed", True)),
-                   outputs if isinstance(outputs, dict) else None)
-
-
-@dataclass(frozen=True)
-class PreflightDecision:
-    """Outcome of the PI↔Critic pre-flight gate for one step (docs/pi_critic_meeting_protocol.md)."""
-    action: str            # "proceed" | "amend" | "skip"
-    reason: str = ""
-    amendment: str = ""
-    by: str = "model"      # "off" | "guard" (deterministic floor) | "critic" | "pi"
-
-
-@dataclass
-class LabRound:
-    round_no: int
-    step_index: int
-    step: str
-    specialist: str
-    scientist_result: dict[str, Any]   # HarnessResult.to_dict()
-    verdict: CriticVerdict
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "round_no": self.round_no,
-            "step_index": self.step_index,
-            "step": self.step,
-            "specialist": self.specialist,
-            "scientist_result": self.scientist_result,
-            "verdict": asdict(self.verdict),
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "LabRound":
-        return cls(
-            int(d.get("round_no", 0)), int(d.get("step_index", 0)),
-            str(d.get("step", "")), str(d.get("specialist", "")),
-            dict(d.get("scientist_result", {})), CriticVerdict.from_dict(d.get("verdict", {})),
-        )
-
-
-def _stopped_round_answer(rnd: LabRound) -> str:
-    """Stopped QC steps use their records; preserve other analyses' outcomes and all raw rounds."""
-    if not qc_only_run([rnd]):
-        return str(rnd.scientist_result.get("final_answer") or "(no answer)")
-    summaries = []
-    for step in rnd.scientist_result.get("steps") or []:
-        if not isinstance(step, dict) or step.get("tool") not in QC_ONLY_TOOLS:
-            continue
-        result = step.get("result")
-        if step_succeeded(step) and isinstance(result, dict):
-            summaries.append(f"{step['tool']}: {qc_result_summary(result)}")
-        elif isinstance(result, dict) and result.get("error"):
-            summaries.append(f"{step['tool']} failed: {result['error']}")
-    return " ".join(summaries) or "QC results are recorded in the run's technical details."
-
-
-def _rounds_by_agenda_index(agenda: list[str], rounds: "list[LabRound]") -> "dict[int, LabRound]":
-    """Map each round to the 0-based agenda step it ran, by the step's TEXT.
-
-    ``LabRound.step_index`` is the agenda position only on the linear loop. The DAG scheduler, the
-    LangGraph path and multi-cycle runs number rounds in completion order instead: in run
-    78a707cd79e9 round 5 is the clustering step, agenda step 4, so keying a resume by ``step_index``
-    handed the marker-gene step the clustering result. ``step_index`` still decides between two steps
-    with the same text. A later round for the same step wins (a revise, then its accept). A round
-    whose text is no longer in the agenda (a resume replaced that step's text) maps nowhere."""
-    positions: dict[str, list[int]] = {}
-    for i, text in enumerate(agenda):
-        positions.setdefault(text, []).append(i)
-    by_index: dict[int, LabRound] = {}
-    for r in rounds:
-        candidates = positions.get(r.step)
-        if not candidates:
-            continue
-        by_index[r.step_index - 1 if (r.step_index - 1) in candidates else candidates[0]] = r
-    return by_index
-
-
-@dataclass
-class LabResult:
-    question: str
-    agenda: list[str]
-    rounds: list[LabRound]
-    converged: bool
-    accepted_steps: int
-    final_answer: str
-    # Hypotheses the RUN generated (empty unless ``config.hypothesis_driven``) — the research paths
-    # the original plan did not contain. Last field with a default so every existing positional
-    # construction keeps working.
-    hypotheses: list[dict[str, Any]] = field(default_factory=list)
-    # Papers the EXPERTS looked up while designing the study (meeting-phase ``literature_search`` /
-    # ``deep_literature``). Deliberately NOT merged into the report's ``## References``: those are
-    # claimed to support the findings and are drawn only from Critic-ACCEPTED analysis steps, while
-    # these were never adjudicated — they informed the plan. Discarding them was the other error:
-    # a run can spend a dozen real, DOI-backed lookups shaping its design and show none of them.
-    design_background: list[dict[str, Any]] = field(default_factory=list)
-    # The claim audit run before the write-up (agents/claim_audit.py): each candidate headline finding,
-    # the separate checks it went through and its status. Binding for both writers; shown in the
-    # technical report. Empty when the audit is off or nothing was accepted.
-    claim_audit: dict[str, Any] = field(default_factory=dict)
-    # The steps the user skipped at a failed step's decision point ("Skip this step"), by their text.
-    # The rounds show that such a step was never accepted, not that the user chose to leave it; the
-    # QC reply says which (RCHENLAB/AiScientist issue 75).
-    skipped_steps: list[str] = field(default_factory=list)
-    # The approved plan had a ``write_report`` step (#102): the gateway writes the report after the
-    # analysis. False: the run ends with its answer in the chat.
-    report_requested: bool = False
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "question": self.question,
-            "agenda": list(self.agenda),
-            "rounds": [r.to_dict() for r in self.rounds],
-            "converged": self.converged,
-            "accepted_steps": self.accepted_steps,
-            "final_answer": self.final_answer,
-            "hypotheses": list(self.hypotheses),
-            "design_background": list(self.design_background),
-            "claim_audit": dict(self.claim_audit),
-            "skipped_steps": list(self.skipped_steps),
-            "report_requested": self.report_requested,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "LabResult":
-        return cls(
-            str(d.get("question", "")), list(d.get("agenda", [])),
-            [LabRound.from_dict(r) for r in d.get("rounds", [])],
-            bool(d.get("converged", False)), int(d.get("accepted_steps", 0)),
-            str(d.get("final_answer", "")),
-            [h for h in (d.get("hypotheses") or []) if isinstance(h, dict)],
-            [c for c in (d.get("design_background") or []) if isinstance(c, dict)],
-            dict(d.get("claim_audit") or {}),
-            [str(s) for s in (d.get("skipped_steps") or []) if str(s).strip()],
-            bool(d.get("report_requested", False)),
-        )
-
-
-@dataclass(frozen=True)
-class ResumeState:
-    """Enough to re-enter :meth:`ResearchLab.run` WITHOUT re-planning — the A2 continuation state.
-
-    ``agenda`` is the prior run's plan (the caller may have edited one step's text, e.g. a new
-    clustering resolution). ``prior_rounds`` are ALL the accepted rounds from the prior run — the
-    ones NOT re-run are reused verbatim as read-only findings; their on-disk checkpoints
-    (``work/adata_*.h5ad``) must still exist. ``from_step_index`` is the CHANGED step (always
-    re-run). Which DOWNSTREAM steps also re-run is decided per-run: when ``redo_indices`` is None the
-    lab EVALUATES which later steps actually depend on the change and re-runs only those (an
-    independent literature step, say, is kept); pass an explicit set to force the choice.
-    ``modify_note`` steers the changed step; ``guidance`` restores the skill steering;
-    ``self_sourced`` is the plan's own-judgement disclosure, which the write-up quotes.
-    """
-
-    agenda: list[str]
-    prior_rounds: list["LabRound"]
-    from_step_index: int            # 0-based index of the changed step (always re-run)
-    modify_note: str = ""
-    guidance: str | None = None
-    redo_indices: "frozenset[int] | None" = None   # None = evaluate; else the exact 0-based set to re-run
-    self_sourced: str = ""
-    report_requested: bool = False   # the plan had a write_report step, kept out of ``agenda`` (#102)
-
-    @classmethod
-    def from_run_state(cls, state: dict[str, Any], from_step_index: int, *, modify_note: str = "",
-                       guidance: str | None = None,
-                       redo_indices: "set[int] | frozenset[int] | None" = None) -> "ResumeState":
-        """Build a resume from a persisted run_state (a :meth:`LabResult.to_dict`, plus optional
-        ``guidance``). Keeps ALL accepted rounds — the run loop decides per step whether to reuse or
-        re-run it (see :meth:`ResearchLab._evaluate_redo_indices`)."""
-        rounds = [LabRound.from_dict(r) for r in state.get("rounds", [])]
-        kept = [r for r in rounds if r.verdict.verdict == "accept"]
-        return cls(list(state.get("agenda", [])), kept, int(from_step_index),
-                   modify_note=modify_note, guidance=guidance or state.get("guidance"),
-                   redo_indices=frozenset(redo_indices) if redo_indices is not None else None,
-                   self_sourced=str(state.get("self_sourced") or ""),
-                   report_requested=bool(state.get("report_requested", False)))
-
-    @classmethod
-    def from_interrupted(cls, state: dict[str, Any], *, guidance: str | None = None) -> "ResumeState":
-        """Pick up a run that stopped part-way — a crash, a gateway restart, a dropped session — from
-        the run_state.json it checkpoints after every round: keep every step that has an accepted
-        result and run every step that has none, starting with the first. Nothing is re-evaluated or
-        re-run that already finished. Raises ``ValueError`` when no step is left to run."""
-        resume = cls.from_run_state(state, 0, guidance=guidance)
-        done = _rounds_by_agenda_index(resume.agenda, resume.prior_rounds)
-        todo = [i for i in range(len(resume.agenda)) if i not in done]
-        if not todo:
-            raise ValueError("Every planned step of this run already has an accepted result — "
-                             "there is nothing left to continue. Re-run a chosen step instead.")
-        return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
-                   redo_indices=frozenset(todo), self_sourced=resume.self_sourced,
-                   report_requested=resume.report_requested)
-
-
-# --- plan revision: patch ONE step instead of re-drafting the whole plan -----------------------
-# MEASURED (experiments/plan_revision_ab, 2026-08-10, the real served Qwen3.6, 19 trials): asking
-# the PI to re-draft the plan with the user's feedback damaged steps the user never mentioned in
-# 100% of trials — a mean of 3.89 other steps rewritten, and the plan's length changed 89% of the
-# time. In the worst case "use resolution 1.0" silently replaced the differential-expression step
-# with a descriptive summary and dropped the final step. The SAME model asked for a PATCH instead
-# was 19/19 perfect, because the steps it does not name are never regenerated at all.
-#
-# So the revision path asks for a patch first. Anything a single-step edit cannot express — adding,
-# removing or reordering steps — is signalled by the model with step 0 and falls back to the
-# unchanged whole-plan redraft, which is still what handles those cases.
-# One step, written by the PI, to be INSERTED into an existing plan by scaffolding that has decided
-# the step must exist (a requested literature step; a DE step that planned enrichment depends on).
-# The scaffolding used to write these itself from string templates — which is how a plan card came
-# to say "Literature search for has donors". Deciding THAT a step exists is a deterministic guard's
-# job; deciding WHAT it says is the planner's, with the full question and dataset in front of it.
-_PLAN_AUTHOR_STEP_SYSTEM = (
-    "You are the Principal Investigator. Your analysis plan is missing ONE step that the study "
-    "needs; write that single step. Write it exactly like the other steps: start with a short bold "
-    "title (`**2-6 word title** — `), then one or two complete sentences a researcher can review — "
-    "the TOOL in backticks, the concrete operation, the UNIT any statistic runs over, and the key "
-    "settings with their numbers (state the default when you keep it). Adapt it to THIS question "
-    "and dataset; do not restate the other steps. Reply with ONLY the step text — no numbering, no "
-    "JSON, no preamble."
-)
-
-
-# Which of a step's stated numbers are its tool's arguments. Asked as a separate, narrow question
-# AFTER the plan is written, for the reason the patch below exists: the model that drafts a sound
-# plan in prose is the same model that damages it when asked to restate it in another shape. Here it
-# restates nothing — it fills in argument names for values the text already contains, and
-# ``plan_doc.bind_settings`` then admits an argument only if the tool declares it and the step's
-# text states the value. A wrong reply costs a missing setting, never a wrong one.
-_PLAN_BIND_SYSTEM = (
-    "You are filling in a form. For each numbered plan step you are given the step's text and the "
-    "parameters of the ONE tool it runs (name, type, default, allowed values, meaning). Return the "
-    "tool arguments the step's text STATES, and nothing else. Use the tool's parameter names "
-    "exactly. Give a value only when the text states it: a number written in the sentence, a "
-    "column, group or method it names. Never supply a default the text does not mention and never "
-    "invent a value to be helpful — an argument you leave out stays the tool's own choice. Do not "
-    "return file paths. "
-    'Reply with ONLY a JSON array holding one object per step that states an argument, e.g. '
-    '[{"step": 1, "settings": {"min_genes": 200, "max_pct_mt": 10}}]. An empty array is a valid '
-    "answer."
-)
-
-
-def _describe_param(name: str, spec: "dict[str, Any]") -> str:
-    """One tool parameter as the binder reads it: name, type, default, closed set, meaning."""
-    bits = [str(spec.get("type") or "any")]
-    if "default" in spec:
-        bits.append(f"default {json.dumps(spec['default'], default=str)}")
-    if spec.get("enum"):
-        bits.append("one of " + "/".join(map(str, spec["enum"])))
-    meaning = " ".join(str(spec.get("description") or "").split())[:140]
-    return f"{name} ({', '.join(bits)})" + (f": {meaning}" if meaning else "")
-
-
-def _tool_runs_on(tool: str) -> str:
-    """Where a tool's manifest says it runs (``hpc:analysis``, ``inprocess``, …); "" if unknown."""
-    try:
-        from ..tools import catalog as tool_catalog
-        found = tool_catalog.manifest(tool)
-    except Exception:  # noqa: BLE001 - a label on the plan card, never a reason to fail a plan
-        return ""
-    return found.runs_on if found is not None else ""
-
-
-def _tool_skill(tool: str) -> "Skill | None":
-    """The skill a tool's manifest names (``skill:`` in TOOL.md, e.g. run_cellqc's CellQC skill), if it
-    is in the library; ``None`` for a tool that names none."""
-    try:
-        from ..tools import catalog as tool_catalog
-        found = tool_catalog.manifest(tool)
-        if found is not None and found.skill:
-            return get_skill(found.skill)
-        from .mcp_bridge import configured_tool_skills
-        skill_name = configured_tool_skills().get(tool)
-        if skill_name:
-            refresh_skills()
-        return get_skill(skill_name) if skill_name else None
-    except Exception:  # noqa: BLE001 - an unreadable manifest names no skill
-        return None
-
-
-def _tool_ends_step(tool: str) -> bool:
-    """Whether a tool's manifest says one successful call is its whole step (``ends_step``)."""
-    try:
-        from ..tools import catalog as tool_catalog
-        found = tool_catalog.manifest(tool)
-    except Exception:  # noqa: BLE001 - without the manifest the step runs as any other step
-        return False
-    return bool(found is not None and found.ends_step)
-
-
-def _planner_tool_description(tool: HarnessTool) -> str:
-    """The tool's description plus the schema defaults its manifest asks the planner to see."""
-    from ..tools.catalog import manifest
-    found = manifest(tool.name)
-    props = (tool.parameters or {}).get("properties", {})
-    defaults = [_describe_param(n, props[n]) for n in (found.planner_defaults if found else ())
-                if n in props and "default" in props[n]]
-    return tool.description + (" Declared defaults: " + "; ".join(defaults) if defaults else "")
 
 
 _PLAN_FINDING_WORDS = {
@@ -4007,144 +431,6 @@ def _skill_name(name: str) -> "str | None":
     return found.name if found is not None else None
 
 
-def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
-    """The researcher's own edit of the plan, in words, for the revision history.
-
-    A later change asked for in words is made on the edited document. But when that cannot be done
-    the plan is patched or redrafted from the feedback so far, and a redraft that was never told
-    about the edit could put back a step the researcher removed or a value they changed."""
-    def title(text: str) -> str:
-        return split_step(text)[0] or text[:80]
-
-    said: list[str] = []
-    for c in changes:
-        kind, n = c.get("kind"), c.get("step")
-        if kind == "removed":
-            said.append(f'removed the step "{title(str(c.get("before") or ""))}"')
-        elif kind == "added":
-            said.append(f'added the step "{title(str(c.get("after") or ""))}" as step {n}')
-        elif kind == "title":
-            said.append(f'renamed step {n} from "{c.get("before")}" to "{c.get("after")}"')
-        elif kind == "setting":
-            said.append(f"removed the setting {c.get('param')} from step {n}" if c.get("after") is None
-                        else f"set {c.get('param')} to {json.dumps(c.get('after'))} in step {n}")
-        elif kind == "tool":
-            said.append(f"changed the tool of step {n} to {c.get('after') or 'none'}")
-        elif kind == "skill":
-            said.append(f"took the skill off step {n}" if not c.get("after")
-                        else f"set the skill of step {n} to {c.get('after')}")
-        elif kind == "moved":
-            said.append(f"moved step {c.get('before')} to position {n}")
-        elif kind == "text":
-            said.append(f'rewrote step {n} as: {str(c.get("after") or "")[:300]}')
-    return ("The researcher edited the plan by hand; keep these changes: " + "; ".join(said) + "."
-            if said else "")
-
-
-# Sent with the PI's own reply when that reply could not be read as a plan: the reply is in front of
-# the model, so it rewrites what it meant rather than planning again.
-_PLAN_REFORMAT = (
-    "Your reply above could not be read as the plan. The plan must be ONE JSON object and nothing "
-    "else. Send it again as ONLY the JSON object your instructions describe, "
-    '{"breadth": ..., "agenda": [...], "self_sourced": "...", "later": [...]} (or the clarify '
-    'object), with no prose, no '
-    "headings and no code fences. Keep the steps you meant, one string per step, and keep the whole "
-    "reply short enough to finish."
-)
-
-#: What a run says when the PI's plan cannot be read, even after it was asked again.
-_PLAN_FAILED_MESSAGE = (
-    "The PI's plan could not be read, even after it was asked to send it again, so nothing was "
-    "run. Send the request again to plan it again. The PI's replies are saved with this run in "
-    "process/plan_replies/.")
-
-_PLAN_SKILLS_SYSTEM = (
-    "You match the steps of an analysis plan to the lab's vetted SKILLS. A skill is tested code and "
-    "guidance for one kind of analysis; its description says what it does and when to use it. For "
-    "each numbered step, name the ONE skill whose description covers the analysis that step does, or "
-    "null when none does. Match on the analysis, not on shared words: a step that tests two "
-    "conditions for differential expression is not a signature-scoring skill because both mention "
-    "a condition, and a step a listed tool performs needs no skill. A skill the research path names "
-    "for this kind of study is the right one when its step is there. Give a skill to the step that "
-    "carries out its analysis: a later step that compares, tabulates or plots what that step "
-    "produced does not run the skill again and gets null, even when the skill's description "
-    "mentions the summaries or plots it makes. "
-    'Reply with ONLY a JSON array: [{"step": <number>, "skill": "<skill name>" | null}].'
-)
-
-_PLAN_REVISE_SYSTEM = (
-    "You are changing an analysis plan for the researcher who asked for the change. The plan is a "
-    "YAML document: each step has an `id`, a `title`, the `tool` it runs, `settings` (arguments "
-    "passed to that tool exactly as written), `does` (what the step does, in prose) and, for a step "
-    "that runs code, the `skill` whose vetted code it uses. Make the "
-    "requested change with the FEWEST operations and leave every step the request does not concern "
-    "exactly as it is: you return operations on the document, never the document. "
-    'Reply with ONLY a JSON object {"ops": [...]}. An operation is one of:\n'
-    '{"op": "change", "step": "<id>", "settings": {"<name>": <value>}} - set a tool argument (null '
-    "removes it). A number that is listed under `settings` is changed THERE; the step's sentence is "
-    "updated for you.\n"
-    '{"op": "change", "step": "<id>", "title": "...", "does": "..."} - reword a step: either field '
-    'or both, and "tool" when the step should run another tool. Keep its style and level of '
-    "detail, and name the tool in `does` in backticks.\n"
-    '{"op": "change", "step": "<id>", "skill": null} - the step goes without its skill, when the '
-    "researcher asks for that; a skill's name sets it.\n"
-    '{"op": "remove", "step": "<id>"}\n'
-    '{"op": "add", "after": "<id>", "title": "...", "does": "...", "tool": "<tool>", "settings": '
-    '{...}} - a new step after that one ("after": "start" puts it first; leave "after" out to add '
-    "it at the end).\n"
-    '{"op": "move", "step": "<id>", "after": "<id>"} - "after": "start" moves it first.\n'
-    "Use only tools from the list you are given and only settings that tool takes; give a setting "
-    "only when the request or the step states its value. A step that runs code (run_code) has no "
-    "settings: say in `does` what the code is to do. When a change leaves a step's `does` describing "
-    "something other than what will now run (the old value, the old way of choosing it), reword that "
-    "`does` in the same operation. "
-    'If the request asks for a different analysis altogether - a new plan, not a change to this '
-    'one - reply {"ops": []} and the plan will be drafted again.'
-)
-
-_PLAN_PATCH_SYSTEM = (
-    "You are revising ONE step of an analysis plan. You are given the numbered plan and the user's "
-    "requested change. Identify the SINGLE step the user is talking about and rewrite ONLY that "
-    "step, keeping its style and level of detail — including the leading `**bold title** — ` if "
-    "the plan's steps carry one (update the title when the change makes it stale). Do NOT rewrite, "
-    "reorder, add, or remove any other step. "
-    'Reply with ONLY a JSON object: {"step": <1-based step number>, "new_text": "<the rewritten '
-    'step>"}. '
-    'If the request CANNOT be expressed as a change to one existing step — it adds a step, removes '
-    'one, reorders them, or changes the whole approach — reply {"step": 0, "new_text": ""} instead. '
-    "Do not guess in that case; step 0 is the correct answer and the plan will be redrafted properly."
-)
-
-
-def _parse_plan_patch(raw: str, n_steps: int) -> "tuple[int, str] | None":
-    """``(0-based index, new step text)`` from the patch reply, or ``None`` when it is unusable or
-    the model declined (step 0). ``None`` means "fall back to the redraft" — never "do nothing"."""
-    obj = safe_json_loads(raw)
-    if not isinstance(obj, dict):
-        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
-        try:
-            obj = json.loads(m.group(0)) if m else None
-        except (ValueError, TypeError):
-            obj = None
-    if not isinstance(obj, dict):
-        return None
-    try:
-        n = int(obj.get("step", 0))
-    except (TypeError, ValueError):
-        return None
-    text = _strip_step_ordinal(str(obj.get("new_text") or ""))
-    if not (1 <= n <= n_steps) or not text:
-        return None
-    return n - 1, text
-
-
-_RESUME_EVAL_SYSTEM = (
-    "You are the Principal Investigator deciding, after ONE analysis step is re-run, which of the "
-    "LATER steps must also be re-run because their result depends on the changed step's output. "
-    "Answer with ONLY a JSON array of step numbers to re-run (e.g. [3,4]); [] if none."
-)
-
-
 #: Turns added to a RETRY whose previous attempt ran out of them. Re-running a heavy step under
 #: the cap that already proved too small reaches the same wall: run ed4cfce52a2a spent rounds 14
 #: AND 15 on one step, both ending on ``max_steps``, both marked revise. Escalation applies only
@@ -4167,15 +453,6 @@ class _RunCancelled(BaseException):
     """Unwind cancellation past best-effort model/tool fallbacks."""
 
 
-def _from_fields(cls: Any, data: "dict[str, Any]") -> Any:
-    """``cls(**data)`` with only the fields ``cls`` has: a plan saved before a deploy that drops a
-    field is still restored after it."""
-    from dataclasses import fields
-
-    names = {f.name for f in fields(cls)}
-    return cls(**{k: v for k, v in data.items() if k in names})
-
-
 class ResearchLab:
     """PI → Scientist → Critic loop. Roles are injectable for offline tests."""
 
@@ -4189,13 +466,13 @@ class ResearchLab:
         code_executor: CodeExecutor | None = None,
     ) -> None:
         self.ctx = ctx
-        from .skills_registry import init_manifest
+        from ..skills_registry import init_manifest
         init_manifest(ctx)
         self.config = config or LabConfig()
         self._complete_fn = complete_fn
         # Scientist = the tool-calling harness with the FULL registry catalog (curated
         # tools + analysis line + schematic + run_code CodeAct). Tests inject their own.
-        from .registry import build_scientist_catalog
+        from ..registry import build_scientist_catalog
         if scientist is not None:
             self.scientist = scientist
         else:
@@ -4267,7 +544,7 @@ class ResearchLab:
         # AND a persistent root is set; rooted OUTSIDE the per-run workspace so it survives across runs.
         self._agent_memory = None
         if self.config.agent_memory and self.config.agent_memory_dir:
-            from .agent_memory import AgentMemory
+            from ..agent_memory import AgentMemory
             self._agent_memory = AgentMemory(self.config.agent_memory_dir)
         # Hypothesis-driven exploration state (config.hypothesis_driven). The ledger is this run's
         # generated research paths; the counter enforces ``max_new_steps`` across BOTH planners.
@@ -5176,10 +1453,10 @@ class ResearchLab:
         """
         if not (self.config.skill_induction and self.config.induced_skills_dir):
             return []
-        from .skill_induction import candidates, induce, write_skill
+        from ..skill_induction import candidates, induce, write_skill
         # ALL_SKILLS, not SKILLS: a skill still awaiting review is invisible to the models but its
         # name is taken, and the inducer must not re-learn it under another name.
-        from .skills import ALL_SKILLS as _LIB, register_skill
+        from ..skills import ALL_SKILLS as _LIB, register_skill
         try:
             cands = candidates(rounds)
             if not cands:
@@ -5625,7 +1902,7 @@ class ResearchLab:
             linear = lift_agenda_to_dag(agenda)
             decided = {n.id: n for n in plan.nodes if n.decision}
             if decided:
-                from .dag import LabPlan, TaskNode
+                from ..dag import LabPlan, TaskNode
                 linear = LabPlan(tuple(
                     (TaskNode(id=n.id, goal=n.goal, depends_on=n.depends_on,
                               decision=True, options=decided[n.id].options)
@@ -5641,7 +1918,7 @@ class ResearchLab:
             settled = [n.id for n in plan.nodes if n.decision and _is_label_fork(n.options)]
             if settled:
                 from dataclasses import replace as _dc_replace
-                from .dag import LabPlan
+                from ..dag import LabPlan
                 plan = LabPlan(tuple(_dc_replace(n, decision=False, options=())
                                      if n.id in settled else n for n in plan.nodes))
                 for sid in settled:
@@ -5656,7 +1933,7 @@ class ResearchLab:
         fork = self._label_decision([n.goal for n in plan.nodes])
         if fork is not None and not any(n.decision for n in plan.nodes):
             from dataclasses import replace as _dc_replace
-            from .dag import LabPlan
+            from ..dag import LabPlan
             _, options = fork
             flagged = False
             new_nodes = []
@@ -5953,7 +2230,7 @@ class ResearchLab:
         mid-run agenda growth of hypothesis-driven exploration (the graph is compiled up front) —
         both are deliberate omissions of the first increment, not oversights.
         """
-        from .lab_graph import build_lab_graph, order_rounds, serialize_conflicting_nodes
+        from ..lab_graph import build_lab_graph, order_rounds, serialize_conflicting_nodes
 
         graph_plan, added_edges = serialize_conflicting_nodes(
             plan, lambda a, b: not _concurrency_safe(a, b))
@@ -6076,7 +2353,7 @@ class ResearchLab:
                                                exec_roster, exec_multi, decision_review, user_notes)]
             else:
                 emit({"type": "concurrency_batch", "nodes": [n.id for n in batch]})
-                from .loop_utils import ContextThreadPoolExecutor
+                from ..loop_utils import ContextThreadPoolExecutor
                 with ContextThreadPoolExecutor(max_workers=len(batch)) as ex:
                     futs = [ex.submit(self._run_one_node, question, n, snapshot, emit, should_cancel,
                                       exec_roster, exec_multi, decision_review, user_notes)
@@ -6342,7 +2619,7 @@ class ResearchLab:
         for step in steps or ():
             if not isinstance(step, dict) or not step.get("ok"):
                 continue
-            if step.get("tool") not in _LITERATURE_TOOLS:
+            if canonical_tool_name(step.get("tool")) not in _LITERATURE_TOOLS:
                 continue
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
             for citation in (result.get("results") or result.get("citations") or ()):
@@ -6377,13 +2654,13 @@ class ResearchLab:
 
         Falls back to plain completions when no tool-capable Scientist is wired (offline tests), so
         the meeting always works."""
-        tools = [t for t in getattr(self.scientist, "catalog", []) if t.name in _MEETING_TOOLS]
+        tools = [t for t in getattr(self.scientist, "catalog", []) if canonical_tool_name(t.name) in _MEETING_TOOLS]
         if not tools or not self.config.meeting_tools:
             return self._complete_concurrent(msg_lists)
 
         from dataclasses import replace as _dc_replace
 
-        from .research_harness import HarnessConfig, ResearchHarness
+        from ..research_harness import HarnessConfig, ResearchHarness
         try:
             # A meeting turn is a LOOKUP, not an analysis: cap the tool budget hard so an expert
             # cannot turn a meeting into a second execution phase.
@@ -6452,7 +2729,7 @@ class ResearchLab:
                 emit({"type": "expert_tools_failed", "error": f"{type(exc).__name__}: {exc}"})
                 return self._complete(messages)
 
-        from .loop_utils import ContextThreadPoolExecutor
+        from ..loop_utils import ContextThreadPoolExecutor
         workers = max(1, min(len(msg_lists), self.config.max_meeting_concurrency))
         labels = list(names or [])
         items = [(labels[i] if i < len(labels) else f"expert {i + 1}", m)
@@ -6905,7 +3182,7 @@ class ResearchLab:
         (``metadata/description.py``), and the gateway keeps it with the dataset
         (``dataset_described``). The description goes into the run's bundle as data/DATASET.md.
         Never raises: the plan does not depend on it."""
-        from ..metadata import description as dmd
+        from ...metadata import description as dmd
         decisions = self.ctx.decisions if self.ctx.decisions is not None else {}
         dd = decisions.get("dataset_description")
         if not isinstance(dd, dict) or not dd.get("uuid"):
@@ -7942,7 +4219,7 @@ class ResearchLab:
     def _context_pressure(self, rounds: list[LabRound]) -> "Any":
         """Measure the CARRIED history — the findings block rebuilt into every step's brief — against
         its share of the served window. Pure measurement; no model call."""
-        from . import context_budget as cb
+        from .. import context_budget as cb
         hc = self.scientist.config
         return cb.assess(self._accepted_findings_block(rounds), hc.max_model_len,
                          reserve=hc.output_reserve_tokens + hc.context_safety_margin)
@@ -7960,7 +4237,7 @@ class ResearchLab:
         with the evidence pointers re-attached afterwards from the original rounds so provenance
         cannot be lost no matter what it writes.
         """
-        from . import context_budget as cb
+        from .. import context_budget as cb
         if not self.config.context_management:
             return ""
         pressure = self._context_pressure(rounds)
@@ -8236,7 +4513,7 @@ class ResearchLab:
 
         ``pinned``: the ``search_corpus`` settings the researcher approved with the plan. They go to
         the call as written, like every other tool's; approved ``queries`` replace the model's own."""
-        from . import corpus_answer as ca
+        from .. import corpus_answer as ca
 
         emit({"type": "scientist_start", "step": step, "specialist": specialist.name})
         pinned = dict(pinned or {})
@@ -8337,7 +4614,11 @@ class ResearchLab:
         # Literature grounding: prefer deep_literature (PaperQA over the lab's indexed corpus on
         # HPC3); fall back to literature_search (Europe PMC) ONLY when the corpus tool isn't wired
         # (dev / no-HPC), so behaviour never regresses where deep_literature can't run.
-        if _is_literature_step(step):
+        primary = _primary_tool(plan_step if plan_step is not None else step)
+        native_tool = canonical_tool_name(primary) != str(primary or "")
+        # An explicitly approved MCP call keeps its own schema, dispatch and provenance.
+        # The historical forced-literature path below selects only legacy tools.
+        if _is_literature_step(step) and not native_tool:
             deep_tool = next((t for t in self.scientist.catalog if t.name == "deep_literature"), None)
             lit_tool = next((t for t in self.scientist.catalog if t.name == "literature_search"), None)
             corpus_tool = next((t for t in self.scientist.catalog if t.name == "search_corpus"), None)
@@ -8499,7 +4780,7 @@ class ResearchLab:
         # it. The skill's version is counted once for the step, by the code that ran its method, and
         # a revision of the step is the same step. Nothing of it outlives the step, in sequence or
         # in parallel.
-        from .skills_registry import record_use, step_scope
+        from ..skills_registry import record_use, step_scope
         with step_scope(assigned, step=plan_step if plan_step is not None else step):
             if assigned is not None:
                 record_use(self.ctx, assigned)
@@ -9343,7 +5624,7 @@ class ResearchLab:
             return []
         if len(message_lists) == 1:
             return [self._complete(message_lists[0])]
-        from .loop_utils import ContextThreadPoolExecutor
+        from ..loop_utils import ContextThreadPoolExecutor
         workers = max(1, min(len(message_lists), self.config.max_meeting_concurrency))
         with ContextThreadPoolExecutor(max_workers=workers) as ex:
             return list(ex.map(self._complete, message_lists))   # ex.map preserves input order
@@ -9372,7 +5653,7 @@ class ResearchLab:
         if self._complete_fn is not None:
             result = _call_with_role(self._complete_fn, budgeted, role)
         else:
-            from ..gateway import vllm_client  # deferred: keep agents decoupled from the gateway
+            from ...gateway import vllm_client  # deferred: keep agents decoupled from the gateway
             result = vllm_client.complete(
                 self.ctx.tunnel_port, self.ctx.model, budgeted, max_tokens=max_tokens
             )

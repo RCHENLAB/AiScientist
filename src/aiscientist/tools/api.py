@@ -32,37 +32,37 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "build_single_cell_qc_execution": ("aiscientist.tools.execution", "build_single_cell_qc_execution"),
     "build_de_marker_execution": ("aiscientist.tools.execution", "build_de_marker_execution"),
     # dataset triage (inspect_dataset), also run by the gateway at upload / run start
-    "describe_dataset": ("aiscientist.tools.inspect_dataset.tool", "describe_dataset"),
-    "peek_dataset": ("aiscientist.tools.inspect_dataset.tool", "peek_dataset"),
+    "describe_dataset": ("aiscientist.tools._lib.dataset_inspection", "describe_dataset"),
+    "peek_dataset": ("aiscientist.tools._lib.dataset_inspection", "peek_dataset"),
     # variants (annotate_variants)
-    "detect_assembly": ("aiscientist.tools.annotate_variants.offline", "detect_assembly"),
+    "detect_assembly": ("aiscientist.tools._lib.variant_assembly", "detect_assembly"),
     "annotate_variants_rest": ("aiscientist.tools.annotate_variants.tool", "annotate_variants_rest"),
     "load_gene_panel": ("aiscientist.tools.gene_panels", "load_gene_panel"),
     # figures (make_schematic), also used for the report's workflow figure
-    "render_dot": ("aiscientist.tools.make_schematic.tool", "render_dot"),
-    "workflow_schematic_dot": ("aiscientist.tools.make_schematic.tool", "workflow_schematic_dot"),
-    "render_workflow_schematic": ("aiscientist.tools.make_schematic.tool", "render_workflow_schematic"),
+    "render_dot": ("aiscientist.tools._lib.schematics", "render_dot"),
+    "workflow_schematic_dot": ("aiscientist.tools._lib.schematics", "workflow_schematic_dot"),
+    "render_workflow_schematic": ("aiscientist.tools._lib.schematics", "render_workflow_schematic"),
     # literature
     "CorpusPaths": ("aiscientist.tools._lib.corpus", "CorpusPaths"),
     "CORPUS_DEFAULT_EMBEDDING": ("aiscientist.tools._lib.corpus", "DEFAULT_EMBEDDING"),
     "make_search_corpus_tool": ("aiscientist.tools.search_corpus.tool", "make_tool"),
     "run_search_corpus": ("aiscientist.tools.search_corpus.tool", "run_search"),
     "preload_search_corpus": ("aiscientist.tools.search_corpus.tool", "preload"),
-    "focus_literature_query": ("aiscientist.tools.literature_search.tool", "focus_literature_query"),
+    "focus_literature_query": ("aiscientist.literature_contract", "focus_literature_query"),
     "search_literature": ("aiscientist.tools.literature_search.tool", "search_europepmc"),
-    "QUERY_STOPWORDS": ("aiscientist.tools.literature_search.tool", "_QUERY_STOPWORDS"),
+    "QUERY_STOPWORDS": ("aiscientist.literature_contract", "QUERY_STOPWORDS"),
     # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
     "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),
     # a task spec for a property the scan has no rules for: the drafting prompt, its check, and the
     # folder the scan writes that spec's tables to
-    "CORPUS_SCAN_SPEC_SYSTEM": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "SPEC_SYSTEM"),
-    "parse_corpus_scan_spec": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "parse_spec"),
-    "corpus_scan_spec_folder": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "spec_folder"),
+    "CORPUS_SCAN_SPEC_SYSTEM": ("aiscientist.literature_contract", "SPEC_SYSTEM"),
+    "parse_corpus_scan_spec": ("aiscientist.literature_contract", "parse_spec"),
+    "corpus_scan_spec_folder": ("aiscientist.literature_contract", "spec_folder"),
     # the scRNA analysis line
     "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
     # curated marker references (run_marker_annotation), also read by the report's marker-claim check
-    "available_references": ("aiscientist.tools.run_marker_annotation.tool", "available_references"),
-    "load_marker_reference": ("aiscientist.tools.run_marker_annotation.tool", "_load_reference"),
+    "available_references": ("aiscientist.tools._lib.marker_references", "available_references"),
+    "load_marker_reference": ("aiscientist.tools._lib.marker_references", "load_reference"),
     # Cell Ranger deliveries in an uploaded folder: what they are, and the QC route they imply
     "describe_cellranger_layout": ("aiscientist.tools._lib.cellranger", "describe_cellranger_layout"),
     "merge_cellranger_layouts": ("aiscientist.tools._lib.cellranger", "merge_cellranger_layouts"),

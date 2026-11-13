@@ -29,9 +29,10 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+from .._lib.variant_assembly import detect_assembly as detect_assembly
 
 from .tool import (
     ANNOTATION_COLUMNS,
@@ -243,28 +244,6 @@ def merge_spliceai(rows: list[dict[str, Any]],
 
 # Injectable subprocess runner (so command construction is unit-testable without bcftools/VEP).
 Runner = Callable[[list[str]], Any]
-
-# chr1 reference length is the single most reliable build signal in a VCF header — GRCh37/hg19 and
-# GRCh38/hg38 differ here, so it disambiguates even when the ``##reference``/``assembly=`` tags are
-# absent or wrong. Used to pick the matching VEP cache: annotating hg19 coordinates against a GRCh38
-# cache runs cleanly but mis-assigns the gene at ~90% of sites (empirically verified on a real WGS VCF).
-_CHR1_LEN_TO_BUILD: dict[str, str] = {"249250621": "GRCh37", "248956422": "GRCh38"}
-
-
-def detect_assembly(header_text: str) -> str:
-    """Best-effort genome build (``'GRCh37'`` | ``'GRCh38'`` | ``''``) from a VCF header. Prefers the
-    chr1 contig length (unambiguous across builds), then falls back to explicit ``assembly=`` /
-    ``##reference`` tags. Returns ``''`` when unknown so the caller keeps its configured default."""
-    m = re.search(r"##contig=<ID=(?:chr)?1,length=(\d+)", header_text)
-    if m and m.group(1) in _CHR1_LEN_TO_BUILD:
-        return _CHR1_LEN_TO_BUILD[m.group(1)]
-    low = header_text.lower()
-    if any(tag in low for tag in ("grch37", "hg19", "b37")):
-        return "GRCh37"
-    if any(tag in low for tag in ("grch38", "hg38", "b38")):
-        return "GRCh38"
-    return ""
-
 
 def _default_run(argv: list[str]) -> Any:
     import subprocess

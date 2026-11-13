@@ -22,8 +22,18 @@ from typing import Any
 
 from . import dataset_storage
 from .run_monitor import timed_stage
-from ..tools.api import (CorpusPaths, CORPUS_DEFAULT_EMBEDDING,
-                         make_search_corpus_tool, preload_search_corpus, run_search_corpus)
+from ..tools import api as _legacy_tools
+
+CORPUS_DEFAULT_EMBEDDING = "st-NeuML/pubmedbert-base-embeddings"
+
+
+def preload_search_corpus(*args, **kwargs):
+    """Unregistered deployments retain their original in-process retrieval."""
+    return _legacy_tools.preload_search_corpus(*args, **kwargs)
+
+
+def run_search_corpus(*args, **kwargs):
+    return _legacy_tools.run_search_corpus(*args, **kwargs)
 
 _LOG = logging.getLogger(__name__)
 _LOCK = threading.Lock()
@@ -205,7 +215,7 @@ def run_local_search(args: dict[str, Any], ctx: Any = None) -> dict[str, Any] | 
         embed = _embedder(root)
         manifest = index / "manifest.csv"
         hgnc = index / "hgnc_complete_set.txt"
-        paths = CorpusPaths(index, manifest if manifest.is_file() else None,
+        paths = _legacy_tools.CorpusPaths(index, manifest if manifest.is_file() else None,
                             index / "mechanism_cache", False,
                             hgnc if hgnc.is_file() else None, root / "hf_cache")
         preloaded = _preloaded(paths)
@@ -221,6 +231,9 @@ def run_local_search(args: dict[str, Any], ctx: Any = None) -> dict[str, Any] | 
 
 def make_local_tool() -> Any:
     """Return a ready local tool, or None. Model loading belongs in a worker thread."""
+    from . import local_literature_mcp
+    if local_literature_mcp.enabled():
+        return local_literature_mcp.make_tool()
     if not has_local_index():
         return None
     try:
@@ -228,4 +241,4 @@ def make_local_tool() -> Any:
     except Exception:
         return None
     from dataclasses import replace
-    return replace(make_search_corpus_tool(), executor=run_local_search)
+    return replace(_legacy_tools.make_search_corpus_tool(), executor=run_local_search)

@@ -35,9 +35,31 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from aiscientist.tools._lib.corpus import l2  # noqa: E402
-from aiscientist.tools.extract_haploinsufficient_genes.tool import (  # noqa: E402
-    build_text_cache, chunk_vectors, load_chunks, sentence_transformer_embed)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _literature_runtime import Component  # noqa: E402
+
+_CORPUS, _EXTRACT = Component("corpus"), Component("extract")
+
+
+def l2(*args, **kwargs):
+    return _CORPUS.l2(*args, **kwargs)
+
+
+def build_text_cache(*args, **kwargs):
+    return _EXTRACT.build_text_cache(*args, **kwargs)
+
+
+def chunk_vectors(*args, **kwargs):
+    return _CORPUS.chunk_vectors(*args, **kwargs)
+
+
+def load_chunks(*args, **kwargs):
+    return _CORPUS.load_chunks(*args, **kwargs)
+
+
+def sentence_transformer_embed(*args, **kwargs):
+    return _CORPUS.sentence_transformer_embed(*args, **kwargs)
+
 
 MARKER = "AISCIENTIST_INDEX_BUILD "   # gateway/corpus_index.REBUILD_MARKER reads it
 SAMPLE = 4                            # cached vectors embedded again before only new chunks are
