@@ -19,45 +19,33 @@ import importlib
 from typing import Any
 
 # Job entry points, run as ``python -m <module>`` inside each HPC3 image.
-ANALYSIS_ENTRYPOINT = "aiscientist.tools.scrna_cli"        # analysis.sif: the scRNA tool line
-PHENOTYPE_ENTRYPOINT = "aiscientist.tools.phenotype_cli"   # lirical.sif: run_lirical
-LITERATURE_ENTRYPOINT = "aiscientist.tools.paperqa_cli"    # paperqa.sif: deep_literature
+ANALYSIS_ENTRYPOINT = "aiscientist.tools.worker_cli"        # analysis.sif: the scRNA tool line
 
 # public name -> (module, attribute)
 _EXPORTS: dict[str, tuple[str, str]] = {
     # the dataset profile the gateway computes at run start (in-process, or on HPC3 through the
     # analysis line's `preflight` step), and the smoke QC/DE stand-ins used without scanpy
-    "run_dataset_smoke_analysis": ("aiscientist.tools.datasets", "run_dataset_smoke_analysis"),
-    "build_single_cell_qc_execution": ("aiscientist.tools.execution", "build_single_cell_qc_execution"),
-    "build_de_marker_execution": ("aiscientist.tools.execution", "build_de_marker_execution"),
+    "run_dataset_smoke_analysis": ("aiscientist.tools._lib.dataset_preflight", "run_dataset_preflight"),
     # dataset triage (inspect_dataset), also run by the gateway at upload / run start
     "describe_dataset": ("aiscientist.tools._lib.dataset_inspection", "describe_dataset"),
     "peek_dataset": ("aiscientist.tools._lib.dataset_inspection", "peek_dataset"),
     # variants (annotate_variants)
     "detect_assembly": ("aiscientist.tools._lib.variant_assembly", "detect_assembly"),
-    "load_gene_panel": ("aiscientist.tools.gene_panels", "load_gene_panel"),
+    "load_gene_panel": ("aiscientist.agents.reference_panels", "load_gene_panel"),
     # figures (make_schematic), also used for the report's workflow figure
     "render_dot": ("aiscientist.tools._lib.schematics", "render_dot"),
     "workflow_schematic_dot": ("aiscientist.tools._lib.schematics", "workflow_schematic_dot"),
     "render_workflow_schematic": ("aiscientist.tools._lib.schematics", "render_workflow_schematic"),
     # literature
-    "CorpusPaths": ("aiscientist.tools._lib.corpus", "CorpusPaths"),
-    "CORPUS_DEFAULT_EMBEDDING": ("aiscientist.tools._lib.corpus", "DEFAULT_EMBEDDING"),
-    "make_search_corpus_tool": ("aiscientist.tools.search_corpus.tool", "make_tool"),
-    "run_search_corpus": ("aiscientist.tools.search_corpus.tool", "run_search"),
-    "preload_search_corpus": ("aiscientist.tools.search_corpus.tool", "preload"),
     "focus_literature_query": ("aiscientist.literature_contract", "focus_literature_query"),
-    "search_literature": ("aiscientist.tools.literature_search.tool", "search_europepmc"),
     "QUERY_STOPWORDS": ("aiscientist.literature_contract", "QUERY_STOPWORDS"),
     # the corpus scan's rules as one fingerprint: a stored scan is reused only under the same rules
-    "corpus_scan_rules_digest": ("aiscientist.tools.extract_haploinsufficient_genes.tool", "rules_digest"),
     # a task spec for a property the scan has no rules for: the drafting prompt, its check, and the
     # folder the scan writes that spec's tables to
     "CORPUS_SCAN_SPEC_SYSTEM": ("aiscientist.literature_contract", "SPEC_SYSTEM"),
     "parse_corpus_scan_spec": ("aiscientist.literature_contract", "parse_spec"),
     "corpus_scan_spec_folder": ("aiscientist.literature_contract", "spec_folder"),
     # the scRNA analysis line
-    "scrna_catalog": ("aiscientist.tools.catalog", "scrna_catalog"),
     # curated marker references (run_marker_annotation), also read by the report's marker-claim check
     "available_references": ("aiscientist.tools._lib.marker_references", "available_references"),
     "load_marker_reference": ("aiscientist.tools._lib.marker_references", "load_reference"),
@@ -69,16 +57,16 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "profile_cellranger_libraries": ("aiscientist.tools._lib.cellranger", "profile_cellranger_libraries"),
     "CELLRANGER_FIND_NAMES": ("aiscientist.tools._lib.cellranger", "FIND_NAMES"),
     "CELLRANGER_FIND_MAXDEPTH": ("aiscientist.tools._lib.cellranger", "FIND_MAXDEPTH"),
-    "genesets_dir": ("aiscientist.tools._lib.scrna", "_genesets_dir"),
-    "looks_like_celltype_column": ("aiscientist.tools._lib.scrna", "_looks_like_celltype_column"),
-    "looks_like_condition_column": ("aiscientist.tools._lib.scrna", "_looks_like_condition_column"),
-    "DECLARED_PARAMS": ("aiscientist.tools._lib.scrna", "PARAMS"),
-    "TOOL_SUMMARY": ("aiscientist.tools._lib.scrna", "TOOL_SUMMARY"),
+    "genesets_dir": ("aiscientist.tools._lib.analysis_metadata", "_genesets_dir"),
+    "looks_like_celltype_column": ("aiscientist.tools._lib.analysis_metadata", "_looks_like_celltype_column"),
+    "looks_like_condition_column": ("aiscientist.tools._lib.analysis_metadata", "_looks_like_condition_column"),
+    "DECLARED_PARAMS": ("aiscientist.tools._lib.analysis_metadata", "PARAMS"),
+    "TOOL_SUMMARY": ("aiscientist.tools._lib.analysis_metadata", "TOOL_SUMMARY"),
     # HPC3 job runtime
-    "run_analysis_tool": ("aiscientist.tools.scrna_cli", "run_tool"),
-    "INSTALL_DEPENDENCY": ("aiscientist.tools.scrna_cli", "INSTALL_DEPENDENCY"),
+    "run_analysis_tool": ("aiscientist.tools.worker_cli", "run_tool"),
+    "INSTALL_DEPENDENCY": ("aiscientist.tools.worker_cli", "INSTALL_DEPENDENCY"),
     # the processed dataset a run hands on (built from its checkpoints at the end of the run)
-    "EXPORT_RESULT_DATASET": ("aiscientist.tools.scrna_cli", "EXPORT_RESULT_DATASET"),
+    "EXPORT_RESULT_DATASET": ("aiscientist.tools.worker_cli", "EXPORT_RESULT_DATASET"),
     "export_result_dataset": ("aiscientist.tools._lib.result_dataset", "export"),
     "result_dataset_name": ("aiscientist.tools._lib.result_dataset", "result_name"),
     "RESULT_DATASET_POINTER": ("aiscientist.tools._lib.result_dataset", "POINTER"),
@@ -86,23 +74,15 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "CELLQC_RESULT_POINTER": ("aiscientist.tools._lib.result_dataset", "CELLQC_POINTER"),
     "cellqc_result_name": ("aiscientist.tools._lib.result_dataset", "cellqc_result_name"),
     # ... and the next run of the conversation starts from (written back as its checkpoints)
-    "ADOPT_RESULT_DATASET": ("aiscientist.tools.scrna_cli", "ADOPT_RESULT_DATASET"),
+    "ADOPT_RESULT_DATASET": ("aiscientist.tools.worker_cli", "ADOPT_RESULT_DATASET"),
     "adopt_result_dataset": ("aiscientist.tools._lib.result_dataset", "adopt"),
     "resolve_run_dependency": ("aiscientist.tools.run_deps", "resolve"),
     "DEPS_DIRNAME": ("aiscientist.tools.run_deps", "DEPS_DIRNAME"),
     "SITECUSTOMIZE": ("aiscientist.tools.run_deps", "SITECUSTOMIZE"),
     # tool factories, for the registry
-    "make_inspect_dataset_tool": ("aiscientist.tools.inspect_dataset.tool", "make_inspect_dataset_tool"),
-    "make_hpo_mapping_tool": ("aiscientist.tools.map_phenotype_to_hpo.tool", "make_hpo_mapping_tool"),
-    "make_literature_search_tool": ("aiscientist.tools.literature_search.tool", "make_literature_search_tool"),
-    "make_paperqa_tool": ("aiscientist.tools.deep_literature.tool", "make_paperqa_tool"),
-    "make_phenotype_differential_tool": ("aiscientist.tools.run_lirical.tool", "make_phenotype_differential_tool"),
-    "make_diagnose_disease_tool": ("aiscientist.tools.diagnose_disease.tool", "make_diagnose_disease_tool"),
-    "make_schematic_tool": ("aiscientist.tools.make_schematic.tool", "make_schematic_tool"),
 }
 
-__all__ = sorted([*_EXPORTS, "ANALYSIS_ENTRYPOINT", "PHENOTYPE_ENTRYPOINT",
-                  "LITERATURE_ENTRYPOINT"])
+__all__ = sorted([*_EXPORTS, "ANALYSIS_ENTRYPOINT"])
 
 
 def __getattr__(name: str) -> Any:

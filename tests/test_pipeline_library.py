@@ -15,7 +15,7 @@ from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG, load_servers
 
 # Read from where the platform reads them ($AISCIENTIST_PIPELINES_DIR or preset_pipelines/).
 PIPELINES_DIR = _pipelines_dir()
-PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",
+PLATFORM_TOOLS = {"finish", "mcp_run_scanpy_qc", "mcp_run_de", "run_code", "describe_environment",
                   "search_skills", "read_skill_reference", "read_tool_source",
                   "list_dir", "stat_path", "find_files", "read_text", "disk_usage", "run_shell",
                   "fetch_url", "install_package"}

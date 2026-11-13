@@ -12,19 +12,19 @@ from aiscientist.tools.catalog import ManifestError, load_manifest, parse_front_
 def test_scalars_lists_comments_and_body():
     fields, body = parse_front_matter(
         "---\n"
-        "name: run_de            # trailing comment\n"
+        "name: mcp_run_de            # trailing comment\n"
         "summary: \"A #hash inside quotes stays\"\n"
         "order: 220\n"
         "chat: false\n"
         "needs: [lirical_fn=tool:run_lirical, literature_fn=tool:deep_literature]\n"
         "empty: []\n"
         "---\n"
-        "# run_de\n\nBody text.\n")
+        "# mcp_run_de\n\nBody text.\n")
     assert fields == {
-        "name": "run_de", "summary": "A #hash inside quotes stays", "order": 220, "chat": False,
+        "name": "mcp_run_de", "summary": "A #hash inside quotes stays", "order": 220, "chat": False,
         "needs": ["lirical_fn=tool:run_lirical", "literature_fn=tool:deep_literature"], "empty": [],
     }
-    assert body.startswith("# run_de") and "Body text." in body
+    assert body.startswith("# mcp_run_de") and "Body text." in body
 
 
 def test_indented_lines_fold_into_the_previous_text_field():
@@ -72,5 +72,7 @@ def test_a_job_brings_its_own_gpu_or_calls_the_sessions_model_not_both(tmp_path)
 def test_only_a_tool_that_says_so_ends_its_step_on_one_call(tmp_path):
     assert load_manifest(_folder(tmp_path, "ends_step: true\n")).ends_step is True
     assert load_manifest(_folder(tmp_path / "b")).ends_step is False
-    from aiscientist.tools.catalog import manifest
-    assert manifest("run_cellqc").ends_step and not manifest("run_de").ends_step
+    from aiscientist.agents.research_lab import _tool_ends_step
+    assert _tool_ends_step("mcp_run_cellqc")
+    assert not _tool_ends_step("mcp_run_de")
+    assert not _tool_ends_step("mcp_foreign_run_cellqc")

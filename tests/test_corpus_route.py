@@ -362,42 +362,8 @@ def test_a_model_that_never_started_is_reported_with_its_log(tmp_path, monkeypat
 
 # --- a chat message asking for the gene list --------------------------------------------------
 
-def test_a_chat_question_for_the_gene_list_is_answered_from_a_kept_scan(tmp_path, monkeypatch):
-    # The pre-retirement fallback is tested only under an explicit unregistered deployment.
-    from aiscientist.gateway import literature_mcp
-    monkeypatch.setattr(literature_mcp, "registered_server", lambda: None)
-    conn = _conn(tmp_path)
-    stored = object()
-    seen = {}
-
-    async def fake_corpus(c, req, stored=None):
-        seen["stored"] = stored
-
-    async def never_chat(c, req):
-        raise AssertionError("the chat ran")
-
-    monkeypatch.setattr(gw_app, "_stored_corpus_scan", lambda c: stored)
-    monkeypatch.setattr(gw_app, "_run_corpus_scan", fake_corpus)
-    monkeypatch.setattr(gw_app, "_run_quick_chat", never_chat)
-    _dispatch(conn, "What are haploinsufficient genes?", route="chat")
-    assert seen["stored"] is stored
 
 
-def test_without_a_kept_scan_dispatches_to_the_gene_table(tmp_path, monkeypatch):
-    # The pre-retirement fallback is tested only under an explicit unregistered deployment.
-    from aiscientist.gateway import literature_mcp
-    monkeypatch.setattr(literature_mcp, "registered_server", lambda: None)
-    conn = _conn(tmp_path)
-    ran = []
-
-    async def table(c, req):
-        ran.append(req.question)
-
-    monkeypatch.setattr(gw_app, "_literature_corpus_available", lambda c: True)
-    monkeypatch.setattr(gw_app, "_stored_corpus_scan", lambda c: None)
-    monkeypatch.setattr(gw_app, "_run_gene_table", table)
-    _dispatch(conn, "What are haploinsufficient genes?", route="chat")
-    assert ran == ["What are haploinsufficient genes?"]
 
 
 def test_a_question_about_one_gene_goes_to_the_chat_without_a_lookup(tmp_path, monkeypatch):
@@ -417,42 +383,3 @@ def test_a_question_about_one_gene_goes_to_the_chat_without_a_lookup(tmp_path, m
 
 
 # --- the job's own GPU ----------------------------------------------------------------------
-
-
-
-@pytest.mark.parametrize("hpc_enabled", [False, True])
-def test_gene_list_without_reachable_corpus_uses_quick_chat(tmp_path, monkeypatch, hpc_enabled):
-    # The pre-retirement fallback is tested only under an explicit unregistered deployment.
-    from aiscientist.gateway import literature_mcp
-    monkeypatch.setattr(literature_mcp, "registered_server", lambda: None)
-    import threading
-
-    conn = _conn(tmp_path)
-    conn.push = lambda payload, **kw: pushed.append(payload)
-    pushed, ran, checks = [], [], []
-    loop_thread = threading.get_ident()
-    if hpc_enabled:
-        monkeypatch.setenv("AISCIENTIST_PAPERQA_ON_HPC", "1")
-    else:
-        monkeypatch.delenv("AISCIENTIST_PAPERQA_ON_HPC", raising=False)
-    monkeypatch.setattr(gw_app, "_stored_corpus_scan", lambda c: None)
-
-    def available(c):
-        checks.append(threading.get_ident())
-        assert threading.get_ident() != loop_thread
-        return False
-
-    async def chat(c, req):
-        ran.append(req.question)
-
-    async def no_table(*args):
-        raise AssertionError("unreachable corpus used for a table")
-
-    monkeypatch.setattr(gw_app, "_literature_corpus_available", available)
-    monkeypatch.setattr(gw_app, "_run_quick_chat", chat)
-    monkeypatch.setattr(gw_app, "_run_gene_table", no_table)
-    _dispatch(conn, "What are haploinsufficient genes?", route="chat")
-    assert ran == ["What are haploinsufficient genes?"] and len(checks) == 1
-    notices = [p for p in pushed
-               if "Ask about the RetiGene papers by name for the complete table" in p.get("text", "")]
-    assert bool(notices) == hpc_enabled

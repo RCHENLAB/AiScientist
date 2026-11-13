@@ -96,11 +96,20 @@ print("native platform imported without scientific tool folders")
 def test_native_index_bundle_contains_only_operator_scripts(tmp_path, monkeypatch):
     import tarfile
     monkeypatch.setenv("AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME", "mcp")
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "build_mechanism_cache.py").write_text("def main(argv=None): return 0\n")
+    monkeypatch.setenv("AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS", str(native))
     update = script("update_corpus_index")
     archive = tmp_path / "code.tgz"
     update.pack_code(archive)
     with tarfile.open(archive) as tar:
-        assert set(tar.getnames()) == {"scripts/build_mechanism_cache.py", "scripts/_literature_runtime.py"}
+        assert set(tar.getnames()) == {"scripts/build_mechanism_cache.py", "scripts/_literature_runtime.py",
+            "native_scripts/build_mechanism_cache.py", "native_scripts/manifest.json"}
+        import hashlib
+        import json
+        record = json.load(tar.extractfile("native_scripts/manifest.json"))
+        assert record["sha256"] == hashlib.sha256(tar.extractfile("native_scripts/build_mechanism_cache.py").read()).hexdigest()
     image = "docker://ghcr.io/example/mcp-literature@sha256:" + "a" * 64
     monkeypatch.setenv("AISCIENTIST_CORPUS_MAINTENANCE_IMAGE", image)
     monkeypatch.setenv("AISCIENTIST_PAPERQA_PAPERS", "/refs/retigene/papers")
@@ -112,26 +121,37 @@ def test_native_index_bundle_contains_only_operator_scripts(tmp_path, monkeypatc
     command = corpus_index.rebuild_inner_command(stage="/stage", archive="/stage/code.tgz", image=image,
         root="/refs/retigene", papers="/refs/retigene/papers", manifest="/refs/retigene/manifest.csv", runtime="mcp")
     assert "AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp" in command
+    assert "AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS=/stage/native_scripts" in command
     assert "HF_HUB_OFFLINE=1" in command and image in command
     assert "LITERATURE_CORPUS_ROOT=/refs/retigene" in command
     assert "LITERATURE_ALLOWED_ROOTS=/refs/retigene:/refs/retigene/papers" in command
     assert "python3 /stage/scripts/build_mechanism_cache.py --replace" in command
 
 
-def test_native_operator_loader_cannot_silently_fall_back(monkeypatch):
+def test_native_operator_loader_requires_explicit_reviewed_source(monkeypatch, tmp_path):
     runtime = script("_literature_runtime")
-    monkeypatch.setenv(runtime.ENV, "mcp")
-    calls = []
-    def absent(name):
-        calls.append(name)
-        raise ModuleNotFoundError(name)
-    monkeypatch.setattr(runtime.importlib, "import_module", absent)
-    with pytest.raises(RuntimeError, match="published literature image"):
-        runtime.Component("corpus").load_chunks
-    assert calls == ["aiscientist_mcp.literature.corpus"]
-    monkeypatch.setenv(runtime.ENV, "typo")
-    with pytest.raises(ValueError, match="mcp or legacy"):
+    monkeypatch.delenv(runtime.SCRIPTS_ENV, raising=False)
+    with pytest.raises(RuntimeError, match="reviewed aiscientist-mcp checkout"):
+        runtime.operator_script("build_mechanism_cache")
+    monkeypatch.setenv(runtime.SCRIPTS_ENV, str(tmp_path))
+    with pytest.raises(ValueError, match="Unknown"):
+        runtime.operator_script("../../arbitrary")
+    target = tmp_path / "build_mechanism_cache.py"
+    target.write_text("def main(argv=None): return argv\n")
+    assert runtime.operator_module("build_mechanism_cache").main(["--no-vectors"]) == ["--no-vectors"]
+    target.unlink()
+    target.symlink_to(tmp_path / "other.py")
+    with pytest.raises(RuntimeError, match="regular file"):
+        runtime.operator_script("build_mechanism_cache")
+    root_link = tmp_path / "linked"
+    root_link.symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setenv(runtime.SCRIPTS_ENV, str(root_link))
+    with pytest.raises(RuntimeError, match="symlink"):
+        runtime.operator_script("build_mechanism_cache")
+    monkeypatch.setenv(runtime.ENV, "legacy")
+    with pytest.raises(ValueError, match="must be mcp"):
         runtime.runtime()
+
 
 
 def test_native_publication_measurement_uses_real_mcp_contract(monkeypatch, tmp_path):

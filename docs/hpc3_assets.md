@@ -34,13 +34,13 @@ code change.
 | `analysis.sif` | 431 M | `run_code` and the single-cell tools (scanpy, gseapy), plus bcftools, samtools, tabix/bgzip, bedtools, pysam and cyvcf2 | `AISCIENTIST_ANALYSIS_IMAGE` | `deploy/analysis/build_and_stage.sh` |
 | `report.sif` | 444 M | report rendering (pandoc, XeLaTeX) | `AISCIENTIST_REPORT_IMAGE` | `deploy/report/build_and_stage.sh` |
 | `vep.sif` | 230 M | offline Ensembl VEP release 112 and bcftools; OpenSpliceAI is executed inside it | `AISCIENTIST_VEP_IMAGE` | `deploy/vep/build_and_stage.sh` |
-| `lirical.sif` | 129 M | LIRICAL, phenotype to disease ranking | `AISCIENTIST_LIRICAL_IMAGE` | `deploy/lirical/build_and_stage.sh` |
+| `mcp-phenotype-diagnosis` | release-specific | Native HPO mapping, LIRICAL ranking and literature adjudication | pinned MCP catalog | external released image; references only: `deploy/lirical/build_and_stage.sh` |
 | `mcp-scgpt-annotation` | release-specific | scGPT per-cell annotation, on a GPU | pinned MCP catalog | released MCP image; external assets in `deploy/scgpt/README.md` |
 | `vlreview.sif` | 3.6 G | the vision model that reviews the rendered report | `AISCIENTIST_VLREVIEW_IMAGE` | `scripts/hpc3_vlreview_setup.sh` with `deploy/vlreview/` |
 | `cellqc-0.3.6_4509649d69.sif` | 1.0 G | `run_cellqc` and the standalone CellQC skill: CellQC 0.3.6, Python 3.12, R with DoubletFinder | `image:` in `run_cellqc/TOOL.md` | automatic, see below |
 | `rockylinux_9.7.20251123.sif` | 83 M | the agent's `run_shell` sandbox: the compute nodes' OS (Rocky Linux 9.7), with RCIC's modules and the host's `/usr` mounted read-only | `SHELL_IMAGE_REF` in `hpc/shell.py` | automatic: pulled on the session's CPU worker on first use (`docker://rockylinux/rockylinux:9.7.20251123`) |
 
-The PaperQA image is with the literature files, under `<root>/retigene/`.
+Native scientific images are resolved from the pinned MCP catalog; historical app images are not used by migrated tools.
 
 ### Building an image
 
@@ -112,25 +112,17 @@ together:
 
 ## Literature: `<root>/retigene/` (7.5 G)
 
-`deep_literature` and `extract_haploinsufficient_genes` run as HPC3 jobs that read these files.
-The literature line owns the directory; the other members' jobs only read it. The corpus scan's job
-also starts its own model on a paid-partition GPU from `<root>/containers/vllm-0.28.0.sif` and the
-weights in `<root>/models/hf` (`deploy/paperqa/README.md`).
+The native literature MCP server reads the shared corpus in contained CPU jobs. The operator owns indexing; ordinary analyses bind it read-only. Generative calls use the session-selected model through the guarded gateway relay or its selected cluster service. A corpus request does not provision another GPU automatically.
 
-| Path | Size | What | Setting |
+| Path | Recorded size | What | Native setting |
 |---|---|---|---|
-| `paperqa.sif` | 2.8 G | the PaperQA container | `AISCIENTIST_PAPERQA_IMAGE` |
-| `papers/` | 3.6 G | the corpus, 1,739 PDFs | `AISCIENTIST_PAPERQA_PAPERS` |
-| `index_pubmedbert/` | 215 M | the index `retigene_full_pubmedbert` | `AISCIENTIST_PAPERQA_INDEX_DIR`, `AISCIENTIST_PAPERQA_INDEX_NAME` |
-| `paperqa_manifest.csv` | 1.2 M | title, authors and DOI per paper | `AISCIENTIST_PAPERQA_MANIFEST` |
-| `hf_cache/` | 412 M | the embedding model `NeuML/pubmedbert-base-embeddings` | `AISCIENTIST_PAPERQA_ROOT` (the job sets `HF_HOME=<that>/hf_cache`) |
-| `mechanism_cache/`, `hgnc_complete_set.txt` | 395 M, 17 M | the corpus split into sentences with their embeddings, and the HGNC gene table, for the corpus scan | found beside `papers/`; `AISCIENTIST_MECHANISM_CACHE` and `AISCIENTIST_HGNC_TABLE` override |
+| `papers/` | 3.6 G | public PDF corpus | `LITERATURE_PAPERS` |
+| `index_pubmedbert/` | 215 M | index `retigene_full_pubmedbert` | `LITERATURE_INDEX_DIR`, `LITERATURE_INDEX_NAME` |
+| `paperqa_manifest.csv` | 1.2 M | titles, authors and DOI/PMID | `LITERATURE_MANIFEST` |
+| `hf_cache/` | 412 M | local PubMedBERT embedding weights | `LITERATURE_HF_CACHE` |
+| `mechanism_cache/`, `hgnc_complete_set.txt` | 395 M, 17 M | cached passages/vectors and HGNC symbols | `LITERATURE_CACHE_DIR`, `LITERATURE_HGNC` |
 
-None of these paths has a default in the code: with the `AISCIENTIST_PAPERQA_*` settings unset
-the literature tools are unavailable and a run continues without them.
-Rebuild: the image with `deploy/paperqa/build_and_stage.sh`
-(`AISCIENTIST_PAPERQA_CONTAINER_DIR=<root>/retigene` stages it here), the index with
-`deploy/paperqa/embed_corpus.slurm`, the corpus-scan cache with `scripts/build_mechanism_cache.py`.
+These recorded sizes describe the earlier shared snapshot, not a validation of any later update. Configure existing reference roots explicitly. The gateway's `AISCIENTIST_PAPERQA_PAPERS`/`_MANIFEST` remain transfer/fingerprint inputs; they do not select an app scientific runtime. Reference-only staging remains in this repository. Algorithms for directory indexing, cache replacement and retrieval evaluation live in the external MCP checkout; see `deploy/paperqa/RUNBOOK.md` and `docs/development/literature-maintenance.md`. Published image tags are immutable and are not rebuilt by those operator scripts.
 
 ## Annotation databases: `<reference>/` (241 G)
 

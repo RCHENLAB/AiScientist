@@ -1,7 +1,7 @@
 ---
 name: variant_annotation
 description: Interpret a VCF's variants (germline/somatic, WGS/WES) — gene + functional consequence (Ensembl VEP), ClinVar pathogenicity, gnomAD frequency, deleteriousness (CADD/REVEL/AlphaMissense) + splice disruption (SpliceAI), then prioritise. Rare-disease known-gene-first (IRD). Offline, WGS-scale.
-tools: mcp_annotate_variants, run_code, literature_search
+tools: mcp_annotate_variants, run_code, mcp_literature_search
 ---
 
 # Variant Annotation & Prioritisation Protocol
@@ -50,7 +50,7 @@ tiers the survivors by **inheritance model** — the lab's IRD protocol, reprodu
 | 4 | **Annotate** (VEP + ClinVar + gnomAD + predictors + **IRD layers**) | `mcp_annotate_variants` | 🧭 `assembly` auto-detected (GRCh37 fallback) | `variant_annotation.tsv` + 5 tables |
 | 5 | **Summarise the landscape** | *(report from Step 4 tables)* | — | consequence / impact dists |
 | 6 | **Prioritise + tier by disease model** | `mcp_annotate_variants` (built-in) + `clinical_variant_prioritization` | dominant/recessive/X AF thresholds | `high_priority_variants.csv` + `Disease_Model` |
-| 7 | **Literature context** | `literature_search` | gene + phenotype query | citations |
+| 7 | **Literature context** | `mcp_literature_search` | gene + phenotype query | citations |
 
 > Plan these as **distinct agenda steps** — a real variant study is not one "annotate" call. The heavy
 > compute lives inside `mcp_annotate_variants` (Step 4); Steps 5–6 **report from the tables it already wrote**
@@ -299,7 +299,7 @@ if high-impact — note the frequency.
 <summary><b>Step 7 · Literature context</b></summary>
 
 **What.** For the prioritised pathogenic genes/variants, pull real citations (gene + disease/phenotype)
-via `literature_search` to ground the interpretation.
+via `mcp_literature_search` to ground the interpretation.
 
 **Why / honesty.** Cite **only** what the tool returns — never invent a PMID or a claim.
 

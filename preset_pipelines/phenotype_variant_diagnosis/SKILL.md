@@ -1,7 +1,7 @@
 ---
 name: phenotype_variant_diagnosis
 description: Diagnose a rare-disease CASE — a VCF **plus** the patient's clinical description (free text, any language) — by reconciling two independent tracks: the prioritised variant shortlist (VEP/ClinVar/predictors) and a phenotype-driven per-disease differential (HPO → LIRICAL post-test probability). Use ONLY when the case's phenotype/symptoms/diagnosis are actually given; a VCF alone is the variant_annotation protocol.
-tools: mcp_annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
+tools: mcp_annotate_variants, mcp_map_phenotype_to_hpo, mcp_run_lirical, mcp_literature_search, run_code
 data_type: variants
 outputs:
   - path: tables/variant_annotation.tsv
@@ -29,9 +29,9 @@ outputs:
     tool: mcp_annotate_variants
     description: Rare variants not in ClinVar that are high impact, predicted deleterious or IRD-flagged, ranked, at most 50, a header only when there are none.
     required: false
-  - path: phenotype/lirical*.tsv
+  - path: **/mcp/phenotype-diagnosis/*/phenotype/lirical*.tsv
     kind: table
-    tool: run_lirical
+    tool: mcp_run_lirical
     description: LIRICAL's ranked differential diagnosis, one row per candidate disease with its post-test probability, composite likelihood ratio and gene.
     required: true
 ---
@@ -49,21 +49,21 @@ informal it is ("夜盲、视野缩窄、ERG 熄灭型", "Stargardt", "RP with m
 **Where the description comes from — either is fine, you do not have to care which:**
 * the **research question** itself (the clinician pasted the note into the chat), or
 * an **attached case note** (sent with the request as a separate slot from the dataset — the VCF
-  keeps the dataset slot). `map_phenotype_to_hpo` reads the attached note automatically when you
+  keeps the dataset slot). `mcp_map_phenotype_to_hpo` reads the attached note automatically when you
   call it with no `text`.
 
 So: if the question carries the description, pass it as `text` VERBATIM. If it does not, call
-`map_phenotype_to_hpo` with NO arguments — it will map the attached note. If neither exists, the tool
+`mcp_map_phenotype_to_hpo` with NO arguments — it will map the attached note. If neither exists, the tool
 returns an error, and that is the signal to use `variant_annotation` instead.
 
 **If there is no phenotype anywhere, use the `variant_annotation` protocol instead** and do not plan a
 phenotype step. Do NOT invent, assume, or infer a phenotype from the gene names, the file name, or the
 fact that it is an eye study — a fabricated phenotype produces a confident, wrong differential, which is
-worse than no differential at all. `run_lirical` will refuse an empty phenotype; do not work around it.
+worse than no differential at all. `mcp_run_lirical` will refuse an empty phenotype; do not work around it.
 
 ## The two tracks (they are INDEPENDENT — do not make one wait on the other)
 
-`run_lirical` does **not** consume `mcp_annotate_variants`' output: in genotype-aware mode it scores the raw
+`mcp_run_lirical` does **not** consume `mcp_annotate_variants`' output: in genotype-aware mode it scores the raw
 VCF itself via its own Exomiser database. So the tracks are parallel and only meet at the reconcile step.
 Plan them as distinct agenda steps:
 
@@ -78,8 +78,8 @@ Follow the `variant_annotation` protocol's approach; the essentials, not restate
 4. **Prioritise** — lead with the `high_priority_variants` shortlist the tool already wrote. Report from
    its tables; do not hand-roll `run_code` to re-derive them.
 
-### Track B — phenotype (`map_phenotype_to_hpo` → `run_lirical`)
-1. **`map_phenotype_to_hpo`** on the case description, **verbatim** — pass the clinician's own words, not
+### Track B — phenotype (`mcp_map_phenotype_to_hpo` → `mcp_run_lirical`)
+1. **`mcp_map_phenotype_to_hpo`** on the case description, **verbatim** — pass the clinician's own words, not
    your paraphrase (or no `text` at all, to map the attached note). It returns real, ontology-validated
    HPO IDs. **Never write HPO IDs yourself**: IDs one digit apart are different real phenotypes
    (HP:0000662 = Nyctalopia, HP:0000622 = Blurred vision), and a wrong-but-real ID fails silently.
@@ -88,7 +88,7 @@ Follow the `variant_annotation` protocol's approach; the essentials, not restate
    - Pass `excluded_hpo` through as well: a finding the text says is ABSENT ("无听力障碍", "hearing is
      normal") is evidence, and LIRICAL uses it to push diseases DOWN.
    - If it returns **no observed terms**, stop this track and say so — the text had no usable phenotype.
-2. **`run_lirical`** with those terms. With the VCF + the Exomiser DB present it scores GENOTYPE-AWARE
+2. **`mcp_run_lirical`** with those terms. With the VCF + the Exomiser DB present it scores GENOTYPE-AWARE
    (variants sharpen the ranking); otherwise PHENOTYPE-ONLY (still a valid posterior from symptoms alone).
    Report which mode ran, and the `phenotype_notes` (IDs the ontology gate dropped/forwarded).
 
@@ -106,7 +106,7 @@ Put the two tracks side by side and say what they agree on:
   NOT a contradiction.** LIRICAL scores against *curated* HPO/OMIM annotations, so a gene whose
   disease association is new, or a phenotype expansion of a known gene, CANNOT rank — by construction.
   Treat a low LIRICAL rank as "not in the curated annotations", never as "not causal". When the
-  user asks for literature, `literature_search` on that gene + the phenotype checks for recent
+  user asks for literature, `mcp_literature_search` on that gene + the phenotype checks for recent
   evidence the curation lags; otherwise say that this check is available as a follow-up.
 
 Report BOTH tracks even when they disagree — the disagreement is often the finding.

@@ -279,7 +279,7 @@ def test_gateway_same_run_revision_survives_restart_and_approval(lab_gateway):
     conn = env.connection()
     rid = "original-run"
     art = conn.workspace / rid / "artifacts"
-    doc = replace(_doc("run_scanpy_qc", {"max_pct_mt": 20}), request="q")
+    doc = replace(_doc("mcp_run_scanpy_qc", {"max_pct_mt": 20}), request="q")
     saved_plans.save(art, doc.to_yaml(), source="draft", state="approved")
     state = {"question": "q", "agenda": doc.agenda(), "rounds": [],
              "approved_plan_yaml": doc.to_yaml()}

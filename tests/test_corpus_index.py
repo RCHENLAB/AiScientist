@@ -201,69 +201,14 @@ def test_the_rebuild_job_runs_the_build_beside_the_index_inside_the_image():
 
 # --- build_mechanism_cache.py --replace -------------------------------------------------------
 
-@pytest.fixture
-def build_script():
-    return _script("build_mechanism_cache")
 
 
-def test_replace_puts_a_checked_build_in_place_and_keeps_the_old_one(tmp_path, build_script):
-    out = tmp_path / "retigene" / "mechanism_cache"
-    write_index(out.parent, 3)
-    summary = build_script.build_beside(out, lambda nxt: write_cache(nxt, 5))
-    assert summary["changed"] and summary["chunks"] == 5 and summary["new_chunks"] == 2
-    assert sum(1 for _ in (out / "chunks.jsonl").open()) == 5
-    assert sum(1 for _ in (out.with_name("mechanism_cache.prev") / "chunks.jsonl").open()) == 3
-    assert not out.with_name("mechanism_cache.next").exists()
 
 
-def test_replace_without_new_papers_changes_nothing(tmp_path, build_script):
-    out = tmp_path / "retigene" / "mechanism_cache"
-    write_index(out.parent, 3)
-    inode = (out / "chunks.jsonl").stat().st_ino
-    summary = build_script.build_beside(out, lambda nxt: None)
-    assert not summary["changed"] and (out / "chunks.jsonl").stat().st_ino == inode
-    assert not out.with_name("mechanism_cache.next").exists()
-    assert not out.with_name("mechanism_cache.prev").exists()
 
 
-@pytest.mark.parametrize("bad", ["raises", "vectors short"])
-def test_a_failed_build_leaves_the_index_alone(tmp_path, build_script, bad):
-    out = tmp_path / "retigene" / "mechanism_cache"
-    write_index(out.parent, 3)
-    before = (out / "chunks.jsonl").read_bytes()
-
-    def build(nxt):
-        if bad == "raises":
-            raise RuntimeError("model missing")
-        (nxt / "chunks.jsonl").write_text((out / "chunks.jsonl").read_text() * 2)
-
-    with pytest.raises(RuntimeError):
-        build_script.build_beside(out, build)
-    assert (out / "chunks.jsonl").read_bytes() == before
-    assert not out.with_name("mechanism_cache.next").exists()
 
 
-def test_only_new_chunks_are_embedded(tmp_path, build_script):
-    cache = tmp_path / "mechanism_cache"
-    cache.mkdir()
-    chunks = [{"text": f"chunk {i}"} for i in range(6)]
-
-    def embed(texts):
-        seen.extend(texts)
-        return np.array([[float(t.split()[-1]) + 1.0, 1.0] for t in texts], dtype="float32")
-
-    seen = []
-    np.save(cache / "chunk_vecs.npy", build_script.l2(embed([c["text"] for c in chunks[:4]])))
-    seen.clear()
-    assert build_script.extend_vectors(chunks, cache, embed, lambda s: None)
-    vecs = np.load(cache / "chunk_vecs.npy")
-    assert vecs.shape == (6, 2)
-    assert np.allclose(vecs, build_script.l2(embed([c["text"] for c in chunks])))
-    assert seen[:6] == ["chunk 0", "chunk 1", "chunk 2", "chunk 3", "chunk 4", "chunk 5"]  # 4 checked + 2 new
-    # Cached vectors of other chunks: everything is embedded again by the caller.
-    np.save(cache / "chunk_vecs.npy", np.tile(np.array([[0.0, 1.0]], dtype="float32"), (4, 1)))
-    assert not build_script.extend_vectors(chunks, cache, embed, lambda s: None)
-    assert np.load(cache / "chunk_vecs.npy").shape == (4, 2)
 
 
 # --- update_corpus_index.py ----------------------------------------------------------------------
@@ -315,9 +260,9 @@ def test_the_corpus_settings_come_from_the_deployment(monkeypatch):
     update = _script("update_corpus_index")
     monkeypatch.setenv("AISCIENTIST_PAPERQA_PAPERS", "/dfs3b/r/retigene/papers/")
     monkeypatch.setenv("AISCIENTIST_PAPERQA_MANIFEST", "/dfs3b/r/retigene/paperqa_manifest.csv")
-    monkeypatch.setenv("AISCIENTIST_PAPERQA_IMAGE", "/dfs3b/r/retigene/paperqa.sif")
+    monkeypatch.setenv("AISCIENTIST_CORPUS_MAINTENANCE_IMAGE", "/images/literature-pinned.sif")
     assert update.corpus_settings() == ("/dfs3b/r/retigene", "/dfs3b/r/retigene/papers",
-                                        "/dfs3b/r/retigene/paperqa_manifest.csv", "/dfs3b/r/retigene/paperqa.sif")
+                                        "/dfs3b/r/retigene/paperqa_manifest.csv", "/images/literature-pinned.sif")
     assert update.corpus_settings("/dfs3b/me/test")[:3] == (
         "/dfs3b/me/test", "/dfs3b/me/test/papers", "/dfs3b/me/test/paperqa_manifest.csv")
 
@@ -352,33 +297,18 @@ def test_run_from_a_release_it_reads_config_env_through_the_release_s_link(tmp_p
     assert first.version.name in capsys.readouterr().out
 
 
-def test_the_build_job_ships_the_build_script_and_the_package(tmp_path):
+def test_the_build_job_ships_only_the_reviewed_native_operator(tmp_path, monkeypatch):
     import tarfile
 
     update = _script("update_corpus_index")
+    native = tmp_path / "native"
+    native.mkdir()
+    (native / "build_mechanism_cache.py").write_text("def main(argv=None): return 0\n")
+    monkeypatch.setenv("AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS", str(native))
     archive = tmp_path / "code.tgz"
     update.pack_code(archive)
     names = tarfile.open(archive).getnames()
     assert "scripts/build_mechanism_cache.py" in names
-    assert "src/aiscientist/tools/extract_haploinsufficient_genes/tool.py" in names
+    assert "native_scripts/build_mechanism_cache.py" in names
+    assert not any(n.startswith("src/") for n in names)
     assert not [n for n in names if "__pycache__" in n]
-
-
-def test_a_previous_index_another_member_owns_is_set_aside_not_deleted(tmp_path, build_script, monkeypatch):
-    out = tmp_path / "retigene" / "mechanism_cache"
-    write_index(out.parent, 3)
-    build_script.build_beside(out, lambda nxt: write_cache(nxt, 4))      # .prev now exists
-    assert (out.stat().st_mode & 0o7777) == 0o2775                     # the next member may replace it
-    assert ((out / "chunks.jsonl").stat().st_mode & 0o777) == 0o664
-    real_rmtree = build_script.shutil.rmtree
-
-    def rmtree(path, *a, **k):
-        if Path(path).name == "mechanism_cache.prev":
-            raise PermissionError("owned by another member")
-        return real_rmtree(path, *a, **k)
-
-    monkeypatch.setattr(build_script.shutil, "rmtree", rmtree)
-    summary = build_script.build_beside(out, lambda nxt: write_cache(nxt, 5))
-    assert summary["changed"] and Path(summary["not_removed"]).name.startswith("mechanism_cache.prev-")
-    assert sum(1 for _ in (out / "chunks.jsonl").open()) == 5
-    assert sum(1 for _ in (out.with_name("mechanism_cache.prev") / "chunks.jsonl").open()) == 4

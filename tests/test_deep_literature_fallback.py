@@ -119,20 +119,14 @@ def test_a_failed_corpus_call_says_why_in_the_event_log():
     assert "paper-qa" in summary and "not installed" in summary
 
 
-def test_a_step_naming_deep_literature_in_a_session_without_it_goes_to_europe_pmc_and_says_so():
-    """A session with no HPC3 literature line has no `deep_literature` in its roster, but a preset or
-    a plan drafted earlier can still name it. The step runs on Europe PMC without a doomed call
-    first, and the Critic is told the platform chose the tool (run 7f2955e8e revised a step for
-    exactly that switch)."""
-    calls, events = [], []
-    res = _lab([_europe_pmc(calls)])._scientist(
-        "Which cell types are in this mouse retina?",
-        "**Literature grounding** — Run `deep_literature` for the rod genes found above.",
-        Specialist("s", "p"), "", [], events.append)
-    assert calls and res.status == "ok", "Europe PMC did not run"
-    assert not any(e.get("tool") == "deep_literature" for e in events)
-    assert (res.final_answer or "").startswith(
-        "(Platform note: `deep_literature`, the RetiGene corpus, is not available in this session")
+def test_saved_legacy_corpus_step_requires_review_not_silent_public_substitution():
+    import pytest
+    from aiscientist.agents.mcp_plan_migration import PlanMigrationRequired, assert_plan_available
+    calls = []
+    agenda = ["Run `deep_literature` for the rod genes found above."]
+    with pytest.raises(PlanMigrationRequired, match="requires re-planning and review"):
+        assert_plan_available(agenda, [_europe_pmc(calls)])
+    assert not calls
 
 
 def test_a_literature_search_step_gets_no_platform_note():

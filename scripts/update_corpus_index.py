@@ -5,7 +5,7 @@ release:
     sudo -u aiscientist /data/aiscientist/app/current/.venv/bin/python \\
         /data/aiscientist/app/current/scripts/update_corpus_index.py [--rebuild] [--check]
 
-1. ``--rebuild``: one CPU Slurm job on HPC3, inside ``paperqa.sif``, extracts and embeds the papers
+1. ``--rebuild``: one CPU Slurm job on HPC3, inside the pinned native literature image, extracts and embeds the papers
    added to the corpus since the last build (``build_mechanism_cache.py --replace``) and puts the new
    index in place, keeping the previous one as ``mechanism_cache.prev``. Nothing changes when no
    paper was added.
@@ -18,7 +18,7 @@ release:
 missing. ``--rollback`` makes the previous version of the copy current again.
 
 Settings come from the ``.env`` beside ``scripts/``, in a release the link to ``config/.env``: the
-corpus (``AISCIENTIST_PAPERQA_PAPERS``, ``_MANIFEST``, ``_IMAGE``), HPC3 (host, transfer host, CPU
+corpus (``AISCIENTIST_PAPERQA_PAPERS``, ``_MANIFEST``; image from the MCP catalog or ``AISCIENTIST_CORPUS_MAINTENANCE_IMAGE``)), HPC3 (host, transfer host, CPU
 partition and account, Apptainer module) and the copy's root (``AISCIENTIST_LOCAL_CORPUS_ROOT``,
 default ``<data root>/reference/retigene``). The HPC3 login
 is ``--hpc-user`` with ``--ssh-key``, by default the shared model server's (the saved key of
@@ -39,6 +39,7 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "scripts"))
 
 from aiscientist.gateway import corpus_index, local_corpus  # noqa: E402
 
@@ -46,9 +47,9 @@ MAINTENANCE_RUNTIME_ENV = "AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME"
 
 
 def maintenance_runtime() -> str:
-    mode = os.environ.get(MAINTENANCE_RUNTIME_ENV, "legacy")
-    if mode not in {"mcp", "legacy"}:
-        raise SystemExit(f"{MAINTENANCE_RUNTIME_ENV} must be mcp or legacy")
+    mode = os.environ.get(MAINTENANCE_RUNTIME_ENV, "mcp")
+    if mode != "mcp":
+        raise SystemExit(f"{MAINTENANCE_RUNTIME_ENV} must be mcp; the legacy scientific runtime has been retired")
     return mode
 
 
@@ -80,8 +81,6 @@ def corpus_settings(hpc_root: str = "") -> tuple[str, str, str, str]:
         local_sif = image.startswith("/") and image.endswith(".sif") and not any(c in image for c in "\r\n\0")
         if not (pinned or local_sif):
             raise SystemExit("Native corpus maintenance requires a digest-pinned Docker URI or an absolute verified SIF path.")
-    else:
-        image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "") or f"{root}/paperqa.sif"
     return root, papers, manifest or f"{root}/paperqa_manifest.csv", image
 
 
@@ -100,15 +99,26 @@ def identity(user: str, key: str, hpc: Any) -> tuple[str, str]:
 
 
 def pack_code(out: Path) -> None:
-    """Native jobs stage only operator scripts; legacy jobs also carry the app tools."""
-    def skip(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-        return None if "__pycache__" in info.name or info.name.endswith(".pyc") else info
+    """Stage only operator scripts; the published image contains its scientific runtime."""
+    import hashlib
+    import io
+    import json
+    from _literature_runtime import operator_script
 
+    native = operator_script("build_mechanism_cache")
+    data = native.read_bytes()
     with tarfile.open(out, "w:gz") as tar:
-        if maintenance_runtime() == "legacy":
-            tar.add(REPO / "src" / "aiscientist", arcname="src/aiscientist", filter=skip)
         tar.add(REPO / "scripts" / "_literature_runtime.py", arcname="scripts/_literature_runtime.py")
         tar.add(REPO / "scripts" / "build_mechanism_cache.py", arcname="scripts/build_mechanism_cache.py")
+        info = tarfile.TarInfo("native_scripts/build_mechanism_cache.py")
+        info.size = len(data)
+        info.mode = 0o444
+        tar.addfile(info, io.BytesIO(data))
+        record = json.dumps({"operator": "build_mechanism_cache.py", "sha256": hashlib.sha256(data).hexdigest()}).encode()
+        info = tarfile.TarInfo("native_scripts/manifest.json")
+        info.size = len(record)
+        info.mode = 0o444
+        tar.addfile(info, io.BytesIO(record))
 
 
 def rebuild(ex: Any, hpc: Any, user: str, root: str, papers: str, manifest: str, image: str) -> dict[str, Any]:

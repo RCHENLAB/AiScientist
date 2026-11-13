@@ -7,10 +7,10 @@ Two kinds of tool meet here:
   one: a new tool is a new folder. Its manifest says where it runs (``runs_on``), and that is all
   the routing below needs.
 * **Platform tools** expose the platform's own machinery, so they are assembled here: ``finish`` and
-  the smoke QC/DE fallbacks (``research_harness.default_catalog``), CodeAct ``run_code`` (the per-run
+  loop control (``research_harness.default_catalog``), CodeAct ``run_code`` (the per-run
   sandbox), the HPC3 shell family (``hpc.shell``) and ``describe_environment``.
 
-    build_scientist_catalog(code_executor=..., analysis_executor=..., ...) -> list[HarnessTool]
+    build_scientist_catalog(code_executor=..., ...) -> list[HarnessTool]
 
 Each HarnessTool self-describes (``category`` / ``requires`` / ``reads_private_data``), so the
 System page renders straight off this list.
@@ -27,12 +27,6 @@ if TYPE_CHECKING:
     from .research_harness import HarnessTool
 
 
-# Lightweight smoke tools that the REAL scanpy analysis line supersedes. They exist as a
-# fallback for hosts WITHOUT scanpy; when scanpy is installed, keeping them would force the
-# PI/Scientist to choose between a real tool and a placeholder twin for the same step, which
-# muddies planning and weakens results — so we drop the twins whenever the real tool can run.
-_SUPERSEDED_WHEN_SCANPY = ("run_qc", "run_de_markers")
-
 # Which tools go to which HPC3 job line now comes from each tool's manifest (``runs_on``). These
 # names survive as views of the manifests because tests and docs refer to them.
 #
@@ -48,8 +42,6 @@ _SUPERSEDED_WHEN_SCANPY = ("run_qc", "run_de_markers")
 # which the eyeserver gateway cannot read in place.
 _HPC_ANALYSIS_TOOLS = tuple(tool_catalog.names(tool_catalog.runs_on("hpc:analysis")))
 _HPC_VARIANT_TOOLS = tuple(tool_catalog.names(tool_catalog.runs_on("hpc:variant")))
-_HPC_PHENOTYPE_TOOLS = tuple(tool_catalog.names(tool_catalog.runs_on("hpc:phenotype")))
-_HPC_LITERATURE_TOOLS = tuple(tool_catalog.names(tool_catalog.runs_on("hpc:literature")))
 
 
 def _route_to_executor(tool: "HarnessTool", executor: Any, names: tuple[str, ...]) -> "HarnessTool":
@@ -88,34 +80,23 @@ def _router(executors: dict[str, Any]) -> Callable[[Any, "HarnessTool"], "Harnes
 
 
 def build_scientist_catalog(code_executor: Any = None,
-                            analysis_executor: Any = None,
-                            phenotype_executor: Any = None,
-                            literature_executor: Any = None,
                             hpc_shell: Any = None) -> list["HarnessTool"]:
-    """Assemble the full ordered Scientist catalog. When scanpy is available, the lightweight
-    smoke QC/DE tools are dropped in favour of the real scanpy analysis line (they remain only as a
-    no-scanpy fallback).
+    """Assemble platform tools and registered native scientific capabilities.
 
-    The four executors are the HPC3 job lines (``SlurmAnalysisExecutor``s) the gateway built for
-    this session: ``analysis_executor`` runs the retained analysis worker, ``phenotype_executor``
-    LIRICAL, ``literature_executor`` PaperQA. A tool goes to the one its manifest names.
+    Native scientific tools are appended by the registered MCP bridge; this catalog contains
+    the platform tools and any remaining local manifests.
 
     A manifest that says ``research: false`` is left out: that tool runs only from its own console
     line (the corpus scan is an hour-long job the user starts, with a workspace of its own), so
     the PI cannot plan it and the Scientist cannot call it. The line reaches it by name through
     its executor, not through this catalog.
 
-    ``diagnose_disease`` composes ``run_lirical`` and ``deep_literature``; the catalog binds it to
-    their ROUTED executors, after routing, so the adjudicated differential uses HPC3 exactly when the
-    two tools it wraps do."""
-    import importlib.util
-
+    Cross-server scientific composition belongs to the standalone MCP packages."""
     from .research_harness import default_catalog
     from .research_lab import make_run_code_tool, make_run_in_environment_tool
 
-    executors = {"hpc:analysis": analysis_executor,
-                 "hpc:phenotype": phenotype_executor, "hpc:literature": literature_executor}
-    catalog: list[HarnessTool] = list(default_catalog())                  # finish + smoke QC/DE
+    executors = {}
+    catalog: list[HarnessTool] = list(default_catalog())                  # finish; scientific operations come from registered MCP servers
     catalog += tool_catalog.build_tools(where=lambda m: m.research,
                                         route=_router(executors))
     # A failed snippet that lacked a program gets the HPC3 module that provides it (hpc/modules.py).
@@ -130,8 +111,6 @@ def build_scientist_catalog(code_executor: Any = None,
     env_tool = make_run_in_environment_tool(code_executor, environments=lab_envs)
     if env_tool is not None:
         catalog.append(env_tool)
-    if importlib.util.find_spec("scanpy") is not None:
-        catalog = [t for t in catalog if t.name not in _SUPERSEDED_WHEN_SCANPY]
     # The HPC3 filesystem/shell line — appended LAST so it never displaces a typed tool in the
     # model's reading of the roster. These exist because the Scientist previously had NO way to
     # look at the cluster's filesystem: the only escape hatch was run_code, a Slurm batch job, so
@@ -157,7 +136,7 @@ def build_scientist_catalog(code_executor: Any = None,
 
 
 # A tool's declared requirement (its PyPI name) -> the module it imports as, where they differ.
-_IMPORT_NAMES = {"paper-qa": "paperqa"}
+_IMPORT_NAMES: dict[str, str] = {}
 
 
 def _importable(requirement: str) -> bool:
@@ -169,35 +148,9 @@ def _importable(requirement: str) -> bool:
         return False
 
 
-def session_catalog(catalog: list["HarnessTool"], literature_executor: Any = None,
-                    served_model: bool = True) -> list["HarnessTool"]:
-    """The roster ONE SESSION is offered: ``catalog`` without the HPC3 literature tools it cannot run.
-
-    ``deep_literature`` runs as a job in paperqa.sif on HPC3 and calls the session's served model
-    from there, so the gateway builds its executor only for a session with a GPU allocation. Without
-    one the tool is left unrouted and runs in the gateway process. That works on a development
-    machine with ``paper-qa`` installed and nowhere else: the prod gateway has neither the package
-    nor the /dfs3b index. Prod run BioAdmin/1e887ed2bf8e (2026-10-12) reasoned on the user's own API
-    key, so it had no GPU: the PI planned a ``deep_literature`` step, the plan review rewrote it
-    around that tool's contract, and the call answered ``dependency_missing`` in under a second.
-
-    A literature executor can exist without a served model (a session on the user's own API key):
-    ``search_corpus`` runs there, because its job calls no model. The tools whose manifest says
-    ``served_model`` are offered only when ``served_model`` is true, so the rule is data, not a list
-    of names.
-
-    Only the session's roster changes. ``build_scientist_catalog()`` keeps listing the tool, because
-    the System page and the step classifier (``research_lab._known_tool_names``) read that catalog as
-    the tools that exist, and ``diagnose_disease`` stays bound to the executor it was built with."""
-    def offered(t: "HarnessTool") -> bool:
-        if t.name not in _HPC_LITERATURE_TOOLS:
-            return True
-        if literature_executor is not None:
-            m = tool_catalog.manifest(t.name)
-            return served_model or not (m and m.served_model)
-        return all(_importable(r) for r in t.requires)
-
-    return [t for t in catalog if offered(t)]
+def session_catalog(catalog: list["HarnessTool"]) -> list["HarnessTool"]:
+    """Native MCP availability and model binding are handled by the per-run bridge."""
+    return list(catalog)
 
 
 def _make_describe_environment_tool(hpc_shell: Any = None) -> "HarnessTool":
@@ -246,23 +199,7 @@ def _make_describe_environment_tool(hpc_shell: Any = None) -> "HarnessTool":
 #     ```mermaid fence and the browser renders it (Feature B). The two are complementary, and the
 #     schematic tool is untouched on the research path.
 # ``deep_literature`` is the one chat tool that runs on HPC3 (its index is on /dfs3b).
-def build_quickchat_catalog(literature_executor: Any = None, served_model: bool = True, *,
-                            exclude_literature: bool = False) -> list["HarnessTool"]:
-    """The tools the answer-first chat loop may call: the ``chat: true`` manifests, built from the
-    SAME factories as the research catalog (so a tool is never defined twice and cannot drift
-    between paths).
-
-    A chat tool that runs on an HPC3 line is routed to that line's executor; with no executor it
-    is DROPPED, never run in-process. ``deep_literature`` reads the /dfs3b index the eyeserver
-    cannot see, so running it on the gateway would fail to find the index."""
-    executors = {"hpc:literature": literature_executor}
-
-    def wanted(m: Any) -> bool:
-        if exclude_literature and m.name in {"literature_search", "deep_literature", "search_corpus",
-                                            "extract_haploinsufficient_genes"}:
-            return False
-        if m.served_model and not served_model:
-            return False
-        return m.chat and (not m.runs_on.startswith("hpc:") or executors.get(m.runs_on) is not None)
-
-    return tool_catalog.build_tools(where=wanted, route=_router(executors))
+def build_quickchat_catalog() -> list["HarnessTool"]:
+    """Local platform chat tools; scientific literature uses the dedicated native run route."""
+    return tool_catalog.build_tools(where=lambda m: m.chat and not m.runs_on.startswith("hpc:"),
+                                    route=_router({}))

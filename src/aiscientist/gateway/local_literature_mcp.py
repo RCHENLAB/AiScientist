@@ -1,7 +1,8 @@
 """Opt-in local corpus retrieval in the registered, immutable literature image.
 
-Only search_corpus is callable. The administrator pre-pulls the digest; requests
-cannot select commands, images, mounts, models or network access. The gateway
+The administrator pre-pulls the digest. Corpus retrieval is offline; public
+lookup has a separate explicit opt-in and a fixed network-enabled command.
+Requests cannot select commands, images, mounts, models or network access. The gateway
 does not import any scientific code from the server package.
 """
 from __future__ import annotations
@@ -33,10 +34,13 @@ async def main():
     async with Client(StdioServerParameters(command="literature-mcp", env=dict(os.environ)),
                       read_timeout_seconds=540) as client:
         listed = (await client.list_tools()).tools
-        actual = next(t for t in listed if t.name == "search_corpus")
+        tool = request["tool"]
+        if tool not in {"search_corpus", "literature_search"}:
+            raise ValueError("tool is not enabled for local literature retrieval")
+        actual = next(t for t in listed if t.name == tool)
         if actual.model_dump(by_alias=True)["inputSchema"] != request["schema"]:
-            raise ValueError("live search_corpus schema differs from its registered schema")
-        result = await client.call_tool("search_corpus", request["arguments"])
+            raise ValueError("live literature schema differs from its registered schema")
+        result = await client.call_tool(tool, request["arguments"])
         if result.is_error:
             return {"status": "error", "error": " ".join(getattr(c, "text", "") for c in result.content)}
         return result.structured_content
@@ -55,31 +59,37 @@ def _mount(source: Path, target: str, *, readonly: bool) -> list[str]:
     return ["--mount", f"type=bind,src={value},dst={target}" + (",readonly" if readonly else "")]
 
 
-def command(docker: str, image: str, index: Path, hf_cache: Path, output: Path, name: str) -> list[str]:
-    """Fixed resource/mount policy, independent of model-selected arguments."""
+def command(docker: str, image: str, index: Path | None, hf_cache: Path | None,
+            output: Path, name: str, *, public: bool = False) -> list[str]:
+    """Two fixed deployment policies; the public route never mounts a corpus or model cache."""
     args = [docker, "run", "--rm", "--pull=never", "--name", name, "--init", "-i",
-            "--network=none", "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--network=bridge" if public else "--network=none",
+            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--cpus=2", "--memory=8g", "--memory-swap=8g", "--pids-limit=128",
             "--user", f"{os.getuid()}:{os.getgid()}", "--workdir=/output",
-            "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
-            *_mount(index, "/corpus", readonly=True), *_mount(hf_cache, "/hf_cache", readonly=True),
-            *_mount(output, "/output", readonly=False)]
+            "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m"]
+    if not public:
+        if index is None or hf_cache is None:
+            raise ValueError("offline corpus retrieval requires its fixed index and model cache")
+        args += _mount(index, "/corpus", readonly=True) + _mount(hf_cache, "/hf_cache", readonly=True)
+    args += _mount(output, "/output", readonly=False)
     for group in sorted(set(os.getgroups())):
         args += ["--group-add", str(group)]
     settings = {"AISCI_DATA_DIR": "/output", "AISCI_EXECUTOR": "inline", "HOME": "/tmp",
-                "LITERATURE_CORPUS_ROOT": "/corpus", "LITERATURE_ALLOWED_ROOTS": "/corpus:/hf_cache",
-                "LITERATURE_PAPERS": "/corpus",
-                "LITERATURE_CACHE_DIR": "/corpus/mechanism_cache", "LITERATURE_HF_CACHE": "/hf_cache",
-                "HF_HOME": "/hf_cache", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                 "OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2", "MKL_NUM_THREADS": "2",
                 "TOKENIZERS_PARALLELISM": "false"}
-    for filename in ("manifest.csv", "paperqa_manifest.csv"):
-        if (index / filename).is_file():
-            settings["LITERATURE_MANIFEST"] = "/corpus/" + filename
-            break
-    embedding = os.environ.get("LITERATURE_EMBEDDING") or os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING")
-    if embedding:
-        settings["LITERATURE_EMBEDDING"] = embedding
+    if not public:
+        settings.update({"LITERATURE_CORPUS_ROOT": "/corpus", "LITERATURE_ALLOWED_ROOTS": "/corpus:/hf_cache",
+                         "LITERATURE_PAPERS": "/corpus", "LITERATURE_CACHE_DIR": "/corpus/mechanism_cache",
+                         "LITERATURE_HF_CACHE": "/hf_cache", "HF_HOME": "/hf_cache",
+                         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
+        for filename in ("manifest.csv", "paperqa_manifest.csv"):
+            if (index / filename).is_file():
+                settings["LITERATURE_MANIFEST"] = "/corpus/" + filename
+                break
+        embedding = os.environ.get("LITERATURE_EMBEDDING") or os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING")
+        if embedding:
+            settings["LITERATURE_EMBEDDING"] = embedding
     for key, value in settings.items():
         args += ["--env", f"{key}={value}"]
     return [*args, image.removeprefix("docker://"), "python", "-c", _CLIENT]
@@ -143,21 +153,31 @@ def _execute(args: list[str], payload: dict, output: Path, *, should_cancel: Cal
 
 
 def make_tool(*, should_cancel: Callable[[], bool] | None = None) -> Any:
-    """Return the local typed search tool only for an explicit, usable deployment."""
-    if not enabled():
+    """Return the offline corpus tool only for its explicit deployment."""
+    return _make_tool("search_corpus", should_cancel=should_cancel) if enabled() else None
+
+
+def make_public_tool(*, should_cancel: Callable[[], bool] | None = None) -> Any:
+    """Public Europe PMC lookup has separate operator consent for outbound network access."""
+    if os.environ.get("AISCIENTIST_LOCAL_PUBLIC_LITERATURE_MCP", "").lower() != "docker":
         return None
+    return _make_tool("literature_search", should_cancel=should_cancel)
+
+
+def _make_tool(wire_name: str, *, should_cancel: Callable[[], bool] | None = None) -> Any:
     from .local_corpus import local_root, index_dir, has_local_index
     from ..agents.research_harness import HarnessTool
     from ..agents.skills import get_skill
 
+    public = wire_name == "literature_search"
     server = registered_server()
     docker = shutil.which("docker")
-    if server is None or not docker or not has_local_index():
+    if server is None or not docker or (not public and not has_local_index()):
         return None
     skill = get_skill(server.skill)
     if skill is None or skill.image != server.image:
         return None
-    entry = next((row for row in server.tools if row["name"] == "search_corpus"), None)
+    entry = next((row for row in server.tools if row["name"] == wire_name), None)
     if entry is None:
         return None
     schema = copy.deepcopy(entry["inputSchema"])
@@ -174,10 +194,13 @@ def make_tool(*, should_cancel: Callable[[], bool] | None = None) -> Any:
         if active_cancel():
             return {"status": "cancelled"}
         try:
-            root, index = local_root(), index_dir()
-            hf = root / "hf_cache"
-            if not hf.is_dir():
-                raise ValueError("the offline local embedding cache is unavailable")
+            if len(json.dumps(arguments, allow_nan=False).encode()) > 128 * 1024:
+                raise ValueError("local lookup arguments exceed the request size limit")
+            index, hf = None, None
+            if not public:
+                index, hf = index_dir(), local_root() / "hf_cache"
+                if not hf.is_dir():
+                    raise ValueError("the offline local embedding cache is unavailable")
             workspace = Path(ctx.workspace)
             if not workspace.is_absolute() or workspace.is_symlink():
                 raise ValueError("local literature requires a private absolute run workspace")
@@ -187,12 +210,14 @@ def make_tool(*, should_cancel: Callable[[], bool] | None = None) -> Any:
             scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
             with tempfile.TemporaryDirectory(prefix="search-", dir=scratch) as folder:
                 output = Path(folder)
-                argv = command(docker, server.image, index, hf, output, "aisci-lit-" + uuid4().hex)
-                result = _execute(argv, {"version": server.version, "schema": schema,
-                                         "arguments": arguments}, output, should_cancel=active_cancel)
-            return {**result, "mcp": {**server.identity(), "execution_mode": "local-docker"}}
+                argv = command(docker, server.image, index, hf, output, "aisci-lit-" + uuid4().hex,
+                               public=public)
+                result = _execute(argv, {"version": server.version, "schema": schema, "tool": wire_name,
+                                        "arguments": arguments}, output, should_cancel=active_cancel)
+            return {**result, "mcp": {**server.identity(), "execution_mode": "local-docker",
+                                      "wire_tool": wire_name}}
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             return {"status": "error", "error": f"Local literature MCP unavailable: {type(exc).__name__}"}
 
-    return HarnessTool(name="search_corpus", description=entry["description"], parameters=schema,
+    return HarnessTool(name=server.planner_name(wire_name), description=entry["description"], parameters=schema,
                        executor=run, category="literature", reads_private_data=False)

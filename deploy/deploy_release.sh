@@ -50,8 +50,7 @@
 # aiscientist.service), AISCIENTIST_HOST (default: the --host the installed unit passes, else
 # 127.0.0.1), AISCIENTIST_PORT (8800), AISCIENTIST_KEYS_SERVICE (default aiscientist-keys.service;
 # none = this site has no key service to restart, as on the staging site), AISCIENTIST_EXTRAS
-# (pip extras, default gateway,auth,anthropic,langgraph,analysis; add corpus for the Eye Server copy
-# of the RetiGene index, which installs CPU torch from AISCIENTIST_TORCH_INDEX first),
+# (pip extras; scientific dependencies live in independently pinned MCP images),
 # AISCIENTIST_PYTHON (python3; its version must be the one requirements.lock was made for),
 # AISCIENTIST_CHANNEL (stable or prerelease, above), AISCIENTIST_ENV_FILE (default
 # $AISCIENTIST_ROOT/config/.env),
@@ -332,12 +331,6 @@ pip_install() {
     "$PYTHON" -m venv "$venv"
   fi
   export PIP_DISABLE_PIP_VERSION_CHECK=1
-  local corpus=""
-  [[ ",$EXTRAS," == *",corpus,"* ]] && corpus=1
-  if [ -n "$corpus" ]; then
-    # The corpus extra embeds on this server's CPU: CPU torch first, or pip pulls the CUDA build.
-    "$venv/bin/pip" install -q torch --index-url "${AISCIENTIST_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
-  fi
   if [ -f "$dest/requirements.lock" ]; then
     # The lock is made for one Python version (its header names it); another would resolve differently.
     local want have
@@ -348,8 +341,6 @@ pip_install() {
     echo "==> pip install --require-hashes -r requirements.lock (Python $have)"
     "$venv/bin/pip" install -q --require-hashes -r "$dest/requirements.lock"
     "$venv/bin/pip" install -q --no-deps --no-build-isolation -e "$dest"
-    # requirements.lock covers the default extras only; the corpus extra comes on top of it.
-    [ -z "$corpus" ] || "$venv/bin/pip" install -q -e "$dest[corpus]"
   else
     echo "==> pip install -e $dest[$EXTRAS] (this package has no requirements.lock)"
     "$venv/bin/pip" install -q -U pip

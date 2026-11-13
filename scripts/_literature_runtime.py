@@ -1,67 +1,70 @@
 """Operator-only runtime selection for corpus maintenance scripts.
 
 The gateway stages these scripts into its configured literature image. It never
-imports the external scientific package. The legacy option remains available
-until the deployment's native-tool acceptance gate is complete.
+imports the external scientific package. The scientific runtime is the independently published MCP image.
 """
 from __future__ import annotations
 
-import importlib
 import os
-from typing import Any
 
 ENV = "AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME"
-_MODULES = {
-    "mcp": {"corpus": "aiscientist_mcp.literature.corpus", "extract": "aiscientist_mcp.literature.extract",
-            "search": "aiscientist_mcp.literature.search", "public_search": "aiscientist_mcp.literature.public_search"},
-    "legacy": {"corpus": "aiscientist.tools._lib.corpus",
-               "extract": "aiscientist.tools.extract_haploinsufficient_genes.tool",
-               "search": "aiscientist.tools.search_corpus.tool",
-               "public_search": "aiscientist.tools.literature_search.tool"},
-}
+SCRIPTS_ENV = "AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS"
+_OPERATORS = frozenset({"build_mechanism_cache", "eval_corpus_retrieval"})
 
 
 def runtime() -> str:
-    choice = os.environ.get(ENV, "legacy")
-    if choice not in _MODULES:
-        raise ValueError(f"{ENV} must be mcp or legacy")
+    choice = os.environ.get(ENV, "mcp")
+    if choice != "mcp":
+        raise ValueError(f"{ENV} must be mcp (the app scientific runtime has been retired)")
     return choice
 
 
-class Component:
-    """Lazy access: importing an operator script never loads a scientific runtime."""
-    def __init__(self, name: str):
-        if name not in _MODULES["mcp"]:
-            raise ValueError("unknown literature maintenance component")
-        self.name = name
+def operator_script(name: str):
+    """Resolve one fixed operator file from an explicitly configured trusted checkout."""
+    from pathlib import Path
 
-    def module(self) -> Any:
-        """Load only the selected operator runtime, with no cross-runtime fallback."""
-        mode = runtime()
+    runtime()
+    if name not in _OPERATORS:
+        raise ValueError("Unknown corpus maintenance operator")
+    root = Path(os.environ.get(SCRIPTS_ENV, ""))
+    if not root.is_absolute() or ".." in root.parts:
+        raise RuntimeError(f"Set {SCRIPTS_ENV} to the absolute scripts directory of a reviewed aiscientist-mcp checkout")
+    if any(part.is_symlink() for part in [root, *root.parents]):
+        raise RuntimeError("Corpus maintenance scripts directory must not traverse a symlink")
+    path = root / (name + ".py")
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+        raise RuntimeError("Configured corpus maintenance operator must be a regular file no larger than 2 MiB")
+    return path
+
+
+def operator_module(name: str):
+    """Run the reviewed external operator inside its native image, never in the gateway."""
+    import hashlib
+    import importlib.util
+    import sys
+
+    path = operator_script(name)
+    module_name = "_native_corpus_operator_" + hashlib.sha256(path.read_bytes()).hexdigest()
+    if module_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
         try:
-            module = importlib.import_module(_MODULES[mode][self.name])
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "Corpus maintenance runtime is unavailable. Run this script inside the configured "
-                "published literature image with AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp; "
-                "do not install scientific server packages in the gateway."
-            ) from exc
-        return module
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.module(), name)
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+    return sys.modules[module_name]
 
 
 def search_publications(query: str, limit: int, *, timeout_s: float = 20.0,
                         abstracts: bool = True, pubmed_only: bool = True) -> dict:
-    """Benchmark the published MCP tool, or the explicitly retained legacy baseline.
+    """Benchmark the published MCP tool.
 
     Native mode runs only inside the operator's literature image, on the current
     compute node. Fresh scratch prevents result caching from distorting timings.
     """
-    if runtime() == "legacy":
-        return Component("public_search").search_europepmc(
-            query, limit, timeout_s=timeout_s, abstracts=abstracts, pubmed_only=pubmed_only)
+    runtime()  # reject a stale operator setting before launching a job
     import asyncio
     import json
     from pathlib import Path

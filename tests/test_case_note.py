@@ -17,7 +17,8 @@ pytest.importorskip("fastapi")
 from aiscientist.agents.research_lab import LabResult, LabRound  # noqa: E402
 from aiscientist.agents.research_lab import CriticVerdict  # noqa: E402
 from aiscientist.gateway import app as gw_app  # noqa: E402
-from aiscientist.tools.map_phenotype_to_hpo.tool import make_hpo_mapping_tool  # noqa: E402
+from aiscientist.agents.mcp_analysis import AnalysisAdapter  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 
 
@@ -61,40 +62,12 @@ def test_the_request_carries_a_note_without_touching_the_dataset_slot():
 # --- the mapper reads it ----------------------------------------------------------------------
 
 
-def test_mapper_falls_back_to_the_attached_note():
-    tool = make_hpo_mapping_tool()
-    out = tool.executor({}, _Ctx(case_note="Patient with retinitis pigmentosa"))
-    assert out["status"] == "ok"
-    assert out["hpo_terms"] == ["HP:0000510"]
-    assert out["text_source"] == "attached_case_note"       # auditable: which text was mapped
 
 
-def test_the_attachment_takes_precedence_over_a_text_argument():
-    """The attached case note is AUTHORITATIVE — the user attached it for this tool. A `text` argument
-    the model improvises must NOT shadow it: in prod the model called the tool with a task-description
-    `text` ("map the phenotype for this patient's variants") that extracted to nothing and silently
-    bypassed the real note → n_observed:0, so the attachment looked like it "didn't work". So when a
-    case note is attached it wins, regardless of what `text` the model passed (fixed 2026-07-17)."""
-    tool = make_hpo_mapping_tool()
-    out = tool.executor({"text": "achromatopsia"}, _Ctx(case_note="Patient with retinitis pigmentosa"))
-    assert out["hpo_terms"] == ["HP:0000510"] and out["text_source"] == "attached_case_note"
 
 
-def test_no_text_and_no_note_is_an_error_not_an_invented_phenotype():
-    tool = make_hpo_mapping_tool()
-    out = tool.executor({}, _Ctx())
-    assert out["status"] == "error" and out["observed"] == []
-    assert "HP:" not in out["error"]                        # it must not suggest a phenotype either
-    # and with a dataset but no note, still nothing — a VCF alone never implies a phenotype
-    assert tool.executor({}, _Ctx(dataset_path="/x/case.vcf.gz"))["status"] == "error"
 
 
-def test_a_note_with_no_phenotype_maps_to_nothing():
-    """An attached file that isn't a clinical note (a sample sheet, a README) must NOT yield terms —
-    otherwise the attachment silently becomes a source of invented phenotypes."""
-    tool = make_hpo_mapping_tool()
-    out = tool.executor({}, _Ctx(case_note="Sample CASE_A sequenced on NovaSeq at 30x coverage."))
-    assert out["status"] == "ok" and out["hpo_terms"] == []
 
 
 # --- it survives a resume ----------------------------------------------------------------------
@@ -116,3 +89,12 @@ def test_run_state_omits_the_note_when_there_was_none(tmp_path):
     res = LabResult("q", ["Annotate"], rounds, True, 1, "final")
     gw_app._write_run_state(tmp_path, res, None, {"dataset_path": "/data/a.h5ad"})
     assert "case_note" not in json.loads((tmp_path / "process" / "run_state.json").read_text())
+
+
+def test_attached_case_note_is_authoritative_at_native_mcp_boundary():
+    adapter = AnalysisAdapter(SimpleNamespace(name="phenotype-diagnosis"))
+    args = {"text": "model invented text", "k": 8}
+    actual = adapter.authoritative(args, _Ctx(case_note="Patient with night blindness"), "map_phenotype_to_hpo", None)
+    assert actual == {"text": "Patient with night blindness", "k": 8}
+    assert args["text"] == "model invented text"
+    assert adapter.authoritative({}, _Ctx(dataset_path="case.vcf"), "map_phenotype_to_hpo", None) == {}

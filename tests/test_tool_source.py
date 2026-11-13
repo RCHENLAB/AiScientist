@@ -1,319 +1,128 @@
-"""The agent can read the code of the tools it calls.
-
-`run_de` capped its output at 50 genes per group for seven weeks. The tool description said
-"differential expression / marker genes per cluster", the result dict reported the cap
-truthfully as `n_genes_per_group: 50`, the suite was green, and the reports were self-
-consistent. Nothing the model could see said "this is a cap, and 50 may be too few for what
-the next step needs" — because the model could only ever see the DESCRIPTION, never the body.
-
-These tests pin the capability that removes that asymmetry, and are written against the exact
-shape of the defect that motivated it.
-"""
-
+"""Read-only introspection uses real callable source and declared schemas after tool retirement."""
 from __future__ import annotations
 
+import dataclasses
 import types
+from pathlib import Path
 
-from aiscientist.agents.tool_source import (
-    _declared_defaults,
-    _split_top_level,
-    make_tool_source_tool,
-)
-from aiscientist.tools.catalog import scrna_catalog
+import pytest
 
-
-def _tool(catalog=None):
-    cat = catalog if catalog is not None else scrna_catalog()
-    return make_tool_source_tool(lambda: cat), types.SimpleNamespace(catalog=cat)
+from aiscientist.agents.registry import _route_to_executor
+from aiscientist.agents.tool_source import _declared_defaults, _split_top_level, make_tool_source_tool
+from aiscientist.tools import catalog
+from aiscientist.tools.sdk import HarnessTool
 
 
-def test_reading_a_tool_returns_its_real_body_not_its_description():
-    tool, ctx = _tool()
-    out = tool.executor({"tool": "run_de"}, ctx)
-    assert "def run_de" in out["source"]
-    assert out["module"] == "aiscientist.tools.run_de.tool"
-    assert out["file"].endswith("run_de/tool.py") and out["first_line"] > 0
-    # The declared contract travels WITH the code, so the two can be compared. A description
-    # that promises more than the body delivers is the defect class this exists to surface.
-    assert out["declared_description"] == next(
-        t.description for t in scrna_catalog() if t.name == "run_de")
-    assert out["declared_parameters"]["type"] == "object"
+def source_helper(value):
+    return value
 
 
-def test_the_defaults_nobody_chose_are_listed_explicitly():
-    # This is the whole point: `n_genes=50` was invisible to the model. Surfacing defaults as a
-    # structured field turns "read the code" from an instruction that can be skipped into a
-    # list the model has to look at.
-    tool, ctx = _tool()
-    entries = tool.executor({"tool": "run_de"}, ctx)["defaults"]
-    defaults = {d["param"]: d["value"] for d in entries}
-    assert defaults["n_genes"] == 50            # the cap, stated
-    assert defaults["groupby"] == "leiden"
-    assert all(d["line"] > 0 for d in entries)
-
-    clustering = {d["param"]: d["value"]
-                  for d in tool.executor({"tool": "run_clustering"}, ctx)["defaults"]}
-    assert clustering["resolution"] == 1.0      # the other frozen choice
-    assert clustering["stability_min"] == 0.90
+def source_fixture(args, ctx):
+    count = int(args.get("count", 50))
+    return {"count": source_helper(count)}
 
 
-def test_a_declared_default_carries_what_it_MEANS_not_just_its_value():
-    # A reviewer cannot judge `max_pct_mt = 20.0` from the number. The declared-parameter table
-    # (scrna_pack.PARAMS) attaches the sentence that makes it reviewable, and read_tool_source
-    # hands that to the model alongside the value rather than making it infer one from the name.
-    tool, ctx = _tool()
-    entries = {d["param"]: d for d in tool.executor({"tool": "run_scanpy_qc"}, ctx)["defaults"]}
-    mt = entries["max_pct_mt"]
-    assert mt["value"] == 10.0 and mt["declared"] is True
-    assert "mitochondrial" in mt["meaning"]
-    assert all(e["meaning"] for e in entries.values() if e["declared"])
+def _catalog():
+    return [HarnessTool("source_fixture", "Read fixture parameter metadata.",
+                        {"type": "object", "properties": {"count": {
+                            "type": "integer", "default": 50, "description": "maximum entries"}}}, source_fixture)]
 
 
-def test_the_review_prompt_asks_the_question_that_finds_this_class_of_bug():
-    tool, ctx = _tool()
-    out = tool.executor({"tool": "run_enrichment"}, ctx)
-    prompt = out["review_prompt"]
-    assert "THIS dataset" in prompt                     # not "is 50 a reasonable number"
-    assert "truncate" in prompt or "cap" in prompt
-    assert "run_code" in prompt                         # verify, don't just assert
+def _reader(tools=None):
+    return make_tool_source_tool(lambda: _catalog() if tools is None else tools)
 
 
-def test_the_review_prompt_guards_against_flagging_everything():
-    # Measured against the served model (scripts/probe_tool_audit.py): the first wording caught
-    # both planted defects 3/3 but flagged a perfectly standard QC step 3/3 as well — it read
-    # "is anything a problem?" as an invitation to find one. An audit that objects to everything
-    # gets ignored, so the prompt now states that "no problem" is the expected answer and
-    # demands a concrete damaged downstream step before a flag counts.
-    tool, ctx = _tool()
-    prompt = tool.executor({"tool": "run_scanpy_qc"}, ctx)["review_prompt"]
-    assert "conventional and correct" in prompt
-    assert "flagging a sound step costs as much as missing a bad one" in prompt.lower()
-    assert "downstream step" in prompt
-    assert "is not a problem" in prompt.lower()         # "a different value might be better"
+def test_reads_real_callable_and_its_declared_contract():
+    result = _reader().executor({"tool": "source_fixture"}, None)
+    assert "def source_fixture" in result["source"]
+    assert result["module"] == __name__
+    assert Path(result["file"]).samefile(__file__) and result["first_line"] > 0
+    assert result["declared_parameters"] == _catalog()[0].parameters
+    assert result["declared_description"] == _catalog()[0].description
 
 
-def test_a_helper_the_tool_leans_on_is_reachable_too():
-    # Behaviour often lives in the helper, not the tool body — `_slug` decides whether a cell
-    # type containing '/' gets a table at all.
-    tool, ctx = _tool()
-    out = tool.executor({"tool": "run_de", "symbol": "_slug"}, ctx)
-    assert "def _slug" in out["source"]
-    assert out["symbol"] == "_slug"
-    # A module-level fetch is a single symbol, so the defaults scan (a whole-body notion) is off.
-    assert "defaults" not in out
+def test_declared_defaults_carry_value_meaning_and_source_line():
+    result = _reader().executor({"tool": "source_fixture"}, None)
+    default = next(value for value in result["defaults"] if value["param"] == "count")
+    assert default["value"] == 50 and default["declared"]
+    assert default["meaning"] == "maximum entries" and default["line"] > 0
 
 
-def test_unknown_names_are_reported_with_what_is_available():
-    tool, ctx = _tool()
-    out = tool.executor({"tool": "run_nonexistent"}, ctx)
-    assert "unknown tool" in out["error"] and "run_de" in out["available"]
-
-    out = tool.executor({"tool": "run_de", "symbol": "not_a_symbol"}, ctx)
-    assert "does not resolve a symbol" in out["error"]
-    assert "read the tool body" in out["hint"]
+@pytest.mark.parametrize("phrase", ["THIS dataset", "run_code", "conventional and correct", "downstream step"])
+def test_review_prompt_requires_relevant_evidence(phrase):
+    result = _reader().executor({"tool": "source_fixture"}, None)
+    assert phrase in result["review_prompt"]
 
 
-def test_no_catalog_is_a_clear_message_not_a_crash():
-    tool = make_tool_source_tool(lambda: [])
-    out = tool.executor({"tool": "run_de"}, types.SimpleNamespace())
-    assert "no tool catalog" in out["error"]
+def test_helpers_are_read_only_symbol_lookups():
+    result = _reader().executor({"tool": "source_fixture", "symbol": "source_helper"}, None)
+    assert "def source_helper" in result["source"] and result["symbol"] == "source_helper"
+    assert "defaults" not in result
+    tool = _reader()
+    assert not tool.reads_private_data and set(tool.parameters["properties"]) == {"tool", "symbol"}
 
 
-def test_the_tool_is_read_only_and_carries_no_private_data():
-    tool, _ = _tool()
-    assert tool.reads_private_data is False
-    # Nothing in the schema can name a file to write or code to execute.
-    assert set(tool.parameters["properties"]) == {"tool", "symbol"}
+def test_unknown_tool_symbol_and_empty_catalog_are_explicit():
+    result = _reader().executor({"tool": "absent"}, None)
+    assert "unknown tool" in result["error"] and "source_fixture" in result["available"]
+    result = _reader().executor({"tool": "source_fixture", "symbol": "absent"}, None)
+    assert "does not resolve a symbol" in result["error"] and "read the tool body" in result["hint"]
+    assert "no tool catalog" in _reader([]).executor({"tool": "source_fixture"}, None)["error"]
 
 
-# --- the default parser -------------------------------------------------------
-
-
-def test_default_parsing_handles_the_shapes_that_appear_in_real_tools():
-    src = (
-        'def f(args, ctx):\n'
-        '    a = int(args.get("n_genes", 50))\n'
-        '    b = str(args.get("groupby", "leiden"))\n'
-        '    c = args.get("gene_sets", ["GO", "Reactome"])\n'      # a bracketed default
-        '    d = float(args.get("thr", 0.05)) * int(args.get("k", 3))\n'   # two on one line
-        '    e = args.get("no_default")\n'                          # no default -> not listed
-    )
-    got = {d["param"]: d["default"] for d in _declared_defaults(src)}
-    assert got["n_genes"] == "50"
-    assert got["groupby"] == '"leiden"'
-    assert got["gene_sets"] == '["GO", "Reactome"]'      # the comma inside [] is not a split
-    assert got["thr"] == "0.05" and got["k"] == "3"      # both calls on one line are found
-    assert "no_default" not in got
-
-
-def test_split_top_level_ignores_commas_inside_brackets_and_quotes():
+def test_literal_default_parser_preserves_containers_quotes_and_multiple_calls():
+    source = ('def f(args, ctx):\n'
+              '    a = int(args.get("n_genes", 50))\n'
+              '    b = str(args.get("groupby", "leiden"))\n'
+              '    c = args.get("gene_sets", ["GO", "Reactome"])\n'
+              '    d = float(args.get("thr", 0.05)) * int(args.get("k", 3))\n'
+              '    e = args.get("no_default")\n')
+    found = {value["param"]: value["default"] for value in _declared_defaults(source)}
+    assert found == {"n_genes": "50", "groupby": '"leiden"', "gene_sets": '["GO", "Reactome"]',
+                     "thr": "0.05", "k": "3"}
     assert _split_top_level('"a", [1, 2], "x,y"') == ['"a"', ' [1, 2]', ' "x,y"']
-    assert _split_top_level("only") == ["only"]
 
 
-# --- an injected implementation must be reachable ------------------------------------------
-# Keep this platform contract independent of any retired scientific tool implementation.
-
-def _catalog_with_injected_runner():
-    from aiscientist.agents.research_harness import HarnessTool
-
-    def runner(args, ctx):
-        """SENTINEL_BODY — the injected implementation."""
-        return {"status": "ok"}
-
-    def dispatch(args, ctx):
-        return runner(args, ctx)
-
-    return [HarnessTool(name="injected_example", description="Injected callable example",
-                        parameters={"type": "object", "properties": {}}, executor=dispatch)], runner
+def test_routed_callable_exposes_implementation_and_helpers():
+    calls = []
+    line = types.SimpleNamespace(run_tool=lambda name, args, ctx: calls.append(name) or {"status": "dispatched"})
+    routed = _route_to_executor(_catalog()[0], line, ("source_fixture",))
+    assert routed.executor({}, None)["status"] == "dispatched" and calls == ["source_fixture"]
+    result = _reader([routed]).executor({"tool": "source_fixture"}, None)
+    assert "def source_fixture" in result["source"] and Path(result["file"]).samefile(__file__)
+    helper = _reader([routed]).executor({"tool": "source_fixture", "symbol": "source_helper"}, None)
+    assert "def source_helper" in helper["source"]
 
 
-def test_the_tool_body_names_what_it_delegates_to():
-    from aiscientist.agents.tool_source import make_tool_source_tool
-
-    cat, _ = _catalog_with_injected_runner()
-    out = make_tool_source_tool(lambda: cat).executor({"tool": "injected_example"}, None)
-    assert "runner" in out["dispatches_to"], "the dispatcher does not say what it dispatches to"
-    assert "SENTINEL_BODY" not in out["source"]          # the wrapper, as before
-
-
-def test_the_injected_implementation_can_be_fetched_as_a_symbol():
-    from aiscientist.agents.tool_source import make_tool_source_tool
-
-    cat, _ = _catalog_with_injected_runner()
-    out = make_tool_source_tool(lambda: cat).executor(
-        {"tool": "injected_example", "symbol": "runner"}, None)
-    assert "error" not in out, out
-    assert "SENTINEL_BODY" in out["source"], "fetching the runner did not return the runner"
+def test_manifest_can_recover_opaque_wrapper(monkeypatch):
+    base = _catalog()[0]
+    manifest = types.SimpleNamespace(folder=Path(__file__).parent, runs_on="hpc:analysis",
+                                     factory=lambda: lambda: base, injected=lambda: [], name=base.name, entry="fixture")
+    monkeypatch.setattr(catalog, "manifest", lambda name: manifest if name == base.name else None)
+    opaque = dataclasses.replace(base, executor=print)
+    result = _reader([opaque]).executor({"tool": base.name}, None)
+    assert "def source_fixture" in result["source"] and result["runs_on"] == "hpc:analysis"
 
 
-def test_an_unknown_symbol_still_errors_and_now_points_at_the_way_in():
-    from aiscientist.agents.tool_source import make_tool_source_tool
+def test_closure_dependencies_resolve_to_unwrapped_implementation():
+    import functools
 
-    cat, _ = _catalog_with_injected_runner()
-    out = make_tool_source_tool(lambda: cat).executor(
-        {"tool": "injected_example", "symbol": "no_such_thing"}, None)
-    assert "error" in out
-    assert "runner" in out.get("injected", {}), "the error does not name what IS reachable"
+    @functools.wraps(source_fixture)
+    def routed(args, ctx):
+        return source_fixture(args, ctx)
 
+    def factory(child):
+        def composite(args, ctx):
+            return child(args, ctx)
+        return composite
 
-def test_a_self_contained_tool_reports_nothing_to_dispatch_to():
-    """The field has to be empty when there is no indirection, or it becomes noise the model
-    learns to ignore on exactly the tools where it matters."""
-    from aiscientist.agents.research_harness import default_catalog
-    from aiscientist.agents.tool_source import make_tool_source_tool
-
-    cat = [t for t in default_catalog() if t.name != "finish"]
-    if not cat:
-        return
-    out = make_tool_source_tool(lambda: cat).executor({"tool": cat[0].name}, None)
-    assert isinstance(out.get("dispatches_to"), dict)
+    tool = dataclasses.replace(_catalog()[0], executor=factory(routed))
+    result = _reader([tool]).executor({"tool": tool.name}, None)
+    assert str(Path(__file__)) in result["dispatches_to"]["child"]["where"]
+    child = _reader([tool]).executor({"tool": tool.name, "symbol": "child"}, None)
+    assert "def source_fixture" in child["source"]
 
 
-# --- a tool dispatched to HPC3 must read as ITS OWN code, not the dispatcher --------------------
-#
-# The registry routes every `runs_on: hpc:*` tool through a three-line dispatcher
-# (`registry._exec`: "hand this to the line's Slurm executor"). read_tool_source introspected that
-# dispatcher. Run 78a707cd79e9's ORA step called read_tool_source("run_enrichment") twice and got
-# `_exec` from agents/registry.py both times; `symbol="run_enrichment"` then failed because the
-# lookup searched registry.py; the model went grepping on HPC3 for a gateway path, and the step ended
-# `done_early` without ever calling run_enrichment.
-
-
-class _RecordingLine:
-    """Stands in for a SlurmAnalysisExecutor: records what was dispatched, runs nothing."""
-
-    def __init__(self):
-        self.calls: list[str] = []
-
-    def run_tool(self, name, args, ctx):
-        self.calls.append(name)
-        return {"status": "dispatched", "tool": name}
-
-
-def _routed_catalog():
-    from aiscientist.agents.registry import build_scientist_catalog
-
-    lines = {k: _RecordingLine() for k in
-             ("analysis_executor", "phenotype_executor", "literature_executor")}
-    return build_scientist_catalog(**lines), lines
-
-
-def test_an_hpc_dispatched_tool_reads_its_own_tool_py_not_the_registry_dispatcher():
-    cat, lines = _routed_catalog()
-    enrichment = next(t for t in cat if t.name == "run_enrichment")
-    # Precondition: this IS the routed tool, so the test exercises the wrapper that misled the run.
-    assert enrichment.executor({}, None)["status"] == "dispatched"
-    assert lines["analysis_executor"].calls == ["run_enrichment"]
-
-    out = make_tool_source_tool(lambda: cat).executor({"tool": "run_enrichment"}, None)
-    assert "error" not in out, out
-    assert out["module"] == "aiscientist.tools.run_enrichment.tool"
-    assert out["file"].endswith("tools/run_enrichment/tool.py")
-    assert out["symbol"] == "run_enrichment"
-    assert "def run_enrichment" in out["source"]
-    assert "registry" not in out["file"] and "run_tool" not in out["source"]
-    assert out["defaults"], "the defaults of the real body, not of the dispatcher"
-    # Where it runs travels with the code, so the model does not go hunting for the file on HPC3.
-    assert out["runs_on"] == "hpc:analysis"
-    assert "symbol" in out["note"] and "run_shell" in out["note"]
-
-
-def test_a_symbol_inside_an_hpc_dispatched_tools_module_is_found():
-    cat, _ = _routed_catalog()
-    tool = make_tool_source_tool(lambda: cat)
-
-    # The exact call that errored in run 78a707cd79e9.
-    out = tool.executor({"tool": "run_enrichment", "symbol": "run_enrichment"}, None)
-    assert "error" not in out, out
-    assert "def run_enrichment" in out["source"]
-    assert out["module"] == "aiscientist.tools.run_enrichment.tool"
-
-    out = tool.executor({"tool": "run_enrichment", "symbol": "_enrichment_input_rows"}, None)
-    assert "error" not in out, out
-    assert "def _enrichment_input_rows" in out["source"]
-
-    # The other one from the same run: a helper run_de imports from the shared scRNA library.
-    out = tool.executor({"tool": "run_de", "symbol": "_write_table"}, None)
-    assert "error" not in out, out
-    assert "def _write_table" in out["source"]
-    assert out["module"] == "aiscientist.tools.run_de.tool"
-
-
-def test_a_wrapper_that_does_not_say_what_it_wraps_still_resolves_to_the_tool_folder():
-    """The registry now marks its dispatcher with `__wrapped__`; any other layer that wraps an
-    executor without doing so must not bring the defect back. The tool's folder is the authority."""
-    import dataclasses
-
-    base = next(t for t in scrna_catalog() if t.name == "run_enrichment")
-
-    def opaque_dispatch(args, ctx):
-        return {"status": "dispatched"}
-
-    cat = [dataclasses.replace(base, executor=opaque_dispatch)]
-    tool = make_tool_source_tool(lambda: cat)
-    out = tool.executor({"tool": "run_enrichment"}, None)
-    assert out["file"].endswith("tools/run_enrichment/tool.py")
-    assert "def run_enrichment" in out["source"]
-    out = tool.executor({"tool": "run_enrichment", "symbol": "_gmt_term_count"}, None)
-    assert "def _gmt_term_count" in out["source"]
-
-
-def test_a_composite_points_at_the_tools_it_composes_not_at_their_dispatchers():
-    # diagnose_disease closes over the ROUTED executors of run_lirical and deep_literature.
-    cat, _ = _routed_catalog()
-    tool = make_tool_source_tool(lambda: cat)
-    out = tool.executor({"tool": "diagnose_disease"}, None)
-    where = {k: v["where"] for k, v in out["dispatches_to"].items()}
-    assert "tools/run_lirical/tool.py:" in where["lirical_fn"], where
-    assert "tools/deep_literature/tool.py:" in where["literature_fn"], where
-
-    out = tool.executor({"tool": "diagnose_disease", "symbol": "lirical_fn"}, None)
-    assert out["file"].endswith("tools/run_lirical/tool.py")
-
-
-def test_platform_tools_carry_no_runs_on():
-    # `runs_on` comes from a tool folder's manifest; a platform tool has none and must not guess.
-    cat, _ = _routed_catalog()
-    out = make_tool_source_tool(lambda: cat).executor({"tool": "finish"}, None)
-    assert "runs_on" not in out and "note" not in out
+def test_platform_tool_has_no_invented_execution_location():
+    result = _reader().executor({"tool": "source_fixture"}, None)
+    assert "runs_on" not in result and "note" not in result

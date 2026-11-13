@@ -136,8 +136,7 @@ downgrade: a release that finds the database at a revision it does not ship leav
 
 **A new Python dependency** is a change to `pyproject.toml` and to `requirements.lock`
 (`scripts/lock_requirements.sh`, after `pip install uv`), then a release. A large one weighs on every
-release's venv: `sentence-transformers` for a local embedding model brings PyTorch, about 2 GB more
-per release.
+release's venv. Scientific embedding/ranking packages belong in the published MCP images, not a gateway extra.
 
 ### Skills releases
 
@@ -264,8 +263,7 @@ public server needs at least:
 `config/deploy.env` holds the settings of `deploy_release.sh` and `deploy_skills.sh`, described at
 the top of [`deploy_release.sh`](deploy_release.sh): `AISCIENTIST_APP_TAG` and
 `AISCIENTIST_SKILLS_TAG` pin a release, and `AISCIENTIST_EXTRAS` names the pip extras of each
-release's venv. The Eye Server sets the default extras plus `corpus`, which adds CPU PyTorch and
-`sentence-transformers` on top of the lock for its copy of the RetiGene index.
+release's venv. The former `literature` and `corpus` extras are retired. Configure the pinned native MCP runtime and, optionally, restricted local Docker lookup instead; the gateway does not install PyTorch or an embedding model. See `paperqa/README.md`.
 
 **Session secret.** It signs every sign-in cookie, so whoever can read it can sign in as any
 account, an admin's included. It is not a setting in `config/.env`: with `AISCIENTIST_STATE_DIR`

@@ -31,7 +31,7 @@ def console(tmp_path, monkeypatch):
     monkeypatch.setattr(gw, "_push_usage", lambda *a: None)
     monkeypatch.setattr(gw, "_bound_credential", lambda c: {"id": "selected", "model": "haiku"})
     monkeypatch.setattr(gw, "_corpus_scan_cost_cap", lambda c: (0.1, "test budget"))
-    monkeypatch.setattr(gw, "_build_literature_executor", lambda *a, **kw: pytest.fail("legacy executor used"))
+    assert not hasattr(gw, "_build_literature_executor")
     return conn, run, route, result, calls, staged, kept
 
 
@@ -43,8 +43,8 @@ def test_registered_scan_uses_selected_model_and_preserves_publication(console, 
     monkeypatch.setattr(gw, "_mcp_session_model", lambda c: binding)
     monkeypatch.setattr(gw, "_bound_credential", lambda c: {"builtin": "shared"} if kind == "shared" else {})
     say = []
-    out = asyncio.run(gw._corpus_scan_on_own_gpu(conn, run, "run1", ("cache", {}),
-                      lambda *a: say.append(a), lambda *a: None))
+    out = asyncio.run(gw._corpus_scan_via_mcp(conn, run, "run1", ("cache", {}),
+                      lambda *a: say.append(a), lambda *a: None, corpus_scan.HAPLOINSUFFICIENCY))
     assert out["api_usage"]["model"] == binding.model
     assert calls[0][0] == "extract_haploinsufficient_genes"
     assert calls[0][1] == ({"max_cost_usd": 0.1} if kind == "api" else {})
@@ -58,8 +58,8 @@ def test_failed_priced_pilot_does_not_publish_or_cache(console, monkeypatch):
     monkeypatch.setattr(gw, "_mcp_session_model", lambda c: RelayBinding("haiku", lambda *a: None, priced=True))
     result.update(status="failed", state="FAILED", over_budget=True, error="pilot exceeds budget")
     with pytest.raises(GatewayError, match="pilot exceeds budget.*0.0210"):
-        asyncio.run(gw._corpus_scan_via_relay(conn, run, "run1", ("cache", {}), lambda *a: None,
-                                            lambda *a: None, {}))
+        asyncio.run(gw._corpus_scan_via_mcp(conn, run, "run1", ("cache", {}), lambda *a: None,
+                                            lambda *a: None, corpus_scan.HAPLOINSUFFICIENCY))
     assert not staged and not kept and "cache" not in gw._CORPUS_SCANS_RUNNING
 
 
@@ -67,7 +67,7 @@ def test_unknown_price_refuses_before_model_or_extraction(console, monkeypatch):
     conn, run, _, _, calls, staged, kept = console
     monkeypatch.setattr(gw, "_mcp_session_model", lambda c: RelayBinding("unpriced", lambda *a: None))
     with pytest.raises(GatewayError, match="no known price"):
-        asyncio.run(gw._corpus_scan_via_relay(conn, run, "run1", None, lambda *a: None, lambda *a: None, {}))
+        asyncio.run(gw._corpus_scan_via_mcp(conn, run, "run1", None, lambda *a: None, lambda *a: None, corpus_scan.HAPLOINSUFFICIENCY))
     assert not calls and not staged and not kept
 
 
@@ -75,7 +75,7 @@ def test_small_remaining_budget_is_never_rounded_to_unlimited(console, monkeypat
     conn, run, _, _, calls, _, _ = console
     monkeypatch.setattr(gw, "_mcp_session_model", lambda c: RelayBinding("haiku", lambda *a: None, priced=True))
     monkeypatch.setattr(gw, "_corpus_scan_cost_cap", lambda c: (0.000001, "remaining credit"))
-    asyncio.run(gw._corpus_scan_via_relay(conn, run, "run1", None, lambda *a: None, lambda *a: None, {}))
+    asyncio.run(gw._corpus_scan_via_mcp(conn, run, "run1", None, lambda *a: None, lambda *a: None, corpus_scan.HAPLOINSUFFICIENCY))
     assert calls[0][1]["max_cost_usd"] == 0.000001
 
 
@@ -83,8 +83,8 @@ def test_stop_cannot_publish_successful_inflight_result(console, monkeypatch):
     conn, run, _, _, _, staged, kept = console
     monkeypatch.setattr(gw, "_mcp_session_model", lambda c: ModelBinding("http://cluster/v1", "cluster"))
     run.chat_stop.set()
-    assert asyncio.run(gw._corpus_scan_on_own_gpu(conn, run, "run1", None, lambda *a: None,
-                                               lambda *a: None)) is None
+    assert asyncio.run(gw._corpus_scan_via_mcp(conn, run, "run1", None, lambda *a: None,
+                                               lambda *a: None, corpus_scan.HAPLOINSUFFICIENCY)) is None
     assert not staged and not kept
 
 
@@ -92,7 +92,7 @@ def test_pubmed_console_calls_registered_tool_with_abstracts(console, monkeypatc
     conn, run, route, result, calls, _, _ = console
     run.literature_mcp, run.literature_mcp_context = route, object()
     result.update(results=[])
-    monkeypatch.setattr(gw._tools_api, "search_literature", lambda *a, **k: pytest.fail("legacy search used"))
+    assert not hasattr(gw, "_tools_api")
     gw._literature_search_logged(conn, run, ["PRPF31"], per_query=8)
     assert calls[0][0:2] == ("literature_search", {"query": "PRPF31", "limit": 8,
                                                   "abstracts": True, "pubmed_only": True, "analysis_id": "pubmed"})
@@ -101,5 +101,5 @@ def test_pubmed_console_calls_registered_tool_with_abstracts(console, monkeypatc
 def test_registered_model_label_never_uses_legacy_dedicated_gpu(console, monkeypatch):
     conn, *_ = console
     monkeypatch.setattr(gw, "_mcp_session_model", lambda c: RelayBinding("selected-haiku", lambda *a: None))
-    monkeypatch.setattr(corpus_scan, "scan_model", lambda c: pytest.fail("legacy GPU model selected"))
+    assert not hasattr(corpus_scan, "scan_model")
     assert gw._corpus_scan_model(conn) == "selected-haiku"

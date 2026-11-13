@@ -91,10 +91,11 @@ def test_the_settings_defaults_name_listed_images():
     from aiscientist.gateway.settings import HPCSettings
 
     s = HPCSettings()
-    for field in ("vllm_image", "analysis_image", "report_image", "lirical_image",
-                  "vlreview_image"):
+    for field in ("vllm_image", "analysis_image", "report_image", "vlreview_image"):
         assert hpc3_assets.image_pin(getattr(s, field)) is not None, field
     assert hpc3_assets.model_pin(s.vllm_model) is not None
+    # Native phenotype image provenance belongs to its reviewed MCP/skill pin.
+    assert not hasattr(s, "lirical_image")
 
 
 def test_pins_by_path_and_by_model(pins):

@@ -1,7 +1,7 @@
 ---
 name: scgpt_annotation
 description: scGPT foundation-model per-cell annotation for a .h5ad — transfers reference cell-type labels + calibrated confidence to every cell, AND independently cross-validates ANY existing celltype/majorclass labels the data already carries. Use for scGPT / .sif / foundation-model annotation, per-cell labelling, OR an independent second-opinion check of a dataset's existing cell-type labels.
-tools: mcp_scgpt_annotate, run_scanpy_qc, run_cellqc, run_clustering, run_de, run_enrichment, literature_search, run_code
+tools: mcp_scgpt_annotate, mcp_run_scanpy_qc, mcp_run_cellqc, mcp_run_clustering, mcp_run_de, mcp_run_enrichment, mcp_literature_search, run_code
 data_type: scrna
 outputs:
   - path: data/scgpt_predictions.csv
@@ -11,27 +11,27 @@ outputs:
     required: true
   - path: figures/umap_clusters.png
     kind: figure
-    tool: run_clustering
+    tool: mcp_run_clustering
     description: UMAP of the cells coloured by Leiden cluster.
     required: true
   - path: tables/de_*_all.csv
     kind: table
-    tool: run_de
+    tool: mcp_run_de
     description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
     required: true
   - path: figures/volcano_*.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
     required: false
   - path: figures/dotplot__markers.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
     required: false
   - path: tables/enrichment_*.csv
     kind: table
-    tool: run_enrichment
+    tool: mcp_run_enrichment
     description: Over-representation results per group, split into up- and down-regulated halves for a contrast, with term, gene-set library, adjusted p-value, combined score and overlap.
     required: true
 ---
@@ -86,16 +86,16 @@ Adapt parameters to THIS dataset; plan ordered steps that:
      labels — and write them down NOW, before any agreement percentage is visible. An agreement
      threshold chosen after seeing the confusion table is not a threshold. Say what happens when
      a gate fails: the comparison is marked unsupported, not relaxed until it passes.
-2. QC the dataset (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint) — this prepares the data for the INDEPENDENT structure/figures below, not for scGPT.
-3. Cluster independently (`run_clustering`): neighbors -> Leiden -> UMAP, giving data-driven structure that does NOT depend on the scGPT labels.
-4. Find marker genes per cluster (`run_de`) so the clusters' biology can be read directly from the data.
+2. QC the dataset (`mcp_run_scanpy_qc` for one matrix; `mcp_run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint) — this prepares the data for the INDEPENDENT structure/figures below, not for scGPT.
+3. Cluster independently (`mcp_run_clustering`): neighbors -> Leiden -> UMAP, giving data-driven structure that does NOT depend on the scGPT labels.
+4. Find marker genes per cluster (`mcp_run_de`) so the clusters' biology can be read directly from the data.
 5. CROSS-VALIDATE the scGPT per-cell labels: a confusion-style comparison against the independent Leiden cluster structure AND — when the dataset carries a `celltype`/`majorclass` column — directly against those existing labels (agreement %, per-label confidence, the populations where scGPT disagrees), plus the scGPT confidence distribution flagging low-confidence cells/populations. **Merge the predictions by BARCODE, never by row order (see the ⚑ callout below).** No curated tool covers this — adapt the reference template `crossvalidate_scgpt_vs_leiden.py` via `run_code`; it does the barcode-safe merge and covers BOTH the Leiden confusion table AND the existing majorclass/celltype agreement, so adapt it rather than writing the merge from scratch.
 6. Produce figures: UMAP colored by scGPT predictions AND by Leiden cluster, the confidence distribution, and violins of canonical markers for the predicted types.
 7. **GROUND THE BIOLOGY — this is what the write-up is allowed to draw on.**
-   `run_enrichment` over the step-4 cluster markers (and over any condition contrast the study
+   `mcp_run_enrichment` over the step-4 cluster markers (and over any condition contrast the study
    carries). The report writer may name ONLY pathways, enrichment terms and citations that appear
    in an ACCEPTED step result — so with no enrichment step the report cannot name a single pathway.
-   `literature_search` on the cell types and genes the analysis surfaced is OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+   `mcp_literature_search` on the cell types and genes the analysis surfaced is OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
    A run without it has no reference list, and its report says so. Annotation is not by itself a
    finding: state what the labels and their disagreements MEAN for the question that was asked.
 8. Do NOT plan a report-WRITING or rendering step of your own — a written report is one `write_report` step, last, planned only when the request asks for it.
@@ -112,12 +112,13 @@ alignment error and the whole cross-validation step fails (this is the single mo
 skill's runs stall). The same barcode alignment applies to the Leiden AND the majorclass/celltype
 comparison.
 
-**Pathway analysis: use `run_enrichment` / `run_gsea_prerank` when the design supports them, and
+**Pathway analysis: use `mcp_run_enrichment` / `mcp_run_gsea_prerank` when the design supports them, and
 when it does not, still take the gene sets from disk.** Both tools read `.gmt` libraries that are
-ALREADY ON DISK next to the tools — GO_Biological_Process_2023, Reactome_2022, MSigDB_Hallmark_2020
-(`AISCIENTIST_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
-consume `run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
-replication forbids exactly those p-values and therefore often skips `run_de` entirely, which
+configured by the operator under `SCRNA_GENESETS_DIR` — for example GO_Biological_Process_2023,
+Reactome_2022 and MSigDB_Hallmark_2020 — offline, no download, no network. Confirm the required
+local GMT files are available; report a missing library without inventing results or downloading it. But both also
+consume `mcp_run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
+replication forbids exactly those p-values and therefore often skips `mcp_run_de` entirely, which
 leaves both tools unusable through no fault of the plan. That is NOT a reason to go to the network:
 run 3c5fbc8608a7 hand-rolled a p-value-free pathway score, went looking for a collection to fetch,
 hit the confirmation guarding downloads from non-allowlisted hosts, was declined, and recorded

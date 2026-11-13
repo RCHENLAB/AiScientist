@@ -1384,6 +1384,9 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
             if not raw.startswith("run_"):
                 continue                      # retain the legacy typo policy, using complete names
             target = _TOOL_NAME_FIXES.get(raw.lower())
+            if target and target not in schemas:
+                matches = [name for name in schemas if canonical_tool_name(name) == target]
+                target = matches[0] if len(matches) == 1 else None
             if target and target in schemas:
                 text = re.sub(NAME_LEFT + re.escape(raw) + NAME_RIGHT, target, text)
                 findings.append({"kind": "renamed", "tool": raw, "detail": target})
@@ -3956,6 +3959,10 @@ def _describe_param(name: str, spec: "dict[str, Any]") -> str:
 
 def _tool_runs_on(tool: str) -> str:
     """Where a tool's manifest says it runs (``hpc:analysis``, ``inprocess``, …); "" if unknown."""
+    from .mcp_bridge import configured_servers
+    for server in configured_servers():
+        if any(server.planner_name(entry["name"]) == tool for entry in server.tools):
+            return getattr(server, "runs_on", "")
     try:
         from ..tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
@@ -3983,6 +3990,8 @@ def _tool_skill(tool: str) -> "Skill | None":
 
 def _tool_ends_step(tool: str) -> bool:
     """Whether a tool's manifest says one successful call is its whole step (``ends_step``)."""
+    if tool.startswith("mcp_") and canonical_tool_name(tool) == "run_cellqc":
+        return True
     try:
         from ..tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
@@ -3996,7 +4005,10 @@ def _planner_tool_description(tool: HarnessTool) -> str:
     from ..tools.catalog import manifest
     found = manifest(tool.name)
     props = (tool.parameters or {}).get("properties", {})
-    defaults = [_describe_param(n, props[n]) for n in (found.planner_defaults if found else ())
+    names = (found.planner_defaults if found else
+             ("min_counts", "min_features", "max_pct_mt") if tool.name.startswith("mcp_")
+             and canonical_tool_name(tool.name) == "run_cellqc" else ())
+    defaults = [_describe_param(n, props[n]) for n in names
                 if n in props and "default" in props[n]]
     return tool.description + (" Declared defaults: " + "; ".join(defaults) if defaults else "")
 
@@ -6728,6 +6740,10 @@ class ResearchLab:
         """A stratified condition-vs-control `run_de` step written from the dataset profile, or ""
         when the profile shows no condition column to contrast. Used ONLY to repair a plan that
         schedules enrichment with nothing producing a DE table."""
+        de_tool = next((tool.name for tool in self.scientist.catalog
+                        if canonical_tool_name(tool.name) == "run_de"), "")
+        if not de_tool:
+            return ""
         dr = (self.ctx.decisions or {}).get("dataset_result") or {}
         cats = dr.get("obs_categoricals") if isinstance(dr, dict) else None
         if not isinstance(cats, dict):
@@ -6750,7 +6766,7 @@ class ResearchLab:
                    cond_levels[0] if cond_levels else "<control level>")
         strat = (f", separately within each `{ct}` cell type (stratify_by='{ct}')" if ct else "")
         return (f"**Condition contrast** — Compare the levels of `{cond}` against the reference "
-                f"'{ref}' with `run_de` (Wilcoxon rank-sum, reference='{ref}'{strat}), testing "
+                f"'{ref}' with `{de_tool}` (Wilcoxon rank-sum, reference='{ref}'{strat}), testing "
                 f"only genes detected in >=10% of either arm's cells and calling a gene changed at "
                 f"adjusted p < 0.05 with |log2FC| >= 0.25. This produces the ranked DE tables the "
                 f"enrichment step below reads.")
@@ -7144,7 +7160,7 @@ class ResearchLab:
         together = {str(d) for d in ((layout or {}).get("datasets") or [])} if isinstance(layout, dict) else set()
         lines = ["Attached files (the profile above describes the PRIMARY only; run_code reads the "
                  "others through AISCIENTIST_INPUTS, and the other tools read only the primary"
-                 + ("; `run_cellqc` reads the Cell Ranger libraries of every attached folder "
+                 + ("; the registered CellQC tool reads the Cell Ranger libraries of every attached folder "
                     "marked SAMPLE FOLDER, with the primary's" if len(together) > 1 else "") + "):"]
         for r in records:
             role = str(r.get("role") or "").strip()
@@ -8685,7 +8701,7 @@ class ResearchLab:
             # step: one exploratory run_code, two failed ones, run_enrichment never called). Never
             # applied to a step that stopped for a cancel, an error budget or a step limit — those are
             # not "forgot to call it".
-            named = {n for n in _BACKTICK_TOOL_RE.findall(step or "")}
+            named = set(_declared_tools(step))
             catalog = {t.name for t in getattr(self.scientist, "catalog", [])}
             named &= catalog
             called = {str(st.get("tool")) for st in (result.steps or [])}

@@ -299,10 +299,10 @@ def test_registry_quickchat_catalog_is_the_cheap_subset():
     from aiscientist.agents.registry import build_quickchat_catalog
 
     names = {t.name for t in build_quickchat_catalog()}
-    assert names == {"literature_search", "map_phenotype_to_hpo"}
-    for heavy in ("run_code", "annotate_variants", "run_lirical", "run_scanpy_qc",
-                  "run_clustering", "run_de", "run_enrichment", "scgpt_annotate",
-                  "make_schematic"):
+    assert names == set()  # scientific retrieval uses the reviewed native literature run route
+    for heavy in ("run_code", "mcp_annotate_variants", "mcp_run_lirical", "mcp_run_scanpy_qc",
+                  "mcp_run_clustering", "mcp_run_de", "mcp_run_enrichment", "mcp_scgpt_annotate",
+                  "mcp_make_schematic"):
         assert heavy not in names, f"{heavy} must not be reachable from the fast chat path"
     # Every entry still has to be a usable tool schema.
     for t in build_quickchat_catalog():
@@ -314,7 +314,9 @@ def test_schematic_tool_is_untouched_on_the_research_path():
     """Feature B adds INLINE chat diagrams; it must not have removed the backend figure tool."""
     from aiscientist.agents.registry import build_scientist_catalog
 
-    assert "make_schematic" in {t.name for t in build_scientist_catalog()}
+    from aiscientist.agents.mcp_bridge import configured_tool_names
+    assert "mcp_make_schematic" in configured_tool_names()
+    assert "make_schematic" not in {t.name for t in build_scientist_catalog()}
 
 
 def test_system_prompt_states_the_load_bearing_contracts():

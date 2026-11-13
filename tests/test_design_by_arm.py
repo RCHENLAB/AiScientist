@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 pytest.importorskip("h5py")
-pytest.importorskip("scanpy")
+pytest.importorskip("anndata")
 
 import anndata as ad  # noqa: E402
 import h5py  # noqa: E402
@@ -61,21 +61,6 @@ def test_matched_depth_is_not_flagged(tmp_path):
     assert "depth_imbalance" not in r["design_by_arm"]
 
 
-def test_run_de_names_a_same_direction_skew_across_strata(tmp_path):
-    """Every stratum up >> down is a technical signature; the tool says so where the numbers are."""
-    from types import SimpleNamespace
-    from aiscientist.tools.run_de import tool as run_de_tool
-    from aiscientist.tools.run_scanpy_qc import tool as run_scanpy_qc_tool
-    p = _two_arm_h5ad(tmp_path, depth_ratio=2.5)      # a big depth gap -> global 'up' in KO
-    ctx = SimpleNamespace(workspace=tmp_path, decisions={"dataset_path": str(p)})
-    assert run_scanpy_qc_tool.run_scanpy_qc({"min_genes": 1, "min_cells": 1, "max_pct_mt": 100.0}, ctx)["status"] == "ok"
-    out = run_de_tool.run_de({"groupby": "sampleid", "reference": "WT", "stratify_by": "majorclass",
-                             "min_cells": 10, "min_pct": 0}, ctx)
-    assert out["status"] == "ok"
-    # Whether the toy data trips the >=100-genes gate depends on the draw; the CONTRACT is that
-    # when the skew is there it is named as technical, not biological.
-    if out.get("direction_bias"):
-        assert any("DIRECTION BIAS" in w and "technical" in w for w in out["warnings"])
 
 
 def test_the_dataset_section_renders_the_per_arm_table(tmp_path):

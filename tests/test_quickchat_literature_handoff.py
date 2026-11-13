@@ -53,10 +53,10 @@ def test_omitting_pubmed_can_preserve_explicit_corpus_retrieval():
 
 
 def test_native_plain_chat_roster_does_not_construct_old_literature_tools():
-    native = {tool.name for tool in build_quickchat_catalog(object(), exclude_literature=True)}
+    native = {tool.name for tool in build_quickchat_catalog()}
     assert native.isdisjoint({"literature_search", "search_corpus", "deep_literature",
                               "extract_haploinsufficient_genes"})
-    assert "literature_search" in {tool.name for tool in build_quickchat_catalog()}
+    assert not hasattr(gw, "_build_literature_executor")
 
 
 @pytest.fixture
@@ -73,7 +73,7 @@ def session(tmp_path, monkeypatch):
     monkeypatch.setattr(gw, "_model_ready", lambda c: True)
     monkeypatch.setattr(gw, "_corpus_curation", lambda *a, **kw: None)
     monkeypatch.setattr(gw, "_literature_corpus_available", lambda c: False)
-    monkeypatch.setattr(gw, "_build_literature_executor", lambda *a, **kw: pytest.fail("legacy HPC executor"))
+    assert not hasattr(gw, "_build_literature_executor")
     monkeypatch.setattr(gw, "_stopped_run_target", lambda *a: pytest.fail("chat entered analysis resume router"))
     monkeypatch.setattr(gw, "_followup_target", lambda *a: pytest.fail("chat entered report follow-up router"))
     yield conn

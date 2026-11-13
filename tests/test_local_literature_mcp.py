@@ -23,7 +23,7 @@ def test_docker_command_is_digest_pinned_offline_and_mounts_only_corpus_and_outp
     assert image.removeprefix("docker://") in args
     assert "LITERATURE_PAPERS=/corpus" in args  # cache-only mirror has no papers/ child
     assert "docker.sock" not in " ".join(args) and "API_KEY" not in " ".join(args)
-    assert 'call_tool("search_corpus"' in args[-1]
+    assert 'client.call_tool(tool' in args[-1]
 
 
 def test_mount_separator_injection_is_refused(tmp_path):
@@ -51,11 +51,12 @@ def test_local_search_validates_schema_and_never_loads_legacy_science(tmp_path, 
               "required": ["queries"], "additionalProperties": False}
     server = SimpleNamespace(skill="registered", image="docker://example@sha256:" + "a" * 64,
                              version="0.0.3", tools=({"name": "search_corpus", "description": "Search", "inputSchema": schema},),
-                             identity=lambda: {"name": "literature", "version": "0.0.3"})
+                             identity=lambda: {"name": "literature", "version": "0.0.3"},
+                             planner_name=lambda wire: "mcp_" + wire)
     monkeypatch.setattr(local, "registered_server", lambda: server)
     monkeypatch.setattr(local.shutil, "which", lambda binary: "/usr/bin/docker")
     monkeypatch.setattr(skills, "get_skill", lambda name: SimpleNamespace(image=server.image))
-    monkeypatch.setattr(local_corpus, "_embedder", lambda *a: pytest.fail("gateway loaded legacy embedding model"))
+    assert not hasattr(local_corpus, "_embedder")
     calls = []
     def execute(argv, payload, output, **kw):
         calls.append((argv, json.loads(json.dumps(payload))))
@@ -65,9 +66,47 @@ def test_local_search_validates_schema_and_never_loads_legacy_science(tmp_path, 
     ctx = SimpleNamespace(workspace=tmp_path / "private-run")
     actual = tool.executor({"queries": ["PRPF31"]}, ctx)
     assert actual["status"] == "ok" and actual["mcp"]["execution_mode"] == "local-docker"
-    assert calls[0][1] == {"version": "0.0.3", "schema": schema, "arguments": {"queries": ["PRPF31"]}}
+    assert calls[0][1] == {"version": "0.0.3", "schema": schema, "tool": "search_corpus", "arguments": {"queries": ["PRPF31"]}}
     assert tool.executor({"queries": ["PRPF31"], "model": "other"}, ctx)["status"] == "error"
     assert len(calls) == 1
     ctx.should_cancel = lambda: True
     assert tool.executor({"queries": ["PRPF31"]}, ctx)["status"] == "cancelled"
+    assert len(calls) == 1
+
+
+def test_public_lookup_requires_separate_network_opt_in(monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_LOCAL_CORPUS_MCP", "docker")
+    monkeypatch.delenv("AISCIENTIST_LOCAL_PUBLIC_LITERATURE_MCP", raising=False)
+    monkeypatch.setattr(local, "registered_server", lambda: pytest.fail("public lookup not enabled"))
+    assert local.make_public_tool() is None
+
+
+def test_public_lookup_has_no_corpus_mount_or_model_configuration(tmp_path, monkeypatch):
+    from aiscientist.agents import skills
+    from aiscientist.gateway import local_corpus
+    monkeypatch.setenv("AISCIENTIST_LOCAL_PUBLIC_LITERATURE_MCP", "docker")
+    monkeypatch.setenv("LITERATURE_MODEL_API_KEY", "must-not-inherit-this")
+    monkeypatch.setenv("LITERATURE_SEARCH_ENDPOINT", "http://operator-override-ignored")
+    monkeypatch.setattr(local_corpus, "has_local_index", lambda: pytest.fail("public lookup needs no corpus"))
+    schema = {"type": "object", "properties": {"query": {"type": "string"}},
+              "required": ["query"], "additionalProperties": False}
+    server = SimpleNamespace(skill="registered", image="docker://example@sha256:" + "a" * 64,
+                             version="0.0.4", tools=({"name": "literature_search", "description": "Search", "inputSchema": schema},),
+                             identity=lambda: {"name": "literature", "version": "0.0.4"},
+                             planner_name=lambda wire: "custom_" + wire)
+    monkeypatch.setattr(local, "registered_server", lambda: server)
+    monkeypatch.setattr(local.shutil, "which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(skills, "get_skill", lambda _: SimpleNamespace(image=server.image))
+    calls = []
+    monkeypatch.setattr(local, "_execute", lambda argv, payload, output, **kw:
+                        calls.append((argv, payload)) or {"status": "ok", "results": []})
+    tool = local.make_public_tool()
+    assert tool.name == "custom_literature_search"
+    out = tool.executor({"query": "PRPF31"}, SimpleNamespace(workspace=tmp_path / "private-run"))
+    assert out["status"] == "ok" and calls[0][1]["tool"] == "literature_search"
+    argv = calls[0][0]
+    assert "--network=bridge" in argv and "--pull=never" in argv
+    assert len([a for a in argv if a == "--mount"]) == 1
+    assert not any("API_KEY" in a or "LITERATURE_SEARCH_ENDPOINT" in a or "must-not-inherit" in a for a in argv)
+    assert tool.executor({"query": "PRPF31", "endpoint": "https://untrusted"}, SimpleNamespace())["status"] == "error"
     assert len(calls) == 1

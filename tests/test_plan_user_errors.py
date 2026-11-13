@@ -31,14 +31,14 @@ def test_unreadable_edit_stays_unchanged_and_chat_has_an_actionable_error():
     chat = " ".join(p.get("text", "") for p in _lab_event_to_chat(rejected))
     assert message in chat and "plan is unchanged" in chat
     assert shown[1] == shown[0] and not _of(events, "plan_edited")
-    assert ("run_clustering", {"resolution": 0.5, "n_pcs": 30}) in calls
+    assert ("mcp_run_clustering", {"resolution": 0.5, "n_pcs": 30}) in calls
 
 
 @pytest.mark.parametrize(("text", "message"), [
     ("[one, two]", "list of steps"),
     ("steps: [12]", "title and description"),
     ("steps: [{}]", "title or description"),
-    ("steps: [{title: QC, tool: run_scanpy_qc, settings: 12}]", "unreadable settings"),
+    ("steps: [{title: QC, tool: mcp_run_scanpy_qc, settings: 12}]", "unreadable settings"),
     ("steps: [{title: QC, settings: {resolution: 1}}]", "no tool selected"),
 ])
 def test_structure_errors_name_the_readable_plan_detail(text, message):

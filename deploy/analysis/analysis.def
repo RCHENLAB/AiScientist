@@ -18,11 +18,10 @@ From: python:3.11-slim
 # Build ON an HPC3 compute node with `apptainer build --fakeroot` (macOS cannot build .sif). See
 # deploy/analysis/build_and_stage.sh and deploy/analysis/README.md.
 #
-# Phase 4 of the HPC3 offload ALSO runs the scanpy analysis line here via
-# `python -m aiscientist.tools.scrna_cli` (gateway/slurm_analysis.py::SlurmAnalysisExecutor). The
-# AiScientist tools are NOT baked in — they are bind-mounted from dfs3b at run time and put on
-# PYTHONPATH by the executor, so editing a tool needs only a code sync, never an image rebuild.
-# This image therefore carries ONLY the heavy deps below.
+# This retained image also runs platform preflight, dependency installation and AnnData
+# export/adopt via `python -m aiscientist.tools.worker_cli`. The worker source is bound
+# read-only from the current app checkout. Scientific tools run in their pinned MCP
+# service images; they are no longer dispatched through this worker.
 
 %post
     set -eux
@@ -92,10 +91,10 @@ print('analysis stack OK — scanpy', scanpy.__version__, 'pandas', pandas.__ver
            apptainer exec --containall --writable-tmpfs --net --network none \
              -B <dataset>:<dataset>:ro -B <work>:<work> -B <artifacts>:<artifacts> \
              analysis.sif python <snippet>.py
-      2) The scanpy analysis line (gateway/slurm_analysis.py), tools BOUND from dfs3b (not baked):
+      2) Platform preflight/result handoff (gateway/slurm_analysis.py), source BOUND read-only:
            apptainer exec --containall --net --network none \
              -B <dataset>:<dataset>:ro -B <run_ws>:<run_ws> -B <pysrc>:<pysrc>:ro \
              --env PYTHONPATH=<pysrc> \
-             analysis.sif python -m aiscientist.tools.scrna_cli \
-               --tool run_scanpy_qc --workspace <run_ws> --dataset <dataset> --args <args.json>
+             analysis.sif python -m aiscientist.tools.worker_cli \
+               --tool preflight --workspace <run_ws> --dataset <dataset> --args <args.json>
          (<pysrc> = <lab_storage>/<user>/pysrc, synced by the gateway; contains aiscientist/)

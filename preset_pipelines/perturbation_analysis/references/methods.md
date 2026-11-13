@@ -38,7 +38,7 @@ A distribution-shape-sensitive variant needs non-squared Euclidean + subsampled 
 ## Per-perturbation DE (`perturbation_de_vs_control.py`)
 
 scanpy `rank_genes_groups(..., groups=[pert], reference=CONTROL, method="wilcoxon")` looped over
-perturbations against the shared control — the shared-reference comparison `run_de` (per-cluster
+perturbations against the shared control — the shared-reference comparison `mcp_run_de` (per-cluster
 one-vs-rest) does not do. **Positive control:** a bona-fide knockout shows its own target gene *down*
 in its DE; the template checks this per perturbation (`target_self_knockdown`) and flags guides that
 fail it (possible mislabel / no editing). Report adjusted p-values + log fold-changes.

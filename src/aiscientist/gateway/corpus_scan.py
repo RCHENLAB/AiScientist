@@ -1,13 +1,7 @@
-"""The corpus scan's own GPU job, and the finished scans kept on the Eye Server.
+"""Publish and cache native corpus-curation tables on the Eye Server.
 
-``extract_haploinsufficient_genes`` has a language model write search requests and read every
-passage they retrieve from the corpus. It used to call the session's served model, so a session on
-the lab's shared model or on an API key could not run it at all, and a session with a GPU had its
-model busy for an hour. Now the scan brings its own model: ONE Slurm job on the paid ``gpu``
-partition starts vLLM on the job's card (:func:`vllm_prelude`), runs the scan in ``paperqa.sif``
-against ``127.0.0.1``, and exits, which frees the card. The model is fixed (``corpus_scan_model``,
-else the cluster sessions' model) and runs at temperature 0, so the tables do not depend on the
-model the asking session uses.
+The registered literature MCP performs retrieval and extraction with the selected
+session model. This module owns only cache identity, storage, and presentation.
 
 A scan's tables depend only on the corpus, the scan's rules and that model. They are kept under
 ``<data root>/corpus_scans/<key>/`` (:func:`store`), keyed by a fingerprint of all three
@@ -31,7 +25,6 @@ per sentence, each with its paper and page.
 
 from __future__ import annotations
 
-import base64
 import csv
 import hashlib
 import io
@@ -46,7 +39,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .settings import HPCSettings
 
 OUT_SUBDIR = "haploinsufficiency"     # where the tool writes its tables under artifacts/
 TABLES = ("genes.csv", "hits.csv", "requests.csv")
@@ -54,98 +46,16 @@ CACHE_DIRNAME = "corpus_scans"
 
 
 # ---------------------------------------------------------------------------------------------
-# The job's own model
+# Native execution lives in the registered MCP server.
 # ---------------------------------------------------------------------------------------------
 
-def scan_model(settings: HPCSettings) -> str:
-    """The model the scan's job serves and judges with."""
-    return settings.corpus_scan_model or settings.vllm_model
 
 
-def _vllm_body(settings: HPCSettings, port_file: str) -> str:
-    """The vLLM server, as the serve job runs it (same image, weights and runtime module), on the
-    node's loopback only and with a short window: the judge's prompts are a few thousand tokens."""
-    hf = settings.hf_home
-    model = scan_model(settings)
-    flags = [
-        "--host 127.0.0.1",
-        f'--port "$(cat {shlex.quote(port_file)})"',
-        f"--served-model-name {model}",
-        f"--max-model-len {settings.corpus_scan_max_model_len}",
-        f"--gpu-memory-utilization {settings.vllm_gpu_mem_util}",
-    ]
-    if settings.vllm_quantization:
-        flags.append(f"--quantization {settings.vllm_quantization}")
-    if settings.vllm_reasoning_parser:
-        flags.append(f"--reasoning-parser {settings.vllm_reasoning_parser}")
-    if settings.corpus_scan_vllm_args:
-        flags.append(settings.corpus_scan_vllm_args)
-    return (
-        f'export HF_HOME="{hf}"\n'
-        "export HF_HUB_OFFLINE=1\n"
-        "source /etc/profile.d/lmod.sh 2>/dev/null || true\n"
-        f"module load {settings.container_module} 2>/dev/null || true\n"
-        f"exec {settings.container_bin} exec --nv -B {hf}:{hf} --env HF_HOME={hf} --env HF_HUB_OFFLINE=1 "
-        f"{settings.vllm_image} vllm serve {model} " + " ".join(flags) + "\n"
-    )
 
 
-def vllm_prelude(settings: HPCSettings, *, name: str, scratch: str, res_f: str) -> tuple[str, str]:
-    """``(shell, payload env)`` for ``SlurmAnalysisExecutor.job_prelude``.
 
-    The shell runs on the job's node before the scan's container: it picks a free port, starts vLLM
-    in a session of its own (stopped when the job script exits), and waits until ``/v1/models``
-    answers. When the model never comes up it writes a ``failed`` result with the reason and the
-    path of the server's log and ends the job, so the gateway reports that instead of a scan that
-    found no model. The payload env points the scan at the server
-    (``AISCIENTIST_PAPERQA_LLM_BASE_URL``, read by the tool when its args carry no endpoint)."""
-    port_file = f"{scratch}/{name}.port"
-    vllm_log = f"{scratch}/{name}.vllm.log"
-    body = base64.b64encode(_vllm_body(settings, port_file).encode("utf-8")).decode("ascii")
-    group = settings.data_group()
-    runner = f"sg {group} -c 'bash -s'" if group else "bash -s"
-    timeout = max(60, int(settings.corpus_scan_ready_timeout_s))
-    q_port, q_log, q_res = shlex.quote(port_file), shlex.quote(vllm_log), shlex.quote(res_f)
 
-    def failed(why: str) -> str:
-        payload = json.dumps({"status": "failed", "model_unreachable": False, "vllm_log": vllm_log,
-                              "error": f"The scan's model did not start: {why}. Its log is {vllm_log}."})
-        return f"  echo {shlex.quote('AISCIENTIST_RESULT_JSON ' + payload)} > {q_res}\n"
 
-    shell = (
-        "# The scan's own model (gateway/corpus_scan.py): vLLM on this job's card, loopback only.\n"
-        'AISCIENTIST_PORT=""\n'
-        "for _try in {1..50}; do\n"
-        "  _cand=$(( (RANDOM % 20000) + 30000 ))\n"
-        '  if ! (exec 3<>/dev/tcp/127.0.0.1/$_cand) 2>/dev/null; then AISCIENTIST_PORT=$_cand; break; fi\n'
-        "done\n"
-        f'[ -n "$AISCIENTIST_PORT" ] || AISCIENTIST_PORT={settings.serve_port}\n'
-        f'echo "$AISCIENTIST_PORT" > {q_port}\n'
-        f"setsid bash -c \"printf %s '{body}' | base64 --decode | {runner}\" > {q_log} 2>&1 &\n"
-        "_vllm=$!\n"
-        # `|| true` on each: the job script runs under `set -e`, which a failing kill in the trap
-        # would turn into the job's exit status.
-        "trap 'kill -TERM -- \"-$_vllm\" 2>/dev/null || true; pkill -TERM -s \"$_vllm\" 2>/dev/null || true' EXIT\n"
-        f'echo "Starting {scan_model(settings)} on 127.0.0.1:$AISCIENTIST_PORT ($(date))"\n'
-        "_ready=0\n"
-        f"_deadline=$((SECONDS + {timeout}))\n"
-        'while [ "$SECONDS" -lt "$_deadline" ]; do\n'
-        '  if curl -sf -m 5 "http://127.0.0.1:$AISCIENTIST_PORT/v1/models" >/dev/null 2>&1; then _ready=1; break; fi\n'
-        '  kill -0 "$_vllm" 2>/dev/null || break\n'
-        "  sleep 5\n"
-        "done\n"
-        'if [ "$_ready" != 1 ]; then\n'
-        '  if kill -0 "$_vllm" 2>/dev/null; then\n'
-        f"{failed(f'it did not answer within {timeout} s')}"
-        "  else\n"
-        f"{failed('the server exited before it answered')}"
-        "  fi\n"
-        "  exit 0\n"
-        "fi\n"
-        'echo "Model ready ($(date))"\n'
-    )
-    env = f"export AISCIENTIST_PAPERQA_LLM_BASE_URL=http://127.0.0.1:$(cat {q_port})/v1; "
-    return shell, env
 
 
 # ---------------------------------------------------------------------------------------------

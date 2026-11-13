@@ -169,24 +169,13 @@ def test_the_handed_on_dataset_is_written_back_as_the_new_runs_checkpoints(tmp_p
     assert plain["status"] == "skipped" and not (tmp_path / "run3" / "work").exists()
 
 
-def test_the_tools_read_it_and_qc_refuses_to_run_on_it_again(tmp_path, libs):
-    pytest.importorskip("scanpy")
+def test_reexport_preserves_the_source_run_chain(tmp_path, libs):
+    """Native DE/QC consumption is tested in MCP; platform export still owns provenance."""
     from aiscientist.tools._lib.result_dataset import adopt, export
-    from aiscientist.tools.run_de.tool import make_tool as de_tool
-    from aiscientist.tools.run_scanpy_qc.tool import make_tool as qc_tool
+
     src = _handed_on(tmp_path, libs)
     ws = tmp_path / "run2"
-    adopt(ws, src)
-    ctx = types.SimpleNamespace(workspace=ws, decisions={"dataset_path": str(src)})
-
-    de = de_tool().executor({"groupby": "leiden"}, ctx)
-    assert de["status"] == "ok" and (ws / "work" / "adata_de.h5ad").is_file()
-
-    qc = qc_tool().executor({}, ctx)
-    assert qc["status"] == "error" and "already quality-controlled" in qc["error"]
-    assert "normalise twice" in qc["error"]
-
-    # What THIS run hands on says which run it built on.
+    assert adopt(ws, src)["status"] == "ok"
     again = export(ws, "Sample1_WT.processed.20261012-1100.run2.h5ad", {"run_id": "run2"})
     assert again["status"] == "ok"
     out = libs.ad.read_h5ad(ws / "result" / "Sample1_WT.processed.20261012-1100.run2.h5ad")

@@ -57,21 +57,7 @@ auth = [
 biomni = [
   "biomni",
 ]
-# Deep literature agent (PaperQA2 — the open-source engine behind Edison Literature).
-# Eye-server only; imported lazily by tools/paperqa_search.py, so the core/CI stay light
-# and a host without it just gets status="dependency_missing". The [local] extra pulls in
-# sentence-transformers for a LOCAL embedding model, so chunk text never leaves UCI; the
-# LLM is pointed at the session's local Qwen vLLM endpoint (no cloud model).
-literature = [
-  "paper-qa[local]>=5",
-]
-# The Eye Server copy of the RetiGene index (gateway/local_corpus.py): a search embeds its queries with
-# PubMedBERT on the gateway's CPU instead of a Slurm job on HPC3. Install torch from the CPU index
-# first (deploy/deploy_release.sh does), or pip pulls the CUDA build and its NVIDIA libraries, which
-# this server never uses. Without this extra the searches run on HPC3.
-corpus = [
-  "sentence-transformers>=3",
-]
+# Literature science and embeddings are installed in the pinned literature MCP image.
 # Single-cell analysis stack for the run_code (CodeAct) sandbox + the analysis line
 # (real scanpy QC/cluster/DE + gseapy enrichment + matplotlib figures). Eye-server
 # only; the lightweight core/CI never import these. The CodeSandbox runs the app
@@ -80,7 +66,6 @@ corpus = [
 # for PDF rendering, `graphviz` for deterministic schematic figures (the `dot` binary).
 analysis = [
   "scanpy>=1.10",
-  "pydeseq2>=0.4",           # pseudobulk DE: DESeq2's NB Wald test (run_pseudobulk_de)
   "anndata>=0.10",
   "gseapy>=1.1",
   "matplotlib>=3.8",
@@ -100,7 +85,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.setuptools.package-data]
-aiscientist = ["agents/mcp_catalog/*.json", "agents/mcp_catalog/mcp/*.json", "tools/*/TOOL.md", "tools/_lib/marker_references/*.json"]
+aiscientist = ["agents/mcp_catalog/*.json", "agents/mcp_catalog/mcp/*.json", "tools/*/TOOL.md", "tools/_lib/marker_references/*.json", "agents/reference_data/*.txt"]
 
 [tool.ruff]
 target-version = "py310"

@@ -1,6 +1,6 @@
 """The model calls of an HPC3 job, made here with the user's own API key.
 
-A user's key never leaves the Eye Server: no job on HPC3 is given one (``_build_literature_executor``).
+A user's key never leaves the Eye Server: no job on HPC3 is given one (the guarded native MCP model binding).
 A job that needs the user's API model — the corpus scan on a session that runs on its own key —
 writes each prompt as a JSON file under ``<relay>/req/`` on dfs3b; :class:`ModelRelay` lists that
 folder over SFTP on the transfer host, calls the model, records the call against the user's usage

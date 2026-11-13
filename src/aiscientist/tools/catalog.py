@@ -348,10 +348,6 @@ def line_tools(line: str) -> list[HarnessTool]:
     return build_tools(where=lambda m: m.line == line)
 
 
-def scrna_catalog() -> list[HarnessTool]:
-    """The single-cell analysis line, in pipeline order: what ``scrna_pack.scrna_catalog()``
-    returned before the tools moved into folders."""
-    return line_tools("scrna")
 
 
 def runs_on(where: str) -> list[ToolManifest]:

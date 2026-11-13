@@ -265,40 +265,6 @@ class HPCSettings:
     vlreview_dpi: int = 200                 # rasterization DPI (200 catches text overlap)
     vlreview_max_iters: int = 3             # render -> review -> re-render passes before giving up
 
-    # --- The corpus scan's own GPU (gateway/corpus_scan.py) ---------------------
-    # The scan has a model write search requests and read the passages they retrieve. It used to
-    # call the session's served model, so a session on the shared model or an API key could not run
-    # it at all, and a session with a GPU had that model busy for an hour. It now submits ONE job of
-    # its own: vLLM starts on the job's card, the scan runs against it on 127.0.0.1, the job exits
-    # and frees the card.
-    # Paid `gpu` partition, lab GPU account: 32 SU per GPU-hour whatever the card (2026-10). `gpu:1`
-    # + `nvme` takes the first free A30 or A100 (the V100 nodes lack the feature, and their 16 GB
-    # are too small). The 27B INT4 fits a 24 GB A30 only with the flags below: its image and video
-    # encoders off (the judge sends text) and at most 16 requests at once (the tool's concurrency).
-    # Measured 2026-10-19 on 400 sentences: an A100 judged them in 196 s, an A30 in 372 s.
-    corpus_scan_partition: str = "gpu"
-    corpus_scan_account: str | None = "ruic20_lab_gpu"
-    corpus_scan_gres: str = "gpu:1"
-    corpus_scan_constraint: str = "nvme"
-    corpus_scan_model: str = ""             # "" = vllm_model (the cluster sessions' model)
-    # The judge's prompts are a few thousand tokens: a short window costs less KV per request.
-    corpus_scan_max_model_len: int = 16384
-    # Extra `vllm serve` flags for this job only. The default suits the multimodal default model;
-    # a text-only `corpus_scan_model` takes "--max-num-seqs 16".
-    corpus_scan_vllm_args: str = ("--limit-mm-per-prompt '{\"image\":0,\"video\":0}' --max-num-seqs 16 "
-                                  "--max-num-batched-tokens 4096")
-    # The job's CPUs, memory and time come from the tool's TOOL.md, like every literature job's.
-    corpus_scan_ready_timeout_s: int = 1500  # model load; ~400 s measured for the 27B INT4 on A100
-    # How long the job may wait in the paid queue for a card. 30 min (the analysis jobs' 3 x 600 s)
-    # was too short: on 2026-10-19 21:13 a scan queued behind 40 others (Slurm: Priority) and was
-    # cancelled at 21:43 without starting. A queued job keeps its place for the whole wait; the
-    # window is how often the chat hears where it stands.
-    corpus_scan_queue_wait_s: int = 7200
-    corpus_scan_queue_window_s: int = 1800
-    # After a wait that ends with no card, submit the job again this many times (a retry of that one
-    # step: the run is not failed while a retry is left). Nothing runs, so nothing is lost.
-    corpus_scan_queue_retries: int = 2
-
     # --- CodeAct (run_code) as a CPU Slurm batch job (opt-in) -------------------
     # By default run_code executes in the LOCAL CodeSandbox on the gateway host (uncapped
     # subprocess), which only a console WITHOUT accounts may do: with accounts on, run_code never
@@ -384,7 +350,7 @@ class HPCSettings:
     vep_assembly: str = "GRCh37"            # header auto-detection wins; this is only the fallback
     # Known-gene panel applied by DEFAULT for a variant study — deterministic known-gene-first (Rui
     # Chen's IRD protocol) instead of relying on the LLM to pass a panel. A name in
-    # aiscientist.tools.gene_panels (e.g. "ird"); empty = annotate genome-wide. A caller-supplied
+    # aiscientist.agents.reference_panels (e.g. "ird"); empty = annotate genome-wide. A caller-supplied
     # `genes`/`regions_bed` OVERRIDES it (this rides in inject_args, which the caller wins over).
     default_gene_panel: str = ""
     # Default rarity floor injected as `max_pop_af` for a variant study (0 = off; the lab's IRD base
@@ -448,39 +414,6 @@ class HPCSettings:
     #                                         headroom — a batch job frees the node the instant its
     #                                         script exits and the gateway job-wait auto-tracks this
     #                                         --time, so a long request costs nothing for a normal run.
-
-    # --- phenotype → disease differential (LIRICAL) ---------------------------------------------------
-    # DOWNSTREAM of the variant line: LIRICAL fuses the patient's HPO terms with the VCF findings into a
-    # per-disease post-test probability (Rui Chen's confidence ask). OFF until the sif + data are staged
-    # (deploy/lirical/build_and_stage.sh); when off, the phenotype step reports not_installed and the run
-    # continues without the differential. Genotype-aware scoring needs an Exomiser DB (>= 2302 — the
-    # lab's existing 1805_hg19/exomiser-10.1.0 data is too old for LIRICAL v2); leave the exomiser_* paths
-    # empty for phenotype-only, which needs no Exomiser DB. See deploy/lirical/README.md.
-    phenotype_on_hpc: bool = False
-    lirical_image: str = f"{SHARED_ROOT}/containers/lirical.sif"
-    lirical_data_dir: str = f"{REFERENCE_ROOT}/lirical/data"
-    lirical_exomiser_hg19: str = ""         # e.g. .../reference/lirical/exomiser/2302_hg19 (optional)
-    lirical_exomiser_hg38: str = ""         # e.g. .../reference/lirical/exomiser/2302_hg38 (optional)
-    # MEASURED on HPC3 2026-07-15, genotype-aware, on a REAL 1.13 GB WGS VCF (CASE_A, 4,928,515
-    # variants, standard partition, 4 CPUs): the whole job took **4m22s** — Exomiser streamed the
-    # callset at ~21.6k variants/s (3m48s) and the disease pass added seconds. So 1h already carried
-    # ~13x headroom and this does NOT need VEP's 4h: LIRICAL scores variants against the prebuilt
-    # Jannovar/Exomiser stores, it does not re-run VEP's per-variant transcript annotation.
-    # Phenotype-only is seconds. --time is a CEILING, not a reservation, so 1h costs nothing when the
-    # job finishes in 5 min, and keeps better backfill priority than an inflated ask.
-    lirical_time_limit: str = "01:00:00"
-    lirical_cpus: int = 4
-    # Its own knob: this used to borrow run_code_mem_gb, so tightening the CodeAct sandbox's memory
-    # would have silently starved LIRICAL — unrelated things sharing a number.
-    #
-    # Why 64 when the MEASURED peak is 7.9 GB (MaxRSS on the WGS run above — Exomiser mmaps the ~28 GB
-    # store, so most of it is page cache, not RSS): the sif's launcher is a bare ``java -jar`` with NO
-    # ``-Xmx``, and the JVM — despite reporting UseContainerSupport=true — sized MaxHeapSize at 32 GB,
-    # i.e. 1/4 of the NODE's 187 GB, NOT of this --mem. The heap ceiling and --mem are therefore
-    # independent, and a JVM that decided to grow into its 32 GB would be OOM-KILLED by Slurm if --mem
-    # sat below it. So --mem stays above the heap the JVM believes it owns. Pinning -Xmx in the image
-    # (a rebuild) would let this drop to ~16 GB and schedule better.
-    lirical_mem_gb: int = 64
 
     # A2 resume keeps each run's analysis checkpoints (work/adata_*.h5ad) so a follow-up can re-run
     # one step without redoing the whole pipeline. Those densified matrices are large, so they auto-
@@ -599,20 +532,6 @@ class HPCSettings:
             vlreview_time_limit=os.environ.get("AISCIENTIST_VLREVIEW_TIME_LIMIT", cls.vlreview_time_limit),
             vlreview_dpi=_int("AISCIENTIST_VLREVIEW_DPI", cls.vlreview_dpi),
             vlreview_max_iters=_int("AISCIENTIST_VLREVIEW_MAX_ITERS", cls.vlreview_max_iters),
-            corpus_scan_partition=os.environ.get("AISCIENTIST_CORPUS_SCAN_PARTITION", cls.corpus_scan_partition),
-            corpus_scan_account=(os.environ.get("AISCIENTIST_CORPUS_SCAN_ACCOUNT", cls.corpus_scan_account or "")
-                                 or None),
-            corpus_scan_gres=os.environ.get("AISCIENTIST_CORPUS_SCAN_GRES", cls.corpus_scan_gres),
-            corpus_scan_constraint=os.environ.get("AISCIENTIST_CORPUS_SCAN_CONSTRAINT", cls.corpus_scan_constraint),
-            corpus_scan_model=os.environ.get("AISCIENTIST_CORPUS_SCAN_MODEL", cls.corpus_scan_model),
-            corpus_scan_max_model_len=_int("AISCIENTIST_CORPUS_SCAN_MAX_MODEL_LEN", cls.corpus_scan_max_model_len),
-            corpus_scan_vllm_args=os.environ.get("AISCIENTIST_CORPUS_SCAN_VLLM_ARGS", cls.corpus_scan_vllm_args),
-            corpus_scan_ready_timeout_s=_int("AISCIENTIST_CORPUS_SCAN_READY_TIMEOUT_S",
-                                             cls.corpus_scan_ready_timeout_s),
-            corpus_scan_queue_wait_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WAIT_S", cls.corpus_scan_queue_wait_s),
-            corpus_scan_queue_window_s=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_WINDOW_S",
-                                            cls.corpus_scan_queue_window_s),
-            corpus_scan_queue_retries=_int("AISCIENTIST_CORPUS_SCAN_QUEUE_RETRIES", cls.corpus_scan_queue_retries),
             run_code_on_hpc=(os.environ.get("AISCIENTIST_RUN_CODE_ON_HPC", "").strip().lower()
                              in ("1", "true", "yes", "on")),
             uploads_on_hpc=(os.environ.get("AISCIENTIST_UPLOADS_ON_HPC", "").strip().lower()
@@ -670,15 +589,5 @@ class HPCSettings:
             spliceai_models=os.environ.get("AISCIENTIST_SPLICEAI_MODELS", cls.spliceai_models),
             spliceai_max_variants=_int("AISCIENTIST_SPLICEAI_MAX_VARIANTS", cls.spliceai_max_variants),
             vep_fork=_int("AISCIENTIST_VEP_FORK", cls.vep_fork),
-            phenotype_on_hpc=(os.environ.get("AISCIENTIST_PHENOTYPE_ON_HPC", "").strip().lower()
-                              in ("1", "true", "yes", "on")),
-            lirical_image=os.environ.get("AISCIENTIST_LIRICAL_IMAGE", cls.lirical_image),
-            lirical_data_dir=os.environ.get("AISCIENTIST_LIRICAL_DATA_DIR", cls.lirical_data_dir),
-            lirical_exomiser_hg19=os.environ.get("AISCIENTIST_LIRICAL_EXOMISER_HG19",
-                                                 cls.lirical_exomiser_hg19),
-            lirical_exomiser_hg38=os.environ.get("AISCIENTIST_LIRICAL_EXOMISER_HG38",
-                                                 cls.lirical_exomiser_hg38),
-            lirical_time_limit=os.environ.get("AISCIENTIST_LIRICAL_TIME_LIMIT", cls.lirical_time_limit),
-            lirical_cpus=_int("AISCIENTIST_LIRICAL_CPUS", cls.lirical_cpus),
-            lirical_mem_gb=_int("AISCIENTIST_LIRICAL_MEM_GB", cls.lirical_mem_gb),
+
         )

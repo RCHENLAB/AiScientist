@@ -14,42 +14,27 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from . import dataset_storage
-from .run_monitor import timed_stage
-from ..tools import api as _legacy_tools
 
 CORPUS_DEFAULT_EMBEDDING = "st-NeuML/pubmedbert-base-embeddings"
 
 
-def preload_search_corpus(*args, **kwargs):
-    """Unregistered deployments retain their original in-process retrieval."""
-    return _legacy_tools.preload_search_corpus(*args, **kwargs)
 
 
-def run_search_corpus(*args, **kwargs):
-    return _legacy_tools.run_search_corpus(*args, **kwargs)
+
+
 
 _LOG = logging.getLogger(__name__)
-_LOCK = threading.Lock()
-_EMBEDDERS: dict[tuple[str, str], Any] = {}
-_LOAD_FAILURES: dict[tuple[str, str], float] = {}
-_LOAD_RETRY_S = 180
 # Where the copy lives under the data root: reference data, beside users/, analysis_results/ and
 # corpus_scans/ (issue 28's layout).
 DEFAULT_DIR = ("reference", "retigene")
 # How long the HPC3 index's fingerprint is trusted before it is read again.
 FINGERPRINT_TTL_S = 300
 _FINGERPRINTS: dict[str, tuple[float, "dict[str, str] | None"]] = {}
-# The copy's text, ready to search (``preload_search_corpus``): one version at a time, kept for the
-# life of the process. Building it takes ~7 s of CPU for the 39,563 chunks; a search then takes ~2 s.
-_TEXT_LOCK = threading.Lock()
-_TEXT: dict[tuple[str, int, int], Any] = {}
 _MANIFEST_SHA: dict[tuple[str, int, int], str] = {}
 
 
@@ -75,9 +60,41 @@ def vectors_match_chunks(cache: Path) -> bool:
     """Whether ``chunk_vecs.npy`` has one row per line of ``chunks.jsonl``. When it does not (a copy
     caught between two index builds), ``search_corpus`` would embed the whole corpus again, which on
     the gateway's CPU takes hours inside one request: such a copy is not used."""
-    import numpy as np
+    import ast
+    import math
+    import re
+    import struct
 
-    rows = np.load(cache / "chunk_vecs.npy", mmap_mode="r").shape[0]
+    # Inspect the bounded NPY metadata without importing an embedding/numeric stack.
+    # The native server reads the matrix; this is only the transfer completeness check.
+    path = cache / "chunk_vecs.npy"
+    with path.open("rb") as fh:
+        if fh.read(6) != b"\x93NUMPY":
+            raise ValueError("The corpus vector file is not an NPY array")
+        version = fh.read(2)
+        width = 2 if version == b"\x01\x00" else 4 if version in (b"\x02\x00", b"\x03\x00") else 0
+        if not width:
+            raise ValueError("Unsupported corpus vector metadata version")
+        raw = fh.read(width)
+        if len(raw) != width:
+            raise ValueError("Truncated corpus vector metadata")
+        size = struct.unpack("<H" if width == 2 else "<I", raw)[0]
+        if size > 65536:
+            raise ValueError("Corpus vector metadata exceeds its limit")
+        header = fh.read(size)
+        if len(header) != size:
+            raise ValueError("Truncated corpus vector metadata")
+        metadata = ast.literal_eval(header.decode("utf-8" if version == b"\x03\x00" else "latin1"))
+        shape = metadata.get("shape") if isinstance(metadata, dict) else None
+        dtype = re.fullmatch(r"[<>=|][biufc](\d+)", str(metadata.get("descr", ""))) if isinstance(metadata, dict) else None
+        if (not isinstance(shape, tuple) or len(shape) != 2
+                or any(type(n) is not int or n < 0 for n in shape)
+                or not dtype or not 0 < int(dtype[1]) <= 32
+                or type(metadata.get("fortran_order")) is not bool):
+            raise ValueError("Invalid corpus vector matrix metadata")
+        if path.stat().st_size < fh.tell() + math.prod(shape) * int(dtype[1]):
+            raise ValueError("Truncated corpus vector matrix")
+        rows = shape[0]
     with (cache / "chunks.jsonl").open("rb") as fh:
         lines = sum(1 for line in fh if line.strip())
     return rows == lines
@@ -152,93 +169,19 @@ def stale(executor: Any) -> list[str]:
     return diff
 
 
-@contextmanager
-def _loading_lock(lock: Any, source: str):
-    """Only contention is waiting; the holder's model/text load belongs to its own run."""
-    if not lock.acquire(blocking=False):
-        with timed_stage("corpus_wait", category="observation", source=source):
-            lock.acquire()
-    try:
-        yield
-    finally:
-        lock.release()
 
 
-def _preloaded(paths: Any) -> Any:
-    st = (paths.cache / "chunks.jsonl").stat()
-    key = (str(paths.cache), st.st_size, st.st_mtime_ns)
-    with _loading_lock(_TEXT_LOCK, "local_text"):
-        if key not in _TEXT:
-            _TEXT.clear()            # the previous version's text goes once no search holds it
-            with timed_stage("corpus_load", source="local_text"):
-                _TEXT[key] = preload_search_corpus(paths)
-        return _TEXT[key]
 
 
-def _embedder(root: Path) -> Any:
-    name = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", CORPUS_DEFAULT_EMBEDDING).removeprefix("st-")
-    hf = root / "hf_cache" / "hub"
-    key = (name, str(hf))
-    with _loading_lock(_LOCK, "local_embedder"):
-        if key not in _EMBEDDERS:
-            if time.monotonic() < _LOAD_FAILURES.get(key, 0):
-                raise RuntimeError("The offline embedding model is temporarily unavailable")
-            try:
-                with timed_stage("corpus_load", source="local_embedder"):
-                    from sentence_transformers import SentenceTransformer
-
-                    model = SentenceTransformer(name, device="cpu", local_files_only=True,
-                                                cache_folder=str(hf) if hf.is_dir() else None)
-            except Exception:
-                _LOAD_FAILURES[key] = time.monotonic() + _LOAD_RETRY_S
-                raise
-            _LOAD_FAILURES.pop(key, None)
-            _EMBEDDERS[key] = lambda texts: model.encode(
-                texts, batch_size=32, show_progress_bar=False, normalize_embeddings=True)
-        return _EMBEDDERS[key]
 
 
-def run_local_search(args: dict[str, Any], ctx: Any = None) -> dict[str, Any] | None:
-    """Call in a worker thread. None means use the existing HPC3 fallback.
 
-    Loading never downloads a model or changes process environment. Failed loads are cached for
-    three minutes before retrying, allowing model installation without restarting the gateway.
-    """
-    if not has_local_index():
-        return None
-    root = local_root()
-    index = index_dir(root)
-    try:
-        if not vectors_match_chunks(index / "mechanism_cache"):
-            _LOG.warning("Local corpus copy has vectors for a different index; using HPC3 fallback")
-            return None
-        embed = _embedder(root)
-        manifest = index / "manifest.csv"
-        hgnc = index / "hgnc_complete_set.txt"
-        paths = _legacy_tools.CorpusPaths(index, manifest if manifest.is_file() else None,
-                            index / "mechanism_cache", False,
-                            hgnc if hgnc.is_file() else None, root / "hf_cache")
-        preloaded = _preloaded(paths)
-        with timed_stage("corpus_search", source="local_index") as span:
-            result = run_search_corpus(args, ctx, embed_fn=embed, paths=paths, preloaded=preloaded)
-            if result.get("status") != "ok":
-                span.end("failed")
-            return result
-    except Exception:
-        _LOG.warning("Local corpus retrieval unavailable; using HPC3 fallback", exc_info=True)
-        return None
+
+
+
 
 
 def make_local_tool() -> Any:
-    """Return a ready local tool, or None. Model loading belongs in a worker thread."""
+    """Use the opt-in external MCP image; no embedding model loads in the gateway."""
     from . import local_literature_mcp
-    if local_literature_mcp.enabled():
-        return local_literature_mcp.make_tool()
-    if not has_local_index():
-        return None
-    try:
-        _embedder(local_root())
-    except Exception:
-        return None
-    from dataclasses import replace
-    return replace(_legacy_tools.make_search_corpus_tool(), executor=run_local_search)
+    return local_literature_mcp.make_tool()

@@ -2,37 +2,37 @@
 name: celltype_annotation
 version: 2
 description: Single-cell cell-type annotation + report (v2 — stability-selected resolution, raw-expression label confirmation, preranked GSEA)
-tools: run_scanpy_qc, run_cellqc, run_doublet_detection, run_integration, run_clustering, run_de, run_marker_annotation, run_composition, run_enrichment, run_gsea_prerank, literature_search, run_code
+tools: mcp_run_scanpy_qc, mcp_run_cellqc, mcp_run_doublet_detection, mcp_run_integration, mcp_run_clustering, mcp_run_de, mcp_run_marker_annotation, mcp_run_composition, mcp_run_enrichment, mcp_run_gsea_prerank, mcp_literature_search, run_code
 data_type: scrna
 outputs:
   - path: figures/umap_clusters.png
     kind: figure
-    tool: run_clustering
+    tool: mcp_run_clustering
     description: UMAP of the cells coloured by Leiden cluster.
     required: true
   - path: tables/de_*_all.csv
     kind: table
-    tool: run_de
+    tool: mcp_run_de
     description: Combined differential-expression table, one row per gene and group with log2 fold change, p-value, adjusted p-value and score. Markers list the top genes per group; a contrast lists the genes that pass the adjusted-p and log2 fold-change gates.
     required: true
   - path: figures/volcano_*.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Volcano plot per compared group or cell type, drawn only for a contrast against a reference level.
     required: false
   - path: figures/dotplot__markers.png
     kind: figure
-    tool: run_de
+    tool: mcp_run_de
     description: Dot plot of the top marker genes of each group, drawn only for one-vs-rest markers.
     required: false
   - path: tables/cluster_cell_types.csv
     kind: table
-    tool: run_marker_annotation
+    tool: mcp_run_marker_annotation
     description: One row per cluster with the assigned cell type, the first-pass label, the confidence, the deciding marker evidence and, for an Unassigned cluster, the reason.
     required: true
   - path: figures/umap_cell_types.png
     kind: figure
-    tool: run_marker_annotation
+    tool: mcp_run_marker_annotation
     description: UMAP of the cells coloured by assigned cell type.
     required: false
 ---
@@ -70,34 +70,34 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
      down NOW, while no differential or marker result is visible yet. A threshold chosen after
      seeing which one flatters the answer is not a threshold. Say what happens when a gate
      FAILS: the estimate is marked unsupported and omitted, not softened until it passes.
-1. QC the dataset (`run_scanpy_qc` for one matrix; `run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter low-quality cells/genes,
+1. QC the dataset (`mcp_run_scanpy_qc` for one matrix; `mcp_run_cellqc` INSTEAD when the data profile says the input is a folder of 10x Cell Ranger outputs (raw + filtered matrices): it corrects ambient RNA, removes doublets and writes the same normalised checkpoint): per-cell metrics, filter low-quality cells/genes,
    normalize + log1p + HVG. Report pre/post counts. For snRNA-seq, a few hundred UMIs per
    nucleus is EXPECTED — do not treat it as a failed run and do not filter it away.
-1b. **Doublets** (`run_doublet_detection`): two cells in one droplet express both parents'
+1b. **Doublets** (`mcp_run_doublet_detection`): two cells in one droplet express both parents'
    programmes and form an "intermediate" cluster that reads as a novel transitional cell type.
-   Run this before clustering. Report the rate. SKIP it after `run_cellqc`, which already called
+   Run this before clustering. Report the rate. SKIP it after `mcp_run_cellqc`, which already called
    and removed the doublets (DoubletFinder, with scDblFinder as a second opinion).
-1c. **Integration** (`run_integration`) — REQUIRED when the object holds more than one sample.
+1c. **Integration** (`mcp_run_integration`) — REQUIRED when the object holds more than one sample.
    Check the obs profile for a donor/sample/batch column first. Without it the cells cluster by
    donor and every label below is really a donor label, with no visible symptom. Report
    `method_used` and the before/after batch silhouette; if the tool returns a warning that the
    batches did not mix, say so rather than proceeding as if they had.
-2. Cluster the cells (`run_clustering`) with **`select_resolution: true`**. Every label
+2. Cluster the cells (`mcp_run_clustering`) with **`select_resolution: true`**. Every label
    assigned later inherits this partition, so the resolution is chosen by bootstrap stability
    (the finest resolution whose clusters still reproduce under resampling, scored by ARI),
    not left at the default. Report the selected resolution AND how it was selected
    (`resolution_source`), and sanity-check it against biology: the major lineages of the
    panel should come apart.
-3. Find marker genes per cluster (`run_de`): Wilcoxon `rank_genes_groups`. This also writes
+3. Find marker genes per cluster (`mcp_run_de`): Wilcoxon `rank_genes_groups`. This also writes
    the complete tested universe and a full ranked list per cluster, which steps 4-5 need.
-4. Pathway context — `run_enrichment` (ORA over the significant markers, against the tested
-   universe as background) and `run_gsea_prerank` (preranked GSEA over the whole ranking).
+4. Pathway context — `mcp_run_enrichment` (ORA over the significant markers, against the tested
+   universe as background) and `mcp_run_gsea_prerank` (preranked GSEA over the whole ranking).
    Run BOTH when pathway interpretation matters: ORA tests the SIGNIFICANT set (every gene
    passing `padj` and `lfc` — not a top-N of it, which would make the input size differ per
    cluster and the results incomparable), GSEA walks the entire ranking and returns a signed
    NES, so GSEA can see coordinated shifts that no per-gene cutoff keeps. They use different inputs and different null hypotheses, so **do
    not require them to agree**, and do not report disagreement as an error in either.
-5. Assign a cell-type label to each cluster with **`run_marker_annotation`**. For a tissue with a
+5. Assign a cell-type label to each cluster with **`mcp_run_marker_annotation`**. For a tissue with a
    curated reference (retina, human or mouse) pass `reference: "retina"` and NO panel: the
    markers then come from the curated reference, not from memory (a model-written retina panel
    once labelled 1,631 Muller glia "Unassigned"/"ganglion"). Otherwise pass a `panel` and
@@ -110,10 +110,10 @@ Adapt the parameters to THIS dataset; plan ordered steps that:
    Report which clusters the raw check CORRECTED, which were withdrawn or stayed unassigned, the
    tool's warnings, and its composition notes (e.g. a lineage absent because the sample was
    depleted of it).
-5b. **Composition** (`run_composition`): the proportion each label makes up, per sample.
+5b. **Composition** (`mcp_run_composition`): the proportion each label makes up, per sample.
 6. Produce figures: a UMAP colored by cluster and by assigned cell type, and violin/dot plots
    of canonical marker genes.
-6b. **Literature grounding** (`literature_search`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
+6b. **Literature grounding** (`mcp_literature_search`) — OPTIONAL, and its own step: plan it ONLY when the user asks for literature, references or citations; otherwise leave it out and offer it as a follow-up.
    When it is planned: search on the cell types, markers and pathway terms the analysis actually
    surfaced. The manuscript's `## References` are built ONLY from an ACCEPTED literature step, so
    a run without one has no reference list, and its report says so.
@@ -135,12 +135,13 @@ Reporting discipline — these belong in the write-up, not only in the logs:
   parameters (set-size limits, permutations, seed);
 - **null findings.** A group where nothing cleared FDR is a result and stays in the report.
 
-**Pathway analysis: use `run_enrichment` / `run_gsea_prerank` when the design supports them, and
+**Pathway analysis: use `mcp_run_enrichment` / `mcp_run_gsea_prerank` when the design supports them, and
 when it does not, still take the gene sets from disk.** Both tools read `.gmt` libraries that are
-ALREADY ON DISK next to the tools — GO_Biological_Process_2023, Reactome_2022, MSigDB_Hallmark_2020
-(`AISCIENTIST_GENESETS_DIR` overrides the location) — offline, no download, no network. But both also
-consume `run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
-replication forbids exactly those p-values and therefore often skips `run_de` entirely, which
+configured by the operator under `SCRNA_GENESETS_DIR` — for example GO_Biological_Process_2023,
+Reactome_2022 and MSigDB_Hallmark_2020 — offline, no download, no network. Confirm the required
+local GMT files are available; report a missing library without inventing results or downloading it. But both also
+consume `mcp_run_de`'s output table and return ORA/GSEA p-values and FDR. A design with no biological
+replication forbids exactly those p-values and therefore often skips `mcp_run_de` entirely, which
 leaves both tools unusable through no fault of the plan. That is NOT a reason to go to the network:
 run 3c5fbc8608a7 hand-rolled a p-value-free pathway score, went looking for a collection to fetch,
 hit the confirmation guarding downloads from non-allowlisted hosts, was declined, and recorded

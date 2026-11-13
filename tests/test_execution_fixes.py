@@ -50,22 +50,8 @@ def test_different_returned_errors_are_debugging_not_stuck():
     assert harness.run("do it", _ctx()).stop_reason != "repeated_tool_errors"
 
 
-# --- 2. inspect_dataset: the bound dataset wins over a path this host does not have -------------
+# --- 2. mcp_inspect_dataset: the bound dataset wins over a path this host does not have -------------
 
-def test_bound_dataset_wins_over_a_model_typed_hpc3_path(monkeypatch, tmp_path):
-    from aiscientist.tools.inspect_dataset import tool as dataset_inspect
-    bound = tmp_path / "bound.h5ad"
-    bound.write_bytes(b"x")
-    seen = []
-    monkeypatch.setattr(dataset_inspect, "inspect_dataset", lambda path, chat_fn=None: seen.append(path) or {})
-    tool = next(t for t in [dataset_inspect.make_inspect_dataset_tool()] if t.name == "inspect_dataset")
-    ctx = SimpleNamespace(decisions={"dataset_path": str(bound)}, workspace=tmp_path, tunnel_port=None,
-                          model="m")
-    tool.executor({"path": "/dfs3b/ruic20_lab/software/AiScientist/uploads/u/Ddx41.h5ad"}, ctx)
-    other = tmp_path / "other.h5ad"
-    other.write_bytes(b"y")
-    tool.executor({"path": str(other)}, ctx)                 # a real local file of this run
-    assert seen == [str(bound), str(other.resolve())]
 
 
 # --- 3. literature routing reads the step's headline -------------------------------------------

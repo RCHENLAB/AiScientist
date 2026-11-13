@@ -7,39 +7,41 @@ ranking, quote checks and curation remain in the scientific runtime. A fresh-pro
 regression blocks all four legacy tool packages, `_lib.corpus`, and the external
 scientific package while importing the gateway and choosing its local Docker route.
 
-The four legacy tools and unregistered deployment fallback remain until the real
-website acceptance gate passes. No helper relocation is evidence that a full
-curation or scientific parity gate has passed.
+The application owns planning, model-session relay, transfer, cancellation and publication. All seven literature/phenotype scientific tools execute through registered native MCP servers. Local no-HPC search is an explicitly enabled Docker deployment with the same pinned literature image; public lookup and offline corpus retrieval have separate network policies. Scientific and report validation are separate gates; see the issue94 validation record for actual outcomes.
 
 ## Native operator maintenance
 
-`build_mechanism_cache.py` and `eval_corpus_retrieval.py` are operator commands,
-not model-callable MCP tools. Set `AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp`
-**inside the published literature image**. Their lazy loader uses the installed
-`aiscientist_mcp.literature` implementation; do not install that scientific package
-into the gateway. Native mode never falls back to the app's old tools. The scripts
-still support explicit `legacy` mode for deployments before cutover.
+`build_mechanism_cache.py` and `eval_corpus_retrieval.py` are fixed operator shims, not model-callable MCP tools. Set `AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS` to the absolute, non-symlink `scripts` directory of a reviewed MCP checkout. Their algorithm implementations and dependencies live in that repository. Run the shim **inside the published literature image**, or let the gateway's update command stage the fixed cache builder. Missing configuration fails before compute submission. `AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp` is the only runtime; there is no legacy fallback and no server-package installation in the gateway.
 
 For an HPC index rebuild, set these in the operator's deployment environment:
 
 ```sh
 export AISCIENTIST_CORPUS_MAINTENANCE_RUNTIME=mcp
+export AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS=/path/to/reviewed/aiscientist-mcp/scripts
+export AISCIENTIST_HPC_HOST=login.cluster.example.edu
+export AISCIENTIST_HPC_TRANSFER_HOST=transfer.cluster.example.edu
+export AISCIENTIST_CPU_PARTITION=standard
+export AISCIENTIST_CPU_ACCOUNT=your_cpu_charge_account
+export AISCIENTIST_PAPERQA_PAPERS=/shared/corpus/papers
+export AISCIENTIST_PAPERQA_MANIFEST=/shared/corpus/paperqa_manifest.csv
+export AISCIENTIST_LOCAL_CORPUS_ROOT=/data/reference/corpus-copy
 # Omit this when the app already registers the pinned literature server image.
-export AISCIENTIST_CORPUS_MAINTENANCE_IMAGE='docker://ghcr.io/liujs123456/mcp-literature@sha256:655ad065365672a67b8b6e8ba3f1cc71a7afde141e28ed47b73f17f9eb1c148b'
-python scripts/update_corpus_index.py --rebuild
+export AISCIENTIST_CORPUS_MAINTENANCE_IMAGE='docker://ghcr.io/liujs123456/mcp-literature@sha256:ea3d66b0b7bc6f217da5dd78e1fd16ae018cea780e45728a097fbaa306fd12e7'
+python scripts/update_corpus_index.py --rebuild \
+  --hpc-user your_cluster_user --ssh-key /path/to/operator_key
 ```
+
+Use an existing operator-authorized SSH identity; this command does not provision keys or grant access. `--hpc-root` can replace the remote corpus-root settings, and `--destination` can replace `AISCIENTIST_LOCAL_CORPUS_ROOT`. Keep the reviewed external checkout revision with the operator evidence. These `AISCIENTIST_PAPERQA_*` names are retained only as platform transfer inputs; inside the image the staged job sets the corresponding bounded `LITERATURE_*` references.
 
 The update command preserves the existing CPU Slurm submission, corpus settings,
 `.next`/`.prev` index replacement, transfer-node sync, rollback and fingerprint
-checks. In native mode its archive contains only the build script and its runtime
-loader. The job binds the corpus writable and staged scripts read-only, disables
-network access and uses the existing offline embedding cache. It does not stage
+checks. In native mode its archive contains only the app transport shim/runtime loader and the reviewed external cache builder with its SHA-256 manifest. The job binds the corpus writable and staged scripts read-only, sets offline Hugging Face/Transformers resolution, and uses the existing embedding cache. It does not impose container-level network isolation on the cluster. It does not stage
 the app or its old scientific tool folders into the container. An explicitly
 configured local SIF can also be used; the operator must verify it against the
 published image pin before use. Run compute through Slurm, not on a login node.
 
 For manual evaluation, mount this checkout read-only into that exact image, plus
-read-only corpus/model files and a private writable output directory. Run the
+read-only corpus/model files and a private writable output directory. Also mount the reviewed MCP `scripts` directory read-only and set `AISCIENTIST_CORPUS_MAINTENANCE_SCRIPTS` to that **container-visible** path, not its host path. The fixed external script must remain a regular file; the wrapper refuses symlinked ancestors and unknown operator names. Run the
 existing `scripts/eval_corpus_retrieval.py` arguments with the runtime setting
 above and `LITERATURE_CORPUS_ROOT` set to the mounted corpus root (add any separate
 read-only input roots to `LITERATURE_ALLOWED_ROOTS`). The scheduled rebuild sets
@@ -88,10 +90,6 @@ This public-search benchmark needs network access. It neither rebuilds nor write
 the shared corpus. Its private per-call MCP scratch is removed after reading full
 results. Native index rebuilding remains a separate offline operation.
 
-## Remaining cutover work
+## Validation scope
 
-This preparation keeps legacy runtime targets and the legacy operator default for
-unregistered deployments. After the website acceptance gates pass, retirement must
-remove those legacy targets and tool exports, switch the operator default together
-with the default MCP catalog, and migrate or retire the old CLI/source-bundle tests.
-Do not infer full retirement from import isolation or synthetic operator smoke.
+Import isolation, maintenance unit tests, and synthetic operator smoke do not establish scientific or report acceptance. Keep the frozen native-image tests, selected-session-model website results, and any failed or corrected report attempts in the validation record. Never rebuild or move an immutable image tag for an operator-script-only update.

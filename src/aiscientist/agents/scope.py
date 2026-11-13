@@ -168,7 +168,7 @@ _EXCEPT = re.compile(r"\b(?:except|other than|apart from)\b|除了", re.IGNORECA
 _LIMIT_CUE = re.compile(r"\b(?:only|just|no|not|don'?t|skip|without|except|nothing else)\b|"
                         r"只|仅|不做|不要|不用|不需要|无需|别|跳过|除了", re.IGNORECASE)
 _METHOD_RESULT = re.compile(
-    r"\s*(?:please\s+)?(?:do|run|perform)\s+(?:run[_ ]cellqc|cell[- ]?qc)"
+    r"\s*(?:please\s+)?(?:do|run|perform)\s+(?:(?:mcp_)?run[_ ]cellqc|cell[- ]?qc)"
     r"(?:\s+quality\s+controll?)?\s*[,;]?\s*(?:and\s+)?(?:give|show|return)\s+"
     r"(?:me\s+)?(?:(?:a|the|its)\s+)?results?(?:\s+dataset)?\s*[.!]?\s*", re.IGNORECASE)
 _BRIEF_REPORT = re.compile(
