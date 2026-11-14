@@ -1,6 +1,6 @@
 # Native phenotype references
 
-Phenotype tools run in the independently published [phenotype-diagnosis MCP](https://github.com/liujs123456/aiscientist-mcp/tree/main/packages/phenotype-diagnosis), pinned by the application's reviewed MCP catalog and instruction skill. This folder retains reference-data staging; the app no longer builds a LIRICAL image or ships its scientific CLI.
+Phenotype tools run in the independently published [phenotype-diagnosis MCP](https://github.com/lijinbio/aiscientist-mcp/tree/main/packages/phenotype-diagnosis), pinned by the application's reviewed MCP catalog and instruction skill. This folder retains reference-data staging; the app no longer builds a LIRICAL image or ships its scientific CLI.
 
 Use the catalog's immutable image, converted to a verified SIF by the operator or gateway image cache. On a compute node, set `PHENOTYPE_MCP_SIF` to that file and `AISCIENTIST_LIRICAL_REF_ROOT` to a dedicated writable reference root, then run `build_and_stage.sh`. The script preserves existing phenotype references and optionally downloads Exomiser with `EXOMISER=1 EXOMISER_ASSEMBLY=hg19` (or `hg38`). It refuses to run outside a Slurm allocation. For example, submit with `sbatch --account=<account> --partition=<cpu-partition> --cpus-per-task=4 --mem=16G --time=08:00:00 deploy/lirical/build_and_stage.sh` after exporting those operator settings.
 
