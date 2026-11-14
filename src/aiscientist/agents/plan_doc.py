@@ -37,7 +37,7 @@ import json
 import math
 import re
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping
 
 from .tool_schema import NAME_LEFT, NAME_RIGHT, PlanParameters
@@ -52,6 +52,8 @@ _HEADER = (
     "# AiScientist plan. Run it as it is, or edit it and choose \"Apply edits\".\n"
     "# `settings` are passed to the step's tool exactly as written here.\n"
     "# `skill` is the vetted skill a step uses; delete the line to let the step go without it.\n"
+    "# `tools` lists planned tool/provider/version identities; `skills` lists planned skill versions.\n"
+    "# Assignment is not evidence that a tool or skill ran successfully.\n"
     "# `request` and `runs_on` are filled in by AiScientist; changes to them are ignored.\n"
 )
 
@@ -104,6 +106,17 @@ class PlanStep:
     settings: "dict[str, Any]" = field(default_factory=dict)
     runs_on: str = ""
     skill: "str | None" = None
+    tools: "tuple[dict[str, str], ...]" = ()
+    skills: "tuple[dict[str, str], ...]" = ()
+
+    def planned_tools(self) -> "list[dict[str, str]]":
+        return [dict(t) for t in self.tools] if self.tools else ([{
+            "tool": self.tool, "provider": "unknown", "server": "unknown", "version": "unknown"
+        }] if self.tool else [])
+
+    def planned_skills(self) -> "list[dict[str, str]]":
+        return [dict(s) for s in self.skills] if self.skills else ([{
+            "name": self.skill, "version": "unknown"}] if self.skill else [])
 
     @property
     def title(self) -> str:
@@ -123,6 +136,8 @@ class PlanStep:
             out["runs_on"] = self.runs_on
         if self.skill:
             out["skill"] = self.skill
+        out["tools"] = self.planned_tools()
+        out["skills"] = self.planned_skills()
         return out
 
 
@@ -252,6 +267,10 @@ def dump_plan_yaml(doc: PlanDoc) -> str:
             out.append(f"    runs_on: {_scalar(step.runs_on)}")
         if step.skill:
             out.append(f"    skill: {_scalar(step.skill)}")
+        if step.tools:
+            out.append(f"    tools: {_scalar(list(step.tools))}")
+        if step.skills:
+            out.append(f"    skills: {_scalar(list(step.skills))}")
         if step.settings:
             out.append("    settings:")
             out.extend(f"      {_scalar(str(k))}: {_scalar(v)}" for k, v in step.settings.items())
@@ -278,6 +297,27 @@ def _json_setting(value: Any, *, depth: int = 0, budget: list[int] | None = None
         return all(isinstance(k, str) and _json_setting(v, depth=depth + 1, budget=budget)
                    for k, v in value.items())
     return False
+
+
+def _identities(raw: Any, *, tools: bool = False) -> tuple[dict[str, str], ...]:
+    """Read structured identities; missing metadata is explicit, never a prose guess."""
+    if raw is None:
+        return ()
+    key = "tool" if tools else "name"
+    if not isinstance(raw, (list, tuple)) or any(
+            not isinstance(item, Mapping) or not isinstance(item.get(key), str)
+            or not item[key].strip() for item in raw):
+        raise PlanError([f"{'tools' if tools else 'skills'} must be a list of named identities."])
+    result = []
+    for item in raw:
+        row = {key: item[key].strip(), "version": str(item.get("version") or "unknown")}
+        if tools:
+            provider = str(item.get("provider") or "unknown")
+            if provider not in {"mcp", "local", "unknown"}:
+                raise PlanError(["A tool provider must be mcp, local or unknown."])
+            row.update(provider=provider, server=str(item.get("server") or "unknown"))
+        result.append(row)
+    return tuple(result)
 
 
 def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
@@ -330,6 +370,9 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         tool = str(tool).strip() if tool not in (None, "") else None
         skill = raw.get("skill")
         skill = str(skill).strip() if skill not in (None, "", False) else None
+        tools = _identities(raw.get("tools"), tools=True)
+        skills = _identities(raw.get("skills"))
+        tool = tool or (tools[0]["tool"] if tools else None)
         settings_raw = raw.get("settings")
         settings: dict[str, Any] = {}
         if settings_raw not in (None, {}, []):
@@ -347,7 +390,7 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         if settings and not tool:
             problems.append(f"Step {n} has settings but no tool selected to use them.")
         parsed.append({"id": sid, "title": title, "does": does, "tool": tool, "settings": settings,
-                       "skill": skill})
+                       "skill": skill, "tools": tools, "skills": skills})
     if problems:
         raise PlanError(problems)
 
@@ -356,7 +399,8 @@ def parse_plan_yaml(text: str, *, request: str = "") -> PlanDoc:
         sid = item["id"] or _fresh_id(seen)
         seen.add(sid)
         steps.append(PlanStep(id=sid, text=join_step(item["title"], item["does"]),
-                              tool=item["tool"], settings=item["settings"], skill=item["skill"]))
+                              tool=item["tool"], settings=item["settings"], skill=item["skill"],
+                              tools=item["tools"], skills=item["skills"]))
     return PlanDoc(request=request, steps=tuple(steps))
 
 
@@ -402,9 +446,7 @@ def sync_plan(prev: "PlanDoc | None", agenda: "list[str]", *, request: str,
             step = PlanStep(id=sid, text=text, tool=tool_of(text))
             fresh.append(i)
         if runs_on_of is not None and step.tool:
-            step = PlanStep(id=step.id, text=step.text, tool=step.tool,
-                            settings=step.settings, runs_on=runs_on_of(step.tool) or "",
-                            skill=step.skill)
+            step = replace(step, runs_on=runs_on_of(step.tool) or "")
         steps.append(step)
     return PlanDoc(request=request, steps=tuple(steps)), fresh
 
@@ -589,9 +631,17 @@ def bind_settings(text: str, properties: "Mapping[str, Any]",
     return settings, dropped
 
 
+def _edited_primary_tool(step: PlanStep, old: "PlanStep | None") -> PlanStep:
+    """A changed tools list selects the primary unless the singular tool was also changed."""
+    if old is not None and step.tools != old.tools and step.tool == old.tool:
+        return replace(step, tool=step.tools[0]["tool"] if step.tools else None)
+    return step
+
+
 def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
                is_known: "Callable[[str], bool] | None" = None,
                skill_name: "Callable[[str], str | None] | None" = None,
+               *, before: "PlanDoc | None" = None,
                ) -> "tuple[PlanDoc, list[dict[str, Any]]]":
     """``(doc with settings in their declared types, findings)`` for a document a person edited.
 
@@ -601,19 +651,33 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
     findings: with no catalog there is nothing to judge against.
 
     ``skill_name`` resolves a step's ``skill`` to the library's own name (an old name of a migrated
-    skill resolves too), or ``None`` when no such skill is loaded."""
+    skill resolves too), or ``None`` when no such skill is loaded. ``before`` settles a tools-only
+    edit's primary tool before validating its settings, using the same rule as ``apply_edit``."""
+    if before is not None:
+        old_by_id = {s.id: s for s in before.steps}
+        doc = PlanDoc(request=doc.request, steps=tuple(
+            _edited_primary_tool(s, old_by_id.get(s.id)) for s in doc.steps))
     if skill_name is not None:
         resolved: list[PlanStep] = []
         skill_findings: list[dict[str, Any]] = []
         for n, step in enumerate(doc.steps, 1):
+            identities = []
+            for identity in step.skills:
+                name = skill_name(identity["name"])
+                if name is None:
+                    skill_findings.append({"step": n, "id": step.id, "tool": step.tool or "",
+                                           "kind": "unknown_skill", "param": identity["name"], "detail": ""})
+                identities.append({**identity, "name": name or identity["name"]})
+            if identities:
+                step = replace(step, skills=tuple(identities))
             if step.skill:
                 name = skill_name(step.skill)
                 if name is None:
                     skill_findings.append({"step": n, "id": step.id, "tool": step.tool or "",
                                            "kind": "unknown_skill", "param": step.skill, "detail": ""})
                 elif name != step.skill:
-                    step = PlanStep(id=step.id, text=step.text, tool=step.tool, settings=step.settings,
-                                    runs_on=step.runs_on, skill=name)
+                    step = replace(step, skill=name, skills=tuple(
+                        {**s, "name": name} if s["name"] == step.skill else s for s in step.skills))
             resolved.append(step)
         doc = PlanDoc(request=doc.request, steps=tuple(resolved))
         if skill_findings:
@@ -625,6 +689,10 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
     steps: list[PlanStep] = []
     for n, step in enumerate(doc.steps, 1):
         base = {"step": n, "id": step.id, "tool": step.tool or ""}
+        for identity in step.tools:
+            name = identity["tool"]
+            if name != step.tool and name not in schemas and not (is_known and is_known(name)):
+                findings.append({**base, "tool": name, "kind": "unknown_tool", "param": "", "detail": ""})
         if not step.tool:
             steps.append(step)
             continue
@@ -658,8 +726,7 @@ def check_plan(doc: PlanDoc, schemas: "Mapping[str, Mapping[str, Any]]",
         if isinstance(props, PlanParameters) and typed:
             findings.extend({**base, "kind": "bad_value", "param": ".".join(map(str, error.absolute_path))
                              or "settings", "detail": error.message} for error in props.errors(typed))
-        steps.append(PlanStep(id=step.id, text=step.text, tool=step.tool,
-                              settings=typed, runs_on=step.runs_on, skill=step.skill))
+        steps.append(replace(step, settings=typed))
     return PlanDoc(request=doc.request, steps=tuple(steps)), findings
 
 
@@ -717,6 +784,18 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
             changes.append({"kind": "added", "step": n, "id": step.id, "after": step.text})
             steps.append(step)
             continue
+        if step.skills != old.skills and step.skill == old.skill:
+            step = replace(step, skill=step.skills[0]["name"] if step.skills else None)
+        step = _edited_primary_tool(step, old)
+        # Old editors remove/change the singular line. Do not resurrect it from
+        # an unchanged plural mirror written by a newer version.
+        mirrored_skill_edit = step.skill != old.skill and step.skills == old.skills
+        if mirrored_skill_edit:
+            step = replace(step, skills=())
+        if step.tool != old.tool and step.tools == old.tools:
+            step = replace(step, tools=tuple(
+                {"tool": step.tool, "provider": "unknown", "server": "unknown", "version": "unknown"}
+                if t["tool"] == old.tool else t for t in step.tools if t["tool"] != old.tool or step.tool))
         text = step.text
         same_prose = (_flat(step.title) == _flat(old.title) and _flat(step.does) == _flat(old.does))
         if same_prose:
@@ -737,6 +816,12 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
         if (step.skill or None) != (old.skill or None):
             changes.append({"kind": "skill", "step": n, "id": step.id,
                             "before": old.skill or "", "after": step.skill or ""})
+        for field_name in ("tools", "skills"):
+            if getattr(step, field_name) != getattr(old, field_name) and not (
+                    field_name == "skills" and mirrored_skill_edit):
+                changes.append({"kind": field_name, "step": n, "id": step.id,
+                                "before": list(getattr(old, field_name)),
+                                "after": list(getattr(step, field_name))})
         for key in [*old.settings, *(k for k in step.settings if k not in old.settings)]:
             was, now = old.settings.get(key, _ABSENT), step.settings.get(key, _ABSENT)
             if was is not _ABSENT and now is not _ABSENT and _same_value(was, now):
@@ -760,11 +845,12 @@ def apply_edit(before: PlanDoc, edited: PlanDoc) -> "tuple[PlanDoc, list[dict[st
             changes.append({"kind": "moved", "step": n, "id": step.id, "before": old_pos[step.id] + 1})
         unchanged = (text == old.text and (step.tool or None) == (old.tool or None)
                      and (step.skill or None) == (old.skill or None)
+                     and step.tools == old.tools and step.skills == old.skills
                      and _settings_equal(step.settings, old.settings))
         steps.append(old if unchanged else PlanStep(
             id=step.id, text=text, tool=step.tool, settings=dict(step.settings),
             runs_on=old.runs_on if (step.tool or None) == (old.tool or None) else "",
-            skill=step.skill or None))
+            skill=step.skill or None, tools=step.tools, skills=step.skills))
     kept = {s.id for s in edited.steps}
     for s in before.steps:
         if s.id not in kept:
@@ -865,7 +951,8 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
             skill = str(op.get("skill") or "").strip() or None
             steps.insert(at, PlanStep(id=sid, text=join_step(title, does), tool=tool,
                                       settings={str(k): v for k, v in (settings or {}).items() if v is not None},
-                                      skill=skill))
+                                      skill=skill, tools=_identities(op.get("tools"), tools=True),
+                                      skills=_identities(op.get("skills"))))
             continue
         at = find(op.get("step"))
         if at is None:
@@ -897,9 +984,19 @@ def apply_ops(doc: PlanDoc, ops: "Iterable[Mapping[str, Any]]") -> PlanDoc:
             tool = (str(op["tool"]).strip() or None) if "tool" in op and op["tool"] is not None else step.tool
             # ``"skill": null`` takes the step's skill away; no ``skill`` key leaves it as it is.
             skill = (str(op["skill"] or "").strip() or None) if "skill" in op else step.skill
+            if "skills" in op and "skill" not in op:
+                identities = _identities(op["skills"])
+                skill = identities[0]["name"] if identities else None
+            if "tools" in op and "tool" not in op:
+                identities = _identities(op["tools"], tools=True)
+                tool = identities[0]["tool"] if identities else None
             prose_same = title == step.title and does == step.does
             steps[at] = PlanStep(id=step.id, text=step.text if prose_same else join_step(title, does),
-                                 tool=tool, settings=settings, runs_on=step.runs_on, skill=skill)
+                                 tool=tool, settings=settings, runs_on=step.runs_on, skill=skill,
+                                 tools=_identities(op["tools"], tools=True) if "tools" in op else (
+                                     step.tools if tool == step.tool else ()),
+                                 skills=_identities(op["skills"]) if "skills" in op else (
+                                     step.skills if skill == step.skill and op.get("skill", True) is not None else ()))
     if not problems and not steps:
         problems.append("The operations remove every step. To run nothing, cancel the plan instead.")
     if problems:
@@ -926,6 +1023,16 @@ def pin_args(args: "Mapping[str, Any]", pinned: "Mapping[str, Any]") -> "tuple[d
 
 # --- reading a finished run back against the approved plan --------------------------------------------
 
+def _provider_changed(approved: Mapping[str, Any], used: Any) -> bool:
+    """Missing provenance is not evidence of a provider change."""
+    if not isinstance(used, Mapping) or approved.get("provider") not in {"local", "mcp"} \
+            or used.get("provider") not in {"local", "mcp"}:
+        return False
+    return any(approved.get(key) not in (None, "", "unknown")
+               and used.get(key) not in (None, "", "unknown")
+               and approved[key] != used[key] for key in ("provider", "server", "version"))
+
+
 def check_adherence(doc: PlanDoc, executed: "list[dict[str, Any]]",
                     approved_additions: "Iterable[str]" = ()) -> "dict[str, Any]":
     """What the run did with each approved step.
@@ -951,12 +1058,22 @@ def check_adherence(doc: PlanDoc, executed: "list[dict[str, Any]]",
     for n, step in enumerate(doc.steps, 1):
         row: dict[str, Any] = {"step": n, "id": step.id, "title": step.title or step.does[:60],
                                "tool": step.tool or "", "status": "as_planned", "detail": []}
+        row.update(planned_tools=step.planned_tools(), planned_skills=step.planned_skills())
         runs = by_text.get(step.text) or []
         if not runs:
             row["status"] = "not_run"
             rows.append(row)
             continue
         calls = [c for r in runs for c in (r.get("calls") or []) if isinstance(c, Mapping)]
+        row["unused_planned_tools"] = [t["tool"] for t in step.tools if t["tool"] != step.tool
+                                       and not any(c.get("tool") == t["tool"] for c in calls)]
+        row["failed_optional_tools"] = [t["tool"] for t in step.tools if t["tool"] != step.tool
+                                        and any(c.get("tool") == t["tool"] for c in calls)
+                                        and not any(c.get("tool") == t["tool"] and c.get("ok") for c in calls)]
+        changed = [{"tool": c.get("tool"), "approved": t, "used": c.get("provider")}
+                   for t in step.tools for c in calls if c.get("tool") == t["tool"]
+                   and _provider_changed(t, c.get("provider"))]
+        row["provider_changes"] = changed
         if step.tool:
             mine = [c for c in calls if c.get("tool") == step.tool]
             if not mine:
@@ -982,6 +1099,9 @@ def check_adherence(doc: PlanDoc, executed: "list[dict[str, Any]]",
                 continue
         if not runs[-1].get("accepted", False):
             row["status"] = "not_accepted"
+        elif changed:
+            row["status"] = "provider_changed"
+            row["detail"] = changed
         rows.append(row)
     planned = {s.text for s in doc.steps}
     allowed = {str(t) for t in approved_additions or ()}
@@ -1007,6 +1127,7 @@ _STATUS_WORDS = {
     "tool_failed": "its tool never succeeded",
     "settings_differ": "ran with a different setting than approved",
     "not_accepted": "ran as approved; the result was not accepted",
+    "provider_changed": "ran with a different provider or version than approved",
 }
 
 
@@ -1019,6 +1140,15 @@ def describe_status(row: "Mapping[str, Any]") -> str:
             f"{d['param']}: approved {d['approved']!r}, used {d['used']!r}" for d in detail) + ")"
     elif row.get("status") == "tool_not_called" and detail:
         words += " (called: " + ", ".join(f"`{t}`" for t in detail) + ")"
+    for key, label in (("unused_planned_tools", "unused planned tools"),
+                       ("failed_optional_tools", "failed optional tools")):
+        if row.get(key):
+            words += f"; {label}: " + ", ".join(f"`{t}`" for t in row[key])
+    if row.get("provider_changes"):
+        words += "; provider changes: " + "; ".join(
+            f"`{c['tool']}`: {c['approved'].get('server', 'unknown')} @ "
+            f"{c['approved'].get('version', 'unknown')} -> {c['used'].get('server', 'unknown')} @ "
+            f"{c['used'].get('version', 'unknown')}" for c in row["provider_changes"])
     return words
 
 

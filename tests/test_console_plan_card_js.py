@@ -32,7 +32,7 @@ const src = require("fs").readFileSync(0, "utf8");
 const escapeHtml = __ESCAPE__;
 const sandbox = { state: { planDoc: null, planProblems: [], planDraftYaml: "" }, escapeHtml,
   renderMarkdown: (s) => escapeHtml(s).replace(/`([^`]+)`/g, "<code>$1</code>") };
-const api = vm.runInNewContext(src + "\n;({ planStepParts, planStepHtml, planCardHtml, planEditorHtml, planRunsOnText, planEntryHtml, planEmphasisHtml })", sandbox);
+const api = vm.runInNewContext(src + "\n;({ planStepParts, planStepHtml, planCardHtml, planEditorHtml, planRunsOnText, planEntryHtml, planEmphasisHtml, stepProvenanceMarkdown })", sandbox);
 const agenda = [
   "**QC & normalization** — Filter cells with `run_scanpy_qc` below 200 genes.",
   "2. **Clustering <UMAP>** — Cluster at resolution 1.2.",
@@ -82,6 +82,22 @@ out.single = api.planCardHtml([agenda[0]], { yaml: doc.yaml, steps: [steps[0]] }
 const codeDoc = { yaml: doc.yaml, steps: [{ id: "s1", tool: "run_code", skill: "score_signature" }, { id: "s2", tool: "run_in_environment" }, steps[1]] };
 out.codeCard = api.planCardHtml(agenda, codeDoc, []);
 out.codeEntry = api.planEntryHtml(agenda, codeDoc, { status: "Approved" });
+const provenanceSteps = [
+  {id:"atlas", tool:"resolve_genes", tools:[
+    {tool:"resolve_genes", provider:"mcp", server:"atlas-expression-exploration", version:"0.0.3"},
+    {tool:"submit_query", provider:"mcp", server:"atlas-expression-exploration", version:"0.0.3"}],
+    skills:[{name:"atlas_query", version:"2.0"}, {name:"gene_review", version:"1.1"}]},
+  {id:"other", tool:"run_code", tools:[{tool:"run_code",provider:"local",version:"unknown"}],skills:[]}
+];
+out.provenanceReview = api.planCardHtml(agenda.slice(0,2), {steps:provenanceSteps}, [1]);
+out.provenanceSaved = api.planCardHtml(agenda.slice(0,2), {steps:provenanceSteps}, [], {mode:"saved"});
+out.provenanceLegacy = api.planStepHtml("Legacy", 1, {tool:"run_code",skill:"legacy_skill"});
+out.provenanceUsed = api.stepProvenanceMarkdown({id:"atlas",step:"Query",status:"used",
+  planned_tools:provenanceSteps[0].tools,planned_skills:provenanceSteps[0].skills,
+  tools:[{tool:"submit_query",provider:"mcp",server:"atlas-expression-exploration",version:"0.0.4",ok:true}],
+  skills:[{name:"atlas_query",version:"2.0",status:"used"}],provider_changes:[{planned:"0.0.3",actual:"0.0.4"}]});
+out.provenanceFailed = api.stepProvenanceMarkdown({id:"other",status:"failed",skills:[{name:"gene_review",version:"1.1",status:"failed"}]});
+out.provenanceSkipped = api.stepProvenanceMarkdown({id:"other",status:"skipped"});
 console.log(JSON.stringify(out));
 """.replace("__ESCAPE__", ESCAPE)
 
@@ -92,7 +108,7 @@ def _node(harness: str, start: str, end: str) -> dict:
         pytest.skip("node is not installed")
     source = APP_JS.read_text(encoding="utf-8")
     block = source[source.index(start):source.index(end)]
-    done = subprocess.run([node, "-e", harness], input=block, capture_output=True, text=True, timeout=30)
+    done = subprocess.run([node, "-e", harness], input=block, capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
@@ -239,7 +255,7 @@ def test_the_panel_has_no_second_message_box_for_changing_the_plan():
 
 
 def test_the_composer_marks_the_chat_that_has_a_plan_waiting():
-    src = APP_JS.read_text()
+    src = APP_JS.read_text(encoding="utf-8")
     assert "function syncPlanCue(c)" in src and 'c.plan.kind === "plan"' in src
     assert "planWords" not in src and "wirePlanRevise" not in src
     # switching chats applies the cue for the chat entered, next to restoring its own draft
@@ -266,7 +282,7 @@ def _edits(yaml_text: str, changes: list) -> list:
 
     source = APP_JS.read_text(encoding="utf-8")
     block = source[source.index("function planYamlUnquote"):source.index("function commitPlanChange")]
-    done = subprocess.run([node, "-e", EDIT_HARNESS], input=block, capture_output=True, text=True, timeout=30,
+    done = subprocess.run([node, "-e", EDIT_HARNESS], input=block, capture_output=True, text=True, encoding="utf-8", timeout=30,
                           env={**os.environ, "PLAN_EDIT_INPUT": json.dumps({"yaml": yaml_text, "changes": changes})})
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
@@ -515,3 +531,63 @@ def test_a_step_shows_each_qc_cutoff_with_its_unit_and_whether_it_was_changed():
     assert '<span class="plan-cutoff-unit">counts</span><span class="plan-cutoff-tag">default</span>' in default
     assert 'data-edit' not in default.split("plan-cutoff-tag")[0], "a default cutoff is changed in the chat, not in place"
     assert "data-edit" not in out["cutoffsReadOnly"].split("plan-step-meta")[1], "a plan no longer waiting is read-only"
+
+
+def test_each_planned_tool_retains_provider_and_each_skill_retains_version_on_all_cards():
+    out = _card()
+    for surface in ("provenanceReview", "provenanceSaved"):
+        html = out[surface]
+        assert html.count("MCP atlas-expression-exploration / version 0.0.3") == 2
+        assert "submit_query" in html and "resolve_genes" in html
+        assert "run_code / Local / version unknown" in html
+        assert "Planned skill: atlas_query / version 2.0" in html
+        assert "Planned skill: gene_review / version 1.1" in html
+        assert "No skill assigned" in html
+        assert html.index("gene_review") < html.rindex("No skill assigned")
+    assert "Unknown provider / version unknown" in out["provenanceLegacy"]
+    assert "legacy_skill / version unknown" in out["provenanceLegacy"]
+
+
+def test_actual_provenance_separates_assignment_use_failure_skip_and_provider_change():
+    out = _card()
+    used = out["provenanceUsed"]
+    assert "Planned skills: atlas_query / version 2.0; gene_review / version 1.1" in used
+    assert "Recorded skills: atlas_query / version 2.0 (recorded used)" in used
+    assert "Provider changed from approved plan" in used and "0.0.4" in used
+    assert "failed; no successful use" in out["provenanceFailed"]
+    assert "Skill changed from approved plan: gene_review / version 1.1" in out["provenanceFailed"]
+    assert "(recorded used)" not in out["provenanceFailed"]
+    assert "Skipped; no successful use" in out["provenanceSkipped"]
+    assert "Recorded skills: None recorded" in out["provenanceSkipped"]
+
+
+@pytest.mark.parametrize("plural_only", [False, True])
+@pytest.mark.parametrize("layout", ["flow", "block", "indentless"])
+def test_removing_assigned_skills_clears_legacy_and_plural_yaml_without_touching_other_steps(plural_only, layout):
+    import yaml
+    from aiscientist.agents.plan_doc import PlanDoc, PlanStep, parse_plan_yaml
+
+    assigned = ({"name": "analysis", "version": "1.0"}, {"name": "review", "version": "2.0"})
+    doc = PlanDoc("Analyse", (
+        PlanStep("s1", "Analyse first atlas", "run_code", skill=None if plural_only else "analysis", skills=assigned),
+        PlanStep("s2", "Analyse second atlas", "run_code", skill="review", skills=(assigned[1],)),
+    ))
+    original = doc.to_yaml()
+    if layout != "flow":
+        lines = original.splitlines()
+        index = next(i for i, line in enumerate(lines) if line.startswith("    skills:"))
+        pad = "      " if layout == "block" else "    "
+        lines[index:index + 1] = ["    skills:", pad + "- name: analysis", pad + "  version: '1.0'",
+                                  pad + "- name: review", pad + "  version: '2.0'"]
+        original = "\n".join(lines) + "\n"
+    result = _edits(original, [{"id": "s1", "skill": None}])[0]
+    assert "error" not in result
+    before = yaml.safe_load(original)
+    after = yaml.safe_load(result["yaml"])
+    assert "skill" not in after["steps"][0] and "skills" not in after["steps"][0]
+    expected = {key: value for key, value in before["steps"][0].items() if key not in {"skill", "skills"}}
+    assert after["steps"][0] == expected
+    assert after["steps"][1] == before["steps"][1]
+    restored = parse_plan_yaml(result["yaml"])
+    assert restored.steps[0].skill is None and restored.steps[0].planned_skills() == []
+    assert restored.steps[1].planned_skills() == [assigned[1]]

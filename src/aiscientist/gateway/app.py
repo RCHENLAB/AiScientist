@@ -13352,7 +13352,9 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         # the conversation — not dumped into the always-visible feed.
         out.append({"type": "step_code", "code": code})
 
-    if t == "pi_agenda":
+    if t == "step_provenance":
+        out.append(dict(ev))
+    elif t == "pi_agenda":
         agenda = list(ev.get("agenda") or [])
         progress(f"📋 Plan ready — {len(agenda)} step{'s' if len(agenda) != 1 else ''}")
         for i, step in enumerate(agenda, 1):
@@ -13474,7 +13476,7 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
             + (f" ({a.get('release')})" if a.get("release") else " (local)")
             for a in list(ev.get("assigned") or [])[:12]))
     elif t == "step_skill":
-        activity(f"this step uses the skill `{ev.get('skill')}` {ev.get('version')}"
+        activity(f"this step was assigned skill guidance `{ev.get('skill')}` {ev.get('version')}"
                  + (f" from {ev.get('release')}" if ev.get("release") else " (local copy)")
                  + "; its guidance and code are in the step's brief")
     elif t == "turn_budget_low":
@@ -14215,6 +14217,76 @@ def _build_report_render_fn(conn: "Connection", run_id: str = ""):
 _STAGING_DECISIONS = ("dataset_result", "dataset_root", "hpc_dataset_root", "input_folders",
                       "cellranger_layout", "metadata_inputs", "dataset_metadata", "dataset_description",
                       "input_name", "unusable_inputs")
+
+
+def _provenance_tool_label(tool: dict[str, Any]) -> str:
+    """Provider identity comes only from structured registration/recorded metadata."""
+    name = str(tool.get("tool") or "unknown")
+    provider = str(tool.get("provider") or "unknown")
+    version = str(tool.get("version") or "unknown")
+    if provider == "mcp":
+        identity = f"MCP {tool.get('server') or 'unknown'} @ {version}"
+    elif provider == "local":
+        identity = f"local @ {version}"
+    else:
+        identity = f"unknown provider @ {version}"
+    return f"{name} ({identity})"
+
+
+def _provenance_skill_label(skill: dict[str, Any]) -> str:
+    return f"{skill.get('name') or 'unknown'} @ {skill.get('version') or 'unknown'}"
+
+
+def _planned_provenance_lines(step: dict[str, Any]) -> list[str]:
+    tools = step.get("tools") or ([{"tool": step["tool"]}] if step.get("tool") else [])
+    skills = step.get("skills") or ([{"name": step["skill"]}] if step.get("skill") else [])
+    return [
+        "Planned tools: " + ("; ".join(_provenance_tool_label(t) for t in tools)
+                             or "No tool assigned (provider/version unknown)"),
+        "Planned skills: " + ("; ".join(_provenance_skill_label(sk) for sk in skills)
+                              or "No skill assigned"),
+    ]
+
+
+def _readable_plan_steps(steps: list[dict[str, Any]], agenda: list[str]) -> str:
+    """Export every approved assignment, including explicit legacy/unknown identities."""
+    lines: list[str] = []
+    for index, text in enumerate(agenda):
+        step = steps[index] if index < len(steps) else {}
+        lines.append(f"{index + 1}. {text}")
+        lines.extend(f"   - {line}" for line in _planned_provenance_lines(step))
+    return "\n".join(lines) + "\n"
+
+
+def _readable_step_usage(rows: list[dict[str, Any]]) -> str:
+    """Deterministic final record: assignment never implies successful execution."""
+    lines: list[str] = []
+    for index, row in enumerate(rows, 1):
+        lines.append(f"## {row.get('id') or index}: {row.get('step') or 'Unknown step'}")
+        lines.append("")
+        planned = {"tools": row.get("planned_tools") or [],
+                   "skills": row.get("planned_skills") or []}
+        lines.extend(f"- {line}" for line in _planned_provenance_lines(planned))
+        lines.append(f"- Step status: {row.get('status') or 'unknown'}")
+        tools = row.get("tools") or []
+        skills = row.get("skills") or []
+        lines.append("- Recorded tools: " + ("; ".join(
+            _provenance_tool_label(t) + (" [used]" if t.get("ok") is True else " [failed]")
+            for t in tools) or "No tool use recorded"))
+        lines.append("- Recorded skills: " + ("; ".join(
+            _provenance_skill_label(sk) + f" [{sk.get('status') or 'unknown'}]"
+            for sk in skills) or "No successful skill use recorded"))
+        for change in row.get("provider_changes") or []:
+            if isinstance(change, dict):
+                approved = "; ".join(_provenance_tool_label(t)
+                                     for t in change.get("planned") or []) or "No tool assigned"
+                actual = _provenance_tool_label(change.get("used") or {})
+                detail = f"{approved} -> {actual}"
+            else:
+                detail = str(change)
+            lines.append("- Provider changed from approved plan: " + detail)
+        lines.append("")
+    return "\n".join(lines) or "No step execution recorded.\n"
 
 
 def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: dict[str, Any],
@@ -15860,6 +15932,17 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                       "estimate": plan_estimate(agenda) if agenda else None,
                       **({"step_outputs": step_outputs} if step_outputs else {})}
             saved_plans.save(art, doc_yaml, source=source, kind=kind, payload=payload, prompt=prompt)
+            if kind == "agenda":
+                from ..agents.plan_doc import PlanError, parse_plan_yaml
+                # The readable copy is a convenience: a plan it cannot render must still be saved.
+                try:
+                    (art / "report").mkdir(parents=True, exist_ok=True)
+                    (art / "report" / "plan.md").write_text(
+                        f"# Research plan\n\n**Question:** {req.question}\n\n"
+                        + _readable_plan_steps(parse_plan_yaml(doc_yaml).to_public(), agenda),
+                        encoding="utf-8")
+                except (PlanError, OSError) as exc:
+                    print(f"[plan] readable plan.md not written: {exc}")
             card = saved_plans.build_prompt(art)
             _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
             conn.push({**card, "saved": True})
@@ -15901,6 +15984,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             session_meta.update(plan_context=lab_obj.plan_context,
                                 approved_plan_yaml=lab_obj.approved_plan_yaml)
             session_meta.pop("resume_review", None)
+            session_meta["step_provenance"] = getattr(lab_obj, "step_provenance", lambda: [])()
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
             _remember_planned_run(conn, run)
@@ -15936,14 +16020,30 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             should_compact=take_compact_request,
             checkpoint=checkpoint_run, **saved_args)
 
+        # Keep the execution ledger even when no analysis step succeeded.
+        step_usage = getattr(lab_obj, "step_provenance", lambda: [])()
+        session_meta["step_provenance"] = step_usage
+        if step_usage:
+            try:
+                (art / "process").mkdir(parents=True, exist_ok=True)
+                (art / "process" / "step_provenance.md").write_text(
+                    "# Step execution record\n\n" + _readable_step_usage(step_usage), encoding="utf-8")
+            except OSError:
+                pass
+
         # A plan cancelled or timed-out during review — or a run that executed and accepted NOTHING —
         # has no results to write up. Rendering a report from it produced a placeholder, DATALESS
         # manuscript ("[Figure 1. Schematic of the intended … workflow]") that read like a real
         # deliverable AND became the connection's "last run", so the NEXT message was misrouted as a
         # follow-up to it (dropping the dataset, reverting the assembly). Finish cleanly with NO report,
-        # NO run_state, and NO last_run_id, so the conversation's next message is a fresh, dataset-bound
+        # NO last_run_id, so the conversation's next message is a fresh, dataset-bound
         # study. (A mid-run Stop that accepted ≥1 step still writes up what ran — that path has rounds.)
         if _run_produced_nothing(result, run_flags["plan_cancelled"]):
+            if step_usage:
+                _write_run_state(art, result, getattr(lab_obj, "guidance", None), decisions,
+                                 getattr(lab_obj, "execution_profile", None),
+                                 protocols=getattr(lab_obj, "protocols", None),
+                                 self_sourced=getattr(lab_obj, "self_sourced", ""), extra=session_meta)
             reason = (result.final_answer or "").strip() or \
                 "The plan review ended before anything ran — no analysis steps were executed."
             # One event, one sentence — the three end-of-run lines used to disagree with each
@@ -15956,7 +16056,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("warning", "lab", "Run ended before any step was accepted — skipping report render.")
             conn.push({"type": "chat_token", "token": reason})
             conn.push({"type": "chat_stopped"})
-            _finish_run_record(conn, run_id, "cancelled", None, reason)
+            _finish_run_record(conn, run_id, "cancelled", str(art) if step_usage else None, reason)
             return
 
         # Persist the approved plan as a human-readable Markdown file (the user asked for
@@ -15965,7 +16065,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             try:
                 plan_md = art / "report" / "plan.md"
                 plan_md.parent.mkdir(parents=True, exist_ok=True)
-                body = "\n".join(f"{i}. {s}" for i, s in enumerate(result.agenda, 1))
+                from ..agents.plan_doc import parse_plan_yaml
+                approved = str(getattr(lab_obj, "approved_plan_yaml", "") or "")
+                plan_steps = (parse_plan_yaml(approved).to_public() if approved else
+                              (run_flags["plan_doc"] or {}).get("steps") or [])
+                body = _readable_plan_steps(plan_steps, result.agenda)
                 # WHICH protocol steered this plan, and WHAT the PI decided on its own. Both were
                 # known at plan time and neither was ever written down: the protocol's identity
                 # lived only in an ephemeral chat line, and nothing recorded which choices the

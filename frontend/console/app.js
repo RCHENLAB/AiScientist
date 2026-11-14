@@ -3257,7 +3257,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "run_usage", "confirm_request", "confirm_done",
+  "plan_status", "run_usage", "step_provenance", "confirm_request", "confirm_done",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -3330,6 +3330,14 @@ function handleRunEvent(c, msg) {
     case "step_code": streamCode(c, msg.code); break;
     case "run_job": streamJob(c, msg); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
+    case "step_provenance":
+      // A step's record is re-sent when a retry changes it. The id carries the outcome, so the later
+      // record is shown after the failed one instead of being dropped as a replay of it.
+      pushToSession(c.sid, { role: "assistant", content: stepProvenanceMarkdown(msg),
+        streamId: `provenance:${msg.run_id || msg.stream_id || c.lastStreamId}:${msg.id || msg.step}`
+          + `:${msg.status || ""}:${(msg.tools || []).length}` });
+      if (chatVisible(c)) renderChat();
+      break;
     case "run_usage":
       if (msg.actual) {
         pushToSession(c.sid, { role: "assistant", content: runUsageMarkdown(msg),
@@ -4477,6 +4485,40 @@ function planUntestedFlag(step) {
   return `<span class="plan-step-flag untested" title="${escapeHtml(why)}">Untested code</span>`;
 }
 
+// Provider identities come only from the registered catalog, never from the step prose.
+function planTools(step) {
+  if (!step) return [];
+  return Array.isArray(step.tools) ? step.tools : step.tool ? [{tool: step.tool, provider: "unknown", server: "unknown", version: "unknown"}] : [];
+}
+
+function planSkills(step) {
+  if (!step) return [];
+  return Array.isArray(step.skills) ? step.skills : step.skill ? [{name: step.skill, version: "unknown"}] : [];
+}
+
+function planToolText(tool) {
+  const provider = tool.provider === "local" ? "Local" : tool.provider === "mcp" ? `MCP ${tool.server || "unknown"}` : "Unknown provider";
+  return `${tool.tool || "unknown tool"} / ${provider} / version ${tool.version || "unknown"}`;
+}
+
+function planSkillText(skill) {
+  return `${skill.name || "unknown skill"} / version ${skill.version || "unknown"}`;
+}
+
+function stepProvenanceMarkdown(record) {
+  const skills = (record.skills || []).map((skill) => `${planSkillText(skill)} (${record.status === "used" && skill.status === "used" ? "recorded used" : "failed; no successful use"})`);
+  const changedSkills = (record.skills || []).filter((skill) => !(record.planned_skills || []).some((planned) => planned.name === skill.name && planned.version === skill.version));
+  const tools = (record.tools || []).map((tool) => `${planToolText(tool)} (${tool.ok === true ? "succeeded" : "failed"})`);
+  const state = record.status === "skipped" ? "Skipped; no successful use" : record.status === "failed" ? "Failed; no successful skill use" : "Recorded use";
+  return `**Step ${record.id || ""}: ${record.step || ""}**\n\n${state}\n`
+    + `- Planned tools: ${(record.planned_tools || []).map(planToolText).join("; ") || "None assigned"}\n`
+    + `- Planned skills: ${(record.planned_skills || []).map(planSkillText).join("; ") || "No skill assigned"}\n`
+    + `- Recorded tools: ${tools.join("; ") || "None recorded"}\n`
+    + `- Recorded skills: ${skills.join("; ") || "None recorded"}`
+    + (changedSkills.length ? `\n- Skill changed from approved plan: ${changedSkills.map(planSkillText).join("; ")}` : "")
+    + ((record.provider_changes || []).length ? `\n- Provider changed from approved plan: ${planSettingText(record.provider_changes)}` : "");
+}
+
 function planStepHtml(text, n, step, revised, showWhere, edit) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
@@ -4509,20 +4551,17 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + `<span class="plan-setting-v${editable && canEdit(k) ? " editable" : ""}"${editAttrs("setting", k)}>`
     + `${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
   const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
-  // The vetted skill the step uses: matched by AiScientist, handed to the agent with its guidance
-  // and code when the step runs. The researcher can take it off.
-  const skill = step && step.skill
-    ? `<span class="plan-step-skill" title="This step uses the vetted skill ${escapeHtml(step.skill)}: its guidance and code go to the agent">`
-      + `${planIcon("extension")}<span>${escapeHtml(step.skill)}</span>`
-      + (editable && edit.remove ? `<button type="button" class="plan-skill-remove" data-skill-remove `
-        + `aria-label="Run step ${n} without the skill" title="Run this step without the skill">${planIcon("close")}</button>` : "")
-      + `</span>`
-    : "";
-  const meta = (chips || where || skill)
-    ? `<div class="plan-step-meta">${skill}${chips}`
-      + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
-      + `</div>`
-    : "";
+  const skills = planSkills(step);
+  const skill = skills.length ? skills.map((assigned, index) =>
+    `<span class="plan-step-skill" title="Planned assignment; successful use is recorded separately">`
+    + `${planIcon("extension")}<span>Planned skill: ${escapeHtml(planSkillText(assigned))}</span>`
+    + (editable && edit.remove && index === 0 ? `<button type="button" class="plan-skill-remove" data-skill-remove `
+      + `aria-label="Run step ${n} without assigned skills" title="Run this step without assigned skills">${planIcon("close")}</button>` : "")
+    + `</span>`).join("") : `<span class="plan-step-skill">No skill assigned</span>`;
+  const providers = planTools(step).map((tool) => `<span class="plan-step-skill plan-step-provider" title="Planned tool provider">${escapeHtml(planToolText(tool))}</span>`).join("");
+  const meta = `<div class="plan-step-meta">${providers}${skill}${chips}`
+    + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
+    + `</div>`;
   // What the step should leave behind: declared by its skill, or by the active pipeline for its tool.
   // Checked after the step; a required one that is missing keeps the step from being accepted.
   const outs = step && Array.isArray(step.outputs) ? step.outputs : [];
@@ -4541,7 +4580,7 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + `<div class="plan-step-head"><span class="plan-step-title${editable ? " editable" : ""}"${editAttrs("title")}>`
     + `${renderMarkdown(parts.title)}</span>`
     + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
-    + (step && step.tool ? `<code class="plan-step-tool">${escapeHtml(step.tool)}</code>` : "")
+    + planTools(step).map((tool) => `<code class="plan-step-tool">${escapeHtml(tool.tool || "unknown tool")}</code>`).join("")
     + planUntestedFlag(step)
     + `<span class="plan-step-acts">`
     + (editable && edit.remove ? `<button type="button" class="plan-step-remove" data-step-remove `
@@ -4720,9 +4759,11 @@ function planEntryHtml(agenda, doc, opts) {
   const rows = agenda.map((s, i) => `<li class="plan-entry-step${revised.has(i + 1) ? " revised" : ""}">`
     + `<span class="plan-entry-num">${i + 1}</span>`
     + `<span class="plan-entry-title">${escapeHtml(planStepParts(s).title.replace(/[*`]/g, ""))}</span>`
-    + (docSteps[i] && docSteps[i].tool ? `<code class="plan-step-tool">${escapeHtml(docSteps[i].tool)}</code>` : "")
-    + (docSteps[i] && docSteps[i].skill
-      ? `<span class="plan-step-skill" title="Uses the vetted skill ${escapeHtml(docSteps[i].skill)}">${planIcon("extension")}<span>${escapeHtml(docSteps[i].skill)}</span></span>` : "")
+    + planTools(docSteps[i]).map((tool) => `<code class="plan-step-tool">${escapeHtml(tool.tool || "unknown tool")}</code>`
+      + `<span class="plan-step-skill plan-step-provider">${escapeHtml(planToolText(tool))}</span>`).join("")
+    + (planSkills(docSteps[i]).length ? planSkills(docSteps[i]).map((skill) =>
+      `<span class="plan-step-skill" title="Planned assignment; successful use is recorded separately">${planIcon("extension")}<span>${escapeHtml(planSkillText(skill))}</span></span>`).join("")
+      : `<span class="plan-step-skill">No skill assigned</span>`)
     + planUntestedFlag(docSteps[i])
     + `</li>`).join("");
   const refused = (o.problems || []).length
@@ -4877,13 +4918,20 @@ function planYamlEdit(yaml, change) {
     return { yaml: lines.join("\n") };
   }
   if (change.skill === null) {
-    for (let i = start + 1; i < end; i += 1) {
-      if (indent(lines[i]) === keyCol && /^\s*skill:/.test(lines[i])) {
-        lines.splice(i, 1);
-        return { yaml: lines.join("\n") };
-      }
+    let removed = false;
+    for (let i = start + 1; i < end;) {
+      if (indent(lines[i]) !== keyCol || !/^\s*skills?:/.test(lines[i])) { i += 1; continue; }
+      let stop = i + 1;
+      // Lists may be flow-style, indented blocks, or YAML's indentless block sequences.
+      while (stop < end && (!lines[stop].trim() || indent(lines[stop]) > keyCol
+        || (indent(lines[stop]) === keyCol && /^\s*-\s/.test(lines[stop])))) stop += 1;
+      const count = stop - i;
+      lines.splice(i, count);
+      end -= count;
+      removed = true;
     }
-    return { error: "The skill is not where the plan document keeps it: ask for this change in words." };
+    return removed ? { yaml: lines.join("\n") }
+      : { error: "The skill is not where the plan document keeps it: ask for this change in words." };
   }
   if (change.title !== undefined) {
     const title = String(change.title).replace(/\s+/g, " ").trim();
@@ -5249,9 +5297,12 @@ function planSavedMessage(p) {
     const values = Object.entries(s.settings || {});
     return values.length ? `\n\nStep ${i + 1} settings\n` + values.map(([k, v]) => `- ${k}: ${planSettingText(v)}`).join("\n") : "";
   }).join("");
+  const provenance = ((p.doc && p.doc.steps) || []).map((s, i) =>
+    `\n\nStep ${i + 1} planned tools: ${planTools(s).map(planToolText).join("; ") || "None assigned"}`
+    + `\nPlanned skills: ${planSkills(s).map(planSkillText).join("; ") || "No skill assigned"}`).join("");
   return { role: "assistant", kind: "plan",
            content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n")
-             + settings + planEstimateMarkdown(p.estimate),
+             + settings + provenance + planEstimateMarkdown(p.estimate),
            plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved" } };
 }
 

@@ -482,7 +482,7 @@ def test_the_card_shows_the_skill_and_takes_it_off_as_one_line_of_the_document()
     source = (Path(__file__).resolve().parents[1] / "frontend" / "console" / "app.js").read_text(encoding="utf-8")
     block = source[source.index("function planStepParts"):source.index("function showPlanPanel")]
     done = subprocess.run([node, "-e", STEP_HARNESS], input=block,
-                          capture_output=True, text=True, timeout=60,
+                          capture_output=True, text=True, encoding="utf-8", timeout=60,
                           env={**os.environ, "PLAN_YAML": doc.to_yaml()})
     assert done.returncode == 0, done.stderr
     out = json.loads(done.stdout)

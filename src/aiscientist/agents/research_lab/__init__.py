@@ -42,7 +42,8 @@ import threading
 import time
 from pathlib import Path
 from dataclasses import asdict, replace
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
+from ...tools.sdk import tool_identity
 from .. import claim_audit
 from ..dag import LabPlan, TaskNode, lift_agenda_to_dag, parse_dag
 from ..cellqc_cutoffs import CUTOFFS as CUTOFF_SETTINGS, cutoff_rows, read_cutoffs
@@ -509,6 +510,7 @@ class ResearchLab:
         self._approved_plan: "PlanDoc | None" = None
         self._plan_feedback: list[str] = []
         self._plan_adherence: dict[str, Any] = {}
+        self._step_provenance: dict[str, dict[str, Any]] = {}
         # Steps the researcher said yes to DURING the run (``_approve_new_step``). They are not in
         # the approved document, and the read-back must not report them as unapproved work.
         self._approved_additions: list[str] = []
@@ -750,14 +752,25 @@ class ResearchLab:
             self._plan_adherence = check_adherence(self._approved_plan, [
                 {"step": r.step, "accepted": r.verdict.verdict == "accept",
                  "calls": [{"tool": c.get("tool"), "args": c.get("args") or {},
-                            "ok": step_succeeded(c)}
+                            "ok": step_succeeded(c), "provider": c.get("provider")}
                            for c in (r.scientist_result.get("steps") or []) if isinstance(c, dict)]}
                 for r in result.rounds] + [
-                {"step": s, "accepted": True, "calls": [{"tool": REPORT_TOOL, "args": {}, "ok": True}]}
+                {"step": s, "accepted": True, "calls": [{"tool": REPORT_TOOL, "args": {}, "ok": True,
+                 "provider": tool_identity(next((t for t in getattr(self.scientist, "catalog", [])
+                                                   if t.name == REPORT_TOOL), None), REPORT_TOOL)}]}
                 for s in self._report_steps], approved_additions=self._approved_additions)
             on_event = kwargs.get("on_event") or (args[1] if len(args) > 1 else None)
             if on_event is not None:
                 on_event({"type": "plan_adherence", **self._plan_adherence})
+        if isinstance(result, LabResult) and self._approved_plan is not None:
+            on_event = kwargs.get("on_event") or (args[1] if len(args) > 1 else None) or (lambda _e: None)
+            # Includes restored rounds and alternate Scientist paths, then explicit unrun steps.
+            for r in result.rounds:
+                self._record_step_provenance(r.step, r.scientist_result.get("steps") or [], on_event)
+            for row in self.step_provenance():
+                self._persist_step_provenance(row)
+                if row["status"] == "skipped":
+                    on_event({"type": "step_provenance", **row})
         return result
 
     def _run_inner(
@@ -802,6 +815,17 @@ class ResearchLab:
             from ..mcp_plan_migration import PlanMigrationRequired
             raise PlanMigrationRequired("This changed saved plan needs the normal plan review before execution.")
         self._skipped_steps = []
+
+        if resume is not None:
+            # Restored rounds carry tool calls, but skill outcomes live only in this ledger.
+            for row in copy.deepcopy(resume.step_provenance):
+                self._step_provenance[row["id"]] = {**row, **self._step_provenance.get(row["id"], {})}
+                observed = self.ctx.decisions.setdefault("step_skill_use", {})
+                skills = {(s["name"], s["version"]): s for s in row.get("skills", [])}
+                for skill in observed.get(row["step"], []):
+                    key = (skill["name"], skill["version"])
+                    skills[key] = {**skills.get(key, {}), **skill}
+                observed[row["step"]] = list(skills.values())
 
         def check_restored(agenda: list[str]) -> None:
             from ..mcp_plan_migration import assert_plan_available
@@ -3458,8 +3482,131 @@ class ResearchLab:
         if fresh:
             doc = self._bind_plan_settings(doc, fresh, emit)
             doc = self._assign_plan_skills(doc, fresh, emit)
+        doc = self._resolve_plan_provenance(doc, fresh)
         self._plan_doc = doc
         emit({"type": "plan_doc", "yaml": doc.to_yaml(), "steps": self._public_plan_steps(doc)})
+
+    def _resolve_plan_provenance(self, doc: PlanDoc, fresh: Iterable[int] = ()) -> PlanDoc:
+        """Resolve new assignments from registration; retain approved/restored pins verbatim."""
+        catalog = {t.name: t for t in getattr(self.scientist, "catalog", [])}
+        fresh = set(fresh)
+        steps = []
+        for i, step in enumerate(doc.steps):
+            if i not in fresh:
+                steps.append(step)
+                continue
+            tools = step.tools
+            if not tools:
+                names = [step.tool] if step.tool else []
+                declared = _declared_tools(step.text) & set(catalog)
+                names += sorted(declared - set(names), key=lambda n: step.text.find(n))
+                tools = tuple(tool_identity(catalog[n], n) if n in catalog else {
+                    "tool": n, "provider": "unknown", "server": "unknown", "version": "unknown"
+                } for n in names)
+            else:
+                tools = tuple(tool_identity(catalog[t["tool"]], t["tool"]) if t.get("provider") == "unknown"
+                              and t["tool"] in catalog else t for t in tools)
+            skills = list(step.skills)
+            names = [step.skill] if step.skill and not skills else []
+            names += skills_named_in(step.text)
+            for identity in tools:
+                tool = catalog.get(identity["tool"])
+                if tool is not None:
+                    skills.extend(dict(s) for s in getattr(tool, "skills", ()))
+                by_tool = _tool_skill(identity["tool"])
+                if by_tool is not None:
+                    names.append(by_tool.name)
+            for name in names:
+                skill = get_skill(name)
+                skills.append({"name": skill.name if skill else name,
+                               "version": (skill.version or "unknown") if skill else "unknown"})
+            unique = {(s["name"], s["version"]): s for s in skills}
+            steps.append(replace(step, tools=tools, skills=tuple(unique.values())))
+        return PlanDoc(doc.request, tuple(steps))
+
+    def _assigned_skills(self, step: str) -> list[Skill]:
+        plan = self._approved_plan or self._plan_doc
+        found = plan.step_for(step) if plan is not None else None
+        return [skill for identity in (found.planned_skills() if found else [])
+                if (skill := get_skill(identity["name"])) is not None]
+
+    def _version_edited_skills(self, doc: PlanDoc, changes: list[dict[str, Any]]) -> PlanDoc:
+        changed = {c["id"] for c in changes if c["kind"] in {"skill", "skills"}}
+        steps = []
+        for step in doc.steps:
+            if step.id in changed:
+                identities = step.planned_skills()
+                for identity in identities:
+                    skill = get_skill(identity["name"])
+                    if identity["version"] == "unknown" and skill is not None:
+                        identity["version"] = skill.version or "unknown"
+                step = replace(step, skills=tuple(identities))
+            steps.append(step)
+        return PlanDoc(doc.request, tuple(steps))
+
+    def step_provenance(self) -> list[dict[str, Any]]:
+        """Per-step planned and observed identities, including steps that never ran."""
+        plan = self._approved_plan or self._plan_doc
+        rows = []
+        for step in plan.steps if plan is not None else ():
+            rows.append(self._step_provenance.get(step.id) or {
+                "id": step.id, "step": step.text, "planned_tools": step.planned_tools(),
+                "planned_skills": step.planned_skills(), "tools": [], "skills": [],
+                "status": "skipped", "provider_changes": []})
+        ids = {r["id"] for r in rows}
+        rows.extend(r for key, r in self._step_provenance.items() if key not in ids)
+        return rows
+
+    def _persist_step_provenance(self, row: dict[str, Any]) -> None:
+        from .. import run_manifest
+        def change(doc):
+            doc.setdefault("step_provenance", {})[row["id"]] = row
+        run_manifest.update(self.ctx, change)
+
+    def _record_step_provenance(self, text: str, calls: list[dict[str, Any]], emit: EventFn) -> None:
+        plan = self._approved_plan or self._plan_doc
+        step = plan.step_for(text) if plan is not None else None
+        key = step.id if step is not None else text
+        planned_tools = step.planned_tools() if step else []
+        planned_skills = step.planned_skills() if step else []
+        # Parallel steps have independent keys. The manifest's lock serializes persistence.
+        prior = self._step_provenance.get(key, {})
+        tools = list(prior.get("tools") or [])
+        for call in calls:
+            if call.get("tool") == "finish":
+                continue
+            identity = call.get("provider")
+            if not isinstance(identity, dict):
+                identity = {"tool": str(call.get("tool") or "unknown"), "provider": "unknown",
+                            "server": "unknown", "version": "unknown"}
+            row = {**identity, "ok": step_succeeded(call)}
+            if row not in tools:
+                tools.append(row)
+        skills_by_id = {(s["name"], s["version"]): dict(s) for s in prior.get("skills", [])}
+        for skill in self.ctx.decisions.get("step_skill_use", {}).get(text, []):
+            identity = (skill["name"], skill["version"])
+            skills_by_id[identity] = {**skills_by_id.get(identity, {}), **skill}
+        skills = list(skills_by_id.values())
+        changes = []
+        for tool in tools:
+            identity = {k: tool[k] for k in ("tool", "provider", "server", "version")}
+            expected = [t for t in planned_tools if t["tool"] == identity["tool"]]
+            # As in check_adherence: only a planned tool whose identity is known on both sides can
+            # have changed. A helper the plan never named, or unknown metadata, is not a change.
+            known = [t for t in expected if t.get("provider") != "unknown"]
+            if not known or identity["provider"] == "unknown":
+                continue
+            if identity not in known:
+                changes.append({"tool": identity["tool"], "planned": expected, "used": identity})
+        row = {"id": key, "step": text, "planned_tools": planned_tools,
+               "planned_skills": planned_skills, "tools": tools, "skills": skills,
+               "status": "used" if any(t["ok"] for t in tools) else "failed",
+               "provider_changes": changes}
+        if row == prior:
+            return
+        self._step_provenance[key] = row
+        self._persist_step_provenance(row)
+        emit({"type": "step_provenance", **row})
 
     def _expected_outputs(self, step: str) -> "tuple[list[skill_outputs.DeclaredOutput], list[str]]":
         """What ``step`` should leave under the artifacts directory, and where that comes from: the
@@ -3469,10 +3616,10 @@ class ResearchLab:
         found = plan.step_for(step) if plan is not None else None
         expected: list[skill_outputs.DeclaredOutput] = []
         sources: list[str] = []
-        skill = get_skill(found.skill) if found is not None and found.skill else None
-        if skill is not None and skill.outputs:
-            expected.extend(skill.outputs)
-            sources.append(f"skill {skill.name} {skill.version or 'local'}".strip())
+        for skill in self._assigned_skills(step):
+            if skill.outputs:
+                expected.extend(o for o in skill.outputs if all(o.path != e.path for e in expected))
+                sources.append(f"skill {skill.name} {skill.version or 'unknown'}".strip())
         tool = found.tool if found is not None else _primary_tool(step)
         for pipeline in self._skills:
             mine = [o for o in skill_outputs.for_tool(pipeline.outputs, tool)
@@ -3516,7 +3663,7 @@ class ResearchLab:
         hidden = superseded_names(ATOMIC_SKILLS)
         lib = {n: s for n, s in list(ATOMIC_SKILLS.items()) if n not in hidden}
         steps = list(doc.steps)
-        candidates = [i for i in fresh if 0 <= i < len(steps) and not steps[i].skill
+        candidates = [i for i in fresh if 0 <= i < len(steps) and not steps[i].skill and not steps[i].skills
                       and (steps[i].tool is None or steps[i].tool in CODE_TOOLS)
                       and not _is_literature_step(steps[i].text)]
         if not lib or not candidates:
@@ -3576,8 +3723,7 @@ class ResearchLab:
             return doc
         for i, name in assigned.items():
             s = steps[i]
-            steps[i] = PlanStep(id=s.id, text=s.text, tool=s.tool, settings=s.settings,
-                                runs_on=s.runs_on, skill=name)
+            steps[i] = replace(s, skill=name)
         emit({"type": "plan_skills", "assigned": [
             {"step": i + 1, "id": steps[i].id, "skill": name,
              "version": lib[name].version or "local", "release": lib[name].registry_release or ""}
@@ -3634,8 +3780,7 @@ class ResearchLab:
         dropped: list[dict[str, Any]] = []
         for i in askable:
             settings, refused = bind_settings(steps[i].text, schemas[str(steps[i].tool)], proposed[i])
-            steps[i] = PlanStep(id=steps[i].id, text=steps[i].text, tool=steps[i].tool,
-                                settings=settings, runs_on=steps[i].runs_on, skill=steps[i].skill)
+            steps[i] = replace(steps[i], settings=settings)
             dropped += [{"step": i + 1, "tool": steps[i].tool, **d} for d in refused]
         if dropped:
             # Feed only: what the binder proposed and the step's text did not support.
@@ -3671,11 +3816,12 @@ class ResearchLab:
         # A step the researcher added without naming its tool still says which one in its text.
         known = {s.id for s in self._plan_doc.steps}
         edited = PlanDoc(request=question, steps=tuple(
-            PlanStep(id=s.id, text=s.text, tool=_primary_tool(s.text), settings=s.settings, skill=s.skill)
+            replace(s, tool=_primary_tool(s.text))
             if s.id not in known and not s.tool else s for s in edited.steps))
         edited, findings = check_plan(
             edited, _tool_schemas(list(getattr(self.scientist, "catalog", []))),
-            is_known=lambda name: get_skill(name) is not None, skill_name=_skill_name)
+            is_known=lambda name: get_skill(name) is not None, skill_name=_skill_name,
+            before=self._plan_doc)
         if findings:
             refuse([_PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) + "." for f in findings])
             return None
@@ -3685,6 +3831,9 @@ class ResearchLab:
                 return self._plan_doc.agenda(), []
             refuse(["The edited plan is the same as the current one."])
             return None
+        doc = self._version_edited_skills(doc, changes)
+        changed_ids = {c["id"] for c in changes if c["kind"] in {"added", "tool", "text"}}
+        doc = self._resolve_plan_provenance(doc, [i for i, st in enumerate(doc.steps) if st.id in changed_ids])
         self._plan_doc = doc
         emit({"type": "plan_edited", "changes": changes, "notes": notes,
               "steps": sorted({c["step"] for c in changes if c["kind"] != "removed"})})
@@ -3856,12 +4005,11 @@ class ResearchLab:
                 stated_now, _ = bind_settings(step.text, schemas[tool], carried)
                 settings = {k: v for k, v in settings.items()
                             if not (k in stated_before and k not in stated_now)}
-            steps.append(step if (tool == step.tool and settings == step.settings) else PlanStep(
-                id=step.id, text=step.text, tool=tool, settings=settings, runs_on=step.runs_on,
-                skill=step.skill))
+            steps.append(step if (tool == step.tool and settings == step.settings) else replace(
+                step, tool=tool, settings=settings, tools=step.tools if tool == step.tool else ()))
         edited, findings = check_plan(PlanDoc(request=question, steps=tuple(steps)), schemas,
                                       is_known=lambda name: get_skill(name) is not None,
-                                      skill_name=_skill_name)
+                                      skill_name=_skill_name, before=before)
         if findings:
             emit({"type": "plan_revise_skipped", "why": "; ".join(
                 _PLAN_FINDING_WORDS.get(f["kind"], "{kind}").format(**f) for f in findings)[:300]})
@@ -3885,9 +4033,13 @@ class ResearchLab:
                             for c in changes):
                         changes.append({"kind": "setting", "step": i + 1, "id": final.id, "param": key,
                                         "before": was.get(key), "after": final.settings.get(key)})
+        doc = self._version_edited_skills(doc, changes)
+        changed_ids = {c["id"] for c in changes if c["kind"] in {"added", "tool", "text"}}
+        reworded_ids = {c["id"] for c in changes if c["kind"] == "text"}
+        doc = PlanDoc(doc.request, tuple(replace(s, tools=()) if s.id in reworded_ids else s for s in doc.steps))
+        doc = self._resolve_plan_provenance(doc, [i for i, st in enumerate(doc.steps) if st.id in changed_ids])
         self._plan_doc = PlanDoc(request=doc.request, steps=tuple(
-            s if not s.tool or s.runs_on else PlanStep(id=s.id, text=s.text, tool=s.tool, settings=s.settings,
-                                                       runs_on=_tool_runs_on(s.tool), skill=s.skill)
+            s if not s.tool or s.runs_on else replace(s, runs_on=_tool_runs_on(s.tool))
             for s in doc.steps))
         emit({"type": "plan_edited", "by": "pi", "request": request[:300], "changes": changes, "notes": notes,
               "steps": sorted({c["step"] for c in changes if c["kind"] != "removed"})})
@@ -3904,19 +4056,13 @@ class ResearchLab:
     def _assigned_skill(self, step: str) -> "Skill | None":
         """The skill the plan assigned to ``step`` (``skill:`` in the plan document), if it is still in
         the library; ``None`` otherwise. The approved plan when there is one, else the draft."""
-        plan = self._approved_plan or self._plan_doc
-        found = plan.step_for(step) if plan is not None else None
-        if found is None or not found.skill:
-            return None
-        return get_skill(found.skill)
+        return next(iter(self._assigned_skills(step)), None)
 
     def _step_skills(self, step: str) -> "list[Skill]":
         """Every skill ``step`` uses: the one the plan assigned (``skill:``), any its text names, and
         the one its tool's TOOL.md names (run_cellqc runs the CellQC skill). Each skill once."""
         found: "list[Skill]" = []
-        assigned = self._assigned_skill(step)
-        if assigned is not None:
-            found.append(assigned)
+        found.extend(self._assigned_skills(step))
         found += [s for s in map(get_skill, skills_named_in(step)) if s is not None]
         tool = _primary_tool(step)
         by_tool = _tool_skill(tool) if tool else None
@@ -4489,12 +4635,14 @@ class ResearchLab:
             args = {"query": q, "limit": per_limit}
             emit({"type": "tool_start", "tool": "literature_search", "args": args})
             try:
-                output = lit_tool.executor(args, self.ctx)
+                from ..skills_registry import step_scope
+                with step_scope(step=step):
+                    output = lit_tool.executor(args, self.ctx)
             except Exception as exc:  # noqa: BLE001 - one bad query never fails the whole step
                 error_text = f"{type(exc).__name__}: {exc}"
                 emit({"type": "tool_error", "tool": "literature_search", "error": error_text})
                 errors.append({"tool": "literature_search", "error": error_text})
-                tool_calls.append({"tool": "literature_search", "args": args, "ok": False,
+                tool_calls.append({"tool": "literature_search", "provider": tool_identity(lit_tool, "literature_search"), "args": args, "ok": False,
                                    "error": error_text})
                 continue
             res = output.get("results") if isinstance(output, dict) else []
@@ -4502,7 +4650,7 @@ class ResearchLab:
             emit({"type": "tool_result", "tool": "literature_search",
                   "summary": f"{'ok' if ok else 'error'}: {len(res or [])}",
                   "timing_outcome": tool_result_outcome(output) if isinstance(output, dict) else "failed"})
-            tool_calls.append({"tool": "literature_search", "args": args, "ok": bool(ok),
+            tool_calls.append({"tool": "literature_search", "provider": tool_identity(lit_tool, "literature_search"), "args": args, "ok": bool(ok),
                                "summary": f"{len(res or [])} result(s)", "result": output})
             for c in (res or []):
                 if not isinstance(c, dict):
@@ -4540,7 +4688,9 @@ class ResearchLab:
         args = {"question": q}
         emit({"type": "tool_start", "tool": "deep_literature", "args": args})
         try:
-            output = deep_tool.executor(args, self.ctx)
+            from ..skills_registry import step_scope
+            with step_scope(step=step):
+                output = deep_tool.executor(args, self.ctx)
         except Exception as exc:  # noqa: BLE001 - one literature failure never fails the whole run
             error_text = f"{type(exc).__name__}: {exc}"
             emit({"type": "tool_error", "tool": "deep_literature", "error": error_text})
@@ -4548,7 +4698,7 @@ class ResearchLab:
                 "incomplete", "deep_literature_error",
                 "The deep_literature (indexed corpus) step failed; state this limitation in the "
                 "report rather than inventing references.",
-                [{"tool": "deep_literature", "args": args, "ok": False, "error": error_text}],
+                [{"tool": "deep_literature", "provider": tool_identity(deep_tool, "deep_literature"), "args": args, "ok": False, "error": error_text}],
                 [{"tool": "deep_literature", "error": error_text}],
             )
         ok = isinstance(output, dict) and output.get("status") == "ok"
@@ -4564,7 +4714,7 @@ class ResearchLab:
               "summary": f"{'ok' if ok else state}: {len(contexts)} context(s)"
                          + (f" ({why[:240]})" if why else ""),
               "timing_outcome": tool_result_outcome(output) if isinstance(output, dict) else "failed"})
-        tool_calls = [{"tool": "deep_literature", "args": args, "ok": bool(ok),
+        tool_calls = [{"tool": "deep_literature", "provider": tool_identity(deep_tool, "deep_literature"), "args": args, "ok": bool(ok),
                        "summary": f"{len(contexts)} context(s)", "result": output}]
         # Build the accepted answer: the grounded cited answer, then a numbered list of the corpus
         # citations (de-duplicated) that the report's References section reuses.
@@ -4640,7 +4790,9 @@ class ResearchLab:
         args = {**pinned, "queries": queries}
         emit({"type": "tool_start", "tool": "search_corpus", "args": args})
         try:
-            output = corpus_tool.executor(args, self.ctx)
+            from ..skills_registry import step_scope
+            with step_scope(step=step):
+                output = corpus_tool.executor(args, self.ctx)
         except Exception as exc:  # noqa: BLE001 - one literature failure never fails the whole run
             error_text = f"{type(exc).__name__}: {exc}"
             emit({"type": "tool_error", "tool": "search_corpus", "error": error_text})
@@ -4648,7 +4800,7 @@ class ResearchLab:
                 "incomplete", "search_corpus_error",
                 "The search_corpus (indexed corpus) step failed; state this limitation in the report "
                 "rather than inventing references.",
-                [{"tool": "search_corpus", "args": args, "ok": False, "error": error_text}],
+                [{"tool": "search_corpus", "provider": tool_identity(corpus_tool, "search_corpus"), "args": args, "ok": False, "error": error_text}],
                 [{"tool": "search_corpus", "error": error_text}])
         ok = isinstance(output, dict) and output.get("status") == "ok"
         contexts = [c for c in ((output.get("contexts") if isinstance(output, dict) else None) or [])
@@ -4660,7 +4812,7 @@ class ResearchLab:
               "summary": f"{'ok' if ok else (output or {}).get('status', 'error') if isinstance(output, dict) else 'error'}"
                          f": {len(contexts)} passage(s)" + (f" ({why[:240]})" if why else ""),
               "timing_outcome": tool_result_outcome(output) if isinstance(output, dict) else "failed"})
-        tool_calls = [{"tool": "search_corpus", "args": args, "ok": bool(ok),
+        tool_calls = [{"tool": "search_corpus", "provider": tool_identity(corpus_tool, "search_corpus"), "args": args, "ok": bool(ok),
                        "summary": f"{len(contexts)} passage(s)", "result": output}]
         incomplete = HarnessResult(
             "incomplete", "no_literature_citations",
@@ -4830,9 +4982,9 @@ class ResearchLab:
         # a skill. Otherwise a skill the step's text names is pointed at, as before.
         assigned = self._assigned_skill(plan_step if plan_step is not None else step)
         named = skills_named_in(step)
-        if assigned is not None:
-            parts.append(_assigned_skill_block(assigned))
-        elif named:
+        for planned_skill in self._assigned_skills(plan_step if plan_step is not None else step):
+            parts.append(_assigned_skill_block(planned_skill))
+        if assigned is None and named:
             parts.append(("The plan assigns skill " if len(named) == 1 else "The plan assigns skills ")
                          + ", ".join(f"`{n}`" for n in named) + f" to this step: {_fetch}.")
         if n_skills:
@@ -4888,8 +5040,10 @@ class ResearchLab:
         with step_scope(assigned, step=plan_step if plan_step is not None else step):
             if assigned is not None:
                 record_use(self.ctx, assigned)
-                emit({"type": "step_skill", "step": step, "skill": assigned.name,
-                      "version": assigned.version or "local", "release": assigned.registry_release or ""})
+            for planned_skill in self._assigned_skills(plan_step if plan_step is not None else step):
+                emit({"type": "step_skill", "step": step, "skill": planned_skill.name,
+                      "version": planned_skill.version or "unknown", "release": planned_skill.registry_release or "",
+                      "status": "planned"})
             result = self.scientist.run(brief, self.ctx, on_event=emit, should_cancel=should_cancel,
                                         untrusted_text=untrusted_text, extra_steps=extra_steps,
                                         **pin_kwargs)
@@ -4916,9 +5070,12 @@ class ResearchLab:
                          + ", ".join(f"`{n}`" for n in sorted(named))
                          + " — the tool this step is about. The reconnaissance is done; call it now with "
                          "the settings the step specifies, then report what it returned.")
+                first_calls = list(result.steps)
                 result = self.scientist.run(brief + nudge, self.ctx, on_event=emit,
                                             should_cancel=should_cancel, untrusted_text=untrusted_text,
                                             extra_steps=extra_steps, **pin_kwargs)
+                result.steps = first_calls + result.steps
+        self._record_step_provenance(plan_step if plan_step is not None else step, result.steps, emit)
         return result
 
     def _count_problems(self, step: str, result: HarnessResult) -> list[str]:

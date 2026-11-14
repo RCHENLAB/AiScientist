@@ -530,6 +530,8 @@ def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
         elif kind == "skill":
             said.append(f"took the skill off step {n}" if not c.get("after")
                         else f"set the skill of step {n} to {c.get('after')}")
+        elif kind in {"tools", "skills"}:
+            said.append(f"set the planned {kind} of step {n} to {json.dumps(c.get('after') or [])}")
         elif kind == "moved":
             said.append(f"moved step {c.get('before')} to position {n}")
         elif kind == "text":

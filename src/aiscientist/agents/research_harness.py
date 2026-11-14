@@ -40,7 +40,7 @@ from ..integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
 from ..tools.api import build_de_marker_execution, build_single_cell_qc_execution
 # The tool record lives in the tools' contract module so the tools never import this package;
 # re-exported here because the whole platform (and its tests) import it from this name.
-from ..tools.sdk import HarnessTool  # noqa: F401
+from ..tools.sdk import HarnessTool, tool_identity  # noqa: F401
 
 # chat_fn(messages, tools) -> {"content": str, "tool_calls": list}
 ChatToolFn = Callable[[list[dict[str, Any]], list[dict[str, Any]]], dict[str, Any]]
@@ -519,7 +519,8 @@ class ResearchHarness:
                                                    "the step is complete."})
                         continue
 
-                    emit({"type": "tool_start", "tool": name, "args": args})
+                    identity = tool_identity(self._by_name[name], name)
+                    emit({"type": "tool_start", "tool": name, "args": args, "provider": identity})
                     # Provenance for every number this call does NOT take from the tool's declared
                     # default. Once a threshold is in a Methods sentence, "the protocol says 20%"
                     # and "the model typed 10% this once" read identically — and only one of them
@@ -537,7 +538,8 @@ class ResearchHarness:
                     except Exception as exc:  # noqa: BLE001 - any tool failure must be reported, never fatal
                         error_text = f"{type(exc).__name__}: {exc}"
                         errors.append({"tool": name, "error": error_text})
-                        steps.append({"tool": name, "args": args, "ok": False, "error": error_text})
+                        steps.append({"tool": name, "args": args, "ok": False, "error": error_text,
+                                      "provider": identity})
                         emit({"type": "tool_error", "tool": name, "error": error_text})  # immediate feedback
                         if checkpoint:
                             checkpoint.log("tool_error", tool=name, error=error_text)
@@ -556,7 +558,8 @@ class ResearchHarness:
                     # A cancellable tool (run_code) scancelled/killed itself because Stop fired —
                     # end the step now instead of treating it as a normal result and pressing on.
                     if isinstance(output, dict) and output.get("status") == "cancelled":
-                        steps.append({"tool": name, "args": args, "ok": False, "result": output})
+                        steps.append({"tool": name, "args": args, "ok": False, "result": output,
+                                      "provider": identity})
                         emit({"type": "tool_result", "tool": name, "summary": _summarize(output),
                               "timing_outcome": "cancelled"})
                         stop_reason = "cancelled"
@@ -589,7 +592,7 @@ class ResearchHarness:
                     # instead of a hand-maintained field projection. ``summary`` stays for
                     # the live event stream.
                     steps.append({"tool": name, "args": args, "ok": True, "summary": summary,
-                                  "result": output,
+                                  "result": output, "provider": identity,
                                   # Carried on the step, not just emitted, so the technical report
                                   # can list every non-default setting the run actually used
                                   # instead of re-deriving it from prose.
@@ -599,7 +602,7 @@ class ResearchHarness:
                     # code (run_code) as a formatted block, without pasting the raw snippet into
                     # the always-visible progress feed.
                     emit({"type": "tool_result", "tool": name, "summary": summary, "args": args,
-                          "timing_outcome": tool_result_outcome(output)})
+                          "provider": identity, "timing_outcome": tool_result_outcome(output)})
                     fed = output
                     if enforced and isinstance(output, dict):
                         # The model must reason from the call that ran, not the one it wrote.
