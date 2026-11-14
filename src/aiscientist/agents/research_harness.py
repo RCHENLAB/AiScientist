@@ -37,7 +37,6 @@ from .loop_utils import CheckpointWriter, safe_json_loads
 from .plan_doc import pin_args
 from ..integrations.biomni_adapter import BiomniAdapter
 from ..integrations.safety import DataBoundaryGuard, DataBoundaryPolicy
-from ..tools.api import build_de_marker_execution, build_single_cell_qc_execution
 # The tool record lives in the tools' contract module so the tools never import this package;
 # re-exported here because the whole platform (and its tests) import it from this name.
 from ..tools.sdk import HarnessTool  # noqa: F401
@@ -233,12 +232,8 @@ class HarnessResult:
 # --- tool executors (wrap existing code; never reimplement) ------------------
 
 
-def _exec_qc(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
-    return build_single_cell_qc_execution(ctx.decisions)
 
 
-def _exec_de(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:
-    return build_de_marker_execution(ctx.decisions)
 
 
 def _exec_finish(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:  # pragma: no cover - loop intercepts
@@ -247,22 +242,6 @@ def _exec_finish(args: dict[str, Any], ctx: HarnessContext) -> dict[str, Any]:  
 
 def default_catalog() -> list[HarnessTool]:
     return [
-        HarnessTool(
-            "run_qc",
-            "Run lightweight single-cell QC on the already-loaded dataset and return cell/gene counts, "
-            "mean UMI, mean mito fraction, and QC flags.",
-            {"type": "object", "properties": {}},
-            _exec_qc,
-            reads_private_data=True, category="qc",
-        ),
-        HarnessTool(
-            "run_de_markers",
-            "Run a lightweight differential-expression / marker effect-size screen on the loaded dataset "
-            "and return ranked candidate genes (effect sizes only, no statistical test).",
-            {"type": "object", "properties": {}},
-            _exec_de,
-            reads_private_data=True, category="de",
-        ),
         HarnessTool(
             "finish",
             "Finish the research and return the final answer to the user. Call this exactly once when done.",

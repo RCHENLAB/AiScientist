@@ -30,7 +30,7 @@ def _round(step: str, calls: list[dict], verdict: str = "accept", critique: str 
             "verdict": {"verdict": verdict, "score": 0.8, "critique": critique}}
 
 
-QC = "**QC** — Run `run_cellqc` on the libraries."
+QC = "**QC** — Run `mcp_run_cellqc` on the libraries."
 SCORE = "**Score the signature** — adapt `score_signature` via `run_code`."
 LOOK = "**Look at the matrix** — read the skill."
 # Key-shaped, built here so no scanner of the repository takes the test for a leaked key.
@@ -39,7 +39,7 @@ CODE = "import scanpy as sc\nadata = sc.read_h5ad('/dfs3b/ruic20/u/alice/sample.
 
 ROUNDS = [
     _round(QC, [{"tool": "read_skill_reference", "ok": True, "args": {"name": "x"}},
-                {"tool": "run_cellqc", "ok": True, "args": {}, "summary": "4 libraries"}]),
+                {"tool": "mcp_run_cellqc", "ok": True, "args": {}, "summary": "4 libraries"}]),
     # a revise, then the accepted attempt: both attempts' code is kept, the last one labels the step
     _round(SCORE, [{"tool": "run_code", "ok": False, "args": {"code": "1/0"},
                     "error": "ZeroDivisionError"}], verdict="revise", critique="it crashed"),
@@ -55,16 +55,16 @@ def _code(code: str, **result) -> dict:
 
 
 def test_a_step_is_labelled_by_the_calls_that_ran_not_by_what_it_matched():
-    assert step_status([{"tool": "run_de", "ok": True}]) == TESTED
+    assert step_status([{"tool": "mcp_run_de", "ok": True}]) == TESTED
     # code alone produced the step's result
     assert step_status([_code("print(adata.shape)")]) == UNTESTED
     assert step_status([{"tool": "run_in_environment", "ok": True, "args": {"command": "cellqc"}}]) == UNTESTED
     # code that wrote a table after a tool: part of the result came from the code
-    assert step_status([{"tool": "run_de", "ok": True}, _code("df.to_csv('x.csv')")]) == UNTESTED
-    assert step_status([{"tool": "run_de", "ok": True},
+    assert step_status([{"tool": "mcp_run_de", "ok": True}, _code("df.to_csv('x.csv')")]) == UNTESTED
+    assert step_status([{"tool": "mcp_run_de", "ok": True},
                         _code("x", execution_mode="hpc_slurm", tables=["tables/x.csv"])]) == UNTESTED
     # a failed code attempt that a tool then replaced: the result is the tool's
-    assert step_status([{"tool": "run_code", "ok": False}, {"tool": "run_de", "ok": True}]) == TESTED
+    assert step_status([{"tool": "run_code", "ok": False}, {"tool": "mcp_run_de", "ok": True}]) == TESTED
     assert step_status([{"tool": "list_dir", "ok": True}, {"tool": "finish", "ok": True}]) == NONE
 
 
@@ -72,7 +72,7 @@ def test_code_that_only_checks_a_tested_tools_result_keeps_the_step_tested():
     """Production, 2026-10-19: every CellQC step read the tool's output once more — `cat
     qc_status.csv` with run_shell, or the QC checkpoint's shape with run_code. Those runs used only
     the tested tool, so they get no notice and are no skill request."""
-    cellqc = [{"tool": "inspect_dataset", "ok": True}, {"tool": "run_cellqc", "ok": True},
+    cellqc = [{"tool": "mcp_inspect_dataset", "ok": True}, {"tool": "mcp_run_cellqc", "ok": True},
               {"tool": "run_shell", "ok": True, "args": {"command": "cd out/result && cat qc_status.csv"},
                "result": {"execution_mode": "hpc_slurm", "status": "ok"}},
               _code("import scanpy as sc\na = sc.read_h5ad(os.path.join(os.environ['AISCIENTIST_WORK'], "
@@ -88,7 +88,7 @@ def test_the_run_record_keeps_every_attempt_and_labels_each_step_by_its_last():
     prov = run_provenance(ROUNDS)
     steps = {s["step"]: s for s in prov["steps"]}
     assert list(steps) == [QC, SCORE, LOOK]
-    assert steps[QC]["status"] == TESTED and steps[QC]["tools"] == ["run_cellqc"]
+    assert steps[QC]["status"] == TESTED and steps[QC]["tools"] == ["mcp_run_cellqc"]
     score = steps[SCORE]
     assert score["status"] == UNTESTED and score["accepted"] and score["attempts"] == 2
     assert [c["ok"] for c in score["code_calls"]] == [False, True]
@@ -194,7 +194,7 @@ def test_past_the_retention_period_the_raw_parts_go_and_the_summary_stays(store)
 
 def test_the_summary_comes_from_the_cheap_model_and_falls_back_to_code(store):
     rec = _record(store)
-    choices = ["gene_signature_scoring", "run_de"]
+    choices = ["gene_signature_scoring", "mcp_run_de"]
     seen = {}
 
     def model(messages, *, role=None):
@@ -242,7 +242,7 @@ def test_the_gateway_writes_the_code_file_and_the_record(store):
     result = SimpleNamespace(converged=True, claim_audit={})
     lab = SimpleNamespace(protocols=[{"key": "gene_signature_scoring", "label": "x"}],
                           induced_skills=["score_x"],
-                          scientist=SimpleNamespace(catalog=[SimpleNamespace(name="run_de"),
+                          scientist=SimpleNamespace(catalog=[SimpleNamespace(name="mcp_run_de"),
                                                              SimpleNamespace(name="run_code")]))
     decisions = {"datasets": [{"path": "/dfs3b/x/sample.h5ad", "kind": "h5ad"}],
                  "content_modality": "scrna"}
@@ -253,9 +253,9 @@ def test_the_gateway_writes_the_code_file_and_the_record(store):
     assert saved["earlier_requests"] == ["Run CellQC"] and saved["induced_skills"] == ["score_x"]
     assert saved["datasets"][0]["content_modality"] == "scrna"
     app._summarize_skill_request(rec, lambda m, role=None: '{"one_line": "Score cells", '
-                                 '"category": "gene signature scoring", "closest_skill": "run_de"}', lab)
+                                 '"category": "gene signature scoring", "closest_skill": "mcp_run_de"}', lab)
     filled = store.load("abc123def456")
-    assert filled["summary_by"] == "model" and filled["summary"]["closest_skill"] == "run_de"
+    assert filled["summary_by"] == "model" and filled["summary"]["closest_skill"] == "mcp_run_de"
 
 
 def test_the_bundles_code_file_carries_no_server_path_and_no_key(store, monkeypatch):
@@ -317,7 +317,7 @@ def test_a_record_names_the_vetted_skills_behind_its_code(store):
     app = pytest.importorskip("aiscientist.gateway.app")
     from aiscientist.agents.plan_doc import PlanDoc, PlanStep
     doc = PlanDoc(request="Score my cells", steps=(
-        PlanStep(id="s1", text="**QC** — Run CellQC.", tool="run_cellqc"),
+        PlanStep(id="s1", text="**QC** — Run CellQC.", tool="mcp_run_cellqc"),
         PlanStep(id="s2", text="**Score the signature** — Adapt the skill.", tool="run_code",
                  skill="score_signature")))
     prov = run_provenance([_round(SCORE, [
@@ -416,7 +416,7 @@ def test_a_run_whose_code_wrote_results_says_so_and_leaves_a_request(tmp_path, m
 
         def run(self, question, on_event=None, plan_review=None, **_kw):
             r1 = LabRound(1, 0, qc._STEP, "Scientist", {"final_answer": "QC done", "steps": [
-                {"tool": "run_cellqc", "ok": True, "args": {}, "result": qc._CELLQC}]},
+                {"tool": "mcp_run_cellqc", "ok": True, "args": {}, "result": qc._CELLQC}]},
                 CriticVerdict("accept", 0.8, ""))
             r2 = LabRound(2, 1, audit, "Scientist", {"final_answer": "3% rod reads", "steps": [
                 {"tool": "run_code", "ok": True, "args": {"code": leak_code}, "summary": "3% rod reads",

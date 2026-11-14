@@ -2,8 +2,6 @@
 import json
 import subprocess
 import sys
-from pathlib import Path
-from types import SimpleNamespace
 
 
 def test_platform_api_works_with_retiring_tool_modules_unavailable(tmp_path):
@@ -41,40 +39,10 @@ print(json.dumps({"format":peek["detected_format"],"reference":"retina","figure"
     assert json.loads(result.stdout)["reference"] == "retina"
 
 
-def test_legacy_inspection_factory_still_uses_its_patchable_entrypoint(tmp_path, monkeypatch):
-    from aiscientist.tools.inspect_dataset import tool
-
-    query = tmp_path / "query.tsv"
-    query.write_text("name\tvalue\nx\t1\n")
-    seen = []
-    monkeypatch.setattr(tool, "inspect_dataset", lambda path, **kwargs: seen.append(path) or {"status": "sentinel"})
-    ctx = SimpleNamespace(workspace=tmp_path, decisions={"dataset_path": str(query)}, tunnel_port=None)
-    result = tool.make_inspect_dataset_tool().executor({}, ctx)
-    assert seen == [str(query)] and result["status"] == "sentinel"
 
 
-def test_legacy_schematic_factory_and_shared_process_patches_remain_supported(tmp_path, monkeypatch):
-    from aiscientist.tools._lib import schematics
-    from aiscientist.tools.make_schematic import tool
-
-    assert tool.shutil is schematics.shutil and tool.subprocess is schematics.subprocess
-    seen = []
-    monkeypatch.setattr(tool, "render_dot", lambda source, directory, **kwargs:
-                        seen.append((source, directory)) or {"status": "sentinel"})
-    result = tool.make_schematic_tool().executor({"source": "digraph { a -> b }"},
-                                               SimpleNamespace(workspace=tmp_path))
-    assert result["status"] == "sentinel"
-    assert seen == [("digraph { a -> b }", tmp_path / "artifacts/figures")]
 
 
-def test_curated_reference_copy_preserves_the_existing_resource():
-    from aiscientist.tools._lib import marker_references
-    from aiscientist.tools.run_marker_annotation import tool
-
-    shared = marker_references._REFERENCES / "retina.json"
-    legacy = Path(tool.__file__).with_name("references") / "retina.json"
-    assert shared.read_bytes() == legacy.read_bytes()
-    assert tool._load_reference("retina") == marker_references.load_reference("retina")
 
 
 def test_cellranger_profiler_reads_the_packaged_shared_markers():

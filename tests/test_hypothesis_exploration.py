@@ -12,13 +12,15 @@ style as test_step_meetings.py.
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
 import pytest
 
 from aiscientist.agents.dag import LabPlan, TaskNode, lift_agenda_to_dag
 from aiscientist.agents.hypotheses import DesignFacts, HypothesisLedger
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 # The exploration prompt's unique marker (distinct from the post-step review's "reviewing a step
@@ -50,11 +52,11 @@ def _finish():
 
 
 def _scientist():
-    """Scripted Scientist: call run_qc, then finish."""
+    """Scripted Scientist: call mcp_run_scanpy_qc, then finish."""
     def chat(messages, _tools):
         if any(m.get("role") == "tool" for m in messages):
             return _finish()
-        return _call("run_qc", {})
+        return _call("mcp_run_scanpy_qc", {})
     return chat
 
 
@@ -91,7 +93,7 @@ _AUTO = {"hypothesis_driven": True, "new_steps_need_approval": False}
 def _lab(agenda, *, config=None, **router_kw):
     return ResearchLab(_ctx(), config or LabConfig(**_AUTO),
                        complete_fn=_router(agenda, **router_kw),
-                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                       scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
 
 
 # A well-formed proposal: a falsifiable hypothesis plus the one step that tests it.
@@ -172,7 +174,7 @@ def test_exploration_off_by_default_never_asks_and_never_grows():
     seen: list[str] = []
     agenda = ["Run QC on the dataset", "Identify marker genes"]
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=_router(agenda, explore=_proposal(), seen=seen),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.agenda == agenda and result.accepted_steps == 2
     assert result.hypotheses == []
@@ -233,7 +235,7 @@ def test_a_later_step_can_refute_an_open_hypothesis_and_the_report_says_so():
     events: list[dict] = []
     synth: list[str] = []
     lab = _lab(agenda, explore=explore, synth=synth)
-    result = lab.run("Characterize the dataset", on_event=events.append)
+    result = lab.run("Characterize the dataset and write a report", on_event=events.append)
 
     assert result.hypotheses[0]["status"] == "refuted"
     resolved = [e for e in events if e["type"] == "hypothesis_resolved"]
@@ -299,7 +301,7 @@ def test_max_new_steps_caps_a_model_that_finds_everything_surprising():
 
     cfg = LabConfig(**_AUTO, max_new_steps=2)
     lab = ResearchLab(_ctx(), cfg, complete_fn=_router(agenda, explore=explore),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert len(result.agenda) == len(agenda) + 2      # capped, run still terminates
 
@@ -317,7 +319,7 @@ def test_max_steps_caps_total_plan_length():
 
     cfg = LabConfig(**_AUTO, max_new_steps=99, max_steps=3)
     lab = ResearchLab(_ctx(), cfg, complete_fn=_router(agenda, explore=explore),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert len(result.agenda) == 3
 
@@ -336,7 +338,7 @@ def test_malformed_exploration_reply_degrades_to_no_growth():
         return "FINAL REPORT"
 
     lab = ResearchLab(_ctx(), LabConfig(**_AUTO), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.agenda == agenda and result.accepted_steps == 2
 
@@ -370,7 +372,7 @@ def test_dag_planner_adds_a_node_that_depends_on_the_step_that_provoked_it():
     events: list[dict] = []
     lab = ResearchLab(_ctx(), LabConfig(**_AUTO, planner="dag"),
                       complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset", on_event=events.append)
 
     assert new_step in result.agenda and new_step in [r.step for r in result.rounds]
@@ -411,7 +413,7 @@ def test_no_exploration_call_when_the_step_produced_nothing_to_be_surprised_by()
     agenda = ["Run QC on the dataset"]
     lab = ResearchLab(_ctx(), LabConfig(**_AUTO),
                       complete_fn=_router(agenda, explore=_QUIET, seen=seen),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=chat))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=chat))
     lab.run("Characterize the dataset")
     assert _explore_calls(seen) == 0
 
@@ -585,7 +587,7 @@ def _asking_lab(answers, **config):
     agenda = ["Run QC on the dataset", "Cluster the cells"]
     lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True, planner="linear", **config),
                       complete_fn=_router(agenda, explore=_proposal()),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     return lab, asked, decision_review
 
 
@@ -641,7 +643,7 @@ def test_after_one_unanswered_proposal_the_run_stops_asking():
 
     lab = ResearchLab(_ctx(), LabConfig(hypothesis_driven=True, planner="linear"),
                       complete_fn=_router(["Run QC on the dataset", "Cluster the cells"], explore=explore),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Q", lambda _e: None, decision_review=review)
     assert len([n for n in asked if getattr(n, "kind", "") == "add_step"]) == 1   # asked once only
     assert [p["decision"] for p in lab.proposed_steps] == ["unanswered", "not_asked"]

@@ -10,9 +10,11 @@ Every completion is injected — no GPU/LLM, no scanpy.
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 _NEXT_CYCLE_MARK = "deciding whether to run ANOTHER cycle"
@@ -42,7 +44,7 @@ def _scientist():
     def chat(messages, _tools):
         if any(m.get("role") == "tool" for m in messages):
             return _finish()
-        return _call("run_qc", {})
+        return _call("mcp_run_scanpy_qc", {})
     return chat
 
 
@@ -74,7 +76,7 @@ def _router(first_agenda, *, next_cycle=None, explore=None, seen=None, synth=Non
 def _lab(first_agenda, *, cycles=3, **router_kw):
     return ResearchLab(_ctx(), LabConfig(max_cycles=cycles),
                        complete_fn=_router(first_agenda, **router_kw),
-                       scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                       scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
 
 
 # --- off by default ----------------------------------------------------------
@@ -82,7 +84,7 @@ def _lab(first_agenda, *, cycles=3, **router_kw):
 def test_single_cycle_is_the_default_and_never_asks_about_another():
     seen: list[str] = []
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=_router(CYCLE1, seen=seen),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.agenda == CYCLE1 and result.accepted_steps == 2
     assert not any(_NEXT_CYCLE_MARK in s for s in seen)
@@ -135,7 +137,7 @@ def test_the_report_is_written_once_over_every_cycles_rounds():
 
     synth: list[str] = []
     events: list[dict] = []
-    result = _lab(CYCLE1, next_cycle=wrapped, synth=synth).run("Q", on_event=events.append)
+    result = _lab(CYCLE1, next_cycle=wrapped, synth=synth).run("Q and write a report", on_event=events.append)
     assert sum(1 for e in events if e["type"] == "synthesize") == 1
     brief = "\n".join(synth)
     for step in CYCLE1 + CYCLE2:                      # every cycle's work reaches the writer
@@ -196,7 +198,7 @@ def test_nothing_left_to_chase_stops_before_the_pi_is_even_asked():
     cfg = LabConfig(max_cycles=3, hypothesis_driven=True)
     events: list[dict] = []
     lab = ResearchLab(_ctx(), cfg, complete_fn=_router(CYCLE1, next_cycle=next_cycle),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     lab.run("Q", on_event=events.append)
     assert next(e for e in events if e["type"] == "campaign_done")["reason"] == "nothing_left_to_chase"
     assert calls["n"] == 0        # the re-plan turn was never issued
@@ -214,8 +216,8 @@ def test_a_replan_failure_ends_the_campaign_instead_of_killing_the_run():
         return "FINAL REPORT"
 
     lab = ResearchLab(_ctx(), LabConfig(max_cycles=3), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
-    result = lab.run("Q")
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
+    result = lab.run("Q and write a report")
     assert result.accepted_steps == 2 and result.final_answer.startswith("FINAL REPORT")
 
 
@@ -229,7 +231,7 @@ def test_cancelling_between_cycles_stops_without_writing_a_manuscript():
     events: list[dict] = []
     lab = ResearchLab(_ctx(), LabConfig(max_cycles=3),
                       complete_fn=_router(CYCLE1, next_cycle=next_cycle),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Q", on_event=events.append, should_cancel=lambda: state["stop"])
     assert next(e for e in events if e["type"] == "campaign_done")["reason"] == "cancelled"
     assert "stopped by the user" in result.final_answer
@@ -269,7 +271,7 @@ def test_exploration_and_cycles_compose_within_and_across_cycles(monkeypatch):
     cfg = LabConfig(max_cycles=3, hypothesis_driven=True, new_steps_need_approval=False)
     lab = ResearchLab(_ctx(), cfg,
                       complete_fn=_router(CYCLE1, explore=explore, next_cycle=next_cycle),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Q")
 
     # cycle 1 grew by the discovered step; cycle 2 was planned on top of the whole picture
@@ -313,7 +315,7 @@ def test_a_team_campaign_reaches_its_interpretation_meeting(tmp_path):
             return HarnessResult(
                 status="ok", stop_reason=None, final_answer="did it",
                 # Not a QC tool: a run that only did QC is answered without the writer.
-                steps=[{"tool": "run_clustering", "ok": True,
+                steps=[{"tool": "mcp_run_clustering", "ok": True,
                         "result": {"status": "ok", "figures": ["figures/a.png"]}}],
                 errors=[])
 

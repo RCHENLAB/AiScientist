@@ -49,24 +49,21 @@ def test_every_tool_resolves_to_a_real_source_location():
 
 
 def test_an_hpc_routed_tool_is_located_at_its_own_tool_py():
-    """A tool routed to HPC3 is registered with the registry's dispatcher as its executor; its
-    location must still be the tool's own folder, not agents/registry.py."""
-    from aiscientist.agents.registry import _HPC_ANALYSIS_TOOLS, build_scientist_catalog
+    from aiscientist.agents.registry import _route_to_executor
+    from aiscientist.tools.sdk import HarnessTool
+    from native_tool_fixtures import _executor
+    from types import SimpleNamespace
+    original = HarnessTool("fixture_job", "A test-only HPC callable", {}, _executor("fixture_job"))
+    routed = _route_to_executor(original, SimpleNamespace(run_tool=lambda *args: {}), (original.name,))
+    tool = tool_index([routed])[0]
+    assert tool["source"].startswith("tests/native_tool_fixtures.py:")
+    assert "registry.py" not in tool["source"]
 
-    class _Line:
-        def run_tool(self, name, args, ctx):
-            return {}
-
-    tools = {t["name"]: t for t in tool_index(build_scientist_catalog(analysis_executor=_Line()))}
-    assert tools["run_enrichment"]["source"].startswith("src/aiscientist/tools/run_enrichment/tool.py:")
-    wrong = {n: tools[n]["source"] for n in _HPC_ANALYSIS_TOOLS
-             if n in tools and not tools[n]["source"].startswith(f"src/aiscientist/tools/{n}/")}
-    assert not wrong, wrong
 
 def test_the_gene_sets_that_caused_the_failure_are_in_the_inventory():
     items = {a["label"]: a for a in asset_inventory()}
     gmt = next(a for k, a in items.items() if "Gene-set" in k)
-    assert gmt["where"] == "gateway"
+    assert gmt["where"] == "hpc3"
     # The note must state the two facts the pathway step lacked: they are read offline, and a
     # hand-computed summary should use these same files instead of fetching a collection.
     note = " ".join(gmt["note"].split())
@@ -123,7 +120,7 @@ def test_agent_rendering_is_non_empty_for_every_section(section):
 
 def test_the_markdown_carries_the_tool_locations():
     md = render_markdown(environment_manifest())
-    assert "src/aiscientist/tools/run_de/tool.py:" in md
+    assert "src/aiscientist/agents/research_lab/tooling.py:" in md
     assert "regenerate it" in md            # the doc says not to hand-edit it
     assert "| tool | what it does | source | available |" in md
 

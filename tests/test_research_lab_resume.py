@@ -7,9 +7,11 @@ the whole loop runs with no GPU/LLM. Mirrors tests/test_research_lab.py's harnes
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import (
     CriticVerdict, LabConfig, LabResult, LabRound, ResearchLab, ResumeState)
 
@@ -48,8 +50,8 @@ def _accepting_complete(agenda, *, pi_counter=None):
     return complete
 
 
-def _lab(agenda, tool="run_qc", *, pi_counter=None, on_messages=None):
-    scientist = ResearchHarness(catalog=default_catalog(),
+def _lab(agenda, tool="mcp_run_scanpy_qc", *, pi_counter=None, on_messages=None):
+    scientist = ResearchHarness(catalog=fixture_catalog(),
                                 chat_fn=_scientist_calls(tool, on_messages=on_messages))
     return ResearchLab(_ctx(), LabConfig(), complete_fn=_accepting_complete(agenda, pi_counter=pi_counter),
                        scientist=scientist)
@@ -58,7 +60,7 @@ def _lab(agenda, tool="run_qc", *, pi_counter=None, on_messages=None):
 # --- serialization round-trip ------------------------------------------------
 
 def test_labresult_round_trips_through_dict():
-    res = _lab(["Run QC", "Cluster the cells"]).run("characterize")
+    res = _lab(["Run QC", "Cluster the cells"]).run("characterize and write a report")
     back = LabResult.from_dict(json.loads(json.dumps(res.to_dict())))   # JSON-safe round trip
     assert back.question == res.question
     assert back.agenda == res.agenda
@@ -84,16 +86,16 @@ def test_resume_state_keeps_all_accepted_rounds():
 
 def test_resume_reruns_from_boundary_without_replanning():
     agenda = ["Run QC", "Cluster the cells", "Differential expression"]
-    first = _lab(agenda).run("characterize")
+    first = _lab(agenda).run("characterize and write a report")
     assert first.accepted_steps == 3 and first.converged
 
     # Resume: keep step 0 (QC), re-run steps 1..2. A PI-plan call here would be a bug.
     pi = {"n": 0}
-    lab2 = _lab(agenda, tool="run_qc", pi_counter=pi)
+    lab2 = _lab(agenda, tool="mcp_run_scanpy_qc", pi_counter=pi)
     resume = ResumeState.from_run_state(first.to_dict(), from_step_index=1,
                                         modify_note="re-cluster at resolution 1.0")
     events: list = []
-    result = lab2.run("characterize", on_event=events.append, resume=resume)
+    result = lab2.run("characterize and write a report", on_event=events.append, resume=resume)
 
     assert pi["n"] == 0                                         # NO re-planning
     assert any(e["type"] == "run_resumed" for e in events)
@@ -107,24 +109,24 @@ def test_resume_reruns_from_boundary_without_replanning():
 
 def test_resume_from_first_step_reruns_everything():
     agenda = ["Run QC", "Cluster the cells"]
-    first = _lab(agenda).run("characterize")
+    first = _lab(agenda).run("characterize and write a report")
     resume = ResumeState.from_run_state(first.to_dict(), from_step_index=0)
     # From step 0, both steps are in the re-run set (nothing upstream to reuse), so all re-run.
-    result = _lab(agenda).run("characterize", resume=resume)
+    result = _lab(agenda).run("characterize and write a report", resume=resume)
     assert len(result.rounds) == 2 and result.accepted_steps == 2 and result.converged
 
 
 def test_resume_modify_note_steers_the_resumed_step():
     agenda = ["Run QC", "Cluster the cells"]
-    first = _lab(agenda).run("characterize")
+    first = _lab(agenda).run("characterize and write a report")
 
     seen: list[str] = []
     def capture(messages):
         seen.extend(m["content"] for m in messages if isinstance(m.get("content"), str))
-    lab2 = _lab(agenda, tool="run_qc", on_messages=capture)
+    lab2 = _lab(agenda, tool="mcp_run_scanpy_qc", on_messages=capture)
     resume = ResumeState.from_run_state(first.to_dict(), from_step_index=1,
                                         modify_note="RECLUSTER_AT_RES_1P0")
-    lab2.run("characterize", resume=resume)
+    lab2.run("characterize and write a report", resume=resume)
 
     assert any("RECLUSTER_AT_RES_1P0" in s for s in seen)     # the note reached the Scientist's brief
 
@@ -153,7 +155,7 @@ def test_run_state_persist_round_trips_into_resume_state(tmp_path):
 # --- dependency evaluation: which downstream steps actually need re-running ---
 
 def _lab_with_complete(complete):
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc"))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc"))
     return ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
 
@@ -196,7 +198,7 @@ def test_resume_keeps_independent_literature_end_to_end():
         if "Critic" in sys:
             return json.dumps({"verdict": "accept", "score": 0.9, "critique": "ok"})
         return "FINAL REPORT."
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc"))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc"))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     resume = ResumeState.from_run_state(state, from_step_index=1)   # change "Cluster the cells"

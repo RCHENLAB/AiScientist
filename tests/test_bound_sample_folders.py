@@ -5,12 +5,12 @@ Two folders attached to one chat, ``Sample3_GSM5676874/`` and ``Sample1_WT/``: t
 "Sample1_WT/: A unknown file (~4.1 KB)", and the plan scoped CellQC to Sample3. Sample1_WT was whole
 on the server (21 GB) and its session copy on HPC3 was complete: the gateway read only the PRIMARY
 folder as a Cell Ranger delivery and took every other bound path for one file (4 KB is a directory's
-own size), and run_cellqc read only the primary's folder. Sample3 had also come from its HPC3
+own size), and mcp_run_cellqc read only the primary's folder. Sample3 had also come from its HPC3
 original, which the chat still named after the dataset was moved to the server.
 
 Now every bound folder is a sample folder: one layout covers the libraries of all of them, each
 named after its dataset (a folder kept on the server is ``…/<uuid>/original``, so both were
-"original"), run_cellqc reads them all, a dataset that cannot be used is named to the planner with
+"original"), mcp_run_cellqc reads them all, a dataset that cannot be used is named to the planner with
 the reason, and an HPC3 original is read from its copy on the server.
 """
 
@@ -28,7 +28,7 @@ import pytest
 from aiscientist.tools._lib.cellranger import (cellranger_layout_hint, describe_cellranger_layout,
                                                merge_cellranger_layouts)
 from test_kept_storage import LAB, SHARED, FakeHpc, _live, kept  # noqa: F401 - kept is a fixture
-from test_run_cellqc import _web_summary, _write_10x_h5, fake_cellqc  # noqa: F401 - a fixture
+from test_run_cellqc import _web_summary, _write_10x_h5
 from test_tus_upload import env  # noqa: F401 - a fixture kept needs
 
 _LIBRARY = ["raw_feature_bc_matrix.h5", "filtered_feature_bc_matrix.h5"]
@@ -202,7 +202,7 @@ def test_the_planner_is_told_which_attached_datasets_it_cannot_use(tmp_path):
                       complete_fn=lambda m: "x")
     ctx = lab._dataset_context()
     assert "Sample1_WT/ — SAMPLE FOLDER" in ctx and "notes/ — extra folder" in ctx
-    assert "`run_cellqc` reads the Cell Ranger libraries of every attached folder" in ctx
+    assert "the registered CellQC tool reads the Cell Ranger libraries of every attached folder" in ctx
     assert "ATTACHED BUT NOT USABLE" in ctx and "  - notes: it holds no Cell Ranger library" in ctx
 
 
@@ -330,38 +330,9 @@ def test_a_dfs3b_folder_bound_beside_the_primary_is_a_folder_not_a_file(tmp_path
     assert not (tmp_path / "staged").exists()                 # a folder is never pulled back whole
 
 
-# --- run_cellqc reads them all -----------------------------------------------------------------------
+# --- mcp_run_cellqc reads them all -----------------------------------------------------------------------
 
 
-def test_cellqc_reads_every_bound_folder_in_one_run(tmp_path, fake_cellqc):  # noqa: F811 - a fixture imported above
-    pytest.importorskip("scanpy")
-    from aiscientist.agents.research_harness import HarnessContext
-    from aiscientist.tools.run_cellqc.tool import run_cellqc
-
-    a = _library(tmp_path / "data" / "aaa" / "original", matrix=False)
-    b = _library(tmp_path / "data" / "bbb" / "original", matrix=False)
-    notes = tmp_path / "data" / "ccc" / "original"
-    notes.mkdir(parents=True)
-    (notes / "notes.txt").write_text("x")
-    ws = tmp_path / "run"
-    ctx = HarnessContext(workspace=ws, decisions={
-        "dataset_root": str(a),
-        "input_folders": [{"name": "Sample3_GSM5676874", "path": str(a)},
-                          {"name": "Sample1_WT", "path": str(b)},
-                          {"name": "notes", "path": str(notes)},
-                          {"name": "gone", "path": str(tmp_path / "missing")}]})
-    out = run_cellqc({}, ctx)
-    assert out["status"] == "ok", out
-    lines = (ws / "work" / "cellqc" / "samples.txt").read_text().splitlines()[1:]
-    assert [ln.split("\t")[0] for ln in lines] == ["Sample3_GSM5676874", "Sample1_WT"]
-    assert out["n_libraries"] == 2
-    assert {lib["sample"] for lib in out["libraries"]} == {"Sample3_GSM5676874", "Sample1_WT"}
-    text = "\n".join(out["warnings"])
-    assert "notes/ holds no Cell Ranger library" in text and "gone/ could not be read" in text
-    assert out["read_from"] == "the bound folders (Sample3_GSM5676874/, Sample1_WT/)"
-    import anndata as ad
-    adata = ad.read_h5ad(ws / "work" / "adata_qc.h5ad")
-    assert set(adata.obs["sampleid"]) == {"Sample3_GSM5676874", "Sample1_WT"}
 
 
 def test_results_are_named_after_the_datasets_not_their_folder():
@@ -450,7 +421,7 @@ def test_the_verification_names_each_species_checkpoint():
     result = {"status": "ok", "cells_before": 32240, "cells_after": 26000, "libraries": libs,
               "checkpoints": {"human": {"checkpoint": "adata_qc.h5ad", "cells": 11000},
                               "mouse": {"checkpoint": "adata_qc.mouse.h5ad", "cells": 15000}}}
-    rounds = [{"scientist_result": {"steps": [{"tool": "run_cellqc", "result": result}]}}]
+    rounds = [{"scientist_result": {"steps": [{"tool": "mcp_run_cellqc", "result": result}]}}]
     lines, _ = qc_section(rounds)
     text = "\n".join(lines)
     assert ("The QC checkpoints hold 26,000 cells (human: 11,000 in adata_qc.h5ad; mouse: 15,000 in "

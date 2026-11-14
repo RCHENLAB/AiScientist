@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import dataclasses
 import functools
 import json
 import mimetypes
@@ -30,8 +29,6 @@ from ..core.config import load_project_env
 from .dataset_limits import MAX_BOUND_DATASETS as _MAX_BOUND_DATASETS
 from .. import literature_contract
 from . import cluster_models, gpu, vllm_client
-from ..tools import api as _tools_api   # the tools' public surface (see tools/api.py)
-from ..tools import catalog as _tools_catalog   # the tool manifests (here: which jobs call a served model)
 from ..tools import sdk as _tools_sdk   # the tool contract (here: what a tool may read on this host)
 # The endpoint-locality test lives with the data-boundary guard it feeds (a privacy decision,
 # and testable without the web stack). Aliased so every call site reads the same as before.
@@ -3387,7 +3384,20 @@ def _record_input_layout(decisions: dict, layout: "dict | None",
     dr = decisions.setdefault("dataset_result", {})
     if isinstance(dr, dict):
         dr["cellranger_layout"] = layout
-        dr["input_layout_hint"] = cellranger_layout_hint(layout)
+        from ..agents.mcp_bridge import configured_servers
+        from ..agents.tool_names import canonical_tool_name
+        registered = {canonical_tool_name(server.planner_name(entry["name"])):
+                      server.planner_name(entry["name"])
+                      for server in configured_servers() if server.adapter == "analysis"
+                      for entry in server.tools}
+        hint = cellranger_layout_hint(layout)
+        methods = {"run_cellqc": "CellQC", "run_scanpy_qc": "matrix QC",
+                   "run_doublet_detection": "doublet detection"}
+        for name, method in methods.items():
+            actual = registered.get(name)
+            hint = hint.replace(f"`{name}`", f"`{actual}`" if actual else
+                                f"{method} (native service not configured)")
+        dr["input_layout_hint"] = hint
         if dr.get("tenx_h5") and any(lib.get("matrix") == dr["tenx_h5"] for lib in layout["libraries"]):
             # The hint states the primary matrix's facts with the rest of the delivery's: once is enough.
             dr["note"] = "the primary file is one of this delivery's filtered matrices (read above)"
@@ -5724,19 +5734,7 @@ def _remote_path_status(executor: Any, path: str, *, is_dir: bool) -> "bool | No
         return None
 
 
-def _phenotype_preflight(executor: Any, lirical_image: str, data_dir: str,
-                         exomiser_dir: str = "") -> dict:
-    """Cheap HPC3 existence checks for the LIRICAL stack (sif image + LIRICAL data dir + the optional
-    Exomiser data dir for genotype-aware scoring). Returns ``{name: (path, exists?)}`` with exists? =
-    True / False / None(unverifiable). SSH round-trips, so call via ``asyncio.to_thread``. Turns a silent
-    ``not_installed`` into ``lirical_data_dir NOT found on HPC3: <path>``."""
-    checks = {
-        "lirical_image": (lirical_image, _remote_path_status(executor, lirical_image, is_dir=False)),
-        "lirical_data_dir": (data_dir, _remote_path_status(executor, data_dir, is_dir=True)),
-    }
-    if exomiser_dir:   # only when genotype-aware is configured (else phenotype-only needs no Exomiser)
-        checks["exomiser_dir"] = (exomiser_dir, _remote_path_status(executor, exomiser_dir, is_dir=True))
-    return checks
+
 
 
 def _detect_vcf_assembly(conn: "Connection", decisions: dict) -> str:
@@ -6390,194 +6388,22 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
     return RelayBinding(model=model, start=start, priced=priced, identity=identity)
 
 
-class _NoServedModelExecutor:
-    """The literature line of a session with no served model (the user's own API key). A tool whose
-    HPC3 job calls the served model (manifest ``served_model``) answers ``dependency_missing`` at once
-    instead of submitting a Slurm job that cannot reach a model. The roster already leaves those tools
-    out (``registry.session_catalog``); this covers a composite bound to one of them, such as
-    ``diagnose_disease``, which composes ``deep_literature`` and degrades to its LIRICAL track.
-    A tool whose job brings its own GPU (manifest ``own_gpu``, the corpus scan) is refused here too:
-    it runs only through its own executor (``_build_literature_executor(own_gpu=True)``)."""
-
-    def __init__(self, inner: Any) -> None:
-        self._inner = inner
-        self._needs_model = frozenset(m.name for m in _tools_catalog.manifests() if m.served_model)
-        self._own_gpu = frozenset(m.name for m in _tools_catalog.manifests() if m.own_gpu)
-
-    def run_tool(self, tool: str, args: dict[str, Any], ctx: Any) -> dict[str, Any]:
-        if tool in self._needs_model:
-            return {"status": "dependency_missing", "dependency": "served-model",
-                    "note": f"{tool} calls the model a session serves on an HPC3 GPU, and this session "
-                            "has no GPU allocation."}
-        if tool in self._own_gpu:
-            return {"status": "dependency_missing", "dependency": "own-gpu-job",
-                    "note": f"{tool} runs as a job with a GPU and a model of its own (the RetiGene "
-                            "corpus scan), not on this literature line."}
-        return self._inner.run_tool(tool, args, ctx)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
 
 
-def _build_literature_executor(conn: "Connection", run_id: str | None = None, *,
-                               own_gpu: bool = False, relay: "dict[str, Any] | None" = None) -> Any:
-    """Offload the literature tools (deep_literature, extract_haploinsufficient_genes) to HPC3
-    (paperqa.sif), or None to keep them disabled. With ``run_id`` the job gets that run's own
-    workspace (``Temp/<user>/corpus/<run_id>`` on dfs3b, ``<workspace>/<run_id>`` locally), so its
-    artifacts are synced back under the run and show up in the run's files; without it (the chat
-    path) the shared ``Temp/<user>/paperqa`` dir is used as before.
-
-    ``own_gpu`` (the corpus scan): each job runs on a GPU of its own on the paid partition and
-    starts its own model there (``gateway/corpus_scan.py``), so it needs no allocation of the
-    session and never calls the session's model.
-
-    PaperQA cannot run in-process on the eyeserver: the PubMedBERT index lives on /dfs3b, which the
-    gateway can't read in place. When AISCIENTIST_PAPERQA_ON_HPC is set (and there is a live SSH session
-    + a GPU serve job whose node hosts Qwen), run paperqa_cli inside paperqa.sif on HPC3, reaching the
-    served Qwen at the GPU node's own host:port (the offload branch in paperqa_search._local_endpoint).
-    Returns None (deep_literature simply absent) whenever anything required is missing — so the
-    feature is fully OPT-IN and its absence never changes existing behaviour.
-    """
-    st = conn.settings
-    image = os.environ.get("AISCIENTIST_PAPERQA_IMAGE", "")
-    # Opt-in guard: build the executor ONLY when the feature is enabled AND a live HPC3 session
-    # exists — else return None so the literature tools are simply absent. A session with no GPU
-    # allocation (the user's own API key) still gets the executor: ``search_corpus`` runs there
-    # without a model. The tools whose manifest says ``served_model`` are left out of that session's
-    # roster (``registry.session_catalog``), and the job gets no model endpoint.
-    if (not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") or not image
-            or conn.executor is None or conn.mock):
-        return None
-    retigene = os.environ.get("AISCIENTIST_PAPERQA_ROOT", "")
-    index_dir = os.environ.get("AISCIENTIST_PAPERQA_INDEX_DIR", "")
-    papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
-    embedding = os.environ.get("AISCIENTIST_PAPERQA_EMBEDDING", "st-NeuML/pubmedbert-base-embeddings")
-    index_name = os.environ.get("AISCIENTIST_PAPERQA_INDEX_NAME", "retigene_full_pubmedbert")
-    try:
-        pysrc = _sync_aiscientist_source_to_hpc(conn)   # live AiScientist src, bound + PYTHONPATH'd in-sif
-    except Exception:  # noqa: BLE001 - HPC sync failed → feature simply absent this run
-        return None
-    if not pysrc:
-        return None
-    # vllm serves --host 0.0.0.0, so any HPC3 node reaches Qwen at the GPU node's own host:port.
-    # Without an allocation nothing is injected: no job on HPC3 gets a model endpoint or an API key.
-    served = ({"model": conn.selected_model, "llm_base_url": f"http://{conn.alloc.node}:{conn.alloc.port}/v1"}
-              if conn.alloc is not None else {})
-    if own_gpu:
-        # The job's own model, reached on the node's loopback (the URL is set inside the job, once
-        # the port is known): no endpoint of the session goes in.
-        served = {"model": corpus_scan.scan_model(st)}
-        window = max(60, int(st.corpus_scan_queue_window_s))
-        gpu_job: dict[str, Any] = {
-            "partition": st.corpus_scan_partition, "account": st.corpus_scan_account or "",
-            "gres": st.corpus_scan_gres, "constraint": st.corpus_scan_constraint,
-            "exclude": st.exclude or "", "network": True, "job_prefix": "bioagent_corpusscan",
-            # The paid queue can hold a card back for hours: wait in windows the chat hears about.
-            "startup_timeout_s": window,
-            "queue_windows": max(1, -(-int(st.corpus_scan_queue_wait_s) // window)),   # ceil
-            "queue_progress": True,
-            "job_prelude": lambda name, scratch, res_f: corpus_scan.vllm_prelude(
-                st, name=name, scratch=scratch, res_f=res_f),
-            "live_args": None,
-        }
-
-    def _lit_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-        return {"status": "dependency_missing", "dependency": "paperqa-hpc",
-                "note": "deep_literature unavailable this run (HPC down or paperqa.sif not staged)."}
-
-    # Retrieval-breadth / determinism / LLM-budget overrides, passed as ARGS rather than env: the
-    # paperqa .sif runs with --containall, so the eyeserver's environment never reaches the job.
-    # Unset keys are dropped so paperqa_search's in-code defaults stay authoritative — .env only
-    # overrides.
-    tuning = {key: val for key, val in (
-        ("search_count", os.environ.get("AISCIENTIST_PAPERQA_SEARCH_COUNT", "")),
-        ("evidence_k", os.environ.get("AISCIENTIST_PAPERQA_EVIDENCE_K", "")),
-        ("max_sources", os.environ.get("AISCIENTIST_PAPERQA_MAX_SOURCES", "")),
-        ("answer_length", os.environ.get("AISCIENTIST_PAPERQA_ANSWER_LENGTH", "")),
-        ("concurrency", os.environ.get("AISCIENTIST_PAPERQA_CONCURRENCY", "")),
-        ("temperature", os.environ.get("AISCIENTIST_PAPERQA_TEMPERATURE", "")),
-        ("llm_timeout", os.environ.get("AISCIENTIST_PAPERQA_LLM_TIMEOUT", "")),
-        ("reasoning_effort", os.environ.get("AISCIENTIST_PAPERQA_REASONING_EFFORT", "")),
-        ("summary_reasoning_effort", os.environ.get("AISCIENTIST_PAPERQA_SUMMARY_REASONING_EFFORT", "")),
-        ("agent_timeout", os.environ.get("AISCIENTIST_PAPERQA_AGENT_TIMEOUT", "")),
-    ) if val}
-    from .slurm_analysis import SlurmAnalysisExecutor
-    ro_binds = tuple(dict.fromkeys(p for p in (
-        retigene, papers, (os.path.dirname(manifest) if manifest else "")) if p))
-    executor = SlurmAnalysisExecutor(
-        remote=conn.executor, container_image=image,
-        remote_workspace=(_run_home(conn, run_id).dir("corpus") if run_id else f"{_temp_base(conn)}/paperqa"),
-        local_workspace=(conn.workspace / run_id if run_id else conn.workspace), source_dir=pysrc,
-        entrypoint=(
-            f"export HF_HOME={retigene}/hf_cache HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1; "
-            f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
-            if retigene else f"python3 -m {_tools_api.LITERATURE_ENTRYPOINT}"
-        ),
-        job_prefix="bioagent_paperqa",
-        scratch_dir=_scratch_dir(conn, "paperqa", run_id=run_id),
-        extra_ro_binds=ro_binds,
-        extra_rw_binds=(index_dir,) if index_dir else (),
-        # Deploy config the model never sends — merged into the tool-call args before the job runs, so
-        # paperqa_cli builds the ctx (Qwen endpoint) and points PaperQA at the pre-built /dfs3b index.
-        inject_args={**served,
-                     "embedding": embedding, "papers": papers, "index_dir": index_dir,
-                     "index_name": index_name, "manifest": manifest, **tuning},
-        # The endpoint is re-read at every job: the serve job can be replaced mid-run on another
-        # node and port (its time limit, a dead node), and the build-time URL then points at nothing.
-        live_args=lambda: _live_llm_args(conn),
-        mem_gb=st.run_code_mem_gb, cpus=st.run_code_cpus, partition=st.cpu_partition,
-        account=st.cpu_account or "", time_limit=st.run_code_time_limit,
-        container_module=st.container_module, container_bin=st.container_bin,
-        local_fallback=_lit_local_fallback,
-        should_cancel=conn.chat_stop.is_set,
-    )
-    if own_gpu:
-        return dataclasses.replace(executor, **gpu_job)
-    if relay is not None:
-        # The corpus scan on the user's own API model (``_corpus_scan_via_relay``): a CPU job whose
-        # model calls come back to this server (``gateway/llm_relay.py``), so neither an endpoint of
-        # the session nor a key goes in — only the model's name and the relay folder.
-        base = {k: v for k, v in executor.inject_args.items() if k not in ("model", "llm_base_url", "tunnel_port")}
-        return dataclasses.replace(executor, inject_args={**base, **relay}, live_args=None,
-                                   job_prefix="bioagent_corpusscan")
-    return executor if conn.alloc is not None else _NoServedModelExecutor(executor)
 
 
-def _session_roster(conn: "Connection", catalog: list, literature_executor: Any,
+
+
+def _session_roster(conn: "Connection", catalog: list,
                     emit: Callable[[str, str, str], None]) -> list:
-    """The tools this run is offered: ``catalog`` minus what the session cannot run
-    (``registry.session_catalog``), with one console line when PaperQA on HPC3 is configured but
-    this session cannot use it. The usual case is a session on the user's own API key: no GPU
-    allocation, so no served model for the PaperQA job to call."""
-    from ..agents.registry import session_catalog
-
-    roster = session_catalog(catalog, literature_executor=literature_executor,
-                             served_model=conn.alloc is not None)
-    from .local_corpus import has_local_index
-    if has_local_index():
-        corpus = _literature_corpus_tool(conn)
-        if corpus is not None:
-            roster = [t for t in roster if t.name != "search_corpus"] + [corpus[0]]
-    if len(roster) < len(catalog) and os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
-        no_gpu = conn.executor is not None and not conn.mock and conn.alloc is None
-        names = {t.name for t in roster}
-        if no_gpu and "search_corpus" in names:
-            emit("info", "lab", "`deep_literature` needs the model a session serves on a GPU, and this session "
-                                "has none: literature steps use `search_corpus` (the RetiGene corpus, "
-                                "retrieval only; the session's model writes the answer).")
-        else:
-            why = ("its HPC3 job calls the model a session serves on a GPU, and this session has no GPU "
-                   "allocation" if no_gpu else "its HPC3 job line could not be set up")
-            emit("info", "lab", f"`deep_literature` (the RetiGene corpus) is not available in this run: "
-                                f"{why}. Literature steps use `literature_search` (Europe PMC).")
-    return roster
+    """Keep the platform roster; registered MCP tools are attached by the run bridge."""
+    return list(catalog)
 
 
-async def _prepare_session_roster(conn: "Connection", catalog: list, literature_executor: Any,
+async def _prepare_session_roster(conn: "Connection", catalog: list,
                                   emit: Callable[[str, str, str], None]) -> list:
-    """Prepare the local embedding model away from the run's event loop."""
-    return await asyncio.to_thread(_session_roster, conn, catalog, literature_executor, emit)
+    """Prepare this session's platform roster away from the event loop."""
+    return await asyncio.to_thread(_session_roster, conn, catalog, emit)
 
 
 def _active_conn_for_user(user) -> Connection | None:
@@ -9525,21 +9351,6 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
                 conn.emit("info", "route", "This chat question needs published evidence; continuing with "
                           "the literature plan and this session's selected model.")
         if not chat_literature_handoff:
-            if not native_literature and corpus_scan.asks_for_gene_list(req.question):
-                # "What are haploinsufficient genes?": the complete answer is the corpus scan's table,
-                # and a kept scan of this corpus answers it at once, whatever model the session uses.
-                stored = await asyncio.to_thread(_stored_corpus_scan, conn)
-                if stored is not None:
-                    await _run_corpus_scan(conn, req, stored=stored)
-                    return
-                if await asyncio.to_thread(_literature_corpus_available, conn):
-                    await _run_gene_table(conn, req)
-                    return
-                if os.environ.get("AISCIENTIST_PAPERQA_ON_HPC"):
-                    conn.push({"type": "lab_progress", "level": "info", "text": (
-                        "ℹ No scan of the RetiGene papers is kept yet, so this answer comes from a search of "
-                        "the RetiGene corpus (the passages nearest to the question), not from every paper. Ask "
-                        "about the RetiGene papers by name for the complete table.")})
             await _run_quick_chat(conn, req)
             return
     if _corpus_path(req):
@@ -9958,53 +9769,45 @@ def _corpus_path(req: LabRequest) -> bool:
 CORPUS_TOOL = "extract_haploinsufficient_genes"
 SPEC_FILE = "task_spec.json"   # a task spec's curation keeps the spec it read with, beside its tables
 CORPUS_MAX_ATTEMPTS = 3      # submissions of the job per run: the first plus two resumes after its model died
-# (A job that never left the queue is submitted again separately: settings.corpus_scan_queue_retries.)
+# The registered native runner owns queue and task status; this bounds model-recovery retries.
 # One scan per corpus at a time: the key of each scan in progress (corpus_scan.scan_key) -> its run.
 _CORPUS_SCANS_RUNNING: dict[str, str] = {}
 
 
 def _corpus_scan_identity(conn: Connection, spec: "dict[str, Any] | None" = None,
                           ) -> "tuple[str, dict[str, Any]] | None":
-    """``(key, what it is made of)`` for a scan this session would make now: the corpus as it is on
-    HPC3, the scan's rules (the built-in ones, or a task spec's, ``spec``) and its model
-    (``corpus_scan.scan_key``). None without the literature line, a live HPC3 session or a corpus
-    text cache: nothing is reused or kept then."""
+    """Fingerprint a native scan's public corpus, rules, and selected model identity."""
     from .literature_mcp import registered_server, rules_identity
+    from ..agents.mcp_analysis import setting_values
     server = registered_server()
-    papers = os.environ.get("AISCIENTIST_PAPERQA_PAPERS", "")
-    manifest = os.environ.get("AISCIENTIST_PAPERQA_MANIFEST", "")
-    if server is not None:
-        from ..agents.mcp_analysis import setting_values
-        settings = setting_values(server)
-        root = settings.get("LITERATURE_CORPUS_ROOT", "").rstrip("/")
-        papers = settings.get("LITERATURE_PAPERS") or (root + "/papers" if root else "")
-        manifest = settings.get("LITERATURE_MANIFEST") or (root + "/paperqa_manifest.csv" if root else "")
-    if ((server is None and not os.environ.get("AISCIENTIST_PAPERQA_ON_HPC")) or not papers
-            or conn.executor is None or conn.mock):
+    if server is None or conn.executor is None or conn.mock:
+        return None
+    settings = setting_values(server)
+    root = settings.get("LITERATURE_CORPUS_ROOT", "").rstrip("/")
+    papers = settings.get("LITERATURE_PAPERS") or (root + "/papers" if root else "")
+    manifest = settings.get("LITERATURE_MANIFEST") or (root + "/paperqa_manifest.csv" if root else "")
+    if not papers:
         return None
     fp = corpus_scan.corpus_fingerprint(conn.executor, papers, manifest)
-    if fp is None:
+    binding = _mcp_session_model(conn)
+    if fp is None or binding is None:
         return None
-    rules = rules_identity(server, spec) if server else _tools_api.corpus_scan_rules_digest(spec)
-    model = _corpus_scan_model(conn)
-    model_key = model
-    if server is not None:
-        binding = _mcp_session_model(conn)
-        if binding is None:
-            return None
-        model_key = getattr(binding, "identity", "") or json.dumps(
-            {"model": binding.model, "endpoint": getattr(binding, "endpoint", ""),
-             "protocol": getattr(binding, "protocol", "openai")}, sort_keys=True)
-    return corpus_scan.scan_key(fp, rules, model_key), {"corpus": fp, "rules": rules, "model": model}
+    rules = rules_identity(server, spec)
+    model_key = getattr(binding, "identity", "") or json.dumps(
+        {"model": binding.model, "endpoint": getattr(binding, "endpoint", ""),
+         "protocol": getattr(binding, "protocol", "openai")}, sort_keys=True)
+    return corpus_scan.scan_key(fp, rules, model_key), {"corpus": fp, "rules": rules, "model": binding.model}
 
 
 def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
-    """The session's own API model when it runs on one (a saved key, not the cluster GPU and not the
-    lab's shared model): ``{"cred", "model", "base_url", "native_anthropic"}``, else None. The scan
-    then reads with that model, through ``_corpus_scan_via_relay``, on the user's bill."""
+    """Return the session API model metadata used by corpus-scan UI and billing previews.
+
+    Scientific calls use the selected model through the guarded native MCP binding.
+    Shared and cluster models are resolved by that binding, not by this metadata helper.
+    """
     try:
         cred = _session_credential(conn)
-    except Exception:  # noqa: BLE001 - the store unreadable: fall back to the GPU path
+    except Exception:  # noqa: BLE001 - an unreadable store provides no preview metadata
         return None
     if cred is None or cred.get("builtin") or not cred.get("model"):
         return None
@@ -10015,13 +9818,9 @@ def _corpus_scan_api(conn: Connection) -> "dict[str, Any] | None":
 
 
 def _corpus_scan_model(conn: Connection) -> str:
-    """The model a scan by this session reads with: the session's API model, else the GPU job's."""
-    from .literature_mcp import registered_server
-    if registered_server() is not None:
-        binding = _mcp_session_model(conn)
-        return str(binding.model if binding is not None else conn.selected_model)
-    api = _corpus_scan_api(conn)
-    return api["model"] if api else corpus_scan.scan_model(conn.settings)
+    """The selected session model; native scans never allocate another model."""
+    binding = _mcp_session_model(conn)
+    return str(binding.model if binding is not None else conn.selected_model)
 
 
 def _stored_corpus_scan(conn: Connection) -> "corpus_scan.StoredScan | None":
@@ -10030,14 +9829,7 @@ def _stored_corpus_scan(conn: Connection) -> "corpus_scan.StoredScan | None":
     return corpus_scan.load(ident[0]) if ident else None
 
 
-def _vllm_log_tail(conn: Connection, path: str) -> str:
-    """The end of the scan job's model log, for the error a run shows when the model never came up."""
-    if not path or conn.executor is None:
-        return ""
-    try:
-        return conn.executor.read_bytes(path).decode("utf-8", errors="replace")[-1500:]
-    except Exception:  # noqa: BLE001 - the log is a diagnostic, not a requirement
-        return ""
+
 
 
 def _corpus_curation(conn: Connection, question: str, *, with_context: bool = False) -> Any:
@@ -10200,23 +9992,7 @@ def _curation_time_words(conn: Connection, stored: "corpus_scan.StoredScan | Non
             return text + (f"; a pilot first estimates the full scan cost, and subsequent model calls stop at "
                            f"the ${cap:.2f} cap ({why}); one in-flight call can cross that threshold")
         return text + "; it uses the session's existing cluster model and no API credit"
-    if api:
-        from . import llm_pricing
-        model = str(api["model"])
-        est = llm_pricing.estimate(model, **_API_SCAN_TOKENS)
-        try:
-            cap, why = _corpus_scan_cost_cap(conn)
-            limit = (f"; it stops at ${cap:.2f} ({why}), and reads about 1% of the passages first to check "
-                     "the cost")
-        except GatewayError as exc:
-            limit = f". {exc.message}"
-        return (f"with your API model {model}, on your key: it reads about 1,500 passages, which took Claude "
-                "Haiku about 10 minutes" + ("" if "haiku" in model.lower() else " (a larger model takes longer)")
-                + (f", for an estimated ${est:.2f}" if est is not None else "") + limit)
-    wait = _duration_words(conn.settings.corpus_scan_queue_wait_s)
-    return ("about 2 hours on a GPU of its own (an A100; about 4 hours on an A30) on the lab's paid partition, "
-            f"plus the wait for a free card (often minutes; after {wait} without one it is submitted again), "
-            "and no API cost. The tables are kept, so the next request about the RetiGene papers is answered at once")
+    return "the registered literature MCP must be configured before the scan can run"
 
 
 async def _review_corpus_curation(conn: Connection, run: RunState, emit: Callable[..., None],
@@ -10384,9 +10160,8 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
     """The haploinsufficient genes of the indexed corpus, curated: two tables (one row per gene with
     its claim, one per sentence) and a chat answer written from them. A scan of the corpus as it is
     now, if one is kept (``stored``, else looked up here), answers at once; otherwise
-    ``extract_haploinsufficient_genes`` runs as ONE HPC3 job with a GPU and a model of its own
-    (``gateway/corpus_scan.py``), or on the session's own API model, and its tables are kept for the
-    next request.
+    ``extract_haploinsufficient_genes`` runs through the registered MCP with the selected
+    session model, and its tables are kept for the next request.
 
     ``review``: the console's route for a list question about the RetiGene papers (issue 46,
     ``_corpus_curation``). The plan card shows the curation and how long it takes, and nothing runs
@@ -10465,8 +10240,7 @@ async def _run_corpus_scan(conn: Connection, req: LabRequest,
             await asyncio.to_thread(corpus_scan.copy_into, stored, art)
             result = stored.result
         else:
-            result = await (_corpus_scan_via_relay(conn, run, run_id, ident, say, emit, api, cur) if api
-                            else _corpus_scan_on_own_gpu(conn, run, run_id, ident, say, emit, cur))
+            result = await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, cur)
             if result is None:                   # stopped
                 return None
         tables = art / cur.subdir
@@ -10538,7 +10312,7 @@ async def _build_literature_mcp_route(conn: Connection, run: RunState, run_id: s
                                     emit: Callable[..., None]) -> Any:
     """One registered literature executor and context per console run."""
     from .literature_mcp import build_literature_route, registered_server
-    if registered_server() is None:
+    if registered_server() is None or conn.executor is None or conn.mock:
         return None
     if getattr(run, "literature_mcp_ready", False):
         return getattr(run, "literature_mcp", None)
@@ -10615,92 +10389,7 @@ async def _corpus_scan_via_mcp(conn: Connection, run: RunState, run_id: str,
         _push_usage(conn, run, run.conversation_id, run_id)
 
 
-async def _corpus_scan_on_own_gpu(conn: Connection, run: RunState, run_id: str,
-                                  ident: "tuple[str, dict[str, Any]] | None",
-                                  say: Callable[..., None], emit: Callable[..., None],
-                                  curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
-                                  ) -> "dict[str, Any] | None":
-    """Run the scan as one job with its own GPU and model, keep its tables, and return its result
-    (None when the user stopped it). ``curation``: what it collects; a task spec's goes to the tool
-    as its ``spec``. Raises ``GatewayError`` when it cannot run or does not finish."""
-    from .literature_mcp import registered_server
-    if registered_server() is not None:
-        return await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, curation)
-    key = ident[0] if ident else ""
-    if key and key in _CORPUS_SCANS_RUNNING:
-        raise GatewayError(
-            f"A scan of the RetiGene corpus is already running (run {_CORPUS_SCANS_RUNNING[key]}). Its tables "
-            "are kept when it finishes: ask again then, and they are shown at once.", stage="corpus")
-    executor = _build_literature_executor(conn, run_id=run_id, own_gpu=True)
-    if executor is None:
-        raise GatewayError(
-            "The RetiGene corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
-            "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
-            "nothing was started.", stage="corpus")
-    executor.notify = lambda level, message: emit(level, "corpus", message)
-    from ..agents.research_harness import HarnessContext
-    model = corpus_scan.scan_model(conn.settings)
-    ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
-                         llm_is_remote=False, read_roots=_tool_read_roots(conn))
-    st = conn.settings
-    emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} on its own GPU ({st.corpus_scan_partition} "
-                           f"{st.corpus_scan_gres}, model {model}).")
-    say(f"📚 Scanning all the RetiGene papers for {_curation_what(curation)} — one "
-        "HPC3 job with a GPU of its own (an A30 or A100 on the lab's paid partition): it starts the "
-        "scan's model, which writes search requests, reads the passages they retrieve and quotes "
-        "the papers; every quote is checked against its paper, then the card is freed. The paid queue "
-        "can add a wait before the job starts; the tables are kept, so the next request about the "
-        "RetiGene papers is answered at once.")
-    if key:
-        _CORPUS_SCANS_RUNNING[key] = run_id
-    wait = _duration_words(getattr(executor, "startup_timeout_s", 600) * getattr(executor, "queue_windows", 3))
-    queue_retries = max(0, int(st.corpus_scan_queue_retries))
-    try:
-        # Two ways the job is submitted again, each a retry of this one step, never a failed run
-        # while a retry is left:
-        # - it never got a card (the paid queue was full for the whole wait): nothing ran;
-        # - its model died mid-scan (out of memory, a lost node): the tool returns model_unreachable
-        #   with what it read so far, and the rerun resumes from the kept replies in the run's work
-        #   dir, so nothing is read twice.
-        result: dict[str, Any] = {}
-        resumes = requeues = 0
-        while True:
-            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
-            if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
-                conn.push({"type": "chat_stopped"})
-                return None
-            if result.get("queue_timeout") and requeues < queue_retries:
-                requeues += 1
-                why = f" (Slurm: {result.get('slurm_reason')})" if result.get("slurm_reason") else ""
-                say(f"⚠ No GPU card became free on the paid partition within {wait}{why}. The job never "
-                    f"started, so nothing ran. Submitting it again — retry {requeues} of {queue_retries}.",
-                    "warning")
-                continue
-            if result.get("model_unreachable") and resumes < CORPUS_MAX_ATTEMPTS - 1:
-                resumes += 1
-                say(f"⚠ The scan's model went away mid-scan ({result.get('n_judged', 0)} of "
-                    f"{result.get('n_passages', '?')} passages read so far). Submitting the job "
-                    f"again; it resumes where it stopped — attempt {resumes + 1} of {CORPUS_MAX_ATTEMPTS}.",
-                    "warning")
-                continue
-            break
-    finally:
-        if key:
-            _CORPUS_SCANS_RUNNING.pop(key, None)
-    if result.get("queue_timeout"):
-        why = f"; Slurm's reason: {result.get('slurm_reason')}" if result.get("slurm_reason") else ""
-        raise GatewayError(
-            f"The RetiGene corpus scan could not start: no GPU card became free on the paid partition in "
-            f"{requeues + 1} waits of {wait}{why}. The job never ran, so nothing was lost. Ask "
-            "again later to try once more.", stage="corpus",
-            detail=json.dumps(result, default=str)[:2000])
-    if str(result.get("status") or "") != "ok":
-        msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
-        tail = await asyncio.to_thread(_vllm_log_tail, conn, str(result.get("vllm_log") or ""))
-        raise GatewayError(f"The RetiGene corpus scan did not finish: {msg}", stage="corpus",
-                           detail=(tail or json.dumps(result, default=str))[:2000])
-    await _keep_corpus_scan(conn, run_id, result, emit, curation)
-    return result
+
 
 
 def _corpus_scan_args(curation: "corpus_scan.Curation") -> dict[str, Any]:
@@ -10839,127 +10528,6 @@ def _mcp_model_relay(conn: Connection, run: "RunState | None", work_dir: str) ->
         should_stop=stop, log=lambda s: print(f"[mcp-relay] {s}"))
 
 
-async def _corpus_scan_via_relay(conn: Connection, run: RunState, run_id: str,
-                                 ident: "tuple[str, dict[str, Any]] | None",
-                                 say: Callable[..., None], emit: Callable[..., None],
-                                 api: dict[str, Any],
-                                 curation: "corpus_scan.Curation" = corpus_scan.HAPLOINSUFFICIENCY,
-                                 ) -> "dict[str, Any] | None":
-    """The scan on the session's own API model. One CPU job on HPC3 retrieves the passages and
-    builds the tables; every model call it needs comes back here (``gateway/llm_relay.py``) and is
-    made with the user's key, recorded against the user's usage and capped by the budget left. The
-    job reads about 1% of the passages first (the tool's pilot) and stops if they fail or if their
-    cost projects past the cap. Returns the result (None when stopped); raises ``GatewayError``."""
-    from .literature_mcp import registered_server
-    if registered_server() is not None:
-        return await _corpus_scan_via_mcp(conn, run, run_id, ident, say, emit, curation)
-    key = ident[0] if ident else ""
-    if key and key in _CORPUS_SCANS_RUNNING:
-        raise GatewayError(
-            f"A scan of the RetiGene corpus with this model is already running (run {_CORPUS_SCANS_RUNNING[key]}). "
-            "Its tables are kept when it finishes: ask again then.", stage="corpus")
-    cap, cap_why = _corpus_scan_cost_cap(conn)
-    from . import anthropic_client, auth_routes, llm_credentials, llm_relay
-    cred, model, base_url, native = api["cred"], api["model"], api["base_url"], api["native_anthropic"]
-    target = llm_credentials.call_target(conn.owner, cred["id"])
-    if not target:
-        raise GatewayError(
-            f"The API key for “{cred.get('label') or 'this endpoint'}” could not be read. Re-enter it "
-            "under API endpoints, or switch this session back to the cluster GPU.", stage="llm_credential")
-    # Where the calls are sent (the key's address, or the key service's proxy) and with what; the
-    # usage record keeps naming the key's own address (``endpoint`` below).
-    send_base, api_key = target
-    remote_ws = _run_home(conn, run_id).dir("corpus")
-    relay_dir = f"{remote_ws}/work/relay"
-    executor = _build_literature_executor(
-        conn, run_id=run_id, relay={"model": model, "llm_relay_dir": relay_dir, "max_cost_usd": round(cap, 4)})
-    if executor is None or not hasattr(conn.executor, "open_sftp"):
-        raise GatewayError(
-            "The RetiGene corpus scan needs the literature line on HPC3 (AISCIENTIST_PAPERQA_ON_HPC and "
-            "paperqa.sif) and a live HPC3 session. Neither is available on this session, so "
-            "nothing was started.", stage="corpus")
-    executor.notify = lambda level, message: emit(level, "corpus", message)
-    provider = "anthropic" if native else "openai"
-    endpoint = "anthropic" if native else (base_url or "API")
-
-    # Checked before each relayed call like any run on the key; the scan's own cap is its allowance
-    # in the spike check (a scan the user started and capped is not misuse).
-    key_use = _key_use(conn, cred, allowance_usd=cap, allowance_calls=_CORPUS_SPIKE_CALLS)
-
-    def call(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str, dict[str, Any]]:
-        key_use.before_call()
-        if native:
-            # Only the rules are shared between calls (the passages all differ): cache those alone.
-            return anthropic_client.complete_ex(model, messages, api_key=api_key, base_url=send_base,
-                                                max_tokens=max_tokens,
-                                                effort=anthropic_client.role_effort("corpus_scan"),
-                                                cache="system")
-        return vllm_client.complete_ex(0, model, messages, base_url=send_base, api_key=api_key,
-                                       max_tokens=max_tokens)
-
-    def price(usage: dict[str, Any]) -> "float | None":
-        return _relay_usage_price(model, usage)
-
-    pushed = {"n": 0}
-
-    def record(usage: "dict[str, Any] | None", duration_ms: int, error_type: "str | None") -> None:
-        try:
-            auth_routes.record_llm_call(run_id=run_id, user_id=getattr(conn, "app_user_id", None),
-                                        conversation_id=run.conversation_id, step="RetiGene corpus scan",
-                                        provider=provider, role="corpus_scan", model=model, endpoint=endpoint,
-                                        remote=True, usage=usage, max_tokens=None, duration_ms=duration_ms,
-                                        error_type=error_type, key_fp=key_use.fingerprint)
-            pushed["n"] += 1
-            if pushed["n"] % 25 == 1:          # the chat header's counter, not on every call
-                _push_usage(conn, run, run.conversation_id, run_id)
-        except Exception as exc:  # noqa: BLE001 - accounting never breaks a scan
-            print(f"[corpus] call not recorded: {exc}")
-        key_use.after_call()
-
-    relay = llm_relay.ModelRelay(
-        lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), relay_dir, call, price=price, record=record,
-        max_cost_usd=cap, concurrency=16, poll_s=1.0, should_stop=run.chat_stop.is_set,
-        log=lambda s: print(f"[corpus] {s}"))
-    from ..agents.research_harness import HarnessContext
-    ctx = HarnessContext(decisions={}, workspace=conn.workspace / run_id, model=model,
-                         llm_is_remote=True, read_roots=_tool_read_roots(conn))
-    emit("step", "corpus", f"RetiGene corpus scan: {CORPUS_TOOL} with your API model {model} (a CPU job on HPC3; "
-                           f"the model calls are made here, at most ${cap:.2f}: {cap_why}).")
-    say(f"📚 Scanning all the RetiGene papers for {_curation_what(curation)} with your "
-        f"API model **{model}**, on your key. One HPC3 job (CPU only) retrieves the passages; this server "
-        f"makes every model call and records it in your API usage. It reads about 1% of the passages "
-        f"first and stops there if they fail or if they project a cost above ${cap:.2f} ({cap_why}).")
-    if key:
-        _CORPUS_SCANS_RUNNING[key] = run_id
-    relay.start()
-    try:
-        result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
-        if (result.get("model_unreachable") and not run.chat_stop.is_set()
-                and not relay.stats.stopped):
-            say(f"⚠ The model stopped answering mid-scan ({result.get('n_judged', 0)} of "
-                f"{result.get('n_passages', '?')} passages read). Submitting the job once more; it "
-                "resumes where it stopped.", "warning")
-            result = await asyncio.to_thread(executor.run_tool, CORPUS_TOOL, _corpus_scan_args(curation), ctx)
-    finally:
-        stats = relay.stop()
-        key_use.close()
-        if key:
-            _CORPUS_SCANS_RUNNING.pop(key, None)
-        _push_usage(conn, run, run.conversation_id, run_id)
-    usage = {"model": model, **stats.public()}
-    result["api_usage"] = usage
-    spent = f"${usage['cost_usd']:.4f} on your key ({usage['calls']} model calls)"
-    if run.chat_stop.is_set() or str(result.get("status") or "") == "cancelled":
-        say(f"Stopped. {spent} so far.")
-        conn.push({"type": "chat_stopped"})
-        return None
-    if str(result.get("status") or "") != "ok":
-        msg = str(result.get("error") or result.get("note") or f"status {result.get('status')}")
-        raise GatewayError(f"The RetiGene corpus scan did not finish: {msg} Spent: {spent}.", stage="corpus",
-                           detail=json.dumps(result, default=str)[:2000])
-    emit("info", "corpus", f"RetiGene corpus scan model cost: {spent}.")
-    await _keep_corpus_scan(conn, run_id, result, emit, curation)
-    return result
 
 
 def _duration_words(seconds: float) -> str:
@@ -11324,82 +10892,6 @@ def _quickchat_context_fns(conn: Connection, model: str, base_url: str | None, a
     return count_tokens, summarize
 
 
-async def _run_gene_table(conn: Connection, req: LabRequest) -> None:
-    """A passage-grounded table when no complete scan has been kept."""
-    import csv
-    from ..agents import corpus_answer
-
-    run = conn.active_run or conn.begin_run(req.conversation_id)
-    run.kind = "literature"
-    run_id = run.run_id or uuid4().hex[:12]
-    conn.bind_run_id(run, run_id)
-    run.running = True
-    run.chat_stop.clear()
-    run.hard_stop.clear()
-    _watch_run(conn, run, req)
-    conn.push({"type": "chat_start"})
-    art = conn.workspace / run_id / "artifacts"
-    notice = ("From a search of the RetiGene corpus (the passages nearest to the question), not from "
-              "every paper. Ask about the RetiGene papers by name for the complete table.")
-    conn.push({"type": "lab_progress", "level": "info", "text": notice})
-    status, summary = "cancelled", "Stopped by the user"
-    try:
-        if _AUTH_ENABLED and conn.app_user_id:
-            try:
-                auth_routes.record_run_start(conn.app_user_id, run_id, req.question, False,
-                                             conversation_id=run.conversation_id)
-            except Exception as exc:  # noqa: BLE001 - history is best-effort
-                print(f"[auth] record_run_start failed: {exc}")
-        corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
-        out = (await asyncio.to_thread(_literature_corpus_logged, conn, run, corpus, req.question, [])
-               if corpus is not None else {"status": "error", "error": "The RetiGene corpus cannot be searched from this session."})
-        contexts = out.get("contexts", []) if out.get("status") == "ok" else []
-        rows = []
-        if contexts and not run.chat_stop.is_set():
-            llm = await asyncio.to_thread(_lab_llm, conn)
-            raw = await asyncio.to_thread(llm.complete_fn,
-                                          corpus_answer.gene_table_messages(req.question, contexts),
-                                          role="literature")
-            rows = corpus_answer.verify_gene_table(str(raw or ""), contexts)
-        if run.chat_stop.is_set():
-            conn.push({"type": "chat_stopped"})
-            return
-        folder = art / "literature"
-        folder.mkdir(parents=True, exist_ok=True)
-        with (folder / "genes.csv").open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["gene", "evidence", "citation"])
-            writer.writeheader()
-            writer.writerows({key: row[key] for key in writer.fieldnames} for row in rows)
-        def cell(value: str) -> str:
-            return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
-        answer = notice + "\n\n| gene | evidence (short verbatim quote) | citation |\n|---|---|---|\n"
-        answer += "\n".join("| " + " | ".join(cell(row[k]) for k in ("gene", "evidence", "citation"))
-                            + " |" for row in rows)
-        if not rows:
-            answer += ("\n\nThe RetiGene passages this search returned do not answer this with verified "
-                       "gene evidence.")
-            if out.get("error"):
-                answer += " " + str(out["error"])
-        (art / "report").mkdir(parents=True, exist_ok=True)
-        (art / "report" / "summary.md").write_text(answer, encoding="utf-8")
-        conn.push({"type": "chat_token", "token": answer})
-        await asyncio.to_thread(_write_result_metadata, conn, run_id, art, req, {}, "done", [], [])
-        await asyncio.to_thread(_stamp_literature_result, conn, run_id, art)
-        items = [{"name": p.name, "kind": _file_kind(p.name), "summary": _file_kind(p.name),
-                  "url": f"/api/file/{conn.owner}/{run_id}/{p.relative_to(art).as_posix()}"}
-                 for p in sorted(art.rglob("*")) if p.is_file()]
-        conn.push({"type": "artifacts", "items": items, "bundle_url": f"/api/bundle/{conn.owner}/{run_id}"})
-        status, summary = "done", f"{len(rows)} genes (RetiGene corpus search)"
-        conn.push({"type": "chat_done"})
-    except Exception as exc:  # noqa: BLE001 - report the failed run to the chat
-        status, summary = ("cancelled", "Stopped by the user") if run.chat_stop.is_set() else ("failed", str(exc))
-        conn.push({"type": "chat_error", "message": public_error(exc)})
-    finally:
-        try:
-            _finish_run_record(conn, run_id, status, str(art) if status != "cancelled" else None, summary)
-        finally:
-            run.running = False
-            conn.end_run(run)
 
 
 async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
@@ -11460,16 +10952,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             key_use = _key_use(conn, cred)
         emit("step", "chat", f"Fast chat turn (model: {model}).")
 
-        from .literature_mcp import registered_server
-        native_literature = registered_server() is not None
-        tools = build_quickchat_catalog(
-            literature_executor=None if native_literature else _build_literature_executor(conn),
-            served_model=conn.alloc is not None, exclude_literature=native_literature)
-        from .local_corpus import has_local_index
-        if not native_literature and has_local_index():
-            corpus = await asyncio.to_thread(_literature_corpus_tool, conn)
-            if corpus is not None:
-                tools = [t for t in tools if t.name != "search_corpus"] + [corpus[0]]
+        tools = build_quickchat_catalog()
         # The case note reaches map_phenotype_to_hpo the same way it does on the research path
         # (via ctx.decisions), so attaching a note and asking a question in chat still works.
         decisions: dict[str, Any] = {}
@@ -11619,17 +11102,14 @@ def _literature_plan_review(conn: Connection, emit: Callable[..., None], step: s
 
 
 def _literature_corpus_on_hpc(conn: Connection) -> bool:
-    """Whether this session reaches the corpus on HPC3: the literature line is set up for HPC3 and
-    the session has a live HPC3 connection (what ``_build_literature_executor`` and the corpus scan
-    need). Cheap, so the event loop may call it."""
+    """Whether the registered native corpus is reachable through this session's HPC executor."""
     from .literature_mcp import registered_server
+    from ..agents.mcp_analysis import setting_values
     server = registered_server()
-    if server is not None:
-        from ..agents.mcp_analysis import setting_values
-        values = setting_values(server)
-        return bool((values.get("LITERATURE_CORPUS_ROOT") or values.get("LITERATURE_PAPERS"))
-                    and conn.executor is not None and not conn.mock)
-    return bool(os.environ.get("AISCIENTIST_PAPERQA_ON_HPC") and os.environ.get("AISCIENTIST_PAPERQA_IMAGE")
+    if server is None:
+        return False
+    values = setting_values(server)
+    return bool((values.get("LITERATURE_CORPUS_ROOT") or values.get("LITERATURE_PAPERS"))
                 and conn.executor is not None and not conn.mock)
 
 
@@ -11647,7 +11127,6 @@ def _literature_corpus_available(conn: Connection) -> bool:
 
 def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
     """Local ``search_corpus`` with HPC3 fallback, and its context; None if neither is ready."""
-    from ..agents.registry import build_quickchat_catalog
     from ..agents.research_harness import HarnessContext
     from ..agents import literature_answer as lit
     from .local_corpus import make_local_tool, stale
@@ -11661,9 +11140,6 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
             return route.run_tool(lit.CORPUS_TOOL, {"analysis_id": "corpus", **args}, ctx)
         if registered:
             return {"status": "error", "error": "The registered literature MCP is unavailable in this run"}
-        executor = _build_literature_executor(conn)
-        if executor is not None:
-            return executor.run_tool(lit.CORPUS_TOOL, args, ctx)
         return {"status": "error", "error": "The RetiGene corpus copy could not be searched and HPC3 is unavailable"}
     local = make_local_tool()
     if local is not None:
@@ -11673,7 +11149,9 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
             # A copy that is not the HPC3 index (papers added and the copy not updated yet) is
             # skipped: the search then runs on HPC3, which has the new papers.
             out = None if stale(None if conn.mock else conn.executor) else local_run(args, ctx)
-            if out is not None:
+            if isinstance(out, dict) and out.get("status") in {"ok", "cancelled"}:
+                return out
+            if route is None and isinstance(out, dict):
                 return out
             return remote(args, ctx)
 
@@ -11690,21 +11168,8 @@ def _literature_corpus_tool(conn: Connection) -> "tuple[Any, Any] | None":
         tool = route.tools.get(lit.CORPUS_TOOL)
         if tool is None:
             return None
-        return replace(tool, name=lit.CORPUS_TOOL, executor=remote), run.literature_mcp_context
-    try:
-        executor = _build_literature_executor(conn)
-    except Exception as exc:  # noqa: BLE001 - no corpus: PubMed alone
-        print(f"[literature] corpus executor failed: {type(exc).__name__}: {exc}")
-        return None
-    if executor is None:
-        return None
-    tools = build_quickchat_catalog(literature_executor=executor, served_model=conn.alloc is not None)
-    tool = next((t for t in tools if getattr(t, "name", "") == lit.CORPUS_TOOL), None)
-    if tool is None:
-        return None
-    ctx = HarnessContext(decisions={}, workspace=conn.workspace, model=conn.selected_model,
-                         tunnel_port=conn.tunnel_port, read_roots=_tool_read_roots(conn))
-    return tool, ctx
+        return replace(tool, executor=remote), run.literature_mcp_context
+    return None
 
 
 def _literature_corpus_logged(conn: Connection, run: RunState, corpus: "tuple[Any, Any]", question: str,
@@ -11760,7 +11225,15 @@ def _literature_search_logged(conn: Connection, run: RunState, queries: list[str
                                           "pubmed_only": True, "analysis_id": "pubmed"}, run.literature_mcp_context)
                    if route is not None else {"status": "error", "error": "The registered literature MCP is unavailable"})
         else:
-            out = _tools_api.search_literature(query, limit, abstracts=True, pubmed_only=True)
+            out = {"status": "error", "error": "The literature MCP is not registered"}
+        if getattr(run, "literature_mcp", None) is None:
+            from .local_literature_mcp import make_public_tool
+            from ..agents.research_harness import HarnessContext
+            local = make_public_tool(should_cancel=run.chat_stop.is_set)
+            if local is not None:
+                context = HarnessContext(decisions={}, workspace=conn.workspace / run.run_id)
+                out = local.executor({"query": query, "limit": limit, "abstracts": True,
+                                      "pubmed_only": True}, context)
         ok = isinstance(out, dict) and out.get("status") == "ok"
         n = len(out.get("results") or []) if ok else 0
         if run.monitor is not None:
@@ -15429,91 +14902,6 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("info", "lab", f"Native variant annotation uses {_assembly}; "
                  + ("assembly read from the VCF header." if _detected else "configured fallback assembly."))
         decisions["mcp_variant_assembly"] = "GRCh37" if _assembly.lower() in ("grch37", "hg19") else "GRCh38"
-        _grch37 = _assembly.lower() in ("grch37", "hg19")
-
-        # Opt-in: phenotype -> disease DIFFERENTIAL DIAGNOSIS on HPC3 (LIRICAL). DOWNSTREAM of the variant
-        # line: the model calls run_lirical with the patient's HPO terms; when a VCF is loaded it scores
-        # GENOTYPE-AWARE (variants sharpen the ranking), else PHENOTYPE-ONLY. Gated by
-        # AISCIENTIST_PHENOTYPE_ON_HPC; when off/unstaged the tool reports not_installed and the run continues
-        # without the differential. Mirrors the variant line's wiring (deploy/lirical/build_and_stage.sh).
-        phenotype_executor = None
-        if st.phenotype_on_hpc:
-            # Genotype-aware needs the assembly-matched Exomiser dir; reuse the build detected above.
-            _p_exo = st.lirical_exomiser_hg19 if _grch37 else st.lirical_exomiser_hg38
-            if conn.executor is None or conn.mock:
-                emit("warning", "lab",
-                     f"Phenotype (LIRICAL) line requested but not runnable this run: "
-                     f"executor={'NONE' if conn.executor is None else 'ok'}, mock={conn.mock}.")
-            else:
-                _p_checks = await asyncio.to_thread(
-                    _phenotype_preflight, conn.executor, st.lirical_image, st.lirical_data_dir, _p_exo)
-                for name, (path, ok) in _p_checks.items():
-                    if not path:
-                        emit("warning", "lab", f"LIRICAL: {name} is not configured (empty path in .env).")
-                    elif ok is False:
-                        emit("warning", "lab",
-                             f"LIRICAL: {name} NOT found on HPC3: {path} — the phenotype step would report "
-                             "not_installed. Stage it (deploy/lirical/build_and_stage.sh).")
-                    elif ok is None:
-                        emit("warning", "lab",
-                             f"LIRICAL: could NOT verify {name} on HPC3 ({path}) — SSH check failed.")
-                    else:
-                        emit("info", "lab", f"LIRICAL: {name} present on HPC3 ({path}).")
-                try:
-                    p_pysrc = await asyncio.to_thread(_sync_aiscientist_source_to_hpc, conn)
-                except Exception as exc:  # noqa: BLE001
-                    emit("warning", "lab", f"Phenotype line disabled: couldn't stage the tools to dfs3b "
-                                           f"({exc}).")
-                    p_pysrc = None
-                if p_pysrc:
-                    p_remote_ws = _run_home(conn, run_id).dir("phenotype")
-                    conn.executor.exec(f"mkdir -p {shlex.quote(p_remote_ws)}")
-                    # The VCF is OPTIONAL (phenotype-only works without it). Reuse the dfs3b copy the run
-                    # already resolved; only stage a local dataset if it isn't a VCF (then None -> phenotype-only).
-                    if decisions.get("hpc_primary") and _is_vcf:
-                        p_remote_ds = decisions["hpc_primary"]      # dfs3b VCF — scored in place
-                    elif decisions.get("dataset_path") and _is_vcf:
-                        p_remote_ds = f"{p_remote_ws}/{Path(decisions['dataset_path']).name}"
-                        await asyncio.to_thread(conn.executor.put_file, decisions["dataset_path"], p_remote_ds)
-                    else:
-                        p_remote_ds = None                          # no VCF -> phenotype-only differential
-
-                    def _phenotype_local_fallback(tool: str, args: dict, ctx: Any) -> dict:
-                        # No LIRICAL on the eyeserver: a clean not_installed (never a hard error) so the
-                        # run continues without the differential, same as the gated in-process default.
-                        return {"status": "not_installed", "candidates": [],
-                                "note": "LIRICAL unavailable this run (HPC down or not staged)."}
-
-                    _exo_binds = tuple(d for d in (st.lirical_exomiser_hg19, st.lirical_exomiser_hg38) if d)
-                    from .slurm_analysis import SlurmAnalysisExecutor
-                    phenotype_executor = SlurmAnalysisExecutor(
-                        remote=conn.executor, container_image=st.lirical_image,
-                        remote_workspace=p_remote_ws, remote_dataset=p_remote_ds,
-                        local_workspace=conn.workspace / run_id, source_dir=p_pysrc,
-                        entrypoint=f"python3 -m {_tools_api.PHENOTYPE_ENTRYPOINT}",   # lirical.sif has python3
-                        job_prefix="bioagent_phenotype",
-                        scratch_dir=_scratch_dir(conn, "phenotype", run_id=run_id),
-                        # Bind the LIRICAL data dir + the Exomiser data dir(s) read-only (--containall hides
-                        # everything not bound); a dir bind exposes the .mv.db / .ser files inside.
-                        extra_ro_binds=tuple(dict.fromkeys((st.lirical_data_dir, *_exo_binds))),
-                        # Deploy config the model never sends — injected so it resolves inside lirical.sif.
-                        inject_args={"data_dir": st.lirical_data_dir,
-                                     "exomiser_hg19": st.lirical_exomiser_hg19,
-                                     "exomiser_hg38": st.lirical_exomiser_hg38,
-                                     "assembly": _assembly},
-                        mem_gb=st.lirical_mem_gb, cpus=st.lirical_cpus, partition=st.cpu_partition,
-                        account=st.cpu_account or "", time_limit=st.lirical_time_limit,
-                        container_module=st.container_module, container_bin=st.container_bin,
-                        local_fallback=_phenotype_local_fallback,
-                        should_cancel=conn.chat_stop.is_set,   # Stop scancels the in-flight LIRICAL job
-                        memoize_result=True,   # deterministic for the same HPO+VCF — don't re-run in a step loop
-                    )
-                    if any(ok is False for _, (p, ok) in _p_checks.items() if p):
-                        emit("warning", "lab", "LIRICAL wired BUT a required path is missing above — the "
-                                               "phenotype step will report not_installed. Fix the path(s).")
-                    else:
-                        _mode = "genotype-aware" if p_remote_ds else "phenotype-only"
-                        emit("info", "lab", f"Phenotype differential runs on HPC3 (LIRICAL, {_mode}).")
 
         # Opt-in: render the report (pandoc/xelatex) as an HPC3 CPU job so texlive stays off the
         # eyeserver. Passed to build_pdf_report as render_fn; its local fallback starts TeX only
@@ -15521,18 +14909,14 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         report_render_fn = _build_report_render_fn(conn, run_id)
         if getattr(report_render_fn, "remote", None) is not None:
             emit("info", "lab", "Report rendering runs on HPC3 (CPU Slurm, pandoc/xelatex).")
-        literature_executor = _build_literature_executor(conn)
         from .estimates import estimate_plan, instrument_catalog, run_usage, save_estimate
 
         scientist = ResearchHarness(
             catalog=instrument_catalog(await _prepare_session_roster(
                 conn,
                 build_scientist_catalog(code_executor=code_executor,
-                                        analysis_executor=analysis_executor,
-                                        phenotype_executor=phenotype_executor,
-                                        literature_executor=literature_executor,
                                         hpc_shell=_build_hpc_shell(conn, run)),
-                literature_executor, emit), run_id, conn.settings),
+                emit), run_id, conn.settings),
             chat_fn=scientist_chat,
             count_tokens_fn=count_tokens,   # exact server-side window sensing (vLLM /tokenize)
             # The shared model is served with a smaller window than the session GPU's Qwen, and its

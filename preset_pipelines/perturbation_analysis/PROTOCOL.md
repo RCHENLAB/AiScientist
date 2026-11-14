@@ -1,7 +1,7 @@
 ---
 name: perturbation_analysis
 description: Analyze a pooled CRISPR / Perturb-seq screen — rank which perturbations change the transcriptome, then per-perturbation DE vs the non-targeting control
-tools: run_scanpy_qc, run_clustering, run_de, run_enrichment, run_code, literature_search
+tools: mcp_run_scanpy_qc, mcp_run_clustering, mcp_run_de, mcp_run_enrichment, run_code, mcp_literature_search
 ---
 
 # Pooled-Perturbation (Perturb-seq) Analysis Protocol
@@ -40,18 +40,18 @@ phenotype.
 
 | # | Step | Tool / skill | 🔬 Key agent-chosen params | Output |
 |---|------|--------------|----------------------------|--------|
-| 1 | **QC the cells** | `run_scanpy_qc` | filter/normalize thresholds; **keep control cells** | filtered + log1p AnnData (+ HVG) + counts |
-| 2 | **Embedding** | `run_clustering` | (agent-chosen `n_pcs` / neighbors) | PCA embedding + UMAP-by-perturbation |
+| 1 | **QC the cells** | `mcp_run_scanpy_qc` | filter/normalize thresholds; **keep control cells** | filtered + log1p AnnData (+ HVG) + counts |
+| 2 | **Embedding** | `mcp_run_clustering` | (agent-chosen `n_pcs` / neighbors) | PCA embedding + UMAP-by-perturbation |
 | 3 | **Define the screen** | *(from DATASET PROFILE)* | perturbation column · control level · guide\|target · min cells (`<30`) | screen definition + per-perturbation cell counts |
 | 4 | **Rank perturbation strength (E-distance)** | `run_code` · `perturbation_edistance.py` | control level · FDR · `N_PERM` | ranked E-distances + **silent-guide** list |
 | 5 | **(Optional) Remove escaping cells** | `run_code` · `mixscape_escape_filter.py` | run Mixscape or not | `mixscape_class_global` (NP cells droppable) |
 | 6 | **Per-perturbation DE vs control** | `run_code` · `perturbation_de_vs_control.py` | `reference` = control level · guide\|target | per-perturbation DE + self-knockdown check |
-| 7 | **(Optional) Pathway enrichment** | `run_enrichment` | up/down gene SYMBOL sets of strong hits | enriched pathways per perturbation |
+| 7 | **(Optional) Pathway enrichment** | `mcp_run_enrichment` | up/down gene SYMBOL sets of strong hits | enriched pathways per perturbation |
 | 8 | **(Optional) Group perturbations by effect** | `run_code` · `perturbation_edistance.py` (pairwise) | — | perturbation×perturbation E-distance matrix / modules |
-| 9 | **(Optional) Literature context** | `literature_search` | gene + program query | citations |
+| 9 | **(Optional) Literature context** | `mcp_literature_search` | gene + program query | citations |
 
 > The heavy compute lives inside the `run_code` **E-distance** (Step 4) and **DE** (Step 6) templates;
-> `run_de` is per-cluster one-vs-rest and **cannot** do the shared-control comparison, so it is not used
+> `mcp_run_de` is per-cluster one-vs-rest and **cannot** do the shared-control comparison, so it is not used
 > for the DE step. Steps 5, 7, 8, 9 are genuinely **optional** — take them only when the data supports
 > them. **Plan no other report-writing
 > step:** a written report is one `write_report` step, last, planned only when the request asks for it.
@@ -84,7 +84,7 @@ category values are given at planning time) and infer:
 <details open>
 <summary><b>Step 1 · QC the cells</b> — are the cells usable — and did you keep the controls?</summary>
 
-**What.** `run_scanpy_qc`: per-cell metrics, cell/gene filtering, normalize + log1p (and HVG). Report
+**What.** `mcp_run_scanpy_qc`: per-cell metrics, cell/gene filtering, normalize + log1p (and HVG). Report
 the cell/gene counts before and after.
 
 **Why.** Standard scRNA-seq QC — but with one perturbation-specific rule: every perturbation is scored
@@ -96,7 +96,7 @@ cells**; respect any existing QC columns.
 
 **What runs** — the registered QC tool call:
 ```
-run_scanpy_qc  →  per-cell QC metrics · cell/gene filters · normalize_total + log1p · (optional HVG)
+mcp_run_scanpy_qc  →  per-cell QC metrics · cell/gene filters · normalize_total + log1p · (optional HVG)
 ```
 
 **✅ Verify this step:** the control cells are still present after QC · cell/gene counts reported
@@ -108,7 +108,7 @@ before→after · pre-existing QC columns are honored, not silently overwritten.
 <details>
 <summary><b>Step 2 · Embedding</b> — build the space the effect-size ranking measures distances in</summary>
 
-**What.** `run_clustering`: compute PCA / neighbors / UMAP.
+**What.** `mcp_run_clustering`: compute PCA / neighbors / UMAP.
 
 **Why.** The **PCA embedding is what the E-distance ranking (Step 4) measures distances in**, so it is a
 hard prerequisite for Step 4. A UMAP colored by perturbation is a useful overview figure. Leiden clusters
@@ -119,7 +119,7 @@ clusters.
 
 **What runs** — the registered clustering tool call:
 ```
-run_clustering  →  PCA · neighbors · UMAP
+mcp_run_clustering  →  PCA · neighbors · UMAP
 ```
 
 **✅ Verify this step:** a PCA embedding exists (it feeds Step 4) · a UMAP colored by the perturbation
@@ -222,11 +222,11 @@ and states pertpy was unavailable · the step never blocks the pipeline.
 </details>
 
 <details>
-<summary><b>Step 6 · Per-perturbation DE vs the control</b> — the shared-reference comparison run_de cannot do</summary>
+<summary><b>Step 6 · Per-perturbation DE vs the control</b> — the shared-reference comparison mcp_run_de cannot do</summary>
 
 **What.** `run_code`, adapting `perturbation_de_vs_control.py`: for **each perturbation with a real effect
 and enough cells**, run perturbation-vs-non-targeting-control DE (scanpy `rank_genes_groups` with an
-**explicit `reference` = the control level**, looped over perturbations). `run_de` is **per-cluster
+**explicit `reference` = the control level**, looped over perturbations). `mcp_run_de` is **per-cluster
 one-vs-rest**, so it does NOT do this shared-reference comparison — use the template.
 
 **Why / sanity check.** A bona-fide knockout should show its **OWN target gene down** in its DE — report
@@ -259,14 +259,14 @@ excluded.
 <details>
 <summary><b>Step 7 · (Optional) Pathway enrichment per strong perturbation</b> — what program did each strong guide move?</summary>
 
-**What.** `run_enrichment` on the **up-/down-gene sets** of each perturbation with a substantial DE result.
+**What.** `mcp_run_enrichment` on the **up-/down-gene sets** of each perturbation with a substantial DE result.
 Send gene **SYMBOLS only**.
 
 **Why.** Interpret the transcriptional program each strong perturbation induced.
 
 **🔬 Agent-chosen:** which perturbations count as "substantial DE"; the up vs down gene sets fed in.
 
-**What runs** — `run_enrichment` on the up/down gene-symbol sets.
+**What runs** — `mcp_run_enrichment` on the up/down gene-symbol sets.
 
 **✅ Verify this step:** only gene **symbols** are sent · enrichment is run per strong perturbation's
 up/down sets · resulting pathways are framed as hypotheses.
@@ -298,7 +298,7 @@ framed as hypotheses, not established pathways.
 <summary><b>Step 9 · (Optional) Literature context</b></summary>
 
 **What.** For the strongest hits, pull real citations linking the perturbed gene to the observed program
-via `literature_search`.
+via `mcp_literature_search`.
 
 **Why / honesty.** Cite **only** what the tool returns — never invent a PMID or a claim.
 

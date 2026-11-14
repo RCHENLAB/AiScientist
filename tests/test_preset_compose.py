@@ -55,7 +55,7 @@ def test_phenotype_pipeline_is_the_vcf_plus_case_path():
     the phenotype tools on top. The two must stay distinguishable to the router by description alone."""
     p = get_pipeline("phenotype_variant_diagnosis")
     assert p.data_type == "variants"                       # so a scanpy pinned pipeline is dropped on it
-    assert {"map_phenotype_to_hpo", "run_lirical", "mcp_annotate_variants"} <= set(p.tools)
+    assert {"mcp_map_phenotype_to_hpo", "mcp_run_lirical", "mcp_annotate_variants"} <= set(p.tools)
     # the precondition a router / PI must be able to read off the one-liner
     assert "only when" in p.label.lower() or "only if" in p.label.lower()
 
@@ -92,7 +92,7 @@ def test_modality_agnostic_pick_drops_nothing():
 # planned five steps around `scgpt_annotate`, and only the empty sections of the final report
 # revealed that the tool could not run. Selection now knows, and says so.
 
-def _pipe(key="scgpt_annotation", tools=("scgpt_annotate", "run_clustering", "run_code"),
+def _pipe(key="scgpt_annotation", tools=("scgpt_annotate", "mcp_run_clustering", "run_code"),
           data_type="scrna"):
     from aiscientist.agents.preset_pipelines import PresetPipeline
     return PresetPipeline(key=key, label=f"{key} label", prompt="steer", tools=tuple(tools),
@@ -105,9 +105,9 @@ def test_missing_tools_is_skipped_entirely_when_availability_is_unknown():
 
 
 def test_missing_tools_reports_only_the_gaps_in_declaration_order():
-    available = frozenset({"run_clustering", "run_code"})
+    available = frozenset({"mcp_run_clustering", "run_code"})
     assert _pipe().missing_tools(available) == ("scgpt_annotate",)
-    assert _pipe().missing_tools(frozenset({"scgpt_annotate", "run_clustering", "run_code"})) == ()
+    assert _pipe().missing_tools(frozenset({"scgpt_annotate", "mcp_run_clustering", "run_code"})) == ()
 
 
 def test_the_router_listing_flags_a_pipeline_it_cannot_run():
@@ -121,8 +121,8 @@ def test_the_router_listing_flags_a_pipeline_it_cannot_run():
 
     select_pipeline(fake_complete, "annotate my h5ad", "",
                     (_pipe(), _pipe(key="celltype_annotation",
-                                    tools=("run_clustering", "run_de"))),
-                    None, available_tools=frozenset({"run_clustering", "run_de", "run_code"}))
+                                    tools=("mcp_run_clustering", "mcp_run_de"))),
+                    None, available_tools=frozenset({"mcp_run_clustering", "mcp_run_de", "run_code"}))
     # The model picks by description; the gap has to be IN the description it reads.
     assert "[NOT AVAILABLE in this deployment: scgpt_annotate]" in seen["listing"]
     assert "celltype_annotation label\n" in seen["listing"] + "\n"   # the intact one is unmarked
@@ -134,7 +134,7 @@ def test_the_deterministic_content_route_still_reports_the_gap():
     events = []
     chosen = select_pipeline(lambda m: "none", "q", "", (_pipe(),), events.append,
                              content_modality="scrna", content_confidence="high",
-                             available_tools=frozenset({"run_clustering", "run_code"}))
+                             available_tools=frozenset({"mcp_run_clustering", "run_code"}))
     # A single modality match is chosen with NO model call — the one path where a silent gap
     # would never be seen by anything.
     assert chosen is not None and chosen.key == "scgpt_annotation"
@@ -194,7 +194,7 @@ def test_every_skill_points_pathway_work_at_the_offline_tool():
     """Run 3c5fbc8608a7's pathway step hand-rolled its own scoring in run_code, went looking for a
     gene-set collection to download, was declined at the non-allowlisted-host confirmation, and
     recorded "no verified authorized species-compatible collection" -- while GO_Biological_Process_2023,
-    Reactome_2022 and MSigDB_Hallmark_2020 sat in the directory run_enrichment reads from, on both
+    Reactome_2022 and MSigDB_Hallmark_2020 sat in the directory mcp_run_enrichment reads from, on both
     the gateway host and HPC3. Nothing in the plan's context said those files existed."""
     from aiscientist.agents.preset_pipelines import PIPELINES
 
@@ -203,12 +203,12 @@ def test_every_skill_points_pathway_work_at_the_offline_tool():
         # line in the file can be split across two, and a raw substring check then fails for a
         # reason that has nothing to do with the content being present.
         prompt = " ".join(PIPELINES[key].prompt.split())
-        assert "run_enrichment" in prompt, key
-        assert "ALREADY ON DISK" in prompt, key
+        assert "mcp_run_enrichment" in prompt, key
+        assert "configured by the operator" in prompt and "SCRNA_GENESETS_DIR" in prompt, key
         assert "offline, no download, no network" in prompt, key
         assert "GO_Biological_Process_2023" in prompt, key
-        # ...AND the case the first version of this guidance got wrong: run_enrichment consumes
-        # run_de's table and returns ORA p-values, so a design with no replication cannot use it.
+        # ...AND the case the first version of this guidance got wrong: mcp_run_enrichment consumes
+        # mcp_run_de's table and returns ORA p-values, so a design with no replication cannot use it.
         # Telling the model to use it anyway sends it at a tool that cannot run; what it needs to
         # know is that the gene sets stay available even when the tool does not.
         assert "no biological replication" in prompt, key

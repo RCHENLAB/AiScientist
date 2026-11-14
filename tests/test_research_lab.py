@@ -6,6 +6,8 @@ tool-calling chat — so the whole multi-agent loop runs with no GPU/LLM.
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
 import pytest
@@ -15,7 +17,6 @@ from aiscientist.agents.research_harness import (
     HarnessTool,
     ResearchHarness,
     _msg_tokens,
-    default_catalog,
 )
 from aiscientist.agents.research_lab import (
     DEFAULT_SPECIALISTS,
@@ -67,9 +68,9 @@ def _scientist_calls(tool_name, tool_args):
 
 def test_injected_scientist_gets_progressive_disclosure_tools():
     # The GATEWAY builds the scientist itself (a catalog WITHOUT the skill tools) and injects it —
-    # exactly like `default_catalog()` here. Progressive disclosure requires read_skill_reference /
+    # exactly like `fixture_catalog()` here. Progressive disclosure requires read_skill_reference /
     # search_skills to be DISPATCHABLE, or the brief tells the model to call tools that don't exist.
-    injected = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    injected = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     assert "read_skill_reference" not in injected._by_name          # gateway catalog lacks them...
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "", scientist=injected)
     # ...the lab must attach them to the injected scientist (both catalog + dispatch map)
@@ -83,15 +84,15 @@ def test_injected_scientist_can_read_the_source_of_its_own_tools():
     # so without the attach the system prompt tells the model to read an implementation using a
     # tool that does not exist. And it must introspect the RUN's catalog — a list captured at
     # import time would not include whatever the gateway injected.
-    injected = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    injected = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     assert "read_tool_source" not in injected._by_name
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "", scientist=injected)
     assert "read_tool_source" in lab.scientist._by_name
 
     reader = lab.scientist._by_name["read_tool_source"]
-    out = reader.executor({"tool": "run_qc"}, _ctx())
+    out = reader.executor({"tool": "mcp_run_scanpy_qc"}, _ctx())
     assert "source" in out and out["source"].strip()
-    assert out["tool"] == "run_qc"
+    assert out["tool"] == "mcp_run_scanpy_qc"
     # The catalog it introspects is the RUN's, including the tools attached after injection —
     # so it can read itself, which is what makes auditing the auditor possible.
     listed = reader.executor({"tool": "__nope__"}, _ctx())["available"]
@@ -105,11 +106,11 @@ def test_lab_converges_when_critic_accepts_all_steps():
         agenda=["Run QC on the dataset", "Identify marker genes"],
         critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
     )
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     events = []
-    result = lab.run("Characterize the PBMC dataset", on_event=events.append)
+    result = lab.run("Characterize the PBMC dataset and write a report", on_event=events.append)
 
     assert result.agenda == ["Run QC on the dataset", "Identify marker genes"]
     assert len(result.rounds) == 2
@@ -126,7 +127,7 @@ def test_plan_mode_streams_the_reviewed_agenda_once():
         agenda=["Run QC on the dataset"],
         critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
     )
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
     events = []
     lab.run("QC the dataset", on_event=events.append,
@@ -141,7 +142,7 @@ def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatc
     # analysis extras installed (without them the catalog cannot be built).
     from aiscientist.agents.research_lab import tooling
     monkeypatch.setattr(tooling, "_known_tool_names",
-                        lambda: frozenset({"run_cellqc", "run_de", "run_code", "run_qc"}))
+                        lambda: frozenset({"mcp_run_cellqc", "mcp_run_de", "run_code", "mcp_run_scanpy_qc"}))
     first_call = {}
 
     class Recording(ResearchHarness):
@@ -149,7 +150,7 @@ def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatc
             calls.append(planned_tools)
             return super().run(*args, planned_tools=planned_tools, **kwargs)
 
-    steps = ("Run `run_cellqc` on the bound folders", "Test WT against KO with `run_de`",
+    steps = ("Run `mcp_run_cellqc` on the bound folders", "Test WT against KO with `mcp_run_de`",
              "Plot the QC metrics with `run_code`")
     for step in steps:
         calls = []
@@ -157,18 +158,19 @@ def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatc
             agenda=[step],
             critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "grounded"}],
         )
-        scientist = Recording(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+        scientist = Recording(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
         ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist).run("QC")
         first_call[step] = calls[0]
-    # run_cellqc's manifest says one call is its step; run_de and run_code may need more calls.
-    assert list(first_call.values()) == [["run_cellqc"], None, None]
+    # mcp_run_cellqc's manifest says one call is its step; mcp_run_de and run_code may need more calls.
+    assert list(first_call.values()) == [["mcp_run_cellqc"], None, None]
 
 
 # --- convergence is LLM-judged (no fixed score threshold) --------------------
 
 def test_cellqc_planner_sees_declared_threshold_defaults(monkeypatch):
-    from aiscientist.tools._lib.scrna import PARAMS
-    from aiscientist.tools.run_cellqc.tool import make_tool
+    tool = next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
+    def make_tool():
+        return tool
 
     seen = {}
     lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False),
@@ -179,7 +181,7 @@ def test_cellqc_planner_sees_declared_threshold_defaults(monkeypatch):
         assert f"{name} (" in seen["pi_user"]
         assert f"default {value}" in seen["pi_user"]
     # A changed declaration must reach the planner without editing its prompt or manifest.
-    monkeypatch.setitem(PARAMS["run_cellqc"], "min_features", (350, "Minimum detected genes"))
+    tool.parameters["properties"]["min_features"]["default"] = 350
     lab.scientist.catalog = [make_tool()]
     lab._pi_plan("Run CellQC", lambda _event: None)
     assert "min_features (integer, default 350)" in seen["pi_user"]
@@ -195,7 +197,7 @@ def test_qc_reply_names_every_threshold_changed_from_default(tmp_path, libraries
         result = {"status": "ok", "cells_before": 100, "cells_after": 80,
                   "thresholds": thresholds, "libraries": libraries}
         return _qc_chat_reply(tmp_path, SimpleNamespace(rounds=[{
-            "scientist_result": {"steps": [{"tool": "run_cellqc", "ok": True,
+            "scientist_result": {"steps": [{"tool": "mcp_run_cellqc", "ok": True,
                                             "result": result}]}}]))
 
     text = reply({"min_counts": 500, "min_features": 200, "max_pct_mt": 10})
@@ -229,7 +231,7 @@ def test_qc_reply_uses_the_accepted_round_else_the_latest(tmp_path, as_dict, ver
     rounds = []
     for i, (qc, verdict) in enumerate(zip(results, verdicts)):
         rnd = LabRound(i + 1, 0, "Run QC", "QC", {
-            "steps": [{"tool": "run_cellqc", "ok": True, "result": qc}]},
+            "steps": [{"tool": "mcp_run_cellqc", "ok": True, "result": qc}]},
             CriticVerdict(verdict, 0.9, "reviewed") if verdict else None)
         if as_dict:
             rnd = {"scientist_result": rnd.scientist_result,
@@ -277,7 +279,7 @@ def _b2_rounds(verdicts, as_dict):
     rounds = []
     for i, (verdict, score, critique, reviewed) in enumerate(verdicts):
         rnd = LabRound(i + 1, 0, _B2_STEP, "QC",
-                       {"steps": [{"tool": "run_cellqc", "ok": True, "result": _B2_QC}]},
+                       {"steps": [{"tool": "mcp_run_cellqc", "ok": True, "result": _B2_QC}]},
                        CriticVerdict(verdict, score, critique, reviewed))
         rounds.append(rnd.to_dict() if as_dict else rnd)
     return rounds
@@ -367,7 +369,7 @@ def test_qc_reply_for_an_accepted_round_covering_every_library_is_unchanged(tmp_
     def result(libs):
         r = dict(qc, libraries=qc["libraries"][:libs])
         return LabResult("q", [_B2_STEP], [LabRound(
-            1, 0, _B2_STEP, "QC", {"steps": [{"tool": "run_cellqc", "ok": True, "result": r}]},
+            1, 0, _B2_STEP, "QC", {"steps": [{"tool": "mcp_run_cellqc", "ok": True, "result": r}]},
             CriticVerdict("accept", 0.72, "All three libraries were QC'd."))], True, 1, "")
 
     assert _qc_chat_reply(art, result(3)) == (
@@ -411,13 +413,13 @@ def test_unusable_critic_review_retries_only_the_review(bad_reply, retry_succeed
         return base(messages)
 
     events = []
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(planner=planner, auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
     result = lab.run("QC the dataset", on_event=events.append)
     assert len(reviews) == 2
     assert len(result.rounds) == 1
-    assert result.rounds[0].scientist_result["steps"][0]["tool"] == "run_qc"
+    assert result.rounds[0].scientist_result["steps"][0]["tool"] == "mcp_run_scanpy_qc"
     assert result.rounds[0].scientist_result["steps"][0]["ok"]
     assert result.accepted_steps == 1
     assert result.rounds[0].verdict.reviewed is retry_succeeds
@@ -438,7 +440,7 @@ def test_two_unusable_critic_replies_do_not_keep_a_step_that_produced_nothing():
                       complete_fn=lambda m: (calls.append(m), "")[1])
     events = []
     v = lab._critic("q", "Run QC", HarnessResult(
-        "ok", None, "done", [{"tool": "run_qc", "ok": False, "error": "boom"}], ["boom"]),
+        "ok", None, "done", [{"tool": "mcp_run_scanpy_qc", "ok": False, "error": "boom"}], ["boom"]),
         events.append)
     assert len(calls) == 2
     assert v.verdict == "revise" and v.reviewed and "auto-guard" in v.critique
@@ -450,7 +452,7 @@ def test_convergence_is_llm_judged_not_thresholded():
     # advance; now convergence is the LLM's call, so the step is accepted.
     complete = _make_complete(agenda=["Run QC"],
                               critic_responses=[{"verdict": "accept", "score": 0.4, "critique": "fine"}])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
     result = lab.run("QC the dataset")
     assert result.accepted_steps == 1 and result.converged is True
@@ -478,7 +480,7 @@ def test_specialist_persona_is_injected_into_the_scientist_brief():
 
     complete = _make_complete(agenda=["Run QC and filtering"],
                               critic_responses=[{"verdict": "accept", "score": 0.9}])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=recording_chat)
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=recording_chat)
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
     result = lab.run("QC the data")
     assert "QC & preprocessing specialist" in seen["brief"]        # persona prepended
@@ -504,7 +506,7 @@ def test_plan_mode_revise_replans_then_approves():
             return json.dumps({"verdict": "accept", "score": 0.9, "critique": "ok"})
         return "FINAL REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     seen = []
@@ -541,7 +543,7 @@ def test_plan_mode_clarify_then_answer_then_run():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     seen = []
@@ -559,7 +561,7 @@ def test_plan_mode_clarify_then_answer_then_run():
 
 def test_plan_mode_cancel_runs_nothing():
     complete = _make_complete(agenda=["Run QC"], critic_responses=[{"verdict": "accept", "score": 0.9}])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     events = []
@@ -586,7 +588,7 @@ def test_preset_prompt_steers_pi_planning_without_bypassing_it():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     preset = get_preset("celltype_annotation")
     lab = ResearchLab(_ctx(), LabConfig(preset_prompt=preset.prompt),
                       complete_fn=recording_complete, scientist=scientist)
@@ -612,7 +614,7 @@ def test_no_preset_means_no_guidance_line():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=recording_complete, scientist=scientist)
     lab.run("anything")
     assert "research-path guidance" not in seen["pi_user"]
@@ -640,7 +642,7 @@ def _planning_prompt(question="Compare Ddx41 KO vs WT retina"):
         raise AssertionError("only planning should run")
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog()))
+                      scientist=ResearchHarness(catalog=fixture_catalog()))
     kind, _ = lab._pi_plan(question, lambda _event: None)
     assert kind == "agenda"
     return seen["pi_user"]
@@ -691,7 +693,7 @@ def test_a_large_skill_library_lists_the_best_matches_first():
 
 def test_only_an_overlong_skill_description_is_cut_in_the_planning_list():
     # The cut is the Agent-Skills maximum (1024): a routing sentence at the END of a normal
-    # description ("... is the run_cellqc tool, not this skill") must reach the PI.
+    # description ("... is the mcp_run_cellqc tool, not this skill") must reach the PI.
     from aiscientist.agents.skills import Skill, plan_skill_lines
     normal = "Run the pipeline by hand. " * 20 + "Inside an analysis, use the tool instead."
     lines, left_out = plan_skill_lines("q", skills={"n": Skill("n", normal),
@@ -717,7 +719,7 @@ def test_skills_named_in_a_step_match_whole_names_only():
         == ["annotate_clusters_by_markers"]
     assert skills_named_in("Fetch the PDFs with literature-corpus-recovery", lib) \
         == ["literature-corpus-recovery"]
-    assert skills_named_in("Run QC with `run_qc`", lib) == []
+    assert skills_named_in("Run QC with `mcp_run_scanpy_qc`", lib) == []
 
 
 def test_the_scientist_is_pointed_at_the_skill_its_step_names(monkeypatch):
@@ -732,14 +734,14 @@ def test_the_scientist_is_pointed_at_the_skill_its_step_names(monkeypatch):
             "name": "finish", "arguments": json.dumps({"answer": "done"})}}]}
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "x",
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=chat))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=chat))
     lab._scientist("q", "**KO vs WT** — apply skill `pairwise_de` with `run_code` to compare KO and WT.",
                    Specialist("Sci", "persona"), "", [], lambda _event: None)
     assert "The plan assigns skill `pairwise_de` to this step: call `read_skill_reference(name)`" \
         in briefs[0]
 
     briefs.clear()
-    lab._scientist("q", "**QC** — Filter cells with `run_qc` at the defaults.",
+    lab._scientist("q", "**QC** — Filter cells with `mcp_run_scanpy_qc` at the defaults.",
                    Specialist("Sci", "persona"), "", [], lambda _event: None)
     assert "The plan assigns" not in briefs[0]
 
@@ -754,7 +756,7 @@ def test_the_next_cycle_plan_is_offered_the_skills(monkeypatch):
         return json.dumps({"continue": False, "reason": "answered"})
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog()))
+                      scientist=ResearchHarness(catalog=fixture_catalog()))
     lab._plan_next_cycle("q", [], 2, lambda _event: None)
     assert any(line.startswith("- pairwise_de — ") for line in seen["payload"]["skills_available"])
 
@@ -764,7 +766,7 @@ def test_a_skill_named_like_a_tool_is_not_reported_as_an_unknown_tool(monkeypatc
     from aiscientist.agents.research_lab import check_plan_tooling
     from aiscientist.agents.skills import Skill
     monkeypatch.setattr(skills_mod, "SKILLS", {"run_custom_qc": Skill("run_custom_qc", "Induced QC.")})
-    _, findings = check_plan_tooling(["Apply skill `run_custom_qc` with `run_code`."], default_catalog())
+    _, findings = check_plan_tooling(["Apply skill `run_custom_qc` with `run_code`."], fixture_catalog())
     assert not any(f["tool"] == "run_custom_qc" for f in findings)
 
 
@@ -799,7 +801,7 @@ def test_pi_planner_sees_condition_groups_and_existing_labels():
             "celltype": {"n": 130, "values": []},          # high-cardinality -> count only
         },
     }
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx_with_dataset(dr), LabConfig(),
                       complete_fn=_record_pi_user(seen), scientist=scientist)
     lab.run("complete the research and write the topic by yourself")
@@ -932,13 +934,13 @@ def test_pi_is_told_to_plan_the_literature_tool_the_session_has():
 # because the protocol text says "reference" and "Literature", then because the note asking for
 # the removal contains the word "literature". The approved plan ran four literature searches.
 
-_QC_STEP = "**Cell QC** — Quality-control the delivery with `run_cellqc` and report what was removed."
-_CLUSTER_STEP = "**Clustering** — Cluster the cells with `run_clustering` and draw the UMAP."
+_QC_STEP = "**Cell QC** — Quality-control the delivery with `mcp_run_cellqc` and report what was removed."
+_CLUSTER_STEP = "**Clustering** — Cluster the cells with `mcp_run_clustering` and draw the UMAP."
 _LIT_STEP = ("**Mouse retina literature grounding** — Search the published literature with "
              "`deep_literature` for mouse retina cell-type markers and attach DOI-backed citations.")
 # What the celltype_annotation protocol hands the PI in every run it matches: "reference" as
 # something to annotate against, and a literature stage.
-_PROTOCOL = ('5. Annotate with `run_marker_annotation`: for a curated reference pass '
+_PROTOCOL = ('5. Annotate with `mcp_run_marker_annotation`: for a curated reference pass '
              '`reference: "retina"` and NO panel, or score against the reference panel.\n'
              "6b. **Literature grounding** (`literature_search`): search on the cell types and "
              "markers, and attach the references to the report.")
@@ -962,7 +964,7 @@ def _guard_lab(*drafts, **config):
 
     tools = [HarnessTool(name, f"{name} tool", {"type": "object", "properties": {}},
                          lambda _args, _ctx: {"status": "ok"}, category="analysis")
-             for name in ("run_cellqc", "run_clustering", "deep_literature", "literature_search")]
+             for name in ("mcp_run_cellqc", "mcp_run_clustering", "deep_literature", "literature_search")]
     return ResearchLab(_ctx(), LabConfig(**config), complete_fn=complete,
                        scientist=ResearchHarness(catalog=tools))
 
@@ -1090,7 +1092,7 @@ def test_what_a_sentence_says_about_literature():
                 "discard the enrichment and literature steps",
                 "remove literature and add GSEA instead",
                 "不要文献", "去掉文献", "文献步骤也去掉", "把文献检索删掉", "文献不要了",
-                "不要保留文献", "去掉富集、文献", "不做聚类、注释、run_de、enrichment、GSEA 和文献检索"]
+                "不要保留文献", "去掉富集、文献", "不做聚类、注释、mcp_run_de、enrichment、GSEA 和文献检索"]
     silent = [_QC_REQUEST, "only keep 1. cell QC quality control ,discard all other step",
               "Align to the reference genome.", "Score the markers against the reference panel.",
               "只保留第一步"]
@@ -1192,12 +1194,12 @@ def test_literature_step_is_backfilled_when_round_budget_is_exhausted():
         {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
         literature_exec, category="literature",
     )
-    catalog = list(default_catalog()) + [lit_tool]
+    catalog = list(fixture_catalog()) + [lit_tool]
     complete = _make_complete(
         agenda=["Run QC and report the metrics", "Summarize findings with literature context"],
         critic_responses=[{"verdict": "accept", "score": 1.0, "critique": "ok"}],
     )
-    scientist = ResearchHarness(catalog=catalog, chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=catalog, chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     # max_rounds=1: the single QC round exhausts the budget; literature (step 2) is never reached
     # by the main loop and can only be executed by the backfill.
     lab = ResearchLab(_ctx(), LabConfig(max_rounds=1), complete_fn=complete, scientist=scientist)
@@ -1220,8 +1222,8 @@ def test_default_round_budget_runs_every_planned_step_no_starvation():
         agenda=agenda,
         critic_responses=[{"verdict": "accept", "score": 1.0, "critique": "ok"}],
     )
-    scientist = ResearchHarness(catalog=list(default_catalog()),
-                                chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=list(fixture_catalog()),
+                                chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
     result = lab.run("Run a nine-step analysis")   # no literature requested -> agenda stays at 9
 
@@ -1360,7 +1362,7 @@ def test_dag_planner_runs_branch_and_coordinator_schedules():
         {"id": "s4", "depends_on": ["s2"]},
     ])
     complete = _dag_complete(agenda, structure, coordinator_next=["s4"])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(planner="dag", auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
 
@@ -1380,7 +1382,7 @@ def test_dag_planner_runs_branch_and_coordinator_schedules():
 def test_dag_planner_falls_back_to_linear_when_structure_unparseable():
     agenda = ["Run QC", "Cluster", "DE"]
     complete = _dag_complete(agenda, structure_json="not json", coordinator_next=[])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(planner="dag", auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -1393,7 +1395,7 @@ def test_dag_planner_falls_back_to_linear_when_structure_unparseable():
 
 def test_default_planner_is_linear_and_skips_dag():
     complete = _dag_complete(["Run QC"], structure_json="[]", coordinator_next=[])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False),   # planner defaults to "linear"
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2008,18 +2010,18 @@ def test_a_step_is_classified_by_the_tool_it_names_not_by_its_prose():
     its markers and its cell-type labels. Abridged from that plan card, trigger words verbatim."""
     from aiscientist.agents.research_lab import _is_de_producer_step, _is_enrichment_step
     marker_de = ("**Marker genes per cluster** — Identify the genes that define each cluster with "
-                 "`run_de` in marker (default) mode: a Wilcoxon rank-sum test (`rank_genes_groups`) "
+                 "`mcp_run_de` in marker (default) mode: a Wilcoxon rank-sum test (`rank_genes_groups`) "
                  "comparing every cell of one cluster against all remaining cells, writing a table "
                  "per cluster (group, gene, log2fc, pval, pval_adj, score) that the pathway steps "
                  "consume.")
     ora = ("**ORA pathway context per cluster** — Put pathway context on each cluster with "
-           "`run_enrichment`: an offline over-representation test against the background of the "
-           "ACTUAL tested universe that `run_de` wrote, with the top enriched terms per cluster.")
+           "`mcp_run_enrichment`: an offline over-representation test against the background of the "
+           "ACTUAL tested universe that `mcp_run_de` wrote, with the top enriched terms per cluster.")
     gsea = ("**Preranked GSEA per cluster** — Complement the thresholded ORA with "
-            "`run_gsea_prerank`: a preranked GSEA that walks the COMPLETE ranked gene list per "
-            "cluster (every tested gene, ranked by Wilcoxon z, from `run_de`'s ranking files).")
+            "`mcp_run_gsea_prerank`: a preranked GSEA that walks the COMPLETE ranked gene list per "
+            "cluster (every tested gene, ranked by Wilcoxon z, from `mcp_run_de`'s ranking files).")
     annotation = ("**Marker-based cell-type annotation** — Assign a cell type to each cluster with "
-                  "`run_marker_annotation`, passing `reference: \"retina\"` and NO hand-built "
+                  "`mcp_run_marker_annotation`, passing `reference: \"retina\"` and NO hand-built "
                   "panel: a label is assigned only when that lineage's markers dominate the cluster "
                   "AND at least one is enriched in it versus other lineages.")
     assert _is_de_producer_step(marker_de) and not _is_enrichment_step(marker_de)
@@ -2082,11 +2084,11 @@ def test_methods_performed_lists_only_executed_tools():
                         {"final_answer": "x", "steps": [{"tool": t, "status": "ok"} for t in tools]},
                         CriticVerdict(verdict, 1.0, ""))
 
-    qc = rnd("QC", ["run_scanpy_qc"])
-    de = rnd("DE", ["run_de", "finish"])
+    qc = rnd("QC", ["mcp_run_scanpy_qc"])
+    de = rnd("DE", ["mcp_run_de", "finish"])
     never_ran = rnd("scGPT annotation", ["scgpt_annotate"], verdict="revise")   # not accepted
     out = _methods_performed([qc, de, never_ran])
-    assert "run_scanpy_qc" in out and "run_de" in out
+    assert "mcp_run_scanpy_qc" in out and "mcp_run_de" in out
     assert "scgpt_annotate" not in out          # never accepted -> not an executed method
     assert "finish" not in out                  # the sentinel is not a method
     assert _methods_performed([never_ran]) == ""   # nothing accepted -> empty allowlist
@@ -2129,7 +2131,7 @@ def test_accepted_findings_block_forbids_rerunning_upstream():
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=lambda m: "x")
     rounds = [LabRound(1, 1, "Run QC", "S",
-                       {"steps": [{"tool": "run_scanpy_qc", "ok": True, "result": {"status": "ok"}}],
+                       {"steps": [{"tool": "mcp_run_scanpy_qc", "ok": True, "result": {"status": "ok"}}],
                         "final_answer": "QC done"},
                        CriticVerdict("accept", 1.0, ""))]
     block = lab._accepted_findings_block(rounds)
@@ -2225,7 +2227,7 @@ def test_synthesize_prompt_carries_grounding_vocab():
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete)
     rounds = [
         LabRound(1, 1, "Enrichment", "S",
-                 {"steps": [{"tool": "run_enrichment", "ok": True,
+                 {"steps": [{"tool": "mcp_run_enrichment", "ok": True,
                              "result": {"top_terms_by_group": {"Rod": ["Visual Phototransduction"]}}}],
                   "final_answer": "done"},
                  CriticVerdict("accept", 1.0, "")),
@@ -2396,7 +2398,7 @@ def test_literature_step_detection_does_not_match_background_rna_cleanup():
 
 def test_no_dataset_means_no_profile_line():
     seen = {}
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=_record_pi_user(seen), scientist=scientist)
     lab.run("anything")
     assert "Dataset profile" not in seen["pi_user"]
@@ -2433,7 +2435,7 @@ def test_pi_autonomously_selects_skill_when_no_preset_given():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(skill_library=lib),   # auto_select_skill defaults True
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2464,7 +2466,7 @@ def test_explicit_preset_overrides_pi_skill_selection():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(preset_prompt="USER FORCED GUIDANCE", skill_library=lib),
                       complete_fn=complete, scientist=scientist)
     lab.run("anything")
@@ -2497,7 +2499,7 @@ def test_pinned_skills_are_mandatory_and_auto_augments():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(pinned_skills=(pinned,), skill_library=auto_lib),
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2531,7 +2533,7 @@ def test_skill_selection_sees_the_dataset_profile():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx_with_dataset({"dataset_kind": "vcf_variants"}),
                       LabConfig(skill_library=lib), complete_fn=complete, scientist=scientist)
     lab.run("complete the research")                # vague question — the dataset must carry the signal
@@ -2555,7 +2557,7 @@ def test_no_skill_selected_means_free_planning():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(skill_library=lib), complete_fn=complete, scientist=scientist)
     lab.run("something unrelated to any known protocol")
 
@@ -2591,7 +2593,7 @@ def test_atomic_skills_reach_the_scientist_by_manifest(monkeypatch):
             return {"content": "", "tool_calls": [{"id": "f1", "type": "function",
                     "function": {"name": "finish", "arguments": json.dumps({"answer": "done"})}}]}
         return {"content": "", "tool_calls": [{"id": "t1", "type": "function",
-                "function": {"name": "run_qc", "arguments": "{}"}}]}
+                "function": {"name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
 
     def complete(messages):
         sys = messages[0]["content"]
@@ -2601,7 +2603,7 @@ def test_atomic_skills_reach_the_scientist_by_manifest(monkeypatch):
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=recording_chat)
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=recording_chat)
     lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False), complete_fn=complete, scientist=scientist)
     lab.run("do the analysis")
 
@@ -2656,7 +2658,7 @@ def test_required_skills_inject_a_mandatory_directive(tmp_path, skill_release):
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     # A legacy ".py"-suffixed required name still resolves (tolerant lookup); the directive names the
     # canonical skill (no ".py") and points at the two-level read_skill_reference fetch.
     lab = ResearchLab(_ctx(),
@@ -2706,7 +2708,7 @@ def test_brief_lists_every_skill_however_large_the_library(monkeypatch):
             return {"content": "", "tool_calls": [{"id": "f1", "type": "function",
                     "function": {"name": "finish", "arguments": json.dumps({"answer": "done"})}}]}
         return {"content": "", "tool_calls": [{"id": "t1", "type": "function",
-                "function": {"name": "run_qc", "arguments": "{}"}}]}
+                "function": {"name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
 
     def complete(messages):
         sys = messages[0]["content"]
@@ -2716,7 +2718,7 @@ def test_brief_lists_every_skill_however_large_the_library(monkeypatch):
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "FINAL"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=recording_chat)
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=recording_chat)
     lab = ResearchLab(_ctx(), LabConfig(auto_select_skill=False), complete_fn=complete, scientist=scientist)
     lab.run("do the analysis")
     brief = captured["brief"]
@@ -2727,7 +2729,7 @@ def test_brief_lists_every_skill_however_large_the_library(monkeypatch):
 
 
 def test_unknown_required_skill_is_dropped_not_injected():
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(),
                       LabConfig(auto_select_skill=False, required_skills=("does_not_exist.py",)),
                       complete_fn=lambda m: (json.dumps(["Run QC"])
@@ -2767,11 +2769,11 @@ def test_team_mode_runs_virtual_lab_meetings():
             return "FINAL TEAM REPORT"
         return "x"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(mode="team", auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
     events = []
-    result = lab.run("Characterize cell states in my dataset", on_event=events.append)
+    result = lab.run("Characterize cell states in my dataset and write a report", on_event=events.append)
 
     types = [e.get("type") for e in events]
     assert "team_formed" in types
@@ -2811,7 +2813,7 @@ def test_team_meeting_multi_round_collaborates_and_is_score_driven():
             return "REPORT"
         return "x"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(mode="team", meeting_rounds=2, auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2842,7 +2844,7 @@ def test_team_mode_default_is_two_rounds():
             return "REPORT"
         return "x"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(mode="team", auto_select_skill=False),   # meeting_rounds defaults to 2
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2870,7 +2872,7 @@ def test_high_meeting_score_ends_meeting_early():
             return "REPORT"
         return "x"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(mode="team", meeting_rounds=3, auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2891,7 +2893,7 @@ def test_auto_mode_lets_pi_route_single_vs_team():
             return json.dumps({"verdict": "accept", "score": 0.9})
         return "REPORT"
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(mode="auto", auto_select_skill=False),
                       complete_fn=complete, scientist=scientist)
     events = []
@@ -2911,7 +2913,7 @@ def test_lab_revises_then_accepts():
             {"verdict": "accept", "score": 0.95, "critique": "now grounded"},
         ],
     )
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     result = lab.run("QC the dataset")
@@ -2927,7 +2929,7 @@ def test_lab_revises_then_accepts():
 def test_cancel_before_any_step_runs_nothing_and_reports_partial():
     complete = _make_complete(agenda=["Run QC", "Cluster"],
                               critic_responses=[{"verdict": "accept", "score": 0.9}])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     events = []
@@ -2949,7 +2951,7 @@ def test_cancel_after_step_one_keeps_partial_results():
 
     complete = _make_complete(agenda=["Run QC", "Identify markers"],
                               critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "ok"}])
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=_scientist_calls("run_qc", {}))
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist_calls("mcp_run_scanpy_qc", {}))
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     result = lab.run("Annotate", on_event=on_event, should_cancel=lambda: flag["stop"])
@@ -2961,7 +2963,7 @@ def test_cancel_after_step_one_keeps_partial_results():
 
 
 def test_harness_cancel_stops_before_calling_the_model():
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 
     calls = {"n": 0}
 
@@ -2969,7 +2971,7 @@ def test_harness_cancel_stops_before_calling_the_model():
         calls["n"] += 1
         return {"content": "", "tool_calls": []}
 
-    h = ResearchHarness(catalog=default_catalog(), chat_fn=chat)
+    h = ResearchHarness(catalog=fixture_catalog(), chat_fn=chat)
     res = h.run("brief", HarnessContext(decisions={}, tunnel_port=1, model="m"), should_cancel=lambda: True)
     assert res.stop_reason == "cancelled" and calls["n"] == 0          # never even called the model
 
@@ -2986,7 +2988,7 @@ def test_critic_guard_downgrades_accept_when_scientist_errored():
         agenda=["Do the thing"],
         critic_responses=[{"verdict": "accept", "score": 1.0, "critique": "looks fine"}],
     )
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=boom_chat)
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=boom_chat)
     lab = ResearchLab(_ctx(), LabConfig(max_rounds=4, max_revisions=1), complete_fn=complete, scientist=scientist)
 
     result = lab.run("anything")
@@ -3013,14 +3015,14 @@ def test_step_with_artifact_but_no_final_answer_is_accepted():
     # producing output but the loop never converged on a finish).
     def chat(messages, tools):
         return {"content": "", "tool_calls": [
-            {"id": "t1", "type": "function", "function": {"name": "run_qc", "arguments": "{}"}}]}
+            {"id": "t1", "type": "function", "function": {"name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
 
     complete = _make_complete(
         agenda=["Run QC"],
         critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "artifact produced"}],
     )
     scientist = ResearchHarness(
-        catalog=default_catalog(), config=HarnessConfig(max_steps=2), chat_fn=chat)
+        catalog=fixture_catalog(), config=HarnessConfig(max_steps=2), chat_fn=chat)
     lab = ResearchLab(_ctx(), LabConfig(max_revisions=1), complete_fn=complete, scientist=scientist)
 
     result = lab.run("QC the dataset")
@@ -3029,7 +3031,7 @@ def test_step_with_artifact_but_no_final_answer_is_accepted():
     # status is NOT "ok" (the loop never finished) — the OLD guard force-revised on this
     # alone; the new guard looks at the produced artifact instead.
     assert r0.scientist_result["status"] != "ok"
-    assert any(s["tool"] == "run_qc" and s["ok"] for s in r0.scientist_result["steps"])  # a real result exists
+    assert any(s["tool"] == "mcp_run_scanpy_qc" and s["ok"] for s in r0.scientist_result["steps"])  # a real result exists
     assert r0.verdict.verdict == "accept"                       # accept STANDS (not auto-revised)
     assert "auto-guard" not in r0.verdict.critique
     assert result.accepted_steps == 1
@@ -3050,7 +3052,7 @@ def test_lab_scientist_uses_run_code_codeact_tool():
     )
     # hybrid catalog = curated function tools + the CodeAct run_code tool
     scientist = ResearchHarness(
-        catalog=[*default_catalog(), make_run_code_tool(code_executor)],
+        catalog=[*fixture_catalog(), make_run_code_tool(code_executor)],
         chat_fn=_scientist_calls("run_code", {"code": "print(6*7)"}),
     )
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
@@ -3077,7 +3079,7 @@ def test_run_code_without_executor_is_not_enabled():
 # --- end-to-end with the REAL sandbox: lab -> Scientist -> run_code -> subprocess
 
 def test_lab_run_code_executes_in_real_sandbox():
-    from aiscientist.agents.research_harness import ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import ResearchHarness
     from aiscientist.agents.sandbox import CodeSandbox
 
     complete = _make_complete(
@@ -3085,7 +3087,7 @@ def test_lab_run_code_executes_in_real_sandbox():
         critic_responses=[{"verdict": "accept", "score": 0.9, "critique": "ok"}],
     )
     scientist = ResearchHarness(
-        catalog=[*default_catalog(), make_run_code_tool(CodeSandbox(timeout_s=10))],
+        catalog=[*fixture_catalog(), make_run_code_tool(CodeSandbox(timeout_s=10))],
         chat_fn=_scientist_calls("run_code", {"code": "print(6 * 7)"}),
     )
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
@@ -3117,9 +3119,9 @@ def test_lab_folds_midrun_injection_into_remaining_steps():
                  "function": {"name": "finish", "arguments": json.dumps({"answer": "done"})}}]}
         return {"content": "", "tool_calls": [
             {"id": "t1", "type": "function",
-             "function": {"name": "run_qc", "arguments": "{}"}}]}
+             "function": {"name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
 
-    scientist = ResearchHarness(catalog=default_catalog(), chat_fn=chat)
+    scientist = ResearchHarness(catalog=fixture_catalog(), chat_fn=chat)
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete, scientist=scientist)
 
     # Inject exactly once (before the first step); it must persist to the second step too.
@@ -3277,7 +3279,7 @@ def test_critic_payload_carries_evidence_for_each_tool_and_a_step_union():
 
     tool = HarnessTool("make_art", "writes artifacts",
                        {"type": "object", "properties": {}}, _exec, category="analysis")
-    finish = default_catalog()[-1]   # the shared `finish` control tool
+    finish = fixture_catalog()[-1]   # the shared `finish` control tool
     scientist = ResearchHarness(catalog=[tool, finish], chat_fn=_scientist_calls("make_art", {}))
 
     captured: dict = {}
@@ -3346,7 +3348,7 @@ def test_downstream_step_brief_carries_prior_evidence_and_verify_framing():
 
     tool = HarnessTool("make_art", "writes artifacts",
                        {"type": "object", "properties": {}}, _exec, category="analysis")
-    finish = default_catalog()[-1]
+    finish = fixture_catalog()[-1]
 
     briefs: list[str] = []
     base = _scientist_calls("make_art", {})

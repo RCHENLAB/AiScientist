@@ -33,7 +33,7 @@ _CELLQC = {"status": "ok", "cells_before": 15872, "cells_after": 14553, "genes_a
                           "ambient_soupx_contamination_mean": 0.016, "median_pct_mt_kept": 0.6897,
                           "removed_only_by": {"min_counts": 2, "min_features": 28, "max_pct_mt": 317,
                                               "several_thresholds": 43}}]}
-_STEP = "**CellQC quality control** — Run `run_cellqc` on the Sample2_Ddx41 library."
+_STEP = "**CellQC quality control** — Run `mcp_run_cellqc` on the Sample2_Ddx41 library."
 # What the writer returns when a report is asked for: its own layout, the tool's numbers.
 _WRITTEN = ("# Quality control of Sample2_Ddx41\n\n"
             "CellQC kept 14,553 of 15,872 cells (91.7%).\n\n"
@@ -81,7 +81,7 @@ def _run(tmp_path, monkeypatch, question: str, final_answer: str, extra_steps=()
             self.report_requested = wants_written_report(question)
             if writeup_mode == "stopped":
                 conn.hard_stop.set()
-            steps = [{"tool": "run_cellqc", "ok": True, "args": {"species": "mouse"}, "result": _CELLQC},
+            steps = [{"tool": "mcp_run_cellqc", "ok": True, "args": {"species": "mouse"}, "result": _CELLQC},
                      *extra_steps, {"tool": "finish", "ok": True, "result": {}}]
             rnd = LabRound(1, 0, _STEP, "Scientist",
                            {"final_answer": "CellQC kept 14,553 of 15,872 barcodes.", "steps": steps},
@@ -243,7 +243,7 @@ def test_final_outputs_enforce_policy_even_when_model_text_disobeys(tmp_path, mo
         extra = [{"tool": "run_code", "ok": True, "args": {"code": "write_summary()"},
                   "result": {"status": "ok", "tables": ["tables/isg.csv"]}}]
     elif mode != "qc":
-        extra = [{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}]
+        extra = [{"tool": "mcp_run_clustering", "ok": True, "result": {"status": "ok"}}]
     _, _, payloads, art, rendered = _run(
         tmp_path, monkeypatch, "Analyze this dataset and write a report.", dirty,
         extra_steps=extra, writeup_mode=mode)
@@ -277,7 +277,7 @@ def test_a_request_for_the_doublet_comparison_keeps_it(tmp_path, monkeypatch):
     _, _, payloads, art, rendered = _run(
         tmp_path, monkeypatch, "Analyze this dataset and write a report that compares "
         "DoubletFinder with scDblFinder.", dirty,
-        extra_steps=[{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}],
+        extra_steps=[{"tool": "mcp_run_clustering", "ok": True, "result": {"status": "ok"}}],
         writeup_mode="full")
     for output in (rendered[0], _reply(payloads)):
         assert "DoubletFinder and scDblFinder agree poorly (kappa 0.10)." in output
@@ -298,7 +298,7 @@ def test_final_manuscript_and_chat_keep_methods_limitations_and_residual_finding
              "DoubletFinder and scDblFinder agree poorly (kappa 0.10).\n")
     _, _, payloads, art, rendered = _run(
         tmp_path, monkeypatch, "Analyze this dataset and write a report.", draft,
-        extra_steps=[{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}],
+        extra_steps=[{"tool": "mcp_run_clustering", "ok": True, "result": {"status": "ok"}}],
         writeup_mode="full")
     for output in (rendered[0], _reply(payloads)):
         for preserved in (method, limitation, finding, failure, warning):
@@ -318,7 +318,7 @@ def test_an_analysis_with_no_report_asked_for_answers_in_the_chat(tmp_path, monk
     in the chat can still continue from the run."""
     conn, req, payloads, art, rendered = _run(
         tmp_path, monkeypatch, "Cluster these cells.", "Three clusters were found.",
-        extra_steps=[{"tool": "run_clustering", "ok": True, "result": {"status": "ok"}}])
+        extra_steps=[{"tool": "mcp_run_clustering", "ok": True, "result": {"status": "ok"}}])
     assert rendered == []
     assert not (art / "report" / "report.md").exists()
     assert "Three clusters were found." in _reply(payloads)

@@ -1,6 +1,6 @@
 """A chat message changes a CellQC cutoff in the waiting plan (issue 61).
 
-"Raise the mitochondrial limit to 20" sets ``max_pct_mt`` to 20 on the plan's ``run_cellqc`` step —
+"Raise the mitochondrial limit to 20" sets ``max_pct_mt`` to 20 on the plan's ``mcp_run_cellqc`` step —
 read by code, shown on the card as changed from its default, kept through a later revision, passed to
 the tool as written, and reported in the QC reply. A request that cannot be used (out of range, no
 value, no cutoff named) is explained back and the plan stays as it was.
@@ -20,9 +20,9 @@ from aiscientist.agents.research_harness import HarnessContext, HarnessTool, Res
 from aiscientist.agents.research_lab import LabConfig, ResearchLab  # noqa: E402
 from aiscientist.reporting.qc_summary import QC_SUMMARY_POLICY, cutoff_lines, qc_result_summary  # noqa: E402
 
-QC = ("**CellQC** — Filter the barcodes with `run_cellqc`: drop barcodes with fewer than 500 counts, "
+QC = ("**CellQC** — Filter the barcodes with `mcp_run_cellqc`: drop barcodes with fewer than 500 counts, "
       "fewer than 300 genes, or more than 10% mitochondrial reads.")
-CLUSTER = ("**Clustering & UMAP** — Group the cells with `run_clustering` at resolution 0.5 and "
+CLUSTER = ("**Clustering & UMAP** — Group the cells with `mcp_run_clustering` at resolution 0.5 and "
            "lay them out on a 2-D map.")
 SCHEMA = {"min_counts": {"type": "integer", "default": 500},
           "min_features": {"type": "integer", "default": 300},
@@ -85,8 +85,8 @@ def _catalog(calls: list) -> list[HarnessTool]:
             return {"status": "ok", "tool": name}
         return HarnessTool(name, f"{name} test double", {"type": "object", "properties": props}, run)
 
-    return [tool("run_cellqc", SCHEMA),
-            tool("run_clustering", {"resolution": {"type": "number", "default": 1.0}})]
+    return [tool("mcp_run_cellqc", SCHEMA),
+            tool("mcp_run_clustering", {"resolution": {"type": "number", "default": 1.0}})]
 
 
 def _scientist_chat(messages, _tools):
@@ -97,7 +97,7 @@ def _scientist_chat(messages, _tools):
         return finish
     brief = next(m["content"] for m in messages if m.get("role") == "user")
     step = brief.split("Step to execute now:", 1)[1].split("\n", 1)[0]
-    for name, args in (("run_cellqc", {}), ("run_clustering", {"resolution": 0.5})):
+    for name, args in (("mcp_run_cellqc", {}), ("mcp_run_clustering", {"resolution": 0.5})):
         if f"`{name}`" in step:
             return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
                 "name": name, "arguments": json.dumps(args)}}]}
@@ -202,10 +202,10 @@ def test_the_value_survives_a_later_revision_and_reaches_the_tool_unchanged():
     _result, events, _seen = _run(_lab(calls, {}, reply),
                                   "set max_pct_mt to 20", "cluster at resolution 0.8")
     assert _cutoffs(events)["max_pct_mt"]["value"] == 20.0 and _cutoffs(events)["max_pct_mt"]["changed"]
-    run = [args for name, args in calls if name == "run_cellqc"]
+    run = [args for name, args in calls if name == "mcp_run_cellqc"]
     assert run == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}], \
         "the Scientist sent nothing; the approved value is exactly what ran"
-    assert ("run_clustering", {"resolution": 0.8}) in calls
+    assert ("mcp_run_clustering", {"resolution": 0.8}) in calls
 
 
 def test_two_cutoffs_in_one_message_are_both_set():
@@ -213,7 +213,7 @@ def test_two_cutoffs_in_one_message_are_both_set():
     _result, events, _seen = _run(_lab(calls, {}), "set min_counts to 1000 and min_features to 250")
     rows = _cutoffs(events)
     assert (rows["min_counts"]["value"], rows["min_features"]["value"]) == (1000, 250)
-    assert [args for name, args in calls if name == "run_cellqc"] == [
+    assert [args for name, args in calls if name == "mcp_run_cellqc"] == [
         {"min_counts": 1000, "min_features": 250, "max_pct_mt": 10.0}]
 
 
@@ -230,7 +230,7 @@ def test_a_request_that_cannot_be_used_is_explained_before_anything_runs(request
     assert why in answer and answer.startswith("Nothing was changed.")
     assert seen[1] == seen[0] and not _of(events, "plan_edited"), "the plan is as it was"
     assert "revise" not in counts and "patch" not in counts and counts["plan"] == 1
-    assert [args for name, args in calls if name == "run_cellqc"] == [
+    assert [args for name, args in calls if name == "mcp_run_cellqc"] == [
         {"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}], "it ran with the defaults, as approved"
 
 
@@ -245,7 +245,7 @@ def test_a_plan_with_no_cellqc_step_leaves_the_message_to_the_other_ways_of_revi
     calls: list = []
     counts: dict = {}
     lab = _lab(calls, counts)
-    lab.scientist = ResearchHarness(catalog=[t for t in _catalog(calls) if t.name != "run_cellqc"],
+    lab.scientist = ResearchHarness(catalog=[t for t in _catalog(calls) if t.name != "mcp_run_cellqc"],
                                     chat_fn=_scientist_chat)
     _result, events, _seen = _run(lab, "raise the mitochondrial limit to 20")
     assert not [e for e in events if e.get("type") == "plan_answer"], "the cutoff path explains nothing here"
@@ -338,8 +338,8 @@ def test_a_reply_with_a_cutoff_and_another_change_keeps_both(qc_settings):
     _result, events, _seen = _run(_lab(calls, counts, _resolution_reply(**qc_settings)),
                                   "raise the mitochondrial limit to 20 and cluster at resolution 0.8")
     assert counts["revise"] == 1 and counts["plan"] == 1
-    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}]
-    assert _ran(calls, "run_clustering") == [{"resolution": 0.8}]
+    assert _ran(calls, "mcp_run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}]
+    assert _ran(calls, "mcp_run_clustering") == [{"resolution": 0.8}]
     assert not _of(events, "plan_answer")
 
 
@@ -349,7 +349,7 @@ def test_when_the_model_names_nothing_the_redraft_still_gets_the_stated_cutoff()
     _result, _events, _seen = _run(_lab(calls, counts),
                                    "raise the mitochondrial limit to 20 and cluster at resolution 0.8")
     assert counts["revise"] == 1 and counts["plan"] == 2, "the model named nothing: patch, then redraft"
-    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}]
+    assert _ran(calls, "mcp_run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 20.0}]
 
 
 def test_a_mito_word_and_another_number_go_to_the_reviser_untouched():
@@ -358,8 +358,8 @@ def test_a_mito_word_and_another_number_go_to_the_reviser_untouched():
     _result, events, _seen = _run(_lab(calls, counts, _resolution_reply()),
                                   "regress out mitochondrial content and cluster at resolution 0.8")
     assert counts["revise"] == 1 and not _of(events, "plan_answer")
-    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}]
-    assert _ran(calls, "run_clustering") == [{"resolution": 0.8}]
+    assert _ran(calls, "mcp_run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}]
+    assert _ran(calls, "mcp_run_clustering") == [{"resolution": 0.8}]
 
 
 @pytest.mark.parametrize("text", ORDINARY[4:7])
@@ -377,15 +377,15 @@ def test_a_number_that_contradicts_raise_is_explained_and_nothing_changes():
     answer = _of(events, "plan_answer")[0]["answer"]
     assert answer.startswith("Nothing was changed.") and "below the plan's 10%" in answer
     assert seen[1] == seen[0] and "revise" not in counts
-    assert _ran(calls, "run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}]
+    assert _ran(calls, "mcp_run_cellqc") == [{"min_counts": 500, "min_features": 300, "max_pct_mt": 10.0}]
 
 
-SCANPY = ("**Scanpy QC** — Filter the cells with `run_scanpy_qc`: keep cells with at least 200 genes "
+SCANPY = ("**Scanpy QC** — Filter the cells with `mcp_run_scanpy_qc`: keep cells with at least 200 genes "
           "and under 10% mitochondrial reads.")
 
 
 def test_a_cutoff_no_step_takes_goes_to_the_reviser_on_a_scanpy_plan():
-    # run_scanpy_qc takes max_pct_mt but calls the gene floor min_genes: "minimum genes per cell" is
+    # mcp_run_scanpy_qc takes max_pct_mt but calls the gene floor min_genes: "minimum genes per cell" is
     # min_features to the reader, which no step takes, so the model maps it, as before issue 61.
     calls: list = []
     counts: dict = {}
@@ -401,25 +401,25 @@ def test_a_cutoff_no_step_takes_goes_to_the_reviser_on_a_scanpy_plan():
 
     def scanpy_chat(messages, _tools):
         brief = next(m["content"] for m in messages if m.get("role") == "user")
-        if not any(m.get("role") == "tool" for m in messages) and "`run_scanpy_qc`" in \
+        if not any(m.get("role") == "tool" for m in messages) and "`mcp_run_scanpy_qc`" in \
                 brief.split("Step to execute now:", 1)[1].split("\n", 1)[0]:
             return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
-                "name": "run_scanpy_qc", "arguments": "{}"}}]}
+                "name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
         return _scientist_chat(messages, _tools)
 
     def run(args, _ctx):
-        calls.append(("run_scanpy_qc", dict(args)))
-        return {"status": "ok", "tool": "run_scanpy_qc"}
+        calls.append(("mcp_run_scanpy_qc", dict(args)))
+        return {"status": "ok", "tool": "mcp_run_scanpy_qc"}
 
-    scanpy = HarnessTool("run_scanpy_qc", "scanpy QC test double", {"type": "object", "properties": {
+    scanpy = HarnessTool("mcp_run_scanpy_qc", "scanpy QC test double", {"type": "object", "properties": {
         "min_genes": {"type": "integer", "default": 200}, "max_pct_mt": {"type": "number", "default": 10.0}}}, run)
     lab._complete_fn = scanpy_complete
-    lab.scientist = ResearchHarness(catalog=[scanpy] + [t for t in _catalog(calls) if t.name != "run_cellqc"],
+    lab.scientist = ResearchHarness(catalog=[scanpy] + [t for t in _catalog(calls) if t.name != "mcp_run_cellqc"],
                                     chat_fn=scanpy_chat)
     _result, events, _seen = _run(lab, "lower the minimum genes per cell to 150")
     assert counts["revise"] == 1
     assert not [e for e in _of(events, "plan_answer") if e["answer"].startswith("Nothing was changed")]
-    assert [args.get("min_genes") for args in _ran(calls, "run_scanpy_qc")] == [150]
+    assert [args.get("min_genes") for args in _ran(calls, "mcp_run_scanpy_qc")] == [150]
 
 
 def test_a_cellqc_step_is_the_qc_step_a_reply_points_at():

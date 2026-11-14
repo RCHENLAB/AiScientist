@@ -106,25 +106,25 @@ def test_the_svg_has_a_focusable_node_per_graph_node_and_escapes_labels():
 
 def test_a_task_is_drawn_where_it_is():
     runs = [
-        _run_view("a", active=[{"phase": "tool", "tool": "run_de", "since": NOW - 70, "step": "DE per cell type",
+        _run_view("a", active=[{"phase": "tool", "tool": "mcp_run_de", "since": NOW - 70, "step": "DE per cell type",
                                 "n": 3, "specialist": "Clustering & cell-type specialist"},
                                {"phase": "critic", "tool": "", "since": NOW - 5, "step": "Literature", "n": 4,
                                 "specialist": "Scientist"}]),
         _run_view("b", stage="approve", stage_label="Your review", waiting="plan"),
         _run_view("c", stage="plan", stage_label="Plan", llm={"calls": 1, "thinking": ["plan"]}),
         _run_view("d", kind="chat", stage="chat", stage_label="Chat answer", mine=False,
-                  active=[{"phase": "tool", "tool": "literature_search", "since": NOW - 2}]),
+                  active=[{"phase": "tool", "tool": "mcp_literature_search", "since": NOW - 2}]),
         _run_view("e", stage="done", stage_label="Done", ended=NOW - 60, outcome="failed"),
     ]
     t = _run(runs)["targets"]
     at = {k["key"]: k["node"] for k in t["tokens"]}
-    assert at == {"a": "tool:run_de", "a:4": "critic", "b": "approve", "c": "plan",
-                  "d": "tool:literature_search", "e": "done"}
-    assert t["hot"]["tool:run_de"] == "hot" and t["hot"]["critic"] == "hot"
+    assert at == {"a": "tool:mcp_run_de", "a:4": "critic", "b": "approve", "c": "plan",
+                  "d": "tool:mcp_literature_search", "e": "done"}
+    assert t["hot"]["tool:mcp_run_de"] == "hot" and t["hot"]["critic"] == "hot"
     assert t["hot"]["approve"] == "waiting", "a run waiting for its owner is shown waiting"
     assert "done" not in t["hot"], "a finished run sits at Done without lighting it"
     links = {(x["from"], x["to"]) for x in t["links"]}
-    assert ("scientist", "tool:run_de") in links and ("chat", "tool:literature_search") in links
+    assert ("scientist", "tool:mcp_run_de") in links and ("chat", "tool:mcp_literature_search") in links
     assert ("model", "plan") in links, "the model is drawn thinking for the stage that called it"
     assert "approve>execute" in t["flows"] and "request>chat" in t["flows"]
     tok = next(k for k in t["tokens"] if k["key"] == "e")
@@ -150,12 +150,12 @@ def test_a_busy_node_shows_four_tasks_and_a_count_and_finished_ones_leave_done()
 
 def test_a_run_card_says_what_runs_and_escapes_what_the_run_carries():
     runs = [_run_view("a", question="<img src=x onerror=alert(1)> DDX41", active=[
-        {"phase": "tool", "tool": "run_de<b>", "since": NOW - 70, "step": "DE <per> cell type", "n": 3,
+        {"phase": "tool", "tool": "mcp_run_de<b>", "since": NOW - 70, "step": "DE <per> cell type", "n": 3,
          "specialist": "Clustering & cell-type specialist"}]),
             _run_view("b", mine=False, stage="approve", stage_label="Your review", waiting="plan")]
     cards = _run(runs)["cards"]
     assert "&lt;img src=x" in cards[0] and "<img" not in cards[0]
-    assert "<code>run_de&lt;b&gt;</code>" in cards[0] and "DE &lt;per&gt; cell type" in cards[0]
+    assert "<code>mcp_run_de&lt;b&gt;</code>" in cards[0] and "DE &lt;per&gt; cell type" in cards[0]
     assert "<b>Step 3</b>" in cards[0] and "1m 10s" in cards[0] and "5m 00s" in cards[0]
     assert "1/4 steps accepted" in cards[0]
     assert "another account" in cards[1] and "Waiting for its owner to review the plan." in cards[1]
@@ -185,9 +185,9 @@ def test_the_catalog_lists_every_entry_one_line_each_and_its_search_and_escaping
     o = system_info.system_overview()
     hostile = {"name": "evil<b>", "summary": "<img src=x onerror=alert(1)>", "description": 'say "hi" & <script>',
                "where": "HPC3", "requires": [], "available": None, "reads_private_data": False, "category": "x", "code": ""}
-    queries = [["run_de", ["run_de"]], ["cell type", ["celltype_annotation", "cell-type labels"]],
+    queries = [["mcp_run_de", ["mcp_run_de"]], ["cell type", ["celltype_annotation", "cell-type labels"]],
                ["hpc3 variant", ["annotate_variants", "HPC3 · variants (VEP)"]],
-               ["hpc3 variant", ["run_de", "HPC3 · analysis"]], ["", ["anything"]]]
+               ["hpc3 variant", ["mcp_run_de", "HPC3 · analysis"]], ["", ["anything"]]]
     payload = json.dumps({"src": block, "overview": o, "queries": queries, "hostile": hostile})
     done = subprocess.run([node, "-e", CATALOG_HARNESS], input=payload, capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr

@@ -344,8 +344,8 @@ valid scientific results.
 
 ## Dedicated literature routes and local retrieval
 
-When a literature server is registered, the console's corpus curation and PubMed
-answer routes use that same MCP image through `gateway/literature_mcp.py`. They
+The console's corpus curation and PubMed answer routes require the reviewed native
+literature server and use its image through `gateway/literature_mcp.py`. They
 retain their plan/spec review, public-corpus cache, cancellation, curation tables,
 and download layout. The selected session model is used for extraction, including
 native Anthropic, the lab's shared model, or the session's existing cluster model.
@@ -355,8 +355,8 @@ through the same analysis's status tool so their measured spend and stop reason
 remain available; a failed scan does not publish or cache completed tables.
 PubMed and corpus retrieval use separate analysis identifiers because they run
 concurrently. The complete synced JSON is read only from the expected tool and
-analysis under this run's artifacts. Unregistered deployments keep their existing
-routes during the migration acceptance period.
+analysis under this run's artifacts. An unregistered or unavailable server produces an
+explicit availability error; no retired scientific implementation is imported as fallback.
 
 The local corpus mirror can use the published server without an HPC connection:
 
@@ -379,14 +379,23 @@ filesystem and corpus/model mounts are read-only; only a private run directory
 and bounded `/tmp` are writable. It runs as the service user's numeric UID with
 2 CPUs, 8 GiB memory, 128 PIDs and a 10-minute timeout. Cancellation removes its
 uniquely named container. The existing mirror-freshness check still decides when
-HPC retrieval is preferred. The legacy local implementation remains available
-when this option is unset, pending complete tool retirement.
+HPC retrieval is preferred. Without a connected cluster or explicitly configured local
+runner, retrieval reports that capability unavailable. Plain conversation remains available.
+
+Public lookup is separately enabled with
+`AISCIENTIST_LOCAL_PUBLIC_LITERATURE_MCP=docker`. It runs only the fixed native
+`literature_search` command, with outbound network access but no corpus/model-cache
+mount or model credential. This does not enable network access in the offline corpus
+container. Both local modes require the operator to pre-pull the reviewed image;
+the app does not change Docker permissions or mount the Docker socket.
 
 The published literature 0.0.3 digest was exercised on the Eye Server using its
 existing public mirror and offline PubMedBERT: live schema verification and a
 PRPF31 retrieval returned two passages in 19.12 seconds with network disabled.
-An in-flight cancellation left no owned container. This validates local retrieval,
-not a generative model or a complete corpus extraction.
+An in-flight cancellation left no owned container. The final literature 0.0.4 image
+also completed real public Europe PMC lookup on the Eye Server, returning three
+identifiers without an HPC or model call. These are scoped retrieval checks, not
+generative-model or full-corpus extraction acceptance.
 
 ## Exporting and reviewing a catalog
 
@@ -443,7 +452,7 @@ object: omitted fields retain server defaults, the model cannot add `rerun` or
 change an omitted scientific setting, and another scientific tool is refused for
 that step. Read-only metadata/status checks remain available. The session's
 selected model, resource, billing, budget and cancellation paths are unchanged.
-# Saved plans across tool retirement
+## Saved plans across tool retirement
 
 Restoring a saved plan does not rename retired scientific tools automatically. A
 pending step that names an unavailable migrated tool requires a replacement plan
@@ -463,3 +472,32 @@ containing only registered job-status calls uses the exact-call guard and cannot
 launch a new scientific job. Prose-only historical continuations retain their
 existing behavior. Added, removed or reordered steps require a newly reviewed
 study rather than silently changing continuation indices.
+
+
+### Recovering completed task evidence
+
+An explicit original run ID plus `sN: registered_status_tool {JSON}` lines opens
+normal review of that run. Every requested task must match a completed accepted
+receipt from that original step, including server, analysis ID and task ID. All
+retained steps must have accepted evidence. Ownership, conversation and the exact
+recorded RunHome are checked before review; a missing original workspace stops
+recovery. This narrow path does not require an AnnData checkpoint for literature
+or phenotype tasks. Ordinary analysis continuation keeps its checkpoint checks.
+
+Approval preserves the question, step identifiers and unselected steps, and executes
+only the selected status calls. Requests cannot add tools or change a verified task.
+Prior process records, plans and reports are archived with SHA-256 before the review.
+Full corrected responses get separate owned task paths; untracked historical aliases
+are kept as evidence rather than silently replaced.
+
+### Revising reports from accepted results
+
+A report-only request names an existing run in its original conversation and opens
+a one-step report review. The revision reads checksum-verified accepted full-result
+artifacts and preserves the scientific plan and run state. Both the manuscript and
+technical report receive that same evidence and the correction instructions. Old
+planning disclosures, critiques and claim-audit statements remain labelled as
+historical, not re-validated conclusions. Brief/QC templates cannot skip the approved
+correction. A revision may use the selected session model and report rendering jobs;
+it does not resubmit scientific tools. Earlier reports and each revision's grounding
+manifest remain in the run's evidence.

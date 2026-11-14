@@ -146,8 +146,8 @@ body"""
     assert any("relative" in p for p in problems) and any("spreadsheet" in p for p in problems)
     assert any("no description" in p for p in problems) and any("true or false" in p for p in problems)
     # a pipeline's entry must name the tool whose step writes it
-    assert so.from_text(text.replace("tables/ok.csv", "tables/ok.csv\n    tool: run_de"),
-                        needs_tool=True)[0][0].tool == "run_de"
+    assert so.from_text(text.replace("tables/ok.csv", "tables/ok.csv\n    tool: mcp_run_de"),
+                        needs_tool=True)[0][0].tool == "mcp_run_de"
     assert so.from_text(DE_MD, needs_tool=True)[0] == ()
 
 
@@ -218,11 +218,11 @@ def test_a_pipeline_declares_outputs_per_tool_and_keeps_its_own_description(tmp_
     (folder / "SKILL.md").write_text("""---
 name: demo
 description: The demo protocol
-tools: run_de
+tools: mcp_run_de
 outputs:
   - path: tables/de_*_all.csv
     kind: table
-    tool: run_de
+    tool: mcp_run_de
     description: One row per gene and group.
     required: true
 data_type: scrna
@@ -231,8 +231,8 @@ Plan the demo.""", encoding="utf-8")
     monkeypatch.setenv("AISCIENTIST_PIPELINES_DIR", str(tmp_path / "pipes"))
     loaded = pp._load_pipelines()["demo"]
     assert loaded.label == "The demo protocol"          # not the output's description
-    assert loaded.data_type == "scrna" and loaded.tools == ("run_de",)
-    assert [(o.path, o.tool) for o in loaded.outputs] == [("tables/de_*_all.csv", "run_de")]
+    assert loaded.data_type == "scrna" and loaded.tools == ("mcp_run_de",)
+    assert [(o.path, o.tool) for o in loaded.outputs] == [("tables/de_*_all.csv", "mcp_run_de")]
 
 
 # --- the check ------------------------------------------------------------------------------------
@@ -429,11 +429,11 @@ def test_a_skill_without_outputs_is_checked_for_nothing(tmp_path, library):
 
 def test_a_pipeline_tool_step_is_checked_for_the_outputs_the_pipeline_declares(tmp_path, library):
     lab, record, workspace = _lab(tmp_path, writes={})
-    lab._skills = [pp.PresetPipeline(key="demo", label="demo", prompt="p", tools=("run_de",), outputs=(
-        so.DeclaredOutput("tables/de_*_all.csv", "table", "One row per gene and group.", True, "run_de"),))]
-    expected, sources = lab._expected_outputs("**Markers** — Rank markers per cluster with `run_de`.")
+    lab._skills = [pp.PresetPipeline(key="demo", label="demo", prompt="p", tools=("mcp_run_de",), outputs=(
+        so.DeclaredOutput("tables/de_*_all.csv", "table", "One row per gene and group.", True, "mcp_run_de"),))]
+    expected, sources = lab._expected_outputs("**Markers** — Rank markers per cluster with `mcp_run_de`.")
     assert [o.path for o in expected] == ["tables/de_*_all.csv"] and sources == ["pipeline demo"]
-    assert lab._expected_outputs("**Cluster** — Group the cells with `run_clustering`.") == ([], [])
+    assert lab._expected_outputs("**Cluster** — Group the cells with `mcp_run_clustering`.") == ([], [])
 
 
 def test_old_verdicts_without_a_check_still_load():

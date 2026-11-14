@@ -5,12 +5,14 @@ much of the model's context they cost.
 
 | Layer | What it is | Can the model rewrite it? | Where |
 |---|---|---|---|
-| **Tool** | Fixed, tested code the Scientist calls by name. Most tools are Slurm jobs on HPC3. | No | [`src/aiscientist/tools/<name>/`](../src/aiscientist/tools/README.md) |
-| **Skill** | Guidance plus a code template that the Scientist reads, adapts to the dataset and runs. | Yes, that is its purpose | the pinned release of [`aiscientist-skills`](https://github.com/lijinbio/aiscientist-skills), and the induced-skill directory |
+| **Tool** | Fixed, tested code the Scientist calls by name. Most tools are Slurm jobs on HPC3. | No | [native MCP packages](https://github.com/liujs123456/aiscientist-mcp) and [platform utilities](../src/aiscientist/tools/README.md) |
+| **Skill** | Guidance for registered native tools, optionally with a code template the Scientist adapts. | Code templates can be adapted; native server implementations cannot. | the configured pinned [`aiscientist-skills`](https://github.com/liujs123456/aiscientist-skills) release, and the induced-skill directory |
 | **Pipeline** | A protocol for a whole study. It steers the PI's plan and names the tools it composes. | No | [`preset_pipelines/<name>/`](../preset_pipelines/README.md) |
 
-Adding any of the three is adding a folder (a skill's goes into the registry, which publishes it in
-a release). No platform code changes.
+A new scientific tool needs a native server release, exported schema and reviewed application catalog
+binding. Skills and pipelines add folders to their respective registries; a curated skill also needs
+a new pinned release. Instruction-only MCP skills describe existing registered calls and do not
+require a reference script or permission to rewrite the server's scientific implementation.
 
 Which layer a new capability belongs in: code that carries infrastructure (a Slurm job, a
 checkpoint, a container, an external service) or that must behave the same in every run is a tool.
@@ -19,13 +21,17 @@ of study are a pipeline.
 
 ## Tools
 
-A tool is a folder with a `TOOL.md` and a `tool.py`. The front matter of `TOOL.md` is the tool's
-manifest: its name, category, where it runs (`runs_on`), and optionally a container image.
-`tools/catalog.py` discovers the folders, and `agents/registry.py` builds the Scientist's tool list
-from them and routes each tool by its manifest: in the gateway process, or as a job on the
-analysis, variant, phenotype, literature or scGPT line of HPC3. The index of tools is generated
-from the manifests into [`src/aiscientist/tools/README.md`](../src/aiscientist/tools/README.md).
+Scientific tools live in independently released MCP packages. The application's reviewed
+[catalog](../src/aiscientist/agents/mcp_catalog/mcp_servers.json) pins the server version,
+image digest, full input schemas and executor settings. `agents/mcp_bridge.py` registers
+those descriptions and `agents/mcp_analysis.py` runs the contained CPU or GPU server,
+collects complete task evidence and returns a bounded response. The installed skill must
+bind the same image. Server settings and reference mounts are operator configuration.
 
+The remaining platform tools use `TOOL.md` manifests and `tools/catalog.py`; their
+[index](../src/aiscientist/tools/README.md) is generated from those manifests. The app
+retains staging, metadata, report and CodeAct infrastructure, not copies of the migrated
+scientific algorithms.
 The platform adds its own tools to that list: `finish`, `run_code` (the sandbox every skill runs
 in), the HPC3 shell tools when the session has a shell, `describe_environment`, and the tools that
 read the other layers (`read_skill_reference`, `search_skills`, `read_tool_source`,
@@ -276,7 +282,8 @@ Successes and errors are counted per release, skill and version in one file for 
 it), so a broken version can be found and the pin rolled back. A registry skill is counted once
 per plan step whose code ran its method: a `run_code` call that calls one of the skill's own
 functions (every call, for a skill whose code has none to find), a `run_in_environment`
-command, or a call of a tool that runs the skill (`skill:` in its TOOL.md, such as `run_cellqc`).
+command, or a registered tool call bound to the skill (for example `mcp_run_cellqc` through its
+reviewed MCP catalog binding; platform tools can also declare `skill:` in their manifests).
 The step is a success when one of those calls succeeded and an error when none did. A
 step that only listed files or read what another step made is not counted. The attempts of one
 step are one use: a revision that succeeds turns the step's error into a success. Outside a plan
@@ -468,5 +475,8 @@ path. The collector also saves
 for other oversized responses. Stdout stays below the executor's 20,000-character
 limit and is removed from the parsed tool response.
 
-The schemas are the MCP `tools/list` of the pinned 0.0.3 source release. GPU and
-in-process execution, sampling and an HTTP transport are not part of this bridge.
+The Atlas schemas are the MCP `tools/list` of its pinned 0.0.3 release. The analysis
+adapter additionally supports the seven migrated domains, including scGPT GPU jobs
+and contained CPU execution for native `inprocess` declarations. Model-backed tools
+use the selected session model through the guarded gateway relay; provider credentials
+remain in the gateway. MCP calls use stdio, not an HTTP server transport.

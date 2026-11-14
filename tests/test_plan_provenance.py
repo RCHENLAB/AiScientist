@@ -17,6 +17,8 @@ is precisely why it stayed absent:
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 from aiscientist.agents.research_harness import nondefault_params
 from aiscientist.gateway.settings import LAB_STORAGE, REFERENCE_ROOT, SHARED_ROOT  # noqa: F401
 from aiscientist.agents.research_lab import (
@@ -32,8 +34,8 @@ from aiscientist.agents.research_lab import (
 def test_the_disclosure_is_separated_from_the_executable_agenda():
     """Left in the agenda it would be dispatched to the Scientist as a step to run."""
     agenda, disclosure = _split_self_sourced([
-        "Assess per-cell quality with `run_scanpy_qc`.",
-        "Compare the conditions within each cell type with `run_pseudobulk_de`.",
+        "Assess per-cell quality with `mcp_run_scanpy_qc`.",
+        "Compare the conditions within each cell type with `mcp_run_pseudobulk_de`.",
         "SELF-SOURCED: chose max_pct_mt=10 rather than the default 20 because retina nuclei "
         "tolerate less mitochondrial signal; the protocol names no threshold.",
     ])
@@ -116,11 +118,11 @@ def test_a_step_that_only_re_reads_an_earlier_result_is_recognised():
 def test_real_analysis_steps_that_happen_to_say_report_survive():
     """Half of a well-written plan says "report" — the word alone cannot be the signal."""
     for step in (
-        "Assess per-cell data quality with `run_scanpy_qc` and report how many cells and genes "
+        "Assess per-cell data quality with `mcp_run_scanpy_qc` and report how many cells and genes "
         "remain after filtering.",
-        "Compare cell-type proportions between the arms with `run_composition` and report which "
+        "Compare cell-type proportions between the arms with `mcp_run_composition` and report which "
         "populations shift.",
-        "Identify the genes marking each population with `run_de` and report their effect sizes.",
+        "Identify the genes marking each population with `mcp_run_de` and report their effect sizes.",
     ):
         assert not _is_readback_step(step), step
 
@@ -146,7 +148,7 @@ def test_a_plan_naming_an_invented_tool_is_annotated_not_pruned():
     step must survive; what must not survive is the reviewer's belief that a tested tool will run."""
     import json as _json
 
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**Contrast** — Compare arms with `run_wilcoxon_DE` stratified by majorclass",
@@ -164,7 +166,7 @@ def test_a_plan_naming_an_invented_tool_is_annotated_not_pruned():
 
     lab = ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="m"), LabConfig(),
                       complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(),
+                      scientist=ResearchHarness(catalog=[t for t in fixture_catalog() if t.name != "mcp_run_de"],
                                                 chat_fn=lambda *_a: {"content": "", "tool_calls": [
                                                     {"id": "f", "type": "function",
                                                      "function": {"name": "finish",
@@ -173,7 +175,7 @@ def test_a_plan_naming_an_invented_tool_is_annotated_not_pruned():
     result = lab.run("Compare the arms", on_event=events.append)
 
     flagged = [f for e in events if e["type"] == "plan_tooling" for f in e["findings"]]
-    # Neither name has a single obvious referent in THIS catalog (run_qc / run_de_markers / finish),
+    # Neither name has a single obvious referent in THIS catalog (mcp_run_scanpy_qc / mcp_run_de / finish),
     # so both are reported rather than corrected.
     assert {f["tool"] for f in flagged} == {"run_cell_bootstrapping", "run_wilcoxon_DE"}
     assert {f["kind"] for f in flagged} == {"unknown_tool"}
@@ -186,11 +188,11 @@ def test_enrichment_without_a_de_producer_gets_a_contrast_step_inserted():
     failed as 'no significant DE genes' and read like a null result."""
     import json as _json
 
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
-    agenda = ["**QC** — Filter and normalize with `run_scanpy_qc`",
-              "**Pathways** — Test enriched pathways with `run_enrichment` on the DE table"]
+    agenda = ["**QC** — Filter and normalize with `mcp_run_scanpy_qc`",
+              "**Pathways** — Test enriched pathways with `mcp_run_enrichment` on the DE table"]
 
     def complete(messages):
         sys_prompt = messages[0]["content"]
@@ -206,7 +208,7 @@ def test_enrichment_without_a_de_producer_gets_a_contrast_step_inserted():
                                     "majorclass": {"n": 11, "values": ["Rod", "Cone"]}}}
     lab = ResearchLab(HarnessContext(decisions={"dataset_result": profile}, tunnel_port=1,
                                      model="m"), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(),
+                      scientist=ResearchHarness(catalog=fixture_catalog(),
                                                 chat_fn=lambda *_a: {"content": "", "tool_calls": [
                                                     {"id": "f", "type": "function",
                                                      "function": {"name": "finish",
@@ -218,7 +220,7 @@ def test_enrichment_without_a_de_producer_gets_a_contrast_step_inserted():
     assert fixed and fixed[0]["before_step"] == 2
     assert len(result.agenda) == 3
     inserted = result.agenda[1]
-    assert "`run_de`" in inserted and "sampleid" in inserted and "WT" in inserted
+    assert "`mcp_run_de`" in inserted and "sampleid" in inserted and "WT" in inserted
     assert "stratify_by='majorclass'" in inserted
     assert result.agenda[2] == agenda[1], "the enrichment step itself is untouched"
 
@@ -241,13 +243,13 @@ def test_an_inserted_step_is_written_by_the_pi_not_a_template():
     the offline fallback."""
     import json as _json
 
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
-    agenda = ["**QC** — Filter and normalize with `run_scanpy_qc`",
-              "**Pathways** — Test enriched pathways with `run_enrichment` on the DE table"]
+    agenda = ["**QC** — Filter and normalize with `mcp_run_scanpy_qc`",
+              "**Pathways** — Test enriched pathways with `mcp_run_enrichment` on the DE table"]
     PI_SENTENCE = ("**Per-cell-type DDX41 vs WT contrast** — Within each `majorclass` population, "
-                   "compare DDX41 against WT cells with `run_de` (Wilcoxon, reference='WT', "
+                   "compare DDX41 against WT cells with `mcp_run_de` (Wilcoxon, reference='WT', "
                    "stratify_by='majorclass'), testing genes detected in >=10% of either arm and "
                    "calling changes at adjusted p<0.05 with |log2FC|>=0.25; the cell is the unit, "
                    "so this is an exploratory ranking.")
@@ -268,7 +270,7 @@ def test_an_inserted_step_is_written_by_the_pi_not_a_template():
                                     "majorclass": {"n": 11, "values": ["Rod", "Cone"]}}}
     lab = ResearchLab(HarnessContext(decisions={"dataset_result": profile}, tunnel_port=1,
                                      model="m"), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(),
+                      scientist=ResearchHarness(catalog=fixture_catalog(),
                                                 chat_fn=lambda *_a: {"content": "", "tool_calls": [
                                                     {"id": "f", "type": "function",
                                                      "function": {"name": "finish",
@@ -279,10 +281,10 @@ def test_an_inserted_step_is_written_by_the_pi_not_a_template():
 
 def test_a_step_naming_an_analysis_tool_is_never_a_literature_step():
     """A production DE step ending '…to guide biological interpretation' matched the literature
-    phrase list and was routed to the literature fast path: four literature_search calls, run_de
+    phrase list and was routed to the literature fast path: four literature_search calls, mcp_run_de
     never ran, the plan's central contrast was lost twice."""
     from aiscientist.agents.research_lab import _is_literature_step
-    de = ("**Descriptive differential ranking** — Rank genes with `run_de` (reference='WT', "
+    de = ("**Descriptive differential ranking** — Rank genes with `mcp_run_de` (reference='WT', "
           "stratify_by='majorclass') … This yields a ranking to guide biological interpretation.")
     assert not _is_literature_step(de)
     assert _is_literature_step("**Literature grounding** — Search the literature with "
@@ -291,12 +293,13 @@ def test_a_step_naming_an_analysis_tool_is_never_a_literature_step():
 
 
 def test_every_checkpoint_reading_analysis_tool_is_offloaded_to_hpc():
-    """run_composition ran IN-PROCESS on the eyeserver while QC's checkpoint sat on dfs3b — three
-    rounds of 'no analysis checkpoint found' on a labelled two-arm dataset, i.e. the protocol's
-    first analysis was structurally un-runnable. Every tool scrna_cli can dispatch must be routed."""
-    from aiscientist.agents.registry import _HPC_ANALYSIS_TOOLS
-    from aiscientist.tools.scrna_cli import _analysis_tools
-    assert set(_analysis_tools()) <= set(_HPC_ANALYSIS_TOOLS)
+    from aiscientist.agents.mcp_bridge import configured_servers
+    from aiscientist.tools import worker_cli
+    server = next(s for s in configured_servers() if s.name == "scrna-analysis")
+    assert server.adapter == "analysis" and server.runs_on == "hpc:analysis"
+    assert len([t for t in server.tools if t["name"].startswith("run_")]) == 11
+    assert worker_cli.run_tool("run_composition", "/unused", None, {})["status"] == "error"
+
 
 
 def test_mode_routing_is_decided_by_the_dataset_first():
@@ -424,46 +427,45 @@ def test_remote_dfs3b_paths_are_not_reported_as_missing_evidence(tmp_path):
 
 def test_a_step_that_names_a_tool_the_scientist_never_called_is_nudged_once():
     """From E2E run 3: the DE step ended on the model's own final text after five reconnaissance
-    calls, run_de never called; the Critic bounced it and a whole extra round fixed it. One
+    calls, mcp_run_de never called; the Critic bounced it and a whole extra round fixed it. One
     deterministic nudge is cheaper. Never applied when the tool WAS called."""
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
 
     calls: list[str] = []
     def chat_fn(messages, tools):
         calls.append(messages[-1]["content"] if messages else "")
         n = len(calls)
-        # first attempt: recon then final text; second (nudged) attempt: call run_qc then finish
+        # first attempt: recon then final text; second (nudged) attempt: call mcp_run_scanpy_qc then finish
         if n == 1:
             return {"content": "", "tool_calls": [{"id": "a", "type": "function",
-                    "function": {"name": "inspect_dataset", "arguments": "{}"}}]}
+                    "function": {"name": "mcp_inspect_dataset", "arguments": "{}"}}]}
         if n == 2:
             return {"content": "Ready to run the QC now.", "tool_calls": []}
         if n == 3:
             return {"content": "", "tool_calls": [{"id": "b", "type": "function",
-                    "function": {"name": "run_qc", "arguments": "{}"}}]}
+                    "function": {"name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
         return {"content": "", "tool_calls": [{"id": "f", "type": "function",
                 "function": {"name": "finish", "arguments": '{"answer": "done"}'}}]}
 
     lab = ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="m"), LabConfig(),
                       complete_fn=lambda m: "x",
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=chat_fn))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=chat_fn))
     events: list[dict] = []
-    res = lab._scientist("q", "**QC** — Filter cells with `run_qc` at the defaults.",
+    res = lab._scientist("q", "**QC** — Filter cells with `mcp_run_scanpy_qc` at the defaults.",
                          Specialist("Sci", "persona"), "", [], events.append)
     nudges = [e for e in events if e["type"] == "tool_nudge"]
-    assert nudges and nudges[0]["tools"] == ["run_qc"]
-    assert any(st.get("tool") == "run_qc" for st in res.steps), "the nudged attempt ran the tool"
+    assert nudges and nudges[0]["tools"] == ["mcp_run_scanpy_qc"]
+    assert any(st.get("tool") == "mcp_run_scanpy_qc" for st in res.steps), "the nudged attempt ran the tool"
     assert "never called" not in (calls[0] or ""), "first attempt is un-nudged"
-    assert any("without calling `run_qc`" in c for c in calls[1:]), "the nudge names the tool"
+    assert any("without calling `mcp_run_scanpy_qc`" in c for c in calls[1:]), "the nudge names the tool"
 
 
 def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
     """Run f3b8268c4fd4's second ORA attempt: an exploratory run_code succeeded, two more failed,
-    and the harness stopped "with the win" (done_early) though run_enrichment never ran. That is
+    and the harness stopped "with the win" (done_early) though mcp_run_enrichment never ran. That is
     the same "forgot to call it" as stopping on final text, and gets the same single nudge."""
-    from aiscientist.agents.research_harness import (HarnessContext, HarnessTool, ResearchHarness,
-                                                     default_catalog)
+    from aiscientist.agents.research_harness import (HarnessContext, HarnessTool, ResearchHarness)
     from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
 
     probes = iter([{"status": "ok", "stdout": "50 rows per group"},
@@ -471,8 +473,8 @@ def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
                    {"status": "error", "stderr": "IndexError: too many indices"}])
     empty = {"type": "object", "properties": {}}
     catalog = [HarnessTool("run_code", "python", empty, lambda _a, _c: next(probes)),
-               HarnessTool("run_enrichment", "ORA", empty, lambda _a, _c: {"status": "ok"}),
-               *[t for t in default_catalog() if t.name == "finish"]]
+               HarnessTool("mcp_run_enrichment", "ORA", empty, lambda _a, _c: {"status": "ok"}),
+               *[t for t in fixture_catalog() if t.name == "finish"]]
 
     calls: list[str] = []
     def chat_fn(messages, tools):
@@ -483,7 +485,7 @@ def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
                     "function": {"name": "run_code", "arguments": f'{{"n": {n}}}'}}]}
         if n == 4:                                    # nudged attempt: the step's tool, then finish
             return {"content": "", "tool_calls": [{"id": "e", "type": "function",
-                    "function": {"name": "run_enrichment", "arguments": "{}"}}]}
+                    "function": {"name": "mcp_run_enrichment", "arguments": "{}"}}]}
         return {"content": "", "tool_calls": [{"id": "f", "type": "function",
                 "function": {"name": "finish", "arguments": '{"answer": "done"}'}}]}
 
@@ -491,11 +493,11 @@ def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
                       complete_fn=lambda m: "x",
                       scientist=ResearchHarness(catalog=catalog, chat_fn=chat_fn))
     events: list[dict] = []
-    res = lab._scientist("q", "**ORA** — Map each cluster with `run_enrichment`.",
+    res = lab._scientist("q", "**ORA** — Map each cluster with `mcp_run_enrichment`.",
                          Specialist("Sci", "persona"), "", [], events.append)
 
     assert any(e["type"] == "early_stop" and e["reason"] == "done_early" for e in events)
     nudges = [e for e in events if e["type"] == "tool_nudge"]
-    assert len(nudges) == 1 and nudges[0]["tools"] == ["run_enrichment"]
+    assert len(nudges) == 1 and nudges[0]["tools"] == ["mcp_run_enrichment"]
     assert res.stop_reason == "finished"
-    assert any(st.get("tool") == "run_enrichment" for st in res.steps)
+    assert any(st.get("tool") == "mcp_run_enrichment" for st in res.steps)

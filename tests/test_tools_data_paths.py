@@ -14,16 +14,15 @@ TOOLS = Path(catalog.TOOLS_DIR)
 
 def test_gene_sets_are_read_from_tools_genesets(monkeypatch):
     monkeypatch.delenv("AISCIENTIST_GENESETS_DIR", raising=False)
-    assert Path(api.genesets_dir()).resolve() == (TOOLS / "genesets").resolve()
-    assert (TOOLS / "genesets" / "README.md").is_file()     # the folder the deploy fills with .gmt
+    monkeypatch.delenv("SCRNA_GENESETS_DIR", raising=False)
+    assert api.genesets_dir() is None  # no implicit source-tree science assets
 
 
 def test_gene_sets_dir_can_be_overridden(monkeypatch, tmp_path):
+    monkeypatch.delenv("SCRNA_GENESETS_DIR", raising=False)
     monkeypatch.setenv("AISCIENTIST_GENESETS_DIR", str(tmp_path))
     assert Path(api.genesets_dir()) == tmp_path
 
 
-def test_bundled_reference_files_exist():
-    for rel in ("map_phenotype_to_hpo/hpo_lexicon.tsv.gz", "map_phenotype_to_hpo/ird_hpo.tsv",
-                "gene_panels/ird_retnet.txt"):
-        assert (TOOLS / rel).is_file(), rel
+def test_native_hpo_assets_are_not_bundled_in_the_gateway():
+    assert not (TOOLS / "map_phenotype_to_hpo").exists()

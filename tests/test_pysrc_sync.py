@@ -24,7 +24,7 @@ def test_the_live_package_ships_tool_code_and_manifests(tmp_path):
     _pack_aiscientist_source(out)
     names = _members(out)
     for expected in ("aiscientist/gateway/app.py", "aiscientist/tools/sdk.py", "aiscientist/tools/catalog.py",
-                     "aiscientist/tools/run_de/tool.py", "aiscientist/tools/run_de/TOOL.md",
+                     "aiscientist/tools/worker_cli.py", "aiscientist/tools/_lib/dataset_preflight.py",
                      "aiscientist/tools/scrna_cli.py"):
         assert expected in names, expected
     assert not any(n.endswith(".pyc") or "__pycache__" in n for n in names)

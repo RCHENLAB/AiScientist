@@ -64,7 +64,10 @@ def test_base_wheel_contains_registry_and_can_register_atlas(tmp_path, skill_rel
         info = message_from_bytes(archive.read(next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))))
         assert "aiscientist/agents/mcp_catalog/mcp_servers.json" in archive.namelist()
         assert "aiscientist/agents/mcp_catalog/mcp/atlas-expression-exploration-0.0.3.tools.json" in archive.namelist()
-        assert "aiscientist/tools/run_scanpy_qc/TOOL.md" in archive.namelist()
+        assert "aiscientist/tools/run_scanpy_qc/TOOL.md" not in archive.namelist()
+        assert "aiscientist/tools/worker_cli.py" in archive.namelist()
+        assert "aiscientist/tools/_lib/dataset_preflight.py" in archive.namelist()
+        assert "aiscientist/agents/reference_data/ird_retnet.txt" in archive.namelist()
         assert "aiscientist/tools/_lib/marker_references/retina.json" in archive.namelist()
 
     pending = list(info.get_all("Requires-Dist", []))
@@ -118,8 +121,9 @@ servers = load_servers()
 assert {server.name for server in servers} >= {'atlas-expression-exploration', 'variant-annotation', 'scgpt-annotation'}
 assert len(servers[0].tools) == 9
 plain = {tool.name for tool in build_scientist_catalog()}
-assert 'run_scanpy_qc' in plain and 'resolve_genes' not in plain
-assert any(tool['name'] == 'run_scanpy_qc' for tool in system_overview()['tools'])
+assert 'finish' in plain and not {'run_scanpy_qc', 'run_qc', 'run_de_markers', 'resolve_genes'} & plain
+assert not any(tool['name'] in {'run_scanpy_qc', 'run_qc', 'run_de_markers'} for tool in system_overview()['tools'])
+assert api.load_gene_panel('ird')
 class Runner:
     supports_skill_policy = True
     def run_in_image(self, *args, **kwargs):

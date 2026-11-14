@@ -13,7 +13,7 @@ def test_perturbation_analysis_skill_loads():
     assert "perturb" in low and "control" in low and "e-distance" in low
     # composes the DE + code-exec tools — the shared-reference (vs one control) DE needs run_code,
     # which run_de (per-cluster one-vs-rest) does not cover.
-    for t in ("run_de", "run_enrichment", "run_code"):
+    for t in ("mcp_run_de", "mcp_run_enrichment", "run_code"):
         assert t in p.tools, f"expected tool {t!r} in {p.tools}"
 
 

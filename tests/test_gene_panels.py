@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from aiscientist.tools.gene_panels import available_panels, load_gene_panel
+from aiscientist.agents.reference_panels import available_panels, load_gene_panel
 
 
 def test_ird_panel_loads_and_is_sane():

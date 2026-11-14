@@ -1,7 +1,7 @@
 ---
 name: differential_expression
 description: Compare an experimental condition vs control (e.g. KO vs WT) per cell type, with pathway interpretation
-tools: run_scanpy_qc, run_clustering, run_de, run_enrichment, run_code
+tools: mcp_run_scanpy_qc, mcp_run_clustering, mcp_run_de, mcp_run_enrichment, run_code
 ---
 
 # Differential Expression Protocol
@@ -17,7 +17,7 @@ that).
 |---|---|
 | **Input** | one scRNA-seq AnnData whose `obs` has a **2-group condition column** (+ ideally an existing cell-type / cluster label column) |
 | **Output** | per-cell-type DE tables (logFC + adjusted p), per-cell-type enrichment, a DEG-count summary table, volcano plots, shared up/down-regulated heatmaps, enrichment bar plots |
-| **Engine** | `scanpy` (`rank_genes_groups`) driven by `run_scanpy_qc` / `run_de` (`reference=` + `stratify_by=`) / `run_enrichment`; `run_clustering` only when the data has no labels |
+| **Engine** | `scanpy` (`rank_genes_groups`) driven by `mcp_run_scanpy_qc` / `mcp_run_de` (`reference=` + `stratify_by=`) / `mcp_run_enrichment`; `mcp_run_clustering` only when the data has no labels |
 | **Not for** | assigning / predicting cell-type labels (use the `celltype_annotation` pipeline instead) |
 
 > **How to read the "parameters" in each step.** Two kinds of knob feed these tools, and this protocol
@@ -37,10 +37,10 @@ that).
 
 | # | Step | Tool / skill | 🔬 Key agent-chosen params | Output |
 |---|------|--------------|----------------------------|--------|
-| 1 | **QC the cells** | `run_scanpy_qc` | filter thresholds, HVG *(agent-chosen per study)* | filtered + normalized AnnData, reported counts |
-| 2 | **Define the comparison** | *(planning, from DATASET PROFILE)* · `run_clustering` **only if no labels** | condition column, reference group, cell-type column | named contrast + stratification |
-| 3 | **Per-cell-type DE** | `run_de` with `reference=` + `stratify_by=` | condition-vs-**reference** contrast, cell-type column, `min_cells` | per-cell-type DEG tables + volcanoes |
-| 4 | **Pathway enrichment** | `run_enrichment` | up- & down-gene sets per cell type (SYMBOLS) | enrichment per cell type |
+| 1 | **QC the cells** | `mcp_run_scanpy_qc` | filter thresholds, HVG *(agent-chosen per study)* | filtered + normalized AnnData, reported counts |
+| 2 | **Define the comparison** | *(planning, from DATASET PROFILE)* · `mcp_run_clustering` **only if no labels** | condition column, reference group, cell-type column | named contrast + stratification |
+| 3 | **Per-cell-type DE** | `mcp_run_de` with `reference=` + `stratify_by=` | condition-vs-**reference** contrast, cell-type column, `min_cells` | per-cell-type DEG tables + volcanoes |
+| 4 | **Pathway enrichment** | `mcp_run_enrichment` | up- & down-gene sets per cell type (SYMBOLS) | enrichment per cell type |
 | 5 | **Cross-cell-type synthesis** | *(report from Step-3 tables)* | — | shared vs cell-type-specific signatures |
 | 6 | **Figures / tables** | `run_code` (adapt template) | *(adapt template)* | DEG-count table, volcano, heatmaps, enrichment bars |
 
@@ -70,16 +70,16 @@ filtering are the audit trail for what entered the comparison.
 **🔬 Agent-chosen:** the filter thresholds and whether to select HVGs *(agent-chosen per study)*. **Honor
 any QC columns already in the data** (e.g. `percent.mt`, doublet calls) rather than recomputing over them.
 
-**What runs** — the `run_scanpy_qc` tool call:
+**What runs** — the `mcp_run_scanpy_qc` tool call:
 ```
-run_scanpy_qc(...)   # per-cell QC metrics → filter → normalize + log1p (+ HVG); report counts
+mcp_run_scanpy_qc(...)   # per-cell QC metrics → filter → normalize + log1p (+ HVG); report counts
 ```
 
 **✅ Verify this step:** cell counts before/after filtering are reported · existing QC columns
 (`percent.mt`, doublet flags) were honored, not silently overwritten · the matrix is normalized + log1p'd
 before any DE.
 
-<sub>Source: `run_scanpy_qc` · SKILL.md "Ordered plan" §1</sub>
+<sub>Source: `mcp_run_scanpy_qc` · SKILL.md "Ordered plan" §1</sub>
 </details>
 
 <details>
@@ -98,20 +98,20 @@ reference group right is what makes the fold-changes point the correct direction
 |---|---|
 | **Condition / group column** | a low-cardinality (usually 2-level) `obs` column naming an experimental variable: `sampleid`, `condition`, `genotype`, `treatment`, `group`, `orig.ident`, `disease`. Its two values **are** the comparison (e.g. `sampleid=[DDX41, WT]` → DDX41 vs WT). The dataset / file name often confirms intent (`*_DEG` = they want DE). |
 | **Reference (control) group** | the level whose name looks like the baseline — `WT`, `wild-type`, `control`, `ctrl`, `untreated`, `vehicle`, `DMSO`, `normal`, `sham`. The **other** level is the condition of interest. **State which you chose.** If it is genuinely unclear, ask **ONE** clarify question in plan mode rather than guessing. |
-| **Cell-type stratification** | if `obs` already has a cell-type / cluster label column (`majorclass`, `celltype`, a predicted-label column), **REUSE it** and compare **within each cell type**. Do **NOT** re-cluster or re-annotate. **Only if no label column exists** do you `run_clustering` first and compare across clusters. |
+| **Cell-type stratification** | if `obs` already has a cell-type / cluster label column (`majorclass`, `celltype`, a predicted-label column), **REUSE it** and compare **within each cell type**. Do **NOT** re-cluster or re-annotate. **Only if no label column exists** do you `mcp_run_clustering` first and compare across clusters. |
 
-**What runs** — nothing heavy: this is a planning decision. `run_clustering` runs **only** in the no-label
+**What runs** — nothing heavy: this is a planning decision. `mcp_run_clustering` runs **only** in the no-label
 fallback:
 ```
 # only if obs has NO cell-type / cluster label column:
-run_clustering(...)   # otherwise: reuse the existing label column, skip clustering
+mcp_run_clustering(...)   # otherwise: reuse the existing label column, skip clustering
 ```
 
 **✅ Verify this step:** the condition column, both groups, and the **chosen reference group** are stated
 explicitly · the cell-type column used for stratification is named · clustering was **skipped** when labels
 already existed.
 
-<sub>Source: SKILL.md "Figuring out WHAT to compare from the data" + "Ordered plan" §2 · `run_clustering`</sub>
+<sub>Source: SKILL.md "Figuring out WHAT to compare from the data" + "Ordered plan" §2 · `mcp_run_clustering`</sub>
 </details>
 
 <details>
@@ -119,13 +119,13 @@ already existed.
 
 **First, pick the test from the DESIGN.** A condition contrast is a statement about the CONDITION, so the
 unit of replication is the **sample** (donor / animal / library), never the cell. With **≥2 samples per
-arm**, use **`run_pseudobulk_de`** (`sample_key`, `condition_key`, `group_key` = the cell-type column) — a
+arm**, use **`mcp_run_pseudobulk_de`** (`sample_key`, `condition_key`, `group_key` = the cell-type column) — a
 Wilcoxon test over cells treats cells from one donor as independent observations of that donor's condition
 and its p-values are anti-conservative by orders of magnitude. With **1 sample per arm** there is no valid
 p-value for the condition at all: say so, and treat what follows as an exploratory ranking.
 
 **What.** For **EACH** cell type that has enough cells in **BOTH** groups, run condition-vs-reference DE.
-For the no-replicate / exploratory case `run_de` does this directly — pass `reference` (the control level)
+For the no-replicate / exploratory case `mcp_run_de` does this directly — pass `reference` (the control level)
 instead of accepting the one-vs-rest default, and `stratify_by` (the cell-type column) to run the contrast
 within each cell type. Either tool **skips and reports** cell types with too few cells in an arm
 (`skipped_groups`) rather than silently dropping them.
@@ -138,12 +138,12 @@ cell type isolates the per-lineage response. Leaving `reference` at its default 
 Step 2). The per-cell-type minimum-cell cutoff (`min_cells`, default 30) is a judgement call
 *(agent-chosen per study)*.
 
-**What runs** — the `run_de` tool call:
+**What runs** — the `mcp_run_de` tool call:
 ```
-run_de(groupby=<condition column>, reference=<control group>, stratify_by=<cell-type column>,
+mcp_run_de(groupby=<condition column>, reference=<control group>, stratify_by=<cell-type column>,
        min_cells=30)
   # writes tables/de_<cell-type column>_all.csv (BOTH directions), one table + volcano per cell
-  # type, the tested universe, and .rnk files for run_gsea_prerank
+  # type, the tested universe, and .rnk files for mcp_run_gsea_prerank
 ```
 This reads `adata_qc.h5ad` when there is no clustering checkpoint, so a dataset that already carries
 labels needs **only** Step 1 — do not add a clustering step to satisfy it.
@@ -161,15 +161,15 @@ stratification column · `reference` is NOT `"rest"` · `significant_by_group` r
 counts · `skipped_groups` (if any) is carried into the report as cell types the contrast did not cover ·
 results carry **logFC + adjusted p-values**.
 
-<sub>Source: SKILL.md "Ordered plan" §3 · `run_de` · template skill `compare-conditions-by-celltype` (`scripts/reference.py`)</sub>
+<sub>Source: SKILL.md "Ordered plan" §3 · `mcp_run_de` · template skill `compare-conditions-by-celltype` (`scripts/reference.py`)</sub>
 </details>
 
 <details>
 <summary><b>Step 4 · Pathway enrichment per cell type</b></summary>
 
-**What.** Call `run_enrichment` with **no `genes` argument**. It finds Step 3's `de_<key>_all.csv` itself
+**What.** Call `mcp_run_enrichment` with **no `genes` argument**. It finds Step 3's `de_<key>_all.csv` itself
 (`de_pseudobulk_<cell-type column>_all.csv` for a pseudobulk test, which it prefers when a cell-level
-`run_de` table exists too) and runs ORA per cell type, splitting each into its **up-** and
+`mcp_run_de` table exists too) and runs ORA per cell type, splitting each into its **up-** and
 **down-**regulated halves.
 
 **Why.** Enrichment turns each cell type's changed-gene list into interpretable pathways — computed per
@@ -179,9 +179,9 @@ down-regulated programme cannot cancel each other into "nothing enriched".
 **🔬 Agent-chosen:** the enrichment gene sets *(agent-chosen per study)*. The gene lists are **not**
 agent-chosen — they come from the Step-3 table.
 
-**What runs** — the `run_enrichment` tool call:
+**What runs** — the `mcp_run_enrichment` tool call:
 ```
-run_enrichment()   # discovers tables/de_<key>_all.csv; ORA per cell type × direction
+mcp_run_enrichment()   # discovers tables/de_<key>_all.csv; ORA per cell type × direction
 ```
 **Do NOT paste a pooled gene list into `genes`** — that collapses every cell type into one `input` group
 and drops the tested-universe background, which inflates every p-value.
@@ -190,7 +190,7 @@ and drops the tested-universe background, which inflates every p-value.
 says why not) · `background_source` is `tested_universe`, **not** `constant_fallback` · reported pathways
 trace back to the DE gene lists from Step 3.
 
-<sub>Source: `run_enrichment` · SKILL.md "Ordered plan" §4</sub>
+<sub>Source: `mcp_run_enrichment` · SKILL.md "Ordered plan" §4</sub>
 </details>
 
 <details>
@@ -242,8 +242,8 @@ as **hypotheses to validate**, not established fact.
 
 ## Method provenance
 
-scanpy `rank_genes_groups` (per-cell-type condition-vs-reference), driven by `run_scanpy_qc` / `run_de`
-(`reference=` + `stratify_by=`) / `run_enrichment`; `run_clustering` only for unlabeled data. Designs the
+scanpy `rank_genes_groups` (per-cell-type condition-vs-reference), driven by `mcp_run_scanpy_qc` / `mcp_run_de`
+(`reference=` + `stratify_by=`) / `mcp_run_enrichment`; `mcp_run_clustering` only for unlabeled data. Designs the
 tool cannot express fall back to `run_code` adapting skill `compare-conditions-by-celltype` (`scripts/reference.py`), and on
 large datasets that loop runs with a real `--mem` cap under `AISCIENTIST_RUN_CODE_ON_HPC=1` (see
 `deploy/analysis/README.md`).

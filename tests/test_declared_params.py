@@ -1,34 +1,24 @@
-"""A protocol's parameter table and the code's defaults must not be allowed to disagree.
+"""Preset parameter tables agree with the actual pinned native tools/list schemas.
 
-Three places used to carry the same numbers independently: the tool body (``args.get("x", 200)``),
-the JSON schema handed to the model, and whatever a protocol's prose happened to say. Nothing
-compared them. So a researcher could read a protocol claiming one threshold, the model could read a
-schema that named none, and the code could apply a third — and the run would look perfectly
-consistent from every single vantage point.
-
-``scrna_pack.PARAMS`` is now the one table all three read. These tests are what stop the copies
-coming back: the schema is generated from it, the bodies resolve through it, and a protocol that
-documents a value it no longer matches fails here rather than in somebody's Methods section.
+This platform contract runs without Scanpy. The scientific resolver/default regression
+lives with the algorithms in the independent scrna-analysis package.
 """
-
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
 
-import pytest
+from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG, load_servers
+from aiscientist.agents.preset_pipelines import _pipelines_dir, _parse_skill
 
-pytest.importorskip("scanpy")
-
-from aiscientist.agents.preset_pipelines import _pipelines_dir, _parse_skill  # noqa: E402
-from aiscientist.tools._lib.scrna import PARAMS
-from aiscientist.tools.catalog import scrna_catalog  # noqa: E402
-
-# `| `param` | `default` | meaning |` inside a `**`tool`**` block of a SKILL.md Parameters section.
 _TOOL_HEADING_RE = re.compile(r"^\*\*`([a-z_]+)`\*\*\s*$")
 _ROW_RE = re.compile(r"^\|\s*`([a-z_]+)`\s*\|\s*`([^`]+)`\s*\|\s*(.+?)\s*\|\s*$")
-
+NATIVE = {s.planner_name(t["name"]): t["inputSchema"]["properties"]
+          for s in load_servers(DEFAULT_CONFIG) for t in s.tools}
+# Transport/admission and optional override fields are documented by the tool schema,
+# not as scientific defaults in a preset's parameter table.
+CONTROL_FIELDS = {"analysis_id", "dataset", "dataset_paths", "rerun", "input", "samples"}
 
 def _documented_params(body: str) -> dict[str, dict[str, str]]:
     """{tool: {param: default-as-json-text}} parsed out of a SKILL.md ``## Parameters`` section."""
@@ -50,7 +40,6 @@ def _documented_params(body: str) -> dict[str, dict[str, str]]:
             out[tool][row.group(1)] = row.group(2)
     return out
 
-
 def _skills_with_parameters() -> list[tuple[str, str]]:
     found = []
     for skill_md in sorted(_pipelines_dir().glob("*/SKILL.md")):
@@ -59,87 +48,54 @@ def _skills_with_parameters() -> list[tuple[str, str]]:
             found.append((meta.get("name") or skill_md.parent.name, body))
     return found
 
-
 def test_at_least_one_protocol_documents_its_parameters():
     """Guards the guard: a parsing change that silently found nothing would make every check
     below vacuously pass."""
     assert _skills_with_parameters(), "no preset SKILL.md has a '## Parameters' section"
 
+def _same_json_default(shown, expected):
+    actual = json.loads(shown)
+    return type(actual) is type(expected) and actual == expected
 
-def test_every_documented_default_matches_the_code():
+
+def test_documented_defaults_do_not_coerce_json_types():
+    assert _same_json_default("false", False)
+    assert _same_json_default("0", 0)
+    assert _same_json_default("1.0", 1.0)
+    assert not _same_json_default("false", 0)
+    assert not _same_json_default("true", 1)
+    assert not _same_json_default("0", False)
+    assert not _same_json_default("1", 1.0)
+
+
+def test_every_documented_default_matches_the_released_schema():
     for name, body in _skills_with_parameters():
         documented = _documented_params(body)
-        assert documented, f"{name}: '## Parameters' section present but no rows parsed"
+        assert documented, f"{name}: parameter section parsed no rows"
         for tool, params in documented.items():
-            assert tool in PARAMS, f"{name} documents unknown tool '{tool}'"
-            for param, shown in params.items():
-                assert param in PARAMS[tool], f"{name} documents unknown {tool}.{param}"
-                expected = json.dumps(PARAMS[tool][param][0])
-                assert shown == expected, (
-                    f"{name} says {tool}.{param} defaults to {shown}, the code uses {expected}")
+            assert tool in NATIVE, f"{name} documents unregistered tool {tool}"
+            for parameter, shown in params.items():
+                prop = NATIVE[tool][parameter]
+                assert "default" in prop, (name, tool, parameter)
+                assert _same_json_default(shown, prop["default"]), (name, tool, parameter, shown)
+                assert prop.get("description"), (tool, parameter)
 
 
-def test_a_documented_tool_documents_all_of_its_parameters():
-    """Half a table is worse than none: a reader assumes the omitted knobs do not exist."""
+def test_a_documented_tool_documents_all_published_scientific_defaults():
     for name, body in _skills_with_parameters():
         for tool, params in _documented_params(body).items():
-            missing = sorted(set(PARAMS[tool]) - set(params))
-            assert not missing, f"{name} omits {tool} parameter(s): {missing}"
+            required = {k for k, value in NATIVE[tool].items() if "default" in value} - CONTROL_FIELDS
+            assert not required - params.keys(), (name, tool, sorted(required - params.keys()))
 
 
-def test_the_schema_the_model_reads_carries_the_same_defaults_and_a_meaning():
-    """The model never sees PARAMS or the SKILL.md table — it sees the function schema. If the
-    default is only in the other two, the model is choosing values blind, which is how a run ends
-    up filtering at 10% mitochondrial reads against a declared 20."""
-    catalog = {t.name: t for t in scrna_catalog()}
-    for tool, params in PARAMS.items():
-        assert tool in catalog, f"{tool} declares parameters but is not in the catalog"
-        props = catalog[tool].parameters["properties"]
-        for param, (default, meaning) in params.items():
-            assert param in props, f"{tool}.{param} is declared but absent from the schema"
-            assert props[param]["default"] == default
-            assert props[param]["description"] == meaning
-            # A meaning that just respells the parameter name tells a reviewer nothing about
-            # whether the value is right for their data, which is the only question they have.
-            words = [w for w in re.findall(r"[a-z]+", meaning.lower())
-                     if w not in param.split("_")]
-            assert len(words) >= 5, (
-                f"{tool}.{param} needs a plain-English meaning, not a restated name: {meaning!r}")
-
-
-def test_the_tool_body_resolves_through_the_declared_table():
-    """`_p` raises on an undeclared parameter on purpose: adding a knob to a tool body without
-    adding it here would otherwise reintroduce exactly the invisible default this replaced."""
-    from aiscientist.tools._lib.scrna import _p
-
-    assert _p("run_de", "n_genes", {}) == 50
-    assert _p("run_de", "n_genes", {"n_genes": 200}) == 200
-    assert _p("run_scanpy_qc", "max_pct_mt", {}) == 10.0
-    with pytest.raises(KeyError):
-        _p("run_de", "not_a_declared_parameter", {})
-
-
-def test_the_protocol_text_and_the_code_agree_on_the_replication_floor():
-    """The one number the whole protocol turns on. `min_samples_per_condition` is what makes
-    `run_pseudobulk_de` refuse instead of degrading, and the protocol's ">=2 samples per arm" rule
-    is only true while it stays 2."""
-    assert PARAMS["run_pseudobulk_de"]["min_samples_per_condition"][0] == 2
+def test_the_protocol_and_published_replication_floor_agree():
+    assert NATIVE["mcp_run_pseudobulk_de"]["min_samples_per_condition"]["default"] == 2
     body = (Path(_pipelines_dir()) / "differential_expression" / "SKILL.md").read_text()
     assert ">=2 samples per arm" in body or "≥2 samples per arm" in body
 
 
-def test_enrichment_tests_the_significant_set_not_an_arbitrary_top_n():
-    """ORA is run on THE significant genes, defined by a p-value cutoff and an effect-size floor.
-
-    `top_n_genes=100` had no basis, and it hid a worse truncation: the combined DE table it read
-    was itself capped at `run_de.n_genes` (50 per direction), so ORA never saw more than 100 genes
-    per group however many were significant. On the real DDX41 object the selection is AC 128,
-    BC 555, Cone 91, MG 3,996, Rod 4,030 — and MG/Rod being that large is itself the signal that
-    the upstream test was pseudoreplicated, which a cap at 100 made invisible.
-    """
-    assert PARAMS["run_enrichment"]["top_n_genes"][0] == 0, "0 = no cap; the field does not top-N"
-    assert PARAMS["run_enrichment"]["padj"][0] == 0.05
-    assert PARAMS["run_enrichment"]["lfc"][0] == 0.25, "Seurat's single-cell effect-size floor"
-    # the same effect-size convention as the DE step it consumes — two different floors between
-    # the test and its interpretation would be indefensible in a methods section
-    assert PARAMS["run_enrichment"]["lfc"][0] == PARAMS["run_de"]["lfc"][0]
+def test_published_enrichment_defaults_use_the_significant_set_without_a_top_n_cap():
+    props = NATIVE["mcp_run_enrichment"]
+    assert props["top_n_genes"]["default"] == 0
+    assert props["padj"]["default"] == .05
+    assert props["lfc"]["default"] == NATIVE["mcp_run_de"]["lfc"]["default"] == .25

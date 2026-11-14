@@ -7,9 +7,11 @@ GPU/LLM and no scanpy — mirroring test_research_lab.py.
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 
@@ -29,7 +31,7 @@ def _finish():
 
 
 def _scientist(briefs=None):
-    """Scripted Scientist: call run_qc, then finish. Optionally record each brief it is handed."""
+    """Scripted Scientist: call mcp_run_scanpy_qc, then finish. Optionally record each brief it is handed."""
     def chat(messages, _tools):
         if briefs is not None:
             u = next((m["content"] for m in messages if m.get("role") == "user"), "")
@@ -37,7 +39,7 @@ def _scientist(briefs=None):
                 briefs.append(u)
         if any(m.get("role") == "tool" for m in messages):
             return _finish()
-        return _call("run_qc", {})
+        return _call("mcp_run_scanpy_qc", {})
     return chat
 
 
@@ -88,7 +90,7 @@ def test_step_meetings_off_by_default_holds_no_per_step_meetings():
     seen: list[str] = []
     complete = _router(["Run QC on the dataset", "Identify marker genes"], seen=seen)
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.converged is True and result.accepted_steps == 2
     # The two PER-STEP meetings stay opt-in: they cost two completions per step.
@@ -104,7 +106,7 @@ def test_the_plan_review_runs_by_default():
     seen: list[str] = []
     complete = _router(["Run QC on the dataset", "Identify marker genes"], seen=seen)
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     lab.run("Characterize the dataset")
     assert any("DRAFT analysis plan" in s for s in seen)
 
@@ -113,7 +115,7 @@ def test_the_plan_review_can_still_be_switched_off():
     seen: list[str] = []
     complete = _router(["Run QC on the dataset", "Identify marker genes"], seen=seen)
     lab = ResearchLab(_ctx(), LabConfig(plan_review=False), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset")
     assert result.accepted_steps == 2
     assert not any("DRAFT analysis plan" in s for s in seen)
@@ -134,7 +136,7 @@ def test_preflight_floor_skips_enrichment_without_contrast_and_asks_no_model():
           "obs_keys": ["celltype", "sample"]}
     lab = ResearchLab(_ctx({"dataset_result": dr}), LabConfig(step_meetings=True),
                       complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     d = lab._preflight_gate("q", "Run pathway enrichment on the markers", ["s"], 0, [], lambda _e: None)
     assert d.action == "skip" and d.by == "guard"
     assert calls["n"] == 0   # the floor never asks a model
@@ -155,7 +157,7 @@ def test_preflight_skip_prunes_step_and_still_converges():
 
     events: list[dict] = []
     lab = ResearchLab(_ctx(), LabConfig(step_meetings=True), complete_fn=_router(agenda, gate=gate, pi=pi),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset", on_event=events.append)
 
     assert result.converged is True and result.accepted_steps == 2
@@ -181,7 +183,7 @@ def test_poststep_review_prunes_downstream_step():
 
     events: list[dict] = []
     lab = ResearchLab(_ctx(), LabConfig(step_meetings=True), complete_fn=_router(agenda, poststep=poststep),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("Characterize the dataset", on_event=events.append)
 
     assert result.converged is True and result.accepted_steps == 2
@@ -205,7 +207,7 @@ def test_preflight_amend_reaches_the_scientist_brief():
 
     briefs: list[str] = []
     lab = ResearchLab(_ctx(), LabConfig(step_meetings=True), complete_fn=_router(agenda, gate=gate, pi=pi),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist(briefs)))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist(briefs)))
     result = lab.run("Characterize the dataset")
 
     assert result.accepted_steps == 1
@@ -237,7 +239,7 @@ def test_plan_review_revises_incoherent_agenda_before_any_step_runs():
     events: list[dict] = []
     lab = ResearchLab(_ctx(), LabConfig(step_meetings=True),
                       complete_fn=_router(draft, plan_critic=plan_critic, plan_pi=plan_pi),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("complete the research", on_event=events.append)
 
     # the run executes the REVISED plan, not the incoherent draft
@@ -267,7 +269,7 @@ def test_linear_label_decision_is_asked_and_choice_threads_into_the_run():
     briefs: list[str] = []
     lab = ResearchLab(_ctx({"dataset_result": _ANNOTATED_DR}), LabConfig(),  # planner defaults to linear
                       complete_fn=_router(agenda),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist(briefs)))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist(briefs)))
     result = lab.run("complete the research", decision_review=review)
 
     assert asked and "majorclass" in asked["goal"]                       # the fork was put to the user
@@ -279,7 +281,7 @@ def test_linear_label_decision_is_asked_and_choice_threads_into_the_run():
 def test_linear_no_decision_hook_runs_without_asking():
     agenda = ["Run QC on the dataset", "Leiden clustering of the cells", "Marker genes per group"]
     lab = ResearchLab(_ctx({"dataset_result": _ANNOTATED_DR}), LabConfig(), complete_fn=_router(agenda),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     result = lab.run("complete the research")   # no decision_review → nothing to ask, runs straight through
     assert result.accepted_steps == 3 and result.converged is True
 
@@ -293,7 +295,7 @@ def test_linear_unlabeled_dataset_asks_no_decision():
 
     agenda = ["Run QC on the dataset", "Leiden clustering of the cells", "Marker genes per group"]
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=_router(agenda),   # no dataset_result → not labeled
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     lab.run("complete the research", decision_review=review)
     assert called["n"] == 0
 
@@ -311,7 +313,7 @@ def test_dag_structurer_deterministically_flags_label_decision():
 
     lab = ResearchLab(_ctx({"dataset_result": _ANNOTATED_DR}), LabConfig(planner="dag"),
                       complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     plan = lab._structure_agenda_dag("complete the research", agenda, lambda _e: None)
 
     clustering = [n for n in plan.nodes if _CLUSTERS(n.goal)]
@@ -330,36 +332,36 @@ def _CLUSTERS(goal: str) -> bool:
 #
 # Measured, not hypothesised: over 12 plans drafted by the served model against the DDX41
 # profile, the first version of this review cut a mean of 4.6 steps to 1.9. The question was
-# deliberately narrow ("call run_de with groupby=sampleid and report what it returns"), and the
+# deliberately narrow ("call mcp_run_de with groupby=sampleid and report what it returns"), and the
 # Critic read it literally — calling the QC, composition and enrichment steps "orphans relative
 # to the research question". A prompt alone cannot be trusted to hold that line, so there is a
 # floor underneath it: a review may trim, it may not delete most of a study.
 
 def test_a_review_that_deletes_most_of_the_plan_is_rejected():
-    draft = ["Assess quality with `run_scanpy_qc`", "Compare composition with `run_composition`",
-             "Contrast the conditions with `run_de`", "Interpret with `run_enrichment`",
+    draft = ["Assess quality with `mcp_run_scanpy_qc`", "Compare composition with `mcp_run_composition`",
+             "Contrast the conditions with `mcp_run_de`", "Interpret with `mcp_run_enrichment`",
              "Attach citations with `deep_literature`"]
 
     def complete(messages):
         system = messages[0]["content"]
         if "Scientific Critic reviewing a DRAFT" in system:
             return json.dumps({"issues": ["everything but the DE step is an orphan"],
-                               "revised_agenda": ["Contrast the conditions with `run_de`"]})
-        return json.dumps({"final_agenda": ["Contrast the conditions with `run_de`"],
+                               "revised_agenda": ["Contrast the conditions with `mcp_run_de`"]})
+        return json.dumps({"final_agenda": ["Contrast the conditions with `mcp_run_de`"],
                            "reason": "narrow question"})
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     events: list[dict] = []
-    assert lab._plan_review("Call run_de and report what it returns", draft, events.append) == draft
+    assert lab._plan_review("Call mcp_run_de and report what it returns", draft, events.append) == draft
     assert any(e.get("type") == "plan_review_rejected" for e in events), \
         "dropping the revision silently would look like the Critic found nothing"
 
 
 def test_a_proportionate_trim_is_still_applied():
     """The floor must not turn the review off — trimming one bad step is the whole point."""
-    draft = ["Assess quality with `run_scanpy_qc`", "Parse the generated DE tables and report them",
-             "Contrast the conditions with `run_de`", "Interpret with `run_enrichment`"]
+    draft = ["Assess quality with `mcp_run_scanpy_qc`", "Parse the generated DE tables and report them",
+             "Contrast the conditions with `mcp_run_de`", "Interpret with `mcp_run_enrichment`"]
     kept = [s for s in draft if "Parse" not in s]
 
     def complete(messages):
@@ -369,5 +371,5 @@ def test_a_proportionate_trim_is_still_applied():
         return json.dumps({"final_agenda": kept, "reason": "dropped the read-back step"})
 
     lab = ResearchLab(_ctx(), LabConfig(), complete_fn=complete,
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist()))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist()))
     assert lab._plan_review("Characterize the dataset", draft, lambda _e: None) == kept

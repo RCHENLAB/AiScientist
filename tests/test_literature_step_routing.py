@@ -38,9 +38,9 @@ def test_the_scgpt_step_that_died_is_not_a_literature_step():
     "Use `map_phenotype_to_hpo` to map the free-text phenotype, keeping the ontology reference "
     "version that was applied.",
     "Run `diagnose_disease` and record which reference panel supported each call.",
-    "Use `inspect_dataset` to profile the object and note the reference annotations present.",
+    "Use `mcp_inspect_dataset` to profile the object and note the reference annotations present.",
     # The ``run_`` family was already protected; it must stay protected.
-    'Run `run_de` stratified by majorclass with reference="WT".',
+    'Run `mcp_run_de` stratified by majorclass with reference="WT".',
     "Audit reference coverage: use `run_code` to compare the scGPT reference taxonomy against the "
     "11 existing major classes.",
 ])
@@ -68,16 +68,16 @@ def test_prose_still_decides_when_no_tool_is_named():
 def test_a_backticked_obs_column_is_not_a_tool():
     # Backticks carry column names too; treating any identifier as a tool would let a genuine
     # literature step be vetoed by the word `celltype`.
-    step = ("Compare `majorclass` and `celltype` across `sampleid` arms using `run_composition`; "
+    step = ("Compare `majorclass` and `celltype` across `sampleid` arms using `mcp_run_composition`; "
             "note the reference proportions.")
-    assert _declared_tools(step) == frozenset({"run_composition"})
+    assert _declared_tools(step) == frozenset({"mcp_run_composition"})
     assert _is_literature_step(step) is False
 
 
 def test_declared_tools_reads_a_call_with_arguments():
     # The PI is instructed to write the tool WITH its key settings, which is how it usually appears.
-    step = 'Run `run_de(stratify_by="majorclass", reference="WT")` on the QC checkpoint.'
-    assert "run_de" in _declared_tools(step)
+    step = 'Run `mcp_run_de(stratify_by="majorclass", reference="WT")` on the QC checkpoint.'
+    assert "mcp_run_de" in _declared_tools(step)
     assert _is_literature_step(step) is False
 
 

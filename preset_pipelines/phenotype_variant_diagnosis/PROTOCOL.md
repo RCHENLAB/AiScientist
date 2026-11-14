@@ -1,7 +1,7 @@
 ---
 name: phenotype_variant_diagnosis
 description: Diagnose a rare-disease CASE — a VCF **plus** the patient's clinical description (free text, any language) — by reconciling two independent tracks: the prioritised variant shortlist (VEP/ClinVar/predictors) and a phenotype-driven per-disease differential (HPO → LIRICAL post-test probability). Use ONLY when the case's phenotype/symptoms/diagnosis are actually given; a VCF alone is the variant_annotation protocol.
-tools: mcp_annotate_variants, map_phenotype_to_hpo, run_lirical, literature_search, run_code
+tools: mcp_annotate_variants, mcp_map_phenotype_to_hpo, mcp_run_lirical, mcp_literature_search, run_code
 data_type: variants
 ---
 
@@ -78,12 +78,12 @@ Hearing is normal — no history of hearing loss. No ataxia. No polydactyly.
 | 2 | **Narrow: panel + drop-common** | A | `mcp_annotate_variants` | `genes` / `regions_bed`, `max_pop_af` | in-panel rare set |
 | 3 | **Annotate** | A | `mcp_annotate_variants` | 🧭 `assembly` auto-detected | `variant_annotation.tsv` + tables |
 | 4 | **Prioritise** | A | `mcp_annotate_variants` (built-in) | disease-model AF thresholds | `high_priority_variants.csv` |
-| 5 | **Free text → HPO** | B | `map_phenotype_to_hpo` | the clinical text, **verbatim** | `observed` + `excluded` HPO IDs |
-| 6 | **Per-disease differential** | B | `run_lirical` | `hpo_terms`, `excluded_hpo` | ranked diseases + post-test prob |
+| 5 | **Free text → HPO** | B | `mcp_map_phenotype_to_hpo` | the clinical text, **verbatim** | `observed` + `excluded` HPO IDs |
+| 6 | **Per-disease differential** | B | `mcp_run_lirical` | `hpo_terms`, `excluded_hpo` | ranked diseases + post-test prob |
 | 7 | **Reconcile** | A×B | *(report from 4 + 6)* | — | the actual answer |
-| 8 | **Literature context** | — | `literature_search` | gene + phenotype query | citations |
+| 8 | **Literature context** | — | `mcp_literature_search` | gene + phenotype query | citations |
 
-> **Tracks A and B are INDEPENDENT — do not make one wait on the other.** `run_lirical` does *not*
+> **Tracks A and B are INDEPENDENT — do not make one wait on the other.** `mcp_run_lirical` does *not*
 > consume `mcp_annotate_variants`' output: in genotype-aware mode it scores the raw VCF itself through its
 > own Exomiser database. Plan them as distinct agenda steps that meet only at Step 7. **Plan no other
 > report-writing step:** a written report is one `write_report` step, last, planned only when the request asks for it.
@@ -101,7 +101,7 @@ a diagnosis, an HPO list, or a case note. Language and formality do not matter �
 
 **If there is no phenotype anywhere, use `variant_annotation` instead** and plan no phenotype step. Do
 **not** infer a phenotype from gene names, the file name, or the fact that it is an eye study — a
-fabricated phenotype produces a confident, wrong differential, which is worse than none. `run_lirical`
+fabricated phenotype produces a confident, wrong differential, which is worse than none. `mcp_run_lirical`
 refuses an empty phenotype; do not work around it.
 
 **✅ Verify:** the description is quoted from the case, not from the agent's assumption.
@@ -128,7 +128,7 @@ Follow [`variant_annotation/PROTOCOL.md`](../variant_annotation/PROTOCOL.md); th
 <details open>
 <summary><b>Step 5 · Free text → HPO</b> — the LLM does language, the ONTOLOGY owns identity</summary>
 
-**What.** `map_phenotype_to_hpo` turns the clinician's prose into real, ontology-validated HPO IDs,
+**What.** `mcp_map_phenotype_to_hpo` turns the clinician's prose into real, ontology-validated HPO IDs,
 splitting them into **observed** (present) and **excluded** (explicitly absent).
 
 **Why it is built as a closed set.** HPO IDs one digit apart are *different real phenotypes*
@@ -163,13 +163,13 @@ the token budget before emitting any JSON, returning an empty profile. The call 
 clinician can **audit** the mapping instead of trusting it · negated findings landed in `excluded`, not
 `observed` · a family member's disease ("her mother had RP") did **not** become the patient's phenotype.
 
-<sub>Source: `src/aiscientist/tools/map_phenotype_to_hpo/tool.py` (extract → retrieve → select → validate) · `src/aiscientist/tools/map_phenotype_to_hpo/index.py` (the ontology gate)</sub>
+<sub>Source: `aiscientist-mcp/packages/phenotype-diagnosis/src/aiscientist_mcp/phenotype_diagnosis/hpo/mapper.py` (extract → retrieve → select → validate) · `aiscientist-mcp/packages/phenotype-diagnosis/src/aiscientist_mcp/phenotype_diagnosis/hpo/index.py` (the ontology gate)</sub>
 </details>
 
 <details open>
 <summary><b>Step 6 · Per-disease differential</b> — LIRICAL likelihood ratios</summary>
 
-**What.** `run_lirical` scores each candidate disease against the HPO profile and returns a ranked
+**What.** `mcp_run_lirical` scores each candidate disease against the HPO profile and returns a ranked
 differential with a **compositeLR** (log10 likelihood ratio) and a post-test probability.
 
 **🧭 Auto-detected mode:**
@@ -191,7 +191,7 @@ the compositeLR; treat the percentage as a sorting key, not a probability of bei
 **✅ Verify this step:** the mode is stated · `phenotype_notes` are reported · the ranking is presented by
 rank + compositeLR, with the saturation caveat attached to any percentage shown.
 
-<sub>Source: `src/aiscientist/tools/run_lirical/tool.py` (`parse_lirical_tsv`, `hpo_release_drift`, `normalize_assembly`) · LIRICAL v2.4.1 in `lirical.sif`</sub>
+<sub>Source: `aiscientist-mcp/packages/phenotype-diagnosis/src/aiscientist_mcp/phenotype_diagnosis/lirical.py` (`parse_lirical_tsv`, `hpo_release_drift`, `normalize_assembly`) · LIRICAL v2.4.1 in the pinned native phenotype image</sub>
 </details>
 
 <details open>
@@ -204,18 +204,18 @@ disagree — the disagreement is often the finding.**
 |---|---|---|
 | **Concordant** | the top LIRICAL disease's gene also carries a prioritised variant in Track A | **the strong result** — name the disease, its rank + compositeLR, the gene, and the specific variant(s) with ClinVar/predictor evidence |
 | **Phenotype-only hit** | LIRICAL ranks a disease high, Track A found nothing in that gene | say so plainly: the causal variant may have been **filtered out** (panel too narrow, AF cutoff, an intronic/structural variant VEP does not flag) — **not** that the disease is excluded |
-| **Variant-only hit** | a compelling variant in a gene LIRICAL did not rank | **expected, NOT a contradiction.** LIRICAL scores against *curated* HPO/OMIM annotations, so a new gene-disease association or a phenotype expansion **cannot** rank, by construction. Read a low rank as "not in the curated annotations", never as "not causal" — then use `literature_search` on that gene + phenotype for evidence the curation lags |
+| **Variant-only hit** | a compelling variant in a gene LIRICAL did not rank | **expected, NOT a contradiction.** LIRICAL scores against *curated* HPO/OMIM annotations, so a new gene-disease association or a phenotype expansion **cannot** rank, by construction. Read a low rank as "not in the curated annotations", never as "not causal" — then use `mcp_literature_search` on that gene + phenotype for evidence the curation lags |
 
 **✅ Verify this step:** both tracks are reported · a variant-only hit is framed as a curation gap, not a
 refutation · the named answer cites *both* its phenotype evidence and its variant evidence.
 
-<sub>Source: `src/aiscientist/tools/diagnose_disease/tool.py` (`reconcile`)</sub>
+<sub>Source: `aiscientist-mcp/packages/phenotype-diagnosis/src/aiscientist_mcp/phenotype_diagnosis/diagnose.py` (`reconcile`)</sub>
 </details>
 
 <details>
 <summary><b>Step 8 · Literature context</b></summary>
 
-**What.** For the reconciled gene/disease, pull real citations via `literature_search` — especially for a
+**What.** For the reconciled gene/disease, pull real citations via `mcp_literature_search` — especially for a
 variant-only hit, where recent literature is exactly what the curated annotations are missing.
 
 **Why / honesty.** Cite **only** what the tool returns — never invent a PMID or a claim.

@@ -213,7 +213,7 @@ def test_the_saved_card_keeps_each_steps_expected_outputs(lab_gateway, monkeypat
     # A step whose tool was changed by hand no longer claims the old tool's outputs.
     path = art / "plan" / current["filename"]
     document, mark, record = path.read_text(encoding="utf-8").partition("# --- Saved by AiScientist")
-    path.write_text(document.replace("tool: run_scanpy_qc", "tool: run_code") + mark + record,
+    path.write_text(document.replace("tool: mcp_run_scanpy_qc", "tool: run_code") + mark + record,
                     encoding="utf-8")
     assert "outputs" not in gw._saved_plan_replays(restored)[0]["plan"]["steps"][0]
 

@@ -1,92 +1,11 @@
-# LIRICAL container — build & stage (phenotype → disease differential)
+# Native phenotype references
 
-Build kit for `lirical.sif` + the LIRICAL data — the **phenotype-driven differential-diagnosis** line
-AiScientist runs **when `AISCIENTIST_PHENOTYPE_ON_HPC=1`**. It sits **downstream of the variant line**
-(`vep.sif`): the variant pipeline produces the gene/variant shortlist, then LIRICAL fuses the patient's
-HPO terms with those findings into a **per-disease post-test probability** ("RP 70% / LCA 20% / …") —
-the calibrated confidence Rui Chen asked for.
+Phenotype tools run in the independently published [phenotype-diagnosis MCP](https://github.com/liujs123456/aiscientist-mcp/tree/main/packages/phenotype-diagnosis), pinned by the application's reviewed MCP catalog and instruction skill. This folder retains reference-data staging; the app no longer builds a LIRICAL image or ships its scientific CLI.
 
-The orchestration that *runs* the image is built + offline-tested (`src/aiscientist/tools/run_lirical/tool.py`
-+ `phenotype_cli.py`, driven by `SlurmAnalysisExecutor` with an injected runner — no cluster, no
-LIRICAL, no network in CI: `tests/test_phenotype_dx.py`). This folder is the **image + data build kit**.
+Use the catalog's immutable image, converted to a verified SIF by the operator or gateway image cache. On a compute node, set `PHENOTYPE_MCP_SIF` to that file and `AISCIENTIST_LIRICAL_REF_ROOT` to a dedicated writable reference root, then run `build_and_stage.sh`. The script preserves existing phenotype references and optionally downloads Exomiser with `EXOMISER=1 EXOMISER_ASSEMBLY=hg19` (or `hg38`). It refuses to run outside a Slurm allocation. For example, submit with `sbatch --account=<account> --partition=<cpu-partition> --cpus-per-task=4 --mem=16G --time=08:00:00 deploy/lirical/build_and_stage.sh` after exporting those operator settings.
 
-> ⚠️ macOS cannot build `.sif`. Build on an **HPC3 compute node** (`standard` nodes have egress for the
-> downloads; RCIC bans builds and downloads on login nodes) or any Linux host with `apptainer`.
+LIRICAL 2.4.1's phenotype-only mode needs the phenotype data directory. Genotype-aware scoring additionally needs an assembly-matched Exomiser variant database in the current `.mv.db` layout; old Exomiser 10.x data is incompatible. Bind staged data read-only at analysis time and configure `LIRICAL_DATA_DIR`, `PHENOTYPE_ALLOWED_ROOTS`, and optional `LIRICAL_EXOMISER_HG19` / `LIRICAL_EXOMISER_HG38`. The MCP image contains the versioned implementation and Java/LIRICAL dependencies.
 
-## Two scoring modes
+The app preserves the attached case note and bound VCF, selected session model, reviewed plan arguments, run ownership, budget guards and artifacts. The native diagnosis server obtains complete literature evidence through its bundled independent literature MCP client; evidence tiers remain separate from LIRICAL probabilities. Missing or unsupported literature is reported explicitly. These are research rankings, not a newly validated calibration claim.
 
-| Mode | Needs | Output |
-|---|---|---|
-| **Phenotype-only** (works now) | LIRICAL data only (`lirical download`, ~1–2 GB) | per-disease posterior from HPO terms, gene-restricted to the variant line's shortlist |
-| **Genotype-aware** (full) | + an Exomiser **variant database** (~20 GB) | posterior that also weighs the patient's variants (the sharpened confidence) |
-
-## ⚠️ The Exomiser-version gotcha (read before staging genotype-aware)
-
-The email plan assumed we could **reuse the Exomiser already on HPC3**. We can't, for LIRICAL v2:
-
-- What exists: `/dfs3b/ruic20_lab/{chen/pipeline_restructure/pipeline_restructure,bin/pipeline/pipeline_restructure}/exomiser`
-  → **`1805_hg19`** variant DB + **`1807_phenotype`** + **`exomiser-cli-10.1.0`** — i.e. **2018-era,
-  Exomiser 10.x schema, hg19 only** (~21 GB).
-- What LIRICAL v2 needs: an Exomiser data release **≥ 2302** (the newer `.mv.db` format). The 10.x
-  databases are **not compatible**.
-
-So genotype-aware LIRICAL requires a **fresh** Exomiser DB download (`EXOMISER=1` below). Match the
-assembly to the lab's eye VCFs — those are mostly **GRCh37/hg19** (same as the existing Exomiser data
-and the VEP line's `GRCh37` default), so `EXOMISER_ASSEMBLY=hg19` is the sensible first stage.
-Phenotype-only mode needs **no** Exomiser DB and is usable immediately.
-
-## Build & stage
-
-```bash
-# on HPC3, from a checkout of this repo (builds + downloads go to a COMPUTE node: RCIC bans them on
-# the login nodes, and `standard` compute nodes have egress):
-cd deploy/lirical
-
-# 1. build the image (deps-only: JRE 17 + LIRICAL v2 CLI baked in) — Apptainer --fakeroot, no /etc/subuid entry needed
-sbatch -p standard -A ruic20_lab -c 8 --mem=16G -t 04:00:00 -J build-lirical --wait \
-  --wrap 'module load apptainer/1.4.5 && APPTAINER_CACHEDIR=$TMPDIR/ac apptainer build --fakeroot lirical.sif lirical.def'
-
-# 2. stage the .sif + download the LIRICAL phenotype data (required); Exomiser DB is opt-in
-BUILT=1 ./build_and_stage.sh                       # phenotype-only (no Exomiser)
-BUILT=1 EXOMISER=1 EXOMISER_ASSEMBLY=hg19 ./build_and_stage.sh   # + genotype-aware (hg19)
-#   -> lirical.sif   -> /dfs3b/ruic20_lab/software/AiScientist/containers/lirical.sif
-#   -> data          -> /dfs3b/ruic20_lab/software/reference/lirical/data
-#   -> exomiser      -> /dfs3b/ruic20_lab/software/reference/lirical/exomiser/<ver>_hg19  (if EXOMISER=1)
-#   (idempotent: re-running skips anything already downloaded)
-
-# 3. the script also PRINTS a ready-to-run phenotype-only smoke test (tiny retinal phenopacket) — run
-#    it and confirm /tmp/smoke.tsv has a ranked differential.
-```
-
-The `prioritize` flags (verified against v2.4.1 on HPC3 — CLI-args mode: `-p` observed HPO / `-n` negated
-/ `-d` data / `-o` outdir / `-x` prefix / `-f` format / `--vcf` / `--assembly` / `-ed19`/`-ed38` Exomiser
-data DIR / `--sample-id`) are pinned to the LIRICAL version baked in `lirical.def` (`LIRICAL_VERSION`). If
-a future LIRICAL renames one, run `lirical prioritize --help` in the image and tune
-`tools/phenotype_dx.build_lirical_cmd` — a runtime arg, **no image rebuild needed**.
-
-## Enable it
-
-Set these in the gateway env (`.env` / `HPCSettings`) — until `AISCIENTIST_PHENOTYPE_ON_HPC=1`, the
-phenotype step reports `not_installed` and the run continues without the differential:
-
-```
-AISCIENTIST_PHENOTYPE_ON_HPC=1
-AISCIENTIST_LIRICAL_IMAGE=/dfs3b/ruic20_lab/software/AiScientist/containers/lirical.sif
-AISCIENTIST_LIRICAL_DATA_DIR=/dfs3b/ruic20_lab/software/reference/lirical/data
-# genotype-aware (optional — omit both for phenotype-only):
-AISCIENTIST_LIRICAL_EXOMISER_HG19=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg19
-AISCIENTIST_LIRICAL_EXOMISER_HG38=/dfs3b/ruic20_lab/software/reference/lirical/exomiser/2406_hg38
-```
-
-The VCF + the run's work/artifacts dirs must be reachable on the compute node. They are on dfs3b: a
-VCF kept on the server (an upload under `AISCIENTIST_DATA_ROOT`) is copied to dfs3b when the run
-starts, into the session's own `Temp/<ucinetid>/server-data/` or the run's folder (a deployment
-without a data root uses `AISCIENTIST_UPLOADS_ON_HPC=1`, which puts uploads on dfs3b). The
-AiScientist **tools** are synced to `<lab_storage>/<user>/pysrc` and bind-mounted in, so a tool edit
-needs a code deploy, NOT an image rebuild.
-
-## How it fits the two-track design
-
-LIRICAL is the **PRIMARY (calibrated)** track. The **EVIDENCE (literature / PaperQA2)** track is
-separate and never blended into LIRICAL's probability — see
-[`src/aiscientist/tools/diagnose_disease/evidence.py`](../../src/aiscientist/tools/diagnose_disease/evidence.py).
+Use the native repository's `scripts/build_hpo_lexicon.py` and `scripts/hpo_mapper_smoke.py` for ontology maintenance. Model mapping uses the selected guarded session binding in the app or explicit operator model settings when standalone. No new GPU or different model is silently provisioned.

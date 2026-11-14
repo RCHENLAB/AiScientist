@@ -463,6 +463,9 @@ def check_plan_tooling(agenda: "list[str]", catalog: "list[Any]") -> "tuple[list
             if not raw.startswith("run_"):
                 continue                      # retain the legacy typo policy, using complete names
             target = _TOOL_NAME_FIXES.get(raw.lower())
+            if target and target not in schemas:
+                matches = [name for name in schemas if canonical_tool_name(name) == target]
+                target = matches[0] if len(matches) == 1 else None
             if target and target in schemas:
                 text = re.sub(NAME_LEFT + re.escape(raw) + NAME_RIGHT, target, text)
                 findings.append({"kind": "renamed", "tool": raw, "detail": target})
@@ -557,6 +560,10 @@ def _describe_param(name: str, spec: "dict[str, Any]") -> str:
 
 def _tool_runs_on(tool: str) -> str:
     """Where a tool's manifest says it runs (``hpc:analysis``, ``inprocess``, …); "" if unknown."""
+    from ..mcp_bridge import configured_servers
+    for server in configured_servers():
+        if any(server.planner_name(entry["name"]) == tool for entry in server.tools):
+            return getattr(server, "runs_on", "")
     try:
         from ...tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
@@ -584,6 +591,8 @@ def _tool_skill(tool: str) -> "Skill | None":
 
 def _tool_ends_step(tool: str) -> bool:
     """Whether a tool's manifest says one successful call is its whole step (``ends_step``)."""
+    if tool.startswith("mcp_") and canonical_tool_name(tool) == "run_cellqc":
+        return True
     try:
         from ...tools import catalog as tool_catalog
         found = tool_catalog.manifest(tool)
@@ -597,6 +606,9 @@ def _planner_tool_description(tool: HarnessTool) -> str:
     from ...tools.catalog import manifest
     found = manifest(tool.name)
     props = (tool.parameters or {}).get("properties", {})
-    defaults = [_describe_param(n, props[n]) for n in (found.planner_defaults if found else ())
+    names = (found.planner_defaults if found else
+             ("min_counts", "min_features", "max_pct_mt") if tool.name.startswith("mcp_")
+             and canonical_tool_name(tool.name) == "run_cellqc" else ())
+    defaults = [_describe_param(n, props[n]) for n in names
                 if n in props and "default" in props[n]]
     return tool.description + (" Declared defaults: " + "; ".join(defaults) if defaults else "")

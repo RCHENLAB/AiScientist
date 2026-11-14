@@ -23,45 +23,41 @@ def test_the_scientist_catalog_is_the_manifests_plus_the_platform_tools():
     assert domain == offered, "every domain tool comes from a manifest, in manifest order"
 
 
-def test_a_tool_that_opts_out_of_research_reaches_no_model():
-    """``research: false`` = the tool runs only from its own console line. The PI plans from the
-    Scientist's catalog and the lab recognises a step's tool by it, so absence there is what keeps
-    an hour-long corpus scan out of a study; with a literature executor wired it stays absent."""
+def test_a_tool_that_opts_out_of_research_reaches_no_model(tmp_path, monkeypatch):
+    """A generic hidden manifest stays callable by an operator but is never offered to a model."""
     from aiscientist.agents.registry import build_quickchat_catalog, build_scientist_catalog
+    from aiscientist.agents.research_harness import HarnessTool
     from aiscientist.agents.research_lab import _known_tool_names
 
-    class _Line:
-        def run_tool(self, name, args, ctx):
-            return {"status": "ok"}
+    hidden = catalog.ToolManifest(name="operator_fixture", summary="Operator only", category="fixture",
+                                  runs_on="inprocess", order=1, folder=tmp_path / "operator_fixture",
+                                  research=False, chat=False)
+    visible = catalog.ToolManifest(name="platform_fixture", summary="Read-only platform fixture", category="fixture",
+                                   runs_on="inprocess", order=2, folder=tmp_path / "platform_fixture", chat=True)
+    monkeypatch.setattr(catalog, "manifests", lambda: (hidden, visible))
+    monkeypatch.setattr(catalog.ToolManifest, "factory", lambda m: lambda: HarnessTool(
+        name=m.name, description=m.summary, parameters={}, executor=lambda args, ctx: {"status": "ok"}))
+    for built in (build_scientist_catalog(), build_quickchat_catalog()):
+        names = {t.name for t in built}
+        assert "operator_fixture" not in names and "platform_fixture" in names
+    assert "operator_fixture" not in _known_tool_names()
+    assert catalog.build(hidden).executor({}, None) == {"status": "ok"}
 
-    hidden = {m.name for m in catalog.manifests() if not m.research}
-    assert hidden, "the corpus scan declares research: false; if it no longer does, drop this test"
-    for built in (build_scientist_catalog(), build_scientist_catalog(literature_executor=_Line()),
-                  build_quickchat_catalog(literature_executor=_Line())):
-        assert not hidden & {t.name for t in built}
-    assert not hidden & _known_tool_names()
-    # Still a tool of the package: its job line finds its resources and code by name.
-    assert hidden <= set(catalog.names())
 
-
-def test_hpc_routing_follows_runs_on(cellqc_release):     # run_cellqc runs the CellQC skill's method
-    from aiscientist.agents.registry import build_scientist_catalog
+def test_hpc_routing_follows_manifest_without_a_scientific_factory(tmp_path):
+    from types import SimpleNamespace
+    from aiscientist.agents.registry import _router
+    from aiscientist.agents.research_harness import HarnessTool
 
     seen = []
-
-    class _Line:
-        def __init__(self, line):
-            self.line = line
-
-        def run_tool(self, name, args, ctx):
-            seen.append((self.line, name))
-            return {"status": "ok"}
-
-    lines = {"analysis_executor": "hpc:analysis",
-             "phenotype_executor": "hpc:phenotype", "literature_executor": "hpc:literature"}
-    cat = {t.name: t for t in build_scientist_catalog(**{k: _Line(v) for k, v in lines.items()})}
-    for m in catalog.manifests():
-        if m.runs_on.startswith("hpc:") and m.research:
-            seen.clear()
-            cat[m.name].executor({}, None)
-            assert seen == [(m.runs_on, m.name)], f"{m.name} did not go to {m.runs_on}"
+    line = SimpleNamespace(run_tool=lambda name, args, ctx: seen.append((name, args, ctx)) or {"status": "ok"})
+    m = catalog.ToolManifest(name="routed_fixture", summary="Routing fixture", category="fixture",
+                             runs_on="hpc:analysis", order=1, folder=tmp_path / "routed_fixture")
+    original = HarnessTool(name=m.name, description=m.summary, parameters={},
+                           executor=lambda args, ctx: {"status": "local"})
+    bound = _router({"hpc:analysis": line})(m, original)
+    args, ctx = {"nested": {"flag": False}}, object()
+    assert bound.executor(args, ctx) == {"status": "ok"}
+    assert seen == [(m.name, args, ctx)]
+    assert bound.executor.__wrapped__ is original.executor
+    assert _router({})(m, original).executor(args, ctx) == {"status": "local"}

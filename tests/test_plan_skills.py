@@ -65,7 +65,7 @@ SCORE_STEP = ("**Score the ISG signature** — Score every cell for the interfer
               "compare the score between DDX41 and WT within each major cell class.")
 NAMED_STEP = ("**Score the ISG signature** — Adapt the reference template `score_signature.py` via "
               "`run_code` and summarise the score per class.")
-CLUSTER_STEP = "**Clustering** — Group the cells with `run_clustering` at resolution 0.5."
+CLUSTER_STEP = "**Clustering** — Group the cells with `mcp_run_clustering` at resolution 0.5."
 ACCEPT = json.dumps({"verdict": "accept", "score": 0.9, "critique": "ok"})
 
 
@@ -172,7 +172,7 @@ def _lab(tmp_path, *, plan_replies, match_reply="[]", record=None, plan_yaml=Tru
 
     catalog = [run_code_tool or HarnessTool("run_code", "run Python", {"type": "object", "properties": {
         "code": {"type": "string"}}}, run_code),
-               HarnessTool("run_clustering", "cluster", {"type": "object", "properties": {
+               HarnessTool("mcp_run_clustering", "cluster", {"type": "object", "properties": {
                    "resolution": {"type": "number"}}}, lambda a, c: {"status": "ok"})]
     workspace = tmp_path / "run"
     workspace.mkdir(exist_ok=True)
@@ -308,7 +308,7 @@ def test_a_pipeline_tool_step_and_an_unknown_name_get_no_skill(tmp_path, library
     lab, record, workspace = _lab(tmp_path, plan_replies=[_agenda(CLUSTER_STEP, SCORE_STEP)],
                                   match_reply=json.dumps([{"step": 2, "skill": "made-up-skill"}]))
     _result, events, _seen = _run(lab)
-    assert "1. " not in record["match_calls"][0], "the run_clustering step is not offered for matching"
+    assert "1. " not in record["match_calls"][0], "the mcp_run_clustering step is not offered for matching"
     assert [s.get("skill") for s in _of(events, "plan_doc")[0]["steps"]] == [None, None]
     assert not _of(events, "plan_skills")
     assert json.loads((workspace / "manifest.json").read_text())["skills"] == []

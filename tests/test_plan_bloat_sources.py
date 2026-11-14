@@ -1,7 +1,7 @@
 """What made a DDX41 plan grow to 18 steps, pinned so it does not come back.
 
 A plan for the mouse DDX41 retina (n = 1 library per arm, DDX41 1.6x deeper) carried:
-  * a run_code step re-deriving the per-direction depth verdict run_depth_matched_de already
+  * a run_code step re-deriving the per-direction depth verdict mcp_run_depth_matched_de already
     returns — and applying it backwards (every UP gene demoted, DOWN genes filtered on a rho the
     tool says is not evidence). The planning prompt had told the PI that DOWN genes were "the most
     credible set", and the tool's own description still sold one rho rule for both directions;
@@ -13,11 +13,13 @@ A plan for the mouse DDX41 retina (n = 1 library per arm, DDX41 1.6x deeper) car
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
 import pytest
 
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import (
     LabConfig, ResearchLab, _PLAN_REVIEW_CRITIC_SYSTEM, plan_tool_contracts,
 )
@@ -42,7 +44,7 @@ def _profile(**extra):
 def _lab(dr, complete=None):
     ctx = HarnessContext(decisions={"dataset_result": dr}, tunnel_port=1, model="m")
     return ResearchLab(ctx, LabConfig(), complete_fn=complete or (lambda _m: "{}"),
-                       scientist=ResearchHarness(catalog=default_catalog(),
+                       scientist=ResearchHarness(catalog=fixture_catalog(),
                                                  chat_fn=lambda *_a: {"content": ""}))
 
 
@@ -58,8 +60,7 @@ def test_planning_context_defers_direction_bookkeeping_to_the_tool():
 
 
 def test_depth_tool_description_states_the_per_direction_verdicts():
-    from aiscientist.tools.run_depth_matched_de.tool import make_tool
-    desc = make_tool().description
+    desc = next(t.description for t in fixture_catalog() if t.name == "mcp_run_depth_matched_de")
     assert "`depth_robust`" in desc and "`against_depth_untestable`" in desc
     assert "must not be used as a filter" in desc
     assert "no later step needs to re-derive it" in desc
@@ -68,11 +69,11 @@ def test_depth_tool_description_states_the_per_direction_verdicts():
 # --- the plan review sees the contracts of the tools the plan names -----------------------------
 
 def test_plan_tool_contracts_lists_only_the_named_tools():
-    catalog = default_catalog()
-    agenda = ["QC with `run_qc`", "Then something in prose only, naming run_de without backticks"]
+    catalog = fixture_catalog()
+    agenda = ["QC with `mcp_run_scanpy_qc`", "Then something in prose only, naming mcp_run_de without backticks"]
     contracts = plan_tool_contracts(agenda, catalog)
-    assert list(contracts) == ["run_qc"]
-    assert contracts["run_qc"] == next(t.description for t in catalog if t.name == "run_qc")
+    assert list(contracts) == ["mcp_run_scanpy_qc"]
+    assert contracts["mcp_run_scanpy_qc"] == next(t.description for t in catalog if t.name == "mcp_run_scanpy_qc")
     assert plan_tool_contracts(["no tools here"], catalog) == {}
 
 
@@ -85,9 +86,9 @@ def test_plan_review_hands_the_critic_the_named_tools_contracts():
         return json.dumps({"issues": [], "revised_agenda": []})
 
     lab = _lab(_profile(), complete)
-    draft = ["QC with `run_qc`", "Markers with `run_de_markers`", "Draw the volcano plots again"]
+    draft = ["QC with `mcp_run_scanpy_qc`", "Markers with `mcp_run_de`", "Draw the volcano plots again"]
     assert lab._plan_review("q", draft, lambda _e: None) == draft
-    assert seen and set(seen[0]["tools_named_in_plan"]) == {"run_qc", "run_de_markers"}
+    assert seen and set(seen[0]["tools_named_in_plan"]) == {"mcp_run_scanpy_qc", "mcp_run_de"}
     assert "tools_named_in_plan" in _PLAN_REVIEW_CRITIC_SYSTEM
     assert "Re-DERIVING is the same waste" in _PLAN_REVIEW_CRITIC_SYSTEM
 
@@ -122,7 +123,7 @@ def test_an_unreadable_review_is_reported_not_passed_as_clean():
             return '{"issues": ["step 2 duplicates step 1'          # cut mid-string
         raise AssertionError("no PI round after an unreadable review")
 
-    draft = ["QC with `run_qc`", "Markers with `run_de_markers`"]
+    draft = ["QC with `mcp_run_scanpy_qc`", "Markers with `mcp_run_de`"]
     assert _lab(_profile(), complete)._plan_review("q", draft, events.append) == draft
     assert [e["type"] for e in events] == ["plan_review_unparsed"]
 

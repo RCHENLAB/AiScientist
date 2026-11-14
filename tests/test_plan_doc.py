@@ -31,9 +31,9 @@ from aiscientist.agents.plan_doc import (  # noqa: E402
     sync_plan,
 )
 
-QC = ("**QC & normalization** — Measure each cell's quality with `run_scanpy_qc` and remove cells "
+QC = ("**QC & normalization** — Measure each cell's quality with `mcp_run_scanpy_qc` and remove cells "
       "detecting fewer than 200 genes and cells whose reads are more than 10% mitochondrial.")
-CLUSTER = ("**Clustering & UMAP** — Group the cells with `run_clustering` at resolution 0.5 and "
+CLUSTER = ("**Clustering & UMAP** — Group the cells with `mcp_run_clustering` at resolution 0.5 and "
            "lay them out on a 2-D map.")
 SUMMARY = "Summarise shared versus class-specific changes"
 AGENDA = [QC, CLUSTER, SUMMARY]
@@ -46,7 +46,7 @@ CLUSTER_PROPS = {
 }
 QC_PROPS = {"min_genes": {"type": "integer", "default": 200},
             "max_pct_mt": {"type": "number", "default": 20}}
-SCHEMAS = {"run_clustering": CLUSTER_PROPS, "run_scanpy_qc": QC_PROPS}
+SCHEMAS = {"mcp_run_clustering": CLUSTER_PROPS, "mcp_run_scanpy_qc": QC_PROPS}
 
 
 def _tool_of(text: str) -> "str | None":
@@ -57,7 +57,7 @@ def _doc(settings: "dict | None" = None) -> PlanDoc:
     doc, _fresh = sync_plan(None, AGENDA, request="Compare DDX41 with WT: rods", tool_of=_tool_of,
                             runs_on_of=lambda _t: "hpc:analysis")
     steps = list(doc.steps)
-    steps[1] = PlanStep(id="s2", text=CLUSTER, tool="run_clustering",
+    steps[1] = PlanStep(id="s2", text=CLUSTER, tool="mcp_run_clustering",
                         settings=settings if settings is not None else {"resolution": 0.5},
                         runs_on="hpc:analysis")
     return PlanDoc(doc.request, tuple(steps))
@@ -70,7 +70,7 @@ def test_a_plan_survives_the_round_trip_through_yaml_unchanged():
     back = parse_plan_yaml(doc.to_yaml(), request=doc.request)
     assert back.agenda() == AGENDA, "the step text the Scientist is handed must not drift"
     assert [(s.id, s.tool, s.settings) for s in back.steps] == [
-        ("s1", "run_scanpy_qc", {}), ("s2", "run_clustering", {"resolution": 0.5}), ("s3", None, {})]
+        ("s1", "mcp_run_scanpy_qc", {}), ("s2", "mcp_run_clustering", {"resolution": 0.5}), ("s3", None, {})]
 
 
 def test_values_yaml_would_reinterpret_stay_what_they_were():
@@ -185,9 +185,11 @@ def test_a_value_of_the_wrong_type_or_outside_the_closed_set_is_dropped():
 
 
 def test_a_multi_library_step_does_not_bind_one_species_or_a_subset_of_samples():
-    from aiscientist.tools.run_cellqc.tool import make_tool
+    from native_tool_fixtures import fixture_catalog
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
-    text = ("Run `run_cellqc` on the three Cell Ranger libraries in this delivery. "
+    text = ("Run `mcp_run_cellqc` on the three Cell Ranger libraries in this delivery. "
             "Sample1_WT and Sample2_Ddx41 are mouse (GRCm39) and are merged into one QC'd "
             "mouse object; Sample3_GSM5676874 is human (GRCh38) and is QC'd in its own "
             "CellQC run and kept as a separate object ...")
@@ -200,10 +202,12 @@ def test_a_multi_library_step_does_not_bind_one_species_or_a_subset_of_samples()
 
 
 def test_a_single_library_step_still_binds_its_species_and_sample():
-    from aiscientist.tools.run_cellqc.tool import make_tool
+    from native_tool_fixtures import fixture_catalog
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
     proposed = {"species": "mouse", "samples": ["Sample2_Ddx41"]}
-    text = "Run run_cellqc on the Sample2_Ddx41 Cell Ranger library, which is mouse (GRCm39)."
+    text = "Run mcp_run_cellqc on the Sample2_Ddx41 Cell Ranger library, which is mouse (GRCm39)."
     assert bind_settings(text, make_tool().parameters["properties"], proposed) == (proposed, [])
 
 
@@ -219,9 +223,11 @@ def test_closed_set_scope_ignores_defaults_and_partial_words(text, expected):
 
 
 def test_a_sentinel_choice_in_prose_does_not_unbind_a_closed_set():
-    from aiscientist.tools.run_cellqc.tool import make_tool
+    from native_tool_fixtures import fixture_catalog
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
-    text = ("Run run_cellqc with decontX for the ambient RNA; none of the libraries is "
+    text = ("Run mcp_run_cellqc with decontX for the ambient RNA; none of the libraries is "
             "corrected with SoupX.")
     assert bind_settings(text, make_tool().parameters["properties"],
                          {"ambient_method": "decontx"}) == ({"ambient_method": "decontx"}, [])
@@ -246,10 +252,12 @@ def test_a_multi_library_step_can_bind_the_complete_sample_list():
                                       ["Sample1", "Sample2", "Sample3"]])
 def test_a_sample_list_that_misses_a_named_library_is_refused_even_with_other_items(proposed):
     # "Sample3" is in the text (inside "Sample3_GSM5676874"), so it passes the stated check; it is no
-    # subset of the full names either. run_cellqc matches sample ids exactly and would refuse it.
-    from aiscientist.tools.run_cellqc.tool import make_tool
+    # subset of the full names either. mcp_run_cellqc matches sample ids exactly and would refuse it.
+    from native_tool_fixtures import fixture_catalog
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
-    text = ("Run run_cellqc on Sample1_WT and Sample2_Ddx41 (mouse) and Sample3_GSM5676874 "
+    text = ("Run mcp_run_cellqc on Sample1_WT and Sample2_Ddx41 (mouse) and Sample3_GSM5676874 "
             "(human).")
     settings, dropped = bind_settings(text, make_tool().parameters["properties"],
                                       {"samples": proposed})
@@ -258,8 +266,8 @@ def test_a_sample_list_that_misses_a_named_library_is_refused_even_with_other_it
 
 
 def test_arguments_written_as_a_call_are_read_from_the_step():
-    step = 'Contrast the arms with `run_de(groupby="sampleid", reference="WT", padj=0.05)`.'
-    assert call_settings(step, "run_de") == {"groupby": "sampleid", "reference": "WT", "padj": "0.05"}
+    step = 'Contrast the arms with `mcp_run_de(groupby="sampleid", reference="WT", padj=0.05)`.'
+    assert call_settings(step, "mcp_run_de") == {"groupby": "sampleid", "reference": "WT", "padj": "0.05"}
 
 
 # --- an edited document is checked against the tools before it is adopted ------------------------------
@@ -294,8 +302,8 @@ def test_changing_a_setting_rewrites_the_one_sentence_that_states_it():
 
 
 def test_a_number_stated_twice_is_left_alone_and_reported():
-    text = "**Clustering** — Cluster with `run_clustering` at resolution 0.5; 0.5 is the lab default."
-    before = PlanDoc("q", (PlanStep(id="s1", text=text, tool="run_clustering",
+    text = "**Clustering** — Cluster with `mcp_run_clustering` at resolution 0.5; 0.5 is the lab default."
+    before = PlanDoc("q", (PlanStep(id="s1", text=text, tool="mcp_run_clustering",
                                     settings={"resolution": 0.5}),))
     edited = parse_plan_yaml(before.to_yaml().replace("resolution: 0.5", "resolution: 1.0"))
     after, _changes, notes = apply_edit(before, edited)
@@ -332,12 +340,12 @@ def test_removing_adding_and_reordering_steps_are_each_named():
 
 
 def test_changing_a_steps_tool_renames_it_in_the_sentence_the_scientist_reads():
-    text = "**DE** — Contrast the arms with `run_de`, reading `run_de`'s ranking table."
-    before = PlanDoc("q", (PlanStep(id="s1", text=text, tool="run_de"),))
-    edited = parse_plan_yaml(before.to_yaml().replace("tool: run_de", "tool: run_pseudobulk_de"))
+    text = "**DE** — Contrast the arms with `mcp_run_de`, reading `mcp_run_de`'s ranking table."
+    before = PlanDoc("q", (PlanStep(id="s1", text=text, tool="mcp_run_de"),))
+    edited = parse_plan_yaml(before.to_yaml().replace("tool: mcp_run_de", "tool: mcp_run_pseudobulk_de"))
     after, changes, _ = apply_edit(before, edited)
-    assert [(c["kind"], c["before"], c["after"]) for c in changes] == [("tool", "run_de", "run_pseudobulk_de")]
-    assert after.steps[0].text == text.replace("run_de", "run_pseudobulk_de")
+    assert [(c["kind"], c["before"], c["after"]) for c in changes] == [("tool", "mcp_run_de", "mcp_run_pseudobulk_de")]
+    assert after.steps[0].text == text.replace("mcp_run_de", "mcp_run_pseudobulk_de")
 
 
 def test_an_edit_that_changes_nothing_reports_no_changes():
@@ -370,14 +378,14 @@ def _call(tool, ok=True, **args):
 def test_each_approved_step_gets_the_status_the_records_support():
     doc = _doc({"resolution": 1.0})
     executed = [
-        {"step": QC, "accepted": True, "calls": [_call("inspect_dataset"), _call("run_code")]},
-        {"step": CLUSTER, "accepted": True, "calls": [_call("run_clustering", resolution=0.5)]},
+        {"step": QC, "accepted": True, "calls": [_call("mcp_inspect_dataset"), _call("run_code")]},
+        {"step": CLUSTER, "accepted": True, "calls": [_call("mcp_run_clustering", resolution=0.5)]},
         {"step": "**Ambient audit** — an extra look", "accepted": True, "calls": [_call("run_code")]},
     ]
     report = check_adherence(doc, executed)
     assert [(r["step"], r["status"]) for r in report["steps"]] == [
         (1, "tool_not_called"), (2, "settings_differ"), (3, "not_run")]
-    assert report["steps"][0]["detail"] == ["inspect_dataset", "run_code"]
+    assert report["steps"][0]["detail"] == ["mcp_inspect_dataset", "run_code"]
     assert report["steps"][1]["detail"] == [{"param": "resolution", "approved": 1.0, "used": 0.5}]
     assert report["unplanned"] == ["**Ambient audit** — an extra look"]
     assert report["ok"] is False and report["as_planned"] == 0
@@ -387,8 +395,8 @@ def test_a_step_the_researcher_approved_mid_run_is_an_addition_not_unapproved_wo
     doc = _doc({"resolution": 1.0})
     extra, stray = "**Doublet check** — approved when asked", "**Ambient audit** — nobody was asked"
     executed = [
-        {"step": QC, "accepted": True, "calls": [_call("run_scanpy_qc")]},
-        {"step": CLUSTER, "accepted": True, "calls": [_call("run_clustering", resolution=1.0)]},
+        {"step": QC, "accepted": True, "calls": [_call("mcp_run_scanpy_qc")]},
+        {"step": CLUSTER, "accepted": True, "calls": [_call("mcp_run_clustering", resolution=1.0)]},
         {"step": SUMMARY, "accepted": True, "calls": []},
         {"step": extra, "accepted": True, "calls": [_call("run_code")]},
     ]
@@ -405,10 +413,10 @@ def test_a_step_the_researcher_approved_mid_run_is_an_addition_not_unapproved_wo
 def test_a_run_that_did_what_was_approved_is_reported_as_such():
     doc = _doc({"resolution": 1.0})
     executed = [
-        {"step": QC, "accepted": True, "calls": [_call("run_scanpy_qc", min_genes=200)]},
+        {"step": QC, "accepted": True, "calls": [_call("mcp_run_scanpy_qc", min_genes=200)]},
         # A failed first attempt does not count against a step whose later call used the value.
-        {"step": CLUSTER, "accepted": False, "calls": [_call("run_clustering", ok=False, resolution=1.0)]},
-        {"step": CLUSTER, "accepted": True, "calls": [_call("run_clustering", resolution=1)]},
+        {"step": CLUSTER, "accepted": False, "calls": [_call("mcp_run_clustering", ok=False, resolution=1.0)]},
+        {"step": CLUSTER, "accepted": True, "calls": [_call("mcp_run_clustering", resolution=1)]},
         {"step": SUMMARY, "accepted": True, "calls": [_call("finish")]},
     ]
     report = check_adherence(doc, executed)
@@ -419,8 +427,8 @@ def test_a_run_that_did_what_was_approved_is_reported_as_such():
 def test_a_step_whose_tool_never_succeeded_and_one_the_reviewer_refused():
     doc = _doc({"resolution": 1.0})
     report = check_adherence(doc, [
-        {"step": QC, "accepted": False, "calls": [_call("run_scanpy_qc")]},
-        {"step": CLUSTER, "accepted": True, "calls": [_call("run_clustering", ok=False, resolution=1.0)]},
+        {"step": QC, "accepted": False, "calls": [_call("mcp_run_scanpy_qc")]},
+        {"step": CLUSTER, "accepted": True, "calls": [_call("mcp_run_clustering", ok=False, resolution=1.0)]},
     ])
     assert [r["status"] for r in report["steps"]] == ["not_accepted", "tool_failed", "not_run"]
 
@@ -428,8 +436,8 @@ def test_a_step_whose_tool_never_succeeded_and_one_the_reviewer_refused():
 # --- a revision as operations on the document -----------------------------------------------------------
 
 def _ops_doc() -> PlanDoc:
-    return PlanDoc("q", (PlanStep("s1", QC, "run_scanpy_qc", {"min_genes": 200}),
-                         PlanStep("s2", CLUSTER, "run_clustering", {"resolution": 0.5}),
+    return PlanDoc("q", (PlanStep("s1", QC, "mcp_run_scanpy_qc", {"min_genes": 200}),
+                         PlanStep("s2", CLUSTER, "mcp_run_clustering", {"resolution": 0.5}),
                          PlanStep("s3", SUMMARY)))
 
 

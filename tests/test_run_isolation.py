@@ -9,6 +9,7 @@ per-conversation last run, and skipping the report for a cancelled/empty run. No
 
 from __future__ import annotations
 
+
 import asyncio
 import json
 
@@ -606,7 +607,7 @@ def test_an_unanswered_decision_proceeds_on_the_agents_judgment():
 def _waiting_chat(conn, conversation_id="184", run_id="c29a015ff8c6"):
     run = conn.begin_run(conversation_id)
     conn.bind_run_id(run, run_id)
-    run.pending_plan = {"kind": "plan", "payload": ["**Cell QC** — run_cellqc on both libraries."]}
+    run.pending_plan = {"kind": "plan", "payload": ["**Cell QC** — mcp_run_cellqc on both libraries."]}
     return run
 
 

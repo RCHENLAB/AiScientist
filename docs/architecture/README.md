@@ -6,8 +6,10 @@ is in [`../FINDINGS.md`](../FINDINGS.md).
 
 The same diagrams, editable, are on the FigJam board
 [AiScientist architecture](https://www.figma.com/board/OHeckC4jS6Yw5ET9UjBeQB) (AiScientist team).
-Every model-callable tool is documented in its own folder; the index is
-[src/aiscientist/tools/README.md](../../src/aiscientist/tools/README.md).
+Scientific tools are released in [aiscientist-mcp](https://github.com/liujs123456/aiscientist-mcp).
+The app reviews their schemas and immutable image pins in its
+[MCP catalog](../../src/aiscientist/agents/mcp_catalog/mcp_servers.json);
+[platform tools](../../src/aiscientist/tools/README.md) remain in the application.
 
 ## The system in one paragraph
 
@@ -34,16 +36,20 @@ flowchart LR
     gw <-->|"LLM calls via SSH tunnel"| vllm["HPC3 GPU job: vLLM"]
     gw -->|"shell tools via SSH"| worker["HPC3 held CPU worker"]
     gw -.->|"sbatch"| slurm[["Slurm"]]
-    slurm -.->|"starts"| jobs["tool jobs: analysis, vep, lirical,<br/>paperqa, report, scgpt, vlreview images"]
+    slurm -.->|"starts"| jobs["native MCP CPU/GPU images;<br/>platform analysis, report and vlreview images"]
     slurm -.->|"starts"| vllm
     jobs -->|"read, write run data"| dfs
-    gw -.->|"REST"| apis["Europe PMC, Ensembl VEP, ClinVar,<br/>the user's LLM API"]
+    jobs -.->|"public scientific services when configured"| apis["Europe PMC, Ensembl VEP, ClinVar"]
+    gw -.->|"optional local Docker retrieval"| local["pinned literature MCP"]
+    local -.->|"public lookup only"| apis
+    gw -.->|"guarded API calls"| llmapi["selected model provider"]
 ```
 
-The gateway orchestrates and never does the heavy compute. On each connect it syncs its own code to
-`pysrc/<user>` on dfs3b; Slurm jobs bind-mount that code into purpose-built Apptainer images, so a
-tool change never needs an image rebuild. All gateway-to-HPC3 traffic goes over one SSH session per
-user. A deploy is a release tag on RCHENLAB/AiScientist, which the server's deploy timer installs
+The gateway orchestrates and never does the heavy compute. Platform workers use the synced
+application source in `pysrc/<user>`. Scientific MCP tools run the implementation packaged in
+the reviewed digest-pinned server image, without an application scientific-source overlay.
+Scientific changes require a new server release and a reviewed catalog update. Command and
+scheduler traffic uses the user session; bulk files use the configured transfer node. A deploy is a release tag on RCHENLAB/AiScientist, which the server's deploy timer installs
 ([deploy/README.md](../../deploy/README.md)).
 
 Users' data is kept on the gateway host ([dataset storage](../dataset_storage.md)); HPC3 holds a copy
@@ -90,9 +96,10 @@ sequenceDiagram
 Before the run, the session's model routes the request (`agents/request_router.py`): anything that
 needs data or computation goes to the lab as above; a general question that published papers answer
 gets a one-step literature plan instead (`agents/literature_answer.py`). Once approved, that step
-searches PubMed through Europe PMC in the gateway and, in a session that reaches HPC3, the full text
-of the lab's RetiGene corpus (`search_corpus`: the question's meaning and the model's exact words,
-merged by rank) at the same time; the model answers from the corpus passages and the abstracts, and
+calls native literature MCP for PubMed/Europe PMC and, when available, the lab's RetiGene corpus (`search_corpus`: the question's meaning and the model's exact words,
+merged by rank) concurrently. The registered server runs on HPC3; separately enabled local Docker
+routes preserve public lookup and offline corpus retrieval without an HPC connection. Public lookup
+and corpus retrieval have distinct network policies; the model answers from the corpus passages and the abstracts, and
 code writes the reference list from the papers the answer cites; the answer is kept with the run.
 A question that names the RetiGene papers searches the corpus alone, and PubMed only when it asks for
 it. A question about them that asks for every gene with a property ("What are haploinsufficient
@@ -102,20 +109,22 @@ decides, `request_router.corpus_ask`), or a haploinsufficient-gene list question
 reads the RetiGene papers and that "search PubMed" asks the public literature), gets a RetiGene
 curation plan instead. For a property other than haploinsufficiency the session's model writes a task
 spec, which the plan lists and a note revises.
-The plan says how long the curation takes on the session: `extract_haploinsufficient_genes`
-reads the whole corpus (a GPU job of its own, or the session's API model through the gateway, or a
-kept scan of the same corpus at once), and the gateway builds two tables from its sentences
-(`gateway/corpus_scan.py`: one row per gene with its claim, the genes the papers argue against
-apart, and one row per sentence, each with its paper and page) and answers from them; the user can
-save the tables to their Datasets. A note on any plan is routed again, so "analyse my data instead"
+The plan describes the curation and its pilot/cost limits. Native `extract_haploinsufficient_genes`
+uses the selected session model through its guarded binding; it does not provision a separate GPU
+or substitute another model. A verified cached scan of the same corpus/spec/model can be reused.
+The native server writes the scientific gene, sentence and request CSVs; the gateway stages those
+files, records curation/publication metadata and answers from them. The user can save the tables
+to their Datasets. A bounded or stopped scan is not described as an exhaustive whole-corpus screen. A note on any plan is routed again, so "analyse my data instead"
 turns a literature plan into an analysis, and a note that makes it a list question about the RetiGene
 papers turns it into the curation, once per message. The literature plan's sources are read from the
 question once; after that only a note that asks for a source changes them. A request for more than
 the usual 12 sources widens the search to 30 corpus passages (3 per paper at most) and 24 PubMed
-papers, and the plan card and the saved method state the budget. Every run saves its processed dataset and CellQC result
-folder to the user's Datasets. The fast chat path (`agents/quick_chat.py`: only the `chat: true`
-tools, a streamed answer, no run directory) and the bare corpus scan stay on the server for a client
-that asks for them by `route`; the console sends none. Anti-fabrication layers: the Critic's
+papers, and the plan card and the saved method state the budget. Runs that produce processed
+datasets or CellQC result folders publish those verified outputs through the existing Datasets
+flow; literature-only and report-only runs do not imply such outputs. Plain fast chat (`agents/quick_chat.py`) streams a conversational answer without requiring HPC.
+A permitted literature request uses the dedicated reviewed native route rather than an old local
+scientific tool; no-search and private-data constraints remain in force. Explicit legacy client
+route selectors use the same retained platform entry points, not retired scientific implementations. Anti-fabrication layers: the Critic's
 deterministic floors (`agents/step_numbers.py`), the claim audit before writing
 (`agents/claim_audit.py`), closed-set grounding facts, and `verify_report_facts` after writing. The final
 manuscript loses any sentence that attributes a gene to a lineage the curated marker reference contradicts
@@ -135,7 +144,10 @@ flowchart TB
     registry -->|"adds platform tools"| shell["hpc/shell.py"]
     lab -->|"runs each step"| harness["agents/research_harness.py"]
     lab -->|"picks a protocol"| pipelines["preset_pipelines/"]
-    harness -->|"calls, many as HPC3 jobs"| folders["tools/NAME/ (one folder per tool)"]
+    harness -->|"platform calls"| folders["tools/: platform contracts and utilities"]
+    registry -->|"reviewed schemas and pins"| bridge["agents/mcp_bridge.py + mcp_analysis.py"]
+    harness -->|"typed scientific calls"| bridge
+    bridge -->|"MCP stdio in contained CPU/GPU jobs"| native["released aiscientist-mcp servers"]
     harness -->|"reads on demand"| skills["pinned aiscientist-skills release"]
     catalog -->|"loads"| folders
     folders -->|"implement"| sdk["tools/sdk.py"]
@@ -148,8 +160,8 @@ flowchart TB
 | `src/aiscientist/reporting/` | Turning a finished run into deliverables: pandoc render, result bundle, reference list, the vision-model render review |
 | `src/aiscientist/metadata/` | Croissant 1.1 metadata of datasets and results: built from what was measured plus the owner's review, validated (mlcroissant when installed), never hand-written. The gateway keeps it in the account database and serves it through the API and the MCP server at `/mcp` ([guideline](../development/metadata.md)) |
 | `src/aiscientist/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
-| `src/aiscientist/tools/` | Every model-callable domain tool, one folder each, plus the contract (`sdk.py`), discovery (`catalog.py`), the public surface (`api.py`), shared code (`_lib/`), reference data and the per-image job entry points |
-| `preset_pipelines/` | Plain files: end-to-end protocols the PI picks. The atomic CodeAct templates the Scientist adapts are the skills of the pinned `lijinbio/aiscientist-skills` release (`configs/skills_registry.json`), installed outside git |
+| `src/aiscientist/tools/` | Platform contracts (`sdk.py`), discovery (`catalog.py`), public utilities (`api.py`) and bounded worker operations; scientific algorithms and server entry points belong to aiscientist-mcp; scientific references are packaged or operator-mounted there, while platform configuration remains in the app |
+| `preset_pipelines/` | Plain files: end-to-end protocols the PI picks. Skills are installed outside git from the repository/release in `configs/skills_registry.json` (currently `liujs123456/aiscientist-skills` v0.2.5); native instruction-only skills and adaptable CodeAct templates have separate roles |
 | `frontend/console/` | The web UI |
 
 Two files are large enough to deserve a warning: `gateway/app.py` and
@@ -168,34 +180,37 @@ modules patches it on that module.
 
 | | Tool | Skill | Pipeline |
 |---|---|---|---|
-| What it is | Fixed code called by name with JSON arguments | An adaptable code template with guidance | An end-to-end protocol with pinned settings |
-| Used by | The Scientist | The Scientist, adapted and run via `run_code` | The PI, when planning |
-| How it loads | `tools/catalog.py` reads every `TOOL.md` | Progressive disclosure: manifest, then SKILL.md, then reference.py | Matched by topic; SKILL.md + PROTOCOL.md enter the plan |
-| How to add one | A `tools/<name>/` folder | A folder in the aiscientist-skills registry, then a new pinned release | A `preset_pipelines/<name>/` folder |
+| What it is | Fixed code called by name with JSON arguments | Guidance for registered tools, optionally an adaptable code template | An end-to-end protocol with pinned settings |
+| Used by | The Scientist | The Scientist; CodeAct templates alone are adapted via `run_code` | The PI, when planning |
+| How it loads | Reviewed MCP schema/image catalog; platform manifests through `tools/catalog.py` | Progressive disclosure: manifest, then SKILL.md, then optional reference.py | Matched by topic; SKILL.md + PROTOCOL.md enter the plan |
+| How to add one | A tested native server release and reviewed app catalog update | A folder in the aiscientist-skills registry, then a new pinned release | A `preset_pipelines/<name>/` folder |
 
 ## How a tool is discovered and routed
 
 ```mermaid
 flowchart LR
-    md["tools/NAME/TOOL.md<br/>manifest + docs"] --> discover["catalog: read every TOOL.md"]
-    py["tools/NAME/tool.py<br/>factory + executor"] --> plain["phase 1: build plain tools"]
-    discover --> plain
-    plain --> route{"registry: route by runs_on"}
-    route -->|"inprocess"| inproc["gateway process"]
-    route -->|"hpc:analysis"| a["analysis.sif via scrna_cli"]
-    route -->|"hpc:variant"| v["vep.sif via variant_cli"]
-    route -->|"hpc:phenotype"| p["lirical.sif via phenotype_cli"]
-    route -->|"hpc:literature"| l["paperqa.sif via paperqa_cli"]
-    route -->|"routed executors"| comp["phase 2: composites<br/>(diagnose_disease)"]
-    comp --> catalog(["Scientist catalog + platform tools"])
-    discover -->|"chat: true"| chat(["fast chat catalog"])
+    pins["reviewed MCP catalog: schemas, versions, digests"] --> registry["agents/registry.py + mcp_bridge.py"]
+    skills["matching pinned skills release"] --> registry
+    platform["platform TOOL.md manifests"] --> registry
+    registry --> catalog["session tool catalog"]
+    catalog -->|"validated tool arguments"| adapter["analysis adapter"]
+    adapter -->|"hpc:* and inprocess declarations"| cpu["contained native CPU runner"]
+    adapter -->|"gpu:scgpt"| gpu["native GPU Slurm job"]
+    cpu --> evidence["bounded response + complete task artifacts"]
+    gpu --> evidence
 ```
 
-A tool folder is the unit: `TOOL.md` (front matter = the manifest, body = the documentation) and
-`tool.py` (the factory and the executor). The registry, the HPC3 routing, the fast-chat selection,
-the analysis job's dispatcher and the System page all read the manifests, so adding a tool changes
-no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's generated sections
-(parameters, where it runs, the model-facing description) and the tool index.
+Server descriptions and schemas come from a reviewed MCP `tools/list` export. The
+catalog pairs them with a package version and immutable image digest; runtime
+execution also verifies the installed skill binding. The model supplies scientific
+arguments, while the operator controls mounts, resources and executor settings.
+Native `inprocess` declarations execute in the server environment, not by importing
+scientific packages into the gateway. The System page displays configured schemas;
+execution still requires the connected session and its registered capabilities.
+
+The remaining platform manifest index is generated with `python scripts/tool_docs.py`.
+See [MCP bridge](../development/mcp_bridge.md) for the response, task ownership,
+selected-session model relay and artifact publication contracts.
 
 ## Boundaries, enforced by tests
 
@@ -203,7 +218,7 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 |---|---|
 | Tools import nothing from the platform; `sdk.py` is standard library only | `tests/test_tools_boundary.py` |
 | The platform reaches the tools only through `sdk`, `catalog`, `api`, and only public names | `tests/test_repo_boundaries.py` |
-| Every tool folder has a manifest that matches its code; the docs are current | `tests/test_tool_manifests.py` |
+| Native tools match reviewed schemas; retained platform manifests and generated docs are current | `tests/test_tool_manifests.py` |
 | The catalog is the manifests plus the platform tools; routing follows `runs_on` | `tests/test_registry_manifests.py` |
 | Tool names the platform keys logic on, and the ones pipelines name, all exist | `tests/test_tool_contract.py` |
 | The installed pinned release loads, and its skills name only tools that exist | `tests/test_pinned_release.py` (where the release is installed) |
@@ -218,7 +233,7 @@ no platform file. `python scripts/tool_docs.py` regenerates each TOOL.md's gener
 3. `agents/research_lab/`: `ResearchLab.run`, the PI / Scientist / Critic loop.
 4. `agents/research_harness.py`: `ResearchHarness`, one step's tool loop.
 5. `agents/registry.py` and `tools/catalog.py`: how the catalog is assembled and routed.
-6. `tools/run_de/`: a typical tool (`TOOL.md`, then `tool.py`).
+6. `agents/mcp_analysis.py` and the native server package: scientific dispatch, evidence and implementation.
 7. `docs/skills_and_pipelines_architecture.md`, `preset_pipelines/README.md`.
 8. `deploy/README.md`, `deploy/deploy_release.sh`: deploys.
 9. `docs/FINDINGS.md`: what has been measured and decided, and why.

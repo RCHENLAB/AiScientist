@@ -37,12 +37,17 @@ HPC3 holds environments, images, model weights and one folder per session
     ├── inputs/               copies of the server datasets its runs read (read-only to the jobs)
     ├── shell-home/           $HOME inside the agent's run_shell sandbox
     ├── downloads/            the agent's fetch_url default
-    ├── jobs/<line>/          job files that belong to no run: the CPU worker, PaperQA in a chat
+    ├── jobs/<line>/          platform job files outside a run, including the CPU worker
     └── runs/<run_id>/
         ├── analysis/         work/ (checkpoints), artifacts/, result/ (the run's results)
-        ├── variant/ phenotype/ reports/ scgpt/ vlreview/ corpus/
+        ├── reports/ vlreview/  platform report rendering and visual review
         └── jobs/<line>/      the run's job scripts, args/result JSON and logs
 ```
+
+Native scientific workspaces are below `analysis/work/env/<skill>/<server>/<analysis_id>/`,
+with task records described in *Job files*. Earlier run folders may still contain the retired
+`variant/`, `phenotype/`, `scgpt/` or `corpus/` executor directories; they are historical data,
+not a second scientific runtime to dispatch.
 
 `sessions/` is group-writable with the setgid and sticky bits (3775): every lab member's session can
 create its folder there, and no one can remove another's. A session folder is its HPC3 user's only
@@ -109,26 +114,25 @@ computed on the server.
 
 ## Job files
 
-Every job a run starts on HPC3 has a few small files of its own: the sbatch script, the args JSON
-it is given, the result JSON it prints, the Slurm log (`#SBATCH --output`) and the tool's stderr
-log. They go to the run's `jobs/<line>/`, so two runs in flight at once (two chats of one session)
-never share a file name. What belongs to no run goes to the session's own `jobs/<line>/`.
+Each outer platform job has its sbatch script, arguments/result JSON and Slurm/stderr logs in the
+run's `jobs/<line>/`, so concurrent runs do not share job files. Jobs with no run use the session
+root. Native MCP packages additionally keep their own durable task requests, state and results
+under the run-local skill environment; these inner task records are distinct from the outer
+platform Slurm files.
 
 | Job line | Directory |
 |---|---|
-| scanpy analysis tools (QC, clustering, DE, CellQC ...) and image pulls | `runs/<run_id>/jobs/analysis/` |
+| platform staging, CodeAct analysis and image pulls | `runs/<run_id>/jobs/analysis/` |
 | `run_code` snippets | `runs/<run_id>/jobs/runcode/` |
-| offline VEP variant annotation | `runs/<run_id>/jobs/variant/` |
-| LIRICAL phenotype | `runs/<run_id>/jobs/phenotype/` |
-| PaperQA literature | `runs/<run_id>/jobs/paperqa/` (in a chat with no run: `jobs/paperqa/`) |
+| native scientific MCP tools | `runs/<run_id>/analysis/work/env/<skill>/<server>/<analysis_id>/jobs/<task_id>/` contains immutable task requests and durable status/results; complete exported responses are task-specific under `artifacts/mcp/` |
 | report rendering (pandoc / xelatex), including the staged `render_<n>.tgz` | `runs/<run_id>/jobs/report/` |
 | the session's CPU worker (holder script, log, heartbeat) | `jobs/worker/` |
 | scGPT annotation | native MCP task workspace; exported predictions in the run's `artifacts/data/` and `artifacts/mcp/scgpt-annotation/` |
 | render review | beside its output: `runs/<run_id>/vlreview/pass<n>/out/` |
 
-The gateway takes each of these from one function (`app._scratch_dir`), and the job classes have
-no default directory: a job line that names none fails when it is built instead of writing
-somewhere else. The paths are absolute on purpose. Slurm does not expand `$HOME` in
+The gateway takes the outer platform job directories from `app._scratch_dir`; those job classes
+have no default directory and fail if their line names none. Native task directories are derived
+inside the server from its confined `AISCI_DATA_DIR`, server name, analysis ID and task ID. The paths are absolute on purpose. Slurm does not expand `$HOME` in
 `#SBATCH --output`, so a path with a shell variable in it is created as written.
 
 ## A run's folder across sessions
@@ -136,8 +140,10 @@ somewhere else. The paths are absolute on purpose. Slurm does not expand `$HOME`
 A run's folders are in the session that started it (`runs/<run_id>/`), and the run's folder on
 the server records where (`hpc3_home.json`). A run continued in a later session keeps using that
 folder while it exists: continuing from a middle step reads the checkpoints there. A run started
-before session folders keeps its `Temp/<ucinetid>/<kind>/<run_id>/` folders the same way. When the
-folder is gone, the run starts again in the current session's folder. The gateway decides this
+before session folders keeps its `Temp/<ucinetid>/<kind>/<run_id>/` folders the same way. For ordinary new execution, when the
+folder is gone, the run starts again in the current session's folder. Explicit completed-task
+status recovery instead refuses a missing original RunHome, so it cannot query a different
+empty task namespace. The gateway decides this
 once per run and session, with one `test -d` (`app._resolve_run_home`).
 
 ## When a session disconnects

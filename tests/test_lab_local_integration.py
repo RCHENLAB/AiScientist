@@ -1,11 +1,11 @@
-"""Local END-TO-END integration: the real ResearchLab loop driving the REAL scanpy
-analysis tools on a synthetic dataset — no HPC3, no live LLM (the PI/Critic/Scientist
-turns are scripted), but the tools, CodeAct sandbox, and bundle are all real.
+"""Local END-TO-END integration: the real ResearchLab loop driving the REAL CodeAct sandbox on a
+synthetic dataset. No HPC3 and no live LLM (the PI, Critic and Scientist turns are scripted), but
+the catalog, the sandbox and the artifacts are real.
 
-This is the fast local debug loop: it exercises the whole chain (PI agenda → multi-step
-Scientist running real run_scanpy_qc/run_clustering/run_de + a CodeAct snippet that
-reads the dataset → Critic → categorized bundle) without a GPU. Skipped where the
-analysis stack isn't installed (light CI); runs locally + on the eye-server.
+It exercises the chain the platform owns: PI agenda -> a Scientist that runs ``run_code`` snippets
+which read the dataset -> Critic -> files under ``artifacts/``. The scientific tools run in their
+MCP servers' images (``lijinbio/aiscientist-mcp``) and are tested there, not here. Skipped where
+anndata is not installed (light CI).
 """
 
 from __future__ import annotations
@@ -14,8 +14,7 @@ import json
 
 import pytest
 
-pytest.importorskip("scanpy")
-pytest.importorskip("leidenalg")
+pytest.importorskip("anndata")
 
 from aiscientist.agents.registry import build_scientist_catalog  # noqa: E402
 from aiscientist.agents.research_harness import HarnessContext, ResearchHarness  # noqa: E402
@@ -60,8 +59,15 @@ def _tool_call(name, args):
 
 
 def _smart_scientist():
-    """Per step, call the matching real tool once, then finish on the next turn."""
+    """Per step, run one snippet in the real sandbox, then finish on the next turn."""
     import re
+
+    def snippet(name, expr):
+        return _tool_call("run_code", {"code":
+            "import os, anndata as ad\n"
+            "a = ad.read_h5ad(os.environ['AISCIENTIST_DATASET'])\n"
+            f"open(os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 'tables', '{name}'), 'w').write({expr})\n"
+            "print('codeact read', a.shape)\n"})
 
     def chat(messages, _tools):
         if any(m.get("role") == "tool" for m in messages):   # a tool result is in → finish
@@ -69,24 +75,15 @@ def _smart_scientist():
         brief = next((m["content"] for m in messages if m["role"] == "user"), "")
         m = re.search(r"Step to execute now:\s*(.+)", brief)   # the CURRENT step only
         step = (m.group(1) if m else brief).lower()
-        if "qc" in step:
-            return _tool_call("run_scanpy_qc", {"min_genes": 5, "max_pct_mt": 100, "n_top_genes": 30})
-        if "cluster" in step:
-            return _tool_call("run_clustering", {"resolution": 1.0, "n_neighbors": 10, "n_pcs": 10})
-        if "expression" in step or "marker" in step:
-            return _tool_call("run_de", {"n_genes": 20})
-        if "code" in step:
-            return _tool_call("run_code", {"code":
-                "import os, anndata as ad\n"
-                "a = ad.read_h5ad(os.environ['AISCIENTIST_DATASET'])\n"
-                "open(os.path.join(os.environ['AISCIENTIST_ARTIFACTS'], 'tables', 'codeact_shape.txt'), 'w')"
-                ".write(f'{a.n_obs}x{a.n_vars}')\n"
-                "print('codeact read', a.shape)\n"})
+        if "shape" in step:
+            return snippet("codeact_shape.txt", "f'{a.n_obs}x{a.n_vars}'")
+        if "mitochondrial" in step:
+            return snippet("codeact_mt.txt", "str(sum(v.startswith('MT-') for v in a.var_names))")
         return _tool_call("finish", {"answer": "nothing to do"})
     return chat
 
 
-def test_full_lab_loop_runs_real_tools_locally(tmp_path):
+def test_full_lab_loop_runs_code_steps_locally(tmp_path):
     ds = tmp_path / "synthetic.h5ad"
     _synthetic_h5ad(ds)
     run = tmp_path / "run"
@@ -96,33 +93,15 @@ def test_full_lab_loop_runs_real_tools_locally(tmp_path):
     ctx = HarnessContext(decisions={"dataset_path": str(ds)}, workspace=run, model="test")
     sandbox = CodeSandbox(dataset_path=str(ds), work_dir=str(run / "work"), artifacts_dir=str(art))
     scientist = ResearchHarness(catalog=build_scientist_catalog(code_executor=sandbox), chat_fn=_smart_scientist())
-    agenda = ["Run scanpy QC", "Cluster the cells", "Differential expression markers", "Custom code check"]
+    agenda = ["Write the dataset's shape with code", "Count the mitochondrial genes with code"]
     lab = ResearchLab(ctx, LabConfig(max_rounds=8), complete_fn=_scripted_pi_critic(agenda), scientist=scientist)
 
     result = lab.run("Characterize the synthetic dataset")
 
     assert result.accepted_steps == len(agenda) and result.converged
-    # real scanpy artifacts landed
-    figs = list((art / "figures").glob("*.png"))
-    tables = list((art / "tables").glob("*.csv"))
-    assert any("umap" in f.name for f in figs)            # clustering produced a UMAP
-    assert any(t.name.startswith("de_") for t in tables)  # DE wrote ranked tables
-    # the CodeAct snippet read the dataset via AISCIENTIST_DATASET and wrote an artifact
+    # each snippet read the dataset through AISCIENTIST_DATASET and wrote its file under artifacts/
     assert (art / "tables" / "codeact_shape.txt").read_text() == "240x60"
-
-    # Regression (read-out bug): run_de asked for 20 genes/group, so the RETURN must expose the
-    # true count (20) via explicit fields — NOT let a reviewer infer "10" from the capped
-    # ``top_genes_by_group`` preview. Cross-check the reported counts against the on-disk CSVs.
-    de_result = next(
-        (s["result"] for r in result.rounds for s in r.scientist_result.get("steps", [])
-         if s.get("tool") == "run_de" and isinstance(s.get("result"), dict)),
-        None,
-    )
-    assert de_result is not None and de_result.get("status") == "ok"
-    assert de_result["n_genes_per_group"] == 20
-    assert de_result["de_rows_total"] > 10
-    assert de_result["de_rows_by_group"] and all(v > 10 for v in de_result["de_rows_by_group"].values())
-    assert all(len(v) <= 10 for v in de_result["top_genes_by_group"].values())  # preview stays capped
-    for grp, n in de_result["de_rows_by_group"].items():
-        csv = art / "tables" / f"de_leiden_{grp}.csv"
-        assert len(csv.read_text().splitlines()) - 1 == n   # reported count == real CSV rows
+    assert (art / "tables" / "codeact_mt.txt").read_text() == "3"
+    # both steps ran in the sandbox, as run_code, and nothing else was called
+    tools = [s.get("tool") for r in result.rounds for s in r.scientist_result.get("steps", [])]
+    assert [t for t in tools if t != "finish"] == ["run_code", "run_code"]

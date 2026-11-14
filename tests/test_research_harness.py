@@ -8,6 +8,8 @@ that don't emit native tool_calls, the stop reasons, and the privacy guard.
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 from typing import Any
 
@@ -15,13 +17,22 @@ from aiscientist.agents.research_harness import (
     HarnessConfig,
     HarnessContext,
     HarnessTool,
-    ResearchHarness,
+    ResearchHarness as _ResearchHarness,
     _compress_message,
     _group_turns,
     _is_context_overflow,
     _msg_tokens,
-    default_catalog,
 )
+
+def _fixture_catalog():
+    return [HarnessTool("mcp_run_scanpy_qc", "Injected QC result fixture", {"type": "object", "properties": {}},
+                        lambda args, ctx: {"status": "ok", "cells": 400}),
+            HarnessTool("mcp_run_de", "Injected DE result fixture", {"type": "object", "properties": {}},
+                        lambda args, ctx: {"status": "ok", "effect_count": 2}), *fixture_catalog()]
+
+def ResearchHarness(*args, **kwargs):
+    kwargs.setdefault("catalog", _fixture_catalog())
+    return _ResearchHarness(*args, **kwargs)
 
 # A loaded single-cell dataset the QC/DE tools can read (decisions['dataset_result']).
 DATASET_RESULT = {
@@ -63,8 +74,8 @@ def _scripted(responses: list[dict[str, Any]], record: list | None = None):
 def test_runs_tools_in_order_then_finishes() -> None:
     events: list[dict] = []
     harness = ResearchHarness(chat_fn=_scripted([
-        _tool_call("run_qc", {}),
-        _tool_call("run_de_markers", {}),
+        _tool_call("mcp_run_scanpy_qc", {}),
+        _tool_call("mcp_run_de", {}),
         _tool_call("finish", {"answer": "QC clean; CD3D/MS4A1 are candidate markers (hypotheses)."}),
     ]))
 
@@ -73,10 +84,10 @@ def test_runs_tools_in_order_then_finishes() -> None:
     assert result.status == "ok"
     assert result.stop_reason == "finished"
     assert result.final_answer.startswith("QC clean")
-    assert [s["tool"] for s in result.steps] == ["run_qc", "run_de_markers", "finish"]
+    assert [s["tool"] for s in result.steps] == ["mcp_run_scanpy_qc", "mcp_run_de", "finish"]
     assert all(s["ok"] for s in result.steps)
     # QC actually executed (real lab builder output flowed through).
-    assert any(e["type"] == "tool_result" and e["tool"] == "run_qc" for e in events)
+    assert any(e["type"] == "tool_result" and e["tool"] == "mcp_run_scanpy_qc" for e in events)
     assert not result.errors
 
 
@@ -85,7 +96,7 @@ def test_tool_error_is_emitted_fed_back_and_not_faked() -> None:
         raise RuntimeError("simulated tool crash")
 
     boom_tool = HarnessTool("boom", "always fails", {"type": "object", "properties": {}}, boom)
-    catalog = [boom_tool, *[t for t in default_catalog() if t.name == "finish"]]
+    catalog = [boom_tool, *[t for t in fixture_catalog() if t.name == "finish"]]
 
     events: list[dict] = []
     seen_messages: list[list[dict]] = []
@@ -115,13 +126,13 @@ def test_tool_error_is_emitted_fed_back_and_not_faked() -> None:
 def test_malformed_or_absent_tool_calls_trigger_json_fallback() -> None:
     # First turn: no native tool_calls, but a JSON {"tool": ...} object in the text.
     harness = ResearchHarness(chat_fn=_scripted([
-        {"content": '{"tool": "run_qc", "args": {}}', "tool_calls": []},
+        {"content": '{"tool": "mcp_run_scanpy_qc", "args": {}}', "tool_calls": []},
         _tool_call("finish", {"answer": "done via fallback"}),
     ]))
 
     result = harness.run("analyze", _ctx())
 
-    assert [s["tool"] for s in result.steps] == ["run_qc", "finish"]
+    assert [s["tool"] for s in result.steps] == ["mcp_run_scanpy_qc", "finish"]
     assert result.final_answer == "done via fallback"
 
 
@@ -143,7 +154,7 @@ def test_missing_required_arg_is_a_validation_error() -> None:
         {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
         lambda _args, _ctx: {"status": "ok"},
     )
-    harness = ResearchHarness(catalog=[need_arg, *default_catalog()], chat_fn=_scripted([
+    harness = ResearchHarness(catalog=[need_arg, *fixture_catalog()], chat_fn=_scripted([
         _tool_call("need_arg", {}),            # no arguments at all: a reply cut off at the limit
         _tool_call("need_arg", {"y": "1"}),    # a wrong parameter name
         _tool_call("finish", {"answer": "ok"}),
@@ -160,7 +171,7 @@ def test_missing_required_arg_is_a_validation_error() -> None:
 def test_max_steps_stops_with_incomplete_status() -> None:
     harness = ResearchHarness(
         config=HarnessConfig(max_steps=2),
-        chat_fn=_scripted([_tool_call("run_qc", {}), _tool_call("run_qc", {})]),
+        chat_fn=_scripted([_tool_call("mcp_run_scanpy_qc", {}), _tool_call("mcp_run_scanpy_qc", {})]),
     )
 
     result = harness.run("analyze", _ctx())
@@ -181,7 +192,7 @@ def test_repeated_tool_errors_bail_the_step_early() -> None:
 
     boom_tool = HarnessTool("boom", "always fails", {"type": "object", "properties": {}}, boom)
     harness = ResearchHarness(
-        catalog=[boom_tool, *[t for t in default_catalog() if t.name == "finish"]],
+        catalog=[boom_tool, *[t for t in fixture_catalog() if t.name == "finish"]],
         chat_fn=_scripted([_tool_call("boom", {}) for _ in range(6)]),
     )
 
@@ -200,7 +211,7 @@ def test_tool_returning_cancelled_stops_the_step() -> None:
 
     tool = HarnessTool("run_code", "cancellable", {"type": "object", "properties": {}}, cancelled)
     harness = ResearchHarness(
-        catalog=[tool, *[t for t in default_catalog() if t.name == "finish"]],
+        catalog=[tool, *[t for t in fixture_catalog() if t.name == "finish"]],
         chat_fn=_scripted([_tool_call("run_code", {}), _tool_call("run_code", {})]),
     )
 
@@ -225,7 +236,7 @@ def test_distinct_errors_are_not_cut_off_early() -> None:
     flaky_tool = HarnessTool("flaky", "fails differently", {"type": "object", "properties": {}}, flaky)
     harness = ResearchHarness(
         config=HarnessConfig(max_steps=5, max_repeated_errors=3),
-        catalog=[flaky_tool, *[t for t in default_catalog() if t.name == "finish"]],
+        catalog=[flaky_tool, *[t for t in fixture_catalog() if t.name == "finish"]],
         chat_fn=_scripted([_tool_call("flaky", {}) for _ in range(6)]),
     )
 
@@ -247,7 +258,7 @@ def test_redundant_repeats_after_success_stop_early() -> None:
 
     echo_tool = HarnessTool("run_thing", "succeeds", {"type": "object", "properties": {}}, echo)
     harness = ResearchHarness(
-        catalog=[echo_tool, *[t for t in default_catalog() if t.name == "finish"]],
+        catalog=[echo_tool, *[t for t in fixture_catalog() if t.name == "finish"]],
         chat_fn=_scripted([_tool_call("run_thing", {}) for _ in range(5)]),
     )
 
@@ -273,11 +284,11 @@ def _probe_then_two_errors(first: str) -> ResearchHarness:
     empty = {"type": "object", "properties": {}}
     catalog = [HarnessTool(first, "succeeds", empty, _ok),
                HarnessTool("run_code", "fails", empty, _raise),
-               HarnessTool("run_enrichment", "the step's tool", empty, _ok),
-               *[t for t in default_catalog() if t.name == "finish"]]
+               HarnessTool("mcp_run_enrichment", "the step's tool", empty, _ok),
+               *[t for t in fixture_catalog() if t.name == "finish"]]
     return ResearchHarness(catalog=catalog, chat_fn=_scripted([
         _tool_call(first, {}), _tool_call("run_code", {}), _tool_call("run_code", {}),
-        _tool_call("run_enrichment", {}), _tool_call("finish", {"answer": "enriched"})]))
+        _tool_call("mcp_run_enrichment", {}), _tool_call("finish", {"answer": "enriched"})]))
 
 
 def test_a_lookup_is_not_a_result_so_errors_after_it_do_not_stop_the_step() -> None:
@@ -285,14 +296,14 @@ def test_a_lookup_is_not_a_result_so_errors_after_it_do_not_stop_the_step() -> N
 
     assert result.stop_reason == "finished"
     assert [s["tool"] for s in result.steps] == [
-        "read_tool_source", "run_code", "run_code", "run_enrichment", "finish"]
+        "read_tool_source", "run_code", "run_code", "mcp_run_enrichment", "finish"]
 
 
 def test_errors_after_a_real_result_still_stop_the_step_early() -> None:
-    result = _probe_then_two_errors("run_clustering").run("ORA", _ctx())
+    result = _probe_then_two_errors("mcp_run_clustering").run("ORA", _ctx())
 
     assert result.stop_reason == "done_early"
-    assert "run_enrichment" not in [s["tool"] for s in result.steps]
+    assert "mcp_run_enrichment" not in [s["tool"] for s in result.steps]
 
 
 def test_guard_blocks_raw_table_brief_before_any_model_call() -> None:
@@ -428,7 +439,7 @@ def test_budget_messages_noop_when_already_small() -> None:
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "brief"},
-        _assistant_call("c0", "run_qc", "{}"),
+        _assistant_call("c0", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c0", {"status": "ok"}),
     ]
     out = harness._budget_messages(messages, tool_schemas, lambda _e: None)
@@ -443,9 +454,9 @@ def test_extra_reserve_trims_more_aggressively() -> None:
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "brief"},
-        _assistant_call("c0", "run_qc", "{}"),
+        _assistant_call("c0", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c0", {"status": "ok", "blob": big}),
-        _assistant_call("c1", "run_qc", "{}"),
+        _assistant_call("c1", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c1", {"status": "ok", "blob": big}),
     ]
     base = harness._budget_messages(messages, tool_schemas, lambda _e: None)
@@ -461,11 +472,11 @@ def test_exact_counter_tightens_until_real_count_fits() -> None:
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "brief"},
-        _assistant_call("c0", "run_qc", "{}"),
+        _assistant_call("c0", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c0", {"status": "ok", "blob": big}),
-        _assistant_call("c1", "run_qc", "{}"),
+        _assistant_call("c1", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c1", {"status": "ok", "blob": big}),
-        _assistant_call("c2", "run_qc", "{}"),
+        _assistant_call("c2", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c2", {"status": "ok", "blob": big}),
     ]
 
@@ -498,7 +509,7 @@ def test_exact_counter_none_falls_back_to_estimate() -> None:
     messages = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "brief"},
-        _assistant_call("c0", "run_qc", "{}"),
+        _assistant_call("c0", "mcp_run_scanpy_qc", "{}"),
         _tool_reply("c0", {"status": "ok"}),
     ]
     out = harness._budget_messages(messages, tool_schemas, lambda _e: None)
@@ -566,7 +577,7 @@ def test_the_model_is_told_when_its_turns_are_running_out() -> None:
     seen: list[list[dict]] = []
     harness = ResearchHarness(
         config=HarnessConfig(max_steps=3, warn_turns_left=2),
-        chat_fn=_scripted([_tool_call("run_qc", {}), _tool_call("run_qc", {}),
+        chat_fn=_scripted([_tool_call("mcp_run_scanpy_qc", {}), _tool_call("mcp_run_scanpy_qc", {}),
                            _tool_call("finish", {"answer": "done"})], record=seen))
     events: list[dict] = []
     harness.run("Analyze.", _ctx(), on_event=events.append)
@@ -586,7 +597,7 @@ def test_a_step_that_runs_out_of_turns_still_answers_in_its_own_words() -> None:
     def _chat(messages, tools):
         calls.append([dict(m) for m in messages])
         if len(calls) <= 2:
-            return _tool_call("run_qc", {})
+            return _tool_call("mcp_run_scanpy_qc", {})
         return {"content": "QC ran on 400 cells; medians are in tables/qc.csv.", "tool_calls": []}
 
     harness = ResearchHarness(config=HarnessConfig(max_steps=2), chat_fn=_chat)
@@ -634,7 +645,7 @@ def test_a_step_that_finishes_normally_gets_no_closing_turn() -> None:
     def _chat(messages, tools):
         calls.append(1)
         return _tool_call("finish", {"answer": "done early"}) if len(calls) > 1 \
-            else _tool_call("run_qc", {})
+            else _tool_call("mcp_run_scanpy_qc", {})
 
     harness = ResearchHarness(config=HarnessConfig(max_steps=8), chat_fn=_chat)
     result = harness.run("Analyze.", _ctx(), on_event=lambda _e: None)
@@ -651,14 +662,14 @@ def test_a_failing_closing_turn_costs_one_call_and_nothing_else() -> None:
         calls.append(1)
         if len(calls) > 2:
             raise RuntimeError("provider 500 on the closing turn")
-        return _tool_call("run_qc", {})
+        return _tool_call("mcp_run_scanpy_qc", {})
 
     harness = ResearchHarness(config=HarnessConfig(max_steps=2), chat_fn=_chat)
     events: list[dict] = []
     result = harness.run("Analyze.", _ctx(), on_event=events.append)
 
     assert result.stop_reason == "max_steps"
-    assert result.answer_synthesized and "run_qc" in result.final_answer
+    assert result.answer_synthesized and "mcp_run_scanpy_qc" in result.final_answer
     assert any(e["type"] == "closing_turn_failed" for e in events)
 
 
@@ -718,14 +729,14 @@ def test_single_planned_tool_stops_after_success_with_lookups_allowed():
             return {"status": "ok", "cells_after": 80}
         return run
     catalog = [HarnessTool(name, name, {"type": "object", "properties": {}}, executor(name))
-               for name in ("list_dir", "run_cellqc", "run_code")]
-    responses = [_tool_call("list_dir", {}), _tool_call("run_cellqc", {})]
+               for name in ("list_dir", "mcp_run_cellqc", "run_code")]
+    responses = [_tool_call("list_dir", {}), _tool_call("mcp_run_cellqc", {})]
     # Even an extra tool queued in the same model response must not run.
     responses[-1]["tool_calls"].extend(_tool_call("run_code", {})["tool_calls"])
     seen = []
     harness = ResearchHarness(catalog=catalog, chat_fn=_scripted(responses, record=seen))
-    result = harness.run("QC only", _ctx(), planned_tools=["run_cellqc"])
-    assert executed == ["list_dir", "run_cellqc"]
+    result = harness.run("QC only", _ctx(), planned_tools=["mcp_run_cellqc"])
+    assert executed == ["list_dir", "mcp_run_cellqc"]
     assert len(seen) == 2
     assert result.status == "ok" and result.stop_reason == "planned_tool_succeeded"
     assert result.answer_synthesized and "80" in result.final_answer
@@ -733,9 +744,9 @@ def test_single_planned_tool_stops_after_success_with_lookups_allowed():
 
 def test_planned_tool_failure_can_retry_before_stopping():
     outputs = iter([{"status": "error", "error": "try again"}, {"status": "ok"}])
-    tool = HarnessTool("run_cellqc", "QC", {"type": "object", "properties": {}},
+    tool = HarnessTool("mcp_run_cellqc", "QC", {"type": "object", "properties": {}},
                        lambda args, ctx: next(outputs))
     harness = ResearchHarness(catalog=[tool], chat_fn=_scripted([
-        _tool_call("run_cellqc", {}), _tool_call("run_cellqc", {})]))
-    result = harness.run("QC", _ctx(), planned_tools=["run_cellqc"])
+        _tool_call("mcp_run_cellqc", {}), _tool_call("mcp_run_cellqc", {})]))
+    result = harness.run("QC", _ctx(), planned_tools=["mcp_run_cellqc"])
     assert len(result.steps) == 2 and result.stop_reason == "planned_tool_succeeded"

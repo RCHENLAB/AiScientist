@@ -49,7 +49,7 @@ PLATFORM_RELIES_ON = {
     "scgpt_annotate": "gateway/app.py, agents/tool_names.py: native MCP scGPT result reporting",
 }
 
-PLATFORM_TOOLS = {"finish", "run_qc", "run_de_markers", "run_code", "describe_environment",
+PLATFORM_TOOLS = {"finish", "run_code", "describe_environment",
                   "search_skills", "read_skill_reference", "read_tool_source",
                   "list_dir", "stat_path", "find_files", "read_text", "disk_usage", "run_shell",
                   "fetch_url", "install_package", "run_in_environment"}

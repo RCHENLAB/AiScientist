@@ -14,7 +14,7 @@ from aiscientist.agents.scope import RunScope
 
 def _doc(limit=25):
     return PlanDoc(request="QC cells", steps=(PlanStep(
-        id="qc", text="Filter cells with `run_scanpy_qc`.", tool="run_scanpy_qc",
+        id="qc", text="Filter cells with `mcp_run_scanpy_qc`.", tool="mcp_run_scanpy_qc",
         settings={"max_pct_mt": limit, "min_genes": 200}, runs_on="hpc:analysis"),))
 
 
@@ -26,10 +26,10 @@ def _lab(calls, *, complete=None, planner="linear"):
     def chat(messages, tools):
         done = any(m.get("role") == "tool" for m in messages)
         return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
-            "name": "finish" if done else "run_scanpy_qc",
+            "name": "finish" if done else "mcp_run_scanpy_qc",
             "arguments": json.dumps({"answer": "done"} if done else {"max_pct_mt": 5})}}]}
 
-    tool = HarnessTool("run_scanpy_qc", "Filter cells", {"type": "object", "properties": {
+    tool = HarnessTool("mcp_run_scanpy_qc", "Filter cells", {"type": "object", "properties": {
         "max_pct_mt": {"type": "number"}, "min_genes": {"type": "integer"}}}, run)
     def default_complete(messages):
         system = messages[0]["content"]
@@ -82,7 +82,7 @@ def test_saved_approved_plan_keeps_planner_team_and_post_approval_guards(planner
     lab._guidance, lab._self_sourced = "Saved guidance", "PI notes"
     lab._later = ["enrichment"]
     lab._scope = RunScope(keep=("qc",))
-    lab._skills = [PresetPipeline("qc", "QC", "Saved protocol", ("run_scanpy_qc",))]
+    lab._skills = [PresetPipeline("qc", "QC", "Saved protocol", ("mcp_run_scanpy_qc",))]
     context = json.loads(json.dumps(lab.plan_context))
     restored = _lab([], planner=planner)
     doc = _doc()
@@ -103,7 +103,7 @@ def test_saved_approved_plan_keeps_planner_team_and_post_approval_guards(planner
     assert captured["agenda"] == _doc().agenda()
     assert captured["exec_roster"] == team and captured["exec_multi"] is True
     assert json.loads(json.dumps(restored.plan_context)) == context
-    assert restored._pinned_settings(_doc().agenda()[0])["run_scanpy_qc"]["max_pct_mt"] == 25
+    assert restored._pinned_settings(_doc().agenda()[0])["mcp_run_scanpy_qc"]["max_pct_mt"] == 25
 
 
 class WaitingPlan(Exception):
@@ -176,8 +176,8 @@ def test_restored_skills_keep_their_declared_outputs():
 
     lab = _lab([])
     declared = DeclaredOutput(path="tables/qc_summary.csv", kind="table",
-                              description="Cells kept per sample", tool="run_scanpy_qc")
-    lab._skills = [PresetPipeline("qc", "QC", "Saved protocol", ("run_scanpy_qc",),
+                              description="Cells kept per sample", tool="mcp_run_scanpy_qc")
+    lab._skills = [PresetPipeline("qc", "QC", "Saved protocol", ("mcp_run_scanpy_qc",),
                                   outputs=(declared,))]
     context = json.loads(json.dumps(lab.plan_context))
     # A field a later deploy no longer has must not stop the plan from being restored.

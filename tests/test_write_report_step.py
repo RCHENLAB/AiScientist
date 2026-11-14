@@ -9,18 +9,20 @@ models throughout.
 
 from __future__ import annotations
 
+from native_tool_fixtures import fixture_catalog
+
 import json
 
 import pytest
 
 from aiscientist.agents import research_lab as rl
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import (
     REPORT_STEP, LabConfig, LabResult, ResearchLab, ResumeState, _is_report_step)
 from aiscientist.agents.scope import rules_out_report, wants_written_report
 from aiscientist.agents.skills import Skill
 
-QC = "**QC** — Run `run_qc` on the cells."
+QC = "**QC** — Run `mcp_run_scanpy_qc` on the cells."
 DRAFTED = "**Report** — Write the methods and results report with `write_report`."
 
 
@@ -113,7 +115,7 @@ def _scientist(briefs):
             return {"content": "", "tool_calls": [{"id": "f1", "type": "function", "function": {
                 "name": "finish", "arguments": json.dumps({"answer": "QC done"})}}]}
         return {"content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {
-            "name": "run_qc", "arguments": "{}"}}]}
+            "name": "mcp_run_scanpy_qc", "arguments": "{}"}}]}
     return chat
 
 
@@ -134,7 +136,7 @@ def _run(agenda, question):
     briefs: list[str] = []
     events: list[dict] = []
     lab = ResearchLab(_ctx(), LabConfig(planner="linear"), complete_fn=_router(agenda),
-                      scientist=ResearchHarness(catalog=default_catalog(), chat_fn=_scientist(briefs)))
+                      scientist=ResearchHarness(catalog=fixture_catalog(), chat_fn=_scientist(briefs)))
     result = lab.run(question, on_event=events.append)
     return lab, result, briefs, events
 
@@ -171,9 +173,9 @@ def test_a_limited_run_keeps_its_report_step():
     """"Only QC, and write a report": the limit is about the analysis, not the report step."""
     from aiscientist.agents.scope import RunScope
     lab = _lab()
-    lab._scope = RunScope(keep=("run_cellqc",))
-    cellqc = "**QC** — Quality-control the delivery with `run_cellqc`."
-    cluster = "**Clustering** — Cluster the cells with `run_clustering`."
+    lab._scope = RunScope(keep=("mcp_run_cellqc",))
+    cellqc = "**QC** — Quality-control the delivery with `mcp_run_cellqc`."
+    cluster = "**Clustering** — Cluster the cells with `mcp_run_clustering`."
     _seen, emit = _events()
     assert lab._apply_scope([cellqc, cluster, REPORT_STEP], emit) == [cellqc, REPORT_STEP]
 

@@ -1,7 +1,7 @@
 ---
 name: celltype_annotation
 description: Single-cell cell-type annotation + report
-tools: run_scanpy_qc, run_clustering, run_de, run_enrichment, run_code
+tools: mcp_run_scanpy_qc, mcp_run_clustering, mcp_run_de, mcp_run_enrichment, run_code
 ---
 
 # Single-cell Cell-type Annotation Protocol
@@ -37,10 +37,10 @@ Adapt every parameter to **this** dataset.
 
 | # | Step | Tool / skill | 🔬 Key agent-chosen params | Output |
 |---|------|--------------|----------------------------|--------|
-| 1 | **QC the dataset** | `run_scanpy_qc` | QC filter thresholds *(agent-chosen)* | filtered + normalized AnnData, pre/post counts |
-| 2 | **Cluster the cells** | `run_clustering` | **Leiden resolution** *(agent-chosen)* | clusters + UMAP embedding |
-| 3 | **Markers per cluster** | `run_de` | `groupby` = cluster | per-cluster marker / rank-genes tables |
-| 4 | **(Optional) Enrichment** | `run_enrichment` | top markers + gene-set libraries | pathway / marker enrichment |
+| 1 | **QC the dataset** | `mcp_run_scanpy_qc` | QC filter thresholds *(agent-chosen)* | filtered + normalized AnnData, pre/post counts |
+| 2 | **Cluster the cells** | `mcp_run_clustering` | **Leiden resolution** *(agent-chosen)* | clusters + UMAP embedding |
+| 3 | **Markers per cluster** | `mcp_run_de` | `groupby` = cluster | per-cluster marker / rank-genes tables |
+| 4 | **(Optional) Enrichment** | `mcp_run_enrichment` | top markers + gene-set libraries | pathway / marker enrichment |
 | 5 | **Assign cell-type labels** | `run_code` (`annotate_clusters_by_markers.py`) | marker → cell-type mapping + confidence | a label per cluster |
 | 6 | **Figures** | scanpy plotting / `run_code` | which canonical markers to plot | UMAP (cluster & cell type) + violin/dot |
 
@@ -65,9 +65,9 @@ normalizing first is what makes the downstream labels trustworthy; the pre/post 
 **🔬 Agent-chosen:** the QC filter thresholds (which cells/genes to drop) — *(agent-chosen per study)*; the
 SKILL does not pin values, so adapt them to this dataset's depth and mito profile.
 
-**What runs** — the `run_scanpy_qc` tool call:
+**What runs** — the `mcp_run_scanpy_qc` tool call:
 ```
-run_scanpy_qc(dataset, <QC filter thresholds — agent-chosen per study>)
+mcp_run_scanpy_qc(dataset, <QC filter thresholds — agent-chosen per study>)
 #   → per-cell QC metrics
 #   → filter low-quality cells + genes
 #   → normalize_total → log1p → highly-variable genes     (fixed recipe)
@@ -77,7 +77,7 @@ run_scanpy_qc(dataset, <QC filter thresholds — agent-chosen per study>)
 **✅ Verify this step:** pre/post cell **and** gene counts are both reported · the drop looks sane (not
 near-total, not near-zero) · normalization + HVG ran before any clustering.
 
-<sub>Source: `run_scanpy_qc` · `SKILL.md` step 1</sub>
+<sub>Source: `mcp_run_scanpy_qc` · `SKILL.md` step 1</sub>
 </details>
 
 <details>
@@ -92,16 +92,16 @@ merges distinct types into one label, too high shatters one type across clusters
 **🔬 Agent-chosen:** the **Leiden `resolution`** — *(agent-chosen per study)*; pick a sensible value for this
 dataset and be ready to justify it.
 
-**What runs** — the `run_clustering` tool call:
+**What runs** — the `mcp_run_clustering` tool call:
 ```
-run_clustering(<Leiden resolution — agent-chosen per study>)
+mcp_run_clustering(<Leiden resolution — agent-chosen per study>)
 #   PCA → neighbors → Leiden → UMAP        (fixed order)
 ```
 
 **✅ Verify this step:** the chosen resolution is stated · the cluster count is biologically plausible for
 the tissue · the UMAP shows separated (not one smeared blob) structure.
 
-<sub>Source: `run_clustering` · `SKILL.md` step 2</sub>
+<sub>Source: `mcp_run_clustering` · `SKILL.md` step 2</sub>
 </details>
 
 <details>
@@ -115,16 +115,16 @@ cluster from the rest. This table is the ground truth for Step 5's labels.
 
 **🔬 Agent-chosen:** `groupby` = the cluster labels from Step 2.
 
-**What runs** — the `run_de` tool call:
+**What runs** — the `mcp_run_de` tool call:
 ```
-run_de(groupby = cluster)
+mcp_run_de(groupby = cluster)
 #   differential expression / rank_genes per cluster
 ```
 
 **✅ Verify this step:** every cluster gets a marker list · the top markers are recognisable genes (not all
 mito/ribo artefacts) · the table is what Step 5 actually reads.
 
-<sub>Source: `run_de` · `SKILL.md` step 3</sub>
+<sub>Source: `mcp_run_de` · `SKILL.md` step 3</sub>
 </details>
 
 <details>
@@ -138,15 +138,15 @@ for reading the markers themselves.
 
 **🔬 Agent-chosen:** the top-marker set fed in and the gene-set libraries used — *(agent-chosen per study)*.
 
-**What runs** — the `run_enrichment` tool call:
+**What runs** — the `mcp_run_enrichment` tool call:
 ```
-run_enrichment(top markers per cluster, <gene-set libraries — agent-chosen per study>)
+mcp_run_enrichment(top markers per cluster, <gene-set libraries — agent-chosen per study>)
 ```
 
 **✅ Verify this step:** enrichment is used to *corroborate* a label, not to overrule the actual markers ·
 if skipped, that is fine and should simply not be claimed.
 
-<sub>Source: `run_enrichment` · `SKILL.md` step 4</sub>
+<sub>Source: `mcp_run_enrichment` · `SKILL.md` step 4</sub>
 </details>
 
 <details>
@@ -219,8 +219,8 @@ truth.
 
 scanpy — per-cell QC + `normalize_total`/`log1p`/HVG · `PCA → neighbors → Leiden → UMAP` · `rank_genes`
 per-cluster differential expression · (optional) marker/pathway enrichment · optional `run_code` adaptation
-of the `annotate_clusters_by_markers.py` reference template for label assignment. Tools: `run_scanpy_qc`,
-`run_clustering`, `run_de`, `run_enrichment`, `run_code` (see this pipeline's `SKILL.md`). Plan no other
+of the `annotate_clusters_by_markers.py` reference template for label assignment. Tools: `mcp_run_scanpy_qc`,
+`mcp_run_clustering`, `mcp_run_de`, `mcp_run_enrichment`, `run_code` (see this pipeline's `SKILL.md`). Plan no other
 report-writing step: a written report is one `write_report` step, last, planned only when the request asks for it.
 
 <sub>This protocol renders the `celltype_annotation` SKILL.md; where the SKILL leaves a knob to the agent it

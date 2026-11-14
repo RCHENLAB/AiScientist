@@ -33,7 +33,7 @@ from aiscientist.gateway.slurm_sandbox import SlurmCodeExecutor
 GATEWAY_DIR = Path(worker.__file__).parent
 
 # Every job line the gateway starts on HPC3, by the name of its directory under Temp/<user>/scratch/.
-JOB_LINES = {"analysis", "runcode", "phenotype", "paperqa", "report", "worker"}
+JOB_LINES = {"analysis", "runcode", "report", "worker"}
 
 
 # --- no default: a caller that names no directory does not get the home directory ---------------

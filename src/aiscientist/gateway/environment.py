@@ -133,15 +133,16 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
     from ..tools.api import genesets_dir as _genesets_dir
 
     gmt_dir = _genesets_dir()
-    gmts = sorted(p.name for p in gmt_dir.glob("*.gmt")) if gmt_dir.is_dir() else []
     items = [
-        _local("gene_sets", "Gene-set libraries (.gmt) for run_enrichment / run_gsea_prerank",
-               gmt_dir,
-               "Read OFFLINE by the enrichment tools — no network, no Enrichr API. Present: "
-               + (", ".join(gmts) if gmts else "NONE — run scripts/fetch_genesets.py")
-               + ". AISCIENTIST_GENESETS_DIR overrides this location. A pathway summary computed by "
-                 "hand should read these same files rather than fetch a collection."),
-        _remote("container", "Analysis image (run_code, scanpy line)", settings.analysis_image,
+        _remote("gene_sets", "Gene-set libraries (.gmt) for native enrichment",
+                str(gmt_dir) if gmt_dir is not None else "",
+                "Read OFFLINE by the native enrichment tools — no network, no Enrichr API. "
+                + ("Operator-configured SCRNA_GENESETS_DIR (legacy AISCIENTIST_GENESETS_DIR accepted); "
+                   "remote contents are not inspected by the gateway. " if gmt_dir is not None else
+                   "Not configured: set SCRNA_GENESETS_DIR to the read-only HPC reference directory. ")
+                + "A hand-computed summary should use these same files rather than fetch a collection. "
+                  "The gene-set fetch script belongs to the aiscientist-mcp repository."),
+        _remote("container", "CodeAct and platform worker image", settings.analysis_image,
                 "Fixed at build time and read-only. A package it lacks is resolved into the shared "
                 "cache below, not installed into the image."),
         _remote("model", "scGPT weights + vocabulary + label map", settings.scgpt_model_dir,
@@ -160,12 +161,6 @@ def asset_inventory(settings: Any = None) -> list[dict[str, Any]]:
                 "generated sitecustomize."),
         _remote("reference", "Lab reference data (VEP caches, LIRICAL data, SpliceAI models)",
                 f"{settings.lab_storage.rstrip('/')}/software/reference"),
-        _remote("gene_sets", "Gene-set libraries (.gmt), the copy HPC3 jobs can read",
-                f"{settings.shared_root.rstrip('/')}/sessions/<session>/app/aiscientist/tools/genesets",
-                "The same files as the gateway copy, synced with the live source for analysis jobs. "
-                "They list human (upper-case) symbols: run_enrichment / run_gsea_prerank matched "
-                "mouse genes in past runs, but code that reads a .gmt directly must upper-case "
-                "mouse symbols first."),
         _remote("workspace", "This session's folder (removed when the session ends, after its "
                              "results are copied to the server)",
                 f"{settings.shared_root.rstrip('/')}/sessions/<session>"),
