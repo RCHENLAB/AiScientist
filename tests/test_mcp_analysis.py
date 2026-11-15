@@ -525,11 +525,21 @@ def test_collector_rejects_symlinked_configured_root(analysis_bridge, variable):
     assert not (runner.checkpoints / "adata_qc.h5ad").exists()
 
 
-@pytest.mark.parametrize("value", ["adata_qc.h5ad", "work/adata_qc.mouse.h5ad",
+@pytest.mark.parametrize("value", ["work/adata_qc.mouse.h5ad",
                                   "artifacts/tables/rank_group*.rnk", "artifacts/custom/input.h5ad"])
 def test_scrna_accepts_confined_relative_input_paths(tmp_path, value):
     server, = bridge.load_servers(config(tmp_path, "scrna-analysis"))
     assert AnalysisAdapter(server).prepare({"input": value}, SimpleNamespace()).arguments["input"] == value
+
+
+@pytest.mark.parametrize("value", ["adata_annotated.h5ad", "rank_rod.rnk"])
+def test_a_bare_input_name_reaches_the_server_as_a_path_in_work(tmp_path, value):
+    """`mcp_run_de` with `input: adata_annotated.h5ad` found "no .h5ad file in this run" although the
+    annotation step had just written it: the server takes a checkpoint of another analysis of
+    the run only when the name is spelled work/<name>."""
+    server, = bridge.load_servers(config(tmp_path, "scrna-analysis"))
+    prepared = AnalysisAdapter(server).prepare({"input": value}, SimpleNamespace())
+    assert prepared.arguments["input"] == f"work/{value}"
 
 
 @pytest.mark.parametrize("value", ["/etc/adata_qc.h5ad", "work/../secret.h5ad", "artifacts/tables/../../secret.rnk",

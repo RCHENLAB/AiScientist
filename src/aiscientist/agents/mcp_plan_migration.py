@@ -22,12 +22,18 @@ class PlanMigrationRequired(ValueError):
 
 def assert_plan_available(agenda: list[str], catalog: Iterable[Any], *,
                           plan: PlanDoc | None = None,
-                          indices: Iterable[int] | None = None) -> None:
+                          indices: Iterable[int] | None = None,
+                          planned_with: Iterable[str] = ()) -> None:
     """Check pending steps only, using exact identities from the reviewed registry.
 
     A renamed tool is a different implementation, not a spelling correction. We do
     not rebind it or ask the Scientist to recreate it with generic code. Accepted
     historical results may still be reused without their old executable installed.
+
+    ``planned_with`` is the registered tools the plan was drafted against, saved with
+    it. A step with no typed tool whose prose calls a tool by its scientific name
+    (``run_clustering``) was written for the registered tool of that name when that
+    tool was already there: it is not a plan for the removed built-in.
     """
     from .mcp_bridge import configured_servers
 
@@ -42,6 +48,7 @@ def assert_plan_available(agenda: list[str], catalog: Iterable[Any], *,
             public = server.planner_name(wire)
             if wire in owned and public in live:
                 replacements.setdefault(wire, set()).add(public)
+    drafted_against = set(planned_with)
     problems = []
     for index in (range(len(agenda)) if indices is None else sorted(indices)):
         step = agenda[index]
@@ -52,6 +59,9 @@ def assert_plan_available(agenda: list[str], catalog: Iterable[Any], *,
             name for name in _WORD.findall(step) if name in _LEGACY or name.startswith("mcp_")}
         missing = sorted(name for name in names if name not in live
                          and (name in _LEGACY or name.startswith("mcp_")))
+        if declared is None or not declared.tool:
+            missing = [name for name in missing
+                       if not (replacements.get(name, set()) & drafted_against)]
         for name in missing:
             choices = sorted(replacements.get(name, ()))
             replacement = (" Available registered replacement: " + ", ".join(choices) + "."

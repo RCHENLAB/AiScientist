@@ -637,6 +637,11 @@ class AnalysisAdapter:
                     or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts[:-1])
                     or not re.fullmatch(r"[A-Za-z0-9_.*?\[\]-]+\.(?:h5ad|rnk)", parts[-1])):
                 raise ValueError("input must be a filename or a relative path inside work/ or artifacts/")
+            if len(parts) == 1:
+                # A bare name means work/<name>, and the server is told so: a checkpoint an earlier
+                # analysis of this run wrote is handed to the server by that spelling only
+                # (scrna-analysis 0.0.5 looks for a bare name beside work/, and finds nothing).
+                args["input"] = f"work/{value}"
         prefix = PREFIXES[self.server.name]
         from .mcp_model import prepare_model
         model_binding, model_setup = prepare_model(self.server.name, tool, executor, values, arguments=args)

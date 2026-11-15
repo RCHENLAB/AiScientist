@@ -88,6 +88,35 @@ def test_no_prefix_stripping_or_tool_name_substring_inference():
         assert_plan_available(["Run `mcp_unregistered_annotate_variants`."], [])
 
 
+def test_a_plan_drafted_against_the_registered_tools_may_name_them_in_prose():
+    """The planner writes `annotate_variants` in a step with no typed tool; saved, then approved
+    after a restart, that plan was refused as if it were a plan for the removed built-in."""
+    agenda = ["Annotate the variants with `annotate_variants` on GRCh38."]
+    live = _lab(["mcp_annotate_variants"]).scientist.catalog
+    with pytest.raises(PlanMigrationRequired, match="replacement: mcp_annotate_variants"):
+        assert_plan_available(agenda, live)                       # saved before the tools moved
+    assert_plan_available(agenda, live, planned_with=["mcp_annotate_variants"])
+    # The registered tool it was drafted against must still be there, and be the one that vouches.
+    with pytest.raises(PlanMigrationRequired):
+        assert_plan_available(agenda, [], planned_with=["mcp_annotate_variants"])
+    with pytest.raises(PlanMigrationRequired):
+        assert_plan_available(agenda, live, planned_with=["mcp_scgpt_annotate"])
+    # A typed step is what the user approved: its tool is never rebound.
+    with pytest.raises(PlanMigrationRequired):
+        assert_plan_available(_doc().agenda(), live, plan=_doc(), planned_with=["mcp_annotate_variants"])
+
+
+def test_the_tools_a_plan_was_drafted_against_are_saved_with_it_and_survive_a_restore():
+    lab = _lab(["mcp_annotate_variants", "run_code"])
+    assert lab.plan_context["planned_with"] == ["mcp_annotate_variants"]
+    later = _lab(["mcp_annotate_variants", "mcp_scgpt_annotate"])
+    later._restore_plan_context(lab.plan_context)
+    assert later.plan_context["planned_with"] == ["mcp_annotate_variants"]
+    old = _lab(["mcp_annotate_variants"])
+    old._restore_plan_context({"guidance": ""})                   # saved before this was recorded
+    assert old.plan_context["planned_with"] == []
+
+
 def _accepted(step):
     return {"round_no": 1, "step_index": 1, "step": step, "specialist": "S",
             "scientist_result": {"final_answer": "historical result"},

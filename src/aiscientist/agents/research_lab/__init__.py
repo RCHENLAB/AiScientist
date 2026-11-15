@@ -508,6 +508,9 @@ class ResearchLab:
         self._plan_doc: "PlanDoc | None" = None
         self._approved_plan: "PlanDoc | None" = None
         self._plan_feedback: list[str] = []
+        # The registered tools a restored plan was drafted against (saved with it); None while the
+        # plan is this process's own draft, whose tools are the Scientist's catalog.
+        self._planned_with: "list[str] | None" = None
         self._plan_adherence: dict[str, Any] = {}
         # Steps the researcher said yes to DURING the run (``_approve_new_step``). They are not in
         # the approved document, and the read-back must not report them as unapproved work.
@@ -574,6 +577,8 @@ class ResearchLab:
             "self_sourced": self._self_sourced, "later": list(self._later),
             "request_breadth": self._request_breadth, "feedback": list(self._plan_feedback),
             "design_background": list(self._design_citations),
+            "planned_with": (list(self._planned_with) if self._planned_with is not None else
+                             sorted(t.name for t in self.scientist.catalog if t.name.startswith("mcp_"))),
         }
 
     def _restore_plan_context(self, state: "dict[str, Any]") -> None:
@@ -595,6 +600,8 @@ class ResearchLab:
         self._request_breadth = str(state.get("request_breadth") or "")
         self._plan_feedback = list(state.get("feedback") or [])
         self._design_citations = list(state.get("design_background") or [])
+        # A plan saved before this was recorded keeps an empty list: nothing vouches for its prose.
+        self._planned_with = [str(name) for name in state.get("planned_with") or []]
 
     @property
     def approved_plan_yaml(self) -> str:
@@ -812,7 +819,8 @@ class ResearchLab:
                            else set(range(resume.from_step_index, len(agenda))))
                 indices |= {i for i in range(len(agenda)) if i not in done}
             assert_plan_available(agenda, self.scientist.catalog,
-                                  plan=self._approved_plan or self._plan_doc, indices=indices)
+                                  plan=self._approved_plan or self._plan_doc, indices=indices,
+                                  planned_with=self._planned_with or ())
 
         # A2 continuation: re-enter the SAME state machine without re-planning. Skip skill/mode/PI
         # planning, reuse the prior agenda + accepted rounds, and re-execute from the changed step
@@ -846,7 +854,7 @@ class ResearchLab:
             redo_indices = frozenset(i for i in range(len(agenda))
                                      if i in redo or i not in kept_by_index)
             assert_plan_available(agenda, self.scientist.catalog, plan=resume.approved_plan,
-                                  indices=redo_indices)
+                                  indices=redo_indices, planned_with=self._planned_with or ())
             assert_resume_document(agenda, resume.approved_plan, redo_indices, resume.modify_note)
             emit({"type": "run_resumed", "agenda": len(agenda), "from_step": k + 1,
                   "redo": sorted(i + 1 for i in redo_indices),
@@ -882,6 +890,7 @@ class ResearchLab:
                 plan_review = None
         else:
             self._plan_feedback = []
+            self._planned_with = None
             # Axis B — PI-autonomous skill selection: if the user did not force a research path,
             # the PI reads the skill library and picks one itself (researchers do not know which
             # protocol they need). The chosen skill's body then STEERS planning, exactly like a
