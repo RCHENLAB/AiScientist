@@ -4698,6 +4698,12 @@ function planReviseHtml() {
 function planDatasetsHtml(doc) {
   const rows = ((doc && doc.datasets) || []).map((d) => {
     const use = d.use === "sample" ? "sample (QC'd together)" : (d.use || "extra input");
+    const sh = d.shared;
+    // A member of a shared dataset: the dataset and version, the exact file, and what can read it.
+    if (sh) {
+      return `<li><strong>${escapeHtml(sh.dataset)} ${escapeHtml(sh.version)} · ${escapeHtml(sh.file)}</strong> — ${escapeHtml(use)}` +
+        `<small class="muted"> · read by ${escapeHtml(sh.access)}${sh.how ? ` · picked: ${escapeHtml(sh.how)}` : ""}</small></li>`;
+    }
     return `<li><strong>${escapeHtml(d.name)}</strong> — ${escapeHtml(use)}</li>`;
   });
   for (const d of ((doc && doc.unusable_inputs) || [])) {

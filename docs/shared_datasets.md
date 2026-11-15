@@ -137,6 +137,28 @@ Each run writes `artifacts/process/inputs.json`:
 When a chat follows `latest` and a newer version has appeared since its previous run, the reply says which
 version the run used. The result's `croissant.json` links the version's uuid as an input.
 
+## Which file of a version a run reads
+
+A version with many member files (HECA has 13 `.h5ad`) is never bound by size. At run start, before
+anything is staged or read (`gateway/shared_members.py`), the request is resolved against the members'
+facets:
+
+* a file named in the request is that file (`use HRCA_scRNA_allcells.h5ad`);
+* a tissue (`retina`, `iris`, `optic nerve`, ...) and/or an assay (`scRNA`, `snRNA`) narrows the members.
+  One file per requested tissue and assay is a choice: "Use HRCA scRNA" binds `HRCA_scRNA_allcells.h5ad`
+  although the snRNA file is larger, and "compare the retina snRNA and scRNA atlases" binds both files;
+* anything else is ambiguous ("this retina atlas" means two files): a card lists the candidates and the
+  run waits for the pick. A tissue no file covers is never replaced by another tissue. If the card goes
+  unanswered the run does not start;
+* a file attached by name in the chat is used as attached, and the choice made earlier in the chat (read
+  from the previous run's `inputs.json`) stands for the next message unless it names another file.
+
+The chosen files are bound one by one (the first is the main file, the others extra inputs read through
+`run_code`); the plan card lists each with the dataset, version, exact file, role, what can read it
+(only the main file reaches the tools and MCP servers) and why it was picked. The selection is kept in
+the run's decisions, so a revision, a resume or a restored plan binds the same files, and
+`process/inputs.json` records the files read and `selected_by`.
+
 ## Metadata and MCP
 
 Publishing writes `croissant.json` into the version folder: each file is a `cr:FileObject` with the

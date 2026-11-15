@@ -3137,7 +3137,8 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
             if e["path"] in seen:
                 continue
             seen.add(e["path"])
-            raw.append({"path": e["path"], "order": len(raw), "name": e["name"], "role": att.get("role")})
+            raw.append({"path": e["path"], "order": len(raw), "name": e["name"],
+                        "role": e["role"] if "role" in e else att.get("role")})
     if not raw:
         dp = str(getattr(req, "dataset_path", None) or "").strip()
         if not dp:
@@ -3147,6 +3148,139 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
     out = [{"path": d["path"], "name": d["name"], "role": d["role"]} for d in raw]
     if len(raw) - sum(len(a["entries"]) for a in shared) + len(shared) > _MAX_BOUND_DATASETS:
         raise HTTPException(400, f"At most {_MAX_BOUND_DATASETS} datasets per run. Remove one first.")
+    return out
+
+
+#: A member of a shared dataset a run can analyse. A README or a notes file sits beside the data.
+_NOT_ANALYSABLE = (".txt",)
+
+
+def _analysable_members(att: dict) -> list[dict]:
+    """The files of an attached shared version that a run could take as its data."""
+    return [f for f in att["files"] if _primary_suffix(f["name"]) not in (None, *_NOT_ANALYSABLE)]
+
+
+def _apply_members(att: dict, names: "list[str]", *, how: str, candidates: "list[str] | None" = None,
+                   sole: bool = False) -> dict:
+    """``att`` (a whole version, one folder entry) rebound to the member files ``names``: one explicit
+    entry per file, the first main and the others extra inputs, each with the version's verified HPC3
+    copy when there is one. ``sole``: this is the chat's only data, so its default ``reference`` role
+    would only keep it out of the main slot; the main file then has no role."""
+    folder = att["entries"][0]
+    by_name = {f["name"]: f for f in att["files"]}
+    role = att.get("role")
+    first = None if (role == "reference" and sole) else role
+    entries = [{"path": f"{folder['path']}/{n}", "name": n, "files": [],
+                "hpc": f"{folder['hpc']}/{n}" if folder.get("hpc") else None,
+                "role": first if i == 0 else "extra_input"} for i, n in enumerate(names)]
+    return {**att, "whole": False, "entries": entries, "files": [by_name[n] for n in names],
+            "selection": {"how": how, "candidates": list(candidates or names)}}
+
+
+def _restore_shared_members(resolved: list[dict], saved: "list[dict] | None", *, sole: bool) -> list[dict]:
+    """A resumed run or a restored plan binds the members it was approved with (``decisions
+    ["shared_members"]``), not whatever the request would pick now."""
+    chosen = {(m.get("dataset"), m.get("version")): m for m in saved or [] if isinstance(m, dict)}
+    out = []
+    for att in resolved:
+        m = chosen.get((att["dataset"], att["version"]))
+        names = [n for n in (m or {}).get("files") or [] if any(f["name"] == n for f in att["files"])]
+        out.append(_apply_members(att, names, how=str(m.get("how") or "chosen earlier"),
+                                  candidates=m.get("candidates"), sole=sole)
+                   if att["whole"] and names else att)
+    return out
+
+
+def _prior_shared_files(conn: Connection, prior: "dict | None") -> "dict[tuple[str, str], list[str]]":
+    """The member files the chat's previous run read, by (dataset, version) (its ``process/inputs.json``)."""
+    rid = str((prior or {}).get("run_id") or "")
+    if not rid or not _RUN_ID_RE.fullmatch(rid):
+        return {}
+    try:
+        data = json.loads((conn.workspace / rid / "artifacts" / "process" / "inputs.json").read_text(encoding="utf-8"))
+        return {(str(r["dataset"]), str(r["version"])): [str(f["name"]) for f in r.get("files") or []]
+                for r in data.get("shared_inputs") or []}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+async def _ask_member_choice(conn: Connection, att: dict, members: list[dict], sel: Any) -> "list[str] | None":
+    """Put the choice of member file to the user on the clarify card and wait for the answer (nothing
+    is staged or read before it). Returns the chosen names, or None when it went unanswered."""
+    from . import shared_members as sm
+    by_name = {f["name"]: f for f in members}
+    pool = [by_name[n] for n in (sel.candidates or by_name) if n in by_name]
+    options = [sm.describe(f) for f in pool]
+    both = None
+    if len(pool) == 2:
+        both = f"Use both: {pool[0]['name']} and {pool[1]['name']}"
+        options.append(both)
+    q = {"question": f"{sel.reason[:1].upper() + sel.reason[1:]}. Which file of {att['title']} {att['version']} "
+                     "should this run use?",
+         "options": options}
+    conn.plan_value = None
+    conn.plan_event.clear()
+    conn.pending_plan = {"kind": "clarify", "payload": [q]}
+    conn.push({"type": "plan_clarify", "questions": [q]})
+    got = await asyncio.to_thread(conn.plan_event.wait, 600)
+    conn.pending_plan = None
+    conn.push({"type": "plan_done"})
+    if not got:
+        return None
+    fb = str((conn.plan_value or {}).get("feedback", ""))
+    conn.plan_value = None
+    answer = fb.rsplit("?:", 1)[-1].strip()
+    if both and answer == both:
+        return [f["name"] for f in pool]
+    for f, text in zip(pool, options):
+        if answer == text or text in fb:
+            return [f["name"]]
+    return None
+
+
+async def _choose_shared_members(conn: Connection, req: "LabRequest", resolved: list[dict], decisions: dict,
+                                 prior: "dict | None", say_key: "Callable[..., None]") -> list[dict]:
+    """Settle which member file(s) of each attached shared version this run reads (issue 114), before
+    anything is staged: the file the request names, the assay and tissue it says, the choice made
+    earlier in this chat, or else the user's pick on a card. A file attached by name stays as it is.
+    Records ``decisions["shared_members"]`` (what the plan card shows and a resumed run keeps)."""
+    from . import shared_members as sm
+    sole = not (isinstance(req.datasets, list) and req.datasets) and len(resolved) == 1
+    earlier = _prior_shared_files(conn, prior)
+    out, record = [], []
+    for att in resolved:
+        if not att["whole"]:
+            out.append(att)
+            record.append({"dataset": att["dataset"], "version": att["version"], "title": att["title"],
+                           "files": [f["name"] for f in att["files"]], "how": "attached by file name",
+                           "candidates": [f["name"] for f in att["files"]]})
+            continue
+        members = _analysable_members(att)
+        if not members:
+            out.append(att)               # nothing to choose among: the version stays a folder
+            continue
+        sel = sm.select(req.question, members)
+        names, how = sel.chosen, sel.how
+        if sel.status == "ambiguous":
+            kept = [n for n in earlier.get((att["dataset"], att["version"]), []) if n in {f["name"] for f in members}]
+            if kept:
+                names, how = kept, "chosen earlier in this chat"
+            else:
+                say_key(f"❓ {att['title']} {att['version']} has several files this could mean: choose one "
+                        "before the run reads any data.")
+                names = await _ask_member_choice(conn, att, members, sel)
+                if not names:
+                    raise GatewayError(
+                        f"No file of {att['title']} {att['version']} was chosen, so the run did not start. "
+                        "Name the file in your request (for example “use HRCA scRNA”) and send it again.",
+                        stage="data")
+                how = "chosen by you"
+        new = _apply_members(att, names, how=how, candidates=sel.candidates, sole=sole)
+        out.append(new)
+        record.append({"dataset": att["dataset"], "version": att["version"], "title": att["title"],
+                       "files": names, "how": how, "candidates": sel.candidates})
+        say_key(f"📌 {att['title']} {att['version']}: {', '.join(names)} ({how})")
+    decisions["shared_members"] = record
     return out
 
 
@@ -3250,9 +3384,11 @@ def _resolve_shared_refs(req: "LabRequest", conn: Connection) -> list[dict]:
 
 
 def _shared_inputs_record(resolved: list[dict]) -> list[dict]:
-    """``process/inputs.json`` ``shared_inputs``: what each shared dataset meant for this run."""
+    """``process/inputs.json`` ``shared_inputs``: what each shared dataset meant for this run, and which
+    member files it read and why (``selected_by``)."""
     return [{"dataset": a["dataset"], "requested": a["requested"], "version": a["version"],
              "version_uuid": a["version_uuid"], "manifest_sha256": a["manifest_sha256"],
+             **({"selected_by": a["selection"]["how"]} if a.get("selection") else {}),
              "files": [{"name": f["name"], "size": f["size_bytes"], "sha256": f["sha256"]}
                        for f in a["files"]]} for a in resolved]
 
@@ -5389,6 +5525,10 @@ def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
                 (decisions.get("cellranger_layout") or {}).get("datasets", [])}
     unusable = list(decisions.get("unusable_inputs") or [])
     cannot = {str(d.get("name") or "") for d in unusable if isinstance(d, dict)}
+    members = {f: {"dataset": m.get("title") or m.get("dataset"), "version": m.get("version"), "file": f,
+                   "how": m.get("how")}
+               for m in decisions.get("shared_members") or [] if isinstance(m, dict)
+               for f in m.get("files") or []}
     datasets = []
     for rec in decisions.get("datasets") or []:
         name = (primary_name or _display_name(rec)) if rec.get("primary") else _display_name(rec)
@@ -5397,7 +5537,13 @@ def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
         role = str(rec.get("role") or "").lower()
         use = ("reference" if role == "reference" else "main" if rec.get("primary") else
                "sample" if name.rstrip("/") in together else "extra input")
-        datasets.append({"name": name, "role": rec.get("role"), "use": use})
+        entry = {"name": name, "role": rec.get("role"), "use": use}
+        found = members.get(name)
+        if found:
+            # A shared dataset's member file: the dataset and version, the exact file and why it was
+            # picked, and what can read it (only the main file reaches the tools and MCP servers).
+            entry["shared"] = {**found, "access": "tools and MCP servers" if use == "main" else "code only (run_code)"}
+        datasets.append(entry)
     return {"datasets": datasets, "unusable_inputs": unusable}
 
 
@@ -13690,7 +13836,7 @@ def _build_report_render_fn(conn: "Connection", run_id: str = ""):
 # run could not use.
 _STAGING_DECISIONS = ("dataset_result", "dataset_root", "hpc_dataset_root", "input_folders",
                       "cellranger_layout", "metadata_inputs", "dataset_metadata", "dataset_description",
-                      "input_name", "unusable_inputs")
+                      "input_name", "unusable_inputs", "shared_inputs", "shared_members")
 
 
 def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: dict[str, Any],
@@ -14530,7 +14676,19 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         bound = _select_bound_datasets(req)
         shared_resolved = getattr(req, "_shared_resolved", None) or []
         if shared_resolved and resume is None and saved_state is None:
+            # Which member file of each shared version the run reads is settled here, before anything
+            # is staged or read (issue 114); the plan card shows it and a resume keeps it.
+            shared_resolved = await _choose_shared_members(conn, req, shared_resolved, decisions, prior, say_key)
+            req._shared_resolved = shared_resolved
+            bound = _select_bound_datasets(req)
             await _record_shared_inputs(conn, run_id, art, decisions, shared_resolved, prior, say_key)
+        elif shared_resolved:
+            # A resumed run or a restored plan binds the members it was approved with.
+            shared_resolved = _restore_shared_members(
+                shared_resolved, decisions.get("shared_members"),
+                sole=not (isinstance(req.datasets, list) and req.datasets) and len(shared_resolved) == 1)
+            req._shared_resolved = shared_resolved
+            bound = _select_bound_datasets(req)
         # What rides into run_state.json beside the decisions: the dataset as the browser bound it
         # (the follow-up router compares the next message's against it), and, for a run that
         # continues an earlier one, which run and the conversation's work so far.

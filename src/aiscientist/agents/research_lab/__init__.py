@@ -3410,7 +3410,8 @@ class ResearchLab:
         for r in rows:
             requested = str(r.get("requested") or "latest")
             lines.append(f"  - {r.get('title') or r.get('dataset')} {r.get('version')}"
-                         + (" (latest at the start of this run)" if requested == "latest" else " (pinned)"))
+                         + (" (latest at the start of this run)" if requested == "latest" else " (pinned)")
+                         + (f"; member files picked: {r['selected_by']}" if r.get("selected_by") else ""))
             for f in (r.get("files") or [])[:40]:
                 fac = f.get("facets") if isinstance(f.get("facets"), dict) else {}
                 bits = [str(fac[k]) for k in ("tissue", "modality") if fac.get(k)]
@@ -3426,6 +3427,10 @@ class ResearchLab:
                 big = big or ("hrca" in nm and "snrna" in nm)
             if len(r.get("files") or []) > 40:
                 lines.append(f"      … and {len(r['files']) - 40} more files")
+        lines.append("These member files were chosen and shown to the researcher: plan with exactly these, "
+                     "never another file of the dataset. Name the file each step reads in the step "
+                     "itself. Only the main file reaches the tools and the MCP servers; any other is "
+                     "read through run_code (AISCIENTIST_INPUTS), so say which steps need it.")
         if big:
             lines.append("Memory: loading all of HRCA snRNA (3.18M nuclei) into memory peaks at about "
                          "218 GiB. Subset first or read it backed, and size the job's memory to match.")

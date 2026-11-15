@@ -396,3 +396,215 @@ def test_a_maintainer_withdraws_a_version_and_it_is_no_longer_offered(env):
     assert versions == {"v2026.12": "withdrawn", "v2026.11": "published"}
     assert jin.post("/api/shared-datasets/heca/versions/v2026.12/withdraw").status_code == 400
     assert jin.post("/api/shared-datasets/zzz/versions/v1/withdraw").status_code in (400, 403, 404)
+
+
+# --- member files of a shared version (issue 114) -----------------------------------------------------
+
+
+class _Chat:
+    """A connection that answers the clarify card the way the console does, and records what it asked."""
+
+    def __init__(self, tmp_path, answer=None, **kw):
+        import threading
+        base = _conn(tmp_path, **kw)
+        self.__dict__.update(base.__dict__)
+        self.plan_event, self.plan_value, self.pending_plan = threading.Event(), None, None
+        self.pushed, self.asked, self.answer = [], [], answer
+
+    def push(self, msg):
+        import threading
+        self.pushed.append(msg)
+        if msg.get("type") == "plan_clarify":
+            self.asked.append(msg["questions"][0])
+            if self.answer is not None:
+                options = msg["questions"][0]["options"]
+                pick = self.answer(options) if callable(self.answer) else self.answer
+                threading.Timer(0.05, lambda: (setattr(self, "plan_value", {"feedback": f"{msg['questions'][0]['question']}: {pick}"}),
+                                               self.plan_event.set())).start()
+
+
+def _heca(env, names=("HRCA_snRNA_allcells.h5ad", "HRCA_scRNA_allcells.h5ad", "Iris_snRNA_allcells.h5ad")):
+    """Publish a small HECA-like version where the snRNA file is by far the largest."""
+    for old in env["source"].iterdir():
+        if old.name != "facets.json":
+            old.unlink()
+    (env["source"] / "facets.json").write_text("{}")
+    for n in names:
+        (env["source"] / n).write_bytes(b"x" * (60_000 if "HRCA_snRNA" in n else 3_000))
+    (env["source"] / "README.txt").write_text("HECA\n")
+    return _publish(env)
+
+
+def _choose(gw, conn, question, refs=None, prior=None, datasets=None):
+    req = gw.LabRequest(connection_id="c", question=question, shared_datasets=refs or [{"shared": "heca"}],
+                        datasets=datasets)
+    req._shared_resolved = gw._resolve_shared_refs(req, conn)
+    decisions, said = {}, []
+    out = asyncio.run(gw._choose_shared_members(conn, req, req._shared_resolved, decisions, prior,
+                                                lambda t, level="info": said.append(t)))
+    req._shared_resolved = out
+    return req, out, decisions, said
+
+
+def test_use_hrca_scrna_binds_that_file_although_snrna_is_larger_and_asks_nothing(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path)
+    req, out, decisions, said = _choose(gw, conn, "Use HRCA scRNA to annotate the cell types")
+    assert conn.asked == []
+    bound = gw._select_bound_datasets(req)
+    assert [b["name"] for b in bound] == ["HRCA_scRNA_allcells.h5ad"]
+    assert bound[0]["role"] is None                          # the chat's only data: the main file, not a "reference"
+    assert bound[0]["path"].endswith("/heca/v2026.11/HRCA_scRNA_allcells.h5ad")
+    assert decisions["shared_members"][0]["files"] == ["HRCA_scRNA_allcells.h5ad"]
+    assert decisions["shared_members"][0]["how"] == "the assay and tissue named in the request"
+    other = _Chat(tmp_path)
+    req2, *_ = _choose(gw, other, "Use HRCA snRNA")
+    assert [b["name"] for b in gw._select_bound_datasets(req2)] == ["HRCA_snRNA_allcells.h5ad"]
+
+
+def test_this_retina_atlas_asks_before_anything_is_staged_and_waits_for_the_pick(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path, answer=lambda options: next(o for o in options if o.startswith("HRCA_scRNA")))
+    req, out, decisions, said = _choose(gw, conn, "Annotate this retina atlas")
+    card = conn.asked[0]
+    assert "Human Eye Cell Atlas (HECA) v2026.11" in card["question"]
+    assert [o.split(" — ")[0] for o in card["options"][:2]] == ["HRCA_snRNA_allcells.h5ad", "HRCA_scRNA_allcells.h5ad"] \
+        or {o.split(" — ")[0] for o in card["options"][:2]} == {"HRCA_snRNA_allcells.h5ad", "HRCA_scRNA_allcells.h5ad"}
+    assert not any("Iris" in o for o in card["options"])              # an unrelated tissue is not offered
+    assert any(o.startswith("Use both: ") for o in card["options"])
+    assert [b["name"] for b in gw._select_bound_datasets(req)] == ["HRCA_scRNA_allcells.h5ad"]
+    assert decisions["shared_members"][0]["how"] == "chosen by you"
+    assert conn.pending_plan is None and conn.pushed[-1] == {"type": "plan_done"}
+
+
+def test_a_request_with_no_hint_lists_every_analysable_file_not_the_readme(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path, answer=lambda options: options[0])
+    _choose(gw, conn, "cluster it")
+    names = [o.split(" — ")[0] for o in conn.asked[0]["options"]]
+    assert sorted(names) == ["HRCA_scRNA_allcells.h5ad", "HRCA_snRNA_allcells.h5ad", "Iris_snRNA_allcells.h5ad"]
+
+
+def test_two_atlases_bind_two_explicit_files_with_roles_and_a_visible_mapping(gw, env, tmp_path):
+    from aiscientist.agents.research_lab import ResearchLab
+    _heca(env)
+    conn = _Chat(tmp_path)
+    req, out, decisions, _ = _choose(gw, conn, "Compare the HRCA snRNA atlas with the HRCA scRNA atlas")
+    assert conn.asked == []
+    bound = gw._select_bound_datasets(req)
+    assert [(b["name"], b["role"]) for b in bound] == [("HRCA_snRNA_allcells.h5ad", None),
+                                                       ("HRCA_scRNA_allcells.h5ad", "extra_input")]
+    # The plan card shows both, with the version, the exact file, what reads it and why it was picked.
+    decisions["datasets"] = [{"name": "HRCA_snRNA_allcells.h5ad", "role": None, "primary": True},
+                             {"name": "HRCA_scRNA_allcells.h5ad", "role": "extra_input"}]
+    card = gw._plan_dataset_inputs(decisions, "HRCA_snRNA_allcells.h5ad")["datasets"]
+    assert [(d["use"], d["shared"]["file"], d["shared"]["version"], d["shared"]["access"]) for d in card] == [
+        ("main", "HRCA_snRNA_allcells.h5ad", "v2026.11", "tools and MCP servers"),
+        ("extra input", "HRCA_scRNA_allcells.h5ad", "v2026.11", "code only (run_code)")]
+    assert card[0]["shared"]["dataset"] == "Human Eye Cell Atlas (HECA)" and card[0]["shared"]["how"]
+    # The planner is told to name the file each step reads, and who can read which.
+    asyncio.run(gw._record_shared_inputs(conn, "run1", tmp_path / "art", decisions, out, None, lambda *a, **k: None))
+    stub = SimpleNamespace(ctx=SimpleNamespace(decisions=decisions))
+    stub._shared_inputs_context = lambda: ResearchLab._shared_inputs_context(stub)
+    text = ResearchLab._attached_files_context(stub)
+    assert "plan with exactly these" in text and "Name the file each step reads" in text and "run_code" in text
+
+
+def test_a_file_attached_by_name_stays_as_attached(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path)
+    req, out, decisions, _ = _choose(gw, conn, "Use HRCA scRNA",
+                                     refs=[{"shared": "heca", "files": ["Iris_snRNA_allcells.h5ad"]}])
+    assert conn.asked == [] and [b["name"] for b in gw._select_bound_datasets(req)] == ["Iris_snRNA_allcells.h5ad"]
+    assert decisions["shared_members"][0]["how"] == "attached by file name"
+
+
+def test_an_unanswered_card_stops_the_run_before_it_reads_anything(gw, env, tmp_path, monkeypatch):
+    from aiscientist.gateway.errors import GatewayError
+    _heca(env)
+    conn = _Chat(tmp_path)                       # nobody answers
+    real_wait = conn.plan_event.wait
+    conn.plan_event.wait = lambda timeout=None: real_wait(0.05)
+    with pytest.raises(GatewayError) as err:
+        _choose(gw, conn, "analyse the retina atlas")
+    assert "did not start" in str(err.value) and "HRCA scRNA" in str(err.value)
+    assert conn.pending_plan is None
+
+
+def test_the_choice_made_in_a_chat_is_kept_for_its_next_message(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path, answer=lambda options: next(o for o in options if o.startswith("HRCA_scRNA")))
+    req, out, decisions, _ = _choose(gw, conn, "analyse this retina atlas")
+    art = tmp_path / "ws" / "run1" / "artifacts"
+    asyncio.run(gw._record_shared_inputs(conn, "run1", art, decisions, out, None, lambda *a, **k: None))
+    data = json.loads((art / "process" / "inputs.json").read_text())["shared_inputs"][0]
+    assert [f["name"] for f in data["files"]] == ["HRCA_scRNA_allcells.h5ad"] and data["selected_by"] == "chosen by you"
+    # The next message names no file: the previous run's choice stands, nothing is asked again.
+    follow = _Chat(tmp_path)
+    req2, _, decisions2, said = _choose(gw, follow, "now find the differentially expressed genes", prior={"run_id": "run1"})
+    assert follow.asked == [] and [b["name"] for b in gw._select_bound_datasets(req2)] == ["HRCA_scRNA_allcells.h5ad"]
+    assert decisions2["shared_members"][0]["how"] == "chosen earlier in this chat"
+    # A new request that names the other assay still wins over what was chosen before.
+    req3, *_ = _choose(gw, _Chat(tmp_path), "use HRCA snRNA now", prior={"run_id": "run1"})
+    assert [b["name"] for b in gw._select_bound_datasets(req3)] == ["HRCA_snRNA_allcells.h5ad"]
+
+
+def test_a_resumed_run_binds_the_members_it_was_approved_with(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path)
+    req, out, decisions, _ = _choose(gw, conn, "Use HRCA scRNA")
+    fresh = gw.LabRequest(connection_id="c", question="Use HRCA snRNA instead, whatever", shared_datasets=[{"shared": "heca"}])
+    fresh._shared_resolved = gw._resolve_shared_refs(fresh, conn)
+    restored = gw._restore_shared_members(fresh._shared_resolved, decisions["shared_members"], sole=True)
+    fresh._shared_resolved = restored
+    assert [b["name"] for b in gw._select_bound_datasets(fresh)] == ["HRCA_scRNA_allcells.h5ad"]
+    assert "shared_members" in gw._STAGING_DECISIONS and "shared_inputs" in gw._STAGING_DECISIONS
+
+
+def test_the_chosen_members_are_read_in_place_from_the_verified_copy_and_fall_back_to_a_copy(gw, env, tmp_path, monkeypatch):
+    _heca(env)
+    env["sd"].mark_hpc_verified("heca", "v2026.11")
+    conn = _Chat(tmp_path)
+    req, out, decisions, _ = _choose(gw, conn, "Compare HRCA snRNA with HRCA scRNA")
+    copies = []
+    admitted, mirrors, said, refused = _admit(gw, conn, req, monkeypatch, copies)
+    assert copies == [] and refused == [] and len(admitted) == 2
+    assert sorted(m[0] for m in mirrors.values()) == [f"{HPC_ROOT}/datasets/heca/v2026.11/HRCA_scRNA_allcells.h5ad",
+                                                      f"{HPC_ROOT}/datasets/heca/v2026.11/HRCA_snRNA_allcells.h5ad"]
+    # Without a verified copy, the same members are copied for the session and the run says so.
+    other = _Chat(tmp_path)
+    (env["source"] / "HRCA_scRNA_allcells.h5ad").write_bytes(b"y" * 3_001)
+    _publish(env, label="v2026.12", changelog="scRNA updated.")
+    req2, *_ = _choose(gw, other, "Use HRCA scRNA", refs=[{"shared": "heca", "version": "v2026.12"}])
+    copies2 = []
+    admitted2, mirrors2, said2, _ = _admit(gw, other, req2, monkeypatch, copies2)
+    assert len(copies2) == 1 and copies2[0].endswith("v2026.12/HRCA_scRNA_allcells.h5ad")
+    assert any("no verified copy on HPC3" in line for line in said2)
+
+
+def test_the_console_plan_card_shows_the_dataset_version_file_and_how_it_was_picked():
+    import shutil
+    import subprocess
+    from pathlib import Path
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    source = (Path(__file__).resolve().parents[1] / "frontend/console/app.js").read_text(encoding="utf-8")
+    block = source[source.index("function planDatasetsHtml("):source.index("// The plan as the chat shows it")]
+    script = r'''
+const assert = require("assert");
+const escapeHtml = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+''' + block + r'''
+const html = planDatasetsHtml({ datasets: [
+  { name: "HRCA_snRNA_allcells.h5ad", use: "main", shared: { dataset: "Human Eye Cell Atlas (HECA)", version: "v2026.11.1", file: "HRCA_snRNA_allcells.h5ad", how: "chosen by you", access: "tools and MCP servers" } },
+  { name: "HRCA_scRNA_allcells.h5ad", use: "extra input", shared: { dataset: "Human Eye Cell Atlas (HECA)", version: "v2026.11.1", file: "HRCA_scRNA_allcells.h5ad", how: "chosen by you", access: "code only (run_code)" } },
+  { name: "mine.csv", use: "reference" }] });
+assert.ok(html.includes("Human Eye Cell Atlas (HECA) v2026.11.1 · HRCA_snRNA_allcells.h5ad"));
+assert.ok(html.includes("HRCA_scRNA_allcells.h5ad") && html.includes("read by code only (run_code)"));
+assert.ok(html.includes("read by tools and MCP servers") && html.includes("picked: chosen by you"));
+assert.ok(html.includes("<strong>mine.csv</strong> — reference"));      // an ordinary dataset is unchanged
+console.log("ok");
+'''
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
