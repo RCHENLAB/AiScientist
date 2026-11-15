@@ -63,6 +63,9 @@ const toasts = [], uploaded = { files: [], folders: [] };
 const toast = (m) => toasts.push(m);
 const uploadDataset = (f) => uploaded.files.push(f.name);
 const uploadFolder = (fl) => uploaded.folders.push(Array.from(fl).map((f) => f.webkitRelativePath));
+// A picture dropped on the chat goes to the composer (issue 115); none are dropped here.
+const imageFilesOf = (list) => [...(list || [])].filter((f) => f && /^image\//.test(f.type || ""));
+const addComposerImages = () => {};
 // The browser's entries: a file entry hands over a File, a directory reads its children in batches.
 class FakeFile { constructor(name) { this.name = name; this.size = 1; } get webkitRelativePath() { return ""; } }
 const fileEntry = (path) => ({ isFile: true, isDirectory: false, name: path.split("/").pop(), fullPath: "/" + path,

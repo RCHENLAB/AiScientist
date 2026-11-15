@@ -470,7 +470,50 @@ async function renderMermaidIn(root) {
   }
 }
 
-function renderMarkdown(text) {
+// ---- links and images in Markdown (issue 115) ----
+// ![alt](url) and [text](url) are drawn only for a URL the page may follow: the account's own run files
+// (/api/file/<owner>/<run>/...), its dataset files, its chat images, or an https address. A relative
+// path is resolved against the file that holds it (``base``) and must stay inside that run's folder.
+// Nothing else (javascript:, data:, http:, another origin) becomes a link or an image: it is shown as
+// plain text. Everything is escaped, and no HTML a model or a file writes is ever run.
+const MD_URL_ALLOWED = [/^\/api\/file\/[^/]+\/[^/]+\/.+/, /^\/api\/datasets\/\d+\/download$/, /^\/api\/chat-images\/\d+\/[\w.-]+$/];
+function safeMdUrl(raw, base) {
+  raw = String(raw || "").trim();
+  if (!raw || /[\u0000-\u001f\u007f\s]/.test(raw) || raw.startsWith("//") || raw.includes("\\")) return null;
+  const HOST = "http://console.invalid";
+  let u;
+  try { u = new URL(raw, new URL(base || "/", HOST)); } catch { return null; }
+  if (u.origin === HOST) {
+    // An absolute path says exactly where it points: a ``..`` in it (even %2e%2e) is a way around the
+    // allow-list below, since the URL parser would fold it away before the check.
+    const dotdot = (seg) => { try { return decodeURIComponent(seg) === ".."; } catch { return true; } };
+    if (raw.startsWith("/") && raw.split("?")[0].split("/").some(dotdot)) return null;
+    const run = /^(\/api\/file\/[^/]+\/[^/]+\/)/.exec(base || "");
+    const relative = !/^[a-z][a-z0-9+.-]*:/i.test(raw) && !raw.startsWith("/");
+    if (relative && run && !u.pathname.startsWith(run[1])) return null;       // ../ out of the run folder
+    if (u.pathname.split("/").some(dotdot)) return null;
+    return MD_URL_ALLOWED.some((re) => re.test(u.pathname)) ? u.pathname + u.search : null;
+  }
+  // An https address as written: a host straight after ``https://`` (no empty host, no user@ part).
+  return u.protocol === "https:" && /^https:\/\/[^/?#@\s]+(?:[/?#]|$)/i.test(raw) && u.hostname.includes(".") ? u.href : null;
+}
+function mdLinks(escaped, stash, base) {
+  const decode = (t) => t.replace(/&amp;/g, "&");
+  return escaped
+    .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (m, alt, url) => {
+      const href = safeMdUrl(decode(url), base);
+      if (!href) return alt || "";
+      const own = href.startsWith("/");
+      return stash(`<img class="md-img" src="${escapeHtml(href)}" alt="${alt}" loading="lazy"` +
+        `${own ? "" : ' referrerpolicy="no-referrer"'} data-fv-open="${escapeHtml(href)}" data-fv-name="${alt || "image"}" />`);
+    })
+    .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+      const href = safeMdUrl(decode(url), base);
+      return href ? stash(`<a class="md-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${text}</a>`) : text;
+    });
+}
+
+function renderMarkdown(text, opts) {
   // Normalize PaperQA anchor-style citations before anything else: the chat has no #ref anchor
   // targets, so [3](#ref3) / [[1](#ref1), [2](#ref2)] render as raw noise. Collapse them to plain
   // [3] / [1, 2], and strip the literal <i>/<b> HTML the corpus citation titles carry. Display-
@@ -492,7 +535,7 @@ function renderMarkdown(text) {
     .replace(/```[ \t]*[\w-]*\n?([\s\S]*?)```/g, (_m, body) =>
       stash('<pre class="md-code"><code>' + escapeHtml(body.replace(/\n+$/, "")) + "</code></pre>"))
     .replace(/`([^`\n]+)`/g, (_m, c) => stash("<code>" + escapeHtml(c) + "</code>"));
-  s = mdTables(escapeHtml(s))
+  s = mdTables(mdLinks(escapeHtml(s), stash, opts && opts.base))
     .replace(/^#### (.+)$/gm, "<h4>$1</h4>")
     .replace(/^### (.+)$/gm, "<h3>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2>$1</h2>")
@@ -576,6 +619,7 @@ function msgFromServer(m) {
              streamId: meta.stream_id || null };
   }
   const msg = { role: m.role, content: m.content };
+  if (Array.isArray((m.meta || {}).images) && m.meta.images.length) msg.images = m.meta.images;   // a message's images
   // Restore the collapsed run recap (thinking + steps/code) so a finished run stays
   // reviewable after a reload / on another device — not only in a downloaded log.
   const meta = m.meta || {};
@@ -599,9 +643,11 @@ function serverMsgPayload(msg) {
              meta: { items: msg.items || [], bundleUrl: msg.bundleUrl, ...(msg.streamId ? { stream_id: msg.streamId } : {}) } };
   }
   const payload = { role: msg.role, content: msg.content || "" };
+  // A message's images go by id; the server keeps the references it checks (name, type, size, url).
+  if (Array.isArray(msg.images) && msg.images.length) { payload.kind = "text"; payload.meta = { images: msg.images.map((i) => ({ id: i.id })) }; }
   if (msg.thinking || (msg.feed && msg.feed.length) || (msg.jobs && msg.jobs.length)) {
     payload.kind = "text";
-    payload.meta = { thinking: msg.thinking || "", feed: msg.feed || [] };
+    payload.meta = { ...(payload.meta || {}), thinking: msg.thinking || "", feed: msg.feed || [] };
     if (Array.isArray(msg.jobs)) payload.meta.jobs = msg.jobs;
     if (msg.outcome) payload.meta.outcome = msg.outcome;
     if (msg.ms != null) payload.meta.ms = msg.ms;
@@ -714,6 +760,7 @@ function showDialog() {
   syncPlanCue(c);
   syncDatasetSelection();
   renderUploadLine();
+  if (typeof renderImageChips === "function") renderImageChips();   // each chat has its own pending images
   // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
   // conversation's number would be worse than showing nothing.
   if (c && c.ctx) renderContextMeter(c.ctx); else hideContextMeter();
@@ -1136,16 +1183,20 @@ function messageEl(m) {
     const bundle = m.bundleUrl ? `<a class="artifact-bundle" href="${m.bundleUrl}" download>${icon("download")}Download all results (.zip)</a>` : "";
     const n = (m.items && m.items.length) || 0;
     el.innerHTML = `<div class="artifacts-title">${icon("folder_open")}<span>Results &amp; code (${n})</span></div>` + bundle +
+      figuresHtml(m.items) +
       `<div class="result-handoff"></div>` +
       `<div class="artifacts-hint">Browse &amp; preview every file — organized by folder — in the Downloads panel →</div>`;
     const run = (m.bundleUrl || "").match(/\/api\/bundle\/[^/]+\/([^/]+)/);
     if (run) showResultHandoff(el.querySelector(".result-handoff"), run[1]);
-    el.addEventListener("click", onSaveResultClick);
+    el.addEventListener("click", (e) => {
+      if (e.target.closest("[data-open-results]")) { selectSideTab("results"); setPanel("right", true, false); return; }
+      onSaveResultClick(e);
+    });
     return el;
   }
   const el = document.createElement("div");
   el.className = `msg ${m.role}`;
-  if (m.role !== "assistant") { el.innerHTML = escapeHtml(m.content); return el; }
+  if (m.role !== "assistant") { el.innerHTML = escapeHtml(m.content) + userImagesHtml(m.images); return el; }
   // Assistant: the run behind the answer stays with it as one closed line (runCardHtml) — its Slurm
   // jobs, progress, step code and activity log open from there.
   let html = "";
@@ -1446,12 +1497,13 @@ function pushToSession(sessionId, msg) {
   persistSessions();
 }
 
-function appendUserMessage(text) {
+function appendUserMessage(text, images) {
   const stream = $("chatStream");
   const hint = stream.querySelector(".empty-hint");
   if (hint) hint.remove();
-  pushMessage({ role: "user", content: text });
-  stream.appendChild(messageEl({ role: "user", content: text }));
+  const msg = { role: "user", content: text, ...(images && images.length ? { images } : {}) };
+  pushMessage(msg);
+  stream.appendChild(messageEl(msg));
   state.stickBottom = true;   // the user just sent — snap to their message and follow the reply
   stream.scrollTop = stream.scrollHeight;
 }
@@ -1797,17 +1849,63 @@ function switchResultsTab(name) {
   document.querySelectorAll("#downloads .rtab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
 }
 
-// Code/text files preview INLINE in the Preview tab; pdf/image (+ anything else) keep the
-// existing modal (heavier viewers we deliberately don't reimplement here).
-const TEXT_PREVIEW_EXT = new Set([
-  "py", "json", "md", "markdown", "txt", "text", "log", "csv", "tsv", "yaml", "yml",
-  "toml", "ini", "cfg", "conf", "r", "sh", "js", "css", "html", "xml", "tex", "bib", "dot",
-]);
-function isTextPreview(name) { return TEXT_PREVIEW_EXT.has((name.split(".").pop() || "").toLowerCase()); }
+// One preview by file type (frontend/console/fileview.js), the same wherever a file is opened: the
+// Results panel's Preview tab, the dataset preview and the Files page. A table for csv/tsv, rendered
+// Markdown, foldable JSON, highlighted YAML, line numbers for other text, and images and PDFs inside
+// the panel. A file is never inserted as markup, so no preview runs HTML or script from a file.
+const fvStates = new Map();
+let fvSeq = 0;
+
+function isTextPreview(name) {
+  const kind = FileView.kind(name);
+  return !!kind && kind !== "image" && kind !== "pdf";
+}
 
 function openResultFile(url, kind, name) {
-  if (isTextPreview(name)) loadInlinePreview(url, name);
-  else openFilePreview(url, kind, name);   // pdf / image → existing modal
+  const view = FileView.kind(name);
+  if (view) loadInlinePreview(url, name);      // text, table, image and pdf all open in the panel
+  else openFilePreview(url, kind, name);       // anything else keeps the modal
+}
+
+// The first FileView.LIMIT_BYTES of a file, and its size when the server says it. Reads a stream and
+// stops there, so a table of several GB opens as fast as a small one.
+async function readFileHead(url) {
+  const limit = FileView.LIMIT_BYTES;
+  const res = await fetch(url, { headers: { Range: `bytes=0-${limit - 1}` } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const range = /\/(\d+)\s*$/.exec(res.headers.get("Content-Range") || "");
+  let total = range ? +range[1] : (+res.headers.get("Content-Length") || 0);
+  const chunks = [];
+  let got = 0;
+  if (res.body && res.body.getReader) {
+    const reader = res.body.getReader();
+    while (got < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+    }
+    if (got >= limit) await reader.cancel();
+  } else {
+    const buf = new Uint8Array(await res.arrayBuffer());
+    chunks.push(buf.subarray(0, limit)); got = Math.min(buf.length, limit);
+    total = total || buf.length;
+  }
+  const bytes = new Uint8Array(Math.min(got, limit));
+  let at = 0;
+  for (const c of chunks) { const part = c.subarray(0, bytes.length - at); bytes.set(part, at); at += part.length; if (at >= bytes.length) break; }
+  const cut = total ? bytes.length < total : got >= limit;
+  let text = new TextDecoder("utf-8").decode(bytes);
+  if (cut) text = text.replace(/\uFFFD$/, "");       // a character cut in half at the limit
+  return { text, shown: bytes.length, total: total || bytes.length, cut };
+}
+
+// Paint the view of a file's text into ``host`` and keep its table state for sorting.
+function paintFileView(host, text, info) {
+  const id = "fv" + (++fvSeq);
+  const out = FileView.textView(text, { ...info, id, render: (t) => renderMarkdown(t, { base: info.url }) });
+  if (out.state) fvStates.set(out.id, out.state);
+  host.innerHTML = out.html;
+  return id;
 }
 
 async function loadInlinePreview(url, name) {
@@ -1815,14 +1913,56 @@ async function loadInlinePreview(url, name) {
   if (!pane) return;
   switchResultsTab("preview");
   pane.innerHTML = '<div class="preview-empty">Loading…</div>';
+  const head = `<div class="preview-file-head"><span class="preview-file-name">${escapeHtml(name)}</span>` +
+    `<a class="ghost small" href="${escapeHtml(url)}" download title="Download">${icon("download")}</a></div>`;
+  const kind = FileView.kind(name);
+  if (kind === "image" || kind === "pdf") { pane.innerHTML = head + FileView.mediaHtml(kind, url, name); return; }
   try {
-    const t = await (await fetch(url)).text();
-    pane.innerHTML =
-      `<div class="preview-file-head"><span class="preview-file-name">${escapeHtml(name)}</span>` +
-      `<a class="ghost small" href="${url}" download title="Download">${icon("download")}</a></div>` +
-      `<pre class="preview-code"><code></code></pre>`;
-    pane.querySelector("code").textContent = t.slice(0, 200000);   // textContent → no XSS
+    const got = await readFileHead(url);
+    pane.innerHTML = head + '<div class="fv-host"></div>';
+    paintFileView(pane.querySelector(".fv-host"), got.text, { name, url, shown: got.shown, total: got.total });
   } catch (e) { pane.innerHTML = `<div class="preview-empty">Preview failed: ${escapeHtml(e.message)}</div>`; }
+}
+
+// Clicks inside any file view: sort a table by a header, show more rows, fold JSON, switch Markdown
+// between Rendered and Source, open an image full size.
+function onFileViewClick(e) {
+  const sort = e.target.closest("[data-fv-sort]");
+  if (sort) {
+    const host = sort.closest("[data-fv-table]");
+    const st = host && fvStates.get(host.dataset.fvTable);
+    if (!st) return;
+    const col = +sort.dataset.fvSort;
+    st.sort = st.sort.col !== col ? { col, dir: 1 } : st.sort.dir === 1 ? { col, dir: -1 } : { col: -1, dir: 0 };
+    host.innerHTML = FileView.tableHtml(st);
+    return;
+  }
+  const more = e.target.closest("[data-fv-more]");
+  if (more) {
+    const host = more.closest("[data-fv-table]");
+    const st = host && fvStates.get(host.dataset.fvTable);
+    if (st) { st.shown += FileView.PAGE_ROWS; host.innerHTML = FileView.tableHtml(st); }
+    return;
+  }
+  const fold = e.target.closest("[data-fv-fold]");
+  if (fold) {
+    const root = fold.closest(".fv-host, .ds-body, #dsPreviewBody") || document;
+    root.querySelectorAll(".fv-fold").forEach((d) => { d.open = fold.dataset.fvFold === "open"; });
+    return;
+  }
+  const mode = e.target.closest("[data-fv-mode]");
+  if (mode) {
+    const box = mode.closest(".fv-host, #dsPreviewBody") || document;
+    box.querySelectorAll("[data-fv-mode]").forEach((b) => {
+      const on = b === mode;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    box.querySelectorAll("[data-fv-pane]").forEach((p) => p.classList.toggle("hidden", p.dataset.fvPane !== mode.dataset.fvMode));
+    return;
+  }
+  const img = e.target.closest("[data-fv-open]");
+  if (img) openFilePreview(img.dataset.fvOpen, "image", img.dataset.fvName || "image");
 }
 
 // Material Symbols (fonts.google.com/icons) — one consistent icon set across the app,
@@ -1914,7 +2054,11 @@ async function openFilePreview(url, kind, name) {
   try {
     if (kind === "image") body.innerHTML = `<img class="preview-img" src="${url}" alt="${escapeHtml(name)}" />`;
     else if (kind === "pdf") body.innerHTML = `<iframe class="preview-frame" src="${url}"></iframe>`;
-    else { const t = await (await fetch(url)).text(); body.innerHTML = `<pre class="preview-text">${escapeHtml(t.slice(0, 200000))}</pre>`; }
+    else {
+      const got = await readFileHead(url);
+      body.innerHTML = '<div class="fv-host"></div>';
+      paintFileView(body.querySelector(".fv-host"), got.text, { name, url, shown: got.shown, total: got.total });
+    }
   } catch (e) { body.textContent = "Preview failed: " + e.message; }
 }
 
@@ -4091,10 +4235,149 @@ async function injectPrompt(c, text) {
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Inject failed: " + err.message); }
 }
 
+// ---- images in the composer (issue 115) ----------------------------------------------------------------
+// Attach (the Image button), paste or drop a PNG, JPEG, WebP or GIF: it is uploaded to the chat at once
+// (no HPC3 connection needed) and shows as a thumbnail that can be removed before sending. The sent
+// message shows the thumbnails, a click opens one full size, and they are still there after a reload.
+// A session whose model cannot read images says so before the message is sent.
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+const IMAGE_MAX_COUNT = 5;
+const visionCache = { id: null, value: null };
+
+// A run's figures in its reply (issue 115): the first few as thumbnails, each opening full size, and a
+// link to the rest in the Results panel. Only images the run wrote (its own files) are shown.
+const FIGURES_INLINE = 4;
+function figuresHtml(items) {
+  const figs = (items || []).filter((i) => i && i.kind === "image" && typeof i.url === "string" && /^\/api\/file\//.test(i.url));
+  if (!figs.length) return "";
+  // The ones under figures/ first: a plot is the answer, an image in data/ or process/ is not.
+  figs.sort((a, b) => (/\/figures\//.test(b.url) ? 1 : 0) - (/\/figures\//.test(a.url) ? 1 : 0));
+  const shown = figs.slice(0, FIGURES_INLINE);
+  return `<div class="msg-figures">` + shown.map((f) =>
+    `<figure class="msg-figure"><img src="${escapeHtml(f.url)}" alt="${escapeHtml(f.name || "figure")}" loading="lazy" ` +
+    `data-fv-open="${escapeHtml(f.url)}" data-fv-name="${escapeHtml(f.name || "figure")}" title="Click to open full size" />` +
+    `<figcaption>${escapeHtml(f.name || "")}</figcaption></figure>`).join("") +
+    (figs.length > shown.length
+      ? `<button type="button" class="ghost small" data-open-results>${figs.length - shown.length} more ${figs.length - shown.length === 1 ? "figure" : "figures"} in Results</button>` : "") +
+    `</div>`;
+}
+
+function userImagesHtml(images) {
+  if (!Array.isArray(images) || !images.length) return "";
+  return `<div class="msg-images">` + images.map((i) =>
+    `<img class="msg-img" src="${escapeHtml(i.url)}" alt="${escapeHtml(i.name || "image")}" loading="lazy" ` +
+    `data-fv-open="${escapeHtml(i.url)}" data-fv-name="${escapeHtml(i.name || "image")}" title="Click to open full size" />`).join("") + `</div>`;
+}
+
+async function sessionVision() {
+  if (!state.connectionId) return null;
+  if (visionCache.id === state.connectionId && visionCache.value) return visionCache.value;
+  try {
+    const v = await api("GET", `/api/lab/vision?connection_id=${encodeURIComponent(state.connectionId)}`);
+    visionCache.id = state.connectionId; visionCache.value = v;
+    return v;
+  } catch { return null; }
+}
+
+function renderImageChips() {
+  const host = $("imageChips");
+  if (!host) return;
+  const c = activeChat();
+  const list = (c && c.images) || [];
+  host.classList.toggle("hidden", !list.length);
+  host.innerHTML = list.map((i) =>
+    `<span class="image-chip${i.uploading ? " uploading" : ""}" data-image-key="${escapeHtml(i.key)}" title="${escapeHtml(i.name)}">` +
+    `<img src="${escapeHtml(i.thumb || i.url || "")}" alt="${escapeHtml(i.name)}" />` +
+    `<button type="button" class="image-chip-x" data-remove-image="${escapeHtml(i.key)}" aria-label="Remove ${escapeHtml(i.name)}" title="Remove">×</button></span>`).join("") +
+    (list.length ? `<span class="image-note" id="imageNote"></span>` : "");
+  if (list.length) paintImageNote();
+}
+
+async function paintImageNote() {
+  const note = $("imageNote");
+  if (!note) return;
+  const v = await sessionVision();
+  const el = $("imageNote");
+  if (!el) return;
+  if (v && !v.accepts_images) {
+    el.className = "image-note bad";
+    el.textContent = `This session's model (${v.model || "unknown"}) cannot read images, so a message with them will not be sent. Remove them, or switch to a model that accepts images.`;
+  } else if (v) {
+    el.className = "image-note";
+    el.textContent = "Sent to the model with your message (a chat with no dataset attached).";
+  }
+}
+
+async function addComposerImages(files) {
+  const c = activeChat(), s = activeSession();
+  if (!c) return;
+  if (!authed() || !s || !s.cid) { toast("Images need an account and a saved chat."); return; }
+  c.images = c.images || [];
+  for (const f of files) {
+    const name = f.name || "pasted image";
+    if (c.images.length >= IMAGE_MAX_COUNT) { toast(`At most ${IMAGE_MAX_COUNT} images per message.`); break; }
+    if (!IMAGE_TYPES.includes(f.type)) { toast(`${name} is not a PNG, JPEG, WebP or GIF image.`); continue; }
+    if (f.size > IMAGE_MAX_BYTES) { toast(`${name} is ${fmtSize(f.size)}; the limit is ${fmtSize(IMAGE_MAX_BYTES)} each.`); continue; }
+    const item = { key: rid(), name, thumb: URL.createObjectURL(f), uploading: true };
+    c.images.push(item);
+    renderImageChips();
+    try {
+      const res = await fetch(`/api/conversations/${s.cid}/images?name=${encodeURIComponent(name)}`,
+                              { method: "POST", headers: { "Content-Type": f.type }, body: f });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
+      Object.assign(item, data.image, { uploading: false });
+    } catch (err) {
+      c.images = c.images.filter((x) => x !== item);
+      URL.revokeObjectURL(item.thumb);
+      toast(`Image not attached: ${isUnreachable(err) ? "can't reach the server" : err.message}`);
+    }
+    if (chatVisible(c)) renderImageChips();
+  }
+}
+
+function clearComposerImages(c) {
+  for (const i of (c && c.images) || []) if (i.thumb) URL.revokeObjectURL(i.thumb);
+  if (c) c.images = [];
+  if (chatVisible(c)) renderImageChips();
+}
+
+// The image files of a clipboard or drop (a screenshot has no name).
+function imageFilesOf(list) {
+  return [...(list || [])].filter((f) => f && IMAGE_TYPES.includes(f.type));
+}
+
+function wireComposerImages() {
+  const btn = $("imageBtn"), file = $("imageFile"), input = $("chatInput");
+  if (btn && file) {
+    btn.addEventListener("click", () => file.click());
+    file.addEventListener("change", () => { addComposerImages(imageFilesOf(file.files)); file.value = ""; });
+  }
+  if ($("imageChips")) $("imageChips").addEventListener("click", (e) => {
+    const x = e.target.closest("[data-remove-image]");
+    const c = activeChat();
+    if (!x || !c) return;
+    const gone = (c.images || []).find((i) => i.key === x.dataset.removeImage);
+    if (gone && gone.thumb) URL.revokeObjectURL(gone.thumb);
+    c.images = (c.images || []).filter((i) => i.key !== x.dataset.removeImage);
+    renderImageChips();
+  });
+  if (input) input.addEventListener("paste", (e) => {
+    const pics = imageFilesOf(e.clipboardData && e.clipboardData.files);
+    if (!pics.length) return;                 // text pastes as text
+    e.preventDefault();
+    addComposerImages(pics);
+  });
+}
+
 async function sendChat(e) {
   e.preventDefault();
   const input = $("chatInput");
-  const text = input.value.trim();
+  const c0 = activeChat();
+  const picked = ((c0 && c0.images) || []);
+  if (picked.some((i) => i.uploading)) { toast("Wait for the images to finish uploading."); return; }
+  const text = input.value.trim() || (picked.length ? "Describe the attached image." : "");
   if (!text) return;
   // Everything below is about THIS chat: its plan, its run, its attachments. A message typed in a
   // chat is never feedback on another chat's plan, never a note for another chat's run — a tester
@@ -4107,6 +4390,11 @@ async function sendChat(e) {
   if (c.datasetSave) await c.datasetSave;
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
+  const images = (c.images || []).filter((i) => i.id).map((i) => ({ id: i.id, name: i.name, mime: i.mime, size: i.size, url: i.url }));
+  if (images.length && (c.planPending || c.running)) {
+    toast("Images go with a new message, not into a plan or a run that is already going. Remove them or wait.");
+    return;
+  }
   if (c.planPending) {
     input.value = "";
     c.draft = "";
@@ -4135,7 +4423,16 @@ async function sendChat(e) {
     toast(`${inFlight} chats already have a run in progress on this session (at most ${state.maxRuns} at once). Wait for one to finish, or stop one, then send this again.`);
     return;
   }
-  appendUserMessage(text);
+  if (images.length) {
+    // The composer says so before sending: a model that cannot read images is told, the message waits.
+    const v = await sessionVision();
+    if (v && !v.accepts_images) {
+      toast(`This session's model (${v.model || "unknown"}) cannot read images, so the message was not sent. Remove the images, or switch to a model that accepts them.`);
+      return;
+    }
+  }
+  appendUserMessage(text, images);
+  clearComposerImages(c);
   // This chat owns its run, so its streamed report and artifacts land here even if the user
   // switches chats while it runs (pipelines take minutes). Persisted too (saveRunOwners), so a
   // reload/reconnect (which replays the live run) re-binds it to this chat instead of falling back
@@ -4164,6 +4461,9 @@ async function sendChat(e) {
   const planner = "dag";
   // A refused send leaves the chat idle and gives the text back, so it can be sent again.
   const giveBack = () => {
+    // A refused send gives the images back too, so it can be sent again.
+    if (images.length && !(c.images || []).length) c.images = images.map((i) => ({ key: rid(), ...i }));
+    if (images.length && chatVisible(c)) renderImageChips();
     setChatRunning(c, false);
     if (chatVisible(c) && !input.value.trim()) { input.value = text; c.draft = text; updateComposerButton(); }
     else if (!c.draft) c.draft = text;
@@ -4173,7 +4473,7 @@ async function sendChat(e) {
     // One flow for every request, with the same run options (FIXED_RUN_OPTIONS): the server routes
     // it to a literature search or to the lab, and either starts with a plan to review. `history` is
     // the conversation so far, for a line that reads it.
-    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, shared_datasets, ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
+    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, shared_datasets, ...(images.length ? { images: images.map((i) => i.id) } : {}), ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
     const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
     let res = await postLab();
     // The budget hard limit (Account › API usage): "confirm" asks once, then sends the same run again.
@@ -7537,9 +7837,14 @@ async function droppedUploads(found) {
   return { files, folders };
 }
 async function onDataDrop(found) {
+  const dropped = await droppedUploads(found);
+  // Pictures dropped on the chat go to the message box as images (no HPC3 connection needed); every
+  // other file or folder is an upload as before.
+  const pictures = imageFilesOf(dropped.files);
+  if (pictures.length) addComposerImages(pictures);
+  const files = dropped.files.filter((f) => !pictures.includes(f)), folders = dropped.folders;
+  if (!files.length && !folders.length) { if (!pictures.length) toast("Nothing to upload in what was dropped."); return; }
   if (!state.connectionId) { toast("Connect to HPC3 first."); return; }
-  const { files, folders } = await droppedUploads(found);
-  if (!files.length && !folders.length) { toast("Nothing to upload in what was dropped."); return; }
   for (const f of files) uploadDataset(f);
   for (const fl of folders) uploadFolder(fl);
 }
@@ -9171,9 +9476,13 @@ function dsPreviewHtml(base, file, p) {
       return facts + dsSection("Structure", dsTable(["Path", "Kind", "Shape", "Type"], nodes), p.more_nodes ? "The first nodes are listed." : "") +
         (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
     }
-    case "table":
-      return dsTable(p.columns, p.rows, { types: p.column_types }) +
-        `<p class="ds-note">${escapeHtml(p.note || "")} ${p.more_rows ? `Showing the first ${p.rows_shown} rows.` : `${p.rows_shown} ${p.rows_shown === 1 ? "row" : "rows"}.`}</p>`;
+    case "table": {
+      // The same table as a run's csv in the Results panel: sticky header, row numbers, types, sorting.
+      const id = "fv" + (++fvSeq);
+      fvStates.set(id, FileView.tableState(p.columns || [], p.rows || [], { types: p.column_types, cut: !!p.more_rows }));
+      return `<div data-fv-table="${id}">${FileView.tableHtml(fvStates.get(id))}</div>` +
+        (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
+    }
     case "vcf":
       return dsFacts([["Format", p.fileformat], ["Reference", p.reference], ["Contigs", p.n_contigs],
                       ["Samples", p.n_samples ? `${p.n_samples}: ${p.samples.slice(0, 12).join(", ")}${p.n_samples > 12 ? ", …" : ""}` : "none (sites only)"],
@@ -9184,8 +9493,13 @@ function dsPreviewHtml(base, file, p) {
       return `<div class="ds-media"><img src="${dsDownloadUrl(base, file, true)}" alt="${escapeHtml(file || dsPreview.name)}" /></div>`;
     case "pdf":
       return `<iframe class="ds-pdf" src="${dsDownloadUrl(base, file, true)}" title="${escapeHtml(file || dsPreview.name)}"></iframe>`;
-    case "text":
-      return `<pre class="ds-text">${escapeHtml(p.text || "")}</pre>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
+    case "text": {
+      // Rendered Markdown, foldable JSON, highlighted YAML or numbered lines, by the file's name.
+      const name = file || dsPreview.name;
+      const out = FileView.textView(p.text || "", { name, id: "fv" + (++fvSeq), render: renderMarkdown });
+      if (out.state) fvStates.set(out.id, out.state);
+      return `<div class="fv-host">${out.html}</div>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
+    }
     default:
       return `<div class="ds-note">${escapeHtml(p.note || "This file has no preview. Download it to open it.")}</div>`;
   }
@@ -10489,6 +10803,7 @@ function init() {
     if (act) toggleDataMenu(false);
   });
   wireDataDrop();
+  wireComposerImages();
   document.addEventListener("click", (e) => {
     if (!e.composedPath().some((n) => n.classList && n.classList.contains("data-menu-wrap"))) toggleDataMenu(false);
   });
@@ -10502,6 +10817,10 @@ function init() {
   $("filePreviewClose").addEventListener("click", () => { if (panelFullscreen) exitPanelFullscreen(); $("filePreviewModal").classList.add("hidden"); });
   $("dsPreviewClose").addEventListener("click", closeDatasetPreview);
   $("dsPreviewBody").addEventListener("click", onDatasetPreviewClick);
+  document.addEventListener("click", onFileViewClick);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.closest && e.target.closest("[data-fv-sort]")) onFileViewClick(e);
+  });
   $("datasetPreviewModal").addEventListener("click", (e) => { if (e.target.id === "datasetPreviewModal") closeDatasetPreview(); });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();

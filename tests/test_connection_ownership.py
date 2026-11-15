@@ -74,6 +74,7 @@ def _routes(cid: str) -> list[tuple[str, str, dict]]:
         ("post", "/api/chat/stop", {"json": j}),
         ("post", "/api/chat/inject", {"json": {**j, "text": "use the other dataset"}}),
         ("post", "/api/lab/compact", {"json": j}),
+        ("get", "/api/lab/vision", {"params": j}),
         ("post", "/api/upload", {"data": j, "files": {"file": ("planted.csv", b"a,b\n1,2\n")}}),
         ("post", "/api/tus", tus),
         ("post", "/api/tus/", tus),

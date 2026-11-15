@@ -3490,7 +3490,11 @@ async def get_file(owner: str, run_id: str, path: str, request: Request) -> Resp
     content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     # Streamed from disk, never read into memory: an artifact can be a table of several GB, and this
     # process serves every user. "no-cache" keeps a regenerated report from being shown stale.
-    return FileResponse(target, media_type=content_type, headers={"Cache-Control": "no-cache"})
+    headers = {"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"}
+    if target.suffix.lower() in (".html", ".htm", ".xhtml", ".svg", ".xml"):
+        # A file a run wrote is data: opened by link it must never run script on this origin.
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+    return FileResponse(target, media_type=content_type, headers=headers)
 
 
 @app.post("/api/results/delete")
@@ -7258,6 +7262,11 @@ class LabRequest(BaseModel):
     # "latest" | label, "files": [names] | None, "role": ...}``, never a path. The gateway resolves
     # each once at run start (``_resolve_shared_refs``) and keeps what ``latest`` meant.
     shared_datasets: list[dict] | None = None
+    # Images of this message (issue 115): the ids of images uploaded to the conversation (POST
+    # /api/conversations/{cid}/images). The gateway loads them itself, so a request body never carries
+    # bytes or paths; ``_images`` holds what it loaded.
+    images: list[str] | None = None
+    _images: "list[dict] | None" = PrivateAttr(default=None)
     # What the references resolved to. Private: it holds server paths, so a request body can never set it.
     _shared_resolved: "list[dict] | None" = PrivateAttr(default=None)
     # The TEXT attachment: the patient's clinical description / case note, carried as TEXT rather
@@ -7306,6 +7315,63 @@ class LabRequest(BaseModel):
     # (see _budget_refusal). ``tz`` is the browser's time zone, which the billing cycle is counted in.
     budget_ack: bool = False
     tz: str | None = None
+
+
+def _session_model_accepts_images(conn: Connection) -> "tuple[bool, str]":
+    """Whether the session's model reads images, and its name: a native Anthropic key does; any other
+    endpoint by the model's name or AISCIENTIST_VISION_MODELS (``chat_images.accepts_images``)."""
+    from . import chat_images, llm_providers
+    base_url = os.environ.get("AISCIENTIST_LLM_BASE_URL") or None
+    model = (os.environ.get("AISCIENTIST_LLM_MODEL") or "") if base_url else str(getattr(conn, "selected_model", "") or "")
+    native = False
+    try:
+        cred = _bound_credential(conn)
+    except GatewayError:
+        cred = None
+    if cred is not None:
+        if cred.get("builtin") == "shared":
+            model = str(cred.get("model") or shared_llm.SharedLLMSettings().served_name)
+        else:
+            model = str(cred.get("model") or model)
+            native = llm_providers.transport_for(cred.get("provider"), cred.get("base_url") or None) == "anthropic"
+    return chat_images.accepts_images(model, native_anthropic=native), model
+
+
+def _prepare_images(conn: Connection, req: LabRequest) -> "JSONResponse | None":
+    """A message's images: load them from the conversation (never from the request), and refuse, saying
+    why, when this session cannot use them; they are never dropped without a word. With no data
+    attached the message goes to the fast chat, which carries the images to the model. The analysis
+    run reads text and data only, so a message that both attaches data and images is refused."""
+    if not req.images:
+        return None
+    from . import chat_images
+    if not (_AUTH_ENABLED and str(req.conversation_id or "").isdigit()):
+        return JSONResponse({"error": "Images need an account and a saved chat."}, status_code=400)
+    try:
+        req._images = chat_images.load(conn.owner, int(req.conversation_id), req.images)
+    except chat_images.ChatImageError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    ok, model = _session_model_accepts_images(conn)
+    if not ok:
+        return JSONResponse(
+            {"error": f"This session's model ({model or 'unknown'}) cannot read images, so the message was not "
+                      "sent. Remove the image, or switch to a model that accepts images under API endpoints.",
+             "images_unsupported": True}, status_code=409)
+    if _select_bound_datasets(req) or req.shared_datasets:
+        return JSONResponse(
+            {"error": "An analysis reads text and data, not images. Send the image in a chat with no "
+                      "dataset attached, or remove it from this message.", "images_unsupported": True},
+            status_code=409)
+    req.route = "chat"
+    return None
+
+
+@app.get("/api/lab/vision")
+async def lab_vision(connection_id: str, request: Request) -> JSONResponse:
+    """Whether this session's model reads images: the composer says so before a message with one is sent."""
+    conn = _owned_conn(connection_id, request)
+    ok, model = await asyncio.to_thread(_session_model_accepts_images, conn)
+    return JSONResponse({"accepts_images": ok, "model": model})
 
 
 def _fixed_run_options(req: LabRequest) -> LabRequest:
@@ -10921,6 +10987,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     # loop.call_soon_threadsafe, which is the same contract _run_lab's callbacks rely on.
 
     try:
+        from . import chat_images
         from ..agents.quick_chat import QuickChatConfig, run_quick_chat
         from ..agents.registry import build_quickchat_catalog
         from ..agents.research_harness import HarnessContext
@@ -11014,6 +11081,8 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             count_tokens_fn=count_tokens_fn, summarize_fn=summarize_fn,
             prior_summary=str(memory.get("summary") or ""),
             prior_summary_through=int(memory.get("through") or 0),
+            image_parts=[{"type": "image_url", "image_url": {"url": chat_images.data_url(i)}}
+                         for i in getattr(req, "_images", None) or []] or None,
         )
         # Carry the rolling memory forward. Stored even on a stopped/empty turn: the summary
         # describes the CONVERSATION, not this turn's answer, and throwing it away would make
@@ -11568,6 +11637,9 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
     re-run-step / new study) instead of always minting a fresh study."""
     _select_bound_datasets(req)   # refuse an oversized set before scheduling any work
     conn = _owned_conn(req.connection_id, request)
+    refused_images = await asyncio.to_thread(_prepare_images, conn, req)
+    if refused_images is not None:
+        return refused_images
     # Shared datasets: resolved once here, so ``latest`` means the same for the whole run.
     if req.shared_datasets:
         req._shared_resolved = await asyncio.to_thread(_resolve_shared_refs, req, conn)
