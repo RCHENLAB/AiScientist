@@ -324,6 +324,25 @@ def already_processed(adata: Any) -> "str | None":
             f"({BASE_CHECKPOINT}): call the next tool directly.")
 
 
+ADOPTION_RECORD = ".adopted.json"
+
+
+def _adoption_record(work: Path, src: Path) -> "dict[str, Any] | None":
+    """What :func:`adopt` wrote into ``work`` from this same file, or None: the checkpoints there
+    then come from somewhere else (this run's own QC, another dataset) and stay untouched."""
+    try:
+        record = json.loads((work / ADOPTION_RECORD).read_text(encoding="utf-8"))
+        same = (record.get("source") == str(src) and record.get("size") == src.stat().st_size)
+        adopted = record.get("adopted")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not same or not isinstance(adopted, dict):
+        return None
+    if not all((work / str(name)).is_file() for name in adopted.get("checkpoints") or [BASE_CHECKPOINT]):
+        return None
+    return adopted
+
+
 def adopt(workspace: "str | Path", source: "str | Path") -> "dict[str, Any]":
     """Start a run from the dataset an earlier run handed on, by writing it as this run's checkpoints.
 
@@ -332,8 +351,10 @@ def adopt(workspace: "str | Path", source: "str | Path") -> "dict[str, Any]":
     so it goes back as ``work/adata_qc.h5ad`` with ``.raw`` restored — :func:`export` dropped it as
     a copy of ``X``, and the DE and annotation tools read the log-normalised matrix from there —
     and, when it carries a clustering, as ``work/adata_clustered.h5ad`` too. A checkpoint this run
-    already has is never overwritten. ``status`` is ``skipped`` (with ``reason``) for a file no
-    run handed on, which is then used as an ordinary input."""
+    already has is never overwritten. Adopting the same file a second time (a plan is drafted, then
+    approved, in one session) answers ``ok`` with the record of the first time. ``status`` is
+    ``skipped`` (with ``reason``) for a file no run handed on, which is then used as an ordinary
+    input."""
     try:
         import anndata as ad
     except ImportError as exc:                       # pragma: no cover - the images ship it
@@ -343,6 +364,10 @@ def adopt(workspace: "str | Path", source: "str | Path") -> "dict[str, Any]":
         return {"status": "skipped", "reason": f"{src.name} is not an .h5ad file a run handed on"}
     work = Path(workspace) / "work"
     if (work / BASE_CHECKPOINT).is_file():
+        earlier = _adoption_record(work, src)
+        if earlier is not None:
+            return {"status": "ok", "adopted": earlier, "already_in_place": True,
+                    "summary": f"already started from {src.name}: its checkpoints are in place"}
         return {"status": "skipped", "reason": f"this run already has {BASE_CHECKPOINT}"}
     try:
         adata = ad.read_h5ad(src)
@@ -383,6 +408,11 @@ def adopt(workspace: "str | Path", source: "str | Path") -> "dict[str, Any]":
         "layers": sorted(str(k) for k in adata.layers.keys() if k is not None),
         "counts_layer": str(adata.uns.get("counts_layer") or ""),
     }
+    try:
+        record = {"source": str(src), "size": src.stat().st_size, "adopted": adopted}
+        (work / ADOPTION_RECORD).write_text(json.dumps(record), encoding="utf-8")
+    except (OSError, TypeError, ValueError):  # the record only saves a second adoption an error
+        pass
     summary = (f"started from {src.name}: {adata.n_obs} cells x {adata.n_vars} genes"
                + (f", {adopted['n_clusters']} clusters ({cluster_key})" if cluster_key else "")
                + (f", {adopted['n_labels']} cell-type labels ({label_key})" if label_key else ""))

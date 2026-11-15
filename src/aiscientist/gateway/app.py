@@ -5268,7 +5268,10 @@ async def _restage_server_data(conn: Connection, decisions: dict[str, Any],
         return
     from . import server_data as sd
     base = _session_mirror_base(conn)
-    sessions_dir = base.rsplit("/", 1)[0]
+    # <shared root>/sessions/<session>/inputs: the stored path names the session that made the copy,
+    # which is another one whenever there is something to copy again.
+    session_dir, inputs_name = base.rsplit("/", 1)
+    sessions_dir = session_dir.rsplit("/", 1)[0]
     legacy_dir = f"{_hpc_uploads_dir(conn)}/{hpc_gc.SERVER_DATA_KIND}"
     roots = _bindable_roots(conn)
     by_name = {sd.mirror_tag(root): root for root in roots}
@@ -5279,7 +5282,7 @@ async def _restage_server_data(conn: Connection, decisions: dict[str, Any],
               if isinstance(folder, dict)]
     stored: list[tuple[dict, str, str]] = []            # (holder, key, "<root name>/<rel>")
     for holder, key in slots:
-        parts = sd.split_mirror(str(holder.get(key) or ""), sessions_dir, legacy_dir)
+        parts = sd.split_mirror(str(holder.get(key) or ""), sessions_dir, legacy_dir, inputs_name)
         if parts is not None:
             stored.append((holder, key, "/".join(p for p in parts if p)))
     # A bound folder covers the files inside it: copy each outermost path once.
