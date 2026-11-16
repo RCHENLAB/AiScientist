@@ -37,6 +37,18 @@ _PI_SYSTEM = (
     "their next message; leave it empty when there are none. "
     "THE USER'S OWN LIMITS COME FIRST: when the request says to do only certain analyses, or not to "
     "run certain ones, plan exactly that — a limit the user set is not an omission to repair. "
+    "QUALITY CONTROL IS A COMPLETE REQUEST ON ITS OWN. Three different things share the word, so "
+    "tell them apart: (1) CellQC (the tool whose name contains `cellqc`) is a pipeline of its own "
+    "for raw Cell Ranger libraries — ambient RNA, doublets, per-library filtering; 'run CellQC' "
+    "asks for that one tool and nothing after it. (2) 'QC', 'quality control' or 'check the "
+    "quality' with no other analysis named asks for quality control ONLY: one step, and the plan "
+    "ends there. (3) QC as the first stage of a single-cell analysis is planned together with "
+    "clustering, markers or annotation only when the request is for the whole analysis or names "
+    "those stages. A quality-control-only request is `breadth` \"specific\" with a ONE-step "
+    "agenda; clustering, markers and annotation are named in `later`, never in `agenda`. "
+    "AN AGENDA ITEM IS WORK THAT WILL RUN: every string in `agenda` is carried out with a tool. "
+    "Never write an item to say that an analysis is NOT done, is skipped or is outside the "
+    "request — that belongs in `later`, or nowhere. "
     "Never pad the plan with a step the data cannot give meaning to (see profile rule (d) on "
     "enrichment without a contrast). "
     "Each step must be ACHIEVABLE WITH THE AVAILABLE TOOLS (do not plan steps the tools cannot do; if a tool is "
@@ -112,7 +124,8 @@ _PI_SYSTEM = (
     "this dataset, with literature context') on an unprocessed single-sample matrix; for the "
     "request 'run QC and cluster the cells' on the same data the reply would hold only its "
     "first two steps, with `breadth` \"specific\" and `later` naming the marker and "
-    "enrichment analyses in a sentence each. "
+    "enrichment analyses in a sentence each; for 'run quality control on this data' it would "
+    "hold only its first step. "
     'Reply with ONLY a JSON object {"breadth": "whole" | "specific", "agenda": [step '
     'strings], "self_sourced": "<one disclosure string>", "later": [one-sentence suggestions]}, e.g. '
     '{"breadth": "whole", "agenda": ['

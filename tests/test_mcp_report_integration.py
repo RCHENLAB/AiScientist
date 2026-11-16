@@ -60,6 +60,8 @@ def test_atlas_query_report_runs_while_gateway_report_is_handed_off(release, wri
         return "Done."
 
     lab = _lab([], {}, scientist=ResearchHarness(catalog=list(catalog.values()), chat_fn=scientist))
+    # The run holds the atlas, as a run started from a chat with the atlas attached does.
+    lab.ctx.decisions["dataset_path"] = runner.dataset_path
     lab._complete_fn = complete
     events, reviews = [], []
 
@@ -88,6 +90,7 @@ def test_atlas_query_report_runs_while_gateway_report_is_handed_off(release, wri
     if written_report:
         runner.calls.clear()
         resumed_lab = _lab([], {}, scientist=ResearchHarness(catalog=list(catalog.values()), chat_fn=scientist))
+        resumed_lab.ctx.decisions["dataset_path"] = runner.dataset_path
         resumed_lab._complete_fn = complete
         resumed = resumed_lab.run("Continue", resume=rl.ResumeState(
             [atlas_step, rl.REPORT_STEP], [], 0, report_requested=True))

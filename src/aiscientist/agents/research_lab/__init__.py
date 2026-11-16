@@ -181,6 +181,7 @@ from .plan_parse import (  # noqa: F401
     _STEP_ORDINAL_RE,
     _close_unterminated_json,
     _drop_question_echo,
+    _split_not_planned,
     _hand_edit_note,
     _node_step_text,
     _norm_step,
@@ -4258,8 +4259,14 @@ class ResearchLab:
                 emit({"type": "pi_agenda", "agenda": patched})
                 return "agenda", patched
 
+        # A tool whose input is not attached to the chat cannot run here: the PI is told, and a
+        # plan that still calls it is not shown (see below).
+        from ..plan_inputs import missing_inputs, refusal, steps_missing_input
+        input_gaps = missing_inputs((t.name for t in self.scientist.catalog), self.ctx.decisions)
         tools_desc = "\n".join(
             f"- {t.name}: {_planner_tool_description(t)}"
+            + (f" [CANNOT RUN IN THIS CHAT: {input_gaps[t.name]} Do not plan it.]"
+               if t.name in input_gaps else "")
             for t in self.scientist.catalog if t.name != "finish"
         ) + "\n" + _REPORT_TOOL_LINE
         # A pre-selected research path STEERS the PI here (it does not bypass it): the PI
@@ -4360,6 +4367,19 @@ class ResearchLab:
             payload, echoed = _drop_question_echo(list(payload), question)
             if echoed:
                 emit({"type": "steps_pruned", "reason": "question_echo", "steps": echoed})
+            # A step that only says an analysis is NOT done is a note, not work: left in the agenda
+            # it was handed to a specialist, who ran code for it (prod run c2b4d03d524b, "Run
+            # CellQC": step 2 "Clustering and cell-type annotation - Not planned here").
+            payload, not_planned = _split_not_planned(
+                list(payload), {t.name for t in self.scientist.catalog})
+            if not_planned:
+                emit({"type": "steps_pruned", "reason": "not_planned", "steps": not_planned})
+                seen = {x.lower() for x in self._later}
+                for step in not_planned:
+                    title = _step_title(step)
+                    if title.lower() not in seen and len(self._later) < MAX_LATER:
+                        self._later.append(title)
+                        seen.add(title.lower())
             #after PI generate agenda, check if the literature is inside
             _agenda_now = list(payload)
             # Only the user's own words ask for literature. The protocol text mentions it in every
@@ -4396,6 +4416,12 @@ class ResearchLab:
                 payload = self._apply_scope(list(payload), emit)
             payload = self._ensure_report_step(list(payload), question, feedback=feedback,
                                                note=request, prior_agenda=prior_agenda, emit=emit)
+            unbound = steps_missing_input(payload, input_gaps)
+            if unbound:
+                # It would be reviewed, started and fail at its first call. Say what to attach.
+                emit({"type": "plan_input_missing", "steps": [n for n, _ in unbound],
+                      "tools": sorted({tool for _, tool in unbound})})
+                return "failed", refusal(unbound, input_gaps)
             emit({"type": "pi_agenda", "agenda": payload})
             if self._later:
                 emit({"type": "plan_later", "later": list(self._later),

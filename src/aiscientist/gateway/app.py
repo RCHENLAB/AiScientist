@@ -9528,7 +9528,20 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     conn.push({"type": "lab_progress",
                "text": f"🧭 Read as “re-run step {idx + 1} and update the report” — the other results and figures are kept.",
                "level": "info"})
-    await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id, resume_decisions=resume_decisions)
+    stale = await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id,
+                           resume_decisions=resume_decisions, replan_stale_plan=True)
+    if stale:
+        # The earlier plan cannot run as it is (a tool it names is no longer installed, or its
+        # pinned settings do not take a new instruction). The message is still a request: plan it,
+        # from the earlier run's results, in a run of its own.
+        conn.push({"type": "lab_progress", "level": "info",
+                   "text": "🧭 The earlier plan in this chat cannot be re-run as it is (it was written "
+                           "for tools this version no longer has), so a new plan is drafted for "
+                           "your message. The earlier results are kept."})
+        _next = _begin_routed_run(conn, req.conversation_id)
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
+        await continue_from_results()
 
 
 # --- a later message that builds on the conversation's earlier run --------------------------------
@@ -12937,7 +12950,10 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                  f"({ev.get('chars', 0):,} characters). Its replies are saved with the run in "
                  "process/plan_replies/.", "warning")
     elif t == "plan_failed":
-        progress("⛔ No plan, so nothing was run. Send the request again to plan it again.", "warning")
+        # The reply says what to attach when the plan was held back for a missing input.
+        progress("⛔ No plan: the input this request needs is not attached to the chat."
+                 if str(ev.get("reason") or "").startswith("Nothing was planned or run: this request needs")
+                 else "⛔ No plan, so nothing was run. Send the request again to plan it again.", "warning")
     elif t == "plan_revision_failed":
         progress("⚠️ The PI's revised plan could not be read, so the plan is unchanged. Ask for the "
                  "change again.", "warning")
@@ -14527,7 +14543,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                    resume_decisions: dict[str, Any] | None = None,
                    prior: "dict | None" = None,
                    saved_state: "dict | None" = None,
-                   saved_decision: "dict | None" = None) -> None:
+                   saved_decision: "dict | None" = None,
+                   replan_stale_plan: bool = False) -> bool:
+    """Returns True only when ``replan_stale_plan`` is set and the earlier plan could not be
+    resumed (``requires_replan``): nothing ran, no error was shown, and the caller plans anew."""
+    stale_plan = False
     # This run's isolation scope — cancel + plan events keyed to THIS run, and its identity stamped on
     # every streamed WS event so the client demuxes it into the owning conversation bubble. The caller
     # (dispatch / continue endpoints) opened it via begin_run; a direct/legacy call gets a fresh one.
@@ -15767,13 +15787,21 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                    "message": public_error(exc) + _resume_hint(locals().get("art"))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc.message))
     except Exception as exc:  # noqa: BLE001 - any lab failure is reported, never fatal
-        print(f"[lab] run failed (unhandled): {type(exc).__name__}: {exc}")
-        traceback.print_exc()
-        conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
-        conn.push({"type": "chat_error",
-                   "message": public_error(exc) + ("" if getattr(exc, "requires_replan", False)
-                                                  else _resume_hint(locals().get("art")))})
-        _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
+        needs_replan = bool(getattr(exc, "requires_replan", False))
+        if needs_replan and resume is not None and replan_stale_plan:
+            stale_plan = True
+            conn.emit("info", "lab", f"Earlier plan not resumed, planning anew: {public_error(exc)}")
+        else:
+            print(f"[lab] run failed (unhandled): {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
+            conn.push({"type": "chat_error",
+                       "message": public_error(exc) + ("" if needs_replan
+                                                      else _resume_hint(locals().get("art")))})
+        # A plan refused before anything ran leaves the finished run it belongs to as it was:
+        # its record keeps its status, its files and its summary.
+        if not (needs_replan and resume_run_id):
+            _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():
             try:
@@ -15787,6 +15815,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # Close the run scope so a post-run WS reconnect doesn't see a stale pending plan; the run
         # stays in conn.runs so a late approve/cancel that names it resolves to a no-op.
         conn.end_run(run)
+    return stale_plan
 
 
 
