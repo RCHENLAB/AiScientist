@@ -4262,7 +4262,9 @@ class ResearchLab:
         # A tool whose input is not attached to the chat cannot run here: the PI is told, and a
         # plan that still calls it is not shown (see below).
         from ..plan_inputs import missing_inputs, refusal, steps_missing_input
-        input_gaps = missing_inputs((t.name for t in self.scientist.catalog), self.ctx.decisions)
+        # Every configured tool is checked, not only this run's: a tool whose input is missing may
+        # not be registered for the run at all, and a preset pipeline's guidance still names it.
+        input_gaps = missing_inputs(None, self.ctx.decisions)
         tools_desc = "\n".join(
             f"- {t.name}: {_planner_tool_description(t)}"
             + (f" [CANNOT RUN IN THIS CHAT: {input_gaps[t.name]} Do not plan it.]"

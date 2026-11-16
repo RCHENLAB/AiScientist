@@ -91,3 +91,16 @@ def test_the_planner_is_told_quality_control_alone_is_one_step():
     text = " ".join(v for v in vars(prompts).values() if isinstance(v, str))
     assert "QUALITY CONTROL IS A COMPLETE REQUEST ON ITS OWN" in text
     assert "AN AGENDA ITEM IS WORK THAT WILL RUN" in text
+
+
+def test_a_tool_the_run_does_not_register_is_still_checked(names):
+    """Prod v0.4.17: in a chat with no file, variant annotation is not among the run's tools, the
+    preset pipeline's guidance names it, and the plan that calls it was shown for approval."""
+    atlas, variant, other = names
+    annotate = next(n for n in variant if not n.endswith("_job_status"))
+    assert plan_inputs.missing_inputs(other, {}) == {}          # asked about the run's tools only
+    gaps = plan_inputs.missing_inputs(None, {})
+    assert annotate in gaps and set(atlas) <= set(gaps)
+    step = f"**Annotation** \u2014 Run `{annotate}` on the whole VCF."
+    assert plan_inputs.steps_missing_input([step], gaps) == [(1, annotate)]
+    assert plan_inputs.missing_inputs(None, {"dataset_path": "/uploads/u/demo.vcf"}).get(annotate) is None

@@ -46,16 +46,22 @@ def _is_atlas(path: str) -> bool:
     return posixpath.normpath(path) in configured_atlases() or bool(shared_release(path))
 
 
-def missing_inputs(tool_names: Iterable[str], decisions: "dict[str, Any] | None") -> dict[str, str]:
-    """``{tool: why it cannot run in this chat}`` for the registered tools whose input is absent."""
+def missing_inputs(tool_names: "Iterable[str] | None", decisions: "dict[str, Any] | None") -> dict[str, str]:
+    """``{tool: why it cannot run in this chat}`` for the tools whose input is absent.
+
+    ``tool_names`` limits the answer to those tools; ``None`` covers every configured one. A plan
+    is checked against all of them: a tool whose input is missing may not be registered for the
+    run at all (variant annotation is not, in a chat with no file), and a preset pipeline's
+    guidance still names it."""
     from .atlas_expression import SKILL as ATLAS_SKILL
     from .mcp_bridge import configured_servers
 
-    names = set(tool_names)
+    names = None if tool_names is None else set(tool_names)
     paths = attached(decisions)
     gaps: dict[str, str] = {}
     for server in configured_servers():
-        owned = [n for n in (server.planner_name(tool["name"]) for tool in server.tools) if n in names]
+        owned = [n for n in (server.planner_name(tool["name"]) for tool in server.tools)
+                 if names is None or n in names]
         if not owned:
             continue
         if server.skill == ATLAS_SKILL:

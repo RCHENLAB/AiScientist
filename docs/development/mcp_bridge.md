@@ -17,10 +17,10 @@ The server transport is stdio; authenticated remote MCP HTTP is not implemented.
 
 | Server | Package version | Replaced scientific tools |
 | --- | --- | ---: |
-| `scrna-analysis` | `0.0.6` | 11 |
+| `scrna-analysis` | `0.0.5` | 11 |
 | `cellqc` | `0.0.5` | 1 |
 | `literature` | `0.0.4` | 4 |
-| `variant-annotation` | `0.0.3` | 1 |
+| `variant-annotation` | `0.0.2` | 1 |
 | `phenotype-diagnosis` | `0.0.4` | 3 |
 | `scgpt-annotation` | `0.0.3` | 1 |
 | `data-utilities` | `0.0.2` | 2 |
