@@ -480,6 +480,28 @@ def test_bound_inputs_and_authoritative_clinical_variant_context(tmp_path):
     assert variant.prepare({"regions_bed": "bed"}, executor).arguments["regions_bed"] == "/bound/regions.bed"
 
 
+def test_cellqc_is_given_every_folder_bound_to_the_run(tmp_path):
+    """With two sample folders bound, `run_cellqc` called with `samples` alone read only the primary
+    one: the second library was dropped without a word and the step was run a second time."""
+    server, = bridge.load_servers(config(tmp_path, "cellqc"))
+    adapter = AnalysisAdapter(server)
+    wt, mut = "/hpc/inputs/CellQC/Sample1_WT", "/hpc/inputs/CellQC/Sample2_Ddx41"
+    executor = SimpleNamespace(dataset_path=f"{wt}/filtered_feature_bc_matrix.h5", dataset_root=wt,
+                               inputs=[{"name": "Sample2_Ddx41", "path": mut}])
+    ctx = SimpleNamespace(decisions={"input_folders": [
+        {"name": "Sample1_WT", "path": "/data/shared/Sample1_WT", "hpc": wt},
+        {"name": "Sample2_Ddx41", "path": "/data/shared/Sample2_Ddx41", "hpc": mut}]})
+    args = adapter.authoritative({"samples": ["Sample1_WT", "Sample2_Ddx41"]}, ctx, "run_cellqc", executor)
+    assert args["dataset_paths"] == [wt, mut]
+    assert adapter.prepare(args, executor, tool="run_cellqc").arguments["dataset_paths"] == [wt, mut]
+    # What the model passed stands, one folder needs nothing, and other tools are left alone.
+    chosen = adapter.authoritative({"dataset_paths": [mut]}, ctx, "run_cellqc", executor)
+    assert chosen["dataset_paths"] == [mut]
+    one = SimpleNamespace(decisions={"input_folders": ctx.decisions["input_folders"][:1]})
+    assert "dataset_paths" not in adapter.authoritative({}, one, "run_cellqc", executor)
+    assert "dataset_paths" not in adapter.authoritative({}, ctx, "cellqc_job_status", executor)
+
+
 def test_complete_public_response_is_bounded_before_transport(analysis_bridge):
     runner, ctx, make = analysis_bridge
     value, _ = fixture_result(runner)

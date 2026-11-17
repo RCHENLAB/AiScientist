@@ -337,7 +337,7 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                 schema.setdefault("additionalProperties", False)
             validator = Draft202012Validator(schema)
 
-            def call(args, ctx, *, s=server, e=entry, a=adapter, v=validator):
+            def invoke(args, ctx, *, s=server, e=entry, a=adapter, v=validator):
                 if not isinstance(args, dict):
                     return {"status": "error", "error": "MCP arguments must be an object"}
                 if s.adapter == "analysis":
@@ -387,10 +387,23 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                 except (ValueError, TypeError, KeyError, OSError) as exc:
                     return {"status": "error", "error": f"MCP {s.name}: {exc}", "mcp": s.identity()}
 
+            def call(args, ctx, _invoke=invoke, _skill=skill, _name=server.planner_name(entry["name"])):
+                from .skills_registry import count_call
+                try:
+                    result = _invoke(args, ctx)
+                except Exception:
+                    count_call(_skill, ctx, None, _name)
+                    raise
+                count_call(_skill, ctx, result, _name)
+                return result
+
             tools.append(HarnessTool(name=server.planner_name(entry["name"]),
                                      description=f"MCP {server.name}: {entry['description']}" + adapter.description,
                                      parameters=schema, executor=call,
-                                     reads_private_data=True, category=skill.category or "mcp"))
+                                     reads_private_data=True, category=skill.category or "mcp",
+                                     provider={"provider": "mcp", "server": server.name,
+                                               "version": server.version},
+                                     skills=({"name": skill.name, "version": skill.version or "unknown"},)))
     return tools
 
 

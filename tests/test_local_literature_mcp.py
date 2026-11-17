@@ -49,13 +49,14 @@ def test_local_search_validates_schema_and_never_loads_legacy_science(tmp_path, 
     monkeypatch.setenv("AISCIENTIST_LOCAL_CORPUS_MCP", "docker")
     schema = {"type": "object", "properties": {"queries": {"type": "array", "items": {"type": "string"}}},
               "required": ["queries"], "additionalProperties": False}
-    server = SimpleNamespace(skill="registered", image="docker://example@sha256:" + "a" * 64,
+    server = SimpleNamespace(name="literature", skill="registered", image="docker://example@sha256:" + "a" * 64,
                              version="0.0.3", tools=({"name": "search_corpus", "description": "Search", "inputSchema": schema},),
                              identity=lambda: {"name": "literature", "version": "0.0.3"},
                              planner_name=lambda wire: "mcp_" + wire)
     monkeypatch.setattr(local, "registered_server", lambda: server)
     monkeypatch.setattr(local.shutil, "which", lambda binary: "/usr/bin/docker")
-    monkeypatch.setattr(skills, "get_skill", lambda name: SimpleNamespace(image=server.image))
+    monkeypatch.setattr(skills, "get_skill", lambda name: SimpleNamespace(
+        name="registered", version="1.0", image=server.image))
     assert not hasattr(local_corpus, "_embedder")
     calls = []
     def execute(argv, payload, output, **kw):
@@ -63,6 +64,10 @@ def test_local_search_validates_schema_and_never_loads_legacy_science(tmp_path, 
         return {"status": "ok", "contexts": [{"pmid": "123", "text": "public fixture"}]}
     monkeypatch.setattr(local, "_execute", execute)
     tool = local_corpus.make_local_tool()
+    # The plan and the run record name its server from registration, never "local" by default.
+    assert tool.identity() == {"tool": "mcp_search_corpus", "provider": "mcp", "server": "literature",
+                               "version": "0.0.3"}
+    assert tool.skills == ({"name": "registered", "version": "1.0"},)
     ctx = SimpleNamespace(workspace=tmp_path / "private-run")
     actual = tool.executor({"queries": ["PRPF31"]}, ctx)
     assert actual["status"] == "ok" and actual["mcp"]["execution_mode"] == "local-docker"
@@ -90,18 +95,21 @@ def test_public_lookup_has_no_corpus_mount_or_model_configuration(tmp_path, monk
     monkeypatch.setattr(local_corpus, "has_local_index", lambda: pytest.fail("public lookup needs no corpus"))
     schema = {"type": "object", "properties": {"query": {"type": "string"}},
               "required": ["query"], "additionalProperties": False}
-    server = SimpleNamespace(skill="registered", image="docker://example@sha256:" + "a" * 64,
+    server = SimpleNamespace(name="literature", skill="registered", image="docker://example@sha256:" + "a" * 64,
                              version="0.0.4", tools=({"name": "literature_search", "description": "Search", "inputSchema": schema},),
                              identity=lambda: {"name": "literature", "version": "0.0.4"},
                              planner_name=lambda wire: "custom_" + wire)
     monkeypatch.setattr(local, "registered_server", lambda: server)
     monkeypatch.setattr(local.shutil, "which", lambda _: "/usr/bin/docker")
-    monkeypatch.setattr(skills, "get_skill", lambda _: SimpleNamespace(image=server.image))
+    monkeypatch.setattr(skills, "get_skill", lambda _: SimpleNamespace(
+        name="registered", version="1.0", image=server.image))
     calls = []
     monkeypatch.setattr(local, "_execute", lambda argv, payload, output, **kw:
                         calls.append((argv, payload)) or {"status": "ok", "results": []})
     tool = local.make_public_tool()
     assert tool.name == "custom_literature_search"
+    assert tool.identity() == {"tool": "custom_literature_search", "provider": "mcp",
+                               "server": "literature", "version": "0.0.4"}
     out = tool.executor({"query": "PRPF31"}, SimpleNamespace(workspace=tmp_path / "private-run"))
     assert out["status"] == "ok" and calls[0][1]["tool"] == "literature_search"
     argv = calls[0][0]

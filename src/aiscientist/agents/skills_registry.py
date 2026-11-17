@@ -311,7 +311,18 @@ def count_step(step: str, calls: dict) -> None:
         method = [ok for ok, code, tool in ran
                   if tool != "run_code" or not functions or calls_to(code, functions)]
         if method:
-            _count_once(ctx, step, skill, "success" if any(method) else "error")
+            state = "used" if any(method) else "failed"
+            # Method outcomes, rather than loading guidance, are the per-step use record.
+            with run_manifest.LOCK:
+                rows = ctx.decisions.setdefault("step_skill_use", {}).setdefault(step, [])
+                prior = next((r for r in rows if r["name"] == skill.name
+                              and r["version"] == (skill.version or "unknown")), None)
+                if prior is None:
+                    rows.append({"name": skill.name, "version": skill.version or "unknown", "status": state})
+                elif prior["status"] != "used":
+                    prior["status"] = state
+            if skill.registry_release:
+                _count_once(ctx, step, skill, "success" if any(method) else "error")
 
 
 def _count_once(ctx, step: str, skill, state: str) -> None:
@@ -375,7 +386,7 @@ def active_skill(ctx, name: str = ""):
     return ctx.decisions.get("active_registry_skill") if ctx is not None else None
 
 
-def execute(skill, ctx, executor, call, tool: str, code: str = ""):
+def execute(skill, ctx, executor, call, tool: str, code: str = "", *, record_outcome: bool = True):
     """Apply immutable per-call policy; never mutate a shared executor or process environment.
 
     ``code`` is what the call runs (the snippet, the command). The call is counted by
@@ -384,7 +395,10 @@ def execute(skill, ctx, executor, call, tool: str, code: str = ""):
         return call()
     record_use(ctx, skill)
     if not skill.registry_release:
-        return call()
+        result = call()
+        if record_outcome:
+            count_call(skill, ctx, result, tool, code)
+        return result
     req = skill.requirements
     secrets = {}
     token = None
@@ -421,7 +435,8 @@ def execute(skill, ctx, executor, call, tool: str, code: str = ""):
             value = [redact(v) for v in value]
         return value
     result = redact(result)
-    count_call(skill, ctx, result, tool, code)
+    if record_outcome:
+        count_call(skill, ctx, result, tool, code)
     return result
 
 
@@ -431,8 +446,6 @@ def count_call(skill, ctx, result, tool: str, code: str = "") -> None:
     (``skill:`` in its TOOL.md, ``tool_skills.attach_skill``). Inside a plan step the call is
     recorded for the step's count (``count_step``); outside one it is counted as it ends. A call
     the user stopped, or one whose result was reused rather than run again, is not counted."""
-    if not skill.registry_release:
-        return
     status = result.get("status") if isinstance(result, dict) else None
     if status == "cancelled":   # the user pressed Stop: not a verdict on the skill version
         return
@@ -441,7 +454,8 @@ def count_call(skill, ctx, result, tool: str, code: str = "") -> None:
     ok = status in {"ok", "success"}
     step = _STEP_CALLS.get()
     if step is None:
-        _count(skill, "success" if ok else "error", ctx)
+        if skill.registry_release:
+            _count(skill, "success" if ok else "error", ctx)
     else:
         key = (skill.registry_release, skill.name, skill.version)
         step.setdefault(key, (skill, ctx, []))[2].append((ok, str(code or ""), tool))

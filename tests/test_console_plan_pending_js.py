@@ -42,6 +42,7 @@ BLOCKS = [
     ("const DEFAULT_PLACEHOLDER", "// A step arrives as"),
     ("function planProblemText(", "function showPlanPanel("),
     ("function planSettingText(", "function planRunsOnText("),
+    ("// Provider identities come only from the registered catalog", "function planStepHtml("),
     ("function planSavedMessage(", "function planModelContent("),
     ("async function submitDecision(", "// ---- uploads"),
 ]

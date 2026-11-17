@@ -102,7 +102,13 @@ def attach_skill(m: Any, tool: Any) -> Any:
 
     _exec.__wrapped__ = getattr(inner, "__wrapped__", inner)   # source introspection finds the tool
     try:
-        return dataclasses.replace(tool, executor=_exec)
+        # The manifest names the method even when its release is not installed yet.
+        try:
+            skill = tool_skill(m)
+            identity = {"name": skill.name, "version": skill.version or "unknown"}
+        except ToolSkillError:
+            identity = {"name": m.skill, "version": "unknown"}
+        return dataclasses.replace(tool, executor=_exec, skills=(identity,))
     except TypeError:
         tool.executor = _exec
         return tool

@@ -204,6 +204,37 @@ def _split_self_sourced(steps: "list[str]") -> "tuple[list[str], str]":
     return agenda, " ".join(notes).strip()
 
 
+# What a step says when it is a note that an analysis is left out, read at the START of its body
+# (after the bold title): "Not planned here.", "Skipped: not part of this request", "Out of scope".
+_NOT_PLANNED_RE = re.compile(
+    r"^(?:this (?:step|analysis|stage) is |it is |is )?"
+    r"(?:not (?:planned|part of|requested|included|run|performed|needed|done|in scope)"
+    r"|skipp?ed|out of scope|outside (?:the|this) (?:request|scope)|omitted|excluded|left out|deferred)\b",
+    re.IGNORECASE)
+
+
+def _split_not_planned(steps: "list[str]", tool_names: "set[str]") -> "tuple[list[str], list[str]]":
+    """Separate agenda items that only say an analysis is NOT done from the work to run.
+
+    Returns ``(agenda, left_out)``. Such an item names no tool and opens by negating itself
+    ("**Clustering** — Not planned here. Clustering is not part of this request."); left in the
+    agenda it is dispatched like any step. Both conditions must hold, so a real step that mentions
+    what it leaves out ("... with `run_scanpy_qc`; doublets are not removed") is kept. Never
+    empties the agenda."""
+    kept: list[str] = []
+    left_out: list[str] = []
+    for step in steps:
+        text = str(step or "").strip()
+        called = set(re.findall(r"`([A-Za-z_][A-Za-z0-9_-]*)(?:\s*\([^`]*\))?`", text))
+        _, sep, body = text.partition(" — ")
+        body = re.sub(r"[*_`]", "", body if sep else text).strip()
+        if not (called & tool_names) and _NOT_PLANNED_RE.match(body):
+            left_out.append(step)
+        else:
+            kept.append(step)
+    return (kept, left_out) if kept else (steps, [])
+
+
 def _drop_question_echo(steps: "list[str]", question: str) -> "tuple[list[str], list[str]]":
     """Remove agenda items that are just the research question (or a trivial restatement of it)
     echoed back as a "step". Seen in production (run 97dfc89dc5aa): the PI's reply led with the
@@ -530,6 +561,8 @@ def _hand_edit_note(changes: "list[dict[str, Any]]") -> str:
         elif kind == "skill":
             said.append(f"took the skill off step {n}" if not c.get("after")
                         else f"set the skill of step {n} to {c.get('after')}")
+        elif kind in {"tools", "skills"}:
+            said.append(f"set the planned {kind} of step {n} to {json.dumps(c.get('after') or [])}")
         elif kind == "moved":
             said.append(f"moved step {c.get('before')} to position {n}")
         elif kind == "text":

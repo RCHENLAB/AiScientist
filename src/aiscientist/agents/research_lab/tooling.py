@@ -268,7 +268,8 @@ def make_run_in_environment_tool(executor: Any,
             return {"status": "error", "error": "model credentials require a pinned MCP call"}
         result = execute(skill, ctx, executor,
                          lambda: run_with_model(_mcp_model, executor, run),
-                         "run_in_environment", code=command)
+                         "run_in_environment", code=command,
+                         record_outcome=_mcp_server is None)
         if isinstance(result, dict):
             result["skill"] = skill.name
             result["provenance"] = {

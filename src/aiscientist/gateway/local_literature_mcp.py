@@ -220,4 +220,6 @@ def _make_tool(wire_name: str, *, should_cancel: Callable[[], bool] | None = Non
             return {"status": "error", "error": f"Local literature MCP unavailable: {type(exc).__name__}"}
 
     return HarnessTool(name=server.planner_name(wire_name), description=entry["description"], parameters=schema,
-                       executor=run, category="literature", reads_private_data=False)
+                       executor=run, category="literature", reads_private_data=False,
+                       provider={"provider": "mcp", "server": server.name, "version": server.version},
+                       skills=({"name": skill.name, "version": skill.version or "unknown"},))

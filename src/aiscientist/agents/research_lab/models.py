@@ -483,6 +483,7 @@ class ResumeState:
     review_requested: bool = False
     reviewed_note: str = ""
     status_recovery: bool = False  # verified task-only draft; always reviewed before execution
+    step_provenance: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def needs_plan_review(self) -> bool:
@@ -499,6 +500,7 @@ class ResumeState:
                 "status_recovery": self.status_recovery, "reviewed_note": self.reviewed_note,
                 "guidance": self.guidance, "self_sourced": self.self_sourced,
                 "report_requested": self.report_requested, "plan_context": self.plan_context,
+                "step_provenance": copy.deepcopy(self.step_provenance),
                 "approved_plan_yaml": self.approved_plan.to_yaml() if self.approved_plan else ""}
 
     @classmethod
@@ -534,6 +536,7 @@ class ResumeState:
                    report_requested=bool(state.get("report_requested", False)),
                    approved_plan=approved, plan_context=copy.deepcopy(state.get("plan_context")),
                    status_recovery=bool(state.get("status_recovery", False)),
+                   step_provenance=copy.deepcopy(state.get("step_provenance") or []),
                    reviewed_note=str(state.get("reviewed_note") or ""))
 
     @classmethod
@@ -551,7 +554,7 @@ class ResumeState:
         return cls(resume.agenda, resume.prior_rounds, todo[0], guidance=resume.guidance,
                    redo_indices=frozenset(todo), self_sourced=resume.self_sourced,
                    report_requested=resume.report_requested, approved_plan=resume.approved_plan,
-                   plan_context=resume.plan_context)
+                   plan_context=resume.plan_context, step_provenance=resume.step_provenance)
 
 
 def _from_fields(cls: Any, data: "dict[str, Any]") -> Any:

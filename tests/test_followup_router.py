@@ -62,12 +62,14 @@ def _seed_bundle(conn, run_id="run123", *, agenda=None, dataset_path="/data/a.h5
     return art
 
 
-def _fake_run_lab(cap):
-    def fake(c, req, *, resume=None, resume_run_id=None, resume_decisions=None, prior=None):
+def _fake_run_lab(cap, stale_first=False):
+    def fake(c, req, *, resume=None, resume_run_id=None, resume_decisions=None, prior=None, **kw):
+        cap.setdefault("calls", []).append({"resume": resume, "prior": prior, **kw})
         cap.update(path="run_lab", question=req.question, resume=resume,
                    run_id=resume_run_id, decisions=resume_decisions, prior=prior)
         async def _noop():
-            return None
+            # What _run_lab answers when the earlier plan could not be resumed and nothing ran.
+            return stale_first and resume is not None
         return _noop()
     return fake
 
@@ -178,6 +180,27 @@ def test_classify_rerun_step_continues_in_place(tmp_path, monkeypatch):
     assert cap["resume"] is not None
     assert cap["resume"].from_step_index == 3              # the literature step (0-based)
     assert cap["resume"].modify_note == "please search the literature again with better terms"
+
+
+def test_a_rerun_of_a_plan_that_can_no_longer_run_is_planned_anew(tmp_path, monkeypatch):
+    # A chat whose finished run was planned with tools a later version removed: the message used to
+    # be refused with "This saved plan requires re-planning", and worked only when rewritten as
+    # "Make a new plan: ...". It is planned anew, from the earlier run's results.
+    conn = _conn(tmp_path, last_run_id="run123")
+    _seed_bundle(conn)
+    cap: dict = {}
+    monkeypatch.setattr(gw_app, "_run_lab", _fake_run_lab(cap, stale_first=True))
+    _patch_llm(monkeypatch, {"intent": "rerun_step",
+                             "step": "Search literature for contextual grounding", "confidence": 0.88})
+    pushed: list = []
+    push = conn.push
+    monkeypatch.setattr(conn, "push", lambda payload, **kw: (pushed.append(payload), push(payload, **kw))[1])
+    _dispatch(conn, "please search the literature again with better terms")
+    first, second = cap["calls"]
+    assert first["resume"] is not None and first["replan_stale_plan"] is True
+    assert second["resume"] is None and second["prior"]["run_id"] == "run123"
+    notes = [e.get("text", "") for e in pushed if e.get("type") == "lab_progress"]
+    assert any("a new plan is drafted" in n for n in notes)
 
 
 def test_rerun_without_checkpoints_redoes_the_step_from_the_processed_dataset(tmp_path, monkeypatch):
