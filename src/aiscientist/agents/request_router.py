@@ -177,6 +177,38 @@ _POINTS_BACK = re.compile(
     re.IGNORECASE)
 
 
+# A question for RetiGene's gene table, not for its papers: what RetiGene itself curates about a gene
+# (inheritance, phenotype, diseases, key papers). The table lookups answer it completely with no model
+# reading; the papers' routes below would read passages or the whole corpus instead. Named outright
+# (the table, or a lookup tool), or RetiGene as the one that lists / curates / records, and then only
+# when the message names no papers.
+_GENE_TABLE_NAMED = re.compile(
+    r"\bretigene\b[^.?!\n]{0,60}?\b(?:gene[\s_-]+table|table|database|release)\b"
+    r"|\b(?:gene[\s_-]+table|table|database)\b[^.?!\n]{0,40}?\bretigene\b"
+    r"|\b(?:get_gene|find_genes)\b"
+    r"|retigene[^。.!?\n]{0,12}基因表|基因表[^。.!?\n]{0,12}retigene",
+    re.IGNORECASE)
+_GENE_TABLE_SUBJECT = re.compile(
+    r"\bretigene\s+(?:itself\s+)?(?:list(?:s|ed)?|curate[sd]?|record(?:s|ed)?|annotate[sd]?"
+    r"|classif(?:y|ies|ied)|assign(?:s|ed)?|ha(?:s|ve)|contains?|includes?)\b"
+    r"|\b(?:curated|listed|recorded|annotated|classified)\s+(?:in|by)\s+retigene\b"
+    r"|\bretigene(?:'s|\s+gene)?\s+(?:entry|record|annotation|classification)\b",
+    re.IGNORECASE)
+_NAMES_PAPERS = re.compile(
+    r"\b(?:papers?|corpus|literature|articles?|publications?|stud(?:y|ies)|passages?|sentences?)\b"
+    r"|论文|文献|语料", re.IGNORECASE)
+
+
+def asks_gene_table(text: str) -> bool:
+    """Does the message ask what RetiGene's gene table holds? ("Which genes does RetiGene list with
+    autosomal dominant inheritance?", "What does the RetiGene gene table record about USH2A?") A
+    message about the RetiGene papers, or about the user's own data, does not."""
+    t = text or ""
+    if _REFERS_TO_DATA.search(t):
+        return False
+    return bool(_GENE_TABLE_NAMED.search(t)) or bool(_GENE_TABLE_SUBJECT.search(t) and not _NAMES_PAPERS.search(t))
+
+
 def names_corpus(text: str) -> bool:
     """Does the message name the lab's paper collection (the RetiGene corpus)?"""
     return bool(_NAMES_CORPUS.search(text or ""))

@@ -148,6 +148,11 @@ release holds its skill with the same image digest.
   (`mechanism_cache/sentences.jsonl`, `chunks.jsonl`, `chunk_vecs.npy`, `manifest.csv`,
   `hgnc_complete_set.txt`). It is bound read-only into every call's job. Without it,
   the tools are not offered.
+- **Route.** A question for the gene table ("Which genes does RetiGene list with autosomal
+  dominant inheritance?", "What does the RetiGene gene table record about USH2A?") goes to the
+  analysis planner, which is offered the lookups, and not to the two lines about the papers
+  (`request_router.asks_gene_table`, `_gene_table_question`). A question that names the papers
+  keeps going to the corpus search or the curation.
 - **Gene table.** `get_gene` and `find_genes` read a RetiGene release,
   `gene_table/Full_gene_table_v<version>.tsv` in the index folder (the highest version when
   there are several). Every answer names the release. Without the file the two tools say so

@@ -9798,7 +9798,15 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # session's model's call.
     with_context = target is not None or bool(_select_bound_datasets(req))
     curation_offered = False
-    ask = await asyncio.to_thread(_corpus_curation, conn, req.question, with_context=with_context)
+    # A question for RetiGene's gene table is neither of the two lines about its papers: the lookups
+    # answer it completely and read nothing, and only the analysis planner is offered them.
+    gene_table = not chat_literature_handoff and _gene_table_question(conn, req.question)
+    if gene_table:
+        from ..agents import request_router
+        chat_literature_route = request_router.Route(
+            request_router.ANALYSIS, 1.0, "asks what the RetiGene gene table holds", "rules")
+    ask = None if gene_table else await asyncio.to_thread(
+        _corpus_curation, conn, req.question, with_context=with_context)
     if ask:
         from ..agents import request_router
         conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence"
@@ -9866,7 +9874,8 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     if target is None:
         # A new analysis in a chat with nothing attached: when the request points at a shared
         # dataset or an upload, ask which to use before anything is planned.
-        req = await _offer_unattached_data(conn, req)
+        if not gene_table:              # the table is the data of such a question
+            req = await _offer_unattached_data(conn, req)
         await _run_lab(conn, req)
         return
     run_id, art, state = target
@@ -10296,6 +10305,30 @@ def _corpus_curation(conn: Connection, question: str, *, with_context: bool = Fa
     known = corpus_scan.HAPLOINSUFFICIENCY.id
     return request_router.CorpusAsk(request_router.LIST, corpus_scan.KNOWN_CURATIONS.get(known, known),
                                     known, 1.0, "rules")
+
+
+def _gene_table_question(conn: Connection, question: str) -> bool:
+    """A question for RetiGene's gene table (``request_router.asks_gene_table``), on a session that
+    is offered the lookups. The built-in curation's list question stays the curation's."""
+    from ..agents import request_router
+    q = str(question or "")
+    return (request_router.asks_gene_table(q) and not corpus_scan.asks_for_gene_list(q)
+            and _gene_table_lookups_offered(conn))
+
+
+def _gene_table_lookups_offered(conn: Connection) -> bool:
+    """Whether this session's planner is offered the RetiGene gene table lookups: the retigene-rag
+    server registered (its skill names the pinned image) with its index named, and HPC3 reached."""
+    from ..agents import mcp_bridge, retigene
+    from ..agents.skills import get_skill
+    if conn.executor is None or conn.mock or not retigene.index_available():
+        return False
+    try:
+        server = next((s for s in mcp_bridge.configured_servers() if s.adapter == "retigene"), None)
+        skill = get_skill(server.skill) if server is not None else None
+    except Exception:  # noqa: BLE001 - routing never strands the request
+        return False
+    return skill is not None and skill.image == server.image
 
 
 def _corpus_list_rule(text: str) -> "str | None":

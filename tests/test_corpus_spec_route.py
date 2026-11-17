@@ -376,3 +376,55 @@ def test_a_curation_from_a_spec_names_its_tables_after_the_target_class():
         "dominant_negative", "stated", "dominant_negative_genes.csv", T.spec_folder(spec))
     assert cur.conflicting == ("haploinsufficiency", "gain_of_function") and not cur.built_in
     assert corpus_scan.HAPLOINSUFFICIENCY.genes_file == corpus_scan.CURATION_GENES
+
+
+# --- a question for RetiGene's gene table goes to the planner, which is offered the lookups ----------
+
+TABLE_QUESTION = "Which genes does RetiGene list with autosomal dominant inheritance? Give the exact count."
+
+
+def _table_wire(monkeypatch, offered):
+    seen: list = []
+
+    async def lab(c, req, **kw):
+        seen.append(("lab", req.question))
+
+    async def literature(c, req, r=None, **kw):
+        seen.append(("literature", req.question))
+
+    async def offer(c, req):
+        seen.append(("offer", req.question))
+        return req
+
+    def curation(c, question, **kw):
+        seen.append(("curation", question))
+        return None
+
+    monkeypatch.setattr(gw_app, "_gene_table_lookups_offered", lambda c: offered)
+    monkeypatch.setattr(gw_app, "_run_lab", lab)
+    monkeypatch.setattr(gw_app, "_run_literature", literature)
+    monkeypatch.setattr(gw_app, "_offer_unattached_data", offer)
+    monkeypatch.setattr(gw_app, "_corpus_curation", curation)
+    monkeypatch.setattr(gw_app, "_route_request", lambda c, req, prior="": rr.Route(rr.LITERATURE, 0.9, "papers", "model"))
+    return seen
+
+
+def test_a_gene_table_question_is_planned_not_read_from_the_papers(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    seen = _table_wire(monkeypatch, offered=True)
+    _dispatch(conn, TABLE_QUESTION)
+    assert seen == [("lab", TABLE_QUESTION)]        # no curation, no literature search, no dataset question
+
+
+def test_without_the_lookups_a_gene_table_question_goes_the_papers_way(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    seen = _table_wire(monkeypatch, offered=False)
+    _dispatch(conn, TABLE_QUESTION)
+    assert seen == [("curation", TABLE_QUESTION), ("literature", TABLE_QUESTION)]
+
+
+def test_a_question_about_the_papers_is_not_a_gene_table_question(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    seen = _table_wire(monkeypatch, offered=True)
+    _dispatch(conn, "What do the RetiGene papers say about CRX?")
+    assert [what for what, _ in seen] == ["curation", "literature"]
