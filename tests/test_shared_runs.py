@@ -404,31 +404,38 @@ def test_a_maintainer_withdraws_a_version_and_it_is_no_longer_offered(env):
 class _Chat:
     """A connection that answers the clarify card the way the console does, and records what it asked."""
 
-    def __init__(self, tmp_path, answer=None, **kw):
+    def __init__(self, tmp_path, answer=None, typed=None, **kw):
         import threading
         base = _conn(tmp_path, **kw)
         self.__dict__.update(base.__dict__)
         self.plan_event, self.plan_value, self.pending_plan = threading.Event(), None, None
         self.pushed, self.asked, self.answer = [], [], answer
+        self.typed = list(typed or [])       # words typed in the message box, one per card, instead of a chip
 
     def push(self, msg):
         import threading
         self.pushed.append(msg)
         if msg.get("type") == "plan_clarify":
             self.asked.append(msg["questions"][0])
-            if self.answer is not None:
+            if self.typed:
+                words = self.typed.pop(0)
+                threading.Timer(0.05, lambda: (setattr(self, "plan_value", {"feedback": words}),
+                                               self.plan_event.set())).start()
+            elif self.answer is not None:
                 options = msg["questions"][0]["options"]
                 pick = self.answer(options) if callable(self.answer) else self.answer
                 threading.Timer(0.05, lambda: (setattr(self, "plan_value", {"feedback": f"{msg['questions'][0]['question']}: {pick}"}),
                                                self.plan_event.set())).start()
 
 
-def _heca(env, names=("HRCA_snRNA_allcells.h5ad", "HRCA_scRNA_allcells.h5ad", "Iris_snRNA_allcells.h5ad")):
-    """Publish a small HECA-like version where the snRNA file is by far the largest."""
+def _heca(env, names=("HRCA_snRNA_allcells.h5ad", "HRCA_scRNA_allcells.h5ad", "Iris_snRNA_allcells.h5ad"),
+          facets=None):
+    """Publish a small HECA-like version where the snRNA file is by far the largest. ``facets``: the
+    maintainers' facets.json (by default none, so the facets are inferred from the file names)."""
     for old in env["source"].iterdir():
         if old.name != "facets.json":
             old.unlink()
-    (env["source"] / "facets.json").write_text("{}")
+    (env["source"] / "facets.json").write_text(json.dumps(facets or {}))
     for n in names:
         (env["source"] / n).write_bytes(b"x" * (60_000 if "HRCA_snRNA" in n else 3_000))
     (env["source"] / "README.txt").write_text("HECA\n")
@@ -608,3 +615,70 @@ console.log("ok");
     out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "ok"
+
+
+# The tissue facets the maintainers set on the Eye Server's HECA versions (not the file-name prefixes).
+_HECA_FACETS = {"HRCA_snRNA_allcells.h5ad": {"tissue": "retina", "modality": "snRNA"},
+                "HRCA_scRNA_allcells.h5ad": {"tissue": "retina", "modality": "scRNA"},
+                "Iris_snRNA_allcells.h5ad": {"tissue": "iris", "modality": "snRNA"},
+                "ON_snRNA_allcells.h5ad": {"tissue": "optic nerve", "modality": "snRNA"},
+                "TMCB_scRNA_allcells.h5ad": {"tissue": "trabecular meshwork / ciliary body", "modality": "scRNA"}}
+
+
+def test_the_published_heca_facets_bind_the_file_the_request_names(gw, env, tmp_path):
+    _heca(env, names=tuple(_HECA_FACETS), facets=_HECA_FACETS)
+    for text, want in (("Use HRCA scRNA to annotate the cell types", "HRCA_scRNA_allcells.h5ad"),
+                       ("Use the ON snRNA atlas", "ON_snRNA_allcells.h5ad"),
+                       ("markers of the trabecular meshwork", "TMCB_scRNA_allcells.h5ad")):
+        conn = _Chat(tmp_path)
+        req, *_ = _choose(gw, conn, text)
+        assert conn.asked == [], text
+        assert [b["name"] for b in gw._select_bound_datasets(req)] == [want], text
+
+
+def test_a_chat_whose_earlier_run_bound_the_whole_version_is_asked_not_given_every_file(gw, env, tmp_path):
+    # A run made before member files were chosen bound the whole version: its inputs.json lists every
+    # file and no ``selected_by``. That is no choice, so the next message is asked.
+    _heca(env)
+    conn = _Chat(tmp_path)
+    req = gw.LabRequest(connection_id="c", question="x", shared_datasets=[{"shared": "heca"}])
+    whole = gw._resolve_shared_refs(req, conn)
+    art = tmp_path / "ws" / "run0" / "artifacts"
+    asyncio.run(gw._record_shared_inputs(conn, "run0", art, {}, whole, None, lambda *a, **k: None))
+    data = json.loads((art / "process" / "inputs.json").read_text())["shared_inputs"][0]
+    assert len(data["files"]) == 4 and "selected_by" not in data            # three .h5ad and the README
+    follow = _Chat(tmp_path, answer=lambda options: next(o for o in options if o.startswith("Iris")))
+    req2, _, decisions, _ = _choose(gw, follow, "now find the differentially expressed genes", prior={"run_id": "run0"})
+    assert len(follow.asked) == 1
+    assert [b["name"] for b in gw._select_bound_datasets(req2)] == ["Iris_snRNA_allcells.h5ad"]
+    assert decisions["shared_members"][0]["how"] == "chosen by you"
+
+
+def test_words_typed_instead_of_a_chip_choose_the_file(gw, env, tmp_path):
+    _heca(env)
+    conn = _Chat(tmp_path, typed=["the scRNA one"])
+    req, _, decisions, _ = _choose(gw, conn, "Annotate this retina atlas")
+    assert len(conn.asked) == 1
+    assert [b["name"] for b in gw._select_bound_datasets(req)] == ["HRCA_scRNA_allcells.h5ad"]
+    assert decisions["shared_members"][0]["how"] == "chosen by you"
+    both = _Chat(tmp_path, typed=["both"])
+    req, *_ = _choose(gw, both, "Annotate this retina atlas")
+    assert sorted(b["name"] for b in gw._select_bound_datasets(req)) == ["HRCA_scRNA_allcells.h5ad",
+                                                                         "HRCA_snRNA_allcells.h5ad"]
+    other = _Chat(tmp_path, typed=["Iris snRNA instead"])           # a file the card did not offer
+    req, *_ = _choose(gw, other, "Annotate this retina atlas")
+    assert [b["name"] for b in gw._select_bound_datasets(req)] == ["Iris_snRNA_allcells.h5ad"]
+
+
+def test_an_answer_that_names_no_file_puts_the_card_again(gw, env, tmp_path):
+    from aiscientist.gateway.errors import GatewayError
+    _heca(env)
+    conn = _Chat(tmp_path, typed=["hmm, not sure", "2"])
+    req, *_ = _choose(gw, conn, "Annotate this retina atlas")
+    assert len(conn.asked) == 2 and "“hmm, not sure” does not say which file" in conn.asked[1]["question"]
+    second = conn.asked[0]["options"][1].split(" — ")[0]
+    assert [b["name"] for b in gw._select_bound_datasets(req)] == [second]
+    stuck = _Chat(tmp_path, typed=["?", "no idea", "whatever"])
+    with pytest.raises(GatewayError) as err:
+        _choose(gw, stuck, "Annotate this retina atlas")
+    assert len(stuck.asked) == gw._MEMBER_CHOICE_ASKS and "did not start" in str(err.value)

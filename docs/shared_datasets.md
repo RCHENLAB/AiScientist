@@ -145,13 +145,18 @@ facets:
 
 * a file named in the request is that file (`use HRCA_scRNA_allcells.h5ad`);
 * a tissue (`retina`, `iris`, `optic nerve`, ...) and/or an assay (`scRNA`, `snRNA`) narrows the members.
-  One file per requested tissue and assay is a choice: "Use HRCA scRNA" binds `HRCA_scRNA_allcells.h5ad`
-  although the snRNA file is larger, and "compare the retina snRNA and scRNA atlases" binds both files;
+  A tissue is known by its `tissue` facet (`retina`, `RPE/choroid`, `trabecular meshwork / ciliary body`),
+  each part of a compound facet (`RPE`, `ciliary body`), the file-name prefix (`HRCA`, `ON`, `TMCB`) and
+  their aliases (`cornea` for the ocular surface). One file per requested tissue and assay is a choice:
+  "Use HRCA scRNA" binds `HRCA_scRNA_allcells.h5ad` although the snRNA file is larger, and "compare the
+  retina snRNA and scRNA atlases" binds both files;
 * anything else is ambiguous ("this retina atlas" means two files): a card lists the candidates and the
-  run waits for the pick. A tissue no file covers is never replaced by another tissue. If the card goes
-  unanswered the run does not start;
+  run waits for the pick. The answer can be a chip, its number or words typed in the message box ("the
+  scRNA one", "both"); an answer that names no file puts the card again. A tissue no file covers is never
+  replaced by another tissue. If the card goes unanswered the run does not start;
 * a file attached by name in the chat is used as attached, and the choice made earlier in the chat (read
-  from the previous run's `inputs.json`) stands for the next message unless it names another file.
+  from the previous run's `inputs.json`, when it records `selected_by`) stands for the next message
+  unless it names another file.
 
 The chosen files are bound one by one (the first is the main file, the others extra inputs read through
 `run_code`); the plan card lists each with the dataset, version, exact file, role, what can read it

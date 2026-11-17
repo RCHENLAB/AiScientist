@@ -3,6 +3,9 @@ resolved from the request and the members' facets, never from file size.
 
 The HECA file names below are the real ones: 13 .h5ad covering HRCA scRNA/snRNA, Iris, Lens, ON,
 OcularSurface, RPEChoroid and TMCB, where HRCA_snRNA_allcells.h5ad (19.45 GB) is by far the largest.
+``_files()`` gives them the facets a publish infers from the names (``HRCA``, ``ON``...);
+``_heca_published()`` gives them the tissue facets the maintainers set on the Eye Server's HECA
+versions (``retina``, ``optic nerve``, ``RPE/choroid``...).
 """
 
 from __future__ import annotations
@@ -109,3 +112,55 @@ def test_describe_names_the_file_tissue_assay_cells_and_size():
     line = sm.describe({"name": "HRCA_scRNA_allcells.h5ad", "size_bytes": int(4.2 * GB),
                         "facets": {"tissue": "HRCA", "modality": "scRNA", "n_obs": 1234567}})
     assert line == "HRCA_scRNA_allcells.h5ad — HRCA, scRNA, 1,234,567 cells, 4.2 GB"
+
+
+# The tissue facets of the published HECA versions (v2026.11 and v2026.11.1 on the Eye Server), set by
+# the maintainers' facets.json: not the file-name prefixes.
+HECA_TISSUES = {"HRCA": "retina", "Iris": "iris", "Lens": "lens", "ON": "optic nerve",
+                "OcularSurface": "ocular surface", "RPEChoroid": "RPE/choroid",
+                "TMCB": "trabecular meshwork / ciliary body"}
+
+
+def _heca_published():
+    out = []
+    for name, size in HECA.items():
+        prefix, modality = name.split("_")[:2]
+        out.append({"name": name, "size_bytes": int(size),
+                    "facets": {"tissue": HECA_TISSUES[prefix], "modality": modality, "n_obs": 1000}})
+    return out
+
+
+@pytest.mark.parametrize("text, chosen", [
+    ("Use HRCA scRNA for the cell-type markers", ["HRCA_scRNA_allcells.h5ad"]),
+    ("Use HRCA snRNA", ["HRCA_snRNA_allcells.h5ad"]),
+    ("compare HRCA scRNA against HRCA snRNA", ["HRCA_scRNA_allcells.h5ad", "HRCA_snRNA_allcells.h5ad"]),
+    ("Compare the retina snRNA atlas with the retina scRNA atlas", ["HRCA_snRNA_allcells.h5ad", "HRCA_scRNA_allcells.h5ad"]),
+    ("retina scRNA", ["HRCA_scRNA_allcells.h5ad"]),
+    ("Use the ON snRNA atlas", ["ON_snRNA_allcells.h5ad"]),
+    ("optic nerve atlas", ["ON_snRNA_allcells.h5ad"]),
+    ("TMCB snRNA markers", ["TMCB_snRNA_allcells.h5ad"]),
+    ("trabecular meshwork snRNA", ["TMCB_snRNA_allcells.h5ad"]),
+    ("ciliary body scRNA", ["TMCB_scRNA_allcells.h5ad"]),
+    ("RPE scRNA", ["RPEChoroid_scRNA_allcells.h5ad"]),
+    ("choroid snRNA", ["RPEChoroid_snRNA_allcells.h5ad"]),
+    ("retinal pigment epithelium scRNA", ["RPEChoroid_scRNA_allcells.h5ad"]),
+    ("cornea scRNA", ["OcularSurface_scRNA_allcells.h5ad"]),
+    ("ocular surface snRNA", ["OcularSurface_snRNA_allcells.h5ad"]),
+    ("lens scRNA", ["Lens_scRNA_allcells.h5ad"]),
+    ("the retina and the lens snRNA", ["HRCA_snRNA_allcells.h5ad", "Lens_snRNA_allcells.h5ad"]),
+])
+def test_the_published_heca_facets_resolve_like_the_file_names(text, chosen):
+    got = sm.select(text, _heca_published())
+    assert (got.status, got.chosen) == ("chosen", chosen), (text, got)
+    # ...and the same request reads the same way on facets inferred from the names.
+    assert sm.select(text, _files()).chosen == chosen, text
+
+
+def test_the_published_heca_facets_still_ask_when_the_request_is_not_specific():
+    got = sm.select("Annotate cell types in this retina atlas", _heca_published())
+    assert got.status == "ambiguous" and sorted(got.candidates) == ["HRCA_scRNA_allcells.h5ad", "HRCA_snRNA_allcells.h5ad"]
+    assert "retina" in got.reason
+    got = sm.select("build a model based on the snRNA data", _heca_published())   # "on" is not the optic nerve
+    assert got.status == "ambiguous" and len(got.candidates) == 7
+    got = sm.select("show ON scRNA", _heca_published())                          # the optic nerve has snRNA only
+    assert got.status == "ambiguous" and "no file" in got.reason and "optic nerve" in got.reason

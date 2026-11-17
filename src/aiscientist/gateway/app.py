@@ -3192,21 +3192,52 @@ def _restore_shared_members(resolved: list[dict], saved: "list[dict] | None", *,
 
 
 def _prior_shared_files(conn: Connection, prior: "dict | None") -> "dict[tuple[str, str], list[str]]":
-    """The member files the chat's previous run read, by (dataset, version) (its ``process/inputs.json``)."""
+    """The member files the chat's previous run chose, by (dataset, version) (its ``process/inputs.json``).
+    Only a record with ``selected_by`` is a choice: a run made before member files were chosen bound
+    the whole version and lists every file, which must not become "chosen earlier in this chat"."""
     rid = str((prior or {}).get("run_id") or "")
     if not rid or not _RUN_ID_RE.fullmatch(rid):
         return {}
     try:
         data = json.loads((conn.workspace / rid / "artifacts" / "process" / "inputs.json").read_text(encoding="utf-8"))
         return {(str(r["dataset"]), str(r["version"])): [str(f["name"]) for f in r.get("files") or []]
-                for r in data.get("shared_inputs") or []}
-    except (OSError, ValueError, KeyError, TypeError):
+                for r in data.get("shared_inputs") or [] if r.get("selected_by")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return {}
+
+
+#: How many times the member-file card is put again after an answer that does not say which file.
+_MEMBER_CHOICE_ASKS = 3
+
+
+def _member_answer(fb: str, pool: list[dict], members: list[dict], options: list[str],
+                   both: "str | None") -> "list[str] | None":
+    """The member files an answer to the card names: a chip ("<question>: <option>"), its number, or
+    words typed in the message box ("the scRNA one", "HRCA scRNA", "both"). Typed words are resolved
+    against every file of the version first, so a file the card did not offer can still be named
+    ("Iris snRNA instead"), and then against the files offered. None when it says no file."""
+    from . import shared_members as sm
+    answer = fb.rsplit("?:", 1)[-1].strip()
+    if both and (answer == both or re.fullmatch(r"(?i)(?:use )?(?:them )?both(?: of them| files)?[.!]?", answer)):
+        return [f["name"] for f in pool]
+    for f, text in zip(pool, options):
+        if answer == text or text in fb:
+            return [f["name"]]
+    number = re.fullmatch(r"\s*(?:option\s*)?(\d+)\s*[.)]?\s*", answer, re.IGNORECASE)
+    if number and 1 <= int(number.group(1)) <= len(pool):
+        return [pool[int(number.group(1)) - 1]["name"]]
+    for scope in (members, pool):
+        if len(scope) > 1:
+            sel = sm.select(answer, scope)
+            if sel.status == "chosen" and sel.chosen:
+                return list(sel.chosen)
+    return None
 
 
 async def _ask_member_choice(conn: Connection, att: dict, members: list[dict], sel: Any) -> "list[str] | None":
     """Put the choice of member file to the user on the clarify card and wait for the answer (nothing
-    is staged or read before it). Returns the chosen names, or None when it went unanswered."""
+    is staged or read before it). An answer that names no file puts the card again. Returns the
+    chosen names, or None when it went unanswered."""
     from . import shared_members as sm
     by_name = {f["name"]: f for f in members}
     pool = [by_name[n] for n in (sel.candidates or by_name) if n in by_name]
@@ -3215,26 +3246,26 @@ async def _ask_member_choice(conn: Connection, att: dict, members: list[dict], s
     if len(pool) == 2:
         both = f"Use both: {pool[0]['name']} and {pool[1]['name']}"
         options.append(both)
-    q = {"question": f"{sel.reason[:1].upper() + sel.reason[1:]}. Which file of {att['title']} {att['version']} "
-                     "should this run use?",
-         "options": options}
-    conn.plan_value = None
-    conn.plan_event.clear()
-    conn.pending_plan = {"kind": "clarify", "payload": [q]}
-    conn.push({"type": "plan_clarify", "questions": [q]})
-    got = await asyncio.to_thread(conn.plan_event.wait, 600)
-    conn.pending_plan = None
-    conn.push({"type": "plan_done"})
-    if not got:
-        return None
-    fb = str((conn.plan_value or {}).get("feedback", ""))
-    conn.plan_value = None
-    answer = fb.rsplit("?:", 1)[-1].strip()
-    if both and answer == both:
-        return [f["name"] for f in pool]
-    for f, text in zip(pool, options):
-        if answer == text or text in fb:
-            return [f["name"]]
+    reason = sel.reason[:1].upper() + sel.reason[1:]
+    for _ in range(_MEMBER_CHOICE_ASKS):
+        q = {"question": f"{reason}. Which file of {att['title']} {att['version']} should this run use?",
+             "options": options}
+        conn.plan_value = None
+        conn.plan_event.clear()
+        conn.pending_plan = {"kind": "clarify", "payload": [q]}
+        conn.push({"type": "plan_clarify", "questions": [q]})
+        got = await asyncio.to_thread(conn.plan_event.wait, 600)
+        conn.pending_plan = None
+        conn.push({"type": "plan_done"})
+        if not got:
+            return None
+        fb = str((conn.plan_value or {}).get("feedback", ""))
+        conn.plan_value = None
+        names = _member_answer(fb, pool, members, options, both)
+        if names:
+            return names
+        said = " ".join(fb.rsplit("?:", 1)[-1].split())[:80]
+        reason = f"“{said}” does not say which file" if said else "No file was picked"
     return None
 
 
