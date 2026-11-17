@@ -649,7 +649,7 @@ class AnalysisAdapter:
             if len(parts) == 1:
                 # A bare name means work/<name>, and the server is told so: a checkpoint an earlier
                 # analysis of this run wrote is handed to the server by that spelling only
-                # (scrna-analysis 0.0.5 looks for a bare name beside work/, and finds nothing).
+                # (a scrna-analysis server before 0.0.6 looks for a bare name beside work/ only).
                 args["input"] = f"work/{value}"
         prefix = PREFIXES[self.server.name]
         from .mcp_model import prepare_model

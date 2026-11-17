@@ -17,16 +17,16 @@ The server transport is stdio; authenticated remote MCP HTTP is not implemented.
 
 | Server | Package version | Replaced scientific tools |
 | --- | --- | ---: |
-| `scrna-analysis` | `0.0.5` | 11 |
+| `scrna-analysis` | `0.0.6` | 11 |
 | `cellqc` | `0.0.5` | 1 |
 | `literature` | `0.0.4` | 4 |
-| `variant-annotation` | `0.0.2` | 1 |
+| `variant-annotation` | `0.0.3` | 1 |
 | `phenotype-diagnosis` | `0.0.4` | 3 |
 | `scgpt-annotation` | `0.0.3` | 1 |
 | `data-utilities` | `0.0.2` | 2 |
 
 The seven releases are published in `lijinbio/aiscientist-mcp` and paired with
-`lijinbio/aiscientist-skills` `v0.2.6`. The registry records the exact OCI digest,
+`lijinbio/aiscientist-skills` `v0.2.8`. The registry records the exact OCI digest,
 schema checksum and resource policy for every server; version tags alone are
 never executed. Atlas retains its upstream `0.0.3` pin. A new pin
 requires reviewing the published assets and updating the server registry and the
