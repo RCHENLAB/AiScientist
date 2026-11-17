@@ -235,6 +235,11 @@ def test_adapter_clamps_and_refusals(monkeypatch):
     assert "RETIGENE_PROVIDER" not in search.setup and search.read_only == (INDEX,)
     assert a.prepare({"curation_id": "c", "limit": 500}, executor, tool="get_evidence").arguments["limit"] == 20
     assert a.prepare({"curation_id": "c"}, executor, tool="get_genes").arguments["top"] == 100
+    table = a.prepare({"phenotypes": ["RP"], "limit": 200}, executor, tool="find_genes")
+    assert table.arguments["limit"] == retigene.MAX_TABLE_ROWS and table.read_only == (INDEX,)
+    assert table.around is None and "RETIGENE_PROVIDER" not in table.setup      # a lookup calls no model
+    assert a.prepare({"gene": "PRPF31"}, executor, tool="get_gene").arguments == {"gene": "PRPF31"}
+    assert "get_gene / find_genes" in a.description
     with pytest.raises(ValueError, match="bundled curator reference"):
         a.prepare({"curation_id": "c", "reference": "/etc/passwd"}, executor, tool="evaluate")
     with pytest.raises(ValueError, match="cannot answer the curation"):

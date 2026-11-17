@@ -26,7 +26,7 @@ The server transport is stdio; authenticated remote MCP HTTP is not implemented.
 | `data-utilities` | `0.0.2` | 2 |
 
 The seven releases are published in `lijinbio/aiscientist-mcp` and paired with
-`lijinbio/aiscientist-skills` `v0.2.8`. The registry records the exact OCI digest,
+`lijinbio/aiscientist-skills` `v0.2.9`. The registry records the exact OCI digest,
 schema checksum and resource policy for every server; version tags alone are
 never executed. Atlas retains its upstream `0.0.3` pin. A new pin
 requires reviewing the published assets and updating the server registry and the
@@ -140,14 +140,18 @@ job's duration; the model can set neither.
 
 ## retigene-rag
 
-The `retigene` adapter (`agents/retigene.py`) serves the RetiGene papers' search and
-curation tools. The registry does not list retigene-rag yet: a row needs the released
-image digest and its tools snapshot.
+The `retigene` adapter (`agents/retigene.py`) serves the RetiGene gene table lookups and the
+RetiGene papers' search and curation tools. The registry pins retigene-rag 0.0.1; the server registers once the installed skills
+release holds its skill with the same image digest.
 
 - **Index.** `AISCIENTIST_RETIGENE_INDEX` names the index's HPC3 folder
   (`mechanism_cache/sentences.jsonl`, `chunks.jsonl`, `chunk_vecs.npy`, `manifest.csv`,
   `hgnc_complete_set.txt`). It is bound read-only into every call's job. Without it,
   the tools are not offered.
+- **Gene table.** `get_gene` and `find_genes` read a RetiGene release,
+  `gene_table/Full_gene_table_v<version>.tsv` in the index folder (the highest version when
+  there are several). Every answer names the release. Without the file the two tools say so
+  and the others work.
 - **Model.** `submit_curation` reads with the session's own model. The job writes each
   prompt to a folder under the run's work directory (`RETIGENE_PROVIDER=relay`). For the
   job's duration, the gateway answers each prompt with the session's lab-role completion,
@@ -163,7 +167,8 @@ image digest and its tools snapshot.
   `report.md` to `artifacts/retigene/<curation_id>/` and names every server path by where
   the run keeps it.
 - **Bounds.** `search_sentences` pages are at most 40 lines, `get_evidence` at most 20 rows
-  and `get_genes` at most 100 rows. A longer result is trimmed to fit the transport bound,
+  `get_genes` at most 100 rows and `find_genes` at most 40 rows beside its complete list of
+  gene symbols. A longer result is trimmed to fit the transport bound,
   says how much was left out, and is kept whole in `artifacts/retigene/<tool>.json`.
 - **Reference.** `evaluate` scores only against the bundled curator reference.
 

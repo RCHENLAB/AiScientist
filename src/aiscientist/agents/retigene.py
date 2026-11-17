@@ -1,7 +1,7 @@
 """Planner bridge to the pinned retigene-rag MCP image, through run_in_environment.
 
-The server searches the RetiGene papers and runs a corpus-wide gene curation (RCHENLAB/AiScientist issue
-95). Its index is read in place: the deployment names its HPC3 copy (``AISCIENTIST_RETIGENE_INDEX``), which
+The server looks genes up in the RetiGene gene table (RCHENLAB/AiScientist issue 124), searches the
+RetiGene papers and runs a corpus-wide gene curation (issue 95). Its index is read in place: the deployment names its HPC3 copy (``AISCIENTIST_RETIGENE_INDEX``), which
 the job binds read-only. The curation reads with the model of the user's session: the job sends each
 prompt back to the gateway (``RETIGENE_PROVIDER=relay``), which answers it with that session's model and
 records it against the user's usage (``gateway/mcp_model_relay``). No key and no model address enters
@@ -24,6 +24,7 @@ SERVER = "retigene-rag"
 MAX_SENTENCE_LINES = 40
 MAX_EVIDENCE_ROWS = 20
 MAX_GENE_ROWS = 100
+MAX_TABLE_ROWS = 40
 
 # Runs inside the image after a successful CLI call. Only deliverables enter artifacts/, which the executor
 # mirrors to the website; every server path in the result is named by where the run's results keep it.
@@ -95,7 +96,8 @@ print(json.dumps({"result": result}, separators=(",", ":")))
 def configured_index() -> str:
     """The HPC3 path of the RetiGene index the deployment names (``AISCIENTIST_RETIGENE_INDEX``: a folder
     with ``mechanism_cache/sentences.jsonl``, ``chunks.jsonl``, ``chunk_vecs.npy``, ``manifest.csv`` and
-    ``hgnc_complete_set.txt``), or "" when none is named. Only an absolute path is taken."""
+    ``hgnc_complete_set.txt``, and for the gene lookups a RetiGene release
+    ``gene_table/Full_gene_table_v<version>.tsv``), or "" when none is named. Only an absolute path is taken."""
     path = os.environ.get("AISCIENTIST_RETIGENE_INDEX", "").strip()
     return posixpath.normpath(path) if path.startswith("/") else ""
 
@@ -110,9 +112,13 @@ class RetigeneAdapter:
     def __init__(self, *, planner_name: Callable[[str], str]):
         search = " / ".join(planner_name(n) for n in ("search_sentences", "search_passages"))
         tables = ", ".join(planner_name(n) for n in ("get_genes", "get_evidence", "evaluate"))
+        lookups = " / ".join(planner_name(n) for n in ("get_gene", "find_genes"))
         self.description = (
-            f" Flow: {search} -> {planner_name('read_passage')}; for every gene with a property, "
-            f"{planner_name('submit_curation')} (estimate_only first, then the curation; it returns when the "
+            f" What RetiGene itself curates about a gene (status, inheritance, phenotype and functional "
+            f"categories, diseases, expression, key papers) comes from its gene table: {lookups}, exact and "
+            f"complete, no model call. What the papers say: {search} -> {planner_name('read_passage')}; for "
+            f"every gene with a property the papers report, {planner_name('submit_curation')} "
+            f"(estimate_only first, then the curation; it returns when the "
             f"curation ends) -> {tables} -> {planner_name('write_report')}. The curation reads with this "
             "session's own model, on the user's own key or the session's cluster model, recorded in their "
             "usage; its tables and report appear in retigene/<curation_id>/. The index is read in place.")
@@ -126,6 +132,8 @@ class RetigeneAdapter:
             args["limit"] = max(1, min(int(args.get("limit") or MAX_SENTENCE_LINES), MAX_SENTENCE_LINES))
         elif tool == "get_evidence":
             args["limit"] = max(1, min(int(args.get("limit") or MAX_EVIDENCE_ROWS), MAX_EVIDENCE_ROWS))
+        elif tool == "find_genes":
+            args["limit"] = max(1, min(int(args.get("limit") or MAX_TABLE_ROWS), MAX_TABLE_ROWS))
         elif tool == "get_genes":
             args["top"] = max(1, min(int(args.get("top") or MAX_GENE_ROWS), MAX_GENE_ROWS))
         elif tool == "evaluate" and str(args.get("reference") or "").strip():

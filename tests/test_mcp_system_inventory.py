@@ -9,7 +9,7 @@ def test_native_inventory_is_display_only_and_runtime_gates_still_apply():
     declarations = {t.name: t for t in system_info._full_catalog()
                     if isinstance(t, system_info._ConfiguredMCPTool)}
     assert set(declarations) == set(expected)
-    assert len(declarations) == 39
+    assert len(declarations) == 51
     assert all(not hasattr(t, "executor") for t in declarations.values())
     assert not set(expected) & {t.name for t in registry.build_scientist_catalog()}
     rows = {t["name"]: t for t in system_info.system_overview()["tools"]}

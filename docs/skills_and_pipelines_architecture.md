@@ -218,12 +218,12 @@ the reason logged, and the skill still loads as guidance.
 
 ### The pinned registry release
 
-`configs/skills_registry.json` pins `lijinbio/aiscientist-skills` release `v0.2.8`,
+`configs/skills_registry.json` pins `lijinbio/aiscientist-skills` release `v0.2.9`,
 the published migration release paired with the seven analysis MCP image pins.
 A branch name such as `main`
 is refused. The config also lists the tiers to load (`core`, `verified` and `community`)
 and the releases root. Community remains enabled using the existing tier mechanism:
-`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.8 and is not promoted
+`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.9 and is not promoted
 locally. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
 Updating skills means changing the tag and installing the release.
 
@@ -245,8 +245,8 @@ The folder is outside git (`.gitignore`), and an app release never ships or dele
 server `deploy/deploy_skills.sh` installs it; a development checkout that needs skills downloads it:
 
 ```bash
-gh release download v0.2.8 -R lijinbio/aiscientist-skills -D skills/releases/0.2.8
-(cd skills/releases/0.2.8 && sha256sum -c SHA256SUMS)   # leave the zip packed
+gh release download v0.2.9 -R lijinbio/aiscientist-skills -D skills/releases/0.2.9
+(cd skills/releases/0.2.9 && sha256sum -c SHA256SUMS)   # leave the zip packed
 ```
 
 The loader checks `SHA256SUMS` against `catalog.json`, the bundle or every skill zip, and every
@@ -384,8 +384,8 @@ cannot run.
 
 ## Atlas expression MCP bridge
 
-The v0.2.8 bundle SHA-256 is
-`11ee321012cf455e170dff99d2061bfc2f01b895ed9f63d7d7b2cadfc5038c28`.
+The v0.2.9 bundle SHA-256 is
+`8d13e97dc5e01a9bc504e08aa92a8dedcf1668dbc86a2d1cac869bb7f41a8c31`.
 Install the three release assets and verify `SHA256SUMS` as above. The loader
 continues to verify the entire release before exposing skills; no analysis code
 or unverified copy of the skill is bundled into AiScientist.

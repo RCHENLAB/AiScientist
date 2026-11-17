@@ -445,6 +445,84 @@
         "DATA_UTILITIES_MODEL_ENDPOINT",
         "DATA_UTILITIES_MODEL_TIMEOUT"
       ]
+    },
+    {
+      "name": "retigene-rag",
+      "version": "0.0.1",
+      "release_tag": "retigene-rag-v0.0.1",
+      "image": "docker://ghcr.io/lijinbio/mcp-retigene-rag@sha256:6c8dbb40bb8b08cd9713fe2765074c90a79ceab2e474c37362ea54e974371149",
+      "entrypoint": "retigene-rag-mcp",
+      "skill": "query-retigene-papers-with-aiscientist-mcp",
+      "runs_on": "hpc:literature",
+      "tools_file": "mcp/retigene-rag-0.0.1.tools.json",
+      "tools_sha256": "f3fc9471f82b5b94c25701af89bb3600c469e5a0b54a2d44e095b4257448b8e9",
+      "adapter": "retigene",
+      "aliases": {
+        "write_report": "retigene_write_report"
+      },
+      "timeout": 3600,
+      "resources": {
+        "get_gene": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "find_genes": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "search_sentences": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "search_passages": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "read_passage": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "submit_curation": [
+          2,
+          16,
+          "01:00:00"
+        ],
+        "curation_status": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "get_genes": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "get_evidence": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "evaluate": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "write_report": [
+          2,
+          16,
+          "00:30:00"
+        ],
+        "list_curations": [
+          2,
+          16,
+          "00:30:00"
+        ]
+      }
     }
   ]
 }
