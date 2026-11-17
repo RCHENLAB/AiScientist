@@ -476,6 +476,9 @@ async function renderMermaidIn(root) {
 // path is resolved against the file that holds it (``base``) and must stay inside that run's folder.
 // Nothing else (javascript:, data:, http:, another origin) becomes a link or an image: it is shown as
 // plain text. Everything is escaped, and no HTML a model or a file writes is ever run.
+// Only the account's own files are drawn as images. An image on another site is shown as a link: a
+// reply is model text, and an <img> would be fetched as soon as the reply shows, so an address that
+// carries something from the chat would reach that site without a click.
 const MD_URL_ALLOWED = [/^\/api\/file\/[^/]+\/[^/]+\/.+/, /^\/api\/datasets\/\d+\/download$/, /^\/api\/chat-images\/\d+\/[\w.-]+$/];
 function safeMdUrl(raw, base) {
   raw = String(raw || "").trim();
@@ -503,9 +506,12 @@ function mdLinks(escaped, stash, base) {
     .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (m, alt, url) => {
       const href = safeMdUrl(decode(url), base);
       if (!href) return alt || "";
-      const own = href.startsWith("/");
+      if (!href.startsWith("/")) {
+        return stash(`<a class="md-link md-img-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">` +
+          `${alt || escapeHtml(href)}</a>`);
+      }
       return stash(`<img class="md-img" src="${escapeHtml(href)}" alt="${alt}" loading="lazy"` +
-        `${own ? "" : ' referrerpolicy="no-referrer"'} data-fv-open="${escapeHtml(href)}" data-fv-name="${alt || "image"}" />`);
+        ` data-fv-open="${escapeHtml(href)}" data-fv-name="${alt || "image"}" />`);
     })
     .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
       const href = safeMdUrl(decode(url), base);
@@ -2597,6 +2603,8 @@ async function selectLlmEndpoint(value, { accept = false } = {}) {
     if (!res.ok) { toast(d.error || "Could not switch endpoint"); snapEndpointSelect(); return; }
     apiKeys.activeId = credId || clusterValue(d.cluster_model_id || clusterId);
     syncEndpointActions();
+    forgetSessionVision();            // another model now: whether it reads images is asked again
+    paintImageNote();
     const cm = clusterModels.models.find((m) => m.id === (d.cluster_model_id || clusterId));
     toast(credId ? `LLM: ${d.credential ? d.credential.label : "your API endpoint"}`
       : d.status === "provisioning" ? `Starting ${cm ? cm.label : "the cluster model"} on a GPU — a few minutes`
@@ -3161,6 +3169,7 @@ async function submitApiKey(ev) {
     const reverify = d.verify;
     resetApiKeyForm();
     await loadApiCredentials();
+    if (editing) { forgetSessionVision(); paintImageNote(); }   // the endpoint in use may have a new model
     if (saved && !editing) {
       // The key was added FOR the picker the user came from: select it there, so they close the
       // dialog onto the choice they just made rather than back on "Cluster GPU".
@@ -4241,7 +4250,8 @@ async function injectPrompt(c, text) {
 // message shows the thumbnails, a click opens one full size, and they are still there after a reload.
 // A session whose model cannot read images says so before the message is sent.
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-const IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+// 7.5 MB: the Claude API's 10 MB per image counts the base64 text, which is a third longer.
+const IMAGE_MAX_BYTES = 7500000;
 const IMAGE_MAX_COUNT = 5;
 const visionCache = { id: null, value: null };
 
@@ -4270,9 +4280,15 @@ function userImagesHtml(images) {
     `data-fv-open="${escapeHtml(i.url)}" data-fv-name="${escapeHtml(i.name || "image")}" title="Click to open full size" />`).join("") + `</div>`;
 }
 
-async function sessionVision() {
+// The answer holds for the session's model when it was asked. Switching the endpoint on the same
+// connection (selectLlmEndpoint) or editing the endpoint in use forgets it.
+function forgetSessionVision() {
+  visionCache.id = null; visionCache.value = null;
+}
+
+async function sessionVision({ fresh = false } = {}) {
   if (!state.connectionId) return null;
-  if (visionCache.id === state.connectionId && visionCache.value) return visionCache.value;
+  if (!fresh && visionCache.id === state.connectionId && visionCache.value) return visionCache.value;
   try {
     const v = await api("GET", `/api/lab/vision?connection_id=${encodeURIComponent(state.connectionId)}`);
     visionCache.id = state.connectionId; visionCache.value = v;
@@ -4318,7 +4334,10 @@ async function addComposerImages(files) {
     const name = f.name || "pasted image";
     if (c.images.length >= IMAGE_MAX_COUNT) { toast(`At most ${IMAGE_MAX_COUNT} images per message.`); break; }
     if (!IMAGE_TYPES.includes(f.type)) { toast(`${name} is not a PNG, JPEG, WebP or GIF image.`); continue; }
-    if (f.size > IMAGE_MAX_BYTES) { toast(`${name} is ${fmtSize(f.size)}; the limit is ${fmtSize(IMAGE_MAX_BYTES)} each.`); continue; }
+    if (f.size > IMAGE_MAX_BYTES) {
+      toast(`${name} is ${(f.size / 1e6).toFixed(1)} MB; the limit is ${+(IMAGE_MAX_BYTES / 1e6).toFixed(1)} MB each.`);
+      continue;
+    }
     const item = { key: rid(), name, thumb: URL.createObjectURL(f), uploading: true };
     c.images.push(item);
     renderImageChips();
@@ -4328,6 +4347,8 @@ async function addComposerImages(files) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
       Object.assign(item, data.image, { uploading: false });
+      // Removed while it was uploading: the server keeps nothing the composer no longer shows.
+      if (!c.images.includes(item)) discardUploadedImage(s.cid, item);
     } catch (err) {
       c.images = c.images.filter((x) => x !== item);
       URL.revokeObjectURL(item.thumb);
@@ -4335,6 +4356,13 @@ async function addComposerImages(files) {
     }
     if (chatVisible(c)) renderImageChips();
   }
+}
+
+// An image taken off the message before it was sent is deleted on the server too. The server keeps an
+// image a sent message names (409), and the answer changes nothing here, so it is not waited for.
+function discardUploadedImage(cid, item) {
+  if (!cid || !item || !item.id) return;
+  fetch(`/api/conversations/${cid}/images/${encodeURIComponent(item.id)}`, { method: "DELETE" }).catch(() => {});
 }
 
 function clearComposerImages(c) {
@@ -4361,6 +4389,8 @@ function wireComposerImages() {
     const gone = (c.images || []).find((i) => i.key === x.dataset.removeImage);
     if (gone && gone.thumb) URL.revokeObjectURL(gone.thumb);
     c.images = (c.images || []).filter((i) => i.key !== x.dataset.removeImage);
+    const s = activeSession();
+    if (gone && s) discardUploadedImage(s.cid, gone);
     renderImageChips();
   });
   if (input) input.addEventListener("paste", (e) => {
@@ -4425,7 +4455,9 @@ async function sendChat(e) {
   }
   if (images.length) {
     // The composer says so before sending: a model that cannot read images is told, the message waits.
-    const v = await sessionVision();
+    // A "no" is asked again first, so an answer from before a model switch never holds a message back.
+    let v = await sessionVision();
+    if (v && !v.accepts_images) v = await sessionVision({ fresh: true });
     if (v && !v.accepts_images) {
       toast(`This session's model (${v.model || "unknown"}) cannot read images, so the message was not sent. Remove the images, or switch to a model that accepts them.`);
       return;

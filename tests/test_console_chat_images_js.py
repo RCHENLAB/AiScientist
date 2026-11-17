@@ -21,12 +21,12 @@ def _run_verbose(body: str) -> str:
     if not node:
         pytest.skip("node is not installed")
     source = APP.read_text(encoding="utf-8")
-    consts = source[source.index("const FIGURES_INLINE"):source.index("function figuresHtml(")]
+    consts = source[source.index("const IMAGE_TYPES"):source.index("function figuresHtml(")]   # the limits as shipped
     block = (consts + _function(source, "figuresHtml") + _function(source, "userImagesHtml")
-             + 'const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];\n'
-               "const IMAGE_MAX_BYTES = 10 * 1024 * 1024;\nconst IMAGE_MAX_COUNT = 5;\nconst visionCache = { id: null, value: null };\n"
-             + _function(source, "sessionVision") + _function(source, "renderImageChips") + _function(source, "paintImageNote")
-             + _function(source, "addComposerImages") + _function(source, "clearComposerImages")
+             + _function(source, "forgetSessionVision") + _function(source, "sessionVision")
+             + _function(source, "renderImageChips") + _function(source, "paintImageNote")
+             + _function(source, "addComposerImages") + _function(source, "discardUploadedImage")
+             + _function(source, "clearComposerImages")
              + _function(source, "imageFilesOf") + _function(source, "wireComposerImages") + _function(source, "onDataDrop"))
     run = subprocess.run([node, "-e", _HARNESS + block + "\n(async () => {\n" + body + '\nconsole.log("ok");\n})().catch((e) => { console.error(e); process.exit(1); });'],
                          capture_output=True, text=True, timeout=60)
@@ -49,15 +49,18 @@ let seq = 0; const rid = () => "k" + (++seq);
 const toasts = []; const toast = (t) => toasts.push(t);
 const isUnreachable = () => false;
 const revoked = []; globalThis.URL = { createObjectURL: (f) => "blob:" + f.name, revokeObjectURL: (u) => revoked.push(u) };
-let uploads = [], vision = { accepts_images: true, model: "gpt-4o" }, failUpload = null;
+let uploads = [], deletes = [], vision = { accepts_images: true, model: "gpt-4o" }, failUpload = null, visionAsked = 0;
+let holdUpload = null;
 globalThis.fetch = async (url, opt) => {
+  if (opt && opt.method === "DELETE") { deletes.push(url); return { ok: true, status: 200, json: async () => ({}) }; }
   uploads.push({ url, opt });
+  if (holdUpload) await holdUpload;
   if (failUpload) return { ok: false, status: failUpload, json: async () => ({ detail: "Only PNG, JPEG, WebP and GIF images can be attached." }) };
   const name = decodeURIComponent(/name=([^&]*)/.exec(url)[1]);
   const id = "i" + uploads.length;
   return { ok: true, status: 200, json: async () => ({ image: { id, name, mime: opt.headers["Content-Type"], size: opt.body.size, url: `/api/chat-images/9/${id}.png` } }) };
 };
-const api = async () => vision;
+const api = async () => { visionAsked++; return vision; };
 const file = (name, type, size = 100) => ({ name, type, size });
 let dropped = { files: [], folders: [] }; const droppedUploads = async () => dropped;
 const uploadedDatasets = [], uploadedFolders = [];
@@ -82,6 +85,7 @@ const key = chat.images[0].key;
 els.imageChips.listeners.click({ target: { closest: (sel) => sel === "[data-remove-image]" ? { dataset: { removeImage: key } } : null } });
 assert.deepEqual(chat.images.map((i) => i.id), ["i2"]);
 assert.ok(revoked.includes("blob:error.png"));
+assert.deepEqual(deletes, ["/api/conversations/9/images/i1"]);                     // and the server deletes it
 clearComposerImages(chat);
 assert.deepEqual(chat.images, []) ; assert.equal(els.imageChips.hidden, true);
 ''') == "ok"
@@ -117,16 +121,37 @@ assert.equal(els.imageFile.value, "");
 ''') == "ok"
 
 
-def test_the_limits_five_images_ten_megabytes_and_only_four_types():
+def test_the_limits_five_images_seven_and_a_half_megabytes_and_only_four_types():
     assert _run_verbose(r'''
-await addComposerImages([file("big.png", "image/png", 11 * 1048576)]);
-assert.equal(chat.images.length, 0); assert.ok(toasts.at(-1).includes("big.png") && toasts.at(-1).includes("limit"));
+// 7.5 MB: the Claude API's 10 MB per image counts the base64 text
+assert.equal(IMAGE_MAX_BYTES, 7500000);
+assert.ok(Math.ceil(IMAGE_MAX_BYTES / 3) * 4 <= 10000000);
+await addComposerImages([file("big.png", "image/png", 8000000)]);
+assert.equal(chat.images.length, 0); assert.equal(uploads.length, 0);
+assert.equal(toasts.at(-1), "big.png is 8.0 MB; the limit is 7.5 MB each.");
+await addComposerImages([file("ok.png", "image/png", 7500000)]);
+assert.equal(chat.images.length, 1); chat.images = []; uploads = [];
 await addComposerImages([file("v.svg", "image/svg+xml"), file("p.pdf", "application/pdf"), file("t.tiff", "image/tiff")]);
 assert.equal(chat.images.length, 0); assert.equal(uploads.length, 0);
 assert.ok(toasts.slice(-3).every((t) => t.includes("not a PNG, JPEG, WebP or GIF")));
 await addComposerImages(Array.from({ length: 7 }, (_, i) => file(`s${i}.png`, "image/png")));
 assert.equal(chat.images.length, 5); assert.equal(uploads.length, 5);
 assert.ok(toasts.at(-1).includes("At most 5 images per message"));
+''') == "ok"
+
+
+def test_an_image_removed_while_it_uploads_is_deleted_on_the_server_once_it_arrives():
+    assert _run_verbose(r'''
+wireComposerImages();
+let release; holdUpload = new Promise((r) => { release = r; });
+const pending = addComposerImages([file("slow.png", "image/png")]);
+await new Promise((r) => setTimeout(r, 5));
+const key = chat.images[0].key;
+els.imageChips.listeners.click({ target: { closest: (sel) => sel === "[data-remove-image]" ? { dataset: { removeImage: key } } : null } });
+assert.equal(chat.images.length, 0); assert.deepEqual(deletes, []);            // no id yet: nothing to delete
+release(); await pending;
+assert.deepEqual(chat.images, []);
+assert.deepEqual(deletes, ["/api/conversations/9/images/i1"]);
 ''') == "ok"
 
 
@@ -145,11 +170,36 @@ def test_the_composer_says_when_the_model_cannot_read_images():
 await addComposerImages([file("a.png", "image/png")]);
 await paintImageNote();
 assert.ok(els.imageNote.textContent.includes("Sent to the model") && !els.imageNote.className.includes("bad"));
-visionCache.value = null;
+forgetSessionVision();
 vision = { accepts_images: false, model: "deepseek-v4.1-flash" };
 await paintImageNote();
 assert.ok(els.imageNote.className.includes("bad"));
 assert.ok(els.imageNote.textContent.includes("deepseek-v4.1-flash") && els.imageNote.textContent.includes("cannot read images") && els.imageNote.textContent.includes("will not be sent"));
+''') == "ok"
+
+
+def test_a_model_switch_on_the_same_connection_asks_again_whether_it_reads_images():
+    switch = _function(APP.read_text(encoding="utf-8"), "selectLlmEndpoint")
+    assert _run_verbose(r'''
+const CLUSTER_PREFIX = "cluster:", isClusterValue = (v) => String(v || "").startsWith(CLUSTER_PREFIX);
+const clusterValue = (id) => CLUSTER_PREFIX + id, apiKeys = { activeId: null }, clusterModels = { models: [] };
+const syncEndpointActions = () => {}, snapEndpointSelect = () => {}, openEgressDialog = () => {};
+const baseFetch = globalThis.fetch;
+globalThis.fetch = async (url, opt) => url === "/api/llm-endpoint"
+  ? { ok: true, status: 200, json: async () => ({ credential: { label: "Claude key" } }) } : baseFetch(url, opt);
+''' + switch + r'''
+vision = { accepts_images: false, model: "deepseek-v4.1-flash" };
+await addComposerImages([file("a.png", "image/png")]);
+await paintImageNote();
+assert.ok(els.imageNote.className.includes("bad"));
+await paintImageNote();
+assert.equal(visionAsked, 1);                                   // asked once for this model
+// the same connection, another model: the old answer is not kept
+vision = { accepts_images: true, model: "claude-sonnet-5-5" };
+await selectLlmEndpoint("cred-1");
+await new Promise((r) => setTimeout(r, 5));
+assert.equal(visionAsked, 2);
+assert.ok(!els.imageNote.className.includes("bad") && els.imageNote.textContent.includes("Sent to the model"));
 ''') == "ok"
 
 

@@ -2,7 +2,8 @@
 
 One preview by file type: a CSV is a table (sticky header, row numbers, types, sort, cut notice),
 Markdown is rendered with a Source switch, JSON folds, YAML is highlighted. No preview runs HTML or script
-from a file, and a Markdown link or image is drawn only for the account's own files or an https address.
+from a file. A Markdown link is drawn only for the account's own files or an https address, and an image only
+for the account's own files (an https image is shown as a link).
 """
 
 from __future__ import annotations
@@ -187,7 +188,14 @@ const own = renderMarkdown("![fig](/api/file/alice/run1/figures/umap.png) and [t
 assert.ok(own.includes('<img class="md-img" src="/api/file/alice/run1/figures/umap.png" alt="fig"'));
 assert.ok(own.includes('<a class="md-link" href="/api/file/alice/run1/report/report.md" target="_blank" rel="noopener noreferrer">the report</a>'));
 const ext = renderMarkdown("[paper](https://doi.org/10.1/x?a=1&b=2) ![w](https://example.org/p.png)");
-assert.ok(ext.includes('href="https://doi.org/10.1/x?a=1&amp;b=2"') && ext.includes('referrerpolicy="no-referrer"'));
+assert.ok(ext.includes('href="https://doi.org/10.1/x?a=1&amp;b=2"'));
+// an image on another site is a link, never an <img> the browser would fetch when the reply shows
+assert.ok(!/<img\b/.test(ext) && !/src=/.test(ext), ext);
+assert.ok(ext.includes('<a class="md-link md-img-link" href="https://example.org/p.png" target="_blank" rel="noopener noreferrer">w</a>'), ext);
+const leak = renderMarkdown("![](https://some.host/x.png?q=the%20patient%20id) ![a\"b](https://some.host/y.png)");
+assert.ok(!/<img\b/.test(leak) && leak.includes('>https://some.host/x.png?q=the%20patient%20id</a>') && leak.includes(">a&quot;b</a>"), leak);
+// the account's own chat images and dataset files are still drawn
+assert.ok(renderMarkdown("![s](/api/chat-images/7/0123456789abcdef.png)").includes('<img class="md-img" src="/api/chat-images/7/0123456789abcdef.png"'));
 const ds = renderMarkdown("[data](/api/datasets/12/download)");
 assert.ok(ds.includes('href="/api/datasets/12/download"'));
 // everything else is shown as plain text, never as a link or image

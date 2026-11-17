@@ -74,6 +74,57 @@ def test_a_message_names_at_most_five_of_this_chats_own_images(tmp_path, monkeyp
     assert ci.data_url(loaded[0]).startswith("data:image/png;base64,iVBORw0KGgo")
 
 
+def test_the_limit_is_what_the_claude_api_takes_once_base64_encoded():
+    import base64
+    assert ci.MAX_IMAGE_BYTES == 7_500_000
+    assert len(base64.b64encode(b"\0" * ci.MAX_IMAGE_BYTES)) <= 10_000_000      # 10 MB per image, as base64
+    assert ci.mb(ci.MAX_IMAGE_BYTES) == "7.5 MB" and ci.mb(ci.MAX_ACCOUNT_BYTES) == "200 MB"
+
+
+def test_one_image_can_be_removed_and_only_that_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_RESULTS_DIR", str(tmp_path))
+    a, b = ci.save("alice", 3, PNG, "a.png"), ci.save("alice", 3, JPG, "b.jpg")
+    assert not ci.remove("bob", 3, a["id"]) and not ci.remove("alice", 4, a["id"])
+    assert not ci.remove("alice", 3, "../../x") and not ci.remove("alice", 3, "0123456789abcdef")
+    assert ci.remove("alice", 3, a["id"]) and not ci.remove("alice", 3, a["id"])
+    assert ci.path_of("alice", 3, f"{a['id']}.png") is None and ci.path_of("alice", 3, f"{b['id']}.jpg") is not None
+    assert sorted(p.name for p in (tmp_path / "alice" / "chat-images" / "3").iterdir()) == [f"{b['id']}.jpg", f"{b['id']}.json"]
+
+
+def test_images_no_message_names_go_a_day_after_their_upload(tmp_path, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_RESULTS_DIR", str(tmp_path))
+    old_sent, old_unsent, new = (ci.save("alice", 3, PNG, n) for n in ("sent.png", "unsent.png", "new.png"))
+    other_chat = ci.save("alice", 4, PNG, "other.png")
+    now = ci.time.time() + ci.UNSENT_TTL_S + 60
+    sidecar = tmp_path / "alice" / "chat-images" / "3" / f"{new['id']}.json"
+    meta = json.loads(sidecar.read_text())
+    meta["created"] = now - 60                                 # uploaded a minute before ``now``
+    sidecar.write_text(json.dumps(meta))
+    stale = ci.unsent("alice", now=now)
+    assert sorted(stale[3]) == sorted([old_sent["id"], old_unsent["id"]]) and stale[4] == [other_chat["id"]]
+    # a name in another chat does not count: other.png goes with unsent.png
+    assert ci.sweep("alice", {(3, old_sent["id"]), (3, other_chat["id"])}, now=now) == 2
+    kept = {r["id"] for cid, r in ((3, old_sent), (3, old_unsent), (3, new), (4, other_chat))
+            if ci.path_of("alice", cid, r["url"].rsplit("/", 1)[1])}
+    assert kept == {old_sent["id"], new["id"]}
+    assert ci.sweep("bob", set(), now=now) == 0 and ci.sweep("alice", set()) == 0       # nothing is a day old yet
+    assert ci.named_ids(['{"images": [{"id": "a"}, "b"]}', {"images": [{"id": "c"}]}, "not json", None,
+                         '{"items": []}']) == {"a", "b", "c"}
+
+
+def test_an_account_keeps_at_most_its_quota_of_images(tmp_path, monkeypatch):
+    monkeypatch.setenv("AISCIENTIST_RESULTS_DIR", str(tmp_path))
+    monkeypatch.setattr(ci, "MAX_ACCOUNT_BYTES", len(PNG) * 2 + 10)
+    first = ci.save("alice", 1, PNG)
+    ci.save("alice", 2, PNG)
+    assert ci.usage("alice") == len(PNG) * 2
+    with pytest.raises(ci.ChatImageQuotaError, match="at most"):
+        ci.save("alice", 1, PNG)
+    ci.save("bob", 1, PNG)                                     # another account has its own
+    assert ci.remove("alice", 1, first["id"])
+    ci.save("alice", 1, PNG)                                   # room again
+
+
 def test_which_models_read_images():
     assert ci.accepts_images("claude-sonnet-5-5", native_anthropic=True)
     assert ci.accepts_images("anything", native_anthropic=True)
@@ -183,8 +234,10 @@ def test_a_message_cannot_name_another_chats_or_accounts_images_or_more_than_fiv
     a, b = _chat(alice), _chat(bob)
     mine = [_upload(alice, a, PNG).json()["image"] for _ in range(6)]
     theirs = _upload(bob, b, PNG).json()["image"]
-    post = lambda c, cid, ids: c.post(f"/api/conversations/{cid}/messages",
-                                      json={"role": "user", "content": "x", "meta": {"images": [{"id": i} for i in ids]}})
+
+    def post(c, cid, ids):
+        return c.post(f"/api/conversations/{cid}/messages",
+                      json={"role": "user", "content": "x", "meta": {"images": [{"id": i} for i in ids]}})
     assert post(alice, a, [theirs["id"]]).status_code == 400
     assert post(alice, a, [r["id"] for r in mine]).status_code == 400
     assert post(alice, a, ["nope"]).status_code == 400
@@ -201,6 +254,48 @@ def test_deleting_a_chat_deletes_its_images(api):
     assert alice.delete(f"/api/conversations/{cid}").status_code == 200
     assert not any(api.results.rglob("*.png")) and not any(api.results.rglob("*.json"))
     assert alice.get(ref["url"]).status_code == 404
+
+
+def test_an_image_taken_off_the_message_is_deleted_but_a_sent_one_stays(api):
+    alice, bob, anon = api.client("alice"), api.client("bob"), api.client()
+    cid = _chat(alice)
+    unsent, sent = (_upload(alice, cid, PNG, n).json()["image"] for n in ("unsent.png", "sent.png"))
+    assert alice.post(f"/api/conversations/{cid}/messages", json={
+        "role": "user", "content": "look", "meta": {"images": [{"id": sent["id"]}]}}).status_code == 200
+    assert bob.delete(f"/api/conversations/{cid}/images/{unsent['id']}").status_code == 404     # not bob's chat
+    assert anon.delete(f"/api/conversations/{cid}/images/{unsent['id']}").status_code == 401
+    kept = alice.delete(f"/api/conversations/{cid}/images/{sent['id']}")
+    assert kept.status_code == 409 and "sent message" in kept.json()["detail"]
+    assert alice.get(sent["url"]).status_code == 200
+    assert alice.delete(f"/api/conversations/{cid}/images/{unsent['id']}").status_code == 200
+    assert alice.get(unsent["url"]).status_code == 404
+    assert alice.delete(f"/api/conversations/{cid}/images/{unsent['id']}").status_code == 404
+    assert alice.delete(f"/api/conversations/{cid}/images/..%2F..%2Fx").status_code in (404, 405)
+
+
+def test_an_upload_first_clears_the_accounts_day_old_unsent_images(api, monkeypatch):
+    alice = api.client("alice")
+    a, b = _chat(alice), _chat(alice)
+    sent, unsent, other = (_upload(alice, cid, PNG, n).json()["image"] for cid, n in ((a, "s.png"), (a, "u.png"), (b, "o.png")))
+    assert alice.post(f"/api/conversations/{a}/messages", json={
+        "role": "user", "content": "look", "meta": {"images": [{"id": sent["id"]}]}}).status_code == 200
+    _upload(alice, b, PNG, "fresh.png")                        # nothing is a day old: all kept
+    assert all(alice.get(r["url"]).status_code == 200 for r in (sent, unsent, other))
+    later = ci.time.time() + ci.UNSENT_TTL_S + 60
+    monkeypatch.setattr(ci.time, "time", lambda: later)
+    assert _upload(alice, b, PNG, "next.png").status_code == 200
+    assert alice.get(sent["url"]).status_code == 200            # a sent message names it
+    assert alice.get(unsent["url"]).status_code == 404 and alice.get(other["url"]).status_code == 404
+
+
+def test_an_upload_over_the_accounts_quota_is_refused_and_says_so(api, monkeypatch):
+    alice, bob = api.client("alice"), api.client("bob")
+    cid = _chat(alice)
+    monkeypatch.setattr(ci, "MAX_ACCOUNT_BYTES", len(PNG) * 2)
+    assert _upload(alice, cid, PNG).status_code == 200 and _upload(alice, cid, PNG).status_code == 200
+    full = _upload(alice, cid, PNG)
+    assert full.status_code == 413 and "an account keeps at most" in full.json()["detail"]
+    assert _upload(bob, _chat(bob), PNG).status_code == 200    # bob's own room
 
 
 # --- the model path ----------------------------------------------------------------------------------

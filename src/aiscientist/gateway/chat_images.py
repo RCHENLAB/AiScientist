@@ -11,8 +11,10 @@ Each is one file under the account's own folder::
     <results dir>/<account>/chat-images/<conversation>/...)  and a sidecar <image id>.json with its name
 
 Where it lives and how long it stays: chat images belong to their conversation. They are not datasets,
-so the datasets' retention period does not apply to them; deleting the chat deletes its images, and
-nothing else removes them. A message keeps references (id, name, type, size, url), never the bytes.
+so the datasets' retention period does not apply to them; deleting the chat deletes its images. An image
+no message names is removed when its thumbnail is removed from the composer, or a day after its upload
+(the account's next upload sweeps it). An account keeps at most ``MAX_ACCOUNT_BYTES`` of chat images. A
+message keeps references (id, name, type, size, url), never the bytes.
 """
 
 from __future__ import annotations
@@ -29,7 +31,13 @@ from pathlib import Path
 from typing import Any
 
 MAX_IMAGES_PER_MESSAGE = 5
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
+#: The Claude API takes an image of at most 10 MB once it is base64-encoded, and base64 adds a third:
+#: 7.5 MB of bytes is 10,000,000 characters.
+MAX_IMAGE_BYTES = 7_500_000
+#: All of an account's chat images together.
+MAX_ACCOUNT_BYTES = 200_000_000
+#: An image no message names is removed this long after its upload.
+UNSENT_TTL_S = 24 * 3600
 
 _TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
 _FILE_RE = re.compile(r"^([0-9a-f]{16})\.(png|jpg|webp|gif)$")
@@ -38,6 +46,15 @@ _ID_RE = re.compile(r"^[0-9a-f]{16}$")
 
 class ChatImageError(ValueError):
     """An image that cannot be kept; the message is for the user."""
+
+
+class ChatImageQuotaError(ChatImageError):
+    """The account's chat images would go over ``MAX_ACCOUNT_BYTES``."""
+
+
+def mb(n: int) -> str:
+    """A size as the limits are written: decimal megabytes, one decimal when it has one."""
+    return f"{n / 1_000_000:.1f}".removesuffix(".0") + " MB"
 
 
 def sniff(data: bytes) -> "str | None":
@@ -87,11 +104,15 @@ def save(username: str, cid: int, data: bytes, name: str = "") -> dict:
     if not data:
         raise ChatImageError("The image is empty.")
     if len(data) > MAX_IMAGE_BYTES:
-        raise ChatImageError(f"The image is {len(data) / 1048576:.1f} MB; the limit is "
-                             f"{MAX_IMAGE_BYTES // 1048576} MB each.")
+        raise ChatImageError(f"The image is {len(data) / 1_000_000:.1f} MB; the limit is {mb(MAX_IMAGE_BYTES)} each.")
     ext = sniff(data)
     if ext is None:
         raise ChatImageError("Only PNG, JPEG, WebP and GIF images can be attached.")
+    used = usage(username)
+    if used + len(data) > MAX_ACCOUNT_BYTES:
+        raise ChatImageQuotaError(
+            f"Your chats already keep {mb(used)} of images, and an account keeps at most {mb(MAX_ACCOUNT_BYTES)}. "
+            "Delete chats you no longer need, or attach a smaller image.")
     folder = _dir(username, cid)
     folder.mkdir(parents=True, exist_ok=True)
     image_id = uuid.uuid4().hex[:16]
@@ -160,6 +181,76 @@ def load(username: str, cid: int, refs: Any) -> list[dict]:
 
 def data_url(image: dict) -> str:
     return f"data:{image['media_type']};base64,{base64.b64encode(image['data']).decode('ascii')}"
+
+
+def remove(username: str, cid: int, image_id: str) -> bool:
+    """Delete one image of this account's conversation (the file and its name). False if there is none."""
+    folder = _dir(username, cid)
+    meta = _meta(folder, image_id)
+    if meta is None:
+        return False
+    for path in (folder / f"{image_id}.{meta['ext']}", folder / f"{image_id}.json"):
+        path.unlink(missing_ok=True)
+    return True
+
+
+def _images(username: str):
+    """Every image of the account: ``(conversation, image id, meta)``."""
+    root = root_for(username)
+    if not root.is_dir():
+        return
+    for folder in root.iterdir():
+        if not (folder.is_dir() and folder.name.isdigit()):
+            continue
+        for sidecar in folder.glob("*.json"):
+            meta = _meta(folder, sidecar.stem)
+            if meta is not None:
+                yield int(folder.name), sidecar.stem, meta
+
+
+def usage(username: str) -> int:
+    """How many bytes the account's chat images take."""
+    return sum(int(meta.get("size") or 0) for _cid, _id, meta in _images(username))
+
+
+def unsent(username: str, *, older_than: float = UNSENT_TTL_S, now: "float | None" = None) -> dict[int, list[str]]:
+    """The account's images uploaded more than ``older_than`` seconds ago, by conversation: the ones to
+    check against the messages before a sweep."""
+    cutoff = (time.time() if now is None else now) - older_than
+    out: dict[int, list[str]] = {}
+    for cid, image_id, meta in _images(username):
+        if float(meta.get("created") or 0) < cutoff:
+            out.setdefault(cid, []).append(image_id)
+    return out
+
+
+def sweep(username: str, named: "set[tuple[int, str]]", *, older_than: float = UNSENT_TTL_S,
+          now: "float | None" = None) -> int:
+    """Delete the account's images older than ``older_than`` that no message names (``named`` holds the
+    ``(conversation, image id)`` pairs the messages name). Returns how many went."""
+    gone = 0
+    for cid, ids in unsent(username, older_than=older_than, now=now).items():
+        for image_id in ids:
+            if (cid, image_id) not in named and remove(username, cid, image_id):
+                gone += 1
+    return gone
+
+
+def named_ids(metas: Any) -> set[str]:
+    """The image ids that stored messages name, from their ``meta`` (JSON strings or dicts)."""
+    out: set[str] = set()
+    for meta in metas:
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except ValueError:
+                continue
+        images = meta.get("images") if isinstance(meta, dict) else None
+        for ref in images if isinstance(images, list) else ():
+            image_id = ref.get("id") if isinstance(ref, dict) else ref
+            if isinstance(image_id, str):
+                out.add(image_id)
+    return out
 
 
 def remove_conversation(username: str, cid: int) -> int:

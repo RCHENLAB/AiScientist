@@ -30,26 +30,30 @@ and a run's `.html`, `.svg` and `.xml` files are served with a sandboxing Conten
 
 ## Links and images in Markdown
 
-`![alt](url)` and `[text](url)` are drawn only for a URL the page may follow: the account's own run files
+`[text](url)` is drawn as a link only for a URL the page may follow: the account's own run files
 (`/api/file/<owner>/<run>/…`), its dataset files (`/api/datasets/<id>/download`), its chat images, or an
-`https://` address (images from other sites are sent without a referrer). Anything else (`javascript:`,
-`data:`, `http:`, another origin, `//host`, `..` in an absolute path, a relative path that leaves the run
-folder) is shown as plain text. No raw HTML is run.
+`https://` address. `![alt](url)` is drawn as an image only for the account's own files; an image on an
+`https://` address is shown as a link to it. A reply is model text, and an image is fetched as soon as the
+reply shows, so an address carrying something from the chat would reach another site without a click.
+Anything else (`javascript:`, `data:`, `http:`, another origin, `//host`, `..` in an absolute path, a
+relative path that leaves the run folder) is shown as plain text. No raw HTML is run.
 
 ## Images in a message
 
 Attach (the **Image** button), paste from the clipboard or drop a PNG, JPEG, WebP or GIF on the chat. It is
 uploaded to the conversation at once, so **no HPC3 connection is needed**, and shows as a thumbnail that
-can be removed before sending. Limits: 5 images per message, 10 MB each. The sent message shows the
-thumbnails (a click opens one full size), and they are still there after a reload.
+can be removed before sending. Limits: 5 images per message, 7.5 MB each (the Claude API takes 10 MB per
+image once it is base64-encoded, which is a third longer), and 200 MB of chat images per account. The sent
+message shows the thumbnails (a click opens one full size), and they are still there after a reload.
 
 * **Checked by content.** The server accepts a file only if its first bytes are a PNG, JPEG, WebP or GIF, whatever
   its name or type says. SVG and everything else are refused.
 * **Where they live.** One file per image under the account: `<data root>/users/<account>/chat-images/<chat>/`
   (or `<results dir>/<account>/chat-images/<chat>/` with no data root). They belong to their conversation and are
-  **not datasets**, so the 90-day dataset retention does not apply; deleting the chat deletes its images, and nothing
-  else removes them. A message stores references (id, name, type, size, url), never the bytes, and the server rebuilds
-  them from what it holds, not from what the page sent.
+  **not datasets**, so the 90-day dataset retention does not apply; deleting the chat deletes its images. An image no
+  message names is deleted when its thumbnail is removed from the composer, and a day after its upload otherwise (the
+  account's next upload removes it). A message stores references (id, name, type, size, url), never the bytes, and the
+  server rebuilds them from what it holds, not from what the page sent.
 * **Who can read them.** Only the conversation's owner (`GET /api/chat-images/<chat>/<id>.<ext>`), shown as the checked
   image type with `nosniff` and a sandboxing policy.
 
