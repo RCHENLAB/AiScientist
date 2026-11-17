@@ -164,6 +164,37 @@ The chosen files are bound one by one (the first is the main file, the others ex
 the run's decisions, so a revision, a resume or a restored plan binds the same files, and
 `process/inputs.json` records the files read and `selected_by`.
 
+## Attaching member files by hand
+
+Three ways, all saved with the chat (`PUT /api/conversations/{cid}/shared-datasets`, `files`):
+
+* the Files page: each file of a version has "Use this file". A second file of the same dataset and
+  version is added to the first; "Use in chat" attaches the whole version and replaces them;
+* the message box: `@` lists every shared dataset and each of its files;
+* the request itself, as described above.
+
+The chat's chip names the file, or says how many files are attached and lists them on hover.
+
+## A request with no dataset attached
+
+A new analysis in a chat with nothing attached is read against the shared datasets and the account's
+uploads before anything is planned (`gateway/dataset_offers.py`, `_offer_unattached_data` in
+`gateway/app.py`). When it points at some, a card lists them, shared datasets first, with "Continue
+without a dataset" last, and the run waits for the answer: a chip, its number, or words that name one.
+
+| The request | Offered |
+| --- | --- |
+| names a shared dataset (slug or name) | that dataset: the files its tissue or assay words narrow it to, else the whole version (the member card follows) |
+| names a member file, or a tissue or assay only some members carry | those files |
+| names an upload, with or without its extension | that upload |
+| names a file type ("the VCF", "my h5ad") | the uploads of that type |
+| speaks of the user's own data ("my dataset", "the file I uploaded") | the newest uploads |
+
+The pick is attached to the chat (the page shows its chip) and the run goes on with it. "Continue
+without a dataset" is remembered for that chat in the session; an unanswered card goes on without
+data after ten minutes. A request that points at nothing is not interrupted, and neither is a
+literature question, a follow-up on an earlier run, or a chat that already has data.
+
 ## Metadata and MCP
 
 Publishing writes `croissant.json` into the version folder: each file is a `cr:FileObject` with the

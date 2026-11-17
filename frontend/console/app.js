@@ -687,7 +687,9 @@ async function loadSessions() {
       state.sessions = (data.conversations || []).map((c) => ({
         id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false,
         createdAt: c.created_at, updatedAt: c.updated_at,
+        groupId: c.group_id ?? null, titleSource: c.title_source || "prompt",
       }));
+      state.groups = data.groups || [];
       pruneComposers(state.sessions);
       if (!state.sessions.length) { await newSession(); }
       else { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
@@ -725,7 +727,8 @@ async function newSession() {
     try {
       const c = (await api("POST", "/api/conversations", {})).conversation;
       state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
-      createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
+      createdAt: c.created_at, updatedAt: c.updated_at || c.created_at,
+      groupId: null, titleSource: "prompt" });
       state.activeId = String(c.id);
       state.planView = null;
       renderSessionList();
@@ -910,19 +913,154 @@ function relTime(iso) {
 // that chat is, so this is how a person in another chat learns that something waits for them.
 const PLAN_WAITING_LABEL = { plan: "Plan to review", clarify: "Question for you", decision: "Decision needed" };
 
-function renderSessionList() {
-  const list = $("sessionList");
-  if (!state.sessions.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
-  list.innerHTML = state.sessions
-    .map((s) => `
-      <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}">
+function sessionItemHtml(s) {
+  const more = state.user && s.cid
+    ? `<button class="session-more" data-more="${s.id}" title="Rename or move to a group" aria-label="Rename or move to a group" aria-haspopup="menu">⋯</button>` : "";
+  return `
+      <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}" draggable="${state.user && s.cid ? "true" : "false"}">
         <span class="session-text">
-          <span class="session-title">${escapeHtml(s.title || "New chat")}</span>
+          <span class="session-title" title="${escapeHtml(s.title || "New chat")}">${escapeHtml(s.title || "New chat")}</span>
           <span class="session-meta">${sessionBadge(s.id)}<span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span></span>
         </span>
+        ${more}
         <button class="session-del" data-del="${s.id}" title="Delete chat" aria-label="Delete chat">✕</button>
-      </div>`)
-    .join("");
+      </div>`;
+}
+
+// Which groups are folded is a convenience of this browser, not part of the account's data.
+const GROUPS_FOLDED_KEY = "bioagent_chat_groups_folded_v1";
+function foldedGroups() {
+  try { return new Set(JSON.parse(localStorage.getItem(GROUPS_FOLDED_KEY) || "[]").map(String)); } catch { return new Set(); }
+}
+function setGroupFolded(gid, folded) {
+  const set = foldedGroups();
+  if (folded) set.add(String(gid)); else set.delete(String(gid));
+  try { localStorage.setItem(GROUPS_FOLDED_KEY, JSON.stringify([...set])); } catch {}
+}
+
+// The chats, under the user's groups when there are any. A chat in no group (or in one that no
+// longer exists) is listed under "Other chats"; with no groups the list is flat, as it always was.
+function renderSessionList() {
+  const list = $("sessionList");
+  const groups = state.user ? (state.groups || []) : [];
+  $("newGroupBtn")?.classList.toggle("hidden", !state.user);
+  if (!state.sessions.length && !groups.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
+  if (!groups.length) { list.innerHTML = state.sessions.map(sessionItemHtml).join(""); return; }
+  const known = new Set(groups.map((g) => g.id));
+  const folded = foldedGroups();
+  const section = (gid, name, chats, actions) => {
+    const closed = folded.has(String(gid));
+    return `
+      <div class="session-group ${closed ? "folded" : ""}" data-group="${gid}">
+        <div class="session-group-head" data-group-toggle="${gid}" role="button" tabindex="0" aria-expanded="${!closed}">
+          <span class="session-group-caret" aria-hidden="true">▾</span>
+          <span class="session-group-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+          <span class="session-group-count">${chats.length}</span>
+          ${actions}
+        </div>
+        ${closed ? "" : (chats.map(sessionItemHtml).join("") || '<div class="session-empty">Drag a chat here, or use its ⋯ menu.</div>')}
+      </div>`;
+  };
+  const html = groups.map((g) => section(g.id, g.name, state.sessions.filter((s) => s.groupId === g.id),
+    `<button class="session-group-btn" data-group-rename="${g.id}" title="Rename group" aria-label="Rename group">✎</button>
+     <button class="session-group-btn" data-group-del="${g.id}" title="Delete group (its chats are kept)" aria-label="Delete group">✕</button>`));
+  html.push(section("none", "Other chats", state.sessions.filter((s) => !known.has(s.groupId)), ""));
+  list.innerHTML = html.join("");
+}
+
+async function newChatGroup() {
+  const name = (prompt("Name of the new group:") || "").trim();
+  if (!name) return;
+  try {
+    const g = (await api("POST", "/api/conversation-groups", { name })).group;
+    state.groups = [...(state.groups || []), g];
+    renderSessionList();
+  } catch (e) { toast(`Could not create the group: ${e.message || e}`); }
+}
+
+async function renameChatGroup(gid) {
+  const g = (state.groups || []).find((x) => x.id === gid);
+  if (!g) return;
+  const name = (prompt("Rename group:", g.name) || "").trim();
+  if (!name || name === g.name) return;
+  try {
+    g.name = (await api("PATCH", `/api/conversation-groups/${gid}`, { name })).group.name;
+    renderSessionList();
+  } catch (e) { toast(`Could not rename the group: ${e.message || e}`); }
+}
+
+async function deleteChatGroup(gid) {
+  const g = (state.groups || []).find((x) => x.id === gid);
+  if (!g || !confirm(`Delete the group “${g.name}”? Its chats are kept and move to “Other chats”.`)) return;
+  try {
+    await api("DELETE", `/api/conversation-groups/${gid}`);
+    state.groups = state.groups.filter((x) => x.id !== gid);
+    for (const s of state.sessions) if (s.groupId === gid) s.groupId = null;
+    setGroupFolded(gid, false);
+    renderSessionList();
+  } catch (e) { toast(`Could not delete the group: ${e.message || e}`); }
+}
+
+async function moveSessionToGroup(id, gid) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s || !s.cid || (s.groupId ?? null) === gid) return;
+  const before = s.groupId ?? null;
+  s.groupId = gid;
+  if (gid !== null) setGroupFolded(gid, false);
+  renderSessionList();
+  try { await api("PATCH", `/api/conversations/${s.cid}`, { group_id: gid }); }
+  catch (e) { s.groupId = before; renderSessionList(); toast(`Could not move the chat: ${e.message || e}`); }
+}
+
+async function renameSession(id) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s || !s.cid) return;
+  const title = (prompt("Rename chat:", s.title || "") || "").trim();
+  if (!title || title === s.title) return;
+  try {
+    const c = (await api("PATCH", `/api/conversations/${s.cid}`, { title, title_source: "user" })).conversation;
+    s.title = c.title; s.titleSource = c.title_source;
+    if (s.id === state.activeId) $("chatTitle").textContent = s.title;
+    renderSessionList();
+  } catch (e) { toast(`Could not rename the chat: ${e.message || e}`); }
+}
+
+// The ⋯ menu of one chat: rename it, or file it under a group.
+function closeSessionMenu() { document.getElementById("sessionMenu")?.remove(); }
+function openSessionMenu(id, anchor) {
+  closeSessionMenu();
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s) return;
+  const groups = state.groups || [];
+  const here = groups.some((g) => g.id === s.groupId) ? s.groupId : null;
+  const menu = document.createElement("div");
+  menu.id = "sessionMenu";
+  menu.className = "session-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML =
+    `<button type="button" role="menuitem" data-menu-rename="${id}">Rename chat…</button>
+     <div class="session-menu-label">Move to</div>` +
+    groups.map((g) => `<button type="button" role="menuitem" data-menu-move="${g.id}" ${g.id === here ? 'aria-current="true"' : ""}>${escapeHtml(g.name)}</button>`).join("") +
+    (groups.length ? `<button type="button" role="menuitem" data-menu-move="none" ${here === null ? 'aria-current="true"' : ""}>Other chats (no group)</button>` : "") +
+    `<button type="button" role="menuitem" data-menu-newgroup="1">New group…</button>`;
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8))}px`;
+  menu.addEventListener("click", async (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    closeSessionMenu();
+    if (b.dataset.menuRename) return renameSession(id);
+    if (b.dataset.menuMove) return moveSessionToGroup(id, b.dataset.menuMove === "none" ? null : Number(b.dataset.menuMove));
+    if (b.dataset.menuNewgroup) {
+      const n = (state.groups || []).length;
+      await newChatGroup();
+      const made = (state.groups || [])[n];
+      if (made) moveSessionToGroup(id, made.id);
+    }
+  });
+  menu.querySelector("button")?.focus();
 }
 
 // A chat that waits for an answer says what it waits for; a chat whose run is in flight says so.
@@ -1485,7 +1623,7 @@ function pushMessage(msg) {
     s.title = sessionTitle(msg.content);
     $("chatTitle").textContent = s.title;
     renderSessionList();
-    if (authed() && s.cid) api("PATCH", `/api/conversations/${s.cid}`, { title: s.title }).catch(() => {});
+    if (authed() && s.cid) api("PATCH", `/api/conversations/${s.cid}`, { title: s.title, title_source: "prompt" }).catch(() => {});
   }
   syncMessage(s, msg);
   persistSessions();
@@ -3444,6 +3582,27 @@ function handleWsMessage(msg) {
     return;
   }
   switch (msg.type) {
+    // The gateway attached a dataset the user picked on its card: show it on the chat.
+    case "chat_datasets": {
+      const s = state.sessions.find((x) => String(x.id) === String(msg.conversation_id));
+      if (s && s.cid) {
+        api("GET", `/api/conversations/${s.cid}`).then((data) => {
+          hydrateChatDatasets(chatOf(s.id), data);
+          if (s.id === state.activeId) { syncDatasetSelection(); renderDatasetChips(); }
+        }).catch(() => {});
+      }
+      break;
+    }
+    // The session's model named the chat by what its first request asks for.
+    case "chat_title": {
+      const s = state.sessions.find((x) => String(x.id) === String(msg.conversation_id));
+      if (s && msg.title && s.titleSource !== "user") {
+        s.title = msg.title; s.titleSource = "intent";
+        if (s.id === state.activeId) $("chatTitle").textContent = s.title;
+        renderSessionList();
+      }
+      break;
+    }
     case "status": applyStatus(msg.connection); break;
     case "session_state": renderSessionState(msg.session); break;   // the session's copies and state on HPC3
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
@@ -7549,7 +7708,7 @@ function sharedChipLabel(a) {
 }
 function sharedChipsHtml(list) {
   return (list || []).map((a) =>
-    `<span class="dataset-chip active shared" title="${escapeHtml(sharedChipLabel(a))}">` +
+    `<span class="dataset-chip active shared" title="${escapeHtml(sharedChipLabel(a) + (Array.isArray(a.files) && a.files.length > 1 ? `: ${a.files.join(", ")}` : ""))}">` +
     `<span class="material-symbols-outlined msym">${datasetIcon("folder")}</span>` +
     `<span class="dataset-chip-name">${escapeHtml(sharedChipLabel(a))}${a.role === "primary" ? " ★" : ""}</span>` +
     (a.role === "primary" ? '<span class="dataset-chip-role">main</span>'
@@ -7582,11 +7741,18 @@ function changeChatSharedDatasets(c, change) {
 }
 // Attach a shared dataset: the whole version (files null) or the named files; version "latest" follows
 // the newest published one, a label pins it.
+// A file picked by name joins the files of that dataset already attached by name (same version), so
+// two members can be picked one after the other; a pick of the whole version replaces them.
 function attachSharedDataset(slug, version, files, sid) {
   return changeChatSharedDatasets(chatOf(sid || state.activeId), (next) => {
     const entry = { shared: slug, version: version || "latest", files: files && files.length ? files : null, role: "reference" };
     const at = next.findIndex((a) => a.shared === slug);
-    if (at < 0) next.push(entry); else next[at] = { ...next[at], ...entry };
+    if (at < 0) { next.push(entry); return; }
+    const had = next[at];
+    if (entry.files && Array.isArray(had.files) && had.version === entry.version) {
+      entry.files = [...new Set([...had.files, ...entry.files])];
+    }
+    next[at] = { ...had, ...entry, role: had.role || entry.role };
   });
 }
 function makeSharedMain(slug) {
@@ -7610,7 +7776,8 @@ function sharedFilesHtml(ds, view) {
   const label = view.version.label;
   const cells = (f) => (f.facets && Number.isInteger(f.facets.n_obs) ? ` · ${f.facets.n_obs.toLocaleString()} cells` : "");
   const cell = (f) => `<div class="shared-cell"><span class="muted">${escapeHtml(fmtSize(f.size_bytes) + cells(f))}</span>` +
-    `<button type="button" class="ghost small" data-shared-preview="${escapeHtml(f.name)}" data-slug="${escapeHtml(ds.slug)}" data-label="${escapeHtml(label)}">Preview</button></div>`;
+    `<button type="button" class="ghost small" data-shared-preview="${escapeHtml(f.name)}" data-slug="${escapeHtml(ds.slug)}" data-label="${escapeHtml(label)}">Preview</button>` +
+    `<button type="button" class="ghost small" data-shared-use-file="${escapeHtml(f.name)}" title="Attach only this file to the chat. Pick another file to add it.">Use this file</button></div>`;
   const faceted = files.filter((f) => f.facets && f.facets.tissue && f.facets.modality);
   const loose = files.filter((f) => !faceted.includes(f));
   let html = "";
@@ -7765,6 +7932,17 @@ async function onSharedClick(e) {
   if (panel) {
     sharedUi.open[ds.slug] = sharedUi.open[ds.slug] === panel.dataset.sharedPanel ? null : panel.dataset.sharedPanel;
     renderShared();
+    return;
+  }
+  const useFile = e.target.closest("[data-shared-use-file]");
+  if (useFile) {
+    const pick = sharedPicked(ds), file = useFile.dataset.sharedUseFile;
+    if (await attachSharedDataset(ds.slug, pick, [file])) {
+      const a = ((activeChat() || {}).shared || []).find((x) => x.shared === ds.slug);
+      const n = a && Array.isArray(a.files) ? a.files.length : 1;
+      toast(n > 1 ? `${file} added: ${n} files of ${ds.name} are attached to the chat.`
+        : `${file} of ${ds.name} attached to the chat.`);
+    }
     return;
   }
   if (e.target.closest("[data-shared-use]")) {
@@ -10889,12 +11067,58 @@ function init() {
     if (x) { state.serverOfferDismissed.add(x.dataset.spoDismiss); renderServerPathOffer(); }
   });
   $("newSessionBtn").addEventListener("click", newSession);
+  $("newGroupBtn").addEventListener("click", newChatGroup);
   $("sessionList").addEventListener("click", (e) => {
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); deleteSession(del.dataset.del); return; }
+    const more = e.target.closest("[data-more]");
+    if (more) { e.stopPropagation(); openSessionMenu(more.dataset.more, more); return; }
+    const gr = e.target.closest("[data-group-rename]");
+    if (gr) { e.stopPropagation(); renameChatGroup(Number(gr.dataset.groupRename)); return; }
+    const gd = e.target.closest("[data-group-del]");
+    if (gd) { e.stopPropagation(); deleteChatGroup(Number(gd.dataset.groupDel)); return; }
+    const head = e.target.closest("[data-group-toggle]");
+    if (head) { const gid = head.dataset.groupToggle; setGroupFolded(gid, !foldedGroups().has(gid)); renderSessionList(); return; }
     const item = e.target.closest("[data-id]");
     if (item) selectSession(item.dataset.id);
   });
+  $("sessionList").addEventListener("keydown", (e) => {
+    const head = e.target.closest("[data-group-toggle]");
+    if (head && e.target === head && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); head.click(); }
+  });
+  $("sessionList").addEventListener("dblclick", (e) => {
+    const t = e.target.closest(".session-title");
+    const item = t && t.closest("[data-id]");
+    if (item && authed()) renameSession(item.dataset.id);
+  });
+  // Drag a chat onto a group (or onto "Other chats") to file it there.
+  $("sessionList").addEventListener("dragstart", (e) => {
+    const item = e.target.closest?.(".session-item[draggable=true]");
+    if (!item) return;
+    e.dataTransfer.setData("text/x-aiscientist-chat", item.dataset.id);
+    e.dataTransfer.effectAllowed = "move";
+  });
+  $("sessionList").addEventListener("dragover", (e) => {
+    const g = e.target.closest?.(".session-group");
+    if (!g || ![...e.dataTransfer.types].includes("text/x-aiscientist-chat")) return;
+    e.preventDefault();
+    $("sessionList").querySelectorAll(".drop-target").forEach((x) => x !== g && x.classList.remove("drop-target"));
+    g.classList.add("drop-target");
+  });
+  $("sessionList").addEventListener("dragleave", (e) => {
+    const g = e.target.closest?.(".session-group");
+    if (g && !g.contains(e.relatedTarget)) g.classList.remove("drop-target");
+  });
+  $("sessionList").addEventListener("drop", (e) => {
+    const g = e.target.closest?.(".session-group");
+    const id = e.dataTransfer.getData("text/x-aiscientist-chat");
+    if (!g || !id) return;
+    e.preventDefault();
+    g.classList.remove("drop-target");
+    moveSessionToGroup(id, g.dataset.group === "none" ? null : Number(g.dataset.group));
+  });
+  document.addEventListener("click", (e) => { if (!e.target.closest("#sessionMenu, [data-more]")) closeSessionMenu(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSessionMenu(); });
   $("toggleLeft").addEventListener("click", () => togglePanel("left"));
   $("toggleRight").addEventListener("click", () => togglePanel("right"));
   $("sideTabPlan").addEventListener("click", () => { state.planView = null; selectSideTab("plan"); renderPlanPanel(); });

@@ -23,7 +23,7 @@ from sqlalchemy import func, or_, select
 from . import auth, email_send, rate_limit
 from .dataset_limits import MAX_BOUND_DATASETS
 from .db import session_scope
-from .models import (Conversation, ConversationDataset, Dataset, LlmCall, Message, PendingRegistration, Run,
+from .models import (Conversation, ConversationDataset, ConversationGroup, Dataset, LlmCall, Message, PendingRegistration, Run,
                      UsageBudget, User)
 
 router = APIRouter(prefix="/api")
@@ -847,6 +847,11 @@ class ConversationCreate(BaseModel):
 
 class ConversationPatch(BaseModel):
     title: str | None = None
+    # Who wrote `title`: "user" (typed in the sidebar; the model's title never replaces it) or
+    # "prompt" (the page's own title from the first message, the default).
+    title_source: str | None = None
+    # The group to file the chat under; null takes it out of its group. Sent only to change it.
+    group_id: int | None = None
     preset_key: str | None = None        # the selected research path (or "" to clear)
     context_prompt: str | None = None    # the user-edited methodology guidance (or "" to clear)
 
@@ -875,7 +880,11 @@ def list_conversations(request: Request) -> dict:
             select(Conversation).where(Conversation.user_id == user.id)
             .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
         ).all()
-        return {"conversations": [c.public() for c in rows]}
+        groups = s.scalars(
+            select(ConversationGroup).where(ConversationGroup.user_id == user.id)
+            .order_by(ConversationGroup.position, ConversationGroup.id)
+        ).all()
+        return {"conversations": [c.public() for c in rows], "groups": [g.public() for g in groups]}
 
 
 @router.post("/conversations")
@@ -954,13 +963,80 @@ def update_conversation(cid: int, req: ConversationPatch, request: Request) -> d
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
         if req.title is not None:
-            conv.title = (req.title.strip() or "New chat")[:255]
+            source = "user" if req.title_source == "user" else "prompt"
+            # A late automatic title (the page's, from the first message) never replaces one the
+            # user typed or the model's reading of the request.
+            if source == "user" or (conv.title_source or "prompt") == "prompt":
+                conv.title = (req.title.strip() or "New chat")[:255]
+                conv.title_source = source if req.title.strip() else None
+        if "group_id" in req.model_fields_set:
+            if req.group_id is not None:
+                _owned_group(s, req.group_id, user.id)
+            conv.group_id = req.group_id
         if req.preset_key is not None:
             conv.preset_key = (req.preset_key.strip()[:64] or None)
         if req.context_prompt is not None:
             conv.context_prompt = (req.context_prompt or None)
         s.commit()
         return {"conversation": conv.public()}
+
+
+class GroupInput(BaseModel):
+    name: str
+
+
+def _group_name(raw: str) -> str:
+    name = " ".join((raw or "").split())[:80]
+    if not name:
+        raise HTTPException(status_code=400, detail="A group needs a name")
+    return name
+
+
+def _owned_group(s, gid: int, user_id: int) -> ConversationGroup:
+    group = s.get(ConversationGroup, gid)
+    if group is None or group.user_id != user_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    return group
+
+
+@router.post("/conversation-groups")
+def create_conversation_group(req: GroupInput, request: Request) -> dict:
+    """A new, empty group at the end of the user's list."""
+    user = require_user(request)
+    name = _group_name(req.name)
+    with session_scope() as s:
+        last = s.scalar(select(func.max(ConversationGroup.position))
+                        .where(ConversationGroup.user_id == user.id))
+        group = ConversationGroup(user_id=user.id, name=name, position=(last or 0) + 1)
+        s.add(group)
+        s.commit()
+        return {"group": group.public()}
+
+
+@router.patch("/conversation-groups/{gid}")
+def rename_conversation_group(gid: int, req: GroupInput, request: Request) -> dict:
+    user = require_user(request)
+    name = _group_name(req.name)
+    with session_scope() as s:
+        group = _owned_group(s, gid, user.id)
+        group.name = name
+        s.commit()
+        return {"group": group.public()}
+
+
+@router.delete("/conversation-groups/{gid}")
+def delete_conversation_group(gid: int, request: Request) -> dict:
+    """Remove a group. Its chats are kept and become ungrouped."""
+    user = require_user(request)
+    with session_scope() as s:
+        group = _owned_group(s, gid, user.id)
+        chats = list(s.scalars(select(Conversation).where(
+            Conversation.user_id == user.id, Conversation.group_id == gid)).all())
+        for conv in chats:
+            conv.group_id = None
+        s.delete(group)
+        s.commit()
+        return {"status": "ok", "ungrouped": len(chats)}
 
 
 @router.delete("/conversations/{cid}")

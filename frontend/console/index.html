@@ -220,7 +220,10 @@
               <div class="sessions">
                 <div class="sessions-head">
                   <h2>Chats</h2>
-                  <button id="newSessionBtn" type="button" class="icon-btn" title="New chat">+</button>
+                  <span class="sessions-actions">
+                    <button id="newGroupBtn" type="button" class="icon-btn hidden" title="New group" aria-label="New group"><span class="material-symbols-outlined" aria-hidden="true">create_new_folder</span></button>
+                    <button id="newSessionBtn" type="button" class="icon-btn" title="New chat">+</button>
+                  </span>
                 </div>
                 <div id="sessionList" class="session-list"></div>
               </div>

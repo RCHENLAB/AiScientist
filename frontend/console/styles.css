@@ -1078,6 +1078,53 @@ button.full { width: 100%; margin-top: 6px; }
   background: transparent; color: var(--text-tertiary); opacity: 0; transition: opacity 0.12s, background 0.12s;
 }
 .session-item:hover .session-del { opacity: 1; }
+/* The chat's ⋯ menu: rename it or file it under a group. Shown like Delete, on hover or focus. */
+.session-more {
+  width: 22px; height: 22px; padding: 0; border-radius: 6px; font-size: 14px; line-height: 1; flex: none;
+  background: transparent; color: var(--text-tertiary); opacity: 0; transition: opacity 0.12s, background 0.12s;
+}
+.session-item:hover .session-more, .session-more:focus-visible, .session-del:focus-visible { opacity: 1; }
+.session-more:hover { background: var(--surface-hover); color: var(--text); }
+.sessions-actions { display: inline-flex; gap: 6px; }
+.sessions-actions .material-symbols-outlined { font-size: 17px; }
+/* A group of chats. Its head folds it; a chat dragged over it is dropped into it. */
+.session-group { display: flex; flex-direction: column; gap: 3px; border-radius: 10px; }
+.session-group + .session-group { margin-top: 6px; }
+.session-group.drop-target { outline: 1.5px dashed var(--accent); outline-offset: 2px; }
+.session-group-head {
+  display: flex; align-items: center; gap: 6px; padding: 5px 6px 5px 4px; border-radius: 8px;
+  cursor: pointer; user-select: none; color: var(--text-secondary);
+}
+.session-group-head:hover { background: var(--surface-sunken); }
+.session-group-caret { font-size: 11px; width: 12px; text-align: center; transition: transform 0.12s; }
+.session-group.folded .session-group-caret { transform: rotate(-90deg); }
+.session-group-name {
+  flex: 1; min-width: 0; font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session-group-count { font-size: 11px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.session-group-btn {
+  width: 20px; height: 20px; padding: 0; border-radius: 6px; font-size: 11px; flex: none;
+  background: transparent; color: var(--text-tertiary); opacity: 0; transition: opacity 0.12s, background 0.12s;
+}
+.session-group-head:hover .session-group-btn, .session-group-btn:focus-visible { opacity: 1; }
+.session-group-btn:hover { background: var(--surface-hover); color: var(--text); }
+.session-group .session-empty { padding: 4px 11px 6px 22px; font-size: 12px; }
+.session-menu {
+  position: fixed; z-index: 1000; min-width: 190px; max-width: 280px; max-height: 60vh; overflow: auto;
+  padding: 5px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16); display: flex; flex-direction: column; gap: 1px;
+}
+.session-menu button {
+  text-align: left; padding: 7px 9px; border-radius: 7px; background: transparent; color: var(--text);
+  font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session-menu button:hover, .session-menu button:focus-visible { background: var(--surface-sunken); }
+.session-menu button[aria-current="true"] { color: var(--accent); font-weight: 500; }
+.session-menu-label {
+  padding: 7px 9px 3px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--text-tertiary);
+}
 .session-del:hover { background: rgba(255, 59, 48, 0.12); color: var(--red); }
 
 /* chat header */

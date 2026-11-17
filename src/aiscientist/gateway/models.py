@@ -286,6 +286,13 @@ class Conversation(Base):
     # it survives a reload/device change, like the messages themselves.
     preset_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     context_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The group the chat is filed under in the sidebar; None = not in a group.
+    # A plain column (SQLite cannot add a foreign key to an existing table): the API checks that the
+    # group is the owner's and clears this when the group is deleted.
+    group_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Where the title came from: None/"prompt" = the first message's opening words, "intent" = the
+    # session's model named what the request asks for, "user" = typed by the user (never replaced).
+    title_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="conversations", foreign_keys=[user_id])
     messages: Mapped[list["Message"]] = relationship(
@@ -300,11 +307,27 @@ class Conversation(Base):
 
     def public(self) -> dict:
         return {
-            "id": self.id, "title": self.title,
+            "id": self.id, "title": self.title, "title_source": self.title_source or "prompt",
+            "group_id": self.group_id,
             "preset_key": self.preset_key, "context_prompt": self.context_prompt,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class ConversationGroup(Base):
+    """A named group of one user's chats in the sidebar. Deleting it leaves its chats ungrouped."""
+
+    __tablename__ = "conversation_groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def public(self) -> dict:
+        return {"id": self.id, "name": self.name, "position": self.position}
 
 
 class ConversationDataset(Base):

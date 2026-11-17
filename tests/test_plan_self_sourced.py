@@ -145,3 +145,19 @@ def test_the_reply_that_failed_on_haiku_and_dsv4_is_still_not_a_plan_and_is_aske
     assert len(calls) == 2 and _of(events, "plan_reformat")
     assert '"self_sourced"' in calls[1][-1]["content"]
     assert lab.self_sourced == NOTE
+
+
+def test_placeholder_agenda_item_is_not_a_step():
+    """Production run 7b22297797ac (Haiku): the planner closed a one-step agenda with the item
+    "x". It was shown as step 2 and the plan review could not remove it from a two-step plan."""
+    from aiscientist.agents.research_lab.plan_parse import _is_placeholder_step, _parse_agenda
+
+    real = "**VEP & ClinVar annotation** — Annotate every variant with `mcp_annotate_variants`."
+    reply = json.dumps({"breadth": "specific", "agenda": [real, "x"], "self_sourced": "", "later": []})
+    assert _parse_agenda(reply, 8) == [real]
+    for filler in ("x", "-", "...", "…", "<step>", "TBD", "n/a"):
+        assert _is_placeholder_step(filler), filler
+    for step in ("QC", "Cluster the cells", "Run `run_de`", "聚类"):
+        assert not _is_placeholder_step(step), step
+    # Nothing but placeholders: left as sent, so the caller sees the model's reply.
+    assert _parse_agenda(json.dumps(["x", "..."]), 8) == ["x", "..."]

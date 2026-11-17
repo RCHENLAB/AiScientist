@@ -9469,6 +9469,171 @@ def _begin_routed_run(conn: Connection, conversation_id: str | None) -> RunState
     return run
 
 
+_DATA_OFFER_ASKS = 2      # the card is put once more for an answer that names no choice
+
+
+def _data_offer_sources(conn: Connection) -> "tuple[list[dict], list[dict]]":
+    """What a request with no data may mean: each shared dataset's latest version with the files a
+    run can analyse, and the account's own complete uploads, newest first. Either is empty when it
+    cannot be read; neither raises."""
+    shared: list[dict] = []
+    own: list[dict] = []
+    try:
+        from . import shared_datasets as sd
+        if sd.store_root() is not None:
+            for ds in sd.dataset_views():
+                if not ds.get("latest"):
+                    continue
+                version = sd.version_view(ds["slug"])["version"]
+                files = [f for f in version.get("files") or []
+                         if _primary_suffix(f["name"]) not in (None, *_NOT_ANALYSABLE)]
+                shared.append({"slug": ds["slug"], "name": ds["name"], "label": version["label"], "files": files})
+    except Exception as exc:  # noqa: BLE001 - no shared datasets to offer
+        print(f"[data-offer] shared datasets not read: {type(exc).__name__}: {exc}")
+    try:
+        if _AUTH_ENABLED and conn.app_user_id:
+            from sqlalchemy import select
+
+            from .db import session_scope
+            from .models import Dataset
+            with session_scope() as s:
+                rows = s.scalars(select(Dataset).where(
+                    Dataset.user_id == int(conn.app_user_id), Dataset.status == "complete")
+                    .order_by(Dataset.uploaded_at.desc(), Dataset.id.desc()).limit(200)).all()
+                own = [{"id": d.id, "name": d.name, "path": d.path, "size_bytes": d.size_bytes,
+                        "uploaded_at": d.uploaded_at.isoformat() if d.uploaded_at else ""} for d in rows]
+    except Exception as exc:  # noqa: BLE001 - no uploads to offer
+        print(f"[data-offer] uploads not read: {type(exc).__name__}: {exc}")
+    return shared, own
+
+
+def _save_offered_data(conn: Connection, conversation_id: "str | None", pick: Any) -> None:
+    """Attach the picked dataset to the account's chat, so the chat shows it and the next message
+    sends it. Best-effort: this run already has it."""
+    try:
+        cid = int(str(conversation_id or ""))
+        if not (_AUTH_ENABLED and conn.app_user_id):
+            return
+        from .db import session_scope
+        from .models import Conversation, ConversationDataset
+        with session_scope() as s:
+            conv = s.get(Conversation, cid)
+            if conv is None or conv.user_id != int(conn.app_user_id):
+                return
+            if pick.kind == "shared":
+                from . import shared_datasets as sd
+                sd.replace_attachments(s, cid, [{"shared": pick.slug, "version": sd.LATEST,
+                                                 "files": pick.files, "role": "reference"}],
+                                       other_attached=len(conv.datasets))
+            elif not any(d.dataset_id == pick.dataset_id for d in conv.datasets):
+                conv.datasets.append(ConversationDataset(dataset_id=pick.dataset_id,
+                                                         position=len(conv.datasets), role=None))
+            s.commit()
+        conn.push({"type": "chat_datasets", "conversation_id": str(cid)})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[data-offer] attachment not saved: {type(exc).__name__}: {exc}")
+
+
+async def _offer_unattached_data(conn: Connection, req: LabRequest) -> LabRequest:
+    """A request with no dataset attached that points at a shared dataset or an upload
+    (``dataset_offers``): put the choices on the clarify card, shared datasets first, and wait.
+    Returns the request with the picked data bound, or the request as it came: nothing matched, the
+    user chose to go on without, or the card went unanswered. A chat asked once and answered "without"
+    is not asked again in this session."""
+    from . import dataset_offers
+    if _select_bound_datasets(req) or req.shared_datasets:
+        return req
+    declined = conn.__dict__.setdefault("_data_offer_declined", set())
+    key = str(req.conversation_id or "")
+    if key in declined:
+        return req
+    shared, own = await asyncio.to_thread(_data_offer_sources, conn)
+    choices = dataset_offers.offers(req.question, shared, own)
+    if not choices:
+        return req
+    options = [o.text for o in choices] + [dataset_offers.NONE_OPTION]
+    lead = "No dataset is attached to this chat"
+    pick: Any = False
+    for _ in range(_DATA_OFFER_ASKS):
+        q = {"question": f"{lead}. Which one should this request use?", "options": options}
+        conn.plan_value = None
+        conn.plan_event.clear()
+        conn.pending_plan = {"kind": "clarify", "payload": [q]}
+        conn.push({"type": "plan_clarify", "questions": [q]})
+        got = await asyncio.to_thread(conn.plan_event.wait, 600)
+        conn.pending_plan = None
+        conn.push({"type": "plan_done"})
+        if not got:
+            conn.push({"type": "lab_progress", "level": "info",
+                       "text": "No dataset was chosen in time: going on without one."})
+            return req
+        fb = str((conn.plan_value or {}).get("feedback", ""))
+        conn.plan_value = None
+        pick = dataset_offers.answer(fb, choices)
+        if pick is not False:
+            break
+        said = " ".join(fb.rsplit("?:", 1)[-1].split())[:80]
+        lead = f"“{said}” does not say which dataset" if said else "No dataset was picked"
+    if not pick:
+        declined.add(key)
+        conn.push({"type": "lab_progress", "level": "info", "text": "Going on without a dataset."})
+        return req
+    try:
+        if pick.kind == "shared":
+            from . import shared_datasets as sd
+            bound = req.model_copy(update={"shared_datasets": [
+                {"shared": pick.slug, "version": sd.LATEST, "files": pick.files, "role": "reference"}]})
+            bound._shared_resolved = await asyncio.to_thread(_resolve_shared_refs, bound, conn)
+        else:
+            bound = req.model_copy(update={
+                "dataset_path": pick.path, "datasets": [{"path": pick.path, "name": pick.name, "role": None}]})
+        _select_bound_datasets(bound)
+    except Exception as exc:  # noqa: BLE001 - the pick cannot be bound: say so and go on as before
+        detail = getattr(exc, "detail", None) or str(exc)
+        conn.push({"type": "lab_progress", "level": "warn",
+                   "text": f"That dataset could not be attached ({detail}): going on without one."})
+        return req
+    await asyncio.to_thread(_save_offered_data, conn, req.conversation_id, pick)
+    conn.push({"type": "lab_progress", "level": "info", "text": f"📎 Using {pick.text} ({pick.why})."})
+    return bound
+
+
+_CHAT_NAMING: "set[asyncio.Task]" = set()
+
+
+def _name_chat_soon(conn: Connection, req: LabRequest) -> None:
+    """Name the chat by what this request asks for, beside the request and never in its way."""
+    try:
+        task = asyncio.get_running_loop().create_task(asyncio.to_thread(_name_chat, conn, req))
+    except RuntimeError:   # no loop (a direct call in a test)
+        return
+    _CHAT_NAMING.add(task)
+    task.add_done_callback(_CHAT_NAMING.discard)
+
+
+def _name_chat(conn: Connection, req: LabRequest) -> str:
+    """Title an account's chat with the session model's reading of the request (role ``classify``)
+    and tell the page. Does nothing for a chat that is already named this way or by the user, for a
+    session whose model is not up (the next message tries again), and for a chat with no account.
+    Never raises. Returns the title it stored, or ""."""
+    from . import chat_titles
+    try:
+        cid = int(str(req.conversation_id or ""))
+        user_id = _owner_user_id(conn.owner)
+        if user_id is None or not chat_titles.wants_title(user_id, cid):
+            return ""
+        complete, _ = _session_llm(conn, "classify")
+        intent = chat_titles.intent_title(complete, req.question)
+        names = [str(d.get("name") or "") for d in _select_bound_datasets(req)]
+        title = chat_titles.store(user_id, cid, intent, names)
+        if title:
+            conn.push({"type": "chat_title", "conversation_id": str(cid), "title": title})
+        return title
+    except Exception as exc:  # noqa: BLE001 - a title is never worth a failed request
+        print(f"[title] chat not named: {type(exc).__name__}: {exc}")
+        return ""
+
+
 async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     """Entry for a composer message: route a follow-up to edit-report / re-run-step / new-study,
     or fall through to a fresh run. Only engages when a prior bundle exists; classifies with the
@@ -9481,6 +9646,7 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     run = _begin_routed_run(conn, req.conversation_id)
     _note_budget_choice(run, req)
     _watch_run(conn, run, req)
+    _name_chat_soon(conn, req)
     try:
         await _dispatch_lab_run(conn, req)
     finally:
@@ -9698,6 +9864,9 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
     if target is None:
+        # A new analysis in a chat with nothing attached: when the request points at a shared
+        # dataset or an upload, ask which to use before anything is planned.
+        req = await _offer_unattached_data(conn, req)
         await _run_lab(conn, req)
         return
     run_id, art, state = target
@@ -19551,6 +19720,15 @@ def _result_pointer_path(owner: str, run_id: str, what: str = "dataset") -> Path
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / name
 
 
+def _write_pointer(path: Path, rec: dict) -> None:
+    """Replace a result pointer in one step. Written in place, it is empty for a moment, and a
+    reader in that moment (the page asking whether a result is saved, while the copy back from HPC3
+    finishes in its thread) took the result for one with no record."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _read_pointer(path: Path) -> "dict | None":
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
@@ -19586,7 +19764,7 @@ def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dic
            "size_bytes": sum(f["size"] for f in files),
            "kept_days": conn.settings.checkpoint_ttl_days, "until_disconnect": False}
     pointer.parent.mkdir(parents=True, exist_ok=True)
-    pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    _write_pointer(pointer, rec)
     return rec
 
 
@@ -19842,7 +20020,7 @@ def _save_run_result_locked(owner: str, user_id: "int | None", run_id: str, what
                     return 202, {"ok": True, "saving": True, "name": name}
                 rec.pop("save_error", None)
                 rec["saving"] = {"started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+                _write_pointer(pointer_path, rec)
             threading.Thread(target=_bring_result_home,
                              args=(owner, user_id, run_id, what, conn, src, pointer_path),
                              name=f"save-result-{run_id}", daemon=True).start()
@@ -19957,7 +20135,7 @@ def _save_curation_tables_locked(owner: str, user_id: "int | None", run_id: str)
     rec.update(saved_to=dest, saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     rec.pop("save_error", None)
     try:
-        pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        _write_pointer(pointer, rec)
     except OSError as exc:
         print(f"[curation] could not update {pointer}: {exc}")
     return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name, "kind": "folder"}
@@ -19985,7 +20163,7 @@ def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder:
     rec.update(saved_to=dest, path=dest, saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                **({"location": location} if location else {}))
     try:
-        pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        _write_pointer(pointer_path, rec)
         if re.fullmatch(r"result_dataset\.[A-Za-z0-9_-]+\.json", pointer_path.name):
             aggregate_path = pointer_path.with_name("result_dataset.json")
             aggregate = _read_pointer(aggregate_path) or {}
@@ -20044,7 +20222,7 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
             now.pop("saving", None)
             now["save_error"] = f"{type(exc).__name__}: {public_error(exc)}"[:300]
             try:
-                pointer_path.write_text(json.dumps(now, indent=2), encoding="utf-8")
+                _write_pointer(pointer_path, now)
             except OSError:
                 pass
         for c in _owner_connections(safe_name(owner)):

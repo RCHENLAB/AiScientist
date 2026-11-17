@@ -55,7 +55,8 @@ scheduler traffic uses the user session; bulk files use the configured transfer 
 Users' data is kept on the gateway host ([dataset storage](../dataset_storage.md)); HPC3 holds a copy
 only while a session's runs need it. Datasets the lab maintains for every account, such as the eye atlas, are
 [shared datasets](../shared_datasets.md): published in immutable versions, with one read-only copy
-on each host. A session's data movement and housekeeping there go through a
+on each host. In the console a user files chats under their own groups, and a chat is titled by
+what its first request asks for ([chat groups and titles](../chat_groups_and_titles.md)). A session's data movement and housekeeping there go through a
 compute backend (`gateway/compute.py`: stage-in, submit, status, stage-out, clean-up), of which HPC3
 is the one implementation, and the console shows each session's state as it goes (staging in,
 running, staging out, cleaning up, closed, failed; `gateway/session_state.py`).

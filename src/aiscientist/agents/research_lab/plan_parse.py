@@ -72,8 +72,22 @@ def _parse_agenda(raw: str, max_steps: int) -> list[str] | None:
         parsed = parsed.get("steps") or parsed.get("agenda")
     if isinstance(parsed, list) and parsed:
         steps = [s for s in (_strip_step_ordinal(str(x)) for x in parsed) if s]
+        steps = [s for s in steps if not _is_placeholder_step(s)] or steps
         return steps[:max_steps] or None
     return None
+
+
+_PLACEHOLDER_STEPS = frozenset({"step", "tbd", "todo", "na"})
+
+
+def _is_placeholder_step(step: str) -> bool:
+    """True for an agenda item that says nothing: at most one letter or digit ("x", "-", "..."),
+    or a bare filler word ("<step>", "TBD", "n/a"; "None." is the disclosure line, handled as such). A model sometimes closes its list with one;
+    shown as a step it cannot be run, and the plan review may not remove it from a two-step plan.
+    A short real step ("QC") is kept. A list of nothing but placeholders is left as it is, so the
+    caller sees what the model sent."""
+    word = re.sub(r"[\W_]", "", step.lower())
+    return len(word) <= 1 or word in _PLACEHOLDER_STEPS
 
 
 # The PI's disclosure of what it decided on its OWN knowledge rather than from the research-path
