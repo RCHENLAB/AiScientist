@@ -63,7 +63,7 @@ def test_base_wheel_contains_registry_and_can_register_atlas(tmp_path, skill_rel
     with zipfile.ZipFile(app_wheel) as archive:
         info = message_from_bytes(archive.read(next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))))
         assert "aiscientist/agents/mcp_catalog/mcp_servers.json" in archive.namelist()
-        assert "aiscientist/agents/mcp_catalog/mcp/atlas-expression-exploration-0.0.3.tools.json" in archive.namelist()
+        assert "aiscientist/agents/mcp_catalog/mcp/atlas-expression-exploration-0.0.4.tools.json" in archive.namelist()
         assert "aiscientist/tools/run_scanpy_qc/TOOL.md" not in archive.namelist()
         assert "aiscientist/tools/worker_cli.py" in archive.namelist()
         assert "aiscientist/tools/_lib/dataset_preflight.py" in archive.namelist()

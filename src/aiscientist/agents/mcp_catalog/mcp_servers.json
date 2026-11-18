@@ -3,14 +3,14 @@
   "servers": [
     {
       "name": "atlas-expression-exploration",
-      "version": "0.0.3",
-      "release_tag": "atlas-expression-exploration-v0.0.3",
-      "image": "docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a",
+      "version": "0.0.4",
+      "release_tag": "atlas-expression-exploration-v0.0.4",
+      "image": "docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf",
       "entrypoint": "atlas-expression-exploration-mcp",
       "skill": "explore-atlas-expression-with-aiscientist-mcp",
       "runs_on": "hpc:atlas-expression",
-      "tools_file": "mcp/atlas-expression-exploration-0.0.3.tools.json",
-      "tools_sha256": "069f629e1056c37b57d3e6173d6b257200c4cc8b70782b128fa6a6111fcb0020",
+      "tools_file": "mcp/atlas-expression-exploration-0.0.4.tools.json",
+      "tools_sha256": "8874ebabca12a0372988692fcf40598922c2d4e47b9ebe19236e3cf4e77deaeb",
       "adapter": "atlas-expression",
       "aliases": {
         "write_report": "atlas_write_report"

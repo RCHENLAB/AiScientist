@@ -16,7 +16,7 @@ ATLAS_TOOLS = {_SERVER.planner_name(entry["name"]): entry["inputSchema"] for ent
 
 FIXTURE = Path(__file__).parent / "fixtures" / "atlas_expression"
 IMAGE = ("docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:"
-         "5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a")
+         "725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf")
 GENES = "LRAT, CRALBP, rho, ABCR"
 RESOLUTION = [
     {"query": "LRAT", "atlas_gene": "LRAT", "method": "exact"},
@@ -56,7 +56,7 @@ def tools(runner):
 def test_release_metadata_checksum_tier_and_exposure(release, monkeypatch):
     skill = skills.get_skill(atlas.SKILL)
     assert (skill.status, skill.registry_release) == ("community", "v0.2.0")
-    assert (skill.image, skill.cpus, skill.mem_gb, skill.time_limit) == (IMAGE, 4, 300, "04:00:00")
+    assert (skill.image, skill.cpus, skill.mem_gb, skill.time_limit) == (IMAGE, 4, 32, "04:00:00")
     assert set(ATLAS_TOOLS) <= tools(Runner()).keys()
     assert not set(ATLAS_TOOLS) & tools(None).keys()
     monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_ALLOWED_TIERS", "core,verified")
@@ -92,7 +92,7 @@ def test_resolution_flow_preserves_all_user_names_and_provenance(release, tmp_pa
     assert submitted["artifacts"] == ["gene_expression/q/gene_resolution.tsv"]
     for index, (command, image, kwargs) in enumerate(runner.calls):
         assert image == IMAGE
-        assert (kwargs["cpus"], kwargs["mem_gb"], kwargs["time_limit"]) == ((2, 16, "00:30:00") if index == 0 else (4, 300, "04:00:00"))
+        assert (kwargs["cpus"], kwargs["mem_gb"], kwargs["time_limit"]) == ((2, 16, "00:30:00") if index == 0 else (4, 32, "04:00:00"))
         cli = next(line for line in command.splitlines() if line.startswith("aiscientist-mcp "))
         assert json.loads(shlex.split(cli)[7]) == {"genes": GENES}
         assert 'ATLAS_H5AD="$AISCIENTIST_DATASET"' in command
@@ -186,7 +186,7 @@ def test_submit_uses_real_slurm_image_path_with_metadata(release):
     runner.dataset_path = Runner.dataset_path
     tools(runner)["submit_query"].executor({"genes": GENES}, None)
     script = "\n".join(hpc.commands)
-    for value in ("--cpus-per-task=4", "--mem=300G", "--time=04:00:00",
+    for value in ("--cpus-per-task=4", "--mem=32G", "--time=04:00:00",
                   "AISCI_EXECUTOR=inline", "call submit_query", "apptainer"):
         assert value in script
 
@@ -267,7 +267,7 @@ def test_omitting_atlas_registration_does_not_reopen_its_shell(release, tmp_path
 
 @pytest.mark.parametrize("changes", [
     {"adapter": "json"}, {"adapter": None}, {"skill": "unrelated-skill"},
-    {"name": "other", "release_tag": "other-v0.0.3"},
+    {"name": "other", "release_tag": "other-v0.0.4"},
 ])
 def test_atlas_binding_cannot_select_a_generic_adapter(tmp_path, changes):
     from aiscientist.agents.mcp_bridge import DEFAULT_CONFIG

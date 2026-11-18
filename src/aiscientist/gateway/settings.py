@@ -80,7 +80,8 @@ class HPCSettings:
     # allowed"), so ONLY the SFTP subsystem works — sbatch/squeue/module/apptainer and the vLLM
     # tunnel must stay on `host`. It mounts the SAME $HOME and /dfs3b, so paths and authorized_keys
     # are identical and no extra setup is needed.
-    # Set AISCIENTIST_HPC_TRANSFER_HOST="" to disable the split and stage over the login node again.
+    # AISCIENTIST_HPC_TRANSFER_HOST="" is for a cluster that has no transfer host: the session then
+    # carries the files. On HPC3 leave it set: RCIC allows no data transfer on a login node.
     transfer_host: str = "access-hpc3.rcic.uci.edu"
 
     # Slurm GPU allocation. UCI RUIC20 lab charges GPU jobs to ruic20_lab_gpu.

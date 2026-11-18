@@ -23,7 +23,7 @@
   },
   {
     "name": "submit_query",
-    "description": "Start a query: resolve names, then load the full atlas on a big-memory node and write query.h5ad\nplus summary tables. With the Slurm or local executor it returns at once with a query_id (poll\nquery_status); with the inline executor it returns when the step ends. Reuses a finished or\nrunning query unless rerun=True.",
+    "description": "Start a query: resolve names, then stream the atlas counts in row chunks and write query.h5ad\nplus summary tables. With the Slurm or local executor it returns at once with a query_id (poll\nquery_status); with the inline executor it returns when the step ends. Reuses a finished or\nrunning query unless rerun=True.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -77,6 +77,11 @@
         },
         "level": {
           "default": "majorclass",
+          "enum": [
+            "majorclass",
+            "celltype",
+            "region_class"
+          ],
           "title": "Level",
           "type": "string"
         },

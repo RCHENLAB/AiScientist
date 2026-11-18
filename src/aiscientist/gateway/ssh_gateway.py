@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterator
 
 import paramiko
 
-from .errors import (GatewayError, error_detail, public_error, redact_key_store_paths,
+from .errors import (GatewayError, TransferUnavailable, error_detail, public_error, redact_key_store_paths,
                      redact_server_paths)
 from .executor import ExecResult
 from .run_monitor import timed_stage
@@ -97,7 +97,7 @@ class SSHExecutor:
         self._emit = emit
         self._tunnels: list[tuple[int, socketserver.TCPServer]] = []
         # Data plane (see _open_sftp): a SECOND connection used only for file staging, so
-        # bulk transfers stay off the login node. "" / None = stage over the login session.
+        # bulk transfers stay off the login node. "" / None = a host with no transfer host: the session carries the files.
         self.transfer_host = (transfer_host or "").strip() or None
         self._connect_timeout = connect_timeout
         self._transfer_client: paramiko.SSHClient | None = None
@@ -112,7 +112,7 @@ class SSHExecutor:
         self._agent_dir: str | None = None
         self._agent_failed = False
         self._agent_lock = threading.Lock()
-        self._transfer_disabled = False  # set after the one-time fallback warning
+        self._transfer_announced = False  # the routing line is said once per session
         # Serializes reconnects: several threads hit a dead transport at once, and only ONE of
         # them should redial. ``_reconnect_rounds`` counts finished attempts, so a thread that
         # waited out someone else's failed round reports it instead of starting another.
@@ -423,23 +423,24 @@ class SSHExecutor:
 
     # -- file staging (SFTP over the DEDICATED transfer host) ----------------
 
-    def _fall_back_to_login_node(self, why: str) -> None:
-        """Give up on the transfer host for the rest of this session and say so ONCE.
+    def _no_transfer(self, why: str) -> "TransferUnavailable":
+        """The error for a transfer that cannot use the transfer host. It is never rerouted over
+        the login node: RCIC allows no data transfer there (rsync/SFTP/rclone/wget)."""
+        return TransferUnavailable(
+            f"Files cannot be moved to or from HPC3 because {why}. Transfers go through "
+            f"{self.transfer_host} only, never the login node {self.host}.",
+            stage="ssh_transfer")
 
-        Staging still works — it just rides the login session again. We stop retrying so a
-        dead/unreachable transfer host does not add a connect timeout to every single file.
-        """
-        self._transfer_disabled = True
-        self._emit(
-            "warning", "ssh_transfer",
-            f"Staging files over the login node {self.host} because {why}. RCIC asks that bulk "
-            "transfers (rsync/SFTP/rclone/wget) not run on a login node — set "
-            "AISCIENTIST_HPC_TRANSFER_HOST, or log in with an SSH key, to route them properly.",
-        )
+    @property
+    def transfer_ready(self) -> bool:
+        """Can this session move files? True with no transfer host configured (a host that has
+        none: the session itself carries them) or with a key that opens the transfer host."""
+        return self.transfer_host is None or self._transfer_pkey is not None
 
     def _transfer_session(self) -> "paramiko.SSHClient | None":
-        """The lazily-opened connection to ``transfer_host``, or None to use the login session."""
-        if self.transfer_host is None or self._transfer_disabled:
+        """The lazily-opened connection to ``transfer_host``; None only when no transfer host is
+        configured. Raises :class:`TransferUnavailable` when it cannot be opened."""
+        if self.transfer_host is None:
             return None
         if self._transfer_client is not None:
             existing = self._transfer_client.get_transport()
@@ -448,33 +449,49 @@ class SSHExecutor:
             self._transfer_client = None  # reaped mid-session; reopen below
 
         if self._transfer_pkey is None:
-            # Password sessions would need a SECOND Duo push, and firing one in the middle of a
-            # transfer is indistinguishable from a hang. Those stage over the login node until the
-            # user mints a key — which the gateway offers on their first password login.
-            self._fall_back_to_login_node("this session authenticated with a password, not an SSH key")
-            return None
+            # A password session would need a SECOND Duo push for the transfer host, in the middle
+            # of a transfer where nobody is watching for it. It needs a saved key instead, which
+            # the gateway makes on a password login.
+            raise self._no_transfer("this session signed in with a password and has no saved SSH key "
+                                    "(connect again with \"Save an SSH key\" ticked)")
 
-        try:
-            sock = socket.create_connection((self.transfer_host, self.port), timeout=self._connect_timeout)
-            transport = paramiko.Transport(sock)
-            transport.start_client(timeout=self._connect_timeout)
-            transport.auth_publickey(self.username, self._transfer_pkey)
-            if not transport.is_authenticated():
-                raise paramiko.AuthenticationException("Transfer host did not authenticate.")
+        # A transfer host that just failed is not dialled again for a minute: a dead one must not
+        # cost three connect timeouts for every file of a folder.
+        failed = getattr(self, "_transfer_failed", None)
+        if failed is not None and time.monotonic() - failed[0] < 60.0:
+            raise self._no_transfer(failed[1])
+        last: Exception | None = None
+        for attempt in range(3):
             try:
-                transport.set_keepalive(30)
-            except Exception:  # noqa: BLE001 - keepalive is best-effort
-                pass
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client._transport = transport
-        except Exception as exc:  # noqa: BLE001 - ANY failure here must degrade, never break a run
-            self._fall_back_to_login_node(f"{self.transfer_host} is not usable ({public_error(exc)})")
-            return None
+                sock = socket.create_connection((self.transfer_host, self.port), timeout=self._connect_timeout)
+                transport = paramiko.Transport(sock)
+                transport.start_client(timeout=self._connect_timeout)
+                transport.auth_publickey(self.username, self._transfer_pkey)
+                if not transport.is_authenticated():
+                    raise paramiko.AuthenticationException("Transfer host did not authenticate.")
+                try:
+                    transport.set_keepalive(30)
+                except Exception:  # noqa: BLE001 - keepalive is best-effort
+                    pass
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client._transport = transport
+                break
+            except Exception as exc:  # noqa: BLE001 - retried, then reported; never rerouted
+                last = exc
+                if attempt < 2:
+                    time.sleep(1.0 + attempt)
+        else:
+            why = f"{self.transfer_host} is not usable ({public_error(last)})"
+            self._transfer_failed = (time.monotonic(), why)
+            raise self._no_transfer(why) from last
 
+        self._transfer_failed = None
         self._transfer_client = client
-        self._emit("info", "ssh_transfer",
-                   f"File staging routed through {self.transfer_host} (not the login node).")
+        if not getattr(self, "_transfer_announced", False):
+            self._transfer_announced = True
+            self._emit("info", "ssh_transfer",
+                       f"File staging routed through {self.transfer_host} (not the login node).")
         return client
 
     def _open_sftp(self) -> "paramiko.SFTPClient":
@@ -488,7 +505,7 @@ class SSHExecutor:
         """
         client = self._transfer_session()
         if client is None:
-            self._live_transport()   # staging over the login session: bring it back if it dropped
+            self._live_transport()   # no transfer host configured: the session carries the files
             client = self._client
         return client.open_sftp()
 
@@ -591,7 +608,7 @@ class SSHExecutor:
         without a saved key), an encrypted key that could not be loaded into this session's agent,
         no ``sftp`` binary, or ``AISCIENTIST_NATIVE_SFTP=0``. Never the login node: that is
         paramiko's fallback to warn about, not something to speed up."""
-        if self.transfer_host is None or self._transfer_disabled:
+        if self.transfer_host is None:
             return None
         if os.environ.get("AISCIENTIST_NATIVE_SFTP", "1").strip().lower() in ("0", "false", "no", "off"):
             return None
@@ -757,7 +774,10 @@ class SSHExecutor:
         A missing or unreadable file returns ``b""``, matching the ``cat … 2>/dev/null`` this
         replaces — callers that read "absent" as "nothing yet" keep working unchanged.
         """
-        sftp = self._open_sftp()
+        try:
+            sftp = self._open_sftp()
+        except TransferUnavailable:
+            return b""      # as for any read that failed; a copy (put/get) fails with the reason
         try:
             with sftp.open(remote_path, "rb") as handle:
                 if max_bytes is None:

@@ -1,19 +1,19 @@
 ---
 name: explore-atlas-expression-with-aiscientist-mcp
-description: Answer a gene expression query such as "show LRAT across retinal cell types" on a large single-cell or single-nucleus atlas .h5ad with raw counts, by calling the atlas-expression-exploration MCP server from the aiscientist-mcp repository. Its tools resolve gene names (case, HGNC alias, previous symbol, ID), run the full-atlas scanpy step on a big-memory Slurm node, and return donor-aware summary tables at major-class, cell-type and region-by-class resolution, scanpy dot, violin and UMAP feature plots, and a short Markdown report. Use when asked where a gene is expressed in an atlas, to compare a few genes across annotated cell types, to produce standard expression figures for a gene list, or to install or register this MCP server. Not a differential expression test.
+description: Answer a gene expression query such as "show LRAT across retinal cell types" on a large single-cell or single-nucleus atlas .h5ad with raw counts, by calling the atlas-expression-exploration MCP server from the aiscientist-mcp repository. Its tools resolve gene names (case, HGNC alias, previous symbol, ID), run the full-atlas step as a Slurm job that streams the counts and needs little memory, and return donor-aware summary tables at major-class, cell-type and region-by-class resolution, scanpy dot, violin and UMAP feature plots, and a short Markdown report. Use when asked where a gene is expressed in an atlas, to compare a few genes across annotated cell types, to produce standard expression figures for a gene list, or to install or register this MCP server. Not a differential expression test.
 license: MIT
-compatibility: Requires conda or mamba with the aiscientist-mcp packages (common, atlas-expression-exploration) installed from GitHub, or apptainer with the pinned server image, and an MCP client (Claude Code or any stdio MCP client) or the bundled aiscientist-mcp CLI client. The full-atlas step needs a node with about 1.5x the uncompressed count matrix in RAM (218 GiB peak for 8.3e9 non-zeros); Slurm optional. Network only to install and for the one-time HGNC download.
+compatibility: Requires conda or mamba with the aiscientist-mcp packages (common, atlas-expression-exploration) installed from GitHub, or apptainer with the pinned server image, and an MCP client (Claude Code or any stdio MCP client) or the bundled aiscientist-mcp CLI client. The full-atlas step streams the count matrix in chunks (2.2 GB peak for 8.3e9 non-zeros; server 0.0.3 and earlier loaded it whole, 218 GiB); Slurm optional. Network only to install and for the one-time HGNC download.
 metadata:
   category: single-cell
-  version: "0.0.1"
+  version: "0.0.2"
   status: community
   author: "Jin Li"
   tags: "scrna-seq, snrna-seq, gene-expression, mcp, scanpy, dot-plot, violin-plot, umap, cell-atlas, retina"
-  tested-with: "aiscientist-mcp common 0.0.2, atlas-expression-exploration 0.0.2 (conda) and 0.0.3 (image), mcp 2.3.0, scanpy 1.12.5, anndata 0.13.4, Python 3.13.18, Claude Code 2.1.309"
-  compute: "full-atlas step: Slurm job, 4 CPUs, 300 GB requested (218 GiB peak), 10.5-12.5 min for 3.18M nuclei; plot and report calls 5-9 min each from a conda env on a network filesystem (mostly server start and imports), 9-19 s each in the image on a 40,000-nucleus subset"
-  image: "docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a"
+  tested-with: "aiscientist-mcp common 0.0.2, atlas-expression-exploration 0.0.2 (conda), 0.0.3 (image) and 0.0.4 (image, with common 0.0.4, on the full atlas), mcp 2.3.0, scanpy 1.12.5, anndata 0.13.4, Python 3.13.18, Claude Code 2.1.309"
+  compute: "full-atlas step with server 0.0.4: Slurm job, 4 CPUs, 2.2 GB peak, 8 min for 3.18M nuclei (0.0.2 loaded the atlas whole: 218 GiB peak, 10.5-12.5 min); plot and report calls 5-9 min each from a conda env on a network filesystem (mostly server start and imports), 9-19 s each in the image on a 40,000-nucleus subset"
+  image: "docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf"
   cpus: "4"
-  mem_gb: "300"
+  mem_gb: "32"
   time_limit: "04:00:00"
   requires-gpu: "false"
   scheduler: "optional"
@@ -27,15 +27,16 @@ The [aiscientist-mcp](https://github.com/lijinbio/aiscientist-mcp) server
 `atlas-expression-exploration` exposes the gene-expression query as MCP tools. This skill holds no
 analysis code: every step is a tool call.
 
-- In an MCP client such as Claude Code, call the tools directly.
+- In AiScientist, use the typed tools in [On AiScientist](#on-aiscientist).
+- In another MCP client such as Claude Code, call the server's tools directly.
 - In a shell or batch script, use the bundled client:
   `aiscientist-mcp --server atlas-expression-exploration-mcp call <tool> '<json>'`.
 
-Only one step is expensive. `submit_query` loads the whole atlas into memory on a big-memory node,
-as a Slurm job, and writes a small `query.h5ad` (all cells, query genes only) plus the tables.
+Only one step is long. `submit_query` reads the whole atlas's counts in chunks, keeping the query
+genes and each cell's total, as a Slurm job, and writes a small `query.h5ad` (all cells, query genes only) plus the tables.
 The plot and report tools read only that file.
 
-Tested end to end, as written, on the Human Retina Cell Atlas snRNA-seq object:
+The server was tested end to end on the Human Retina Cell Atlas snRNA-seq object:
 
 - 3,177,310 nuclei x 36,601 genes, raw counts in `X` (CSR, 8.30e9 non-zeros, 19.5 GB gzip h5ad);
 - 10 major classes, 123 cell types, 3 retinal regions, 104 donor labels.
@@ -50,6 +51,11 @@ The tested runs:
 - **Image, apptainer.** The four-gene query `LRAT,CRALBP,rho,ABCR` on a 40,000-nucleus subset,
   with one `apptainer exec --containall` per call and `AISCI_EXECUTOR=inline`. The tables and the
   PNGs were identical to those of the conda env.
+- **Full atlas, image 0.0.4, apptainer in a Slurm job.** The query `RPE65 LRAT rho` on the full
+  object, one `apptainer exec --containall` with `AISCI_EXECUTOR=inline` in a 4-CPU job: 7 min 59 s
+  and 2.2 GB peak (Slurm MaxRSS). The LRAT and RHO rows of `summary_majorclass.tsv` equal those
+  written by 0.0.3 for the same atlas in every numeric column (20 rows). The conda install of
+  §1 was not run again with the 0.0.4 tags.
 
 Replace every `/path/to/...`, `<partition>` and `<account>` with your own values.
 
@@ -76,30 +82,43 @@ The atlas is only read, never written.
 
 ## On AiScientist
 
-AiScientist has no MCP client yet. Its `run_in_environment` runs commands in the image of
-`metadata.image` (the server image above, pinned by digest) with the `cpus`, `mem_gb` and
-`time_limit` of this skill. Each call is a fresh container, so:
+AiScientist's pinned MCP bridge exposes typed tools when this skill is installed and allowed,
+its image matches the server's digest pin, and the deployment has an approved atlas configured.
+Attach that atlas or its authorized session copy, then call:
 
-- set `AISCI_EXECUTOR=inline`, `ATLAS_H5AD` and `AISCI_DATA_DIR` (§2); `submit_query` then runs the
-  full-atlas step inside that container and returns when it ends;
-- run the §5 calls with `S="aiscientist-mcp --server atlas-expression-exploration-mcp"`;
-- copy the figures, `summary_*.tsv`, `gene_resolution.tsv` and `report.md` from the query folder
-  into `$AISCIENTIST_ARTIFACTS/gene_expression/<query_id>/`.
+`resolve_genes` → `submit_query` → `query_status` → `get_summary`, `plot_dotplot`,
+`plot_violin`, `plot_featureplot` → `atlas_write_report(query_id)`.
 
-The image with `inline` and one container per call was tested with apptainer (§1, Container); a
-run inside AiScientist itself has not been tested yet.
+Use the returned `query_id` for results and report calls. `list_queries` lists previous queries
+in this run. `atlas_write_report` is the AiScientist name for the server's `write_report` tool;
+it creates the query's `report.md`. AiScientist's separate `write_report` plan step requests the
+whole run's manuscript. Use `atlas_write_report` for the Atlas query report. The generic MCP
+and CLI examples below retain the server's name `write_report`.
+
+The bridge supplies the approved dataset mount, `ATLAS_H5AD`, `AISCI_DATA_DIR`,
+`AISCI_EXECUTOR=inline`, job resources and artifact collection. Pass `genes` unchanged; if
+specifying `atlas`, use the attached dataset or its authorized source. The bridge validates
+that path and omits it from the MCP arguments so the server reads the bound session copy.
+`submit_query` finishes inside its outer CPU allocation before returning. Figures,
+`summary_*.tsv`, `gene_resolution.tsv` and `report.md` appear in the run's
+`gene_expression/<query_id>/` artifacts.
+
+Direct `run_in_environment` shell calls for this skill are refused. If the typed tools are
+unavailable, check the deployed bridge, skill/image binding and approved atlas configuration.
+The installation, environment and client setup in §§1–3 below are for standalone clients;
+AiScientist supplies those settings through its deployment.
 
 ## 1. Install the server
 
-The install is pinned to release tags of `lijinbio/aiscientist-mcp`: `common-v0.0.2` and
-`atlas-expression-exploration-v0.0.3`.
+The install is pinned to release tags of `lijinbio/aiscientist-mcp`: `common-v0.0.4` and
+`atlas-expression-exploration-v0.0.4`.
 
 ```bash
 mamba create -y -n visionkb_mcp -c conda-forge python=3.13.18 scanpy=1.12.5 anndata=0.13.4 pyarrow=26.0.0 mcp=2.3.0 pytest ruff
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate visionkb_mcp
-for t in common-v0.0.2 atlas-expression-exploration-v0.0.3; do
+for t in common-v0.0.4 atlas-expression-exploration-v0.0.4; do
   pip install --no-deps --force-reinstall "git+https://github.com/lijinbio/aiscientist-mcp@${t}#subdirectory=packages/${t%-v*}"
 done
 aiscientist-mcp --server atlas-expression-exploration-mcp tools   # lists the 9 tools below
@@ -112,12 +131,12 @@ scanpy).
 
 **Container.** The same server as a pinned image, with Nimbus Sans for the Helvetica figure text.
 With `--containall` the settings of §2 pass as `APPTAINERENV_<name>`, and each call is a fresh
-container, so use `AISCI_EXECUTOR=inline` on a big-memory node:
+container, so use `AISCI_EXECUTOR=inline` inside a Slurm job:
 
 ```bash
-apptainer pull mcp-atlas-expression-exploration_0.0.3.sif docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a
+apptainer pull mcp-atlas-expression-exploration_0.0.4.sif docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf
 export APPTAINERENV_ATLAS_H5AD=/path/to/atlas.h5ad APPTAINERENV_AISCI_DATA_DIR=/path/to/data/aiscientist-mcp APPTAINERENV_AISCI_EXECUTOR=inline
-S="apptainer exec --containall --bind /path/to mcp-atlas-expression-exploration_0.0.3.sif aiscientist-mcp --server atlas-expression-exploration-mcp"
+S="apptainer exec --containall --bind /path/to mcp-atlas-expression-exploration_0.0.4.sif aiscientist-mcp --server atlas-expression-exploration-mcp"
 $S tools
 ```
 
@@ -137,7 +156,7 @@ or export them before using the CLI.
 | `ATLAS_OBS_COLS` | obs columns: class, cell type, region, donor, then extras | `majorclass,celltype,tissue,donor,sampleid` |
 | `ATLAS_CLASS_ORDER` | display order of classes; others are appended alphabetically | `Rod,Cone,HC,BC,AC,RGC,MG,Astrocyte,Microglia,RPE` |
 | `AISCI_EXECUTOR` | `slurm` (sbatch), `local` (background process on this host) or `inline` (foreground; the call returns when the step ends) | `slurm` |
-| `AISCI_SLURM` | sbatch options of the first attempt | `--partition=<partition> --account=<account> --cpus-per-task=4 --mem=300G --time=04:00:00` |
+| `AISCI_SLURM` | sbatch options of the first attempt | `--partition=<partition> --account=<account> --cpus-per-task=4 --mem=32G --time=04:00:00` |
 | `AISCI_SLURM_FALLBACK` | sbatch options after a preemption, e.g. a non-preemptible partition | same, with the fallback partition |
 | `AISCI_JOB_PREFIX` | optional; prepended to the job command, e.g. `apptainer exec --bind /data image.sif` | unset |
 
@@ -145,9 +164,9 @@ Check that the class, cell-type, region and donor columns have no missing values
 missing labels drop out of every group silently. Choose the executor by how the server is called:
 
 - `slurm` for a server on a login node, persistent (an MCP client) or one-shot (the CLI).
-- `local` only for a persistent server that itself runs on a big-memory node: the job is a
+- `local` only for a persistent server that itself runs on a compute node: the job is a
   detached child of the server and ends if the server or its container exits.
-- `inline` when every call is a fresh process or container on a big-memory node, e.g. one
+- `inline` when every call is a fresh process or container on a compute node, e.g. one
   `apptainer exec` per call; `submit_query` then blocks until the step ends.
 
 ## 3. Register the server
@@ -156,7 +175,7 @@ missing labels drop out of every group silently. Choose the executor by how the 
 millions of cells:
 
 ```bash
-claude mcp add-json --scope project atlas-expression-exploration '{"type":"stdio","command":"/path/to/envs/visionkb_mcp/bin/atlas-expression-exploration-mcp","env":{"ATLAS_H5AD":"/path/to/atlas.h5ad","AISCI_DATA_DIR":"/path/to/data/aiscientist-mcp","AISCI_SLURM":"--partition=<partition> --account=<account> --cpus-per-task=4 --mem=300G --time=04:00:00","AISCI_SLURM_FALLBACK":"--partition=<partition> --account=<account> --cpus-per-task=4 --mem=300G --time=04:00:00"},"timeout":900000}'
+claude mcp add-json --scope project atlas-expression-exploration '{"type":"stdio","command":"/path/to/envs/visionkb_mcp/bin/atlas-expression-exploration-mcp","env":{"ATLAS_H5AD":"/path/to/atlas.h5ad","AISCI_DATA_DIR":"/path/to/data/aiscientist-mcp","AISCI_SLURM":"--partition=<partition> --account=<account> --cpus-per-task=4 --mem=32G --time=04:00:00","AISCI_SLURM_FALLBACK":"--partition=<partition> --account=<account> --cpus-per-task=4 --mem=32G --time=04:00:00"},"timeout":900000}'
 claude mcp get atlas-expression-exploration   # project scope: "Pending approval" until you run `claude` and approve
 ```
 
@@ -206,7 +225,7 @@ $S call resolve_genes '{"genes": "LRAT"}'
 # 2. Start the full-atlas step; note the query_id (here HRCA_snRNA_allcells__LRAT).
 $S call submit_query '{"genes": "LRAT"}'
 
-# 3. Poll until COMPLETED (tested: a 10.5-12.5 min Slurm job, 218 GiB peak).
+# 3. Poll until COMPLETED (tested with 0.0.4: 8 min, 2.2 GB peak).
 $S call query_status '{"query_id": "HRCA_snRNA_allcells__LRAT"}'
 
 # 4. Results.

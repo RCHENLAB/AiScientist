@@ -110,7 +110,9 @@ def test_a_saved_result_can_be_deleted_but_not_the_rest_of_the_lab_folder(accoun
     saved = auth_routes.record_dataset(user_id, "r.h5ad", "/dfs3b/lab/tester/AiScientist_results/r.h5ad", 1, "h5ad")
     got = client.post("/api/datasets/delete", json={"id": saved})
     assert got.status_code == 200, got.text
-    assert ran == ["rm -rf -- /dfs3b/lab/tester/AiScientist_results/r.h5ad"]
+    # As a Slurm step: deleting a tree is not login-node work.
+    assert len(ran) == 1 and ran[0].startswith("srun -p ")
+    assert ran[0].endswith(" rm -rf -- /dfs3b/lab/tester/AiScientist_results/r.h5ad")
     own = auth_routes.record_dataset(user_id, "notes", "/dfs3b/lab/tester/thesis/notes.txt", 1, "txt")
     assert client.post("/api/datasets/delete", json={"id": own}).status_code == 409
     assert len(ran) == 1
@@ -133,7 +135,8 @@ def test_a_bound_server_folder_is_a_reference_even_when_shared(accounts, tmp_pat
     got = client.post("/api/datasets/delete", json={"id": first})
     assert got.status_code == 200, got.text
     assert (shared / "x.h5").exists()
-    assert all(cmd.startswith("rm -rf -- /dfs3b/lab/sw/Temp/tester/server-data/s1/") for cmd in ran)
+    assert all(cmd.startswith("srun -p ") and " rm -rf -- /dfs3b/lab/sw/Temp/tester/server-data/s1/" in cmd
+               for cmd in ran)
 
 
 def test_a_row_from_before_the_data_root_is_still_deleted(accounts, tmp_path, monkeypatch):

@@ -374,3 +374,9 @@ class GatewayEvent:
         if self.extra:
             payload["extra"] = self.extra
         return payload
+
+
+class TransferUnavailable(GatewayError, OSError):
+    """A file transfer could not use the transfer host. Also an ``OSError``: a best-effort read
+    of a small file treats it as "not there", as it does any failed read; a copy fails with it."""
+

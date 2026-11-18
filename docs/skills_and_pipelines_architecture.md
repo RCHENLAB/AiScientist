@@ -218,12 +218,12 @@ the reason logged, and the skill still loads as guidance.
 
 ### The pinned registry release
 
-`configs/skills_registry.json` pins `lijinbio/aiscientist-skills` release `v0.2.10`,
+`configs/skills_registry.json` pins `lijinbio/aiscientist-skills` release `v0.2.11`,
 the published migration release paired with the seven analysis MCP image pins.
 A branch name such as `main`
 is refused. The config also lists the tiers to load (`core`, `verified` and `community`)
 and the releases root. Community remains enabled using the existing tier mechanism:
-`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.10 and is not promoted
+`explore-atlas-expression-with-aiscientist-mcp` is community in v0.2.11 and is not promoted
 locally. Each key has an `AISCIENTIST_SKILLS_REGISTRY_<KEY>` override.
 Updating skills means changing the tag and installing the release.
 
@@ -245,8 +245,8 @@ The folder is outside git (`.gitignore`), and an app release never ships or dele
 server `deploy/deploy_skills.sh` installs it; a development checkout that needs skills downloads it:
 
 ```bash
-gh release download v0.2.10 -R lijinbio/aiscientist-skills -D skills/releases/0.2.10
-(cd skills/releases/0.2.10 && sha256sum -c SHA256SUMS)   # leave the zip packed
+gh release download v0.2.11 -R lijinbio/aiscientist-skills -D skills/releases/0.2.11
+(cd skills/releases/0.2.11 && sha256sum -c SHA256SUMS)   # leave the zip packed
 ```
 
 The loader checks `SHA256SUMS` against `catalog.json`, the bundle or every skill zip, and every
@@ -384,8 +384,8 @@ cannot run.
 
 ## Atlas expression MCP bridge
 
-The v0.2.10 bundle SHA-256 is
-`70e650ccf0814aa4c2db30249b5c3fa1ffb4a1cb1530074c7714a0ed1b981e9d`.
+The v0.2.11 bundle SHA-256 is
+`a36bdcbf70dd030da4cf7a0015cd78c5b2ca257dabdc4cc5176ac4d4eee08266`.
 Install the three release assets and verify `SHA256SUMS` as above. The loader
 continues to verify the entire release before exposing skills; no analysis code
 or unverified copy of the skill is bundled into AiScientist.
@@ -436,14 +436,14 @@ additional identity metadata, not cryptographic checksum verification.
 Inside the container `ATLAS_H5AD=$AISCIENTIST_DATASET`,
 `AISCI_DATA_DIR=$AISCIENTIST_ENV_DIR` (a persistent directory within this run),
 and `AISCI_EXECUTOR=inline`. Only `submit_query` requests the skill's 4 CPUs,
-300 GB and 04:00:00. Registry resource overrides give all other tools 2 CPUs,
+32 GB and 04:00:00. Registry resource overrides give all other tools 2 CPUs,
 16 GB and 00:30:00, including status and list calls, which preserve the server's
 state handling in a light job.
 The platform supplies these resources internally, outside the tool JSON schema.
 There is no nested Slurm submission or gateway fallback. Plot/report calls read the
 small `query.h5ad`, and do not reload the full atlas. The CLI timeout covers the
 four-hour job. The image is pinned to
-`docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a`.
+`docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf`.
 Image provisioning and the server's first HGNC download require deployment
 network access. The HGNC table is kept in the user's tool cache on HPC3,
 `envs/tool-cache/<hpc-user>/atlas-expression/` (`AISCIENTIST_TOOL_CACHE`, bound

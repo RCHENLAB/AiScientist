@@ -1103,6 +1103,14 @@ def _ssh_connect_blocking(conn: Connection, req: ConnectRequest) -> None:
                 emit("warning", "ssh_auth", f"Couldn't set up a reusable SSH key (login still fine): {exc}")
         if req.auth_method == "password_duo":
             _arm_reconnect_key(conn, req.ucinetid, req.key_passphrase)
+        if not getattr(conn.executor, "transfer_ready", True):
+            # Files move through the transfer host only (RCIC: no data transfer on a login node),
+            # and it needs a key: a password session would need a second Duo push mid-transfer.
+            # Said now, at the connect, and not at the first upload or run.
+            emit("warning", "ssh_transfer",
+                 "This session has no saved SSH key, so it cannot move files to or from HPC3: "
+                 "uploads and runs will fail. Connect again with \"Save an SSH key\" ticked, or "
+                 "choose a saved key.")
         conn.push({"type": "duo_done"})
 
     _prepare_shared_storage(conn)
@@ -5921,18 +5929,47 @@ def _remote_path_status(executor: Any, path: str, *, is_dir: bool) -> "bool | No
 
 
 
+_VCF_HEADER_BYTES = 4 << 20
+
+
+def _vcf_header_text(head: bytes, max_lines: int = 3000) -> str:
+    """The ``#`` lines at the start of a VCF, from the first bytes of the file: plain text, gzip or
+    bgzip (gzip members one after another). The bytes are a prefix, so the last member is cut
+    short; what unpacked before the cut is used."""
+    import zlib
+    if head[:2] == b"\x1f\x8b":
+        out, rest = [], head
+        while rest[:2] == b"\x1f\x8b":
+            unpack = zlib.decompressobj(31)
+            try:
+                out.append(unpack.decompress(rest))
+            except zlib.error:
+                break
+            if not unpack.eof:
+                break
+            rest = unpack.unused_data
+        head = b"".join(out)
+    lines = []
+    for line in head.decode("utf-8", errors="replace").splitlines()[:max_lines]:
+        if not line.startswith("#"):
+            break
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def _detect_vcf_assembly(conn: "Connection", decisions: dict) -> str:
     """Infer the uploaded VCF's genome build ('GRCh37' | 'GRCh38' | '') from its header — the dfs3b
-    copy via a bounded remote ``head``, or a local staged copy. '' when unreadable/unknown so the
+    copy from its first bytes over SFTP, or a local staged copy. '' when unreadable/unknown so the
     caller keeps its configured default. Header-only: never streams the whole (WGS-size) VCF."""
     from ..tools.api import detect_assembly
     remote = decisions.get("hpc_primary")
     local = decisions.get("dataset_path")
     try:
         if remote and conn.executor is not None:
-            r = conn.executor.exec(
-                f"zcat -f {shlex.quote(str(remote))} 2>/dev/null | head -n 3000 | grep '^#' || true")
-            return detect_assembly(r.stdout or "")
+            # The first megabytes over SFTP, unpacked here: decompressing the file on the login
+            # node is work it is not for.
+            head = conn.executor.read_bytes(str(remote), max_bytes=_VCF_HEADER_BYTES)
+            return detect_assembly(_vcf_header_text(head))
         if local and os.path.exists(local):
             import gzip
             opener = gzip.open if str(local).endswith(".gz") else open
@@ -8247,7 +8284,7 @@ async def upload_staging_cancel(payload: dict, request: Request) -> JSONResponse
                     raise OSError("A copy is still closing; retry cancellation")
             if _uploads_on_hpc(conn):
                 remote = f"{_hpc_uploads_dir(conn)}/temp/{folder}"
-                result = await asyncio.to_thread(conn.executor.exec, f"rm -rf -- {shlex.quote(remote)}")
+                result = await asyncio.to_thread(_remove_tree_on_hpc, conn, remote)
                 if not result.ok:
                     raise OSError(result.stderr or "Remote cancellation cleanup failed")
             await asyncio.to_thread(upload_storage.cancel, conn, folder)
@@ -8394,6 +8431,17 @@ async def delete_dataset(payload: dict, request: Request) -> JSONResponse:
     return await _delete_owned_dataset(user, dataset_id)
 
 
+def _remove_tree_on_hpc(conn: "Connection", path: str, *, timeout: float = 1800.0) -> Any:
+    """Delete a tree on HPC3 as a Slurm step and wait for it. Deleting a dataset is work (tens of
+    GB, thousands of files), and a login node is for logging in and submitting jobs."""
+    st = conn.settings
+    account = f"-A {shlex.quote(st.cpu_account)} " if getattr(st, "cpu_account", "") else ""
+    return conn.executor.exec(
+        f"srun -p {shlex.quote(st.cpu_partition)} {account}-c 1 --mem=1G -t 00:30:00 --quiet "
+        f"-J {slurm_job_name(f'aiscientist-clean-{conn.owner}')} rm -rf -- {shlex.quote(path)}",
+        timeout=timeout)
+
+
 async def _delete_owned_dataset(user, dataset_id: int) -> JSONResponse:
     """Shared manual/retention deletion: files first, then registry and metadata."""
     conn = _active_conn_for_user(user)
@@ -8409,7 +8457,7 @@ async def _delete_owned_dataset(user, dataset_id: int) -> JSONResponse:
                 mirror = sd.mirror_dir(_session_mirror_base(conn), server_root, Path(stored).resolve())
                 if mirror.startswith(f"{_session_mirror_base(conn)}/"):
                     try:
-                        conn.executor.exec(f"rm -rf -- {shlex.quote(mirror)}")
+                        _remove_tree_on_hpc(conn, mirror)
                     except Exception as exc:  # noqa: BLE001 - a session copy; the disconnect cleans it too
                         print(f"[datasets] could not rm HPC3 copy {mirror}: {exc}")
             return
@@ -8426,7 +8474,7 @@ async def _delete_owned_dataset(user, dataset_id: int) -> JSONResponse:
                 mirror = sd.mirror_dir(_session_mirror_base(conn), own, tree)
                 if mirror.startswith(f"{_session_mirror_base(conn)}/"):
                     try:
-                        conn.executor.exec(f"rm -rf -- {shlex.quote(mirror)}")
+                        _remove_tree_on_hpc(conn, mirror)
                     except Exception as exc:  # noqa: BLE001 - a session copy; the disconnect cleans it too
                         print(f"[datasets] could not rm HPC3 copy {mirror}: {exc}")
             dataset_storage.remove_managed_dataset(target)
@@ -8447,7 +8495,7 @@ async def _delete_owned_dataset(user, dataset_id: int) -> JSONResponse:
             identity = upload_storage.remote_identity(stored)
             deletion_path = (stored.split(f"/datasets/{identity}/", 1)[0] + f"/datasets/{identity}"
                              if identity and f"/datasets/{identity}/" in stored else stored)
-            result = conn.executor.exec(f"rm -rf -- {shlex.quote(deletion_path)}")
+            result = _remove_tree_on_hpc(conn, deletion_path)
             if not result.ok:
                 raise OSError(result.stderr or "Remote deletion failed")
             return

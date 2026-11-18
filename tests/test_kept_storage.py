@@ -286,7 +286,9 @@ def test_saving_a_result_kept_on_hpc3_copies_it_back_in_the_background(kept, tmp
             {"name": "report.html", "size": 6}], "size_bytes": 14}), encoding="utf-8")
         status, body = gw._save_run_result("tester", None, run_id, "cellqc", conn)
         assert status == 202 and body["saving"] is True
-        assert gw._save_run_result("tester", None, run_id, "cellqc", conn)[0] == 202   # not twice
+        # Asked again: no second copy. 202 while the first is still running, 200 once it has
+        # finished, which a fast machine reaches before this line.
+        assert gw._save_run_result("tester", None, run_id, "cellqc", conn)[0] in (200, 202)
         for _ in range(100):
             rec = json.loads(pointer.read_text())
             if rec.get("saved_to") or rec.get("save_error"):

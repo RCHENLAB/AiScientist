@@ -947,7 +947,7 @@ class ResearchLab:
                 # to the suffix-derived dataset profile (self._dataset_context()).
                 _dec = self.ctx.decisions or {}
                 chosen = select_pipeline(self._complete, question, self._dataset_context(),
-                                         self.config.skill_library, emit,
+                                         self._router_library(), emit,
                                          content_modality=str(_dec.get("content_modality") or ""),
                                          content_confidence=str(_dec.get("content_confidence") or ""),
                                          available_tools=self._usable_tool_names())
@@ -2705,6 +2705,26 @@ class ResearchLab:
         if "literature_search" not in names:
             return prompt
         return prompt.replace("`deep_literature`", "`literature_search`")
+
+    def _router_library(self) -> "tuple[PresetPipeline, ...]":
+        """The router's candidates: the preset pipelines, and each skill paired with an MCP server
+        that no preset covers, whose tools are usable here and whose server takes the attached
+        dataset (``mcp_skill_routes``). Run 6bc2b3b32969: a one-gene expression question on a shared
+        atlas file was routed to gene-signature scoring and planned as code, the atlas tools unused."""
+        from ..mcp_skill_routes import skill_pipelines
+        from ..preset_pipelines import PIPELINES
+        library = (self.config.skill_library if self.config.skill_library is not None
+                   else tuple(PIPELINES.values()))
+        dec = self.ctx.decisions or {}
+        catalog = getattr(self.scientist, "catalog", None) or ()
+        try:
+            extra = skill_pipelines(
+                library, self._usable_tool_names(),
+                {t.name: getattr(t, "description", "") or "" for t in catalog},
+                [dec.get(k) for k in ("hpc_primary", "dataset_path", "server_primary") if dec.get(k)])
+        except Exception:  # noqa: BLE001 - routing aids never cost the run
+            extra = ()
+        return (*library, *extra)
 
     def _usable_tool_names(self) -> "frozenset[str] | None":
         """Tools that are in the catalog AND can actually run here, for pipeline routing.

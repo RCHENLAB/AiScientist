@@ -26,9 +26,9 @@ The server transport is stdio; authenticated remote MCP HTTP is not implemented.
 | `data-utilities` | `0.0.2` | 2 |
 
 The seven releases are published in `lijinbio/aiscientist-mcp` and paired with
-`lijinbio/aiscientist-skills` `v0.2.10`. The registry records the exact OCI digest,
+`lijinbio/aiscientist-skills` `v0.2.11`. The registry records the exact OCI digest,
 schema checksum and resource policy for every server; version tags alone are
-never executed. Atlas retains its upstream `0.0.3` pin. A new pin
+never executed. A new pin
 requires reviewing the published assets and updating the server registry and the
 skills release together.
 
@@ -96,6 +96,16 @@ must also serialize as strict JSON, so NaN and Infinity are rejected. Tool names
 descriptions and results do not select executables, images, resources, imports or
 access policy. There is no automatic registration of a server's other tools or
 execution of its instructions.
+
+## Routing a request to a paired skill
+
+Before the plan is drafted the PI's router picks one protocol. Its candidates are the preset
+pipelines and each paired skill that no preset covers: a skill whose server has no tool named by a
+preset pipeline, at least one tool usable in the session, and a dataset the server accepts (the
+Atlas server: a listed atlas or a shared dataset's file). The candidate's line is the skill's
+description; its guidance to the PI names the server's tools and tells it to plan with them, not
+with code. `agents/mcp_skill_routes.py`; with the pinned registry these are the Atlas, RetiGene and
+data-utilities skills.
 
 ## Execution and results
 
@@ -188,11 +198,11 @@ records the skill, image and command hash.
 
 ## Atlas binding
 
-The configured package is `atlas-expression-exploration` 0.0.3, release
-`atlas-expression-exploration-v0.0.3`, with this image:
+The configured package is `atlas-expression-exploration` 0.0.4, release
+`atlas-expression-exploration-v0.0.4`, with this image:
 
 ```text
-docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a
+docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf
 ```
 
 Its skill is `explore-atlas-expression-with-aiscientist-mcp`. The nine planner names
@@ -218,7 +228,8 @@ Transport and registration are generic; `AtlasAdapter` in
   mtime in the manifest. Session copies also record `copied_from` in the manifest,
   without returning that source host path. Size and mtime are identity metadata,
   not a checksum.
-- `submit_query` inherits the skill's 4 CPUs, 300 GB and `04:00:00`. The other
+- `submit_query` inherits the skill's 4 CPUs, 32 GB and `04:00:00`: the server streams the
+  atlas's counts in chunks (2.2 GB peak on 3.18M nuclei) and does not load the matrix. The other
   eight tools have registry overrides of 2 CPUs, 16 GB and `00:30:00`. The outer
   executor schedules all calls; `submit_query` blocks under the inline executor.
 - When the executor provides its user's tool cache, `ATLAS_HGNC` points to
@@ -421,7 +432,7 @@ the server only; it does not call analysis tools.
 For a release update, export from the released digest-pinned image when available:
 
 ```bash
-image='docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:5e9b13da5d180e7983945a7f1f4182e4b12876d3ec8f59ed0a0aa7b43d041d8a'
+image='docker://ghcr.io/lijinbio/mcp-atlas-expression-exploration@sha256:725b31a8cc4f19472144bd6058d9736823718a753a3edf68b1e279f497a6fbaf'
 apptainer exec "$image" python - --server atlas-expression-exploration-mcp \
   < scripts/export_mcp_tools.py > /tmp/atlas-tools.json
 sha256sum /tmp/atlas-tools.json
@@ -433,19 +444,10 @@ checksum. Schema changes are reviewed code changes, not runtime discoveries.
 The released CLI does not attest the live schemas on each call: keeping the
 snapshot paired with the exact release image is part of this review contract.
 
-The Atlas snapshot is the stdio MCP listing of the
-[0.0.3 source release](https://github.com/lijinbio/aiscientist-mcp/releases/tag/atlas-expression-exploration-v0.0.3)
-(`mcp==2.3.0`, `mcp-types==2.3.0`, `pydantic==2.14.2`). From that source checkout, with
-`AISCI_EXPORT_SCRIPT` set to the absolute path of this application's exporter:
-
-```bash
-PYTHONPATH=packages/common/src:packages/atlas-expression-exploration/src \
-uv run --isolated --no-project \
-  --with mcp==2.3.0 --with mcp-types==2.3.0 --with pydantic==2.14.2 \
-  python "$AISCI_EXPORT_SCRIPT" \
-  --server 'python -m aiscientist_mcp.atlas_expression_exploration.server' \
-  > /tmp/atlas-tools.json
-```
+The Atlas snapshot is that export from the 0.0.4 image named above (`mcp` 2.3.0), run in a
+Slurm job on HPC3. It has the nine tools of 0.0.3 with two differences: the description of
+`submit_query`, and `get_summary` takes `level` as one of `majorclass`, `celltype` and
+`region_class`.
 
 ### Explicit ordered workflows
 

@@ -113,7 +113,7 @@ def _executor(*, transfer_host: str | None = "access-hpc3.rcic.uci.edu", pkey: o
     ex._connect_timeout = 30.0
     ex._transfer_client = None
     ex._transfer_pkey = pkey
-    ex._transfer_disabled = False
+    ex._transfer_announced = False
     ex._client = _FakeClient("login")
     ex.execs: list[str] = []
     ex.exec = lambda cmd, timeout=60.0: ex.execs.append(cmd)  # control plane recorder
@@ -253,20 +253,26 @@ def test_remote_size_reports_the_true_size(dtn):
 # -- degrading instead of breaking ----------------------------------------------------
 
 
-def test_password_session_falls_back_and_warns_once(dtn):
-    """No key means a second Duo push, which mid-transfer is indistinguishable from a hang."""
+def test_a_password_session_without_a_key_cannot_transfer(dtn):
+    """No key means a second Duo push mid-transfer. The files are not sent over the login node
+    instead (RCIC: no data transfer there): the transfer fails and says why."""
+    from aiscientist.gateway.errors import TransferUnavailable
+
     ex = _executor(pkey=None)
-    ex.put_file("/local/a", "/dfs3b/a")
-    ex.get_file("/dfs3b/b", "/local/b")
-
-    assert ex._client.puts == [("/local/a", "/dfs3b/a")], "staging must still work"
+    assert not ex.transfer_ready
+    with pytest.raises(TransferUnavailable, match="no saved SSH key"):
+        ex.put_file("/local/a", "/dfs3b/a")
+    with pytest.raises(TransferUnavailable):
+        ex.get_file("/dfs3b/b", "/local/b")
+    assert ex._client.puts == [] and ex._client.gets == [], "nothing may ride the login session"
     assert dtn.dialed == [], "must not attempt the transfer host without a key"
-    warnings = [e for e in ex.events if e[0] == "warning"]
-    assert len(warnings) == 1 and "not an SSH key" in warnings[0][2]
+    # A best-effort read of a small file reads "not there", as for any failed read.
+    assert ex.read_bytes("/dfs3b/x") == b""
 
 
-def test_unreachable_transfer_host_falls_back_and_stops_retrying(monkeypatch):
+def test_an_unreachable_transfer_host_fails_the_transfer_and_is_not_redialled_at_once(monkeypatch):
     from aiscientist.gateway import ssh_gateway
+    from aiscientist.gateway.errors import TransferUnavailable
 
     attempts: list[tuple[str, int]] = []
 
@@ -275,15 +281,17 @@ def test_unreachable_transfer_host_falls_back_and_stops_retrying(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr(ssh_gateway.socket, "create_connection", _refuse)
+    monkeypatch.setattr(ssh_gateway.time, "sleep", lambda s: None)
 
     ex = _executor()
-    ex.put_file("/local/a", "/dfs3b/a")
-    ex.put_file("/local/b", "/dfs3b/b")
+    assert ex.transfer_ready
+    with pytest.raises(TransferUnavailable, match="not usable"):
+        ex.put_file("/local/a", "/dfs3b/a")
+    with pytest.raises(TransferUnavailable, match="not usable"):
+        ex.put_file("/local/b", "/dfs3b/b")
 
-    assert len(attempts) == 1, "a dead transfer host must not cost a timeout per file"
-    assert ex._client.puts == [("/local/a", "/dfs3b/a"), ("/local/b", "/dfs3b/b")]
-    warnings = [e for e in ex.events if e[0] == "warning"]
-    assert len(warnings) == 1 and "not usable" in warnings[0][2]
+    assert len(attempts) == 3, "three tries for the first file, none for the next within a minute"
+    assert ex._client.puts == [], "nothing may ride the login session"
 
 
 def test_opting_out_uses_the_login_node_silently(dtn):
@@ -320,3 +328,49 @@ def test_transfer_host_is_overridable_and_can_be_disabled(monkeypatch):
 
     monkeypatch.setenv("AISCIENTIST_HPC_TRANSFER_HOST", "")
     assert HPCSettings.from_env().transfer_host == ""
+
+
+def test_a_vcf_header_is_read_from_the_first_bytes_and_unpacked_on_the_gateway():
+    """The header used to come from ``zcat file | head`` run on the login node: decompressing a
+    WGS-size VCF there is work a login node is not for. Now the first bytes come over SFTP."""
+    import gzip
+    from types import SimpleNamespace
+
+    from aiscientist.gateway import app
+
+    header = "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=248956422,assembly=GRCh38>\n#CHROM\tPOS\n"
+    body = "".join(f"chr1\t{i}\t.\tA\tG\n" for i in range(20000))
+    # bgzip-like: gzip members one after another, and the read stops in the middle of one.
+    packed = gzip.compress(header.encode()) + gzip.compress(body.encode())
+    assert app._vcf_header_text(packed[: len(packed) - 40]) == header
+    assert app._vcf_header_text((header + body).encode()) == header
+    assert app._vcf_header_text(b"") == ""
+
+    asked: list = []
+
+    class _Executor:
+        def read_bytes(self, path, max_bytes=None):
+            asked.append((path, max_bytes))
+            return packed
+
+        def exec(self, *a, **k):  # pragma: no cover - the point of the test
+            raise AssertionError("the VCF must not be read by a command on the login node")
+
+    conn = SimpleNamespace(executor=_Executor())
+    assert app._detect_vcf_assembly(conn, {"hpc_primary": "/dfs3b/u/x.vcf.gz"}) == "GRCh38"
+    assert asked == [("/dfs3b/u/x.vcf.gz", app._VCF_HEADER_BYTES)]
+
+
+def test_a_dataset_tree_on_hpc3_is_deleted_as_a_slurm_step():
+    from types import SimpleNamespace
+
+    from aiscientist.gateway import app
+
+    ran: list = []
+    conn = SimpleNamespace(
+        owner="u", settings=SimpleNamespace(cpu_partition="standard", cpu_account="lab"),
+        executor=SimpleNamespace(exec=lambda cmd, timeout=60.0: ran.append((cmd, timeout))))
+    app._remove_tree_on_hpc(conn, "/dfs3b/lab/u/uploads/a b")
+    (cmd, timeout), = ran
+    assert cmd.startswith("srun -p standard -A lab ") and cmd.endswith("rm -rf -- '/dfs3b/lab/u/uploads/a b'")
+    assert timeout == 1800.0

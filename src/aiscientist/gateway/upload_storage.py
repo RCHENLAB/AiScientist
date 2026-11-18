@@ -141,9 +141,8 @@ def expire_sessions(conn) -> None:
                              if c.owner == conn.owner and c.executor is not None
                              and (not hpc_user or app._hpc_user(c) == hpc_user)), None)
                 if pending_remote and live is not None:
-                    import shlex
                     remote = f"{app._hpc_uploads_dir(live)}/temp/{path.stem}"
-                    result = live.executor.exec(f"rm -rf -- {shlex.quote(remote)}")
+                    result = app._remove_tree_on_hpc(live, remote)
                     if not result.ok:
                         raise OSError(result.stderr or "Expired remote upload cleanup failed")
                     pending_remote = False

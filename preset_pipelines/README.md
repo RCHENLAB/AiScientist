@@ -28,6 +28,12 @@ preset_pipelines/<name>/
   examples/      optional: a small input to try it on
 ```
 
+The router's candidates are these pipelines and, with them, each skill of the pinned skills
+release that is paired with an MCP server, when no pipeline here composes one of that server's
+tools, its tools are usable in the session and the server accepts the attached dataset
+(`agents/mcp_skill_routes.py`). A request for an atlas expression query is routed to the atlas
+skill that way. Add a pipeline here only for a workflow no paired skill already covers.
+
 `SKILL.md`:
 
 ```markdown
