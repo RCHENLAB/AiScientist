@@ -1468,6 +1468,42 @@ def test_dag_agent_memory_writes_reflects_and_reads_across_runs(tmp_path):
     assert any("Start mito < 5%" in b for b in briefs)                 # …and the lesson reached its brief
 
 
+def test_a_lookup_only_run_writes_no_lessons_and_is_answered_by_its_step(tmp_path):
+    # Runs 550f5a1e98be / 4626f48ba6f9: one exact table lookup, then a lessons update, a claim
+    # audit and a writer. A lookup teaches the next run nothing and its answer is the step's.
+    asked: list[str] = []
+
+    def scientist_chat(messages, tools):
+        if any(m.get("role") == "tool" for m in messages):
+            return {"content": "", "tool_calls": [{"id": "f", "type": "function",
+                    "function": {"name": "finish", "arguments": json.dumps({"answer": "USH2A: AR."})}}]}
+        return {"content": "", "tool_calls": [{"id": "t", "type": "function",
+                "function": {"name": "get_gene", "arguments": json.dumps({"gene": "USH2A"})}}]}
+
+    def complete(messages):
+        sys = messages[0]["content"]
+        asked.append(sys)
+        if "Principal Investigator of a bioinformatics lab" in sys:
+            return json.dumps({"agenda": ["Look up USH2A with get_gene"]})
+        if "rigorous scientific Critic" in sys:
+            return json.dumps({"verdict": "accept", "score": 0.9})
+        return "WRITTEN"
+
+    get_gene = HarnessTool("get_gene", "lookup", {"type": "object", "properties": {"gene": {"type": "string"}}},
+                           lambda a, c: {"status": "ok", "found": True}, category="analysis")
+    cfg = LabConfig(planner="dag", auto_select_skill=False, agent_memory=True,
+                    agent_memory_dir=str(tmp_path))
+    events = []
+    result = ResearchLab(_ctx(), cfg, complete_fn=complete,
+                         scientist=ResearchHarness(catalog=[get_gene], chat_fn=scientist_chat)
+                         ).run("What does the RetiGene gene table record about USH2A?", on_event=events.append)
+    assert result.final_answer == result.rounds[0].scientist_result["final_answer"]
+    assert "get_gene" in result.final_answer and "WRITTEN" not in result.final_answer
+    assert not any(e["type"] == "memory_reflect" for e in events)
+    assert not list(tmp_path.glob("*/lessons.md"))
+    assert not any("PRIVATE lessons of one specialist" in s for s in asked)
+
+
 def test_agent_memory_off_by_default_no_events(tmp_path):
     def scientist_chat(messages, tools):
         if any(m.get("role") == "tool" for m in messages):

@@ -443,8 +443,9 @@ class RunMonitor:
             if entry is not None:
                 self._drop(entry)
         elif t == "synthesize" and self.kind == "research":
-            # A quality-control-only run skips the audit and the writer: the gateway answers it.
-            self._to("report" if ev.get("qc_only") else "audit")
+            # A quality-control-only run skips the audit and the writer (the gateway answers it),
+            # and so does a run that only looked a value up in a table.
+            self._to("report" if ev.get("qc_only") or ev.get("lookup_only") else "audit")
 
     def _observe_push(self, payload: dict[str, Any]) -> None:
         t = str(payload.get("type") or "")

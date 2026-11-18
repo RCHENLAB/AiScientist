@@ -212,3 +212,55 @@ def test_a_qc_only_run_asked_for_a_report_gets_the_writer_and_no_audit(monkeypat
     assert "This run did quality control only, and the request asks for a written report" in \
         calls[0][1]["content"]
     assert not [e for e in events if e.get("type") == "claim_audit"]
+
+
+def test_a_lookup_only_run_is_answered_by_the_lookup_step(monkeypatch):
+    """Runs 550f5a1e98be and 4626f48ba6f9 (one get_gene, one find_genes): a claim audit and a writer
+    turned a two-row table result into Summary, Methods, Results, Limitations and Conclusion. The
+    lookup step's own answer is the answer; a written report asked for still gets the writer."""
+    monkeypatch.setenv("AISCIENTIST_CLAIM_AUDIT", "1")
+    calls: list = []
+
+    def complete(messages):
+        calls.append(messages)
+        return "REPORT"
+
+    def lab():
+        return ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="m"), LabConfig(),
+                           complete_fn=complete)
+
+    steps = [{"tool": "find_genes", "ok": True, "result": {"status": "ok", "total_genes": 2}},
+             {"tool": "finish", "ok": True, "result": {}}]
+    look = LabRound(1, 1, "AD-LCA genes", "sci",
+                    {"final_answer": "2 genes: CRX, IMPDH1.", "steps": steps},
+                    CriticVerdict("accept", 0.8, ""))
+    events: list = []
+    one = lab()
+    assert one._synthesize("Which genes does RetiGene list?", [look], events.append) == "2 genes: CRX, IMPDH1."
+    assert calls == [] and not one._claim_audit
+    assert {"type": "synthesize", "accepted": 1, "lookup_only": True} in events
+    # A written report asked for: the writer writes it.
+    asked = lab()
+    asked._report_requested = True
+    assert asked._synthesize("q", [look], lambda e: None).startswith("REPORT") and calls
+    # One analysis beyond the lookup and the answer is written as before.
+    calls.clear()
+    de = LabRound(1, 2, "DE", "sci", {"final_answer": "x", "steps": [
+        {"tool": "run_de", "ok": True, "result": {"status": "ok"}}]}, CriticVerdict("accept", 0.9, ""))
+    assert lab()._synthesize("q", [look, de], lambda e: None).startswith("REPORT") and calls
+
+
+def test_lookup_only_run_reads_the_tools_that_succeeded():
+    from aiscientist.agents.scope import lookup_only_run
+
+    def rnd(*steps):
+        return {"scientist_result": {"steps": list(steps)}}
+
+    get = {"tool": "get_gene", "ok": True, "result": {"status": "ok"}}
+    assert lookup_only_run([rnd(get, {"tool": "finish", "ok": True, "result": {}})])
+    assert lookup_only_run([rnd(get), rnd({"tool": "find_genes", "ok": True, "result": {"status": "ok"}})])
+    assert not lookup_only_run([])
+    assert not lookup_only_run([rnd({"tool": "get_gene", "ok": False, "result": {}})])
+    assert not lookup_only_run([rnd(get, {"tool": "search_corpus", "ok": True, "result": {"status": "ok"}})])
+    wrote = {"tool": "run_code", "ok": True, "args": {"code": "df.to_csv('x.csv')"}, "result": {"status": "ok"}}
+    assert not lookup_only_run([rnd(get, wrote)])

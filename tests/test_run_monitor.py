@@ -189,6 +189,11 @@ def test_a_qc_only_run_goes_from_its_steps_straight_to_the_report():
     m.observe({"type": "scientist_start", "step": "QC"})
     m.observe({"type": "synthesize", "accepted": 1, "qc_only": True})
     assert _where(m) == ("report", [])
+    # A run that only looked a value up in a table has no audit and no writer either.
+    m = run_monitor.start(kind="research")
+    m.observe({"type": "scientist_start", "step": "Lookup"})
+    m.observe({"type": "synthesize", "accepted": 1, "lookup_only": True})
+    assert _where(m) == ("report", [])
 
 
 # --- steps the DAG scheduler runs side by side ---------------------------------------------------

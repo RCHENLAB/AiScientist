@@ -153,6 +153,9 @@ release holds its skill with the same image digest.
   analysis planner, which is offered the lookups, and not to the two lines about the papers
   (`request_router.asks_gene_table`, `_gene_table_question`). A question that names the papers
   keeps going to the corpus search or the curation.
+- **Answer.** A run that only did these lookups is answered with the lookup step's own answer:
+  no claim audit, no writer and no lessons update (`scope.lookup_only_run`). A written report
+  asked for is still written.
 - **Gene table.** `get_gene` and `find_genes` read a RetiGene release,
   `gene_table/Full_gene_table_v<version>.tsv` in the index folder (the highest version when
   there are several). Every answer names the release. Without the file the two tools say so

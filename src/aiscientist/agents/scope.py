@@ -34,6 +34,8 @@ from .tool_names import STATUS_TOOLS, canonical_tool_name
 GENERIC_TOOLS = frozenset({"run_code", "run_shell", "run_in_environment"})
 LITERATURE_TOOLS = frozenset({"deep_literature", "search_corpus", "literature_search"})
 QC_ONLY_TOOLS = frozenset({"run_scanpy_qc", "run_cellqc", "run_doublet_detection"})
+# Exact lookups in a curated table: no model call, and the result is the whole answer.
+LOOKUP_ONLY_TOOLS = frozenset({"get_gene", "find_genes"})
 # Tools whose success does not make a run "more than QC": lookups, generic code, the closing call.
 NOT_AN_ANALYSIS = frozenset({
     "finish", "inspect_dataset", "read_tool_source", "describe_environment", "search_skills",
@@ -146,6 +148,19 @@ def qc_only_run(rounds: Any) -> bool:
     steps that scored and compared an ISG signature, was written up as a QC report with no claim
     audit, and its report said "This run did quality control only"."""
     return qc_only(tools_that_ran(rounds)) and not code_wrote_outputs(rounds)
+
+def lookup_only_run(rounds: Any) -> bool:
+    """Is an exact table lookup ALL the run did? At least one lookup succeeded, no other analysis
+    did, and no generic-code step wrote a file.
+
+    Such a run is answered with the lookup step's own answer: runs 550f5a1e98be and 4626f48ba6f9
+    (one ``get_gene``, one ``find_genes``) each had a claim audit and a writer turn a two-row
+    result into Summary, Methods, Results, Limitations and Conclusion."""
+    analyses = [canonical_tool_name(t) for t in tools_that_ran(rounds)
+                if canonical_tool_name(t) not in NOT_AN_ANALYSIS]
+    return (bool(analyses) and all(t in LOOKUP_ONLY_TOOLS for t in analyses)
+            and not code_wrote_outputs(rounds))
+
 
 _CLAUSE_SPLIT = re.compile(r"[,;.!?，；。！？\n]+|\bbut\b|\bthen\b|但是?|然后|另外")
 # A limit is an instruction about the WORK, so each cue is bound to a verb of doing or stands where

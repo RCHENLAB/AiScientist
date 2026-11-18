@@ -68,7 +68,7 @@ from ..plan_doc import (
     sync_plan,
 )
 from ..tool_names import canonical_tool_name
-from ..scope import RunScope, qc_only_run, read_scope, rules_out_report, wants_written_report
+from ..scope import RunScope, lookup_only_run, qc_only_run, read_scope, rules_out_report, wants_written_report
 from .. import own_choices
 from ..preset_pipelines import (
     PresetPipeline,
@@ -2516,7 +2516,8 @@ class ResearchLab:
         # Axis C — EVOLVE: at end of run, each expert that acted reflects its episodes into updated
         # lessons (cross-run learning, distinct from the in-step Critic loop). Best-effort, skipped if
         # cancelled early. One bounded LLM call per acting expert; time-shared on the same model.
-        if self._agent_memory is not None and not cancelled:
+        # A run that only looked a value up in a table holds no lesson for the next run.
+        if self._agent_memory is not None and not cancelled and not lookup_only_run(rounds):
             for name in dict.fromkeys(r.specialist for r in rounds):   # unique, in order
                 if self._agent_memory.reflect(name, self._complete, role_hint=name):
                     emit({"type": "memory_reflect", "specialist": name})
@@ -5862,6 +5863,14 @@ class ResearchLab:
             # A report asked for: the writer writes it, as a QC report, with no claim audit (its
             # checks are for findings about conditions; a QC run has none).
             qc_report = True
+
+        if lookup_only_run(rounds) and not self._report_requested:
+            # An exact table lookup is all this run did: the step's own answer is the answer. No
+            # claim audit (there is no finding about conditions to check) and no writer (it wrote
+            # report sections around a two-row result).
+            emit({"type": "synthesize", "accepted": len(accepted), "lookup_only": True})
+            return "\n\n".join(str(r.scientist_result.get("final_answer") or "").strip()
+                               for r in (accepted or rounds[-1:])).strip()
 
         def _step_line(r: LabRound) -> str:
             answer = r.scientist_result.get("final_answer") or "(no textual answer)"
