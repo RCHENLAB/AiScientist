@@ -401,13 +401,70 @@ def test_the_bundle_is_built_on_disk_and_removed_after_the_download(tmp_path, mo
     cut.write_bytes(b"half a zip")
     os.utime(cut, (time.time() - 7200, time.time() - 7200))
 
-    r = _client().get("/api/bundle/tester/run0001")
+    # every file under artifacts, as the application keeps them
+    r = _client().get("/api/bundle/tester/run0001?scope=all")
     assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
     assert 'filename="aiscientist_results_run0001.zip"' in r.headers["content-disposition"]
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
         assert sorted(z.namelist()) == ["report.md", "tables/a.csv"]
         assert z.read("tables/a.csv") == b"x\n1\n"
     assert list(run.glob(".bundle-*")) == []                       # this download's file, and the stale one
+    # the default: the report folder, under the run's id (RCHENLAB/AiScientist#113)
+    (art / "process").mkdir()
+    (art / "process" / "run_state.json").write_text("{}", encoding="utf-8")
+    (art / "figures").mkdir()
+    (art / "figures" / "workflow.png").write_bytes(b"png")
+    r = _client().get("/api/bundle/tester/run0001")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        assert sorted(z.namelist()) == ["run0001/results/extra/report.md", "run0001/results/tables/a.csv",
+                                        "run0001/summary.md"]
+        assert z.read("run0001/results/tables/a.csv") == b"x\n1\n"
+        assert "## Key results" in z.read("run0001/summary.md").decode()
+    assert list(run.glob(".bundle-*")) == [] and list(run.glob(".report-*")) == []
+    assert (art / "process" / "run_state.json").exists()            # the run keeps its own records
+    # a folder that fails its check is not handed out: the download is everything, as before
+    from aiscientist.reporting import report_folder
+    monkeypatch.setattr(report_folder, "build_report_folder", lambda run_dir, dest: ["JSON file in the report: x.json"])
+    with zipfile.ZipFile(io.BytesIO(_client().get("/api/bundle/tester/run0001").content)) as z:
+        assert "tables/a.csv" in z.namelist() and "process/run_state.json" in z.namelist()
+    monkeypatch.setattr(report_folder, "build_report_folder", lambda run_dir, dest: 1 / 0)
+    with zipfile.ZipFile(io.BytesIO(_client().get("/api/bundle/tester/run0001").content)) as z:
+        assert "tables/a.csv" in z.namelist()
+    assert list(run.glob(".bundle-*")) == [] and list(run.glob(".report-*")) == []
+
+
+def test_the_report_narrative_is_written_after_the_report_and_never_fails_it(tmp_path):
+    import asyncio
+
+    art = tmp_path / "tester" / "run0002" / "artifacts"
+    (art / "report").mkdir(parents=True)
+    (art / "report" / "report.md").write_text("# Report\n\nRHO is rod-specific (15.8 CP10k).\n", encoding="utf-8")
+    said, roles = [], []
+
+    def complete(messages, *, role=None):
+        roles.append(role)
+        return '{"key_results": "RHO is rod-specific (15.8 CP10k).", "limitations": "One atlas."}'
+
+    emit = lambda level, src, text: said.append((level, text))  # noqa: E731
+    assert asyncio.run(gw_app._write_report_narrative(art, "Where is RHO expressed?", complete, emit)) is True
+    assert roles == ["writer"] and said == []
+    assert "RHO is rod-specific (15.8 CP10k)." in (art / "report" / "narrative.md").read_text()
+    # a reply that cannot be used, and a model that fails: said, not raised
+    (art / "report" / "narrative.md").unlink()
+    assert asyncio.run(gw_app._write_report_narrative(art, "q", lambda m, role=None: "no", emit)) is False
+    assert said[-1] == ("info", "Report folder: the short summary is taken from the run's own summary "
+                                "(the model's reply was not the JSON asked for).")
+    made_up = lambda m, role=None: '{"key_results": "RHO is rod-specific (16.2 CP10k)."}'  # noqa: E731
+    assert asyncio.run(gw_app._write_report_narrative(art, "q", made_up, emit)) is False
+    assert said[-1][0] == "info" and "numbers the run did not record: 16.2" in said[-1][1]
+
+    def broken(messages, *, role=None):
+        raise RuntimeError("model unreachable")
+
+    assert asyncio.run(gw_app._write_report_narrative(art, "q", broken, emit)) is False
+    assert said[-1][0] == "warning" and "RuntimeError: model unreachable" in said[-1][1]
+    assert not (art / "report" / "narrative.md").exists()
     assert _client().get("/api/bundle/tester/nope").status_code == 404
 
 

@@ -54,9 +54,12 @@ def run_git(args: list[str]) -> str:
 
 def changed_files(base: str | None, head: str | None) -> list[Path]:
     if base and head:
-        diff = run_git(["diff", "--name-only", f"{base}...{head}"])
-        if diff:
-            return [Path(line) for line in diff.splitlines() if line.strip()]
+        proc = subprocess.run(["git", "diff", "--name-only", f"{base}...{head}"],
+                              check=False, capture_output=True, text=True)
+        # A pull request whose diff is empty changes no file, so there is nothing to check. Only when
+        # git cannot compare the two commits does the gate fall back to every tracked file.
+        if proc.returncode == 0:
+            return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
     tracked = run_git(["ls-files"])
     if tracked:
         return [Path(line) for line in tracked.splitlines() if line.strip()]

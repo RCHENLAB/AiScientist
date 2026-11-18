@@ -14825,8 +14825,32 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
                             "record is in process/, and report/verification.md lists every check.")
     except Exception as exc:  # noqa: BLE001 - the manuscript already shipped; never fail the run here
         emit("warning", "lab", f"Technical report step failed: {exc}")
+    if not abandoned():
+        await _write_report_narrative(art, question, complete_fn, emit)
     return {"vl_attempted": vl_attempted, "status": rep.get("status"),
             "rendered": [f.split("_")[0] for f in made]}
+
+
+async def _write_report_narrative(art: Path, question: str, complete_fn: Callable[..., str],
+                                  emit: Callable[..., Any]) -> bool:
+    """The two written parts of the report folder's short summary (RCHENLAB/AiScientist#113), from
+    what this run recorded: one model call, kept with the run as ``report/narrative.md`` for the
+    download. Returns whether they were written. Without them the folder's summary is cut from the
+    run's own, so a failure here is reported and costs only that; it never fails the report."""
+    from ..reporting import report_folder
+    why: list[str] = []
+    try:
+        written = await asyncio.to_thread(
+            report_folder.write_narrative, lambda messages: complete_fn(messages, role="writer"),
+            art.parent, question, why)
+    except Exception as exc:  # noqa: BLE001 - the report is written; the download still works
+        emit("warning", "lab", f"Report folder: the short summary was not written ({type(exc).__name__}: "
+                               f"{str(exc)[:120]}); the download uses the run's own summary.")
+        return False
+    if written is None:
+        emit("info", "lab", "Report folder: the short summary is taken from the run's own summary"
+                            + (f" ({why[0]})." if why else "."))
+    return written is not None
 
 
 # --- write_report for a finished run: the MCP tools write_report / report_status (#102) -------------
@@ -19669,8 +19693,11 @@ async def get_run_timing(owner: str, run_id: str, request: Request) -> Response:
 
 
 @app.get("/api/bundle/{owner}/{run_id}")
-async def get_bundle(owner: str, run_id: str, request: Request) -> Response:
-    """Zip a run's whole artifacts folder for a single 'download all' click."""
+async def get_bundle(owner: str, run_id: str, request: Request, scope: str = "report") -> Response:
+    """A run's results in one zip for the 'download all' click: its report folder (the short
+    summary, the approved plan and every result once; ``reporting/report_folder.py``).
+    ``?scope=all`` gives every file under ``artifacts`` as the application keeps them, process
+    records included."""
     refused = _owner_dir_error(owner, request)
     if refused is not None:
         return refused
@@ -19679,13 +19706,58 @@ async def get_bundle(owner: str, run_id: str, request: Request) -> Response:
     base = (CONSOLE_RUNS_DIR / owner / run_id / "artifacts").resolve()
     if not str(base).startswith(str(CONSOLE_RUNS_DIR)) or not base.is_dir():
         return Response("Run not found", status_code=404)
-    bundle = await asyncio.to_thread(_write_bundle, base)
+    bundle = await asyncio.to_thread(_write_bundle if scope == "all" else _write_report_bundle, base)
     return FileResponse(bundle, media_type="application/zip",
                         filename=f"aiscientist_results_{run_id}.zip",
                         background=BackgroundTask(_unlink_quietly, bundle))
 
 
 _BUNDLE_PREFIX = ".bundle-"
+_REPORT_WORK_PREFIX = ".report-"
+
+
+def _write_report_bundle(base: Path) -> Path:
+    """Zip the report folder of the run that owns ``base`` (its ``artifacts``) into a file beside it
+    and return that file. The folder is built in a working directory beside the run from hard links,
+    checked, zipped under the run's id, and removed. A folder that fails its check is not handed
+    out: the whole ``artifacts`` folder is, as before, and the reasons are printed for the operator,
+    so a fault here never keeps a researcher from their results."""
+    import tempfile
+    from ..reporting import report_folder
+
+    home = base.parent
+    for stale in home.glob(f"{_REPORT_WORK_PREFIX}*"):
+        try:
+            if stale.is_dir() and time.time() - stale.stat().st_mtime > 3600:
+                shutil.rmtree(stale, ignore_errors=True)
+        except OSError:
+            pass
+    work = Path(tempfile.mkdtemp(prefix=_REPORT_WORK_PREFIX, dir=home))
+    try:
+        folder = work / home.name
+        try:
+            problems = report_folder.build_report_folder(home, folder)
+        except Exception as exc:  # noqa: BLE001 - the download falls back to everything, below
+            problems = [f"{type(exc).__name__}: {exc}"]
+        if problems:
+            print(f"[report-folder] {home.name}: not valid, sending all artifacts instead: " + "; ".join(problems[:8]))
+            return _write_bundle(base)
+        for stale in home.glob(f"{_BUNDLE_PREFIX}*.zip"):
+            try:
+                if time.time() - stale.stat().st_mtime > 3600:
+                    stale.unlink()
+            except OSError:
+                pass
+        fd, name = tempfile.mkstemp(prefix=_BUNDLE_PREFIX, suffix=".zip", dir=home)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                report_folder.zip_report_folder(folder, out, home.name)
+        except BaseException:
+            _unlink_quietly(name)
+            raise
+        return Path(name)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _write_bundle(base: Path) -> Path:

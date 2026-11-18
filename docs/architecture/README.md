@@ -162,7 +162,7 @@ flowchart TB
 | `src/aiscientist/metadata/` | Croissant 1.1 metadata of datasets and results: built from what was measured plus the owner's review, validated (mlcroissant when installed), never hand-written. The gateway keeps it in the account database and serves it through the API and the MCP server at `/mcp` ([guideline](../development/metadata.md)) |
 | `src/aiscientist/hpc/shell.py` | The HPC3 shell session and its eight model tools (platform tools, like `run_code`) |
 | `src/aiscientist/tools/` | Platform contracts (`sdk.py`), discovery (`catalog.py`), public utilities (`api.py`) and bounded worker operations; scientific algorithms and server entry points belong to aiscientist-mcp; scientific references are packaged or operator-mounted there, while platform configuration remains in the app |
-| `preset_pipelines/` | Plain files: end-to-end protocols the PI picks. Skills are installed outside git from the repository/release in `configs/skills_registry.json` (currently `lijinbio/aiscientist-skills` v0.2.9); native instruction-only skills and adaptable CodeAct templates have separate roles |
+| `preset_pipelines/` | Plain files: end-to-end protocols the PI picks. Skills are installed outside git from the repository/release in `configs/skills_registry.json` (currently `lijinbio/aiscientist-skills` v0.2.10); native instruction-only skills and adaptable CodeAct templates have separate roles |
 | `frontend/console/` | The web UI |
 
 Two files are large enough to deserve a warning: `gateway/app.py` and

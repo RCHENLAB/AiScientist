@@ -8,7 +8,9 @@ contains the complete trace. Runs created before timing was enabled have no retr
 The authenticated endpoint is `GET /api/timing/{owner}/{run_id}`. The owner and administrators
 can read it, using the same access boundary as result downloads. With accounts disabled, the
 deployment is a single-operator service, as for existing downloads. The journal is also in
-`<results>/<owner>/<run_id>/artifacts/process/timing.jsonl` and **Results (.zip)**. It remains
+`<results>/<owner>/<run_id>/artifacts/process/timing.jsonl` and in the download of every file of the
+run, `GET /api/bundle/{owner}/{run_id}?scope=all` (**Results (.zip)** is the report folder, which
+holds results and no process records). It remains
 available without a live connection. It follows the run's existing retention/deletion policy.
 Because it continues to grow after a result is published or saved, the timing journal is excluded
 from the result's immutable Croissant file checksum inventory; research-result metadata is unchanged.

@@ -26,7 +26,7 @@ The server transport is stdio; authenticated remote MCP HTTP is not implemented.
 | `data-utilities` | `0.0.2` | 2 |
 
 The seven releases are published in `lijinbio/aiscientist-mcp` and paired with
-`lijinbio/aiscientist-skills` `v0.2.9`. The registry records the exact OCI digest,
+`lijinbio/aiscientist-skills` `v0.2.10`. The registry records the exact OCI digest,
 schema checksum and resource policy for every server; version tags alone are
 never executed. Atlas retains its upstream `0.0.3` pin. A new pin
 requires reviewing the published assets and updating the server registry and the
@@ -141,7 +141,7 @@ job's duration; the model can set neither.
 ## retigene-rag
 
 The `retigene` adapter (`agents/retigene.py`) serves the RetiGene gene table lookups and the
-RetiGene papers' search and curation tools. The registry pins retigene-rag 0.0.1; the server registers once the installed skills
+RetiGene papers' search and curation tools. The registry pins retigene-rag 0.0.2; the server registers once the installed skills
 release holds its skill with the same image digest.
 
 - **Index.** `AISCIENTIST_RETIGENE_INDEX` names the index's HPC3 folder

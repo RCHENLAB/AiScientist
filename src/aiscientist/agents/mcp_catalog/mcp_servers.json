@@ -448,13 +448,13 @@
     },
     {
       "name": "retigene-rag",
-      "version": "0.0.1",
-      "release_tag": "retigene-rag-v0.0.1",
-      "image": "docker://ghcr.io/lijinbio/mcp-retigene-rag@sha256:6c8dbb40bb8b08cd9713fe2765074c90a79ceab2e474c37362ea54e974371149",
+      "version": "0.0.2",
+      "release_tag": "retigene-rag-v0.0.2",
+      "image": "docker://ghcr.io/lijinbio/mcp-retigene-rag@sha256:bb4325c1d768ad0d2bd05302d747ab2ce7c609e567a2749e0cda28acd4f7d63a",
       "entrypoint": "retigene-rag-mcp",
       "skill": "query-retigene-papers-with-aiscientist-mcp",
       "runs_on": "hpc:literature",
-      "tools_file": "mcp/retigene-rag-0.0.1.tools.json",
+      "tools_file": "mcp/retigene-rag-0.0.2.tools.json",
       "tools_sha256": "f3fc9471f82b5b94c25701af89bb3600c469e5a0b54a2d44e095b4257448b8e9",
       "adapter": "retigene",
       "aliases": {

@@ -143,13 +143,13 @@ release's venv. Scientific embedding/ranking packages belong in the published MC
 A skills release is a tag of the repository pinned in `configs/skills_registry.json`
 whose GitHub Release holds `catalog.json`, the skills zip and `SHA256SUMS`.
 The migration pins the published
-[`lijinbio/aiscientist-skills` v0.2.9](https://github.com/lijinbio/aiscientist-skills/releases/tag/v0.2.9)
+[`lijinbio/aiscientist-skills` v0.2.10](https://github.com/lijinbio/aiscientist-skills/releases/tag/v0.2.10)
 and its exact MCP image digests. A new pin means a new reviewed release, never a
 tag changed in place.
 [`deploy_skills.sh`](deploy_skills.sh) installs one, as the service account:
 
 ```bash
-deploy_skills.sh v0.2.9       # download, check, install into skills/releases/0.2.9/, switch skills/current
+deploy_skills.sh v0.2.10       # download, check, install into skills/releases/0.2.10/, switch skills/current
 deploy_skills.sh --rollback   # back to skills/previous; the release rolled back from is held
 deploy_skills.sh --list
 ```
