@@ -116,6 +116,8 @@ class Dataset(Base):
     chat_attachments: Mapped[list["ConversationDataset"]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan")
 
+    run_inputs: Mapped[list["RunDataset"]] = relationship(back_populates="dataset")
+
     def public(self) -> dict:
         return {
             "id": self.id, "uuid": self.uuid, "owner": self.user_id,
@@ -187,6 +189,8 @@ class SharedDatasetVersion(Base):
     hpc_verified_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    run_inputs: Mapped[list["RunDataset"]] = relationship(back_populates="shared_version")
+
 
 class SharedDatasetFile(Base):
     """One file of a version, as its manifest lists it. ``facets`` is JSON: tissue, modality and,
@@ -255,15 +259,42 @@ class Run(Base):
     finished_at: Mapped[_dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="runs", foreign_keys=[user_id])
+    datasets: Mapped[list["RunDataset"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="RunDataset.position")
 
     def public(self) -> dict:
         return {
             "id": self.id, "run_id": self.run_id, "question": self.question, "status": self.status,
             "plan_mode": self.plan_mode, "dataset_id": self.dataset_id,
+            "datasets": [d.public() for d in self.datasets],
             "conversation_id": self.conversation_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
         }
+
+
+class RunDataset(Base):
+    """Inputs fixed at run start; the identity snapshot survives removal of the data."""
+
+    __tablename__ = "run_datasets"
+
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dataset_id: Mapped[int | None] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True, index=True)
+    dataset_uuid: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    shared_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shared_dataset_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    role: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    run: Mapped[Run] = relationship(back_populates="datasets")
+    dataset: Mapped[Dataset | None] = relationship(back_populates="run_inputs")
+    shared_version: Mapped[SharedDatasetVersion | None] = relationship(back_populates="run_inputs")
+
+    def public(self) -> dict:
+        return {"name": self.name, "role": self.role, "uuid": self.dataset_uuid}
 
 
 class Conversation(Base):
@@ -286,6 +317,13 @@ class Conversation(Base):
     # it survives a reload/device change, like the messages themselves.
     preset_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     context_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The group the chat is filed under in the sidebar; None = not in a group.
+    # A plain column (SQLite cannot add a foreign key to an existing table): the API checks that the
+    # group is the owner's and clears this when the group is deleted.
+    group_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Where the title came from: None/"prompt" = the first message's opening words, "intent" = the
+    # session's model named what the request asks for, "user" = typed by the user (never replaced).
+    title_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="conversations", foreign_keys=[user_id])
     messages: Mapped[list["Message"]] = relationship(
@@ -300,11 +338,27 @@ class Conversation(Base):
 
     def public(self) -> dict:
         return {
-            "id": self.id, "title": self.title,
+            "id": self.id, "title": self.title, "title_source": self.title_source or "prompt",
+            "group_id": self.group_id,
             "preset_key": self.preset_key, "context_prompt": self.context_prompt,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class ConversationGroup(Base):
+    """A named group of one user's chats in the sidebar. Deleting it leaves its chats ungrouped."""
+
+    __tablename__ = "conversation_groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[_dt.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def public(self) -> dict:
+        return {"id": self.id, "name": self.name, "position": self.position}
 
 
 class ConversationDataset(Base):

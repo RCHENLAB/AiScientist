@@ -17,7 +17,6 @@ from aiscientist.agents.research_harness import (
     HarnessTool,
     ResearchHarness,
     _msg_tokens,
-    default_catalog,
 )
 from aiscientist.agents.research_lab import (
     DEFAULT_SPECIALISTS,
@@ -141,8 +140,8 @@ def test_plan_mode_streams_the_reviewed_agenda_once():
 def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatch):
     # The catalog is pinned so the steps' backticked names are read the same with or without the
     # analysis extras installed (without them the catalog cannot be built).
-    import aiscientist.agents.research_lab as rl
-    monkeypatch.setattr(rl, "_known_tool_names",
+    from aiscientist.agents.research_lab import tooling
+    monkeypatch.setattr(tooling, "_known_tool_names",
                         lambda: frozenset({"mcp_run_cellqc", "mcp_run_de", "run_code", "mcp_run_scanpy_qc"}))
     first_call = {}
 
@@ -169,7 +168,6 @@ def test_only_a_tool_that_ends_its_step_is_passed_as_the_planned_tool(monkeypatc
 # --- convergence is LLM-judged (no fixed score threshold) --------------------
 
 def test_cellqc_planner_sees_declared_threshold_defaults(monkeypatch):
-    from copy import deepcopy
     tool = next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
     def make_tool():
         return tool
@@ -2965,7 +2963,7 @@ def test_cancel_after_step_one_keeps_partial_results():
 
 
 def test_harness_cancel_stops_before_calling_the_model():
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 
     calls = {"n": 0}
 
@@ -3081,7 +3079,7 @@ def test_run_code_without_executor_is_not_enabled():
 # --- end-to-end with the REAL sandbox: lab -> Scientist -> run_code -> subprocess
 
 def test_lab_run_code_executes_in_real_sandbox():
-    from aiscientist.agents.research_harness import ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import ResearchHarness
     from aiscientist.agents.sandbox import CodeSandbox
 
     complete = _make_complete(

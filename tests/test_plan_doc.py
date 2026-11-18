@@ -186,7 +186,8 @@ def test_a_value_of_the_wrong_type_or_outside_the_closed_set_is_dropped():
 
 def test_a_multi_library_step_does_not_bind_one_species_or_a_subset_of_samples():
     from native_tool_fixtures import fixture_catalog
-    make_tool = lambda: next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
     text = ("Run `mcp_run_cellqc` on the three Cell Ranger libraries in this delivery. "
             "Sample1_WT and Sample2_Ddx41 are mouse (GRCm39) and are merged into one QC'd "
@@ -202,7 +203,8 @@ def test_a_multi_library_step_does_not_bind_one_species_or_a_subset_of_samples()
 
 def test_a_single_library_step_still_binds_its_species_and_sample():
     from native_tool_fixtures import fixture_catalog
-    make_tool = lambda: next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
     proposed = {"species": "mouse", "samples": ["Sample2_Ddx41"]}
     text = "Run mcp_run_cellqc on the Sample2_Ddx41 Cell Ranger library, which is mouse (GRCm39)."
@@ -222,7 +224,8 @@ def test_closed_set_scope_ignores_defaults_and_partial_words(text, expected):
 
 def test_a_sentinel_choice_in_prose_does_not_unbind_a_closed_set():
     from native_tool_fixtures import fixture_catalog
-    make_tool = lambda: next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
     text = ("Run mcp_run_cellqc with decontX for the ambient RNA; none of the libraries is "
             "corrected with SoupX.")
@@ -251,7 +254,8 @@ def test_a_sample_list_that_misses_a_named_library_is_refused_even_with_other_it
     # "Sample3" is in the text (inside "Sample3_GSM5676874"), so it passes the stated check; it is no
     # subset of the full names either. mcp_run_cellqc matches sample ids exactly and would refuse it.
     from native_tool_fixtures import fixture_catalog
-    make_tool = lambda: next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
+    def make_tool():
+        return next(t for t in fixture_catalog() if t.name == "mcp_run_cellqc")
 
     text = ("Run mcp_run_cellqc on Sample1_WT and Sample2_Ddx41 (mouse) and Sample3_GSM5676874 "
             "(human).")

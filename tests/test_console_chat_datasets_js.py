@@ -115,6 +115,8 @@ const state = { activeId: "1", status: "ready", connectionId: "conn", maxRuns: 0
 const stored = {}, localStorage = { getItem: k => stored[k] || null,
   setItem: (k,v) => stored[k] = v, removeItem: k => delete stored[k] };
 const COMPOSER_KEY = "composer", RUNOWNER_KEY = "owners", STREAMS_KEY = "streams";
+// The composer's images (issue 115): none are attached in these checks.
+const clearComposerImages = () => {}, sessionVision = async () => null;
 const els = {}, $ = id => els[id] || (els[id] = {value:"", innerHTML:"", textContent:""});
 const escapeHtml = s => String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 const datasetIcon = () => "draft", notices = [], toast = s => notices.push(s);

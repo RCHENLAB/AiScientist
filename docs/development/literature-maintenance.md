@@ -26,7 +26,7 @@ export AISCIENTIST_PAPERQA_PAPERS=/shared/corpus/papers
 export AISCIENTIST_PAPERQA_MANIFEST=/shared/corpus/paperqa_manifest.csv
 export AISCIENTIST_LOCAL_CORPUS_ROOT=/data/reference/corpus-copy
 # Omit this when the app already registers the pinned literature server image.
-export AISCIENTIST_CORPUS_MAINTENANCE_IMAGE='docker://ghcr.io/liujs123456/mcp-literature@sha256:ea3d66b0b7bc6f217da5dd78e1fd16ae018cea780e45728a097fbaa306fd12e7'
+export AISCIENTIST_CORPUS_MAINTENANCE_IMAGE='docker://ghcr.io/lijinbio/mcp-literature@sha256:05ab531fb89a886e43af07d9730252c0db81a7b7e52c46b5f81bc457f53460ad'
 python scripts/update_corpus_index.py --rebuild \
   --hpc-user your_cluster_user --ssh-key /path/to/operator_key
 ```

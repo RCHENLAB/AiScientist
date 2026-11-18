@@ -181,3 +181,27 @@ def test_0002_adds_key_fp_and_its_index_once(fresh_db):
     with create_engine(url).begin() as c:        # back to "0001" with the column and index still there
         c.execute(text("UPDATE alembic_version SET version_num = '0001'"))
     assert db.migrate() == ("0001", db.head_revision())
+
+
+def test_0010_run_datasets_upgrade_downgrade_and_create_all(fresh_db):
+    from alembic import command
+
+    db, _ = fresh_db
+    cfg = db._alembic_config()
+    with db.get_engine().begin() as conn:
+        cfg.attributes["connection"] = conn
+        command.upgrade(cfg, "0009")
+        assert "run_datasets" not in inspect(conn).get_table_names()
+        command.upgrade(cfg, "0010")
+        fks = {fk["constrained_columns"][0]: fk for fk in inspect(conn).get_foreign_keys("run_datasets")}
+        assert fks["run_id"]["options"]["ondelete"] == "CASCADE"
+        assert fks["dataset_id"]["options"]["ondelete"] == "SET NULL"
+        assert fks["shared_version_id"]["options"]["ondelete"] == "SET NULL"
+        command.downgrade(cfg, "0009")
+        assert "run_datasets" not in inspect(conn).get_table_names()
+        # A host without Alembic may have created the table ahead of its revision.
+        db.Base.metadata.create_all(conn)
+        command.upgrade(cfg, "0010")
+        assert "run_datasets" in inspect(conn).get_table_names()
+        command.downgrade(cfg, "0009")
+        assert "run_datasets" not in inspect(conn).get_table_names()

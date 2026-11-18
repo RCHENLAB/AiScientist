@@ -6,7 +6,6 @@ API-key store and its master key, and ``inspect_dataset`` returned the head of t
 
 from __future__ import annotations
 
-import json
 import os
 from types import SimpleNamespace
 

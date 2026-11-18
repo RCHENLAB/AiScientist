@@ -65,21 +65,21 @@ STAGES: tuple[Stage, ...] = (
     Stage("plan", "Plan", ("research",),
           "The request's scope and the matching pipeline are read, the PI drafts the plan as a task "
           "graph, and the Critic reviews it before anyone sees it.",
-          "agents/research_lab.py", ("plan", "critic")),
+          "agents/research_lab/", ("plan", "critic")),
     Stage("approve", "Your review", ("research", "literature"),
           "The run waits for you to run, edit or cancel the plan, or answer its question.",
           "gateway/app.py"),
     Stage("execute", "Run steps", ("research",),
           "The scheduler hands each ready step to the Scientist in the persona of the specialist it "
           "needs; the Scientist calls tools, the Critic accepts the result or sends it back.",
-          "agents/research_lab.py", ("scientist", "critic")),
+          "agents/research_lab/", ("scientist", "critic")),
     Stage("audit", "Claim audit", ("research",),
           "Each claim the accepted steps support is checked on its own before anything is written.",
           "agents/claim_audit.py", ("audit",)),
     Stage("writeup", "Write-up", ("research",),
           "The writer drafts the report from the accepted steps only; citations are attached from the "
           "accepted literature steps and the draft is self-reviewed and its numbers checked.",
-          "agents/research_lab.py", ("writer",)),
+          "agents/research_lab/", ("writer",)),
     Stage("report", "Report", ("research",),
           "The report is rendered to PDF / DOCX (on HPC3 when configured) and reviewed; a run that "
           "only did quality control answers in the chat instead. The files go to Downloads.",

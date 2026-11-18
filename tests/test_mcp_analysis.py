@@ -456,7 +456,7 @@ def test_settings_are_quoted_and_only_deployment_values_are_forwarded(analysis_b
 
 def test_settings_reject_credential_endpoints_and_root_mount(tmp_path, monkeypatch):
     server, = bridge.load_servers(config(tmp_path, "literature", settings=["LITERATURE_MODEL_ENDPOINT"]))
-    monkeypatch.setenv("LITERATURE_MODEL_ENDPOINT", "https://user:password@example.org/v1")
+    monkeypatch.setenv("LITERATURE_MODEL_ENDPOINT", "https://user:placeholder@example.org/v1")
     with pytest.raises(ValueError, match="without credentials"):
         setting_paths(server)
     monkeypatch.setenv("LITERATURE_CORPUS_ROOT", "/data")
@@ -478,6 +478,28 @@ def test_bound_inputs_and_authoritative_clinical_variant_context(tmp_path):
     args = variant.authoritative({"assembly": "GRCh38", "max_variants": 500}, ctx, "annotate_variants", executor)
     assert args == {"assembly": "GRCh37", "max_variants": 0}
     assert variant.prepare({"regions_bed": "bed"}, executor).arguments["regions_bed"] == "/bound/regions.bed"
+
+
+def test_cellqc_is_given_every_folder_bound_to_the_run(tmp_path):
+    """With two sample folders bound, `run_cellqc` called with `samples` alone read only the primary
+    one: the second library was dropped without a word and the step was run a second time."""
+    server, = bridge.load_servers(config(tmp_path, "cellqc"))
+    adapter = AnalysisAdapter(server)
+    wt, mut = "/hpc/inputs/CellQC/Sample1_WT", "/hpc/inputs/CellQC/Sample2_Ddx41"
+    executor = SimpleNamespace(dataset_path=f"{wt}/filtered_feature_bc_matrix.h5", dataset_root=wt,
+                               inputs=[{"name": "Sample2_Ddx41", "path": mut}])
+    ctx = SimpleNamespace(decisions={"input_folders": [
+        {"name": "Sample1_WT", "path": "/data/shared/Sample1_WT", "hpc": wt},
+        {"name": "Sample2_Ddx41", "path": "/data/shared/Sample2_Ddx41", "hpc": mut}]})
+    args = adapter.authoritative({"samples": ["Sample1_WT", "Sample2_Ddx41"]}, ctx, "run_cellqc", executor)
+    assert args["dataset_paths"] == [wt, mut]
+    assert adapter.prepare(args, executor, tool="run_cellqc").arguments["dataset_paths"] == [wt, mut]
+    # What the model passed stands, one folder needs nothing, and other tools are left alone.
+    chosen = adapter.authoritative({"dataset_paths": [mut]}, ctx, "run_cellqc", executor)
+    assert chosen["dataset_paths"] == [mut]
+    one = SimpleNamespace(decisions={"input_folders": ctx.decisions["input_folders"][:1]})
+    assert "dataset_paths" not in adapter.authoritative({}, one, "run_cellqc", executor)
+    assert "dataset_paths" not in adapter.authoritative({}, ctx, "cellqc_job_status", executor)
 
 
 def test_complete_public_response_is_bounded_before_transport(analysis_bridge):
@@ -525,11 +547,21 @@ def test_collector_rejects_symlinked_configured_root(analysis_bridge, variable):
     assert not (runner.checkpoints / "adata_qc.h5ad").exists()
 
 
-@pytest.mark.parametrize("value", ["adata_qc.h5ad", "work/adata_qc.mouse.h5ad",
+@pytest.mark.parametrize("value", ["work/adata_qc.mouse.h5ad",
                                   "artifacts/tables/rank_group*.rnk", "artifacts/custom/input.h5ad"])
 def test_scrna_accepts_confined_relative_input_paths(tmp_path, value):
     server, = bridge.load_servers(config(tmp_path, "scrna-analysis"))
     assert AnalysisAdapter(server).prepare({"input": value}, SimpleNamespace()).arguments["input"] == value
+
+
+@pytest.mark.parametrize("value", ["adata_annotated.h5ad", "rank_rod.rnk"])
+def test_a_bare_input_name_reaches_the_server_as_a_path_in_work(tmp_path, value):
+    """`mcp_run_de` with `input: adata_annotated.h5ad` found "no .h5ad file in this run" although the
+    annotation step had just written it: the server takes a checkpoint of another analysis of
+    the run only when the name is spelled work/<name>."""
+    server, = bridge.load_servers(config(tmp_path, "scrna-analysis"))
+    prepared = AnalysisAdapter(server).prepare({"input": value}, SimpleNamespace())
+    assert prepared.arguments["input"] == f"work/{value}"
 
 
 @pytest.mark.parametrize("value", ["/etc/adata_qc.h5ad", "work/../secret.h5ad", "artifacts/tables/../../secret.rnk",

@@ -470,7 +470,56 @@ async function renderMermaidIn(root) {
   }
 }
 
-function renderMarkdown(text) {
+// ---- links and images in Markdown (issue 115) ----
+// ![alt](url) and [text](url) are drawn only for a URL the page may follow: the account's own run files
+// (/api/file/<owner>/<run>/...), its dataset files, its chat images, or an https address. A relative
+// path is resolved against the file that holds it (``base``) and must stay inside that run's folder.
+// Nothing else (javascript:, data:, http:, another origin) becomes a link or an image: it is shown as
+// plain text. Everything is escaped, and no HTML a model or a file writes is ever run.
+// Only the account's own files are drawn as images. An image on another site is shown as a link: a
+// reply is model text, and an <img> would be fetched as soon as the reply shows, so an address that
+// carries something from the chat would reach that site without a click.
+const MD_URL_ALLOWED = [/^\/api\/file\/[^/]+\/[^/]+\/.+/, /^\/api\/datasets\/\d+\/download$/, /^\/api\/chat-images\/\d+\/[\w.-]+$/];
+function safeMdUrl(raw, base) {
+  raw = String(raw || "").trim();
+  if (!raw || /[\u0000-\u001f\u007f\s]/.test(raw) || raw.startsWith("//") || raw.includes("\\")) return null;
+  const HOST = "http://console.invalid";
+  let u;
+  try { u = new URL(raw, new URL(base || "/", HOST)); } catch { return null; }
+  if (u.origin === HOST) {
+    // An absolute path says exactly where it points: a ``..`` in it (even %2e%2e) is a way around the
+    // allow-list below, since the URL parser would fold it away before the check.
+    const dotdot = (seg) => { try { return decodeURIComponent(seg) === ".."; } catch { return true; } };
+    if (raw.startsWith("/") && raw.split("?")[0].split("/").some(dotdot)) return null;
+    const run = /^(\/api\/file\/[^/]+\/[^/]+\/)/.exec(base || "");
+    const relative = !/^[a-z][a-z0-9+.-]*:/i.test(raw) && !raw.startsWith("/");
+    if (relative && run && !u.pathname.startsWith(run[1])) return null;       // ../ out of the run folder
+    if (u.pathname.split("/").some(dotdot)) return null;
+    return MD_URL_ALLOWED.some((re) => re.test(u.pathname)) ? u.pathname + u.search : null;
+  }
+  // An https address as written: a host straight after ``https://`` (no empty host, no user@ part).
+  return u.protocol === "https:" && /^https:\/\/[^/?#@\s]+(?:[/?#]|$)/i.test(raw) && u.hostname.includes(".") ? u.href : null;
+}
+function mdLinks(escaped, stash, base) {
+  const decode = (t) => t.replace(/&amp;/g, "&");
+  return escaped
+    .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (m, alt, url) => {
+      const href = safeMdUrl(decode(url), base);
+      if (!href) return alt || "";
+      if (!href.startsWith("/")) {
+        return stash(`<a class="md-link md-img-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">` +
+          `${alt || escapeHtml(href)}</a>`);
+      }
+      return stash(`<img class="md-img" src="${escapeHtml(href)}" alt="${alt}" loading="lazy"` +
+        ` data-fv-open="${escapeHtml(href)}" data-fv-name="${alt || "image"}" />`);
+    })
+    .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+      const href = safeMdUrl(decode(url), base);
+      return href ? stash(`<a class="md-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${text}</a>`) : text;
+    });
+}
+
+function renderMarkdown(text, opts) {
   // Normalize PaperQA anchor-style citations before anything else: the chat has no #ref anchor
   // targets, so [3](#ref3) / [[1](#ref1), [2](#ref2)] render as raw noise. Collapse them to plain
   // [3] / [1, 2], and strip the literal <i>/<b> HTML the corpus citation titles carry. Display-
@@ -492,7 +541,7 @@ function renderMarkdown(text) {
     .replace(/```[ \t]*[\w-]*\n?([\s\S]*?)```/g, (_m, body) =>
       stash('<pre class="md-code"><code>' + escapeHtml(body.replace(/\n+$/, "")) + "</code></pre>"))
     .replace(/`([^`\n]+)`/g, (_m, c) => stash("<code>" + escapeHtml(c) + "</code>"));
-  s = mdTables(escapeHtml(s))
+  s = mdTables(mdLinks(escapeHtml(s), stash, opts && opts.base))
     .replace(/^#### (.+)$/gm, "<h4>$1</h4>")
     .replace(/^### (.+)$/gm, "<h3>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2>$1</h2>")
@@ -576,6 +625,7 @@ function msgFromServer(m) {
              streamId: meta.stream_id || null };
   }
   const msg = { role: m.role, content: m.content };
+  if (Array.isArray((m.meta || {}).images) && m.meta.images.length) msg.images = m.meta.images;   // a message's images
   // Restore the collapsed run recap (thinking + steps/code) so a finished run stays
   // reviewable after a reload / on another device — not only in a downloaded log.
   const meta = m.meta || {};
@@ -599,9 +649,11 @@ function serverMsgPayload(msg) {
              meta: { items: msg.items || [], bundleUrl: msg.bundleUrl, ...(msg.streamId ? { stream_id: msg.streamId } : {}) } };
   }
   const payload = { role: msg.role, content: msg.content || "" };
+  // A message's images go by id; the server keeps the references it checks (name, type, size, url).
+  if (Array.isArray(msg.images) && msg.images.length) { payload.kind = "text"; payload.meta = { images: msg.images.map((i) => ({ id: i.id })) }; }
   if (msg.thinking || (msg.feed && msg.feed.length) || (msg.jobs && msg.jobs.length)) {
     payload.kind = "text";
-    payload.meta = { thinking: msg.thinking || "", feed: msg.feed || [] };
+    payload.meta = { ...(payload.meta || {}), thinking: msg.thinking || "", feed: msg.feed || [] };
     if (Array.isArray(msg.jobs)) payload.meta.jobs = msg.jobs;
     if (msg.outcome) payload.meta.outcome = msg.outcome;
     if (msg.ms != null) payload.meta.ms = msg.ms;
@@ -635,7 +687,9 @@ async function loadSessions() {
       state.sessions = (data.conversations || []).map((c) => ({
         id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: false,
         createdAt: c.created_at, updatedAt: c.updated_at,
+        groupId: c.group_id ?? null, titleSource: c.title_source || "prompt",
       }));
+      state.groups = data.groups || [];
       pruneComposers(state.sessions);
       if (!state.sessions.length) { await newSession(); }
       else { state.activeId = state.sessions[0].id; showDialog(); await ensureMessages(activeSession()); }
@@ -673,7 +727,8 @@ async function newSession() {
     try {
       const c = (await api("POST", "/api/conversations", {})).conversation;
       state.sessions.unshift({ id: String(c.id), cid: c.id, title: c.title, messages: [], loaded: true,
-      createdAt: c.created_at, updatedAt: c.updated_at || c.created_at });
+      createdAt: c.created_at, updatedAt: c.updated_at || c.created_at,
+      groupId: null, titleSource: "prompt" });
       state.activeId = String(c.id);
       state.planView = null;
       renderSessionList();
@@ -714,6 +769,7 @@ function showDialog() {
   syncPlanCue(c);
   syncDatasetSelection();
   renderUploadLine();
+  if (typeof renderImageChips === "function") renderImageChips();   // each chat has its own pending images
   // Occupancy is per conversation and only known once THIS chat takes a turn — the previous
   // conversation's number would be worse than showing nothing.
   if (c && c.ctx) renderContextMeter(c.ctx); else hideContextMeter();
@@ -857,19 +913,154 @@ function relTime(iso) {
 // that chat is, so this is how a person in another chat learns that something waits for them.
 const PLAN_WAITING_LABEL = { plan: "Plan to review", clarify: "Question for you", decision: "Decision needed" };
 
-function renderSessionList() {
-  const list = $("sessionList");
-  if (!state.sessions.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
-  list.innerHTML = state.sessions
-    .map((s) => `
-      <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}">
+function sessionItemHtml(s) {
+  const more = state.user && s.cid
+    ? `<button class="session-more" data-more="${s.id}" title="Rename or move to a group" aria-label="Rename or move to a group" aria-haspopup="menu">⋯</button>` : "";
+  return `
+      <div class="session-item ${s.id === state.activeId ? "active" : ""}" data-id="${s.id}" draggable="${state.user && s.cid ? "true" : "false"}">
         <span class="session-text">
-          <span class="session-title">${escapeHtml(s.title || "New chat")}</span>
+          <span class="session-title" title="${escapeHtml(s.title || "New chat")}">${escapeHtml(s.title || "New chat")}</span>
           <span class="session-meta">${sessionBadge(s.id)}<span class="session-time" title="${escapeHtml(absTime(s.updatedAt || s.createdAt))}">${escapeHtml(relTime(s.updatedAt || s.createdAt))}</span></span>
         </span>
+        ${more}
         <button class="session-del" data-del="${s.id}" title="Delete chat" aria-label="Delete chat">✕</button>
-      </div>`)
-    .join("");
+      </div>`;
+}
+
+// Which groups are folded is a convenience of this browser, not part of the account's data.
+const GROUPS_FOLDED_KEY = "bioagent_chat_groups_folded_v1";
+function foldedGroups() {
+  try { return new Set(JSON.parse(localStorage.getItem(GROUPS_FOLDED_KEY) || "[]").map(String)); } catch { return new Set(); }
+}
+function setGroupFolded(gid, folded) {
+  const set = foldedGroups();
+  if (folded) set.add(String(gid)); else set.delete(String(gid));
+  try { localStorage.setItem(GROUPS_FOLDED_KEY, JSON.stringify([...set])); } catch {}
+}
+
+// The chats, under the user's groups when there are any. A chat in no group (or in one that no
+// longer exists) is listed under "Other chats"; with no groups the list is flat, as it always was.
+function renderSessionList() {
+  const list = $("sessionList");
+  const groups = state.user ? (state.groups || []) : [];
+  $("newGroupBtn")?.classList.toggle("hidden", !state.user);
+  if (!state.sessions.length && !groups.length) { list.innerHTML = '<div class="session-empty">No chats yet.</div>'; return; }
+  if (!groups.length) { list.innerHTML = state.sessions.map(sessionItemHtml).join(""); return; }
+  const known = new Set(groups.map((g) => g.id));
+  const folded = foldedGroups();
+  const section = (gid, name, chats, actions) => {
+    const closed = folded.has(String(gid));
+    return `
+      <div class="session-group ${closed ? "folded" : ""}" data-group="${gid}">
+        <div class="session-group-head" data-group-toggle="${gid}" role="button" tabindex="0" aria-expanded="${!closed}">
+          <span class="session-group-caret" aria-hidden="true">▾</span>
+          <span class="session-group-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+          <span class="session-group-count">${chats.length}</span>
+          ${actions}
+        </div>
+        ${closed ? "" : (chats.map(sessionItemHtml).join("") || '<div class="session-empty">Drag a chat here, or use its ⋯ menu.</div>')}
+      </div>`;
+  };
+  const html = groups.map((g) => section(g.id, g.name, state.sessions.filter((s) => s.groupId === g.id),
+    `<button class="session-group-btn" data-group-rename="${g.id}" title="Rename group" aria-label="Rename group">✎</button>
+     <button class="session-group-btn" data-group-del="${g.id}" title="Delete group (its chats are kept)" aria-label="Delete group">✕</button>`));
+  html.push(section("none", "Other chats", state.sessions.filter((s) => !known.has(s.groupId)), ""));
+  list.innerHTML = html.join("");
+}
+
+async function newChatGroup() {
+  const name = (prompt("Name of the new group:") || "").trim();
+  if (!name) return;
+  try {
+    const g = (await api("POST", "/api/conversation-groups", { name })).group;
+    state.groups = [...(state.groups || []), g];
+    renderSessionList();
+  } catch (e) { toast(`Could not create the group: ${e.message || e}`); }
+}
+
+async function renameChatGroup(gid) {
+  const g = (state.groups || []).find((x) => x.id === gid);
+  if (!g) return;
+  const name = (prompt("Rename group:", g.name) || "").trim();
+  if (!name || name === g.name) return;
+  try {
+    g.name = (await api("PATCH", `/api/conversation-groups/${gid}`, { name })).group.name;
+    renderSessionList();
+  } catch (e) { toast(`Could not rename the group: ${e.message || e}`); }
+}
+
+async function deleteChatGroup(gid) {
+  const g = (state.groups || []).find((x) => x.id === gid);
+  if (!g || !confirm(`Delete the group “${g.name}”? Its chats are kept and move to “Other chats”.`)) return;
+  try {
+    await api("DELETE", `/api/conversation-groups/${gid}`);
+    state.groups = state.groups.filter((x) => x.id !== gid);
+    for (const s of state.sessions) if (s.groupId === gid) s.groupId = null;
+    setGroupFolded(gid, false);
+    renderSessionList();
+  } catch (e) { toast(`Could not delete the group: ${e.message || e}`); }
+}
+
+async function moveSessionToGroup(id, gid) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s || !s.cid || (s.groupId ?? null) === gid) return;
+  const before = s.groupId ?? null;
+  s.groupId = gid;
+  if (gid !== null) setGroupFolded(gid, false);
+  renderSessionList();
+  try { await api("PATCH", `/api/conversations/${s.cid}`, { group_id: gid }); }
+  catch (e) { s.groupId = before; renderSessionList(); toast(`Could not move the chat: ${e.message || e}`); }
+}
+
+async function renameSession(id) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s || !s.cid) return;
+  const title = (prompt("Rename chat:", s.title || "") || "").trim();
+  if (!title || title === s.title) return;
+  try {
+    const c = (await api("PATCH", `/api/conversations/${s.cid}`, { title, title_source: "user" })).conversation;
+    s.title = c.title; s.titleSource = c.title_source;
+    if (s.id === state.activeId) $("chatTitle").textContent = s.title;
+    renderSessionList();
+  } catch (e) { toast(`Could not rename the chat: ${e.message || e}`); }
+}
+
+// The ⋯ menu of one chat: rename it, or file it under a group.
+function closeSessionMenu() { document.getElementById("sessionMenu")?.remove(); }
+function openSessionMenu(id, anchor) {
+  closeSessionMenu();
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s) return;
+  const groups = state.groups || [];
+  const here = groups.some((g) => g.id === s.groupId) ? s.groupId : null;
+  const menu = document.createElement("div");
+  menu.id = "sessionMenu";
+  menu.className = "session-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML =
+    `<button type="button" role="menuitem" data-menu-rename="${id}">Rename chat…</button>
+     <div class="session-menu-label">Move to</div>` +
+    groups.map((g) => `<button type="button" role="menuitem" data-menu-move="${g.id}" ${g.id === here ? 'aria-current="true"' : ""}>${escapeHtml(g.name)}</button>`).join("") +
+    (groups.length ? `<button type="button" role="menuitem" data-menu-move="none" ${here === null ? 'aria-current="true"' : ""}>Other chats (no group)</button>` : "") +
+    `<button type="button" role="menuitem" data-menu-newgroup="1">New group…</button>`;
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8))}px`;
+  menu.addEventListener("click", async (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    closeSessionMenu();
+    if (b.dataset.menuRename) return renameSession(id);
+    if (b.dataset.menuMove) return moveSessionToGroup(id, b.dataset.menuMove === "none" ? null : Number(b.dataset.menuMove));
+    if (b.dataset.menuNewgroup) {
+      const n = (state.groups || []).length;
+      await newChatGroup();
+      const made = (state.groups || [])[n];
+      if (made) moveSessionToGroup(id, made.id);
+    }
+  });
+  menu.querySelector("button")?.focus();
 }
 
 // A chat that waits for an answer says what it waits for; a chat whose run is in flight says so.
@@ -1136,16 +1327,20 @@ function messageEl(m) {
     const bundle = m.bundleUrl ? `<a class="artifact-bundle" href="${m.bundleUrl}" download>${icon("download")}Download all results (.zip)</a>` : "";
     const n = (m.items && m.items.length) || 0;
     el.innerHTML = `<div class="artifacts-title">${icon("folder_open")}<span>Results &amp; code (${n})</span></div>` + bundle +
+      figuresHtml(m.items) +
       `<div class="result-handoff"></div>` +
       `<div class="artifacts-hint">Browse &amp; preview every file — organized by folder — in the Downloads panel →</div>`;
     const run = (m.bundleUrl || "").match(/\/api\/bundle\/[^/]+\/([^/]+)/);
     if (run) showResultHandoff(el.querySelector(".result-handoff"), run[1]);
-    el.addEventListener("click", onSaveResultClick);
+    el.addEventListener("click", (e) => {
+      if (e.target.closest("[data-open-results]")) { selectSideTab("results"); setPanel("right", true, false); return; }
+      onSaveResultClick(e);
+    });
     return el;
   }
   const el = document.createElement("div");
   el.className = `msg ${m.role}`;
-  if (m.role !== "assistant") { el.innerHTML = escapeHtml(m.content); return el; }
+  if (m.role !== "assistant") { el.innerHTML = escapeHtml(m.content) + userImagesHtml(m.images); return el; }
   // Assistant: the run behind the answer stays with it as one closed line (runCardHtml) — its Slurm
   // jobs, progress, step code and activity log open from there.
   let html = "";
@@ -1428,7 +1623,7 @@ function pushMessage(msg) {
     s.title = sessionTitle(msg.content);
     $("chatTitle").textContent = s.title;
     renderSessionList();
-    if (authed() && s.cid) api("PATCH", `/api/conversations/${s.cid}`, { title: s.title }).catch(() => {});
+    if (authed() && s.cid) api("PATCH", `/api/conversations/${s.cid}`, { title: s.title, title_source: "prompt" }).catch(() => {});
   }
   syncMessage(s, msg);
   persistSessions();
@@ -1446,12 +1641,13 @@ function pushToSession(sessionId, msg) {
   persistSessions();
 }
 
-function appendUserMessage(text) {
+function appendUserMessage(text, images) {
   const stream = $("chatStream");
   const hint = stream.querySelector(".empty-hint");
   if (hint) hint.remove();
-  pushMessage({ role: "user", content: text });
-  stream.appendChild(messageEl({ role: "user", content: text }));
+  const msg = { role: "user", content: text, ...(images && images.length ? { images } : {}) };
+  pushMessage(msg);
+  stream.appendChild(messageEl(msg));
   state.stickBottom = true;   // the user just sent — snap to their message and follow the reply
   stream.scrollTop = stream.scrollHeight;
 }
@@ -1797,17 +1993,63 @@ function switchResultsTab(name) {
   document.querySelectorAll("#downloads .rtab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
 }
 
-// Code/text files preview INLINE in the Preview tab; pdf/image (+ anything else) keep the
-// existing modal (heavier viewers we deliberately don't reimplement here).
-const TEXT_PREVIEW_EXT = new Set([
-  "py", "json", "md", "markdown", "txt", "text", "log", "csv", "tsv", "yaml", "yml",
-  "toml", "ini", "cfg", "conf", "r", "sh", "js", "css", "html", "xml", "tex", "bib", "dot",
-]);
-function isTextPreview(name) { return TEXT_PREVIEW_EXT.has((name.split(".").pop() || "").toLowerCase()); }
+// One preview by file type (frontend/console/fileview.js), the same wherever a file is opened: the
+// Results panel's Preview tab, the dataset preview and the Files page. A table for csv/tsv, rendered
+// Markdown, foldable JSON, highlighted YAML, line numbers for other text, and images and PDFs inside
+// the panel. A file is never inserted as markup, so no preview runs HTML or script from a file.
+const fvStates = new Map();
+let fvSeq = 0;
+
+function isTextPreview(name) {
+  const kind = FileView.kind(name);
+  return !!kind && kind !== "image" && kind !== "pdf";
+}
 
 function openResultFile(url, kind, name) {
-  if (isTextPreview(name)) loadInlinePreview(url, name);
-  else openFilePreview(url, kind, name);   // pdf / image → existing modal
+  const view = FileView.kind(name);
+  if (view) loadInlinePreview(url, name);      // text, table, image and pdf all open in the panel
+  else openFilePreview(url, kind, name);       // anything else keeps the modal
+}
+
+// The first FileView.LIMIT_BYTES of a file, and its size when the server says it. Reads a stream and
+// stops there, so a table of several GB opens as fast as a small one.
+async function readFileHead(url) {
+  const limit = FileView.LIMIT_BYTES;
+  const res = await fetch(url, { headers: { Range: `bytes=0-${limit - 1}` } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const range = /\/(\d+)\s*$/.exec(res.headers.get("Content-Range") || "");
+  let total = range ? +range[1] : (+res.headers.get("Content-Length") || 0);
+  const chunks = [];
+  let got = 0;
+  if (res.body && res.body.getReader) {
+    const reader = res.body.getReader();
+    while (got < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+    }
+    if (got >= limit) await reader.cancel();
+  } else {
+    const buf = new Uint8Array(await res.arrayBuffer());
+    chunks.push(buf.subarray(0, limit)); got = Math.min(buf.length, limit);
+    total = total || buf.length;
+  }
+  const bytes = new Uint8Array(Math.min(got, limit));
+  let at = 0;
+  for (const c of chunks) { const part = c.subarray(0, bytes.length - at); bytes.set(part, at); at += part.length; if (at >= bytes.length) break; }
+  const cut = total ? bytes.length < total : got >= limit;
+  let text = new TextDecoder("utf-8").decode(bytes);
+  if (cut) text = text.replace(/\uFFFD$/, "");       // a character cut in half at the limit
+  return { text, shown: bytes.length, total: total || bytes.length, cut };
+}
+
+// Paint the view of a file's text into ``host`` and keep its table state for sorting.
+function paintFileView(host, text, info) {
+  const id = "fv" + (++fvSeq);
+  const out = FileView.textView(text, { ...info, id, render: (t) => renderMarkdown(t, { base: info.url }) });
+  if (out.state) fvStates.set(out.id, out.state);
+  host.innerHTML = out.html;
+  return id;
 }
 
 async function loadInlinePreview(url, name) {
@@ -1815,14 +2057,56 @@ async function loadInlinePreview(url, name) {
   if (!pane) return;
   switchResultsTab("preview");
   pane.innerHTML = '<div class="preview-empty">Loading…</div>';
+  const head = `<div class="preview-file-head"><span class="preview-file-name">${escapeHtml(name)}</span>` +
+    `<a class="ghost small" href="${escapeHtml(url)}" download title="Download">${icon("download")}</a></div>`;
+  const kind = FileView.kind(name);
+  if (kind === "image" || kind === "pdf") { pane.innerHTML = head + FileView.mediaHtml(kind, url, name); return; }
   try {
-    const t = await (await fetch(url)).text();
-    pane.innerHTML =
-      `<div class="preview-file-head"><span class="preview-file-name">${escapeHtml(name)}</span>` +
-      `<a class="ghost small" href="${url}" download title="Download">${icon("download")}</a></div>` +
-      `<pre class="preview-code"><code></code></pre>`;
-    pane.querySelector("code").textContent = t.slice(0, 200000);   // textContent → no XSS
+    const got = await readFileHead(url);
+    pane.innerHTML = head + '<div class="fv-host"></div>';
+    paintFileView(pane.querySelector(".fv-host"), got.text, { name, url, shown: got.shown, total: got.total });
   } catch (e) { pane.innerHTML = `<div class="preview-empty">Preview failed: ${escapeHtml(e.message)}</div>`; }
+}
+
+// Clicks inside any file view: sort a table by a header, show more rows, fold JSON, switch Markdown
+// between Rendered and Source, open an image full size.
+function onFileViewClick(e) {
+  const sort = e.target.closest("[data-fv-sort]");
+  if (sort) {
+    const host = sort.closest("[data-fv-table]");
+    const st = host && fvStates.get(host.dataset.fvTable);
+    if (!st) return;
+    const col = +sort.dataset.fvSort;
+    st.sort = st.sort.col !== col ? { col, dir: 1 } : st.sort.dir === 1 ? { col, dir: -1 } : { col: -1, dir: 0 };
+    host.innerHTML = FileView.tableHtml(st);
+    return;
+  }
+  const more = e.target.closest("[data-fv-more]");
+  if (more) {
+    const host = more.closest("[data-fv-table]");
+    const st = host && fvStates.get(host.dataset.fvTable);
+    if (st) { st.shown += FileView.PAGE_ROWS; host.innerHTML = FileView.tableHtml(st); }
+    return;
+  }
+  const fold = e.target.closest("[data-fv-fold]");
+  if (fold) {
+    const root = fold.closest(".fv-host, .ds-body, #dsPreviewBody") || document;
+    root.querySelectorAll(".fv-fold").forEach((d) => { d.open = fold.dataset.fvFold === "open"; });
+    return;
+  }
+  const mode = e.target.closest("[data-fv-mode]");
+  if (mode) {
+    const box = mode.closest(".fv-host, #dsPreviewBody") || document;
+    box.querySelectorAll("[data-fv-mode]").forEach((b) => {
+      const on = b === mode;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    box.querySelectorAll("[data-fv-pane]").forEach((p) => p.classList.toggle("hidden", p.dataset.fvPane !== mode.dataset.fvMode));
+    return;
+  }
+  const img = e.target.closest("[data-fv-open]");
+  if (img) openFilePreview(img.dataset.fvOpen, "image", img.dataset.fvName || "image");
 }
 
 // Material Symbols (fonts.google.com/icons) — one consistent icon set across the app,
@@ -1914,7 +2198,11 @@ async function openFilePreview(url, kind, name) {
   try {
     if (kind === "image") body.innerHTML = `<img class="preview-img" src="${url}" alt="${escapeHtml(name)}" />`;
     else if (kind === "pdf") body.innerHTML = `<iframe class="preview-frame" src="${url}"></iframe>`;
-    else { const t = await (await fetch(url)).text(); body.innerHTML = `<pre class="preview-text">${escapeHtml(t.slice(0, 200000))}</pre>`; }
+    else {
+      const got = await readFileHead(url);
+      body.innerHTML = '<div class="fv-host"></div>';
+      paintFileView(body.querySelector(".fv-host"), got.text, { name, url, shown: got.shown, total: got.total });
+    }
   } catch (e) { body.textContent = "Preview failed: " + e.message; }
 }
 
@@ -2453,6 +2741,8 @@ async function selectLlmEndpoint(value, { accept = false } = {}) {
     if (!res.ok) { toast(d.error || "Could not switch endpoint"); snapEndpointSelect(); return; }
     apiKeys.activeId = credId || clusterValue(d.cluster_model_id || clusterId);
     syncEndpointActions();
+    forgetSessionVision();            // another model now: whether it reads images is asked again
+    paintImageNote();
     const cm = clusterModels.models.find((m) => m.id === (d.cluster_model_id || clusterId));
     toast(credId ? `LLM: ${d.credential ? d.credential.label : "your API endpoint"}`
       : d.status === "provisioning" ? `Starting ${cm ? cm.label : "the cluster model"} on a GPU — a few minutes`
@@ -3017,6 +3307,7 @@ async function submitApiKey(ev) {
     const reverify = d.verify;
     resetApiKeyForm();
     await loadApiCredentials();
+    if (editing) { forgetSessionVision(); paintImageNote(); }   // the endpoint in use may have a new model
     if (saved && !editing) {
       // The key was added FOR the picker the user came from: select it there, so they close the
       // dialog onto the choice they just made rather than back on "Cluster GPU".
@@ -3257,7 +3548,7 @@ const STREAM_TYPES = new Set([
 // window's run never streams into, cancels, or shows a plan card in this one.
 const RUN_SCOPED = new Set([...STREAM_TYPES,
   "chat_start", "plan_prompt", "plan_clarify", "decision_prompt", "plan_done",
-  "plan_status", "run_usage", "confirm_request", "confirm_done",
+  "plan_status", "run_usage", "step_provenance", "confirm_request", "confirm_done",
   // Context occupancy belongs to the conversation that asked, so another chat's turn never
   // rewrites this one's meter. Deliberately NOT in STREAM_TYPES: it is a standing status, not
   // part of the assistant bubble being replayed.
@@ -3291,6 +3582,27 @@ function handleWsMessage(msg) {
     return;
   }
   switch (msg.type) {
+    // The gateway attached a dataset the user picked on its card: show it on the chat.
+    case "chat_datasets": {
+      const s = state.sessions.find((x) => String(x.id) === String(msg.conversation_id));
+      if (s && s.cid) {
+        api("GET", `/api/conversations/${s.cid}`).then((data) => {
+          hydrateChatDatasets(chatOf(s.id), data);
+          if (s.id === state.activeId) { syncDatasetSelection(); renderDatasetChips(); }
+        }).catch(() => {});
+      }
+      break;
+    }
+    // The session's model named the chat by what its first request asks for.
+    case "chat_title": {
+      const s = state.sessions.find((x) => String(x.id) === String(msg.conversation_id));
+      if (s && msg.title && s.titleSource !== "user") {
+        s.title = msg.title; s.titleSource = "intent";
+        if (s.id === state.activeId) $("chatTitle").textContent = s.title;
+        renderSessionList();
+      }
+      break;
+    }
     case "status": applyStatus(msg.connection); break;
     case "session_state": renderSessionState(msg.session); break;   // the session's copies and state on HPC3
     case "event": appendLog(msg); updatePipelineFromEvent(msg); updateBoot(msg); break;
@@ -3330,6 +3642,14 @@ function handleRunEvent(c, msg) {
     case "step_code": streamCode(c, msg.code); break;
     case "run_job": streamJob(c, msg); break;
     case "chat_context": c.ctx = msg; if (chatVisible(c)) renderContextMeter(msg); break;
+    case "step_provenance":
+      // A step's record is re-sent when a retry changes it. The id carries the outcome, so the later
+      // record is shown after the failed one instead of being dropped as a replay of it.
+      pushToSession(c.sid, { role: "assistant", content: stepProvenanceMarkdown(msg),
+        streamId: `provenance:${msg.run_id || msg.stream_id || c.lastStreamId}:${msg.id || msg.step}`
+          + `:${msg.status || ""}:${(msg.tools || []).length}` });
+      if (chatVisible(c)) renderChat();
+      break;
     case "run_usage":
       if (msg.actual) {
         pushToSession(c.sid, { role: "assistant", content: runUsageMarkdown(msg),
@@ -4083,10 +4403,170 @@ async function injectPrompt(c, text) {
   } catch (err) { toast(isUnreachable(err) ? "Can't reach the local server." : "Inject failed: " + err.message); }
 }
 
+// ---- images in the composer (issue 115) ----------------------------------------------------------------
+// Attach (the Image button), paste or drop a PNG, JPEG, WebP or GIF: it is uploaded to the chat at once
+// (no HPC3 connection needed) and shows as a thumbnail that can be removed before sending. The sent
+// message shows the thumbnails, a click opens one full size, and they are still there after a reload.
+// A session whose model cannot read images says so before the message is sent.
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+// 7.5 MB: the Claude API's 10 MB per image counts the base64 text, which is a third longer.
+const IMAGE_MAX_BYTES = 7500000;
+const IMAGE_MAX_COUNT = 5;
+const visionCache = { id: null, value: null };
+
+// A run's figures in its reply (issue 115): the first few as thumbnails, each opening full size, and a
+// link to the rest in the Results panel. Only images the run wrote (its own files) are shown.
+const FIGURES_INLINE = 4;
+function figuresHtml(items) {
+  const figs = (items || []).filter((i) => i && i.kind === "image" && typeof i.url === "string" && /^\/api\/file\//.test(i.url));
+  if (!figs.length) return "";
+  // The ones under figures/ first: a plot is the answer, an image in data/ or process/ is not.
+  figs.sort((a, b) => (/\/figures\//.test(b.url) ? 1 : 0) - (/\/figures\//.test(a.url) ? 1 : 0));
+  const shown = figs.slice(0, FIGURES_INLINE);
+  return `<div class="msg-figures">` + shown.map((f) =>
+    `<figure class="msg-figure"><img src="${escapeHtml(f.url)}" alt="${escapeHtml(f.name || "figure")}" loading="lazy" ` +
+    `data-fv-open="${escapeHtml(f.url)}" data-fv-name="${escapeHtml(f.name || "figure")}" title="Click to open full size" />` +
+    `<figcaption>${escapeHtml(f.name || "")}</figcaption></figure>`).join("") +
+    (figs.length > shown.length
+      ? `<button type="button" class="ghost small" data-open-results>${figs.length - shown.length} more ${figs.length - shown.length === 1 ? "figure" : "figures"} in Results</button>` : "") +
+    `</div>`;
+}
+
+function userImagesHtml(images) {
+  if (!Array.isArray(images) || !images.length) return "";
+  return `<div class="msg-images">` + images.map((i) =>
+    `<img class="msg-img" src="${escapeHtml(i.url)}" alt="${escapeHtml(i.name || "image")}" loading="lazy" ` +
+    `data-fv-open="${escapeHtml(i.url)}" data-fv-name="${escapeHtml(i.name || "image")}" title="Click to open full size" />`).join("") + `</div>`;
+}
+
+// The answer holds for the session's model when it was asked. Switching the endpoint on the same
+// connection (selectLlmEndpoint) or editing the endpoint in use forgets it.
+function forgetSessionVision() {
+  visionCache.id = null; visionCache.value = null;
+}
+
+async function sessionVision({ fresh = false } = {}) {
+  if (!state.connectionId) return null;
+  if (!fresh && visionCache.id === state.connectionId && visionCache.value) return visionCache.value;
+  try {
+    const v = await api("GET", `/api/lab/vision?connection_id=${encodeURIComponent(state.connectionId)}`);
+    visionCache.id = state.connectionId; visionCache.value = v;
+    return v;
+  } catch { return null; }
+}
+
+function renderImageChips() {
+  const host = $("imageChips");
+  if (!host) return;
+  const c = activeChat();
+  const list = (c && c.images) || [];
+  host.classList.toggle("hidden", !list.length);
+  host.innerHTML = list.map((i) =>
+    `<span class="image-chip${i.uploading ? " uploading" : ""}" data-image-key="${escapeHtml(i.key)}" title="${escapeHtml(i.name)}">` +
+    `<img src="${escapeHtml(i.thumb || i.url || "")}" alt="${escapeHtml(i.name)}" />` +
+    `<button type="button" class="image-chip-x" data-remove-image="${escapeHtml(i.key)}" aria-label="Remove ${escapeHtml(i.name)}" title="Remove">×</button></span>`).join("") +
+    (list.length ? `<span class="image-note" id="imageNote"></span>` : "");
+  if (list.length) paintImageNote();
+}
+
+async function paintImageNote() {
+  const note = $("imageNote");
+  if (!note) return;
+  const v = await sessionVision();
+  const el = $("imageNote");
+  if (!el) return;
+  if (v && !v.accepts_images) {
+    el.className = "image-note bad";
+    el.textContent = `This session's model (${v.model || "unknown"}) cannot read images, so a message with them will not be sent. Remove them, or switch to a model that accepts images.`;
+  } else if (v) {
+    el.className = "image-note";
+    el.textContent = "Sent to the model with your message (a chat with no dataset attached).";
+  }
+}
+
+async function addComposerImages(files) {
+  const c = activeChat(), s = activeSession();
+  if (!c) return;
+  if (!authed() || !s || !s.cid) { toast("Images need an account and a saved chat."); return; }
+  c.images = c.images || [];
+  for (const f of files) {
+    const name = f.name || "pasted image";
+    if (c.images.length >= IMAGE_MAX_COUNT) { toast(`At most ${IMAGE_MAX_COUNT} images per message.`); break; }
+    if (!IMAGE_TYPES.includes(f.type)) { toast(`${name} is not a PNG, JPEG, WebP or GIF image.`); continue; }
+    if (f.size > IMAGE_MAX_BYTES) {
+      toast(`${name} is ${(f.size / 1e6).toFixed(1)} MB; the limit is ${+(IMAGE_MAX_BYTES / 1e6).toFixed(1)} MB each.`);
+      continue;
+    }
+    const item = { key: rid(), name, thumb: URL.createObjectURL(f), uploading: true };
+    c.images.push(item);
+    renderImageChips();
+    try {
+      const res = await fetch(`/api/conversations/${s.cid}/images?name=${encodeURIComponent(name)}`,
+                              { method: "POST", headers: { "Content-Type": f.type }, body: f });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`);
+      Object.assign(item, data.image, { uploading: false });
+      // Removed while it was uploading: the server keeps nothing the composer no longer shows.
+      if (!c.images.includes(item)) discardUploadedImage(s.cid, item);
+    } catch (err) {
+      c.images = c.images.filter((x) => x !== item);
+      URL.revokeObjectURL(item.thumb);
+      toast(`Image not attached: ${isUnreachable(err) ? "can't reach the server" : err.message}`);
+    }
+    if (chatVisible(c)) renderImageChips();
+  }
+}
+
+// An image taken off the message before it was sent is deleted on the server too. The server keeps an
+// image a sent message names (409), and the answer changes nothing here, so it is not waited for.
+function discardUploadedImage(cid, item) {
+  if (!cid || !item || !item.id) return;
+  fetch(`/api/conversations/${cid}/images/${encodeURIComponent(item.id)}`, { method: "DELETE" }).catch(() => {});
+}
+
+function clearComposerImages(c) {
+  for (const i of (c && c.images) || []) if (i.thumb) URL.revokeObjectURL(i.thumb);
+  if (c) c.images = [];
+  if (chatVisible(c)) renderImageChips();
+}
+
+// The image files of a clipboard or drop (a screenshot has no name).
+function imageFilesOf(list) {
+  return [...(list || [])].filter((f) => f && IMAGE_TYPES.includes(f.type));
+}
+
+function wireComposerImages() {
+  const btn = $("imageBtn"), file = $("imageFile"), input = $("chatInput");
+  if (btn && file) {
+    btn.addEventListener("click", () => file.click());
+    file.addEventListener("change", () => { addComposerImages(imageFilesOf(file.files)); file.value = ""; });
+  }
+  if ($("imageChips")) $("imageChips").addEventListener("click", (e) => {
+    const x = e.target.closest("[data-remove-image]");
+    const c = activeChat();
+    if (!x || !c) return;
+    const gone = (c.images || []).find((i) => i.key === x.dataset.removeImage);
+    if (gone && gone.thumb) URL.revokeObjectURL(gone.thumb);
+    c.images = (c.images || []).filter((i) => i.key !== x.dataset.removeImage);
+    const s = activeSession();
+    if (gone && s) discardUploadedImage(s.cid, gone);
+    renderImageChips();
+  });
+  if (input) input.addEventListener("paste", (e) => {
+    const pics = imageFilesOf(e.clipboardData && e.clipboardData.files);
+    if (!pics.length) return;                 // text pastes as text
+    e.preventDefault();
+    addComposerImages(pics);
+  });
+}
+
 async function sendChat(e) {
   e.preventDefault();
   const input = $("chatInput");
-  const text = input.value.trim();
+  const c0 = activeChat();
+  const picked = ((c0 && c0.images) || []);
+  if (picked.some((i) => i.uploading)) { toast("Wait for the images to finish uploading."); return; }
+  const text = input.value.trim() || (picked.length ? "Describe the attached image." : "");
   if (!text) return;
   // Everything below is about THIS chat: its plan, its run, its attachments. A message typed in a
   // chat is never feedback on another chat's plan, never a note for another chat's run — a tester
@@ -4099,6 +4579,11 @@ async function sendChat(e) {
   if (c.datasetSave) await c.datasetSave;
   // While a PI plan/clarify is awaiting a decision, the composer is the "refine the plan" channel —
   // the message is natural-language feedback that re-plans (it does NOT start a new run).
+  const images = (c.images || []).filter((i) => i.id).map((i) => ({ id: i.id, name: i.name, mime: i.mime, size: i.size, url: i.url }));
+  if (images.length && (c.planPending || c.running)) {
+    toast("Images go with a new message, not into a plan or a run that is already going. Remove them or wait.");
+    return;
+  }
   if (c.planPending) {
     input.value = "";
     c.draft = "";
@@ -4127,7 +4612,18 @@ async function sendChat(e) {
     toast(`${inFlight} chats already have a run in progress on this session (at most ${state.maxRuns} at once). Wait for one to finish, or stop one, then send this again.`);
     return;
   }
-  appendUserMessage(text);
+  if (images.length) {
+    // The composer says so before sending: a model that cannot read images is told, the message waits.
+    // A "no" is asked again first, so an answer from before a model switch never holds a message back.
+    let v = await sessionVision();
+    if (v && !v.accepts_images) v = await sessionVision({ fresh: true });
+    if (v && !v.accepts_images) {
+      toast(`This session's model (${v.model || "unknown"}) cannot read images, so the message was not sent. Remove the images, or switch to a model that accepts them.`);
+      return;
+    }
+  }
+  appendUserMessage(text, images);
+  clearComposerImages(c);
   // This chat owns its run, so its streamed report and artifacts land here even if the user
   // switches chats while it runs (pipelines take minutes). Persisted too (saveRunOwners), so a
   // reload/reconnect (which replays the live run) re-binds it to this chat instead of falling back
@@ -4156,6 +4652,9 @@ async function sendChat(e) {
   const planner = "dag";
   // A refused send leaves the chat idle and gives the text back, so it can be sent again.
   const giveBack = () => {
+    // A refused send gives the images back too, so it can be sent again.
+    if (images.length && !(c.images || []).length) c.images = images.map((i) => ({ key: rid(), ...i }));
+    if (images.length && chatVisible(c)) renderImageChips();
     setChatRunning(c, false);
     if (chatVisible(c) && !input.value.trim()) { input.value = text; c.draft = text; updateComposerButton(); }
     else if (!c.draft) c.draft = text;
@@ -4165,7 +4664,7 @@ async function sendChat(e) {
     // One flow for every request, with the same run options (FIXED_RUN_OPTIONS): the server routes
     // it to a literature search or to the lab, and either starts with a plan to review. `history` is
     // the conversation so far, for a line that reads it.
-    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, shared_datasets, ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
+    const labBody = { connection_id: state.connectionId, conversation_id: c.sid, question: text, dataset_path, datasets, shared_datasets, ...(images.length ? { images: images.map((i) => i.id) } : {}), ...FIXED_RUN_OPTIONS, planner, history, tz: userTz() };
     const postLab = () => fetch("/api/lab", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(labBody) });
     let res = await postLab();
     // The budget hard limit (Account › API usage): "confirm" asks once, then sends the same run again.
@@ -4477,6 +4976,40 @@ function planUntestedFlag(step) {
   return `<span class="plan-step-flag untested" title="${escapeHtml(why)}">Untested code</span>`;
 }
 
+// Provider identities come only from the registered catalog, never from the step prose.
+function planTools(step) {
+  if (!step) return [];
+  return Array.isArray(step.tools) ? step.tools : step.tool ? [{tool: step.tool, provider: "unknown", server: "unknown", version: "unknown"}] : [];
+}
+
+function planSkills(step) {
+  if (!step) return [];
+  return Array.isArray(step.skills) ? step.skills : step.skill ? [{name: step.skill, version: "unknown"}] : [];
+}
+
+function planToolText(tool) {
+  const provider = tool.provider === "local" ? "Local" : tool.provider === "mcp" ? `MCP ${tool.server || "unknown"}` : "Unknown provider";
+  return `${tool.tool || "unknown tool"} / ${provider} / version ${tool.version || "unknown"}`;
+}
+
+function planSkillText(skill) {
+  return `${skill.name || "unknown skill"} / version ${skill.version || "unknown"}`;
+}
+
+function stepProvenanceMarkdown(record) {
+  const skills = (record.skills || []).map((skill) => `${planSkillText(skill)} (${record.status === "used" && skill.status === "used" ? "recorded used" : "failed; no successful use"})`);
+  const changedSkills = (record.skills || []).filter((skill) => !(record.planned_skills || []).some((planned) => planned.name === skill.name && planned.version === skill.version));
+  const tools = (record.tools || []).map((tool) => `${planToolText(tool)} (${tool.ok === true ? "succeeded" : "failed"})`);
+  const state = record.status === "skipped" ? "Skipped; no successful use" : record.status === "failed" ? "Failed; no successful skill use" : "Recorded use";
+  return `**Step ${record.id || ""}: ${record.step || ""}**\n\n${state}\n`
+    + `- Planned tools: ${(record.planned_tools || []).map(planToolText).join("; ") || "None assigned"}\n`
+    + `- Planned skills: ${(record.planned_skills || []).map(planSkillText).join("; ") || "No skill assigned"}\n`
+    + `- Recorded tools: ${tools.join("; ") || "None recorded"}\n`
+    + `- Recorded skills: ${skills.join("; ") || "None recorded"}`
+    + (changedSkills.length ? `\n- Skill changed from approved plan: ${changedSkills.map(planSkillText).join("; ")}` : "")
+    + ((record.provider_changes || []).length ? `\n- Provider changed from approved plan: ${planSettingText(record.provider_changes)}` : "");
+}
+
 function planStepHtml(text, n, step, revised, showWhere, edit) {
   const parts = planStepParts(text);
   const settings = (step && step.settings) || {};
@@ -4509,20 +5042,17 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + `<span class="plan-setting-v${editable && canEdit(k) ? " editable" : ""}"${editAttrs("setting", k)}>`
     + `${escapeHtml(planSettingText(settings[k]))}</span></span>`).join("");
   const where = showWhere ? planRunsOnText(step && step.runs_on) : "";
-  // The vetted skill the step uses: matched by AiScientist, handed to the agent with its guidance
-  // and code when the step runs. The researcher can take it off.
-  const skill = step && step.skill
-    ? `<span class="plan-step-skill" title="This step uses the vetted skill ${escapeHtml(step.skill)}: its guidance and code go to the agent">`
-      + `${planIcon("extension")}<span>${escapeHtml(step.skill)}</span>`
-      + (editable && edit.remove ? `<button type="button" class="plan-skill-remove" data-skill-remove `
-        + `aria-label="Run step ${n} without the skill" title="Run this step without the skill">${planIcon("close")}</button>` : "")
-      + `</span>`
-    : "";
-  const meta = (chips || where || skill)
-    ? `<div class="plan-step-meta">${skill}${chips}`
-      + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
-      + `</div>`
-    : "";
+  const skills = planSkills(step);
+  const skill = skills.length ? skills.map((assigned, index) =>
+    `<span class="plan-step-skill" title="Planned assignment; successful use is recorded separately">`
+    + `${planIcon("extension")}<span>Planned skill: ${escapeHtml(planSkillText(assigned))}</span>`
+    + (editable && edit.remove && index === 0 ? `<button type="button" class="plan-skill-remove" data-skill-remove `
+      + `aria-label="Run step ${n} without assigned skills" title="Run this step without assigned skills">${planIcon("close")}</button>` : "")
+    + `</span>`).join("") : `<span class="plan-step-skill">No skill assigned</span>`;
+  const providers = planTools(step).map((tool) => `<span class="plan-step-skill plan-step-provider" title="Planned tool provider">${escapeHtml(planToolText(tool))}</span>`).join("");
+  const meta = `<div class="plan-step-meta">${providers}${skill}${chips}`
+    + (where ? `<span class="plan-where">${planIcon(where.startsWith("Runs on") ? "dns" : "memory")}${escapeHtml(where)}</span>` : "")
+    + `</div>`;
   // What the step should leave behind: declared by its skill, or by the active pipeline for its tool.
   // Checked after the step; a required one that is missing keeps the step from being accepted.
   const outs = step && Array.isArray(step.outputs) ? step.outputs : [];
@@ -4541,7 +5071,7 @@ function planStepHtml(text, n, step, revised, showWhere, edit) {
     + `<div class="plan-step-head"><span class="plan-step-title${editable ? " editable" : ""}"${editAttrs("title")}>`
     + `${renderMarkdown(parts.title)}</span>`
     + (revised ? `<span class="plan-step-flag">Revised</span>` : "")
-    + (step && step.tool ? `<code class="plan-step-tool">${escapeHtml(step.tool)}</code>` : "")
+    + planTools(step).map((tool) => `<code class="plan-step-tool">${escapeHtml(tool.tool || "unknown tool")}</code>`).join("")
     + planUntestedFlag(step)
     + `<span class="plan-step-acts">`
     + (editable && edit.remove ? `<button type="button" class="plan-step-remove" data-step-remove `
@@ -4698,6 +5228,12 @@ function planReviseHtml() {
 function planDatasetsHtml(doc) {
   const rows = ((doc && doc.datasets) || []).map((d) => {
     const use = d.use === "sample" ? "sample (QC'd together)" : (d.use || "extra input");
+    const sh = d.shared;
+    // A member of a shared dataset: the dataset and version, the exact file, and what can read it.
+    if (sh) {
+      return `<li><strong>${escapeHtml(sh.dataset)} ${escapeHtml(sh.version)} · ${escapeHtml(sh.file)}</strong> — ${escapeHtml(use)}` +
+        `<small class="muted"> · read by ${escapeHtml(sh.access)}${sh.how ? ` · picked: ${escapeHtml(sh.how)}` : ""}</small></li>`;
+    }
     return `<li><strong>${escapeHtml(d.name)}</strong> — ${escapeHtml(use)}</li>`;
   });
   for (const d of ((doc && doc.unusable_inputs) || [])) {
@@ -4720,9 +5256,11 @@ function planEntryHtml(agenda, doc, opts) {
   const rows = agenda.map((s, i) => `<li class="plan-entry-step${revised.has(i + 1) ? " revised" : ""}">`
     + `<span class="plan-entry-num">${i + 1}</span>`
     + `<span class="plan-entry-title">${escapeHtml(planStepParts(s).title.replace(/[*`]/g, ""))}</span>`
-    + (docSteps[i] && docSteps[i].tool ? `<code class="plan-step-tool">${escapeHtml(docSteps[i].tool)}</code>` : "")
-    + (docSteps[i] && docSteps[i].skill
-      ? `<span class="plan-step-skill" title="Uses the vetted skill ${escapeHtml(docSteps[i].skill)}">${planIcon("extension")}<span>${escapeHtml(docSteps[i].skill)}</span></span>` : "")
+    + planTools(docSteps[i]).map((tool) => `<code class="plan-step-tool">${escapeHtml(tool.tool || "unknown tool")}</code>`
+      + `<span class="plan-step-skill plan-step-provider">${escapeHtml(planToolText(tool))}</span>`).join("")
+    + (planSkills(docSteps[i]).length ? planSkills(docSteps[i]).map((skill) =>
+      `<span class="plan-step-skill" title="Planned assignment; successful use is recorded separately">${planIcon("extension")}<span>${escapeHtml(planSkillText(skill))}</span></span>`).join("")
+      : `<span class="plan-step-skill">No skill assigned</span>`)
     + planUntestedFlag(docSteps[i])
     + `</li>`).join("");
   const refused = (o.problems || []).length
@@ -4877,13 +5415,20 @@ function planYamlEdit(yaml, change) {
     return { yaml: lines.join("\n") };
   }
   if (change.skill === null) {
-    for (let i = start + 1; i < end; i += 1) {
-      if (indent(lines[i]) === keyCol && /^\s*skill:/.test(lines[i])) {
-        lines.splice(i, 1);
-        return { yaml: lines.join("\n") };
-      }
+    let removed = false;
+    for (let i = start + 1; i < end;) {
+      if (indent(lines[i]) !== keyCol || !/^\s*skills?:/.test(lines[i])) { i += 1; continue; }
+      let stop = i + 1;
+      // Lists may be flow-style, indented blocks, or YAML's indentless block sequences.
+      while (stop < end && (!lines[stop].trim() || indent(lines[stop]) > keyCol
+        || (indent(lines[stop]) === keyCol && /^\s*-\s/.test(lines[stop])))) stop += 1;
+      const count = stop - i;
+      lines.splice(i, count);
+      end -= count;
+      removed = true;
     }
-    return { error: "The skill is not where the plan document keeps it: ask for this change in words." };
+    return removed ? { yaml: lines.join("\n") }
+      : { error: "The skill is not where the plan document keeps it: ask for this change in words." };
   }
   if (change.title !== undefined) {
     const title = String(change.title).replace(/\s+/g, " ").trim();
@@ -5249,9 +5794,12 @@ function planSavedMessage(p) {
     const values = Object.entries(s.settings || {});
     return values.length ? `\n\nStep ${i + 1} settings\n` + values.map(([k, v]) => `- ${k}: ${planSettingText(v)}`).join("\n") : "";
   }).join("");
+  const provenance = ((p.doc && p.doc.steps) || []).map((s, i) =>
+    `\n\nStep ${i + 1} planned tools: ${planTools(s).map(planToolText).join("; ") || "None assigned"}`
+    + `\nPlanned skills: ${planSkills(s).map(planSkillText).join("; ") || "No skill assigned"}`).join("");
   return { role: "assistant", kind: "plan",
            content: "## 📋 Research plan\n\n" + p.agenda.map((s, i) => `${i + 1}. ${s}`).join("\n")
-             + settings + planEstimateMarkdown(p.estimate),
+             + settings + provenance + planEstimateMarkdown(p.estimate),
            plan: { agenda: p.agenda, doc: p.doc || null, estimate: p.estimate || null, status: "Approved" } };
 }
 
@@ -7160,7 +7708,7 @@ function sharedChipLabel(a) {
 }
 function sharedChipsHtml(list) {
   return (list || []).map((a) =>
-    `<span class="dataset-chip active shared" title="${escapeHtml(sharedChipLabel(a))}">` +
+    `<span class="dataset-chip active shared" title="${escapeHtml(sharedChipLabel(a) + (Array.isArray(a.files) && a.files.length > 1 ? `: ${a.files.join(", ")}` : ""))}">` +
     `<span class="material-symbols-outlined msym">${datasetIcon("folder")}</span>` +
     `<span class="dataset-chip-name">${escapeHtml(sharedChipLabel(a))}${a.role === "primary" ? " ★" : ""}</span>` +
     (a.role === "primary" ? '<span class="dataset-chip-role">main</span>'
@@ -7193,11 +7741,18 @@ function changeChatSharedDatasets(c, change) {
 }
 // Attach a shared dataset: the whole version (files null) or the named files; version "latest" follows
 // the newest published one, a label pins it.
+// A file picked by name joins the files of that dataset already attached by name (same version), so
+// two members can be picked one after the other; a pick of the whole version replaces them.
 function attachSharedDataset(slug, version, files, sid) {
   return changeChatSharedDatasets(chatOf(sid || state.activeId), (next) => {
     const entry = { shared: slug, version: version || "latest", files: files && files.length ? files : null, role: "reference" };
     const at = next.findIndex((a) => a.shared === slug);
-    if (at < 0) next.push(entry); else next[at] = { ...next[at], ...entry };
+    if (at < 0) { next.push(entry); return; }
+    const had = next[at];
+    if (entry.files && Array.isArray(had.files) && had.version === entry.version) {
+      entry.files = [...new Set([...had.files, ...entry.files])];
+    }
+    next[at] = { ...had, ...entry, role: had.role || entry.role };
   });
 }
 function makeSharedMain(slug) {
@@ -7221,7 +7776,8 @@ function sharedFilesHtml(ds, view) {
   const label = view.version.label;
   const cells = (f) => (f.facets && Number.isInteger(f.facets.n_obs) ? ` · ${f.facets.n_obs.toLocaleString()} cells` : "");
   const cell = (f) => `<div class="shared-cell"><span class="muted">${escapeHtml(fmtSize(f.size_bytes) + cells(f))}</span>` +
-    `<button type="button" class="ghost small" data-shared-preview="${escapeHtml(f.name)}" data-slug="${escapeHtml(ds.slug)}" data-label="${escapeHtml(label)}">Preview</button></div>`;
+    `<button type="button" class="ghost small" data-shared-preview="${escapeHtml(f.name)}" data-slug="${escapeHtml(ds.slug)}" data-label="${escapeHtml(label)}">Preview</button>` +
+    `<button type="button" class="ghost small" data-shared-use-file="${escapeHtml(f.name)}" title="Attach only this file to the chat. Pick another file to add it.">Use this file</button></div>`;
   const faceted = files.filter((f) => f.facets && f.facets.tissue && f.facets.modality);
   const loose = files.filter((f) => !faceted.includes(f));
   let html = "";
@@ -7378,6 +7934,17 @@ async function onSharedClick(e) {
     renderShared();
     return;
   }
+  const useFile = e.target.closest("[data-shared-use-file]");
+  if (useFile) {
+    const pick = sharedPicked(ds), file = useFile.dataset.sharedUseFile;
+    if (await attachSharedDataset(ds.slug, pick, [file])) {
+      const a = ((activeChat() || {}).shared || []).find((x) => x.shared === ds.slug);
+      const n = a && Array.isArray(a.files) ? a.files.length : 1;
+      toast(n > 1 ? `${file} added: ${n} files of ${ds.name} are attached to the chat.`
+        : `${file} of ${ds.name} attached to the chat.`);
+    }
+    return;
+  }
   if (e.target.closest("[data-shared-use]")) {
     const pick = sharedPicked(ds);
     if (await attachSharedDataset(ds.slug, pick, null)) {
@@ -7486,9 +8053,14 @@ async function droppedUploads(found) {
   return { files, folders };
 }
 async function onDataDrop(found) {
+  const dropped = await droppedUploads(found);
+  // Pictures dropped on the chat go to the message box as images (no HPC3 connection needed); every
+  // other file or folder is an upload as before.
+  const pictures = imageFilesOf(dropped.files);
+  if (pictures.length) addComposerImages(pictures);
+  const files = dropped.files.filter((f) => !pictures.includes(f)), folders = dropped.folders;
+  if (!files.length && !folders.length) { if (!pictures.length) toast("Nothing to upload in what was dropped."); return; }
   if (!state.connectionId) { toast("Connect to HPC3 first."); return; }
-  const { files, folders } = await droppedUploads(found);
-  if (!files.length && !folders.length) { toast("Nothing to upload in what was dropped."); return; }
   for (const f of files) uploadDataset(f);
   for (const fl of folders) uploadFolder(fl);
 }
@@ -9120,9 +9692,13 @@ function dsPreviewHtml(base, file, p) {
       return facts + dsSection("Structure", dsTable(["Path", "Kind", "Shape", "Type"], nodes), p.more_nodes ? "The first nodes are listed." : "") +
         (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
     }
-    case "table":
-      return dsTable(p.columns, p.rows, { types: p.column_types }) +
-        `<p class="ds-note">${escapeHtml(p.note || "")} ${p.more_rows ? `Showing the first ${p.rows_shown} rows.` : `${p.rows_shown} ${p.rows_shown === 1 ? "row" : "rows"}.`}</p>`;
+    case "table": {
+      // The same table as a run's csv in the Results panel: sticky header, row numbers, types, sorting.
+      const id = "fv" + (++fvSeq);
+      fvStates.set(id, FileView.tableState(p.columns || [], p.rows || [], { types: p.column_types, cut: !!p.more_rows }));
+      return `<div data-fv-table="${id}">${FileView.tableHtml(fvStates.get(id))}</div>` +
+        (p.note ? `<p class="ds-note">${escapeHtml(p.note)}</p>` : "");
+    }
     case "vcf":
       return dsFacts([["Format", p.fileformat], ["Reference", p.reference], ["Contigs", p.n_contigs],
                       ["Samples", p.n_samples ? `${p.n_samples}: ${p.samples.slice(0, 12).join(", ")}${p.n_samples > 12 ? ", …" : ""}` : "none (sites only)"],
@@ -9133,8 +9709,13 @@ function dsPreviewHtml(base, file, p) {
       return `<div class="ds-media"><img src="${dsDownloadUrl(base, file, true)}" alt="${escapeHtml(file || dsPreview.name)}" /></div>`;
     case "pdf":
       return `<iframe class="ds-pdf" src="${dsDownloadUrl(base, file, true)}" title="${escapeHtml(file || dsPreview.name)}"></iframe>`;
-    case "text":
-      return `<pre class="ds-text">${escapeHtml(p.text || "")}</pre>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
+    case "text": {
+      // Rendered Markdown, foldable JSON, highlighted YAML or numbered lines, by the file's name.
+      const name = file || dsPreview.name;
+      const out = FileView.textView(p.text || "", { name, id: "fv" + (++fvSeq), render: renderMarkdown });
+      if (out.state) fvStates.set(out.id, out.state);
+      return `<div class="fv-host">${out.html}</div>` + (p.more_rows ? `<p class="ds-note">Showing the beginning of the file.</p>` : "");
+    }
     default:
       return `<div class="ds-note">${escapeHtml(p.note || "This file has no preview. Download it to open it.")}</div>`;
   }
@@ -10438,6 +11019,7 @@ function init() {
     if (act) toggleDataMenu(false);
   });
   wireDataDrop();
+  wireComposerImages();
   document.addEventListener("click", (e) => {
     if (!e.composedPath().some((n) => n.classList && n.classList.contains("data-menu-wrap"))) toggleDataMenu(false);
   });
@@ -10451,6 +11033,10 @@ function init() {
   $("filePreviewClose").addEventListener("click", () => { if (panelFullscreen) exitPanelFullscreen(); $("filePreviewModal").classList.add("hidden"); });
   $("dsPreviewClose").addEventListener("click", closeDatasetPreview);
   $("dsPreviewBody").addEventListener("click", onDatasetPreviewClick);
+  document.addEventListener("click", onFileViewClick);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.closest && e.target.closest("[data-fv-sort]")) onFileViewClick(e);
+  });
   $("datasetPreviewModal").addEventListener("click", (e) => { if (e.target.id === "datasetPreviewModal") closeDatasetPreview(); });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !$("datasetPreviewModal").classList.contains("hidden")) closeDatasetPreview();
@@ -10481,12 +11067,58 @@ function init() {
     if (x) { state.serverOfferDismissed.add(x.dataset.spoDismiss); renderServerPathOffer(); }
   });
   $("newSessionBtn").addEventListener("click", newSession);
+  $("newGroupBtn").addEventListener("click", newChatGroup);
   $("sessionList").addEventListener("click", (e) => {
     const del = e.target.closest("[data-del]");
     if (del) { e.stopPropagation(); deleteSession(del.dataset.del); return; }
+    const more = e.target.closest("[data-more]");
+    if (more) { e.stopPropagation(); openSessionMenu(more.dataset.more, more); return; }
+    const gr = e.target.closest("[data-group-rename]");
+    if (gr) { e.stopPropagation(); renameChatGroup(Number(gr.dataset.groupRename)); return; }
+    const gd = e.target.closest("[data-group-del]");
+    if (gd) { e.stopPropagation(); deleteChatGroup(Number(gd.dataset.groupDel)); return; }
+    const head = e.target.closest("[data-group-toggle]");
+    if (head) { const gid = head.dataset.groupToggle; setGroupFolded(gid, !foldedGroups().has(gid)); renderSessionList(); return; }
     const item = e.target.closest("[data-id]");
     if (item) selectSession(item.dataset.id);
   });
+  $("sessionList").addEventListener("keydown", (e) => {
+    const head = e.target.closest("[data-group-toggle]");
+    if (head && e.target === head && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); head.click(); }
+  });
+  $("sessionList").addEventListener("dblclick", (e) => {
+    const t = e.target.closest(".session-title");
+    const item = t && t.closest("[data-id]");
+    if (item && authed()) renameSession(item.dataset.id);
+  });
+  // Drag a chat onto a group (or onto "Other chats") to file it there.
+  $("sessionList").addEventListener("dragstart", (e) => {
+    const item = e.target.closest?.(".session-item[draggable=true]");
+    if (!item) return;
+    e.dataTransfer.setData("text/x-aiscientist-chat", item.dataset.id);
+    e.dataTransfer.effectAllowed = "move";
+  });
+  $("sessionList").addEventListener("dragover", (e) => {
+    const g = e.target.closest?.(".session-group");
+    if (!g || ![...e.dataTransfer.types].includes("text/x-aiscientist-chat")) return;
+    e.preventDefault();
+    $("sessionList").querySelectorAll(".drop-target").forEach((x) => x !== g && x.classList.remove("drop-target"));
+    g.classList.add("drop-target");
+  });
+  $("sessionList").addEventListener("dragleave", (e) => {
+    const g = e.target.closest?.(".session-group");
+    if (g && !g.contains(e.relatedTarget)) g.classList.remove("drop-target");
+  });
+  $("sessionList").addEventListener("drop", (e) => {
+    const g = e.target.closest?.(".session-group");
+    const id = e.dataTransfer.getData("text/x-aiscientist-chat");
+    if (!g || !id) return;
+    e.preventDefault();
+    g.classList.remove("drop-target");
+    moveSessionToGroup(id, g.dataset.group === "none" ? null : Number(g.dataset.group));
+  });
+  document.addEventListener("click", (e) => { if (!e.target.closest("#sessionMenu, [data-more]")) closeSessionMenu(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSessionMenu(); });
   $("toggleLeft").addEventListener("click", () => togglePanel("left"));
   $("toggleRight").addEventListener("click", () => togglePanel("right"));
   $("sideTabPlan").addEventListener("click", () => { state.planView = null; selectSideTab("plan"); renderPlanPanel(); });

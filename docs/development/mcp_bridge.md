@@ -17,20 +17,20 @@ The server transport is stdio; authenticated remote MCP HTTP is not implemented.
 
 | Server | Package version | Replaced scientific tools |
 | --- | --- | ---: |
-| `scrna-analysis` | `0.0.5` | 11 |
+| `scrna-analysis` | `0.0.6` | 11 |
 | `cellqc` | `0.0.5` | 1 |
 | `literature` | `0.0.4` | 4 |
-| `variant-annotation` | `0.0.2` | 1 |
+| `variant-annotation` | `0.0.3` | 1 |
 | `phenotype-diagnosis` | `0.0.4` | 3 |
 | `scgpt-annotation` | `0.0.3` | 1 |
 | `data-utilities` | `0.0.2` | 2 |
 
-The seven releases are published in `liujs123456/aiscientist-mcp` and paired with
-`liujs123456/aiscientist-skills` `v0.2.5`. The registry records the exact OCI digest,
+The seven releases are published in `lijinbio/aiscientist-mcp` and paired with
+`lijinbio/aiscientist-skills` `v0.2.9`. The registry records the exact OCI digest,
 schema checksum and resource policy for every server; version tags alone are
-never executed. Atlas retains its upstream `0.0.3` pin. Changing the release
-owner during upstream promotion requires reviewing actual published assets and
-updating both the server registry and skills release together.
+never executed. Atlas retains its upstream `0.0.3` pin. A new pin
+requires reviewing the published assets and updating the server registry and the
+skills release together.
 
 ## Registry and tool schemas
 
@@ -55,7 +55,7 @@ shell entry point stays closed. A deployment can set
 | `runs_on` | `hpc:<name>` and `inprocess` use the contained CPU image runner; `gpu:scgpt` selects its configured GPU allocation. The model cannot select a partition or account. |
 | `tools_file` | Relative path to a tool snapshot confined to the registry directory. |
 | `tools_sha256` | SHA-256 of the exact snapshot bytes, checked before registration. |
-| `adapter` | `json` by default; `atlas-expression` is required for Atlas, and `analysis` is required for the seven known analysis servers. |
+| `adapter` | `json` by default; `atlas-expression` is required for Atlas, `retigene` for retigene-rag, and `analysis` for the seven known analysis servers. |
 | `prefix` | Optional prefix added to planner tool names; the original name is sent to MCP. Default: empty. |
 | `aliases` | Optional original-name to planner-name mapping, applied before `prefix`. Wire names and resource keys remain unchanged. |
 | `timeout` | Optional CLI call timeout in seconds, from 1 to 86400. Default: 15000. |
@@ -106,7 +106,9 @@ call time after refreshing skills. Direct model calls to `run_in_environment` fo
 a registry-bound skill are refused and directed to its typed MCP tools.
 Atlas's direct shell entry remains forbidden even if a custom registry omits
 Atlas. Its server and skill binding must use the Atlas adapter, so configuration
-cannot replace its dataset checks with the generic JSON adapter.
+cannot replace its dataset checks with the generic JSON adapter. The same holds for
+retigene-rag and its skill `query-retigene-papers-with-aiscientist-mcp`, which must
+use the `retigene` adapter.
 
 The bridge constructs the command from trusted configuration and shell-quotes the
 tool's JSON arguments. The existing executor owns the allocation, image
@@ -132,7 +134,48 @@ status, artifact metadata and provenance. It writes the full result to
 A result exceeding 14,000 serialized characters is replaced in the transport
 response by `response_omitted` and `full_result`. Arbitrary file paths returned by
 a server are not followed or copied by this adapter. Servers with other
-deliverables need an application-owned adapter.
+deliverables need an application-owned adapter. Such an adapter may also bind
+folders the deployment names read-only into the job, and run something for the
+job's duration; the model can set neither.
+
+## retigene-rag
+
+The `retigene` adapter (`agents/retigene.py`) serves the RetiGene gene table lookups and the
+RetiGene papers' search and curation tools. The registry pins retigene-rag 0.0.1; the server registers once the installed skills
+release holds its skill with the same image digest.
+
+- **Index.** `AISCIENTIST_RETIGENE_INDEX` names the index's HPC3 folder
+  (`mechanism_cache/sentences.jsonl`, `chunks.jsonl`, `chunk_vecs.npy`, `manifest.csv`,
+  `hgnc_complete_set.txt`). It is bound read-only into every call's job. Without it,
+  the tools are not offered.
+- **Route.** A question for the gene table ("Which genes does RetiGene list with autosomal
+  dominant inheritance?", "What does the RetiGene gene table record about USH2A?") goes to the
+  analysis planner, which is offered the lookups, and not to the two lines about the papers
+  (`request_router.asks_gene_table`, `_gene_table_question`). A question that names the papers
+  keeps going to the corpus search or the curation.
+- **Gene table.** `get_gene` and `find_genes` read a RetiGene release,
+  `gene_table/Full_gene_table_v<version>.tsv` in the index folder (the highest version when
+  there are several). Every answer names the release. Without the file the two tools say so
+  and the others work.
+- **Model.** `submit_curation` reads with the session's own model. The job writes each
+  prompt to a folder under the run's work directory (`RETIGENE_PROVIDER=relay`). For the
+  job's duration, the gateway answers each prompt with the session's lab-role completion,
+  role `curation` (`gateway/mcp_model_relay.py`). That covers the user's API key, the lab's
+  shared model and the session's GPU. Each call is recorded in the user's usage as any lab
+  call is. On a user's key, the curation's `max_cost_usd` and the relay's cap are what is
+  left of their budget, and a spike allowance is announced for the key while the job runs.
+  No key and no model address enters the job.
+- **Cache.** Model replies are kept in the user's tool cache
+  (`$AISCIENTIST_TOOL_CACHE/retigene-rag/cache`), so a question asked again reads nothing
+  twice.
+- **Outputs.** The collector copies a curation's `genes.csv`, `sentences.csv` and
+  `report.md` to `artifacts/retigene/<curation_id>/` and names every server path by where
+  the run keeps it.
+- **Bounds.** `search_sentences` pages are at most 40 lines, `get_evidence` at most 20 rows
+  `get_genes` at most 100 rows and `find_genes` at most 40 rows beside its complete list of
+  gene symbols. A longer result is trimmed to fit the transport bound,
+  says how much was left out, and is kept whole in `artifacts/retigene/<tool>.json`.
+- **Reference.** `evaluate` scores only against the bundled curator reference.
 
 Every call the server answers records the server name, package version, release tag, image
 digest, schema checksum and `runs_on` in the run manifest's `mcp_servers` list. Refused calls

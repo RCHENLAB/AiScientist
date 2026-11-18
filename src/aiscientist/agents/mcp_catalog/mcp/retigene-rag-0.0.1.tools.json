@@ -1,0 +1,399 @@
+[
+  {
+    "name": "get_gene",
+    "description": "Everything the RetiGene gene table curates about one gene: status (established, candidate with the\nreason, or discarded), class, inheritance, each phenotype category with its own inheritance, functional\ncategories, named diseases (OMIM with inheritance and MIM number, Orphanet), variant spectrum, bulk and\nsingle-cell expression, year of first publication, and its key papers with whether the corpus holds\ntheir full text. A symbol can have two records. found=false means RetiGene does not list the gene (with\nthe similar symbols it does list); that is an answer, not an error.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "gene": {
+          "title": "Gene",
+          "type": "string"
+        }
+      },
+      "required": [
+        "gene"
+      ],
+      "title": "get_geneArguments"
+    }
+  },
+  {
+    "name": "find_genes",
+    "description": "Every gene in the RetiGene gene table that meets ALL the conditions given, with the exact count; the\nlist is complete, not a sample. phenotypes: RetiGene's categories (RP, LCA, CD/CRD, MD, CSNB, CVD, EVR,\nOptic atrophy, OCA / foveal hypoplasia, BBS, Joubert syndrome, USH/USH-like, SLS/NPHP, OA syndromic, Other\nsyndromic, Other non-syndromic); a gene must have every one listed. inheritance: AR, AD, XL (X-linked),\nMT (mitochondrial); given with phenotypes, each listed phenotype must have each listed mode (RP with AD\nand AR = RP in both forms). functions: functional categories (Cilium, RNA splicing, ...), all required.\nstatus: established (default), candidate, discarded, or any. gene_class, cell_type (single-cell\nspecificity, e.g. 'Rod + Cone'), cell_group, tissue_expression, variant_spectrum: the table's own values;\na value the table does not hold is refused with the values it does hold. disease: words of an OMIM or\nOrphanet disease name, or a MIM / ORPHA number. group_by: instead of reading the list, count the matching\ngenes per value of one field (status, gene_class, inheritance, phenotype, function, variant_spectrum,\ntissue_expression, cell_group, cell_type). `genes` always holds every matching symbol; `rows` gives the\nfirst `limit` of them (at most 200) with inheritance, phenotypes and functions. No condition at all lists\nevery established gene.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "phenotypes": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Phenotypes"
+        },
+        "inheritance": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Inheritance"
+        },
+        "functions": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Functions"
+        },
+        "status": {
+          "default": "established",
+          "title": "Status",
+          "type": "string"
+        },
+        "gene_class": {
+          "default": "",
+          "title": "Gene Class",
+          "type": "string"
+        },
+        "cell_type": {
+          "default": "",
+          "title": "Cell Type",
+          "type": "string"
+        },
+        "cell_group": {
+          "default": "",
+          "title": "Cell Group",
+          "type": "string"
+        },
+        "tissue_expression": {
+          "default": "",
+          "title": "Tissue Expression",
+          "type": "string"
+        },
+        "variant_spectrum": {
+          "default": "",
+          "title": "Variant Spectrum",
+          "type": "string"
+        },
+        "disease": {
+          "default": "",
+          "title": "Disease",
+          "type": "string"
+        },
+        "group_by": {
+          "default": "",
+          "title": "Group By",
+          "type": "string"
+        },
+        "limit": {
+          "default": 40,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "title": "find_genesArguments"
+    }
+  },
+  {
+    "name": "search_sentences",
+    "description": "Keyword search over every sentence of the corpus. Returns ALL sentences that hold any of the terms, one\nper line as 'PMID <pmid> p<page> c<chunk>: <sentence>', in pages of `limit` (at most 200; page with\noffset until next_offset is null), with the total count. Case, spaces, hyphens and PDF ligatures are\nignored and a term matches inside words, so 'haploinsufficien' finds haploinsufficient and\nhaplo-insufficiency, and 'loss of function' finds loss-of-function. Terms need at least 4 letters.\ngene: only sentences that name that symbol as a word.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "terms": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Terms",
+          "type": "array"
+        },
+        "gene": {
+          "default": "",
+          "title": "Gene",
+          "type": "string"
+        },
+        "limit": {
+          "default": 40,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "title": "Offset",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "terms"
+      ],
+      "title": "search_sentencesArguments"
+    }
+  },
+  {
+    "name": "search_passages",
+    "description": "Search by meaning (chunk co-embedding, PubMedBERT): the passages (about 300 words each) nearest the query,\nas written, with PMID, page, title and cosine. With `terms`, only passages holding one of them are ranked\n(keywords and embedding together). It ranks passages by their main topic, so it suits a question about one\ngene, disease or method, and misses claims made in passing: for every gene with a property, use\nsearch_sentences and submit_curation. At most 10.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "title": "Query",
+          "type": "string"
+        },
+        "terms": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Terms"
+        },
+        "top_k": {
+          "default": 5,
+          "title": "Top K",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "search_passagesArguments"
+    }
+  },
+  {
+    "name": "read_passage",
+    "description": "The whole passage around a sentence (pmid and chunk as search_sentences gives them), with its paper's\ncitation, title and DOI.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pmid": {
+          "title": "Pmid",
+          "type": "string"
+        },
+        "chunk": {
+          "title": "Chunk",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pmid",
+        "chunk"
+      ],
+      "title": "read_passageArguments"
+    }
+  },
+  {
+    "name": "submit_curation",
+    "description": "The corpus-wide curation of haploinsufficient genes. Reads EVERY sentence of the corpus that states a\ndosage mechanism in words (haploinsufficiency, one functional copy, reduced dosage, ...) or holds one of\n`terms` (the words you searched with search_sentences), groups them by the gene named in or next to each\nsentence, and grades each gene from its own sentences by the curator's rules: A, the authors state\nwithout a hedge that loss of one copy causes a retinal or ocular disease, or a syndrome with one; B,\nhedged, contested by another paper, or one of several mechanisms; N, not supported. A cheap model reads\neach gene's sentences twice, a review model grades the genes with a claim, and the code checks every\nquote verbatim. About 300 genes, 4-5 minutes and $0.30 with Claude Haiku. estimate_only=true: the\ngenes, calls, tokens and cost, with no model call. Refuses when the estimate's upper end exceeds\nmax_cost_usd (0 = no limit). A curation with the same terms, rules, models and corpus is reused (rerun=true\nruns it again; model replies are still reused from the cache). Returns the curation_id and its state;\nwith the inline executor it returns when the curation is COMPLETED, else poll curation_status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "title": "Question",
+          "type": "string"
+        },
+        "terms": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Terms"
+        },
+        "estimate_only": {
+          "default": false,
+          "title": "Estimate Only",
+          "type": "boolean"
+        },
+        "max_cost_usd": {
+          "default": 5.0,
+          "title": "Max Cost Usd",
+          "type": "number"
+        },
+        "rerun": {
+          "default": false,
+          "title": "Rerun",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "title": "submit_curationArguments"
+    }
+  },
+  {
+    "name": "curation_status",
+    "description": "State of a curation (PENDING, RUNNING, COMPLETED, FAILED, ...), with the genes graded so far; when\nCOMPLETED, the grades, the A and B genes, and its time, model calls, tokens and cost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "curation_id": {
+          "title": "Curation Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "curation_id"
+      ],
+      "title": "curation_statusArguments"
+    }
+  },
+  {
+    "name": "get_genes",
+    "description": "The gene table of a curation, A first, then B, then N and unresolved: gene, grade, phenotype kind and\nphenotype, confidence, the quoted sentence with its PMID, page and sentence id, papers and sentences read,\nand what the rules changed (code_adjusted). full=true adds the reason, the counts of claims and the paper's\ncitation. `grades`: comma-separated grades to return (default A,B).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "curation_id": {
+          "title": "Curation Id",
+          "type": "string"
+        },
+        "grades": {
+          "default": "A,B",
+          "title": "Grades",
+          "type": "string"
+        },
+        "top": {
+          "default": 100,
+          "title": "Top",
+          "type": "integer"
+        },
+        "full": {
+          "default": false,
+          "title": "Full",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "curation_id"
+      ],
+      "title": "get_genesArguments"
+    }
+  },
+  {
+    "name": "get_evidence",
+    "description": "The sentence table of a curation: one row per sentence read for a gene, with the checks behind its grade\n(dosage claim, hedge, mechanism, phenotype kind, evidence type, meets_a, contests), the verbatim quote,\nPMID, page, sentence id and paper title. Filter by gene or pmid, or by the genes' grades (default A,B);\npage with offset/limit (limit at most 200).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "curation_id": {
+          "title": "Curation Id",
+          "type": "string"
+        },
+        "gene": {
+          "default": "",
+          "title": "Gene",
+          "type": "string"
+        },
+        "pmid": {
+          "default": "",
+          "title": "Pmid",
+          "type": "string"
+        },
+        "grades": {
+          "default": "A,B",
+          "title": "Grades",
+          "type": "string"
+        },
+        "offset": {
+          "default": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "limit": {
+          "default": 30,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "curation_id"
+      ],
+      "title": "get_evidenceArguments"
+    }
+  },
+  {
+    "name": "evaluate",
+    "description": "Score a curation against a graded reference (default: the curator review of 2026-11-04, confirmed by Dr.\nChen: 15 A, of them 10 ocular and 5 syndromic, 7 B, 2 N). Returns A recall (all, ocular, syndromic), the B\ngenes listed apart (B or not listed, never A), the N genes listed, the A genes outside the reference, the\npass flags, and the curation's time, calls, tokens and cost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "curation_id": {
+          "title": "Curation Id",
+          "type": "string"
+        },
+        "reference": {
+          "default": "",
+          "title": "Reference",
+          "type": "string"
+        }
+      },
+      "required": [
+        "curation_id"
+      ],
+      "title": "evaluateArguments"
+    }
+  },
+  {
+    "name": "write_report",
+    "description": "A Markdown report of a curation: the A genes, then the B genes apart, each with its quote, PMID, page and\npaper; the genes the rules regraded; the score when evaluate was called; the run's models, time, calls,\ntokens and cost. Written to report.md in the curation folder.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "curation_id": {
+          "title": "Curation Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "curation_id"
+      ],
+      "title": "write_reportArguments"
+    }
+  },
+  {
+    "name": "list_curations",
+    "description": "Curations in this server's data directory, with their question, state, grades and cost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "title": "list_curationsArguments"
+    }
+  }
+]

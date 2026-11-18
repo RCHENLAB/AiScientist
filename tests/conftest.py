@@ -154,8 +154,10 @@ def lab_gateway(tmp_path, monkeypatch):
         calls.append(dict(args))
         return {"status": "ok"}
 
+    # Registered as the scrna-analysis server's tool is, so plans show its MCP identity.
     catalog = [HarnessTool("mcp_run_scanpy_qc", "Filter cells", {"type": "object", "properties": {
-        "max_pct_mt": {"type": "number"}, "min_genes": {"type": "integer"}}}, tool)]
+        "max_pct_mt": {"type": "number"}, "min_genes": {"type": "integer"}}}, tool,
+        provider={"provider": "mcp", "server": "scrna-analysis", "version": "0.0.5"})]
     monkeypatch.setattr(registry, "build_scientist_catalog", lambda **kw: catalog)
     # The step classifier caches the catalog's names; this one-tool catalog must not outlive the test.
     research_lab._known_tool_names.cache_clear()

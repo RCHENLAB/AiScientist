@@ -149,6 +149,9 @@ class SlurmCodeExecutor:
     # AISCIENTIST_INPUTS / AISCIENTIST_REFERENCE. ``--containall`` hides every path not bound, so
     # without this a second upload (a reference atlas) existed on dfs3b and no snippet could open it.
     inputs: tuple[dict, ...] = ()
+    # The session's own model for an MCP server that sends its model calls back to the gateway
+    # (``gateway/mcp_model_relay.SessionModelRelay``: retigene-rag's curation). None: no such calls.
+    model_relay: object | None = None
     _counter: int = field(default=0, repr=False)
     _images: dict[str, str] = field(default_factory=dict, repr=False)
     _scratch: str | None = field(default=None, repr=False)
@@ -202,7 +205,7 @@ class SlurmCodeExecutor:
     def run_in_image(self, command: str, image: str, *, workdir: str, cpus: int = 0,
                      mem_gb: int = 0, time_limit: str = "",
                      files: "dict[str, str] | None" = None,
-                     tool_cache: bool = False, gpu: bool | None = None,
+                     tool_cache: bool = False, read_only: "tuple[str, ...]" = (), gpu: bool | None = None,
                      extra_ro_binds: tuple[str, ...] = ()) -> dict[str, object]:
         """Run a SHELL ``command`` inside container ``image`` (a skill's declared environment) as a
         Slurm job, with the same data contract as a snippet: the dataset read-only, work/artifacts
@@ -213,8 +216,9 @@ class SlurmCodeExecutor:
         bundled files, ``{relative path: local path}``, staged into ``<workdir>/.skill``. Resources
         default to this executor's. ``tool_cache`` (platform callers only) binds this user's tool
         cache writable and names it ``AISCIENTIST_TOOL_CACHE``, so a download survives across runs;
-        without one the job runs as before. There is no local fallback: the command needs the
-        image."""
+        without one the job runs as before. ``read_only`` (platform callers only): more folders bound
+        read-only, such as an MCP server's index named by the deployment. There is no local fallback:
+        the command needs the image."""
         command = (command or "").strip()
         if not command:
             return {"status": "error", "error": "no command provided"}
@@ -248,6 +252,7 @@ class SlurmCodeExecutor:
             out = self._submit(command, kind="env", runner="bash", image=sif, cpus=cpus,
                                mem_gb=int(mem_gb or self.mem_gb), time_limit=time_limit,
                                cwd=wd, extra_exports=exports, package_cache=False, cache_dir=cache,
+                               extra_ro=tuple(p for p in read_only if p),
                                gpu=gpu, extra_ro_binds=extra_ro_binds,
                                run_timeout_s=slurm_time_to_seconds(time_limit) + 600)
         except JobCancelled:
@@ -385,6 +390,7 @@ class SlurmCodeExecutor:
                 time_limit: str, run_timeout_s: int, cwd: str = "",
                 extra_exports: "dict[str, str] | None" = None,
                 package_cache: bool = False, secret_file: str = "", cache_dir: str = "",
+                extra_ro: "tuple[str, ...]" = (),
                 gpu: bool | None = None, extra_ro_binds: tuple[str, ...] = ()) -> dict[str, object]:
         """Stage ``source`` as a script, run it with ``runner`` inside ``image`` as a contained Slurm
         job, and collect stdout/stderr/exit code plus the artifacts it wrote."""
@@ -439,7 +445,7 @@ class SlurmCodeExecutor:
         inside_root = bool(root and self.dataset_path
                            and str(self.dataset_path).startswith(root + "/"))
         binds_ro = tuple(p for p in (root, None if inside_root else self.dataset_path, *cache_binds,
-                                     *self._input_binds(), *env_paths, *extra_ro_binds)
+                                     *self._input_binds(), *env_paths, *extra_ro, *extra_ro_binds)
                          if p)
         # Complete CellQC matrices are published beside work/artifacts, outside the small
         # artifact mirror. Bind that exact trusted sibling for environment calls; otherwise

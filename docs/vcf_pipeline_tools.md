@@ -7,7 +7,7 @@ The application stages the input, submits the native image on HPC3, collects
 complete owned task artifacts and reports their provenance. It does not import
 the retired annotation implementation or fall back to a gateway REST request.
 
-The [native package documentation](https://github.com/liujs123456/aiscientist-mcp/tree/main/packages/variant-annotation)
+The [native package documentation](https://github.com/lijinbio/aiscientist-mcp/tree/main/packages/variant-annotation)
 defines all arguments, reference settings, scientific stages and result files.
 Use the [reference staging guide](../deploy/vep/README.md) for deployment and
 [HPC3 asset inventory](hpc3_assets.md) for the site's external data.

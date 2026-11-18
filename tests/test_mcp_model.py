@@ -88,7 +88,7 @@ def test_nonmodel_tools_never_resolve_or_read_credentials():
 def test_native_anthropic_and_credential_urls_are_refused():
     for endpoint, protocol in [("https://proxy.invalid/v1", "anthropic"),
                                ("https://api.anthropic.com/v1", "openai"),
-                               ("https://name:private@example.org/v1", "openai"),
+                               ("https://name:placeholder@example.org/v1", "openai"),
                                ("https://example.org/v1?key=private", "openai")]:
         with pytest.raises(ValueError) as exc:
             ModelBinding(endpoint, "model", "private", protocol)

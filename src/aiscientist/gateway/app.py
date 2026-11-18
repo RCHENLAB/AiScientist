@@ -3137,7 +3137,8 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
             if e["path"] in seen:
                 continue
             seen.add(e["path"])
-            raw.append({"path": e["path"], "order": len(raw), "name": e["name"], "role": att.get("role")})
+            raw.append({"path": e["path"], "order": len(raw), "name": e["name"],
+                        "role": e["role"] if "role" in e else att.get("role")})
     if not raw:
         dp = str(getattr(req, "dataset_path", None) or "").strip()
         if not dp:
@@ -3147,6 +3148,170 @@ def _select_bound_datasets(req: "LabRequest") -> list[dict]:
     out = [{"path": d["path"], "name": d["name"], "role": d["role"]} for d in raw]
     if len(raw) - sum(len(a["entries"]) for a in shared) + len(shared) > _MAX_BOUND_DATASETS:
         raise HTTPException(400, f"At most {_MAX_BOUND_DATASETS} datasets per run. Remove one first.")
+    return out
+
+
+#: A member of a shared dataset a run can analyse. A README or a notes file sits beside the data.
+_NOT_ANALYSABLE = (".txt",)
+
+
+def _analysable_members(att: dict) -> list[dict]:
+    """The files of an attached shared version that a run could take as its data."""
+    return [f for f in att["files"] if _primary_suffix(f["name"]) not in (None, *_NOT_ANALYSABLE)]
+
+
+def _apply_members(att: dict, names: "list[str]", *, how: str, candidates: "list[str] | None" = None,
+                   sole: bool = False) -> dict:
+    """``att`` (a whole version, one folder entry) rebound to the member files ``names``: one explicit
+    entry per file, the first main and the others extra inputs, each with the version's verified HPC3
+    copy when there is one. ``sole``: this is the chat's only data, so its default ``reference`` role
+    would only keep it out of the main slot; the main file then has no role."""
+    folder = att["entries"][0]
+    by_name = {f["name"]: f for f in att["files"]}
+    role = att.get("role")
+    first = None if (role == "reference" and sole) else role
+    entries = [{"path": f"{folder['path']}/{n}", "name": n, "files": [],
+                "hpc": f"{folder['hpc']}/{n}" if folder.get("hpc") else None,
+                "role": first if i == 0 else "extra_input"} for i, n in enumerate(names)]
+    return {**att, "whole": False, "entries": entries, "files": [by_name[n] for n in names],
+            "selection": {"how": how, "candidates": list(candidates or names)}}
+
+
+def _restore_shared_members(resolved: list[dict], saved: "list[dict] | None", *, sole: bool) -> list[dict]:
+    """A resumed run or a restored plan binds the members it was approved with (``decisions
+    ["shared_members"]``), not whatever the request would pick now."""
+    chosen = {(m.get("dataset"), m.get("version")): m for m in saved or [] if isinstance(m, dict)}
+    out = []
+    for att in resolved:
+        m = chosen.get((att["dataset"], att["version"]))
+        names = [n for n in (m or {}).get("files") or [] if any(f["name"] == n for f in att["files"])]
+        out.append(_apply_members(att, names, how=str(m.get("how") or "chosen earlier"),
+                                  candidates=m.get("candidates"), sole=sole)
+                   if att["whole"] and names else att)
+    return out
+
+
+def _prior_shared_files(conn: Connection, prior: "dict | None") -> "dict[tuple[str, str], list[str]]":
+    """The member files the chat's previous run chose, by (dataset, version) (its ``process/inputs.json``).
+    Only a record with ``selected_by`` is a choice: a run made before member files were chosen bound
+    the whole version and lists every file, which must not become "chosen earlier in this chat"."""
+    rid = str((prior or {}).get("run_id") or "")
+    if not rid or not _RUN_ID_RE.fullmatch(rid):
+        return {}
+    try:
+        data = json.loads((conn.workspace / rid / "artifacts" / "process" / "inputs.json").read_text(encoding="utf-8"))
+        return {(str(r["dataset"]), str(r["version"])): [str(f["name"]) for f in r.get("files") or []]
+                for r in data.get("shared_inputs") or [] if r.get("selected_by")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+#: How many times the member-file card is put again after an answer that does not say which file.
+_MEMBER_CHOICE_ASKS = 3
+
+
+def _member_answer(fb: str, pool: list[dict], members: list[dict], options: list[str],
+                   both: "str | None") -> "list[str] | None":
+    """The member files an answer to the card names: a chip ("<question>: <option>"), its number, or
+    words typed in the message box ("the scRNA one", "HRCA scRNA", "both"). Typed words are resolved
+    against every file of the version first, so a file the card did not offer can still be named
+    ("Iris snRNA instead"), and then against the files offered. None when it says no file."""
+    from . import shared_members as sm
+    answer = fb.rsplit("?:", 1)[-1].strip()
+    if both and (answer == both or re.fullmatch(r"(?i)(?:use )?(?:them )?both(?: of them| files)?[.!]?", answer)):
+        return [f["name"] for f in pool]
+    for f, text in zip(pool, options):
+        if answer == text or text in fb:
+            return [f["name"]]
+    number = re.fullmatch(r"\s*(?:option\s*)?(\d+)\s*[.)]?\s*", answer, re.IGNORECASE)
+    if number and 1 <= int(number.group(1)) <= len(pool):
+        return [pool[int(number.group(1)) - 1]["name"]]
+    for scope in (members, pool):
+        if len(scope) > 1:
+            sel = sm.select(answer, scope)
+            if sel.status == "chosen" and sel.chosen:
+                return list(sel.chosen)
+    return None
+
+
+async def _ask_member_choice(conn: Connection, att: dict, members: list[dict], sel: Any) -> "list[str] | None":
+    """Put the choice of member file to the user on the clarify card and wait for the answer (nothing
+    is staged or read before it). An answer that names no file puts the card again. Returns the
+    chosen names, or None when it went unanswered."""
+    from . import shared_members as sm
+    by_name = {f["name"]: f for f in members}
+    pool = [by_name[n] for n in (sel.candidates or by_name) if n in by_name]
+    options = [sm.describe(f) for f in pool]
+    both = None
+    if len(pool) == 2:
+        both = f"Use both: {pool[0]['name']} and {pool[1]['name']}"
+        options.append(both)
+    reason = sel.reason[:1].upper() + sel.reason[1:]
+    for _ in range(_MEMBER_CHOICE_ASKS):
+        q = {"question": f"{reason}. Which file of {att['title']} {att['version']} should this run use?",
+             "options": options}
+        conn.plan_value = None
+        conn.plan_event.clear()
+        conn.pending_plan = {"kind": "clarify", "payload": [q]}
+        conn.push({"type": "plan_clarify", "questions": [q]})
+        got = await asyncio.to_thread(conn.plan_event.wait, 600)
+        conn.pending_plan = None
+        conn.push({"type": "plan_done"})
+        if not got:
+            return None
+        fb = str((conn.plan_value or {}).get("feedback", ""))
+        conn.plan_value = None
+        names = _member_answer(fb, pool, members, options, both)
+        if names:
+            return names
+        said = " ".join(fb.rsplit("?:", 1)[-1].split())[:80]
+        reason = f"“{said}” does not say which file" if said else "No file was picked"
+    return None
+
+
+async def _choose_shared_members(conn: Connection, req: "LabRequest", resolved: list[dict], decisions: dict,
+                                 prior: "dict | None", say_key: "Callable[..., None]") -> list[dict]:
+    """Settle which member file(s) of each attached shared version this run reads (issue 114), before
+    anything is staged: the file the request names, the assay and tissue it says, the choice made
+    earlier in this chat, or else the user's pick on a card. A file attached by name stays as it is.
+    Records ``decisions["shared_members"]`` (what the plan card shows and a resumed run keeps)."""
+    from . import shared_members as sm
+    sole = not (isinstance(req.datasets, list) and req.datasets) and len(resolved) == 1
+    earlier = _prior_shared_files(conn, prior)
+    out, record = [], []
+    for att in resolved:
+        if not att["whole"]:
+            out.append(att)
+            record.append({"dataset": att["dataset"], "version": att["version"], "title": att["title"],
+                           "files": [f["name"] for f in att["files"]], "how": "attached by file name",
+                           "candidates": [f["name"] for f in att["files"]]})
+            continue
+        members = _analysable_members(att)
+        if not members:
+            out.append(att)               # nothing to choose among: the version stays a folder
+            continue
+        sel = sm.select(req.question, members)
+        names, how = sel.chosen, sel.how
+        if sel.status == "ambiguous":
+            kept = [n for n in earlier.get((att["dataset"], att["version"]), []) if n in {f["name"] for f in members}]
+            if kept:
+                names, how = kept, "chosen earlier in this chat"
+            else:
+                say_key(f"❓ {att['title']} {att['version']} has several files this could mean: choose one "
+                        "before the run reads any data.")
+                names = await _ask_member_choice(conn, att, members, sel)
+                if not names:
+                    raise GatewayError(
+                        f"No file of {att['title']} {att['version']} was chosen, so the run did not start. "
+                        "Name the file in your request (for example “use HRCA scRNA”) and send it again.",
+                        stage="data")
+                how = "chosen by you"
+        new = _apply_members(att, names, how=how, candidates=sel.candidates, sole=sole)
+        out.append(new)
+        record.append({"dataset": att["dataset"], "version": att["version"], "title": att["title"],
+                       "files": names, "how": how, "candidates": sel.candidates})
+        say_key(f"📌 {att['title']} {att['version']}: {', '.join(names)} ({how})")
+    decisions["shared_members"] = record
     return out
 
 
@@ -3250,9 +3415,11 @@ def _resolve_shared_refs(req: "LabRequest", conn: Connection) -> list[dict]:
 
 
 def _shared_inputs_record(resolved: list[dict]) -> list[dict]:
-    """``process/inputs.json`` ``shared_inputs``: what each shared dataset meant for this run."""
+    """``process/inputs.json`` ``shared_inputs``: what each shared dataset meant for this run, and which
+    member files it read and why (``selected_by``)."""
     return [{"dataset": a["dataset"], "requested": a["requested"], "version": a["version"],
              "version_uuid": a["version_uuid"], "manifest_sha256": a["manifest_sha256"],
+             **({"selected_by": a["selection"]["how"]} if a.get("selection") else {}),
              "files": [{"name": f["name"], "size": f["size_bytes"], "sha256": f["sha256"]}
                        for f in a["files"]]} for a in resolved]
 
@@ -3490,7 +3657,11 @@ async def get_file(owner: str, run_id: str, path: str, request: Request) -> Resp
     content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     # Streamed from disk, never read into memory: an artifact can be a table of several GB, and this
     # process serves every user. "no-cache" keeps a regenerated report from being shown stale.
-    return FileResponse(target, media_type=content_type, headers={"Cache-Control": "no-cache"})
+    headers = {"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"}
+    if target.suffix.lower() in (".html", ".htm", ".xhtml", ".svg", ".xml"):
+        # A file a run wrote is data: opened by link it must never run script on this origin.
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+    return FileResponse(target, media_type=content_type, headers=headers)
 
 
 @app.post("/api/results/delete")
@@ -5268,7 +5439,10 @@ async def _restage_server_data(conn: Connection, decisions: dict[str, Any],
         return
     from . import server_data as sd
     base = _session_mirror_base(conn)
-    sessions_dir = base.rsplit("/", 1)[0]
+    # <shared root>/sessions/<session>/inputs: the stored path names the session that made the copy,
+    # which is another one whenever there is something to copy again.
+    session_dir, inputs_name = base.rsplit("/", 1)
+    sessions_dir = session_dir.rsplit("/", 1)[0]
     legacy_dir = f"{_hpc_uploads_dir(conn)}/{hpc_gc.SERVER_DATA_KIND}"
     roots = _bindable_roots(conn)
     by_name = {sd.mirror_tag(root): root for root in roots}
@@ -5279,7 +5453,7 @@ async def _restage_server_data(conn: Connection, decisions: dict[str, Any],
               if isinstance(folder, dict)]
     stored: list[tuple[dict, str, str]] = []            # (holder, key, "<root name>/<rel>")
     for holder, key in slots:
-        parts = sd.split_mirror(str(holder.get(key) or ""), sessions_dir, legacy_dir)
+        parts = sd.split_mirror(str(holder.get(key) or ""), sessions_dir, legacy_dir, inputs_name)
         if parts is not None:
             stored.append((holder, key, "/".join(p for p in parts if p)))
     # A bound folder covers the files inside it: copy each outermost path once.
@@ -5386,6 +5560,10 @@ def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
                 (decisions.get("cellranger_layout") or {}).get("datasets", [])}
     unusable = list(decisions.get("unusable_inputs") or [])
     cannot = {str(d.get("name") or "") for d in unusable if isinstance(d, dict)}
+    members = {f: {"dataset": m.get("title") or m.get("dataset"), "version": m.get("version"), "file": f,
+                   "how": m.get("how")}
+               for m in decisions.get("shared_members") or [] if isinstance(m, dict)
+               for f in m.get("files") or []}
     datasets = []
     for rec in decisions.get("datasets") or []:
         name = (primary_name or _display_name(rec)) if rec.get("primary") else _display_name(rec)
@@ -5394,7 +5572,13 @@ def _plan_dataset_inputs(decisions: dict, primary_name: str = "") -> dict:
         role = str(rec.get("role") or "").lower()
         use = ("reference" if role == "reference" else "main" if rec.get("primary") else
                "sample" if name.rstrip("/") in together else "extra input")
-        datasets.append({"name": name, "role": rec.get("role"), "use": use})
+        entry = {"name": name, "role": rec.get("role"), "use": use}
+        found = members.get(name)
+        if found:
+            # A shared dataset's member file: the dataset and version, the exact file and why it was
+            # picked, and what can read it (only the main file reaches the tools and MCP servers).
+            entry["shared"] = {**found, "access": "tools and MCP servers" if use == "main" else "code only (run_code)"}
+        datasets.append(entry)
     return {"datasets": datasets, "unusable_inputs": unusable}
 
 
@@ -6306,7 +6490,10 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
     cancelled = conn.chat_stop.is_set
 
     def start(relay_dir: str, max_cost_usd: float | None = None):
-        cap = CORPUS_SCAN_MAX_COST_USD
+        # One spending rule for every relayed job (the corpus scan, retigene-rag, these servers): the
+        # per-job ceiling, lowered to what is left of the user's budget on their own key.
+        metered = cred is not None and not shared
+        cap = _corpus_scan_cost_cap(conn)[0] if metered else CORPUS_SCAN_MAX_COST_USD
         if max_cost_usd is not None:
             if type(max_cost_usd) not in (int, float) or not 0 < max_cost_usd < float("inf"):
                 raise ValueError("MCP model cost limit must be positive and finite")
@@ -6323,7 +6510,8 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
             send_base, api_key = target
         else:
             send_base, api_key = base, os.environ.get("AISCIENTIST_LLM_API_KEY") or ""
-        key_use = _key_use(conn, cred) if cred is not None and not shared else None
+        key_use = (_key_use(conn, cred, allowance_usd=cap, allowance_calls=_CORPUS_SPIKE_CALLS)
+                   if metered else None)
 
         def chat(request: dict) -> tuple[dict, dict]:
             request = validate_request(request, model)
@@ -6354,24 +6542,7 @@ def _mcp_relay_binding(conn: "Connection", cred: dict | None) -> Any:
                               max_tokens=None, duration_ms=duration_ms, error_type=error_type)
 
         def price(usage):
-            if shared:
-                return 0.0
-            if usage.get("cost") is not None:
-                try:
-                    cost = float(usage["cost"])
-                    if 0 <= cost < float("inf"):
-                        return cost
-                except (TypeError, ValueError):
-                    pass
-            read = int(usage.get("cache_read_input_tokens") or 0)
-            write = int(usage.get("cache_creation_input_tokens") or 0)
-            write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
-            return llm_pricing.estimate(str(usage.get("model") or model),
-                input_tokens=int(usage.get("input_tokens") if "input_tokens" in usage
-                                 else max(0, int(usage.get("prompt_tokens") or 0) - read - write)),
-                output_tokens=int(usage.get("completion_tokens") or 0),
-                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
-                cache_read_tokens=read)
+            return 0.0 if shared else _relay_usage_price(model, usage)
 
         class GuardedRelay(llm_relay.ModelRelay):
             def stop(self, timeout=30.0):
@@ -7268,6 +7439,11 @@ class LabRequest(BaseModel):
     # "latest" | label, "files": [names] | None, "role": ...}``, never a path. The gateway resolves
     # each once at run start (``_resolve_shared_refs``) and keeps what ``latest`` meant.
     shared_datasets: list[dict] | None = None
+    # Images of this message (issue 115): the ids of images uploaded to the conversation (POST
+    # /api/conversations/{cid}/images). The gateway loads them itself, so a request body never carries
+    # bytes or paths; ``_images`` holds what it loaded.
+    images: list[str] | None = None
+    _images: "list[dict] | None" = PrivateAttr(default=None)
     # What the references resolved to. Private: it holds server paths, so a request body can never set it.
     _shared_resolved: "list[dict] | None" = PrivateAttr(default=None)
     # The TEXT attachment: the patient's clinical description / case note, carried as TEXT rather
@@ -7316,6 +7492,63 @@ class LabRequest(BaseModel):
     # (see _budget_refusal). ``tz`` is the browser's time zone, which the billing cycle is counted in.
     budget_ack: bool = False
     tz: str | None = None
+
+
+def _session_model_accepts_images(conn: Connection) -> "tuple[bool, str]":
+    """Whether the session's model reads images, and its name: a native Anthropic key does; any other
+    endpoint by the model's name or AISCIENTIST_VISION_MODELS (``chat_images.accepts_images``)."""
+    from . import chat_images, llm_providers
+    base_url = os.environ.get("AISCIENTIST_LLM_BASE_URL") or None
+    model = (os.environ.get("AISCIENTIST_LLM_MODEL") or "") if base_url else str(getattr(conn, "selected_model", "") or "")
+    native = False
+    try:
+        cred = _bound_credential(conn)
+    except GatewayError:
+        cred = None
+    if cred is not None:
+        if cred.get("builtin") == "shared":
+            model = str(cred.get("model") or shared_llm.SharedLLMSettings().served_name)
+        else:
+            model = str(cred.get("model") or model)
+            native = llm_providers.transport_for(cred.get("provider"), cred.get("base_url") or None) == "anthropic"
+    return chat_images.accepts_images(model, native_anthropic=native), model
+
+
+def _prepare_images(conn: Connection, req: LabRequest) -> "JSONResponse | None":
+    """A message's images: load them from the conversation (never from the request), and refuse, saying
+    why, when this session cannot use them; they are never dropped without a word. With no data
+    attached the message goes to the fast chat, which carries the images to the model. The analysis
+    run reads text and data only, so a message that both attaches data and images is refused."""
+    if not req.images:
+        return None
+    from . import chat_images
+    if not (_AUTH_ENABLED and str(req.conversation_id or "").isdigit()):
+        return JSONResponse({"error": "Images need an account and a saved chat."}, status_code=400)
+    try:
+        req._images = chat_images.load(conn.owner, int(req.conversation_id), req.images)
+    except chat_images.ChatImageError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    ok, model = _session_model_accepts_images(conn)
+    if not ok:
+        return JSONResponse(
+            {"error": f"This session's model ({model or 'unknown'}) cannot read images, so the message was not "
+                      "sent. Remove the image, or switch to a model that accepts images under API endpoints.",
+             "images_unsupported": True}, status_code=409)
+    if _select_bound_datasets(req) or req.shared_datasets:
+        return JSONResponse(
+            {"error": "An analysis reads text and data, not images. Send the image in a chat with no "
+                      "dataset attached, or remove it from this message.", "images_unsupported": True},
+            status_code=409)
+    req.route = "chat"
+    return None
+
+
+@app.get("/api/lab/vision")
+async def lab_vision(connection_id: str, request: Request) -> JSONResponse:
+    """Whether this session's model reads images: the composer says so before a message with one is sent."""
+    conn = _owned_conn(connection_id, request)
+    ok, model = await asyncio.to_thread(_session_model_accepts_images, conn)
+    return JSONResponse({"accepts_images": ok, "model": model})
 
 
 def _fixed_run_options(req: LabRequest) -> LabRequest:
@@ -9236,6 +9469,171 @@ def _begin_routed_run(conn: Connection, conversation_id: str | None) -> RunState
     return run
 
 
+_DATA_OFFER_ASKS = 2      # the card is put once more for an answer that names no choice
+
+
+def _data_offer_sources(conn: Connection) -> "tuple[list[dict], list[dict]]":
+    """What a request with no data may mean: each shared dataset's latest version with the files a
+    run can analyse, and the account's own complete uploads, newest first. Either is empty when it
+    cannot be read; neither raises."""
+    shared: list[dict] = []
+    own: list[dict] = []
+    try:
+        from . import shared_datasets as sd
+        if sd.store_root() is not None:
+            for ds in sd.dataset_views():
+                if not ds.get("latest"):
+                    continue
+                version = sd.version_view(ds["slug"])["version"]
+                files = [f for f in version.get("files") or []
+                         if _primary_suffix(f["name"]) not in (None, *_NOT_ANALYSABLE)]
+                shared.append({"slug": ds["slug"], "name": ds["name"], "label": version["label"], "files": files})
+    except Exception as exc:  # noqa: BLE001 - no shared datasets to offer
+        print(f"[data-offer] shared datasets not read: {type(exc).__name__}: {exc}")
+    try:
+        if _AUTH_ENABLED and conn.app_user_id:
+            from sqlalchemy import select
+
+            from .db import session_scope
+            from .models import Dataset
+            with session_scope() as s:
+                rows = s.scalars(select(Dataset).where(
+                    Dataset.user_id == int(conn.app_user_id), Dataset.status == "complete")
+                    .order_by(Dataset.uploaded_at.desc(), Dataset.id.desc()).limit(200)).all()
+                own = [{"id": d.id, "name": d.name, "path": d.path, "size_bytes": d.size_bytes,
+                        "uploaded_at": d.uploaded_at.isoformat() if d.uploaded_at else ""} for d in rows]
+    except Exception as exc:  # noqa: BLE001 - no uploads to offer
+        print(f"[data-offer] uploads not read: {type(exc).__name__}: {exc}")
+    return shared, own
+
+
+def _save_offered_data(conn: Connection, conversation_id: "str | None", pick: Any) -> None:
+    """Attach the picked dataset to the account's chat, so the chat shows it and the next message
+    sends it. Best-effort: this run already has it."""
+    try:
+        cid = int(str(conversation_id or ""))
+        if not (_AUTH_ENABLED and conn.app_user_id):
+            return
+        from .db import session_scope
+        from .models import Conversation, ConversationDataset
+        with session_scope() as s:
+            conv = s.get(Conversation, cid)
+            if conv is None or conv.user_id != int(conn.app_user_id):
+                return
+            if pick.kind == "shared":
+                from . import shared_datasets as sd
+                sd.replace_attachments(s, cid, [{"shared": pick.slug, "version": sd.LATEST,
+                                                 "files": pick.files, "role": "reference"}],
+                                       other_attached=len(conv.datasets))
+            elif not any(d.dataset_id == pick.dataset_id for d in conv.datasets):
+                conv.datasets.append(ConversationDataset(dataset_id=pick.dataset_id,
+                                                         position=len(conv.datasets), role=None))
+            s.commit()
+        conn.push({"type": "chat_datasets", "conversation_id": str(cid)})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[data-offer] attachment not saved: {type(exc).__name__}: {exc}")
+
+
+async def _offer_unattached_data(conn: Connection, req: LabRequest) -> LabRequest:
+    """A request with no dataset attached that points at a shared dataset or an upload
+    (``dataset_offers``): put the choices on the clarify card, shared datasets first, and wait.
+    Returns the request with the picked data bound, or the request as it came: nothing matched, the
+    user chose to go on without, or the card went unanswered. A chat asked once and answered "without"
+    is not asked again in this session."""
+    from . import dataset_offers
+    if _select_bound_datasets(req) or req.shared_datasets:
+        return req
+    declined = conn.__dict__.setdefault("_data_offer_declined", set())
+    key = str(req.conversation_id or "")
+    if key in declined:
+        return req
+    shared, own = await asyncio.to_thread(_data_offer_sources, conn)
+    choices = dataset_offers.offers(req.question, shared, own)
+    if not choices:
+        return req
+    options = [o.text for o in choices] + [dataset_offers.NONE_OPTION]
+    lead = "No dataset is attached to this chat"
+    pick: Any = False
+    for _ in range(_DATA_OFFER_ASKS):
+        q = {"question": f"{lead}. Which one should this request use?", "options": options}
+        conn.plan_value = None
+        conn.plan_event.clear()
+        conn.pending_plan = {"kind": "clarify", "payload": [q]}
+        conn.push({"type": "plan_clarify", "questions": [q]})
+        got = await asyncio.to_thread(conn.plan_event.wait, 600)
+        conn.pending_plan = None
+        conn.push({"type": "plan_done"})
+        if not got:
+            conn.push({"type": "lab_progress", "level": "info",
+                       "text": "No dataset was chosen in time: going on without one."})
+            return req
+        fb = str((conn.plan_value or {}).get("feedback", ""))
+        conn.plan_value = None
+        pick = dataset_offers.answer(fb, choices)
+        if pick is not False:
+            break
+        said = " ".join(fb.rsplit("?:", 1)[-1].split())[:80]
+        lead = f"“{said}” does not say which dataset" if said else "No dataset was picked"
+    if not pick:
+        declined.add(key)
+        conn.push({"type": "lab_progress", "level": "info", "text": "Going on without a dataset."})
+        return req
+    try:
+        if pick.kind == "shared":
+            from . import shared_datasets as sd
+            bound = req.model_copy(update={"shared_datasets": [
+                {"shared": pick.slug, "version": sd.LATEST, "files": pick.files, "role": "reference"}]})
+            bound._shared_resolved = await asyncio.to_thread(_resolve_shared_refs, bound, conn)
+        else:
+            bound = req.model_copy(update={
+                "dataset_path": pick.path, "datasets": [{"path": pick.path, "name": pick.name, "role": None}]})
+        _select_bound_datasets(bound)
+    except Exception as exc:  # noqa: BLE001 - the pick cannot be bound: say so and go on as before
+        detail = getattr(exc, "detail", None) or str(exc)
+        conn.push({"type": "lab_progress", "level": "warn",
+                   "text": f"That dataset could not be attached ({detail}): going on without one."})
+        return req
+    await asyncio.to_thread(_save_offered_data, conn, req.conversation_id, pick)
+    conn.push({"type": "lab_progress", "level": "info", "text": f"📎 Using {pick.text} ({pick.why})."})
+    return bound
+
+
+_CHAT_NAMING: "set[asyncio.Task]" = set()
+
+
+def _name_chat_soon(conn: Connection, req: LabRequest) -> None:
+    """Name the chat by what this request asks for, beside the request and never in its way."""
+    try:
+        task = asyncio.get_running_loop().create_task(asyncio.to_thread(_name_chat, conn, req))
+    except RuntimeError:   # no loop (a direct call in a test)
+        return
+    _CHAT_NAMING.add(task)
+    task.add_done_callback(_CHAT_NAMING.discard)
+
+
+def _name_chat(conn: Connection, req: LabRequest) -> str:
+    """Title an account's chat with the session model's reading of the request (role ``classify``)
+    and tell the page. Does nothing for a chat that is already named this way or by the user, for a
+    session whose model is not up (the next message tries again), and for a chat with no account.
+    Never raises. Returns the title it stored, or ""."""
+    from . import chat_titles
+    try:
+        cid = int(str(req.conversation_id or ""))
+        user_id = _owner_user_id(conn.owner)
+        if user_id is None or not chat_titles.wants_title(user_id, cid):
+            return ""
+        complete, _ = _session_llm(conn, "classify")
+        intent = chat_titles.intent_title(complete, req.question)
+        names = [str(d.get("name") or "") for d in _select_bound_datasets(req)]
+        title = chat_titles.store(user_id, cid, intent, names)
+        if title:
+            conn.push({"type": "chat_title", "conversation_id": str(cid), "title": title})
+        return title
+    except Exception as exc:  # noqa: BLE001 - a title is never worth a failed request
+        print(f"[title] chat not named: {type(exc).__name__}: {exc}")
+        return ""
+
+
 async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     """Entry for a composer message: route a follow-up to edit-report / re-run-step / new-study,
     or fall through to a fresh run. Only engages when a prior bundle exists; classifies with the
@@ -9248,6 +9646,7 @@ async def _dispatch_lab(conn: Connection, req: LabRequest) -> None:
     run = _begin_routed_run(conn, req.conversation_id)
     _note_budget_choice(run, req)
     _watch_run(conn, run, req)
+    _name_chat_soon(conn, req)
     try:
         await _dispatch_lab_run(conn, req)
     finally:
@@ -9399,7 +9798,15 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # session's model's call.
     with_context = target is not None or bool(_select_bound_datasets(req))
     curation_offered = False
-    ask = await asyncio.to_thread(_corpus_curation, conn, req.question, with_context=with_context)
+    # A question for RetiGene's gene table is neither of the two lines about its papers: the lookups
+    # answer it completely and read nothing, and only the analysis planner is offered them.
+    gene_table = not chat_literature_handoff and _gene_table_question(conn, req.question)
+    if gene_table:
+        from ..agents import request_router
+        chat_literature_route = request_router.Route(
+            request_router.ANALYSIS, 1.0, "asks what the RetiGene gene table holds", "rules")
+    ask = None if gene_table else await asyncio.to_thread(
+        _corpus_curation, conn, req.question, with_context=with_context)
     if ask:
         from ..agents import request_router
         conn.emit("info", "route", "Routed to a curation of the RetiGene papers: every gene with its evidence"
@@ -9465,6 +9872,10 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
         _watch_run(conn, _next, req)
         target = _followup_target(conn, req)
     if target is None:
+        # A new analysis in a chat with nothing attached: when the request points at a shared
+        # dataset or an upload, ask which to use before anything is planned.
+        if not gene_table:              # the table is the data of such a question
+            req = await _offer_unattached_data(conn, req)
         await _run_lab(conn, req)
         return
     run_id, art, state = target
@@ -9538,7 +9949,20 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     conn.push({"type": "lab_progress",
                "text": f"🧭 Read as “re-run step {idx + 1} and update the report” — the other results and figures are kept.",
                "level": "info"})
-    await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id, resume_decisions=resume_decisions)
+    stale = await _run_lab(conn, cont_req, resume=resume, resume_run_id=run_id,
+                           resume_decisions=resume_decisions, replan_stale_plan=True)
+    if stale:
+        # The earlier plan cannot run as it is (a tool it names is no longer installed, or its
+        # pinned settings do not take a new instruction). The message is still a request: plan it,
+        # from the earlier run's results, in a run of its own.
+        conn.push({"type": "lab_progress", "level": "info",
+                   "text": "🧭 The earlier plan in this chat cannot be re-run as it is (it was written "
+                           "for tools this version no longer has), so a new plan is drafted for "
+                           "your message. The earlier results are kept."})
+        _next = _begin_routed_run(conn, req.conversation_id)
+        _note_budget_choice(_next, req)
+        _watch_run(conn, _next, req)
+        await continue_from_results()
 
 
 # --- a later message that builds on the conversation's earlier run --------------------------------
@@ -9722,14 +10146,19 @@ def _watch_llm(run: RunState | None, complete_fn: Callable[..., str],
     if getattr(complete_fn, "_run_watched", False):
         return complete_fn, scientist_chat
 
-    def watched_complete(messages, *, role: str | None = None, max_tokens: int | None = None):
+    def watched_complete(messages, *, role: str | None = None, max_tokens: int | None = None,
+                         usage_out: dict | None = None):
         mon = run.monitor if run is not None else run_monitor.current_monitor()
         if mon is not None:
             mon.llm_begin(role)
         outcome = "failed"
         try:
-            result = (complete_fn(messages, role=role, max_tokens=max_tokens) if max_tokens
-                      else complete_fn(messages, role=role))
+            extra: dict[str, Any] = {}
+            if max_tokens:
+                extra["max_tokens"] = max_tokens
+            if usage_out is not None:
+                extra["usage_out"] = usage_out
+            result = complete_fn(messages, role=role, **extra)
             outcome = "success"
             return result
         except BaseException as exc:
@@ -9876,6 +10305,30 @@ def _corpus_curation(conn: Connection, question: str, *, with_context: bool = Fa
     known = corpus_scan.HAPLOINSUFFICIENCY.id
     return request_router.CorpusAsk(request_router.LIST, corpus_scan.KNOWN_CURATIONS.get(known, known),
                                     known, 1.0, "rules")
+
+
+def _gene_table_question(conn: Connection, question: str) -> bool:
+    """A question for RetiGene's gene table (``request_router.asks_gene_table``), on a session that
+    is offered the lookups. The built-in curation's list question stays the curation's."""
+    from ..agents import request_router
+    q = str(question or "")
+    return (request_router.asks_gene_table(q) and not corpus_scan.asks_for_gene_list(q)
+            and _gene_table_lookups_offered(conn))
+
+
+def _gene_table_lookups_offered(conn: Connection) -> bool:
+    """Whether this session's planner is offered the RetiGene gene table lookups: the retigene-rag
+    server registered (its skill names the pinned image) with its index named, and HPC3 reached."""
+    from ..agents import mcp_bridge, retigene
+    from ..agents.skills import get_skill
+    if conn.executor is None or conn.mock or not retigene.index_available():
+        return False
+    try:
+        server = next((s for s in mcp_bridge.configured_servers() if s.adapter == "retigene"), None)
+        skill = get_skill(server.skill) if server is not None else None
+    except Exception:  # noqa: BLE001 - routing never strands the request
+        return False
+    return skill is not None and skill.image == server.image
 
 
 def _corpus_list_rule(text: str) -> "str | None":
@@ -10476,6 +10929,65 @@ def _corpus_scan_cost_cap(conn: Connection) -> tuple[float, str]:
     return cap, why
 
 
+def _relay_usage_price(model: str, usage: dict[str, Any]) -> "float | None":
+    """USD for one relayed reply: the provider's own figure when it gives one, else the price table
+    for its tokens (cache reads and writes apart)."""
+    from . import llm_pricing
+    if usage.get("cost") is not None:                          # the provider's own figure
+        try:
+            cost = float(usage["cost"])
+            if 0 <= cost < float("inf"):
+                return cost
+        except (TypeError, ValueError):
+            pass
+    read = int(usage.get("cache_read_input_tokens") or 0)
+    write = int(usage.get("cache_creation_input_tokens") or 0)
+    write_1h = int(usage.get("cache_creation_1h_input_tokens") or 0)
+    uncached = int(usage.get("input_tokens") if "input_tokens" in usage
+                   else max(0, int(usage.get("prompt_tokens") or 0) - read - write))
+    return llm_pricing.estimate(str(usage.get("model") or model), input_tokens=uncached,
+                                output_tokens=int(usage.get("completion_tokens") or 0),
+                                cache_write_tokens=write - write_1h, cache_write_1h_tokens=write_1h,
+                                cache_read_tokens=read)
+
+
+def _retigene_relay_binding(conn: Connection) -> Any:
+    """The session's model as an MCP server's relayed calls read with it (``mcp_model_relay.Binding``):
+    its lab-role completion, its name and prices, and on a user's own key the spending cap (what is left
+    of their budget, as for the corpus scan) and the spike allowance. Raises ``GatewayError`` when the
+    session has no model ready (a cold GPU session is not woken for this) or no budget left."""
+    from . import llm_pricing, mcp_model_relay
+    if not _model_ready(conn):
+        raise GatewayError(
+            "This session's model is not running, so the curation has no model to read with. Start the "
+            "session's model, or choose your API key or the shared model for this session, and ask again.",
+            stage="mcp_relay")
+    llm = _lab_llm(conn)
+    cred = _bound_credential(conn)
+    metered = cred is not None and not cred.get("builtin")
+    if not metered:                                   # the lab's shared model, or the session's GPU: free
+        return mcp_model_relay.Binding(complete=llm.complete_fn, model=str(llm.model), metered=False)
+    model = str(cred.get("lab_model") or cred.get("model") or llm.model)
+    cap, _why = _corpus_scan_cost_cap(conn)
+    rates = llm_pricing.rates_for(model) or {}
+    return mcp_model_relay.Binding(
+        complete=llm.complete_fn, model=model, metered=True,
+        rates=(float(rates.get("input") or 0), float(rates.get("output") or 0)), cap=cap,
+        price=lambda usage: _relay_usage_price(model, usage),
+        allowance=lambda usd: _key_use(conn, cred, allowance_usd=usd, allowance_calls=_CORPUS_SPIKE_CALLS))
+
+
+def _mcp_model_relay(conn: Connection, run: "RunState | None", work_dir: str) -> Any:
+    """The executor's ``model_relay`` for this run's MCP calls (``mcp_model_relay.SessionModelRelay``),
+    or None when the session has no SFTP channel to answer through."""
+    if conn.executor is None or not hasattr(conn.executor, "open_sftp") or not work_dir:
+        return None
+    from . import llm_relay, mcp_model_relay
+    stop = run.chat_stop.is_set if run is not None else conn.chat_stop.is_set
+    return mcp_model_relay.SessionModelRelay(
+        lambda: _retigene_relay_binding(conn), lambda: llm_relay.SFTPFS(conn.executor.open_sftp()), work_dir,
+        should_stop=stop, log=lambda s: print(f"[mcp-relay] {s}"))
+
 
 
 
@@ -10867,6 +11379,7 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
     # loop.call_soon_threadsafe, which is the same contract _run_lab's callbacks rely on.
 
     try:
+        from . import chat_images
         from ..agents.quick_chat import QuickChatConfig, run_quick_chat
         from ..agents.registry import build_quickchat_catalog
         from ..agents.research_harness import HarnessContext
@@ -10960,6 +11473,8 @@ async def _run_quick_chat(conn: Connection, req: LabRequest) -> None:
             count_tokens_fn=count_tokens_fn, summarize_fn=summarize_fn,
             prior_summary=str(memory.get("summary") or ""),
             prior_summary_through=int(memory.get("through") or 0),
+            image_parts=[{"type": "image_url", "image_url": {"url": chat_images.data_url(i)}}
+                         for i in getattr(req, "_images", None) or []] or None,
         )
         # Carry the rolling memory forward. Stored even on a stopped/empty turn: the summary
         # describes the CONVERSATION, not this turn's answer, and throwing it away would make
@@ -11514,6 +12029,9 @@ async def lab(req: LabRequest, request: Request) -> JSONResponse:
     re-run-step / new study) instead of always minting a fresh study."""
     _select_bound_datasets(req)   # refuse an oversized set before scheduling any work
     conn = _owned_conn(req.connection_id, request)
+    refused_images = await asyncio.to_thread(_prepare_images, conn, req)
+    if refused_images is not None:
+        return refused_images
     # Shared datasets: resolved once here, so ``latest`` means the same for the whole run.
     if req.shared_datasets:
         req._shared_resolved = await asyncio.to_thread(_resolve_shared_refs, req, conn)
@@ -12501,11 +13019,14 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         """One call to the shared model for a session on it: no other model to fall back on."""
         return _shared_call(conn, call)
 
-    def complete_fn(messages, *, role: str | None = None, max_tokens: int | None = None):
+    def complete_fn(messages, *, role: str | None = None, max_tokens: int | None = None,
+                    usage_out: dict | None = None):
         """One lab-role completion. ``max_tokens``: the caller's own output ceiling, which replaces
         the role's on a metered endpoint (a relayed prompt from an HPC3 job carries the ceiling its
         tool needs; a curation reading runs to ~7k tokens, over the 4096 of a short role). Bounded
-        to 256..64000. The shared model and the cluster's GPU get no ceiling either way."""
+        to 256..64000. The shared model and the cluster's GPU get no ceiling either way.
+        ``usage_out``: filled with the call's usage (tokens, and the model's name), for a caller that
+        prices the reply itself (``mcp_model_relay``); the call is recorded here either way."""
         if shared_endpoint:
             started = time.monotonic()
             b_used: list = []
@@ -12527,6 +13048,8 @@ def _lab_llm(conn: Connection) -> "LabLLM":
             _record_lab_usage(conn, key_use=key_use, role=role or "reason", model=b_used[0].model, endpoint=b_used[0].label,
                               remote=False, usage=usage, max_tokens=None, provider="shared",
                               duration_ms=int((time.monotonic() - started) * 1000))
+            if usage_out is not None:
+                usage_out.update(dict(usage or {}), model=b_used[0].model)
             return text
         # A remote endpoint has no tunnel to heal, so it skips the recovery wrap. Keyed on
         # lab_base_url being set rather than on it differing from base_url: with a saved
@@ -12598,6 +13121,8 @@ def _lab_llm(conn: Connection) -> "LabLLM":
         _record_lab_usage(conn, key_use=key_use, role=role or "reason", model=lab_model, endpoint=lab_label,
                           remote=lab_remote, usage=usage, max_tokens=cap, provider=lab_provider,
                           duration_ms=int((time.monotonic() - started) * 1000))
+        if usage_out is not None:
+            usage_out.update(dict(usage or {}), model=lab_model)
         return text
 
     def scientist_chat(messages, tools):
@@ -12767,7 +13292,9 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
         # the conversation — not dumped into the always-visible feed.
         out.append({"type": "step_code", "code": code})
 
-    if t == "pi_agenda":
+    if t == "step_provenance":
+        out.append(dict(ev))
+    elif t == "pi_agenda":
         agenda = list(ev.get("agenda") or [])
         progress(f"📋 Plan ready — {len(agenda)} step{'s' if len(agenda) != 1 else ''}")
         for i, step in enumerate(agenda, 1):
@@ -12874,7 +13401,10 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                  f"({ev.get('chars', 0):,} characters). Its replies are saved with the run in "
                  "process/plan_replies/.", "warning")
     elif t == "plan_failed":
-        progress("⛔ No plan, so nothing was run. Send the request again to plan it again.", "warning")
+        # The reply says what to attach when the plan was held back for a missing input.
+        progress("⛔ No plan: the input this request needs is not attached to the chat."
+                 if str(ev.get("reason") or "").startswith("Nothing was planned or run: this request needs")
+                 else "⛔ No plan, so nothing was run. Send the request again to plan it again.", "warning")
     elif t == "plan_revision_failed":
         progress("⚠️ The PI's revised plan could not be read, so the plan is unchanged. Ask for the "
                  "change again.", "warning")
@@ -12889,7 +13419,7 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
             + (f" ({a.get('release')})" if a.get("release") else " (local)")
             for a in list(ev.get("assigned") or [])[:12]))
     elif t == "step_skill":
-        activity(f"this step uses the skill `{ev.get('skill')}` {ev.get('version')}"
+        activity(f"this step was assigned skill guidance `{ev.get('skill')}` {ev.get('version')}"
                  + (f" from {ev.get('release')}" if ev.get("release") else " (local copy)")
                  + "; its guidance and code are in the step's brief")
     elif t == "turn_budget_low":
@@ -13524,6 +14054,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         emit("warning", "lab", f"run_code-on-HPC3 workspace setup failed ({exc}); "
                                "run_code uses the local sandbox this run.")
         return sandbox
+    rc_work = os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work"
     code_executor: Any = SlurmCodeExecutor(
         remote=conn.executor,
         container_image=st.analysis_image,
@@ -13534,7 +14065,7 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         # The server file a per-session copy above was made from (None for an HPC3 upload).
         dataset_source=(decisions.get("server_primary") if not os.environ.get("AISCIENTIST_HPC_DATASET")
                         and rc_remote_ds == decisions.get("hpc_primary") else None),
-        work_dir=os.environ.get("AISCIENTIST_HPC_WORK") or f"{rc_remote_ws}/work",
+        work_dir=rc_work,
         artifacts_dir=os.environ.get("AISCIENTIST_HPC_ARTIFACTS") or f"{rc_remote_ws}/artifacts",
         local_artifacts=str(art),   # mirror artifacts back for the still-local report bundler
         # dfs3b scratch, OFF $HOME — Slurm does not expand $HOME in #SBATCH --output, which
@@ -13560,6 +14091,9 @@ async def _build_code_executor(conn: Connection, run: "RunState | None", run_id:
         tool_cache_dir=_tool_cache_dir(conn),
         notify=lambda level, message: emit(level, "lab", message),
         inputs=tuple(rc_inputs),
+        # An MCP server that reads with a model (retigene-rag's curation) reads with this session's,
+        # its prompts answered from here (mcp_model_relay).
+        model_relay=_mcp_model_relay(conn, run, rc_work),
     )
     code_executor.mcp_model_binding = lambda: _mcp_session_model(conn)
     emit("info", "lab", f"CodeAct runs on HPC3 (CPU Slurm, --mem={st.run_code_mem_gb}G).")
@@ -13625,7 +14159,77 @@ def _build_report_render_fn(conn: "Connection", run_id: str = ""):
 # run could not use.
 _STAGING_DECISIONS = ("dataset_result", "dataset_root", "hpc_dataset_root", "input_folders",
                       "cellranger_layout", "metadata_inputs", "dataset_metadata", "dataset_description",
-                      "input_name", "unusable_inputs")
+                      "input_name", "unusable_inputs", "shared_inputs", "shared_members")
+
+
+def _provenance_tool_label(tool: dict[str, Any]) -> str:
+    """Provider identity comes only from structured registration/recorded metadata."""
+    name = str(tool.get("tool") or "unknown")
+    provider = str(tool.get("provider") or "unknown")
+    version = str(tool.get("version") or "unknown")
+    if provider == "mcp":
+        identity = f"MCP {tool.get('server') or 'unknown'} @ {version}"
+    elif provider == "local":
+        identity = f"local @ {version}"
+    else:
+        identity = f"unknown provider @ {version}"
+    return f"{name} ({identity})"
+
+
+def _provenance_skill_label(skill: dict[str, Any]) -> str:
+    return f"{skill.get('name') or 'unknown'} @ {skill.get('version') or 'unknown'}"
+
+
+def _planned_provenance_lines(step: dict[str, Any]) -> list[str]:
+    tools = step.get("tools") or ([{"tool": step["tool"]}] if step.get("tool") else [])
+    skills = step.get("skills") or ([{"name": step["skill"]}] if step.get("skill") else [])
+    return [
+        "Planned tools: " + ("; ".join(_provenance_tool_label(t) for t in tools)
+                             or "No tool assigned (provider/version unknown)"),
+        "Planned skills: " + ("; ".join(_provenance_skill_label(sk) for sk in skills)
+                              or "No skill assigned"),
+    ]
+
+
+def _readable_plan_steps(steps: list[dict[str, Any]], agenda: list[str]) -> str:
+    """Export every approved assignment, including explicit legacy/unknown identities."""
+    lines: list[str] = []
+    for index, text in enumerate(agenda):
+        step = steps[index] if index < len(steps) else {}
+        lines.append(f"{index + 1}. {text}")
+        lines.extend(f"   - {line}" for line in _planned_provenance_lines(step))
+    return "\n".join(lines) + "\n"
+
+
+def _readable_step_usage(rows: list[dict[str, Any]]) -> str:
+    """Deterministic final record: assignment never implies successful execution."""
+    lines: list[str] = []
+    for index, row in enumerate(rows, 1):
+        lines.append(f"## {row.get('id') or index}: {row.get('step') or 'Unknown step'}")
+        lines.append("")
+        planned = {"tools": row.get("planned_tools") or [],
+                   "skills": row.get("planned_skills") or []}
+        lines.extend(f"- {line}" for line in _planned_provenance_lines(planned))
+        lines.append(f"- Step status: {row.get('status') or 'unknown'}")
+        tools = row.get("tools") or []
+        skills = row.get("skills") or []
+        lines.append("- Recorded tools: " + ("; ".join(
+            _provenance_tool_label(t) + (" [used]" if t.get("ok") is True else " [failed]")
+            for t in tools) or "No tool use recorded"))
+        lines.append("- Recorded skills: " + ("; ".join(
+            _provenance_skill_label(sk) + f" [{sk.get('status') or 'unknown'}]"
+            for sk in skills) or "No successful skill use recorded"))
+        for change in row.get("provider_changes") or []:
+            if isinstance(change, dict):
+                approved = "; ".join(_provenance_tool_label(t)
+                                     for t in change.get("planned") or []) or "No tool assigned"
+                actual = _provenance_tool_label(change.get("used") or {})
+                detail = f"{approved} -> {actual}"
+            else:
+                detail = str(change)
+            lines.append("- Provider changed from approved plan: " + detail)
+        lines.append("")
+    return "\n".join(lines) or "No step execution recorded.\n"
 
 
 def _write_run_state(art: Path, result: Any, guidance: str | None, decisions: dict[str, Any],
@@ -14390,7 +14994,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                    resume_decisions: dict[str, Any] | None = None,
                    prior: "dict | None" = None,
                    saved_state: "dict | None" = None,
-                   saved_decision: "dict | None" = None) -> None:
+                   saved_decision: "dict | None" = None,
+                   replan_stale_plan: bool = False) -> bool:
+    """Returns True only when ``replan_stale_plan`` is set and the earlier plan could not be
+    resumed (``requires_replan``): nothing ran, no error was shown, and the caller plans anew."""
+    stale_plan = False
     # This run's isolation scope — cancel + plan events keyed to THIS run, and its identity stamped on
     # every streamed WS event so the client demuxes it into the owning conversation bubble. The caller
     # (dispatch / continue endpoints) opened it via begin_run; a direct/legacy call gets a fresh one.
@@ -14465,7 +15073,19 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         bound = _select_bound_datasets(req)
         shared_resolved = getattr(req, "_shared_resolved", None) or []
         if shared_resolved and resume is None and saved_state is None:
+            # Which member file of each shared version the run reads is settled here, before anything
+            # is staged or read (issue 114); the plan card shows it and a resume keeps it.
+            shared_resolved = await _choose_shared_members(conn, req, shared_resolved, decisions, prior, say_key)
+            req._shared_resolved = shared_resolved
+            bound = _select_bound_datasets(req)
             await _record_shared_inputs(conn, run_id, art, decisions, shared_resolved, prior, say_key)
+        elif shared_resolved:
+            # A resumed run or a restored plan binds the members it was approved with.
+            shared_resolved = _restore_shared_members(
+                shared_resolved, decisions.get("shared_members"),
+                sole=not (isinstance(req.datasets, list) and req.datasets) and len(shared_resolved) == 1)
+            req._shared_resolved = shared_resolved
+            bound = _select_bound_datasets(req)
         # What rides into run_state.json beside the decisions: the dataset as the browser bound it
         # (the follow-up router compares the next message's against it), and, for a run that
         # continues an earlier one, which run and the conversation's work so far.
@@ -14531,6 +15151,12 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             bound, server_mirrors = await _admit_bound_paths(
                 conn, bound, say_key, emit, unusable, _shared_by_path(getattr(req, "_shared_resolved", None)))
             decisions["input_name"] = _display_name(bound[0]) if bound else ""
+        if resume is None and saved_state is None and _AUTH_ENABLED and conn.app_user_id:
+            try:
+                await asyncio.to_thread(auth_routes.record_run_datasets,
+                                        conn.app_user_id, run_id, bound, shared_resolved)
+            except Exception as exc:  # noqa: BLE001 - history is best-effort
+                print(f"[auth] record_run_datasets failed: {exc}")
         primary_path = bound[0]["path"] if bound else None
         primary_name = _display_name(bound[0]) if bound else ""
         # The primary's matrix as staged here from dfs3b, so describing its folder reads that copy.
@@ -15182,6 +15808,17 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                       "estimate": plan_estimate(agenda) if agenda else None,
                       **({"step_outputs": step_outputs} if step_outputs else {})}
             saved_plans.save(art, doc_yaml, source=source, kind=kind, payload=payload, prompt=prompt)
+            if kind == "agenda":
+                from ..agents.plan_doc import PlanError, parse_plan_yaml
+                # The readable copy is a convenience: a plan it cannot render must still be saved.
+                try:
+                    (art / "report").mkdir(parents=True, exist_ok=True)
+                    (art / "report" / "plan.md").write_text(
+                        f"# Research plan\n\n**Question:** {req.question}\n\n"
+                        + _readable_plan_steps(parse_plan_yaml(doc_yaml).to_public(), agenda),
+                        encoding="utf-8")
+                except (PlanError, OSError) as exc:
+                    print(f"[plan] readable plan.md not written: {exc}")
             card = saved_plans.build_prompt(art)
             _finish_run_record(conn, run_id, "awaiting_plan", str(art), "Plan waiting for review.")
             conn.push({**card, "saved": True})
@@ -15223,6 +15860,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             session_meta.update(plan_context=lab_obj.plan_context,
                                 approved_plan_yaml=lab_obj.approved_plan_yaml)
             session_meta.pop("resume_review", None)
+            session_meta["step_provenance"] = getattr(lab_obj, "step_provenance", lambda: [])()
             _write_run_state(art, partial, lab_obj.guidance, decisions,
                              lab_obj.execution_profile, extra=session_meta)
             _remember_planned_run(conn, run)
@@ -15258,14 +15896,33 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             should_compact=take_compact_request,
             checkpoint=checkpoint_run, **saved_args)
 
+        # Keep the execution ledger even when no analysis step succeeded, once a step has run: a plan
+        # cancelled in review lists every step as skipped, and is finished below with no record.
+        step_usage = getattr(lab_obj, "step_provenance", lambda: [])()
+        session_meta["step_provenance"] = step_usage
+        steps_ran = any(row.get("status") != "skipped" for row in step_usage)
+        if steps_ran:
+            try:
+                (art / "process").mkdir(parents=True, exist_ok=True)
+                (art / "process" / "step_provenance.md").write_text(
+                    "# Step execution record\n\n" + _readable_step_usage(step_usage), encoding="utf-8")
+            except OSError:
+                pass
+
         # A plan cancelled or timed-out during review — or a run that executed and accepted NOTHING —
         # has no results to write up. Rendering a report from it produced a placeholder, DATALESS
         # manuscript ("[Figure 1. Schematic of the intended … workflow]") that read like a real
         # deliverable AND became the connection's "last run", so the NEXT message was misrouted as a
-        # follow-up to it (dropping the dataset, reverting the assembly). Finish cleanly with NO report,
-        # NO run_state, and NO last_run_id, so the conversation's next message is a fresh, dataset-bound
-        # study. (A mid-run Stop that accepted ≥1 step still writes up what ran — that path has rounds.)
+        # follow-up to it (dropping the dataset, reverting the assembly). Finish cleanly with NO report
+        # and NO last_run_id, so the conversation's next message is a fresh, dataset-bound study; the
+        # run_state is kept only when a step ran, for its step ledger. (A mid-run Stop that accepted
+        # ≥1 step still writes up what ran — that path has rounds.)
         if _run_produced_nothing(result, run_flags["plan_cancelled"]):
+            if steps_ran:
+                _write_run_state(art, result, getattr(lab_obj, "guidance", None), decisions,
+                                 getattr(lab_obj, "execution_profile", None),
+                                 protocols=getattr(lab_obj, "protocols", None),
+                                 self_sourced=getattr(lab_obj, "self_sourced", ""), extra=session_meta)
             reason = (result.final_answer or "").strip() or \
                 "The plan review ended before anything ran — no analysis steps were executed."
             # One event, one sentence — the three end-of-run lines used to disagree with each
@@ -15278,7 +15935,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             emit("warning", "lab", "Run ended before any step was accepted — skipping report render.")
             conn.push({"type": "chat_token", "token": reason})
             conn.push({"type": "chat_stopped"})
-            _finish_run_record(conn, run_id, "cancelled", None, reason)
+            _finish_run_record(conn, run_id, "cancelled", str(art) if steps_ran else None, reason)
             return
 
         # Persist the approved plan as a human-readable Markdown file (the user asked for
@@ -15287,7 +15944,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
             try:
                 plan_md = art / "report" / "plan.md"
                 plan_md.parent.mkdir(parents=True, exist_ok=True)
-                body = "\n".join(f"{i}. {s}" for i, s in enumerate(result.agenda, 1))
+                from ..agents.plan_doc import parse_plan_yaml
+                approved = str(getattr(lab_obj, "approved_plan_yaml", "") or "")
+                plan_steps = (parse_plan_yaml(approved).to_public() if approved else
+                              (run_flags["plan_doc"] or {}).get("steps") or [])
+                body = _readable_plan_steps(plan_steps, result.agenda)
                 # WHICH protocol steered this plan, and WHAT the PI decided on its own. Both were
                 # known at plan time and neither was ever written down: the protocol's identity
                 # lived only in an ephemeral chat line, and nothing recorded which choices the
@@ -15595,13 +16256,21 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                    "message": public_error(exc) + _resume_hint(locals().get("art"))})
         _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc.message))
     except Exception as exc:  # noqa: BLE001 - any lab failure is reported, never fatal
-        print(f"[lab] run failed (unhandled): {type(exc).__name__}: {exc}")
-        traceback.print_exc()
-        conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
-        conn.push({"type": "chat_error",
-                   "message": public_error(exc) + ("" if getattr(exc, "requires_replan", False)
-                                                  else _resume_hint(locals().get("art")))})
-        _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
+        needs_replan = bool(getattr(exc, "requires_replan", False))
+        if needs_replan and resume is not None and replan_stale_plan:
+            stale_plan = True
+            conn.emit("info", "lab", f"Earlier plan not resumed, planning anew: {public_error(exc)}")
+        else:
+            print(f"[lab] run failed (unhandled): {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            conn.emit("error", "lab", f"Lab run failed: {public_error(exc)}", detail=error_detail(exc))
+            conn.push({"type": "chat_error",
+                       "message": public_error(exc) + ("" if needs_replan
+                                                      else _resume_hint(locals().get("art")))})
+        # A plan refused before anything ran leaves the finished run it belongs to as it was:
+        # its record keeps its status, its files and its summary.
+        if not (needs_replan and resume_run_id):
+            _finish_run_record(conn, locals().get("run_id"), "error", None, str(exc))
     finally:
         if "run_usage" in locals() and "run_id" in locals():
             try:
@@ -15615,6 +16284,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # Close the run scope so a post-run WS reconnect doesn't see a stale pending plan; the run
         # stays in conn.runs so a late approve/cancel that names it resolves to a no-op.
         conn.end_run(run)
+    return stale_plan
 
 
 
@@ -19089,6 +19759,15 @@ def _result_pointer_path(owner: str, run_id: str, what: str = "dataset") -> Path
     return CONSOLE_RUNS_DIR / safe_name(owner) / run_id / "artifacts" / "data" / name
 
 
+def _write_pointer(path: Path, rec: dict) -> None:
+    """Replace a result pointer in one step. Written in place, it is empty for a moment, and a
+    reader in that moment (the page asking whether a result is saved, while the copy back from HPC3
+    finishes in its thread) took the result for one with no record."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _read_pointer(path: Path) -> "dict | None":
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
@@ -19124,7 +19803,7 @@ def _stamp_literature_result(conn: "Connection", run_id: str, art: Path) -> "dic
            "size_bytes": sum(f["size"] for f in files),
            "kept_days": conn.settings.checkpoint_ttl_days, "until_disconnect": False}
     pointer.parent.mkdir(parents=True, exist_ok=True)
-    pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    _write_pointer(pointer, rec)
     return rec
 
 
@@ -19380,7 +20059,7 @@ def _save_run_result_locked(owner: str, user_id: "int | None", run_id: str, what
                     return 202, {"ok": True, "saving": True, "name": name}
                 rec.pop("save_error", None)
                 rec["saving"] = {"started_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+                _write_pointer(pointer_path, rec)
             threading.Thread(target=_bring_result_home,
                              args=(owner, user_id, run_id, what, conn, src, pointer_path),
                              name=f"save-result-{run_id}", daemon=True).start()
@@ -19495,7 +20174,7 @@ def _save_curation_tables_locked(owner: str, user_id: "int | None", run_id: str)
     rec.update(saved_to=dest, saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     rec.pop("save_error", None)
     try:
-        pointer.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        _write_pointer(pointer, rec)
     except OSError as exc:
         print(f"[curation] could not update {pointer}: {exc}")
     return 200, {"ok": True, "path": dest, "dataset_id": dataset_id, "name": name, "kind": "folder"}
@@ -19523,7 +20202,7 @@ def _record_saved_result(owner: str, user_id: "int | None", run_id: str, folder:
     rec.update(saved_to=dest, path=dest, saved_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                **({"location": location} if location else {}))
     try:
-        pointer_path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        _write_pointer(pointer_path, rec)
         if re.fullmatch(r"result_dataset\.[A-Za-z0-9_-]+\.json", pointer_path.name):
             aggregate_path = pointer_path.with_name("result_dataset.json")
             aggregate = _read_pointer(aggregate_path) or {}
@@ -19582,7 +20261,7 @@ def _bring_result_home(owner: str, user_id: "int | None", run_id: str, what: str
             now.pop("saving", None)
             now["save_error"] = f"{type(exc).__name__}: {public_error(exc)}"[:300]
             try:
-                pointer_path.write_text(json.dumps(now, indent=2), encoding="utf-8")
+                _write_pointer(pointer_path, now)
             except OSError:
                 pass
         for c in _owner_connections(safe_name(owner)):

@@ -19,11 +19,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
+from sqlalchemy.orm import selectinload
 
 from . import auth, email_send, rate_limit
 from .dataset_limits import MAX_BOUND_DATASETS
 from .db import session_scope
-from .models import (Conversation, ConversationDataset, Dataset, LlmCall, Message, PendingRegistration, Run,
+from .models import (Conversation, ConversationDataset, ConversationGroup, Dataset, LlmCall, Message, PendingRegistration, Run,
                      UsageBudget, User)
 
 router = APIRouter(prefix="/api")
@@ -422,7 +423,8 @@ def my_datasets(request: Request) -> dict:
 def my_runs(request: Request) -> dict:
     user = require_user(request)
     with session_scope() as s:
-        rows = s.scalars(select(Run).where(Run.user_id == user.id).order_by(Run.id.desc())).all()
+        rows = s.scalars(select(Run).where(Run.user_id == user.id)
+                         .options(selectinload(Run.datasets)).order_by(Run.id.desc())).all()
         # Each run's plan estimate and measured compute (issue 25), two queries for the whole list.
         from .estimates import runs_usage
         usage = runs_usage([r.run_id for r in rows])
@@ -631,10 +633,56 @@ def delete_run_record(user_id: int, run_id: str, run_dir=None, delete_files=None
 
 def record_run_start(user_id: int, run_id: str, question: str, plan_mode: bool,
                      dataset_id: int | None = None, conversation_id: str | None = None) -> None:
+    """Start history; dataset_id is accepted for compatibility but no longer written."""
     with session_scope() as s:
         s.add(Run(user_id=user_id, run_id=run_id, question=question, plan_mode=plan_mode,
-                  dataset_id=dataset_id, conversation_id=conversation_id, status="running"))
+                  conversation_id=conversation_id, status="running"))
         s.commit()
+
+
+def record_run_datasets(user_id: int, run_id: str, bound: list[dict],
+                        shared_resolved: list[dict] | None = None) -> None:
+    """Snapshot the final bind set, in order, before review or execution. Paths stay internal."""
+    from .models import RunDataset, SharedDatasetVersion
+
+    shared = {e["path"]: a for a in shared_resolved or [] for e in a["entries"]}
+    with session_scope() as s:
+        run = s.scalar(select(Run).where(Run.user_id == user_id, Run.run_id == run_id))
+        if run is None or run.datasets:
+            return
+        owned = {d.path: d for d in s.scalars(select(Dataset).where(
+            Dataset.user_id == user_id, Dataset.path.in_([e["path"] for e in bound])))}
+        for position, entry in enumerate(bound):
+            attachment = shared.get(entry["path"])
+            dataset = owned.get(entry["path"]) if attachment is None else None
+            version = (s.scalar(select(SharedDatasetVersion).where(
+                SharedDatasetVersion.uuid == attachment["version_uuid"])) if attachment else None)
+            # A server folder has no registry identity. Store only its display name, never its path.
+            name = (dataset.name if dataset else
+                    f"{attachment['title']} {attachment['version']}" if attachment else
+                    str(entry.get("name") or entry["path"]).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1])
+            run.datasets.append(RunDataset(
+                position=position, dataset_id=dataset.id if dataset else None,
+                dataset_uuid=dataset.uuid if dataset else attachment["version_uuid"] if attachment else None,
+                name=name, shared_version_id=version.id if version else None,
+                role=entry.get("role") or ("primary" if position == 0 else None)))
+        s.commit()
+
+
+def runs_for_dataset(user_id: int, dataset_uuid: str | None = None, *,
+                     shared_version_id: int | None = None) -> list[dict]:
+    """The owner's runs using a dataset UUID or shared version, including deleted datasets."""
+    from .models import RunDataset
+
+    if dataset_uuid is None and shared_version_id is None:
+        return []
+    with session_scope() as s:
+        query = select(Run).join(RunDataset).where(Run.user_id == user_id)
+        if dataset_uuid is not None:
+            query = query.where(RunDataset.dataset_uuid == dataset_uuid)
+        if shared_version_id is not None:
+            query = query.where(RunDataset.shared_version_id == shared_version_id)
+        return [r.public() for r in s.scalars(query.order_by(Run.created_at.desc(), Run.id.desc())).unique()]
 
 
 def _usage_split(usage: dict) -> tuple[int, int, int, int, int]:
@@ -847,6 +895,11 @@ class ConversationCreate(BaseModel):
 
 class ConversationPatch(BaseModel):
     title: str | None = None
+    # Who wrote `title`: "user" (typed in the sidebar; the model's title never replaces it) or
+    # "prompt" (the page's own title from the first message, the default).
+    title_source: str | None = None
+    # The group to file the chat under; null takes it out of its group. Sent only to change it.
+    group_id: int | None = None
     preset_key: str | None = None        # the selected research path (or "" to clear)
     context_prompt: str | None = None    # the user-edited methodology guidance (or "" to clear)
 
@@ -875,7 +928,11 @@ def list_conversations(request: Request) -> dict:
             select(Conversation).where(Conversation.user_id == user.id)
             .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
         ).all()
-        return {"conversations": [c.public() for c in rows]}
+        groups = s.scalars(
+            select(ConversationGroup).where(ConversationGroup.user_id == user.id)
+            .order_by(ConversationGroup.position, ConversationGroup.id)
+        ).all()
+        return {"conversations": [c.public() for c in rows], "groups": [g.public() for g in groups]}
 
 
 @router.post("/conversations")
@@ -954,13 +1011,80 @@ def update_conversation(cid: int, req: ConversationPatch, request: Request) -> d
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
         if req.title is not None:
-            conv.title = (req.title.strip() or "New chat")[:255]
+            source = "user" if req.title_source == "user" else "prompt"
+            # A late automatic title (the page's, from the first message) never replaces one the
+            # user typed or the model's reading of the request.
+            if source == "user" or (conv.title_source or "prompt") == "prompt":
+                conv.title = (req.title.strip() or "New chat")[:255]
+                conv.title_source = source if req.title.strip() else None
+        if "group_id" in req.model_fields_set:
+            if req.group_id is not None:
+                _owned_group(s, req.group_id, user.id)
+            conv.group_id = req.group_id
         if req.preset_key is not None:
             conv.preset_key = (req.preset_key.strip()[:64] or None)
         if req.context_prompt is not None:
             conv.context_prompt = (req.context_prompt or None)
         s.commit()
         return {"conversation": conv.public()}
+
+
+class GroupInput(BaseModel):
+    name: str
+
+
+def _group_name(raw: str) -> str:
+    name = " ".join((raw or "").split())[:80]
+    if not name:
+        raise HTTPException(status_code=400, detail="A group needs a name")
+    return name
+
+
+def _owned_group(s, gid: int, user_id: int) -> ConversationGroup:
+    group = s.get(ConversationGroup, gid)
+    if group is None or group.user_id != user_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    return group
+
+
+@router.post("/conversation-groups")
+def create_conversation_group(req: GroupInput, request: Request) -> dict:
+    """A new, empty group at the end of the user's list."""
+    user = require_user(request)
+    name = _group_name(req.name)
+    with session_scope() as s:
+        last = s.scalar(select(func.max(ConversationGroup.position))
+                        .where(ConversationGroup.user_id == user.id))
+        group = ConversationGroup(user_id=user.id, name=name, position=(last or 0) + 1)
+        s.add(group)
+        s.commit()
+        return {"group": group.public()}
+
+
+@router.patch("/conversation-groups/{gid}")
+def rename_conversation_group(gid: int, req: GroupInput, request: Request) -> dict:
+    user = require_user(request)
+    name = _group_name(req.name)
+    with session_scope() as s:
+        group = _owned_group(s, gid, user.id)
+        group.name = name
+        s.commit()
+        return {"group": group.public()}
+
+
+@router.delete("/conversation-groups/{gid}")
+def delete_conversation_group(gid: int, request: Request) -> dict:
+    """Remove a group. Its chats are kept and become ungrouped."""
+    user = require_user(request)
+    with session_scope() as s:
+        group = _owned_group(s, gid, user.id)
+        chats = list(s.scalars(select(Conversation).where(
+            Conversation.user_id == user.id, Conversation.group_id == gid)).all())
+        for conv in chats:
+            conv.group_id = None
+        s.delete(group)
+        s.commit()
+        return {"status": "ok", "ungrouped": len(chats)}
 
 
 @router.delete("/conversations/{cid}")
@@ -985,6 +1109,8 @@ def delete_conversation(cid: int, request: Request) -> dict:
             s.delete(run)
         s.delete(conv)   # cascade removes the conversation's messages
         s.commit()
+    from . import chat_images
+    chat_images.remove_conversation(user.username, cid)       # a chat's images go with it
     for run_id in run_ids:
         if _delete_run_dir(user.username, run_id):
             removed_dirs += 1
@@ -1013,11 +1139,100 @@ def _delete_run_dir(owner: str, run_id: str) -> bool:
         return False
 
 
+def _named_chat_images(s, user_id: int, cids) -> set[tuple[int, str]]:
+    """The ``(conversation, image id)`` pairs that the stored messages of these conversations of the
+    account name."""
+    from . import chat_images
+    cids = [int(c) for c in cids]
+    if not cids:
+        return set()
+    rows = s.execute(
+        select(Message.conversation_id, Message.meta)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(Conversation.user_id == user_id, Message.conversation_id.in_(cids), Message.meta.like('%"images"%'))
+    ).all()
+    return {(cid, image_id) for cid, meta in rows for image_id in chat_images.named_ids([meta])}
+
+
+@router.post("/conversations/{cid}/images")
+async def upload_chat_image(cid: int, request: Request, name: str = "") -> dict:
+    """Keep one image for this conversation (the body is the image itself). It is checked by its bytes
+    (PNG, JPEG, WebP, GIF), at most 7.5 MB, and kept under the account; the reply is its reference, which
+    the message names when it is sent. No HPC3 connection is needed. The account's images that no message
+    names and that were uploaded more than a day ago are removed first; then the account's total must stay
+    under ``chat_images.MAX_ACCOUNT_BYTES``."""
+    from . import chat_images
+    user = require_user(request)
+    with session_scope() as s:
+        _owned_conversation(s, cid, user.id)
+        stale = chat_images.unsent(user.username)
+        named = _named_chat_images(s, user.id, stale) if stale else set()
+    if stale:
+        chat_images.sweep(user.username, named)
+    too_big = f"The image is over the {chat_images.mb(chat_images.MAX_IMAGE_BYTES)} limit."
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > chat_images.MAX_IMAGE_BYTES + 1024:
+        raise HTTPException(status_code=413, detail=too_big)
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > chat_images.MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail=too_big)
+        chunks.append(chunk)
+    try:
+        return {"image": chat_images.save(user.username, cid, b"".join(chunks), name)}
+    except chat_images.ChatImageQuotaError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from None
+    except chat_images.ChatImageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+@router.delete("/conversations/{cid}/images/{image_id}")
+def delete_chat_image(cid: int, image_id: str, request: Request) -> dict:
+    """Remove an image that was attached and then taken off the message before it was sent. An image a
+    sent message names stays: it goes with its chat."""
+    from . import chat_images
+    user = require_user(request)
+    with session_scope() as s:
+        _owned_conversation(s, cid, user.id)
+        if (cid, image_id) in _named_chat_images(s, user.id, [cid]):
+            raise HTTPException(status_code=409, detail="This image is in a sent message; it is removed with its chat.")
+    if not chat_images.remove(user.username, cid, image_id):
+        raise HTTPException(status_code=404, detail="image not found")
+    return {"removed": image_id}
+
+
+@router.get("/chat-images/{cid}/{filename}")
+def get_chat_image(cid: int, filename: str, request: Request):
+    """One of this account's chat images, shown inline as the image type it was checked to be (never
+    anything else), and only to the conversation's owner."""
+    from fastapi.responses import FileResponse
+    from . import chat_images
+    user = require_user(request)
+    with session_scope() as s:
+        _owned_conversation(s, cid, user.id)
+    found = chat_images.path_of(user.username, cid, filename)
+    if found is None:
+        raise HTTPException(status_code=404, detail="image not found")
+    path, media = found
+    return FileResponse(path, media_type=media, headers={
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400",
+        "Content-Security-Policy": "sandbox; default-src 'none'"})
+
+
 @router.post("/conversations/{cid}/messages")
 def add_message(cid: int, req: MessageCreate, request: Request) -> dict:
     user = require_user(request)
     if req.role not in ("user", "assistant", "system"):
         raise HTTPException(status_code=400, detail="role must be user|assistant|system")
+    if isinstance(req.meta, dict) and req.meta.get("images"):
+        # A message's images are the ones uploaded to this conversation: the page names them by id and
+        # the server keeps the references it checked, not the ones it was sent.
+        from . import chat_images
+        try:
+            req.meta = {**req.meta, "images": chat_images.resolve(user.username, cid, req.meta["images"])}
+        except chat_images.ChatImageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
     with session_scope() as s:
         conv = _owned_conversation(s, cid, user.id)
         # An answer is saved by every window that showed it: two windows of one account share a

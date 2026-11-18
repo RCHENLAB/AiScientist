@@ -131,3 +131,26 @@ def test_unpriced_endpoint_cannot_claim_a_cost_limit(monkeypatch, tmp_path):
     assert binding.priced is False
     with pytest.raises(ValueError, match='no configured price'):
         binding.start(str(tmp_path), max_cost_usd=1)
+
+
+def test_relay_on_a_users_key_is_capped_by_the_budget_left_and_carries_its_allowance(monkeypatch, tmp_path):
+    """One spending rule for every relayed job: on a user's own key the cap is what is left of their
+    budget (never more than the job asked for), and that cap is the key's spike allowance."""
+    from aiscientist.gateway import llm_credentials, llm_relay
+    cred = {'id': 'test-credential', 'model': 'claude-haiku-5-5', 'provider': 'anthropic',
+            'base_url': 'https://api.anthropic.com', 'label': 'Test key'}
+    conn = SimpleNamespace(chat_stop=threading.Event(), executor=SimpleNamespace(open_sftp=lambda: None),
+                           owner='test-owner', emit=lambda *args, **kw: None, app_user_id='test-user')
+    seen = {}
+    guard = SimpleNamespace(fingerprint='test-fp', before_call=lambda: None, after_call=lambda: None,
+                            close=lambda: None)
+    monkeypatch.setattr(app, '_bound_credential', lambda c: cred)
+    monkeypatch.setattr(app, '_corpus_scan_cost_cap', lambda c: (1.25, 'what is left of your monthly credit'))
+    monkeypatch.setattr(app, '_key_use', lambda *a, **kw: seen.update(kw) or guard)
+    monkeypatch.setattr(llm_credentials, 'call_target', lambda *a: ('http://credential-proxy/v1', 'placeholder'))
+    monkeypatch.setattr(llm_relay.ModelRelay, 'start', lambda self: self)
+    binding = app._mcp_session_model(conn)
+    assert binding.start(str(tmp_path))._cap == 1.25                       # the budget left, not the $20 ceiling
+    assert seen == {'allowance_usd': 1.25, 'allowance_calls': app._CORPUS_SPIKE_CALLS}
+    assert binding.start(str(tmp_path), max_cost_usd=0.5)._cap == 0.5      # a job may ask for less
+    assert binding.start(str(tmp_path), max_cost_usd=9.0)._cap == 1.25     # never for more

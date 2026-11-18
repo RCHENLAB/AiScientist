@@ -22,7 +22,6 @@ from aiscientist.agents.research_harness import (
     _group_turns,
     _is_context_overflow,
     _msg_tokens,
-    default_catalog,
 )
 
 def _fixture_catalog():

@@ -390,8 +390,12 @@ def run_quick_chat(
     summarize_fn: SummarizeFn | None = None,
     prior_summary: str = "",
     prior_summary_through: int = 0,
+    image_parts: "list[dict] | None" = None,
 ) -> QuickChatResult:
     """Run the answer-first ReAct loop and return what was produced.
+
+    ``image_parts``: the images of this question as OpenAI ``image_url`` parts (data URLs). They are
+    added to the question's message and nowhere else, so a later turn's history stays text.
 
     ``stream_fn(messages, tool_schemas)`` yields ``("thinking"|"content", str)`` pairs plus at
     most one ``("tool_calls", [call, ...])`` — the contract of
@@ -425,6 +429,11 @@ def run_quick_chat(
         count_tokens_fn=count_tokens_fn, summarize_fn=summarize_fn, on_event=emit,
     )
     messages: list[dict[str, Any]] = ctx_report.messages
+    if image_parts:
+        for m in reversed(messages):
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                m["content"] = [{"type": "text", "text": m["content"]}, *image_parts]
+                break
     grounding_payload: dict[str, Any] | None = None
 
     result = QuickChatResult(

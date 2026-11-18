@@ -120,7 +120,7 @@ def test_agent_rendering_is_non_empty_for_every_section(section):
 
 def test_the_markdown_carries_the_tool_locations():
     md = render_markdown(environment_manifest())
-    assert "src/aiscientist/agents/research_lab.py:" in md
+    assert "src/aiscientist/agents/research_lab/tooling.py:" in md
     assert "regenerate it" in md            # the doc says not to hand-edit it
     assert "| tool | what it does | source | available |" in md
 

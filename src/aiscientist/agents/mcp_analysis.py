@@ -571,6 +571,15 @@ class AnalysisAdapter:
                 dataset = str(getattr(executor, "dataset_path", "") or "")
                 if dataset.lower().endswith((".vcf", ".vcf.gz")):
                     args["vcf_path"] = dataset
+        if self.server.name == "cellqc" and tool == "run_cellqc" and not args.get("dataset_paths"):
+            # Every Cell Ranger folder bound to the run is quality-controlled in the one call
+            # (decisions["input_folders"], RCHENLAB/AiScientist issue 22). The server reads only the
+            # primary folder unless it is given the others, whatever `samples` names.
+            folders = [str(f.get("hpc") or f.get("path") or "") for f in decisions.get("input_folders") or []
+                       if isinstance(f, dict)]
+            folders = [f for f in dict.fromkeys(folders) if f]
+            if len(folders) > 1:
+                args["dataset_paths"] = folders
         if self.server.name == "variant-annotation" and tool == "annotate_variants":
             from .variant_settings import default_arguments
             args = {**default_arguments(setting_values(self.server), args), **args}
@@ -637,6 +646,11 @@ class AnalysisAdapter:
                     or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts[:-1])
                     or not re.fullmatch(r"[A-Za-z0-9_.*?\[\]-]+\.(?:h5ad|rnk)", parts[-1])):
                 raise ValueError("input must be a filename or a relative path inside work/ or artifacts/")
+            if len(parts) == 1:
+                # A bare name means work/<name>, and the server is told so: a checkpoint an earlier
+                # analysis of this run wrote is handed to the server by that spelling only
+                # (a scrna-analysis server before 0.0.6 looks for a bare name beside work/ only).
+                args["input"] = f"work/{value}"
         prefix = PREFIXES[self.server.name]
         from .mcp_model import prepare_model
         model_binding, model_setup = prepare_model(self.server.name, tool, executor, values, arguments=args)

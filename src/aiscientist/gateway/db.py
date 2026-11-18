@@ -172,6 +172,7 @@ def _legacy_upgrade(bind) -> None:
         "last_used_at": "TIMESTAMP",   # revision 0007
     })
     _ensure_columns(bind, "metadata_records", {"description": "TEXT"})
+    _ensure_columns(bind, "conversations", {"group_id": "INTEGER", "title_source": "VARCHAR(16)"})   # revision 0009
     _ensure_columns(bind, "llm_calls", {
         "conversation_id": "VARCHAR(64)", "step": "VARCHAR(160)", "provider": "VARCHAR(16)",
         "input_tokens": "INTEGER", "cache_write_tokens": "INTEGER", "cache_read_tokens": "INTEGER",

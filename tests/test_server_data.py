@@ -261,6 +261,14 @@ def test_a_mirror_path_is_told_from_an_upload(shared):
     assert sd.split_mirror(f"{sessions}/sessA", sessions, legacy) is None               # no root
     assert sd.split_mirror(f"{sessions}/sessA/data_shared/../../x", sessions, legacy) is None
     assert sd.split_mirror("", sessions, legacy) is None
+    # A session keeps its copies in its inputs/: only a path there is a copy, in any session.
+    root = "/dfs/AiScientist/sessions"
+    assert sd.split_mirror(f"{root}/sessA/inputs/data_shared/lab/S3", root, legacy, "inputs") \
+        == ("data_shared", "lab/S3")
+    assert sd.split_mirror(f"{root}/sessB/inputs/data_shared", root, legacy, "inputs") == ("data_shared", "")
+    assert sd.split_mirror(f"{root}/sessA/runs/r1/analysis/work/x.h5ad", root, legacy, "inputs") is None
+    assert sd.split_mirror(f"{root}/sessA/inputs", root, legacy, "inputs") is None
+    assert sd.split_mirror(f"{legacy}/data_shared/lab/S3", root, legacy, "inputs") == ("data_shared", "lab/S3")
 
 
 def test_a_resumed_run_gets_this_sessions_copy_of_its_server_data(shared, tmp_path, monkeypatch):
@@ -269,8 +277,10 @@ def test_a_resumed_run_gets_this_sessions_copy_of_its_server_data(shared, tmp_pa
     root, _ = shared
     conn = _conn(tmp_path, analysis_on_hpc=True)
     tag = sd.mirror_tag(root)
-    sessions = gw_app._session_mirror_base(conn).rsplit("/", 1)[0]
-    gone = f"{sessions}/0ldsession00/{tag}/lab/Sample3"            # removed at that disconnect
+    # Another session's inputs/, as the run stored it: <shared root>/sessions/<session>/inputs/...
+    gone = (gw_app._session_mirror_base(conn).replace(f"/{conn.id}/", "/0ldsession00/")
+            + f"/{tag}/lab/Sample3")                               # removed at that disconnect
+    assert f"/sessions/0ldsession00/inputs/{tag}/" in gone
     legacy = f"{gw_app._hpc_uploads_dir(conn)}/server-data/{tag}/lab/Sample3"   # the shared mirror
     upload = f"{gw_app._hpc_uploads_dir(conn)}/panel.bed"
     decisions = {
@@ -303,9 +313,9 @@ def test_a_resumed_run_gets_this_sessions_copy_of_its_server_data(shared, tmp_pa
 def test_a_resume_whose_server_folder_is_gone_says_so_and_keeps_the_stored_path(shared, tmp_path):
     root, _ = shared
     conn = _conn(tmp_path, analysis_on_hpc=True)
-    sessions = gw_app._session_mirror_base(conn).rsplit("/", 1)[0]
-    stored = f"{sessions}/0ldsession00/{sd.mirror_tag(root)}/lab/NoSuchSample"
-    other = f"{sessions}/0ldsession00/some_other_root/x"
+    inputs = gw_app._session_mirror_base(conn).replace(f"/{conn.id}/", "/0ldsession00/")
+    stored = f"{inputs}/{sd.mirror_tag(root)}/lab/NoSuchSample"
+    other = f"{inputs}/some_other_root/x"
     decisions = {"hpc_primary": stored, "datasets": [{"hpc_primary": other}]}
     said: list[str] = []
     asyncio.run(gw_app._restage_server_data(conn, decisions, lambda *a, **k: None,

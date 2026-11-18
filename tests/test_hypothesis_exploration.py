@@ -20,7 +20,7 @@ import pytest
 
 from aiscientist.agents.dag import LabPlan, TaskNode, lift_agenda_to_dag
 from aiscientist.agents.hypotheses import DesignFacts, HypothesisLedger
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 # The exploration prompt's unique marker (distinct from the post-step review's "reviewing a step

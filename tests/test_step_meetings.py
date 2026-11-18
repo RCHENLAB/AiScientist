@@ -11,7 +11,7 @@ from native_tool_fixtures import fixture_catalog
 
 import json
 
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
 

@@ -164,9 +164,36 @@ def test_the_handed_on_dataset_is_written_back_as_the_new_runs_checkpoints(tmp_p
     # Two files, not two names for one: run_clustering rewrites adata_clustered.h5ad in place.
     assert not (ws / "work" / "adata_qc.h5ad").samefile(ws / "work" / "adata_clustered.h5ad")
 
-    assert adopt(ws, src)["status"] == "skipped"                       # never overwrites a checkpoint
     plain = adopt(tmp_path / "run3", tmp_path / "run1" / "work" / "adata_qc.h5ad")
     assert plain["status"] == "skipped" and not (tmp_path / "run3" / "work").exists()
+
+
+def test_adopting_the_same_dataset_again_is_ok_and_rewrites_nothing(tmp_path, libs):
+    """A plan is drafted and then approved in one session: the gateway adopts at both points, and
+    the second time must not fail the run ("this run already has adata_qc.h5ad")."""
+    from aiscientist.tools._lib.result_dataset import adopt
+    src = _handed_on(tmp_path, libs, annotated=True)
+    ws = tmp_path / "run2"
+    first = adopt(ws, src)
+    qc = ws / "work" / "adata_qc.h5ad"
+    written = qc.stat().st_mtime_ns
+
+    again = adopt(ws, src)
+    assert again["status"] == "ok" and again["already_in_place"] is True
+    assert again["adopted"] == first["adopted"]
+    assert qc.stat().st_mtime_ns == written                            # never overwrites a checkpoint
+
+    # Checkpoints that did not come from this file stay what they are, and the call says so.
+    other = _handed_on(tmp_path / "elsewhere", libs)
+    assert adopt(ws, other)["status"] == "skipped"
+    own = tmp_path / "run4"
+    (own / "work").mkdir(parents=True)
+    (own / "work" / "adata_qc.h5ad").write_bytes(qc.read_bytes())      # this run's own QC output
+    assert adopt(own, src)["status"] == "skipped"
+    # A checkpoint removed since (a later session's folder) is written again, not reported as there.
+    (ws / "work" / "adata_clustered.h5ad").unlink()
+    qc.unlink()
+    assert "already_in_place" not in adopt(ws, src) and qc.is_file()
 
 
 def test_reexport_preserves_the_source_run_chain(tmp_path, libs):

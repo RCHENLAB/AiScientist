@@ -25,27 +25,27 @@ SRC = ROOT / "src" / "aiscientist"
 # Domain tools the platform's own code names as exact string literals, and where.
 PLATFORM_RELIES_ON = {
     "annotate_variants": "agents/mcp_analysis.py: native variant VCF and assembly binding",
-    "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab.py: literature steps",
+    "deep_literature": "gateway/app.py, agents/quick_chat.py, agents/research_lab/: literature steps",
     "diagnose_disease": "agents/mcp_model.py: trusted literature model binding for MCP diagnosis",
     "map_phenotype_to_hpo": "agents/mcp_analysis.py, agents/mcp_model.py: case-note authority and session model",
     "run_lirical": "agents/mcp_analysis.py: attached VCF binding for MCP phenotype ranking",
-    "search_corpus": "agents/quick_chat.py, agents/research_lab.py, agents/registry.py: literature steps in a session with no served model",
+    "search_corpus": "agents/quick_chat.py, agents/research_lab/, agents/registry.py: literature steps in a session with no served model",
     "extract_haploinsufficient_genes": "gateway/app.py: the corpus-scan line (route \"corpus\")",
-    "inspect_dataset": "agents/research_lab.py: dataset triage steps",
-    "literature_search": "gateway/app.py, agents/research_lab.py: literature steps and citations",
-    "make_schematic": "agents/research_lab.py: figure steps",
-    "run_clustering": "agents/research_lab.py: the label-reuse / re-cluster decision",
-    "run_composition": "agents/research_lab.py: condition-study steps",
-    "run_cellqc": "gateway/app.py, agents/research_lab.py: QC steps (the Cell Ranger route)",
-    "run_de": "agents/research_lab.py: DE producers and their tested-count checks",
-    "run_depth_matched_de": "agents/research_lab.py: depth checks",
-    "run_doublet_detection": "agents/research_lab.py: QC steps",
-    "run_enrichment": "agents/research_lab.py: enrichment steps",
-    "run_gsea_prerank": "agents/research_lab.py: enrichment steps",
+    "inspect_dataset": "agents/research_lab/: dataset triage steps",
+    "literature_search": "gateway/app.py, agents/research_lab/: literature steps and citations",
+    "make_schematic": "agents/research_lab/: figure steps",
+    "run_clustering": "agents/research_lab/: the label-reuse / re-cluster decision",
+    "run_composition": "agents/research_lab/: condition-study steps",
+    "run_cellqc": "gateway/app.py, agents/research_lab/: QC steps (the Cell Ranger route)",
+    "run_de": "agents/research_lab/: DE producers and their tested-count checks",
+    "run_depth_matched_de": "agents/research_lab/: depth checks",
+    "run_doublet_detection": "agents/research_lab/: QC steps",
+    "run_enrichment": "agents/research_lab/: enrichment steps",
+    "run_gsea_prerank": "agents/research_lab/: enrichment steps",
     "run_integration": "agents/scope.py: the plain word 'integration' in a user's limit",
     "run_marker_annotation": "agents/scope.py: the plain word 'annotation' in a user's limit",
-    "run_pseudobulk_de": "agents/research_lab.py: DE producers",
-    "run_scanpy_qc": "gateway/app.py, agents/research_lab.py: QC steps",
+    "run_pseudobulk_de": "agents/research_lab/: DE producers",
+    "run_scanpy_qc": "gateway/app.py, agents/research_lab/: QC steps",
     "scgpt_annotate": "gateway/app.py, agents/tool_names.py: native MCP scGPT result reporting",
 }
 
@@ -82,7 +82,7 @@ _TOOLISH = re.compile(r"`((?:mcp|run|make|map|annotate|diagnose|inspect|deep|lit
 
 
 # Skills this repository names: the preset pipelines' guidance, and the PI's example of planning a
-# skill (agents/research_lab.py). They are not tools, and the names are the skills' earlier ones:
+# skill (agents/research_lab/). They are not tools, and the names are the skills' earlier ones:
 # each resolves to a skill of the pinned aiscientist-skills release by an alias, which
 # tests/test_pinned_release.py checks when that release is installed.
 NAMED_SKILLS = {
@@ -97,7 +97,7 @@ NAMED_SKILLS = {
     "clinical_variant_prioritization": "variant_annotation",
     "normalize_vcf": "variant_annotation",
     "variant_output_tables": "variant_annotation",
-    "pairwise_de": "agents/research_lab.py: the PI's planning prompt",
+    "pairwise_de": "agents/research_lab/: the PI's planning prompt",
 }
 
 

@@ -359,6 +359,20 @@ def _pair_tools(out: list[dict]) -> list[dict]:
     return fixed
 
 
+def _image_blocks(content: Any) -> list[dict]:
+    """The images of an OpenAI-shaped ``content`` list (``image_url`` parts with a data URL) as Messages-API
+    image blocks. Anything that is not a base64 data URL is left out: an address is never fetched here."""
+    out = []
+    for part in content if isinstance(content, list) else []:
+        if not (isinstance(part, dict) and part.get("type") == "image_url"):
+            continue
+        url = (part.get("image_url") or {}).get("url") if isinstance(part.get("image_url"), dict) else part.get("image_url")
+        m = re.match(r"^data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=]+)$", str(url or ""))
+        if m:
+            out.append({"type": "image", "source": {"type": "base64", "media_type": m.group(1), "data": m.group(2)}})
+    return out
+
+
 def to_anthropic(messages: list[dict]) -> tuple[list[dict], list[dict]]:
     """OpenAI chat messages -> (system blocks, Messages-API messages).
 
@@ -384,7 +398,9 @@ def to_anthropic(messages: list[dict]) -> tuple[list[dict], list[dict]]:
                                    "content": _text(msg.get("content")) or "(empty)"}])
         else:
             text = _text(msg.get("content"))
-            _append(out, "user", [{"type": "text", "text": text if text.strip() else "(empty)"}])
+            blocks = [{"type": "text", "text": text if text.strip() else "(empty)"}]
+            blocks += _image_blocks(msg.get("content"))
+            _append(out, "user", blocks)
     if out and out[0]["role"] != "user":
         out.insert(0, {"role": "user", "content": [{"type": "text", "text": "(continuing)"}]})
     out = _pair_tools(out)

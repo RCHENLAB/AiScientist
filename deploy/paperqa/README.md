@@ -1,6 +1,6 @@
 # Native literature runtime and corpus deployment
 
-The app uses the independently published [literature MCP](https://github.com/liujs123456/aiscientist-mcp/tree/main/packages/literature), pinned by its MCP catalog and matching instruction skill. PaperQA, embedding models and retrieval/extraction implementations are in that runtime. The app keeps corpus transfer/versioning, selected-model credentials and budget enforcement, plan review, curation specifications, result caches and publication.
+The app uses the independently published [literature MCP](https://github.com/lijinbio/aiscientist-mcp/tree/main/packages/literature), pinned by its MCP catalog and matching instruction skill. PaperQA, embedding models and retrieval/extraction implementations are in that runtime. The app keeps corpus transfer/versioning, selected-model credentials and budget enforcement, plan review, curation specifications, result caches and publication.
 
 ## HPC deployment
 

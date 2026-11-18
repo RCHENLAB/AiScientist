@@ -1,6 +1,7 @@
 """Explicit registered literature workflows retain typed settings and plan review."""
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +86,21 @@ def test_gateway_dispatches_workflow_to_normal_research_review(setup, monkeypatc
     request = gw.LabRequest(connection_id='test', question=question, route='chat')
     asyncio.run(gw._dispatch_lab_run(connection, request))
     assert calls == [(connection, request)]  # same selected-model session, same review/cancel path
+
+
+def test_a_literal_plan_shows_the_registered_server_of_every_step(setup):
+    """The literal plan is built before the card's sync, which keeps every step whose text it already
+    has: its tools' registration facts are resolved when it is built, not left unknown."""
+    question, _args, catalog = setup
+    identity = {"provider": "mcp", "server": "literature", "version": "0.3.1"}
+    catalog = [replace(tool, provider=identity) for tool in catalog]
+    expected = [[{"tool": tool.name, **identity}] for tool in catalog]
+    lab = ResearchLab(scientist=ResearchHarness(catalog=catalog), ctx=HarnessContext(),
+                      complete_fn=lambda *_a, **_kw: pytest.fail('literal first draft needs no model'))
+    events = []
+    kind, agenda = lab._pi_plan(question, events.append)
+    lab._present_plan_document(question, agenda, events.append)
+    assert kind == 'agenda' and [step.planned_tools() for step in lab._plan_doc.steps] == expected
 
 
 @pytest.mark.parametrize('alter', [

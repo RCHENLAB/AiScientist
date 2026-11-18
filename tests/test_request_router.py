@@ -110,3 +110,31 @@ def test_parse_route_rejects_what_names_no_single_route():
     assert rr.parse_route('{"route": "chat"}') is None
     assert rr.parse_route("analysis") == ("analysis", 0.0, "")
     assert rr.parse_route('{"intent": "literature", "confidence": 95}') == ("literature", 0.95, "")
+
+
+# --- a question for RetiGene's gene table (the lookups), not for its papers -------------------------
+
+@pytest.mark.parametrize("text", [
+    "Which genes does RetiGene list with autosomal dominant inheritance and the phenotype retinitis pigmentosa?",
+    "What does the RetiGene gene table record about USH2A: inheritance, phenotypes, diseases and key papers?",
+    "Run a lookup with the RetiGene gene table tools (find_genes, no paper reading): count the autosomal dominant genes.",
+    "How many genes are curated in RetiGene as X-linked?",
+    "Show RetiGene's entry for RPGR.",
+    "RetiGene 的基因表里 USH2A 的遗传方式是什么？",
+])
+def test_gene_table_question(text):
+    assert rr.asks_gene_table(text)
+
+
+@pytest.mark.parametrize("text", [
+    "What are haploinsufficient genes in RetiGene papers?",
+    "What do the RetiGene papers say about CRX?",
+    "Which genes do the RetiGene papers report as acting through a dominant-negative effect?",
+    "Summarize what the RetiGene corpus says about Müller glia",
+    "RetiGene has papers on PRPF31; what do they say about haploinsufficiency?",
+    "Make a gene table of the markers in my dataset",
+    "Which genes in my data does RetiGene list as dominant?",
+    "Cluster the retina cells and annotate cell types",
+])
+def test_not_a_gene_table_question(text):
+    assert not rr.asks_gene_table(text)

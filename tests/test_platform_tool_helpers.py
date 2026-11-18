@@ -2,7 +2,6 @@
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 
 def test_platform_api_works_with_retiring_tool_modules_unavailable(tmp_path):

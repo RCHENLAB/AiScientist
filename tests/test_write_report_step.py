@@ -16,7 +16,7 @@ import json
 import pytest
 
 from aiscientist.agents import research_lab as rl
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import (
     REPORT_STEP, LabConfig, LabResult, ResearchLab, ResumeState, _is_report_step)
 from aiscientist.agents.scope import rules_out_report, wants_written_report

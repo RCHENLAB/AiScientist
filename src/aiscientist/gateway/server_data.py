@@ -307,17 +307,23 @@ def mirror_dir(base: str, root: Path, path: Path) -> str:
     return top if rel in ("", ".") else f"{top}/{rel}"
 
 
-def split_mirror(hpc_path: str, sessions_dir: str, legacy_dir: str) -> "tuple[str, str] | None":
+def split_mirror(hpc_path: str, sessions_dir: str, legacy_dir: str,
+                 inner: str = "") -> "tuple[str, str] | None":
     """``(root name, rel)`` for a path inside a copy of server data on HPC3, whichever session made
-    it: ``<sessions_dir>/<session>/<root name>[/<rel>]``, or the older
-    ``<legacy_dir>/<root name>[/<rel>]`` that every session shared. None for any other path (a
-    dataset the user uploaded, say). A run that is resumed by a later session stored such a path;
-    this is how that session finds what to copy again."""
+    it: ``<sessions_dir>/<session>[/<inner>]/<root name>[/<rel>]`` (``inner`` is the folder of a
+    session that holds its copies, ``inputs``), or the older ``<legacy_dir>/<root name>[/<rel>]``
+    that every session shared. None for any other path (a dataset the user uploaded, another
+    folder of a session). A run that is resumed by a later session stored such a path; this is how
+    that session finds what to copy again."""
     path = (hpc_path or "").rstrip("/")
     for prefix, skip in ((sessions_dir.rstrip("/") + "/", 1), (legacy_dir.rstrip("/") + "/", 0)):
         if not path.startswith(prefix):
             continue
         parts = path[len(prefix):].split("/")[skip:]
+        if skip and inner:
+            if not parts or parts[0] != inner:
+                return None
+            parts = parts[1:]
         if not parts or not parts[0] or ".." in parts:
             return None
         return parts[0], "/".join(parts[1:])

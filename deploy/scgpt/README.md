@@ -2,7 +2,7 @@
 
 scGPT annotation runs through the pinned `scgpt-annotation` MCP server. The application no
 longer builds or dispatches `scgpt.sif`; its container recipe and inference wrapper live in
-[aiscientist-mcp](https://github.com/liujs123456/aiscientist-mcp/tree/main/containers/scgpt-annotation).
+[aiscientist-mcp](https://github.com/lijinbio/aiscientist-mcp/tree/main/containers/scgpt-annotation).
 The reviewed MCP catalog selects the image digest, entrypoint, tool schema and GPU resources.
 See [MCP deployment](../../docs/development/mcp_bridge.md) for image provisioning.
 

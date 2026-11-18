@@ -220,7 +220,10 @@
               <div class="sessions">
                 <div class="sessions-head">
                   <h2>Chats</h2>
-                  <button id="newSessionBtn" type="button" class="icon-btn" title="New chat">+</button>
+                  <span class="sessions-actions">
+                    <button id="newGroupBtn" type="button" class="icon-btn hidden" title="New group" aria-label="New group"><span class="material-symbols-outlined" aria-hidden="true">create_new_folder</span></button>
+                    <button id="newSessionBtn" type="button" class="icon-btn" title="New chat">+</button>
+                  </span>
                 </div>
                 <div id="sessionList" class="session-list"></div>
               </div>
@@ -269,6 +272,10 @@
                     <button type="button" class="data-menu-item" data-act="folder" title="Upload a folder, such as a Cell Ranger output folder. To add several folders at once, drop them onto the chat."><span class="material-symbols-outlined msym">drive_folder_upload</span> Folder</button>
                   </div>
                 </div>
+                <input id="imageFile" type="file" class="hidden" multiple accept="image/png,image/jpeg,image/webp,image/gif" />
+                <button id="imageBtn" type="button" class="ghost small data-menu-btn" title="Attach images to this message (PNG, JPEG, WebP or GIF, up to 5, 7.5 MB each). You can also paste or drop them onto the message box.">
+                  <span class="material-symbols-outlined msym">image</span> Image
+                </button>
                 <div id="uploadStatus" class="upload-status hidden"></div>
                 <button id="uploadCancel" type="button" class="ghost small hidden">Cancel upload</button>
                 <!-- Chat context occupancy. Hidden until the backend reports one (older runs and
@@ -277,6 +284,7 @@
                 <div id="ctxMeter" class="ctx-meter hidden"></div>
               </div>
               <div id="serverPathOffer" class="server-path-offer hidden" role="status"></div>
+              <div id="imageChips" class="image-chips hidden" aria-label="Images attached to this message"></div>
               <form id="chatForm" class="chat-input">
                 <textarea id="chatInput" rows="2" role="combobox" aria-label="Chat message" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="datasetMentions" aria-expanded="false" placeholder="Ask a question, or describe the analysis you want — the agent proposes a plan first…"></textarea>
                 <div id="datasetMentions" class="dataset-mentions hidden" role="listbox" aria-label="Your datasets"></div>
@@ -800,6 +808,7 @@
 
   <div id="toast" class="toast"></div>
   <script src="/static/tus.min.js"></script>
+  <script src="/static/fileview.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

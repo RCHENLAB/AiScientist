@@ -30,9 +30,19 @@ Four pieces:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Mapping, Protocol, runtime_checkable
+
+
+def tool_identity(tool: Any, name: str = "unknown") -> dict[str, str]:
+    """Registration facts for a tool, including older objects without provenance metadata."""
+    provider = getattr(tool, "provider", None)
+    provider = provider if isinstance(provider, Mapping) else {}
+    return {"tool": getattr(tool, "name", None) or name,
+            "provider": provider.get("provider") or "unknown",
+            "server": provider.get("server") or "unknown",
+            "version": provider.get("version") or "unknown"}
 
 
 @runtime_checkable
@@ -70,6 +80,13 @@ class HarnessTool:
     # shows what exists, and the model gets an honest not-enabled result rather than a missing
     # name), but a preset pipeline built around it should not be chosen as if it were available.
     enabled: bool = True
+    # Registration facts, never inferred from the tool's description.
+    provider: dict[str, str] = field(default_factory=lambda: {
+        "provider": "local", "server": "local", "version": "unknown"})
+    skills: tuple[dict[str, str], ...] = ()
+
+    def identity(self) -> dict[str, str]:
+        return tool_identity(self)
 
     def schema(self) -> dict[str, Any]:
         return {

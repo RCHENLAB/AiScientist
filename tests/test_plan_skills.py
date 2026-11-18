@@ -131,10 +131,11 @@ def test_taking_a_skill_off_is_an_edit_and_other_changes_keep_it():
 # --- a scripted lab ------------------------------------------------------------------------------------
 
 def _lab(tmp_path, *, plan_replies, match_reply="[]", record=None, plan_yaml=True, codes=("print(1)",),
-         verdicts=(), run_code_tool=None):
+         verdicts=(), run_code_tool=None, clustering_skills=()):
     """A lab whose PI returns ``plan_replies`` in order and whose matcher returns ``match_reply``.
     Each attempt of a step runs ``codes`` with run_code, one call each, then finishes; the Critic
-    returns ``verdicts`` in order, then accepts. ``run_code_tool`` replaces the stand-in run_code.
+    returns ``verdicts`` in order, then accepts. ``run_code_tool`` replaces the stand-in run_code;
+    ``clustering_skills`` are the skills mcp_run_clustering's server registers for it.
     ``record`` collects the Scientist's briefs, the Critic's payloads and the tool calls."""
     record = record if record is not None else {}
     replies = list(plan_replies)
@@ -173,7 +174,9 @@ def _lab(tmp_path, *, plan_replies, match_reply="[]", record=None, plan_yaml=Tru
     catalog = [run_code_tool or HarnessTool("run_code", "run Python", {"type": "object", "properties": {
         "code": {"type": "string"}}}, run_code),
                HarnessTool("mcp_run_clustering", "cluster", {"type": "object", "properties": {
-                   "resolution": {"type": "number"}}}, lambda a, c: {"status": "ok"})]
+                   "resolution": {"type": "number"}}}, lambda a, c: {"status": "ok"},
+                   provider={"provider": "mcp", "server": "scrna-analysis", "version": "0.0.5"},
+                   skills=tuple(clustering_skills))]
     workspace = tmp_path / "run"
     workspace.mkdir(exist_ok=True)
     return ResearchLab(HarnessContext(decisions={}, tunnel_port=1, model="m", workspace=workspace),
@@ -311,6 +314,20 @@ def test_a_pipeline_tool_step_and_an_unknown_name_get_no_skill(tmp_path, library
     assert "1. " not in record["match_calls"][0], "the mcp_run_clustering step is not offered for matching"
     assert [s.get("skill") for s in _of(events, "plan_doc")[0]["steps"]] == [None, None]
     assert not _of(events, "plan_skills")
+    assert json.loads((workspace / "manifest.json").read_text())["skills"] == []
+
+
+def test_a_tool_step_shows_its_server_skill_but_is_not_handed_it(tmp_path, library):
+    """The skill an MCP server registers for its tool is listed on the step, and the step is not
+    handed it: no guidance block in the brief, nothing counted as used for it, no step_skill line.
+    The tool is the step; it runs its own skill (RCHENLAB PR 117 review)."""
+    lab, record, workspace = _lab(tmp_path, plan_replies=[_agenda(CLUSTER_STEP)],
+                                  clustering_skills=({"name": SIGNATURE, "version": "unknown"},))
+    _result, events, _seen = _run(lab)
+    step = _of(events, "plan_doc")[0]["steps"][0]
+    assert [s["name"] for s in step["skills"]] == [SIGNATURE]
+    assert "The approved plan assigns the skill" not in record["briefs"][0]
+    assert not _of(events, "step_skill")
     assert json.loads((workspace / "manifest.json").read_text())["skills"] == []
 
 
@@ -482,7 +499,7 @@ def test_the_card_shows_the_skill_and_takes_it_off_as_one_line_of_the_document()
     source = (Path(__file__).resolve().parents[1] / "frontend" / "console" / "app.js").read_text(encoding="utf-8")
     block = source[source.index("function planStepParts"):source.index("function showPlanPanel")]
     done = subprocess.run([node, "-e", STEP_HARNESS], input=block,
-                          capture_output=True, text=True, timeout=60,
+                          capture_output=True, text=True, encoding="utf-8", timeout=60,
                           env={**os.environ, "PLAN_YAML": doc.to_yaml()})
     assert done.returncode == 0, done.stderr
     out = json.loads(done.stdout)

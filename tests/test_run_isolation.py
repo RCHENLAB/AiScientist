@@ -9,7 +9,6 @@ per-conversation last run, and skipping the report for a cancelled/empty run. No
 
 from __future__ import annotations
 
-from native_tool_fixtures import fixture_catalog
 
 import asyncio
 import json
@@ -393,6 +392,12 @@ def test_run_lab_skips_report_when_plan_is_cancelled(tmp_path, monkeypatch):
             return LabResult(question, ["Run QC", "Cluster"], [], False, 0,
                              "Run cancelled by the user during plan review — no tools were executed.")
 
+        def step_provenance(self):
+            # What the real lab's ledger holds for a plan nobody ran: every step skipped.
+            return [{"id": f"s{i}", "step": text, "status": "skipped", "planned_tools": [],
+                     "planned_skills": [], "tools": [], "skills": [], "provider_changes": []}
+                    for i, text in enumerate(["Run QC", "Cluster"], 1)]
+
     monkeypatch.setattr(rl, "ResearchLab", _FakeLab)
 
     def _boom_report(*a, **k):                              # the report path must NOT run
@@ -414,8 +419,10 @@ def test_run_lab_skips_report_when_plan_is_cancelled(tmp_path, monkeypatch):
     assert conn.last_run_id is None                         # not remembered as a real run…
     assert "conv-1" not in conn.last_run_by_conversation    # …in this conversation either
     run_id = conn.active_run.run_id if conn.active_run else None
-    # No run_state.json written for a cancelled run (nothing to resume/regenerate).
+    # No run_state.json written for a cancelled run (nothing to resume/regenerate), and no step
+    # ledger: every step of it was skipped.
     assert run_id is None or not (conn.workspace / run_id / "artifacts" / "process" / "run_state.json").exists()
+    assert not list(conn.workspace.rglob("step_provenance.md"))
     assert conn.chat_running is False
 
 

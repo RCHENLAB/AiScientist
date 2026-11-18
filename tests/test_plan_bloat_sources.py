@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import (
     LabConfig, ResearchLab, _PLAN_REVIEW_CRITIC_SYSTEM, plan_tool_contracts,
 )

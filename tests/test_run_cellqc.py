@@ -3,15 +3,6 @@ wrote and merging it into the checkpoint the line reads. CellQC itself is replac
 ``cellqc`` executable that writes CellQC's result files; the real pipeline is exercised on HPC3."""
 from __future__ import annotations
 
-import gzip
-import io
-import json
-import os
-import shutil
-import stat
-import sys
-import tarfile
-from pathlib import Path
 
 import pytest
 

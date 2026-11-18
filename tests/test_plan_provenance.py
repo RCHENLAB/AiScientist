@@ -148,7 +148,7 @@ def test_a_plan_naming_an_invented_tool_is_annotated_not_pruned():
     step must survive; what must not survive is the reviewer's belief that a tested tool will run."""
     import json as _json
 
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**Contrast** — Compare arms with `run_wilcoxon_DE` stratified by majorclass",
@@ -188,7 +188,7 @@ def test_enrichment_without_a_de_producer_gets_a_contrast_step_inserted():
     failed as 'no significant DE genes' and read like a null result."""
     import json as _json
 
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**QC** — Filter and normalize with `mcp_run_scanpy_qc`",
@@ -243,7 +243,7 @@ def test_an_inserted_step_is_written_by_the_pi_not_a_template():
     the offline fallback."""
     import json as _json
 
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab
 
     agenda = ["**QC** — Filter and normalize with `mcp_run_scanpy_qc`",
@@ -429,7 +429,7 @@ def test_a_step_that_names_a_tool_the_scientist_never_called_is_nudged_once():
     """From E2E run 3: the DE step ended on the model's own final text after five reconnaissance
     calls, mcp_run_de never called; the Critic bounced it and a whole extra round fixed it. One
     deterministic nudge is cheaper. Never applied when the tool WAS called."""
-    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+    from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
     from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
 
     calls: list[str] = []
@@ -465,8 +465,7 @@ def test_a_step_stopped_done_early_before_its_named_tool_ran_is_nudged_once():
     """Run f3b8268c4fd4's second ORA attempt: an exploratory run_code succeeded, two more failed,
     and the harness stopped "with the win" (done_early) though mcp_run_enrichment never ran. That is
     the same "forgot to call it" as stopping on final text, and gets the same single nudge."""
-    from aiscientist.agents.research_harness import (HarnessContext, HarnessTool, ResearchHarness,
-                                                     default_catalog)
+    from aiscientist.agents.research_harness import (HarnessContext, HarnessTool, ResearchHarness)
     from aiscientist.agents.research_lab import LabConfig, ResearchLab, Specialist
 
     probes = iter([{"status": "ok", "stdout": "50 rows per group"},

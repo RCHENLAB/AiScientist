@@ -19,7 +19,7 @@ import pytest
 from aiscientist.agents import research_lab as rl
 from aiscientist.agents import skills as skills_mod
 from aiscientist.agents.plan_doc import PlanDoc, PlanStep
-from aiscientist.agents.research_harness import HarnessContext, ResearchHarness, default_catalog
+from aiscientist.agents.research_harness import HarnessContext, ResearchHarness
 from aiscientist.agents.research_lab import LabConfig, ResearchLab
 from aiscientist.agents.skills import Skill, declares, refresh_skills
 
