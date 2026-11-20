@@ -70,6 +70,12 @@ def config() -> dict:
     tiers = cfg["allowed_tiers"]
     if not isinstance(tiers, list) or not tiers or set(tiers) - {"core", "verified", "community"}:
         raise ValueError("invalid skills registry allowed_tiers")
+    # Skills of the release this deployment does not offer, each with the reason (a skill whose
+    # service the deployment does not run): {name: reason}.
+    excluded = cfg.setdefault("excluded_skills", {})
+    if not isinstance(excluded, dict) or any(
+            not isinstance(k, str) or not isinstance(v, str) or not v.strip() for k, v in excluded.items()):
+        raise ValueError("skills registry excluded_skills must map each skill name to a reason")
     root = Path(cfg["releases_root"])
     cfg["releases_root"] = root if root.is_absolute() else ROOT / root
     cfg["pinned_tag"] = cfg["release_tag"]
@@ -221,13 +227,14 @@ def check_release(root: Path, tag: str) -> set[str]:
 
 def _load_row(row: dict, cfg: dict, root: Path, checked: set[str], bundle: Path | None, load_from,
               out: dict) -> None:
-    """Add one catalog row's skill to ``out`` if its tier is allowed."""
+    """Add one catalog row's skill to ``out`` if its tier is allowed and the deployment does not
+    exclude it (``excluded_skills``)."""
     name = row["name"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name in out:
         raise ValueError("invalid or duplicate catalog skill name")
     if row["status"] not in {"core", "verified", "community"}:
         raise ValueError("invalid catalog skill status")
-    if row["status"] not in cfg["allowed_tiers"]:
+    if row["status"] not in cfg["allowed_tiers"] or name in cfg.get("excluded_skills", {}):
         return
     if not row.get("version"):
         raise ValueError(f"missing skill version: {name}")

@@ -93,6 +93,20 @@ def test_checksum_ok_catalog_metadata_and_tiers(release, monkeypatch):
     assert len(registry.load(sk._load_from)) == 3
 
 
+def test_an_excluded_skill_is_not_loaded(release, tmp_path, monkeypatch):
+    config = {"release_tag": "v0.1.0", "releases_root": str(release.parent),
+              "allowed_tiers": ["core", "verified", "community"],
+              "excluded_skills": {"skill-community": "its service does not run on this deployment"}}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    monkeypatch.setenv("AISCIENTIST_SKILLS_REGISTRY_CONFIG", str(path))
+    assert set(registry.load(sk._load_from)) == {"skill-core", "skill-verified"}
+    for bad in ({"skill-community": ""}, ["skill-community"], {"skill-community": 1}):
+        path.write_text(json.dumps({**config, "excluded_skills": bad}))
+        with pytest.raises(ValueError, match="excluded_skills"):
+            registry.config()
+
+
 @pytest.mark.parametrize("missing", [False, True])
 def test_a_checksum_mismatch_or_missing_file_gives_no_curated_skills(release, missing, caplog, monkeypatch):
     monkeypatch.delenv("AISCIENTIST_INDUCED_SKILLS_DIR", raising=False)

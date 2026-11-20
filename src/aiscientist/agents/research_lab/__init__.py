@@ -271,8 +271,11 @@ from .step_kinds import (  # noqa: F401
     _is_label_fork,
     _is_literature_step,
     _is_readback_step,
+    _is_any_report_step,
+    _is_fixed_report_step,
     _is_report_busywork,
     _is_report_step,
+    fixed_report_step,
     _literature_step_wanted,
     _literature_wish,
     _looks_like_celltype_col,
@@ -4459,13 +4462,19 @@ class ResearchLab:
     def _ensure_report_step(self, agenda: "list[str]", question: str, *, feedback: str = "",
                             note: str = "", prior_agenda: "list[str] | None" = None,
                             emit: EventFn) -> "list[str]":
-        """The plan has one ``write_report`` step, last, exactly when a written report is asked for
+        """The plan ends in its report steps exactly when a written report is asked for
         (RCHENLAB/AiScientist#102): by the request, or by a skill a step uses (``writes-report:
         "true"`` in its SKILL.md metadata). A note on a plan under review decides when it mentions
         the report ("add a written report", "drop the report step"); a note that does not keeps the
-        plan as it was. The model's own report step is not one asked for."""
-        steps = [s for s in agenda if not _is_report_step(s)]
+        plan as it was. The model's own report step is not one asked for.
+
+        Which report: a skill whose MCP server writes the report of its results in a fixed format
+        gets that tool's step (:func:`fixed_report_step`), one per such server, so its report is the
+        server's code, not a model's summary (Jin Li, #102). ``write_report``, the manuscript the
+        model writes, is added only when some analysis step uses no such skill."""
+        steps = [s for s in agenda if not _is_any_report_step(s)]
         drafted = [s for s in agenda if _is_report_step(s)]
+        drafted_fixed = [s for s in agenda if _is_fixed_report_step(s)]
         declared: "list[str]" = []
         if feedback:
             if rules_out_report(note):
@@ -4473,35 +4482,66 @@ class ResearchLab:
             elif wants_written_report(note):
                 want = True
             else:
-                want = any(_is_report_step(s) for s in (prior_agenda or []))
+                want = any(_is_any_report_step(s) for s in (prior_agenda or []))
         else:
             declared = sorted({sk.name for s in steps for sk in self._step_skills(s)
                                if declares(sk, "writes-report")})
             want = wants_written_report(question) or bool(declared)
         if not want:
-            if drafted:
-                emit({"type": "steps_pruned", "reason": "report_not_asked", "dropped": drafted})
+            dropped = [s for s in agenda if _is_any_report_step(s)]
+            if dropped:
+                emit({"type": "steps_pruned", "reason": "report_not_asked", "dropped": dropped})
             return steps
-        if not drafted:
-            emit({"type": "report_step_added", "skills": declared})
-        return steps + [drafted[0] if drafted else REPORT_STEP]
+        tools, covered = self._fixed_report_tools(steps)
+        fixed = [next((s for s in drafted_fixed if tool in _declared_tools(s)), None)
+                 or fixed_report_step(tool) for tool in tools]
+        fixed += [s for s in drafted_fixed if s not in fixed]
+        manuscript = [] if covered else [drafted[0] if drafted else REPORT_STEP]
+        if covered and drafted:
+            emit({"type": "steps_pruned", "reason": "fixed_format_report", "dropped": drafted,
+                  "tools": tools})
+        if (manuscript and not drafted) or any(s not in drafted_fixed for s in fixed):
+            emit({"type": "report_step_added", "skills": declared, "tools": tools,
+                  "manuscript": bool(manuscript)})
+        return steps + fixed + manuscript
+
+    def _fixed_report_tools(self, steps: "list[str]") -> "tuple[list[str], bool]":
+        """The report tools of the MCP servers whose skills ``steps`` use, in plan order, and whether
+        every step uses one of those skills (then the model writes no manuscript). Only a tool the
+        Scientist can call counts: a server left out of this deployment offers no report."""
+        try:
+            from ..mcp_bridge import report_tools
+            offered = {t.name for t in getattr(self.scientist, "catalog", [])}
+            by_skill = {skill: tool for skill, tool in report_tools().items() if tool in offered}
+        except Exception:  # noqa: BLE001 - no registry: the model writes the report, as before
+            by_skill = {}
+        if not by_skill:
+            return [], False
+        tools: "list[str]" = []
+        covered = bool(steps)
+        for step in steps:
+            hits = [by_skill[sk.name] for sk in self._step_skills(step) if sk.name in by_skill]
+            covered = covered and bool(hits)
+            tools += [t for t in hits if t not in tools]
+        return tools, covered
 
     @staticmethod
     def _keep_report_step(before: "list[str]", after: "list[str]") -> "list[str]":
-        """The plan review judges the analysis; whether there is a report step was decided before it
-        (``_ensure_report_step``), so the reviewed plan keeps the draft's report step and gets no
-        other."""
+        """The plan review judges the analysis; which report steps there are was decided before it
+        (``_ensure_report_step``), so the reviewed plan keeps the draft's report steps, last, and
+        gets no others."""
+        fixed = [s for s in before if _is_fixed_report_step(s)]
         report = [s for s in before if _is_report_step(s)]
-        return [s for s in after if not _is_report_step(s)] + report[:1]
+        return [s for s in after if not _is_any_report_step(s)] + fixed + report[:1]
 
     def _apply_scope(self, agenda: list[str], emit: EventFn) -> list[str]:
         """Drop the steps the request ruled out (:class:`~aiscientist.agents.scope.RunScope`). The
-        report step is not analysis the limit is about ("only QC, and write a report"): it stays,
-        last, as ``_ensure_report_step`` decided."""
+        report steps are not analysis the limit is about ("only QC, and write a report"): they
+        stay, last, as ``_ensure_report_step`` decided."""
         if not self._scope.limited:
             return agenda
-        report = [s for s in agenda if _is_report_step(s)]
-        kept, dropped = self._apply_scope_to([s for s in agenda if not _is_report_step(s)], emit)
+        report = [s for s in agenda if _is_any_report_step(s)]
+        kept, dropped = self._apply_scope_to([s for s in agenda if not _is_any_report_step(s)], emit)
         return kept + report
 
     def _apply_scope_to(self, agenda: list[str], emit: EventFn) -> "tuple[list[str], list[str]]":

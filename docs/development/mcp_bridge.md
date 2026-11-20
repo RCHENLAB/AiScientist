@@ -61,6 +61,7 @@ shell entry point stays closed. A deployment can set
 | `timeout` | Optional CLI call timeout in seconds, from 1 to 86400. Default: 15000. |
 | `settings_env` | Optional list of approved nonsecret deployment environment names for an analysis server. Values come from the gateway deployment, never from model arguments or registry values. |
 | `resources` | Optional mapping from original tool name to `[cpus, mem_gb, time_limit]`. Omitted tools inherit the skill's resources. |
+| `report` | Optional original name of the server's tool that writes the report of its results in a fixed format. When a written report is wanted, the plan's report step for this server's skill calls it, and the gateway renders what it wrote instead of a model-written manuscript. |
 
 Each snapshot is a JSON array of `{name, description, inputSchema}` objects.
 Schemas must describe objects and pass JSON Schema Draft 2020-12 validation.
@@ -209,8 +210,10 @@ Its skill is `explore-atlas-expression-with-aiscientist-mcp`. The nine planner n
 are `resolve_genes`, `submit_query`, `query_status`, `get_summary`,
 `plot_dotplot`, `plot_violin`, `plot_featureplot`, `atlas_write_report` and `list_queries`.
 `atlas_write_report(query_id)` calls the server's unchanged `write_report` tool to
-produce a query's `report.md`. The separate gateway plan step `write_report`
-requests the whole run's PDF/DOCX manuscript and is never dispatched to Atlas.
+produce a query's `report.md`. It is the server's `report` tool: an Atlas plan that
+wants a written report ends in an `atlas_write_report` step, and the run's
+`report/report.pdf` is that Markdown, rendered. The gateway plan step `write_report`
+(the model-written manuscript) is never dispatched to Atlas.
 Transport and registration are generic; `AtlasAdapter` in
 `agents/atlas_expression.py` owns these domain restrictions and outputs:
 

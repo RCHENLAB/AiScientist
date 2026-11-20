@@ -5,6 +5,9 @@
     "verified",
     "community"
   ],
+  "excluded_skills": {
+    "answer-eye-questions-with-visionkb-kg": "Not deployed in AiScientist: VisionKB runs it against its own service (Jin Li, RCHENLAB/AiScientist#153)."
+  },
   "releases_root": "skills/releases",
   "current": "skills/current",
   "repository": "lijinbio/aiscientist-skills"

@@ -161,6 +161,10 @@ library again when `skills/current` changes, without a restart, and the script w
 `config/deploy.env` pins (`AISCIENTIST_SKILLS_TAG`), else the one the running app release pins in
 `configs/skills_registry.json`. A skills release needs no app release.
 
+`excluded_skills` in `configs/skills_registry.json` names skills of the release that this deployment
+does not offer, each with its reason. It holds `answer-eye-questions-with-visionkb-kg`: VisionKB runs
+that skill against its own service, and AiScientist does not deploy it.
+
 The repository is also a deployment pin. Set `AISCIENTIST_SKILLS_REPO=owner/repository`
 for both the service and deploy environment to use a reviewed fork. Otherwise the
 optional `repository` in `configs/skills_registry.json` applies, with

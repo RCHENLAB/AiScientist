@@ -131,6 +131,17 @@ ends with its answer in the chat and `report/summary.md`. A run that only did qu
 the QC reply. The report of a finished run can be written later with the MCP tool `write_report`
 (`docs/development/metadata.md`).
 
+A skill whose MCP server writes the report of its own results gets that report instead, in the
+server's fixed format, with no model-written text. The server row in `mcp_servers.json` names the tool
+(`report`): Atlas expression's `atlas_write_report` and RetiGene's `retigene_write_report`. When a
+report is wanted, the plan ends in one step for each such server the plan uses, which the Scientist
+runs like any other step (`fixed_report_step` in `research_lab/step_kinds.py`). The gateway then makes
+`report/report.md`, PDF and DOCX from the Markdown those calls wrote, by code
+(`reporting/fixed_report.py`; the sources are listed in `process/fixed_report.json`): no self-review,
+references, verification statement or technical report. The `write_report` manuscript is planned only
+when some analysis step uses a skill without such a tool; a plan that mixes both kinds gets both. With
+no report wanted, the plan has neither.
+
 ### How a skill reaches the model
 
 A skill's text enters the model's context only when a step uses it:
@@ -460,9 +471,9 @@ tools; direct `run_in_environment` calls for this skill are refused.
 Tool arguments are validated against their schemas before scheduling. The Atlas
 domain adapter rejects undeclared arguments; generic MCP schemas retain their
 authored additional-property semantics. Execution options never come from tool
-arguments. Atlas's planner alias `atlas_write_report` still calls the server's
-`write_report(query_id)` to produce `report.md`; the gateway's independent
-`write_report` plan step requests the whole run's PDF/DOCX report. The runner rechecks the skill
+arguments. Atlas's planner alias `atlas_write_report` calls the server's
+`write_report(query_id)` to produce `report.md`; it is the report step of an Atlas plan
+that wants a report (see "Declared report"). The runner rechecks the skill
 image at call time and retains the existing skill access policy. Server content
 cannot replace the execution status, artifact list or image provenance in the
 returned Atlas response.

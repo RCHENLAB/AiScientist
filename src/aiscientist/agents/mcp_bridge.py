@@ -84,6 +84,9 @@ class Server:
     resources: dict | None = None
     aliases: dict | None = None
     settings_env: tuple[str, ...] = ()
+    # The server's own tool that writes the report of its results in a fixed format (its wire name),
+    # or "": when a written report is wanted, the plan calls it instead of having the model write one.
+    report: str = ""
 
     def planner_name(self, wire_name: str) -> str:
         return self.prefix + (self.aliases or {}).get(wire_name, wire_name)
@@ -130,7 +133,7 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
         raise ValueError("Invalid MCP registry format")
     servers, names, tool_names, skills = [], set(), set(), set()
     required = {"name", "version", "release_tag", "image", "entrypoint", "skill", "runs_on", "tools_file", "tools_sha256"}
-    optional = {"adapter", "prefix", "timeout", "resources", "aliases", "settings_env"}
+    optional = {"adapter", "prefix", "timeout", "resources", "aliases", "settings_env", "report"}
     for row in cfg["servers"]:
         if not isinstance(row, dict) or not required <= row.keys() or row.keys() - required - optional:
             raise ValueError("Invalid MCP server fields")
@@ -212,6 +215,8 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
             tool_names.add(planner_name)
         if aliases.keys() - {tool["name"] for tool in entries}:
             raise ValueError("Unknown MCP alias tool")
+        if "report" in row and row["report"] not in {tool["name"] for tool in entries}:
+            raise ValueError("Unknown MCP report tool")
         resources = row.get("resources", {})
         if not isinstance(resources, dict) or resources.keys() - {t["name"] for t in entries}:
             raise ValueError("Unknown MCP resource override tool")
@@ -260,6 +265,14 @@ def configured_tool_names() -> set[str]:
 def configured_tool_skills() -> dict[str, str]:
     return {server.planner_name(tool["name"]): server.skill for server in configured_servers()
             for tool in server.tools}
+
+
+def report_tools() -> dict[str, str]:
+    """``{skill: planner name}`` of the tool each configured server offers to write the report of
+    its results in a fixed format (the server row's ``report``), for the skills whose server has one.
+    Such a report is the server's own code from the run's outputs, with no model-written text."""
+    return {server.skill: server.planner_name(server.report) for server in configured_servers()
+            if server.report}
 
 
 def protected_skill_tools(skill: str) -> list[str]:

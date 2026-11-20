@@ -1,4 +1,5 @@
-"""MCP domain output stays separate from the gateway's requested manuscript step."""
+"""An MCP server's own report tool is the report step of its skill; the gateway's manuscript step is not
+planned beside it (RCHENLAB/AiScientist#102)."""
 import json
 import shlex
 
@@ -28,7 +29,10 @@ def test_mentioning_mcp_output_does_not_allow_code_report_busywork(release, sour
 
 
 @pytest.mark.parametrize("written_report", [False, True])
-def test_atlas_query_report_runs_while_gateway_report_is_handed_off(release, written_report):
+def test_a_report_asked_for_on_an_atlas_plan_is_the_atlas_report_tool(release, written_report):
+    """Jin Li, RCHENLAB/AiScientist#102: a skill whose server writes its own report gets that report,
+    in its fixed format, not one a model writes. Asked for, the Atlas plan ends in its
+    `atlas_write_report` step and has no `write_report` step; not asked for, it has neither."""
     runner = test_atlas_expression.Runner()
     catalog = test_atlas_expression.tools(runner)
     atlas_step = '**Query summary** — Write the query report with `atlas_write_report(query_id="q1")`.'
@@ -36,6 +40,7 @@ def test_atlas_query_report_runs_while_gateway_report_is_handed_off(release, wri
     agenda = [resolve_step, atlas_step, rl.REPORT_STEP]
     assert "write_report" not in catalog
     assert not rl._is_report_step(atlas_step) and not rl._is_report_busywork(atlas_step)
+    assert rl._is_fixed_report_step(atlas_step) and not rl._is_fixed_report_step(resolve_step)
     assert "atlas_write_report" in catalog["atlas_write_report"].description
 
     def scientist(messages, _tools):
@@ -69,33 +74,62 @@ def test_atlas_query_report_runs_while_gateway_report_is_handed_off(release, wri
         doc = next(e for e in reversed(events) if e.get("type") == "plan_doc")
         reviews.append(doc)
         if len(reviews) == 1:
-            assert (doc["steps"][-1]["tool"] == rl.REPORT_TOOL) is written_report
+            tools = [step["tool"] for step in doc["steps"]]
+            assert rl.REPORT_TOOL not in tools
+            assert (tools[-1] == "atlas_write_report") is written_report
             if written_report:
-                assert not doc["steps"][-1].get("settings")  # no Atlas query_id schema on the gateway step
-            return {"action": "edit", "plan_yaml": doc["yaml"].replace("query_id: q1", "query_id: q2")}
+                return {"action": "edit", "plan_yaml": doc["yaml"].replace("query_id: q1", "query_id: q2")}
         return {"action": "approve"}
 
     question = "Resolve LRAT and produce the atlas query summary" + (" and a PDF report" if written_report else "")
     result = lab.run(question, events.append, review)
-    assert len(reviews) == 2
-    assert result.report_requested is written_report
-    assert any("atlas_write_report" in step for step in result.agenda)
+    assert len(reviews) == (2 if written_report else 1)
+    assert result.report_requested is False   # no manuscript is handed to the gateway
+    assert any("atlas_write_report" in step for step in result.agenda) is written_report
     assert all(not rl._is_report_step(step) for step in result.agenda)
     commands = [shlex.split(next(line for line in call[0].splitlines() if line.startswith("aiscientist-mcp ")))
                 for call in runner.calls]
-    assert [command[6] for command in commands] == ["resolve_genes", "write_report"]
-    assert json.loads(commands[1][7]) == {"query_id": "q2"}
-    assert bool([e for e in events if e.get("type") == "report_step"]) is written_report
-    assert not [e for e in events if e.get("type") == "plan_edit_rejected"]
+    assert [command[6] for command in commands] == (["resolve_genes", "write_report"] if written_report
+                                                    else ["resolve_genes"])
     if written_report:
-        runner.calls.clear()
-        resumed_lab = _lab([], {}, scientist=ResearchHarness(catalog=list(catalog.values()), chat_fn=scientist))
-        resumed_lab.ctx.decisions["dataset_path"] = runner.dataset_path
-        resumed_lab._complete_fn = complete
-        resumed = resumed_lab.run("Continue", resume=rl.ResumeState(
-            [atlas_step, rl.REPORT_STEP], [], 0, report_requested=True))
-        assert resumed.report_requested and resumed.agenda == [atlas_step]
-        assert len(runner.calls) == 1 and " call write_report " in runner.calls[0][0]
+        assert json.loads(commands[1][7]) == {"query_id": "q2"}
+        assert {"type": "steps_pruned", "reason": "fixed_format_report", "dropped": [rl.REPORT_STEP],
+                "tools": ["atlas_write_report"]} in events
+    else:
+        assert {"type": "steps_pruned", "reason": "report_not_asked", "dropped": [atlas_step, rl.REPORT_STEP]} in events
+    assert not [e for e in events if e.get("type") == "report_step"]
+    assert not [e for e in events if e.get("type") == "plan_edit_rejected"]
+
+
+def test_a_checkpoint_from_before_keeps_its_handed_off_report_step(release):
+    """A run checkpointed with the gateway's report step resumes as it was planned."""
+    runner = test_atlas_expression.Runner()
+    catalog = test_atlas_expression.tools(runner)
+    atlas_step = '**Query summary** — Write the query report with `atlas_write_report(query_id="q1")`.'
+
+    def scientist(messages, _tools):
+        if any(m.get("role") == "tool" for m in messages):
+            name, args = "finish", {"answer": "Done"}
+        else:
+            name, args = "atlas_write_report", {"query_id": "q1"}
+        return {"content": "", "tool_calls": [{"id": "t", "type": "function", "function": {
+            "name": name, "arguments": json.dumps(args)}}]}
+
+    def complete(messages):
+        system = messages[0]["content"]
+        if "rigorous scientific Critic" in system:
+            return '{"verdict":"accept","score":0.9,"critique":"ok"}'
+        if "filling in a form" in system:
+            return "[]"
+        return "Done."
+
+    lab = _lab([], {}, scientist=ResearchHarness(catalog=list(catalog.values()), chat_fn=scientist))
+    lab.ctx.decisions["dataset_path"] = runner.dataset_path
+    lab._complete_fn = complete
+    resumed = lab.run("Continue", resume=rl.ResumeState([atlas_step, rl.REPORT_STEP], [], 0,
+                                                        report_requested=True))
+    assert resumed.report_requested and resumed.agenda == [atlas_step]
+    assert len(runner.calls) == 1 and " call write_report " in runner.calls[0][0]
 
 
 @pytest.mark.parametrize("declared,allowed", [(False, True), (True, True), (True, False)])

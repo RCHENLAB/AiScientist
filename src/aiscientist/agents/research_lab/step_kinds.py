@@ -364,6 +364,36 @@ def _is_report_step(step: str) -> bool:
     return REPORT_TOOL in _declared_tools(step or "")
 
 
+# A skill whose MCP server writes the report of its results in a fixed format (the server row's
+# ``report`` in mcp_servers.json) gets that tool as its report step instead (Jin Li,
+# RCHENLAB/AiScientist#102): the same layout every time, and no model-written summary of the results.
+# The Scientist runs it like any other step; the gateway makes the run's report from what it wrote.
+def fixed_report_step(tool: str) -> str:
+    return (f"**Report** — Write the report of the results with `{tool}` on what the earlier steps "
+            "ran: the tool's own report, in its fixed format, with no model-written text. It runs "
+            "after the analysis steps.")
+
+
+def _fixed_report_tools() -> frozenset[str]:
+    try:
+        from ..mcp_bridge import report_tools
+        return frozenset(report_tools().values())
+    except Exception:  # noqa: BLE001 - an unreadable registry offers no report tool
+        return frozenset()
+
+
+def _is_fixed_report_step(step: str) -> bool:
+    """A step whose only tool is an MCP server's own report tool (``atlas_write_report``). A step
+    that also plots or queries is an analysis step that happens to end in a report."""
+    declared = _declared_tools(step or "")
+    return bool(declared) and declared <= _fixed_report_tools()
+
+
+def _is_any_report_step(step: str) -> bool:
+    """A report step of either kind: ``write_report`` or an MCP server's own report tool."""
+    return _is_report_step(step) or _is_fixed_report_step(step)
+
+
 # The planner's line for it, beside the catalog's tools.
 _REPORT_TOOL_LINE = (
     f"- {REPORT_TOOL}: the run's written report (the methods and results manuscript with its "

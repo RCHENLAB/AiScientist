@@ -29,9 +29,16 @@ def lib():
 
 def test_every_catalog_skill_of_an_allowed_tier_loads(lib):
     catalog_rows = json.loads((RELEASE / "catalog.json").read_text(encoding="utf-8"))["skills"]
-    wanted = {r["name"] for r in catalog_rows if r["status"] in CFG["allowed_tiers"]}
+    wanted = {r["name"] for r in catalog_rows
+              if r["status"] in CFG["allowed_tiers"] and r["name"] not in CFG["excluded_skills"]}
     assert set(lib) == wanted
     assert {s.registry_release for s in lib.values()} == {CFG["release_tag"]}
+
+
+def test_the_excluded_skills_are_in_the_release_and_not_loaded(lib):
+    names = {r["name"] for r in json.loads((RELEASE / "catalog.json").read_text(encoding="utf-8"))["skills"]}
+    assert set(CFG["excluded_skills"]) <= names, "an excluded skill is no longer in the pinned release"
+    assert not set(CFG["excluded_skills"]) & set(lib)
 
 
 def test_the_skills_name_only_tools_that_exist(lib):
@@ -44,15 +51,11 @@ def test_the_skills_name_only_tools_that_exist(lib):
     known = (set(catalog.names()) | NATIVE_NAMES | {canonical_tool_name(n) for n in NATIVE_NAMES}
              | PLATFORM_TOOLS | set(PIPELINES) | set(lib)
              | {a for s in lib.values() for a in s.aliases})
-    # This optional HTTP-client skill documents its separate VisionKB service, not
-    # an executable gateway tool. Its seven names are the published service contract.
-    external = {"answer-eye-questions-with-visionkb-kg": {"get_release", "search_entities",
-        "get_relationships", "get_evidence", "get_gene_set", "query_atlas_expression", "find_datasets"}}
     bad = []
     for skill in lib.values():
         texts = {"SKILL.md": skill.doc, **{k: v for k, v in skill.files.items() if k.endswith(".md")}}
         bad += [f"{skill.name}/{rel}: `{name}`" for rel, text in texts.items()
-                for name in toolish_names(text) if name not in known | external.get(skill.name, set())]
+                for name in toolish_names(text) if name not in known]
     assert not bad, "skills name tools that do not exist:\n" + "\n".join(sorted(set(bad)))
 
 

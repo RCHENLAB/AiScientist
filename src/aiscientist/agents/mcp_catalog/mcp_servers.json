@@ -15,6 +15,7 @@
       "aliases": {
         "write_report": "atlas_write_report"
       },
+      "report": "write_report",
       "timeout": 15000,
       "resources": {
         "resolve_genes": [
@@ -460,6 +461,7 @@
       "aliases": {
         "write_report": "retigene_write_report"
       },
+      "report": "write_report",
       "timeout": 3600,
       "resources": {
         "get_gene": [

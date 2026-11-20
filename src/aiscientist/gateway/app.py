@@ -13635,9 +13635,22 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                  "results once every analysis step is done.")
     elif t == "report_step_added":
         skills = [str(s) for s in (ev.get("skills") or [])]
-        progress("📝 Added the written-report step (`write_report`), last: "
-                 + (f"skill {', '.join(skills)} asks for a report." if skills
-                    else "the request asks for a written report."))
+        tools = ", ".join(f"`{t}`" for t in (ev.get("tools") or []))
+        why = (f"skill {', '.join(skills)} asks for a report." if skills
+               else "the request asks for a written report.")
+        if tools and not ev.get("manuscript"):
+            progress(f"📝 Added the report step, last: {tools} writes the report in its tool's fixed "
+                     f"format, with no model-written text. {why[0].upper()}{why[1:]}")
+        elif tools:
+            progress(f"📝 Added the report steps, last: {tools} writes its part in a fixed format, and "
+                     "`write_report` the written report of the steps no such tool covers. "
+                     f"{why[0].upper()}{why[1:]}")
+        else:
+            progress("📝 Added the written-report step (`write_report`), last: " + why)
+    elif t == "steps_pruned" and ev.get("reason") == "fixed_format_report":
+        tools = ", ".join(f"`{t}`" for t in (ev.get("tools") or []))
+        progress(f"✂️ Left out the model-written report (`write_report`): {tools} writes this run's "
+                 "report in a fixed format.")
     elif t == "steps_pruned" and ev.get("reason") == "report_not_asked":
         progress("✂️ Left out the report step: the request does not ask for a written report, so the "
                  "run answers in the chat. Ask for one (“with a written report”) to get the PDF.")
@@ -14628,6 +14641,96 @@ def _mark_bound_datasets_used(conn: "Connection", *paths: "list[str]") -> None:
         print(f"[storage] could not record which datasets this run uses: {exc}")
 
 
+def _say_report_render(rep: "dict[str, Any]", art: Path, emit: Callable[..., Any]) -> "list[str]":
+    """Say how the render of report.md went; return the formats made (``pdf_path``, ``docx_path``)."""
+    made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
+    if made:
+        emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
+        if "pdf_path" not in made and rep.get("error"):
+            # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
+            emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
+    elif rep["status"] == "markdown_only":
+        emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
+    else:
+        # Persist the FULL render error (incl. the HPC3 Slurm-log tail with the real LaTeX
+        # cause) to the bundle — the chat emit is truncated, so without this the actual reason
+        # is lost. Best-effort; the .md always survives regardless.
+        full_err = str(rep.get("error", "") or "").strip()
+        if full_err:
+            try:
+                err_dir = art / "process"
+                err_dir.mkdir(parents=True, exist_ok=True)
+                (err_dir / "report_render_error.log").write_text(full_err, encoding="utf-8")
+            except OSError:
+                pass
+        emit("warning", "lab",
+             f"Report render failed (full log: process/report_render_error.log): {full_err[:160]}")
+    return made
+
+
+def _fixed_report_sources(art: Path, result: Any) -> "list[Path]":
+    """The reports the run's MCP servers wrote in their fixed format, from its accepted report steps
+    (RCHENLAB/AiScientist#102); empty when the plan had none, or the registry cannot be read."""
+    from ..agents.mcp_bridge import report_tools
+    from ..agents.research_harness import step_succeeded
+    from ..agents.research_lab import _is_fixed_report_step
+    from ..reporting.fixed_report import report_files
+    try:
+        tools = set(report_tools().values())
+    except Exception:  # noqa: BLE001 - no registry: no fixed-format report
+        return []
+    if not tools:
+        return []
+    return report_files(result, art, is_report_step=_is_fixed_report_step, tools=tools,
+                        succeeded=step_succeeded)
+
+
+async def _write_fixed_report(art: Path, sources: "list[Path]", *, report_render_fn: Any,
+                              emit: Callable[..., Any], say_key: Callable[..., Any],
+                              untested_md: str = "", abandoned: Callable[[], bool] = lambda: False,
+                              on_stage: Callable[[str], Any] = lambda _stage: None) -> "dict[str, Any]":
+    """The run's report when its plan's report steps were MCP servers' own report tools (Jin Li,
+    RCHENLAB/AiScientist#102): their Markdown, assembled and rendered to PDF and DOCX by code. No
+    model writes, reviews or extends it, so there is no self-review, references section, verification
+    statement or technical report; the chat reply is the run's answer as usual."""
+    from ..reporting.fixed_report import assemble
+    from ..reporting.report import build_pdf_report
+    say_key("📝 Making the report from the tools' own reports (fixed format, no model-written text)…")
+    report_md = await asyncio.to_thread(assemble, art, sources)
+    report_md = _drop_strip_embeds(report_md, art, emit, "report")
+    report_title, report_md = _promote_doc_title(report_md, "AiScientist Report")
+    if untested_md:
+        report_md = untested_md + "\n" + report_md
+    try:
+        (art / "process").mkdir(parents=True, exist_ok=True)
+        (art / "process" / "fixed_report.json").write_text(json.dumps(
+            {"sources": [p.resolve().relative_to(art.resolve()).as_posix() for p in sources]},
+            indent=2), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+    on_stage("report")
+    try:
+        if abandoned():
+            (art / "report").mkdir(parents=True, exist_ok=True)
+            (art / "report" / "report.md").write_text(f"# {report_title}\n\n{report_md}", encoding="utf-8")
+            rep = {"status": "markdown_only", "md_path": str(art / "report" / "report.md"),
+                   "pdf_path": None, "docx_path": None}
+        else:
+            say_key("📄 Rendering the report (PDF / DOCX)…", "info")
+            rep = await asyncio.to_thread(
+                build_pdf_report, report_md, art / "report",
+                title=report_title, basename="report", assets_root=art, render_fn=report_render_fn)
+    except Exception as exc:  # noqa: BLE001 - the analysis is done; a render crash keeps the bundle
+        traceback.print_exc()
+        rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
+               "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
+    made = _say_report_render(rep, art, emit)
+    emit("info", "lab", f"The report is the fixed-format report of {len(sources)} tool call(s); no "
+                        "model wrote it.")
+    return {"vl_attempted": False, "status": rep.get("status"),
+            "rendered": [f.split("_")[0] for f in made]}
+
+
 async def _write_report(conn: "Connection | None", art: Path, result: Any, question: str, *,
                         complete_fn: Callable[..., str], report_render_fn: Any,
                         emit: Callable[..., Any], say_key: Callable[..., Any],
@@ -14785,28 +14888,7 @@ async def _write_report(conn: "Connection | None", art: Path, result: Any, quest
         traceback.print_exc()
         rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
                "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
-    made = [f for f in ("pdf_path", "docx_path") if rep.get(f)]
-    if made:
-        emit("success", "lab", f"Rendered report.{' + report.'.join(f.split('_')[0] for f in made)} (pandoc).")
-        if "pdf_path" not in made and rep.get("error"):
-            # One format made it; say why the PDF did not (e.g. no HPC3 session to typeset it).
-            emit("warning", "lab", f"report.pdf was not rendered — {str(rep['error'])[:300]}")
-    elif rep["status"] == "markdown_only":
-        emit("info", "lab", "report.md written — install pandoc (+ texlive-xetex for PDF) on the server.")
-    else:
-        # Persist the FULL render error (incl. the HPC3 Slurm-log tail with the real LaTeX
-        # cause) to the bundle — the chat emit is truncated, so without this the actual reason
-        # is lost. Best-effort; the .md always survives regardless.
-        full_err = str(rep.get("error", "") or "").strip()
-        if full_err:
-            try:
-                err_dir = art / "process"
-                err_dir.mkdir(parents=True, exist_ok=True)
-                (err_dir / "report_render_error.log").write_text(full_err, encoding="utf-8")
-            except OSError:
-                pass
-        emit("warning", "lab",
-             f"Report render failed (full log: process/report_render_error.log): {full_err[:160]}")
+    made = _say_report_render(rep, art, emit)
     # Post-render text review: read the rendered document back and flag any remaining
     # issues (advisory — saved to process/report_review.md, never blocks the run).
     visual_diag = ""
@@ -16108,6 +16190,10 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         # answer. Either way the bundle is the complete folder.
         report_wanted = bool(getattr(lab_obj, "report_requested", False)
                              or getattr(result, "report_requested", False))
+        # The plan's report steps were MCP servers' own report tools (#102): the run's report is
+        # what they wrote, in their fixed format, and no model writes one.
+        fixed_reports = [] if report_wanted else await asyncio.to_thread(
+            _fixed_report_sources, art, result)
         qc_run = _qc_only_run(result) and not _code_wrote_outputs(result)
         qc_report = qc_run and report_wanted
         chat_only = qc_run and not qc_report
@@ -16180,6 +16266,11 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 pass
             emit("info", "lab", "Quality control only — the summary is in the chat; no report was "
                                 "written.")
+        elif fixed_reports:
+            await _write_fixed_report(
+                art, fixed_reports, report_render_fn=report_render_fn, emit=emit, say_key=say_key,
+                untested_md=untested_md, abandoned=abandoned,
+                on_stage=lambda stage: _watch_stage(run, stage))
         elif not report_wanted:
             # No written report was asked for (RCHENLAB/AiScientist#102): the answer is the chat
             # reply, and report/summary.md keeps it in the folder (it also marks the run finished, so
@@ -16217,7 +16308,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
         if chat_only:
             # A warning, as the reply's first line, when the QC step was not accepted (issue 75).
             say_key(*_qc_closing_line(result))
-        elif not report_wanted:
+        elif not report_wanted and not fixed_reports:
             say_key("✅ Done — the answer is below; the figures and tables are in the Downloads panel.",
                     "success")
         else:
