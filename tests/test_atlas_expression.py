@@ -115,6 +115,50 @@ def test_obs_roles_missing_role_takes_the_files_matching_column(tmp_path, monkey
     assert len(set(cols)) == 4
 
 
+# The text and category columns of the HECA v2026.11.1 files whose names differ from the server's
+# defaults, with their category counts, read from the files on HPC3.
+HECA_OBS = {
+    "HRCA_scRNA": ({"age": 30, "donor": 20, "gender": 3, "group1": 21, "group2": 8, "group3": 14,
+                    "majorclass": 10, "race": 5, "sampleid": 51, "tissue": 3},
+                   ["majorclass", "group1", "tissue", "donor"]),
+    "Iris_scRNA": ({"age": 24, "dataset": 2, "donorid": 27, "loh_cell_type": 18, "majorclass": 11,
+                    "race": 5, "sampleid": 34, "sex": 2, "technology": 1, "tissue": 5},
+                   ["majorclass", "loh_cell_type", "tissue", "donorid"]),
+    "Iris_snRNA": ({"age": 12, "dataset": 2, "donorid": 14, "majorclass": 9, "race": 3, "sampleid": 23,
+                    "sanes_cell_type": 10, "sex": 3, "technology": 1, "tissue": 2},
+                   ["majorclass", "sanes_cell_type", "tissue", "donorid"]),
+    "Lens_scRNA": ({"age": 11, "cell_type": 6, "dataset": 1, "donorid": 11, "race": 4, "sampleid": 11,
+                    "sex": 2, "technology": 1, "tissue": 1},
+                   ["dataset", "cell_type", "tissue", "donorid"]),
+    "Lens_snRNA": ({"age": 24, "cell_type": 6, "dataset": 2, "donorid": 31, "race": 5, "sampleid": 32,
+                    "sanes_cell_type": 6, "sex": 3, "technology": 1, "tissue": 1},
+                   ["technology", "cell_type", "tissue", "donorid"]),
+    "RPEChoroid_scRNA": ({"Age": 31, "Chemistry": 4, "Donor": 65, "Ethnicity": 3, "Gender": 3,
+                          "Region": 4, "Tissue": 6, "majorclass": 15, "sampleid": 92, "subclass": 27},
+                         ["majorclass", "subclass", "Tissue", "Donor"]),
+    "RPEChoroid_snRNA": ({"Donor": 53, "Region": 2, "Tissue": 1, "batch": 6, "celltype": 50,
+                          "majorclass": 17, "sample": 82, "sampleid": 82},
+                         ["majorclass", "celltype", "Tissue", "Donor"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(HECA_OBS))
+def test_obs_roles_on_the_heca_files_columns(tmp_path, monkeypatch, capsys, name):
+    # A file without a cell-type column never gets a sample, donor or demographic column as its
+    # cell types (HRCA_scRNA: group1, not its 51 sample ids); Lens has no class column, so its
+    # class is a column with one or two values, which only pools the file's cells.
+    columns, expected = HECA_OBS[name]
+    cols, _ = _obs_roles(tmp_path, monkeypatch, capsys, list(columns), name + "_allcells.h5ad",
+                         categories=columns)
+    assert cols == expected
+
+
+def test_obs_roles_never_take_sample_columns_for_cell_roles(tmp_path, monkeypatch, capsys):
+    with pytest.raises(SystemExit, match="four distinct"):
+        _obs_roles(tmp_path, monkeypatch, capsys, ["majorclass", "tissue", "donor", "sampleid", "age"],
+                   categories={"majorclass": 5, "tissue": 2, "donor": 9, "sampleid": 40, "age": 30})
+
+
 def test_obs_roles_unnamed_annotations_fill_by_category_count(tmp_path, monkeypatch, capsys):
     # No name hints at all: class and region take the fewest categories, cell type and donor the most.
     cols, _ = _obs_roles(tmp_path, monkeypatch, capsys, ["a", "b", "c", "d"],

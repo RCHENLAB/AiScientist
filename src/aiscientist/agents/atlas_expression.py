@@ -43,6 +43,18 @@ def normalized(name):
     return "".join(c for c in name.casefold() if c.isalnum())
 
 
+# Columns about the donor or the sample, never about a cell. Step 3 never gives one
+# of them to class, cell type or region: HRCA_scRNA has no cell-type column, and
+# without this rule its 51 sample ids became the cell types.
+SAMPLE_HINTS = ("donor", "subject", "individual", "patient", "sample", "library", "batch")
+DEMOGRAPHICS = {"age", "ageyear", "agegroup", "sex", "gender", "race", "ethnicity"}
+
+
+def about_cells(name):
+    name = normalized(name)
+    return name not in DEMOGRAPHICS and not any(hint in name for hint in SAMPLE_HINTS)
+
+
 def text(value):
     return value.decode() if isinstance(value, bytes) else str(value)
 
@@ -92,10 +104,12 @@ for role, _, hints, _ in ROLES:
                 chosen[role] = column
                 break
 # 3. any other annotation: the fewest categories for class and region, the most
-#    for cell type and donor; text columns of unknown size count as many.
+#    for cell type and donor; text columns of unknown size count as many. Donor and
+#    sample columns, and demographics, are left to the donor role.
 for role, _, _, size in ROLES:
     if role not in chosen:
-        left = [c for c in columns if c not in chosen.values()]
+        left = [c for c in columns if c not in chosen.values()
+                and (role == "donor" or about_cells(c))]
         if left:
             many = lambda c: float("inf") if sizes[c] is None else sizes[c]
             chosen[role] = (min if size == "few" else max)(left, key=many)
