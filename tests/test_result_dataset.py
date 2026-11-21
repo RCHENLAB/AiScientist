@@ -9,8 +9,10 @@ file to the user's personal folder and lists it among their datasets.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
+import threading
 import types
 from pathlib import Path
 
@@ -306,6 +308,90 @@ def test_a_checkpoint_or_an_unanswered_probe_still_submits_the_export_job(tmp_pa
     asyncio.run(_export_result_dataset(_export_conn(tmp_path), "r1", {}, Executor(), "q",
                                        lambda *a, **k: None))
     assert len(jobs) == 1
+
+
+@pytest.mark.parametrize("probe, response, outcome, reason", [
+    (False, None, "skipped", "no_checkpoint"),
+    (None, {"status": "skipped", "reason": "no output"}, "skipped", "exporter_skipped"),
+    (True, {"status": "ok", "result_dataset": {"name": "delivered"}}, "success", None),
+    (True, {"status": "ok"}, "failed", "missing_result"),
+    (True, {"status": "error", "error": "/private/path"}, "failed", None),
+    (True, OSError("private diagnostic"), "failed", None),
+    (True, {"status": "cancelled"}, "cancelled", None),
+    (True, {"status": "error", "queue_timeout": True}, "timeout", None),
+])
+def test_export_records_one_observation_and_preserves_its_return_value(tmp_path, probe, response, outcome, reason):
+    from aiscientist.gateway import app, run_monitor
+
+    path = tmp_path / "timing.jsonl"
+    monitor = run_monitor.RunMonitor(run_id="r1")
+    monitor.bind_timing(path)
+    during_probe = []
+
+    class Executor:
+        def wrote_checkpoint(self):
+            during_probe.extend(run_monitor.read_timing(path)["spans"])
+            return probe
+
+        def run_tool(self, *args):
+            assert probe is not False
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    with run_monitor.bind_monitor(monitor):
+        output = asyncio.run(app._export_result_dataset(_export_conn(tmp_path), "r1", {}, Executor(),
+                                                       "private question", lambda *args: None))
+    if isinstance(response, dict) and response.get("status") == "ok":
+        assert output == response.get("result_dataset", {})
+    else:
+        assert output is None
+    in_flight, = during_probe
+    assert in_flight["stage"] == "result_export" and in_flight["partial"]
+    span, = run_monitor.read_timing(path)["spans"]
+    assert (span["stage"], span["category"], span["outcome"]) == ("result_export", "observation", outcome)
+    assert span["started_at"] and span["ended_at"] and span["duration_seconds"] >= 0 and not span["partial"]
+    assert span["metadata"]["backend"] == "hpc3"
+    assert span["metadata"].get("reason_code") == reason
+    assert "private" not in path.read_text()
+
+
+def test_cancelling_export_while_waiting_for_probe_keeps_partial_history(tmp_path):
+    from aiscientist.gateway import app, run_monitor
+
+    path = tmp_path / "timing.jsonl"
+    monitor = run_monitor.RunMonitor(run_id="r1")
+    monitor.bind_timing(path)
+    release = threading.Event()
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        probing = asyncio.Event()
+
+        def probe():
+            loop.call_soon_threadsafe(probing.set)
+            release.wait(timeout=10)
+            return False
+
+        with run_monitor.bind_monitor(monitor):
+            task = asyncio.create_task(app._export_result_dataset(
+                _export_conn(tmp_path), "r1", {}, types.SimpleNamespace(wrote_checkpoint=probe),
+                "q", lambda *args: None))
+            try:
+                await asyncio.wait_for(probing.wait(), timeout=5)
+                monitor.end("cancelled")
+                span, = run_monitor.read_timing(path)["spans"]
+                assert span["partial"] and span["outcome"] == "unknown"
+                assert span["duration_seconds"] is None and span["ended_at"] is None
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+
+    asyncio.run(exercise())
+    span, = run_monitor.read_timing(path)["spans"]
+    assert span["outcome"] == "cancelled" and not span["partial"] and span["ended_at"]
 
 
 class _Remote:

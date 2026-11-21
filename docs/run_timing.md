@@ -38,6 +38,7 @@ timestamps and say `duration_basis=wall_clock`; clock corrections can affect the
 | `hpc_submit` | Gateway submission duration. |
 | `hpc_queue_observed`, `hpc_job_observed` | Gateway polling intervals, categorized as observations. They are not Slurm accounting or measured execution time. |
 | `hpc_queue`, `hpc_execution` | Slurm `sacct` Submit→Start and Start→End when available. Unknown timestamps stay null. Start→End is allocation wall time, not CPU/GPU utilization; a requeued job's Submit describes the latest allocation. |
+| `result_export` | Gateway time spent checking for a processed dataset and waiting for its export. This observation includes any nested Slurm spans. A checkpoint probe that avoids submitting the job records `skipped` with `reason_code=no_checkpoint`. A skip returned by the exporter records `reason_code=exporter_skipped`. |
 | `result_packaging` | Writing the literature answer, result pointers/tables and result metadata. Several packaging operations can occur in one run. |
 | `save_decision_wait` | Published `result_ready` to a subsequent manual save request. It is a user wait, separate from compute and from the actual save. No delay is inferred from a result pointer's `created_at`. |
 | `result_save` | Actual foreground save operation or background copy/publish. A foreground `queued` outcome means HTTP 202; the background span records the copy's eventual outcome. Automatic saving has no manual decision wait. |
@@ -63,6 +64,9 @@ timeline reports `truncated: true`. An open processing span remains `partial=tru
 end/duration and unknown outcome, until an actual completion is observed. Reading does not invent a crash
 timestamp or call a WebSocket disconnect a run failure. A run's terminal event and a background
 operation's terminal event can legitimately differ.
+
+The export span stays partial while the gateway is waiting. Cancelling that wait records
+`cancelled` for the gateway operation. The Slurm spans record the job's own outcome when available.
 
 With `AISCIENTIST_RUN_TIMING_LOG=1`, the service journal also gets one
 `run_timing run_id=… stage=… event=… action=… outcome=…` line per transition; it is off by default.

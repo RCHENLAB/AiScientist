@@ -14453,63 +14453,81 @@ async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dic
     meta = {"run_id": run_id, "owner": conn.owner, "question": (question or "")[:500],
             "source_dataset": source, "location": "hpc3" if on_hpc else "gateway",
             "kept_days": kept_days, "until_disconnect": until_disconnect}
-    if on_hpc:
-        # A run that wrote no checkpoint has nothing to hand on, and the export job would only wait
-        # for a place in the queue to say so (issue 152, run 0c070eb6307d: 11 min 38 s).
-        probe = getattr(analysis_executor, "wrote_checkpoint", None)
-        try:
-            wrote = await asyncio.to_thread(probe) if callable(probe) else None
-        except Exception:  # noqa: BLE001 - an unanswered probe leaves the decision to the job
-            wrote = None
-        if wrote is False:
-            emit("info", "lab", "No processed dataset to export: the run wrote no analysis checkpoint "
-                                "(work/adata_*.h5ad) to export")
-            return None
-    try:
+    # Includes the checkpoint probe and any nested Slurm queue/execution observations.
+    with run_monitor.timed_stage("result_export", category="observation", backend=meta["location"]) as span:
         if on_hpc:
-            ctx = SimpleNamespace(workspace=conn.workspace / run_id, decisions=dict(decisions))
-            # The executor carries the run's Stop flag, and the write-up after a Stop is exactly when
-            # the dataset still has to be handed on (run 7f2955e8e: "Run cancelled by the user"). The
-            # export is data, not narrative, so it runs to completion whatever was pressed.
-            saved_cancel = getattr(analysis_executor, "should_cancel", None)
-            analysis_executor.should_cancel = None
+            # A run that wrote no checkpoint has nothing to hand on, and the export job would only wait
+            # for a place in the queue to say so (issue 152, run 0c070eb6307d: 11 min 38 s).
+            probe = getattr(analysis_executor, "wrote_checkpoint", None)
             try:
-                out = await asyncio.to_thread(analysis_executor.run_tool, EXPORT_RESULT_DATASET,
-                                              {"name": name, "meta": meta}, ctx)
-            finally:
-                analysis_executor.should_cancel = saved_cancel
-        else:
-            out = await asyncio.to_thread(export_result_dataset, conn.workspace / run_id, name, meta)
-    except Exception as exc:  # noqa: BLE001 - the analysis and report are done; never fail the run
-        emit("warning", "lab", f"Processed dataset not exported (non-fatal): {exc}")
-        return None
-    status = (out or {}).get("status")
-    if status == "ok":
-        rd = out.get("result_dataset") or {}
-        where = "on HPC3" if on_hpc else "on the server"
-        datasets = out.get("result_datasets") or rd.get("datasets") or [rd]
-        if len(datasets) > 1:
-            for dataset in datasets:
-                emit("success", "lab", f"Processed dataset ready: {dataset['name']} — "
-                     f"{dataset.get('n_cells')} cells × {dataset.get('n_genes')} genes. "
-                     f"Kept {where} {_keep_for(kept_days, until_disconnect)}; "
-                     "Runs → “Save to my data” keeps it for the next analysis.")
+                wrote = await asyncio.to_thread(probe) if callable(probe) else None
+            except Exception:  # noqa: BLE001 - an unanswered probe leaves the decision to the job
+                wrote = None
+            if wrote is False:
+                span.end("skipped", reason_code="no_checkpoint")
+                emit("info", "lab", "No processed dataset to export: the run wrote no analysis checkpoint "
+                                    "(work/adata_*.h5ad) to export")
+                return None
+        try:
+            if on_hpc:
+                ctx = SimpleNamespace(workspace=conn.workspace / run_id, decisions=dict(decisions))
+                # The executor carries the run's Stop flag, and the write-up after a Stop is exactly when
+                # the dataset still has to be handed on (run 7f2955e8e: "Run cancelled by the user"). The
+                # export is data, not narrative, so it runs to completion whatever was pressed.
+                saved_cancel = getattr(analysis_executor, "should_cancel", None)
+                analysis_executor.should_cancel = None
+                try:
+                    out = await asyncio.to_thread(analysis_executor.run_tool, EXPORT_RESULT_DATASET,
+                                                  {"name": name, "meta": meta}, ctx)
+                finally:
+                    analysis_executor.should_cancel = saved_cancel
+            else:
+                out = await asyncio.to_thread(export_result_dataset, conn.workspace / run_id, name, meta)
+        except Exception as exc:  # noqa: BLE001 - the analysis and report are done; never fail the run
+            span.end("failed")
+            emit("warning", "lab", f"Processed dataset not exported (non-fatal): {exc}")
+            return None
+        result = out if isinstance(out, dict) else {}
+        status = result.get("status")
+        if status == "skipped":
+            span.end("skipped", reason_code="exporter_skipped")
+            emit("info", "lab", f"No processed dataset to export: {result.get('reason', '')}")
+            return None
+        if status != "ok":
+            state = str(result.get("slurm_state") or "")
+            if status == "cancelled" or state.startswith("CANCELLED"):
+                span.end("cancelled")
+            elif status == "timeout" or state == "TIMEOUT" or result.get("queue_timeout"):
+                span.end("timeout")
+            else:
+                span.end("failed")
+            emit("warning", "lab", f"Processed dataset not exported (non-fatal): "
+                                   f"{str(result.get('error', out))[:200]}")
+            return None
+        rd = result.get("result_dataset") or {}
+        if not rd:
+            span.end("failed", reason_code="missing_result")
+            emit("warning", "lab", "Processed dataset export returned no dataset pointer.")
             return rd
-        emit("success", "lab",
-             f"📦 Processed dataset ready: {name} — {rd.get('n_cells')} cells × {rd.get('n_genes')} "
-             f"genes, {int(rd.get('size_bytes') or 0) / 1e6:.0f} MB, {_dataset_holds(rd)}. "
-             f"Kept {where} {_keep_for(kept_days, until_disconnect)}; Runs → "
-             "“Save to my data” keeps it "
-             + ("in your data on the server" if dataset_storage.configured() else "in your personal folder")
-             + " as a dataset the next analysis can start from. A per-cell "
-             "table (tables/cells.csv) is in the bundle.")
+
+    where = "on HPC3" if on_hpc else "on the server"
+    datasets = out.get("result_datasets") or rd.get("datasets") or [rd]
+    if len(datasets) > 1:
+        for dataset in datasets:
+            emit("success", "lab", f"Processed dataset ready: {dataset['name']} — "
+                 f"{dataset.get('n_cells')} cells × {dataset.get('n_genes')} genes. "
+                 f"Kept {where} {_keep_for(kept_days, until_disconnect)}; "
+                 "Runs → “Save to my data” keeps it for the next analysis.")
         return rd
-    if status == "skipped":
-        emit("info", "lab", f"No processed dataset to export: {out.get('reason', '')}")
-    else:
-        emit("warning", "lab", f"Processed dataset not exported (non-fatal): "
-                               f"{str((out or {}).get('error', out))[:200]}")
-    return None
+    emit("success", "lab",
+         f"📦 Processed dataset ready: {name} — {rd.get('n_cells')} cells × {rd.get('n_genes')} "
+         f"genes, {int(rd.get('size_bytes') or 0) / 1e6:.0f} MB, {_dataset_holds(rd)}. "
+         f"Kept {where} {_keep_for(kept_days, until_disconnect)}; Runs → "
+         "“Save to my data” keeps it "
+         + ("in your data on the server" if dataset_storage.configured() else "in your personal folder")
+         + " as a dataset the next analysis can start from. A per-cell "
+         "table (tables/cells.csv) is in the bundle.")
+    return rd
 
 
 def _drop_process_files(run_dir: Path) -> int:
