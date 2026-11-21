@@ -7483,6 +7483,10 @@ class LabRequest(BaseModel):
     _images: "list[dict] | None" = PrivateAttr(default=None)
     # What the references resolved to. Private: it holds server paths, so a request body can never set it.
     _shared_resolved: "list[dict] | None" = PrivateAttr(default=None)
+    # The skill the router already chose for this request (``_retigene_route``): the planner composes
+    # it instead of picking a protocol again, and the run expects no dataset. Private: a request body
+    # cannot set it.
+    _route_skill: str = PrivateAttr(default="")
     # The TEXT attachment: the patient's clinical description / case note, carried as TEXT rather
     # than as a file. Its only consumer, map_phenotype_to_hpo, runs IN-PROCESS here on the gateway,
     # never inside a Slurm container. So the note needs neither a dataset row nor a container bind:
@@ -9846,14 +9850,17 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     # session's model's call.
     with_context = target is not None or bool(_select_bound_datasets(req))
     curation_offered = False
-    # A question for RetiGene's gene table is neither of the two lines about its papers: the lookups
-    # answer it completely and read nothing, and only the analysis planner is offered them.
-    gene_table = not chat_literature_handoff and _gene_table_question(conn, req.question)
-    if gene_table:
+    # A question retigene-rag answers (RetiGene's gene table, what its papers alone say, their
+    # haploinsufficient genes) is planned with that server's tools, which only the analysis planner
+    # is offered: neither the literature line's passage search nor the literature server's corpus scan.
+    retigene_reason = "" if chat_literature_handoff else await asyncio.to_thread(
+        _retigene_route, conn, req.question, with_context=with_context)
+    if retigene_reason:
         from ..agents import request_router
-        chat_literature_route = request_router.Route(
-            request_router.ANALYSIS, 1.0, "asks what the RetiGene gene table holds", "rules")
-    ask = None if gene_table else await asyncio.to_thread(
+        from ..agents.retigene import SKILL as RETIGENE_SKILL
+        chat_literature_route = request_router.Route(request_router.ANALYSIS, 1.0, retigene_reason, "rules")
+        req._route_skill = RETIGENE_SKILL
+    ask = None if retigene_reason else await asyncio.to_thread(
         _corpus_curation, conn, req.question, with_context=with_context)
     if ask:
         from ..agents import request_router
@@ -9922,7 +9929,7 @@ async def _dispatch_lab_run(conn: Connection, req: LabRequest) -> None:
     if target is None:
         # A new analysis in a chat with nothing attached: when the request points at a shared
         # dataset or an upload, ask which to use before anything is planned.
-        if not gene_table:              # the table is the data of such a question
+        if not retigene_reason:         # RetiGene's table and papers are the data of such a question
             req = await _offer_unattached_data(conn, req)
         await _run_lab(conn, req)
         return
@@ -10355,13 +10362,49 @@ def _corpus_curation(conn: Connection, question: str, *, with_context: bool = Fa
                                     known, 1.0, "rules")
 
 
-def _gene_table_question(conn: Connection, question: str) -> bool:
-    """A question for RetiGene's gene table (``request_router.asks_gene_table``), on a session that
-    is offered the lookups. The built-in curation's list question stays the curation's."""
+def _retigene_route(conn: Connection, question: str, *, with_context: bool = False) -> str:
+    """Why this request is retigene-rag's, or "" when it is not. On a session offered that server's
+    tools (:func:`_gene_table_lookups_offered`) the analysis planner plans these with them:
+
+    - what RetiGene's gene table holds (``request_router.asks_gene_table``): ``get_gene`` and
+      ``find_genes``;
+    - what the RetiGene papers alone say (``request_router.corpus_only``, one fact by
+      :func:`_corpus_ask`): ``search_sentences`` and ``search_passages``, verbatim sentences with PMID
+      and page;
+    - every gene those papers report as haploinsufficient, the one property its curation's rules are
+      written for, also asked with no source named (issue 20): ``submit_curation``;
+    - a request that names the server or one of its tools.
+
+    RCHENLAB/AiScientist issue 152 (item 2, and Ziyao's test of #149): the passage questions went
+    to the literature server's ``search_corpus``, which ranked reference lists first and found no
+    sentence stating PRPF31's haploinsufficiency (run 550011764e65); the list question went to
+    ``extract_haploinsufficient_genes``, whose job reached its one-hour limit with nothing kept; and a
+    request naming ``submit_curation`` got that scan again, then a task spec. A list of genes with
+    another property stays the literature server's corpus scan, whose task spec reads the corpus for
+    any property; a question that also asks for PubMed stays the literature line's."""
     from ..agents import request_router
     q = str(question or "")
-    return (request_router.asks_gene_table(q) and not corpus_scan.asks_for_gene_list(q)
-            and _gene_table_lookups_offered(conn))
+    if not q.strip() or not _gene_table_lookups_offered(conn):
+        return ""
+    if request_router.names_retigene_tool(q):
+        return "names the retigene-rag server or one of its tools"
+    if request_router.asks_gene_table(q) and not corpus_scan.asks_for_gene_list(q):
+        return "asks what the RetiGene gene table holds"
+    if request_router.refers_to_data(q):
+        return ""
+    if request_router.corpus_only(q):
+        ask = _corpus_ask(conn, q)
+        if not ask.is_list:
+            return "asks what the RetiGene papers say: retigene-rag searches their sentences and passages"
+        if ask.known == corpus_scan.HAPLOINSUFFICIENCY.id:
+            return ("asks for every gene the RetiGene papers report as haploinsufficient: "
+                    "retigene-rag's curation reads them all")
+        return ""
+    if (not with_context and request_router.names_no_source(q)
+            and corpus_scan.asks_for_gene_list(q, strict=True)):
+        return ("asks for the haploinsufficient genes and names no source: retigene-rag's curation of "
+                "the RetiGene papers")
+    return ""
 
 
 def _gene_table_lookups_offered(conn: Connection) -> bool:
@@ -14410,6 +14453,18 @@ async def _export_result_dataset(conn: "Connection", run_id: str, decisions: dic
     meta = {"run_id": run_id, "owner": conn.owner, "question": (question or "")[:500],
             "source_dataset": source, "location": "hpc3" if on_hpc else "gateway",
             "kept_days": kept_days, "until_disconnect": until_disconnect}
+    if on_hpc:
+        # A run that wrote no checkpoint has nothing to hand on, and the export job would only wait
+        # for a place in the queue to say so (issue 152, run 0c070eb6307d: 11 min 38 s).
+        probe = getattr(analysis_executor, "wrote_checkpoint", None)
+        try:
+            wrote = await asyncio.to_thread(probe) if callable(probe) else None
+        except Exception:  # noqa: BLE001 - an unanswered probe leaves the decision to the job
+            wrote = None
+        if wrote is False:
+            emit("info", "lab", "No processed dataset to export: the run wrote no analysis checkpoint "
+                                "(work/adata_*.h5ad) to export")
+            return None
     try:
         if on_hpc:
             ctx = SimpleNamespace(workspace=conn.workspace / run_id, decisions=dict(decisions))
@@ -15437,6 +15492,13 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                 emit("warning", "lab", f"Dataset not found: {p} — {_no_data_warning}")
                 say_key(f"⚠ Dataset not found: {p.name} — analysis will have no data figures.", "warning")
                 unusable.append({"name": primary_name, "reason": "its files were not found"})
+        elif getattr(req, "_route_skill", ""):
+            # A question the router gave to an MCP server's tools (RetiGene's gene table and papers)
+            # has its data on that server: "No dataset attached — the analysis tools (QC / clustering
+            # / DE / enrichment) have no data" was on every gene-table run of RCHENLAB/AiScientist
+            # issue 152, and said nothing true about any of them.
+            emit("info", "lab", "No dataset attached, and none needed: this question is answered from "
+                                "the RetiGene gene table and papers.")
         else:
             # Silent before — the user saw an empty report and couldn't tell why. Make it loud.
             emit("warning", "lab", _no_data_warning)
@@ -15766,6 +15828,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                           in ("1", "true", "yes"))
         lab_obj = ResearchLab(ctx, LabConfig(preset_prompt=preset_prompt, pinned_skills=pinned_skills,
                                              required_skills=required_skills,
+                                             route_skill=str(getattr(req, "_route_skill", "") or ""),
                                              prior_work=prior_block,
                                              new_steps_need_approval=not new_steps_auto,
                                              mode=mode,

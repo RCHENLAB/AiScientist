@@ -298,6 +298,26 @@ class SlurmAnalysisExecutor:
             self._memo_store(tool, args, out)   # only a SUCCESSFUL run is cached (a failure still retries)
         return out
 
+    def wrote_checkpoint(self) -> "bool | None":
+        """Does the run's HPC3 workspace hold an analysis checkpoint (``work/adata_*.h5ad``), the only
+        thing the result-dataset export reads? One ``ls`` over the session's SSH link, no Slurm job.
+        A run with none (a gene-table lookup, a search of the papers) queued the export job only to
+        hear "nothing to export": run 0c070eb6307d of RCHENLAB/AiScientist issue 152 waited 11 min 38 s
+        for that job's place in the queue after its answer was ready. None when it cannot tell; the
+        caller then submits the job as before."""
+        if self.remote is None or not self.remote_workspace:
+            return None
+        work = shlex.quote(f"{self.remote_workspace.rstrip('/')}/work")
+        try:
+            res = self.remote.exec(f'for f in {work}/adata_*.h5ad; do if [ -f "$f" ]; then echo found; '
+                                   f'break; fi; done; echo checked', timeout=30)
+        except Exception:  # noqa: BLE001 - an unanswered probe leaves the decision to the job
+            return None
+        lines = res.out.splitlines() if res.ok else []
+        if not lines or lines[-1].strip() != "checked":
+            return None
+        return any(line.strip() == "found" for line in lines)
+
     # -- a tool's declared dependency, installed for this run only ------------------------------
 
     def _say(self, level: str, message: str) -> None:

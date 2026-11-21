@@ -138,3 +138,24 @@ def test_gene_table_question(text):
 ])
 def test_not_a_gene_table_question(text):
     assert not rr.asks_gene_table(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Use the retigene-rag server's `submit_curation` to curate the haploinsufficient genes in the RetiGene papers.",
+    "Plan one step that calls the tool submit_curation of the MCP server retigene-rag (version 0.0.2).",
+    "Run search_sentences for PRPF31 haploinsufficien",
+    "Ask the retigene_rag server",
+    "Look USH2A up with get_gene",
+])
+def test_names_a_retigene_rag_tool(text):
+    assert rr.names_retigene_tool(text)
+
+
+@pytest.mark.parametrize("text", [
+    "What are haploinsufficient genes in RetiGene papers?",
+    "Use extract_haploinsufficient_genes on the corpus",
+    "evaluate the curation and write_report",          # other servers have these names too
+    "call submit_curation_v2",
+])
+def test_names_no_retigene_rag_tool(text):
+    assert not rr.names_retigene_tool(text)

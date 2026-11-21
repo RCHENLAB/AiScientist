@@ -197,6 +197,15 @@ _GENE_TABLE_SUBJECT = re.compile(
 _NAMES_PAPERS = re.compile(
     r"\b(?:papers?|corpus|literature|articles?|publications?|stud(?:y|ies)|passages?|sentences?)\b"
     r"|论文|文献|语料", re.IGNORECASE)
+# The retigene-rag server, or one of its tools, named in the request ("Use the retigene-rag server's
+# submit_curation ..."). Only names no other server has: get_genes, evaluate and write_report are
+# words or names of other tools too. ``_`` is a word character, so ``\b`` keeps "submit_curation_x"
+# out; the server's name may be written with a hyphen, an underscore or a space.
+_NAMES_RETIGENE_TOOL = re.compile(
+    r"\bretigene[\s_-]+rag\b"
+    r"|\b(?:submit_curation|curation_status|list_curations|search_sentences|search_passages"
+    r"|read_passage|get_evidence|get_gene|find_genes)\b",
+    re.IGNORECASE)
 
 
 def asks_gene_table(text: str) -> bool:
@@ -212,6 +221,12 @@ def asks_gene_table(text: str) -> bool:
 def names_corpus(text: str) -> bool:
     """Does the message name the lab's paper collection (the RetiGene corpus)?"""
     return bool(_NAMES_CORPUS.search(text or ""))
+
+
+def names_retigene_tool(text: str) -> bool:
+    """Does the message name the retigene-rag server or one of its own tools? ("Use the retigene-rag
+    server's submit_curation to curate ...", "search_sentences for PRPF31")"""
+    return bool(_NAMES_RETIGENE_TOOL.search(text or ""))
 
 
 def asks_for_pubmed(text: str) -> bool:

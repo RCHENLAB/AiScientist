@@ -608,7 +608,13 @@ class SlurmCodeExecutor:
         }
         if status == "error":
             hint = ""
-            if returncode is None or (result.state or "").upper().startswith("OUT_OF_MEMORY"):
+            state = (result.state or "").upper()
+            if state.startswith("TIMEOUT"):
+                # Not memory: the job ran to its --time. The memory advice was all the RetiGene corpus
+                # scan of RCHENLAB/AiScientist issue 152 said after its hour (case C1).
+                hint = (f" (Slurm state {result.state}: the job reached its time limit and was stopped "
+                        "before it finished)")
+            elif returncode is None or state.startswith("OUT_OF_MEMORY"):
                 hint = (f" (Slurm state {result.state}; if OUT_OF_MEMORY, raise --mem above "
                         f"{mem_gb or self.mem_gb}G or reduce the snippet's peak memory)")
             out["error"] = (_tail(stderr, 2000).strip() or f"exited with code {returncode}{hint}")

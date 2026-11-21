@@ -301,6 +301,11 @@ class LabConfig:
     # User-REQUIRED atomic skills (the console's skill multi-select): names from the skill
     # library the run MUST apply. Unlike the global on-demand manifest, these are mandatory.
     required_skills: "tuple[str, ...]" = ()
+    # The protocol the gateway's router already chose for this request: the key of one of the
+    # router's candidates (a skill paired with an MCP server, e.g. retigene-rag's). When it is among
+    # this session's candidates it is composed without asking the model to pick again; "" or a key
+    # with no candidate here leaves the choice to ``select_pipeline``.
+    route_skill: str = ""
 
 
 @dataclass(frozen=True)

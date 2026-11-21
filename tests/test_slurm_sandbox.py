@@ -104,6 +104,14 @@ def test_oom_job_reports_returncode_minus9_with_hint():
     assert "--mem" in out["error"]                      # actionable hint
 
 
+def test_a_job_that_reached_its_time_limit_says_so_not_memory():
+    # RCHENLAB/AiScientist issue 152, case C1: an hour's corpus scan ended "if OUT_OF_MEMORY, raise --mem".
+    hpc = FakeHPC({".out": "", ".err": ""}, sacct="TIMEOUT")
+    out = _executor(hpc)("import time; time.sleep(10**6)")
+    assert out["status"] == "error" and out["returncode"] is None
+    assert "time limit" in out["error"] and "--mem" not in out["error"]
+
+
 def test_snippet_is_staged_and_data_env_exposed():
     hpc = FakeHPC({".out": "", ".err": "", ".rc": "0\n"})
     _executor(hpc)("import scanpy")

@@ -423,8 +423,102 @@ def test_without_the_lookups_a_gene_table_question_goes_the_papers_way(tmp_path,
     assert seen == [("curation", TABLE_QUESTION), ("literature", TABLE_QUESTION)]
 
 
-def test_a_question_about_the_papers_is_not_a_gene_table_question(tmp_path, monkeypatch):
+def test_a_question_about_the_papers_goes_to_the_retigene_search_not_the_literature_line(tmp_path, monkeypatch):
+    # RCHENLAB/AiScientist issue 152, Ziyao's case B: the papers' questions went to the literature
+    # server's search_corpus, which found no sentence stating PRPF31's haploinsufficiency.
     conn = _conn(tmp_path)
     seen = _table_wire(monkeypatch, offered=True)
     _dispatch(conn, "What do the RetiGene papers say about CRX?")
-    assert [what for what, _ in seen] == ["curation", "literature"]
+    assert seen == [("lab", "What do the RetiGene papers say about CRX?")]
+
+
+# --- the RetiGene papers on retigene-rag (issue 152: Ziyao's cases B and C of #149) ----------------
+
+B1 = "Find sentences in the RetiGene papers that state PRPF31 is haploinsufficient, with PMID and page."
+B2 = "What do the RetiGene papers say about the inheritance of USH2A?"
+C2 = "Use the retigene-rag server's `submit_curation` to curate the haploinsufficient genes in the RetiGene papers."
+C2_NOTE = ("Do not use extract_haploinsufficient_genes. Plan one step that calls the tool submit_curation of "
+           "the MCP server retigene-rag (version 0.0.2) for the haploinsufficient genes.")
+
+
+def _routed_lab(monkeypatch):
+    """_table_wire, with the request each lab run received."""
+    reqs: list = []
+
+    async def lab(c, req, **kw):
+        reqs.append(req)
+
+    seen = _table_wire(monkeypatch, offered=True)
+    monkeypatch.setattr(gw_app, "_run_lab", lab)
+    return seen, reqs
+
+
+@pytest.mark.parametrize("question", [B1, B2, HI_QUESTION, C2, C2_NOTE, "What are haploinsufficient genes?",
+                                      "What does the RetiGene gene table record about NOTAGENE1?"])
+def test_a_question_retigene_rag_answers_is_planned_with_its_skill(tmp_path, monkeypatch, question):
+    from aiscientist.agents.retigene import SKILL
+    conn = _conn(tmp_path)
+    seen, reqs = _routed_lab(monkeypatch)
+    _dispatch(conn, question)
+    # No curation by the literature server, no literature search, no question about a dataset.
+    assert seen == [] and [r.question for r in reqs] == [question]
+    assert reqs[0]._route_skill == SKILL
+
+
+def test_the_route_says_why_the_request_is_retigene_rags(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    monkeypatch.setattr(gw_app, "_gene_table_lookups_offered", lambda c: True)
+    assert gw_app._retigene_route(conn, HI_QUESTION).startswith("asks for every gene the RetiGene papers")
+    assert gw_app._retigene_route(conn, B1).startswith("asks what the RetiGene papers say")
+    assert gw_app._retigene_route(conn, C2) == "names the retigene-rag server or one of its tools"
+    assert gw_app._retigene_route(conn, "What are haploinsufficient genes?").endswith("of the RetiGene papers")
+    # With data attached or an analysis earlier in the chat, "which genes" may mean the user's own.
+    assert gw_app._retigene_route(conn, "What are haploinsufficient genes?", with_context=True) == ""
+
+
+@pytest.mark.parametrize("question", [
+    "What do the RetiGene papers and PubMed say about USH2A?",   # PubMed too: the literature line
+    "Which genes in my dataset do the RetiGene papers call haploinsufficient?",   # the user's data
+    "What is haploinsufficiency?",                                # names no source, asks for no list
+])
+def test_a_question_that_is_not_retigene_rags_keeps_its_route(tmp_path, monkeypatch, question):
+    conn = _conn(tmp_path)
+    monkeypatch.setattr(gw_app, "_gene_table_lookups_offered", lambda c: True)
+    assert gw_app._retigene_route(conn, question) == ""
+
+
+def test_a_list_of_genes_with_another_property_stays_the_corpus_scan(tmp_path, monkeypatch):
+    # retigene-rag's curation grades haploinsufficiency only; the literature server's scan reads the
+    # corpus with a task spec for any other property.
+    conn = _conn(tmp_path)
+    monkeypatch.setattr(gw_app, "_gene_table_lookups_offered", lambda c: True)
+    monkeypatch.setattr(gw_app, "_corpus_ask",
+                        lambda c, q: rr.CorpusAsk(rr.LIST, "dominant-negative mechanism", None, 0.9, "model"))
+    assert gw_app._retigene_route(conn, QUESTION) == ""
+
+
+def test_without_retigene_rag_the_list_question_is_the_literature_servers_curation(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    seen = _table_wire(monkeypatch, offered=False)
+    _dispatch(conn, HI_QUESTION)
+    assert seen[0] == ("curation", HI_QUESTION)
+
+
+def test_the_planner_composes_the_routed_skill_without_asking_the_model():
+    from aiscientist.agents.preset_pipelines import PresetPipeline
+    from aiscientist.agents.research_lab import ResearchLab
+    retigene = PresetPipeline(key="query-retigene-papers-with-aiscientist-mcp", label="RetiGene", prompt="p",
+                              tools=("submit_curation", "search_sentences"))
+    other = PresetPipeline(key="read-evidence-with-mcp", label="Literature", prompt="q", tools=("search_corpus",))
+    events: list = []
+    lab = types.SimpleNamespace(config=types.SimpleNamespace(route_skill=retigene.key),
+                                _router_library=lambda: (other, retigene),
+                                _usable_tool_names=lambda: frozenset({"search_sentences"}))
+    assert ResearchLab._routed_pipeline(lab, events.append) is retigene
+    assert events == [{"type": "skill_selected", "key": retigene.key, "label": "RetiGene", "reason": "route",
+                       "unavailable_tools": ["submit_curation"]}]
+    # No routed skill, or one this session has no candidate for: the model picks as before.
+    lab.config.route_skill = ""
+    assert ResearchLab._routed_pipeline(lab, events.append) is None
+    lab.config.route_skill = "not-here"
+    assert ResearchLab._routed_pipeline(lab, events.append) is None and len(events) == 1

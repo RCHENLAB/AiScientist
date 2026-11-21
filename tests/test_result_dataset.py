@@ -252,3 +252,90 @@ def test_a_stopped_run_still_exports_its_dataset(tmp_path):
                                        lambda *a, **k: None))
     assert seen["cancel_during"] is None
     assert ex.should_cancel() is True                       # restored afterwards
+
+
+def _export_conn(tmp_path):
+    from types import SimpleNamespace
+    return SimpleNamespace(settings=SimpleNamespace(temp_ttl_days=3, checkpoint_ttl_days=7,
+                                                    session_cleanup=True),
+                           workspace=tmp_path, owner="u")
+
+
+def test_a_run_with_no_checkpoint_submits_no_export_job(tmp_path):
+    # Run 0c070eb6307d (RCHENLAB/AiScientist issue 152, case A3): a gene-table lookup answered in a
+    # minute, then waited 11 min 38 s in the HPC3 queue for the export job, which found nothing.
+    import asyncio
+    from aiscientist.gateway.app import _export_result_dataset
+
+    said, jobs = [], []
+
+    class Executor:
+        should_cancel = None
+
+        def wrote_checkpoint(self):
+            return False
+
+        def run_tool(self, name, args, ctx):
+            jobs.append(name)
+            return {"status": "skipped", "reason": "test"}
+
+    out = asyncio.run(_export_result_dataset(_export_conn(tmp_path), "r1", {}, Executor(), "q",
+                                             lambda *a, **k: said.append(a)))
+    assert out is None and jobs == []
+    assert said == [("info", "lab", "No processed dataset to export: the run wrote no analysis "
+                                    "checkpoint (work/adata_*.h5ad) to export")]
+
+
+@pytest.mark.parametrize("probe", [True, None])
+def test_a_checkpoint_or_an_unanswered_probe_still_submits_the_export_job(tmp_path, probe):
+    import asyncio
+    from aiscientist.gateway.app import _export_result_dataset
+
+    jobs = []
+
+    class Executor:
+        should_cancel = None
+
+        def wrote_checkpoint(self):
+            return probe
+
+        def run_tool(self, name, args, ctx):
+            jobs.append(name)
+            return {"status": "skipped", "reason": "test"}
+
+    asyncio.run(_export_result_dataset(_export_conn(tmp_path), "r1", {}, Executor(), "q",
+                                       lambda *a, **k: None))
+    assert len(jobs) == 1
+
+
+class _Remote:
+    def __init__(self, stdout="", status=0, fail=False):
+        self.stdout, self.status, self.fail, self.commands = stdout, status, fail, []
+
+    def exec(self, command, timeout=60.0):
+        from aiscientist.gateway.executor import ExecResult
+        self.commands.append(command)
+        if self.fail:
+            raise OSError("ssh dropped")
+        return ExecResult(command=command, exit_status=self.status, stdout=self.stdout, stderr="")
+
+
+@pytest.mark.parametrize("remote, expected", [
+    (_Remote("checked\n"), False),
+    (_Remote("found\nchecked\n"), True),
+    (_Remote("", status=255), None),          # the command did not run
+    (_Remote("garbage"), None),               # not the probe's own answer
+    (_Remote(fail=True), None),               # the link failed
+])
+def test_the_checkpoint_probe_reads_the_run_workspace_over_ssh(remote, expected):
+    from aiscientist.gateway.slurm_analysis import SlurmAnalysisExecutor
+    ex = SlurmAnalysisExecutor(remote=remote, container_image="img", remote_workspace="/dfs3b/u/run 1/",
+                               scratch_dir="/dfs3b/u/s")
+    assert ex.wrote_checkpoint() is expected
+    assert "'/dfs3b/u/run 1/work'/adata_*.h5ad" in remote.commands[0]
+    assert "sbatch" not in remote.commands[0]
+
+
+def test_the_checkpoint_probe_needs_a_remote_workspace():
+    from aiscientist.gateway.slurm_analysis import SlurmAnalysisExecutor
+    assert SlurmAnalysisExecutor(remote=None, container_image="img", scratch_dir="/s").wrote_checkpoint() is None

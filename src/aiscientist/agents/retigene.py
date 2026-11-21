@@ -113,15 +113,17 @@ class RetigeneAdapter:
         search = " / ".join(planner_name(n) for n in ("search_sentences", "search_passages"))
         tables = ", ".join(planner_name(n) for n in ("get_genes", "get_evidence", "evaluate"))
         lookups = " / ".join(planner_name(n) for n in ("get_gene", "find_genes"))
+        # Appended to each of the server's tool descriptions, so every word here is sent on every
+        # Scientist turn twelve times over (RCHENLAB/AiScientist issue 155): keep it this short.
         self.description = (
-            f" What RetiGene itself curates about a gene (status, inheritance, phenotype and functional "
-            f"categories, diseases, expression, key papers) comes from its gene table: {lookups}, exact and "
-            f"complete, no model call. What the papers say: {search} -> {planner_name('read_passage')}; for "
-            f"every gene with a property the papers report, {planner_name('submit_curation')} "
-            f"(estimate_only first, then the curation; it returns when the "
-            f"curation ends) -> {tables} -> {planner_name('write_report')}. The curation reads with this "
-            "session's own model, on the user's own key or the session's cluster model, recorded in their "
-            "usage; its tables and report appear in retigene/<curation_id>/. The index is read in place.")
+            f" RetiGene's own record of a gene (status, inheritance, phenotypes, diseases, key papers): "
+            f"{lookups}, exact, no model call. What the papers say: {search} -> "
+            f"{planner_name('read_passage')}; quote each claim's sentence verbatim with PMID and page. "
+            f"Every gene the papers report as haploinsufficient: one {planner_name('submit_curation')} "
+            "step, estimate_only false unless the user asks for an estimate alone (it caps the cost and "
+            f"returns when the curation ends) -> {tables} -> {planner_name('write_report')} if asked. "
+            "The curation reads with this session's own model, on the user's own key or cluster model, "
+            "in their usage; tables and report in retigene/<curation_id>/.")
 
     def prepare(self, args: dict, executor: Any, *, tool: str = "") -> PreparedCall:
         index = configured_index()

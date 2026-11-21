@@ -949,11 +949,11 @@ class ResearchLab:
                 # its extension — picks the modality bucket. Absent/low-confidence → the router falls back
                 # to the suffix-derived dataset profile (self._dataset_context()).
                 _dec = self.ctx.decisions or {}
-                chosen = select_pipeline(self._complete, question, self._dataset_context(),
-                                         self._router_library(), emit,
-                                         content_modality=str(_dec.get("content_modality") or ""),
-                                         content_confidence=str(_dec.get("content_confidence") or ""),
-                                         available_tools=self._usable_tool_names())
+                chosen = self._routed_pipeline(emit) or select_pipeline(
+                    self._complete, question, self._dataset_context(), self._router_library(), emit,
+                    content_modality=str(_dec.get("content_modality") or ""),
+                    content_confidence=str(_dec.get("content_confidence") or ""),
+                    available_tools=self._usable_tool_names())
                 if chosen is not None:
                     # The auto pick is DATASET-derived (select_pipeline reads the dataset profile), so it
                     # is the ground truth on modality. When it names a different ``data_type`` than a
@@ -2708,6 +2708,21 @@ class ResearchLab:
         if "literature_search" not in names:
             return prompt
         return prompt.replace("`deep_literature`", "`literature_search`")
+
+    def _routed_pipeline(self, emit: Any) -> "PresetPipeline | None":
+        """The candidate the gateway's router already chose (``LabConfig.route_skill``), or None to
+        leave the choice to ``select_pipeline``. The gateway sends a question to retigene-rag's tools
+        on its own reading (RCHENLAB/AiScientist issue 152); asking the model to pick a protocol again
+        could hand "What are haploinsufficient genes?" to the literature server's skill instead."""
+        key = str(getattr(self.config, "route_skill", "") or "")
+        if not key:
+            return None
+        chosen = next((p for p in self._router_library() if p.key == key), None)
+        if chosen is not None:
+            gaps = chosen.missing_tools(self._usable_tool_names())
+            emit({"type": "skill_selected", "key": chosen.key, "label": chosen.label, "reason": "route",
+                  **({"unavailable_tools": list(gaps)} if gaps else {})})
+        return chosen
 
     def _router_library(self) -> "tuple[PresetPipeline, ...]":
         """The router's candidates: the preset pipelines, and each skill paired with an MCP server
