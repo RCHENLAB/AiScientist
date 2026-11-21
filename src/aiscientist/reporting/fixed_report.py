@@ -92,3 +92,30 @@ def assemble(art: Path, files: "list[Path]") -> str:
         folder = path.resolve().parent.relative_to(root).as_posix()
         parts.append(_relink(path.read_text(encoding="utf-8").strip(), folder, art))
     return "\n\n".join(p for p in parts if p) + "\n"
+
+
+SOURCES_RECORD = "process/fixed_report.json"
+
+
+def recorded_sources(art: Path) -> "list[Path]":
+    """The report files a run's fixed-format report was made from, as it recorded them
+    (:data:`SOURCES_RECORD`), each once and each one that is still a file in the run's folder: where
+    it was named, or in ``extra/``, where the bundle cleanup moves a server's folder (a run that
+    recorded the place before the move). Empty when the run's report was not one (a model wrote it,
+    or there was none)."""
+    import json
+
+    root = art.resolve()
+    try:
+        names = json.loads((art / SOURCES_RECORD).read_text(encoding="utf-8")).get("sources") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    found: "list[Path]" = []
+    for s in names:
+        if not isinstance(s, str) or not s or s.startswith("/") or ".." in Path(s).parts:
+            continue
+        for cand in ((root / s).resolve(), (root / "extra" / s).resolve()):
+            if cand.is_file() and _inside(cand, root):
+                found.append(cand)
+                break
+    return list(dict.fromkeys(found))

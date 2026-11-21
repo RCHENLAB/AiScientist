@@ -225,6 +225,25 @@ assert.ok(!/<img\b/.test(renderMarkdown("![x](figures/a.png)")));
     assert out == "ok"
 
 
+def test_the_written_report_reads_its_figures_from_the_run_folder():
+    # report/report.md names its figures from the run's folder (figures/..., an MCP server's
+    # extra/<server>/...), as the PDF was rendered; any other Markdown file from its own folder
+    source = APP.read_text(encoding="utf-8")
+    out = _md(_function(source, "fileMdBase") + r'''
+const md = "![dot](extra/gene_expression/q1/dot.png) ![umap](figures/umap.png) ![up](../../run2/x.png)";
+for (const name of ["report.md", "technical_report.md"]) {
+  const html = renderMarkdown(md, { base: fileMdBase(`/api/file/alice/run1/report/${name}`) });
+  assert.ok(html.includes('src="/api/file/alice/run1/extra/gene_expression/q1/dot.png"'), html);
+  assert.ok(html.includes('src="/api/file/alice/run1/figures/umap.png"'), html);
+  assert.ok(!html.includes("run2"), html);                      // still inside the run only
+}
+for (const url of ["/api/file/alice/run1/report/summary.md", "/api/file/alice/run1/extra/gene_expression/q1/report.md",
+    "/api/file/alice/run1/report/sub/report.md"]) assert.equal(fileMdBase(url), url);
+assert.equal(fileMdBase(undefined), undefined);
+''')
+    assert out == "ok"
+
+
 def test_markdown_with_a_table_renders_and_hostile_markdown_runs_nothing():
     out = _md(r'''
 const html = renderMarkdown("# Title\n\n| gene | n |\n|---|---|\n| A | 1 |\n\n![f](chart.png)\n", { base: "/api/file/a/r/x.md" });

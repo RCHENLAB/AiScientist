@@ -562,6 +562,35 @@ def test_a_json_record_too_large_for_a_table_is_named_so(tmp_path, monkeypatch):
     assert not any(p.endswith(".json") for p in tree(dest))
 
 
+def test_the_written_reports_links_lead_to_its_files_in_the_folder(tmp_path):
+    # report.md names its figures from the run's folder (the renderer reads them there); in the
+    # report folder it is in results/report/, so its links are named from there. An MCP server's
+    # report links into extra/ (moved by the bundle cleanup), or, from before that was followed,
+    # into the folder's old place.
+    import re
+    report = ("# Report\n\n![umap](figures/umap.png)\n\n![dot](extra/gene_expression/q1/dot.png)\n\n"
+              "![old](gene_expression/q2/dot.png)\n\n[the table](tables/a.csv), `figures/umap.png`, "
+              "[atlas](https://example.org/x), ![gone](figures/absent.png)\n")
+    run = make_run(tmp_path, {"artifacts/report/plan.yaml": PLAN,
+                              "artifacts/report/report.md": report,
+                              "artifacts/report/report.pdf": b"%PDF-1.4 report",
+                              "artifacts/figures/umap.png": b"\x89PNG umap",
+                              "artifacts/extra/gene_expression/q1/dot.png": b"\x89PNG q1",
+                              "artifacts/extra/gene_expression/q2/dot.png": b"\x89PNG q2",
+                              "artifacts/tables/a.csv": "a\n1\n"})
+    dest = tmp_path / "report"
+    assert R.build_report_folder(run, dest) == []
+    md = (dest / "results/report/report.md").read_text()
+    targets = re.findall(r"\]\(([^)\s]+)\)", md)
+    assert targets == ["../figures/umap.png", "../figures/gene_expression/q1/dot.png",
+                       "../figures/gene_expression/q2/dot.png", "../tables/a.csv", "https://example.org/x",
+                       "figures/absent.png"]
+    assert all((dest / "results/report" / t).is_file() for t in targets[:4])
+    # only the links change: the text is the PDF's
+    assert "`figures/umap.png`" in md and md.startswith("# Report\n")
+    assert (run / "artifacts/report/report.md").read_text() == report
+
+
 def test_the_written_report_has_its_own_folder_and_leads_the_file_index(tmp_path):
     run = make_run(tmp_path, {"artifacts/report/plan.yaml": PLAN,
                               "artifacts/report/report.md": "# Report\n\nThe answer.\n",

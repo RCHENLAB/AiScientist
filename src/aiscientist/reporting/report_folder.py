@@ -32,6 +32,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -907,6 +908,26 @@ def rewrite_links(md: str, folder: ReportFolder) -> str:
     return _MD_CODE.sub(lambda m: f"`{new_path(m.group(1)) or m.group(1)}`" if "/" in m.group(1) else m.group(0), md)
 
 
+def report_markdown_links(md: str, folder: ReportFolder, at: str) -> str:
+    """A written report's Markdown, its links (named from the run's folder, as the renderer reads
+    them) pointing at those files in the report folder, from ``at``, where the report is kept. Only
+    the links change: its text is the PDF's, quoted paths included."""
+    base = PurePosixPath(at).parent.as_posix()
+
+    def new_link(m: "re.Match[str]") -> str:
+        old = m.group(2)
+        if re.match(r"^[a-z][a-z0-9+.-]*:|^#|^/", old):
+            return m.group(0)
+        rel = old.strip().lstrip("./")
+        for cand in (f"artifacts/{rel}", f"artifacts/extra/{rel}", f"result/{rel}", f"artifacts/report/{rel}"):
+            dest = folder.dest_of(cand)
+            if dest:
+                return m.group(1) + _link(posixpath.relpath(dest, base)) + m.group(3)
+        return m.group(0)
+
+    return _MD_LINK.sub(new_link, md)
+
+
 def build_report_folder(run_dir: Path, dest: Path, *, question: str = "", key_results: str = "",
                         limitations: str = "") -> list[str]:
     """Write the report folder of ``run_dir`` at ``dest`` (which must not exist or be empty) and
@@ -934,6 +955,15 @@ def build_report_folder(run_dir: Path, dest: Path, *, question: str = "", key_re
     for e in folder.entries:
         target = dest / e.dest
         target.parent.mkdir(parents=True, exist_ok=True)
+        if e.text is None and e.origin.startswith("artifacts/report/") and e.dest.endswith(".md"):
+            try:
+                text = e.source.read_text(encoding="utf-8")         # type: ignore[union-attr]
+                moved = report_markdown_links(text, folder, e.dest)
+            except (OSError, UnicodeDecodeError):
+                moved = text = None
+            if moved is not None and moved != text:
+                target.write_text(moved, encoding="utf-8")
+                continue
         if e.text is not None:
             text = rewrite_links(e.text, folder) if e.dest == "plan.md" else e.text
             target.write_text(text, encoding="utf-8")
