@@ -14830,8 +14830,8 @@ async def _write_fixed_report(art: Path, sources: "list[Path]", *, report_render
         rep = {"status": "error", "error": f"{type(exc).__name__}: {exc}",
                "md_path": str(art / "report" / "report.md"), "pdf_path": None, "docx_path": None}
     made = _say_report_render(rep, art, emit)
-    emit("info", "lab", f"The report is the fixed-format report of {len(sources)} tool call(s); no "
-                        "model wrote it.")
+    emit("info", "lab", f"The report is the tools' own report ({len(sources)} file(s), fixed format); "
+                        "no model wrote it.")
     return {"vl_attempted": False, "status": rep.get("status"),
             "rendered": [f.split("_")[0] for f in made]}
 

@@ -35,19 +35,20 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def _call_reports(call: dict, art: Path) -> "list[Path]":
-    """The report files one report call wrote: the ``.../report.md`` its result names (a path in the
-    run's folder, as the adapters rewrite them), else the one in a folder named by its id argument
-    (``query_id``, ``curation_id``), for a response the transport bound cut short."""
+    """The report files one report call wrote, each once: the ``.../report.md`` its result names (a
+    path in the run's folder, as the adapters rewrite them), else the one in a folder named by its id
+    argument (``query_id``, ``curation_id``), for a response the transport bound cut short. A result
+    may name the same file more than once: Atlas's names it as its ``file`` and in its ``artifacts``."""
     root = art.resolve()
     named = [s for s in _strings(call.get("result")) if s.endswith("/" + REPORT_NAME)
              and not s.startswith("/") and ".." not in Path(s).parts]
     found = [p for p in ((root / s).resolve() for s in named) if p.is_file() and _inside(p, root)]
     if found:
-        return found
+        return list(dict.fromkeys(found))
     ids = [v for v in (call.get("args") or {}).values()
            if isinstance(v, str) and v and "/" not in v and v not in (".", "..")]
-    return sorted(p.resolve() for v in ids for p in root.glob(f"*/{v}/{REPORT_NAME}")
-                  if p.is_file() and _inside(p.resolve(), root))
+    return sorted({p.resolve() for v in ids for p in root.glob(f"*/{v}/{REPORT_NAME}")
+                   if p.is_file() and _inside(p.resolve(), root)})
 
 
 def report_files(result: Any, art: Path, *, is_report_step: Callable[[str], bool],

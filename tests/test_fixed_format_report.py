@@ -187,6 +187,11 @@ def test_only_the_accepted_report_steps_give_the_report(tmp_path):
     named = _call({"file": "gene_expression/q1/report.md", "status": "ok"})
     want = [(art / "gene_expression/q1/report.md").resolve()]
     assert _files(art, [_round(step, [named, named])]) == want
+    # Atlas 0.0.4 names its report twice in one result, as its file and among its artifacts (prod
+    # run 94c9081f8dea printed the report twice): one file
+    both = _call({"file": "gene_expression/q1/report.md", "status": "ok",
+                  "artifacts": ["gene_expression/q1/report.md", "gene_expression/mcp_result.json"]})
+    assert _files(art, [_round(step, [both])]) == want
     # cut short by the transport bound: found by its query id
     assert _files(art, [_round(step, [_call({"state": "COMPLETED", "response_omitted": True})])]) == want
     assert _files(art, [_round(step, [named], verdict="reject")]) == []
@@ -233,7 +238,8 @@ def test_the_gateway_renders_the_tools_report_and_no_model_writes_one(tmp_path, 
                  "result": {"status": "ok", "query_id": "q1", "state": "COMPLETED"}}]},
                 CriticVerdict("accept", 0.9, ""))
             report = LabRound(2, 0, step, "Scientist", {"final_answer": "Report written.", "steps": [
-                _call({"status": "ok", "file": "gene_expression/q1/report.md"})]},
+                _call({"status": "ok", "file": "gene_expression/q1/report.md",
+                       "artifacts": ["gene_expression/q1/report.md"]})]},
                 CriticVerdict("accept", 0.9, ""))
             return LabResult(question, [QUERY, step], [query, report], True, 2, "RPE65 is highest in RPE.")
 
@@ -267,13 +273,14 @@ def test_the_gateway_renders_the_tools_report_and_no_model_writes_one(tmp_path, 
 
     assert len(rendered) == 1
     md = rendered[0]["md"]
-    assert "Highest in RPE." in md and "gene_expression/q1/dotplot_majorclass.png" in md
+    assert md.count("Highest in RPE.") == 1 and "gene_expression/q1/dotplot_majorclass.png" in md
     assert rendered[0]["title"] == "Expression of RPE65" and rendered[0]["assets_root"] == art
     assert (art / "report" / "report.pdf").exists()
     assert json.loads((art / "process" / "fixed_report.json").read_text()) == {
         "sources": ["gene_expression/q1/report.md"]}
     said = [str(p.get("text") or p.get("message") or "") for p in payloads]
     assert any("fixed format, no model-written text" in s for s in said)
+    assert any("tools' own report (1 file(s)" in s for s in said)
     assert any("Report ready" in s for s in said)
     assert not any("No written report was asked for" in s for s in said)
     assert "RPE65 is highest in RPE." in harness._reply(payloads)
