@@ -2043,10 +2043,17 @@ async function readFileHead(url) {
   return { text, shown: bytes.length, total: total || bytes.length, cut };
 }
 
+// What a file's relative Markdown links are read from: the file's own folder, except for the
+// written report the renderer made (report/report.md, report/technical_report.md), which names its
+// figures and tables from the run's folder, as the PDF was rendered from it.
+function fileMdBase(url) {
+  const m = /^(\/api\/file\/[^/]+\/[^/]+\/)report\/(?:report|technical_report)\.md(?:[?#]|$)/.exec(String(url || ""));
+  return m ? m[1] : url;
+}
 // Paint the view of a file's text into ``host`` and keep its table state for sorting.
 function paintFileView(host, text, info) {
   const id = "fv" + (++fvSeq);
-  const out = FileView.textView(text, { ...info, id, render: (t) => renderMarkdown(t, { base: info.url }) });
+  const out = FileView.textView(text, { ...info, id, render: (t) => renderMarkdown(t, { base: fileMdBase(info.url) }) });
   if (out.state) fvStates.set(out.id, out.state);
   host.innerHTML = out.html;
   return id;

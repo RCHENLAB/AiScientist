@@ -276,11 +276,105 @@ def test_the_gateway_renders_the_tools_report_and_no_model_writes_one(tmp_path, 
     assert md.count("Highest in RPE.") == 1 and "gene_expression/q1/dotplot_majorclass.png" in md
     assert rendered[0]["title"] == "Expression of RPE65" and rendered[0]["assets_root"] == art
     assert (art / "report" / "report.pdf").exists()
+    # the cleanup moved the server's folder to extra/ after the render: the report says where it is
     assert json.loads((art / "process" / "fixed_report.json").read_text()) == {
-        "sources": ["gene_expression/q1/report.md"]}
+        "sources": ["extra/gene_expression/q1/report.md"]}
+    assert "](extra/gene_expression/q1/dotplot_majorclass.png)" in (art / "report" / "report.md").read_text()
+    assert (art / "extra/gene_expression/q1/dotplot_majorclass.png").is_file()
     said = [str(p.get("text") or p.get("message") or "") for p in payloads]
     assert any("fixed format, no model-written text" in s for s in said)
     assert any("tools' own report (1 file(s)" in s for s in said)
     assert any("Report ready" in s for s in said)
     assert not any("No written report was asked for" in s for s in said)
     assert "RPE65 is highest in RPE." in harness._reply(payloads)
+
+
+# --- after the run: the quarantine, and a report asked for later -----------------------------------
+
+def _quarantined(tmp_path):
+    """A finished run whose fixed-format report was made from Atlas's, after the bundle cleanup."""
+    from aiscientist.gateway import app as gw_app
+    art = _art(tmp_path)
+    (art / "figures").mkdir()
+    (art / "figures" / "workflow.png").write_bytes(b"\x89PNG")
+    (art / "report").mkdir()
+    md = fixed_report.assemble(art, [art / "gene_expression/q1/report.md"])
+    (art / "report" / "report.md").write_text(md + "\n![workflow](figures/workflow.png)\n", encoding="utf-8")
+    (art / "process").mkdir()
+    (art / fixed_report.SOURCES_RECORD).write_text(json.dumps({"sources": ["gene_expression/q1/report.md"]}))
+    moved = gw_app._quarantine_strays(art)
+    assert moved == ["gene_expression"]
+    return art, moved
+
+
+def test_the_report_still_finds_its_figures_after_the_quarantine(tmp_path):
+    # prod run 94c9081f8dea: the cleanup moved gene_expression/ to extra/ after the render, and
+    # report/report.md still linked gene_expression/...
+    pytest.importorskip("fastapi")
+    from aiscientist.gateway import app as gw_app
+    art, moved = _quarantined(tmp_path)
+    assert gw_app._follow_quarantine(art, moved) == 2
+    text = (art / "report" / "report.md").read_text()
+    assert "![dotplot_majorclass](extra/gene_expression/q1/dotplot_majorclass.png)" in text
+    assert (art / "extra/gene_expression/q1/dotplot_majorclass.png").is_file()
+    # a link into a folder that stayed, or to nothing, is left as it is
+    assert "](figures/workflow.png)" in text and "![missing](absent.png)" in text
+    assert fixed_report.recorded_sources(art) == [(art / "extra/gene_expression/q1/report.md").resolve()]
+    assert gw_app._follow_quarantine(art, moved) == 0
+    assert gw_app._follow_quarantine(art, []) == 0
+
+
+def test_a_recorded_source_outside_the_run_is_not_read(tmp_path):
+    art = _art(tmp_path)
+    (art / "process").mkdir()
+    (tmp_path / "elsewhere.md").write_text("# not this run's")
+    (art / fixed_report.SOURCES_RECORD).write_text(json.dumps(
+        {"sources": ["../elsewhere.md", "/etc/hosts", "gene_expression/q1/report.md", "gone/report.md", 3]}))
+    assert fixed_report.recorded_sources(art) == [(art / "gene_expression/q1/report.md").resolve()]
+    # recorded before the cleanup moved the server's folder, and twice (v0.4.24, prod run 94c9081f8dea)
+    moved = art / "extra" / "gene_expression"
+    moved.parent.mkdir()
+    (art / "gene_expression").rename(moved)
+    (art / fixed_report.SOURCES_RECORD).write_text(json.dumps({"sources": ["gene_expression/q1/report.md"] * 2}))
+    assert fixed_report.recorded_sources(art) == [(moved / "q1/report.md").resolve()]
+    (art / fixed_report.SOURCES_RECORD).write_text("[]")
+    assert fixed_report.recorded_sources(art) == []
+    assert fixed_report.recorded_sources(tmp_path / "no-run") == []
+
+
+def test_a_report_asked_for_after_the_run_is_the_tools_report_again(tmp_path, monkeypatch):
+    # write_report (the MCP tool) on a run whose report was Atlas's used to replace it with a
+    # model-written manuscript
+    pytest.importorskip("fastapi")
+    import threading
+    from aiscientist.gateway import app as gw_app
+    from aiscientist.reporting import report as reporting
+    art, moved = _quarantined(tmp_path)
+    gw_app._follow_quarantine(art, moved)
+    (art / "process" / "run_state.json").write_text(json.dumps({
+        "question": "Check RPE65 in the atlas and write a report", "agenda": [QUERY],
+        "accepted_steps": 1, "converged": True, "final_answer": "RPE65 is highest in RPE.", "rounds": []}))
+
+    def _not_this(*_a, **_k):
+        raise AssertionError("no model may write the report of a fixed-format run")
+
+    rendered: list[dict] = []
+
+    def _render(md, out_dir, **kw):
+        rendered.append({"md": md, **kw})
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "report.pdf").write_bytes(b"%PDF")
+        return {"status": "ok", "md_path": str(out_dir / "report.md"),
+                "pdf_path": str(out_dir / "report.pdf"), "docx_path": None}
+
+    monkeypatch.setattr(gw_app, "_write_report", _not_this)
+    monkeypatch.setattr(gw_app, "_lab_llm", _not_this)
+    monkeypatch.setattr(gw_app, "_build_report_render_fn", lambda *a: None)
+    monkeypatch.setattr(reporting, "build_pdf_report", _render)
+    asyncio.run(gw_app._report_job(SimpleNamespace(chat_stop=threading.Event()), "tester", "r1", art))
+    job = json.loads((art / "process" / "report_job.json").read_text())
+    assert job["state"] == "done", job
+    assert len(rendered) == 1 and rendered[0]["md"].count("Highest in RPE.") == 1
+    assert "extra/gene_expression/q1/dotplot_majorclass.png" in rendered[0]["md"]
+    assert rendered[0]["title"] == "Expression of RPE65" and rendered[0]["assets_root"] == art
+    assert any("no model wrote it" in line for line in job["log"])

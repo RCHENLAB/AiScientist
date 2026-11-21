@@ -138,7 +138,8 @@ report is wanted, the plan ends in one step for each such server the plan uses, 
 runs like any other step (`fixed_report_step` in `research_lab/step_kinds.py`). The gateway then makes
 `report/report.md`, PDF and DOCX from the Markdown those calls wrote, by code
 (`reporting/fixed_report.py`; the sources are listed in `process/fixed_report.json`): no self-review,
-references, verification statement or technical report. The `write_report` manuscript is planned only
+references, verification statement or technical report. The MCP tool `write_report` remakes such a
+run's report from those sources, again with no model. The `write_report` manuscript is planned only
 when some analysis step uses a skill without such a tool; a plan that mixes both kinds gets both. With
 no report wanted, the plan has neither.
 

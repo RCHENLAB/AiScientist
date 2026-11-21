@@ -15217,17 +15217,27 @@ async def _report_job(conn: "Connection", owner: str, run_id: str, art: Path, *,
         scope = (RunScope.from_dict(saved_scope) if isinstance(saved_scope, dict)
                  else read_scope(question, {}))
         decisions = state.get("decisions") or {}
-        llm = _lab_llm(conn)
-        figure_diag = await asyncio.to_thread(_check_figure_shapes, art, emit)
-        done = await _write_report(
-            conn, art, result, question, complete_fn=llm.complete_fn,
-            report_render_fn=_build_report_render_fn(conn, run_id), emit=emit, say_key=say_key,
-            scope=scope, self_sourced=str(state.get("self_sourced") or ""),
-            dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
-            provenance=_llm_provenance_note(llm),
-            qc_report=revision is None and _qc_only_run(result) and not _code_wrote_outputs(result),
-            is_revision=revision is not None,
-            abandoned=(conn.chat_stop.is_set if revision is not None else lambda: False))
+        # A run whose report was its MCP servers' own (RCHENLAB/AiScientist#102) gets that report
+        # again, rendered from the files it was made from; no model replaces it with a manuscript.
+        # A revision is asked for in words, so a model writes it, as for any report.
+        from ..reporting.fixed_report import recorded_sources
+        fixed = [] if revision is not None else await asyncio.to_thread(recorded_sources, art)
+        if fixed:
+            done = await _write_fixed_report(
+                art, fixed, report_render_fn=_build_report_render_fn(conn, run_id), emit=emit,
+                say_key=say_key)
+        else:
+            llm = _lab_llm(conn)
+            figure_diag = await asyncio.to_thread(_check_figure_shapes, art, emit)
+            done = await _write_report(
+                conn, art, result, question, complete_fn=llm.complete_fn,
+                report_render_fn=_build_report_render_fn(conn, run_id), emit=emit, say_key=say_key,
+                scope=scope, self_sourced=str(state.get("self_sourced") or ""),
+                dataset_result=decisions.get("dataset_result"), figure_diag=figure_diag,
+                provenance=_llm_provenance_note(llm),
+                qc_report=revision is None and _qc_only_run(result) and not _code_wrote_outputs(result),
+                is_revision=revision is not None,
+                abandoned=(conn.chat_stop.is_set if revision is not None else lambda: False))
         cancelled = revision is not None and conn.chat_stop.is_set()
         if revision is not None and not cancelled:
             # The old summary is preserved in prior_report; the current bundle
@@ -16464,6 +16474,7 @@ async def _run_lab(conn: Connection, req: LabRequest, *,
                     emit("info", "lab", "Removed the packages installed for this run only: "
                                         + ", ".join(removed) + ".")
             strays = _quarantine_strays(art)
+            _follow_quarantine(art, strays)
             if strays:
                 emit("info", "lab",
                      f"Quarantined {len(strays)} off-script file(s) to extra/: {', '.join(strays[:6])}"
@@ -19923,6 +19934,48 @@ def _quarantine_strays(art: Path) -> list[str]:
         except Exception:  # noqa: BLE001 - hygiene must never break the run
             pass
     return moved
+
+
+_MD_LINK_TARGET = re.compile(r"(!?\[[^\]\n]*\]\()([^)\s]+)(\))")
+
+
+def _follow_quarantine(art: Path, moved: "list[str]") -> int:
+    """Name what :func:`_quarantine_strays` moved where it is now, in the report's Markdown (whose
+    links are from the run's folder) and in ``process/fixed_report.json``, so the report still finds
+    its figures when it is read or rendered again. An MCP server's own report links the figures in
+    the server's folder (``gene_expression/<query>/``), which the quarantine moves to ``extra/``.
+    Returns the number of files changed."""
+    names = set(moved)
+    if not names:
+        return 0
+    extra = art / "extra"
+
+    def now(target: str) -> "str | None":
+        rel = target[2:] if target.startswith("./") else target
+        if rel.split("/", 1)[0] not in names or ".." in rel.split("/"):
+            return None
+        return f"extra/{rel}" if (extra / rel).exists() else None
+
+    changed = 0
+    for md in sorted((art / "report").glob("*.md")) if (art / "report").is_dir() else []:
+        try:
+            text = md.read_text(encoding="utf-8")
+            new = _MD_LINK_TARGET.sub(lambda m: m.group(1) + (now(m.group(2)) or m.group(2)) + m.group(3), text)
+            if new != text:
+                md.write_text(new, encoding="utf-8")
+                changed += 1
+        except (OSError, UnicodeDecodeError):
+            pass
+    record = art / "process" / "fixed_report.json"
+    try:
+        doc = json.loads(record.read_text(encoding="utf-8"))
+        sources = [now(s) or s for s in doc.get("sources") or [] if isinstance(s, str)]
+        if sources != doc.get("sources"):
+            record.write_text(json.dumps({**doc, "sources": sources}, indent=2), encoding="utf-8")
+            changed += 1
+    except (OSError, ValueError, AttributeError):
+        pass
+    return changed
 
 
 @app.get("/api/timing/{owner}/{run_id}")
