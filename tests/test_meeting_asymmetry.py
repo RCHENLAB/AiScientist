@@ -218,6 +218,42 @@ def test_the_expert_is_offered_ONLY_the_read_only_whitelist(tmp_path):
     assert "run_de" not in names and "run_code" not in names
 
 
+def test_an_expert_is_offered_a_servers_lookups_and_nothing_else_of_it(tmp_path, monkeypatch):
+    """retigene-rag's gene table and paper searches only read, so an expert may check RetiGene when it
+    wants to; its curation, which spends the user's model, is not offered. A lookup is matched on the
+    server that registered the tool, so another server's tool of the same name is not one."""
+    from aiscientist.agents import mcp_bridge
+    from aiscientist.agents.research_harness import HarnessTool
+
+    monkeypatch.setattr(mcp_bridge, "meeting_lookups", lambda: frozenset(
+        {("retigene-rag", "search_sentences"), ("retigene-rag", "get_gene")}))
+
+    def tool(name, server=None):
+        return HarnessTool(name, f"{name} desc", {"type": "object", "properties": {}},
+                           lambda a, c, _n=name: {"status": "ok", "tool": _n},
+                           **({"provider": {"provider": "mcp", "server": server}} if server else {}))
+
+    offered: list[list[str]] = []
+
+    def chat_fn(messages, tools, **_k):
+        offered.append(sorted(t["function"]["name"] for t in tools))
+        return {"content": "spoke"}
+
+    class _Sci:
+        catalog = [tool("literature_search"), tool("search_sentences", "retigene-rag"),
+                   tool("submit_curation", "retigene-rag"), tool("get_gene", "other-server"),
+                   tool("run_de")]
+        _chat_fn = staticmethod(chat_fn)
+
+        def add_tools(self, *_a, **_k):
+            return None
+
+    _lab_with(tmp_path, _Sci())._expert_turns(
+        [[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]], lambda _e: None)
+
+    assert set(offered[0]) - {"finish"} == {"literature_search", "search_sentences"}
+
+
 def test_a_broken_tool_loop_still_yields_an_opinion(tmp_path):
     """An expert that cannot use its tools must still speak — a meeting is not allowed to fail."""
     def chat_fn(*_a, **_k):

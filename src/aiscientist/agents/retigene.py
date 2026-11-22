@@ -59,7 +59,9 @@ if isinstance(cid, str) and cid and "/" not in cid and cid not in (".", ".."):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 dest.mkdir(parents=True, exist_ok=True)
-full = dest / (os.environ["AISCI_MCP_TOOL"] + ".json")
+# One file per call (AISCI_MCP_CALL names its arguments): a later call of the same tool, by the plan
+# or by a meeting's expert, keeps its own result beside this one instead of replacing it.
+full = dest / (os.environ["AISCI_MCP_TOOL"] + "-" + os.environ["AISCI_MCP_CALL"] + ".json")
 full.write_text(json.dumps(result))
 def size():
     return len(json.dumps(result))

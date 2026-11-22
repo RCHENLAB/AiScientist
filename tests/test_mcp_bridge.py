@@ -133,11 +133,25 @@ def test_invalid_arguments_are_rejected_before_a_job(registry, args):
     {"resources": {"check": [True, 1, "00:01:00"]}},
     {"aliases": []}, {"aliases": {"check": "bad;name"}}, {"aliases": {"other": "unused"}},
     {"prefix": "", "aliases": {"check": "write_report"}},
+    {"lookups": "check"}, {"lookups": ["other"]}, {"lookups": ["check", "check"]}, {"lookups": [1]},
+    {"report": "check", "lookups": ["check"]},
 ])
 def test_invalid_pins_paths_and_execution_policy_are_refused(tmp_path, change):
     config = write_config(tmp_path, overrides=change)
     with pytest.raises(ValueError):
         bridge.load_servers(config)
+
+
+def test_a_servers_lookups_are_named_by_their_planner_names(tmp_path, monkeypatch):
+    """What a meeting's expert may call: the server's declared read-only tools, under the names the
+    planner sees them by, paired with the server that registered them."""
+    config = write_config(tmp_path, overrides={"lookups": ["check"]})
+    monkeypatch.setenv("AISCIENTIST_MCP_CONFIG", str(config))
+    assert bridge.configured_servers()[0].lookups == ("check",)
+    assert bridge.meeting_lookups() == {("table-check", "tables_check")}
+    write_config(tmp_path)
+    assert bridge.configured_servers()[0].lookups == ()
+    assert bridge.meeting_lookups() == frozenset()
 
 
 def test_alias_changes_only_the_planner_name(registry):

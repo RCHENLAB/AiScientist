@@ -87,6 +87,9 @@ class Server:
     # The server's own tool that writes the report of its results in a fixed format (its wire name),
     # or "": when a written report is wanted, the plan calls it instead of having the model write one.
     report: str = ""
+    # The server's tools (wire names) that only read: no job that writes the server's state, no model
+    # call on the user's account. A design or interpretation meeting's experts may call these.
+    lookups: tuple[str, ...] = ()
 
     def planner_name(self, wire_name: str) -> str:
         return self.prefix + (self.aliases or {}).get(wire_name, wire_name)
@@ -133,7 +136,7 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
         raise ValueError("Invalid MCP registry format")
     servers, names, tool_names, skills = [], set(), set(), set()
     required = {"name", "version", "release_tag", "image", "entrypoint", "skill", "runs_on", "tools_file", "tools_sha256"}
-    optional = {"adapter", "prefix", "timeout", "resources", "aliases", "settings_env", "report"}
+    optional = {"adapter", "prefix", "timeout", "resources", "aliases", "settings_env", "report", "lookups"}
     for row in cfg["servers"]:
         if not isinstance(row, dict) or not required <= row.keys() or row.keys() - required - optional:
             raise ValueError("Invalid MCP server fields")
@@ -217,6 +220,14 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
             raise ValueError("Unknown MCP alias tool")
         if "report" in row and row["report"] not in {tool["name"] for tool in entries}:
             raise ValueError("Unknown MCP report tool")
+        lookups = row.get("lookups", [])
+        if (not isinstance(lookups, list) or any(not isinstance(name, str) for name in lookups)
+                or len(set(lookups)) != len(lookups)):
+            raise ValueError("Invalid MCP lookups")
+        if set(lookups) - {tool["name"] for tool in entries}:
+            raise ValueError("Unknown MCP lookup tool")
+        if row.get("report") in lookups:
+            raise ValueError("An MCP server's report tool writes a report: it cannot be a lookup")
         resources = row.get("resources", {})
         if not isinstance(resources, dict) or resources.keys() - {t["name"] for t in entries}:
             raise ValueError("Unknown MCP resource override tool")
@@ -226,6 +237,7 @@ def load_servers(path: Path | None = None) -> tuple[Server, ...]:
                     or not isinstance(value[2], str) or not re.fullmatch(r"\d{2,3}:[0-5]\d:[0-5]\d", value[2])):
                 raise ValueError("Invalid MCP resource override")
         data = {key: value for key, value in row.items() if key != "tools_file"}
+        data["lookups"] = tuple(lookups)
         servers.append(Server(**data, tools=tuple(entries)))
         names.add(row["name"])
         skills.add(row["skill"])
@@ -265,6 +277,13 @@ def configured_tool_names() -> set[str]:
 def configured_tool_skills() -> dict[str, str]:
     return {server.planner_name(tool["name"]): server.skill for server in configured_servers()
             for tool in server.tools}
+
+
+def meeting_lookups() -> frozenset[tuple[str, str]]:
+    """``(server, planner name)`` of every configured server's ``lookups``: the tools that only read,
+    which a design or interpretation meeting's experts may call beside the literature tools."""
+    return frozenset((server.name, server.planner_name(name)) for server in configured_servers()
+                     for name in server.lookups)
 
 
 def report_tools() -> dict[str, str]:
@@ -368,9 +387,12 @@ def build_mcp_tools(executor: Any, environment_tool: Any, *, existing_names=(),
                     prepared = (a.prepare(args, executor, ctx=ctx, tool=e["name"]) if s.adapter == "analysis"
                                 else a.prepare(args, executor, tool=e["name"]))
                     encoded = json.dumps(prepared.arguments, allow_nan=False)
+                    # Names this call's arguments, so a collector can keep each call in its own file.
+                    call_id = hashlib.sha256(encoded.encode()).hexdigest()[:10]
                     command = (
                         'export AISCI_DATA_DIR="$AISCIENTIST_ENV_DIR" AISCI_EXECUTOR=inline\n'
-                        f"export AISCI_MCP_SERVER={shlex.quote(s.name)} AISCI_MCP_TOOL={shlex.quote(e['name'])}\n"
+                        f"export AISCI_MCP_SERVER={shlex.quote(s.name)} AISCI_MCP_TOOL={shlex.quote(e['name'])}"
+                        f" AISCI_MCP_CALL={call_id}\n"
                         + prepared.setup +
                         'export AISCI_MCP_RESULT=$(mktemp "$AISCIENTIST_ENV_DIR/.mcp-result.XXXXXX")\n'
                         'trap \'rm -f "$AISCI_MCP_RESULT"\' EXIT\n'

@@ -369,9 +369,20 @@ _DESCRIBE_CONFIDENCE = 0.6
 
 # Tools a MEETING expert may call. A whitelist, never a blacklist: a meeting must not be able to
 # mutate the run's state, and the analysis catalog is full of tools that rewrite the checkpoint
-# chain. These three only READ — the data file, and the published literature — which is exactly
-# what lets one expert hold evidence the others do not.
+# chain. These only READ — the data file, and the published literature — which is exactly what lets
+# one expert hold evidence the others do not. An MCP server's own read-only tools join them through
+# its registry entry's ``lookups`` (``mcp_bridge.meeting_lookups``): retigene-rag's gene table and
+# paper searches, never its curation, which spends the user's model.
 _MEETING_TOOLS = frozenset({"inspect_dataset", "literature_search", "deep_literature", "search_corpus"})
+
+
+def _meeting_tool(tool: Any, lookups: "frozenset[tuple[str, str]]") -> bool:
+    """May a meeting's expert call ``tool``? One of ``_MEETING_TOOLS``, or a lookup its own MCP server
+    declares (matched on the server that registered the tool, not on the name alone)."""
+    if canonical_tool_name(tool.name) in _MEETING_TOOLS:
+        return True
+    server = (getattr(tool, "provider", None) or {}).get("server")
+    return bool(server) and (server, tool.name) in lookups
 
 
 _PLAN_FINDING_WORDS = {
@@ -2605,7 +2616,17 @@ class ResearchLab:
         fovea/macula/periphery ``tissue``: "where are LRAT, CRALBP, rho and ABCR expressed?") held
         a two-round meeting of 20+ minutes whose experts said, in round one, that nothing was
         being compared. So a request that compares none of the dataset's groups is planned by one
-        scientist (:meth:`_asks_for_comparison`)."""
+        scientist (:meth:`_asks_for_comparison`).
+
+        Before either: a request the gateway's router already sent to one server's tools
+        (``LabConfig.route_skill``, retigene-rag for a question about the RetiGene papers or its gene
+        table) is planned by one scientist. The route has already chosen the protocol, and the plan
+        is its steps: on the staging run 605637db5dee ("What are haploinsufficient genes in RetiGene
+        papers?") the design and the interpretation meetings took about seven minutes, and the plan
+        was the protocol's three steps anyway."""
+        if getattr(self.config, "route_skill", ""):
+            emit({"type": "mode_selected", "mode": "single", "reason": "routed"})
+            return "single"
         dr = (self.ctx.decisions or {}).get("dataset_result")
         forced = _dataset_mode_rule(dr)
         if forced == "team" and not self._asks_for_comparison(question, _contrast_columns(dr)):
@@ -2801,13 +2822,18 @@ class ResearchLab:
 
         A meeting expert used to be able only to talk: it received a digest of a finding and had no
         way to check it. Giving it ``inspect_dataset`` / ``literature_search`` / ``deep_literature``
-        (a whitelist — see ``_MEETING_TOOLS``; nothing that writes) turns a persona into something
-        that can go and LOOK, which is the second half of making the disagreement real: one expert
-        can come back with evidence the others simply do not have.
+        and the MCP servers' declared lookups, such as retigene-rag's gene table and paper searches
+        (a whitelist — see ``_MEETING_TOOLS`` and ``_meeting_tool``; nothing that writes), turns a
+        persona into something that can go and LOOK, which is the second half of making the
+        disagreement real: one expert can come back with evidence the others simply do not have.
+        An expert calls them only when it wants to; a server the session does not have is not in
+        the Scientist's catalog, so it is not offered.
 
         Falls back to plain completions when no tool-capable Scientist is wired (offline tests), so
         the meeting always works."""
-        tools = [t for t in getattr(self.scientist, "catalog", []) if canonical_tool_name(t.name) in _MEETING_TOOLS]
+        from ..mcp_bridge import meeting_lookups
+        lookups = meeting_lookups()
+        tools = [t for t in getattr(self.scientist, "catalog", []) if _meeting_tool(t, lookups)]
         if not tools or not self.config.meeting_tools:
             return self._complete_concurrent(msg_lists)
 

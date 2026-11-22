@@ -13587,7 +13587,8 @@ def _lab_event_to_chat(ev: dict[str, Any]) -> list[dict[str, Any]]:
                "descriptive": "your request describes the data and compares none of its groups",
                "question": "the PI's read of the question",
                "scope": "your request names the only analyses it wants",
-               "continuation": "this message adds to the analysis already done in this chat"}.get(
+               "continuation": "this message adds to the analysis already done in this chat",
+               "routed": "this question is answered with the tools it was routed to"}.get(
                    str(ev.get("reason")), "")
         if ev.get("mode") == "team":
             progress(f"👥 Team mode — the PI will form an expert team and hold a design meeting "

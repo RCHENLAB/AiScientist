@@ -62,6 +62,7 @@ shell entry point stays closed. A deployment can set
 | `settings_env` | Optional list of approved nonsecret deployment environment names for an analysis server. Values come from the gateway deployment, never from model arguments or registry values. |
 | `resources` | Optional mapping from original tool name to `[cpus, mem_gb, time_limit]`. Omitted tools inherit the skill's resources. |
 | `report` | Optional original name of the server's tool that writes the report of its results in a fixed format. When a written report is wanted, the plan's report step for this server's skill calls it, and the gateway renders what it wrote instead of a model-written manuscript. |
+| `lookups` | Optional list of the server's original tool names that only read: no job that writes the server's state, no model call on the user's account. The experts of a design or interpretation meeting may call them, beside `inspect_dataset` and the literature tools; a server's other tools are never offered in a meeting. The report tool cannot be one. |
 
 Each snapshot is a JSON array of `{name, description, inputSchema}` objects.
 Schemas must describe objects and pass JSON Schema Draft 2020-12 validation.
@@ -188,7 +189,12 @@ release holds its skill with the same image digest.
 - **Bounds.** `search_sentences` pages are at most 40 lines, `get_evidence` at most 20 rows
   `get_genes` at most 100 rows and `find_genes` at most 40 rows beside its complete list of
   gene symbols. A longer result is trimmed to fit the transport bound,
-  says how much was left out, and is kept whole in `artifacts/retigene/<tool>.json`.
+  says how much was left out, and is kept whole in `artifacts/retigene/<tool>-<call>.json`,
+  where `<call>` names the call's arguments, so a later call of the same tool keeps its own file.
+- **Meetings.** The registry's `lookups` are `get_gene`, `find_genes`, `search_sentences`,
+  `search_passages`, `read_passage`, `get_genes` and `get_evidence`: a meeting's expert may
+  check RetiGene's record of a gene or what the papers say when it wants to. `submit_curation`,
+  `evaluate`, the status tools and the report tool stay with the plan.
 - **Reference.** `evaluate` scores only against the bundled curator reference.
 
 Every call the server answers records the server name, package version, release tag, image

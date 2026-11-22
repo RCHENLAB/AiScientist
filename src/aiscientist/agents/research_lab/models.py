@@ -204,9 +204,10 @@ class LabConfig:
     # CONCURRENTLY and vLLM's continuous batching runs them together on the single GPU. This
     # caps in-flight requests so a big team can't blow the KV-cache pool. Tune to the card.
     max_meeting_concurrency: int = 4
-    # Meeting experts may call READ-ONLY tools (_MEETING_TOOLS) instead of only talking, so an
-    # expert can verify its assigned evidence or fetch outside evidence the others lack. Costs
-    # extra turns per expert; off falls back to plain completions.
+    # Meeting experts may call READ-ONLY tools (_MEETING_TOOLS and the MCP servers' declared
+    # lookups, retigene-rag's among them) instead of only talking, so an expert can verify its
+    # assigned evidence or fetch outside evidence the others lack. Costs extra turns per expert;
+    # off falls back to plain completions.
     meeting_tools: bool = True
     meeting_tool_calls: int = 4          # tool turns one expert may spend per meeting round
     # PI↔Critic step meetings (docs/pi_critic_meeting_protocol.md). Two bounded PI↔Critic exchanges

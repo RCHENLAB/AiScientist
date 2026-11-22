@@ -462,6 +462,15 @@
         "write_report": "retigene_write_report"
       },
       "report": "write_report",
+      "lookups": [
+        "get_gene",
+        "find_genes",
+        "search_sentences",
+        "search_passages",
+        "read_passage",
+        "get_genes",
+        "get_evidence"
+      ],
       "timeout": 3600,
       "resources": {
         "get_gene": [

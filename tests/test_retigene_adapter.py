@@ -249,12 +249,12 @@ def test_adapter_clamps_and_refusals(monkeypatch):
         a.prepare({"terms": ["x"]}, executor, tool="search_sentences")
 
 
-def run_collector(tmp_path, monkeypatch, capsys, result, tool="submit_curation"):
+def run_collector(tmp_path, monkeypatch, capsys, result, tool="submit_curation", call="0123456789"):
     data = tmp_path / "env" / "retigene-rag"
     result_file = tmp_path / "result.json"
     result_file.write_text(json.dumps(result))
     for key, value in {"AISCI_MCP_RESULT": result_file, "AISCIENTIST_ARTIFACTS": tmp_path / "artifacts",
-                       "AISCI_DATA_DIR": tmp_path / "env", "AISCI_MCP_TOOL": tool,
+                       "AISCI_DATA_DIR": tmp_path / "env", "AISCI_MCP_TOOL": tool, "AISCI_MCP_CALL": call,
                        "AISCIENTIST_ENV_DIR": tmp_path / "env", "RETIGENE_INDEX": tmp_path / "index",
                        "RETIGENE_CACHE": tmp_path / "cache" / "retigene-rag" / "cache",
                        "AISCIENTIST_TOOL_CACHE": tmp_path / "cache"}.items():
@@ -279,14 +279,36 @@ def test_collector_names_no_server_path_and_copies_the_tables(tmp_path, monkeypa
     assert shown["note"] == "index the RetiGene index; cache the reply cache"
     copied = sorted(p.name for p in (tmp_path / "artifacts" / "retigene" / cid).iterdir())
     assert copied == ["genes.csv", "report.md", "sentences.csv"]  # deliverables only, not the request
-    assert json.loads((tmp_path / "artifacts" / "retigene" / "submit_curation.json").read_text()) == shown
+    assert json.loads((tmp_path / "artifacts" / "retigene" / "submit_curation-0123456789.json").read_text()) == shown
+
+
+def test_a_meetings_experts_may_call_the_lookups_but_never_the_curation():
+    """The registry's lookups are what a meeting's experts are offered. The curation spends the
+    user's model and starts a long job, the report writes, evaluate and the status tools are the
+    plan's business: none of them is a lookup."""
+    from aiscientist.agents.mcp_bridge import load_servers
+    rag = next(s for s in load_servers() if s.name == retigene.SERVER)
+    assert set(rag.lookups) == {"get_gene", "find_genes", "search_sentences", "search_passages",
+                                "read_passage", "get_genes", "get_evidence"}
+    assert not set(rag.lookups) & {"submit_curation", "write_report", "evaluate", "curation_status",
+                                   "list_curations"}
+
+
+def test_each_call_keeps_its_own_result_file(tmp_path, monkeypatch, capsys):
+    """A second call of a tool (the plan's, or a meeting expert's) must not replace the first's file."""
+    run_collector(tmp_path, monkeypatch, capsys, {"gene": "PRPF31"}, tool="get_gene", call="aaaaaaaaaa")
+    run_collector(tmp_path, monkeypatch, capsys, {"gene": "USH2A"}, tool="get_gene", call="bbbbbbbbbb")
+    folder = tmp_path / "artifacts" / "retigene"
+    assert sorted(p.name for p in folder.glob("get_gene-*.json")) == ["get_gene-aaaaaaaaaa.json",
+                                                                       "get_gene-bbbbbbbbbb.json"]
+    assert json.loads((folder / "get_gene-aaaaaaaaaa.json").read_text()) == {"gene": "PRPF31"}
 
 
 def test_collector_bounds_long_results_and_keeps_them_whole(tmp_path, monkeypatch, capsys):
     rows = [{"gene": f"G{i}", "quote": "x" * 400} for i in range(200)]
     _, out, shown = run_collector(tmp_path, monkeypatch, capsys, {"total": 200, "rows": rows}, tool="get_evidence")
     assert len(out) < 14000 and shown["rows"] and shown["rows_omitted"] == 200 - len(shown["rows"])
-    assert shown["full_result"] == "retigene/get_evidence.json"
+    assert shown["full_result"] == "retigene/get_evidence-0123456789.json"
     assert len(json.loads((tmp_path / "artifacts" / shown["full_result"]).read_text())["rows"]) == 200
     lines = "\n".join(f"PMID {i} p1 c0: " + "y" * 300 for i in range(120))
     _, out, shown = run_collector(tmp_path, monkeypatch, capsys, {"sentences": lines, "total_sentences": 120},

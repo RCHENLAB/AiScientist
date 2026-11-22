@@ -430,6 +430,36 @@ def test_a_dataset_without_a_contrast_is_not_asked_about():
     assert calls == []
 
 
+def test_a_routed_question_holds_no_meeting_whatever_the_dataset_or_the_model_says():
+    """Staging run 605637db5dee (2026-11-21): "What are haploinsufficient genes in RetiGene papers?"
+    was routed to retigene-rag, then the PI's model chose team mode. The design and interpretation
+    meetings took about seven minutes, and the plan was the protocol's three steps anyway: the route
+    had already chosen it. A routed request is planned by one scientist, before the dataset rule and
+    without asking the model."""
+    import dataclasses
+    q = "Compare RHO expression between fovea and periphery"          # team by rule, unrouted
+    lab, calls = _mode_lab(_ATLAS_PROFILE, '{"asks": "compare", "confidence": 1.0}')
+    assert lab._route_mode(q, lambda e: None) == "team"
+    lab, calls = _mode_lab(_ATLAS_PROFILE, '{"asks": "compare", "confidence": 1.0}')
+    lab.config = dataclasses.replace(lab.config, route_skill="query-retigene-papers-with-aiscientist-mcp")
+    events: list = []
+    assert lab._route_mode(q, events.append) == "single"
+    assert events == [{"type": "mode_selected", "mode": "single", "reason": "routed"}]
+    assert calls == []
+    lab, calls = _mode_lab({}, "team")                             # no dataset: the model would say team
+    lab.config = dataclasses.replace(lab.config, route_skill="query-retigene-papers-with-aiscientist-mcp")
+    assert lab._route_mode("What are haploinsufficient genes in RetiGene papers?", lambda e: None) == "single"
+    assert calls == []
+
+
+def test_the_feed_says_why_a_routed_question_has_no_meeting():
+    from aiscientist.gateway.app import _lab_event_to_chat
+    texts = [p["text"] for p in _lab_event_to_chat({"type": "mode_selected", "mode": "single", "reason": "routed"})
+             if p.get("type") == "lab_progress"]
+    assert texts == ["👤 Single-scientist mode — planning directly — this question is answered with the "
+                     "tools it was routed to."]
+
+
 def test_remote_dfs3b_paths_are_not_reported_as_missing_evidence(tmp_path):
     """The HPC3 shell tools return the dfs3b paths they looked at; checked on the gateway host
     those never exist, so a production ORA step was told ALL its evidence was missing while its
